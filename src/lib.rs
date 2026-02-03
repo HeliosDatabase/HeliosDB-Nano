@@ -1398,6 +1398,86 @@ impl EmbeddedDatabase {
                 }
                 Ok(0)
             }
+            sql::LogicalPlan::CreateTrigger {
+                name,
+                table_name,
+                timing,
+                events,
+                for_each,
+                when_condition,
+                body,
+                if_not_exists,
+                referencing,
+                characteristics,
+                trigger_type,
+                from_constraint,
+            } => {
+                // Check if trigger already exists
+                if let Ok(Some(_)) = self.trigger_registry.get_trigger(table_name, name) {
+                    if *if_not_exists {
+                        return Ok(0);
+                    } else {
+                        return Err(Error::query_execution(format!(
+                            "Trigger '{}' already exists on table '{}'",
+                            name, table_name
+                        )));
+                    }
+                }
+
+                // Create trigger definition
+                let definition = sql::triggers::TriggerDefinition {
+                    name: name.clone(),
+                    table_name: table_name.clone(),
+                    timing: timing.clone(),
+                    events: events.clone(),
+                    for_each: for_each.clone(),
+                    when_condition: when_condition.clone(),
+                    body: body.clone(),
+                    enabled: true,
+                    created_at: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as u64,
+                    referencing: referencing.clone(),
+                    characteristics: characteristics.clone(),
+                    trigger_type: trigger_type.clone(),
+                    from_constraint: from_constraint.clone(),
+                };
+
+                // Register trigger
+                self.trigger_registry.register_trigger(definition.clone())?;
+
+                // Log to WAL for replication
+                if let Ok(serialized) = bincode::serialize(&definition) {
+                    if let Err(e) = self.storage.log_create_trigger(name, table_name, &serialized) {
+                        tracing::warn!("Failed to log CREATE TRIGGER to WAL: {}", e);
+                    }
+                }
+
+                Ok(0)
+            }
+            sql::LogicalPlan::DropTrigger { name, table_name, if_exists } => {
+                // Drop trigger from registry - table_name is required
+                let tbl = table_name.as_ref().ok_or_else(|| {
+                    Error::query_execution("DROP TRIGGER requires ON <table_name> clause".to_string())
+                })?;
+
+                let dropped = self.trigger_registry.drop_trigger(tbl, name)?;
+
+                if !dropped && !*if_exists {
+                    return Err(Error::query_execution(format!(
+                        "Trigger '{}' does not exist on table '{}'",
+                        name, tbl
+                    )));
+                }
+
+                // Log to WAL for replication
+                if let Err(e) = self.storage.log_drop_trigger(name, table_name.as_deref()) {
+                    tracing::warn!("Failed to log DROP TRIGGER to WAL: {}", e);
+                }
+
+                Ok(0)
+            }
             sql::LogicalPlan::Call { name, args } => {
                 // Execute procedure
                 let schema = std::sync::Arc::new(Schema { columns: vec![] });
@@ -3269,7 +3349,16 @@ impl EmbeddedDatabase {
     /// Returns the current position in the Write-Ahead Log.
     /// Useful for debugging and transaction tracking.
     pub fn current_lsn(&self) -> Option<u64> {
-        self.storage.wal_lsn()
+        // Return the last snapshot transaction ID for time-travel queries
+        // This is the ID users should use with AS OF TRANSACTION
+        let txn_id = self.storage.snapshot_manager().current_transaction_id();
+        // Return the last registered ID (current - 1, since current is the next to be assigned)
+        if txn_id > 1 {
+            Some(txn_id - 1)
+        } else {
+            // No transactions yet, but show 0 to indicate starting point
+            Some(0)
+        }
     }
 
     /// Close the database
