@@ -23,6 +23,7 @@ pub mod aggregate;
 pub mod ddl;
 pub mod phase3;
 pub mod explain;
+pub mod window;
 
 // Re-export operators for public API
 pub use scan::{ScanOperator, VectorScanOperator, MaterializedOperator};
@@ -30,6 +31,7 @@ pub use filter::FilterOperator;
 pub use project::{ProjectOperator, LimitOperator};
 pub use join::{NestedLoopJoinOperator, HashJoinOperator};
 pub use aggregate::{AggregateOperator, SortOperator};
+pub use window::WindowOperator;
 
 /// DualScan operator for SELECT without FROM
 ///
@@ -194,6 +196,17 @@ pub trait PhysicalOperator {
     fn schema(&self) -> Arc<Schema>;
 }
 
+/// Materialized CTE data
+#[derive(Clone)]
+pub struct CteData {
+    /// CTE name
+    pub name: String,
+    /// Materialized tuples
+    pub tuples: Vec<Tuple>,
+    /// Schema of the CTE
+    pub schema: Arc<Schema>,
+}
+
 /// Query executor
 ///
 /// Converts logical plans into physical operators and executes them.
@@ -206,6 +219,8 @@ pub struct Executor<'a> {
     parameters: Vec<crate::Value>,
     /// Optional transaction context for ACID guarantees
     transaction: Option<&'a crate::storage::Transaction>,
+    /// Materialized CTE results (name -> data)
+    cte_context: std::collections::HashMap<String, CteData>,
 }
 
 impl<'a> Executor<'a> {
@@ -216,6 +231,7 @@ impl<'a> Executor<'a> {
             timeout_ctx: None,
             parameters: Vec::new(),
             transaction: None,
+            cte_context: std::collections::HashMap::new(),
         }
     }
 
@@ -226,7 +242,18 @@ impl<'a> Executor<'a> {
             timeout_ctx: None,
             parameters: Vec::new(),
             transaction: None,
+            cte_context: std::collections::HashMap::new(),
         }
+    }
+
+    /// Get a CTE by name if it exists in the context
+    pub fn get_cte(&self, name: &str) -> Option<&CteData> {
+        self.cte_context.get(name)
+    }
+
+    /// Add a CTE to the context
+    pub fn add_cte(&mut self, cte: CteData) {
+        self.cte_context.insert(cte.name.clone(), cte);
     }
 
     /// Set transaction context
@@ -358,7 +385,7 @@ impl<'a> Executor<'a> {
     }
 
     /// Convert a logical plan to a physical operator
-    pub(crate) fn plan_to_operator(&self, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
+    pub(crate) fn plan_to_operator(&mut self, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
         match plan {
             LogicalPlan::Scan { .. } => {
                 scan::handle_scan(self, plan)
@@ -377,14 +404,82 @@ impl<'a> Executor<'a> {
                 ).with_timeout(self.timeout_ctx.clone())))
             }
             LogicalPlan::Project { input, exprs, aliases, distinct } => {
-                let input_op = self.plan_to_operator(input)?;
-                Ok(Box::new(ProjectOperator::new(
-                    input_op,
-                    exprs.clone(),
-                    aliases.clone(),
-                    *distinct,
-                    self.parameters.clone(),
-                ).with_timeout(self.timeout_ctx.clone())))
+                use crate::sql::LogicalExpr;
+
+                // Check if any expressions are window functions
+                let has_window_functions = exprs.iter().any(|e| matches!(e, LogicalExpr::WindowFunction { .. }));
+
+                if has_window_functions {
+                    let input_op = self.plan_to_operator(input)?;
+                    let input_schema = input_op.schema();
+                    let input_col_count = input_schema.columns.len();
+
+                    // Collect window function expressions with their aliases
+                    let mut window_exprs: Vec<(LogicalExpr, String)> = Vec::new();
+                    let mut window_indices: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+
+                    for (i, (expr, alias)) in exprs.iter().zip(aliases.iter()).enumerate() {
+                        if matches!(expr, LogicalExpr::WindowFunction { .. }) {
+                            window_indices.insert(i, window_exprs.len());
+                            window_exprs.push((expr.clone(), alias.clone()));
+                        }
+                    }
+
+                    // Build window output schema (input + window columns)
+                    let mut window_schema_cols = input_schema.columns.clone();
+                    for (_, name) in &window_exprs {
+                        window_schema_cols.push(crate::Column {
+                            name: name.clone(),
+                            data_type: crate::DataType::Int8, // Will be inferred properly at runtime
+                            nullable: true,
+                            primary_key: false,
+                            source_table: None,
+                            source_table_name: None,
+                            default_expr: None,
+                            unique: false,
+                            storage_mode: crate::ColumnStorageMode::Default,
+                        });
+                    }
+                    let window_schema = Arc::new(Schema { columns: window_schema_cols });
+
+                    // Create window operator
+                    let window_op = WindowOperator::new(input_op, window_exprs, window_schema);
+
+                    // Create modified expressions that reference window columns
+                    // Window function results are appended after input columns
+                    let modified_exprs: Vec<LogicalExpr> = exprs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, expr)| {
+                            if window_indices.contains_key(&i) {
+                                // Reference the appended window column by name
+                                LogicalExpr::Column {
+                                    table: None,
+                                    name: aliases[i].clone(),
+                                }
+                            } else {
+                                expr.clone()
+                            }
+                        })
+                        .collect();
+
+                    Ok(Box::new(ProjectOperator::new(
+                        Box::new(window_op),
+                        modified_exprs,
+                        aliases.clone(),
+                        *distinct,
+                        self.parameters.clone(),
+                    ).with_timeout(self.timeout_ctx.clone())))
+                } else {
+                    let input_op = self.plan_to_operator(input)?;
+                    Ok(Box::new(ProjectOperator::new(
+                        input_op,
+                        exprs.clone(),
+                        aliases.clone(),
+                        *distinct,
+                        self.parameters.clone(),
+                    ).with_timeout(self.timeout_ctx.clone())))
+                }
             }
             LogicalPlan::Limit { input, limit, offset } => {
                 let input_op = self.plan_to_operator(input)?;
@@ -438,14 +533,27 @@ impl<'a> Executor<'a> {
             | LogicalPlan::SystemView { .. } => {
                 phase3::handle_phase3_operation(self, plan)
             }
-            LogicalPlan::With { ctes: _, query } => {
-                // CTE support: for now, just execute the inner query
-                // Full CTE implementation requires:
-                // 1. Materializing CTE results
-                // 2. Creating a CTE scope/context
-                // 3. Replacing table references with CTE tuples
-                // For v2.x, we execute the main query and CTEs are ignored
-                // This is a simplified implementation that at least parses CTEs
+            LogicalPlan::With { ctes, query } => {
+                // Materialize each CTE before executing the main query
+                // CTEs are stored in cte_context and looked up during table scans
+                for (cte_name, cte_plan) in ctes {
+                    // Execute the CTE plan to materialize its results
+                    let cte_schema = cte_plan.schema();
+                    let mut cte_operator = self.plan_to_operator(cte_plan)?;
+                    let mut tuples = Vec::new();
+                    while let Some(tuple) = cte_operator.next()? {
+                        tuples.push(tuple);
+                    }
+
+                    // Store the CTE in context for later lookup during scans
+                    self.add_cte(CteData {
+                        name: cte_name.clone(),
+                        tuples,
+                        schema: cte_schema,
+                    });
+                }
+
+                // Now execute the main query with CTEs available in context
                 self.plan_to_operator(query)
             }
             LogicalPlan::Explain { input, options } => {
@@ -626,6 +734,7 @@ pub(crate) fn compare_values(a: &crate::Value, b: &crate::Value) -> std::cmp::Or
                     Value::DictRef { .. } => 17,
                     Value::CasRef { .. } => 18,
                     Value::ColumnarRef => 19,
+                    Value::Interval(_) => 20, // Interval type
                 }
             }
             type_priority(a).cmp(&type_priority(b))

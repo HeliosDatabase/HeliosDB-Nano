@@ -203,6 +203,25 @@ pub(super) fn handle_scan(
     if let LogicalPlan::Scan { table_name, alias, schema: _plan_schema, projection, as_of } = plan {
         // Use alias for column source_table (for JOIN disambiguation), fallback to table_name
         let source_name = alias.as_ref().unwrap_or(table_name);
+
+        // First, check if this table name is a CTE reference
+        if let Some(cte_data) = executor.get_cte(table_name) {
+            // Return the materialized CTE data
+            let mut schema_with_source = (*cte_data.schema).clone();
+            for col in &mut schema_with_source.columns {
+                col.source_table = Some(source_name.clone());
+                col.source_table_name = Some(table_name.clone());
+            }
+
+            return Ok(Box::new(ScanOperator::new(
+                table_name.clone(),
+                Arc::new(schema_with_source),
+                projection.clone(),
+                cte_data.tuples.clone(),
+                executor.parameters().to_vec(),
+            ).with_timeout(executor.timeout_ctx())));
+        }
+
         // Fetch actual schema from storage and scan table
         let (actual_schema, tuples) = if let Some(storage) = executor.storage() {
             let catalog = storage.catalog();
@@ -369,6 +388,38 @@ pub(super) fn handle_filtered_scan(
     if let LogicalPlan::FilteredScan { table_name, alias, schema: _plan_schema, projection, predicate, as_of } = plan {
         // Use alias for column source_table (for JOIN disambiguation), fallback to table_name
         let source_name = alias.as_ref().unwrap_or(table_name);
+
+        // First, check if this table name is a CTE reference
+        if let Some(cte_data) = executor.get_cte(table_name) {
+            // Return the materialized CTE data with filter applied
+            let mut schema_with_source = (*cte_data.schema).clone();
+            for col in &mut schema_with_source.columns {
+                col.source_table = Some(source_name.clone());
+                col.source_table_name = Some(table_name.clone());
+            }
+
+            let schema_arc = Arc::new(schema_with_source);
+            let scan_op = Box::new(ScanOperator::new(
+                table_name.clone(),
+                schema_arc.clone(),
+                projection.clone(),
+                cte_data.tuples.clone(),
+                executor.parameters().to_vec(),
+            ).with_timeout(executor.timeout_ctx()));
+
+            // Apply filter if predicate exists
+            if let Some(pred) = predicate {
+                let materialized_pred = executor.materialize_subqueries(pred)?;
+                return Ok(Box::new(super::filter::FilterOperator::new(
+                    scan_op,
+                    materialized_pred,
+                    executor.parameters().to_vec(),
+                )));
+            }
+
+            return Ok(scan_op);
+        }
+
         // Fetch actual schema from storage and scan table with filtering
         let (actual_schema, tuples) = if let Some(storage) = executor.storage() {
             let catalog = storage.catalog();

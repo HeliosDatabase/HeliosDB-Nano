@@ -189,17 +189,40 @@ impl ProceduralExecutor {
             )?;
         }
 
-        // Execute statements
-        for stmt in &block.statements {
-            Self::execute_statement(stmt, ctx)?;
+        // Execute statements with exception handling
+        let execution_result: Result<()> = (|| {
+            for stmt in &block.statements {
+                Self::execute_statement(stmt, ctx)?;
 
-            // Check for control flow changes
-            if ctx.returned || ctx.exit_requested {
-                break;
+                // Check for control flow changes
+                if ctx.returned || ctx.exit_requested {
+                    break;
+                }
+            }
+            Ok(())
+        })();
+
+        // Handle exception if one occurred
+        match execution_result {
+            Ok(()) => {}
+            Err(err) => {
+                // Check if any exception handler matches
+                if let Some(handler) = Self::find_matching_handler(&block.exception_handlers, &err) {
+                    // Execute the handler's body
+                    for stmt in &handler.body {
+                        Self::execute_statement(stmt, ctx)?;
+                        if ctx.returned || ctx.exit_requested {
+                            break;
+                        }
+                    }
+                } else {
+                    // No handler matched, re-raise the exception
+                    // Pop scope before returning error
+                    ctx.pop_scope();
+                    return Err(err);
+                }
             }
         }
-
-        // TODO: Handle exception handlers
 
         // Pop scope
         ctx.pop_scope();
@@ -473,6 +496,80 @@ impl ProceduralExecutor {
         }
 
         Ok(())
+    }
+
+    /// Find a matching exception handler for an error
+    ///
+    /// Checks each handler's conditions against the error. Conditions are checked in order:
+    /// - Named conditions match against PostgreSQL exception names (e.g., "division_by_zero")
+    /// - SQLSTATE conditions match against the SQLSTATE code in the error
+    /// - OTHERS matches any exception
+    fn find_matching_handler<'a>(
+        handlers: &'a [ExceptionHandler],
+        error: &Error,
+    ) -> Option<&'a ExceptionHandler> {
+        let error_msg = error.to_string();
+
+        // Extract SQLSTATE from error message if present
+        // Format: "RAISE EXCEPTION: [SQLSTATE: XXXXX] message"
+        let sqlstate = if let Some(start) = error_msg.find("[SQLSTATE:") {
+            let rest = &error_msg[start + 10..];
+            if let Some(end) = rest.find(']') {
+                Some(rest[..end].trim().to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // Map common error patterns to PostgreSQL exception names
+        let exception_name = Self::error_to_exception_name(&error_msg);
+
+        for handler in handlers {
+            for condition in &handler.conditions {
+                let matches = match condition {
+                    ExceptionCondition::Others => true,
+                    ExceptionCondition::SqlState(state) => {
+                        sqlstate.as_ref().map(|s| s == state).unwrap_or(false)
+                    }
+                    ExceptionCondition::Named(name) => {
+                        let name_upper = name.to_uppercase();
+                        exception_name.as_ref().map(|n| n == &name_upper).unwrap_or(false)
+                    }
+                };
+
+                if matches {
+                    return Some(handler);
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Map error message patterns to PostgreSQL exception names
+    fn error_to_exception_name(error_msg: &str) -> Option<String> {
+        let msg_lower = error_msg.to_lowercase();
+
+        // Common PostgreSQL exception name mappings
+        if msg_lower.contains("division by zero") || msg_lower.contains("divide by zero") {
+            Some("DIVISION_BY_ZERO".to_string())
+        } else if msg_lower.contains("null value") && msg_lower.contains("not allowed") {
+            Some("NOT_NULL_VIOLATION".to_string())
+        } else if msg_lower.contains("unique") && msg_lower.contains("violation") {
+            Some("UNIQUE_VIOLATION".to_string())
+        } else if msg_lower.contains("foreign key") && msg_lower.contains("violation") {
+            Some("FOREIGN_KEY_VIOLATION".to_string())
+        } else if msg_lower.contains("no data") || msg_lower.contains("not found") {
+            Some("NO_DATA_FOUND".to_string())
+        } else if msg_lower.contains("too many rows") {
+            Some("TOO_MANY_ROWS".to_string())
+        } else if msg_lower.contains("raise exception") {
+            Some("RAISE_EXCEPTION".to_string())
+        } else {
+            None
+        }
     }
 }
 

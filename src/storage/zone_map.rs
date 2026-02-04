@@ -638,6 +638,7 @@ impl TableZoneMap {
             Value::DictRef { .. } => 4,
             Value::CasRef { .. } => 32,
             Value::ColumnarRef => 1,
+            Value::Interval(_) => 16, // Interval contains months, days, microseconds
         }
     }
 }

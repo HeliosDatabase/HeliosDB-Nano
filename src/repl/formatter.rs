@@ -61,6 +61,19 @@ fn format_value(value: &Value) -> String {
         Value::DictRef { dict_id } => format!("<dict:{}>", dict_id).dimmed().to_string(),
         Value::CasRef { hash } => format!("<cas:{}>", hex::encode(&hash[..8])).dimmed().to_string(),
         Value::ColumnarRef => "<columnar>".dimmed().to_string(),
+        Value::Interval(microseconds) => {
+            // Format interval as human-readable duration
+            let total_secs = *microseconds / 1_000_000;
+            let hours = total_secs / 3600;
+            let mins = (total_secs % 3600) / 60;
+            let secs = total_secs % 60;
+            let micros = *microseconds % 1_000_000;
+            if micros != 0 {
+                format!("{:02}:{:02}:{:02}.{:06}", hours, mins, secs, micros)
+            } else {
+                format!("{:02}:{:02}:{:02}", hours, mins, secs)
+            }
+        }
     }
 }
 

@@ -249,6 +249,17 @@ impl ProjectionPruningRule {
                 Self::collect_used_columns(array, columns);
                 Self::collect_used_columns(index, columns);
             }
+            LogicalExpr::WindowFunction { args, partition_by, order_by, .. } => {
+                for arg in args {
+                    Self::collect_used_columns(arg, columns);
+                }
+                for expr in partition_by {
+                    Self::collect_used_columns(expr, columns);
+                }
+                for (expr, _) in order_by {
+                    Self::collect_used_columns(expr, columns);
+                }
+            }
             LogicalExpr::Literal(_) |
             LogicalExpr::Wildcard |
             LogicalExpr::Parameter { .. } => {}

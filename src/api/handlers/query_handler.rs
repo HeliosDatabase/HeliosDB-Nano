@@ -334,6 +334,7 @@ fn infer_schema_from_tuples(tuples: &[Tuple]) -> Result<Schema, ApiError> {
                 Value::DictRef { .. } => DataType::Text,
                 Value::CasRef { .. } => DataType::Bytea,
                 Value::ColumnarRef => DataType::Text,
+                Value::Interval(_) => DataType::Interval,
             };
 
             crate::Column {

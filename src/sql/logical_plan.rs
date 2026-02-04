@@ -742,6 +742,86 @@ pub enum LogicalExpr {
         /// Index expression (1-based for PostgreSQL compatibility)
         index: Box<LogicalExpr>,
     },
+
+    /// Window function: func(args) OVER (PARTITION BY ... ORDER BY ...)
+    WindowFunction {
+        /// Window function type
+        fun: WindowFunctionType,
+        /// Arguments to the function
+        args: Vec<LogicalExpr>,
+        /// PARTITION BY columns
+        partition_by: Vec<LogicalExpr>,
+        /// ORDER BY expressions and directions (expr, ascending)
+        order_by: Vec<(LogicalExpr, bool)>,
+        /// Window frame specification
+        frame: Option<WindowFrame>,
+    },
+}
+
+/// Window function type
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowFunctionType {
+    /// ROW_NUMBER() - sequential row number within partition
+    RowNumber,
+    /// RANK() - rank with gaps for ties
+    Rank,
+    /// DENSE_RANK() - rank without gaps for ties
+    DenseRank,
+    /// PERCENT_RANK() - relative rank (0 to 1)
+    PercentRank,
+    /// CUME_DIST() - cumulative distribution
+    CumeDist,
+    /// NTILE(n) - divide into n buckets
+    Ntile,
+    /// LAG(expr, offset, default) - value from previous row
+    Lag,
+    /// LEAD(expr, offset, default) - value from next row
+    Lead,
+    /// FIRST_VALUE(expr) - first value in window frame
+    FirstValue,
+    /// LAST_VALUE(expr) - last value in window frame
+    LastValue,
+    /// NTH_VALUE(expr, n) - nth value in window frame
+    NthValue,
+    /// Aggregate function used as window function (SUM, AVG, etc.)
+    Aggregate(AggregateFunction),
+}
+
+/// Window frame specification
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowFrame {
+    /// Frame type (ROWS, RANGE, GROUPS)
+    pub frame_type: WindowFrameType,
+    /// Frame start bound
+    pub start: WindowFrameBound,
+    /// Frame end bound (None means CURRENT ROW for RANGE/ROWS BETWEEN)
+    pub end: Option<WindowFrameBound>,
+}
+
+/// Window frame type
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowFrameType {
+    /// ROWS - physical rows
+    Rows,
+    /// RANGE - logical value ranges
+    Range,
+    /// GROUPS - peer groups (PostgreSQL 11+)
+    Groups,
+}
+
+/// Window frame bound
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowFrameBound {
+    /// UNBOUNDED PRECEDING
+    UnboundedPreceding,
+    /// n PRECEDING
+    Preceding(u64),
+    /// CURRENT ROW
+    CurrentRow,
+    /// n FOLLOWING
+    Following(u64),
+    /// UNBOUNDED FOLLOWING
+    UnboundedFollowing,
 }
 
 /// Binary operator

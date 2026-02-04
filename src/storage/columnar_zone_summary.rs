@@ -142,6 +142,7 @@ impl HyperLogLog {
             Value::DictRef { dict_id } => dict_id.hash(&mut hasher),
             Value::CasRef { hash } => hash.hash(&mut hasher),
             Value::ColumnarRef => 0u64.hash(&mut hasher),
+            Value::Interval(iv) => iv.hash(&mut hasher), // Hash interval microseconds
         }
 
         hasher.finish()

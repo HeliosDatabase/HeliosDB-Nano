@@ -28,6 +28,8 @@ fn convert_referential_action(action: &SqlReferentialAction) -> ReferentialActio
     }
 }
 use std::sync::Arc;
+use std::cell::RefCell;
+use std::collections::HashMap;
 use super::phase3::materialized_views::MaterializedViewParser;
 
 /// Query planner
@@ -35,6 +37,8 @@ pub struct Planner<'a> {
     catalog: Option<&'a Catalog<'a>>,
     /// Original SQL for time-travel AS OF parsing
     original_sql: Option<String>,
+    /// CTE schemas in scope (name -> schema) - uses RefCell for interior mutability
+    cte_schemas: RefCell<HashMap<String, Arc<Schema>>>,
 }
 
 impl<'a> Planner<'a> {
@@ -43,6 +47,7 @@ impl<'a> Planner<'a> {
         Self {
             catalog: None,
             original_sql: None,
+            cte_schemas: RefCell::new(HashMap::new()),
         }
     }
 
@@ -51,6 +56,7 @@ impl<'a> Planner<'a> {
         Self {
             catalog: Some(catalog),
             original_sql: None,
+            cte_schemas: RefCell::new(HashMap::new()),
         }
     }
 
@@ -58,6 +64,21 @@ impl<'a> Planner<'a> {
     pub fn with_sql(mut self, sql: String) -> Self {
         self.original_sql = Some(sql);
         self
+    }
+
+    /// Check if a name is a CTE in scope
+    fn get_cte_schema(&self, name: &str) -> Option<Arc<Schema>> {
+        self.cte_schemas.borrow().get(name).cloned()
+    }
+
+    /// Add a CTE to scope
+    fn add_cte(&self, name: String, schema: Arc<Schema>) {
+        self.cte_schemas.borrow_mut().insert(name, schema);
+    }
+
+    /// Clear all CTEs from scope
+    fn clear_ctes(&self) {
+        self.cte_schemas.borrow_mut().clear();
     }
 
     /// Parse a data type string into a DataType
@@ -526,17 +547,20 @@ impl<'a> Planner<'a> {
         let cte_plans = if let Some(with_clause) = query.with {
             let mut ctes = Vec::new();
             for cte in with_clause.cte_tables {
-                // Each CTE is a CteDefinition - parse the subquery
+                let cte_name = cte.alias.name.to_string();
                 // Convert CTE query to logical plan
                 let cte_plan = self.query_to_plan(*cte.query)?;
-                ctes.push((cte.alias.name.to_string(), Box::new(cte_plan)));
+                // Register CTE schema so it can be resolved in the main query
+                let cte_schema = cte_plan.schema();
+                self.add_cte(cte_name.clone(), cte_schema);
+                ctes.push((cte_name, Box::new(cte_plan)));
             }
             ctes
         } else {
             Vec::new()
         };
 
-        // Convert the body
+        // Convert the body (CTEs are now in scope for table name resolution)
         let mut plan = self.set_expr_to_plan(*query.body)?;
 
         // Handle ORDER BY
@@ -734,7 +758,21 @@ impl<'a> Planner<'a> {
             TableFactor::Table { name, alias, .. } => {
                 let table_name = name.to_string();
 
-                // Check if this is a system view first (Phase 3 features)
+                // Check if this is a CTE reference first
+                if let Some(cte_schema) = self.get_cte_schema(&table_name) {
+                    // This is a CTE reference - create a Scan with the CTE schema
+                    // The executor will handle looking up the CTE data
+                    let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+                    return Ok(LogicalPlan::Scan {
+                        table_name,
+                        alias: table_alias,
+                        schema: cte_schema,
+                        projection: None,
+                        as_of: None, // CTEs don't support time-travel
+                    });
+                }
+
+                // Check if this is a system view (Phase 3 features)
                 use crate::sql::phase3::SystemViewRegistry;
                 let registry = SystemViewRegistry::new();
 
@@ -746,7 +784,7 @@ impl<'a> Planner<'a> {
                     });
                 }
 
-                // Not a system view, treat as regular table
+                // Not a CTE or system view, treat as regular table
                 // Fetch schema from catalog if available
                 let schema = if let Some(catalog) = self.catalog {
                     // Get actual schema from catalog
@@ -982,6 +1020,11 @@ impl<'a> Planner<'a> {
     fn extract_aggregate_from_expr(&self, expr: &Expr) -> Result<Option<LogicalExpr>> {
         match expr {
             Expr::Function(func) => {
+                // If the function has an OVER clause, it's a window function, not a regular aggregate
+                if func.over.is_some() {
+                    return Ok(None);
+                }
+
                 let func_name = func.name.to_string().to_uppercase();
                 let aggr_fun = match func_name.as_str() {
                     "COUNT" => Some(AggregateFunction::Count),
@@ -1033,6 +1076,141 @@ impl<'a> Planner<'a> {
                 }
             }
             _ => Ok(None),
+        }
+    }
+
+    /// Parse a window function expression
+    fn parse_window_function(&self, func: &sqlparser::ast::Function) -> Result<LogicalExpr> {
+        use super::logical_plan::{WindowFunctionType, WindowFrame, WindowFrameType, WindowFrameBound};
+
+        let func_name = func.name.to_string().to_uppercase();
+
+        // Determine window function type
+        let window_fun = match func_name.as_str() {
+            "ROW_NUMBER" => WindowFunctionType::RowNumber,
+            "RANK" => WindowFunctionType::Rank,
+            "DENSE_RANK" => WindowFunctionType::DenseRank,
+            "PERCENT_RANK" => WindowFunctionType::PercentRank,
+            "CUME_DIST" => WindowFunctionType::CumeDist,
+            "NTILE" => WindowFunctionType::Ntile,
+            "LAG" => WindowFunctionType::Lag,
+            "LEAD" => WindowFunctionType::Lead,
+            "FIRST_VALUE" => WindowFunctionType::FirstValue,
+            "LAST_VALUE" => WindowFunctionType::LastValue,
+            "NTH_VALUE" => WindowFunctionType::NthValue,
+            // Aggregate functions used as window functions
+            "COUNT" => WindowFunctionType::Aggregate(AggregateFunction::Count),
+            "SUM" => WindowFunctionType::Aggregate(AggregateFunction::Sum),
+            "AVG" => WindowFunctionType::Aggregate(AggregateFunction::Avg),
+            "MIN" => WindowFunctionType::Aggregate(AggregateFunction::Min),
+            "MAX" => WindowFunctionType::Aggregate(AggregateFunction::Max),
+            _ => return Err(Error::query_execution(format!(
+                "Unknown window function: {}", func_name
+            ))),
+        };
+
+        // Parse function arguments
+        let args = match &func.args {
+            sqlparser::ast::FunctionArguments::List(arg_list) => {
+                arg_list.args.iter()
+                    .filter_map(|arg| {
+                        match arg {
+                            sqlparser::ast::FunctionArg::Unnamed(func_arg_expr) => {
+                                match func_arg_expr {
+                                    sqlparser::ast::FunctionArgExpr::Expr(expr) => {
+                                        self.expr_to_logical(expr).ok()
+                                    }
+                                    _ => None
+                                }
+                            }
+                            _ => None
+                        }
+                    })
+                    .collect()
+            }
+            _ => vec![],
+        };
+
+        // Parse OVER clause
+        let over = func.over.as_ref().ok_or_else(|| {
+            Error::query_execution("Window function requires OVER clause")
+        })?;
+
+        // Parse window specification
+        let (partition_by, order_by, frame) = match over {
+            sqlparser::ast::WindowType::WindowSpec(spec) => {
+                // Parse PARTITION BY
+                let partition_by: Vec<LogicalExpr> = spec.partition_by.iter()
+                    .filter_map(|expr| self.expr_to_logical(expr).ok())
+                    .collect();
+
+                // Parse ORDER BY
+                let order_by: Vec<(LogicalExpr, bool)> = spec.order_by.iter()
+                    .filter_map(|order_expr| {
+                        self.expr_to_logical(&order_expr.expr).ok().map(|expr| {
+                            let ascending = order_expr.asc.unwrap_or(true);
+                            (expr, ascending)
+                        })
+                    })
+                    .collect();
+
+                // Parse window frame if present
+                let frame = spec.window_frame.as_ref().map(|wf| {
+                    let frame_type = match wf.units {
+                        sqlparser::ast::WindowFrameUnits::Rows => WindowFrameType::Rows,
+                        sqlparser::ast::WindowFrameUnits::Range => WindowFrameType::Range,
+                        sqlparser::ast::WindowFrameUnits::Groups => WindowFrameType::Groups,
+                    };
+
+                    let start = Self::parse_frame_bound(&wf.start_bound);
+                    let end = wf.end_bound.as_ref().map(Self::parse_frame_bound);
+
+                    WindowFrame {
+                        frame_type,
+                        start,
+                        end,
+                    }
+                });
+
+                (partition_by, order_by, frame)
+            }
+            sqlparser::ast::WindowType::NamedWindow(_name) => {
+                // Named window references not yet supported
+                return Err(Error::query_execution("Named window references not yet supported"));
+            }
+        };
+
+        Ok(LogicalExpr::WindowFunction {
+            fun: window_fun,
+            args,
+            partition_by,
+            order_by,
+            frame,
+        })
+    }
+
+    /// Parse a window frame bound
+    fn parse_frame_bound(bound: &sqlparser::ast::WindowFrameBound) -> WindowFrameBound {
+        use super::logical_plan::WindowFrameBound;
+
+        match bound {
+            sqlparser::ast::WindowFrameBound::CurrentRow => WindowFrameBound::CurrentRow,
+            sqlparser::ast::WindowFrameBound::Preceding(None) => WindowFrameBound::UnboundedPreceding,
+            sqlparser::ast::WindowFrameBound::Preceding(Some(expr)) => {
+                if let sqlparser::ast::Expr::Value(sqlparser::ast::Value::Number(n, _)) = expr.as_ref() {
+                    WindowFrameBound::Preceding(n.parse().unwrap_or(1))
+                } else {
+                    WindowFrameBound::Preceding(1)
+                }
+            }
+            sqlparser::ast::WindowFrameBound::Following(None) => WindowFrameBound::UnboundedFollowing,
+            sqlparser::ast::WindowFrameBound::Following(Some(expr)) => {
+                if let sqlparser::ast::Expr::Value(sqlparser::ast::Value::Number(n, _)) = expr.as_ref() {
+                    WindowFrameBound::Following(n.parse().unwrap_or(1))
+                } else {
+                    WindowFrameBound::Following(1)
+                }
+            }
         }
     }
 
@@ -1154,6 +1332,11 @@ impl<'a> Planner<'a> {
             }
 
             Expr::Function(func) => {
+                // Check if this is a window function (has OVER clause)
+                if func.over.is_some() {
+                    return self.parse_window_function(func);
+                }
+
                 // Check if it's an aggregate function
                 if let Some(aggr) = self.extract_aggregate_from_expr(expr)? {
                     return Ok(aggr);

@@ -445,6 +445,7 @@ fn value_to_sql_literal(value: &Value) -> String {
         Value::DictRef { dict_id } => format!("'dict:{}'", dict_id),
         Value::CasRef { hash } => format!("E'\\\\x{}'", hex::encode(hash)),
         Value::ColumnarRef => "NULL".to_string(), // Placeholder
+        Value::Interval(iv) => format!("INTERVAL '{} microseconds'", iv),
     }
 }
 

@@ -542,6 +542,7 @@ impl FilterIndexDeltaTracker {
             Value::DictRef { dict_id } => dict_id.hash(&mut hasher1),
             Value::CasRef { hash } => hash.hash(&mut hasher1),
             Value::ColumnarRef => 0u64.hash(&mut hasher1),
+            Value::Interval(iv) => iv.hash(&mut hasher1), // Hash interval microseconds
         }
 
         let h1 = hasher1.finish();

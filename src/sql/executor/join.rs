@@ -11,6 +11,7 @@ use std::sync::Arc;
 /// Nested loop join operator
 ///
 /// Implements joins using nested loop algorithm.
+/// Supports INNER, LEFT, RIGHT, FULL, and CROSS joins.
 pub struct NestedLoopJoinOperator {
     left: Box<dyn PhysicalOperator>,
     join_type: crate::sql::JoinType,
@@ -22,6 +23,13 @@ pub struct NestedLoopJoinOperator {
     right_tuples: Vec<Tuple>,
     right_index: usize,
     timeout_ctx: Option<TimeoutContext>,
+    // Outer join state
+    left_column_count: usize,
+    right_column_count: usize,
+    left_matched: bool,  // Did current left tuple match any right tuple?
+    right_matched: Vec<bool>,  // Which right tuples have been matched?
+    emitting_unmatched_right: bool,  // Are we emitting unmatched right tuples?
+    unmatched_right_index: usize,  // Index into right_tuples for unmatched emission
 }
 
 impl NestedLoopJoinOperator {
@@ -35,6 +43,9 @@ impl NestedLoopJoinOperator {
         // Build output schema by combining left and right schemas
         let left_schema = left.schema();
         let right_schema = right.schema();
+
+        let left_column_count = left_schema.columns.len();
+        let right_column_count = right_schema.columns.len();
 
         let mut columns = left_schema.columns.clone();
         columns.extend(right_schema.columns.clone());
@@ -53,6 +64,8 @@ impl NestedLoopJoinOperator {
             right_tuples.push(tuple);
         }
 
+        let right_count = right_tuples.len();
+
         Ok(Self {
             left,
             join_type,
@@ -63,6 +76,12 @@ impl NestedLoopJoinOperator {
             right_tuples,
             right_index: 0,
             timeout_ctx,
+            left_column_count,
+            right_column_count,
+            left_matched: false,
+            right_matched: vec![false; right_count],
+            emitting_unmatched_right: false,
+            unmatched_right_index: 0,
         })
     }
 
@@ -75,11 +94,11 @@ impl NestedLoopJoinOperator {
 
 impl PhysicalOperator for NestedLoopJoinOperator {
     fn next(&mut self) -> Result<Option<Tuple>> {
-        // For now, only support INNER JOIN
-        if !matches!(self.join_type, crate::sql::JoinType::Inner) {
-            return Err(crate::Error::query_execution(
-                "Only INNER JOIN is currently supported"
-            ));
+        use crate::sql::JoinType;
+
+        // Handle unmatched right tuples phase (for RIGHT/FULL joins)
+        if self.emitting_unmatched_right {
+            return self.emit_unmatched_right();
         }
 
         loop {
@@ -92,18 +111,25 @@ impl PhysicalOperator for NestedLoopJoinOperator {
             if self.left_tuple.is_none() {
                 self.left_tuple = self.left.next()?;
 
-                // If no more left tuples, we're done
+                // If no more left tuples, handle outer join completion
                 if self.left_tuple.is_none() {
+                    // For RIGHT/FULL joins, emit unmatched right tuples
+                    if matches!(self.join_type, JoinType::Right | JoinType::Full) {
+                        self.emitting_unmatched_right = true;
+                        return self.emit_unmatched_right();
+                    }
                     return Ok(None);
                 }
 
                 // Reset right index for new left tuple
                 self.right_index = 0;
+                self.left_matched = false;
             }
 
             // Try to find a matching right tuple
             while self.right_index < self.right_tuples.len() {
-                let right_tuple = &self.right_tuples[self.right_index];
+                let right_idx = self.right_index;
+                let right_tuple = &self.right_tuples[right_idx];
                 self.right_index += 1;
 
                 // Combine left and right tuples
@@ -126,17 +152,62 @@ impl PhysicalOperator for NestedLoopJoinOperator {
                 };
 
                 if matches {
+                    self.left_matched = true;
+                    // Mark right tuple as matched (for RIGHT/FULL joins)
+                    if matches!(self.join_type, JoinType::Right | JoinType::Full) {
+                        self.right_matched[right_idx] = true;
+                    }
                     return Ok(Some(combined_tuple));
                 }
             }
 
-            // No more right tuples for this left tuple, get next left tuple
+            // No more right tuples for this left tuple
+            // For LEFT/FULL joins, emit unmatched left tuple with NULLs
+            if !self.left_matched && matches!(self.join_type, JoinType::Left | JoinType::Full) {
+                let left_tuple = self.left_tuple.as_ref()
+                    .ok_or_else(|| Error::query_execution("Left tuple unexpectedly None"))?;
+                let result = self.join_with_nulls_right(left_tuple);
+                self.left_tuple = None;
+                return Ok(Some(result));
+            }
+
+            // Get next left tuple
             self.left_tuple = None;
         }
     }
 
     fn schema(&self) -> Arc<Schema> {
         self.output_schema.clone()
+    }
+}
+
+impl NestedLoopJoinOperator {
+    /// Emit unmatched right tuples with NULL left columns (for RIGHT/FULL joins)
+    fn emit_unmatched_right(&mut self) -> Result<Option<Tuple>> {
+        while self.unmatched_right_index < self.right_tuples.len() {
+            let idx = self.unmatched_right_index;
+            self.unmatched_right_index += 1;
+
+            if !self.right_matched[idx] {
+                let right_tuple = &self.right_tuples[idx];
+                return Ok(Some(self.join_with_nulls_left(right_tuple)));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Join left tuple with NULLs for right columns
+    fn join_with_nulls_right(&self, left: &Tuple) -> Tuple {
+        let mut values = left.values.clone();
+        values.extend(vec![crate::Value::Null; self.right_column_count]);
+        Tuple::new(values)
+    }
+
+    /// Join right tuple with NULLs for left columns
+    fn join_with_nulls_left(&self, right: &Tuple) -> Tuple {
+        let mut values = vec![crate::Value::Null; self.left_column_count];
+        values.extend(right.values.clone());
+        Tuple::new(values)
     }
 }
 
@@ -625,6 +696,7 @@ impl HashJoinOperator {
             Value::DictRef { .. } => 4,
             Value::CasRef { .. } => 32,
             Value::ColumnarRef => 1,
+            Value::Interval(_) => 16, // Interval contains months, days, microseconds
         }
     }
 
@@ -655,7 +727,7 @@ impl PhysicalOperator for HashJoinOperator {
 
 /// Handle Join logical plan node
 pub(super) fn handle_join(
-    executor: &Executor,
+    executor: &mut Executor,
     left: &crate::sql::LogicalPlan,
     right: &crate::sql::LogicalPlan,
     join_type: &crate::sql::JoinType,

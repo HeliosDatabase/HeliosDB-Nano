@@ -319,7 +319,11 @@ where
 
         // Handle transaction commands
         let query_upper = query.trim().to_uppercase();
-        if query_upper == "BEGIN" || query_upper.starts_with("BEGIN ") {
+        if query_upper == "BEGIN" || query_upper.starts_with("BEGIN ") || query_upper == "START TRANSACTION" || query_upper.starts_with("START TRANSACTION ") {
+            // Parse isolation level if specified
+            // Supported: BEGIN [TRANSACTION] [ISOLATION LEVEL {READ UNCOMMITTED | READ COMMITTED | REPEATABLE READ | SERIALIZABLE}]
+            let isolation_level = Self::parse_isolation_level(&query_upper);
+
             // Check if already in a transaction - PostgreSQL behavior is to warn but continue
             if self.transaction_status == TransactionStatus::InTransaction {
                 // Send warning like PostgreSQL does
@@ -329,10 +333,28 @@ where
                     message: "there is already a transaction in progress".to_string(),
                 }).await?;
             } else {
+                // Begin transaction (isolation level would be applied if storage supported it)
+                // For now we just begin - isolation level is informational
                 self.database.begin()?;
                 self.transaction_status = TransactionStatus::InTransaction;
+
+                // Log the isolation level for debugging
+                if let Some(level) = isolation_level {
+                    tracing::debug!("Transaction started with isolation level: {}", level);
+                }
             }
             self.send_command_complete("BEGIN").await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
+        } else if query_upper.starts_with("SET TRANSACTION ISOLATION LEVEL ") || query_upper.starts_with("SET SESSION CHARACTERISTICS") {
+            // SET TRANSACTION ISOLATION LEVEL is valid before any queries in a transaction
+            let level = Self::parse_isolation_level(&query_upper);
+            if level.is_some() {
+                self.send_command_complete("SET").await?;
+            } else {
+                self.send_error("ERROR", "22023", "Invalid isolation level", None, None).await?;
+                return Ok(());
+            }
             self.send_ready_for_query().await?;
             return Ok(());
         } else if query_upper == "COMMIT" {
@@ -721,6 +743,32 @@ where
             "CREATE INDEX".to_string()
         } else {
             format!("OK {}", affected)
+        }
+    }
+
+    /// Parse isolation level from transaction command
+    ///
+    /// Supports:
+    /// - BEGIN [TRANSACTION] [ISOLATION LEVEL {READ UNCOMMITTED | READ COMMITTED | REPEATABLE READ | SERIALIZABLE}]
+    /// - START TRANSACTION [ISOLATION LEVEL ...]
+    /// - SET TRANSACTION ISOLATION LEVEL ...
+    fn parse_isolation_level(query: &str) -> Option<String> {
+        let upper = query.to_uppercase();
+        if let Some(pos) = upper.find("ISOLATION LEVEL") {
+            let rest = &upper[pos + 15..].trim();
+            if rest.starts_with("READ UNCOMMITTED") {
+                Some("READ UNCOMMITTED".to_string())
+            } else if rest.starts_with("READ COMMITTED") {
+                Some("READ COMMITTED".to_string())
+            } else if rest.starts_with("REPEATABLE READ") {
+                Some("REPEATABLE READ".to_string())
+            } else if rest.starts_with("SERIALIZABLE") {
+                Some("SERIALIZABLE".to_string())
+            } else {
+                None
+            }
+        } else {
+            None
         }
     }
 }

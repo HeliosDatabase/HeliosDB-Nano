@@ -30,7 +30,7 @@ fn count_delta_operations(delta_set: &MvDeltaSet) -> (usize, usize, usize) {
 
 /// Handle Phase 3 logical plan operations
 pub(super) fn handle_phase3_operation(
-    executor: &Executor,
+    executor: &mut Executor,
     plan: &LogicalPlan,
 ) -> Result<Box<dyn PhysicalOperator>> {
     match plan {
@@ -256,7 +256,7 @@ fn handle_merge_branch(
 
 /// Handle CREATE MATERIALIZED VIEW
 fn handle_create_materialized_view(
-    executor: &Executor,
+    executor: &mut Executor,
     name: &str,
     query: &LogicalPlan,
     options: &[crate::sql::logical_plan::MaterializedViewOption],
@@ -267,7 +267,10 @@ fn handle_create_materialized_view(
         name, if_not_exists, options
     );
 
-    if let Some(storage) = executor.storage() {
+    // First check: verify storage exists and view doesn't already exist
+    // We do this separately to avoid borrow conflicts
+    {
+        let storage = executor.storage().ok_or_else(|| Error::execution("No storage engine available"))?;
         let mv_catalog = storage.mv_catalog();
 
         // Check if view already exists
@@ -288,60 +291,66 @@ fn handle_create_materialized_view(
                 )));
             }
         }
+    } // Storage borrow ends here
 
-        // Execute the query to get the schema
-        let mut query_operator = executor.plan_to_operator(query)?;
-        let schema = query_operator.schema();
+    // Execute the query to get the schema (this needs mutable borrow)
+    let mut query_operator = executor.plan_to_operator(query)?;
+    let schema = query_operator.schema();
 
-        // Extract base tables from the query (simplified - just look at Scan nodes)
-        let base_tables = extract_base_tables(query);
+    // Extract base tables from the query (simplified - just look at Scan nodes)
+    let base_tables = extract_base_tables(query);
 
-        // Serialize the query plan for re-execution during REFRESH
-        let query_plan_bytes = bincode::serialize(query)
-            .map_err(|e| Error::execution(format!("Failed to serialize query plan: {}", e)))?;
+    // Serialize the query plan for re-execution during REFRESH
+    let query_plan_bytes = bincode::serialize(query)
+        .map_err(|e| Error::execution(format!("Failed to serialize query plan: {}", e)))?;
 
-        // Store a human-readable query text for display/debugging
-        let query_text = format!("{:?}", query);
+    // Store a human-readable query text for display/debugging
+    let query_text = format!("{:?}", query);
 
-        // Create metadata
-        let mut metadata = crate::storage::MaterializedViewMetadata::new(
-            name.to_string(),
-            query_text,
-            query_plan_bytes,
-            base_tables.clone(),
-            (*schema).clone(),
-        );
+    // Create metadata
+    let mut metadata = crate::storage::MaterializedViewMetadata::new(
+        name.to_string(),
+        query_text,
+        query_plan_bytes,
+        base_tables.clone(),
+        (*schema).clone(),
+    );
 
-        // Process options (parse auto_refresh, etc.)
-        for option in options {
-            match option {
-                crate::sql::logical_plan::MaterializedViewOption::AutoRefresh(enabled) => {
-                    if *enabled {
-                        metadata.refresh_strategy = "auto".to_string();
-                    }
-                }
-                crate::sql::logical_plan::MaterializedViewOption::MaxCpuPercent(pct) => {
-                    metadata.metadata.insert("max_cpu_percent".to_string(), pct.to_string());
-                }
-                crate::sql::logical_plan::MaterializedViewOption::ThresholdDmlRate(rate) => {
-                    metadata.metadata.insert("threshold_dml_rate".to_string(), rate.to_string());
-                }
-                _ => {
-                    // Store other options as metadata
-                    tracing::debug!("Storing MV option: {:?}", option);
+    // Process options (parse auto_refresh, etc.)
+    for option in options {
+        match option {
+            crate::sql::logical_plan::MaterializedViewOption::AutoRefresh(enabled) => {
+                if *enabled {
+                    metadata.refresh_strategy = "auto".to_string();
                 }
             }
+            crate::sql::logical_plan::MaterializedViewOption::MaxCpuPercent(pct) => {
+                metadata.metadata.insert("max_cpu_percent".to_string(), pct.to_string());
+            }
+            crate::sql::logical_plan::MaterializedViewOption::ThresholdDmlRate(rate) => {
+                metadata.metadata.insert("threshold_dml_rate".to_string(), rate.to_string());
+            }
+            _ => {
+                // Store other options as metadata
+                tracing::debug!("Storing MV option: {:?}", option);
+            }
         }
+    }
+
+    // Initial population: Execute query and store results
+    tracing::info!("Populating initial data for materialized view '{}'", name);
+    let mut tuples = Vec::new();
+    while let Some(tuple) = query_operator.next()? {
+        tuples.push(tuple);
+    }
+
+    // Now access storage again to store the data (mutable borrow is done)
+    {
+        let storage = executor.storage().ok_or_else(|| Error::execution("No storage engine available"))?;
+        let mv_catalog = storage.mv_catalog();
 
         // Store metadata in catalog
         mv_catalog.create_view(metadata)?;
-
-        // Initial population: Execute query and store results
-        tracing::info!("Populating initial data for materialized view '{}'", name);
-        let mut tuples = Vec::new();
-        while let Some(tuple) = query_operator.next()? {
-            tuples.push(tuple);
-        }
 
         let row_count = mv_catalog.store_view_data(name, tuples, &schema)?;
 
@@ -360,8 +369,6 @@ fn handle_create_materialized_view(
         }
 
         tracing::info!("Successfully created materialized view '{}' with {} rows (delta tracking active)", name, row_count);
-    } else {
-        return Err(Error::execution("No storage engine available"));
     }
 
     // Return empty result set for DDL
@@ -376,7 +383,7 @@ fn handle_create_materialized_view(
 
 /// Handle REFRESH MATERIALIZED VIEW
 fn handle_refresh_materialized_view(
-    executor: &Executor,
+    executor: &mut Executor,
     name: &str,
     concurrent: bool,
     incremental_requested: bool,
@@ -386,7 +393,9 @@ fn handle_refresh_materialized_view(
         name, concurrent, incremental_requested
     );
 
-    if let Some(storage) = executor.storage() {
+    // Phase 1: Read metadata from storage
+    let (metadata, delta_count, use_incremental, total_deltas) = {
+        let storage = executor.storage().ok_or_else(|| Error::execution("No storage engine available"))?;
         let mv_catalog = storage.mv_catalog();
 
         // Get view metadata
@@ -394,16 +403,10 @@ fn handle_refresh_materialized_view(
         tracing::debug!("Refreshing materialized view '{}' with query: {}", name, metadata.query_text);
 
         // Check if incremental refresh is possible
-        // Incremental refresh requires:
-        // 1. View has been refreshed at least once (has baseline data)
-        // 2. Not using concurrent mode (concurrent + incremental not yet supported)
-        // 3. Delta tracking has captured changes since last refresh
-        // 4. Either user requested INCREMENTALLY or auto-detect decides it's beneficial
         let can_use_incremental = metadata.last_refresh.is_some() && !concurrent;
 
         // Check delta count for incremental refresh decision
         let delta_count = if can_use_incremental {
-            // Get delta count since last refresh
             if let Some(last_refresh) = metadata.last_refresh {
                 let delta_tracker = storage.mv_delta_tracker();
                 delta_tracker.count_deltas_since(&metadata.base_tables, last_refresh)
@@ -415,9 +418,7 @@ fn handle_refresh_materialized_view(
             0
         };
 
-        // Decide refresh strategy:
-        // - If INCREMENTALLY was requested, use incremental if possible
-        // - Otherwise, auto-detect: use incremental if delta_count is reasonable
+        // Decide refresh strategy
         let use_incremental = if incremental_requested {
             if !can_use_incremental {
                 if metadata.last_refresh.is_none() {
@@ -442,76 +443,95 @@ fn handle_refresh_materialized_view(
                 true
             }
         } else {
-            // Auto-detect: use incremental if reasonable delta count
             can_use_incremental && delta_count > 0 && delta_count < 1000
         };
 
-        let row_count;
+        // For incremental, check if there are actually deltas to apply
+        let total_deltas = if use_incremental {
+            if let Some(last_refresh) = metadata.last_refresh {
+                let delta_tracker = storage.mv_delta_tracker();
+                match delta_tracker.get_deltas_since(&metadata.base_tables, last_refresh) {
+                    Ok(delta_map) => {
+                        for (table_name, delta_set) in &delta_map {
+                            let (inserts, updates, deletes) = count_delta_operations(delta_set);
+                            tracing::debug!(
+                                "Table '{}': {} inserts, {} updates, {} deletes",
+                                table_name, inserts, updates, deletes
+                            );
+                        }
+                        delta_map.values().map(|ds| ds.deltas.len()).sum()
+                    }
+                    Err(_) => 0,
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        (metadata, delta_count, use_incremental, total_deltas)
+    }; // Storage borrow ends here
+
+    // Handle case with no deltas to apply
+    if use_incremental && total_deltas == 0 {
+        tracing::info!("No deltas to apply, MV '{}' is already up to date", name);
+        let storage = executor.storage().ok_or_else(|| Error::execution("No storage engine available"))?;
+        let mv_catalog = storage.mv_catalog();
+        let mut updated_metadata = metadata.clone();
+        updated_metadata.mark_refreshed(metadata.row_count.unwrap_or(0));
+        mv_catalog.update_view(&updated_metadata)?;
+
+        return Ok(Box::new(ScanOperator::new(
+            "".to_string(),
+            Arc::new(crate::Schema { columns: vec![] }),
+            None,
+            vec![],
+            vec![],
+        )));
+    }
+
+    // Phase 2: Execute query (requires mutable borrow of executor)
+    let query_plan = metadata.get_query_plan()?;
+    let schema = Arc::new(metadata.schema.clone());
+
+    if use_incremental {
+        tracing::info!(
+            "Incremental refresh for MV '{}': {} deltas to apply",
+            name, delta_count
+        );
+    } else if delta_count > 0 {
+        tracing::info!(
+            "Full refresh for MV '{}': {} deltas (threshold exceeded or concurrent mode)",
+            name, delta_count
+        );
+    } else {
+        tracing::info!("Full refresh for MV '{}'", name);
+    }
+
+    let mut query_operator = executor.plan_to_operator(&query_plan)?;
+    let mut tuples = Vec::new();
+    while let Some(tuple) = query_operator.next()? {
+        tuples.push(tuple);
+    }
+    let row_count = tuples.len() as u64;
+
+    // Phase 3: Store results (re-borrow storage)
+    {
+        let storage = executor.storage().ok_or_else(|| Error::execution("No storage engine available"))?;
+        let mv_catalog = storage.mv_catalog();
+
+        if concurrent {
+            tracing::info!("Using CONCURRENT refresh with atomic swap for zero downtime");
+            mv_catalog.store_view_data_concurrent(name, tuples, &schema)?;
+        } else {
+            tracing::debug!("Using non-CONCURRENT refresh (table will be briefly unavailable)");
+            mv_catalog.store_view_data(name, tuples, &schema)?;
+        }
 
         if use_incremental {
-            tracing::info!(
-                "Incremental refresh for MV '{}': {} deltas to apply",
-                name, delta_count
-            );
-
-            let delta_tracker = storage.mv_delta_tracker();
-            let last_refresh = metadata.last_refresh.ok_or_else(|| {
-                Error::query_execution("Cannot use incremental refresh: no previous refresh timestamp")
-            })?;
-
-            // Get deltas from the persistent tracker
-            // Returns HashMap<table_name, DeltaSet>
-            let delta_map = delta_tracker.get_deltas_since(&metadata.base_tables, last_refresh)?;
-
-            let total_deltas: usize = delta_map.values().map(|ds| ds.deltas.len()).sum();
-            if total_deltas == 0 {
-                tracing::info!("No deltas to apply, MV '{}' is already up to date", name);
-                // Update timestamp without changing data
-                let mut updated_metadata = metadata.clone();
-                updated_metadata.mark_refreshed(metadata.row_count.unwrap_or(0));
-                mv_catalog.update_view(&updated_metadata)?;
-
-                return Ok(Box::new(ScanOperator::new(
-                    "".to_string(),
-                    Arc::new(crate::Schema { columns: vec![] }),
-                    None,
-                    vec![],
-                    vec![],
-                )));
-            }
-
-            // Log delta statistics
-            for (table_name, delta_set) in &delta_map {
-                let (inserts, updates, deletes) = count_delta_operations(delta_set);
-                tracing::debug!(
-                    "Table '{}': {} inserts, {} updates, {} deletes",
-                    table_name, inserts, updates, deletes
-                );
-            }
-
-            // Get the query plan for re-executing the view query
-            let query_plan = metadata.get_query_plan()?;
-            let schema = Arc::new(metadata.schema.clone());
-
-            // For now, use optimized full recompute for incremental refresh
-            // True incremental refresh would:
-            // 1. For INSERTs: evaluate new rows against query, add matching ones
-            // 2. For DELETEs: remove matching rows from view
-            // 3. For UPDATEs: handle as DELETE + INSERT
-            //
-            // The benefit is that we've confirmed deltas exist and logged them,
-            // and we update the delta_count tracking for statistics
-            let mut query_operator = executor.plan_to_operator(&query_plan)?;
-            let mut tuples = Vec::new();
-            while let Some(tuple) = query_operator.next()? {
-                tuples.push(tuple);
-            }
-            row_count = tuples.len() as u64;
-
-            // Store the refreshed data
-            mv_catalog.store_view_data(name, tuples, &schema)?;
-
             // Clear applied deltas (purge all deltas before current time)
+            let delta_tracker = storage.mv_delta_tracker();
             let _ = delta_tracker.purge_deltas_before(chrono::Utc::now());
 
             // Update delta count tracking in metadata
@@ -524,70 +544,18 @@ fn handle_refresh_materialized_view(
                 "Incremental refresh completed for MV '{}': {} rows (processed {} deltas)",
                 name, row_count, total_deltas
             );
-
-            // Return early since we've already updated metadata
-            return Ok(Box::new(ScanOperator::new(
-                "".to_string(),
-                Arc::new(crate::Schema { columns: vec![] }),
-                None,
-                vec![],
-                vec![],
-            ).with_timeout(executor.timeout_ctx())));
         } else {
-            // Full refresh
-            if delta_count > 0 {
-                tracing::info!(
-                    "Full refresh for MV '{}': {} deltas (threshold exceeded or concurrent mode)",
-                    name, delta_count
-                );
-            } else {
-                tracing::info!("Full refresh for MV '{}'", name);
-            }
+            // Update metadata with new row count and timestamp
+            let mut updated_metadata = metadata;
+            updated_metadata.mark_refreshed(row_count);
+            mv_catalog.update_view(&updated_metadata)?;
 
-            // Deserialize the stored query plan
-            let query_plan = metadata.get_query_plan()?;
-            tracing::debug!("Deserialized query plan for refresh");
-
-            // Get the stored schema
-            let schema = Arc::new(metadata.schema.clone());
-
-            // Re-execute the query
-            let mut query_operator = executor.plan_to_operator(&query_plan)?;
-
-            // Collect all tuples from the re-executed query
-            let mut tuples = Vec::new();
-            while let Some(tuple) = query_operator.next()? {
-                tuples.push(tuple);
-            }
-            row_count = tuples.len() as u64;
-
-            // Store the refreshed data using appropriate method
-            if concurrent {
-                // Use concurrent refresh with temporary table and atomic swap
-                // This provides zero-downtime refresh - queries can continue reading
-                // from the old data while the new data is being prepared
-                tracing::info!("Using CONCURRENT refresh with atomic swap for zero downtime");
-                mv_catalog.store_view_data_concurrent(name, tuples, &schema)?;
-            } else {
-                // Use non-concurrent refresh (faster but causes brief downtime)
-                // The table is dropped and recreated, so queries will fail during refresh
-                tracing::debug!("Using non-CONCURRENT refresh (table will be briefly unavailable)");
-                mv_catalog.store_view_data(name, tuples, &schema)?;
-            }
+            tracing::info!(
+                "Successfully refreshed materialized view '{}' with {} rows{}",
+                name, row_count,
+                if concurrent { " (CONCURRENT mode - zero downtime)" } else { "" }
+            );
         }
-
-        // Update metadata with new row count and timestamp
-        let mut updated_metadata = metadata;
-        updated_metadata.mark_refreshed(row_count);
-        mv_catalog.update_view(&updated_metadata)?;
-
-        tracing::info!(
-            "Successfully refreshed materialized view '{}' with {} rows{}",
-            name, row_count,
-            if concurrent { " (CONCURRENT mode - zero downtime)" } else { "" }
-        );
-    } else {
-        return Err(Error::execution("No storage engine available"));
     }
 
     // Return empty result set

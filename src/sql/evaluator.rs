@@ -312,6 +312,15 @@ impl Evaluator {
                 }
             }
 
+            LogicalExpr::WindowFunction { .. } => {
+                // Window functions cannot be evaluated row-by-row
+                // They need access to all rows in a partition and are handled
+                // by the WindowOperator in the executor
+                Err(Error::query_execution(
+                    "Window functions must be evaluated by WindowOperator, not row-by-row"
+                ))
+            }
+
             _ => Err(Error::query_execution(format!(
                 "Expression not yet implemented: {:?}",
                 expr
@@ -814,6 +823,7 @@ impl Evaluator {
                 Value::DictRef { dict_id } => serde_json::json!(format!("dict:{}", dict_id)),
                 Value::CasRef { hash } => serde_json::json!(format!("cas:{}", hex::encode(hash))),
                 Value::ColumnarRef => serde_json::json!("columnar_ref"),
+                Value::Interval(iv) => serde_json::json!(format!("{} microseconds", iv)),
             };
 
             obj[key] = json_val;
@@ -878,6 +888,7 @@ impl Evaluator {
                 Value::DictRef { dict_id } => serde_json::json!(format!("dict:{}", dict_id)),
                 Value::CasRef { hash } => serde_json::json!(format!("cas:{}", hex::encode(hash))),
                 Value::ColumnarRef => serde_json::json!("columnar_ref"),
+                Value::Interval(iv) => serde_json::json!(format!("{} microseconds", iv)),
             };
 
             arr.push(json_val);
@@ -1267,6 +1278,13 @@ impl Evaluator {
             // Array operators
             BinaryOperator::ArrayConcat => self.array_concat_op(left, right),
 
+            // String pattern matching (LIKE)
+            BinaryOperator::Like => self.like_op(left, right, false),
+            BinaryOperator::NotLike => self.like_op(left, right, true),
+
+            // Modulo operator
+            BinaryOperator::Modulo => self.arithmetic_modulo(left, right),
+
             _ => Err(Error::query_execution(format!(
                 "Binary operator not yet implemented: {:?}",
                 op
@@ -1553,6 +1571,32 @@ impl Evaluator {
             (Value::Float4(a), Value::Int2(b)) => Ok(Value::Float4(a + (*b as f32))),
             (Value::Int2(a), Value::Float8(b)) => Ok(Value::Float8((*a as f64) + b)),
             (Value::Float8(a), Value::Int2(b)) => Ok(Value::Float8(a + (*b as f64))),
+            // Timestamp + Interval arithmetic
+            (Value::Timestamp(ts), Value::Interval(micros)) => {
+                let duration = chrono::Duration::microseconds(*micros);
+                let new_ts = *ts + duration;
+                Ok(Value::Timestamp(new_ts))
+            }
+            (Value::Interval(micros), Value::Timestamp(ts)) => {
+                let duration = chrono::Duration::microseconds(*micros);
+                let new_ts = *ts + duration;
+                Ok(Value::Timestamp(new_ts))
+            }
+            // Date + Interval arithmetic (add days)
+            (Value::Date(d), Value::Interval(micros)) => {
+                let days = (*micros / 86_400_000_000) as i64;
+                let new_date = *d + chrono::Duration::days(days);
+                Ok(Value::Date(new_date))
+            }
+            (Value::Interval(micros), Value::Date(d)) => {
+                let days = (*micros / 86_400_000_000) as i64;
+                let new_date = *d + chrono::Duration::days(days);
+                Ok(Value::Date(new_date))
+            }
+            // Interval + Interval
+            (Value::Interval(a), Value::Interval(b)) => {
+                Ok(Value::Interval(a + b))
+            }
             _ => Err(Error::query_execution(format!(
                 "Cannot add {:?} and {:?}",
                 left, right
@@ -1648,6 +1692,34 @@ impl Evaluator {
             (Value::Float4(a), Value::Int2(b)) => Ok(Value::Float4(a - (*b as f32))),
             (Value::Int2(a), Value::Float8(b)) => Ok(Value::Float8((*a as f64) - b)),
             (Value::Float8(a), Value::Int2(b)) => Ok(Value::Float8(a - (*b as f64))),
+            // Timestamp - Interval arithmetic
+            (Value::Timestamp(ts), Value::Interval(micros)) => {
+                let duration = chrono::Duration::microseconds(*micros);
+                let new_ts = *ts - duration;
+                Ok(Value::Timestamp(new_ts))
+            }
+            // Date - Interval arithmetic (subtract days)
+            (Value::Date(d), Value::Interval(micros)) => {
+                let days = (*micros / 86_400_000_000) as i64;
+                let new_date = *d - chrono::Duration::days(days);
+                Ok(Value::Date(new_date))
+            }
+            // Timestamp - Timestamp = Interval
+            (Value::Timestamp(a), Value::Timestamp(b)) => {
+                let diff = *a - *b;
+                let micros = diff.num_microseconds().unwrap_or(0);
+                Ok(Value::Interval(micros))
+            }
+            // Date - Date = Interval (in days)
+            (Value::Date(a), Value::Date(b)) => {
+                let diff = *a - *b;
+                let micros = diff.num_days() * 86_400_000_000;
+                Ok(Value::Interval(micros))
+            }
+            // Interval - Interval
+            (Value::Interval(a), Value::Interval(b)) => {
+                Ok(Value::Interval(a - b))
+            }
             _ => Err(Error::query_execution(format!(
                 "Cannot subtract {:?} and {:?}",
                 left, right
@@ -2581,6 +2653,110 @@ impl Evaluator {
             _ => Err(Error::query_execution(format!(
                 "Array concatenation requires arrays or array-compatible types, got {:?} || {:?}",
                 left, right
+            ))),
+        }
+    }
+
+    /// LIKE pattern matching operator
+    /// Supports SQL LIKE patterns: % (any sequence), _ (single char)
+    fn like_op(&self, left: &Value, right: &Value, negated: bool) -> Result<Value> {
+        // Handle NULL values
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(Value::Null);
+        }
+
+        // Get string values
+        let text = match left {
+            Value::String(s) => s.as_str(),
+            _ => return Err(Error::query_execution(format!(
+                "LIKE requires string operand, got {:?}", left
+            ))),
+        };
+
+        let pattern = match right {
+            Value::String(s) => s.as_str(),
+            _ => return Err(Error::query_execution(format!(
+                "LIKE pattern must be a string, got {:?}", right
+            ))),
+        };
+
+        // Convert SQL LIKE pattern to regex
+        let regex_pattern = self.like_pattern_to_regex(pattern);
+
+        let result = match regex::Regex::new(&regex_pattern) {
+            Ok(re) => re.is_match(text),
+            Err(e) => return Err(Error::query_execution(format!(
+                "Invalid LIKE pattern '{}': {}", pattern, e
+            ))),
+        };
+
+        Ok(Value::Boolean(if negated { !result } else { result }))
+    }
+
+    /// Convert SQL LIKE pattern to regex pattern
+    /// % -> .* (any sequence)
+    /// _ -> . (single char)
+    /// Escape regex special chars
+    fn like_pattern_to_regex(&self, pattern: &str) -> String {
+        let mut regex = String::with_capacity(pattern.len() * 2 + 2);
+        regex.push('^'); // Anchor at start
+
+        let mut chars = pattern.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                // Escape character - next char is literal
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        // Escape regex special chars
+                        if "^$.*+?{}[]|()\\".contains(next) {
+                            regex.push('\\');
+                        }
+                        regex.push(next);
+                    }
+                }
+                // SQL wildcards
+                '%' => regex.push_str(".*"),
+                '_' => regex.push('.'),
+                // Escape regex special characters
+                '^' | '$' | '.' | '*' | '+' | '?' | '{' | '}' | '[' | ']' | '|' | '(' | ')' => {
+                    regex.push('\\');
+                    regex.push(c);
+                }
+                // Regular character
+                _ => regex.push(c),
+            }
+        }
+
+        regex.push('$'); // Anchor at end
+        regex
+    }
+
+    /// Modulo operator
+    fn arithmetic_modulo(&self, left: &Value, right: &Value) -> Result<Value> {
+        match (left, right) {
+            (Value::Int2(a), Value::Int2(b)) => {
+                if *b == 0 { return Err(Error::query_execution("Division by zero")); }
+                Ok(Value::Int2(a % b))
+            }
+            (Value::Int4(a), Value::Int4(b)) => {
+                if *b == 0 { return Err(Error::query_execution("Division by zero")); }
+                Ok(Value::Int4(a % b))
+            }
+            (Value::Int8(a), Value::Int8(b)) => {
+                if *b == 0 { return Err(Error::query_execution("Division by zero")); }
+                Ok(Value::Int8(a % b))
+            }
+            // Cross-type integer modulo
+            (Value::Int4(a), Value::Int8(b)) => {
+                if *b == 0 { return Err(Error::query_execution("Division by zero")); }
+                Ok(Value::Int8(*a as i64 % b))
+            }
+            (Value::Int8(a), Value::Int4(b)) => {
+                if *b == 0 { return Err(Error::query_execution("Division by zero")); }
+                Ok(Value::Int8(a % *b as i64))
+            }
+            _ => Err(Error::query_execution(format!(
+                "Modulo requires integer operands, got {:?} % {:?}", left, right
             ))),
         }
     }

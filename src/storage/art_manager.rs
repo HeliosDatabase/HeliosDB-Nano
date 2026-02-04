@@ -581,6 +581,7 @@ impl ArtIndexManager {
                     // The actual value should be resolved before indexing
                     key.extend_from_slice(b"columnar_ref");
                 }
+                Value::Interval(iv) => key.extend_from_slice(&iv.to_be_bytes()), // Encode interval microseconds
             }
         }
         key

@@ -226,6 +226,9 @@ pub enum Value {
     Date(chrono::NaiveDate),
     /// Time of day without timezone
     Time(chrono::NaiveTime),
+    /// Time interval (duration in microseconds for precision)
+    /// Positive for forward, negative for backward
+    Interval(i64),
     /// JSON value (stored as string for bincode compatibility)
     Json(String),
     /// Array of values
@@ -267,6 +270,7 @@ impl Value {
             Value::Timestamp(_) => DataType::Timestamp,
             Value::Date(_) => DataType::Date,
             Value::Time(_) => DataType::Time,
+            Value::Interval(_) => DataType::Interval,
             Value::Json(_) => DataType::Jsonb,
             Value::Array(arr) => {
                 // Get type from first element if available
@@ -303,6 +307,19 @@ impl fmt::Display for Value {
             Value::Timestamp(ts) => write!(f, "'{}'", ts.to_rfc3339()),
             Value::Date(d) => write!(f, "'{}'", d.format("%Y-%m-%d")),
             Value::Time(t) => write!(f, "'{}'", t.format("%H:%M:%S%.f")),
+            Value::Interval(micros) => {
+                // Format interval in a human-readable way
+                let total_secs = micros / 1_000_000;
+                let days = total_secs / 86400;
+                let hours = (total_secs % 86400) / 3600;
+                let mins = (total_secs % 3600) / 60;
+                let secs = total_secs % 60;
+                if days > 0 {
+                    write!(f, "{} days {:02}:{:02}:{:02}", days, hours, mins, secs)
+                } else {
+                    write!(f, "{:02}:{:02}:{:02}", hours, mins, secs)
+                }
+            }
             Value::Json(j) => write!(f, "'{}'", j),
             Value::Array(arr) => {
                 write!(f, "[")?;
@@ -699,6 +716,9 @@ impl Hash for Value {
                 // Columnar references hash to a constant
                 // since the actual value is stored elsewhere
                 255u8.hash(state);
+            }
+            Value::Interval(microseconds) => {
+                microseconds.hash(state);
             }
         }
     }

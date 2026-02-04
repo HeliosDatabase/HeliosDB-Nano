@@ -195,6 +195,7 @@ impl BloomFilter {
             Value::DictRef { dict_id } => self.insert(dict_id),
             Value::CasRef { hash } => self.insert(hash),
             Value::ColumnarRef => self.insert(&0u8),
+            Value::Interval(iv) => self.insert(iv), // Hash interval microseconds
         }
     }
 
@@ -254,6 +255,7 @@ impl BloomFilter {
             Value::DictRef { dict_id } => self.might_contain(dict_id),
             Value::CasRef { hash } => self.might_contain(hash),
             Value::ColumnarRef => self.might_contain(&0u8),
+            Value::Interval(iv) => self.might_contain(iv), // Check interval microseconds
         }
     }
 
@@ -308,6 +310,7 @@ impl BloomFilter {
             Value::DictRef { dict_id } => self.check(dict_id),
             Value::CasRef { hash } => self.check(hash),
             Value::ColumnarRef => self.check(&0u8),
+            Value::Interval(iv) => self.check(iv), // Check interval microseconds
         }
     }
 
@@ -458,6 +461,7 @@ impl BloomFilter {
             Value::DictRef { dict_id } => dict_id.hash(hasher),
             Value::CasRef { hash } => hash.hash(hasher),
             Value::ColumnarRef => 0u8.hash(hasher),
+            Value::Interval(iv) => iv.hash(hasher), // Hash interval microseconds
         }
     }
 }

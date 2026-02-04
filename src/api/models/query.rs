@@ -200,6 +200,10 @@ impl From<&crate::Value> for serde_json::Value {
                 serde_json::Value::String(format!("cas:{}", hex::encode(hash)))
             }
             crate::Value::ColumnarRef => serde_json::Value::Null,
+            crate::Value::Interval(microseconds) => {
+                // Return interval as microseconds number
+                serde_json::Value::Number((*microseconds).into())
+            }
         }
     }
 }

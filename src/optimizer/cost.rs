@@ -523,6 +523,19 @@ impl CostEstimator {
             LogicalExpr::ArraySubscript { array, index } => {
                 3.0 + self.estimate_expr_complexity(array) + self.estimate_expr_complexity(index)
             }
+            LogicalExpr::WindowFunction { args, partition_by, order_by, .. } => {
+                // Window functions are expensive due to partitioning and sorting
+                let arg_cost: f64 = args.iter()
+                    .map(|e| self.estimate_expr_complexity(e))
+                    .sum();
+                let partition_cost: f64 = partition_by.iter()
+                    .map(|e| self.estimate_expr_complexity(e))
+                    .sum();
+                let order_cost: f64 = order_by.iter()
+                    .map(|(e, _)| self.estimate_expr_complexity(e))
+                    .sum();
+                50.0 + arg_cost + partition_cost + order_cost
+            }
             LogicalExpr::Wildcard | LogicalExpr::Parameter { .. } => 1.0,
         }
     }

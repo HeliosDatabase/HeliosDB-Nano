@@ -280,6 +280,7 @@ pub fn value_to_json(value: &Value) -> serde_json::Value {
         Value::DictRef { dict_id } => serde_json::Value::String(format!("dict:{}", dict_id)),
         Value::CasRef { hash } => serde_json::Value::String(format!("cas:{}", hex::encode(hash))),
         Value::ColumnarRef => serde_json::Value::Null,
+        Value::Interval(microseconds) => serde_json::Value::Number((*microseconds).into()),
     }
 }
 

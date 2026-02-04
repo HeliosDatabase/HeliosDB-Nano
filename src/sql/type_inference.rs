@@ -225,6 +225,54 @@ impl TypeInference for LogicalExpr {
                     )),
                 }
             }
+
+            // Window function: infer based on function type
+            LogicalExpr::WindowFunction { fun, args, .. } => {
+                use super::logical_plan::WindowFunctionType;
+                match fun {
+                    WindowFunctionType::RowNumber |
+                    WindowFunctionType::Rank |
+                    WindowFunctionType::DenseRank |
+                    WindowFunctionType::Ntile => Ok(DataType::Int8),
+                    WindowFunctionType::PercentRank |
+                    WindowFunctionType::CumeDist => Ok(DataType::Float8),
+                    WindowFunctionType::Lag |
+                    WindowFunctionType::Lead |
+                    WindowFunctionType::FirstValue |
+                    WindowFunctionType::LastValue |
+                    WindowFunctionType::NthValue => {
+                        // Return type matches the argument type
+                        if args.is_empty() {
+                            Ok(DataType::Text) // Fallback
+                        } else {
+                            args[0].infer_type(schema)
+                        }
+                    }
+                    WindowFunctionType::Aggregate(aggr) => {
+                        // Delegate to aggregate type inference
+                        match aggr {
+                            crate::sql::AggregateFunction::Count => Ok(DataType::Int8),
+                            crate::sql::AggregateFunction::Sum => {
+                                if args.is_empty() {
+                                    Ok(DataType::Float8)
+                                } else {
+                                    args[0].infer_type(schema)
+                                }
+                            }
+                            crate::sql::AggregateFunction::Avg => Ok(DataType::Float8),
+                            crate::sql::AggregateFunction::Min |
+                            crate::sql::AggregateFunction::Max => {
+                                if args.is_empty() {
+                                    Ok(DataType::Float8)
+                                } else {
+                                    args[0].infer_type(schema)
+                                }
+                            }
+                            crate::sql::AggregateFunction::JsonAgg => Ok(DataType::Jsonb),
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -331,6 +379,23 @@ impl TypeInference for LogicalExpr {
 
             // Array subscript: arr[n] is nullable (could be out of bounds or null input)
             LogicalExpr::ArraySubscript { .. } => true,
+
+            // Window function: most are nullable
+            LogicalExpr::WindowFunction { fun, .. } => {
+                use super::logical_plan::WindowFunctionType;
+                match fun {
+                    // Ranking functions are never null
+                    WindowFunctionType::RowNumber |
+                    WindowFunctionType::Rank |
+                    WindowFunctionType::DenseRank |
+                    WindowFunctionType::Ntile => false,
+                    // Statistical functions are never null
+                    WindowFunctionType::PercentRank |
+                    WindowFunctionType::CumeDist => false,
+                    // Offset and value functions can return null
+                    _ => true,
+                }
+            }
         }
     }
 
