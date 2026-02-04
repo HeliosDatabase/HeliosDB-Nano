@@ -690,6 +690,21 @@ class Connection:
             start_time = time.time()
             last_data_time = start_time
 
+            # Completion patterns that indicate query finished
+            completion_patterns = [
+                'ms)',              # Timing display: "(0.5ms)"
+                'row(s)',           # Row count: "1 row(s) affected"
+                'rows)',            # "(5 rows)"
+                'ERROR:',           # Error message
+                'Query OK',         # Success message
+                'CREATE TABLE',     # DDL success
+                'DROP TABLE',       # DDL success
+                'CREATE INDEX',     # DDL success
+                'BEGIN',            # Transaction started
+                'COMMIT',           # Transaction committed
+                'ROLLBACK',         # Transaction rolled back
+            ]
+
             while True:
                 elapsed = time.time() - start_time
                 if elapsed > self.timeout:
@@ -703,9 +718,9 @@ class Connection:
 
                         # Check for completion patterns
                         output_str = output.decode('utf-8', errors='replace')
-                        if any(p in output_str for p in ['ms)', 'ERROR:', 'Query OK']):
+                        if any(p in output_str for p in completion_patterns):
                             # Wait a tiny bit to ensure we get the full line
-                            time.sleep(0.01)
+                            time.sleep(0.02)
                             try:
                                 extra = os.read(self._heliosdb_process.stdout.fileno(), 4096)
                                 if extra:
@@ -715,10 +730,14 @@ class Connection:
                             break
                 except BlockingIOError:
                     # No data available
-                    if output and time.time() - last_data_time > 0.1:
+                    idle_time = time.time() - last_data_time
+                    if output and idle_time > 0.15:
                         # Haven't received data for a bit, check if we have a complete response
                         output_str = output.decode('utf-8', errors='replace')
-                        if any(p in output_str for p in ['ms)', 'ERROR:', 'Query OK']):
+                        if any(p in output_str for p in completion_patterns):
+                            break
+                        # Also break if we see a newline after table closing (empty result)
+                        if '└' in output_str or '╰' in output_str or '+--' in output_str:
                             break
                     time.sleep(0.01)
                     continue
@@ -726,9 +745,9 @@ class Connection:
             output_str = output.decode('utf-8', errors='replace')
 
             # Check for errors in output
-            if 'ERROR:' in output_str:
+            if 'ERROR:' in output_str or 'error:' in output_str:
                 for line in output_str.split('\n'):
-                    if 'ERROR:' in line:
+                    if 'ERROR:' in line or 'error:' in line:
                         raise DatabaseError(line.strip())
 
             # Parse output
@@ -801,21 +820,47 @@ class Connection:
             # Parse table output
             lines = output.strip().split('\n')
 
-            # Find table boundaries (lines with dashes)
-            separator_indices = [i for i, line in enumerate(lines) if '─' in line or '━' in line or line.startswith('---')]
+            # Find table boundaries (lines with various box drawing characters or dashes)
+            # Support both Unicode box drawing and ASCII fallback
+            separator_indices = []
+            for i, line in enumerate(lines):
+                # Check for Unicode box drawing horizontal lines
+                if '─' in line or '━' in line or '═' in line:
+                    separator_indices.append(i)
+                # Check for ASCII-style separators
+                elif line.strip().startswith('---') or line.strip().startswith('+--'):
+                    separator_indices.append(i)
 
             if len(separator_indices) >= 2:
-                # Extract column names
+                # Extract column names from header line (before first separator)
                 header_line = lines[separator_indices[0] - 1] if separator_indices[0] > 0 else ""
-                columns = [col.strip() for col in header_line.split('│') if col.strip()]
 
-                # Extract rows
+                # Try Unicode box drawing delimiter first, then ASCII pipe
+                if '│' in header_line:
+                    columns = [col.strip() for col in header_line.split('│') if col.strip()]
+                elif '|' in header_line:
+                    columns = [col.strip() for col in header_line.split('|') if col.strip()]
+                else:
+                    # Whitespace-separated columns (fallback)
+                    columns = header_line.split()
+
+                # Extract data rows between first and second separator
                 rows = []
                 for i in range(separator_indices[0] + 1, separator_indices[1]):
                     if i < len(lines):
                         row_line = lines[i]
-                        values = [val.strip() for val in row_line.split('│') if val.strip()]
+                        # Parse based on delimiter type
+                        if '│' in row_line:
+                            values = [val.strip() for val in row_line.split('│') if val.strip()]
+                        elif '|' in row_line:
+                            values = [val.strip() for val in row_line.split('|') if val.strip()]
+                        else:
+                            # Skip empty or malformed lines
+                            continue
+
                         if values:
+                            # Convert NULL strings to None
+                            values = [None if v.upper() == 'NULL' else v for v in values]
                             rows.append(values)
 
                 return {
@@ -823,20 +868,35 @@ class Connection:
                     'columns': columns
                 }
             else:
-                # No table format - return empty
+                # No table format - check for "(0 rows)" pattern indicating empty result
+                if '(0 rows)' in output or 'row(s)' in output:
+                    return {
+                        'rows': [],
+                        'columns': []
+                    }
+                # Return empty for no results
                 return {
                     'rows': [],
                     'columns': []
                 }
         else:
             # Parse row count from output
-            # Look for patterns like "INSERT 0 1" or "UPDATE 5"
-            match = re.search(r'(\d+)\s+rows?', output, re.IGNORECASE)
+            # Look for patterns like "INSERT 0 1", "UPDATE 5", "1 row(s) affected"
+            match = re.search(r'(\d+)\s+rows?\s*\)?(?:\s+affected)?', output, re.IGNORECASE)
             if match:
                 return int(match.group(1))
 
+            # Look for PostgreSQL-style command tags: "INSERT 0 N", "UPDATE N", "DELETE N"
+            match = re.search(r'(?:INSERT|UPDATE|DELETE)\s+\d*\s*(\d+)', output, re.IGNORECASE)
+            if match:
+                return int(match.group(1))
+
+            # Check for CREATE/DROP success indicators
+            if any(p in output.upper() for p in ['CREATE TABLE', 'DROP TABLE', 'CREATE INDEX', 'CREATED', 'DROPPED']):
+                return 1
+
             # Check for success indicators
-            if 'successfully' in output.lower() or 'ok' in output.lower():
+            if 'successfully' in output.lower() or 'ok' in output.lower() or 'query ok' in output.lower():
                 return 1
 
             return -1
@@ -886,8 +946,8 @@ class Connection:
             raise ProgrammingError("Cannot operate on closed connection")
 
         if not self._in_transaction:
-            level = self.isolation_level or "DEFERRED"
-            self._execute_sql(f"BEGIN {level};")
+            # HeliosDB uses standard SQL BEGIN (not SQLite's DEFERRED/IMMEDIATE/EXCLUSIVE)
+            self._execute_sql("BEGIN;")
             self._in_transaction = True
 
     def close(self) -> None:
@@ -899,8 +959,8 @@ class Connection:
             # Terminate persistent REPL process if running
             if hasattr(self, '_heliosdb_process') and self._heliosdb_process is not None:
                 try:
-                    # Send quit command gracefully
-                    self._heliosdb_process.stdin.write('\\q\n')
+                    # Send quit command gracefully (must encode to bytes)
+                    self._heliosdb_process.stdin.write(b'\\q\n')
                     self._heliosdb_process.stdin.flush()
                     self._heliosdb_process.wait(timeout=2)
                 except:
