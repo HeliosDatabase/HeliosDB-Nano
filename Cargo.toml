@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "heliosdb-lite"
-version = "3.5.8"
+version = "3.6.0"
 edition = "2021"
 authors = ["HeliosDB Team"]
 license = "Apache-2.0"

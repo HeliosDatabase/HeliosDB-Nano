@@ -1415,21 +1415,61 @@ impl<'a> Planner<'a> {
                 })
             }
 
-            // Array literals for vectors: '[1.0, 2.0, 3.0]'
+            // Array literals: ARRAY[1, 2, 3] or '[1.0, 2.0, 3.0]' (for vectors)
             Expr::Array(sqlparser::ast::Array { elem, .. }) => {
-                // Parse array elements into vector
-                let elements: Result<Vec<f32>> = elem.iter()
-                    .map(|e| {
-                        match e {
-                            Expr::Value(sqlparser::ast::Value::Number(n, _)) => {
-                                n.parse::<f32>()
-                                    .map_err(|e| Error::query_execution(format!("Invalid vector element: {}", e)))
+                // Check if all elements are numeric - could be vector or array
+                let all_numeric = elem.iter().all(|e| matches!(e, Expr::Value(sqlparser::ast::Value::Number(_, _))));
+                let has_floats = elem.iter().any(|e| {
+                    if let Expr::Value(sqlparser::ast::Value::Number(n, _)) = e {
+                        n.contains('.')
+                    } else {
+                        false
+                    }
+                });
+
+                // If all floats, treat as vector for vector search compatibility
+                if all_numeric && has_floats {
+                    let elements: Result<Vec<f32>> = elem.iter()
+                        .map(|e| {
+                            match e {
+                                Expr::Value(sqlparser::ast::Value::Number(n, _)) => {
+                                    n.parse::<f32>()
+                                        .map_err(|e| Error::query_execution(format!("Invalid vector element: {}", e)))
+                                }
+                                _ => Err(Error::query_execution("Vector elements must be numbers"))
                             }
-                            _ => Err(Error::query_execution("Vector elements must be numbers"))
-                        }
-                    })
-                    .collect();
-                Ok(LogicalExpr::Literal(Value::Vector(elements?)))
+                        })
+                        .collect();
+                    Ok(LogicalExpr::Literal(Value::Vector(elements?)))
+                } else {
+                    // General array - convert each element to a Value
+                    let elements: Result<Vec<Value>> = elem.iter()
+                        .map(|e| {
+                            match e {
+                                Expr::Value(sqlparser::ast::Value::Number(n, _)) => {
+                                    if let Ok(i) = n.parse::<i32>() {
+                                        Ok(Value::Int4(i))
+                                    } else if let Ok(f) = n.parse::<f64>() {
+                                        Ok(Value::Float8(f))
+                                    } else {
+                                        Err(Error::query_execution(format!("Invalid array element: {}", n)))
+                                    }
+                                }
+                                Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
+                                    Ok(Value::String(s.clone()))
+                                }
+                                Expr::Value(sqlparser::ast::Value::Boolean(b)) => {
+                                    Ok(Value::Boolean(*b))
+                                }
+                                Expr::Value(sqlparser::ast::Value::Null) => {
+                                    Ok(Value::Null)
+                                }
+                                _ => Err(Error::query_execution("Unsupported array element type"))
+                            }
+                        })
+                        .collect();
+                    Ok(LogicalExpr::Literal(Value::Array(elements?)))
+                }
             }
 
             // CAST expressions: CAST(expr AS type) or expr::type
