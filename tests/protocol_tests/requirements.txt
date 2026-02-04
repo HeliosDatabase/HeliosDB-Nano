@@ -1,0 +1,12 @@
+# Python Requirements for HeliosDB-Lite Protocol Tests
+#
+# PostgreSQL protocol support
+psycopg2-binary>=2.9.9
+
+# Oracle protocol support
+oracledb>=2.0.0
+
+# Additional testing utilities
+pytest>=7.4.0
+pytest-timeout>=2.2.0
+colorama>=0.4.6

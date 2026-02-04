@@ -1,0 +1,19 @@
+# Build artifacts
+target/
+
+# Database data
+heliosdb-data/
+
+# History files
+.heliosdb_history
+
+# Python cache
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

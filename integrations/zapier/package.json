@@ -1,0 +1,28 @@
+{
+  "name": "heliosdb-zapier",
+  "version": "2.8.0",
+  "description": "Zapier integration for HeliosDB-Lite - AI-native embedded database",
+  "main": "index.js",
+  "scripts": {
+    "test": "zapier test",
+    "build": "zapier build",
+    "push": "zapier push",
+    "validate": "zapier validate"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "zapier-platform-cli": "^15.0.0",
+    "zapier-platform-core": "^15.0.0"
+  },
+  "keywords": [
+    "zapier",
+    "heliosdb",
+    "database",
+    "vector-database",
+    "ai"
+  ],
+  "license": "Apache-2.0"
+}

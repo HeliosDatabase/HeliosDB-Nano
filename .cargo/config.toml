@@ -1,0 +1,53 @@
+# HeliosDB-Lite Cargo Configuration
+# Project-wide Clippy settings for code quality enforcement
+
+[target.'cfg(all())']
+# Enforce strict lints as warnings project-wide
+rustflags = [
+    # Prevent unsafe patterns that can cause runtime panics
+    "-W", "clippy::unwrap_used",
+    "-W", "clippy::expect_used",
+    "-W", "clippy::panic",
+    "-W", "clippy::indexing_slicing",
+    "-W", "clippy::todo",
+    "-W", "clippy::unimplemented",
+
+    # Additional quality checks
+    "-W", "clippy::pedantic",
+    "-W", "clippy::nursery",
+
+    # Performance and correctness
+    "-W", "clippy::perf",
+    "-W", "clippy::complexity",
+    "-W", "clippy::correctness",
+]
+
+# Build settings
+[build]
+# Use all available CPU cores for compilation
+jobs = -1
+
+# Profile configurations for optimized builds
+[profile.dev]
+# Faster linking in development
+split-debuginfo = "unpacked"
+
+[profile.release]
+# Enable Link-Time Optimization for better performance
+lto = "thin"
+# More aggressive optimization
+opt-level = 3
+# Enable runtime checks in release mode
+debug-assertions = false
+overflow-checks = true
+
+[profile.bench]
+# Inherit from release but with debug symbols
+inherits = "release"
+debug = true
+
+# Clippy configuration
+[alias]
+# Convenient aliases for running clippy with strict checks
+clippy-strict = "clippy -- -D warnings -D clippy::unwrap_used -D clippy::expect_used -D clippy::panic -D clippy::indexing_slicing"
+clippy-all = "clippy --all-targets --all-features -- -D warnings"

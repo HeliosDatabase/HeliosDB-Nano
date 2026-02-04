@@ -1,0 +1,48 @@
+{
+  "name": "n8n-nodes-heliosdb",
+  "version": "3.0.0",
+  "description": "n8n nodes for HeliosDB-Lite - AI-native embedded database",
+  "license": "Apache-2.0",
+  "homepage": "https://github.com/heliosdb/heliosdb-lite",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/heliosdb/heliosdb-lite"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc && gulp build:icons",
+    "dev": "tsc --watch",
+    "lint": "eslint . --ext .ts",
+    "prepublishOnly": "npm run build"
+  },
+  "files": [
+    "dist"
+  ],
+  "n8n": {
+    "n8nNodesApiVersion": 1,
+    "credentials": [
+      "dist/credentials/HeliosDbApi.credentials.js"
+    ],
+    "nodes": [
+      "dist/nodes/HeliosDb/HeliosDb.node.js"
+    ]
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "gulp": "^4.0.2",
+    "n8n-workflow": "^1.20.0",
+    "typescript": "^5.3.0"
+  },
+  "peerDependencies": {
+    "n8n-workflow": "*"
+  },
+  "keywords": [
+    "n8n",
+    "n8n-community-node-package",
+    "n8n-node",
+    "database",
+    "heliosdb",
+    "vector-database",
+    "ai"
+  ]
+}

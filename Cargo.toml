@@ -1,0 +1,256 @@
+[workspace]
+members = [
+    ".",
+    "crates/heliosdb-proxy",
+]
+
+[package]
+name = "heliosdb-lite"
+version = "3.5.8"
+edition = "2021"
+authors = ["HeliosDB Team"]
+license = "Apache-2.0"
+description = "PostgreSQL-compatible embedded database with TDE + ZKE encryption, HNSW vector search, Product Quantization, git-like branching, time-travel queries, materialized views, row-level security, and 50+ enterprise features"
+repository = "https://github.com/heliosdb/heliosdb"
+keywords = ["database", "postgresql", "vector-database", "embedded", "encryption"]
+categories = ["database", "embedded"]
+
+[lib]
+name = "heliosdb_lite"
+path = "src/lib.rs"
+
+[[bin]]
+name = "heliosdb-lite"
+path = "src/main.rs"
+
+[dependencies]
+# Storage (Direct RocksDB, no wrapper)
+rocksdb = { version = "0.22", default-features = false, features = ["snappy", "zstd"] }
+
+# SQL Parsing
+sqlparser = { version = "0.53", features = ["visitor"] }
+
+# Columnar Format
+arrow = { version = "52", features = ["prettyprint"] }
+parquet = { version = "52" }
+
+# Async Runtime
+tokio = { version = "1.40", features = ["full"] }
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures = "0.3"
+async-stream = "0.3"
+
+# HTTP Server (for sync protocol v2.3.0)
+axum = "0.7"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "compression-gzip", "trace"] }
+
+# PostgreSQL Protocol
+# Note: Using pgwire when available, for now we'll implement basic protocol
+bytes = "1.7"
+md5 = "0.7"
+base64 = "0.22"
+
+# Vector Search
+hnsw_rs = "0.3"
+
+# Cryptography
+blake3 = "1.5"  # Fast cryptographic hashing for content-addressed storage (non-FIPS)
+aes-gcm = "0.10"
+ring = { version = "0.17", optional = true }
+sha2 = "0.10"
+argon2 = "0.5"  # Non-FIPS KDF (Argon2id)
+pbkdf2 = { version = "0.12", features = ["simple"] }  # FIPS-approved KDF
+zeroize = "1.8"
+hex = "0.4"
+rustls = { version = "0.23", default-features = false }
+tokio-rustls = "0.26"
+rustls-pemfile = "2.0"
+jsonwebtoken = "9"
+# AWS-LC FIPS provider (FIPS 140-3 Certificate #4816)
+aws-lc-rs = { version = "1.12", features = ["fips"], optional = true }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+bincode = "1.3"
+
+# Compression (for dump/backup functionality)
+zstd = "0.13"
+lz4 = "1.26"
+flate2 = "1.0"
+brotli = "6.0"
+crc32fast = "1.4"
+
+# Parallelism for WAL optimization and concurrent processing
+rayon = "1.8"
+
+# Error Handling
+thiserror = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Utilities
+uuid = { version = "1.10", features = ["v4", "serde"] }
+chrono = { version = "=0.4.39", features = ["serde"] }
+rand = "0.8"
+parking_lot = "0.12"
+crossbeam = "0.8"
+tempfile = "3.12"
+num-traits = "0.2"
+rust_decimal = "1.33"  # Arbitrary precision decimal arithmetic for DECIMAL type
+regex = "1.10"
+once_cell = "1.19"
+lru = "0.12"
+dashmap = "5.5"
+sysinfo = "0.30"  # CPU monitoring for MV scheduler
+
+# Config
+toml = "0.8"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+rustyline = "14"
+prettytable-rs = "0.10"
+colored = "2"
+terminal_size = "0.4"
+indicatif = "0.17"
+
+[dev-dependencies]
+criterion = "0.5"
+proptest = "1.5"
+tokio-postgres = "0.7"
+
+[lints.clippy]
+# Deny unwrap in production code - forces proper error handling
+unwrap_used = "deny"
+# Warn on expect - should have descriptive context
+expect_used = "warn"
+# Deny indexing that could panic
+indexing_slicing = "warn"
+# Warn on panic in production code
+panic = "warn"
+# Warn on unimplemented/todo in production
+unimplemented = "warn"
+todo = "warn"
+
+[features]
+default = ["encryption", "vector-search", "ring-crypto"]
+encryption = []
+vector-search = []
+simd = []
+sync-experimental = []  # Sync/replication module - Core features implemented (conflict detection, vector clocks, field-level merge)
+test-utils = []  # Test utilities for integration tests and benchmarks
+server = []  # Server-mode features requiring async runtime
+internal-tests = []  # Internal API tests (disabled for public builds)
+
+# =============================================================================
+# CRYPTOGRAPHIC PROVIDER FEATURE FLAGS
+# =============================================================================
+# Choose ONE crypto provider (ring-crypto is default, fips for FIPS 140-3 compliance)
+
+# Standard crypto provider (ring + BLAKE3) - DEFAULT
+# Uses: ring for TLS/signatures, BLAKE3 for content hashing, Argon2id for KDF
+ring-crypto = ["dep:ring"]
+
+# FIPS 140-3 compliant crypto provider (AWS-LC FIPS + SHA-256)
+# Uses: aws-lc-rs (FIPS Certificate #4816), SHA-256 for hashing, PBKDF2 for KDF
+# Build with: cargo build --no-default-features --features fips,encryption,vector-search
+fips = ["dep:aws-lc-rs"]
+
+# =============================================================================
+# HIGH AVAILABILITY FEATURE FLAGS
+# =============================================================================
+# See docs/guides/HIGH_AVAILABILITY_OVERVIEW.md for full documentation
+
+# HA Tier 1: Warm Standby (Active-Passive)
+# - WAL streaming replication
+# - Automatic failover detection
+# - Read replica support
+ha-tier1 = []
+
+# HA Tier 2: Multi-Primary (Active-Active)
+# - Branch-based replication (unique to HeliosDB)
+# - Vector clock conflict resolution
+# - Multi-region support
+# Requires: ha-tier1 (for fallback)
+ha-tier2 = ["ha-tier1"]
+
+# HA Tier 3: Sharding (Horizontal Scaling)
+# - Consistent hash ring
+# - Cross-shard query routing
+# - Dynamic resharding
+ha-tier3 = []
+
+# Innovation Features
+ha-innovations = []  # Base innovation module
+
+# HeliosProxy: Connection router with load balancing
+ha-proxy = ["ha-innovations"]
+
+# TR: Transaction Replay (Oracle TAF+TAC merged)
+# - Transaction journaling and replay
+# - Cursor restoration
+# - Session migration
+ha-tr = ["ha-proxy", "ha-tier1"]
+
+# HA-Dedup: Content-addressed deduplication across nodes
+ha-dedup = ["ha-innovations"]
+
+# A/B Testing: Branch-based experiment routing
+ha-ab-testing = ["ha-innovations"]
+
+# Branch-to-Server Replication: Selective branch sync to remote servers
+ha-branch-replication = ["ha-tier2"]
+
+# Convenience bundles
+ha-full = [
+    "ha-tier1", "ha-tier2", "ha-tier3",
+    "ha-innovations", "ha-proxy", "ha-tr",
+    "ha-dedup", "ha-ab-testing", "ha-branch-replication"
+]
+ha-standard = ["ha-tier1", "ha-tier2", "ha-proxy", "ha-tr"]
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[[bench]]
+name = "vector_search_bench"
+harness = false
+
+[[bench]]
+name = "encryption_benchmark"
+harness = false
+
+[[bench]]
+name = "simd_benchmark"
+harness = false
+
+[[bench]]
+name = "time_travel_optimization"
+harness = false
+
+[[bench]]
+name = "conflict_detection_bench"
+harness = false
+
+[[bench]]
+name = "sync_benchmark"
+harness = false
+
+[[bench]]
+name = "branch_performance"
+harness = false
+
+[[bench]]
+name = "art_index_bench"
+harness = false
+
+[profile.bench]
+inherits = "release"

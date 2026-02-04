@@ -1,0 +1,560 @@
+# HeliosDB-Lite Configuration File (v2.1)
+#
+# This is a comprehensive example configuration file showing all available
+# options for HeliosDB-Lite. Copy this file to config.toml and customize
+# as needed for your deployment.
+
+# ============================================================================
+# STORAGE CONFIGURATION
+# ============================================================================
+[storage]
+# Database storage path (None or omit for in-memory database)
+path = "./heliosdb-data"
+
+# Memory-only mode (overrides path setting)
+memory_only = false
+
+# Write-Ahead Log (WAL) configuration
+# WAL provides durability and crash recovery
+wal_enabled = true
+
+# WAL synchronization mode:
+# - "sync": Synchronous (safest, slowest) - fsync on every write
+# - "async": Asynchronous (faster, less safe) - OS-managed flush
+# - "group_commit": Batch operations (balanced performance/safety)
+wal_sync_mode = "sync"
+
+# Maximum memory for cache (in bytes)
+# Default: 512MB (536870912 bytes)
+cache_size = 536870912
+
+# Default compression type:
+# - "None": No compression
+# - "Zstd": Zstandard compression (recommended, good ratio and speed)
+# - "Lz4": LZ4 compression (faster, lower ratio)
+compression = "Zstd"
+
+# Enable automatic time-travel versioning
+# When true, all insert/update operations create versioned snapshots
+# for time-travel queries (AS OF TIMESTAMP/TRANSACTION/SCN)
+time_travel_enabled = true
+
+# Query timeout in milliseconds (None or 0 for unlimited)
+# Queries exceeding this duration will be automatically terminated
+# Recommended: 30000 (30 seconds) for production
+query_timeout_ms = 0
+
+# Statement timeout in milliseconds (None or 0 for unlimited)
+# Currently not implemented, reserved for future use
+statement_timeout_ms = 0
+
+# Transaction isolation level:
+# - "READ_UNCOMMITTED": Not fully supported, maps to READ_COMMITTED
+# - "READ_COMMITTED": Standard PostgreSQL default
+# - "REPEATABLE_READ": Consistent snapshot from transaction start
+# - "SERIALIZABLE": Strictest isolation, may cause serialization failures
+transaction_isolation = "READ_COMMITTED"
+
+# ============================================================================
+# ENCRYPTION CONFIGURATION
+# ============================================================================
+[encryption]
+# Enable encryption at rest
+enabled = false
+
+# Encryption algorithm (currently only AES-256-GCM supported)
+algorithm = "Aes256Gcm"
+
+# Key rotation interval in days
+rotation_interval_days = 90
+
+# Key source configuration
+# Option 1: Environment variable
+[encryption.key_source]
+Environment = "HELIOSDB_ENCRYPTION_KEY"
+
+# Option 2: File path (uncomment to use)
+# [encryption.key_source]
+# File = "/secure/path/to/encryption.key"
+
+# Option 3: Cloud KMS (uncomment to use)
+# [encryption.key_source.Kms]
+# provider = "aws"  # aws, azure, or gcp
+# key_id = "arn:aws:kms:us-east-1:123456789:key/abc-123"
+
+# ============================================================================
+# SERVER CONFIGURATION
+# ============================================================================
+[server]
+# Listen address (use "0.0.0.0" to accept connections from any IP)
+listen_addr = "127.0.0.1"
+
+# PostgreSQL protocol port
+port = 5432
+
+# Oracle TNS protocol port (None to disable Oracle protocol)
+oracle_port = 1521
+
+# Maximum concurrent connections
+max_connections = 100
+
+# Enable TLS/SSL
+tls_enabled = false
+
+# TLS certificate path (required if tls_enabled = true)
+# tls_cert_path = "/path/to/cert.pem"
+
+# TLS private key path (required if tls_enabled = true)
+# tls_key_path = "/path/to/key.pem"
+
+# ============================================================================
+# PERFORMANCE CONFIGURATION
+# ============================================================================
+[performance]
+# Number of worker threads (default: number of CPU cores)
+# Set to 0 to use all available cores
+worker_threads = 0
+
+# Query timeout in seconds (legacy setting, use storage.query_timeout_ms instead)
+query_timeout_secs = 300
+
+# Enable SIMD optimizations for vector operations
+simd_enabled = true
+
+# Enable parallel query execution
+parallel_query = true
+
+# ============================================================================
+# AUDIT CONFIGURATION
+# ============================================================================
+[audit]
+# Enable audit logging
+enabled = false
+
+# Audit log file path
+# log_path = "/var/log/heliosdb/audit.log"
+
+# Events to audit (comma-separated):
+# - "all": All events
+# - "auth": Authentication events
+# - "query": Query execution
+# - "ddl": Schema changes (CREATE, ALTER, DROP)
+# - "dml": Data modifications (INSERT, UPDATE, DELETE)
+# log_events = ["auth", "ddl"]
+
+# ============================================================================
+# OPTIMIZER CONFIGURATION (v2.1)
+# ============================================================================
+[optimizer]
+# Enable query optimizer
+enabled = true
+
+# Enable/disable specific scan and join methods
+enable_seqscan = true
+enable_indexscan = true
+enable_hashjoin = true
+enable_mergejoin = true
+enable_nestloop = true
+
+# Cost model parameters (PostgreSQL-compatible)
+# Adjust these to tune optimizer behavior for your workload
+seq_page_cost = 1.0          # Cost of sequential page fetch
+random_page_cost = 4.0       # Cost of random page fetch (SSD: 1.1, HDD: 4.0)
+cpu_tuple_cost = 0.01        # Cost of processing one tuple
+cpu_index_tuple_cost = 0.005 # Cost of processing one index tuple
+
+# ============================================================================
+# AUTHENTICATION CONFIGURATION (v2.1)
+# ============================================================================
+[authentication]
+# Enable authentication
+enabled = false
+
+# Authentication method:
+# - "trust": No authentication (dev mode only!)
+# - "password": Password-based authentication
+# - "jwt": JWT token authentication
+# - "ldap": LDAP authentication
+method = "trust"
+
+# JWT configuration (only used if method = "jwt")
+# jwt_secret = "your-secret-key-here-change-in-production"
+jwt_expiration_secs = 86400  # 24 hours
+
+# Password hash algorithm:
+# - "argon2": Argon2 (recommended, most secure)
+# - "bcrypt": BCrypt (good balance)
+# - "pbkdf2": PBKDF2 (widely supported)
+password_hash_algorithm = "argon2"
+
+# Users file path (for file-based authentication)
+# users_file = "/etc/heliosdb/users.json"
+
+# ============================================================================
+# COMPRESSION CONFIGURATION (v2.1)
+# ============================================================================
+[compression]
+# Default compression type for new tables
+# Options: "None", "Zstd", "Lz4"
+default_type = "Zstd"
+
+# Compression level (1-22 for Zstd, higher = better ratio but slower)
+# Recommended: 3 for balanced performance, 9+ for maximum compression
+level = 3
+
+# Enable ALP (Adaptive Lossless floating-Point) compression
+# Specialized compression for numeric columns
+enable_alp = true
+
+# Enable FSST (Fast Static Symbol Table) compression
+# Specialized compression for string columns
+enable_fsst = true
+
+# Minimum data size to trigger compression (bytes)
+# Small data blocks aren't worth compressing
+min_size_bytes = 1024
+
+# ============================================================================
+# MATERIALIZED VIEW CONFIGURATION (v2.1)
+# ============================================================================
+[materialized_views]
+# Enable auto-refresh by default for new materialized views
+auto_refresh_default = false
+
+# Default maximum CPU percentage for refresh operations
+# Prevents refresh from consuming all CPU resources
+default_max_cpu_percent = 15
+
+# Interval to check if views need refresh (seconds)
+refresh_check_interval_secs = 60
+
+# Maximum concurrent refresh operations
+max_concurrent_refreshes = 2
+
+# ============================================================================
+# VECTOR INDEX CONFIGURATION (v2.1)
+# ============================================================================
+[vector]
+# Default vector index type:
+# - "flat": Brute force, exact search (small datasets)
+# - "hnsw": HNSW approximate search (recommended, fast)
+# - "ivf": Inverted file index (large datasets)
+default_index_type = "hnsw"
+
+# HNSW parameters
+# ef_construction: Higher = better recall but slower build (default: 200)
+hnsw_ef_construction = 200
+
+# M: Number of connections per layer (default: 16)
+# Higher M = better recall but more memory
+hnsw_m = 16
+
+# Enable Product Quantization (PQ) for vector compression
+# Provides 8-16x compression with minimal accuracy loss
+enable_pq = true
+
+# PQ subvector count (default: 8)
+# Must divide vector dimension evenly
+pq_subvectors = 8
+
+# PQ bits per subvector (default: 8, which gives 256 centroids)
+pq_bits = 8
+
+# ============================================================================
+# EXAMPLE DEPLOYMENT CONFIGURATIONS
+# ============================================================================
+
+# --- Development Configuration ---
+# Uncomment and modify for local development:
+# [storage]
+# memory_only = true
+# wal_enabled = false
+# [server]
+# listen_addr = "127.0.0.1"
+# [authentication]
+# method = "trust"
+
+# --- Production Configuration ---
+# Uncomment and modify for production:
+# [storage]
+# wal_sync_mode = "group_commit"
+# query_timeout_ms = 30000
+# [server]
+# listen_addr = "0.0.0.0"
+# tls_enabled = true
+# tls_cert_path = "/etc/heliosdb/ssl/cert.pem"
+# tls_key_path = "/etc/heliosdb/ssl/key.pem"
+# [authentication]
+# enabled = true
+# method = "jwt"
+# jwt_secret = "CHANGE-THIS-SECRET-IN-PRODUCTION"
+# [encryption]
+# enabled = true
+# [audit]
+# enabled = true
+# log_path = "/var/log/heliosdb/audit.log"
+
+# --- High-Performance Configuration (SSD) ---
+# Uncomment for SSD-optimized settings:
+# [optimizer]
+# random_page_cost = 1.1  # SSDs have low random access cost
+# [performance]
+# worker_threads = 0      # Use all cores
+# [storage]
+# cache_size = 2147483648 # 2GB cache
+
+# ============================================================================
+# AI/LLM CONFIGURATION
+# ============================================================================
+[ai]
+# Enable AI features (schema inference, generation, chat)
+enabled = true
+
+[ai.llm]
+# LLM provider: "openai", "anthropic", "ollama", "local", "none"
+provider = "none"
+
+# Model selection (provider-specific)
+# OpenAI: "gpt-4-turbo", "gpt-4o", "gpt-3.5-turbo"
+# Anthropic: "claude-3-opus", "claude-3-sonnet", "claude-3-haiku"
+# Ollama: "llama3", "codellama", "mistral"
+model = "gpt-4-turbo"
+
+# API key environment variable (not the key itself!)
+api_key_env = "OPENAI_API_KEY"
+
+# Generation parameters
+temperature = 0.7
+top_p = 0.9
+max_tokens = 2048
+
+# Request configuration
+timeout_seconds = 60
+max_retries = 3
+
+# Rate limiting
+requests_per_minute = 60
+
+[ai.embedding]
+# Embedding provider (usually same as LLM provider)
+provider = "openai"
+
+# Embedding model
+# OpenAI: "text-embedding-3-large", "text-embedding-3-small", "text-embedding-ada-002"
+model = "text-embedding-3-small"
+
+# Embedding dimensions (must match vector column sizes)
+dimensions = 1536
+
+# Batch processing
+batch_size = 100
+
+# API configuration
+api_key_env = "OPENAI_API_KEY"
+timeout_seconds = 30
+
+# ============================================================================
+# RAG (RETRIEVAL-AUGMENTED GENERATION) CONFIGURATION
+# ============================================================================
+[rag]
+# Enable RAG features
+enabled = true
+
+# Document chunking strategy
+chunk_size = 512
+chunk_overlap = 100
+
+# Chunking method: "fixed", "sentence", "paragraph", "semantic"
+chunking_method = "sentence"
+
+# Similarity threshold for retrieval (0.0 - 1.0)
+similarity_threshold = 0.7
+
+# Context window configuration
+max_context_tokens = 4000
+max_chunks_per_query = 10
+
+# Store chunk embeddings automatically
+auto_embed_chunks = true
+
+# Reranking (requires compatible model)
+enable_reranking = false
+rerank_top_k = 20
+
+# ============================================================================
+# FULL-TEXT SEARCH CONFIGURATION
+# ============================================================================
+[search]
+# Enable full-text search
+enabled = true
+
+# Tokenizer: "simple", "english", "standard"
+tokenizer = "english"
+
+# Term length limits
+min_term_length = 2
+max_term_length = 64
+
+# Search features
+phrase_search_enabled = true
+proximity_search_enabled = true
+fuzzy_search_enabled = true
+
+# Fuzzy search configuration
+fuzzy_max_edits = 2
+
+# Result highlighting
+enable_highlighting = true
+highlight_tag_open = "<mark>"
+highlight_tag_close = "</mark>"
+
+# ============================================================================
+# WASM CONFIGURATION
+# ============================================================================
+[wasm]
+# Enable WebAssembly execution
+enabled = false
+
+# Security limits
+memory_limit_mb = 128
+timeout_seconds = 30
+max_stack_depth = 1000
+
+# Allowed WASM modules (empty = all allowed)
+# allowed_modules = ["trusted_module.wasm"]
+
+# ============================================================================
+# MCP (MODEL CONTEXT PROTOCOL) CONFIGURATION
+# ============================================================================
+[mcp]
+# Enable MCP server
+enabled = false
+
+# Server configuration
+host = "127.0.0.1"
+port = 3000
+
+# Resource limits
+resource_limit_mb = 100
+timeout_seconds = 30
+
+# Allowed hosts for connections
+allowed_hosts = ["localhost", "127.0.0.1"]
+
+# ============================================================================
+# ADVANCED STORAGE TUNING
+# ============================================================================
+[storage.tuning]
+# Write amplification target (RocksDB writes per logical write)
+# Lower = faster writes, higher = better space efficiency
+write_amplification_target = 10
+
+# MVCC snapshot retention policy: "auto", "manual", "aggressive"
+# auto: Keep snapshots based on usage patterns
+# manual: Keep all snapshots until explicitly deleted
+# aggressive: Minimize snapshot retention for space savings
+snapshot_retention_policy = "auto"
+
+# Maximum snapshot age in hours (for auto/aggressive policies)
+snapshot_max_age_hours = 168  # 7 days
+
+# Index building strategy
+parallel_index_builds = true
+max_concurrent_index_builds = 2
+
+# Batch operation sizing
+default_batch_size = 1000
+max_batch_size = 10000
+
+# Compaction settings
+enable_auto_compaction = true
+compaction_style = "level"  # "level", "universal", "fifo"
+
+# Memory-mapped I/O
+enable_mmap = true
+mmap_size_mb = 256
+
+# ============================================================================
+# SESSION CONFIGURATION (v3.1.0 - Multi-User ACID)
+# ============================================================================
+[session]
+# How long a session can be idle before timeout (seconds)
+# Default: 3600 (1 hour)
+timeout_secs = 3600
+
+# Maximum sessions per user
+# Default: 10
+max_sessions_per_user = 10
+
+# How often to clean up inactive sessions (seconds)
+# Default: 300 (5 minutes)
+cleanup_interval_secs = 300
+
+# ============================================================================
+# LOCK CONFIGURATION (v3.1.0 - Multi-User ACID)
+# ============================================================================
+[locks]
+# How long to wait for a lock before timing out (milliseconds)
+# Default: 30000 (30 seconds)
+timeout_ms = 30000
+
+# How often to check for deadlocks (milliseconds)
+# Default: 100
+deadlock_check_interval_ms = 100
+
+# Maximum number of concurrent lock holders
+# Default: 10000
+max_lock_holders = 10000
+
+# ============================================================================
+# DUMP CONFIGURATION (v3.1.0 - Memory-to-Disk Persistence)
+# ============================================================================
+[dump]
+# Enable automatic dumps on a schedule
+# Default: false
+auto_dump_enabled = false
+
+# Cron schedule for automatic dumps (requires auto_dump_enabled = true)
+# Format: "minute hour day month weekday" (standard 5-field cron)
+# Examples:
+#   "0 */6 * * *"  - Every 6 hours
+#   "0 2 * * *"    - Daily at 2:00 AM
+#   "0 0 * * 0"    - Weekly on Sunday at midnight
+# Default: "" (empty, no schedule)
+schedule = "0 */6 * * *"
+
+# Compression algorithm for dumps
+# Options: "zstd", "gzip", "none"
+# Default: "zstd"
+compression = "zstd"
+
+# Maximum size of a single dump file before rolling (MB)
+# Default: 10000 (10 GB)
+max_dump_size_mb = 10000
+
+# Number of old dumps to keep (0 = keep all)
+# Default: 10
+keep_dumps = 10
+
+# Directory to store dumps (relative or absolute path)
+# Default: ".dumps"
+dump_dir = ".dumps"
+
+# ============================================================================
+# RESOURCE QUOTA CONFIGURATION (v3.1.0 - Multi-User ACID)
+# ============================================================================
+[resource_quotas]
+# Memory limit per user (MB)
+# Prevents any single user from consuming all available memory
+# Default: 1024 (1 GB)
+memory_limit_per_user_mb = 1024
+
+# Maximum concurrent queries per user
+# Prevents query storms from a single user
+# Default: 100
+max_concurrent_queries = 100
+
+# Query execution timeout (seconds)
+# Queries exceeding this duration will be automatically terminated
+# Default: 300 (5 minutes)
+query_timeout_secs = 300

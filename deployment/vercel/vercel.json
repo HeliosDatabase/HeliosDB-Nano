@@ -1,0 +1,25 @@
+{
+  "version": 2,
+  "name": "heliosdb-lite-api",
+  "builds": [
+    {
+      "src": "api/**/*.ts",
+      "use": "@vercel/node"
+    }
+  ],
+  "routes": [
+    {
+      "src": "/api/(.*)",
+      "dest": "/api/$1"
+    },
+    {
+      "src": "/(.*)",
+      "dest": "/api/index.ts"
+    }
+  ],
+  "env": {
+    "HELIOSDB_URL": "@heliosdb_url",
+    "HELIOSDB_API_KEY": "@heliosdb_api_key"
+  },
+  "regions": ["iad1"]
+}

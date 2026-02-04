@@ -1,0 +1,1621 @@
+openapi: 3.0.3
+info:
+  title: HeliosDB-Lite REST API
+  description: |
+    PostgreSQL-compatible embedded database with vector search, time-travel, and branching.
+
+    ## Key Features
+    - **Unified SQL + Vector**: Full SQL with native vector search
+    - **Time-Travel**: Query historical data, audit decisions
+    - **Branching**: Git-like branches for experiments
+    - **Embedded Mode**: No server needed, just a file
+    - **AI-Native**: Built for AI agents and LLM applications
+
+    ## Authentication
+    All API requests require authentication via API key or JWT token.
+    Include the key in the `Authorization` header as `Bearer <token>`.
+
+  version: 3.0.0
+  contact:
+    name: HeliosDB Team
+    url: https://github.com/heliosdb/heliosdb-lite
+  license:
+    name: Apache 2.0
+    url: https://www.apache.org/licenses/LICENSE-2.0
+
+servers:
+  - url: http://localhost:8080/v1
+    description: Local development server
+  - url: https://api.heliosdb.io/v1
+    description: Production server
+
+tags:
+  - name: Health
+    description: Health check endpoints
+  - name: Query
+    description: SQL query execution
+  - name: Branches
+    description: Branch management (git-like)
+  - name: Data
+    description: Data manipulation operations
+  - name: Tables
+    description: Table and schema management
+  - name: Vectors
+    description: Vector store and semantic search
+  - name: Agents
+    description: AI agent memory and sessions
+  - name: Documents
+    description: Document ingestion and RAG
+  - name: Chat
+    description: Chat session management
+  - name: Time Travel
+    description: Historical data queries
+  - name: Schema
+    description: Schema inference and management
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      operationId: healthCheck
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /branches:
+    get:
+      tags: [Branches]
+      summary: List all branches
+      operationId: listBranches
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: List of branches
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  branches:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Branch'
+    post:
+      tags: [Branches]
+      summary: Create a new branch
+      operationId: createBranch
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBranchRequest'
+      responses:
+        '201':
+          description: Branch created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Branch'
+
+  /branches/{branch}:
+    get:
+      tags: [Branches]
+      summary: Get branch details
+      operationId: getBranch
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/branchName'
+      responses:
+        '200':
+          description: Branch details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Branch'
+    delete:
+      tags: [Branches]
+      summary: Delete a branch
+      operationId: deleteBranch
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/branchName'
+      responses:
+        '204':
+          description: Branch deleted
+
+  /branches/{branch}/merge:
+    post:
+      tags: [Branches]
+      summary: Merge branch into target
+      operationId: mergeBranch
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/branchName'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MergeBranchRequest'
+      responses:
+        '200':
+          description: Merge completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MergeResult'
+
+  /branches/{branch}/query:
+    post:
+      tags: [Query]
+      summary: Execute SQL query on branch
+      operationId: executeQuery
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/branchName'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/QueryRequest'
+      responses:
+        '200':
+          description: Query results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResponse'
+
+  /branches/{branch}/tables:
+    get:
+      tags: [Tables]
+      summary: List tables in branch
+      operationId: listTables
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/branchName'
+      responses:
+        '200':
+          description: List of tables
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  tables:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/TableInfo'
+    post:
+      tags: [Tables]
+      summary: Create a new table
+      operationId: createTable
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/branchName'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTableRequest'
+      responses:
+        '201':
+          description: Table created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableInfo'
+
+  /branches/{branch}/tables/{table}:
+    get:
+      tags: [Tables]
+      summary: Get table schema
+      operationId: getTableSchema
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/branchName'
+        - $ref: '#/components/parameters/tableName'
+      responses:
+        '200':
+          description: Table schema
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableSchema'
+    delete:
+      tags: [Tables]
+      summary: Drop a table
+      operationId: dropTable
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/branchName'
+        - $ref: '#/components/parameters/tableName'
+      responses:
+        '204':
+          description: Table dropped
+
+  /branches/{branch}/tables/{table}/data:
+    get:
+      tags: [Data]
+      summary: Get table data
+      operationId: getTableData
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/branchName'
+        - $ref: '#/components/parameters/tableName'
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+            maximum: 10000
+        - name: offset
+          in: query
+          schema:
+            type: integer
+            default: 0
+        - name: order_by
+          in: query
+          schema:
+            type: string
+        - name: filter
+          in: query
+          description: JSON filter object
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Table data
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableDataResponse'
+    post:
+      tags: [Data]
+      summary: Insert rows into table
+      operationId: insertData
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/branchName'
+        - $ref: '#/components/parameters/tableName'
+        - name: auto_create
+          in: query
+          description: Auto-create table from data if not exists
+          schema:
+            type: boolean
+            default: false
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InsertDataRequest'
+      responses:
+        '201':
+          description: Data inserted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InsertDataResponse'
+    put:
+      tags: [Data]
+      summary: Update rows in table
+      operationId: updateData
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/branchName'
+        - $ref: '#/components/parameters/tableName'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateDataRequest'
+      responses:
+        '200':
+          description: Data updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpdateDataResponse'
+    delete:
+      tags: [Data]
+      summary: Delete rows from table
+      operationId: deleteData
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/branchName'
+        - $ref: '#/components/parameters/tableName'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DeleteDataRequest'
+      responses:
+        '200':
+          description: Data deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DeleteDataResponse'
+
+  # Vector Store Endpoints
+  /vectors/stores:
+    get:
+      tags: [Vectors]
+      summary: List vector stores
+      operationId: listVectorStores
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: List of vector stores
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  stores:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/VectorStore'
+    post:
+      tags: [Vectors]
+      summary: Create a vector store
+      operationId: createVectorStore
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateVectorStoreRequest'
+      responses:
+        '201':
+          description: Vector store created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VectorStore'
+
+  /vectors/stores/{name}:
+    get:
+      tags: [Vectors]
+      summary: Get vector store details
+      operationId: getVectorStore
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Vector store details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VectorStore'
+    delete:
+      tags: [Vectors]
+      summary: Delete vector store
+      operationId: deleteVectorStore
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Vector store deleted
+
+  /vectors/stores/{name}/vectors:
+    post:
+      tags: [Vectors]
+      summary: Upsert vectors
+      operationId: upsertVectors
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpsertVectorsRequest'
+      responses:
+        '200':
+          description: Vectors upserted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UpsertVectorsResponse'
+
+  /vectors/stores/{name}/search:
+    post:
+      tags: [Vectors]
+      summary: Search vectors by similarity
+      operationId: searchVectors
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/VectorSearchRequest'
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VectorSearchResponse'
+
+  /vectors/stores/{name}/texts:
+    post:
+      tags: [Vectors]
+      summary: Add texts with auto-embedding
+      operationId: addTexts
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddTextsRequest'
+      responses:
+        '201':
+          description: Texts added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AddTextsResponse'
+
+  # Agent Memory Endpoints
+  /agents/memory/{session}:
+    get:
+      tags: [Agents]
+      summary: Get agent conversation history
+      operationId: getAgentMemory
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: session
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Conversation history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AgentMemoryResponse'
+    delete:
+      tags: [Agents]
+      summary: Clear agent memory
+      operationId: clearAgentMemory
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: session
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Memory cleared
+
+  /agents/memory/{session}/add:
+    post:
+      tags: [Agents]
+      summary: Add to agent memory
+      operationId: addAgentMemory
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: session
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddMemoryRequest'
+      responses:
+        '201':
+          description: Memory added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AddMemoryResponse'
+
+  /agents/memory/{session}/search:
+    post:
+      tags: [Agents]
+      summary: Semantic search in agent memory
+      operationId: searchAgentMemory
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: session
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MemorySearchRequest'
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemorySearchResponse'
+
+  # Document Ingestion (RAG)
+  /documents/ingest:
+    post:
+      tags: [Documents]
+      summary: Ingest documents (auto-chunk, embed, store)
+      operationId: ingestDocuments
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestDocumentsRequest'
+      responses:
+        '201':
+          description: Documents ingested
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestDocumentsResponse'
+
+  /documents/search:
+    post:
+      tags: [Documents]
+      summary: Semantic document search
+      operationId: searchDocuments
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DocumentSearchRequest'
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DocumentSearchResponse'
+
+  /documents/{id}:
+    get:
+      tags: [Documents]
+      summary: Get document by ID
+      operationId: getDocument
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Document content
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Document'
+
+  # Chat Sessions
+  /chat/sessions:
+    get:
+      tags: [Chat]
+      summary: List chat sessions
+      operationId: listChatSessions
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: List of sessions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ChatSession'
+    post:
+      tags: [Chat]
+      summary: Create chat session
+      operationId: createChatSession
+      security:
+        - bearerAuth: []
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateChatSessionRequest'
+      responses:
+        '201':
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatSession'
+
+  /chat/sessions/{id}/messages:
+    get:
+      tags: [Chat]
+      summary: Get chat messages
+      operationId: getChatMessages
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 100
+      responses:
+        '200':
+          description: Chat messages
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatMessagesResponse'
+    post:
+      tags: [Chat]
+      summary: Add chat message
+      operationId: addChatMessage
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddChatMessageRequest'
+      responses:
+        '201':
+          description: Message added
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatMessage'
+
+  /chat/sessions/{id}/summarize:
+    post:
+      tags: [Chat]
+      summary: Summarize conversation
+      operationId: summarizeChat
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Summary generated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ChatSummaryResponse'
+
+  # Time Travel
+  /branches/{branch}/time-travel:
+    post:
+      tags: [Time Travel]
+      summary: Query at historical timestamp
+      operationId: timeTravelQuery
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/branchName'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TimeTravelRequest'
+      responses:
+        '200':
+          description: Historical query results
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/QueryResponse'
+
+  /branches/{branch}/history:
+    get:
+      tags: [Time Travel]
+      summary: Get table change history
+      operationId: getHistory
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/branchName'
+        - name: table
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: since
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: until
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Change history
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HistoryResponse'
+
+  # Schema Inference
+  /schema/infer:
+    post:
+      tags: [Schema]
+      summary: Infer schema from data
+      operationId: inferSchema
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/InferSchemaRequest'
+      responses:
+        '200':
+          description: Inferred schema
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferSchemaResponse'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    branchName:
+      name: branch
+      in: path
+      required: true
+      description: Branch name
+      schema:
+        type: string
+        default: main
+    tableName:
+      name: table
+      in: path
+      required: true
+      description: Table name
+      schema:
+        type: string
+
+  schemas:
+    HealthResponse:
+      type: object
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+        version:
+          type: string
+        uptime_seconds:
+          type: integer
+
+    Branch:
+      type: object
+      properties:
+        name:
+          type: string
+        parent:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        commit_count:
+          type: integer
+
+    CreateBranchRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+        from_branch:
+          type: string
+          default: main
+        at_timestamp:
+          type: string
+          format: date-time
+
+    MergeBranchRequest:
+      type: object
+      required: [target]
+      properties:
+        target:
+          type: string
+        strategy:
+          type: string
+          enum: [fast_forward, three_way, rebase]
+          default: three_way
+
+    MergeResult:
+      type: object
+      properties:
+        success:
+          type: boolean
+        conflicts:
+          type: array
+          items:
+            $ref: '#/components/schemas/MergeConflict'
+        changes_applied:
+          type: integer
+
+    MergeConflict:
+      type: object
+      properties:
+        table:
+          type: string
+        row_id:
+          type: string
+        source_value:
+          type: object
+        target_value:
+          type: object
+
+    QueryRequest:
+      type: object
+      required: [sql]
+      properties:
+        sql:
+          type: string
+          description: SQL query to execute
+        params:
+          type: array
+          items: {}
+          description: Query parameters
+        timeout_ms:
+          type: integer
+          default: 30000
+        mode:
+          type: string
+          enum: [normal, safe, explain]
+          default: normal
+
+    QueryResponse:
+      type: object
+      properties:
+        columns:
+          type: array
+          items:
+            $ref: '#/components/schemas/Column'
+        rows:
+          type: array
+          items:
+            type: array
+            items: {}
+        row_count:
+          type: integer
+        execution_time_ms:
+          type: number
+
+    Column:
+      type: object
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+
+    TableInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        row_count:
+          type: integer
+        size_bytes:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+
+    TableSchema:
+      type: object
+      properties:
+        name:
+          type: string
+        columns:
+          type: array
+          items:
+            $ref: '#/components/schemas/ColumnDefinition'
+        primary_key:
+          type: array
+          items:
+            type: string
+        indexes:
+          type: array
+          items:
+            $ref: '#/components/schemas/IndexInfo'
+
+    ColumnDefinition:
+      type: object
+      properties:
+        name:
+          type: string
+        type:
+          type: string
+        nullable:
+          type: boolean
+        default:
+          type: string
+
+    IndexInfo:
+      type: object
+      properties:
+        name:
+          type: string
+        columns:
+          type: array
+          items:
+            type: string
+        type:
+          type: string
+          enum: [btree, hash, hnsw, ivfflat]
+        unique:
+          type: boolean
+
+    CreateTableRequest:
+      type: object
+      required: [name, columns]
+      properties:
+        name:
+          type: string
+        columns:
+          type: array
+          items:
+            $ref: '#/components/schemas/ColumnDefinition'
+        primary_key:
+          type: array
+          items:
+            type: string
+
+    TableDataResponse:
+      type: object
+      properties:
+        columns:
+          type: array
+          items:
+            type: string
+        rows:
+          type: array
+          items:
+            type: object
+        total_count:
+          type: integer
+        has_more:
+          type: boolean
+
+    InsertDataRequest:
+      type: object
+      required: [rows]
+      properties:
+        rows:
+          type: array
+          items:
+            type: object
+        on_conflict:
+          type: string
+          enum: [error, ignore, update]
+          default: error
+
+    InsertDataResponse:
+      type: object
+      properties:
+        inserted:
+          type: integer
+        table_created:
+          type: boolean
+        inferred_schema:
+          type: object
+
+    UpdateDataRequest:
+      type: object
+      required: [filter, set]
+      properties:
+        filter:
+          type: object
+        set:
+          type: object
+
+    UpdateDataResponse:
+      type: object
+      properties:
+        updated:
+          type: integer
+
+    DeleteDataRequest:
+      type: object
+      required: [filter]
+      properties:
+        filter:
+          type: object
+
+    DeleteDataResponse:
+      type: object
+      properties:
+        deleted:
+          type: integer
+
+    # Vector Schemas
+    VectorStore:
+      type: object
+      properties:
+        name:
+          type: string
+        dimension:
+          type: integer
+        metric:
+          type: string
+          enum: [cosine, euclidean, dot_product]
+        vector_count:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+
+    CreateVectorStoreRequest:
+      type: object
+      required: [name, dimension]
+      properties:
+        name:
+          type: string
+        dimension:
+          type: integer
+        metric:
+          type: string
+          enum: [cosine, euclidean, dot_product]
+          default: cosine
+        index_type:
+          type: string
+          enum: [hnsw, ivfflat, flat]
+          default: hnsw
+
+    UpsertVectorsRequest:
+      type: object
+      required: [vectors]
+      properties:
+        vectors:
+          type: array
+          items:
+            $ref: '#/components/schemas/VectorEntry'
+
+    VectorEntry:
+      type: object
+      required: [id, vector]
+      properties:
+        id:
+          type: string
+        vector:
+          type: array
+          items:
+            type: number
+        metadata:
+          type: object
+
+    UpsertVectorsResponse:
+      type: object
+      properties:
+        upserted:
+          type: integer
+
+    VectorSearchRequest:
+      type: object
+      required: [vector]
+      properties:
+        vector:
+          type: array
+          items:
+            type: number
+        top_k:
+          type: integer
+          default: 10
+        filter:
+          type: object
+        include_metadata:
+          type: boolean
+          default: true
+        include_vectors:
+          type: boolean
+          default: false
+
+    VectorSearchResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/VectorSearchResult'
+
+    VectorSearchResult:
+      type: object
+      properties:
+        id:
+          type: string
+        score:
+          type: number
+        vector:
+          type: array
+          items:
+            type: number
+        metadata:
+          type: object
+
+    AddTextsRequest:
+      type: object
+      required: [texts]
+      properties:
+        texts:
+          type: array
+          items:
+            type: string
+        metadatas:
+          type: array
+          items:
+            type: object
+        ids:
+          type: array
+          items:
+            type: string
+        embedding_model:
+          type: string
+          description: Embedding model to use (local or provider)
+
+    AddTextsResponse:
+      type: object
+      properties:
+        ids:
+          type: array
+          items:
+            type: string
+
+    # Agent Memory Schemas
+    AgentMemoryResponse:
+      type: object
+      properties:
+        session_id:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemoryMessage'
+        created_at:
+          type: string
+          format: date-time
+
+    MemoryMessage:
+      type: object
+      properties:
+        id:
+          type: string
+        role:
+          type: string
+          enum: [user, assistant, system, tool]
+        content:
+          type: string
+        metadata:
+          type: object
+        timestamp:
+          type: string
+          format: date-time
+
+    AddMemoryRequest:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [user, assistant, system, tool]
+        content:
+          type: string
+        metadata:
+          type: object
+        generate_embedding:
+          type: boolean
+          default: true
+
+    AddMemoryResponse:
+      type: object
+      properties:
+        id:
+          type: string
+        session_id:
+          type: string
+
+    MemorySearchRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+        top_k:
+          type: integer
+          default: 5
+        filter:
+          type: object
+
+    MemorySearchResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/MemorySearchResult'
+
+    MemorySearchResult:
+      type: object
+      properties:
+        message:
+          $ref: '#/components/schemas/MemoryMessage'
+        score:
+          type: number
+
+    # Document Schemas
+    IngestDocumentsRequest:
+      type: object
+      required: [documents]
+      properties:
+        documents:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentInput'
+        collection:
+          type: string
+          default: documents
+        chunk_size:
+          type: integer
+          default: 512
+        chunk_overlap:
+          type: integer
+          default: 50
+        embedding_model:
+          type: string
+
+    DocumentInput:
+      type: object
+      required: [content]
+      properties:
+        id:
+          type: string
+        content:
+          type: string
+        metadata:
+          type: object
+        source:
+          type: string
+
+    IngestDocumentsResponse:
+      type: object
+      properties:
+        document_ids:
+          type: array
+          items:
+            type: string
+        chunks_created:
+          type: integer
+
+    DocumentSearchRequest:
+      type: object
+      required: [query]
+      properties:
+        query:
+          type: string
+        collection:
+          type: string
+          default: documents
+        top_k:
+          type: integer
+          default: 5
+        filter:
+          type: object
+        include_content:
+          type: boolean
+          default: true
+
+    DocumentSearchResponse:
+      type: object
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentSearchResult'
+
+    DocumentSearchResult:
+      type: object
+      properties:
+        document_id:
+          type: string
+        chunk_id:
+          type: string
+        content:
+          type: string
+        score:
+          type: number
+        metadata:
+          type: object
+
+    Document:
+      type: object
+      properties:
+        id:
+          type: string
+        content:
+          type: string
+        metadata:
+          type: object
+        chunks:
+          type: array
+          items:
+            $ref: '#/components/schemas/DocumentChunk'
+        created_at:
+          type: string
+          format: date-time
+
+    DocumentChunk:
+      type: object
+      properties:
+        id:
+          type: string
+        content:
+          type: string
+        index:
+          type: integer
+
+    # Chat Schemas
+    ChatSession:
+      type: object
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        message_count:
+          type: integer
+        metadata:
+          type: object
+
+    CreateChatSessionRequest:
+      type: object
+      properties:
+        name:
+          type: string
+        metadata:
+          type: object
+
+    ChatMessagesResponse:
+      type: object
+      properties:
+        session_id:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChatMessage'
+
+    ChatMessage:
+      type: object
+      properties:
+        id:
+          type: string
+        role:
+          type: string
+          enum: [user, assistant, system]
+        content:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+
+    AddChatMessageRequest:
+      type: object
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [user, assistant, system]
+        content:
+          type: string
+
+    ChatSummaryResponse:
+      type: object
+      properties:
+        summary:
+          type: string
+        key_topics:
+          type: array
+          items:
+            type: string
+        message_count:
+          type: integer
+
+    # Time Travel Schemas
+    TimeTravelRequest:
+      type: object
+      required: [sql, timestamp]
+      properties:
+        sql:
+          type: string
+        timestamp:
+          type: string
+          format: date-time
+        params:
+          type: array
+          items: {}
+
+    HistoryResponse:
+      type: object
+      properties:
+        table:
+          type: string
+        changes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ChangeRecord'
+
+    ChangeRecord:
+      type: object
+      properties:
+        timestamp:
+          type: string
+          format: date-time
+        operation:
+          type: string
+          enum: [insert, update, delete]
+        row_id:
+          type: string
+        old_values:
+          type: object
+        new_values:
+          type: object
+
+    # Schema Inference
+    InferSchemaRequest:
+      type: object
+      required: [data]
+      properties:
+        data:
+          type: array
+          items:
+            type: object
+        table_name:
+          type: string
+
+    InferSchemaResponse:
+      type: object
+      properties:
+        inferred_schema:
+          type: object
+          additionalProperties:
+            type: string
+        create_sql:
+          type: string
+        confidence:
+          type: number
+
+    # Error
+    Error:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        details:
+          type: object

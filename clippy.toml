@@ -1,0 +1,9 @@
+# Clippy configuration for HeliosDB-Lite
+
+# Allow unwrap and expect in test code
+# Tests are allowed to panic - it's their purpose
+avoid-breaking-exported-api = false
+
+# Custom allowed lints for test modules
+# Note: clippy.toml doesn't support per-module configuration,
+# so we use #[allow(clippy::unwrap_used)] in test modules instead

@@ -1,0 +1,54 @@
+# Fly.io deployment configuration for HeliosDB-Lite
+# Deploy with: fly deploy
+
+app = "heliosdb-lite"
+primary_region = "iad"
+kill_signal = "SIGINT"
+kill_timeout = 30
+
+[build]
+dockerfile = "deployment/docker/Dockerfile"
+
+[env]
+HELIOSDB_MODE = "server"
+HELIOSDB_LOG_LEVEL = "info"
+HELIOSDB_DATA_DIR = "/data"
+HELIOSDB_REST_PORT = "8080"
+HELIOSDB_PG_PORT = "5432"
+
+[mounts]
+source = "heliosdb_data"
+destination = "/data"
+
+[http_service]
+internal_port = 8080
+force_https = true
+auto_stop_machines = false
+auto_start_machines = true
+min_machines_running = 1
+processes = ["app"]
+
+[[services]]
+protocol = "tcp"
+internal_port = 5432
+
+[[services.ports]]
+port = 5432
+handlers = ["tls"]
+
+[http_service.concurrency]
+type = "connections"
+hard_limit = 100
+soft_limit = 80
+
+[[http_service.checks]]
+grace_period = "10s"
+interval = "30s"
+method = "GET"
+timeout = "10s"
+path = "/health"
+
+[[vm]]
+memory = "1gb"
+cpu_kind = "shared"
+cpus = 1

@@ -1,0 +1,226 @@
+{
+  "Create Table": {
+    "prefix": ["create table", "ct"],
+    "body": [
+      "CREATE TABLE ${1:table_name} (",
+      "    id INTEGER PRIMARY KEY,",
+      "    ${2:column_name} ${3:TEXT}${4:,}",
+      "    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+      ");"
+    ],
+    "description": "Create a new table"
+  },
+  "Create Table with Vector Column": {
+    "prefix": ["create vector table", "cvt"],
+    "body": [
+      "CREATE TABLE ${1:table_name} (",
+      "    id INTEGER PRIMARY KEY,",
+      "    content TEXT NOT NULL,",
+      "    embedding VECTOR(${2:1536}),",
+      "    metadata JSON,",
+      "    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP",
+      ");",
+      "",
+      "CREATE VECTOR INDEX ${1:table_name}_embedding_idx",
+      "ON ${1:table_name}(embedding)",
+      "USING hnsw",
+      "WITH (m = 16, ef_construction = 64);"
+    ],
+    "description": "Create a table with vector column and index"
+  },
+  "Vector Search": {
+    "prefix": ["vector search", "vs"],
+    "body": [
+      "SELECT id, content, metadata,",
+      "       COSINE_DISTANCE(embedding, $1) AS distance",
+      "FROM ${1:table_name}",
+      "ORDER BY distance",
+      "LIMIT ${2:10};"
+    ],
+    "description": "Vector similarity search"
+  },
+  "Vector Search with Filter": {
+    "prefix": ["vector search filter", "vsf"],
+    "body": [
+      "SELECT id, content, metadata,",
+      "       COSINE_DISTANCE(embedding, $1) AS distance",
+      "FROM ${1:table_name}",
+      "WHERE ${2:category} = ${3:'value'}",
+      "  AND COSINE_DISTANCE(embedding, $1) < ${4:0.5}",
+      "ORDER BY distance",
+      "LIMIT ${5:10};"
+    ],
+    "description": "Vector search with metadata filter"
+  },
+  "Create Branch": {
+    "prefix": ["create branch", "cb"],
+    "body": [
+      "CREATE BRANCH ${1:branch_name} FROM ${2:main};"
+    ],
+    "description": "Create a new database branch"
+  },
+  "Switch Branch": {
+    "prefix": ["use branch", "ub"],
+    "body": [
+      "USE BRANCH ${1:branch_name};"
+    ],
+    "description": "Switch to a different branch"
+  },
+  "Merge Branch": {
+    "prefix": ["merge branch", "mb"],
+    "body": [
+      "MERGE BRANCH ${1:source_branch} INTO ${2:main};"
+    ],
+    "description": "Merge branches"
+  },
+  "Time Travel Query": {
+    "prefix": ["as of timestamp", "tt"],
+    "body": [
+      "SELECT ${1:*}",
+      "FROM ${2:table_name}",
+      "AS OF TIMESTAMP '${3:2024-01-01T00:00:00Z}';"
+    ],
+    "description": "Query data at a specific point in time"
+  },
+  "Time Travel Version": {
+    "prefix": ["as of version", "tv"],
+    "body": [
+      "SELECT ${1:*}",
+      "FROM ${2:table_name}",
+      "AS OF VERSION ${3:42};"
+    ],
+    "description": "Query data at a specific version"
+  },
+  "Insert with Embedding": {
+    "prefix": ["insert embedding", "ie"],
+    "body": [
+      "INSERT INTO ${1:table_name} (content, embedding, metadata)",
+      "VALUES (",
+      "    '${2:text content}',",
+      "    EMBEDDING('${2:text content}'),",
+      "    '${3:{\"key\": \"value\"}}'::JSON",
+      ");"
+    ],
+    "description": "Insert row with auto-generated embedding"
+  },
+  "Upsert": {
+    "prefix": ["upsert", "up"],
+    "body": [
+      "INSERT INTO ${1:table_name} (${2:id}, ${3:name})",
+      "VALUES (${4:1}, ${5:'value'})",
+      "ON CONFLICT (${2:id}) DO UPDATE SET",
+      "    ${3:name} = EXCLUDED.${3:name};"
+    ],
+    "description": "Insert or update on conflict"
+  },
+  "Create Vector Store": {
+    "prefix": ["create vector store", "cvs"],
+    "body": [
+      "CREATE VECTOR STORE ${1:store_name}",
+      "WITH (",
+      "    dimensions = ${2:1536},",
+      "    metric = '${3|cosine,euclidean,dot|}',",
+      "    index_type = 'hnsw'",
+      ");"
+    ],
+    "description": "Create a vector store"
+  },
+  "Hybrid Search": {
+    "prefix": ["hybrid search", "hs"],
+    "body": [
+      "SELECT id, content,",
+      "       (0.7 * semantic_score + 0.3 * keyword_score) AS combined_score",
+      "FROM (",
+      "    SELECT id, content,",
+      "           COSINE_DISTANCE(embedding, $1) AS semantic_score,",
+      "           TS_RANK(to_tsvector(content), plainto_tsquery($2)) AS keyword_score",
+      "    FROM ${1:table_name}",
+      "    WHERE to_tsvector(content) @@ plainto_tsquery($2)",
+      ") AS hybrid",
+      "ORDER BY combined_score DESC",
+      "LIMIT ${2:10};"
+    ],
+    "description": "Hybrid semantic + keyword search"
+  },
+  "Agent Memory - Create Session": {
+    "prefix": ["agent session", "as"],
+    "body": [
+      "INSERT INTO agent_sessions (session_id, agent_id, started_at)",
+      "VALUES ('${1:session-uuid}', '${2:agent-id}', CURRENT_TIMESTAMP);"
+    ],
+    "description": "Create an agent memory session"
+  },
+  "Agent Memory - Add Message": {
+    "prefix": ["agent message", "am"],
+    "body": [
+      "INSERT INTO agent_messages (session_id, role, content, embedding)",
+      "VALUES (",
+      "    '${1:session-uuid}',",
+      "    '${2|user,assistant,system|}',",
+      "    '${3:message content}',",
+      "    EMBEDDING('${3:message content}')",
+      ");"
+    ],
+    "description": "Add message to agent memory"
+  },
+  "Agent Memory - Search": {
+    "prefix": ["agent search", "asearch"],
+    "body": [
+      "SELECT role, content, created_at,",
+      "       COSINE_DISTANCE(embedding, EMBEDDING($1)) AS relevance",
+      "FROM agent_messages",
+      "WHERE session_id = '${1:session-uuid}'",
+      "ORDER BY relevance",
+      "LIMIT ${2:10};"
+    ],
+    "description": "Search agent memory semantically"
+  },
+  "Explain Query": {
+    "prefix": ["explain", "ex"],
+    "body": [
+      "EXPLAIN ANALYZE",
+      "${1:SELECT * FROM table_name};"
+    ],
+    "description": "Explain query execution plan"
+  },
+  "JSON Query": {
+    "prefix": ["json query", "jq"],
+    "body": [
+      "SELECT ${1:id},",
+      "       ${2:data}->>'${3:key}' AS ${3:key},",
+      "       ${2:data}->'${4:nested}'->>'${5:field}' AS ${5:field}",
+      "FROM ${6:table_name}",
+      "WHERE ${2:data}->>'${3:key}' = '${7:value}';"
+    ],
+    "description": "Query JSON columns"
+  },
+  "Create Index": {
+    "prefix": ["create index", "ci"],
+    "body": [
+      "CREATE INDEX ${1:idx_name}",
+      "ON ${2:table_name}(${3:column_name});"
+    ],
+    "description": "Create a standard index"
+  },
+  "Full Text Search Index": {
+    "prefix": ["create fts index", "fts"],
+    "body": [
+      "CREATE INDEX ${1:idx_name}",
+      "ON ${2:table_name}",
+      "USING gin(to_tsvector('english', ${3:content}));"
+    ],
+    "description": "Create full-text search index"
+  },
+  "Paginated Query": {
+    "prefix": ["paginate", "pg"],
+    "body": [
+      "SELECT ${1:*}",
+      "FROM ${2:table_name}",
+      "${3:WHERE condition}",
+      "ORDER BY ${4:id}",
+      "LIMIT ${5:20}",
+      "OFFSET ${6:0};"
+    ],
+    "description": "Paginated query with limit and offset"
+  }
+}

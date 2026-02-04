@@ -1,0 +1,558 @@
+//! Procedural Language Runtime
+//!
+//! Execution engine for procedural code blocks. Provides variable scoping,
+//! control flow execution, and SQL statement execution within procedural context.
+
+use std::collections::HashMap;
+use crate::{Result, Error, Value, DataType};
+use crate::sql::Evaluator;
+use super::ast::*;
+
+/// Maximum recursion depth for procedure calls
+pub const MAX_CALL_DEPTH: usize = 100;
+
+/// Variable scope for procedural execution
+#[derive(Debug, Clone)]
+pub struct VariableScope {
+    /// Variables in this scope
+    variables: HashMap<String, Variable>,
+    /// Parent scope (for nested blocks)
+    parent: Option<Box<VariableScope>>,
+}
+
+/// A variable with its value and metadata
+#[derive(Debug, Clone)]
+pub struct Variable {
+    pub value: Value,
+    pub data_type: Option<DataType>,
+    pub is_constant: bool,
+    pub not_null: bool,
+}
+
+impl VariableScope {
+    pub fn new() -> Self {
+        Self {
+            variables: HashMap::new(),
+            parent: None,
+        }
+    }
+
+    pub fn with_parent(parent: VariableScope) -> Self {
+        Self {
+            variables: HashMap::new(),
+            parent: Some(Box::new(parent)),
+        }
+    }
+
+    /// Declare a new variable in the current scope
+    pub fn declare(&mut self, name: String, var: Variable) -> Result<()> {
+        if self.variables.contains_key(&name) {
+            return Err(Error::query_execution(format!(
+                "Variable '{}' already declared in this scope",
+                name
+            )));
+        }
+        self.variables.insert(name, var);
+        Ok(())
+    }
+
+    /// Get a variable's value (searches parent scopes)
+    pub fn get(&self, name: &str) -> Option<&Variable> {
+        if let Some(var) = self.variables.get(name) {
+            Some(var)
+        } else if let Some(ref parent) = self.parent {
+            parent.get(name)
+        } else {
+            None
+        }
+    }
+
+    /// Set a variable's value (searches parent scopes)
+    pub fn set(&mut self, name: &str, value: Value) -> Result<()> {
+        if let Some(var) = self.variables.get_mut(name) {
+            if var.is_constant {
+                return Err(Error::query_execution(format!(
+                    "Cannot assign to constant '{}'",
+                    name
+                )));
+            }
+            if var.not_null && matches!(value, Value::Null) {
+                return Err(Error::query_execution(format!(
+                    "Cannot assign NULL to NOT NULL variable '{}'",
+                    name
+                )));
+            }
+            var.value = value;
+            Ok(())
+        } else if let Some(ref mut parent) = self.parent {
+            parent.set(name, value)
+        } else {
+            Err(Error::query_execution(format!(
+                "Variable '{}' not declared",
+                name
+            )))
+        }
+    }
+}
+
+impl Default for VariableScope {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Execution context for procedural code
+pub struct ExecutionContext<'a> {
+    /// Current variable scope
+    pub scope: VariableScope,
+    /// Expression evaluator
+    pub evaluator: &'a Evaluator,
+    /// SQL executor function
+    pub sql_executor: Box<dyn FnMut(&str) -> Result<Vec<Vec<Value>>> + 'a>,
+    /// Current call depth (for recursion detection)
+    pub call_depth: usize,
+    /// Whether to exit the current block
+    pub exit_requested: bool,
+    /// Exit label (for labeled EXIT)
+    pub exit_label: Option<String>,
+    /// Whether to continue to next iteration
+    pub continue_requested: bool,
+    /// Continue label (for labeled CONTINUE)
+    pub continue_label: Option<String>,
+    /// Return value (if RETURN was executed)
+    pub return_value: Option<Value>,
+    /// Whether RETURN was executed
+    pub returned: bool,
+}
+
+impl<'a> ExecutionContext<'a> {
+    pub fn new(
+        evaluator: &'a Evaluator,
+        sql_executor: impl FnMut(&str) -> Result<Vec<Vec<Value>>> + 'a,
+    ) -> Self {
+        Self {
+            scope: VariableScope::new(),
+            evaluator,
+            sql_executor: Box::new(sql_executor),
+            call_depth: 0,
+            exit_requested: false,
+            exit_label: None,
+            continue_requested: false,
+            continue_label: None,
+            return_value: None,
+            returned: false,
+        }
+    }
+
+    /// Push a new variable scope
+    pub fn push_scope(&mut self) {
+        let old_scope = std::mem::take(&mut self.scope);
+        self.scope = VariableScope::with_parent(old_scope);
+    }
+
+    /// Pop the current variable scope
+    pub fn pop_scope(&mut self) {
+        if let Some(parent) = self.scope.parent.take() {
+            self.scope = *parent;
+        }
+    }
+}
+
+/// Procedural code executor
+pub struct ProceduralExecutor;
+
+impl ProceduralExecutor {
+    /// Execute a procedural block
+    pub fn execute_block<'a>(
+        block: &ProceduralBlock,
+        ctx: &mut ExecutionContext<'a>,
+    ) -> Result<()> {
+        // Push new scope for this block
+        ctx.push_scope();
+
+        // Declare variables
+        for decl in &block.declarations {
+            let default_value = if let Some(ref expr) = decl.default {
+                ctx.evaluator.evaluate(expr, &crate::Tuple::new(vec![]))?
+            } else {
+                Value::Null
+            };
+
+            ctx.scope.declare(
+                decl.name.clone(),
+                Variable {
+                    value: default_value,
+                    data_type: decl.data_type.clone(),
+                    is_constant: decl.is_constant,
+                    not_null: decl.not_null,
+                },
+            )?;
+        }
+
+        // Execute statements
+        for stmt in &block.statements {
+            Self::execute_statement(stmt, ctx)?;
+
+            // Check for control flow changes
+            if ctx.returned || ctx.exit_requested {
+                break;
+            }
+        }
+
+        // TODO: Handle exception handlers
+
+        // Pop scope
+        ctx.pop_scope();
+
+        Ok(())
+    }
+
+    /// Execute a single statement
+    pub fn execute_statement<'a>(
+        stmt: &ProceduralStatement,
+        ctx: &mut ExecutionContext<'a>,
+    ) -> Result<()> {
+        match stmt {
+            ProceduralStatement::Assignment { target, value } => {
+                let val = ctx.evaluator.evaluate(value, &crate::Tuple::new(vec![]))?;
+                ctx.scope.set(target, val)?;
+            }
+
+            ProceduralStatement::If { condition, then_block, elsif_branches, else_block } => {
+                let cond_val = ctx.evaluator.evaluate(condition, &crate::Tuple::new(vec![]))?;
+                let cond_bool = match cond_val {
+                    Value::Boolean(b) => b,
+                    _ => false,
+                };
+
+                if cond_bool {
+                    for stmt in then_block {
+                        Self::execute_statement(stmt, ctx)?;
+                        if ctx.returned || ctx.exit_requested {
+                            break;
+                        }
+                    }
+                } else {
+                    let mut executed = false;
+                    for (elsif_cond, elsif_stmts) in elsif_branches {
+                        let elsif_val = ctx.evaluator.evaluate(elsif_cond, &crate::Tuple::new(vec![]))?;
+                        if matches!(elsif_val, Value::Boolean(true)) {
+                            for stmt in elsif_stmts {
+                                Self::execute_statement(stmt, ctx)?;
+                                if ctx.returned || ctx.exit_requested {
+                                    break;
+                                }
+                            }
+                            executed = true;
+                            break;
+                        }
+                    }
+
+                    if !executed {
+                        if let Some(else_stmts) = else_block {
+                            for stmt in else_stmts {
+                                Self::execute_statement(stmt, ctx)?;
+                                if ctx.returned || ctx.exit_requested {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            ProceduralStatement::While { label, condition, body } => {
+                loop {
+                    let cond_val = ctx.evaluator.evaluate(condition, &crate::Tuple::new(vec![]))?;
+                    if !matches!(cond_val, Value::Boolean(true)) {
+                        break;
+                    }
+
+                    for stmt in body {
+                        Self::execute_statement(stmt, ctx)?;
+
+                        if ctx.continue_requested {
+                            if ctx.continue_label.is_none() || ctx.continue_label.as_ref() == label.as_ref() {
+                                ctx.continue_requested = false;
+                                ctx.continue_label = None;
+                                break;
+                            }
+                        }
+
+                        if ctx.exit_requested {
+                            if ctx.exit_label.is_none() || ctx.exit_label.as_ref() == label.as_ref() {
+                                ctx.exit_requested = false;
+                                ctx.exit_label = None;
+                                return Ok(());
+                            }
+                            return Ok(());
+                        }
+
+                        if ctx.returned {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            ProceduralStatement::Loop { label, body } => {
+                loop {
+                    for stmt in body {
+                        Self::execute_statement(stmt, ctx)?;
+
+                        if ctx.continue_requested {
+                            if ctx.continue_label.is_none() || ctx.continue_label.as_ref() == label.as_ref() {
+                                ctx.continue_requested = false;
+                                ctx.continue_label = None;
+                                break;
+                            }
+                        }
+
+                        if ctx.exit_requested {
+                            if ctx.exit_label.is_none() || ctx.exit_label.as_ref() == label.as_ref() {
+                                ctx.exit_requested = false;
+                                ctx.exit_label = None;
+                                return Ok(());
+                            }
+                            return Ok(());
+                        }
+
+                        if ctx.returned {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            ProceduralStatement::ForNumeric { label, variable, lower_bound, upper_bound, step, reverse, body } => {
+                let lower = ctx.evaluator.evaluate(lower_bound, &crate::Tuple::new(vec![]))?;
+                let upper = ctx.evaluator.evaluate(upper_bound, &crate::Tuple::new(vec![]))?;
+                let step_val = if let Some(s) = step {
+                    ctx.evaluator.evaluate(s, &crate::Tuple::new(vec![]))?
+                } else {
+                    Value::Int8(1)
+                };
+
+                // Convert to i64 for iteration
+                let lower_i64 = value_to_i64(&lower)?;
+                let upper_i64 = value_to_i64(&upper)?;
+                let step_i64 = value_to_i64(&step_val)?.max(1);
+
+                // Create iterator variable
+                ctx.scope.declare(
+                    variable.clone(),
+                    Variable {
+                        value: Value::Int8(lower_i64),
+                        data_type: Some(DataType::Int8),
+                        is_constant: false,
+                        not_null: false,
+                    },
+                )?;
+
+                let range: Vec<i64> = if *reverse {
+                    (lower_i64..=upper_i64).rev().step_by(step_i64 as usize).collect()
+                } else {
+                    (lower_i64..=upper_i64).step_by(step_i64 as usize).collect()
+                };
+
+                for i in range {
+                    ctx.scope.set(variable, Value::Int8(i))?;
+
+                    for stmt in body {
+                        Self::execute_statement(stmt, ctx)?;
+
+                        if ctx.continue_requested {
+                            if ctx.continue_label.is_none() || ctx.continue_label.as_ref() == label.as_ref() {
+                                ctx.continue_requested = false;
+                                ctx.continue_label = None;
+                                break;
+                            }
+                        }
+
+                        if ctx.exit_requested {
+                            if ctx.exit_label.is_none() || ctx.exit_label.as_ref() == label.as_ref() {
+                                ctx.exit_requested = false;
+                                ctx.exit_label = None;
+                                return Ok(());
+                            }
+                            return Ok(());
+                        }
+
+                        if ctx.returned {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+
+            ProceduralStatement::Exit { label, when_condition } => {
+                let should_exit = if let Some(cond) = when_condition {
+                    let val = ctx.evaluator.evaluate(cond, &crate::Tuple::new(vec![]))?;
+                    matches!(val, Value::Boolean(true))
+                } else {
+                    true
+                };
+
+                if should_exit {
+                    ctx.exit_requested = true;
+                    ctx.exit_label = label.clone();
+                }
+            }
+
+            ProceduralStatement::Continue { label, when_condition } => {
+                let should_continue = if let Some(cond) = when_condition {
+                    let val = ctx.evaluator.evaluate(cond, &crate::Tuple::new(vec![]))?;
+                    matches!(val, Value::Boolean(true))
+                } else {
+                    true
+                };
+
+                if should_continue {
+                    ctx.continue_requested = true;
+                    ctx.continue_label = label.clone();
+                }
+            }
+
+            ProceduralStatement::Return { value } => {
+                ctx.return_value = if let Some(expr) = value {
+                    Some(ctx.evaluator.evaluate(expr, &crate::Tuple::new(vec![]))?)
+                } else {
+                    None
+                };
+                ctx.returned = true;
+            }
+
+            ProceduralStatement::Execute { sql, into_variables } => {
+                let results = (ctx.sql_executor)(sql)?;
+                if !into_variables.is_empty() && !results.is_empty() && !results[0].is_empty() {
+                    for (i, var_name) in into_variables.iter().enumerate() {
+                        if i < results[0].len() {
+                            ctx.scope.set(var_name, results[0][i].clone())?;
+                        }
+                    }
+                }
+            }
+
+            ProceduralStatement::Raise { level, message, sqlstate, detail, hint } => {
+                let msg = if let Some(expr) = message {
+                    let val = ctx.evaluator.evaluate(expr, &crate::Tuple::new(vec![]))?;
+                    format!("{}", val)
+                } else {
+                    String::new()
+                };
+
+                match level {
+                    RaiseLevel::Exception => {
+                        let sqlstate_str = sqlstate.as_ref().map(|s| format!(" [SQLSTATE: {}]", s)).unwrap_or_default();
+                        return Err(Error::query_execution(format!("RAISE EXCEPTION:{} {}", sqlstate_str, msg)));
+                    }
+                    RaiseLevel::Warning | RaiseLevel::Notice | RaiseLevel::Info | RaiseLevel::Log | RaiseLevel::Debug => {
+                        // TODO: Log these appropriately
+                        tracing::info!("[{:?}] {}", level, msg);
+                    }
+                }
+            }
+
+            ProceduralStatement::Block(inner_block) => {
+                Self::execute_block(inner_block, ctx)?;
+            }
+
+            ProceduralStatement::Null => {
+                // No-op
+            }
+
+            ProceduralStatement::Print { message } => {
+                let val = ctx.evaluator.evaluate(message, &crate::Tuple::new(vec![]))?;
+                println!("{}", val);
+            }
+
+            // TODO: Implement remaining statements
+            _ => {
+                return Err(Error::query_execution("Unsupported procedural statement"));
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// Convert a Value to i64 for loop iteration
+fn value_to_i64(value: &Value) -> Result<i64> {
+    match value {
+        Value::Int2(v) => Ok(*v as i64),
+        Value::Int4(v) => Ok(*v as i64),
+        Value::Int8(v) => Ok(*v),
+        Value::Float4(v) => Ok(*v as i64),
+        Value::Float8(v) => Ok(*v as i64),
+        _ => Err(Error::type_conversion(format!(
+            "Cannot convert {} to integer for loop iteration",
+            value.data_type()
+        ))),
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use crate::Schema;
+
+    #[test]
+    fn test_variable_scope() {
+        let mut scope = VariableScope::new();
+
+        scope.declare(
+            "x".to_string(),
+            Variable {
+                value: Value::Int4(10),
+                data_type: Some(DataType::Int4),
+                is_constant: false,
+                not_null: false,
+            },
+        ).unwrap();
+
+        assert_eq!(scope.get("x").unwrap().value, Value::Int4(10));
+
+        scope.set("x", Value::Int4(20)).unwrap();
+        assert_eq!(scope.get("x").unwrap().value, Value::Int4(20));
+    }
+
+    #[test]
+    fn test_constant_assignment() {
+        let mut scope = VariableScope::new();
+
+        scope.declare(
+            "PI".to_string(),
+            Variable {
+                value: Value::Float8(3.14159),
+                data_type: Some(DataType::Float8),
+                is_constant: true,
+                not_null: false,
+            },
+        ).unwrap();
+
+        // Should fail
+        let result = scope.set("PI", Value::Float8(3.0));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_nested_scope() {
+        let mut parent = VariableScope::new();
+        parent.declare(
+            "outer".to_string(),
+            Variable {
+                value: Value::Int4(1),
+                data_type: Some(DataType::Int4),
+                is_constant: false,
+                not_null: false,
+            },
+        ).unwrap();
+
+        let child = VariableScope::with_parent(parent);
+
+        // Should find variable from parent
+        assert!(child.get("outer").is_some());
+    }
+}

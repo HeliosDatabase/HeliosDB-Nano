@@ -1,0 +1,110 @@
+# cargo-deny configuration for supply chain security
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Ensure all dependencies are checked
+all-features = true
+
+[advisories]
+version = 2
+# The path where the advisory databases are cloned/fetched into
+db-path = "~/.cargo/advisory-db"
+# The url(s) of the advisory databases to use
+db-urls = ["https://github.com/rustsec/advisory-db"]
+
+# Deny all security vulnerabilities
+vulnerability = "deny"
+# Deny unmaintained dependencies
+unmaintained = "warn"
+# Deny dependencies with yanked versions
+yanked = "deny"
+# Deny dependencies with unsound behavior
+unsound = "warn"
+
+# Ignore specific advisories (use sparingly and document why)
+ignore = [
+    # Example: "RUSTSEC-2020-0001",
+]
+
+[licenses]
+version = 2
+# Allow only permissive licenses
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "0BSD",
+]
+
+# Deny copyleft licenses
+deny = [
+    "GPL-3.0",
+    "AGPL-3.0",
+]
+
+# Warn about weak copyleft
+copyleft = "warn"
+
+# Allow OSI-approved and FSF Free/Libre licenses
+allow-osi-fsf-free = "both"
+
+# Require license information for all dependencies
+unlicensed = "deny"
+
+confidence-threshold = 0.8
+
+# Exceptions for specific crates (document why)
+exceptions = [
+    # Example: { allow = ["GPL-3.0"], name = "some-crate", version = "*" },
+]
+
+[bans]
+# Deny multiple versions of the same crate
+multiple-versions = "warn"
+wildcards = "allow"
+
+# Deny git dependencies in production
+external-default-features = "allow"
+
+# Skip specific crate versions
+skip = [
+    # Example: { name = "crate-name", version = "=0.1.0" },
+]
+
+# Skip specific dependency trees
+skip-tree = [
+    # Example: { name = "crate-name", version = "=0.1.0" },
+]
+
+# Specific crates to deny
+deny = [
+    # Deny old, insecure crypto libraries
+    { name = "openssl", wrappers = ["openssl-sys"] },
+
+    # Deny known problematic crates
+    # { name = "problematic-crate" },
+]
+
+[sources]
+# Lint for unknown registries
+unknown-registry = "warn"
+# Lint for unknown git sources
+unknown-git = "warn"
+
+# Allow crates from these git sources
+allow-git = [
+    # Example: "https://github.com/organization/repo",
+]
+
+[sources.allow-org]
+# Allow GitHub organizations
+github = [
+    "heliosdb",
+    # Add trusted organizations
+]

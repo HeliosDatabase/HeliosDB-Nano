@@ -1,0 +1,17 @@
+# HeliosDB SQLite Compatibility Checker Dependencies
+# Version: 1.0.0
+
+# Core SQL parsing library
+sqlparse>=0.4.0
+
+# Optional: Enhanced reporting
+# colorama>=0.4.6  # For colored console output (cross-platform)
+# jinja2>=3.1.0    # For advanced HTML templating
+
+# Optional: Testing integration
+# pytest>=7.0.0
+# pytest-cov>=4.0.0
+
+# Optional: Code analysis enhancements
+# astroid>=2.15.0  # Advanced Python AST analysis
+# pylint>=2.17.0   # Additional Python linting

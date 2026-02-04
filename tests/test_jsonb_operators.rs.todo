@@ -1,0 +1,587 @@
+//! Comprehensive tests for JSONB operators and functions
+//!
+//! Tests all PostgreSQL-compatible JSONB operators:
+//! - -> (JsonGet)
+//! - ->> (JsonGetText)
+//! - @> (JsonContains)
+//! - <@ (JsonContainedBy)
+//! - ? (JsonExists)
+//! - ?| (JsonExistsAny)
+//! - ?& (JsonExistsAll)
+//!
+//! And JSONB functions:
+//! - jsonb_extract_path
+//! - jsonb_array_elements
+//! - jsonb_object_keys
+//! - jsonb_typeof
+//! - jsonb_path_query
+
+use heliosdb_lite::{Value, Tuple, Schema, Column, DataType, Result};
+use heliosdb_lite::sql::{Evaluator, LogicalExpr, BinaryOperator};
+use serde_json::json;
+use std::sync::Arc;
+
+fn test_schema() -> Arc<Schema> {
+    Arc::new(Schema::new(vec![
+        Column {
+            name: "id".to_string(),
+            data_type: DataType::Int4,
+            nullable: false,
+            primary_key: true,
+        },
+        Column {
+            name: "data".to_string(),
+            data_type: DataType::Jsonb,
+            nullable: true,
+            primary_key: false,
+        },
+    ]))
+}
+
+#[test]
+fn test_json_get_operator_object() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    let json_data = json!({
+        "name": "Alice",
+        "age": 30,
+        "city": "NYC"
+    });
+
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json_data.to_string()),
+    ]);
+
+    // Test: data -> 'name'
+    let expr = LogicalExpr::BinaryExpr {
+        left: Box::new(LogicalExpr::Column { name: "data".to_string() }),
+        op: BinaryOperator::JsonGet,
+        right: Box::new(LogicalExpr::Literal(Value::String("name".to_string()))),
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    match result {
+        Value::Json(j) => assert_eq!(j, json!("Alice").to_string()),
+        _ => panic!("Expected JSON value"),
+    }
+}
+
+#[test]
+fn test_json_get_text_operator() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    let json_data = json!({
+        "name": "Bob",
+        "age": 25
+    });
+
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json_data.to_string()),
+    ]);
+
+    // Test: data ->> 'name'
+    let expr = LogicalExpr::BinaryExpr {
+        left: Box::new(LogicalExpr::Column { name: "data".to_string() }),
+        op: BinaryOperator::JsonGetText,
+        right: Box::new(LogicalExpr::Literal(Value::String("name".to_string()))),
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::String("Bob".to_string()));
+}
+
+#[test]
+fn test_json_get_array_index() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    let json_data = json!(["apple", "banana", "cherry"]);
+
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json_data.to_string()),
+    ]);
+
+    // Test: data -> 1 (get second element)
+    let expr = LogicalExpr::BinaryExpr {
+        left: Box::new(LogicalExpr::Column { name: "data".to_string() }),
+        op: BinaryOperator::JsonGet,
+        right: Box::new(LogicalExpr::Literal(Value::Int4(1))),
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    match result {
+        Value::Json(j) => assert_eq!(j, json!("banana").to_string()),
+        _ => panic!("Expected JSON value"),
+    }
+}
+
+#[test]
+fn test_json_get_negative_index() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    let json_data = json!(["a", "b", "c"]);
+
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json_data.to_string()),
+    ]);
+
+    // Test: data -> -1 (get last element)
+    let expr = LogicalExpr::BinaryExpr {
+        left: Box::new(LogicalExpr::Column { name: "data".to_string() }),
+        op: BinaryOperator::JsonGet,
+        right: Box::new(LogicalExpr::Literal(Value::Int4(-1))),
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    match result {
+        Value::Json(j) => assert_eq!(j, json!("c").to_string()),
+        _ => panic!("Expected JSON value"),
+    }
+}
+
+#[test]
+fn test_json_contains_object() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    let json_data = json!({
+        "name": "Alice",
+        "age": 30,
+        "city": "NYC"
+    });
+
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json_data.to_string()),
+    ]);
+
+    // Test: data @> '{"name": "Alice"}'
+    let expr = LogicalExpr::BinaryExpr {
+        left: Box::new(LogicalExpr::Column { name: "data".to_string() }),
+        op: BinaryOperator::JsonContains,
+        right: Box::new(LogicalExpr::Literal(Value::Json(json!({"name": "Alice"}).to_string()))),
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::Boolean(true));
+
+    // Test: data @> '{"name": "Bob"}' (should be false)
+    let expr = LogicalExpr::BinaryExpr {
+        left: Box::new(LogicalExpr::Column { name: "data".to_string() }),
+        op: BinaryOperator::JsonContains,
+        right: Box::new(LogicalExpr::Literal(Value::Json(json!({"name": "Bob"}).to_string()))),
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::Boolean(false));
+}
+
+#[test]
+fn test_json_contains_nested() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    let json_data = json!({
+        "user": {
+            "name": "Alice",
+            "address": {
+                "city": "NYC"
+            }
+        }
+    });
+
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json_data.to_string()),
+    ]);
+
+    // Test: data @> '{"user": {"address": {"city": "NYC"}}}'
+    let expr = LogicalExpr::BinaryExpr {
+        left: Box::new(LogicalExpr::Column { name: "data".to_string() }),
+        op: BinaryOperator::JsonContains,
+        right: Box::new(LogicalExpr::Literal(Value::Json(json!({
+            "user": {
+                "address": {
+                    "city": "NYC"
+                }
+            }
+        })))),
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::Boolean(true));
+}
+
+#[test]
+fn test_json_contains_array() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    let json_data = json!({
+        "tags": ["rust", "database", "json"]
+    });
+
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json_data.to_string()),
+    ]);
+
+    // Test: data @> '{"tags": ["rust"]}'
+    let expr = LogicalExpr::BinaryExpr {
+        left: Box::new(LogicalExpr::Column { name: "data".to_string() }),
+        op: BinaryOperator::JsonContains,
+        right: Box::new(LogicalExpr::Literal(Value::Json(json!({"tags": ["rust"]}).to_string()))),
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::Boolean(true));
+}
+
+#[test]
+fn test_json_exists_operator() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    let json_data = json!({
+        "name": "Alice",
+        "age": 30
+    });
+
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json_data.to_string()),
+    ]);
+
+    // Test: data ? 'name' (key exists)
+    let expr = LogicalExpr::BinaryExpr {
+        left: Box::new(LogicalExpr::Column { name: "data".to_string() }),
+        op: BinaryOperator::JsonExists,
+        right: Box::new(LogicalExpr::Literal(Value::String("name".to_string()))),
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::Boolean(true));
+
+    // Test: data ? 'city' (key does not exist)
+    let expr = LogicalExpr::BinaryExpr {
+        left: Box::new(LogicalExpr::Column { name: "data".to_string() }),
+        op: BinaryOperator::JsonExists,
+        right: Box::new(LogicalExpr::Literal(Value::String("city".to_string()))),
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::Boolean(false));
+}
+
+#[test]
+fn test_json_exists_any_operator() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    let json_data = json!({
+        "name": "Alice",
+        "age": 30
+    });
+
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json_data.to_string()),
+    ]);
+
+    // Test: data ?| array['name', 'city'] (at least one exists)
+    let expr = LogicalExpr::BinaryExpr {
+        left: Box::new(LogicalExpr::Column { name: "data".to_string() }),
+        op: BinaryOperator::JsonExistsAny,
+        right: Box::new(LogicalExpr::Literal(Value::Array(vec![
+            Value::String("name".to_string()),
+            Value::String("city".to_string()),
+        ]))),
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::Boolean(true));
+
+    // Test: data ?| array['city', 'country'] (none exist)
+    let expr = LogicalExpr::BinaryExpr {
+        left: Box::new(LogicalExpr::Column { name: "data".to_string() }),
+        op: BinaryOperator::JsonExistsAny,
+        right: Box::new(LogicalExpr::Literal(Value::Array(vec![
+            Value::String("city".to_string()),
+            Value::String("country".to_string()),
+        ]))),
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::Boolean(false));
+}
+
+#[test]
+fn test_json_exists_all_operator() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    let json_data = json!({
+        "name": "Alice",
+        "age": 30,
+        "city": "NYC"
+    });
+
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json_data.to_string()),
+    ]);
+
+    // Test: data ?& array['name', 'age'] (all exist)
+    let expr = LogicalExpr::BinaryExpr {
+        left: Box::new(LogicalExpr::Column { name: "data".to_string() }),
+        op: BinaryOperator::JsonExistsAll,
+        right: Box::new(LogicalExpr::Literal(Value::Array(vec![
+            Value::String("name".to_string()),
+            Value::String("age".to_string()),
+        ]))),
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::Boolean(true));
+
+    // Test: data ?& array['name', 'country'] (not all exist)
+    let expr = LogicalExpr::BinaryExpr {
+        left: Box::new(LogicalExpr::Column { name: "data".to_string() }),
+        op: BinaryOperator::JsonExistsAll,
+        right: Box::new(LogicalExpr::Literal(Value::Array(vec![
+            Value::String("name".to_string()),
+            Value::String("country".to_string()),
+        ]))),
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::Boolean(false));
+}
+
+#[test]
+fn test_jsonb_extract_path_function() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    let json_data = json!({
+        "user": {
+            "name": "Alice",
+            "address": {
+                "city": "NYC"
+            }
+        }
+    });
+
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json_data.to_string()),
+    ]);
+
+    // Test: jsonb_extract_path(data, 'user', 'address', 'city')
+    let expr = LogicalExpr::ScalarFunction {
+        fun: "jsonb_extract_path".to_string(),
+        args: vec![
+            LogicalExpr::Column { name: "data".to_string() },
+            LogicalExpr::Literal(Value::String("user".to_string())),
+            LogicalExpr::Literal(Value::String("address".to_string())),
+            LogicalExpr::Literal(Value::String("city".to_string())),
+        ],
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    match result {
+        Value::Json(j) => assert_eq!(j, json!("NYC").to_string()),
+        _ => panic!("Expected JSON value"),
+    }
+}
+
+#[test]
+fn test_jsonb_object_keys_function() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    let json_data = json!({
+        "name": "Alice",
+        "age": 30,
+        "city": "NYC"
+    });
+
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json_data.to_string()),
+    ]);
+
+    // Test: jsonb_object_keys(data)
+    let expr = LogicalExpr::ScalarFunction {
+        fun: "jsonb_object_keys".to_string(),
+        args: vec![
+            LogicalExpr::Column { name: "data".to_string() },
+        ],
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    match result {
+        Value::Array(keys) => {
+            assert_eq!(keys.len(), 3);
+            // Check that keys contain expected values
+            let key_strings: Vec<String> = keys.iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(key_strings.contains(&"name".to_string()));
+            assert!(key_strings.contains(&"age".to_string()));
+            assert!(key_strings.contains(&"city".to_string()));
+        }
+        _ => panic!("Expected array value"),
+    }
+}
+
+#[test]
+fn test_jsonb_typeof_function() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    // Test object type
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json!({"key": "value"}).to_string()),
+    ]);
+
+    let expr = LogicalExpr::ScalarFunction {
+        fun: "jsonb_typeof".to_string(),
+        args: vec![
+            LogicalExpr::Column { name: "data".to_string() },
+        ],
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::String("object".to_string()));
+
+    // Test array type
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json!([1, 2, 3]).to_string()),
+    ]);
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::String("array".to_string()));
+
+    // Test string type
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json!("hello").to_string()),
+    ]);
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::String("string".to_string()));
+}
+
+#[test]
+fn test_jsonb_array_length_function() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    let json_data = json!(["a", "b", "c", "d"]);
+
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json_data.to_string()),
+    ]);
+
+    // Test: jsonb_array_length(data)
+    let expr = LogicalExpr::ScalarFunction {
+        fun: "jsonb_array_length".to_string(),
+        args: vec![
+            LogicalExpr::Column { name: "data".to_string() },
+        ],
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::Int4(4));
+}
+
+#[test]
+fn test_jsonb_path_query_function() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    let json_data = json!({
+        "user": {
+            "name": "Alice",
+            "age": 30
+        }
+    });
+
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json_data.to_string()),
+    ]);
+
+    // Test: jsonb_path_query(data, 'user.name')
+    let expr = LogicalExpr::ScalarFunction {
+        fun: "jsonb_path_query".to_string(),
+        args: vec![
+            LogicalExpr::Column { name: "data".to_string() },
+            LogicalExpr::Literal(Value::String("user.name".to_string())),
+        ],
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    match result {
+        Value::Json(j) => assert_eq!(j, json!("Alice").to_string()),
+        _ => panic!("Expected JSON value"),
+    }
+}
+
+#[test]
+fn test_json_null_handling() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Null,
+    ]);
+
+    // Test: NULL -> 'key' should return NULL
+    let expr = LogicalExpr::BinaryExpr {
+        left: Box::new(LogicalExpr::Column { name: "data".to_string() }),
+        op: BinaryOperator::JsonGet,
+        right: Box::new(LogicalExpr::Literal(Value::String("key".to_string()))),
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::Null);
+}
+
+#[test]
+fn test_json_missing_key() {
+    let schema = test_schema();
+    let evaluator = Evaluator::new(schema);
+
+    let json_data = json!({"name": "Alice"});
+
+    let tuple = Tuple::new(vec![
+        Value::Int4(1),
+        Value::Json(json_data.to_string()),
+    ]);
+
+    // Test: data -> 'missing_key' should return NULL
+    let expr = LogicalExpr::BinaryExpr {
+        left: Box::new(LogicalExpr::Column { name: "data".to_string() }),
+        op: BinaryOperator::JsonGet,
+        right: Box::new(LogicalExpr::Literal(Value::String("missing_key".to_string()))),
+    };
+
+    let result = evaluator.evaluate(&expr, &tuple).expect("Evaluation failed");
+    assert_eq!(result, Value::Null);
+}

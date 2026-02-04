@@ -1,0 +1,22 @@
+# Railway deployment configuration for HeliosDB-Lite
+# Deploy with: railway up
+
+[build]
+builder = "dockerfile"
+dockerfilePath = "deployment/docker/Dockerfile"
+
+[deploy]
+startCommand = "heliosdb-lite start --mode server --port $PORT"
+healthcheckPath = "/health"
+healthcheckTimeout = 30
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+
+[variables]
+HELIOSDB_MODE = "server"
+HELIOSDB_LOG_LEVEL = "info"
+HELIOSDB_CACHE_SIZE_MB = "256"
+# Set these in Railway dashboard:
+# HELIOSDB_API_KEY
+# HELIOSDB_ENCRYPTION_KEY
+# HELIOSDB_JWT_SECRET

@@ -1,0 +1,34 @@
+# MANIFEST.in for heliosdb-sqlite package
+
+# Include documentation
+include README.md
+include LICENSE
+include HELIOSDB_SQLITE_ARCHITECTURE.md
+include HELIOSDB_SQLITE_API_REFERENCE.md
+include HELIOSDB_SQLITE_USAGE_EXAMPLES.py
+
+# Include package documentation
+recursive-include heliosdb_sqlite *.md
+recursive-include heliosdb_sqlite *.txt
+
+# Include type stubs
+include heliosdb_sqlite/py.typed
+recursive-include heliosdb_sqlite *.pyi
+
+# Exclude development files
+exclude .gitignore
+exclude .pylintrc
+exclude pytest.ini
+exclude mypy.ini
+exclude tox.ini
+
+# Exclude tests
+recursive-exclude tests *
+recursive-exclude tests .*
+
+# Exclude build artifacts
+global-exclude __pycache__
+global-exclude *.py[co]
+global-exclude *.so
+global-exclude *.dylib
+global-exclude .DS_Store

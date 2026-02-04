@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  heliosdb:
+    image: heliosdb/lite:3.0.0
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile
+    ports:
+      - "5432:5432"  # PostgreSQL protocol
+      - "8080:8080"  # REST API
+    volumes:
+      - heliosdb_data:/data
+    environment:
+      - HELIOSDB_MODE=server
+      - HELIOSDB_DATA_DIR=/data
+      - HELIOSDB_LOG_LEVEL=info
+      - HELIOSDB_REST_PORT=8080
+      - HELIOSDB_PG_PORT=5432
+      # Security (set these in production)
+      - HELIOSDB_API_KEY=${HELIOSDB_API_KEY:-}
+      - HELIOSDB_ENCRYPTION_KEY=${HELIOSDB_ENCRYPTION_KEY:-}
+      - HELIOSDB_JWT_SECRET=${HELIOSDB_JWT_SECRET:-}
+      # Performance tuning
+      - HELIOSDB_CACHE_SIZE_MB=512
+      - HELIOSDB_MAX_CONNECTIONS=100
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+
+volumes:
+  heliosdb_data:
+    driver: local
+
+# Optional: Add these services for monitoring
+# prometheus:
+#   image: prom/prometheus:latest
+#   ports:
+#     - "9090:9090"
+#   volumes:
+#     - ./prometheus.yml:/etc/prometheus/prometheus.yml
+#
+# grafana:
+#   image: grafana/grafana:latest
+#   ports:
+#     - "3000:3000"
+#   environment:
+#     - GF_SECURITY_ADMIN_PASSWORD=admin
