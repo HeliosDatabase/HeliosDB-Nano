@@ -424,13 +424,20 @@ impl AdaptiveRadixTree {
         let old_key = old_prefix[mismatch_pos];
         new_parent.add_child(old_key, node);
 
-        // Add new leaf as child
-        let new_key = key[depth + mismatch_pos];
-        let new_leaf = ArtNode::Leaf(LeafNode::new(key.to_vec(), value));
-        new_parent.add_child(new_key, new_leaf);
+        // Add new key - check if key is exhausted (one key is prefix of another)
+        let new_key_pos = depth + mismatch_pos;
+        if new_key_pos < key.len() {
+            // Key has more bytes - add as leaf child
+            let new_key = key[new_key_pos];
+            let new_leaf = ArtNode::Leaf(LeafNode::new(key.to_vec(), value));
+            new_parent.add_child(new_key, new_leaf);
+            self.stats.leaf_count += 1;
+        } else {
+            // Key exhausted at this node - store value in header
+            new_parent.header.value = Some(value);
+        }
 
         self.stats.node4_count += 1;
-        self.stats.leaf_count += 1;
 
         Ok(ArtNode::Node4(Box::new(new_parent)))
     }

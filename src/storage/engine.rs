@@ -1225,6 +1225,9 @@ impl StorageEngine {
             // Store transformed tuple
             self.put(&key, &value)?;
 
+            // Log to WAL for durability/replication
+            self.log_data_insert(table_name, &value)?;
+
             // Skip delta tracking in bulk load mode for improved performance
             if !bulk_mode {
                 // Record delta for incremental MV refresh
@@ -3226,6 +3229,9 @@ impl StorageEngine {
         // Write current version (for fast non-time-travel queries)
         let key = Self::build_data_key(table_name, row_id);
         self.put(&key, &value)?;
+
+        // Log to WAL for durability/replication
+        self.log_data_insert(table_name, &value)?;
 
         // Write versioned copy (for time-travel queries)
         self.snapshot_manager.write_version(table_name, row_id, timestamp, &value)?;
