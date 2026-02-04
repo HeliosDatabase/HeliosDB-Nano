@@ -261,6 +261,57 @@ impl Evaluator {
                 ))
             }
 
+            LogicalExpr::Between { expr, low, high, negated } => {
+                let value = self.evaluate(expr, tuple)?;
+                let low_value = self.evaluate(low, tuple)?;
+                let high_value = self.evaluate(high, tuple)?;
+
+                // NULL handling: if any value is NULL, result is NULL
+                if matches!(value, Value::Null) || matches!(low_value, Value::Null) || matches!(high_value, Value::Null) {
+                    return Ok(Value::Null);
+                }
+
+                // value BETWEEN low AND high is equivalent to: value >= low AND value <= high
+                let gte_low = self.compare_values(&value, &low_value, |ord| ord != std::cmp::Ordering::Less)?;
+                let lte_high = self.compare_values(&value, &high_value, |ord| ord != std::cmp::Ordering::Greater)?;
+
+                // Both comparisons must be true for value to be in range
+                let in_range = matches!(gte_low, Value::Boolean(true)) && matches!(lte_high, Value::Boolean(true));
+                let result = if *negated { !in_range } else { in_range };
+
+                Ok(Value::Boolean(result))
+            }
+
+            LogicalExpr::Case { expr: operand, when_then, else_result } => {
+                // If there's an operand, we're doing: CASE operand WHEN val THEN result...
+                // Otherwise, we're doing: CASE WHEN condition THEN result...
+                if let Some(op) = operand {
+                    let op_value = self.evaluate(op, tuple)?;
+
+                    for (when_expr, then_expr) in when_then {
+                        let when_value = self.evaluate(when_expr, tuple)?;
+                        if self.values_equal(&op_value, &when_value) {
+                            return self.evaluate(then_expr, tuple);
+                        }
+                    }
+                } else {
+                    // Searched CASE: CASE WHEN condition THEN result...
+                    for (when_expr, then_expr) in when_then {
+                        let condition = self.evaluate(when_expr, tuple)?;
+                        if matches!(condition, Value::Boolean(true)) {
+                            return self.evaluate(then_expr, tuple);
+                        }
+                    }
+                }
+
+                // No condition matched, return ELSE result or NULL
+                if let Some(else_expr) = else_result {
+                    self.evaluate(else_expr, tuple)
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+
             _ => Err(Error::query_execution(format!(
                 "Expression not yet implemented: {:?}",
                 expr
@@ -1377,6 +1428,13 @@ impl Evaluator {
                 }
             }
 
+            // Timestamp comparisons
+            (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+            (Value::Date(a), Value::Date(b)) => a.cmp(b),
+            // Timestamp to Date comparisons (compare dates only)
+            (Value::Timestamp(a), Value::Date(b)) => a.date_naive().cmp(b),
+            (Value::Date(a), Value::Timestamp(b)) => a.cmp(&b.date_naive()),
+
             _ => {
                 return Err(Error::query_execution(format!(
                     "Cannot compare {:?} and {:?}",
@@ -2388,6 +2446,15 @@ impl Evaluator {
                         .or_else(|_| {
                             chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
                                 .map(|ndt| Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(ndt, Utc)))
+                        })
+                        .or_else(|_| {
+                            // Date-only format: treat as midnight UTC
+                            if let Ok(date) = chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d") {
+                                if let Some(ndt) = date.and_hms_opt(0, 0, 0) {
+                                    return Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(ndt, Utc)));
+                                }
+                            }
+                            Err(chrono::NaiveDate::parse_from_str("", "%Y-%m-%d").unwrap_err())
                         })
                         .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to TIMESTAMP: {}", s, e)))
                 }

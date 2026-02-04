@@ -1250,6 +1250,47 @@ impl<'a> Planner<'a> {
                 })
             }
 
+            // BETWEEN: expr BETWEEN low AND high
+            Expr::Between { expr, negated, low, high } => {
+                Ok(LogicalExpr::Between {
+                    expr: Box::new(self.expr_to_logical(expr)?),
+                    low: Box::new(self.expr_to_logical(low)?),
+                    high: Box::new(self.expr_to_logical(high)?),
+                    negated: *negated,
+                })
+            }
+
+            // CASE expression
+            Expr::Case { operand, conditions, results, else_result } => {
+                // Convert operand (if present)
+                let expr = if let Some(op) = operand {
+                    Some(Box::new(self.expr_to_logical(op)?))
+                } else {
+                    None
+                };
+
+                // Convert WHEN conditions and THEN results
+                let when_then: Vec<(LogicalExpr, LogicalExpr)> = conditions.iter()
+                    .zip(results.iter())
+                    .map(|(cond, res)| {
+                        Ok((self.expr_to_logical(cond)?, self.expr_to_logical(res)?))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+
+                // Convert ELSE result (if present)
+                let else_result = if let Some(e) = else_result {
+                    Some(Box::new(self.expr_to_logical(e)?))
+                } else {
+                    None
+                };
+
+                Ok(LogicalExpr::Case {
+                    expr,
+                    when_then,
+                    else_result,
+                })
+            }
+
             _ => Err(Error::query_execution(format!(
                 "Expression not yet supported: {:?}",
                 expr
