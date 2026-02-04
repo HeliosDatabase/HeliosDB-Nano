@@ -856,8 +856,8 @@ impl<'a> Planner<'a> {
             match item {
                 SelectItem::UnnamedExpr(expr) => {
                     let logical_expr = self.expr_to_logical(expr)?;
-                    // Generate alias from expression
-                    let alias = format!("col_{}", exprs.len());
+                    // Try to extract a meaningful alias from the expression
+                    let alias = self.extract_expr_alias(expr, exprs.len());
                     exprs.push(logical_expr);
                     aliases.push(alias);
                 }
@@ -879,6 +879,60 @@ impl<'a> Planner<'a> {
         }
 
         Ok((exprs, aliases))
+    }
+
+    /// Extract a meaningful alias from an expression
+    /// Falls back to col_{index} if no meaningful name can be extracted
+    fn extract_expr_alias(&self, expr: &Expr, index: usize) -> String {
+        match expr {
+            // Simple column reference: use column name
+            Expr::Identifier(ident) => ident.value.clone(),
+            // Qualified column: table.column - use column name
+            Expr::CompoundIdentifier(idents) => {
+                idents.last().map(|i| i.value.clone()).unwrap_or_else(|| format!("col_{}", index))
+            }
+            // Aggregate functions: use function name + column
+            Expr::Function(func) => {
+                let func_name = func.name.to_string().to_lowercase();
+                match func.args {
+                    sqlparser::ast::FunctionArguments::List(ref list) if !list.args.is_empty() => {
+                        if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(inner)) = &list.args[0] {
+                            if let Expr::Identifier(ident) = inner {
+                                return format!("{}({})", func_name, ident.value);
+                            }
+                        }
+                        format!("{}(...)", func_name)
+                    }
+                    _ => func_name,
+                }
+            }
+            // Binary expressions: left op right
+            Expr::BinaryOp { left, op, right } => {
+                let left_name = self.extract_expr_alias(left, 0);
+                let right_name = self.extract_expr_alias(right, 0);
+                format!("{} {} {}", left_name, op, right_name)
+            }
+            // Cast: use inner expression name
+            Expr::Cast { expr: inner, .. } => self.extract_expr_alias(inner, index),
+            // Unary expressions
+            Expr::UnaryOp { expr: inner, op } => {
+                let inner_name = self.extract_expr_alias(inner, index);
+                format!("{}{}", op, inner_name)
+            }
+            // Nested expressions in parentheses
+            Expr::Nested(inner) => self.extract_expr_alias(inner, index),
+            // Literal values: use the value representation
+            Expr::Value(val) => match val {
+                sqlparser::ast::Value::Number(n, _) => n.clone(),
+                sqlparser::ast::Value::SingleQuotedString(s) => format!("'{}'", s),
+                sqlparser::ast::Value::DoubleQuotedString(s) => format!("\"{}\"", s),
+                sqlparser::ast::Value::Boolean(b) => b.to_string(),
+                sqlparser::ast::Value::Null => "NULL".to_string(),
+                _ => format!("col_{}", index),
+            },
+            // Default fallback
+            _ => format!("col_{}", index),
+        }
     }
 
     /// Extract aggregate expressions from SELECT items
@@ -1133,6 +1187,41 @@ impl<'a> Planner<'a> {
                 Ok(LogicalExpr::Cast {
                     expr: Box::new(logical_expr),
                     data_type: target_type,
+                })
+            }
+
+            // IN list: expr IN (val1, val2, ...)
+            Expr::InList { expr, list, negated } => {
+                let logical_expr = self.expr_to_logical(expr)?;
+                let logical_list: Vec<LogicalExpr> = list
+                    .iter()
+                    .map(|e| self.expr_to_logical(e))
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(LogicalExpr::InList {
+                    expr: Box::new(logical_expr),
+                    list: logical_list,
+                    negated: *negated,
+                })
+            }
+
+            // IN subquery: expr IN (SELECT ...)
+            Expr::InSubquery { expr, subquery, negated } => {
+                // Convert subquery to a logical plan (dereference Box and clone Query)
+                let subquery_plan = self.query_to_plan((**subquery).clone())?;
+                let logical_expr = self.expr_to_logical(expr)?;
+                Ok(LogicalExpr::InSubquery {
+                    expr: Box::new(logical_expr),
+                    subquery: Box::new(subquery_plan),
+                    negated: *negated,
+                })
+            }
+
+            // EXISTS subquery: EXISTS (SELECT ...)
+            Expr::Exists { subquery, negated } => {
+                let subquery_plan = self.query_to_plan((**subquery).clone())?;
+                Ok(LogicalExpr::Exists {
+                    subquery: Box::new(subquery_plan),
+                    negated: *negated,
                 })
             }
 

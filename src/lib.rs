@@ -709,6 +709,48 @@ impl EmbeddedDatabase {
                     catalog.save_table_constraints(name, &table_constraints)?;
                 }
 
+                // Also add column-level UNIQUE and PRIMARY KEY constraints
+                // These are stored in ColumnDef but need to be in table_constraints for enforcement
+                let catalog = self.storage.catalog();
+                let mut col_constraints = sql::TableConstraints::new();
+                let mut has_col_constraints = false;
+
+                for col_def in columns {
+                    if col_def.primary_key {
+                        col_constraints.add_unique(sql::UniqueConstraint::new(
+                            format!("{}_{}_pkey", name, col_def.name),
+                            name.clone(),
+                            vec![col_def.name.clone()],
+                            true, // is_primary_key
+                        ));
+                        has_col_constraints = true;
+                    } else if col_def.unique {
+                        col_constraints.add_unique(sql::UniqueConstraint::new(
+                            format!("{}_{}_unique", name, col_def.name),
+                            name.clone(),
+                            vec![col_def.name.clone()],
+                            false, // is_primary_key
+                        ));
+                        has_col_constraints = true;
+                    }
+                }
+
+                if has_col_constraints {
+                    // Merge with existing table constraints
+                    if let Ok(existing) = catalog.load_table_constraints(name) {
+                        for fk in existing.foreign_keys {
+                            col_constraints.foreign_keys.push(fk);
+                        }
+                        for check in existing.check_constraints {
+                            col_constraints.check_constraints.push(check);
+                        }
+                        for unique in existing.unique_constraints {
+                            col_constraints.unique_constraints.push(unique);
+                        }
+                    }
+                    catalog.save_table_constraints(name, &col_constraints)?;
+                }
+
                 Ok(1)
             }
             sql::LogicalPlan::Insert { table_name, columns, values, returning } => {
@@ -895,6 +937,38 @@ impl EmbeddedDatabase {
                             return Err(Error::constraint_violation(format!(
                                 "CHECK constraint '{}' violated: expression '{}' evaluated to false",
                                 check.name, check.expression
+                            )));
+                        }
+                    }
+
+                    // Validate UNIQUE constraints (including PRIMARY KEY)
+                    for unique in &table_constraints.unique_constraints {
+                        // Get unique column values from the tuple being inserted
+                        let unique_values: Vec<Value> = unique.columns.iter()
+                            .filter_map(|col_name| {
+                                schema.columns.iter()
+                                    .position(|c| &c.name == col_name)
+                                    .map(|idx| final_values_vec[idx].clone())
+                            })
+                            .collect();
+
+                        // Skip validation if any unique column is NULL (NULL is always unique)
+                        if unique_values.iter().any(|v| matches!(v, Value::Null)) {
+                            continue;
+                        }
+
+                        // Check if a row with these values already exists
+                        let duplicate_exists = self.check_unique_violation(
+                            table_name,
+                            &unique.columns,
+                            &unique_values,
+                        )?;
+
+                        if duplicate_exists {
+                            let constraint_type = if unique.is_primary_key { "PRIMARY KEY" } else { "UNIQUE" };
+                            return Err(Error::constraint_violation(format!(
+                                "{} constraint '{}' violated: duplicate value for column(s) ({})",
+                                constraint_type, unique.name, unique.columns.join(", ")
                             )));
                         }
                     }
@@ -1249,14 +1323,27 @@ impl EmbeddedDatabase {
                                                 )));
                                             }
                                             sql::constraints::ReferentialAction::Cascade => {
-                                                // TODO: CASCADE delete referencing rows
-                                                // For now, just allow the delete
+                                                // CASCADE: Delete all referencing rows in child table
+                                                self.cascade_delete_referencing_rows(
+                                                    &fk.table_name,
+                                                    &fk.columns,
+                                                    &ref_values,
+                                                )?;
                                             }
                                             sql::constraints::ReferentialAction::SetNull => {
-                                                // TODO: SET NULL in referencing rows
+                                                // SET NULL: Set FK columns to NULL in referencing rows
+                                                self.set_null_referencing_rows(
+                                                    &fk.table_name,
+                                                    &fk.columns,
+                                                    &ref_values,
+                                                )?;
                                             }
                                             sql::constraints::ReferentialAction::SetDefault => {
-                                                // TODO: SET DEFAULT in referencing rows
+                                                // SET DEFAULT is not implemented yet - treat as RESTRICT
+                                                return Err(Error::constraint_violation(format!(
+                                                    "Foreign key constraint '{}' with SET DEFAULT action: not implemented",
+                                                    fk.name
+                                                )));
                                             }
                                         }
                                     }
@@ -2007,7 +2094,7 @@ impl EmbeddedDatabase {
                         }
                     }
 
-                    self.storage.insert_tuple(table_name, tuple)?;
+                    self.storage.insert_tuple_branch_aware(table_name, tuple)?;
                     count += 1;
                 }
                 Ok(count)
@@ -2533,7 +2620,7 @@ impl EmbeddedDatabase {
                     }
 
                     let tuple = Tuple::new(tuple_values);
-                    self.storage.insert_tuple(table_name, tuple)?;
+                    self.storage.insert_tuple_branch_aware(table_name, tuple)?;
                     count += 1;
                 }
                 Ok((count, Vec::new()))
@@ -3370,66 +3457,228 @@ impl EmbeddedDatabase {
         }
     }
 
-    // Vector store operations (stub implementations for v3.0.0)
+    // Vector store operations - backed by VectorIndexManager
 
     /// List all vector stores
     pub fn list_vector_stores(&self) -> Result<Vec<VectorStoreInfo>> {
-        Ok(vec![])
+        use crate::vector::DistanceMetric;
+
+        let vector_mgr = self.storage.vector_indexes();
+        let metadata_list = vector_mgr.list_all_metadata();
+
+        Ok(metadata_list.iter().map(|meta| {
+            // Get vector count if possible
+            let (vector_count, metric, index_type) = match vector_mgr.get_index_stats(&meta.name) {
+                Ok(stats) => (
+                    stats.num_vectors as u64,
+                    match &meta.index_type {
+                        storage::VectorIndexType::Standard(cfg) => match cfg.distance_metric {
+                            DistanceMetric::L2 => "l2".to_string(),
+                            DistanceMetric::Cosine => "cosine".to_string(),
+                            DistanceMetric::InnerProduct => "inner_product".to_string(),
+                        },
+                        storage::VectorIndexType::Quantized(cfg) => match cfg.distance_metric {
+                            DistanceMetric::L2 => "l2".to_string(),
+                            DistanceMetric::Cosine => "cosine".to_string(),
+                            DistanceMetric::InnerProduct => "inner_product".to_string(),
+                        },
+                    },
+                    match &meta.index_type {
+                        storage::VectorIndexType::Standard(_) => "hnsw".to_string(),
+                        storage::VectorIndexType::Quantized(_) => "hnsw_pq".to_string(),
+                    },
+                ),
+                Err(_) => (0, "cosine".to_string(), "hnsw".to_string()),
+            };
+
+            let dimensions = match &meta.index_type {
+                storage::VectorIndexType::Standard(cfg) => cfg.dimension as u32,
+                storage::VectorIndexType::Quantized(cfg) => cfg.dimension as u32,
+            };
+
+            VectorStoreInfo {
+                name: meta.name.clone(),
+                dimensions,
+                vector_count,
+                created_at: "N/A".to_string(),
+                metric,
+                index_type,
+            }
+        }).collect())
     }
 
     /// Create a new vector store
     pub fn create_vector_store(&self, name: &str, dimensions: u32) -> Result<VectorStoreInfo> {
-        Err(Error::Generic("Vector store operations not yet implemented".to_string()))
+        use crate::vector::DistanceMetric;
+
+        let vector_mgr = self.storage.vector_indexes();
+
+        // Create a HNSW index for the vector store
+        vector_mgr.create_index(
+            name.to_string(),
+            name.to_string(),  // table_name
+            "embedding".to_string(),  // column_name
+            dimensions as usize,
+            DistanceMetric::Cosine,  // Default to cosine similarity
+        )?;
+
+        Ok(VectorStoreInfo {
+            name: name.to_string(),
+            dimensions,
+            vector_count: 0,
+            created_at: chrono::Utc::now().to_rfc3339(),
+            metric: "cosine".to_string(),
+            index_type: "hnsw".to_string(),
+        })
     }
 
     /// Get vector store info
-    pub fn get_vector_store(&self, _name: &str) -> Result<VectorStoreInfo> {
-        Err(Error::Generic("Vector store operations not yet implemented".to_string()))
+    pub fn get_vector_store(&self, name: &str) -> Result<VectorStoreInfo> {
+        use crate::vector::DistanceMetric;
+
+        let vector_mgr = self.storage.vector_indexes();
+
+        let meta = vector_mgr.get_metadata(name)?;
+        let stats = vector_mgr.get_index_stats(name)?;
+
+        let metric = match &meta.index_type {
+            storage::VectorIndexType::Standard(cfg) => match cfg.distance_metric {
+                DistanceMetric::L2 => "l2".to_string(),
+                DistanceMetric::Cosine => "cosine".to_string(),
+                DistanceMetric::InnerProduct => "inner_product".to_string(),
+            },
+            storage::VectorIndexType::Quantized(cfg) => match cfg.distance_metric {
+                DistanceMetric::L2 => "l2".to_string(),
+                DistanceMetric::Cosine => "cosine".to_string(),
+                DistanceMetric::InnerProduct => "inner_product".to_string(),
+            },
+        };
+
+        let index_type = match &meta.index_type {
+            storage::VectorIndexType::Standard(_) => "hnsw".to_string(),
+            storage::VectorIndexType::Quantized(_) => "hnsw_pq".to_string(),
+        };
+
+        Ok(VectorStoreInfo {
+            name: name.to_string(),
+            dimensions: stats.dimensions as u32,
+            vector_count: stats.num_vectors as u64,
+            created_at: "N/A".to_string(),
+            metric,
+            index_type,
+        })
     }
 
     /// Delete a vector store
-    pub fn delete_vector_store(&self, _name: &str) -> Result<()> {
-        Err(Error::Generic("Vector store operations not yet implemented".to_string()))
+    pub fn delete_vector_store(&self, name: &str) -> Result<()> {
+        let vector_mgr = self.storage.vector_indexes();
+        vector_mgr.drop_index(name)
     }
 
-    /// Insert vectors
-    pub fn insert_vectors(&self, _store: &str, _vectors: Vec<Vec<f32>>) -> Result<Vec<String>> {
-        Err(Error::Generic("Vector operations not yet implemented".to_string()))
+    /// Insert vectors into a store
+    ///
+    /// Returns a list of generated vector IDs
+    pub fn insert_vectors(&self, store: &str, vectors: Vec<Vec<f32>>) -> Result<Vec<String>> {
+        let vector_mgr = self.storage.vector_indexes();
+
+        // Verify store exists
+        let _ = vector_mgr.get_metadata(store)?;
+
+        let mut ids = Vec::with_capacity(vectors.len());
+
+        for vector in vectors {
+            // Generate a unique ID using timestamp + counter
+            let id = self.storage.next_timestamp();
+            let id_str = format!("vec_{}", id);
+
+            // Insert into HNSW index
+            vector_mgr.insert_vector(store, id, &vector)?;
+
+            ids.push(id_str);
+        }
+
+        Ok(ids)
     }
 
-    /// Upsert vectors
-    pub fn upsert_vectors(&self, _store: &str, _vectors: Vec<(String, Vec<f32>)>) -> Result<()> {
-        Err(Error::Generic("Vector operations not yet implemented".to_string()))
+    /// Upsert vectors (insert or update)
+    pub fn upsert_vectors(&self, store: &str, vectors: Vec<(String, Vec<f32>)>) -> Result<()> {
+        let vector_mgr = self.storage.vector_indexes();
+
+        // Verify store exists
+        let _ = vector_mgr.get_metadata(store)?;
+
+        for (id_str, vector) in vectors {
+            // Parse ID from string (format: vec_123)
+            let id = id_str.strip_prefix("vec_")
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or_else(|| {
+                    // Generate new ID for non-standard IDs
+                    self.storage.next_timestamp()
+                });
+
+            // Try to delete existing vector (ignore errors if not found)
+            let _ = vector_mgr.delete_vector(store, id);
+
+            // Insert the vector
+            vector_mgr.insert_vector(store, id, &vector)?;
+        }
+
+        Ok(())
     }
 
-    /// Search vectors
-    pub fn search_vectors(&self, _store: &str, _query: Vec<f32>, _k: usize) -> Result<Vec<(String, f32)>> {
-        Err(Error::Generic("Vector search not yet implemented".to_string()))
+    /// Search for similar vectors
+    ///
+    /// Returns (vector_id, distance) pairs sorted by similarity
+    pub fn search_vectors(&self, store: &str, query: Vec<f32>, k: usize) -> Result<Vec<(String, f32)>> {
+        let vector_mgr = self.storage.vector_indexes();
+
+        // Verify store exists
+        let _ = vector_mgr.get_metadata(store)?;
+
+        // Search HNSW index
+        let results = vector_mgr.search(store, &query, k)?;
+
+        // Convert row_ids to string IDs
+        Ok(results.into_iter()
+            .map(|(row_id, distance)| (format!("vec_{}", row_id), distance))
+            .collect())
     }
 
-    /// Text search
+    /// Text search (requires text embedding - stub for now)
     pub fn text_search(&self, _query: &str) -> Result<Vec<String>> {
-        Err(Error::Generic("Text search not yet implemented".to_string()))
+        Err(Error::Generic("Text search requires embedding model - not yet implemented".to_string()))
     }
 
-    /// Store texts for embedding
+    /// Store texts for embedding (requires embedding model - stub for now)
     pub fn store_texts(&self, _store: &str, _texts: Vec<String>) -> Result<Vec<String>> {
-        Err(Error::Generic("Text storage not yet implemented".to_string()))
+        Err(Error::Generic("Text storage requires embedding model - not yet implemented".to_string()))
     }
 
-    /// Hybrid search (vector + text)
+    /// Hybrid search (vector + text) - requires embedding model
     pub fn hybrid_search(&self, _store: &str, _query: &str, _k: usize) -> Result<Vec<(String, f32)>> {
-        Err(Error::Generic("Hybrid search not yet implemented".to_string()))
+        Err(Error::Generic("Hybrid search requires embedding model - not yet implemented".to_string()))
     }
 
-    /// Delete vectors
-    pub fn delete_vectors(&self, _store: &str, _ids: Vec<String>) -> Result<()> {
-        Err(Error::Generic("Vector deletion not yet implemented".to_string()))
+    /// Delete vectors by ID
+    pub fn delete_vectors(&self, store: &str, ids: Vec<String>) -> Result<()> {
+        let vector_mgr = self.storage.vector_indexes();
+
+        // Verify store exists
+        let _ = vector_mgr.get_metadata(store)?;
+
+        for id_str in ids {
+            // Parse ID from string
+            if let Some(id) = id_str.strip_prefix("vec_").and_then(|s| s.parse::<u64>().ok()) {
+                vector_mgr.delete_vector(store, id)?;
+            }
+        }
+
+        Ok(())
     }
 
-    /// Fetch vectors by ID
+    /// Fetch vectors by ID (not yet implemented - requires storing raw vectors)
     pub fn fetch_vectors(&self, _store: &str, _ids: Vec<String>) -> Result<Vec<(String, Vec<f32>)>> {
-        Err(Error::Generic("Vector fetch not yet implemented".to_string()))
+        Err(Error::Generic("Vector fetch not yet implemented - HNSW index doesn't store raw vectors".to_string()))
     }
 
     // Agent session operations
@@ -3712,6 +3961,173 @@ impl EmbeddedDatabase {
         }
 
         Ok(false)
+    }
+
+    /// Check if inserting the given values would violate a UNIQUE constraint
+    ///
+    /// Scans the table to check if a row with the same values for the specified
+    /// columns already exists.
+    fn check_unique_violation(
+        &self,
+        table_name: &str,
+        column_names: &[String],
+        values: &[Value],
+    ) -> Result<bool> {
+        let catalog = self.storage.catalog();
+        let schema = catalog.get_table_schema(table_name)?;
+
+        // Scan the table and check for a matching row
+        let tuples = self.storage.scan_table(table_name)?;
+
+        for tuple in tuples {
+            let mut matches = true;
+            for (col_name, expected_value) in column_names.iter().zip(values.iter()) {
+                // Find column index
+                let col_idx = schema.columns.iter()
+                    .position(|c| &c.name == col_name);
+
+                if let Some(idx) = col_idx {
+                    if idx < tuple.values.len() {
+                        let actual_value = &tuple.values[idx];
+                        if actual_value != expected_value {
+                            matches = false;
+                            break;
+                        }
+                    } else {
+                        matches = false;
+                        break;
+                    }
+                } else {
+                    matches = false;
+                    break;
+                }
+            }
+
+            if matches {
+                return Ok(true); // Found a duplicate
+            }
+        }
+
+        Ok(false) // No duplicate found
+    }
+
+    /// CASCADE DELETE: Delete all rows in a table that reference the given values
+    ///
+    /// Used for ON DELETE CASCADE foreign key action
+    fn cascade_delete_referencing_rows(
+        &self,
+        table_name: &str,
+        fk_columns: &[String],
+        parent_values: &[Value],
+    ) -> Result<()> {
+        let catalog = self.storage.catalog();
+        let schema = catalog.get_table_schema(table_name)?;
+
+        // Find all rows that reference the parent row
+        let tuples = self.storage.scan_table(table_name)?;
+        let mut row_ids_to_delete: Vec<u64> = Vec::new();
+
+        for tuple in tuples {
+            let mut matches = true;
+            for (fk_col, parent_val) in fk_columns.iter().zip(parent_values.iter()) {
+                let col_idx = schema.columns.iter().position(|c| &c.name == fk_col);
+                if let Some(idx) = col_idx {
+                    if idx < tuple.values.len() {
+                        if &tuple.values[idx] != parent_val {
+                            matches = false;
+                            break;
+                        }
+                    } else {
+                        matches = false;
+                        break;
+                    }
+                } else {
+                    matches = false;
+                    break;
+                }
+            }
+
+            if matches {
+                if let Some(row_id) = tuple.row_id {
+                    row_ids_to_delete.push(row_id);
+                }
+            }
+        }
+
+        // Delete the matching rows
+        let txn = self.storage.begin_transaction()?;
+        for row_id in row_ids_to_delete {
+            let key = self.storage.branch_aware_data_key(table_name, row_id);
+            txn.delete(key)?;
+        }
+        txn.commit()?;
+
+        Ok(())
+    }
+
+    /// SET NULL: Set FK columns to NULL in all rows that reference the given values
+    ///
+    /// Used for ON DELETE SET NULL foreign key action
+    fn set_null_referencing_rows(
+        &self,
+        table_name: &str,
+        fk_columns: &[String],
+        parent_values: &[Value],
+    ) -> Result<()> {
+        let catalog = self.storage.catalog();
+        let schema = catalog.get_table_schema(table_name)?;
+
+        // Find all rows that reference the parent row
+        let tuples = self.storage.scan_table(table_name)?;
+        let mut rows_to_update: Vec<(u64, Tuple)> = Vec::new();
+
+        for tuple in tuples {
+            let mut matches = true;
+            for (fk_col, parent_val) in fk_columns.iter().zip(parent_values.iter()) {
+                let col_idx = schema.columns.iter().position(|c| &c.name == fk_col);
+                if let Some(idx) = col_idx {
+                    if idx < tuple.values.len() {
+                        if &tuple.values[idx] != parent_val {
+                            matches = false;
+                            break;
+                        }
+                    } else {
+                        matches = false;
+                        break;
+                    }
+                } else {
+                    matches = false;
+                    break;
+                }
+            }
+
+            if matches {
+                if let Some(row_id) = tuple.row_id {
+                    // Create updated tuple with FK columns set to NULL
+                    let mut new_values = tuple.values.clone();
+                    for fk_col in fk_columns {
+                        if let Some(idx) = schema.columns.iter().position(|c| &c.name == fk_col) {
+                            if idx < new_values.len() {
+                                new_values[idx] = Value::Null;
+                            }
+                        }
+                    }
+                    let new_tuple = Tuple::new(new_values);
+                    rows_to_update.push((row_id, new_tuple));
+                }
+            }
+        }
+
+        // Update the matching rows
+        let txn = self.storage.begin_transaction()?;
+        for (row_id, new_tuple) in rows_to_update {
+            let key = self.storage.branch_aware_data_key(table_name, row_id);
+            let val = bincode::serialize(&new_tuple).map_err(|e| Error::storage(e.to_string()))?;
+            txn.put(key, val)?;
+        }
+        txn.commit()?;
+
+        Ok(())
     }
 
     /// Evaluate a CHECK constraint expression against a row's values
