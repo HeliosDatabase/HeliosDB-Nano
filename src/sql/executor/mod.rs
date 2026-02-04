@@ -259,6 +259,104 @@ impl<'a> Executor<'a> {
         Ok(results)
     }
 
+    /// Materialize IN subqueries by executing them and converting to InList
+    ///
+    /// This allows the evaluator to handle IN expressions without needing
+    /// access to the storage engine.
+    pub(crate) fn materialize_subqueries(&self, expr: &crate::sql::LogicalExpr) -> Result<crate::sql::LogicalExpr> {
+        use crate::sql::LogicalExpr;
+
+        match expr {
+            LogicalExpr::InSubquery { expr: inner_expr, subquery, negated } => {
+                // Execute the subquery to get the list of values
+                let mut subquery_executor = Executor::new();
+                if let Some(storage) = self.storage {
+                    subquery_executor = Executor::with_storage(storage);
+                }
+                subquery_executor = subquery_executor.with_parameters(self.parameters.clone());
+
+                let results = subquery_executor.execute(subquery)?;
+
+                // Extract the first column value from each result row
+                let list: Vec<LogicalExpr> = results.iter()
+                    .filter_map(|tuple| {
+                        tuple.values.first().map(|v| LogicalExpr::Literal(v.clone()))
+                    })
+                    .collect();
+
+                // Materialize the inner expression as well
+                let materialized_inner = self.materialize_subqueries(inner_expr)?;
+
+                // Convert to InList
+                Ok(LogicalExpr::InList {
+                    expr: Box::new(materialized_inner),
+                    list,
+                    negated: *negated,
+                })
+            }
+            // Recursively process compound expressions
+            LogicalExpr::BinaryExpr { left, op, right } => {
+                Ok(LogicalExpr::BinaryExpr {
+                    left: Box::new(self.materialize_subqueries(left)?),
+                    op: *op,
+                    right: Box::new(self.materialize_subqueries(right)?),
+                })
+            }
+            LogicalExpr::UnaryExpr { op, expr: inner } => {
+                Ok(LogicalExpr::UnaryExpr {
+                    op: *op,
+                    expr: Box::new(self.materialize_subqueries(inner)?),
+                })
+            }
+            LogicalExpr::IsNull { expr: inner, is_null } => {
+                Ok(LogicalExpr::IsNull {
+                    expr: Box::new(self.materialize_subqueries(inner)?),
+                    is_null: *is_null,
+                })
+            }
+            LogicalExpr::Between { expr: inner, low, high, negated } => {
+                Ok(LogicalExpr::Between {
+                    expr: Box::new(self.materialize_subqueries(inner)?),
+                    low: Box::new(self.materialize_subqueries(low)?),
+                    high: Box::new(self.materialize_subqueries(high)?),
+                    negated: *negated,
+                })
+            }
+            LogicalExpr::InList { expr: inner, list, negated } => {
+                let materialized_list: Result<Vec<LogicalExpr>> = list.iter()
+                    .map(|e| self.materialize_subqueries(e))
+                    .collect();
+                Ok(LogicalExpr::InList {
+                    expr: Box::new(self.materialize_subqueries(inner)?),
+                    list: materialized_list?,
+                    negated: *negated,
+                })
+            }
+            LogicalExpr::Case { expr: operand, when_then, else_result } => {
+                let materialized_operand = if let Some(op) = operand {
+                    Some(Box::new(self.materialize_subqueries(op)?))
+                } else {
+                    None
+                };
+                let materialized_when_then: Result<Vec<(LogicalExpr, LogicalExpr)>> = when_then.iter()
+                    .map(|(w, t)| Ok((self.materialize_subqueries(w)?, self.materialize_subqueries(t)?)))
+                    .collect();
+                let materialized_else = if let Some(e) = else_result {
+                    Some(Box::new(self.materialize_subqueries(e)?))
+                } else {
+                    None
+                };
+                Ok(LogicalExpr::Case {
+                    expr: materialized_operand,
+                    when_then: materialized_when_then?,
+                    else_result: materialized_else,
+                })
+            }
+            // For other expressions, return as-is
+            _ => Ok(expr.clone()),
+        }
+    }
+
     /// Convert a logical plan to a physical operator
     pub(crate) fn plan_to_operator(&self, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
         match plan {
@@ -270,9 +368,11 @@ impl<'a> Executor<'a> {
             }
             LogicalPlan::Filter { input, predicate } => {
                 let input_op = self.plan_to_operator(input)?;
+                // Materialize any IN subqueries before creating the filter
+                let materialized_predicate = self.materialize_subqueries(predicate)?;
                 Ok(Box::new(FilterOperator::new(
                     input_op,
-                    predicate.clone(),
+                    materialized_predicate,
                     self.parameters.clone(),
                 ).with_timeout(self.timeout_ctx.clone())))
             }

@@ -396,8 +396,16 @@ pub(super) fn handle_filtered_scan(
                 }
             };
 
+            // Materialize any IN subqueries before storage-level pushdown
+            // This converts InSubquery to InList which storage layer can handle
+            let materialized_predicate = if let Some(pred) = predicate {
+                Some(executor.materialize_subqueries(pred)?)
+            } else {
+                None
+            };
+
             // Analyze the predicate for storage-level pushdown
-            let analyzed_predicates = if let Some(pred) = predicate {
+            let analyzed_predicates = if let Some(ref pred) = materialized_predicate {
                 storage.predicate_pushdown().analyze_predicate(pred, &schema)
             } else {
                 Vec::new()

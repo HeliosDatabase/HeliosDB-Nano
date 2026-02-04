@@ -642,13 +642,38 @@ impl<'a> Planner<'a> {
 
             plan = LogicalPlan::Aggregate {
                 input: Box::new(plan),
-                group_by,
-                aggr_exprs,
+                group_by: group_by.clone(),
+                aggr_exprs: aggr_exprs.clone(),
                 having,
             };
 
-            // The Aggregate operator outputs GROUP BY columns followed by aggregate results
-            // This matches the SELECT clause, so we don't need a Project on top
+            // Add a Project layer to apply user-defined aliases
+            // The Aggregate operator outputs: group_0, group_1, ..., agg_0, agg_1, ...
+            // We need to rename these to the user's aliases (e.g., COUNT(*) as user_count)
+            let (proj_exprs, aliases) = self.select_items_to_exprs(&select.projection, &plan)?;
+            let distinct = select.distinct.is_some();
+
+            // Build column references to aggregate output columns
+            let mut output_exprs = Vec::new();
+            for (i, _) in group_by.iter().enumerate() {
+                output_exprs.push(LogicalExpr::Column {
+                    table: None,
+                    name: format!("group_{}", i),
+                });
+            }
+            for (i, _) in aggr_exprs.iter().enumerate() {
+                output_exprs.push(LogicalExpr::Column {
+                    table: None,
+                    name: format!("agg_{}", i),
+                });
+            }
+
+            plan = LogicalPlan::Project {
+                input: Box::new(plan),
+                exprs: output_exprs,
+                aliases,
+                distinct,
+            };
         } else {
             // No aggregates - just add projection (SELECT columns)
             let (exprs, aliases) = self.select_items_to_exprs(&select.projection, &plan)?;
