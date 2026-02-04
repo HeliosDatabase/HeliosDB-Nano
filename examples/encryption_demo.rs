@@ -50,6 +50,7 @@ fn main() -> Result<()> {
             source_table_name: None,
             default_expr: None,
             unique: false,
+            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
         },
         heliosdb_lite::Column {
             name: "ssn".to_string(),
@@ -60,6 +61,7 @@ fn main() -> Result<()> {
             source_table_name: None,
             default_expr: None,
             unique: false,
+            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
         },
         heliosdb_lite::Column {
             name: "credit_card".to_string(),
@@ -70,6 +72,7 @@ fn main() -> Result<()> {
             source_table_name: None,
             default_expr: None,
             unique: false,
+            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
         },
     ]);
 

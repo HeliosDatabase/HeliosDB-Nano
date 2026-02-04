@@ -274,6 +274,7 @@ fn test_selection_pushdown_through_projection() {
         ],
         aliases: vec!["id".to_string(), "name".to_string(), "age".to_string()],
         distinct: false,
+        distinct_on: None,
     };
 
     // Filter on top
@@ -388,6 +389,7 @@ fn test_projection_pruning_removes_unused_columns() {
         ],
         aliases: vec!["name".to_string()],
         distinct: false,
+        distinct_on: None,
     };
 
     let optimized = optimizer.optimize(project).expect("Optimization failed");
@@ -591,6 +593,7 @@ fn test_complex_query_all_optimizations() {
         exprs: vec![LogicalExpr::Column { table: None, name: "name".to_string() }],
         aliases: vec!["name".to_string()],
         distinct: false,
+        distinct_on: None,
     };
 
     // Sort

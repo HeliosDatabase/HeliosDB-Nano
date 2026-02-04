@@ -3460,7 +3460,6 @@ mod tests {
                     default_expr: None,
                     unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                    storage_mode: ColumnStorageMode::Default,
                 },
                 Column {
                     name: "value".to_string(),
@@ -3472,7 +3471,6 @@ mod tests {
                     default_expr: None,
                     unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                    storage_mode: ColumnStorageMode::Default,
                 },
             ],
         };
@@ -3560,7 +3558,6 @@ mod tests {
                     default_expr: None,
                     unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                    storage_mode: ColumnStorageMode::Default,
                 },
             ],
         };
@@ -3624,7 +3621,6 @@ mod tests {
                     default_expr: None,
                     unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                    storage_mode: ColumnStorageMode::Default,
                 },
             ],
         };
@@ -3659,7 +3655,6 @@ mod tests {
                     default_expr: None,
                     unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                    storage_mode: ColumnStorageMode::Default,
                 },
             ],
         };
@@ -3795,7 +3790,6 @@ mod tests {
                     default_expr: None,
                     unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                    storage_mode: ColumnStorageMode::Default,
                 },
                 Column {
                     name: "name".to_string(),
@@ -3807,7 +3801,6 @@ mod tests {
                     default_expr: None,
                     unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                    storage_mode: ColumnStorageMode::Default,
                 },
             ],
         };

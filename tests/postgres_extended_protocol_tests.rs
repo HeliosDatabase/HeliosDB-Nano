@@ -27,6 +27,7 @@ fn test_prepared_statement_manager() {
         query: "SELECT * FROM users WHERE id = $1".to_string(),
         param_types: vec![23], // INT4
         result_schema: None,
+        cached_plan: None,
     };
 
     manager.store_statement(stmt.clone()).unwrap();
@@ -85,6 +86,7 @@ fn test_capacity_limits() {
             query: "SELECT 1".to_string(),
             param_types: vec![],
             result_schema: None,
+            cached_plan: None,
         };
         manager.store_statement(stmt).unwrap();
     }
@@ -95,6 +97,7 @@ fn test_capacity_limits() {
         query: "SELECT 1".to_string(),
         param_types: vec![],
         result_schema: None,
+        cached_plan: None,
     };
     manager.store_statement(stmt).unwrap();
     // stmt0 should have been evicted
@@ -226,6 +229,7 @@ fn test_clear_all() {
             query: "SELECT 1".to_string(),
             param_types: vec![],
             result_schema: None,
+            cached_plan: None,
         };
         manager.store_statement(stmt).unwrap();
 
@@ -293,6 +297,7 @@ fn test_unnamed_statement_and_portal() {
         query: "SELECT $1".to_string(),
         param_types: vec![23],
         result_schema: None,
+        cached_plan: None,
     };
 
     manager.store_statement(stmt).unwrap();

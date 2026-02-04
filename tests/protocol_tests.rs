@@ -2,7 +2,7 @@
 //!
 //! Tests for message encoding/decoding and protocol flows
 
-use heliosdb_lite::{Value, Schema, Column, DataType};
+use heliosdb_lite::{Value, Schema, Column, DataType, ColumnStorageMode};
 use bytes::{BufMut, BytesMut};
 
 /// Helper to write a C string (null-terminated)
@@ -355,6 +355,7 @@ async fn test_schema_to_row_description() {
             source_table_name: None,
             default_expr: None,
             unique: false,
+            storage_mode: ColumnStorageMode::Default,
         },
         Column {
             name: "name".to_string(),
@@ -365,6 +366,7 @@ async fn test_schema_to_row_description() {
             source_table_name: None,
             default_expr: None,
             unique: false,
+            storage_mode: ColumnStorageMode::Default,
         },
     ]);
 

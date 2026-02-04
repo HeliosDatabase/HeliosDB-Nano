@@ -3,7 +3,7 @@
 // This example shows how to use NEW and OLD to access row data in trigger bodies
 
 use heliosdb_lite::sql::{LogicalExpr, Evaluator, triggers::TriggerRowContext};
-use heliosdb_lite::{Schema, Column, DataType, Tuple, Value};
+use heliosdb_lite::{Schema, Column, DataType, Tuple, Value, ColumnStorageMode};
 use std::sync::Arc;
 
 fn main() -> heliosdb_lite::Result<()> {
@@ -22,6 +22,7 @@ fn main() -> heliosdb_lite::Result<()> {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
+                storage_mode: ColumnStorageMode::Default,
             },
             Column {
                 name: "name".to_string(),
@@ -32,6 +33,7 @@ fn main() -> heliosdb_lite::Result<()> {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
+                storage_mode: ColumnStorageMode::Default,
             },
             Column {
                 name: "price".to_string(),
@@ -42,6 +44,7 @@ fn main() -> heliosdb_lite::Result<()> {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
+                storage_mode: ColumnStorageMode::Default,
             },
         ],
     });

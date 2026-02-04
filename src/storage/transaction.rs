@@ -725,7 +725,7 @@ mod tests {
                     source_table_name: None,
                     default_expr: None,
                     unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
                 Column {
                     name: "value".to_string(),
@@ -736,7 +736,7 @@ mod tests {
                     source_table_name: None,
                     default_expr: None,
                     unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
             ],
         };
@@ -819,7 +819,7 @@ mod tests {
                     source_table_name: None,
                     default_expr: None,
                     unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
             ],
         };
@@ -884,7 +884,7 @@ mod tests {
                     source_table_name: None,
                     default_expr: None,
                     unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
             ],
         };

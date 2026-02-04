@@ -618,6 +618,7 @@ mod tests {
                     source_table_name: None,
                 default_expr: None,
                 unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
                 }
             ],
         });
@@ -657,6 +658,7 @@ mod tests {
                     source_table_name: None,
                 default_expr: None,
                 unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
                 }
             ],
         });

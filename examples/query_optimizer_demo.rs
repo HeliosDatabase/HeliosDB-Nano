@@ -128,6 +128,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
+            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
             },
             Column {
                 name: "name".to_string(),
@@ -138,6 +139,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
+            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
             },
             Column {
                 name: "email".to_string(),
@@ -148,6 +150,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
+            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
             },
             Column {
                 name: "age".to_string(),
@@ -158,6 +161,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
+            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
             },
             Column {
                 name: "status".to_string(),
@@ -168,6 +172,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
+            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
             },
         ],
     });
@@ -183,6 +188,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
+            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
             },
             Column {
                 name: "user_id".to_string(),
@@ -193,6 +199,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
+            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
             },
             Column {
                 name: "amount".to_string(),
@@ -203,6 +210,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
+            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
             },
             Column {
                 name: "order_date".to_string(),
@@ -213,6 +221,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
+            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
             },
         ],
     });
@@ -295,6 +304,7 @@ fn demo_selection_pushdown(optimizer: &Optimizer, schema: Arc<Schema>) {
         ],
         aliases: vec!["id".to_string(), "name".to_string(), "age".to_string()],
         distinct: false,
+        distinct_on: None,
     };
 
     let filter = LogicalPlan::Filter {
@@ -347,6 +357,7 @@ fn demo_projection_pruning(optimizer: &Optimizer, schema: Arc<Schema>) {
         exprs: vec![LogicalExpr::Column { table: None, name: "name".to_string() }],
         aliases: vec!["name".to_string()],
         distinct: false,
+        distinct_on: None,
     };
 
     let before_cost = optimizer.cost_estimator().estimate_cost(&project).unwrap_or(0.0);

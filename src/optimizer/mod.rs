@@ -397,6 +397,7 @@ mod tests {
                     source_table_name: None,
                 default_expr: None,
                 unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
                 },
                 Column {
                     name: "name".to_string(),
@@ -407,6 +408,7 @@ mod tests {
                     source_table_name: None,
                 default_expr: None,
                 unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
                 },
                 Column {
                     name: "age".to_string(),
@@ -417,6 +419,7 @@ mod tests {
                     source_table_name: None,
                 default_expr: None,
                 unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
                 },
             ],
         })

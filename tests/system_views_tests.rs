@@ -618,13 +618,10 @@ fn test_pg_compression_stats() {
     use std::collections::HashMap;
     let compression_config = CompressionConfig {
         enabled: true,
-        alp_enabled: true,
-        min_rows_for_compression: 100,
         compression_level: 3,
         min_data_size: 1024,
         min_compression_ratio: 1.2,
         column_overrides: HashMap::new(),
-        adaptive_compression: true,
     };
     storage.catalog().set_compression_config("compressed_table", &compression_config).unwrap();
 

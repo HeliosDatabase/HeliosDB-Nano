@@ -8,7 +8,6 @@
 
 use heliosdb_lite::{Config, StorageEngine, Column, DataType, Schema, Tuple, Value, Error};
 use heliosdb_lite::sql::{LogicalPlan, Executor};
-use heliosdb_lite::storage::compression::CompressionConfig;
 use std::sync::Arc;
 
 #[test]
@@ -236,11 +235,7 @@ fn test_concurrent_refresh_preserves_schema() {
     let storage = StorageEngine::open_in_memory(&config)
         .expect("Failed to open storage");
 
-    // Disable compression to avoid FSST dictionary persistence issues
-    storage.compression_manager().set_config(CompressionConfig {
-        enabled: false,
-        ..Default::default()
-    });
+    // Note: compression is managed at RocksDB level with LZ4
 
     let schema = Schema::new(vec![
         Column::new("name", DataType::Text),
@@ -385,11 +380,7 @@ fn test_catalog_rename_table() {
     let storage = StorageEngine::open_in_memory(&config)
         .expect("Failed to open storage");
 
-    // Disable compression to avoid FSST dictionary persistence issues after rename
-    storage.compression_manager().set_config(CompressionConfig {
-        enabled: false,
-        ..Default::default()
-    });
+    // Note: compression is managed at RocksDB level with LZ4
 
     let catalog = storage.catalog();
 
