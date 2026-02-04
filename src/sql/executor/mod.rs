@@ -24,6 +24,7 @@ pub mod ddl;
 pub mod phase3;
 pub mod explain;
 pub mod window;
+pub mod set_ops;
 
 // Re-export operators for public API
 pub use scan::{ScanOperator, VectorScanOperator, MaterializedOperator};
@@ -32,6 +33,7 @@ pub use project::{ProjectOperator, LimitOperator};
 pub use join::{NestedLoopJoinOperator, HashJoinOperator};
 pub use aggregate::{AggregateOperator, SortOperator};
 pub use window::WindowOperator;
+pub use set_ops::{UnionOperator, IntersectOperator, ExceptOperator};
 
 /// DualScan operator for SELECT without FROM
 ///
@@ -321,6 +323,22 @@ impl<'a> Executor<'a> {
                     negated: *negated,
                 })
             }
+            LogicalExpr::Exists { subquery, negated } => {
+                // Execute the subquery to check if any rows exist
+                let mut subquery_executor = Executor::new();
+                if let Some(storage) = self.storage {
+                    subquery_executor = Executor::with_storage(storage);
+                }
+                subquery_executor = subquery_executor.with_parameters(self.parameters.clone());
+
+                let results = subquery_executor.execute(subquery)?;
+
+                // EXISTS returns true if subquery returns any rows
+                let exists = !results.is_empty();
+                let result = if *negated { !exists } else { exists };
+
+                Ok(LogicalExpr::Literal(crate::Value::Boolean(result)))
+            }
             // Recursively process compound expressions
             LogicalExpr::BinaryExpr { left, op, right } => {
                 Ok(LogicalExpr::BinaryExpr {
@@ -403,7 +421,7 @@ impl<'a> Executor<'a> {
                     self.parameters.clone(),
                 ).with_timeout(self.timeout_ctx.clone())))
             }
-            LogicalPlan::Project { input, exprs, aliases, distinct } => {
+            LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => {
                 use crate::sql::LogicalExpr;
 
                 // Check if any expressions are window functions
@@ -463,20 +481,27 @@ impl<'a> Executor<'a> {
                         })
                         .collect();
 
-                    Ok(Box::new(ProjectOperator::new(
+                    Ok(Box::new(ProjectOperator::new_with_distinct_on(
                         Box::new(window_op),
                         modified_exprs,
                         aliases.clone(),
                         *distinct,
+                        distinct_on.clone(),
                         self.parameters.clone(),
                     ).with_timeout(self.timeout_ctx.clone())))
                 } else {
                     let input_op = self.plan_to_operator(input)?;
-                    Ok(Box::new(ProjectOperator::new(
+                    // Materialize any subqueries in project expressions
+                    let materialized_exprs: Vec<LogicalExpr> = exprs
+                        .iter()
+                        .map(|e| self.materialize_subqueries(e))
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Box::new(ProjectOperator::new_with_distinct_on(
                         input_op,
-                        exprs.clone(),
+                        materialized_exprs,
                         aliases.clone(),
                         *distinct,
+                        distinct_on.clone(),
                         self.parameters.clone(),
                     ).with_timeout(self.timeout_ctx.clone())))
                 }
@@ -511,6 +536,21 @@ impl<'a> Executor<'a> {
             }
             LogicalPlan::Join { left, right, join_type, on } => {
                 join::handle_join(self, left, right, join_type, on)
+            }
+            LogicalPlan::Union { left, right, all } => {
+                let left_op = self.plan_to_operator(left)?;
+                let right_op = self.plan_to_operator(right)?;
+                Ok(Box::new(UnionOperator::new(left_op, right_op, *all)?))
+            }
+            LogicalPlan::Intersect { left, right, all } => {
+                let left_op = self.plan_to_operator(left)?;
+                let right_op = self.plan_to_operator(right)?;
+                Ok(Box::new(IntersectOperator::new(left_op, right_op, *all)?))
+            }
+            LogicalPlan::Except { left, right, all } => {
+                let left_op = self.plan_to_operator(left)?;
+                let right_op = self.plan_to_operator(right)?;
+                Ok(Box::new(ExceptOperator::new(left_op, right_op, *all)?))
             }
             LogicalPlan::CreateIndex { .. } => {
                 ddl::handle_create_index(self, plan)

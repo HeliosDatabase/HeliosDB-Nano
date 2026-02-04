@@ -610,9 +610,37 @@ impl<'a> Planner<'a> {
 
     /// Convert a SetExpr to a logical plan
     fn set_expr_to_plan(&self, set_expr: SetExpr) -> Result<LogicalPlan> {
+        use sqlparser::ast::{SetOperator, SetQuantifier};
+
         match set_expr {
             SetExpr::Select(select) => self.select_to_plan(*select),
-            _ => Err(Error::query_execution("UNION/INTERSECT/EXCEPT not yet supported")),
+            SetExpr::SetOperation { op, set_quantifier, left, right } => {
+                let left_plan = self.set_expr_to_plan(*left)?;
+                let right_plan = self.set_expr_to_plan(*right)?;
+
+                // ALL keyword means keep duplicates
+                let all = matches!(set_quantifier, SetQuantifier::All | SetQuantifier::AllByName);
+
+                match op {
+                    SetOperator::Union => Ok(LogicalPlan::Union {
+                        left: Box::new(left_plan),
+                        right: Box::new(right_plan),
+                        all,
+                    }),
+                    SetOperator::Intersect => Ok(LogicalPlan::Intersect {
+                        left: Box::new(left_plan),
+                        right: Box::new(right_plan),
+                        all,
+                    }),
+                    SetOperator::Except => Ok(LogicalPlan::Except {
+                        left: Box::new(left_plan),
+                        right: Box::new(right_plan),
+                        all,
+                    }),
+                }
+            }
+            SetExpr::Query(query) => self.query_to_plan(*query),
+            _ => Err(Error::query_execution("Unsupported set expression")),
         }
     }
 
@@ -697,16 +725,32 @@ impl<'a> Planner<'a> {
                 exprs: output_exprs,
                 aliases,
                 distinct,
+                distinct_on: None,
             };
         } else {
             // No aggregates - just add projection (SELECT columns)
             let (exprs, aliases) = self.select_items_to_exprs(&select.projection, &plan)?;
-            let distinct = select.distinct.is_some();
+
+            // Handle DISTINCT and DISTINCT ON
+            let (distinct, distinct_on) = match &select.distinct {
+                None => (false, None),
+                Some(sqlparser::ast::Distinct::Distinct) => (true, None),
+                Some(sqlparser::ast::Distinct::On(on_exprs)) => {
+                    // DISTINCT ON (expr1, expr2, ...)
+                    let on_parsed: Result<Vec<LogicalExpr>> = on_exprs
+                        .iter()
+                        .map(|e| self.expr_to_logical(e))
+                        .collect();
+                    (true, Some(on_parsed?))
+                }
+            };
+
             plan = LogicalPlan::Project {
                 input: Box::new(plan),
                 exprs,
                 aliases,
                 distinct,
+                distinct_on,
             };
         }
 

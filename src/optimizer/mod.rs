@@ -247,13 +247,14 @@ impl Optimizer {
                     predicate,
                 }
             }
-            LogicalPlan::Project { input, exprs, aliases, distinct } => {
+            LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => {
                 let optimized_input = self.optimize_recursive(*input)?;
                 LogicalPlan::Project {
                     input: Box::new(optimized_input),
                     exprs,
                     aliases,
                     distinct,
+                    distinct_on,
                 }
             }
             LogicalPlan::Join { left, right, join_type, on } => {

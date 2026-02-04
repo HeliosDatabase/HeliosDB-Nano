@@ -4,10 +4,11 @@
 //! for the PostgreSQL extended query protocol.
 
 use crate::{Result, Error, Value, Schema, Tuple};
+use crate::sql::logical_plan::LogicalPlan;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-/// Prepared statement
+/// Prepared statement with optional cached plan
 #[derive(Debug, Clone)]
 pub struct PreparedStatement {
     /// Statement name (empty string for unnamed)
@@ -18,6 +19,9 @@ pub struct PreparedStatement {
     pub param_types: Vec<i32>,
     /// Result schema (if available)
     pub result_schema: Option<Schema>,
+    /// Cached logical plan (avoids re-parsing on each Execute)
+    /// The plan contains Parameter nodes that are resolved at execution time
+    pub cached_plan: Option<LogicalPlan>,
 }
 
 /// Portal (bound statement ready for execution)
@@ -435,6 +439,7 @@ mod tests {
             query: "SELECT * FROM users WHERE id = $1".to_string(),
             param_types: vec![23], // INT4
             result_schema: None,
+            cached_plan: None,
         };
 
         manager.store_statement(stmt.clone()).unwrap();
@@ -519,6 +524,7 @@ mod tests {
                 query: "SELECT 1".to_string(),
                 param_types: vec![],
                 result_schema: None,
+                cached_plan: None,
             };
             manager.store_statement(stmt).unwrap();
         }
@@ -529,6 +535,7 @@ mod tests {
             query: "SELECT 1".to_string(),
             param_types: vec![],
             result_schema: None,
+            cached_plan: None,
         };
         let result = manager.store_statement(stmt);
         assert!(result.is_ok(), "LRU eviction should allow new statement");

@@ -377,6 +377,26 @@ impl Evaluator {
             "jsonb_path_query" => {
                 self.jsonb_path_query(&arg_values)
             }
+            "jsonb_path_query_array" => {
+                self.jsonb_path_query_array(&arg_values)
+            }
+            "jsonb_path_query_first" => {
+                self.jsonb_path_query_first(&arg_values)
+            }
+            "jsonb_path_exists" => {
+                self.jsonb_path_exists(&arg_values)
+            }
+            "jsonb_path_match" => {
+                self.jsonb_path_match(&arg_values)
+            }
+
+            // JSONB formatting functions
+            "jsonb_pretty" => {
+                self.jsonb_pretty(&arg_values)
+            }
+            "jsonb_strip_nulls" => {
+                self.jsonb_strip_nulls(&arg_values)
+            }
 
             // JSONB construction functions (Phase 1)
             "jsonb_build_object" | "json_build_object" => {
@@ -453,6 +473,22 @@ impl Evaluator {
                     Ok(Value::Null)
                 }
             }
+
+            // NULL handling functions
+            "coalesce" => self.func_coalesce(&arg_values),
+            "nullif" => self.func_nullif(&arg_values),
+            "ifnull" | "nvl" => self.func_coalesce(&arg_values), // Aliases for COALESCE(a, b)
+
+            // Array functions (PostgreSQL compatible)
+            "array_length" => self.array_length(&arg_values),
+            "array_upper" => self.array_upper(&arg_values),
+            "array_lower" => self.array_lower(&arg_values),
+            "array_append" => self.array_append(&arg_values),
+            "array_prepend" => self.array_prepend(&arg_values),
+            "array_cat" => self.array_cat(&arg_values),
+            "array_remove" => self.array_remove(&arg_values),
+            "array_position" => self.array_position(&arg_values),
+            "cardinality" => self.array_cardinality(&arg_values),
 
             _ => Err(Error::query_execution(format!(
                 "Unknown scalar function: {}",
@@ -744,6 +780,113 @@ impl Evaluator {
         }
 
         Ok(Value::Json(current.to_string()))
+    }
+
+    /// jsonb_path_query_array(target, path)
+    /// Query JSON using path and return results as an array
+    fn jsonb_path_query_array(&self, args: &[Value]) -> Result<Value> {
+        let result = self.jsonb_path_query(args)?;
+        match result {
+            Value::Array(_) => Ok(result),
+            Value::Null => Ok(Value::Null),
+            other => Ok(Value::Array(vec![other])),
+        }
+    }
+
+    /// jsonb_path_query_first(target, path)
+    /// Query JSON using path and return first result
+    fn jsonb_path_query_first(&self, args: &[Value]) -> Result<Value> {
+        let result = self.jsonb_path_query(args)?;
+        match result {
+            Value::Array(arr) => Ok(arr.into_iter().next().unwrap_or(Value::Null)),
+            other => Ok(other),
+        }
+    }
+
+    /// jsonb_path_exists(target, path)
+    /// Check if path exists in JSON
+    fn jsonb_path_exists(&self, args: &[Value]) -> Result<Value> {
+        let result = self.jsonb_path_query(args)?;
+        let exists = !matches!(result, Value::Null);
+        Ok(Value::Boolean(exists))
+    }
+
+    /// jsonb_path_match(target, path)
+    /// Check if path returns true
+    fn jsonb_path_match(&self, args: &[Value]) -> Result<Value> {
+        let result = self.jsonb_path_query(args)?;
+        match result {
+            Value::Boolean(b) => Ok(Value::Boolean(b)),
+            Value::Json(s) => {
+                if s == "true" {
+                    Ok(Value::Boolean(true))
+                } else if s == "false" {
+                    Ok(Value::Boolean(false))
+                } else {
+                    Ok(Value::Null)
+                }
+            }
+            _ => Ok(Value::Null),
+        }
+    }
+
+    /// jsonb_pretty(json)
+    /// Pretty print JSON
+    fn jsonb_pretty(&self, args: &[Value]) -> Result<Value> {
+        if args.is_empty() {
+            return Err(Error::query_execution("jsonb_pretty requires an argument"));
+        }
+
+        let json_str = match &args[0] {
+            Value::Json(j) => j,
+            Value::Null => return Ok(Value::Null),
+            _ => return Err(Error::query_execution("Argument must be JSON")),
+        };
+
+        let json: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+
+        let pretty = serde_json::to_string_pretty(&json)
+            .map_err(|e| Error::query_execution(format!("Failed to format JSON: {}", e)))?;
+
+        Ok(Value::String(pretty))
+    }
+
+    /// jsonb_strip_nulls(json)
+    /// Remove null values from JSON
+    fn jsonb_strip_nulls(&self, args: &[Value]) -> Result<Value> {
+        if args.is_empty() {
+            return Err(Error::query_execution("jsonb_strip_nulls requires an argument"));
+        }
+
+        let json_str = match &args[0] {
+            Value::Json(j) => j,
+            Value::Null => return Ok(Value::Null),
+            _ => return Err(Error::query_execution("Argument must be JSON")),
+        };
+
+        let json: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+
+        fn strip_nulls(val: serde_json::Value) -> serde_json::Value {
+            match val {
+                serde_json::Value::Object(map) => {
+                    let new_map: serde_json::Map<String, serde_json::Value> = map
+                        .into_iter()
+                        .filter(|(_, v)| !v.is_null())
+                        .map(|(k, v)| (k, strip_nulls(v)))
+                        .collect();
+                    serde_json::Value::Object(new_map)
+                }
+                serde_json::Value::Array(arr) => {
+                    serde_json::Value::Array(arr.into_iter().map(strip_nulls).collect())
+                }
+                other => other,
+            }
+        }
+
+        let stripped = strip_nulls(json);
+        Ok(Value::Json(stripped.to_string()))
     }
 
     /// jsonb_build_object(key1, val1, key2, val2, ...)
@@ -2053,6 +2196,248 @@ impl Evaluator {
             ));
         }
         self.vector_distance_op(&args[0], &args[1], crate::vector::inner_product_distance)
+    }
+
+    /// COALESCE(val1, val2, ...) - return first non-null value
+    fn func_coalesce(&self, args: &[Value]) -> Result<Value> {
+        for arg in args {
+            if !matches!(arg, Value::Null) {
+                return Ok(arg.clone());
+            }
+        }
+        // All values are NULL, return NULL
+        Ok(Value::Null)
+    }
+
+    /// NULLIF(val1, val2) - return NULL if val1 = val2, else val1
+    fn func_nullif(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::query_execution("NULLIF requires exactly 2 arguments"));
+        }
+        let val1 = &args[0];
+        let val2 = &args[1];
+
+        // If val1 equals val2, return NULL
+        if self.values_equal(val1, val2) {
+            Ok(Value::Null)
+        } else {
+            Ok(val1.clone())
+        }
+    }
+
+    /// array_length(arr, dimension) - returns length of array dimension (1-based)
+    /// PostgreSQL compatible: dimension is typically 1 for one-dimensional arrays
+    fn array_length(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::query_execution(
+                "array_length requires exactly two arguments"
+            ));
+        }
+
+        match (&args[0], &args[1]) {
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (Value::Array(arr), Value::Int2(dim)) if *dim == 1 => {
+                Ok(Value::Int4(arr.len() as i32))
+            }
+            (Value::Array(arr), Value::Int4(dim)) if *dim == 1 => {
+                Ok(Value::Int4(arr.len() as i32))
+            }
+            (Value::Array(arr), Value::Int8(dim)) if *dim == 1 => {
+                Ok(Value::Int4(arr.len() as i32))
+            }
+            // Also support Vector type
+            (Value::Vector(vec), Value::Int2(dim)) if *dim == 1 => {
+                Ok(Value::Int4(vec.len() as i32))
+            }
+            (Value::Vector(vec), Value::Int4(dim)) if *dim == 1 => {
+                Ok(Value::Int4(vec.len() as i32))
+            }
+            (Value::Vector(vec), Value::Int8(dim)) if *dim == 1 => {
+                Ok(Value::Int4(vec.len() as i32))
+            }
+            (Value::Array(_), _) | (Value::Vector(_), _) => {
+                // Dimension other than 1 for one-dimensional array returns NULL
+                Ok(Value::Null)
+            }
+            _ => Err(Error::query_execution(
+                "array_length requires an array and an integer dimension"
+            )),
+        }
+    }
+
+    /// array_upper(arr, dimension) - returns upper bound of array dimension (1-based)
+    fn array_upper(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::query_execution(
+                "array_upper requires exactly two arguments"
+            ));
+        }
+
+        match (&args[0], &args[1]) {
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (Value::Array(arr), Value::Int2(dim)) if *dim == 1 => {
+                Ok(Value::Int4(arr.len() as i32))
+            }
+            (Value::Array(arr), Value::Int4(dim)) if *dim == 1 => {
+                Ok(Value::Int4(arr.len() as i32))
+            }
+            (Value::Array(arr), Value::Int8(dim)) if *dim == 1 => {
+                Ok(Value::Int4(arr.len() as i32))
+            }
+            (Value::Array(_), _) => Ok(Value::Null),
+            _ => Err(Error::query_execution(
+                "array_upper requires an array and an integer dimension"
+            )),
+        }
+    }
+
+    /// array_lower(arr, dimension) - returns lower bound of array dimension (always 1 in PostgreSQL)
+    fn array_lower(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::query_execution(
+                "array_lower requires exactly two arguments"
+            ));
+        }
+
+        match (&args[0], &args[1]) {
+            (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+            (Value::Array(arr), _) if arr.is_empty() => Ok(Value::Null),
+            (Value::Array(_), Value::Int2(dim)) if *dim == 1 => {
+                Ok(Value::Int4(1))
+            }
+            (Value::Array(_), Value::Int4(dim)) if *dim == 1 => {
+                Ok(Value::Int4(1))
+            }
+            (Value::Array(_), Value::Int8(dim)) if *dim == 1 => {
+                Ok(Value::Int4(1))
+            }
+            (Value::Array(_), _) => Ok(Value::Null),
+            _ => Err(Error::query_execution(
+                "array_lower requires an array and an integer dimension"
+            )),
+        }
+    }
+
+    /// array_append(arr, element) - appends element to array
+    fn array_append(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::query_execution(
+                "array_append requires exactly two arguments"
+            ));
+        }
+
+        match (&args[0], &args[1]) {
+            (Value::Array(arr), elem) => {
+                let mut result = arr.clone();
+                result.push(elem.clone());
+                Ok(Value::Array(result))
+            }
+            (Value::Null, elem) => {
+                Ok(Value::Array(vec![elem.clone()]))
+            }
+            _ => Err(Error::query_execution(
+                "array_append requires an array as first argument"
+            )),
+        }
+    }
+
+    /// array_prepend(element, arr) - prepends element to array
+    fn array_prepend(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::query_execution(
+                "array_prepend requires exactly two arguments"
+            ));
+        }
+
+        match (&args[0], &args[1]) {
+            (elem, Value::Array(arr)) => {
+                let mut result = vec![elem.clone()];
+                result.extend(arr.clone());
+                Ok(Value::Array(result))
+            }
+            (elem, Value::Null) => {
+                Ok(Value::Array(vec![elem.clone()]))
+            }
+            _ => Err(Error::query_execution(
+                "array_prepend requires an array as second argument"
+            )),
+        }
+    }
+
+    /// array_cat(arr1, arr2) - concatenates two arrays
+    fn array_cat(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::query_execution(
+                "array_cat requires exactly two arguments"
+            ));
+        }
+
+        self.array_concat_op(&args[0], &args[1])
+    }
+
+    /// array_remove(arr, element) - removes all occurrences of element from array
+    fn array_remove(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::query_execution(
+                "array_remove requires exactly two arguments"
+            ));
+        }
+
+        match (&args[0], &args[1]) {
+            (Value::Array(arr), elem) => {
+                let result: Vec<Value> = arr.iter()
+                    .filter(|v| *v != elem)
+                    .cloned()
+                    .collect();
+                Ok(Value::Array(result))
+            }
+            (Value::Null, _) => Ok(Value::Null),
+            _ => Err(Error::query_execution(
+                "array_remove requires an array as first argument"
+            )),
+        }
+    }
+
+    /// array_position(arr, element) - returns 1-based position of first occurrence
+    fn array_position(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::query_execution(
+                "array_position requires exactly two arguments"
+            ));
+        }
+
+        match (&args[0], &args[1]) {
+            (Value::Array(arr), elem) => {
+                for (i, v) in arr.iter().enumerate() {
+                    if v == elem {
+                        return Ok(Value::Int4((i + 1) as i32)); // 1-based index
+                    }
+                }
+                Ok(Value::Null)
+            }
+            (Value::Null, _) => Ok(Value::Null),
+            _ => Err(Error::query_execution(
+                "array_position requires an array as first argument"
+            )),
+        }
+    }
+
+    /// cardinality(arr) - returns total number of elements in array
+    fn array_cardinality(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution(
+                "cardinality requires exactly one argument"
+            ));
+        }
+
+        match &args[0] {
+            Value::Array(arr) => Ok(Value::Int8(arr.len() as i64)),
+            Value::Vector(vec) => Ok(Value::Int8(vec.len() as i64)),
+            Value::Null => Ok(Value::Null),
+            _ => Err(Error::query_execution(
+                "cardinality requires an array argument"
+            )),
+        }
     }
 
     /// JSON get operator: -> or ->>

@@ -16,6 +16,7 @@ pub mod triggers;
 pub mod constraints;
 pub mod procedural;
 pub mod functions;
+pub mod query_cache;
 
 // EXPLAIN modules (Week 7-8)
 pub mod explain;
@@ -68,6 +69,9 @@ pub use procedural::{
 
 // Function registry exports
 pub use functions::{FunctionRegistry, StoredFunction, StoredProcedure};
+
+// Query cache exports
+pub use query_cache::{QueryCache, CacheKey, CachedResult, CacheStats};
 
 // EXPLAIN options and storage features exports
 pub use explain_options::{ExplainOptions, ExplainFormatOption};

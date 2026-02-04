@@ -18,6 +18,8 @@ pub struct ProjectOperator {
     distinct: bool,
     seen: std::collections::HashSet<Vec<u8>>,
     timeout_ctx: Option<TimeoutContext>,
+    /// DISTINCT ON expressions (PostgreSQL extension)
+    distinct_on_exprs: Option<Vec<crate::sql::LogicalExpr>>,
 }
 
 impl ProjectOperator {
@@ -26,6 +28,17 @@ impl ProjectOperator {
         exprs: Vec<crate::sql::LogicalExpr>,
         aliases: Vec<String>,
         distinct: bool,
+        parameters: Vec<crate::Value>,
+    ) -> Self {
+        Self::new_with_distinct_on(input, exprs, aliases, distinct, None, parameters)
+    }
+
+    pub fn new_with_distinct_on(
+        input: Box<dyn PhysicalOperator>,
+        exprs: Vec<crate::sql::LogicalExpr>,
+        aliases: Vec<String>,
+        distinct: bool,
+        distinct_on: Option<Vec<crate::sql::LogicalExpr>>,
         parameters: Vec<crate::Value>,
     ) -> Self {
         // Get input schema for type inference
@@ -67,6 +80,7 @@ impl ProjectOperator {
             distinct,
             seen: std::collections::HashSet::new(),
             timeout_ctx: None,
+            distinct_on_exprs: distinct_on,
         }
     }
 
@@ -92,8 +106,24 @@ impl PhysicalOperator for ProjectOperator {
                     // Preserve row_id through projection for DML operations
                     output_tuple.row_id = tuple.row_id;
 
-                    // If DISTINCT, check for duplicates
-                    if self.distinct {
+                    // Handle DISTINCT ON (PostgreSQL extension)
+                    // Only return the first row for each unique combination of DISTINCT ON expressions
+                    if let Some(ref distinct_on_exprs) = self.distinct_on_exprs {
+                        let key_values: Result<Vec<crate::Value>> = distinct_on_exprs.iter()
+                            .map(|expr| self.evaluator.evaluate(expr, &tuple))
+                            .collect();
+                        let key = bincode::serialize(&key_values?)
+                            .map_err(|e| crate::Error::query_execution(
+                                format!("Failed to serialize DISTINCT ON key: {}", e)
+                            ))?;
+
+                        if self.seen.contains(&key) {
+                            // Skip rows with duplicate DISTINCT ON values
+                            continue;
+                        }
+                        self.seen.insert(key);
+                    } else if self.distinct {
+                        // Regular DISTINCT - check for duplicates using full tuple values
                         // Serialize only the values for deduplication (not row_id or branch_id)
                         let serialized = bincode::serialize(&output_tuple.values)
                             .map_err(|e| crate::Error::query_execution(

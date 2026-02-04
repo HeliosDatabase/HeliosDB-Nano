@@ -214,7 +214,7 @@ impl Planner {
             }
 
             // Projection - plan input, then add projection
-            LogicalPlan::Project { input, exprs, aliases, distinct: _ } => {
+            LogicalPlan::Project { input, exprs, aliases, distinct: _, distinct_on: _ } => {
                 if self.verbose {
                     eprintln!("Planning: Projection ({} columns)", exprs.len());
                 }
@@ -330,9 +330,12 @@ impl Planner {
             LogicalPlan::Commit |
             LogicalPlan::Rollback |
             LogicalPlan::SetConstraints { .. } |
+            LogicalPlan::Union { .. } |
+            LogicalPlan::Intersect { .. } |
+            LogicalPlan::Except { .. } |
             LogicalPlan::DualScan => {
                 return Err(Error::internal(
-                    "DML/DDL/CTE/TRIGGER/EXPLAIN/Transaction/Procedural/DualScan operations should be executed directly, not planned"
+                    "DML/DDL/CTE/TRIGGER/EXPLAIN/Transaction/Procedural/SetOps/DualScan operations should be executed directly, not planned"
                 ));
             }
 

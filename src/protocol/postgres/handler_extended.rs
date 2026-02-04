@@ -55,12 +55,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             inferred_param_types.len()
         );
 
-        // Create prepared statement
+        // Create prepared statement with cached plan for faster execution
         let prepared = PreparedStatement {
             name: statement_name.clone(),
             query: query.clone(),
             param_types: inferred_param_types,
             result_schema,
+            cached_plan: None, // Plan will be parsed and cached on first execute
         };
 
         // Store in prepared statement manager

@@ -1188,10 +1188,9 @@ impl EmbeddedDatabase {
                 }
 
                 let update_count = updates.len() as u64;
-                // Use branch-aware update which properly handles:
-                // - Main branch: direct key update
-                // - Other branches: write to branch-specific keys
-                self.storage.update_tuples_branch_aware(table_name, updates.clone())?;
+                // Buffer updates in transaction write set for ACID guarantees
+                // Updates are only visible after transaction commits
+                txn.update_tuples(table_name, updates.clone())?;
 
                 // Update storage quota tracking (UPDATEs may change storage size)
                 if let Some(context) = self.tenant_manager.get_current_context() {
@@ -1402,10 +1401,9 @@ impl EmbeddedDatabase {
                 }
 
                 let delete_count = row_ids_to_delete.len() as u64;
-                // Use branch-aware delete which properly handles:
-                // - Main branch: actual key deletion
-                // - Other branches: delete marker creation
-                self.storage.delete_tuples_branch_aware(table_name, row_ids_to_delete)?;
+                // Buffer deletions in transaction write set for ACID guarantees
+                // Deletions are only visible after transaction commits
+                txn.delete_tuples(table_name, row_ids_to_delete)?;
 
                 // Update storage quota tracking (reclaim deleted storage)
                 if let Some(context) = self.tenant_manager.get_current_context() {
@@ -2661,21 +2659,32 @@ impl EmbeddedDatabase {
                     }
                 }
 
+                // Project RETURNING clause columns from updated tuples
+                let returned_tuples: Vec<Tuple> = if returning.is_some() {
+                    updates.iter()
+                        .filter_map(|(_, tuple)| Self::project_returning_columns(tuple, &schema, returning))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
                 // Use branch-aware update
                 let count = self.storage.update_tuples_branch_aware(table_name, updates)?;
-                Ok((count, Vec::new()))
+                Ok((count, returned_tuples))
             }
             sql::LogicalPlan::Delete { table_name, selection, returning } => {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
                 let evaluator = sql::Evaluator::with_parameters(
-                    std::sync::Arc::new(schema),
+                    std::sync::Arc::new(schema.clone()),
                     params.to_vec(),
                 );
 
                 // Use branch-aware scan to read tuples
                 let tuples = self.storage.scan_table_branch_aware(table_name)?;
                 let mut row_ids_to_delete: Vec<u64> = Vec::new();
+                let mut returned_tuples: Vec<Tuple> = Vec::new();
+                let has_returning = returning.is_some();
 
                 for tuple in tuples {
                     let matches = if let Some(predicate) = selection {
@@ -2689,6 +2698,13 @@ impl EmbeddedDatabase {
                     };
 
                     if matches {
+                        // Collect tuple for RETURNING clause before deletion
+                        if has_returning {
+                            if let Some(projected) = Self::project_returning_columns(&tuple, &schema, returning) {
+                                returned_tuples.push(projected);
+                            }
+                        }
+
                         if let Some(row_id) = tuple.row_id {
                             row_ids_to_delete.push(row_id);
                         }
@@ -2697,7 +2713,7 @@ impl EmbeddedDatabase {
 
                 // Use branch-aware delete
                 let count = self.storage.delete_tuples_branch_aware(table_name, row_ids_to_delete)?;
-                Ok((count, Vec::new()))
+                Ok((count, returned_tuples))
             }
             // Transaction control statements
             sql::LogicalPlan::StartTransaction => {
@@ -4387,12 +4403,13 @@ impl EmbeddedDatabase {
                 })
             }
 
-            sql::LogicalPlan::Project { input, exprs, aliases, distinct } => {
+            sql::LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => {
                 Ok(sql::LogicalPlan::Project {
                     input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
                     exprs,
                     aliases,
                     distinct,
+                    distinct_on,
                 })
             }
 

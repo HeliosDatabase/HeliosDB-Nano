@@ -49,7 +49,7 @@ impl SelectionPushdownRule {
         project: Box<LogicalPlan>,
         filter_pred: LogicalExpr,
     ) -> Result<Option<LogicalPlan>> {
-        if let LogicalPlan::Project { input, exprs, aliases, distinct } = *project {
+        if let LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } = *project {
             // Create filter below projection
             let new_filter = LogicalPlan::Filter {
                 input,
@@ -62,6 +62,7 @@ impl SelectionPushdownRule {
                 exprs,
                 aliases,
                 distinct,
+                distinct_on,
             }))
         } else {
             Ok(None)
@@ -309,6 +310,7 @@ impl ProjectionPruningRule {
                     exprs,
                     aliases,
                     distinct: false,
+                    distinct_on: None,
                 }));
             }
         }
@@ -328,7 +330,7 @@ impl OptimizationRule for ProjectionPruningRule {
 
     fn apply(&self, plan: LogicalPlan, _cost_estimator: &CostEstimator) -> Result<Option<LogicalPlan>> {
         match plan {
-            LogicalPlan::Project { input, exprs, aliases, distinct: false } => {
+            LogicalPlan::Project { input, exprs, aliases, distinct: false, distinct_on: None } => {
                 self.prune_projection(input, exprs, aliases)
             }
             _ => Ok(None),
@@ -681,7 +683,7 @@ impl ConstantFoldingRule {
                     predicate: folded_predicate,
                 })
             }
-            LogicalPlan::Project { input, exprs, aliases, distinct } => {
+            LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => {
                 let folded_exprs: Result<Vec<_>> = exprs.into_iter()
                     .map(|e| self.fold_expr(e))
                     .collect();
@@ -690,6 +692,7 @@ impl ConstantFoldingRule {
                     exprs: folded_exprs?,
                     aliases,
                     distinct,
+                    distinct_on,
                 })
             }
             other => Ok(other),

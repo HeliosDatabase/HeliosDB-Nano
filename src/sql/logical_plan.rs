@@ -171,6 +171,8 @@ pub enum LogicalPlan {
         aliases: Vec<String>,
         /// Whether to deduplicate results (DISTINCT)
         distinct: bool,
+        /// DISTINCT ON expressions (PostgreSQL extension)
+        distinct_on: Option<Vec<LogicalExpr>>,
     },
 
     /// Aggregate
@@ -215,6 +217,36 @@ pub enum LogicalPlan {
         limit: usize,
         /// Number of rows to skip
         offset: usize,
+    },
+
+    /// UNION - combine results from two queries
+    Union {
+        /// Left input plan
+        left: Box<LogicalPlan>,
+        /// Right input plan
+        right: Box<LogicalPlan>,
+        /// If true, keep duplicates (UNION ALL)
+        all: bool,
+    },
+
+    /// INTERSECT - rows that appear in both queries
+    Intersect {
+        /// Left input plan
+        left: Box<LogicalPlan>,
+        /// Right input plan
+        right: Box<LogicalPlan>,
+        /// If true, keep duplicates (INTERSECT ALL)
+        all: bool,
+    },
+
+    /// EXCEPT - rows in left that don't appear in right
+    Except {
+        /// Left input plan
+        left: Box<LogicalPlan>,
+        /// Right input plan
+        right: Box<LogicalPlan>,
+        /// If true, keep duplicates (EXCEPT ALL)
+        all: bool,
     },
 
     /// Insert values
@@ -1178,6 +1210,10 @@ impl LogicalPlan {
             }
             LogicalPlan::Sort { input, .. } => input.schema(),
             LogicalPlan::Limit { input, .. } => input.schema(),
+            // Set operations use left schema (both sides must have compatible schemas)
+            LogicalPlan::Union { left, .. } => left.schema(),
+            LogicalPlan::Intersect { left, .. } => left.schema(),
+            LogicalPlan::Except { left, .. } => left.schema(),
             LogicalPlan::Join { left, right, .. } => {
                 // Combine schemas from left and right
                 let mut columns = left.schema().columns.clone();

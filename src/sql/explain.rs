@@ -385,12 +385,15 @@ impl ExplainPlanner {
                 })
             }
 
-            LogicalPlan::Project { input, exprs, aliases, distinct } => {
+            LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => {
                 let input_node = self.plan_to_node(input, depth + 1)?;
 
                 let mut details = HashMap::new();
                 details.insert("expressions".to_string(), format!("{}", exprs.len()));
                 details.insert("distinct".to_string(), distinct.to_string());
+                if let Some(on_exprs) = distinct_on {
+                    details.insert("distinct_on".to_string(), format!("{} columns", on_exprs.len()));
+                }
 
                 let cost = input_node.cost + (input_node.rows as f64 * exprs.len() as f64 * 0.01);
                 let rows = if *distinct {

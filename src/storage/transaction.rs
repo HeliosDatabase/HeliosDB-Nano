@@ -317,6 +317,62 @@ impl Transaction {
         Ok(())
     }
 
+    /// Update tuples within transaction
+    ///
+    /// Buffers updates in the transaction's write set instead of writing directly to storage.
+    /// This ensures ACID guarantees - writes are only visible after commit.
+    pub fn update_tuples(&self, table_name: &str, updates: Vec<(u64, crate::Tuple)>) -> Result<u64> {
+        // Lock-free state check
+        let state_value = self.state.load(Ordering::Acquire);
+        let state = TransactionState::from_u8(state_value);
+        if state != TransactionState::Active {
+            return Err(Error::transaction("Transaction is not active"));
+        }
+
+        let mut update_count = 0u64;
+
+        for (row_id, tuple) in updates {
+            // Format key for data table (using main branch format)
+            let key = format!("data:{}:{}", table_name, row_id).into_bytes();
+
+            // Serialize tuple
+            let value = bincode::serialize(&tuple)
+                .map_err(|e| crate::Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+
+            // Buffer in write set (will be applied on commit)
+            self.put(key, value)?;
+            update_count += 1;
+        }
+
+        Ok(update_count)
+    }
+
+    /// Delete tuples within transaction
+    ///
+    /// Buffers deletions as tombstones in the transaction's write set.
+    /// This ensures ACID guarantees - deletions are only visible after commit.
+    pub fn delete_tuples(&self, table_name: &str, row_ids: Vec<u64>) -> Result<u64> {
+        // Lock-free state check
+        let state_value = self.state.load(Ordering::Acquire);
+        let state = TransactionState::from_u8(state_value);
+        if state != TransactionState::Active {
+            return Err(Error::transaction("Transaction is not active"));
+        }
+
+        let mut delete_count = 0u64;
+
+        for row_id in row_ids {
+            // Format key for data table (using main branch format)
+            let key = format!("data:{}:{}", table_name, row_id).into_bytes();
+
+            // Buffer tombstone in write set (will be applied on commit)
+            self.delete(key)?;
+            delete_count += 1;
+        }
+
+        Ok(delete_count)
+    }
+
     /// Check if transaction is active
     ///
     /// Lock-free atomic check for maximum performance.
