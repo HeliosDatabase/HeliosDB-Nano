@@ -119,7 +119,7 @@ impl ArtIndexManager {
 
         // Check if PK already exists for this table
         {
-            let pk_indexes = self.pk_indexes.read().unwrap();
+            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
             if pk_indexes.contains_key(table) {
                 return Err(ArtIndexError::IndexAlreadyExists(format!(
                     "Primary key already exists for table '{}'",
@@ -138,17 +138,17 @@ impl ArtIndexManager {
 
         // Register the index
         {
-            let mut indexes = self.indexes.write().unwrap();
+            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
             indexes.insert(index_name.clone(), index);
         }
 
         {
-            let mut pk_indexes = self.pk_indexes.write().unwrap();
+            let mut pk_indexes = self.pk_indexes.write().unwrap_or_else(|e| e.into_inner());
             pk_indexes.insert(table.to_string(), index_name.clone());
         }
 
         {
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
             stats.total_indexes += 1;
             stats.pk_indexes += 1;
         }
@@ -171,7 +171,7 @@ impl ArtIndexManager {
 
         // Check if index already exists
         {
-            let indexes = self.indexes.read().unwrap();
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
             if indexes.contains_key(&index_name) {
                 return Err(ArtIndexError::IndexAlreadyExists(index_name));
             }
@@ -200,12 +200,12 @@ impl ArtIndexManager {
 
         // Register everything
         {
-            let mut indexes = self.indexes.write().unwrap();
+            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
             indexes.insert(index_name.clone(), index);
         }
 
         {
-            let mut fk_indexes = self.fk_indexes.write().unwrap();
+            let mut fk_indexes = self.fk_indexes.write().unwrap_or_else(|e| e.into_inner());
             fk_indexes
                 .entry(table.to_string())
                 .or_insert_with(Vec::new)
@@ -213,12 +213,12 @@ impl ArtIndexManager {
         }
 
         {
-            let mut fk_info_map = self.fk_info.write().unwrap();
+            let mut fk_info_map = self.fk_info.write().unwrap_or_else(|e| e.into_inner());
             fk_info_map.insert(index_name.clone(), fk_info);
         }
 
         {
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
             stats.total_indexes += 1;
             stats.fk_indexes += 1;
         }
@@ -234,7 +234,7 @@ impl ArtIndexManager {
 
         // Check if index already exists
         {
-            let indexes = self.indexes.read().unwrap();
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
             if indexes.contains_key(&index_name) {
                 return Err(ArtIndexError::IndexAlreadyExists(index_name));
             }
@@ -250,12 +250,12 @@ impl ArtIndexManager {
 
         // Register the index
         {
-            let mut indexes = self.indexes.write().unwrap();
+            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
             indexes.insert(index_name.clone(), index);
         }
 
         {
-            let mut unique_indexes = self.unique_indexes.write().unwrap();
+            let mut unique_indexes = self.unique_indexes.write().unwrap_or_else(|e| e.into_inner());
             unique_indexes
                 .entry(table.to_string())
                 .or_insert_with(Vec::new)
@@ -263,7 +263,7 @@ impl ArtIndexManager {
         }
 
         {
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
             stats.total_indexes += 1;
             stats.unique_indexes += 1;
         }
@@ -275,7 +275,7 @@ impl ArtIndexManager {
     pub fn create_manual_index(&self, name: &str, table: &str, columns: &[String]) -> ArtResult<String> {
         // Check if index already exists
         {
-            let indexes = self.indexes.read().unwrap();
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
             if indexes.contains_key(name) {
                 return Err(ArtIndexError::IndexAlreadyExists(name.to_string()));
             }
@@ -286,12 +286,12 @@ impl ArtIndexManager {
 
         // Register the index
         {
-            let mut indexes = self.indexes.write().unwrap();
+            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
             indexes.insert(name.to_string(), index);
         }
 
         {
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
             stats.total_indexes += 1;
             stats.manual_indexes += 1;
         }
@@ -309,7 +309,7 @@ impl ArtIndexManager {
 
         // Remove from main index map
         {
-            let mut indexes = self.indexes.write().unwrap();
+            let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
             if let Some(idx) = indexes.remove(name) {
                 index_type = idx.index_type();
             } else {
@@ -320,19 +320,19 @@ impl ArtIndexManager {
         // Remove from type-specific maps
         match index_type {
             ArtIndexType::PrimaryKey => {
-                let mut pk_indexes = self.pk_indexes.write().unwrap();
+                let mut pk_indexes = self.pk_indexes.write().unwrap_or_else(|e| e.into_inner());
                 pk_indexes.retain(|_, v| v != name);
             }
             ArtIndexType::ForeignKey => {
-                let mut fk_indexes = self.fk_indexes.write().unwrap();
+                let mut fk_indexes = self.fk_indexes.write().unwrap_or_else(|e| e.into_inner());
                 for fks in fk_indexes.values_mut() {
                     fks.retain(|n| n != name);
                 }
-                let mut fk_info = self.fk_info.write().unwrap();
+                let mut fk_info = self.fk_info.write().unwrap_or_else(|e| e.into_inner());
                 fk_info.remove(name);
             }
             ArtIndexType::Unique => {
-                let mut unique_indexes = self.unique_indexes.write().unwrap();
+                let mut unique_indexes = self.unique_indexes.write().unwrap_or_else(|e| e.into_inner());
                 for uqs in unique_indexes.values_mut() {
                     uqs.retain(|n| n != name);
                 }
@@ -344,7 +344,7 @@ impl ArtIndexManager {
 
         // Update stats
         {
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
             stats.total_indexes -= 1;
             match index_type {
                 ArtIndexType::PrimaryKey => stats.pk_indexes -= 1,
@@ -363,7 +363,7 @@ impl ArtIndexManager {
 
         // Collect all indexes for this table
         {
-            let indexes = self.indexes.read().unwrap();
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
             for (name, idx) in indexes.iter() {
                 if idx.table() == table {
                     to_drop.push(name.clone());
@@ -385,7 +385,7 @@ impl ArtIndexManager {
         let mut renames: Vec<(String, String, AdaptiveRadixTree)> = Vec::new();
 
         {
-            let indexes = self.indexes.read().unwrap();
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
             for (name, idx) in indexes.iter() {
                 if idx.table() == old_table {
                     // Generate new index name by replacing table name
@@ -406,14 +406,14 @@ impl ArtIndexManager {
         for (old_name, new_name, new_idx) in renames {
             // Remove old index
             {
-                let mut indexes = self.indexes.write().unwrap();
+                let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
                 indexes.remove(&old_name);
                 indexes.insert(new_name.clone(), new_idx);
             }
 
             // Update pk_indexes mapping
             {
-                let mut pk_indexes = self.pk_indexes.write().unwrap();
+                let mut pk_indexes = self.pk_indexes.write().unwrap_or_else(|e| e.into_inner());
                 if pk_indexes.get(old_table) == Some(&old_name) {
                     pk_indexes.remove(old_table);
                     pk_indexes.insert(new_table.to_string(), new_name.clone());
@@ -422,7 +422,7 @@ impl ArtIndexManager {
 
             // Update fk_indexes mapping
             {
-                let mut fk_indexes = self.fk_indexes.write().unwrap();
+                let mut fk_indexes = self.fk_indexes.write().unwrap_or_else(|e| e.into_inner());
                 if let Some(fks) = fk_indexes.remove(old_table) {
                     let new_fks: Vec<String> = fks.iter()
                         .map(|n| if n == &old_name { new_name.clone() } else { n.clone() })
@@ -433,7 +433,7 @@ impl ArtIndexManager {
 
             // Update unique_indexes mapping
             {
-                let mut unique_indexes = self.unique_indexes.write().unwrap();
+                let mut unique_indexes = self.unique_indexes.write().unwrap_or_else(|e| e.into_inner());
                 if let Some(uniques) = unique_indexes.remove(old_table) {
                     let new_uniques: Vec<String> = uniques.iter()
                         .map(|n| if n == &old_name { new_name.clone() } else { n.clone() })
@@ -445,7 +445,7 @@ impl ArtIndexManager {
 
         // Update stats
         {
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
             stats.index_renames += 1;
         }
 
@@ -458,14 +458,14 @@ impl ArtIndexManager {
 
     /// Get a reference to an index by name
     pub fn get_index(&self, name: &str) -> Option<AdaptiveRadixTree> {
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         indexes.get(name).cloned()
     }
 
     /// Get the primary key index for a table
     pub fn get_pk_index(&self, table: &str) -> Option<AdaptiveRadixTree> {
         let pk_name = {
-            let pk_indexes = self.pk_indexes.read().unwrap();
+            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
             pk_indexes.get(table).cloned()
         };
 
@@ -475,7 +475,7 @@ impl ArtIndexManager {
     /// Get all foreign key indexes for a table
     pub fn get_fk_indexes(&self, table: &str) -> Vec<AdaptiveRadixTree> {
         let fk_names = {
-            let fk_indexes = self.fk_indexes.read().unwrap();
+            let fk_indexes = self.fk_indexes.read().unwrap_or_else(|e| e.into_inner());
             fk_indexes.get(table).cloned().unwrap_or_default()
         };
 
@@ -488,7 +488,7 @@ impl ArtIndexManager {
     /// Get all unique indexes for a table
     pub fn get_unique_indexes(&self, table: &str) -> Vec<AdaptiveRadixTree> {
         let unique_names = {
-            let unique_indexes = self.unique_indexes.read().unwrap();
+            let unique_indexes = self.unique_indexes.read().unwrap_or_else(|e| e.into_inner());
             unique_indexes.get(table).cloned().unwrap_or_default()
         };
 
@@ -500,13 +500,13 @@ impl ArtIndexManager {
 
     /// Get FK info by index name
     pub fn get_fk_info(&self, index_name: &str) -> Option<ForeignKeyInfo> {
-        let fk_info = self.fk_info.read().unwrap();
+        let fk_info = self.fk_info.read().unwrap_or_else(|e| e.into_inner());
         fk_info.get(index_name).cloned()
     }
 
     /// List all indexes
     pub fn list_indexes(&self) -> Vec<(String, String, ArtIndexType, Vec<String>)> {
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         indexes
             .values()
             .map(|idx| {
@@ -522,7 +522,7 @@ impl ArtIndexManager {
 
     /// List indexes for a specific table
     pub fn list_table_indexes(&self, table: &str) -> Vec<(String, ArtIndexType, Vec<String>)> {
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         indexes
             .values()
             .filter(|idx| idx.table() == table)
@@ -596,8 +596,8 @@ impl ArtIndexManager {
             }
         }
 
-        let indexes = self.indexes.read().unwrap();
-        let pk_indexes = self.pk_indexes.read().unwrap();
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
 
         if let Some(pk_name) = pk_indexes.get(table) {
             if let Some(index) = indexes.get(pk_name) {
@@ -612,7 +612,7 @@ impl ArtIndexManager {
         }
 
         {
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
             stats.constraint_checks += 1;
         }
 
@@ -621,8 +621,8 @@ impl ArtIndexManager {
 
     /// Check unique constraint before INSERT/UPDATE
     pub fn check_unique_constraints(&self, table: &str, column_values: &HashMap<String, Value>) -> ArtResult<()> {
-        let indexes = self.indexes.read().unwrap();
-        let unique_indexes = self.unique_indexes.read().unwrap();
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let unique_indexes = self.unique_indexes.read().unwrap_or_else(|e| e.into_inner());
 
         if let Some(unique_names) = unique_indexes.get(table) {
             for unique_name in unique_names {
@@ -661,7 +661,7 @@ impl ArtIndexManager {
         }
 
         {
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
             stats.constraint_checks += 1;
         }
 
@@ -670,9 +670,9 @@ impl ArtIndexManager {
 
     /// Check foreign key constraint before INSERT/UPDATE
     pub fn check_fk_constraints(&self, table: &str, column_values: &HashMap<String, Value>) -> ArtResult<()> {
-        let fk_indexes = self.fk_indexes.read().unwrap();
-        let fk_info_map = self.fk_info.read().unwrap();
-        let indexes = self.indexes.read().unwrap();
+        let fk_indexes = self.fk_indexes.read().unwrap_or_else(|e| e.into_inner());
+        let fk_info_map = self.fk_info.read().unwrap_or_else(|e| e.into_inner());
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
 
         if let Some(fk_names) = fk_indexes.get(table) {
             for fk_name in fk_names {
@@ -698,13 +698,13 @@ impl ArtIndexManager {
 
                     // Check if referenced row exists in parent table's PK index
                     let ref_table = &fk_info.ref_table;
-                    let pk_indexes = self.pk_indexes.read().unwrap();
+                    let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
 
                     if let Some(ref_pk_name) = pk_indexes.get(ref_table) {
                         if let Some(ref_index) = indexes.get(ref_pk_name) {
                             let key = Self::encode_key(&values);
                             if !ref_index.contains(&key) {
-                                let mut stats = self.stats.write().unwrap();
+                                let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
                                 stats.violations_caught += 1;
                                 return Err(ArtIndexError::ForeignKeyViolation(format!(
                                     "Key ({:?}) not present in table \"{}\"",
@@ -718,7 +718,7 @@ impl ArtIndexManager {
         }
 
         {
-            let mut stats = self.stats.write().unwrap();
+            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
             stats.constraint_checks += 1;
         }
 
@@ -731,7 +731,7 @@ impl ArtIndexManager {
 
     /// Update indexes after INSERT
     pub fn on_insert(&self, table: &str, row_id: RowId, column_values: &HashMap<String, Value>) -> ArtResult<()> {
-        let mut indexes = self.indexes.write().unwrap();
+        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
 
         // Update all indexes for this table
         for index in indexes.values_mut() {
@@ -768,7 +768,7 @@ impl ArtIndexManager {
 
     /// Update indexes after DELETE
     pub fn on_delete(&self, table: &str, row_id: RowId, column_values: &HashMap<String, Value>) -> ArtResult<()> {
-        let mut indexes = self.indexes.write().unwrap();
+        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
 
         for index in indexes.values_mut() {
             if index.table() != table {
@@ -810,29 +810,30 @@ impl ArtIndexManager {
 
     /// Get manager statistics
     pub fn stats(&self) -> ArtManagerStats {
-        self.stats.read().unwrap().clone()
+        self.stats.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Get statistics for a specific index
     pub fn index_stats(&self, name: &str) -> Option<ArtIndexStats> {
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         indexes.get(name).map(|idx| idx.stats().clone())
     }
 
     /// Check if a table has a primary key
     pub fn has_pk(&self, table: &str) -> bool {
-        let pk_indexes = self.pk_indexes.read().unwrap();
+        let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
         pk_indexes.contains_key(table)
     }
 
     /// Check if a specific index exists
     pub fn index_exists(&self, name: &str) -> bool {
-        let indexes = self.indexes.read().unwrap();
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         indexes.contains_key(name)
     }
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

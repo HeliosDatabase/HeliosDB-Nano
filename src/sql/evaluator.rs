@@ -2966,14 +2966,14 @@ impl Evaluator {
                             chrono::NaiveDateTime::parse_from_str(&s, "%Y-%m-%d %H:%M:%S%.f")
                                 .map(|ndt| Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(ndt, Utc)))
                         })
-                        .or_else(|_| {
+                        .or_else(|e| {
                             // Date-only format: treat as midnight UTC
                             if let Ok(date) = chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d") {
                                 if let Some(ndt) = date.and_hms_opt(0, 0, 0) {
                                     return Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(ndt, Utc)));
                                 }
                             }
-                            Err(chrono::NaiveDate::parse_from_str("", "%Y-%m-%d").unwrap_err())
+                            Err(e)
                         })
                         .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to TIMESTAMP: {}", s, e)))
                 }

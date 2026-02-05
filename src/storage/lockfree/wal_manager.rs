@@ -272,7 +272,7 @@ impl PartitionedWalManager {
             global_timestamp: AtomicU64::new(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
-                    .unwrap()
+                    .unwrap_or_default()
                     .as_millis() as u64,
             ),
             pending_2pc: RwLock::new(HashMap::new()),
@@ -505,7 +505,10 @@ impl PartitionedWalManager {
 
             if partitions_used.len() == 1 {
                 // Single partition - direct commit
-                let partition_id = *partitions_used.iter().next().unwrap();
+                let partition_id = match partitions_used.iter().next() {
+                    Some(&id) => id,
+                    None => return Err(std::io::Error::new(std::io::ErrorKind::Other, "No partition found")),
+                };
                 let wal_ops: Vec<WalOp> = request.operations.iter().map(|op| op.into()).collect();
                 let record = WalRecord::Commit {
                     txn_id: request.txn_id,

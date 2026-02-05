@@ -227,7 +227,8 @@ impl AdaptiveRadixTree {
 
     /// Internal recursive insert
     fn insert_recursive(&mut self, key: &[u8], value: RowId, depth: usize) -> ArtResult<()> {
-        let root = self.root.take().unwrap();
+        let root = self.root.take()
+            .ok_or_else(|| ArtIndexError::Internal("Missing root node during insert".to_string()))?;
         self.root = Some(self.insert_into_node(root, key, value, depth)?);
         Ok(())
     }
@@ -325,25 +326,29 @@ impl AdaptiveRadixTree {
             match &mut node {
                 ArtNode::Node4(n) => {
                     if let Some(idx) = n.find_child_index(next_byte) {
-                        let child = n.children[idx].take().unwrap();
+                        let child = n.children[idx].take()
+                            .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node4 child".to_string()))?;
                         n.children[idx] = Some(self.insert_into_node(child, key, value, new_depth + 1)?);
                     }
                 }
                 ArtNode::Node16(n) => {
                     if let Some(idx) = n.find_child_index(next_byte) {
-                        let child = n.children[idx].take().unwrap();
+                        let child = n.children[idx].take()
+                            .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node16 child".to_string()))?;
                         n.children[idx] = Some(self.insert_into_node(child, key, value, new_depth + 1)?);
                     }
                 }
                 ArtNode::Node48(n) => {
                     let idx = n.child_index[next_byte as usize];
                     if idx != 255 {
-                        let child = n.children[idx as usize].take().unwrap();
+                        let child = n.children[idx as usize].take()
+                            .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node48 child".to_string()))?;
                         n.children[idx as usize] = Some(self.insert_into_node(child, key, value, new_depth + 1)?);
                     }
                 }
                 ArtNode::Node256(n) => {
-                    let child = n.children[next_byte as usize].take().unwrap();
+                    let child = n.children[next_byte as usize].take()
+                        .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node256 child".to_string()))?;
                     n.children[next_byte as usize] = Some(self.insert_into_node(child, key, value, new_depth + 1)?);
                 }
                 ArtNode::Leaf(_) => unreachable!(),
@@ -497,7 +502,8 @@ impl AdaptiveRadixTree {
         }
 
         // Take the root to avoid borrow issues
-        let root = self.root.take().unwrap();
+        let root = self.root.take()
+            .ok_or_else(|| ArtIndexError::Internal("Missing root node during remove".to_string()))?;
         let (new_root, removed_value) = self.remove_recursive(root, key, 0)?;
         self.root = new_root;
 
@@ -545,7 +551,8 @@ impl AdaptiveRadixTree {
                 let removed = match &mut inner {
                     ArtNode::Node4(n) => {
                         if let Some(idx) = n.find_child_index(next_byte) {
-                            let child = n.children[idx].take().unwrap();
+                            let child = n.children[idx].take()
+                                .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node4 child".to_string()))?;
                             let (new_child, value) = self.remove_recursive(child, key, new_depth + 1)?;
                             if new_child.is_some() {
                                 n.children[idx] = new_child;
@@ -560,7 +567,8 @@ impl AdaptiveRadixTree {
                     }
                     ArtNode::Node16(n) => {
                         if let Some(idx) = n.find_child_index(next_byte) {
-                            let child = n.children[idx].take().unwrap();
+                            let child = n.children[idx].take()
+                                .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node16 child".to_string()))?;
                             let (new_child, value) = self.remove_recursive(child, key, new_depth + 1)?;
                             if new_child.is_some() {
                                 n.children[idx] = new_child;
@@ -575,7 +583,8 @@ impl AdaptiveRadixTree {
                     ArtNode::Node48(n) => {
                         let idx = n.child_index[next_byte as usize];
                         if idx != 255 {
-                            let child = n.children[idx as usize].take().unwrap();
+                            let child = n.children[idx as usize].take()
+                                .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node48 child".to_string()))?;
                             let (new_child, value) = self.remove_recursive(child, key, new_depth + 1)?;
                             if new_child.is_some() {
                                 n.children[idx as usize] = new_child;
@@ -772,6 +781,7 @@ impl<'a> Iterator for ArtIterator<'a> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
 

@@ -834,11 +834,11 @@ impl RateLimiter {
     pub fn check(&self, key: &str) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .unwrap_or_default()
             .as_secs();
         let minute = now / 60;
 
-        let mut counts = self.counts.write().unwrap();
+        let mut counts = self.counts.write().unwrap_or_else(|e| e.into_inner());
         let entry = counts.entry(key.to_string()).or_insert((minute, 0));
 
         if entry.0 != minute {

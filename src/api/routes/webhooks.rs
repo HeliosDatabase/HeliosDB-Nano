@@ -346,7 +346,7 @@ async fn handle_generic_webhook(
         timestamp: Some(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs(),
         ),
         raw_payload: None,

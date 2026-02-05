@@ -1320,7 +1320,7 @@ impl ProceduralParser {
 
         if remaining.starts_with(&upper_keyword) {
             let after = remaining.chars().nth(upper_keyword.len());
-            if after.is_none() || !after.unwrap().is_alphanumeric() {
+            if after.map_or(true, |c| !c.is_alphanumeric()) {
                 self.pos += keyword.len();
                 return true;
             }
@@ -1334,7 +1334,7 @@ impl ProceduralParser {
 
         if remaining.starts_with(&upper_keyword) {
             let after = remaining.chars().nth(upper_keyword.len());
-            after.is_none() || !after.unwrap().is_alphanumeric()
+            after.map_or(true, |c| !c.is_alphanumeric())
         } else {
             false
         }
