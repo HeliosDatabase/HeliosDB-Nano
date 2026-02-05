@@ -1188,21 +1188,33 @@ impl StorageEngine {
                 match column.storage_mode {
                     ColumnStorageMode::Dictionary => {
                         // Dictionary encode string values
-                        if let crate::Value::String(s) = &transformed_tuple.values[idx] {
-                            let dict_id = self.dict_manager.encode(&self.db, table_name, &column.name, s)?;
-                            transformed_tuple.values[idx] = crate::Value::DictRef { dict_id };
+                        if let Some(crate::Value::String(s)) = transformed_tuple.values.get(idx) {
+                            let s = s.clone();
+                            let dict_id = self.dict_manager.encode(&self.db, table_name, &column.name, &s)?;
+                            if let Some(val) = transformed_tuple.values.get_mut(idx) {
+                                *val = crate::Value::DictRef { dict_id };
+                            }
                         }
                     }
                     ColumnStorageMode::ContentAddressed => {
                         // Use content-addressed storage for large values
-                        let new_val = ContentAddressedStore::maybe_store(&self.db, &transformed_tuple.values[idx])?;
-                        transformed_tuple.values[idx] = new_val;
+                        let cur_val = transformed_tuple.values.get(idx)
+                            .ok_or_else(|| Error::internal("index out of bounds in content-addressed transform"))?;
+                        let new_val = ContentAddressedStore::maybe_store(&self.db, cur_val)?;
+                        if let Some(val) = transformed_tuple.values.get_mut(idx) {
+                            *val = new_val;
+                        }
                     }
                     ColumnStorageMode::Columnar => {
                         // Store in columnar format separately
-                        ColumnarStore::store(&self.db, table_name, &column.name, row_id, transformed_tuple.values[idx].clone())?;
+                        let cur_val = transformed_tuple.values.get(idx)
+                            .ok_or_else(|| Error::internal("index out of bounds in columnar transform"))?
+                            .clone();
+                        ColumnarStore::store(&self.db, table_name, &column.name, row_id, cur_val)?;
                         // Mark as columnar reference in row tuple
-                        transformed_tuple.values[idx] = crate::Value::ColumnarRef;
+                        if let Some(val) = transformed_tuple.values.get_mut(idx) {
+                            *val = crate::Value::ColumnarRef;
+                        }
                     }
                     ColumnStorageMode::Default => {
                         // No transformation needed
@@ -1305,23 +1317,31 @@ impl StorageEngine {
                     match column.storage_mode {
                         ColumnStorageMode::Dictionary => {
                             // Resolve dictionary reference
-                            if let crate::Value::DictRef { dict_id } = &tuple.values[idx] {
-                                let s = self.dict_manager.decode(&self.db, table_name, &column.name, *dict_id)?;
-                                tuple.values[idx] = crate::Value::String(s);
+                            if let Some(crate::Value::DictRef { dict_id }) = tuple.values.get(idx) {
+                                let dict_id = *dict_id;
+                                let s = self.dict_manager.decode(&self.db, table_name, &column.name, dict_id)?;
+                                if let Some(val) = tuple.values.get_mut(idx) {
+                                    *val = crate::Value::String(s);
+                                }
                             }
                         }
                         ColumnStorageMode::ContentAddressed => {
                             // Resolve content-addressed reference
-                            if let crate::Value::CasRef { hash } = &tuple.values[idx] {
-                                let resolved = ContentAddressedStore::resolve(&self.db, hash, &column.data_type)?;
-                                tuple.values[idx] = resolved;
+                            if let Some(crate::Value::CasRef { hash }) = tuple.values.get(idx) {
+                                let hash = hash.clone();
+                                let resolved = ContentAddressedStore::resolve(&self.db, &hash, &column.data_type)?;
+                                if let Some(val) = tuple.values.get_mut(idx) {
+                                    *val = resolved;
+                                }
                             }
                         }
                         ColumnStorageMode::Columnar => {
                             // Resolve columnar reference
-                            if matches!(tuple.values[idx], crate::Value::ColumnarRef) {
+                            if matches!(tuple.values.get(idx), Some(crate::Value::ColumnarRef)) {
                                 if let Some(val) = ColumnarStore::get(&self.db, table_name, &column.name, row_id)? {
-                                    tuple.values[idx] = val;
+                                    if let Some(slot) = tuple.values.get_mut(idx) {
+                                        *slot = val;
+                                    }
                                 }
                             }
                         }
@@ -1332,7 +1352,7 @@ impl StorageEngine {
                 }
 
                 tuples.push(tuple);
-            } else if !key.is_empty() && key[0] > prefix_bytes[0] {
+            } else if key.first() > prefix_bytes.first() {
                 // Optimization: break early if we've passed the prefix range
                 break;
             }
@@ -1414,7 +1434,7 @@ impl StorageEngine {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
             if key.starts_with(prefix_bytes) {
                 keys_to_migrate.push(key.to_vec());
-            } else if !key.is_empty() && key[0] > prefix_bytes[0] {
+            } else if key.first() > prefix_bytes.first() {
                 break;
             }
         }
@@ -1451,35 +1471,37 @@ impl StorageEngine {
             };
 
             // Step 1: Decode from old format to original value
+            let cur_val = tuple.values.get(col_idx)
+                .ok_or_else(|| Error::internal("col_idx out of bounds during migration decode"))?;
             let original_value = match old_mode {
                 ColumnStorageMode::Dictionary => {
-                    if let crate::Value::DictRef { dict_id } = &tuple.values[col_idx] {
+                    if let crate::Value::DictRef { dict_id } = cur_val {
                         let s = self.dict_manager.decode(&self.db, table_name, &column.name, *dict_id)?;
                         crate::Value::String(s)
                     } else {
-                        tuple.values[col_idx].clone()
+                        cur_val.clone()
                     }
                 }
                 ColumnStorageMode::ContentAddressed => {
-                    if let crate::Value::CasRef { hash } = &tuple.values[col_idx] {
+                    if let crate::Value::CasRef { hash } = cur_val {
                         ContentAddressedStore::resolve(&self.db, hash, &column.data_type)?
                     } else {
-                        tuple.values[col_idx].clone()
+                        cur_val.clone()
                     }
                 }
                 ColumnStorageMode::Columnar => {
-                    if matches!(tuple.values[col_idx], crate::Value::ColumnarRef) {
+                    if matches!(cur_val, crate::Value::ColumnarRef) {
                         ColumnarStore::get(&self.db, table_name, &column.name, row_id)?
                             .unwrap_or(crate::Value::Null)
                     } else {
-                        tuple.values[col_idx].clone()
+                        cur_val.clone()
                     }
                 }
-                ColumnStorageMode::Default => tuple.values[col_idx].clone(),
+                ColumnStorageMode::Default => cur_val.clone(),
             };
 
             // Step 2: Encode to new format
-            tuple.values[col_idx] = match new_mode {
+            let new_val = match new_mode {
                 ColumnStorageMode::Dictionary => {
                     if let crate::Value::String(s) = &original_value {
                         let dict_id = self.dict_manager.encode(&self.db, table_name, &column.name, s)?;
@@ -1504,6 +1526,8 @@ impl StorageEngine {
                 }
                 ColumnStorageMode::Default => original_value,
             };
+            *tuple.values.get_mut(col_idx)
+                .ok_or_else(|| Error::internal("col_idx out of bounds during migration encode"))? = new_val;
 
             // Step 3: Clean up old columnar data if migrating away from columnar
             if old_mode == ColumnStorageMode::Columnar && new_mode != ColumnStorageMode::Columnar {
@@ -1581,7 +1605,7 @@ impl StorageEngine {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
             if key.starts_with(prefix_bytes) {
                 keys_to_update.push(key.to_vec());
-            } else if !key.is_empty() && key[0] > prefix_bytes[0] {
+            } else if key.first() > prefix_bytes.first() {
                 break;
             }
         }
@@ -1653,7 +1677,7 @@ impl StorageEngine {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
             if key.starts_with(prefix_bytes) {
                 keys_to_update.push(key.to_vec());
-            } else if !key.is_empty() && key[0] > prefix_bytes[0] {
+            } else if key.first() > prefix_bytes.first() {
                 break;
             }
         }
@@ -2976,7 +3000,7 @@ impl StorageEngine {
                     if let Ok((key, _)) = item {
                         if key.starts_with(prefix_bytes) {
                             keys_to_delete.push(key.to_vec());
-                        } else if !key.is_empty() && key[0] > prefix_bytes[0] {
+                        } else if key.first() > prefix_bytes.first() {
                             break;
                         }
                     }
@@ -3489,7 +3513,7 @@ impl StorageEngine {
                         }
                     }
                 }
-            } else if !key.is_empty() && key[0] > prefix_bytes[0] {
+            } else if key.first() > prefix_bytes.first() {
                 // Optimization: break early if we've passed the prefix range
                 break;
             }
@@ -3528,12 +3552,12 @@ impl StorageEngine {
                 // Decrypt value if encryption is enabled
                 let value = self.decrypt_value(&raw_value)?;
 
-                let table_name = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
+                let table_name = String::from_utf8_lossy(key.get(prefix.len()..).unwrap_or_default()).to_string();
                 let count: u64 = bincode::deserialize(&value)
                     .map_err(|e| Error::storage(format!("Failed to deserialize counter: {}", e)))?;
 
                 self.row_counters.insert(table_name, std::sync::atomic::AtomicU64::new(count));
-            } else if !key.is_empty() && key[0] > prefix[0] {
+            } else if key.first() > prefix.first() {
                 break;
             }
         }

@@ -332,7 +332,8 @@ impl PartitionedWalManager {
             operations: wal_ops,
         };
 
-        let partition = &self.partitions[partition_id as usize];
+        let partition = self.partitions.get(partition_id as usize)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid partition ID: {}", partition_id)))?;
         partition.append(&record)?;
 
         if sync {
@@ -371,7 +372,8 @@ impl PartitionedWalManager {
             operations,
         };
 
-        let partition = &self.partitions[partition_id as usize];
+        let partition = self.partitions.get(partition_id as usize)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid partition ID: {}", partition_id)))?;
         partition.append(&record)?;
 
         Ok(())
@@ -413,8 +415,10 @@ impl PartitionedWalManager {
                 partition: partition_id,
                 operations: ops,
             };
-            self.partitions[partition_id as usize].append(&record)?;
-            self.partitions[partition_id as usize].sync()?; // Must sync prepare
+            let partition = self.partitions.get(partition_id as usize)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid partition ID: {}", partition_id)))?;
+            partition.append(&record)?;
+            partition.sync()?; // Must sync prepare
 
             // Update prepared set
             if let Some(state) = self.pending_2pc.write().get_mut(&txn_id) {
@@ -444,7 +448,9 @@ impl PartitionedWalManager {
             // Phase 2: Commit on all partitions
             let record = WalRecord::CommitPrepared { txn_id };
             for partition_id in partitions {
-                self.partitions[partition_id as usize].append(&record)?;
+                let partition = self.partitions.get(partition_id as usize)
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid partition ID: {}", partition_id)))?;
+                partition.append(&record)?;
             }
 
             // Sync all partitions
@@ -472,7 +478,9 @@ impl PartitionedWalManager {
         if let Some(partitions) = partitions {
             let record = WalRecord::RollbackPrepared { txn_id };
             for partition_id in partitions {
-                self.partitions[partition_id as usize].append(&record)?;
+                let partition = self.partitions.get(partition_id as usize)
+                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid partition ID: {}", partition_id)))?;
+                partition.append(&record)?;
             }
         }
 
@@ -556,7 +564,8 @@ impl PartitionedWalManager {
 
         // Write records to each partition
         for (partition_id, records) in partition_records {
-            let partition = &self.partitions[partition_id as usize];
+            let partition = self.partitions.get(partition_id as usize)
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid partition ID: {}", partition_id)))?;
             for record in records {
                 partition.append(&record)?;
             }
@@ -652,12 +661,15 @@ impl WalRecovery {
         let mut pos = 0;
         while pos + 4 <= buffer.len() {
             // Read length prefix
-            let len = u32::from_le_bytes([
-                buffer[pos],
-                buffer[pos + 1],
-                buffer[pos + 2],
-                buffer[pos + 3],
-            ]) as usize;
+            // SAFETY: We checked pos + 4 <= buffer.len() above
+            let len_bytes: [u8; 4] = match buffer.get(pos..pos + 4) {
+                Some(slice) => match slice.try_into() {
+                    Ok(arr) => arr,
+                    Err(_) => break,
+                },
+                None => break,
+            };
+            let len = u32::from_le_bytes(len_bytes) as usize;
             pos += 4;
 
             if pos + len > buffer.len() {
@@ -665,8 +677,10 @@ impl WalRecovery {
             }
 
             // Deserialize record
-            if let Ok(record) = bincode::deserialize::<WalRecord>(&buffer[pos..pos + len]) {
-                self.process_record_for_recovery(record, row_ids);
+            if let Some(record_slice) = buffer.get(pos..pos + len) {
+                if let Ok(record) = bincode::deserialize::<WalRecord>(record_slice) {
+                    self.process_record_for_recovery(record, row_ids);
+                }
             }
 
             pos += len;
@@ -760,19 +774,22 @@ impl WalRecovery {
 
         let mut pos = 0;
         while pos + 4 <= buffer.len() {
-            let len = u32::from_le_bytes([
-                buffer[pos],
-                buffer[pos + 1],
-                buffer[pos + 2],
-                buffer[pos + 3],
-            ]) as usize;
+            let len_bytes: [u8; 4] = match buffer.get(pos..pos + 4) {
+                Some(slice) => match slice.try_into() {
+                    Ok(arr) => arr,
+                    Err(_) => break,
+                },
+                None => break,
+            };
+            let len = u32::from_le_bytes(len_bytes) as usize;
             pos += 4;
 
             if pos + len > buffer.len() {
                 break;
             }
 
-            if let Ok(record) = bincode::deserialize::<WalRecord>(&buffer[pos..pos + len]) {
+            if let Some(record_slice) = buffer.get(pos..pos + len) {
+            if let Ok(record) = bincode::deserialize::<WalRecord>(record_slice) {
                 match record {
                     WalRecord::Prepare { txn_id, partition, .. } => {
                         prepared
@@ -788,6 +805,7 @@ impl WalRecovery {
                     }
                     _ => {}
                 }
+            }
             }
 
             pos += len;

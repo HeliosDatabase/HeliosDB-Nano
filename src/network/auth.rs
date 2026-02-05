@@ -73,7 +73,7 @@ impl ScramAuth {
         } else {
             return Err(Error::protocol("Missing username in SCRAM message"));
         };
-        self.client_first_message_bare = client_first[bare_start..].to_string();
+        self.client_first_message_bare = client_first.get(bare_start..).unwrap_or_default().to_string();
 
         // Parse client-first-message-bare attributes
         let attrs = Self::parse_attributes(&self.client_first_message_bare)?;
@@ -110,7 +110,7 @@ impl ScramAuth {
         let proof_pos = client_final
             .rfind(",p=")
             .ok_or_else(|| Error::protocol("Missing proof in SCRAM message"))?;
-        let client_final_without_proof = &client_final[..proof_pos];
+        let client_final_without_proof = client_final.get(..proof_pos).unwrap_or(client_final);
 
         // Parse attributes
         let attrs = Self::parse_attributes(client_final)?;
@@ -159,10 +159,10 @@ impl ScramAuth {
         let client_signature = hmac::sign(&client_key, auth_message.as_bytes());
 
         // Compute client key from proof
-        let mut computed_client_key = vec![0u8; client_proof.len()];
-        for i in 0..client_proof.len() {
-            computed_client_key[i] = client_proof[i] ^ client_signature.as_ref()[i];
-        }
+        let computed_client_key: Vec<u8> = client_proof.iter()
+            .zip(client_signature.as_ref().iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
 
         // Hash the computed client key
         let mut hasher = Sha256::new();
@@ -224,8 +224,8 @@ impl ScramAuth {
 
         for part in message.split(',') {
             if let Some(eq_pos) = part.find('=') {
-                let key = part[..eq_pos].to_string();
-                let value = part[eq_pos + 1..].to_string();
+                let key = part.get(..eq_pos).unwrap_or_default().to_string();
+                let value = part.get(eq_pos + 1..).unwrap_or_default().to_string();
                 attrs.insert(key, value);
             }
         }
@@ -298,6 +298,7 @@ mod base64 {
                 }
             }
 
+            #[allow(clippy::indexing_slicing)] // SAFETY: chunk length is checked by match arms (1/2/3), CHARS indexed by 6-bit values (0-63) into [u8; 64]
             fn encode_chunk(&mut self, chunk: &[u8]) -> io::Result<()> {
                 const CHARS: &[u8; 64] =
                     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -331,6 +332,7 @@ mod base64 {
         }
 
         impl<W: Write> Write for Encoder<W> {
+            #[allow(clippy::indexing_slicing)] // SAFETY: buffer_len is always 0..3, buffer is [u8; 3]
             fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
                 let mut written = 0;
                 for &byte in buf {
@@ -350,7 +352,7 @@ mod base64 {
             fn flush(&mut self) -> io::Result<()> {
                 if self.buffer_len > 0 {
                     let buffer_len = self.buffer_len;
-                    let buffer_slice: Vec<u8> = self.buffer[..buffer_len].to_vec();
+                    let buffer_slice: Vec<u8> = self.buffer.get(..buffer_len).unwrap_or_default().to_vec();
                     self.encode_chunk(&buffer_slice)?;
                     self.buffer_len = 0;
                 }
@@ -395,6 +397,7 @@ mod base64 {
                 }
             }
 
+            #[allow(clippy::indexing_slicing)] // SAFETY: values length checked before each access (>= 2, 3, 4)
             fn decode_chunk(chunk: &[u8], output: &mut Vec<u8>) -> io::Result<()> {
                 if chunk.is_empty() {
                     return Ok(());
@@ -449,9 +452,11 @@ mod base64 {
                     self.pos = 0;
                 }
 
-                let available = self.buffer.len() - self.pos;
+                let available = self.buffer.len().saturating_sub(self.pos);
                 let to_copy = available.min(buf.len());
-                buf[..to_copy].copy_from_slice(&self.buffer[self.pos..self.pos + to_copy]);
+                if let (Some(dst), Some(src)) = (buf.get_mut(..to_copy), self.buffer.get(self.pos..self.pos + to_copy)) {
+                    dst.copy_from_slice(src);
+                }
                 self.pos += to_copy;
 
                 Ok(to_copy)

@@ -825,19 +825,18 @@ impl EmbeddedDatabase {
                                     "More values than columns specified"
                                 ));
                             }
-                            indices[val_idx]
+                            *indices.get(val_idx).ok_or_else(|| Error::internal("column index out of bounds"))?
                         } else {
                             val_idx
                         };
 
-                        if target_col_idx >= schema.columns.len() {
-                            return Err(Error::query_execution(format!(
+                        let target_col = schema.get_column_at(target_col_idx)
+                            .ok_or_else(|| Error::query_execution(format!(
                                 "Too many values for INSERT: table has {} columns",
                                 schema.columns.len()
-                            )));
-                        }
+                            )))?;
 
-                        let target_type = &schema.columns[target_col_idx].data_type;
+                        let target_type = &target_col.data_type;
                         let mut value = evaluator.evaluate(expr, &empty_tuple)?;
 
                         let needs_cast = match (&value, target_type) {
@@ -860,14 +859,18 @@ impl EmbeddedDatabase {
                         }
 
                         // Enforce NOT NULL constraint for explicitly provided values
-                        if matches!(value, Value::Null) && !schema.columns[target_col_idx].nullable {
-                            return Err(Error::constraint_violation(format!(
-                                "NOT NULL constraint violated: cannot insert NULL into column '{}'",
-                                schema.columns[target_col_idx].name
-                            )));
+                        if let Some(target_col_ref) = schema.get_column_at(target_col_idx) {
+                            if matches!(value, Value::Null) && !target_col_ref.nullable {
+                                return Err(Error::constraint_violation(format!(
+                                    "NOT NULL constraint violated: cannot insert NULL into column '{}'",
+                                    target_col_ref.name
+                                )));
+                            }
                         }
 
-                        tuple_values[target_col_idx] = Some(value);
+                        let tv = tuple_values.get_mut(target_col_idx)
+                            .ok_or_else(|| Error::internal("column index out of bounds"))?;
+                        *tv = Some(value);
                     }
 
                     // Fill in missing columns with defaults or NULL
@@ -879,8 +882,9 @@ impl EmbeddedDatabase {
                                 Ok(val)
                             } else {
                                 // Column not provided, use default or NULL
-                                let col = &schema.columns[idx];
-                                if let Some(ref default_expr) = default_exprs[idx] {
+                                let col = schema.get_column_at(idx)
+                                    .ok_or_else(|| Error::internal("column index out of bounds"))?;
+                                if let Some(ref default_expr) = default_exprs.get(idx).and_then(|d| d.as_ref()) {
                                     // Evaluate default expression
                                     let mut value = evaluator.evaluate(default_expr, &empty_tuple)?;
                                     // Cast if needed
@@ -912,7 +916,7 @@ impl EmbeddedDatabase {
                                 .map(|col_name| {
                                     schema.columns.iter()
                                         .position(|c| &c.name == col_name)
-                                        .map(|idx| final_values_vec[idx].clone())
+                                        .and_then(|idx| final_values_vec.get(idx).cloned())
                                         .unwrap_or(Value::Null)
                                 })
                                 .collect();
@@ -962,7 +966,7 @@ impl EmbeddedDatabase {
                             .filter_map(|col_name| {
                                 schema.columns.iter()
                                     .position(|c| &c.name == col_name)
-                                    .map(|idx| final_values_vec[idx].clone())
+                                    .and_then(|idx| final_values_vec.get(idx).cloned())
                             })
                             .collect();
 
@@ -1127,7 +1131,8 @@ impl EmbeddedDatabase {
                             let new_value = evaluator.evaluate(value_expr, &old_tuple)?;
                             let col_index = evaluator.schema().get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
-                            new_tuple.values[col_index] = new_value;
+                            *new_tuple.values.get_mut(col_index)
+                                .ok_or_else(|| Error::internal("column index out of bounds"))? = new_value;
                         }
 
                         // Execute BEFORE UPDATE triggers
@@ -1314,7 +1319,7 @@ impl EmbeddedDatabase {
                                         .map(|col_name| {
                                             schema_arc.columns.iter()
                                                 .position(|c| &c.name == col_name)
-                                                .map(|idx| tuple.values[idx].clone())
+                                                .and_then(|idx| tuple.values.get(idx).cloned())
                                                 .unwrap_or(Value::Null)
                                         })
                                         .collect();
@@ -1619,14 +1624,16 @@ impl EmbeddedDatabase {
                         "Column '{}' not found in table '{}'", column_name, table_name
                     )))?;
 
-                let old_mode = schema.columns[col_idx].storage_mode;
+                let col_ref = schema.get_column_at(col_idx)
+                    .ok_or_else(|| Error::internal("column index out of bounds"))?;
+                let old_mode = col_ref.storage_mode;
                 if old_mode == *storage_mode {
                     // No change needed
                     return Ok(0);
                 }
 
                 // Migrate existing data online
-                let column = schema.columns[col_idx].clone();
+                let column = col_ref.clone();
                 let rows_migrated = self.storage.migrate_column_storage(
                     table_name,
                     col_idx,
@@ -1636,7 +1643,9 @@ impl EmbeddedDatabase {
                 )?;
 
                 // Update schema with new storage mode
-                schema.columns[col_idx].storage_mode = *storage_mode;
+                schema.get_column_at_mut(col_idx)
+                    .ok_or_else(|| Error::internal("column index out of bounds"))?
+                    .storage_mode = *storage_mode;
                 catalog.update_table_schema(table_name, &schema)?;
 
                 // Log to WAL for replication
@@ -1706,7 +1715,10 @@ impl EmbeddedDatabase {
                 match col_idx {
                     Some(idx) => {
                         // Check if column is primary key
-                        if schema.columns[idx].primary_key && !cascade {
+                        let is_pk = schema.get_column_at(idx)
+                            .ok_or_else(|| Error::internal("column index out of bounds"))?
+                            .primary_key;
+                        if is_pk && !cascade {
                             return Err(Error::query_execution(format!(
                                 "Cannot drop primary key column '{}' without CASCADE", column_name
                             )));
@@ -1755,7 +1767,9 @@ impl EmbeddedDatabase {
                         "Column '{}' does not exist in table '{}'", old_column_name, table_name
                     )))?;
 
-                schema.columns[col_idx].name = new_column_name.clone();
+                schema.get_column_at_mut(col_idx)
+                    .ok_or_else(|| Error::internal("column index out of bounds"))?
+                    .name = new_column_name.clone();
                 catalog.update_table_schema(table_name, &schema)?;
 
                 tracing::info!(
@@ -2181,7 +2195,8 @@ impl EmbeddedDatabase {
                         // Determine target column type for auto-casting
                         let target_col_idx = if let Some(ref cols) = columns {
                             // Explicit column list - find index
-                            let col_name = &cols[col_idx];
+                            let col_name = cols.get(col_idx)
+                                .ok_or_else(|| Error::internal("column index out of bounds"))?;
                             schema.get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?
                         } else {
@@ -2189,14 +2204,13 @@ impl EmbeddedDatabase {
                             col_idx
                         };
 
-                        if target_col_idx >= schema.columns.len() {
-                            return Err(Error::query_execution(format!(
+                        let target_col = schema.get_column_at(target_col_idx)
+                            .ok_or_else(|| Error::query_execution(format!(
                                 "Too many values for INSERT: table has {} columns",
                                 schema.columns.len()
-                            )));
-                        }
+                            )))?;
 
-                        let target_type = &schema.columns[target_col_idx].data_type;
+                        let target_type = &target_col.data_type;
 
                         // Evaluate expression
                         let mut value = evaluator.evaluate(expr, &empty_tuple)?;
@@ -2503,14 +2517,16 @@ impl EmbeddedDatabase {
                         "Column '{}' not found in table '{}'", column_name, table_name
                     )))?;
 
-                let old_mode = schema.columns[col_idx].storage_mode;
+                let col_ref = schema.get_column_at(col_idx)
+                    .ok_or_else(|| Error::internal("column index out of bounds"))?;
+                let old_mode = col_ref.storage_mode;
                 if old_mode == *storage_mode {
                     // No change needed
                     return Ok(0);
                 }
 
                 // Migrate existing data online
-                let column = schema.columns[col_idx].clone();
+                let column = col_ref.clone();
                 let rows_migrated = self.storage.migrate_column_storage(
                     table_name,
                     col_idx,
@@ -2520,7 +2536,9 @@ impl EmbeddedDatabase {
                 )?;
 
                 // Update schema with new storage mode
-                schema.columns[col_idx].storage_mode = *storage_mode;
+                schema.get_column_at_mut(col_idx)
+                    .ok_or_else(|| Error::internal("column index out of bounds"))?
+                    .storage_mode = *storage_mode;
                 catalog.update_table_schema(table_name, &schema)?;
 
                 // Log to WAL for replication
@@ -2612,7 +2630,9 @@ impl EmbeddedDatabase {
                         "Column '{}' does not exist in table '{}'", old_column_name, table_name
                     )))?;
 
-                schema.columns[col_idx].name = new_column_name.clone();
+                schema.get_column_at_mut(col_idx)
+                    .ok_or_else(|| Error::internal("column index out of bounds"))?
+                    .name = new_column_name.clone();
                 catalog.update_table_schema(table_name, &schema)?;
                 Ok(0)
             }
@@ -2824,21 +2844,21 @@ impl EmbeddedDatabase {
 
                     for (col_idx, expr) in value_row.iter().enumerate() {
                         let target_col_idx = if let Some(ref cols) = columns {
-                            let col_name = &cols[col_idx];
+                            let col_name = cols.get(col_idx)
+                                .ok_or_else(|| Error::internal("column index out of bounds"))?;
                             schema.get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?
                         } else {
                             col_idx
                         };
 
-                        if target_col_idx >= schema.columns.len() {
-                            return Err(Error::query_execution(format!(
+                        let target_col = schema.get_column_at(target_col_idx)
+                            .ok_or_else(|| Error::query_execution(format!(
                                 "Too many values for INSERT: table has {} columns",
                                 schema.columns.len()
-                            )));
-                        }
+                            )))?;
 
-                        let target_type = &schema.columns[target_col_idx].data_type;
+                        let target_type = &target_col.data_type;
                         let mut value = evaluator.evaluate(expr, &empty_tuple)?;
 
                         // Auto-cast if needed

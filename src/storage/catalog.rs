@@ -198,9 +198,11 @@ impl<'a> Catalog<'a> {
             // Check if key starts with our data prefix
             if key.starts_with(prefix_bytes) {
                 keys_to_delete.push(key.to_vec());
-            } else if !key.is_empty() && key[0] > prefix_bytes[0] {
-                // Optimization: break early if we've passed the prefix range
-                break;
+            } else if let (Some(&k0), Some(&p0)) = (key.first(), prefix_bytes.first()) {
+                if k0 > p0 {
+                    // Optimization: break early if we've passed the prefix range
+                    break;
+                }
             }
         }
 
@@ -227,14 +229,16 @@ impl<'a> Catalog<'a> {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(prefix) {
-                if !key.is_empty() && key[0] > prefix[0] {
-                    break;
+                if let (Some(&k0), Some(&p0)) = (key.first(), prefix.first()) {
+                    if k0 > p0 {
+                        break;
+                    }
                 }
                 continue;
             }
 
             // Extract table name from key
-            let table_name = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
+            let table_name = String::from_utf8_lossy(key.get(prefix.len()..).unwrap_or_default()).to_string();
             tables.push(table_name);
         }
 
@@ -320,8 +324,10 @@ impl<'a> Catalog<'a> {
                 if let Some(row_id_str) = key_str.strip_prefix(&old_data_prefix) {
                     rows_to_move.push((row_id_str.to_string(), value.to_vec()));
                 }
-            } else if !key.is_empty() && key[0] > old_prefix_bytes[0] {
-                break;
+            } else if let (Some(&k0), Some(&p0)) = (key.first(), old_prefix_bytes.first()) {
+                if k0 > p0 {
+                    break;
+                }
             }
         }
 
@@ -533,8 +539,10 @@ impl<'a> Catalog<'a> {
             let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(prefix) {
-                if !key.is_empty() && key[0] > prefix[0] {
-                    break;
+                if let (Some(&k0), Some(&p0)) = (key.first(), prefix.first()) {
+                    if k0 > p0 {
+                        break;
+                    }
                 }
                 continue;
             }
@@ -560,8 +568,10 @@ impl<'a> Catalog<'a> {
 
             if key.starts_with(prefix_bytes) {
                 keys_to_delete.push(key.to_vec());
-            } else if !key.is_empty() && key[0] > prefix_bytes[0] {
-                break;
+            } else if let (Some(&k0), Some(&p0)) = (key.first(), prefix_bytes.first()) {
+                if k0 > p0 {
+                    break;
+                }
             }
         }
 
@@ -639,8 +649,10 @@ impl<'a> Catalog<'a> {
             let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(prefix) {
-                if !key.is_empty() && key[0] > prefix[0] {
-                    break;
+                if let (Some(&k0), Some(&p0)) = (key.first(), prefix.first()) {
+                    if k0 > p0 {
+                        break;
+                    }
                 }
                 continue;
             }
@@ -720,7 +732,7 @@ impl<'a> Catalog<'a> {
 }
 
 /// Implement TriggerPersistence trait for Catalog
-impl<'a> TriggerPersistence for Catalog<'a> {
+impl TriggerPersistence for Catalog<'_> {
     fn save_trigger(&self, definition: &TriggerDefinition) -> Result<()> {
         self.save_trigger(definition)
     }

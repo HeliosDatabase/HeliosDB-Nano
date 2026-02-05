@@ -377,8 +377,8 @@ impl IncrementalRefresher {
         let mv_size = self.count_tuples(&mv_data_table)?;
 
         // Get base table size
-        let base_size = if !mv_metadata.base_tables.is_empty() {
-            self.count_tuples(&mv_metadata.base_tables[0])?
+        let base_size = if let Some(first_table) = mv_metadata.base_tables.first() {
+            self.count_tuples(first_table)?
         } else {
             0
         };
@@ -459,43 +459,55 @@ impl IncrementalRefresher {
         // Update aggregates
         for (i, aggr_expr) in aggr_exprs.iter().enumerate() {
             if let LogicalExpr::AggregateFunction { fun, args, .. } = aggr_expr {
+                let agg_val = agg_row.values.get(i).cloned().unwrap_or(Value::Null);
                 match fun {
                     AggregateFunction::Count => {
-                        if let Value::Int8(count) = agg_row.values[i] {
-                            agg_row.values[i] = Value::Int8(count + 1);
+                        if let Value::Int8(count) = agg_val {
+                            if let Some(slot) = agg_row.values.get_mut(i) {
+                                *slot = Value::Int8(count + 1);
+                            }
                         }
                     }
                     AggregateFunction::Sum => {
-                        if !args.is_empty() {
-                            let value = self.evaluate_expr_with_schema(&args[0], tuple, None)?;
-                            agg_row.values[i] = self.add_values(&agg_row.values[i], &value)?;
+                        if let Some(first_arg) = args.first() {
+                            let value = self.evaluate_expr_with_schema(first_arg, tuple, None)?;
+                            let new_val = self.add_values(&agg_val, &value)?;
+                            if let Some(slot) = agg_row.values.get_mut(i) {
+                                *slot = new_val;
+                            }
                         }
                     }
                     AggregateFunction::Avg => {
                         // For AVG, we need to maintain SUM and COUNT
                         // This is a simplified implementation
-                        if !args.is_empty() {
-                            let value = self.evaluate_expr_with_schema(&args[0], tuple, None)?;
+                        if let Some(first_arg) = args.first() {
+                            let value = self.evaluate_expr_with_schema(first_arg, tuple, None)?;
                             // Update running average (simplified)
-                            if let (Value::Float8(old_avg), Value::Float8(new_val)) = (&agg_row.values[i], value) {
+                            if let (Value::Float8(old_avg), Value::Float8(new_val)) = (&agg_val, value) {
                                 // This is approximate; real implementation needs count tracking
-                                agg_row.values[i] = Value::Float8((old_avg + new_val) / 2.0);
+                                if let Some(slot) = agg_row.values.get_mut(i) {
+                                    *slot = Value::Float8((old_avg + new_val) / 2.0);
+                                }
                             }
                         }
                     }
                     AggregateFunction::Min => {
-                        if !args.is_empty() {
-                            let value = self.evaluate_expr_with_schema(&args[0], tuple, None)?;
-                            if self.compare_values(&value, &agg_row.values[i])? < 0 {
-                                agg_row.values[i] = value;
+                        if let Some(first_arg) = args.first() {
+                            let value = self.evaluate_expr_with_schema(first_arg, tuple, None)?;
+                            if self.compare_values(&value, &agg_val)? < 0 {
+                                if let Some(slot) = agg_row.values.get_mut(i) {
+                                    *slot = value;
+                                }
                             }
                         }
                     }
                     AggregateFunction::Max => {
-                        if !args.is_empty() {
-                            let value = self.evaluate_expr_with_schema(&args[0], tuple, None)?;
-                            if self.compare_values(&value, &agg_row.values[i])? > 0 {
-                                agg_row.values[i] = value;
+                        if let Some(first_arg) = args.first() {
+                            let value = self.evaluate_expr_with_schema(first_arg, tuple, None)?;
+                            if self.compare_values(&value, &agg_val)? > 0 {
+                                if let Some(slot) = agg_row.values.get_mut(i) {
+                                    *slot = value;
+                                }
                             }
                         }
                     }
@@ -532,35 +544,41 @@ impl IncrementalRefresher {
         // Update aggregates (reverse operation)
         for (i, aggr_expr) in aggr_exprs.iter().enumerate() {
             if let LogicalExpr::AggregateFunction { fun, args, .. } = aggr_expr {
+                let agg_val = agg_row.values.get(i).cloned().unwrap_or(Value::Null);
                 match fun {
                     AggregateFunction::Count => {
-                        if let Value::Int8(count) = agg_row.values[i] {
-                            agg_row.values[i] = Value::Int8(count - 1);
+                        if let Value::Int8(count) = agg_val {
+                            if let Some(slot) = agg_row.values.get_mut(i) {
+                                *slot = Value::Int8(count - 1);
+                            }
                         }
                     }
                     AggregateFunction::Sum => {
-                        if !args.is_empty() {
-                            let value = self.evaluate_expr_with_schema(&args[0], tuple, None)?;
-                            agg_row.values[i] = self.subtract_values(&agg_row.values[i], &value)?;
+                        if let Some(first_arg) = args.first() {
+                            let value = self.evaluate_expr_with_schema(first_arg, tuple, None)?;
+                            let new_val = self.subtract_values(&agg_val, &value)?;
+                            if let Some(slot) = agg_row.values.get_mut(i) {
+                                *slot = new_val;
+                            }
                         }
                     }
                     AggregateFunction::Min | AggregateFunction::Max => {
                         // MIN/MAX require special handling when deleting values
                         // Check if the deleted value equals the current min/max
-                        if !args.is_empty() {
-                            let deleted_value = self.evaluate_expr_with_schema(&args[0], tuple, None)?;
+                        if let Some(first_arg) = args.first() {
+                            let deleted_value = self.evaluate_expr_with_schema(first_arg, tuple, None)?;
                             let group_key_len = group_key.len();
                             let agg_idx = group_key_len + i;
 
-                            if agg_idx < agg_row.values.len() {
-                                let current_agg = &agg_row.values[agg_idx];
-
+                            if let Some(current_agg) = agg_row.values.get(agg_idx) {
                                 // Check if deleted value affects the min/max
                                 if current_agg == &deleted_value {
                                     // Need to recompute min/max for this group
                                     // This requires scanning all tuples in the group
                                     // For now, we mark it as Null to indicate recomputation needed
-                                    agg_row.values[agg_idx] = Value::Null;
+                                    if let Some(slot) = agg_row.values.get_mut(agg_idx) {
+                                        *slot = Value::Null;
+                                    }
 
                                     // In a production system, we would:
                                     // 1. Scan the base table for this group
@@ -576,7 +594,7 @@ impl IncrementalRefresher {
         }
 
         // Update or delete aggregate row
-        if let Value::Int8(count) = agg_row.values[0] {
+        if let Some(Value::Int8(count)) = agg_row.values.first().cloned() {
             if count <= 0 {
                 self.delete_agg_row(mv_name, &group_key)?;
             } else {
@@ -602,9 +620,9 @@ impl IncrementalRefresher {
         let mv_data_table = format!("__mv_{}", mv_name);
 
         // Get base table schema for column mapping
-        let base_table_schema = if !mv_metadata.base_tables.is_empty() {
+        let base_table_schema = if let Some(first_table) = mv_metadata.base_tables.first() {
             let catalog = self.storage.catalog();
-            Some(catalog.get_table_schema(&mv_metadata.base_tables[0])?)
+            Some(catalog.get_table_schema(first_table)?)
         } else {
             None
         };
@@ -682,8 +700,12 @@ impl IncrementalRefresher {
             )));
         }
 
-        let left_table = &mv_metadata.base_tables[0];
-        let right_table = &mv_metadata.base_tables[1];
+        let left_table = mv_metadata.base_tables.first().ok_or_else(|| {
+            Error::query_execution("Join MV missing left base table")
+        })?;
+        let right_table = mv_metadata.base_tables.get(1).ok_or_else(|| {
+            Error::query_execution("Join MV missing right base table")
+        })?;
 
         // Process deltas from each table
         for delta_set in delta_sets {
@@ -863,41 +885,30 @@ impl IncrementalRefresher {
                 // Parse column reference: might be "table.column" or just "column"
                 // For simplicity, we use index-based access
                 // Format: "$left.0" for left table column 0, "$right.1" for right table column 1
-                if name.starts_with("$left.") {
-                    let idx_str = &name[6..];
+                if let Some(idx_str) = name.strip_prefix("$left.") {
                     let idx: usize = idx_str.parse()
                         .map_err(|_| Error::query_execution(format!("Invalid column index: {}", idx_str)))?;
 
-                    if idx < left_tuple.values.len() {
-                        Ok(left_tuple.values[idx].clone())
-                    } else {
-                        Err(Error::query_execution(format!("Column index {} out of bounds", idx)))
-                    }
-                } else if name.starts_with("$right.") {
-                    let idx_str = &name[7..];
+                    left_tuple.values.get(idx).cloned()
+                        .ok_or_else(|| Error::query_execution(format!("Column index {} out of bounds", idx)))
+                } else if let Some(idx_str) = name.strip_prefix("$right.") {
                     let idx: usize = idx_str.parse()
                         .map_err(|_| Error::query_execution(format!("Invalid column index: {}", idx_str)))?;
 
-                    if idx < right_tuple.values.len() {
-                        Ok(right_tuple.values[idx].clone())
-                    } else {
-                        Err(Error::query_execution(format!("Column index {} out of bounds", idx)))
-                    }
+                    right_tuple.values.get(idx).cloned()
+                        .ok_or_else(|| Error::query_execution(format!("Column index {} out of bounds", idx)))
                 } else {
                     // Assume it's an index directly
                     let idx: usize = name.parse()
                         .map_err(|_| Error::query_execution(format!("Invalid column reference: {}", name)))?;
 
                     // Try left first, then right
-                    if idx < left_tuple.values.len() {
-                        Ok(left_tuple.values[idx].clone())
+                    if let Some(val) = left_tuple.values.get(idx) {
+                        Ok(val.clone())
                     } else {
-                        let right_idx = idx - left_tuple.values.len();
-                        if right_idx < right_tuple.values.len() {
-                            Ok(right_tuple.values[right_idx].clone())
-                        } else {
-                            Err(Error::query_execution(format!("Column index {} out of bounds", idx)))
-                        }
+                        let right_idx = idx.saturating_sub(left_tuple.values.len());
+                        right_tuple.values.get(right_idx).cloned()
+                            .ok_or_else(|| Error::query_execution(format!("Column index {} out of bounds", idx)))
                     }
                 }
             }
@@ -1005,8 +1016,7 @@ impl IncrementalRefresher {
 
         for tuple in tuples {
             // Check if the first N values match the group key
-            if tuple.values.len() >= group_key.len() {
-                let tuple_key = &tuple.values[..group_key.len()];
+            if let Some(tuple_key) = tuple.values.get(..group_key.len()) {
                 if tuple_key == group_key {
                     return Ok(tuple);
                 }
@@ -1046,8 +1056,7 @@ impl IncrementalRefresher {
 
         for tuple in tuples {
             // Check if the first N values match the group key
-            if tuple.values.len() >= group_key.len() {
-                let tuple_key = &tuple.values[..group_key.len()];
+            if let Some(tuple_key) = tuple.values.get(..group_key.len()) {
                 if tuple_key == group_key {
                     // Delete using the low-level key-value API
                     if let Some(row_id) = tuple.row_id {
@@ -1086,14 +1095,11 @@ impl IncrementalRefresher {
                     // Find column index by name
                     for (idx, column) in schema.columns.iter().enumerate() {
                         if column.name == *name {
-                            if idx < tuple.values.len() {
-                                return Ok(tuple.values[idx].clone());
-                            } else {
-                                return Err(Error::query_execution(format!(
+                            return tuple.values.get(idx).cloned()
+                                .ok_or_else(|| Error::query_execution(format!(
                                     "Column index {} out of bounds for tuple with {} values",
                                     idx, tuple.values.len()
                                 )));
-                            }
                         }
                     }
                     Err(Error::query_execution(format!(

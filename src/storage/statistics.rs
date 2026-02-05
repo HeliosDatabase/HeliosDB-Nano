@@ -257,19 +257,22 @@ impl ColumnStatistics {
 
         // Find the first bound that is >= value
         for i in 0..self.histogram_bounds.len() {
-            let cmp = StatisticsAnalyzer::compare_values(value, &self.histogram_bounds[i]);
+            let Some(bound) = self.histogram_bounds.get(i) else { break };
+            let cmp = StatisticsAnalyzer::compare_values(value, bound);
             if cmp < 0 {
                 // Value is less than this bound
                 if i == 0 {
                     return (0, 0.0); // Before first bucket
                 }
                 // Value is in bucket i-1
-                let position = self.interpolate_position(
-                    value,
-                    &self.histogram_bounds[i - 1],
-                    &self.histogram_bounds[i],
-                );
-                return (i - 1, position);
+                if let (Some(lower), Some(upper)) = (
+                    self.histogram_bounds.get(i - 1),
+                    self.histogram_bounds.get(i),
+                ) {
+                    let position = self.interpolate_position(value, lower, upper);
+                    return (i - 1, position);
+                }
+                return (i - 1, 0.5); // Fallback if bounds missing
             } else if cmp == 0 {
                 // Value equals this bound
                 if i >= num_buckets {
@@ -640,11 +643,12 @@ impl StatisticsAnalyzer {
 
             // Process each column value
             for (i, value) in tuple.values.iter().enumerate() {
-                if i >= schema.columns.len() {
-                    continue;
-                }
+                let column = match schema.columns.get(i) {
+                    Some(col) => col,
+                    None => continue,
+                };
 
-                let column_name = &schema.columns[i].name;
+                let column_name = &column.name;
                 let value_size = Self::estimate_value_size(value);
 
                 // Track column sizes
@@ -676,12 +680,12 @@ impl StatisticsAnalyzer {
                 // Update min/max values
                 if let Some(col_stats) = stats.columns.get_mut(column_name) {
                     let should_update_min = col_stats.min_value.as_ref()
-                        .map_or(true, |min_val| Self::compare_values(value, min_val) < 0);
+                        .is_none_or(|min_val| Self::compare_values(value, min_val) < 0);
                     if should_update_min {
                         col_stats.min_value = Some(value.clone());
                     }
                     let should_update_max = col_stats.max_value.as_ref()
-                        .map_or(true, |max_val| Self::compare_values(value, max_val) > 0);
+                        .is_none_or(|max_val| Self::compare_values(value, max_val) > 0);
                     if should_update_max {
                         col_stats.max_value = Some(value.clone());
                     }
@@ -731,12 +735,16 @@ impl StatisticsAnalyzer {
                     let mut bounds = Vec::with_capacity(num_buckets + 1);
 
                     // First bound is the minimum value
-                    bounds.push(values[0].clone());
+                    if let Some(first) = values.first() {
+                        bounds.push(first.clone());
+                    }
 
                     // Add bucket boundaries
                     for i in 1..=num_buckets {
                         let idx = (i * bucket_size).min(values.len() - 1);
-                        bounds.push(values[idx].clone());
+                        if let Some(val) = values.get(idx) {
+                            bounds.push(val.clone());
+                        }
                     }
 
                     // Ensure last bound is the maximum value
@@ -808,19 +816,35 @@ impl StatisticsAnalyzer {
     fn compare_values(a: &Value, b: &Value) -> i32 {
         match (a, b) {
             (Value::Int4(x), Value::Int4(y)) => {
-                if x < y { -1 } else if x > y { 1 } else { 0 }
+                match x.cmp(y) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Greater => 1,
+                    std::cmp::Ordering::Equal => 0,
+                }
             }
             (Value::Int8(x), Value::Int8(y)) => {
-                if x < y { -1 } else if x > y { 1 } else { 0 }
+                match x.cmp(y) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Greater => 1,
+                    std::cmp::Ordering::Equal => 0,
+                }
             }
             (Value::Float8(x), Value::Float8(y)) => {
                 if x < y { -1 } else if x > y { 1 } else { 0 }
             }
             (Value::String(x), Value::String(y)) => {
-                if x < y { -1 } else if x > y { 1 } else { 0 }
+                match x.cmp(y) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Greater => 1,
+                    std::cmp::Ordering::Equal => 0,
+                }
             }
             (Value::Timestamp(x), Value::Timestamp(y)) => {
-                if x < y { -1 } else if x > y { 1 } else { 0 }
+                match x.cmp(y) {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Greater => 1,
+                    std::cmp::Ordering::Equal => 0,
+                }
             }
             _ => 0, // Default: consider equal
         }

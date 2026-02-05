@@ -92,9 +92,10 @@ impl<'a> Planner<'a> {
             // Extract length if present: VARCHAR(255)
             if let Some(start) = upper.find('(') {
                 if let Some(end) = upper.find(')') {
-                    let len_str = &upper[start + 1..end];
-                    if let Ok(len) = len_str.parse::<usize>() {
-                        return Ok(DataType::Varchar(Some(len)));
+                    if let Some(len_str) = upper.get(start + 1..end) {
+                        if let Ok(len) = len_str.parse::<usize>() {
+                            return Ok(DataType::Varchar(Some(len)));
+                        }
                     }
                 }
             }
@@ -108,9 +109,10 @@ impl<'a> Planner<'a> {
         if upper.starts_with("VECTOR") {
             if let Some(start) = upper.find('(') {
                 if let Some(end) = upper.find(')') {
-                    let dim_str = &upper[start + 1..end];
-                    if let Ok(dim) = dim_str.parse::<usize>() {
-                        return Ok(DataType::Vector(dim));
+                    if let Some(dim_str) = upper.get(start + 1..end) {
+                        if let Ok(dim) = dim_str.parse::<usize>() {
+                            return Ok(DataType::Vector(dim));
+                        }
                     }
                 }
             }
@@ -187,7 +189,10 @@ impl<'a> Planner<'a> {
                 if names.len() != 1 {
                     return Err(Error::query_execution("Multiple drops not supported"));
                 }
-                let name = names[0].to_string();
+                // SAFETY: We've verified names.len() == 1 above
+                let name = names.first()
+                    .ok_or_else(|| Error::query_execution("DROP requires a name"))?
+                    .to_string();
 
                 match object_type {
                     sqlparser::ast::ObjectType::View => {
@@ -220,8 +225,10 @@ impl<'a> Planner<'a> {
                 if table_names.len() > 1 {
                     return Err(Error::query_execution("Multiple table TRUNCATE not supported"));
                 }
+                let first_table = table_names.first()
+                    .ok_or_else(|| Error::query_execution("TRUNCATE requires a table name"))?;
                 Ok(LogicalPlan::Truncate {
-                    table_name: table_names[0].to_string(),
+                    table_name: first_table.to_string(),
                 })
             }
             Statement::Update { table, assignments, selection, returning, .. } => {
@@ -252,13 +259,17 @@ impl<'a> Planner<'a> {
                         if tables.len() != 1 {
                             return Err(Error::query_execution("Multi-table DELETE not supported"));
                         }
-                        tables[0].clone()
+                        tables.first()
+                            .ok_or_else(|| Error::query_execution("DELETE requires a table"))?
+                            .clone()
                     }
                     sqlparser::ast::FromTable::WithoutKeyword(tables) => {
                         if tables.len() != 1 {
                             return Err(Error::query_execution("Multi-table DELETE not supported"));
                         }
-                        tables[0].clone()
+                        tables.first()
+                            .ok_or_else(|| Error::query_execution("DELETE requires a table"))?
+                            .clone()
                     }
                 };
                 // Extract RETURNING clause if present
@@ -298,7 +309,9 @@ impl<'a> Planner<'a> {
                     return Err(Error::query_execution("Multi-column vector indexes not yet supported"));
                 }
 
-                let column = match &create_index.columns[0].expr {
+                let first_col = create_index.columns.first()
+                    .ok_or_else(|| Error::query_execution("At least one column required for index"))?;
+                let column = match &first_col.expr {
                     Expr::Identifier(ident) => ident.value.clone(),
                     _ => return Err(Error::query_execution("Column name expected in CREATE INDEX")),
                 };
@@ -773,7 +786,10 @@ impl<'a> Planner<'a> {
         } else if select.from.len() > 1 {
             return Err(Error::query_execution("Multiple FROM tables require explicit JOIN"));
         } else {
-            self.table_with_joins_to_plan(&select.from[0])?
+            self.table_with_joins_to_plan(
+                select.from.first()
+                    .ok_or_else(|| Error::query_execution("FROM clause is empty"))?
+            )?
         };
 
         // Add WHERE clause as Filter
@@ -1160,7 +1176,7 @@ impl<'a> Planner<'a> {
         if let Some(pos) = upper.find("VERSIONS BETWEEN") {
             // Skip "VERSIONS BETWEEN " to get the clause content
             let start = pos + "VERSIONS BETWEEN".len();
-            let remainder = &sql[start..].trim_start();
+            let remainder = sql.get(start..)?.trim_start();
 
             // Find the end of the clause - look for SQL keywords or end
             let keywords = ["WHERE", "GROUP BY", "ORDER BY", "LIMIT", "JOIN", ";"];
@@ -1174,7 +1190,7 @@ impl<'a> Planner<'a> {
                 }
             }
 
-            let clause = remainder[..end].trim();
+            let clause = remainder.get(..end).unwrap_or_default().trim();
             if !clause.is_empty() {
                 return Some(clause.to_string());
             }
@@ -1232,7 +1248,7 @@ impl<'a> Planner<'a> {
                 let func_name = func.name.to_string().to_lowercase();
                 match func.args {
                     sqlparser::ast::FunctionArguments::List(ref list) if !list.args.is_empty() => {
-                        if let sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(inner)) = &list.args[0] {
+                        if let Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(inner))) = list.args.first() {
                             if let Expr::Identifier(ident) = inner {
                                 return format!("{}({})", func_name, ident.value);
                             }
@@ -1389,7 +1405,9 @@ impl<'a> Planner<'a> {
         }
 
         // Extract delimiter from second argument (must be a literal string)
-        let delimiter = match &args[1] {
+        let delimiter_arg = args.get(1)
+            .ok_or_else(|| Error::query_execution("STRING_AGG requires a delimiter argument"))?;
+        let delimiter = match delimiter_arg {
             LogicalExpr::Literal(crate::Value::String(s)) => s.clone(),
             _ => return Err(Error::query_execution("STRING_AGG delimiter must be a string literal")),
         };
@@ -1401,9 +1419,11 @@ impl<'a> Planner<'a> {
             _ => false,
         };
 
+        let value_expr = args.first()
+            .ok_or_else(|| Error::query_execution("STRING_AGG requires a value argument"))?;
         Ok(Some(LogicalExpr::AggregateFunction {
             fun: AggregateFunction::StringAgg { delimiter },
-            args: vec![args[0].clone()], // Only the value expression
+            args: vec![value_expr.clone()], // Only the value expression
             distinct,
         }))
     }
@@ -1562,7 +1582,10 @@ impl<'a> Planner<'a> {
             Expr::CompoundIdentifier(idents) => {
                 // Handle table.column references - preserve the table qualifier for JOIN disambiguation
                 if idents.len() >= 2 {
-                    let table_alias = idents[idents.len() - 2].value.clone();
+                    // SAFETY: len() >= 2 guarantees len()-2 is valid
+                    let table_alias = idents.get(idents.len() - 2)
+                        .ok_or_else(|| Error::query_execution("Invalid compound identifier"))?
+                        .value.clone();
                     let column_name = idents.last()
                         .ok_or_else(|| Error::query_execution("Empty compound identifier"))?
                         .value.clone();
@@ -1587,7 +1610,7 @@ impl<'a> Planner<'a> {
                     sqlparser::ast::Value::Placeholder(placeholder) => {
                         // PostgreSQL-style parameter: $1, $2, etc.
                         if placeholder.starts_with('$') {
-                            let index_str = &placeholder[1..];
+                            let index_str = placeholder.get(1..).unwrap_or_default();
                             let index = index_str.parse::<usize>()
                                 .map_err(|_| Error::query_execution(format!(
                                     "Invalid parameter placeholder: {}. Expected format: $1, $2, etc.",
@@ -2183,7 +2206,8 @@ impl<'a> Planner<'a> {
             ));
         }
 
-        let operation = &operations[0];
+        let operation = operations.first()
+            .ok_or_else(|| Error::query_execution("ALTER TABLE requires an operation"))?;
 
         match operation {
             AlterTableOperation::AddColumn { column_def, if_not_exists, .. } => {
@@ -2301,8 +2325,10 @@ impl<'a> Planner<'a> {
                     "SMALLSERIAL" => Ok(DataType::Int2), // SMALLSERIAL is Int2 with auto-increment
                     "VECTOR" => {
                         // Parse dimension from type modifiers: VECTOR(1536)
-                        if !type_modifiers.is_empty() && type_modifiers.len() == 1 {
-                            let dimension = type_modifiers[0].parse::<usize>()
+                        if type_modifiers.len() == 1 {
+                            let modifier = type_modifiers.first()
+                                .ok_or_else(|| Error::query_execution("VECTOR type requires dimension"))?;
+                            let dimension = modifier.parse::<usize>()
                                 .map_err(|e| Error::query_execution(format!("Invalid vector dimension: {}", e)))?;
                             return Ok(DataType::Vector(dimension));
                         }

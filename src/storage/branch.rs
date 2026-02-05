@@ -1164,8 +1164,8 @@ impl BranchManager {
 
         // Get the current value for this key
         // Since we no longer store timestamps in the key, we just return the value directly
-        let iter = self.db.prefix_iterator(&prefix);
-        for item in iter {
+        let mut iter = self.db.prefix_iterator(&prefix);
+        if let Some(item) = iter.next() {
             let (_k, v) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
             // Return the first (and only) match for this key
             return Ok(Some((v.to_vec(), 0))); // Return 0 as default timestamp since it's not stored
@@ -1365,20 +1365,20 @@ pub fn decode_branch_data_key(key: &[u8]) -> Option<(BranchId, String)> {
         return None;
     }
 
-    let remaining = &key[BRANCH_DATA_PREFIX.len()..];
+    let remaining = key.get(BRANCH_DATA_PREFIX.len()..)?;
 
     // Parse branch ID (8 bytes)
     if remaining.len() < 8 {
         return None;
     }
-    let branch_id = u64::from_be_bytes(remaining[..8].try_into().ok()?);
+    let branch_id = u64::from_be_bytes(remaining.get(..8)?.try_into().ok()?);
 
     // Find separator
     if remaining.get(8)? != &b':' {
         return None;
     }
 
-    let remaining = &remaining[9..];
+    let remaining = remaining.get(9..)?;
 
     // Remaining is the user key
     let user_key = String::from_utf8(remaining.to_vec()).ok()?;

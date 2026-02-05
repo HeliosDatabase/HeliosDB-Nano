@@ -148,6 +148,9 @@ impl Parser {
         let mut in_single_quote = false;
         let mut in_double_quote = false;
 
+        // SAFETY: All indexing below is guarded by `while i < chars.len()` and
+        // `i + 1 < chars.len()` checks that structurally guarantee bounds.
+        #[allow(clippy::indexing_slicing)]
         while i < chars.len() {
             // Handle string literals (don't strip comments inside strings)
             if chars[i] == '\'' && !in_double_quote {
@@ -459,8 +462,12 @@ impl Parser {
                 )));
             }
 
-            let key = parts[0].trim().to_lowercase();
-            let value = parts[1].trim().trim_matches('\'').trim_matches('"').to_string();
+            let key = parts.get(0).ok_or_else(|| Error::query_execution(
+                format!("Invalid option format '{}', expected 'key = value'", pair)
+            ))?.trim().to_lowercase();
+            let value = parts.get(1).ok_or_else(|| Error::query_execution(
+                format!("Invalid option format '{}', expected 'key = value'", pair)
+            ))?.trim().trim_matches('\'').trim_matches('"').to_string();
 
             // Validate known options
             match key.as_str() {
@@ -893,10 +900,12 @@ impl Parser {
             // Split name and type
             let parts: Vec<&str> = param_content.splitn(2, char::is_whitespace).collect();
             if parts.len() >= 2 {
-                params.push((parts[0].trim().to_string(), parts[1].trim().to_string()));
-            } else if parts.len() == 1 {
+                if let (Some(name), Some(typ)) = (parts.get(0), parts.get(1)) {
+                    params.push((name.trim().to_string(), typ.trim().to_string()));
+                }
+            } else if let Some(typ) = parts.first() {
                 // Type only (unnamed parameter)
-                params.push(("".to_string(), parts[0].trim().to_string()));
+                params.push(("".to_string(), typ.trim().to_string()));
             }
         }
 
@@ -938,6 +947,9 @@ impl Parser {
             // Find matching closing quote (handle escaped quotes)
             let mut i = 1;
             let chars: Vec<char> = trimmed.chars().collect();
+            // SAFETY: All indexing below is guarded by `while i < chars.len()` and
+            // `i + 1 < chars.len()` checks that structurally guarantee bounds.
+            #[allow(clippy::indexing_slicing)]
             while i < chars.len() {
                 if chars[i] == '\'' {
                     if i + 1 < chars.len() && chars[i + 1] == '\'' {
@@ -1085,6 +1097,10 @@ impl Parser {
         let chars: Vec<(usize, char)> = sql.char_indices().collect();
         let mut char_idx = 0;
 
+        // SAFETY: All indexing below is guarded by `while char_idx < chars.len()` and
+        // `char_idx + 7 <= chars.len()` / `char_idx + 7 >= chars.len()` checks, plus
+        // `char_idx == 0` guard before `char_idx - 1` access. Bounds are structurally guaranteed.
+        #[allow(clippy::indexing_slicing)]
         while char_idx < chars.len() {
             let (byte_pos, _) = chars[char_idx];
 
