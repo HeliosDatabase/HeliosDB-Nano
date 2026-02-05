@@ -909,6 +909,8 @@ pub struct ReplicationServer {
 
 /// Server state
 struct ServerState {
+    /// This node's ID
+    node_id: Uuid,
     /// Connected standbys
     standbys: HashMap<Uuid, StandbyInfo>,
     /// Connected observers
@@ -919,6 +921,8 @@ struct ServerState {
     term: u64,
     /// Is this server the primary
     is_primary: bool,
+    /// Current primary LSN
+    primary_lsn: Lsn,
 }
 
 /// Connected standby info
@@ -946,11 +950,13 @@ impl ReplicationServer {
         Self {
             listen_addr,
             state: Arc::new(RwLock::new(ServerState {
+                node_id: Uuid::new_v4(),
                 standbys: HashMap::new(),
                 observers: HashMap::new(),
                 fencing_token: 1,
                 term: 1,
                 is_primary: true,
+                primary_lsn: 0,
             })),
             shutdown_tx,
         }
@@ -1023,9 +1029,9 @@ impl ReplicationServer {
         let state_guard = state.read().await;
         let response = HandshakeResponse {
             accepted: state_guard.is_primary,
-            server_node_id: Uuid::new_v4(), // TODO: Get from config
+            server_node_id: state_guard.node_id,
             sync_mode: request.sync_mode,
-            primary_lsn: 0, // TODO: Get actual LSN
+            primary_lsn: state_guard.primary_lsn,
             slot_name: request.slot_name.clone(),
             fencing_token: state_guard.fencing_token,
             capabilities: Capabilities::all(),
