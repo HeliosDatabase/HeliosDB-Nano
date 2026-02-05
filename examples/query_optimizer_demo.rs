@@ -415,6 +415,7 @@ fn demo_join_reordering(optimizer: &Optimizer, users_schema: Arc<Schema>, orders
             op: BinaryOperator::Eq,
             right: Box::new(LogicalExpr::Column { table: None, name: "id".to_string() }),
         }),
+        lateral: false,
     };
 
     let before_cost = optimizer.cost_estimator().estimate_cost(&join).unwrap_or(0.0);
@@ -524,6 +525,7 @@ fn demo_complex_query(optimizer: &Optimizer, users_schema: Arc<Schema>, orders_s
             op: BinaryOperator::Eq,
             right: Box::new(LogicalExpr::Column { table: None, name: "id".to_string() }),
         }),
+        lateral: false,
     };
 
     // Filter with constants

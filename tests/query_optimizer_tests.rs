@@ -446,6 +446,7 @@ fn test_join_reordering_puts_small_table_first() {
             op: BinaryOperator::Eq,
             right: Box::new(LogicalExpr::Column { table: None, name: "id".to_string() }),
         }),
+        lateral: false,
     };
 
     let optimized = optimizer.optimize(join).expect("Optimization failed");
@@ -488,6 +489,7 @@ fn test_join_reordering_preserves_outer_join() {
         right: Box::new(users_scan),
         join_type: JoinType::Left,
         on: None,
+        lateral: false,
     };
 
     let optimized = optimizer.optimize(left_join.clone()).expect("Optimization failed");
@@ -650,6 +652,7 @@ fn test_optimization_cost_improvement() {
         right: Box::new(users_scan),
         join_type: JoinType::Inner,
         on: None,
+        lateral: false,
     };
 
     // Measure costs
