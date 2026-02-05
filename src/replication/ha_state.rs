@@ -565,11 +565,12 @@ impl HAStateRegistry {
             WalOperation::UpdateCounter { .. } => (WalEntryType::Update, serialize_operation(operation)),
         };
 
+        let checksum = crc32fast::hash(&data);
         let entry = WalEntry {
             lsn,
             entry_type,
             data,
-            checksum: 0, // TODO: Compute CRC32
+            checksum,
         };
 
         self.broadcast_wal_entry(entry)
@@ -578,7 +579,13 @@ impl HAStateRegistry {
 
 /// Serialize a WalOperation to bytes for replication
 fn serialize_operation(operation: &WalOperation) -> Vec<u8> {
-    bincode::serialize(operation).unwrap_or_default()
+    match bincode::serialize(operation) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::error!("Failed to serialize WAL operation: {}", e);
+            Vec::new()
+        }
+    }
 }
 
 impl Default for HAStateRegistry {

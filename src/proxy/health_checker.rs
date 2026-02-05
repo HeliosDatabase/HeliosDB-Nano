@@ -181,15 +181,20 @@ impl HealthChecker {
                 // Get all nodes to check
                 let node_ids: Vec<NodeId> = nodes.read().await.keys().cloned().collect();
 
-                for node_id in node_ids {
+                // Get node endpoints for checking
+                let node_map = nodes.read().await;
+                for (node_id, endpoint) in node_map.iter() {
                     let config = config.clone();
                     let health = health.clone();
                     let event_tx = event_tx.clone();
+                    let node_id = *node_id;
+                    let endpoint = endpoint.clone();
 
                     tokio::spawn(async move {
-                        Self::check_node_health(node_id, &config, &health, &event_tx).await;
+                        Self::check_node_health(node_id, &endpoint, &config, &health, &event_tx).await;
                     });
                 }
+                drop(node_map);
             }
 
             tracing::info!("Health checker stopped");
@@ -208,12 +213,13 @@ impl HealthChecker {
     /// Check a single node's health
     async fn check_node_health(
         node_id: NodeId,
+        endpoint: &NodeEndpoint,
         config: &HealthConfig,
         health: &Arc<RwLock<HashMap<NodeId, NodeHealth>>>,
         event_tx: &mpsc::Sender<HealthEvent>,
     ) {
         let start = std::time::Instant::now();
-        let check_result = Self::perform_check(node_id, config).await;
+        let check_result = Self::perform_check(endpoint, config).await;
         let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
         let mut health_guard = health.write().await;
@@ -277,23 +283,44 @@ impl HealthChecker {
     }
 
     /// Perform the actual health check
-    async fn perform_check(_node_id: NodeId, config: &HealthConfig) -> std::result::Result<(), String> {
-        // TODO: Implement actual health check
-        // 1. Try to connect to the node
-        // 2. If detailed_checks, execute check_query
-        // 3. Return success or error
-
-        // For skeleton, simulate with timeout
-        let check = tokio::time::timeout(config.check_timeout, async {
-            // Simulate check delay
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            Ok::<(), String>(())
-        });
-
-        match check.await {
-            Ok(result) => result,
-            Err(_) => Err("Health check timeout".to_string()),
+    async fn perform_check(endpoint: &NodeEndpoint, config: &HealthConfig) -> std::result::Result<(), String> {
+        // Check if node is enabled
+        if !endpoint.enabled {
+            return Err("Node is disabled".to_string());
         }
+
+        // Step 1: Try to establish TCP connection
+        let addr = format!("{}:{}", endpoint.host, endpoint.port);
+        let connect_result = tokio::time::timeout(
+            config.check_timeout,
+            tokio::net::TcpStream::connect(&addr),
+        ).await;
+
+        let stream = match connect_result {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                return Err(format!("Connection failed: {}", e));
+            }
+            Err(_) => {
+                return Err("Connection timeout".to_string());
+            }
+        };
+
+        // Connection successful - node is reachable
+        drop(stream);
+
+        // Step 2: If detailed checks enabled, we would execute the check_query
+        // This requires a database connection which we don't have in this module
+        // For now, just log that detailed checks would be performed
+        if config.detailed_checks {
+            tracing::trace!(
+                "Detailed health check for {} would execute: {}",
+                addr,
+                config.check_query
+            );
+        }
+
+        Ok(())
     }
 
     /// Get health status for a node

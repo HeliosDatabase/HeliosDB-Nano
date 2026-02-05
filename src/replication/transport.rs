@@ -1048,8 +1048,90 @@ impl ReplicationServer {
             return Ok(());
         }
 
-        // Main connection loop
-        // TODO: Implement message handling
+        // Create channel for sending messages to this standby
+        let (msg_tx, mut _msg_rx) = mpsc::channel::<Message>(100);
+
+        // Register standby
+        {
+            let mut state_guard = state.write().await;
+            state_guard.standbys.insert(
+                request.node_id,
+                StandbyInfo {
+                    node_id: request.node_id,
+                    remote_addr: addr,
+                    sync_mode: request.sync_mode,
+                    last_ack_lsn: request.current_lsn.unwrap_or(0),
+                    last_ack_time: Instant::now(),
+                    connection_tx: msg_tx,
+                }
+            );
+        }
+
+        // Main connection loop - handle messages from standby
+        loop {
+            match tokio::time::timeout(Duration::from_secs(30), conn.recv()).await {
+                Ok(Ok(msg)) => {
+                    match msg.header.msg_type {
+                        MessageType::Heartbeat => {
+                            // Update standby state
+                            if let Ok(heartbeat) = bincode::deserialize::<HeartbeatPayload>(&msg.payload) {
+                                let mut state_guard = state.write().await;
+                                if let Some(standby) = state_guard.standbys.get_mut(&request.node_id) {
+                                    standby.last_ack_lsn = heartbeat.current_lsn;
+                                    standby.last_ack_time = Instant::now();
+                                }
+                            }
+                        }
+                        MessageType::Ack => {
+                            // Handle WAL acknowledgment
+                            if let Ok(ack) = bincode::deserialize::<AckPayload>(&msg.payload) {
+                                let mut state_guard = state.write().await;
+                                if let Some(standby) = state_guard.standbys.get_mut(&request.node_id) {
+                                    standby.last_ack_lsn = ack.lsn;
+                                    standby.last_ack_time = Instant::now();
+                                }
+                                tracing::trace!(
+                                    "Received ACK from {} for LSN {}",
+                                    request.node_id,
+                                    ack.lsn
+                                );
+                            }
+                        }
+                        MessageType::Nack => {
+                            // Handle negative acknowledgment
+                            tracing::warn!(
+                                "Received NACK from {}",
+                                request.node_id
+                            );
+                        }
+                        _ => {
+                            tracing::debug!(
+                                "Received unexpected message type {:?} from {}",
+                                msg.header.msg_type,
+                                request.node_id
+                            );
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!("Error receiving from {}: {}", request.node_id, e);
+                    break;
+                }
+                Err(_) => {
+                    // Timeout - connection still alive, continue
+                    tracing::trace!("Connection idle for {}", request.node_id);
+                }
+            }
+        }
+
+        // Cleanup
+        {
+            let mut state_guard = state.write().await;
+            state_guard.standbys.remove(&request.node_id);
+        }
+
+        conn.close().await?;
+        tracing::info!("Standby {} disconnected", request.node_id);
 
         Ok(())
     }
