@@ -399,17 +399,17 @@ fn handle_event_with_storage(
 
 /// Get webhook configuration from app state
 ///
-/// For now, returns default config. In production, this would read from
-/// database or environment configuration.
+/// Reads webhook secrets from environment variables:
+/// - HELIOS_GITHUB_WEBHOOK_SECRET: GitHub webhook signature secret
+/// - HELIOS_GITLAB_WEBHOOK_TOKEN: GitLab webhook token
+/// - HELIOS_WEBHOOK_SECRET: Generic webhook secret
 fn get_webhook_config(_state: &AppState) -> WebhookConfig {
-    // TODO: Read from database or environment
-    // For now, check environment variables
     WebhookConfig {
         github_secret: std::env::var("HELIOS_GITHUB_WEBHOOK_SECRET").ok(),
         gitlab_token: std::env::var("HELIOS_GITLAB_WEBHOOK_TOKEN").ok(),
         generic_secret: std::env::var("HELIOS_WEBHOOK_SECRET").ok(),
         allowed_ips: Vec::new(),
-        rate_limit: 60,
+        rate_limit: 60, // requests per minute
     }
 }
 

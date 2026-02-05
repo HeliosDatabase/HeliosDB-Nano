@@ -470,8 +470,15 @@ impl ProceduralExecutor {
                         return Err(Error::query_execution(format!("RAISE EXCEPTION:{} {}", sqlstate_str, msg)));
                     }
                     RaiseLevel::Warning | RaiseLevel::Notice | RaiseLevel::Info | RaiseLevel::Log | RaiseLevel::Debug => {
-                        // TODO: Log these appropriately
-                        tracing::info!("[{:?}] {}", level, msg);
+                        // Log at appropriate tracing level based on RAISE level
+                        match level {
+                            RaiseLevel::Warning => tracing::warn!("[RAISE WARNING] {}", msg),
+                            RaiseLevel::Notice => tracing::info!("[RAISE NOTICE] {}", msg),
+                            RaiseLevel::Info => tracing::info!("[RAISE INFO] {}", msg),
+                            RaiseLevel::Log => tracing::debug!("[RAISE LOG] {}", msg),
+                            RaiseLevel::Debug => tracing::trace!("[RAISE DEBUG] {}", msg),
+                            _ => unreachable!(),
+                        }
                     }
                 }
             }

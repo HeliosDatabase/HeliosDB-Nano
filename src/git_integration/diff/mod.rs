@@ -1097,10 +1097,18 @@ impl<'a> DiffEngine<'a> {
         for table_diff in &diff.table_diffs {
             match table_diff.change_type {
                 SchemaChangeType::Added => {
-                    output.push_str(&format!(
-                        "-- TODO: Generate CREATE TABLE {} statement\n",
-                        table_diff.table_name
-                    ));
+                    // Generate CREATE TABLE statement from column changes
+                    output.push_str(&format!("CREATE TABLE {} (\n", table_diff.table_name));
+                    let columns: Vec<String> = table_diff.column_changes.iter()
+                        .filter(|c| matches!(c.change_type, SchemaChangeType::Added))
+                        .map(|c| {
+                            let col_type = c.new_type.as_deref().unwrap_or("TEXT");
+                            let nullable = if c.new_nullable == Some(false) { " NOT NULL" } else { "" };
+                            format!("    {} {}{}", c.column_name, col_type, nullable)
+                        })
+                        .collect();
+                    output.push_str(&columns.join(",\n"));
+                    output.push_str("\n);\n");
                 }
                 SchemaChangeType::Removed => {
                     output.push_str(&format!("DROP TABLE IF EXISTS {};\n", table_diff.table_name));

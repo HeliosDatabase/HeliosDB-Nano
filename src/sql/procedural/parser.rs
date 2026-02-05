@@ -680,7 +680,41 @@ impl ProceduralParser {
             None
         };
 
-        // TODO: Parse USING DETAIL = ..., HINT = ...
+        // Parse optional USING clause: USING DETAIL = expr, HINT = expr
+        let mut detail = None;
+        let mut hint = None;
+
+        self.skip_whitespace();
+        if self.try_keyword("USING") {
+            loop {
+                self.skip_whitespace();
+
+                if self.try_keyword("DETAIL") {
+                    self.skip_whitespace();
+                    if self.peek_char() == Some('=') {
+                        self.advance();
+                        self.skip_whitespace();
+                    }
+                    detail = Some(self.parse_expression()?);
+                } else if self.try_keyword("HINT") {
+                    self.skip_whitespace();
+                    if self.peek_char() == Some('=') {
+                        self.advance();
+                        self.skip_whitespace();
+                    }
+                    hint = Some(self.parse_expression()?);
+                } else {
+                    break;
+                }
+
+                self.skip_whitespace();
+                if self.peek_char() == Some(',') {
+                    self.advance();
+                } else {
+                    break;
+                }
+            }
+        }
 
         self.skip_whitespace();
         if self.peek_char() == Some(';') {
@@ -691,8 +725,8 @@ impl ProceduralParser {
             level,
             message,
             sqlstate,
-            detail: None,
-            hint: None,
+            detail,
+            hint,
         })
     }
 
