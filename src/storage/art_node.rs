@@ -36,6 +36,7 @@ impl Default for NodeHeader {
     }
 }
 
+#[allow(clippy::indexing_slicing)] // SAFETY: prefix bounded by MAX_PREFIX_LEN (10)
 impl NodeHeader {
     /// Create a new header with the given prefix
     pub fn with_prefix(prefix: &[u8]) -> Self {
@@ -117,6 +118,7 @@ impl Default for Node4 {
     }
 }
 
+#[allow(clippy::indexing_slicing)] // SAFETY: indices bounded by num_children (max 4)
 impl Node4 {
     /// Create a new empty Node4
     pub fn new() -> Self {
@@ -232,6 +234,7 @@ impl Default for Node16 {
     }
 }
 
+#[allow(clippy::indexing_slicing)] // SAFETY: indices bounded by num_children (max 16)
 impl Node16 {
     /// Create a new empty Node16
     pub fn new() -> Self {
@@ -374,6 +377,7 @@ impl Default for Node48 {
     }
 }
 
+#[allow(clippy::indexing_slicing)] // SAFETY: key is u8 (0-255), child_index is [u8; 256], children bounded by num_children (max 48)
 impl Node48 {
     /// Create a new empty Node48
     pub fn new() -> Self {
@@ -526,6 +530,7 @@ impl Default for Node256 {
     }
 }
 
+#[allow(clippy::indexing_slicing)] // SAFETY: key is u8 (0-255), children is [Option<ArtNode>; 256]
 impl Node256 {
     /// Create a new empty Node256
     pub fn new() -> Self {

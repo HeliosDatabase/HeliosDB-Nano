@@ -131,6 +131,7 @@ pub struct AdaptiveRadixTree {
     stats: ArtIndexStats,
 }
 
+#[allow(clippy::indexing_slicing)] // SAFETY: key[depth] access bounded by depth < key.len() checks; node child access bounded by node type invariants
 impl AdaptiveRadixTree {
     /// Create a new ART index
     pub fn new(name: &str, table: &str, columns: Vec<String>, index_type: ArtIndexType) -> Self {
@@ -681,6 +682,7 @@ impl<'a> ArtIterator<'a> {
     }
 }
 
+#[allow(clippy::indexing_slicing)] // SAFETY: node child indexing bounded by node type invariants
 impl<'a> Iterator for ArtIterator<'a> {
     type Item = (Vec<u8>, RowId);
 

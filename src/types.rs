@@ -622,6 +622,16 @@ impl Schema {
         }
     }
 
+    /// Get column by index (bounds-checked)
+    pub fn get_column_at(&self, index: usize) -> Option<&Column> {
+        self.columns.get(index)
+    }
+
+    /// Get mutable column by index (bounds-checked)
+    pub fn get_column_at_mut(&mut self, index: usize) -> Option<&mut Column> {
+        self.columns.get_mut(index)
+    }
+
     /// Number of columns
     pub fn len(&self) -> usize {
         self.columns.len()

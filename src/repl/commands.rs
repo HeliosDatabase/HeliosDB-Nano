@@ -276,63 +276,63 @@ impl MetaCommand {
             return None;
         }
 
-        let parts: Vec<&str> = trimmed[1..].split_whitespace().collect();
+        let parts: Vec<&str> = trimmed.get(1..).unwrap_or("").split_whitespace().collect();
         if parts.is_empty() {
             return None;
         }
 
-        match parts[0] {
+        match parts.first().copied() {
             // Basic commands
-            "q" | "quit" | "exit" => Some(MetaCommand::Quit),
-            "h" | "help" | "?" => {
+            Some("q" | "quit" | "exit") => Some(MetaCommand::Quit),
+            Some("h" | "help" | "?") => {
                 if parts.len() > 1 {
                     // \h <category> - Help for specific category
-                    Some(MetaCommand::HelpCategory(parts[1].to_string()))
+                    Some(MetaCommand::HelpCategory(parts.get(1).copied().unwrap_or("").to_string()))
                 } else {
                     Some(MetaCommand::Help)
                 }
             }
-            "d" => {
+            Some("d") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::DescribeTable(parts[1].to_string()))
+                    Some(MetaCommand::DescribeTable(parts.get(1).copied().unwrap_or("").to_string()))
                 } else {
                     Some(MetaCommand::ListTables)
                 }
             }
-            "dt" => Some(MetaCommand::ListTablesDetailed),
-            "dS" => {
+            Some("dt") => Some(MetaCommand::ListTablesDetailed),
+            Some("dS") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::DescribeSystemView(parts[1].to_string()))
+                    Some(MetaCommand::DescribeSystemView(parts.get(1).copied().unwrap_or("").to_string()))
                 } else {
                     Some(MetaCommand::ListSystemViews)
                 }
             }
-            "timing" => Some(MetaCommand::ToggleTiming),
+            Some("timing") => Some(MetaCommand::ToggleTiming),
 
             // v3.4 Information Commands
-            "version" => Some(MetaCommand::Version),
-            "status" => Some(MetaCommand::Status),
-            "settings" => Some(MetaCommand::Settings),
+            Some("version") => Some(MetaCommand::Version),
+            Some("status") => Some(MetaCommand::Status),
+            Some("settings") => Some(MetaCommand::Settings),
 
             // v3.4 Storage Maintenance
-            "vacuum" => {
+            Some("vacuum") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::Vacuum(Some(parts[1].to_string())))
+                    Some(MetaCommand::Vacuum(Some(parts.get(1).copied().unwrap_or("").to_string())))
                 } else {
                     Some(MetaCommand::Vacuum(None))
                 }
             }
 
             // v3.5 Replication
-            "replication" | "repl" => Some(MetaCommand::ReplicationStatus),
+            Some("replication" | "repl") => Some(MetaCommand::ReplicationStatus),
 
-            "show" => {
+            Some("show") => {
                 if parts.len() > 1 {
-                    match parts[1] {
-                        "lsn" => Some(MetaCommand::ShowLsn),
-                        "branch" => Some(MetaCommand::ShowBranch),
+                    match parts.get(1).copied() {
+                        Some("lsn") => Some(MetaCommand::ShowLsn),
+                        Some("branch") => Some(MetaCommand::ShowBranch),
                         _ => {
-                            eprintln!("Unknown show command: {}. Try \\show lsn or \\show branch", parts[1]);
+                            eprintln!("Unknown show command: {}. Try \\show lsn or \\show branch", parts.get(1).copied().unwrap_or(""));
                             None
                         }
                     }
@@ -341,77 +341,77 @@ impl MetaCommand {
                     None
                 }
             }
-            "lsn" => Some(MetaCommand::ShowLsn), // Keep for backward compatibility
-            "e" | "edit" => Some(MetaCommand::EditQuery),
+            Some("lsn") => Some(MetaCommand::ShowLsn), // Keep for backward compatibility
+            Some("e" | "edit") => Some(MetaCommand::EditQuery),
 
             // v2.0 Feature commands
-            "branches" => Some(MetaCommand::ListBranches),
-            "use" | "switch" => {
+            Some("branches") => Some(MetaCommand::ListBranches),
+            Some("use" | "switch") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::UseBranch(parts[1].to_string()))
+                    Some(MetaCommand::UseBranch(parts.get(1).copied().unwrap_or("").to_string()))
                 } else {
                     eprintln!("Usage: \\use <branch_name>");
                     None
                 }
             }
-            "snapshots" => Some(MetaCommand::ListSnapshots),
-            "dmv" => {
+            Some("snapshots") => Some(MetaCommand::ListSnapshots),
+            Some("dmv") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::DescribeMaterializedView(parts[1].to_string()))
+                    Some(MetaCommand::DescribeMaterializedView(parts.get(1).copied().unwrap_or("").to_string()))
                 } else {
                     Some(MetaCommand::ListMaterializedViews)
                 }
             }
-            "compression" => {
+            Some("compression") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::ShowCompressionTable(parts[1].to_string()))
+                    Some(MetaCommand::ShowCompressionTable(parts.get(1).copied().unwrap_or("").to_string()))
                 } else {
                     Some(MetaCommand::ShowCompression)
                 }
             }
 
             // v2.1 Feature commands
-            "set" => {
+            Some("set") => {
                 if parts.len() > 2 {
-                    let value = parts[2..].join(" ");
-                    Some(MetaCommand::SetVariable(parts[1].to_string(), value))
+                    let value = parts.get(2..).map_or(String::new(), |s| s.join(" "));
+                    Some(MetaCommand::SetVariable(parts.get(1).copied().unwrap_or("").to_string(), value))
                 } else {
                     Some(MetaCommand::ShowVariables)
                 }
             }
-            "server" => {
+            Some("server") => {
                 if parts.len() > 1 {
-                    match parts[1] {
-                        "start" => Some(MetaCommand::ServerStart),
-                        "stop" => Some(MetaCommand::ServerStop),
-                        "status" => Some(MetaCommand::ServerStatus),
+                    match parts.get(1).copied() {
+                        Some("start") => Some(MetaCommand::ServerStart),
+                        Some("stop") => Some(MetaCommand::ServerStop),
+                        Some("status") => Some(MetaCommand::ServerStatus),
                         _ => None,
                     }
                 } else {
                     Some(MetaCommand::ServerStatus)
                 }
             }
-            "ssl" => {
-                if parts.len() > 1 && parts[1] == "status" {
+            Some("ssl") => {
+                if parts.len() > 1 && parts.get(1).copied() == Some("status") {
                     Some(MetaCommand::SslStatus)
                 } else {
                     Some(MetaCommand::SslStatus)
                 }
             }
-            "user" => {
+            Some("user") => {
                 if parts.len() > 1 {
-                    match parts[1] {
-                        "list" => Some(MetaCommand::UserList),
-                        "add" => {
+                    match parts.get(1).copied() {
+                        Some("list") => Some(MetaCommand::UserList),
+                        Some("add") => {
                             if parts.len() > 2 {
-                                Some(MetaCommand::UserAdd(parts[2].to_string()))
+                                Some(MetaCommand::UserAdd(parts.get(2).copied().unwrap_or("").to_string()))
                             } else {
                                 None
                             }
                         }
-                        "remove" => {
+                        Some("remove") => {
                             if parts.len() > 2 {
-                                Some(MetaCommand::UserRemove(parts[2].to_string()))
+                                Some(MetaCommand::UserRemove(parts.get(2).copied().unwrap_or("").to_string()))
                             } else {
                                 None
                             }
@@ -422,85 +422,85 @@ impl MetaCommand {
                     Some(MetaCommand::UserList)
                 }
             }
-            "password" => {
+            Some("password") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::ChangePassword(parts[1].to_string()))
+                    Some(MetaCommand::ChangePassword(parts.get(1).copied().unwrap_or("").to_string()))
                 } else {
                     None
                 }
             }
-            "config" => {
-                if parts.len() > 1 && parts[1] == "reload" {
+            Some("config") => {
+                if parts.len() > 1 && parts.get(1).copied() == Some("reload") {
                     Some(MetaCommand::ConfigReload)
                 } else {
                     Some(MetaCommand::ShowConfig)
                 }
             }
-            "optimize" => {
+            Some("optimize") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::OptimizeTable(parts[1].to_string()))
+                    Some(MetaCommand::OptimizeTable(parts.get(1).copied().unwrap_or("").to_string()))
                 } else {
                     None
                 }
             }
-            "indexes" => {
+            Some("indexes") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::ShowIndexes(parts[1].to_string()))
+                    Some(MetaCommand::ShowIndexes(parts.get(1).copied().unwrap_or("").to_string()))
                 } else {
                     None
                 }
             }
-            "stats" => Some(MetaCommand::ShowStats),
+            Some("stats") => Some(MetaCommand::ShowStats),
 
             // v2.6 AI Feature commands
-            "ai" => {
+            Some("ai") => {
                 if parts.len() > 1 {
-                    match parts[1] {
-                        "templates" => Some(MetaCommand::AiTemplates),
-                        "template" => {
+                    match parts.get(1).copied() {
+                        Some("templates") => Some(MetaCommand::AiTemplates),
+                        Some("template") => {
                             if parts.len() > 2 {
-                                Some(MetaCommand::AiTemplateDetails(parts[2].to_string()))
+                                Some(MetaCommand::AiTemplateDetails(parts.get(2).copied().unwrap_or("").to_string()))
                             } else {
                                 eprintln!("Usage: \\ai template <name>");
                                 None
                             }
                         }
-                        "infer" => {
-                            let format = if parts.len() > 2 { parts[2] } else { "json" };
+                        Some("infer") => {
+                            let format = if parts.len() > 2 { parts.get(2).copied().unwrap_or("json") } else { "json" };
                             Some(MetaCommand::AiInferSchema(format.to_string()))
                         }
-                        "generate" => {
+                        Some("generate") => {
                             if parts.len() > 2 {
-                                let desc = parts[2..].join(" ");
+                                let desc = parts.get(2..).map_or(String::new(), |s| s.join(" "));
                                 Some(MetaCommand::AiGenerateSchema(desc))
                             } else {
                                 eprintln!("Usage: \\ai generate <description>");
                                 None
                             }
                         }
-                        "optimize" => {
+                        Some("optimize") => {
                             if parts.len() > 2 {
-                                Some(MetaCommand::AiOptimize(parts[2].to_string()))
+                                Some(MetaCommand::AiOptimize(parts.get(2).copied().unwrap_or("").to_string()))
                             } else {
                                 eprintln!("Usage: \\ai optimize <table>");
                                 None
                             }
                         }
-                        "models" => Some(MetaCommand::AiModels),
-                        "embed" => {
+                        Some("models") => Some(MetaCommand::AiModels),
+                        Some("embed") => {
                             if parts.len() > 2 {
-                                let text = parts[2..].join(" ");
+                                let text = parts.get(2..).map_or(String::new(), |s| s.join(" "));
                                 Some(MetaCommand::AiEmbed(text))
                             } else {
                                 eprintln!("Usage: \\ai embed <text>");
                                 None
                             }
                         }
-                        "compare-schema" => {
+                        Some("compare-schema") => {
                             if parts.len() >= 4 {
                                 Some(MetaCommand::AiCompareSchema {
-                                    schema1: parts[2].to_string(),
-                                    schema2: parts[3].to_string(),
+                                    schema1: parts.get(2).copied().unwrap_or("").to_string(),
+                                    schema2: parts.get(3).copied().unwrap_or("").to_string(),
                                 })
                             } else {
                                 eprintln!("Usage: \\ai compare-schema <schema1> <schema2>");
@@ -519,51 +519,51 @@ impl MetaCommand {
             }
 
             // Agent Session Commands
-            "sessions" => Some(MetaCommand::ListSessions),
-            "session-new" => {
+            Some("sessions") => Some(MetaCommand::ListSessions),
+            Some("session-new") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::SessionNew(parts[1].to_string()))
+                    Some(MetaCommand::SessionNew(parts.get(1).copied().unwrap_or("").to_string()))
                 } else {
                     eprintln!("Usage: \\session-new <name>");
                     None
                 }
             }
-            "session" => {
+            Some("session") => {
                 if parts.len() > 1 {
-                    match parts[1] {
-                        "fork" => {
+                    match parts.get(1).copied() {
+                        Some("fork") => {
                             if parts.len() >= 4 {
                                 Some(MetaCommand::SessionFork {
-                                    id: parts[2].to_string(),
-                                    name: parts[3..].join(" "),
+                                    id: parts.get(2).copied().unwrap_or("").to_string(),
+                                    name: parts.get(3..).map_or(String::new(), |s| s.join(" ")),
                                 })
                             } else {
                                 eprintln!("Usage: \\session fork <id> <new_name>");
                                 None
                             }
                         }
-                        "context" => {
+                        Some("context") => {
                             if parts.len() >= 3 {
-                                Some(MetaCommand::SessionContext(parts[2].to_string()))
+                                Some(MetaCommand::SessionContext(parts.get(2).copied().unwrap_or("").to_string()))
                             } else {
                                 eprintln!("Usage: \\session context <id>");
                                 None
                             }
                         }
-                        "memory" => {
+                        Some("memory") => {
                             if parts.len() >= 4 {
                                 Some(MetaCommand::SessionMemory {
-                                    id: parts[2].to_string(),
-                                    query: parts[3..].join(" "),
+                                    id: parts.get(2).copied().unwrap_or("").to_string(),
+                                    query: parts.get(3..).map_or(String::new(), |s| s.join(" ")),
                                 })
                             } else {
                                 eprintln!("Usage: \\session memory <id> <query>");
                                 None
                             }
                         }
-                        "summarize" => {
+                        Some("summarize") => {
                             if parts.len() >= 3 {
-                                Some(MetaCommand::SessionSummarize(parts[2].to_string()))
+                                Some(MetaCommand::SessionSummarize(parts.get(2).copied().unwrap_or("").to_string()))
                             } else {
                                 eprintln!("Usage: \\session summarize <id>");
                                 None
@@ -571,7 +571,7 @@ impl MetaCommand {
                         }
                         _ => {
                             // Default: treat as session ID for details
-                            Some(MetaCommand::SessionDetails(parts[1].to_string()))
+                            Some(MetaCommand::SessionDetails(parts.get(1).copied().unwrap_or("").to_string()))
                         }
                     }
                 } else {
@@ -579,25 +579,25 @@ impl MetaCommand {
                     None
                 }
             }
-            "session-delete" => {
+            Some("session-delete") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::SessionDelete(parts[1].to_string()))
+                    Some(MetaCommand::SessionDelete(parts.get(1).copied().unwrap_or("").to_string()))
                 } else {
                     eprintln!("Usage: \\session-delete <id>");
                     None
                 }
             }
-            "chat" => {
+            Some("chat") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::ChatSession(parts[1].to_string()))
+                    Some(MetaCommand::ChatSession(parts.get(1).copied().unwrap_or("").to_string()))
                 } else {
                     eprintln!("Usage: \\chat <session_id>");
                     None
                 }
             }
-            "session-clear" => {
+            Some("session-clear") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::SessionClear(parts[1].to_string()))
+                    Some(MetaCommand::SessionClear(parts.get(1).copied().unwrap_or("").to_string()))
                 } else {
                     eprintln!("Usage: \\session-clear <id>");
                     None
@@ -605,14 +605,14 @@ impl MetaCommand {
             }
 
             // Vector Management Commands
-            "vectors" => Some(MetaCommand::ListVectors),
-            "vector" => {
+            Some("vectors") => Some(MetaCommand::ListVectors),
+            Some("vector") => {
                 if parts.len() > 1 {
-                    match parts[1] {
-                        "create" => {
+                    match parts.get(1).copied() {
+                        Some("create") => {
                             if parts.len() >= 4 {
-                                let name = parts[2].to_string();
-                                let dims = parts[3].parse::<u32>().unwrap_or(384);
+                                let name = parts.get(2).copied().unwrap_or("").to_string();
+                                let dims = parts.get(3).and_then(|s| s.parse::<u32>().ok()).unwrap_or(384);
                                 let metric = parts.get(4).map(|s| s.to_string());
                                 Some(MetaCommand::VectorCreate { name, dimensions: dims, metric })
                             } else {
@@ -622,17 +622,17 @@ impl MetaCommand {
                                 None
                             }
                         }
-                        "delete" => {
+                        Some("delete") => {
                             if parts.len() > 2 {
-                                Some(MetaCommand::VectorDelete(parts[2].to_string()))
+                                Some(MetaCommand::VectorDelete(parts.get(2).copied().unwrap_or("").to_string()))
                             } else {
                                 eprintln!("Usage: \\vector delete <name>");
                                 None
                             }
                         }
-                        "stats" => {
+                        Some("stats") => {
                             if parts.len() > 2 {
-                                Some(MetaCommand::VectorStats(parts[2].to_string()))
+                                Some(MetaCommand::VectorStats(parts.get(2).copied().unwrap_or("").to_string()))
                             } else {
                                 eprintln!("Usage: \\vector stats <name>");
                                 None
@@ -640,7 +640,7 @@ impl MetaCommand {
                         }
                         _ => {
                             // Default to showing details for the store name
-                            Some(MetaCommand::VectorDetails(parts[1].to_string()))
+                            Some(MetaCommand::VectorDetails(parts.get(1).copied().unwrap_or("").to_string()))
                         }
                     }
                 } else {
@@ -650,43 +650,43 @@ impl MetaCommand {
             }
 
             // Document Management Commands
-            "collections" => Some(MetaCommand::ListCollections),
-            "collection" => {
+            Some("collections") => Some(MetaCommand::ListCollections),
+            Some("collection") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::CollectionDetails(parts[1].to_string()))
+                    Some(MetaCommand::CollectionDetails(parts.get(1).copied().unwrap_or("").to_string()))
                 } else {
                     eprintln!("Usage: \\collection <name>");
                     None
                 }
             }
-            "docs" => {
+            Some("docs") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::ListDocumentsInCollection(parts[1].to_string()))
+                    Some(MetaCommand::ListDocumentsInCollection(parts.get(1).copied().unwrap_or("").to_string()))
                 } else {
                     eprintln!("Usage: \\docs <collection>");
                     None
                 }
             }
-            "doc" => {
+            Some("doc") => {
                 if parts.len() > 1 {
-                    match parts[1] {
-                        "chunks" => {
+                    match parts.get(1).copied() {
+                        Some("chunks") => {
                             if parts.len() >= 4 {
                                 Some(MetaCommand::DocumentChunks {
-                                    collection: parts[2].to_string(),
-                                    id: parts[3].to_string(),
+                                    collection: parts.get(2).copied().unwrap_or("").to_string(),
+                                    id: parts.get(3).copied().unwrap_or("").to_string(),
                                 })
                             } else {
                                 eprintln!("Usage: \\doc chunks <collection> <id>");
                                 None
                             }
                         }
-                        "rechunk" => {
+                        Some("rechunk") => {
                             if parts.len() >= 5 {
-                                let chunk_size = parts[4].parse::<usize>().unwrap_or(512);
+                                let chunk_size = parts.get(4).and_then(|s| s.parse::<usize>().ok()).unwrap_or(512);
                                 Some(MetaCommand::DocumentRechunk {
-                                    collection: parts[2].to_string(),
-                                    id: parts[3].to_string(),
+                                    collection: parts.get(2).copied().unwrap_or("").to_string(),
+                                    id: parts.get(3).copied().unwrap_or("").to_string(),
                                     chunk_size,
                                 })
                             } else {
@@ -698,8 +698,8 @@ impl MetaCommand {
                             // Default: treat as \doc <collection> <id>
                             if parts.len() >= 3 {
                                 Some(MetaCommand::DocumentDetails {
-                                    collection: parts[1].to_string(),
-                                    id: parts[2].to_string(),
+                                    collection: parts.get(1).copied().unwrap_or("").to_string(),
+                                    id: parts.get(2).copied().unwrap_or("").to_string(),
                                 })
                             } else {
                                 eprintln!("Usage: \\doc <collection> <id> | \\doc chunks|rechunk <args>");
@@ -712,12 +712,12 @@ impl MetaCommand {
                     None
                 }
             }
-            "rag" => {
+            Some("rag") => {
                 if parts.len() >= 3 {
                     let k = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(5);
                     Some(MetaCommand::RagSearch {
-                        collection: parts[1].to_string(),
-                        query: parts[2..].iter().filter(|s| s.parse::<usize>().is_err()).cloned().collect::<Vec<_>>().join(" "),
+                        collection: parts.get(1).copied().unwrap_or("").to_string(),
+                        query: parts.get(2..).map_or(String::new(), |s| s.iter().filter(|s| s.parse::<usize>().is_err()).cloned().collect::<Vec<_>>().join(" ")),
                         k,
                     })
                 } else {
@@ -726,9 +726,9 @@ impl MetaCommand {
                     None
                 }
             }
-            "search-docs" => {
+            Some("search-docs") => {
                 if parts.len() > 1 {
-                    let query = parts[1..].join(" ");
+                    let query = parts.get(1..).map_or(String::new(), |s| s.join(" "));
                     Some(MetaCommand::SearchDocuments(query))
                 } else {
                     eprintln!("Usage: \\search-docs <query>");
@@ -737,14 +737,14 @@ impl MetaCommand {
             }
 
             // Performance & Utility Commands
-            "explain" => {
+            Some("explain") => {
                 if parts.len() > 1 {
                     // Parse options: \explain [analyze] [verbose] [storage] [ai] [why_not] [indexes] [stats] [format json|yaml|tree] <query>
                     let mut options = ExplainOptions::default();
                     let mut idx = 1;
 
                     while idx < parts.len() {
-                        let part_lower = parts[idx].to_lowercase();
+                        let part_lower = parts.get(idx).map_or(String::new(), |s| s.to_lowercase());
                         match part_lower.as_str() {
                             "analyze" => { options.analyze = true; idx += 1; }
                             "verbose" => { options.verbose = true; idx += 1; }
@@ -759,7 +759,7 @@ impl MetaCommand {
                             "summary" => { options.summary = true; idx += 1; }
                             "format" => {
                                 if idx + 1 < parts.len() {
-                                    options.format = match parts[idx + 1].to_lowercase().as_str() {
+                                    options.format = match parts.get(idx + 1).map_or(String::new(), |s| s.to_lowercase()).as_str() {
                                         "json" => ExplainFormatOption::Json,
                                         "yaml" => ExplainFormatOption::Yaml,
                                         "tree" => ExplainFormatOption::Tree,
@@ -777,7 +777,7 @@ impl MetaCommand {
                     }
 
                     if idx < parts.len() {
-                        let query = parts[idx..].join(" ");
+                        let query = parts.get(idx..).map_or(String::new(), |s| s.join(" "));
                         Some(MetaCommand::ExplainQueryWithOptions { query, options })
                     } else {
                         Self::print_explain_usage();
@@ -788,9 +788,9 @@ impl MetaCommand {
                     None
                 }
             }
-            "profile" => {
+            Some("profile") => {
                 if parts.len() > 1 {
-                    let query = parts[1..].join(" ");
+                    let query = parts.get(1..).map_or(String::new(), |s| s.join(" "));
                     Some(MetaCommand::ProfileQuery(query))
                 } else {
                     eprintln!("Usage: \\profile <SQL query>");
@@ -798,11 +798,11 @@ impl MetaCommand {
                     None
                 }
             }
-            "telemetry" => Some(MetaCommand::Telemetry),
+            Some("telemetry") => Some(MetaCommand::Telemetry),
 
-            "dump" => {
+            Some("dump") => {
                 let file = if parts.len() > 1 {
-                    Some(std::path::PathBuf::from(parts[1]))
+                    Some(std::path::PathBuf::from(parts.get(1).copied().unwrap_or("")))
                 } else {
                     None
                 };
@@ -810,14 +810,14 @@ impl MetaCommand {
             }
 
             // v3.2 Multi-Tenancy Commands
-            "tenants" => Some(MetaCommand::TenantList),
-            "tenant" => {
+            Some("tenants") => Some(MetaCommand::TenantList),
+            Some("tenant") => {
                 if parts.len() > 1 {
-                    match parts[1] {
-                        "list" => Some(MetaCommand::TenantList),
-                        "create" => {
+                    match parts.get(1).copied() {
+                        Some("list") => Some(MetaCommand::TenantList),
+                        Some("create") => {
                             if parts.len() > 2 {
-                                let name = parts[2].to_string();
+                                let name = parts.get(2).copied().unwrap_or("").to_string();
                                 let plan = parts.get(3).map(|s| s.to_string());
                                 let isolation = parts.get(4).map(|s| s.to_string());
                                 Some(MetaCommand::TenantCreate { name, plan, isolation })
@@ -849,31 +849,31 @@ impl MetaCommand {
                                 None
                             }
                         }
-                        "use" => {
+                        Some("use") => {
                             if parts.len() > 2 {
-                                Some(MetaCommand::TenantUse(parts[2].to_string()))
+                                Some(MetaCommand::TenantUse(parts.get(2).copied().unwrap_or("").to_string()))
                             } else {
                                 eprintln!("Usage: \\tenant use <name|id>");
                                 None
                             }
                         }
-                        "info" => {
+                        Some("info") => {
                             if parts.len() > 2 {
-                                Some(MetaCommand::TenantInfo(parts[2].to_string()))
+                                Some(MetaCommand::TenantInfo(parts.get(2).copied().unwrap_or("").to_string()))
                             } else {
                                 eprintln!("Usage: \\tenant info <name|id>");
                                 None
                             }
                         }
-                        "quota" => {
+                        Some("quota") => {
                             // Check for 'set' subcommand
-                            if parts.len() > 2 && parts[2] == "set" {
+                            if parts.len() > 2 && parts.get(2).copied() == Some("set") {
                                 // \tenant quota set <tenant> <storage_mb> <connections> <qps>
                                 if parts.len() >= 7 {
-                                    let tenant = parts[3].to_string();
-                                    let storage_mb = parts[4].parse::<u64>().unwrap_or(1024);
-                                    let max_connections = parts[5].parse::<usize>().unwrap_or(10);
-                                    let max_qps = parts[6].parse::<u64>().unwrap_or(1000);
+                                    let tenant = parts.get(3).copied().unwrap_or("").to_string();
+                                    let storage_mb = parts.get(4).and_then(|s| s.parse::<u64>().ok()).unwrap_or(1024);
+                                    let max_connections = parts.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
+                                    let max_qps = parts.get(6).and_then(|s| s.parse::<u64>().ok()).unwrap_or(1000);
 
                                     Some(MetaCommand::TenantQuotaSet {
                                         tenant,
@@ -892,35 +892,35 @@ impl MetaCommand {
                                 Some(MetaCommand::TenantQuota(tenant_ref))
                             }
                         }
-                        "usage" => {
+                        Some("usage") => {
                             // \tenant usage [tenant]
                             let tenant_ref = parts.get(2).map(|s| s.to_string());
                             Some(MetaCommand::TenantUsage(tenant_ref))
                         }
-                        "plans" => {
+                        Some("plans") => {
                             // \tenant plans - list available plans
                             Some(MetaCommand::TenantPlansList)
                         }
-                        "plan" => {
+                        Some("plan") => {
                             if parts.len() > 2 {
-                                match parts[2] {
-                                    "info" => {
+                                match parts.get(2).copied() {
+                                    Some("info") => {
                                         // \tenant plan info <plan>
                                         if parts.len() > 3 {
-                                            Some(MetaCommand::TenantPlanInfo(parts[3].to_string()))
+                                            Some(MetaCommand::TenantPlanInfo(parts.get(3).copied().unwrap_or("").to_string()))
                                         } else {
                                             eprintln!("Usage: \\tenant plan info <plan>");
                                             None
                                         }
                                     }
-                                    "create" => {
+                                    Some("create") => {
                                         // \tenant plan create <name> <tier> <storage_mb> <conn> <qps>
                                         if parts.len() >= 8 {
-                                            let name = parts[3].to_string();
-                                            let tier_id = parts[4].parse::<u32>().unwrap_or(100);
-                                            let storage_mb = parts[5].parse::<u64>().unwrap_or(100);
-                                            let max_connections = parts[6].parse::<usize>().unwrap_or(5);
-                                            let max_qps = parts[7].parse::<usize>().unwrap_or(10);
+                                            let name = parts.get(3).copied().unwrap_or("").to_string();
+                                            let tier_id = parts.get(4).and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
+                                            let storage_mb = parts.get(5).and_then(|s| s.parse::<u64>().ok()).unwrap_or(100);
+                                            let max_connections = parts.get(6).and_then(|s| s.parse::<usize>().ok()).unwrap_or(5);
+                                            let max_qps = parts.get(7).and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
                                             Some(MetaCommand::TenantPlanCreate {
                                                 name,
                                                 tier_id,
@@ -935,13 +935,13 @@ impl MetaCommand {
                                             None
                                         }
                                     }
-                                    "edit" => {
+                                    Some("edit") => {
                                         // \tenant plan edit <id> <field> <value>
                                         if parts.len() >= 6 {
                                             Some(MetaCommand::TenantPlanEdit {
-                                                plan_id: parts[3].to_string(),
-                                                field: parts[4].to_string(),
-                                                value: parts[5..].join(" "),
+                                                plan_id: parts.get(3).copied().unwrap_or("").to_string(),
+                                                field: parts.get(4).copied().unwrap_or("").to_string(),
+                                                value: parts.get(5..).map_or(String::new(), |s| s.join(" ")),
                                             })
                                         } else {
                                             eprintln!("Usage: \\tenant plan edit <id> <field> <value>");
@@ -950,28 +950,28 @@ impl MetaCommand {
                                             None
                                         }
                                     }
-                                    "enable" => {
+                                    Some("enable") => {
                                         // \tenant plan enable <id>
                                         if parts.len() > 3 {
-                                            Some(MetaCommand::TenantPlanEnable(parts[3].to_string()))
+                                            Some(MetaCommand::TenantPlanEnable(parts.get(3).copied().unwrap_or("").to_string()))
                                         } else {
                                             eprintln!("Usage: \\tenant plan enable <plan_id>");
                                             None
                                         }
                                     }
-                                    "disable" => {
+                                    Some("disable") => {
                                         // \tenant plan disable <id>
                                         if parts.len() > 3 {
-                                            Some(MetaCommand::TenantPlanDisable(parts[3].to_string()))
+                                            Some(MetaCommand::TenantPlanDisable(parts.get(3).copied().unwrap_or("").to_string()))
                                         } else {
                                             eprintln!("Usage: \\tenant plan disable <plan_id>");
                                             None
                                         }
                                     }
-                                    "delete" => {
+                                    Some("delete") => {
                                         // \tenant plan delete <id>
                                         if parts.len() > 3 {
-                                            Some(MetaCommand::TenantPlanDelete(parts[3].to_string()))
+                                            Some(MetaCommand::TenantPlanDelete(parts.get(3).copied().unwrap_or("").to_string()))
                                         } else {
                                             eprintln!("Usage: \\tenant plan delete <plan_id>");
                                             eprintln!("  Note: Tenants on this plan will be downgraded");
@@ -982,8 +982,8 @@ impl MetaCommand {
                                         // \tenant plan <tenant> <plan> - assign tenant to plan
                                         if parts.len() > 3 {
                                             Some(MetaCommand::TenantPlan {
-                                                tenant: parts[2].to_string(),
-                                                plan: parts[3].to_string(),
+                                                tenant: parts.get(2).copied().unwrap_or("").to_string(),
+                                                plan: parts.get(3).copied().unwrap_or("").to_string(),
                                             })
                                         } else {
                                             Self::print_plan_help();
@@ -996,25 +996,25 @@ impl MetaCommand {
                                 None
                             }
                         }
-                        "delete" => {
+                        Some("delete") => {
                             if parts.len() > 2 {
-                                Some(MetaCommand::TenantDelete(parts[2].to_string()))
+                                Some(MetaCommand::TenantDelete(parts.get(2).copied().unwrap_or("").to_string()))
                             } else {
                                 eprintln!("Usage: \\tenant delete <name|id>");
                                 None
                             }
                         }
-                        "rls" => {
+                        Some("rls") => {
                             // \tenant rls <subcommand>
                             if parts.len() > 2 {
-                                match parts[2] {
-                                    "create" => {
+                                match parts.get(2).copied() {
+                                    Some("create") => {
                                         // \tenant rls create <table> <policy> <expr> <cmd>
                                         if parts.len() >= 7 {
-                                            let table = parts[3].to_string();
-                                            let policy = parts[4].to_string();
-                                            let expression = parts[5].to_string();
-                                            let command = parts[6].to_string();
+                                            let table = parts.get(3).copied().unwrap_or("").to_string();
+                                            let policy = parts.get(4).copied().unwrap_or("").to_string();
+                                            let expression = parts.get(5).copied().unwrap_or("").to_string();
+                                            let command = parts.get(6).copied().unwrap_or("").to_string();
 
                                             Some(MetaCommand::TenantRlsCreate {
                                                 table,
@@ -1029,21 +1029,21 @@ impl MetaCommand {
                                             None
                                         }
                                     }
-                                    "list" => {
+                                    Some("list") => {
                                         // \tenant rls list <table>
                                         if parts.len() >= 4 {
-                                            Some(MetaCommand::TenantRlsList(parts[3].to_string()))
+                                            Some(MetaCommand::TenantRlsList(parts.get(3).copied().unwrap_or("").to_string()))
                                         } else {
                                             eprintln!("Usage: \\tenant rls list <table>");
                                             None
                                         }
                                     }
-                                    "delete" => {
+                                    Some("delete") => {
                                         // \tenant rls delete <table> <policy>
                                         if parts.len() >= 5 {
                                             Some(MetaCommand::TenantRlsDelete {
-                                                table: parts[3].to_string(),
-                                                policy: parts[4].to_string(),
+                                                table: parts.get(3).copied().unwrap_or("").to_string(),
+                                                policy: parts.get(4).copied().unwrap_or("").to_string(),
                                             })
                                         } else {
                                             eprintln!("Usage: \\tenant rls delete <table> <policy>");
@@ -1051,7 +1051,7 @@ impl MetaCommand {
                                         }
                                     }
                                     _ => {
-                                        eprintln!("Unknown rls subcommand: {}", parts[2]);
+                                        eprintln!("Unknown rls subcommand: {}", parts.get(2).copied().unwrap_or(""));
                                         eprintln!("Available: create, list, delete");
                                         None
                                     }
@@ -1061,24 +1061,24 @@ impl MetaCommand {
                                 None
                             }
                         }
-                        "cdc" => {
+                        Some("cdc") => {
                             // \tenant cdc <subcommand>
                             if parts.len() > 2 {
-                                match parts[2] {
-                                    "show" => {
+                                match parts.get(2).copied() {
+                                    Some("show") => {
                                         let limit = parts.get(3).and_then(|s| s.parse::<usize>().ok());
                                         Some(MetaCommand::TenantCdcShow(limit))
                                     }
-                                    "export" => {
+                                    Some("export") => {
                                         if parts.len() >= 4 {
-                                            Some(MetaCommand::TenantCdcExport(parts[3].to_string()))
+                                            Some(MetaCommand::TenantCdcExport(parts.get(3).copied().unwrap_or("").to_string()))
                                         } else {
                                             eprintln!("Usage: \\tenant cdc export <file>");
                                             None
                                         }
                                     }
                                     _ => {
-                                        eprintln!("Unknown cdc subcommand: {}", parts[2]);
+                                        eprintln!("Unknown cdc subcommand: {}", parts.get(2).copied().unwrap_or(""));
                                         eprintln!("Available: show, export");
                                         None
                                     }
@@ -1088,24 +1088,24 @@ impl MetaCommand {
                                 Some(MetaCommand::TenantCdcShow(Some(10)))
                             }
                         }
-                        "migrate" => {
+                        Some("migrate") => {
                             // \tenant migrate <subcommand>
                             if parts.len() > 2 {
-                                match parts[2] {
-                                    "to" => {
+                                match parts.get(2).copied() {
+                                    Some("to") => {
                                         if parts.len() >= 4 {
-                                            Some(MetaCommand::TenantMigrateTo(parts[3].to_string()))
+                                            Some(MetaCommand::TenantMigrateTo(parts.get(3).copied().unwrap_or("").to_string()))
                                         } else {
                                             eprintln!("Usage: \\tenant migrate to <target>");
                                             None
                                         }
                                     }
-                                    "status" => {
+                                    Some("status") => {
                                         let tenant = parts.get(3).map(|s| s.to_string());
                                         Some(MetaCommand::TenantMigrateStatus(tenant))
                                     }
                                     _ => {
-                                        eprintln!("Unknown migrate subcommand: {}", parts[2]);
+                                        eprintln!("Unknown migrate subcommand: {}", parts.get(2).copied().unwrap_or(""));
                                         eprintln!("Available: to, status");
                                         None
                                     }
@@ -1115,11 +1115,11 @@ impl MetaCommand {
                                 None
                             }
                         }
-                        "current" => Some(MetaCommand::TenantCurrent),
-                        "clear" => Some(MetaCommand::TenantClearContext),
+                        Some("current") => Some(MetaCommand::TenantCurrent),
+                        Some("clear") => Some(MetaCommand::TenantClearContext),
                         _ => {
                             // Treat as shorthand for \tenant info <name>
-                            Some(MetaCommand::TenantInfo(parts[1].to_string()))
+                            Some(MetaCommand::TenantInfo(parts.get(1).copied().unwrap_or("").to_string()))
                         }
                     }
                 } else {
@@ -3946,7 +3946,8 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         println!("{}", "No CDC events recorded for this tenant.".dimmed());
                     } else {
                         let display_limit = limit.unwrap_or(10).min(events.len());
-                        let events_to_show = &events[events.len().saturating_sub(display_limit)..];
+                        let start = events.len().saturating_sub(display_limit);
+                        let events_to_show = events.get(start..).unwrap_or(&[]);
 
                         println!("\n{:<20} {:<10} {:<30} {}", "Timestamp".bold(), "Type".bold(), "Table".bold(), "Row ID".bold());
                         println!("{}", "─".repeat(100));

@@ -549,13 +549,11 @@ impl Evaluator {
     /// jsonb_extract_path(json, path_elements...)
     /// Extract JSON sub-object at the specified path
     fn jsonb_extract_path(&self, args: &[Value]) -> Result<Value> {
-        if args.is_empty() {
-            return Err(Error::query_execution(
-                "jsonb_extract_path requires at least one argument"
-            ));
-        }
+        let (first, rest) = args.split_first().ok_or_else(|| Error::query_execution(
+            "jsonb_extract_path requires at least one argument"
+        ))?;
 
-        let json_str = match &args[0] {
+        let json_str = match first {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Null),
             _ => return Err(Error::query_execution(
@@ -568,7 +566,7 @@ impl Evaluator {
             .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         // Navigate through the path
-        for path_elem in &args[1..] {
+        for path_elem in rest {
             match path_elem {
                 Value::String(key) => {
                     current = match current.get(key) {
@@ -624,13 +622,13 @@ impl Evaluator {
     /// jsonb_array_elements(json)
     /// Expands JSON array to set of JSON values (returns first element for now)
     fn jsonb_array_elements(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution(
                 "jsonb_array_elements requires exactly one argument"
             ));
-        }
+        };
 
-        let json_str = match &args[0] {
+        let json_str = match arg {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Null),
             _ => return Err(Error::query_execution(
@@ -677,13 +675,13 @@ impl Evaluator {
     /// jsonb_object_keys(json)
     /// Returns set of keys in the JSON object (returns array for now)
     fn jsonb_object_keys(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution(
                 "jsonb_object_keys requires exactly one argument"
             ));
-        }
+        };
 
-        let json_str = match &args[0] {
+        let json_str = match arg {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Null),
             _ => return Err(Error::query_execution(
@@ -710,13 +708,13 @@ impl Evaluator {
     /// jsonb_array_length(json)
     /// Returns the number of elements in the JSON array
     fn jsonb_array_length(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution(
                 "jsonb_array_length requires exactly one argument"
             ));
-        }
+        };
 
-        let json_str = match &args[0] {
+        let json_str = match arg {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Null),
             _ => return Err(Error::query_execution(
@@ -740,13 +738,13 @@ impl Evaluator {
     /// jsonb_typeof(json)
     /// Returns the type of the JSON value as text
     fn jsonb_typeof(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution(
                 "jsonb_typeof requires exactly one argument"
             ));
-        }
+        };
 
-        let json_str = match &args[0] {
+        let json_str = match arg {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::String("null".to_string())),
             _ => return Err(Error::query_execution(
@@ -773,13 +771,13 @@ impl Evaluator {
     /// jsonb_path_query(json, path)
     /// Basic JSON path query support (simplified)
     fn jsonb_path_query(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [first, second] = args else {
             return Err(Error::query_execution(
                 "jsonb_path_query requires exactly two arguments"
             ));
-        }
+        };
 
-        let json_str = match &args[0] {
+        let json_str = match first {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Null),
             _ => return Err(Error::query_execution(
@@ -787,7 +785,7 @@ impl Evaluator {
             )),
         };
 
-        let path = match &args[1] {
+        let path = match second {
             Value::String(s) => s,
             _ => return Err(Error::query_execution(
                 "Second argument must be string (JSON path)"
@@ -882,11 +880,9 @@ impl Evaluator {
     /// jsonb_pretty(json)
     /// Pretty print JSON
     fn jsonb_pretty(&self, args: &[Value]) -> Result<Value> {
-        if args.is_empty() {
-            return Err(Error::query_execution("jsonb_pretty requires an argument"));
-        }
+        let first = args.first().ok_or_else(|| Error::query_execution("jsonb_pretty requires an argument"))?;
 
-        let json_str = match &args[0] {
+        let json_str = match first {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Null),
             _ => return Err(Error::query_execution("Argument must be JSON")),
@@ -904,11 +900,9 @@ impl Evaluator {
     /// jsonb_strip_nulls(json)
     /// Remove null values from JSON
     fn jsonb_strip_nulls(&self, args: &[Value]) -> Result<Value> {
-        if args.is_empty() {
-            return Err(Error::query_execution("jsonb_strip_nulls requires an argument"));
-        }
+        let first = args.first().ok_or_else(|| Error::query_execution("jsonb_strip_nulls requires an argument"))?;
 
-        let json_str = match &args[0] {
+        let json_str = match first {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Null),
             _ => return Err(Error::query_execution("Argument must be JSON")),
@@ -947,17 +941,18 @@ impl Evaluator {
             ));
         }
 
-        let mut obj = serde_json::json!({});
+        let mut obj = serde_json::Map::new();
 
-        for i in (0..args.len()).step_by(2) {
+        for pair in args.chunks(2) {
+            let key_val = pair.first().ok_or_else(|| Error::query_execution("Missing key in jsonb_build_object"))?;
+            let value = pair.get(1).ok_or_else(|| Error::query_execution("Missing value in jsonb_build_object"))?;
+
             // Convert key to string
-            let key = match &args[i] {
+            let key = match key_val {
                 Value::String(s) => s.clone(),
                 Value::Null => continue, // Skip null keys
                 other => other.to_string().trim_matches('\'').to_string(),
             };
-
-            let value = &args[i + 1];
 
             // Convert value to serde_json::Value
             let json_val = match value {
@@ -979,7 +974,11 @@ impl Evaluator {
                 Value::String(s) => serde_json::json!(s),
                 Value::Bytes(b) => {
                     // Encode bytes as hex string
-                    let hex = b.iter().map(|byte| format!("{:02x}", byte)).collect::<String>();
+                    let hex: String = b.iter().fold(String::new(), |mut acc, byte| {
+                        use std::fmt::Write;
+                        let _ = write!(acc, "{:02x}", byte);
+                        acc
+                    });
                     serde_json::json!(hex)
                 }
                 Value::Uuid(u) => serde_json::json!(u.to_string()),
@@ -1018,10 +1017,10 @@ impl Evaluator {
                 Value::Interval(iv) => serde_json::json!(format!("{} microseconds", iv)),
             };
 
-            obj[key] = json_val;
+            obj.insert(key, json_val);
         }
 
-        Ok(Value::Json(obj.to_string()))
+        Ok(Value::Json(serde_json::Value::Object(obj).to_string()))
     }
 
     /// jsonb_build_array(val1, val2, ...)
@@ -1047,7 +1046,11 @@ impl Evaluator {
                 }
                 Value::String(s) => serde_json::json!(s),
                 Value::Bytes(b) => {
-                    let hex = b.iter().map(|byte| format!("{:02x}", byte)).collect::<String>();
+                    let hex: String = b.iter().fold(String::new(), |mut acc, byte| {
+                        use std::fmt::Write;
+                        let _ = write!(acc, "{:02x}", byte);
+                        acc
+                    });
                     serde_json::json!(hex)
                 }
                 Value::Uuid(u) => serde_json::json!(u.to_string()),
@@ -1098,19 +1101,23 @@ impl Evaluator {
             ));
         }
 
-        let json_str = match &args[0] {
+        let arg0 = args.get(0).ok_or_else(|| Error::query_execution("jsonb_set: missing target"))?;
+        let arg1 = args.get(1).ok_or_else(|| Error::query_execution("jsonb_set: missing path"))?;
+        let arg2 = args.get(2).ok_or_else(|| Error::query_execution("jsonb_set: missing new_value"))?;
+
+        let json_str = match arg0 {
             Value::Json(j) => j.clone(),
             Value::Null => return Ok(Value::Null),
             _ => return Err(Error::query_execution("First argument must be JSON")),
         };
 
-        let path_arr = match &args[1] {
+        let path_arr = match arg1 {
             Value::Array(arr) => arr,
             _ => return Err(Error::query_execution("Second argument must be an array (path)")),
         };
 
-        let create_missing = if args.len() == 4 {
-            match &args[3] {
+        let create_missing = if let Some(arg3) = args.get(3) {
+            match arg3 {
                 Value::Boolean(b) => *b,
                 _ => true,
             }
@@ -1137,7 +1144,7 @@ impl Evaluator {
             .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         // Convert new_value to JSON
-        let new_val = match &args[2] {
+        let new_val = match arg2 {
             Value::Null => serde_json::json!(null),
             Value::Boolean(b) => serde_json::json!(b),
             Value::Int2(i) => serde_json::json!(i),
@@ -1148,7 +1155,7 @@ impl Evaluator {
             Value::String(s) => serde_json::json!(s),
             Value::Uuid(u) => serde_json::json!(u.to_string()),
             Value::Json(j) => serde_json::from_str(j).unwrap_or_else(|_| serde_json::json!(j.as_str())),
-            _ => serde_json::json!(args[2].to_string()),
+            other => serde_json::json!(other.to_string()),
         };
 
         // Navigate and set the value
@@ -1168,72 +1175,23 @@ impl Evaluator {
         value: &serde_json::Value,
         create_missing: bool,
     ) -> Result<()> {
-        if index >= path.len() {
-            return Ok(());
-        }
-
-        let key = &path[index];
-        let is_last = index == path.len() - 1;
-
-        // Check if key is a number (array index)
-        if let Ok(arr_idx) = key.parse::<usize>() {
-            // Handle array index
-            if !current.is_array() && create_missing {
-                *current = serde_json::json!([]);
-            }
-
-            if let Some(arr) = current.as_array_mut() {
-                // Extend array if necessary
-                while arr.len() <= arr_idx {
-                    arr.push(serde_json::json!(null));
-                }
-
-                if is_last {
-                    arr[arr_idx] = value.clone();
-                } else {
-                    if arr[arr_idx].is_null() && create_missing {
-                        arr[arr_idx] = serde_json::json!({});
-                    }
-                    self.jsonb_set_recursive(&mut arr[arr_idx], path, index + 1, value, create_missing)?;
-                }
-            }
-        } else {
-            // Handle object key
-            if !current.is_object() && create_missing {
-                *current = serde_json::json!({});
-            }
-
-            if let Some(obj) = current.as_object_mut() {
-                if is_last {
-                    obj.insert(key.clone(), value.clone());
-                } else {
-                    if !obj.contains_key(key) && create_missing {
-                        obj.insert(key.clone(), serde_json::json!({}));
-                    }
-                    if let Some(next) = obj.get_mut(key) {
-                        self.jsonb_set_recursive(next, path, index + 1, value, create_missing)?;
-                    }
-                }
-            }
-        }
-
-        Ok(())
+        jsonb_set_recursive_impl(current, path, index, value, create_missing)
     }
 
     /// jsonb_concat(jsonb1, jsonb2)
     /// Merges two JSONB objects
     fn jsonb_concat(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [first, second] = args else {
             return Err(Error::query_execution("jsonb_concat requires exactly 2 arguments"));
-        }
+        };
 
-        let json1_str = match &args[0] {
+        let json1_str = match first {
             Value::Json(j) => j.clone(),
             Value::Null => return Ok(Value::Null),
             _ => return Err(Error::query_execution("First argument must be JSON")),
         };
 
-        let json2_str = match &args[1] {
+        let json2_str = match second {
             Value::Json(j) => j.clone(),
             Value::Null => return Ok(Value::Json(json1_str)),
             _ => return Err(Error::query_execution("Second argument must be JSON")),
@@ -1267,17 +1225,17 @@ impl Evaluator {
     /// jsonb_delete(jsonb, path_array)
     /// Deletes the element at the specified path
     fn jsonb_delete(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [first, second] = args else {
             return Err(Error::query_execution("jsonb_delete requires exactly 2 arguments"));
-        }
+        };
 
-        let json_str = match &args[0] {
+        let json_str = match first {
             Value::Json(j) => j.clone(),
             Value::Null => return Ok(Value::Null),
             _ => return Err(Error::query_execution("First argument must be JSON")),
         };
 
-        let path_arr = match &args[1] {
+        let path_arr = match second {
             Value::Array(arr) => arr,
             _ => return Err(Error::query_execution("Second argument must be an array (path)")),
         };
@@ -1311,46 +1269,17 @@ impl Evaluator {
         path: &[String],
         index: usize,
     ) -> Result<()> {
-        if index >= path.len() {
-            return Ok(());
-        }
-
-        let key = &path[index];
-        let is_last = index == path.len() - 1;
-
-        if let Ok(arr_idx) = key.parse::<usize>() {
-            // Array index
-            if let Some(arr) = current.as_array_mut() {
-                if is_last {
-                    if arr_idx < arr.len() {
-                        arr.remove(arr_idx);
-                    }
-                } else if arr_idx < arr.len() {
-                    self.jsonb_delete_recursive(&mut arr[arr_idx], path, index + 1)?;
-                }
-            }
-        } else {
-            // Object key
-            if let Some(obj) = current.as_object_mut() {
-                if is_last {
-                    obj.remove(key);
-                } else if let Some(next) = obj.get_mut(key) {
-                    self.jsonb_delete_recursive(next, path, index + 1)?;
-                }
-            }
-        }
-
-        Ok(())
+        jsonb_delete_recursive_impl(current, path, index)
     }
 
     /// jsonb_each(jsonb_object)
     /// Returns object key-value pairs (returns array of keys for MVP)
     fn jsonb_each(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("jsonb_each requires exactly 1 argument"));
-        }
+        };
 
-        let json_str = match &args[0] {
+        let json_str = match arg {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Null),
             _ => return Err(Error::query_execution("Argument must be JSON")),
@@ -1374,11 +1303,11 @@ impl Evaluator {
     /// jsonb_each_text(jsonb_object)
     /// Returns object key-value pairs as text (returns array for MVP)
     fn jsonb_each_text(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("jsonb_each_text requires exactly 1 argument"));
-        }
+        };
 
-        let json_str = match &args[0] {
+        let json_str = match arg {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Null),
             _ => return Err(Error::query_execution("Argument must be JSON")),
@@ -2218,12 +2147,12 @@ impl Evaluator {
 
     /// COSINE_SIMILARITY(v1, v2) - returns similarity (1 - cosine_distance)
     fn vector_cosine_similarity(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution(
                 "COSINE_SIMILARITY requires exactly 2 vector arguments".to_string()
             ));
-        }
-        let distance = self.vector_distance_op(&args[0], &args[1], crate::vector::cosine_distance)?;
+        };
+        let distance = self.vector_distance_op(a, b, crate::vector::cosine_distance)?;
         match distance {
             Value::Float4(d) => Ok(Value::Float4(1.0 - d)),
             _ => Err(Error::query_execution("Unexpected result type".to_string())),
@@ -2232,32 +2161,32 @@ impl Evaluator {
 
     /// COSINE_DISTANCE(v1, v2) - returns cosine distance
     fn vector_cosine_distance(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution(
                 "COSINE_DISTANCE requires exactly 2 vector arguments".to_string()
             ));
-        }
-        self.vector_distance_op(&args[0], &args[1], crate::vector::cosine_distance)
+        };
+        self.vector_distance_op(a, b, crate::vector::cosine_distance)
     }
 
     /// L2_DISTANCE(v1, v2) - returns Euclidean distance
     fn vector_l2_distance(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution(
                 "L2_DISTANCE requires exactly 2 vector arguments".to_string()
             ));
-        }
-        self.vector_distance_op(&args[0], &args[1], crate::vector::l2_distance)
+        };
+        self.vector_distance_op(a, b, crate::vector::l2_distance)
     }
 
     /// INNER_PRODUCT(v1, v2) - returns inner product distance
     fn vector_inner_product(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution(
                 "INNER_PRODUCT requires exactly 2 vector arguments".to_string()
             ));
-        }
-        self.vector_distance_op(&args[0], &args[1], crate::vector::inner_product_distance)
+        };
+        self.vector_distance_op(a, b, crate::vector::inner_product_distance)
     }
 
     /// COALESCE(val1, val2, ...) - return first non-null value
@@ -2273,11 +2202,9 @@ impl Evaluator {
 
     /// NULLIF(val1, val2) - return NULL if val1 = val2, else val1
     fn func_nullif(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [val1, val2] = args else {
             return Err(Error::query_execution("NULLIF requires exactly 2 arguments"));
-        }
-        let val1 = &args[0];
-        let val2 = &args[1];
+        };
 
         // If val1 equals val2, return NULL
         if self.values_equal(val1, val2) {
@@ -2290,13 +2217,13 @@ impl Evaluator {
     /// array_length(arr, dimension) - returns length of array dimension (1-based)
     /// PostgreSQL compatible: dimension is typically 1 for one-dimensional arrays
     fn array_length(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution(
                 "array_length requires exactly two arguments"
             ));
-        }
+        };
 
-        match (&args[0], &args[1]) {
+        match (a, b) {
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
             (Value::Array(arr), Value::Int2(dim)) if *dim == 1 => {
                 Ok(Value::Int4(arr.len() as i32))
@@ -2329,13 +2256,13 @@ impl Evaluator {
 
     /// array_upper(arr, dimension) - returns upper bound of array dimension (1-based)
     fn array_upper(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution(
                 "array_upper requires exactly two arguments"
             ));
-        }
+        };
 
-        match (&args[0], &args[1]) {
+        match (a, b) {
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
             (Value::Array(arr), Value::Int2(dim)) if *dim == 1 => {
                 Ok(Value::Int4(arr.len() as i32))
@@ -2355,13 +2282,13 @@ impl Evaluator {
 
     /// array_lower(arr, dimension) - returns lower bound of array dimension (always 1 in PostgreSQL)
     fn array_lower(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution(
                 "array_lower requires exactly two arguments"
             ));
-        }
+        };
 
-        match (&args[0], &args[1]) {
+        match (a, b) {
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
             (Value::Array(arr), _) if arr.is_empty() => Ok(Value::Null),
             (Value::Array(_), Value::Int2(dim)) if *dim == 1 => {
@@ -2382,13 +2309,13 @@ impl Evaluator {
 
     /// array_append(arr, element) - appends element to array
     fn array_append(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution(
                 "array_append requires exactly two arguments"
             ));
-        }
+        };
 
-        match (&args[0], &args[1]) {
+        match (a, b) {
             (Value::Array(arr), elem) => {
                 let mut result = arr.clone();
                 result.push(elem.clone());
@@ -2405,13 +2332,13 @@ impl Evaluator {
 
     /// array_prepend(element, arr) - prepends element to array
     fn array_prepend(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution(
                 "array_prepend requires exactly two arguments"
             ));
-        }
+        };
 
-        match (&args[0], &args[1]) {
+        match (a, b) {
             (elem, Value::Array(arr)) => {
                 let mut result = vec![elem.clone()];
                 result.extend(arr.clone());
@@ -2428,24 +2355,24 @@ impl Evaluator {
 
     /// array_cat(arr1, arr2) - concatenates two arrays
     fn array_cat(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution(
                 "array_cat requires exactly two arguments"
             ));
-        }
+        };
 
-        self.array_concat_op(&args[0], &args[1])
+        self.array_concat_op(a, b)
     }
 
     /// array_remove(arr, element) - removes all occurrences of element from array
     fn array_remove(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution(
                 "array_remove requires exactly two arguments"
             ));
-        }
+        };
 
-        match (&args[0], &args[1]) {
+        match (a, b) {
             (Value::Array(arr), elem) => {
                 let result: Vec<Value> = arr.iter()
                     .filter(|v| *v != elem)
@@ -2462,13 +2389,13 @@ impl Evaluator {
 
     /// array_position(arr, element) - returns 1-based position of first occurrence
     fn array_position(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution(
                 "array_position requires exactly two arguments"
             ));
-        }
+        };
 
-        match (&args[0], &args[1]) {
+        match (a, b) {
             (Value::Array(arr), elem) => {
                 for (i, v) in arr.iter().enumerate() {
                     if v == elem {
@@ -2486,13 +2413,13 @@ impl Evaluator {
 
     /// cardinality(arr) - returns total number of elements in array
     fn array_cardinality(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution(
                 "cardinality requires exactly one argument"
             ));
-        }
+        };
 
-        match &args[0] {
+        match arg {
             Value::Array(arr) => Ok(Value::Int8(arr.len() as i64)),
             Value::Vector(vec) => Ok(Value::Int8(vec.len() as i64)),
             Value::Null => Ok(Value::Null),
@@ -3023,6 +2950,7 @@ impl Evaluator {
 
     /// Compare two values for equality (used by IN list evaluation)
     /// Handles type coercion for common numeric comparisons
+    #[allow(clippy::float_cmp)]
     fn values_equal(&self, left: &Value, right: &Value) -> bool {
         match (left, right) {
             // Exact matches
@@ -3148,7 +3076,7 @@ impl Evaluator {
         let mut regex = String::with_capacity(pattern.len() * 2 + 2);
         regex.push('^'); // Anchor at start
 
-        let mut chars = pattern.chars().peekable();
+        let mut chars = pattern.chars();
         while let Some(c) = chars.next() {
             match c {
                 // Escape character - next char is literal
@@ -3294,7 +3222,7 @@ impl Evaluator {
         let mut regex = String::with_capacity(pattern.len() * 2 + 2);
         regex.push('^'); // Anchor at start
 
-        let mut chars = pattern.chars().peekable();
+        let mut chars = pattern.chars();
         while let Some(c) = chars.next() {
             match c {
                 // Escape character
@@ -3315,7 +3243,7 @@ impl Evaluator {
                 '[' => {
                     regex.push('[');
                     // Copy until closing ]
-                    while let Some(inner) = chars.next() {
+                    for inner in chars.by_ref() {
                         regex.push(inner);
                         if inner == ']' {
                             break;
@@ -3370,10 +3298,10 @@ impl Evaluator {
 
     /// UPPER(string) - convert to uppercase
     fn func_upper(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("UPPER requires exactly one argument"));
-        }
-        match &args[0] {
+        };
+        match arg {
             Value::Null => Ok(Value::Null),
             Value::String(s) => Ok(Value::String(s.to_uppercase())),
             _ => Err(Error::query_execution("UPPER requires a string argument")),
@@ -3382,10 +3310,10 @@ impl Evaluator {
 
     /// LOWER(string) - convert to lowercase
     fn func_lower(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("LOWER requires exactly one argument"));
-        }
-        match &args[0] {
+        };
+        match arg {
             Value::Null => Ok(Value::Null),
             Value::String(s) => Ok(Value::String(s.to_lowercase())),
             _ => Err(Error::query_execution("LOWER requires a string argument")),
@@ -3394,10 +3322,10 @@ impl Evaluator {
 
     /// LENGTH(string) - get string length in characters
     fn func_length(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("LENGTH requires exactly one argument"));
-        }
-        match &args[0] {
+        };
+        match arg {
             Value::Null => Ok(Value::Null),
             Value::String(s) => Ok(Value::Int4(s.chars().count() as i32)),
             Value::Bytes(b) => Ok(Value::Int4(b.len() as i32)),
@@ -3411,13 +3339,16 @@ impl Evaluator {
             return Err(Error::query_execution("SUBSTR requires 2 or 3 arguments"));
         }
 
-        let s = match &args[0] {
+        let arg0 = args.get(0).ok_or_else(|| Error::query_execution("SUBSTR: missing string"))?;
+        let arg1 = args.get(1).ok_or_else(|| Error::query_execution("SUBSTR: missing start"))?;
+
+        let s = match arg0 {
             Value::Null => return Ok(Value::Null),
             Value::String(s) => s,
             _ => return Err(Error::query_execution("SUBSTR first argument must be a string")),
         };
 
-        let start = match &args[1] {
+        let start = match arg1 {
             Value::Int2(n) => *n as i64,
             Value::Int4(n) => *n as i64,
             Value::Int8(n) => *n,
@@ -3428,8 +3359,8 @@ impl Evaluator {
         let start_idx = if start < 1 { 0 } else { (start - 1) as usize };
         let chars: Vec<char> = s.chars().collect();
 
-        let result = if args.len() == 3 {
-            let length = match &args[2] {
+        let result = if let Some(arg2) = args.get(2) {
+            let length = match arg2 {
                 Value::Int2(n) => *n as usize,
                 Value::Int4(n) => *n as usize,
                 Value::Int8(n) => *n as usize,
@@ -3449,14 +3380,16 @@ impl Evaluator {
             return Err(Error::query_execution("TRIM requires 1 or 2 arguments"));
         }
 
-        let s = match &args[0] {
+        let first = args.first().ok_or_else(|| Error::query_execution("TRIM requires at least 1 argument"))?;
+
+        let s = match first {
             Value::Null => return Ok(Value::Null),
             Value::String(s) => s.as_str(),
             _ => return Err(Error::query_execution("TRIM argument must be a string")),
         };
 
-        let chars_to_trim: &[char] = if args.len() > 1 {
-            match &args[1] {
+        let chars_to_trim: &[char] = if let Some(second) = args.get(1) {
+            match second {
                 Value::String(chars) => &chars.chars().collect::<Vec<_>>(),
                 _ => &[' '],
             }
@@ -3488,17 +3421,17 @@ impl Evaluator {
 
     /// CONCAT_WS(separator, str1, str2, ...) - concatenate with separator
     fn func_concat_ws(&self, args: &[Value]) -> Result<Value> {
-        if args.is_empty() {
-            return Err(Error::query_execution("CONCAT_WS requires at least one argument"));
-        }
+        let (first, rest) = args.split_first().ok_or_else(|| {
+            Error::query_execution("CONCAT_WS requires at least one argument")
+        })?;
 
-        let sep = match &args[0] {
+        let sep = match first {
             Value::Null => return Ok(Value::Null),
             Value::String(s) => s.clone(),
             other => other.to_string(),
         };
 
-        let parts: Vec<String> = args[1..].iter()
+        let parts: Vec<String> = rest.iter()
             .filter_map(|arg| match arg {
                 Value::Null => None,
                 Value::String(s) => Some(s.clone()),
@@ -3511,15 +3444,15 @@ impl Evaluator {
 
     /// LEFT(string, n) - get first n characters
     fn func_left(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution("LEFT requires exactly 2 arguments"));
-        }
-        let s = match &args[0] {
+        };
+        let s = match a {
             Value::Null => return Ok(Value::Null),
             Value::String(s) => s,
             _ => return Err(Error::query_execution("LEFT first argument must be a string")),
         };
-        let n = match &args[1] {
+        let n = match b {
             Value::Int2(n) => *n as usize,
             Value::Int4(n) => *n as usize,
             Value::Int8(n) => *n as usize,
@@ -3530,15 +3463,15 @@ impl Evaluator {
 
     /// RIGHT(string, n) - get last n characters
     fn func_right(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution("RIGHT requires exactly 2 arguments"));
-        }
-        let s = match &args[0] {
+        };
+        let s = match a {
             Value::Null => return Ok(Value::Null),
             Value::String(s) => s,
             _ => return Err(Error::query_execution("RIGHT first argument must be a string")),
         };
-        let n = match &args[1] {
+        let n = match b {
             Value::Int2(n) => *n as usize,
             Value::Int4(n) => *n as usize,
             Value::Int8(n) => *n as usize,
@@ -3551,15 +3484,15 @@ impl Evaluator {
 
     /// REPEAT(string, n) - repeat string n times
     fn func_repeat(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution("REPEAT requires exactly 2 arguments"));
-        }
-        let s = match &args[0] {
+        };
+        let s = match a {
             Value::Null => return Ok(Value::Null),
             Value::String(s) => s,
             _ => return Err(Error::query_execution("REPEAT first argument must be a string")),
         };
-        let n = match &args[1] {
+        let n = match b {
             Value::Int2(n) => *n as usize,
             Value::Int4(n) => *n as usize,
             Value::Int8(n) => *n as usize,
@@ -3570,19 +3503,19 @@ impl Evaluator {
 
     /// REPLACE(string, from, to) - replace all occurrences
     fn func_replace(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 3 {
+        let [a, b, c] = args else {
             return Err(Error::query_execution("REPLACE requires exactly 3 arguments"));
-        }
-        let s = match &args[0] {
+        };
+        let s = match a {
             Value::Null => return Ok(Value::Null),
             Value::String(s) => s,
             _ => return Err(Error::query_execution("REPLACE first argument must be a string")),
         };
-        let from = match &args[1] {
+        let from = match b {
             Value::String(s) => s,
             _ => return Err(Error::query_execution("REPLACE second argument must be a string")),
         };
-        let to = match &args[2] {
+        let to = match c {
             Value::String(s) => s,
             _ => return Err(Error::query_execution("REPLACE third argument must be a string")),
         };
@@ -3591,10 +3524,10 @@ impl Evaluator {
 
     /// REVERSE(string) - reverse string
     fn func_reverse(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("REVERSE requires exactly one argument"));
-        }
-        match &args[0] {
+        };
+        match arg {
             Value::Null => Ok(Value::Null),
             Value::String(s) => Ok(Value::String(s.chars().rev().collect())),
             _ => Err(Error::query_execution("REVERSE requires a string argument")),
@@ -3603,10 +3536,10 @@ impl Evaluator {
 
     /// POSITION(substring IN string) or STRPOS(string, substring) - find position (1-based)
     fn func_position(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution("POSITION/STRPOS requires exactly 2 arguments"));
-        }
-        let (haystack, needle) = match (&args[0], &args[1]) {
+        };
+        let (haystack, needle) = match (a, b) {
             (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
             (Value::String(h), Value::String(n)) => (h, n),
             _ => return Err(Error::query_execution("POSITION/STRPOS requires string arguments")),
@@ -3619,19 +3552,19 @@ impl Evaluator {
 
     /// SPLIT_PART(string, delimiter, field) - split string and get nth part (1-based)
     fn func_split_part(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 3 {
+        let [str_arg, delim_arg, field_arg] = args else {
             return Err(Error::query_execution("SPLIT_PART requires exactly 3 arguments"));
-        }
-        let s = match &args[0] {
+        };
+        let s = match str_arg {
             Value::Null => return Ok(Value::Null),
             Value::String(s) => s,
             _ => return Err(Error::query_execution("SPLIT_PART first argument must be a string")),
         };
-        let delim = match &args[1] {
+        let delim = match delim_arg {
             Value::String(s) => s,
             _ => return Err(Error::query_execution("SPLIT_PART second argument must be a string")),
         };
-        let field = match &args[2] {
+        let field = match field_arg {
             Value::Int2(n) => *n as usize,
             Value::Int4(n) => *n as usize,
             Value::Int8(n) => *n as usize,
@@ -3649,10 +3582,10 @@ impl Evaluator {
 
     /// INITCAP(string) - capitalize first letter of each word
     fn func_initcap(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("INITCAP requires exactly one argument"));
-        }
-        match &args[0] {
+        };
+        match arg {
             Value::Null => Ok(Value::Null),
             Value::String(s) => {
                 let mut result = String::with_capacity(s.len());
@@ -3679,19 +3612,22 @@ impl Evaluator {
         if args.len() < 2 || args.len() > 3 {
             return Err(Error::query_execution("LPAD requires 2 or 3 arguments"));
         }
-        let s = match &args[0] {
+        let arg0 = args.get(0).ok_or_else(|| Error::query_execution("LPAD: missing string"))?;
+        let arg1 = args.get(1).ok_or_else(|| Error::query_execution("LPAD: missing length"))?;
+
+        let s = match arg0 {
             Value::Null => return Ok(Value::Null),
             Value::String(s) => s,
             _ => return Err(Error::query_execution("LPAD first argument must be a string")),
         };
-        let length = match &args[1] {
+        let length = match arg1 {
             Value::Int2(n) => *n as usize,
             Value::Int4(n) => *n as usize,
             Value::Int8(n) => *n as usize,
             _ => return Err(Error::query_execution("LPAD second argument must be an integer")),
         };
-        let fill = if args.len() > 2 {
-            match &args[2] {
+        let fill = if let Some(arg2) = args.get(2) {
+            match arg2 {
                 Value::String(f) => f.clone(),
                 _ => " ".to_string(),
             }
@@ -3707,8 +3643,8 @@ impl Evaluator {
         let pad_len = length - char_count;
         let fill_chars: Vec<char> = fill.chars().collect();
         let mut result = String::with_capacity(length);
-        for i in 0..pad_len {
-            result.push(fill_chars[i % fill_chars.len()]);
+        if !fill_chars.is_empty() {
+            result.extend(fill_chars.iter().cycle().take(pad_len));
         }
         result.push_str(s);
         Ok(Value::String(result))
@@ -3719,19 +3655,22 @@ impl Evaluator {
         if args.len() < 2 || args.len() > 3 {
             return Err(Error::query_execution("RPAD requires 2 or 3 arguments"));
         }
-        let s = match &args[0] {
+        let arg0 = args.get(0).ok_or_else(|| Error::query_execution("RPAD: missing string"))?;
+        let arg1 = args.get(1).ok_or_else(|| Error::query_execution("RPAD: missing length"))?;
+
+        let s = match arg0 {
             Value::Null => return Ok(Value::Null),
             Value::String(s) => s,
             _ => return Err(Error::query_execution("RPAD first argument must be a string")),
         };
-        let length = match &args[1] {
+        let length = match arg1 {
             Value::Int2(n) => *n as usize,
             Value::Int4(n) => *n as usize,
             Value::Int8(n) => *n as usize,
             _ => return Err(Error::query_execution("RPAD second argument must be an integer")),
         };
-        let fill = if args.len() > 2 {
-            match &args[2] {
+        let fill = if let Some(arg2) = args.get(2) {
+            match arg2 {
                 Value::String(f) => f.clone(),
                 _ => " ".to_string(),
             }
@@ -3747,8 +3686,8 @@ impl Evaluator {
         let pad_len = length - char_count;
         let fill_chars: Vec<char> = fill.chars().collect();
         let mut result = s.clone();
-        for i in 0..pad_len {
-            result.push(fill_chars[i % fill_chars.len()]);
+        if !fill_chars.is_empty() {
+            result.extend(fill_chars.iter().cycle().take(pad_len));
         }
         Ok(Value::String(result))
     }
@@ -3771,10 +3710,10 @@ impl Evaluator {
 
     /// ABS(x) - absolute value
     fn func_abs(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("ABS requires exactly one argument"));
-        }
-        match &args[0] {
+        };
+        match arg {
             Value::Null => Ok(Value::Null),
             Value::Int2(n) => Ok(Value::Int2(n.abs())),
             Value::Int4(n) => Ok(Value::Int4(n.abs())),
@@ -3797,12 +3736,13 @@ impl Evaluator {
         if args.is_empty() || args.len() > 2 {
             return Err(Error::query_execution("ROUND requires 1 or 2 arguments"));
         }
-        if matches!(args[0], Value::Null) {
+        let first = args.first().ok_or_else(|| Error::query_execution("ROUND requires at least 1 argument"))?;
+        if matches!(first, Value::Null) {
             return Ok(Value::Null);
         }
 
-        let precision = if args.len() > 1 {
-            match &args[1] {
+        let precision = if let Some(second) = args.get(1) {
+            match second {
                 Value::Int2(n) => *n as i32,
                 Value::Int4(n) => *n,
                 Value::Int8(n) => *n as i32,
@@ -3812,7 +3752,7 @@ impl Evaluator {
             0
         };
 
-        match &args[0] {
+        match first {
             Value::Int2(n) => Ok(Value::Int2(*n)),
             Value::Int4(n) => Ok(Value::Int4(*n)),
             Value::Int8(n) => Ok(Value::Int8(*n)),
@@ -3837,10 +3777,10 @@ impl Evaluator {
 
     /// CEIL(x) - smallest integer >= x
     fn func_ceil(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("CEIL requires exactly one argument"));
-        }
-        match &args[0] {
+        };
+        match arg {
             Value::Null => Ok(Value::Null),
             Value::Int2(n) => Ok(Value::Int2(*n)),
             Value::Int4(n) => Ok(Value::Int4(*n)),
@@ -3860,10 +3800,10 @@ impl Evaluator {
 
     /// FLOOR(x) - largest integer <= x
     fn func_floor(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("FLOOR requires exactly one argument"));
-        }
-        match &args[0] {
+        };
+        match arg {
             Value::Null => Ok(Value::Null),
             Value::Int2(n) => Ok(Value::Int2(*n)),
             Value::Int4(n) => Ok(Value::Int4(*n)),
@@ -3886,12 +3826,13 @@ impl Evaluator {
         if args.is_empty() || args.len() > 2 {
             return Err(Error::query_execution("TRUNC requires 1 or 2 arguments"));
         }
-        if matches!(args[0], Value::Null) {
+        let first = args.first().ok_or_else(|| Error::query_execution("TRUNC requires at least 1 argument"))?;
+        if matches!(first, Value::Null) {
             return Ok(Value::Null);
         }
 
-        let precision = if args.len() > 1 {
-            match &args[1] {
+        let precision = if let Some(second) = args.get(1) {
+            match second {
                 Value::Int2(n) => *n as i32,
                 Value::Int4(n) => *n,
                 Value::Int8(n) => *n as i32,
@@ -3901,7 +3842,7 @@ impl Evaluator {
             0
         };
 
-        match &args[0] {
+        match first {
             Value::Int2(n) => Ok(Value::Int2(*n)),
             Value::Int4(n) => Ok(Value::Int4(*n)),
             Value::Int8(n) => Ok(Value::Int8(*n)),
@@ -3926,13 +3867,13 @@ impl Evaluator {
 
     /// SQRT(x) - square root
     fn func_sqrt(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("SQRT requires exactly one argument"));
-        }
-        if matches!(args[0], Value::Null) {
+        };
+        if matches!(arg, Value::Null) {
             return Ok(Value::Null);
         }
-        let x = self.value_to_f64(&args[0])?;
+        let x = self.value_to_f64(arg)?;
         if x < 0.0 {
             return Err(Error::query_execution("SQRT of negative number"));
         }
@@ -3941,31 +3882,31 @@ impl Evaluator {
 
     /// POWER(x, y) - x raised to power y
     fn func_power(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution("POWER requires exactly 2 arguments"));
-        }
-        if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+        };
+        if matches!(a, Value::Null) || matches!(b, Value::Null) {
             return Ok(Value::Null);
         }
-        let x = self.value_to_f64(&args[0])?;
-        let y = self.value_to_f64(&args[1])?;
+        let x = self.value_to_f64(a)?;
+        let y = self.value_to_f64(b)?;
         Ok(Value::Float8(x.powf(y)))
     }
 
     /// MOD(x, y) - modulo (same as x % y)
     fn func_mod(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution("MOD requires exactly 2 arguments"));
-        }
-        self.arithmetic_modulo(&args[0], &args[1])
+        };
+        self.arithmetic_modulo(a, b)
     }
 
     /// SIGN(x) - returns -1, 0, or 1
     fn func_sign(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("SIGN requires exactly one argument"));
-        }
-        match &args[0] {
+        };
+        match arg {
             Value::Null => Ok(Value::Null),
             Value::Int2(n) => Ok(Value::Int4(n.signum() as i32)),
             Value::Int4(n) => Ok(Value::Int4(n.signum())),
@@ -3988,11 +3929,11 @@ impl Evaluator {
 
     /// GREATEST(val1, val2, ...) - returns the largest value
     fn func_greatest(&self, args: &[Value]) -> Result<Value> {
-        if args.is_empty() {
-            return Err(Error::query_execution("GREATEST requires at least one argument"));
-        }
-        let mut result = &args[0];
-        for arg in &args[1..] {
+        let (first, rest) = args.split_first().ok_or_else(|| {
+            Error::query_execution("GREATEST requires at least one argument")
+        })?;
+        let mut result = first;
+        for arg in rest {
             if matches!(arg, Value::Null) {
                 continue;
             }
@@ -4009,11 +3950,11 @@ impl Evaluator {
 
     /// LEAST(val1, val2, ...) - returns the smallest value
     fn func_least(&self, args: &[Value]) -> Result<Value> {
-        if args.is_empty() {
-            return Err(Error::query_execution("LEAST requires at least one argument"));
-        }
-        let mut result = &args[0];
-        for arg in &args[1..] {
+        let (first, rest) = args.split_first().ok_or_else(|| {
+            Error::query_execution("LEAST requires at least one argument")
+        })?;
+        let mut result = first;
+        for arg in rest {
             if matches!(arg, Value::Null) {
                 continue;
             }
@@ -4064,25 +4005,25 @@ impl Evaluator {
 
     /// EXP(x) - e raised to power x
     fn func_exp(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("EXP requires exactly one argument"));
-        }
-        if matches!(args[0], Value::Null) {
+        };
+        if matches!(arg, Value::Null) {
             return Ok(Value::Null);
         }
-        let x = self.value_to_f64(&args[0])?;
+        let x = self.value_to_f64(arg)?;
         Ok(Value::Float8(x.exp()))
     }
 
     /// LN(x) or LOG(x) - natural logarithm
     fn func_ln(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("LN requires exactly one argument"));
-        }
-        if matches!(args[0], Value::Null) {
+        };
+        if matches!(arg, Value::Null) {
             return Ok(Value::Null);
         }
-        let x = self.value_to_f64(&args[0])?;
+        let x = self.value_to_f64(arg)?;
         if x <= 0.0 {
             return Err(Error::query_execution("LN of non-positive number"));
         }
@@ -4091,13 +4032,13 @@ impl Evaluator {
 
     /// LOG10(x) - base-10 logarithm
     fn func_log10(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("LOG10 requires exactly one argument"));
-        }
-        if matches!(args[0], Value::Null) {
+        };
+        if matches!(arg, Value::Null) {
             return Ok(Value::Null);
         }
-        let x = self.value_to_f64(&args[0])?;
+        let x = self.value_to_f64(arg)?;
         if x <= 0.0 {
             return Err(Error::query_execution("LOG10 of non-positive number"));
         }
@@ -4106,49 +4047,49 @@ impl Evaluator {
 
     /// SIN(x) - sine (x in radians)
     fn func_sin(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("SIN requires exactly one argument"));
-        }
-        if matches!(args[0], Value::Null) {
+        };
+        if matches!(arg, Value::Null) {
             return Ok(Value::Null);
         }
-        let x = self.value_to_f64(&args[0])?;
+        let x = self.value_to_f64(arg)?;
         Ok(Value::Float8(x.sin()))
     }
 
     /// COS(x) - cosine (x in radians)
     fn func_cos(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("COS requires exactly one argument"));
-        }
-        if matches!(args[0], Value::Null) {
+        };
+        if matches!(arg, Value::Null) {
             return Ok(Value::Null);
         }
-        let x = self.value_to_f64(&args[0])?;
+        let x = self.value_to_f64(arg)?;
         Ok(Value::Float8(x.cos()))
     }
 
     /// TAN(x) - tangent (x in radians)
     fn func_tan(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("TAN requires exactly one argument"));
-        }
-        if matches!(args[0], Value::Null) {
+        };
+        if matches!(arg, Value::Null) {
             return Ok(Value::Null);
         }
-        let x = self.value_to_f64(&args[0])?;
+        let x = self.value_to_f64(arg)?;
         Ok(Value::Float8(x.tan()))
     }
 
     /// ASIN(x) - arcsine (result in radians)
     fn func_asin(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("ASIN requires exactly one argument"));
-        }
-        if matches!(args[0], Value::Null) {
+        };
+        if matches!(arg, Value::Null) {
             return Ok(Value::Null);
         }
-        let x = self.value_to_f64(&args[0])?;
+        let x = self.value_to_f64(arg)?;
         if x < -1.0 || x > 1.0 {
             return Err(Error::query_execution("ASIN argument out of range [-1, 1]"));
         }
@@ -4157,13 +4098,13 @@ impl Evaluator {
 
     /// ACOS(x) - arccosine (result in radians)
     fn func_acos(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("ACOS requires exactly one argument"));
-        }
-        if matches!(args[0], Value::Null) {
+        };
+        if matches!(arg, Value::Null) {
             return Ok(Value::Null);
         }
-        let x = self.value_to_f64(&args[0])?;
+        let x = self.value_to_f64(arg)?;
         if x < -1.0 || x > 1.0 {
             return Err(Error::query_execution("ACOS argument out of range [-1, 1]"));
         }
@@ -4172,52 +4113,154 @@ impl Evaluator {
 
     /// ATAN(x) - arctangent (result in radians)
     fn func_atan(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("ATAN requires exactly one argument"));
-        }
-        if matches!(args[0], Value::Null) {
+        };
+        if matches!(arg, Value::Null) {
             return Ok(Value::Null);
         }
-        let x = self.value_to_f64(&args[0])?;
+        let x = self.value_to_f64(arg)?;
         Ok(Value::Float8(x.atan()))
     }
 
     /// ATAN2(y, x) - arctangent of y/x
     fn func_atan2(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 2 {
+        let [a, b] = args else {
             return Err(Error::query_execution("ATAN2 requires exactly 2 arguments"));
-        }
-        if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+        };
+        if matches!(a, Value::Null) || matches!(b, Value::Null) {
             return Ok(Value::Null);
         }
-        let y = self.value_to_f64(&args[0])?;
-        let x = self.value_to_f64(&args[1])?;
+        let y = self.value_to_f64(a)?;
+        let x = self.value_to_f64(b)?;
         Ok(Value::Float8(y.atan2(x)))
     }
 
     /// DEGREES(x) - convert radians to degrees
     fn func_degrees(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("DEGREES requires exactly one argument"));
-        }
-        if matches!(args[0], Value::Null) {
+        };
+        if matches!(arg, Value::Null) {
             return Ok(Value::Null);
         }
-        let x = self.value_to_f64(&args[0])?;
+        let x = self.value_to_f64(arg)?;
         Ok(Value::Float8(x.to_degrees()))
     }
 
     /// RADIANS(x) - convert degrees to radians
     fn func_radians(&self, args: &[Value]) -> Result<Value> {
-        if args.len() != 1 {
+        let [arg] = args else {
             return Err(Error::query_execution("RADIANS requires exactly one argument"));
-        }
-        if matches!(args[0], Value::Null) {
+        };
+        if matches!(arg, Value::Null) {
             return Ok(Value::Null);
         }
-        let x = self.value_to_f64(&args[0])?;
+        let x = self.value_to_f64(arg)?;
         Ok(Value::Float8(x.to_radians()))
     }
+}
+
+/// Standalone recursive helper for JSON path setting (avoids clippy::only_used_in_recursion)
+fn jsonb_set_recursive_impl(
+    current: &mut serde_json::Value,
+    path: &[String],
+    index: usize,
+    value: &serde_json::Value,
+    create_missing: bool,
+) -> Result<()> {
+    let key = match path.get(index) {
+        Some(k) => k,
+        None => return Ok(()),
+    };
+    let is_last = index == path.len() - 1;
+
+    // Check if key is a number (array index)
+    if let Ok(arr_idx) = key.parse::<usize>() {
+        // Handle array index
+        if !current.is_array() && create_missing {
+            *current = serde_json::json!([]);
+        }
+
+        if let Some(arr) = current.as_array_mut() {
+            // Extend array if necessary
+            while arr.len() <= arr_idx {
+                arr.push(serde_json::json!(null));
+            }
+
+            if is_last {
+                if let Some(elem) = arr.get_mut(arr_idx) {
+                    *elem = value.clone();
+                }
+            } else {
+                if arr.get(arr_idx).is_some_and(|v| v.is_null()) && create_missing {
+                    if let Some(elem) = arr.get_mut(arr_idx) {
+                        *elem = serde_json::json!({});
+                    }
+                }
+                if let Some(elem) = arr.get_mut(arr_idx) {
+                    jsonb_set_recursive_impl(elem, path, index + 1, value, create_missing)?;
+                }
+            }
+        }
+    } else {
+        // Handle object key
+        if !current.is_object() && create_missing {
+            *current = serde_json::json!({});
+        }
+
+        if let Some(obj) = current.as_object_mut() {
+            if is_last {
+                obj.insert(key.clone(), value.clone());
+            } else {
+                if !obj.contains_key(key) && create_missing {
+                    obj.insert(key.clone(), serde_json::json!({}));
+                }
+                if let Some(next) = obj.get_mut(key) {
+                    jsonb_set_recursive_impl(next, path, index + 1, value, create_missing)?;
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Standalone recursive helper for JSON path deletion (avoids clippy::only_used_in_recursion)
+fn jsonb_delete_recursive_impl(
+    current: &mut serde_json::Value,
+    path: &[String],
+    index: usize,
+) -> Result<()> {
+    let key = match path.get(index) {
+        Some(k) => k,
+        None => return Ok(()),
+    };
+    let is_last = index == path.len() - 1;
+
+    if let Ok(arr_idx) = key.parse::<usize>() {
+        // Array index
+        if let Some(arr) = current.as_array_mut() {
+            if is_last {
+                if arr_idx < arr.len() {
+                    arr.remove(arr_idx);
+                }
+            } else if let Some(elem) = arr.get_mut(arr_idx) {
+                jsonb_delete_recursive_impl(elem, path, index + 1)?;
+            }
+        }
+    } else {
+        // Object key
+        if let Some(obj) = current.as_object_mut() {
+            if is_last {
+                obj.remove(key);
+            } else if let Some(next) = obj.get_mut(key) {
+                jsonb_delete_recursive_impl(next, path, index + 1)?;
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Check if left JSON contains right JSON (recursive containment check)
@@ -4231,7 +4274,7 @@ fn json_contains(left: &serde_json::Value, right: &serde_json::Value) -> bool {
         // Object containment: all key-value pairs in right must be in left
         (JV::Object(left_obj), JV::Object(right_obj)) => {
             right_obj.iter().all(|(key, right_val)| {
-                left_obj.get(key).map_or(false, |left_val| json_contains(left_val, right_val))
+                left_obj.get(key).is_some_and(|left_val| json_contains(left_val, right_val))
             })
         }
 
