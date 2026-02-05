@@ -496,9 +496,143 @@ impl ProceduralExecutor {
                 println!("{}", val);
             }
 
-            // TODO: Implement remaining statements
-            _ => {
-                return Err(Error::query_execution("Unsupported procedural statement"));
+            ProceduralStatement::Case { when_branches, else_block } => {
+                // Searched CASE: evaluates each condition until one is true
+                let mut executed = false;
+                for (condition, statements) in when_branches {
+                    let val = ctx.evaluator.evaluate(condition, &crate::Tuple::new(vec![]))?;
+                    if matches!(val, Value::Boolean(true)) {
+                        for stmt in statements {
+                            Self::execute_statement(stmt, ctx)?;
+                            if ctx.returned || ctx.exit_requested {
+                                break;
+                            }
+                        }
+                        executed = true;
+                        break;
+                    }
+                }
+                if !executed {
+                    if let Some(else_stmts) = else_block {
+                        for stmt in else_stmts {
+                            Self::execute_statement(stmt, ctx)?;
+                            if ctx.returned || ctx.exit_requested {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            ProceduralStatement::SimpleCase { operand, when_branches, else_block } => {
+                // Simple CASE: compares operand against each WHEN value
+                let operand_val = ctx.evaluator.evaluate(operand, &crate::Tuple::new(vec![]))?;
+                let mut executed = false;
+                for (when_val, statements) in when_branches {
+                    let val = ctx.evaluator.evaluate(when_val, &crate::Tuple::new(vec![]))?;
+                    if operand_val == val {
+                        for stmt in statements {
+                            Self::execute_statement(stmt, ctx)?;
+                            if ctx.returned || ctx.exit_requested {
+                                break;
+                            }
+                        }
+                        executed = true;
+                        break;
+                    }
+                }
+                if !executed {
+                    if let Some(else_stmts) = else_block {
+                        for stmt in else_stmts {
+                            Self::execute_statement(stmt, ctx)?;
+                            if ctx.returned || ctx.exit_requested {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            ProceduralStatement::SelectInto { query, variables } => {
+                // Execute query and store first row's columns into variables
+                let results = (ctx.sql_executor)(query)?;
+                if !results.is_empty() && !results[0].is_empty() {
+                    for (i, var_name) in variables.iter().enumerate() {
+                        if i < results[0].len() {
+                            ctx.scope.set(var_name, results[0][i].clone())?;
+                        }
+                    }
+                }
+            }
+
+            ProceduralStatement::ExecuteDynamic { sql_expression, into_variables, using_parameters: _ } => {
+                // Evaluate the SQL expression to get the SQL string
+                let sql_val = ctx.evaluator.evaluate(sql_expression, &crate::Tuple::new(vec![]))?;
+                let sql = match sql_val {
+                    Value::String(s) => s,
+                    other => other.to_string(),
+                };
+                // Execute the dynamic SQL
+                let results = (ctx.sql_executor)(&sql)?;
+                if !into_variables.is_empty() && !results.is_empty() && !results[0].is_empty() {
+                    for (i, var_name) in into_variables.iter().enumerate() {
+                        if i < results[0].len() {
+                            ctx.scope.set(var_name, results[0][i].clone())?;
+                        }
+                    }
+                }
+            }
+
+            // Cursor operations require external cursor infrastructure
+            ProceduralStatement::OpenCursor { cursor_name, .. } => {
+                return Err(Error::query_execution(format!(
+                    "Cursor operations not supported in embedded mode: OPEN {}",
+                    cursor_name
+                )));
+            }
+            ProceduralStatement::FetchCursor { cursor_name, .. } => {
+                return Err(Error::query_execution(format!(
+                    "Cursor operations not supported in embedded mode: FETCH {}",
+                    cursor_name
+                )));
+            }
+            ProceduralStatement::CloseCursor { cursor_name } => {
+                return Err(Error::query_execution(format!(
+                    "Cursor operations not supported in embedded mode: CLOSE {}",
+                    cursor_name
+                )));
+            }
+
+            // Set-returning function features require special result handling
+            ProceduralStatement::ReturnNext { .. } => {
+                return Err(Error::query_execution(
+                    "RETURN NEXT requires set-returning function context"
+                ));
+            }
+            ProceduralStatement::ReturnQuery { .. } => {
+                return Err(Error::query_execution(
+                    "RETURN QUERY requires set-returning function context"
+                ));
+            }
+
+            // FOR query loops require cursor infrastructure
+            ProceduralStatement::ForQuery { record_variable, query, .. } => {
+                // Simple implementation: execute query and iterate over results
+                let results = (ctx.sql_executor)(query)?;
+                for row in results {
+                    // Store the row as a composite value in the record variable
+                    // For simplicity, store first column value
+                    if !row.is_empty() {
+                        ctx.scope.set(record_variable, row[0].clone())?;
+                    }
+                }
+            }
+
+            ProceduralStatement::Call { procedure_name, arguments: _ } => {
+                return Err(Error::query_execution(format!(
+                    "Procedure calls not supported in embedded mode: CALL {}",
+                    procedure_name
+                )));
             }
         }
 

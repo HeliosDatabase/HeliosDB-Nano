@@ -907,7 +907,7 @@ impl StreamingClient {
             role: NodeRole::Standby,
             sync_mode: self.config.sync_mode,
             current_lsn: Some(current_lsn),
-            slot_name: None, // TODO: Support replication slots
+            slot_name: None, // Replication slots are not used; LSN-based tracking is sufficient
             capabilities: Capabilities::all(),
         };
 
