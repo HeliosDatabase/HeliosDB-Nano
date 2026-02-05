@@ -594,17 +594,18 @@ impl SplitBrainProtector {
         }
 
         // If we already voted for someone else in this term, reject
-        if vote_state.term == request.term && vote_state.voted_for.is_some() {
-            let voted_for = vote_state.voted_for.unwrap();
-            if voted_for != request.candidate_id {
-                return VoteResponsePayload {
-                    voter_id: self.node_id,
-                    vote_granted: false,
-                    term: current_term,
-                    fencing_token: self.fencing_token.load(Ordering::SeqCst),
-                    known_primary: *self.known_primary.read().await,
-                    rejection_reason: Some(format!("Already voted for {}", voted_for)),
-                };
+        if vote_state.term == request.term {
+            if let Some(voted_for) = vote_state.voted_for {
+                if voted_for != request.candidate_id {
+                    return VoteResponsePayload {
+                        voter_id: self.node_id,
+                        vote_granted: false,
+                        term: current_term,
+                        fencing_token: self.fencing_token.load(Ordering::SeqCst),
+                        known_primary: *self.known_primary.read().await,
+                        rejection_reason: Some(format!("Already voted for {}", voted_for)),
+                    };
+                }
             }
         }
 
@@ -941,17 +942,18 @@ impl ObserverNode {
         }
 
         // Already voted in this term
-        if state.term == request.term && state.voted_for.is_some() {
-            let voted_for = state.voted_for.unwrap();
-            if voted_for != request.candidate_id {
-                return VoteResponsePayload {
-                    voter_id: node_id,
-                    vote_granted: false,
-                    term: current_term,
-                    fencing_token: fencing_token.load(Ordering::SeqCst),
-                    known_primary: *known_primary.read().await,
-                    rejection_reason: Some(format!("Already voted for {}", voted_for)),
-                };
+        if state.term == request.term {
+            if let Some(voted_for) = state.voted_for {
+                if voted_for != request.candidate_id {
+                    return VoteResponsePayload {
+                        voter_id: node_id,
+                        vote_granted: false,
+                        term: current_term,
+                        fencing_token: fencing_token.load(Ordering::SeqCst),
+                        known_primary: *known_primary.read().await,
+                        rejection_reason: Some(format!("Already voted for {}", voted_for)),
+                    };
+                }
             }
         }
 

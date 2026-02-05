@@ -386,8 +386,8 @@ impl NonceTracker {
         // Clean up expired nonces first
         self.cleanup_expired();
 
-        let mut nonces = self.nonces.write().unwrap();
-        let mut expiry = self.expiry.write().unwrap();
+        let mut nonces = self.nonces.write().unwrap_or_else(|e| e.into_inner());
+        let mut expiry = self.expiry.write().unwrap_or_else(|e| e.into_inner());
 
         // Check if at capacity
         if nonces.len() >= self.max_nonces {
@@ -410,8 +410,8 @@ impl NonceTracker {
     /// Clean up expired nonces
     fn cleanup_expired(&self) {
         let now = Instant::now();
-        let mut nonces = self.nonces.write().unwrap();
-        let mut expiry = self.expiry.write().unwrap();
+        let mut nonces = self.nonces.write().unwrap_or_else(|e| e.into_inner());
+        let mut expiry = self.expiry.write().unwrap_or_else(|e| e.into_inner());
 
         expiry.retain(|(created, nonce)| {
             if now.duration_since(*created) > self.window {
@@ -443,7 +443,7 @@ impl NonceTracker {
 
     /// Get number of tracked nonces
     pub fn len(&self) -> usize {
-        self.nonces.read().unwrap().len()
+        self.nonces.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// Check if tracker is empty
