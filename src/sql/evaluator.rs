@@ -1366,9 +1366,10 @@ impl Evaluator {
         use super::BinaryOperator;
 
         match op {
-            // Comparison operators
-            BinaryOperator::Eq => Ok(Value::Boolean(left == right)),
-            BinaryOperator::NotEq => Ok(Value::Boolean(left != right)),
+            // Comparison operators with type coercion
+            // Use compare_values for Eq/NotEq to handle cross-type comparisons (e.g., 1 = 1.0)
+            BinaryOperator::Eq => self.compare_values(left, right, |cmp| cmp.is_eq()),
+            BinaryOperator::NotEq => self.compare_values(left, right, |cmp| cmp.is_ne()),
             BinaryOperator::Lt => self.compare_values(left, right, |cmp| cmp.is_lt()),
             BinaryOperator::LtEq => self.compare_values(left, right, |cmp| cmp.is_le()),
             BinaryOperator::Gt => self.compare_values(left, right, |cmp| cmp.is_gt()),

@@ -257,7 +257,7 @@ impl Optimizer {
                     distinct_on,
                 }
             }
-            LogicalPlan::Join { left, right, join_type, on } => {
+            LogicalPlan::Join { left, right, join_type, on, lateral } => {
                 let optimized_left = self.optimize_recursive(*left)?;
                 let optimized_right = self.optimize_recursive(*right)?;
                 LogicalPlan::Join {
@@ -265,6 +265,7 @@ impl Optimizer {
                     right: Box::new(optimized_right),
                     join_type,
                     on,
+                    lateral,
                 }
             }
             LogicalPlan::Aggregate { input, group_by, aggr_exprs, having } => {

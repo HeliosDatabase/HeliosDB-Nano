@@ -376,9 +376,10 @@ impl OptimizationRule for JoinReorderingRule {
 
     fn apply(&self, plan: LogicalPlan, cost_estimator: &CostEstimator) -> Result<Option<LogicalPlan>> {
         match plan {
-            LogicalPlan::Join { left, right, join_type, on } => {
+            LogicalPlan::Join { left, right, join_type, on, lateral } => {
                 // Only reorder inner joins (outer joins are order-dependent)
-                if !matches!(join_type, crate::sql::logical_plan::JoinType::Inner) {
+                // Also don't reorder LATERAL joins (right depends on left)
+                if !matches!(join_type, crate::sql::logical_plan::JoinType::Inner) || lateral {
                     return Ok(None);
                 }
 
@@ -393,6 +394,7 @@ impl OptimizationRule for JoinReorderingRule {
                         right: left,
                         join_type,
                         on,
+                        lateral: false,
                     }))
                 } else {
                     Ok(None) // Already in optimal order
@@ -1167,6 +1169,7 @@ mod tests {
             right: Box::new(small_scan),
             join_type: JoinType::Inner,
             on: None,
+            lateral: false,
         };
 
         let result = rule.apply(join, &estimator).unwrap();

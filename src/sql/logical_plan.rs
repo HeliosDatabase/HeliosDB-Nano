@@ -197,6 +197,9 @@ pub enum LogicalPlan {
         join_type: JoinType,
         /// Join condition
         on: Option<LogicalExpr>,
+        /// LATERAL join - right side can reference left side columns
+        #[serde(default)]
+        lateral: bool,
     },
 
     /// Sort
@@ -337,6 +340,48 @@ pub enum LogicalPlan {
         storage_mode: crate::ColumnStorageMode,
     },
 
+    // === ALTER TABLE operations ===
+
+    /// Add a column to an existing table
+    AlterTableAddColumn {
+        /// Table name
+        table_name: String,
+        /// Column definition
+        column_def: ColumnDef,
+        /// IF NOT EXISTS
+        if_not_exists: bool,
+    },
+
+    /// Drop a column from an existing table
+    AlterTableDropColumn {
+        /// Table name
+        table_name: String,
+        /// Column name to drop
+        column_name: String,
+        /// IF EXISTS
+        if_exists: bool,
+        /// CASCADE
+        cascade: bool,
+    },
+
+    /// Rename a column in an existing table
+    AlterTableRenameColumn {
+        /// Table name
+        table_name: String,
+        /// Old column name
+        old_column_name: String,
+        /// New column name
+        new_column_name: String,
+    },
+
+    /// Rename a table
+    AlterTableRename {
+        /// Current table name
+        table_name: String,
+        /// New table name
+        new_table_name: String,
+    },
+
     // === Phase 3: Database Branching ===
 
     /// Create a database branch
@@ -418,6 +463,28 @@ pub enum LogicalPlan {
         options: std::collections::HashMap<String, String>,
     },
 
+    // === Regular Views (non-materialized) ===
+
+    /// Create a regular view (virtual table)
+    CreateView {
+        /// View name
+        name: String,
+        /// Query definition (stored as SQL string for expansion)
+        query_sql: String,
+        /// If view already exists, do nothing
+        if_not_exists: bool,
+        /// OR REPLACE - replace existing view
+        or_replace: bool,
+    },
+
+    /// Drop a regular view
+    DropView {
+        /// View name
+        name: String,
+        /// If view doesn't exist, do nothing
+        if_exists: bool,
+    },
+
     // === Phase 3: System Views ===
 
     /// Query a system view (e.g., pg_database_branches())
@@ -430,10 +497,13 @@ pub enum LogicalPlan {
 
     /// Common Table Expression (WITH clause)
     With {
-        /// CTE definitions (name -> query plan)
-        ctes: Vec<(String, Box<LogicalPlan>)>,
+        /// CTE definitions (name -> query plan -> optional column aliases)
+        /// Column aliases rename the output columns (e.g., `nums(n)` renames column to `n`)
+        ctes: Vec<(String, Box<LogicalPlan>, Option<Vec<String>>)>,
         /// Main query plan
         query: Box<LogicalPlan>,
+        /// Whether this is WITH RECURSIVE
+        recursive: bool,
     },
 
     /// Create a trigger
@@ -1250,6 +1320,22 @@ impl LogicalPlan {
                 // AlterColumnStorage doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
             }
+            LogicalPlan::AlterTableAddColumn { .. } => {
+                // ALTER TABLE ADD COLUMN doesn't have output schema
+                Arc::new(Schema { columns: vec![] })
+            }
+            LogicalPlan::AlterTableDropColumn { .. } => {
+                // ALTER TABLE DROP COLUMN doesn't have output schema
+                Arc::new(Schema { columns: vec![] })
+            }
+            LogicalPlan::AlterTableRenameColumn { .. } => {
+                // ALTER TABLE RENAME COLUMN doesn't have output schema
+                Arc::new(Schema { columns: vec![] })
+            }
+            LogicalPlan::AlterTableRename { .. } => {
+                // ALTER TABLE RENAME doesn't have output schema
+                Arc::new(Schema { columns: vec![] })
+            }
             LogicalPlan::CreateBranch { .. } => {
                 // CreateBranch doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
@@ -1401,6 +1487,16 @@ impl LogicalPlan {
             // DualScan - empty schema (single row, no columns)
             // Used as input for SELECT without FROM, expressions are evaluated in Project
             LogicalPlan::DualScan => Arc::new(Schema { columns: vec![] }),
+
+            // Regular Views
+            LogicalPlan::CreateView { .. } => {
+                // CreateView doesn't have output schema
+                Arc::new(Schema { columns: vec![] })
+            }
+            LogicalPlan::DropView { .. } => {
+                // DropView doesn't have output schema
+                Arc::new(Schema { columns: vec![] })
+            }
 
             // HA Operations
             #[cfg(feature = "ha-tier1")]

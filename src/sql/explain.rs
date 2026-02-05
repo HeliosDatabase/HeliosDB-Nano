@@ -434,7 +434,7 @@ impl ExplainPlanner {
                 })
             }
 
-            LogicalPlan::Join { left, right, join_type, on } => {
+            LogicalPlan::Join { left, right, join_type, on, lateral } => {
                 let left_node = self.plan_to_node(left, depth + 1)?;
                 let right_node = self.plan_to_node(right, depth + 1)?;
 
@@ -443,16 +443,20 @@ impl ExplainPlanner {
                 if let Some(cond) = on {
                     details.insert("condition".to_string(), format!("{:?}", cond));
                 }
+                if *lateral {
+                    details.insert("lateral".to_string(), "true".to_string());
+                }
 
-                // Hash join cost model
+                // Hash join cost model (LATERAL uses nested loop, higher cost)
                 let build_cost = right_node.rows as f64 * 2.0;
                 let probe_cost = left_node.rows as f64 * 1.0;
                 let cost = left_node.cost + right_node.cost + build_cost + probe_cost;
                 let rows = left_node.rows * right_node.rows / 10; // Rough estimate
 
+                let join_method = if *lateral { "NestedLoop" } else { "HashJoin" };
                 Ok(PlanNode {
                     node_type: "Join".to_string(),
-                    operation: format!("{:?} HashJoin", join_type),
+                    operation: format!("{:?} {}", join_type, join_method),
                     cost,
                     rows,
                     details,

@@ -19,6 +19,11 @@ impl<'a> Catalog<'a> {
         Self { storage }
     }
 
+    /// Get a reference to the storage engine
+    pub fn storage(&self) -> &'a StorageEngine {
+        self.storage
+    }
+
     /// Create a table with the given schema
     pub fn create_table(&self, table_name: &str, schema: Schema) -> Result<()> {
         // Check if table already exists

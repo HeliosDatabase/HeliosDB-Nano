@@ -14,6 +14,7 @@ mod gin_index;
 mod time_travel;
 mod branch;
 mod materialized_view;
+mod view_catalog;
 mod mv_auto_refresh;
 mod mv_delta;
 mod mv_scheduler;
@@ -70,6 +71,7 @@ pub use branch::{
     GIT_DDL_HISTORY_PREFIX, GIT_SCHEMA_SNAPSHOT_PREFIX, GIT_PR_PREFIX,
 };
 pub use materialized_view::{MaterializedViewCatalog, MaterializedViewMetadata};
+pub use view_catalog::{ViewCatalog, ViewMetadata};
 pub use mv_auto_refresh::{AutoRefreshWorker, AutoRefreshConfig};
 pub use mv_delta::{
     DeltaTracker as MvDeltaTracker, Delta as MvDelta, DeltaSet as MvDeltaSet,

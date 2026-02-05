@@ -732,10 +732,24 @@ pub(super) fn handle_join(
     right: &crate::sql::LogicalPlan,
     join_type: &crate::sql::JoinType,
     on: &Option<crate::sql::LogicalExpr>,
+    lateral: bool,
 ) -> Result<Box<dyn PhysicalOperator>> {
     let left_op = executor.plan_to_operator(left)?;
     let right_op = executor.plan_to_operator(right)?;
     let timeout_ctx = executor.timeout_ctx();
+
+    // LATERAL joins require nested loop join (right side depends on left row)
+    if lateral {
+        // LATERAL joins always use nested loop join because the right side
+        // must be re-evaluated for each row from the left side
+        return Ok(Box::new(NestedLoopJoinOperator::new(
+            left_op,
+            right_op,
+            join_type.clone(),
+            on.clone(),
+            timeout_ctx,
+        )?));
+    }
 
     // Use HashJoin for equi-joins (with equality conditions)
     // Fall back to NestedLoopJoin for non-equi joins or cross joins

@@ -534,8 +534,8 @@ impl<'a> Executor<'a> {
                     self.timeout_ctx.clone(),
                 )?))
             }
-            LogicalPlan::Join { left, right, join_type, on } => {
-                join::handle_join(self, left, right, join_type, on)
+            LogicalPlan::Join { left, right, join_type, on, lateral } => {
+                join::handle_join(self, left, right, join_type, on, *lateral)
             }
             LogicalPlan::Union { left, right, all } => {
                 let left_op = self.plan_to_operator(left)?;
@@ -570,27 +570,117 @@ impl<'a> Executor<'a> {
             | LogicalPlan::RefreshMaterializedView { .. }
             | LogicalPlan::DropMaterializedView { .. }
             | LogicalPlan::AlterMaterializedView { .. }
+            | LogicalPlan::CreateView { .. }
+            | LogicalPlan::DropView { .. }
             | LogicalPlan::SystemView { .. } => {
                 phase3::handle_phase3_operation(self, plan)
             }
-            LogicalPlan::With { ctes, query } => {
+            LogicalPlan::With { ctes, query, recursive } => {
                 // Materialize each CTE before executing the main query
                 // CTEs are stored in cte_context and looked up during table scans
-                for (cte_name, cte_plan) in ctes {
-                    // Execute the CTE plan to materialize its results
-                    let cte_schema = cte_plan.schema();
-                    let mut cte_operator = self.plan_to_operator(cte_plan)?;
-                    let mut tuples = Vec::new();
-                    while let Some(tuple) = cte_operator.next()? {
-                        tuples.push(tuple);
-                    }
+                for (cte_name, cte_plan, column_aliases) in ctes {
+                    // Get the plan's schema and apply column aliases if present
+                    let original_schema = cte_plan.schema();
+                    let cte_schema = if let Some(aliases) = column_aliases {
+                        if aliases.len() == original_schema.columns.len() {
+                            // Rename columns using the aliases
+                            Arc::new(Schema::new(
+                                original_schema.columns.iter()
+                                    .zip(aliases.iter())
+                                    .map(|(col, alias)| {
+                                        let mut new_col = col.clone();
+                                        new_col.name = alias.clone();
+                                        new_col
+                                    })
+                                    .collect()
+                            ))
+                        } else {
+                            original_schema
+                        }
+                    } else {
+                        original_schema
+                    };
 
-                    // Store the CTE in context for later lookup during scans
-                    self.add_cte(CteData {
-                        name: cte_name.clone(),
-                        tuples,
-                        schema: cte_schema,
-                    });
+                    if *recursive {
+                        // Handle recursive CTE using iterative fixpoint evaluation
+                        // The CTE plan is typically a UNION ALL of:
+                        //   1. Base case (anchor term) - doesn't reference the CTE
+                        //   2. Recursive case - references the CTE itself
+                        //
+                        // Algorithm:
+                        // 1. Execute the full plan once to get initial results (base case)
+                        // 2. Loop: re-execute with current results as the CTE's value
+                        // 3. Stop when no new rows are produced
+
+                        const MAX_RECURSION_DEPTH: usize = 1000;
+                        let mut all_tuples: Vec<Tuple> = Vec::new();
+                        let mut iteration = 0;
+
+                        // First iteration: register empty CTE, then execute to get base results
+                        self.add_cte(CteData {
+                            name: cte_name.clone(),
+                            tuples: vec![],
+                            schema: cte_schema.clone(),
+                        });
+
+                        let mut cte_operator = self.plan_to_operator(cte_plan)?;
+                        let mut new_tuples = Vec::new();
+                        while let Some(tuple) = cte_operator.next()? {
+                            new_tuples.push(tuple);
+                        }
+
+                        all_tuples.extend(new_tuples.clone());
+
+                        // Iterative loop: keep re-executing with the new results
+                        // until no new rows are produced (fixpoint)
+                        while !new_tuples.is_empty() && iteration < MAX_RECURSION_DEPTH {
+                            iteration += 1;
+
+                            // Update the CTE with the working table (new_tuples from last iteration)
+                            self.add_cte(CteData {
+                                name: cte_name.clone(),
+                                tuples: new_tuples.clone(),
+                                schema: cte_schema.clone(),
+                            });
+
+                            // Re-execute to get next iteration's results
+                            let mut cte_operator = self.plan_to_operator(cte_plan)?;
+                            new_tuples.clear();
+                            while let Some(tuple) = cte_operator.next()? {
+                                // Only add tuples not already in all_tuples to avoid infinite loops
+                                if !all_tuples.contains(&tuple) {
+                                    new_tuples.push(tuple);
+                                }
+                            }
+
+                            all_tuples.extend(new_tuples.clone());
+                        }
+
+                        if iteration >= MAX_RECURSION_DEPTH {
+                            tracing::warn!("Recursive CTE '{}' reached maximum recursion depth {}", cte_name, MAX_RECURSION_DEPTH);
+                        }
+
+                        // Store final results
+                        self.add_cte(CteData {
+                            name: cte_name.clone(),
+                            tuples: all_tuples,
+                            schema: cte_schema,
+                        });
+                    } else {
+                        // Non-recursive CTE: execute once and materialize
+                        let mut cte_operator = self.plan_to_operator(cte_plan)?;
+                        let mut tuples = Vec::new();
+                        while let Some(tuple) = cte_operator.next()? {
+                            tuples.push(tuple);
+                        }
+
+                        // Store the CTE in context for later lookup during scans
+                        self.add_cte(CteData {
+                            name: cte_name.clone(),
+                            tuples,
+                            schema: cte_schema,
+                        });
+                    }
                 }
 
                 // Now execute the main query with CTEs available in context

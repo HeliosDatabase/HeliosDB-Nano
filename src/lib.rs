@@ -1637,6 +1637,140 @@ impl EmbeddedDatabase {
 
                 Ok(rows_migrated as u64)
             }
+            sql::LogicalPlan::AlterTableAddColumn { table_name, column_def, if_not_exists } => {
+                let catalog = self.storage.catalog();
+                let mut schema = catalog.get_table_schema(table_name)?;
+
+                // Check if column already exists
+                if schema.columns.iter().any(|c| c.name == column_def.name) {
+                    if *if_not_exists {
+                        return Ok(0);
+                    }
+                    return Err(Error::query_execution(format!(
+                        "Column '{}' already exists in table '{}'", column_def.name, table_name
+                    )));
+                }
+
+                // Convert ColumnDef to Column
+                let new_column = Column {
+                    name: column_def.name.clone(),
+                    data_type: column_def.data_type.clone(),
+                    nullable: !column_def.not_null,
+                    primary_key: column_def.primary_key,
+                    source_table: None,
+                    source_table_name: Some(table_name.clone()),
+                    default_expr: column_def.default.as_ref().map(|e| format!("{:?}", e)),
+                    unique: column_def.unique,
+                    storage_mode: column_def.storage_mode,
+                };
+
+                // Add column to schema
+                schema.columns.push(new_column);
+                catalog.update_table_schema(table_name, &schema)?;
+
+                // Update existing rows with NULL (or default) for the new column
+                let rows_updated = self.storage.add_column_to_rows(
+                    table_name,
+                    &column_def.default,
+                )?;
+
+                tracing::info!(
+                    "Added column '{}' to table '{}', updated {} rows",
+                    column_def.name, table_name, rows_updated
+                );
+
+                Ok(rows_updated as u64)
+            }
+            sql::LogicalPlan::AlterTableDropColumn { table_name, column_name, if_exists, cascade } => {
+                let catalog = self.storage.catalog();
+                let mut schema = catalog.get_table_schema(table_name)?;
+
+                // Find column index
+                let col_idx = schema.columns.iter()
+                    .position(|c| c.name == *column_name);
+
+                match col_idx {
+                    Some(idx) => {
+                        // Check if column is primary key
+                        if schema.columns[idx].primary_key && !cascade {
+                            return Err(Error::query_execution(format!(
+                                "Cannot drop primary key column '{}' without CASCADE", column_name
+                            )));
+                        }
+
+                        // Remove column from schema
+                        schema.columns.remove(idx);
+                        catalog.update_table_schema(table_name, &schema)?;
+
+                        // Update existing rows by removing the column value
+                        let rows_updated = self.storage.drop_column_from_rows(table_name, idx)?;
+
+                        tracing::info!(
+                            "Dropped column '{}' from table '{}', updated {} rows",
+                            column_name, table_name, rows_updated
+                        );
+
+                        Ok(rows_updated as u64)
+                    }
+                    None => {
+                        if *if_exists {
+                            Ok(0)
+                        } else {
+                            Err(Error::query_execution(format!(
+                                "Column '{}' does not exist in table '{}'", column_name, table_name
+                            )))
+                        }
+                    }
+                }
+            }
+            sql::LogicalPlan::AlterTableRenameColumn { table_name, old_column_name, new_column_name } => {
+                let catalog = self.storage.catalog();
+                let mut schema = catalog.get_table_schema(table_name)?;
+
+                // Check if new column name already exists
+                if schema.columns.iter().any(|c| c.name == *new_column_name) {
+                    return Err(Error::query_execution(format!(
+                        "Column '{}' already exists in table '{}'", new_column_name, table_name
+                    )));
+                }
+
+                // Find and rename column
+                let col_idx = schema.columns.iter()
+                    .position(|c| c.name == *old_column_name)
+                    .ok_or_else(|| Error::query_execution(format!(
+                        "Column '{}' does not exist in table '{}'", old_column_name, table_name
+                    )))?;
+
+                schema.columns[col_idx].name = new_column_name.clone();
+                catalog.update_table_schema(table_name, &schema)?;
+
+                tracing::info!(
+                    "Renamed column '{}' to '{}' in table '{}'",
+                    old_column_name, new_column_name, table_name
+                );
+
+                Ok(0)
+            }
+            sql::LogicalPlan::AlterTableRename { table_name, new_table_name } => {
+                let catalog = self.storage.catalog();
+
+                // Check if new table name already exists
+                if catalog.get_table_schema(new_table_name).is_ok() {
+                    return Err(Error::query_execution(format!(
+                        "Table '{}' already exists", new_table_name
+                    )));
+                }
+
+                // Rename table
+                self.storage.rename_table(table_name, new_table_name)?;
+
+                tracing::info!(
+                    "Renamed table '{}' to '{}'",
+                    table_name, new_table_name
+                );
+
+                Ok(0)
+            }
             _ => {
                 // For other operations (TRUNCATE, CREATE INDEX, etc.), use executor
                 let mut executor = sql::Executor::with_storage(&self.storage)
@@ -2380,6 +2514,99 @@ impl EmbeddedDatabase {
                 );
 
                 Ok(rows_migrated as u64)
+            }
+            sql::LogicalPlan::AlterTableAddColumn { table_name, column_def, if_not_exists } => {
+                let catalog = self.storage.catalog();
+                let mut schema = catalog.get_table_schema(table_name)?;
+
+                if schema.columns.iter().any(|c| c.name == column_def.name) {
+                    if *if_not_exists {
+                        return Ok(0);
+                    }
+                    return Err(Error::query_execution(format!(
+                        "Column '{}' already exists in table '{}'", column_def.name, table_name
+                    )));
+                }
+
+                let new_column = Column {
+                    name: column_def.name.clone(),
+                    data_type: column_def.data_type.clone(),
+                    nullable: !column_def.not_null,
+                    primary_key: column_def.primary_key,
+                    source_table: None,
+                    source_table_name: Some(table_name.clone()),
+                    default_expr: column_def.default.as_ref().map(|e| format!("{:?}", e)),
+                    unique: column_def.unique,
+                    storage_mode: column_def.storage_mode,
+                };
+
+                schema.columns.push(new_column);
+                catalog.update_table_schema(table_name, &schema)?;
+
+                let rows_updated = self.storage.add_column_to_rows(table_name, &column_def.default)?;
+                Ok(rows_updated as u64)
+            }
+            sql::LogicalPlan::AlterTableDropColumn { table_name, column_name, if_exists, cascade } => {
+                let catalog = self.storage.catalog();
+                let mut schema = catalog.get_table_schema(table_name)?;
+
+                let col_idx = schema.columns.iter().position(|c| c.name == *column_name);
+
+                match col_idx {
+                    Some(idx) => {
+                        if schema.columns[idx].primary_key && !cascade {
+                            return Err(Error::query_execution(format!(
+                                "Cannot drop primary key column '{}' without CASCADE", column_name
+                            )));
+                        }
+
+                        schema.columns.remove(idx);
+                        catalog.update_table_schema(table_name, &schema)?;
+                        let rows_updated = self.storage.drop_column_from_rows(table_name, idx)?;
+                        Ok(rows_updated as u64)
+                    }
+                    None => {
+                        if *if_exists {
+                            Ok(0)
+                        } else {
+                            Err(Error::query_execution(format!(
+                                "Column '{}' does not exist in table '{}'", column_name, table_name
+                            )))
+                        }
+                    }
+                }
+            }
+            sql::LogicalPlan::AlterTableRenameColumn { table_name, old_column_name, new_column_name } => {
+                let catalog = self.storage.catalog();
+                let mut schema = catalog.get_table_schema(table_name)?;
+
+                if schema.columns.iter().any(|c| c.name == *new_column_name) {
+                    return Err(Error::query_execution(format!(
+                        "Column '{}' already exists in table '{}'", new_column_name, table_name
+                    )));
+                }
+
+                let col_idx = schema.columns.iter()
+                    .position(|c| c.name == *old_column_name)
+                    .ok_or_else(|| Error::query_execution(format!(
+                        "Column '{}' does not exist in table '{}'", old_column_name, table_name
+                    )))?;
+
+                schema.columns[col_idx].name = new_column_name.clone();
+                catalog.update_table_schema(table_name, &schema)?;
+                Ok(0)
+            }
+            sql::LogicalPlan::AlterTableRename { table_name, new_table_name } => {
+                let catalog = self.storage.catalog();
+
+                if catalog.get_table_schema(new_table_name).is_ok() {
+                    return Err(Error::query_execution(format!(
+                        "Table '{}' already exists", new_table_name
+                    )));
+                }
+
+                self.storage.rename_table(table_name, new_table_name)?;
+                Ok(0)
             }
             _ => {
                 // For query plans, use executor
@@ -4422,12 +4649,13 @@ impl EmbeddedDatabase {
                 })
             }
 
-            sql::LogicalPlan::Join { left, right, join_type, on } => {
+            sql::LogicalPlan::Join { left, right, join_type, on, lateral } => {
                 Ok(sql::LogicalPlan::Join {
                     left: Box::new(self.apply_rls_to_plan_recursive(*left)?),
                     right: Box::new(self.apply_rls_to_plan_recursive(*right)?),
                     join_type,
                     on,
+                    lateral,
                 })
             }
 

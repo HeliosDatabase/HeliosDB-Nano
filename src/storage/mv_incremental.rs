@@ -297,7 +297,7 @@ impl IncrementalRefresher {
                 }
             }
 
-            LogicalPlan::Join { left, right, join_type, on } => {
+            LogicalPlan::Join { left, right, join_type, on, .. } => {
                 // Get base tables from left and right
                 let left_table = self.extract_table_name(left)?;
                 let right_table = self.extract_table_name(right)?;

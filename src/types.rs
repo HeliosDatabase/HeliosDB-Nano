@@ -322,14 +322,25 @@ impl fmt::Display for Value {
             }
             Value::Json(j) => write!(f, "'{}'", j),
             Value::Array(arr) => {
-                write!(f, "[")?;
+                write!(f, "{{")?;
                 for (i, v) in arr.iter().enumerate() {
                     if i > 0 {
                         write!(f, ", ")?;
                     }
-                    write!(f, "{}", v)?;
+                    // Format array elements without type wrappers for cleaner output
+                    match v {
+                        Value::Int2(n) => write!(f, "{}", n)?,
+                        Value::Int4(n) => write!(f, "{}", n)?,
+                        Value::Int8(n) => write!(f, "{}", n)?,
+                        Value::Float4(n) => write!(f, "{}", n)?,
+                        Value::Float8(n) => write!(f, "{}", n)?,
+                        Value::String(s) => write!(f, "\"{}\"", s)?,
+                        Value::Boolean(b) => write!(f, "{}", b)?,
+                        Value::Null => write!(f, "NULL")?,
+                        other => write!(f, "{}", other)?,
+                    }
                 }
-                write!(f, "]")
+                write!(f, "}}")
             }
             Value::Vector(vec) => write!(f, "[{}]", vec.iter()
                 .map(|v| v.to_string())

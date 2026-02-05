@@ -416,13 +416,14 @@ fn format_plan(lines: &mut Vec<String>, plan: &LogicalPlan, depth: usize, verbos
             lines.push(format!("{}{}Aggregate: {:?}{}{}", indent, arrow, aggr_exprs, group_str, having_str));
             format_plan(lines, input, depth + 1, verbose);
         }
-        LogicalPlan::Join { left, right, join_type, on } => {
+        LogicalPlan::Join { left, right, join_type, on, lateral } => {
             let on_str = if let Some(cond) = on {
                 format!(" ON {:?}", cond)
             } else {
                 String::new()
             };
-            lines.push(format!("{}{}Nested Loop {:?} Join{}", indent, arrow, join_type, on_str));
+            let lateral_str = if *lateral { "LATERAL " } else { "" };
+            lines.push(format!("{}{}{}Nested Loop {:?} Join{}", indent, arrow, lateral_str, join_type, on_str));
             format_plan(lines, left, depth + 1, verbose);
             format_plan(lines, right, depth + 1, verbose);
         }

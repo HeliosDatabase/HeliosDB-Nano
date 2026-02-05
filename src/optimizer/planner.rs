@@ -227,7 +227,7 @@ impl Planner {
             }
 
             // Join - use cost-based decision between hash join and nested loop join
-            LogicalPlan::Join { left, right, join_type, on } => {
+            LogicalPlan::Join { left, right, join_type, on, .. } => {
                 // Choose join algorithm based on cost estimation (before consuming left/right)
                 let use_hash_join = self.should_use_hash_join(&left, &right, &on)?;
 
@@ -306,6 +306,10 @@ impl Planner {
             LogicalPlan::DropTable { .. } |
             LogicalPlan::CreateIndex { .. } |
             LogicalPlan::AlterColumnStorage { .. } |
+            LogicalPlan::AlterTableAddColumn { .. } |
+            LogicalPlan::AlterTableDropColumn { .. } |
+            LogicalPlan::AlterTableRenameColumn { .. } |
+            LogicalPlan::AlterTableRename { .. } |
             LogicalPlan::Truncate { .. } |
             LogicalPlan::CreateBranch { .. } |
             LogicalPlan::DropBranch { .. } |
@@ -316,6 +320,8 @@ impl Planner {
             LogicalPlan::RefreshMaterializedView { .. } |
             LogicalPlan::DropMaterializedView { .. } |
             LogicalPlan::AlterMaterializedView { .. } |
+            LogicalPlan::CreateView { .. } |
+            LogicalPlan::DropView { .. } |
             LogicalPlan::SystemView { .. } |
             LogicalPlan::With { .. } |
             LogicalPlan::CreateTrigger { .. } |

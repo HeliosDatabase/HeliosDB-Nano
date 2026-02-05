@@ -1541,6 +1541,174 @@ impl StorageEngine {
         Ok(migrated)
     }
 
+    /// Add a new column to all existing rows in a table
+    ///
+    /// This method updates all existing rows by appending a new value
+    /// (NULL or the default value if provided) for the new column.
+    ///
+    /// # Arguments
+    /// * `table_name` - Name of the table
+    /// * `default_expr` - Optional default value expression
+    ///
+    /// # Returns
+    /// Number of rows updated
+    pub fn add_column_to_rows(
+        &self,
+        table_name: &str,
+        default_expr: &Option<crate::sql::LogicalExpr>,
+    ) -> Result<usize> {
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut updated = 0;
+
+        // Evaluate default expression if provided
+        let default_value = if let Some(expr) = default_expr {
+            // For simple literal defaults, extract the value
+            match expr {
+                crate::sql::LogicalExpr::Literal(v) => v.clone(),
+                _ => crate::Value::Null, // Complex expressions default to NULL
+            }
+        } else {
+            crate::Value::Null
+        };
+
+        // Collect keys first to avoid iterator invalidation
+        let mut keys_to_update = Vec::new();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if key.starts_with(prefix_bytes) {
+                keys_to_update.push(key.to_vec());
+            } else if !key.is_empty() && key[0] > prefix_bytes[0] {
+                break;
+            }
+        }
+
+        // Update each row by appending the new column value
+        for key in keys_to_update {
+            let raw_value = self.db.get(&key)
+                .map_err(|e| Error::storage(format!("Failed to read row: {}", e)))?
+                .ok_or_else(|| Error::storage("Row disappeared during update"))?;
+
+            // Decrypt if needed
+            let value = if let Some(km) = &self.key_manager {
+                crypto::decrypt(km.key(), &raw_value)?
+            } else {
+                raw_value.to_vec()
+            };
+
+            let mut tuple: Tuple = bincode::deserialize(&value)
+                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+
+            // Append the new column value
+            tuple.values.push(default_value.clone());
+
+            // Serialize and encrypt if needed
+            let new_value = bincode::serialize(&tuple)
+                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+
+            let final_value = if let Some(km) = &self.key_manager {
+                crypto::encrypt(km.key(), &new_value)?
+            } else {
+                new_value
+            };
+
+            self.db.put(&key, &final_value)
+                .map_err(|e| Error::storage(format!("Failed to write updated row: {}", e)))?;
+
+            updated += 1;
+        }
+
+        Ok(updated)
+    }
+
+    /// Drop a column from all existing rows in a table
+    ///
+    /// This method updates all existing rows by removing the value
+    /// at the specified column index.
+    ///
+    /// # Arguments
+    /// * `table_name` - Name of the table
+    /// * `col_idx` - Index of the column to drop
+    ///
+    /// # Returns
+    /// Number of rows updated
+    pub fn drop_column_from_rows(
+        &self,
+        table_name: &str,
+        col_idx: usize,
+    ) -> Result<usize> {
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut updated = 0;
+
+        // Collect keys first to avoid iterator invalidation
+        let mut keys_to_update = Vec::new();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if key.starts_with(prefix_bytes) {
+                keys_to_update.push(key.to_vec());
+            } else if !key.is_empty() && key[0] > prefix_bytes[0] {
+                break;
+            }
+        }
+
+        // Update each row by removing the column value
+        for key in keys_to_update {
+            let raw_value = self.db.get(&key)
+                .map_err(|e| Error::storage(format!("Failed to read row: {}", e)))?
+                .ok_or_else(|| Error::storage("Row disappeared during update"))?;
+
+            // Decrypt if needed
+            let value = if let Some(km) = &self.key_manager {
+                crypto::decrypt(km.key(), &raw_value)?
+            } else {
+                raw_value.to_vec()
+            };
+
+            let mut tuple: Tuple = bincode::deserialize(&value)
+                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+
+            // Remove the column value if it exists
+            if col_idx < tuple.values.len() {
+                tuple.values.remove(col_idx);
+
+                // Serialize and encrypt if needed
+                let new_value = bincode::serialize(&tuple)
+                    .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+
+                let final_value = if let Some(km) = &self.key_manager {
+                    crypto::encrypt(km.key(), &new_value)?
+                } else {
+                    new_value
+                };
+
+                self.db.put(&key, &final_value)
+                    .map_err(|e| Error::storage(format!("Failed to write updated row: {}", e)))?;
+
+                updated += 1;
+            }
+        }
+
+        Ok(updated)
+    }
+
+    /// Rename a table
+    ///
+    /// Delegates to catalog.rename_table for the actual rename operation.
+    ///
+    /// # Arguments
+    /// * `old_name` - Current table name
+    /// * `new_name` - New table name
+    pub fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()> {
+        self.catalog().rename_table(old_name, new_name)
+    }
+
     /// Register bloom filters for a table
     ///
     /// This enables bloom filter-based row pruning for subsequent scans.
@@ -2221,6 +2389,11 @@ impl StorageEngine {
     /// Get a materialized view catalog reference
     pub fn mv_catalog(&self) -> super::MaterializedViewCatalog<'_> {
         super::MaterializedViewCatalog::new(self)
+    }
+
+    /// Get a regular view catalog reference
+    pub fn view_catalog(&self) -> super::ViewCatalog<'_> {
+        super::ViewCatalog::new(self)
     }
 
     /// Get delta tracker for incremental materialized view refresh

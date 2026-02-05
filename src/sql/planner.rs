@@ -183,14 +183,35 @@ impl<'a> Planner<'a> {
                 let with_options = create_table.with_options;
                 self.create_table_to_plan(name, columns, if_not_exists, constraints, with_options)
             }
-            Statement::Drop { names, if_exists, .. } => {
+            Statement::Drop { names, if_exists, object_type, .. } => {
                 if names.len() != 1 {
-                    return Err(Error::query_execution("Multiple table drops not supported"));
+                    return Err(Error::query_execution("Multiple drops not supported"));
                 }
-                Ok(LogicalPlan::DropTable {
-                    name: names[0].to_string(),
-                    if_exists,
-                })
+                let name = names[0].to_string();
+
+                match object_type {
+                    sqlparser::ast::ObjectType::View => {
+                        // DROP VIEW
+                        Ok(LogicalPlan::DropView {
+                            name,
+                            if_exists,
+                        })
+                    }
+                    sqlparser::ast::ObjectType::Table => {
+                        // DROP TABLE
+                        Ok(LogicalPlan::DropTable {
+                            name,
+                            if_exists,
+                        })
+                    }
+                    _ => {
+                        // Default to DROP TABLE for backwards compatibility
+                        Ok(LogicalPlan::DropTable {
+                            name,
+                            if_exists,
+                        })
+                    }
+                }
             }
             Statement::Truncate { table_names, .. } => {
                 if table_names.is_empty() {
@@ -343,7 +364,7 @@ impl<'a> Planner<'a> {
                 name,
                 query,
                 materialized,
-                or_replace: _,
+                or_replace,
                 if_not_exists,
                 options,
                 ..
@@ -351,7 +372,7 @@ impl<'a> Planner<'a> {
                 // Check if this is a materialized view
                 if materialized {
                     // Convert the query to a logical plan
-                    let query_plan = self.query_to_plan(*query)?;
+                    let query_plan = self.query_to_plan(*query.clone())?;
 
                     // Extract WITH options as string for parsing
                     let options_str = match options {
@@ -386,10 +407,16 @@ impl<'a> Planner<'a> {
                         if_not_exists,
                     )
                 } else {
-                    // Regular views not yet supported
-                    Err(Error::query_execution(
-                        "Non-materialized views are not yet supported. Use CREATE MATERIALIZED VIEW instead."
-                    ))
+                    // Regular (non-materialized) view
+                    // Store the query SQL for expansion at query time
+                    let query_sql = query.to_string();
+
+                    Ok(LogicalPlan::CreateView {
+                        name: name.to_string(),
+                        query_sql,
+                        if_not_exists,
+                        or_replace,
+                    })
                 }
             }
             Statement::Explain {
@@ -544,20 +571,69 @@ impl<'a> Planner<'a> {
     /// Convert a Query to a logical plan
     fn query_to_plan(&self, query: Query) -> Result<LogicalPlan> {
         // Handle WITH clause (CTEs)
-        let cte_plans = if let Some(with_clause) = query.with {
+        let (cte_plans, is_recursive) = if let Some(with_clause) = query.with {
+            let is_recursive = with_clause.recursive;
             let mut ctes = Vec::new();
             for cte in with_clause.cte_tables {
                 let cte_name = cte.alias.name.to_string();
+
+                // For recursive CTEs, pre-register a placeholder schema
+                // so that the recursive reference can resolve
+                let column_aliases: Vec<String> = cte.alias.columns
+                    .iter()
+                    .map(|col| col.name.value.clone())
+                    .collect();
+
+                if is_recursive && !column_aliases.is_empty() {
+                    // Use the explicit column aliases with Int8 as placeholder type
+                    // (works for numeric recursion like n+1)
+                    let schema = Arc::new(Schema::new(
+                        column_aliases.iter().map(|name| {
+                            Column::new(name, DataType::Int8)
+                        }).collect()
+                    ));
+                    self.add_cte(cte_name.clone(), schema);
+                }
+
                 // Convert CTE query to logical plan
                 let cte_plan = self.query_to_plan(*cte.query)?;
-                // Register CTE schema so it can be resolved in the main query
-                let cte_schema = cte_plan.schema();
+
+                // Apply column aliases if specified (rename CTE columns)
+                let cte_schema = if !column_aliases.is_empty() {
+                    let original_schema = cte_plan.schema();
+                    if column_aliases.len() == original_schema.columns.len() {
+                        // Rename columns using the aliases
+                        Arc::new(Schema::new(
+                            original_schema.columns.iter()
+                                .zip(column_aliases.iter())
+                                .map(|(col, alias)| {
+                                    let mut new_col = col.clone();
+                                    new_col.name = alias.clone();
+                                    new_col
+                                })
+                                .collect()
+                        ))
+                    } else {
+                        // Column count mismatch - use original schema
+                        original_schema
+                    }
+                } else {
+                    cte_plan.schema()
+                };
+
+                // Pass column aliases to executor for renaming
+                let aliases = if !column_aliases.is_empty() {
+                    Some(column_aliases)
+                } else {
+                    None
+                };
+
                 self.add_cte(cte_name.clone(), cte_schema);
-                ctes.push((cte_name, Box::new(cte_plan)));
+                ctes.push((cte_name, Box::new(cte_plan), aliases));
             }
-            ctes
+            (ctes, is_recursive)
         } else {
-            Vec::new()
+            (Vec::new(), false)
         };
 
         // Convert the body (CTEs are now in scope for table name resolution)
@@ -601,6 +677,7 @@ impl<'a> Planner<'a> {
         if !cte_plans.is_empty() {
             plan = LogicalPlan::With {
                 ctes: cte_plans,
+                recursive: is_recursive,
                 query: Box::new(plan),
             };
         }
@@ -766,6 +843,12 @@ impl<'a> Planner<'a> {
         for join in &table_with_joins.joins {
             let right = self.table_factor_to_plan(&join.relation)?;
 
+            // Check if this is a LATERAL join (right side is a LATERAL subquery)
+            let is_lateral = matches!(
+                &join.relation,
+                TableFactor::Derived { lateral: true, .. }
+            );
+
             let join_type = match &join.join_operator {
                 JoinOperator::Inner(_) => JoinType::Inner,
                 JoinOperator::LeftOuter(_) => JoinType::Left,
@@ -775,14 +858,72 @@ impl<'a> Planner<'a> {
                 _ => return Err(Error::query_execution("Join type not supported")),
             };
 
-            let on = match &join.join_operator {
-                JoinOperator::Inner(JoinConstraint::On(expr))
-                | JoinOperator::LeftOuter(JoinConstraint::On(expr))
-                | JoinOperator::RightOuter(JoinConstraint::On(expr))
-                | JoinOperator::FullOuter(JoinConstraint::On(expr)) => {
-                    Some(self.expr_to_logical(expr)?)
+            // Check for NATURAL join - auto-generate ON clause from common columns
+            let is_natural = matches!(
+                &join.join_operator,
+                JoinOperator::Inner(JoinConstraint::Natural)
+                | JoinOperator::LeftOuter(JoinConstraint::Natural)
+                | JoinOperator::RightOuter(JoinConstraint::Natural)
+                | JoinOperator::FullOuter(JoinConstraint::Natural)
+            );
+
+            let on = if is_natural {
+                // Find common columns between left and right schemas
+                let left_schema = plan.schema();
+                let right_schema = right.schema();
+
+                let common_columns: Vec<String> = left_schema.columns.iter()
+                    .filter_map(|lc| {
+                        if right_schema.columns.iter().any(|rc| rc.name == lc.name) {
+                            Some(lc.name.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
+
+                if common_columns.is_empty() {
+                    return Err(Error::query_execution(
+                        "NATURAL JOIN requires at least one common column between tables"
+                    ));
                 }
-                _ => None,
+
+                // Build AND of all column equalities: l.col1 = r.col1 AND l.col2 = r.col2 ...
+                let mut condition: Option<LogicalExpr> = None;
+                for col_name in common_columns {
+                    let eq_expr = LogicalExpr::BinaryExpr {
+                        left: Box::new(LogicalExpr::Column {
+                            table: None,
+                            name: col_name.clone(),
+                        }),
+                        op: super::BinaryOperator::Eq,
+                        right: Box::new(LogicalExpr::Column {
+                            table: None,
+                            name: col_name,
+                        }),
+                    };
+
+                    condition = Some(match condition {
+                        Some(cond) => LogicalExpr::BinaryExpr {
+                            left: Box::new(cond),
+                            op: super::BinaryOperator::And,
+                            right: Box::new(eq_expr),
+                        },
+                        None => eq_expr,
+                    });
+                }
+
+                condition
+            } else {
+                match &join.join_operator {
+                    JoinOperator::Inner(JoinConstraint::On(expr))
+                    | JoinOperator::LeftOuter(JoinConstraint::On(expr))
+                    | JoinOperator::RightOuter(JoinConstraint::On(expr))
+                    | JoinOperator::FullOuter(JoinConstraint::On(expr)) => {
+                        Some(self.expr_to_logical(expr)?)
+                    }
+                    _ => None,
+                }
             };
 
             plan = LogicalPlan::Join {
@@ -790,6 +931,7 @@ impl<'a> Planner<'a> {
                 right: Box::new(right),
                 join_type,
                 on,
+                lateral: is_lateral,
             };
         }
 
@@ -828,7 +970,29 @@ impl<'a> Planner<'a> {
                     });
                 }
 
-                // Not a CTE or system view, treat as regular table
+                // Check if this is a regular view (non-materialized)
+                if let Some(catalog) = self.catalog {
+                    let storage = catalog.storage();
+                    let view_catalog = storage.view_catalog();
+                    if view_catalog.view_exists(&table_name)? {
+                        // This is a regular view - expand it by parsing and planning its query
+                        let view_metadata = view_catalog.get_view(&table_name)?;
+
+                        // Parse the view's query SQL
+                        let parser = super::Parser::new();
+                        let stmt = parser.parse_one(&view_metadata.query_sql)?;
+
+                        // Create a new planner for the view query (to avoid self-borrow issues)
+                        let view_planner = Planner::with_catalog(catalog);
+                        let view_plan = view_planner.statement_to_plan(stmt)?;
+
+                        // If there's an alias, wrap in a subquery with alias
+                        // For now, just return the expanded plan
+                        return Ok(view_plan);
+                    }
+                }
+
+                // Not a CTE, system view, or regular view - treat as regular table
                 // Fetch schema from catalog if available
                 let schema = if let Some(catalog) = self.catalog {
                     // Get actual schema from catalog
@@ -866,7 +1030,30 @@ impl<'a> Planner<'a> {
                     as_of,
                 })
             }
-            _ => Err(Error::query_execution("Complex table expressions not yet supported")),
+            TableFactor::Derived { subquery, alias, lateral } => {
+                // Handle subqueries in FROM clause: SELECT * FROM (SELECT ...) AS sub
+                // Also handles LATERAL: SELECT * FROM t, LATERAL (SELECT ... WHERE t.id = ...)
+                let subquery_plan = self.query_to_plan(*subquery.clone())?;
+
+                // If there's an alias, we could wrap this but for now just return the plan
+                // The LATERAL flag is handled at the join level
+                let _ = alias; // Alias is used for column qualification but schema already has names
+                let _ = lateral; // LATERAL is tracked at the join level
+
+                Ok(subquery_plan)
+            }
+            TableFactor::TableFunction { expr, alias } => {
+                // Handle table functions like generate_series(), unnest(), etc.
+                // For now, return an error for unsupported table functions
+                Err(Error::query_execution(format!(
+                    "Table function '{}' not yet supported",
+                    expr
+                )))
+            }
+            other => Err(Error::query_execution(format!(
+                "Unsupported table expression: {:?}",
+                other
+            ))),
         }
     }
 
@@ -1830,9 +2017,11 @@ impl<'a> Planner<'a> {
     /// Convert ALTER TABLE statement to logical plan
     fn alter_table_to_plan(
         &self,
-        _table_name: String,
+        table_name: String,
         operations: Vec<sqlparser::ast::AlterTableOperation>,
     ) -> Result<LogicalPlan> {
+        use sqlparser::ast::AlterTableOperation;
+
         // Check if operations are empty
         if operations.is_empty() {
             return Err(Error::query_execution(
@@ -1840,10 +2029,50 @@ impl<'a> Planner<'a> {
             ));
         }
 
-        // For now, return error for unsupported operations
-        Err(Error::query_execution(
-            "ALTER TABLE operation not yet supported"
-        ))
+        // Currently we only support a single operation per ALTER TABLE
+        if operations.len() > 1 {
+            return Err(Error::query_execution(
+                "Multiple ALTER TABLE operations in single statement not yet supported"
+            ));
+        }
+
+        let operation = &operations[0];
+
+        match operation {
+            AlterTableOperation::AddColumn { column_def, if_not_exists, .. } => {
+                let col_def = self.sql_column_def_to_column_def(column_def)?;
+                Ok(LogicalPlan::AlterTableAddColumn {
+                    table_name,
+                    column_def: col_def,
+                    if_not_exists: *if_not_exists,
+                })
+            }
+            AlterTableOperation::DropColumn { column_name, if_exists, cascade } => {
+                Ok(LogicalPlan::AlterTableDropColumn {
+                    table_name,
+                    column_name: column_name.value.clone(),
+                    if_exists: *if_exists,
+                    cascade: *cascade,
+                })
+            }
+            AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
+                Ok(LogicalPlan::AlterTableRenameColumn {
+                    table_name,
+                    old_column_name: old_column_name.value.clone(),
+                    new_column_name: new_column_name.value.clone(),
+                })
+            }
+            AlterTableOperation::RenameTable { table_name: new_name } => {
+                Ok(LogicalPlan::AlterTableRename {
+                    table_name,
+                    new_table_name: new_name.to_string(),
+                })
+            }
+            _ => Err(Error::query_execution(format!(
+                "Unsupported ALTER TABLE operation: {:?}",
+                operation
+            ))),
+        }
     }
 
     /// Convert SQL column definition to internal ColumnDef

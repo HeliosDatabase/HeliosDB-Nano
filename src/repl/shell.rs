@@ -323,11 +323,16 @@ impl ReplShell {
         }
 
         // Try to determine if this is a query (SELECT) or a command (INSERT, UPDATE, etc.)
+        // Also treat UPDATE/DELETE/INSERT with RETURNING as queries
+        // EXPLAIN also returns results, so treat it as a query
         let sql_upper = sql.trim().to_uppercase();
+        let has_returning = sql_upper.contains(" RETURNING ");
         let is_query = sql_upper.starts_with("SELECT")
             || sql_upper.starts_with("WITH")
             || sql_upper.starts_with("TABLE")
-            || sql_upper.starts_with("VALUES");
+            || sql_upper.starts_with("VALUES")
+            || sql_upper.starts_with("EXPLAIN")
+            || has_returning;
 
         if is_query {
             // Execute query

@@ -403,7 +403,7 @@ impl StorageFeatureCollector {
                 Self::extract_tables_recursive(right, tables);
             }
             LogicalPlan::With { ctes, query, .. } => {
-                for (_, cte_plan) in ctes {
+                for (_, cte_plan, _) in ctes {
                     Self::extract_tables_recursive(cte_plan, tables);
                 }
                 Self::extract_tables_recursive(query, tables);

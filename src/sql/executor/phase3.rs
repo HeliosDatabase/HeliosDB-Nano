@@ -64,6 +64,12 @@ pub(super) fn handle_phase3_operation(
         LogicalPlan::SystemView { name, .. } => {
             handle_system_view(executor, name)
         }
+        LogicalPlan::CreateView { name, query_sql, if_not_exists, or_replace } => {
+            handle_create_view(executor, name, query_sql, *if_not_exists, *or_replace)
+        }
+        LogicalPlan::DropView { name, if_exists } => {
+            handle_drop_view(executor, name, *if_exists)
+        }
         _ => Err(Error::query_execution("Unsupported advanced operation")),
     }
 }
@@ -938,4 +944,82 @@ fn handle_show_branches(
     } else {
         return Err(Error::execution("No storage engine available"));
     }
+}
+
+/// Handle CREATE VIEW (regular, non-materialized view)
+fn handle_create_view(
+    executor: &mut Executor,
+    name: &str,
+    query_sql: &str,
+    if_not_exists: bool,
+    or_replace: bool,
+) -> Result<Box<dyn PhysicalOperator>> {
+    tracing::info!(
+        "CREATE{}VIEW {} (IF NOT EXISTS: {})",
+        if or_replace { " OR REPLACE " } else { " " },
+        name, if_not_exists
+    );
+
+    let storage = executor.storage().ok_or_else(|| Error::execution("No storage engine available"))?;
+
+    // Parse the query to get the schema
+    let parser = crate::sql::Parser::new();
+    let stmt = parser.parse_one(query_sql)?;
+
+    // Plan the query to get the schema
+    let catalog = storage.catalog();
+    let planner = crate::sql::Planner::with_catalog(&catalog);
+    let plan = planner.statement_to_plan(stmt)?;
+    let schema = (*plan.schema()).clone();
+
+    // Create view metadata
+    let metadata = crate::storage::ViewMetadata::new(
+        name.to_string(),
+        query_sql.to_string(),
+        schema,
+    ).with_or_replace(or_replace);
+
+    // Store the view
+    let view_catalog = storage.view_catalog();
+    view_catalog.create_view(metadata, if_not_exists, or_replace)?;
+
+    tracing::info!("Successfully created view '{}'", name);
+
+    // Return empty result set for DDL
+    Ok(Box::new(ScanOperator::new(
+        "".to_string(),
+        Arc::new(crate::Schema { columns: vec![] }),
+        None,
+        vec![],
+        vec![],
+    ).with_timeout(executor.timeout_ctx())))
+}
+
+/// Handle DROP VIEW
+fn handle_drop_view(
+    executor: &Executor,
+    name: &str,
+    if_exists: bool,
+) -> Result<Box<dyn PhysicalOperator>> {
+    tracing::info!(
+        "DROP VIEW {} (IF EXISTS: {})",
+        name, if_exists
+    );
+
+    let storage = executor.storage().ok_or_else(|| Error::execution("No storage engine available"))?;
+
+    // Drop the view
+    let view_catalog = storage.view_catalog();
+    view_catalog.drop_view(name, if_exists)?;
+
+    tracing::info!("Successfully dropped view '{}'", name);
+
+    // Return empty result set for DDL
+    Ok(Box::new(ScanOperator::new(
+        "".to_string(),
+        Arc::new(crate::Schema { columns: vec![] }),
+        None,
+        vec![],
+        vec![],
+    ).with_timeout(executor.timeout_ctx())))
 }
