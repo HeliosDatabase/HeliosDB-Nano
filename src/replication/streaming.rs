@@ -583,7 +583,7 @@ impl StreamingServer {
 
         WalEntryPayload {
             lsn: entry.lsn,
-            tx_id: None, // TODO: Track transaction IDs
+            tx_id: entry.tx_id, // Pass through transaction ID
             entry_type,
             data: entry.data.clone(),
             timestamp_us: chrono::Utc::now().timestamp_micros() as u64,
@@ -760,8 +760,10 @@ pub struct StreamingClient {
     config: StreamingClientConfig,
     /// Client state
     state: Arc<RwLock<StreamingClientState>>,
-    /// Applied LSN
+    /// Applied LSN (WAL entries that have been fully applied)
     applied_lsn: Arc<AtomicU64>,
+    /// Flush LSN (WAL entries that have been flushed to disk but may not be applied)
+    flush_lsn: Arc<AtomicU64>,
     /// Primary's LSN (from heartbeats)
     primary_lsn: Arc<AtomicU64>,
     /// Fencing token from primary
@@ -782,6 +784,7 @@ impl StreamingClient {
             config,
             state: Arc::new(RwLock::new(StreamingClientState::Disconnected)),
             applied_lsn: Arc::new(AtomicU64::new(0)),
+            flush_lsn: Arc::new(AtomicU64::new(0)),
             primary_lsn: Arc::new(AtomicU64::new(0)),
             fencing_token: Arc::new(AtomicU64::new(0)),
             entry_tx,
@@ -1066,6 +1069,7 @@ impl StreamingClient {
 
         WalEntry {
             lsn: payload.lsn,
+            tx_id: payload.tx_id, // Extract transaction ID from payload
             entry_type,
             data: payload.data.clone(),
             checksum: payload.checksum,
@@ -1102,16 +1106,17 @@ impl StreamingClient {
     /// Send heartbeat to primary
     async fn send_heartbeat(&self, conn: &mut ReplicationConnection) -> Result<()> {
         let applied = self.applied_lsn.load(Ordering::SeqCst);
+        let flushed = self.flush_lsn.load(Ordering::SeqCst);
         let primary = self.primary_lsn.load(Ordering::SeqCst);
 
         let heartbeat = HeartbeatPayload {
             node_id: self.config.node_id,
             role: NodeRole::Standby,
-            current_lsn: applied,
-            flush_lsn: applied, // TODO: Track flush separately
+            current_lsn: flushed.max(applied), // Current position is max of flush and apply
+            flush_lsn: flushed,                 // Separately tracked flush position
             apply_lsn: Some(applied),
             timestamp_ms: chrono::Utc::now().timestamp_millis() as u64,
-            lag_bytes: primary.saturating_sub(applied),
+            lag_bytes: primary.saturating_sub(flushed),
             health: HealthStatus::Healthy,
         };
 
@@ -1125,6 +1130,16 @@ impl StreamingClient {
     /// Report that an entry has been applied
     pub fn report_applied(&self, lsn: Lsn) {
         self.applied_lsn.fetch_max(lsn, Ordering::SeqCst);
+    }
+
+    /// Report that an entry has been flushed to disk (but not yet applied)
+    pub fn report_flushed(&self, lsn: Lsn) {
+        self.flush_lsn.fetch_max(lsn, Ordering::SeqCst);
+    }
+
+    /// Get flush LSN
+    pub fn flush_lsn(&self) -> Lsn {
+        self.flush_lsn.load(Ordering::SeqCst)
     }
 
     /// Get current state
@@ -1169,6 +1184,7 @@ mod tests {
     fn test_wal_entry_to_payload_conversion() {
         let entry = WalEntry {
             lsn: 100,
+            tx_id: Some(42),
             entry_type: WalEntryType::Insert,
             data: vec![1, 2, 3],
             checksum: 0xDEADBEEF,

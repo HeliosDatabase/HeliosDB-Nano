@@ -726,18 +726,99 @@ impl TopologyDiscovery {
     }
 
     async fn refresh_from_seeds(&self) -> Result<()> {
-        // For each seed node, try to fetch cluster topology
+        use tokio::net::TcpStream;
+        use tokio::time::timeout;
+
+        // For each seed node, try to fetch cluster topology via TCP probe
         for seed in &self.config.seed_nodes {
-            // TODO: Implement actual topology fetch via replication protocol
-            tracing::trace!("Would refresh topology from seed: {}", seed);
+            let addr = match seed.parse::<std::net::SocketAddr>() {
+                Ok(a) => a,
+                Err(_) => {
+                    // Try to resolve hostname:port
+                    match tokio::net::lookup_host(seed).await {
+                        Ok(mut addrs) => match addrs.next() {
+                            Some(a) => a,
+                            None => continue,
+                        },
+                        Err(_) => continue,
+                    }
+                }
+            };
+
+            // Try to connect with timeout to verify node is alive
+            let connect_timeout = Duration::from_secs(2);
+            match timeout(connect_timeout, TcpStream::connect(addr)).await {
+                Ok(Ok(_stream)) => {
+                    // Node is reachable - in a full implementation we would:
+                    // 1. Perform replication protocol handshake
+                    // 2. Request cluster topology list
+                    // 3. Update topology manager with returned nodes
+                    // For now, we just mark that the seed is reachable
+                    tracing::trace!("Seed node {} is reachable", seed);
+
+                    // Update last_seen for any node matching this address
+                    let nodes = self.topology.get_all_nodes();
+                    for node in nodes {
+                        if node.client_addr.contains(&addr.ip().to_string())
+                            || node.replication_addr.contains(&addr.ip().to_string())
+                        {
+                            self.topology.update_health(node.node_id, true);
+                        }
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::trace!("Seed node {} connection failed: {}", seed, e);
+                }
+                Err(_) => {
+                    tracing::trace!("Seed node {} connection timeout", seed);
+                }
+            }
         }
         Ok(())
     }
 
     async fn discover_from_dns(&self) -> Result<()> {
+        use std::net::ToSocketAddrs;
+
         if let Some(hostname) = &self.config.dns_hostname {
-            // TODO: Implement DNS SRV record lookup
-            tracing::trace!("Would discover nodes from DNS: {}", hostname);
+            // Perform A/AAAA record lookup for the hostname
+            // In production, this would use DNS SRV records for proper service discovery
+            // SRV records contain priority, weight, port, and target information
+            match tokio::task::spawn_blocking({
+                let hostname = hostname.clone();
+                move || {
+                    // Standard DNS lookup - resolves A/AAAA records
+                    // Format: hostname:port for ToSocketAddrs
+                    let lookup_addr = format!("{}:5433", hostname); // Default replication port
+                    lookup_addr.to_socket_addrs()
+                }
+            })
+            .await
+            {
+                Ok(Ok(addrs)) => {
+                    for addr in addrs {
+                        tracing::trace!("DNS discovery found address: {}", addr);
+
+                        // In production, we would connect and verify each discovered node
+                        // For now, just log the discovery
+                        // The node would need to be properly registered via the replication protocol
+                    }
+                }
+                Ok(Err(e)) => {
+                    tracing::trace!("DNS lookup for {} failed: {}", hostname, e);
+                }
+                Err(e) => {
+                    tracing::trace!("DNS lookup task failed: {}", e);
+                }
+            }
+
+            // SRV record lookup would be done like:
+            // _heliosdb._tcp.{hostname} -> returns priority, weight, port, target
+            // This requires a DNS library like trust-dns-resolver
+            tracing::trace!(
+                "SRV record lookup for _heliosdb._tcp.{} would be performed with DNS resolver",
+                hostname
+            );
         }
         Ok(())
     }

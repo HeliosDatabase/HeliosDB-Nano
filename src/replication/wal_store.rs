@@ -393,6 +393,7 @@ impl WalStore {
 
             let entry = WalEntry {
                 lsn,
+                tx_id: None, // tx_id not stored in segment format v1
                 entry_type: Self::u8_to_entry_type(entry_type),
                 data,
                 checksum,
@@ -969,6 +970,7 @@ mod tests {
         let checksum = crc32fast::hash(&data);
         WalEntry {
             lsn,
+            tx_id: None,
             entry_type: WalEntryType::Insert,
             data,
             checksum,

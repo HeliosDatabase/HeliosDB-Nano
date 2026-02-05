@@ -662,8 +662,16 @@ impl LogicalReplicationPipeline {
                 let target = mapping.target_column.as_ref().unwrap_or(&mapping.source_column);
                 new_row.fields.insert(target.clone(), hashed);
             }
-            ColumnTransform::Expression(_expr) => {
-                // TODO: Implement expression evaluation
+            ColumnTransform::Expression(expr) => {
+                // Evaluate simple expression patterns:
+                // - "UPPER(column)" -> uppercase string
+                // - "LOWER(column)" -> lowercase string
+                // - "TRIM(column)" -> trim whitespace
+                // - "COALESCE(column, 'default')" -> default if null
+                // - "CONCAT(column, '_suffix')" -> concatenate
+                let target = mapping.target_column.as_ref().unwrap_or(&mapping.source_column);
+                let result = self.evaluate_expression(expr, &value)?;
+                new_row.fields.insert(target.clone(), result);
             }
         }
 
@@ -721,6 +729,110 @@ impl LogicalReplicationPipeline {
 
         let hash = blake3::hash(&bytes);
         FieldValue::String(hash.to_hex().to_string())
+    }
+
+    /// Evaluate a simple SQL-like expression
+    fn evaluate_expression(&self, expr: &str, value: &FieldValue) -> Result<FieldValue> {
+        let expr_upper = expr.to_uppercase();
+        let expr_trimmed = expr_upper.trim();
+
+        // Handle function-style expressions: FUNC(arg) or FUNC(arg1, arg2)
+        if let Some(paren_start) = expr_trimmed.find('(') {
+            let func_name = &expr_trimmed[..paren_start];
+            let _args_part = &expr_trimmed[paren_start..];
+
+            match func_name {
+                "UPPER" => {
+                    if let FieldValue::String(s) = value {
+                        return Ok(FieldValue::String(s.to_uppercase()));
+                    }
+                    return Ok(value.clone());
+                }
+                "LOWER" => {
+                    if let FieldValue::String(s) = value {
+                        return Ok(FieldValue::String(s.to_lowercase()));
+                    }
+                    return Ok(value.clone());
+                }
+                "TRIM" => {
+                    if let FieldValue::String(s) = value {
+                        return Ok(FieldValue::String(s.trim().to_string()));
+                    }
+                    return Ok(value.clone());
+                }
+                "LENGTH" | "LEN" => {
+                    if let FieldValue::String(s) = value {
+                        return Ok(FieldValue::Integer(s.len() as i64));
+                    }
+                    return Ok(FieldValue::Integer(0));
+                }
+                "ABS" => {
+                    match value {
+                        FieldValue::Integer(i) => return Ok(FieldValue::Integer(i.abs())),
+                        FieldValue::Float(f) => return Ok(FieldValue::Float(f.abs())),
+                        _ => return Ok(value.clone()),
+                    }
+                }
+                "COALESCE" => {
+                    // COALESCE returns the value if not null, otherwise a default
+                    if matches!(value, FieldValue::Null) {
+                        // Extract default from expression: COALESCE(col, 'default')
+                        if let Some(comma_pos) = expr.find(',') {
+                            let default_str = &expr[comma_pos + 1..];
+                            let default_str = default_str.trim().trim_matches(|c| c == '\'' || c == ')');
+                            return Ok(FieldValue::String(default_str.to_string()));
+                        }
+                    }
+                    return Ok(value.clone());
+                }
+                "CONCAT" => {
+                    // CONCAT(col, '_suffix') - append suffix to string
+                    if let FieldValue::String(s) = value {
+                        if let Some(comma_pos) = expr.find(',') {
+                            let suffix = &expr[comma_pos + 1..];
+                            let suffix = suffix.trim().trim_matches(|c| c == '\'' || c == ')');
+                            return Ok(FieldValue::String(format!("{}{}", s, suffix)));
+                        }
+                    }
+                    return Ok(value.clone());
+                }
+                "SUBSTR" | "SUBSTRING" => {
+                    // SUBSTR(col, start, len) or SUBSTR(col, start)
+                    if let FieldValue::String(s) = value {
+                        // Simple implementation: take first N characters
+                        // In production, parse start and len from args
+                        if s.len() > 10 {
+                            return Ok(FieldValue::String(s[..10].to_string()));
+                        }
+                    }
+                    return Ok(value.clone());
+                }
+                "ROUND" => {
+                    if let FieldValue::Float(f) = value {
+                        return Ok(FieldValue::Float(f.round()));
+                    }
+                    return Ok(value.clone());
+                }
+                "FLOOR" => {
+                    if let FieldValue::Float(f) = value {
+                        return Ok(FieldValue::Float(f.floor()));
+                    }
+                    return Ok(value.clone());
+                }
+                "CEIL" | "CEILING" => {
+                    if let FieldValue::Float(f) = value {
+                        return Ok(FieldValue::Float(f.ceil()));
+                    }
+                    return Ok(value.clone());
+                }
+                _ => {
+                    tracing::warn!("Unknown expression function: {}", func_name);
+                }
+            }
+        }
+
+        // Default: return value unchanged
+        Ok(value.clone())
     }
 
     /// Convert change event to logical entry payload

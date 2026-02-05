@@ -322,10 +322,8 @@ impl WebhookHandler {
     }
 
     /// Validate GitHub webhook signature (HMAC-SHA256)
-    ///
-    /// TODO: Implement actual HMAC-SHA256 validation when hmac/sha2 crates are added
-    pub fn validate_github_signature(&self, _payload: &[u8], signature: &str) -> Result<bool> {
-        let Some(ref _secret) = self.config.github_secret else {
+    pub fn validate_github_signature(&self, payload: &[u8], signature: &str) -> Result<bool> {
+        let Some(ref secret) = self.config.github_secret else {
             // No secret configured, skip validation
             return Ok(true);
         };
@@ -335,10 +333,72 @@ impl WebhookHandler {
             return Err(Error::authentication("Invalid GitHub signature format"));
         }
 
-        // TODO: Implement HMAC-SHA256 validation
-        // For now, warn and accept (development mode)
-        tracing::warn!("GitHub webhook signature validation not yet implemented");
-        Ok(true)
+        let expected_hex = &signature[7..]; // Skip "sha256="
+
+        // Compute HMAC-SHA256
+        let computed = Self::hmac_sha256(secret.as_bytes(), payload);
+        let computed_hex = hex::encode(&computed);
+
+        // Constant-time comparison to prevent timing attacks
+        if computed_hex.len() != expected_hex.len() {
+            return Ok(false);
+        }
+
+        let matches = computed_hex
+            .bytes()
+            .zip(expected_hex.bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0;
+
+        Ok(matches)
+    }
+
+    /// Compute HMAC-SHA256 using sha2 crate
+    fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+
+        const BLOCK_SIZE: usize = 64; // SHA-256 block size
+        const IPAD: u8 = 0x36;
+        const OPAD: u8 = 0x5c;
+
+        // If key is longer than block size, hash it first
+        let key_hash: Vec<u8>;
+        let key = if key.len() > BLOCK_SIZE {
+            let mut hasher = Sha256::new();
+            hasher.update(key);
+            key_hash = hasher.finalize().to_vec();
+            &key_hash
+        } else {
+            key
+        };
+
+        // Pad key to block size
+        let mut k_ipad = [0u8; BLOCK_SIZE];
+        let mut k_opad = [0u8; BLOCK_SIZE];
+        k_ipad[..key.len()].copy_from_slice(key);
+        k_opad[..key.len()].copy_from_slice(key);
+
+        // XOR with ipad and opad
+        for i in 0..BLOCK_SIZE {
+            k_ipad[i] ^= IPAD;
+            k_opad[i] ^= OPAD;
+        }
+
+        // Inner hash: H(k_ipad || message)
+        let mut inner_hasher = Sha256::new();
+        inner_hasher.update(&k_ipad);
+        inner_hasher.update(message);
+        let inner_hash = inner_hasher.finalize();
+
+        // Outer hash: H(k_opad || inner_hash)
+        let mut outer_hasher = Sha256::new();
+        outer_hasher.update(&k_opad);
+        outer_hasher.update(&inner_hash);
+
+        let result = outer_hasher.finalize();
+        let mut output = [0u8; 32];
+        output.copy_from_slice(&result);
+        output
     }
 
     /// Validate GitLab webhook token

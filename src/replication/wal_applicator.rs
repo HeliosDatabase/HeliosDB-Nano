@@ -360,6 +360,7 @@ mod tests {
 
         let entry = WalEntry {
             lsn: 1,
+            tx_id: None,
             entry_type: WalEntryType::Insert,
             data: vec![1, 2, 3],
             checksum: 0,
@@ -383,6 +384,7 @@ mod tests {
 
         let entry = WalEntry {
             lsn: 1,
+            tx_id: None,
             entry_type: WalEntryType::Insert,
             data: vec![1, 2, 3],
             checksum: 0,
@@ -408,6 +410,7 @@ mod tests {
 
         let entry = WalEntry {
             lsn: 1,
+            tx_id: None,
             entry_type: WalEntryType::Insert,
             data: vec![1, 2, 3],
             checksum: 0,

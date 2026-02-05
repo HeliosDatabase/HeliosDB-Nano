@@ -49,6 +49,8 @@ pub struct WalSegment {
 pub struct WalEntry {
     /// Log sequence number
     pub lsn: Lsn,
+    /// Transaction ID (for grouping related changes)
+    pub tx_id: Option<u64>,
     /// Entry type
     pub entry_type: WalEntryType,
     /// Serialized entry data
@@ -261,14 +263,21 @@ impl WalReplicator {
     /// Append a WAL entry for replication
     ///
     /// This is called by the storage engine after writing to local WAL.
+    /// The entry is broadcast to all connected standbys.
     pub async fn append(&self, entry: WalEntry) -> Result<Lsn> {
-        // TODO: Implement entry appending
-        // 1. Assign LSN
-        // 2. Broadcast to standbys
-        // 3. Handle sync mode (wait for acks if needed)
+        // Update current LSN
         let mut current = self.current_lsn.write().await;
         *current = entry.lsn;
 
+        // Update lag for all standbys
+        {
+            let mut states = self.standby_states.write().await;
+            for state in states.values_mut() {
+                state.lag_bytes = entry.lsn.saturating_sub(state.ack_lsn);
+            }
+        }
+
+        // Broadcast to all subscribers (standby connections)
         self.wal_broadcast
             .send(entry.clone())
             .map_err(|e| ReplicationError::WalStreaming(e.to_string()))?;
@@ -330,6 +339,7 @@ mod tests {
 
         let entry = WalEntry {
             lsn: 1,
+            tx_id: None,
             entry_type: WalEntryType::Insert,
             data: vec![1, 2, 3],
             checksum: 0,

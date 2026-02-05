@@ -568,6 +568,7 @@ impl HAStateRegistry {
         let checksum = crc32fast::hash(&data);
         let entry = WalEntry {
             lsn,
+            tx_id: None, // Individual operations don't have tx_id
             entry_type,
             data,
             checksum,

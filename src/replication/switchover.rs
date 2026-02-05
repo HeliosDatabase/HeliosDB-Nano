@@ -630,6 +630,15 @@ impl Drop for TransactionGuard {
     }
 }
 
+/// Reconnection target for WAL replicator
+#[derive(Debug, Clone)]
+pub struct ReconnectTarget {
+    /// New primary node ID
+    pub node_id: Uuid,
+    /// New primary address (host:port)
+    pub address: String,
+}
+
 /// Switchover handler for standby nodes (receives switchover events)
 pub struct StandbySwitchoverHandler {
     node_id: Uuid,
@@ -637,6 +646,8 @@ pub struct StandbySwitchoverHandler {
     ha_registry: Arc<HAStateRegistry>,
     /// Channel to receive switchover events from primary
     event_rx: broadcast::Receiver<SwitchoverEvent>,
+    /// Channel to signal WAL replicator reconnection
+    reconnect_tx: Option<mpsc::Sender<ReconnectTarget>>,
 }
 
 impl StandbySwitchoverHandler {
@@ -651,6 +662,24 @@ impl StandbySwitchoverHandler {
             role_manager,
             ha_registry,
             event_rx,
+            reconnect_tx: None,
+        }
+    }
+
+    /// Create with a reconnect channel for WAL replicator
+    pub fn with_reconnect_channel(
+        node_id: Uuid,
+        role_manager: Arc<RoleManager>,
+        ha_registry: Arc<HAStateRegistry>,
+        event_rx: broadcast::Receiver<SwitchoverEvent>,
+        reconnect_tx: mpsc::Sender<ReconnectTarget>,
+    ) -> Self {
+        Self {
+            node_id,
+            role_manager,
+            ha_registry,
+            event_rx,
+            reconnect_tx: Some(reconnect_tx),
         }
     }
 
@@ -712,7 +741,19 @@ impl StandbySwitchoverHandler {
                     // Reconfigure to follow new primary
                     self.role_manager.set_current_primary(Some(new_primary));
                     tracing::info!("Reconfigured to follow new primary {}", new_primary);
-                    // TODO: Reconnect WAL replicator to new primary address
+
+                    // Signal WAL replicator to reconnect to new primary
+                    if let Some(ref tx) = self.reconnect_tx {
+                        let target = ReconnectTarget {
+                            node_id: new_primary,
+                            address: new_primary_addr.clone(),
+                        };
+                        if let Err(e) = tx.try_send(target) {
+                            tracing::error!("Failed to signal WAL replicator reconnection: {}", e);
+                        } else {
+                            tracing::info!("Signaled WAL replicator to reconnect to {}", new_primary_addr);
+                        }
+                    }
                 }
             }
             SwitchoverEvent::Completed { switchover_id, new_primary, duration_ms } => {

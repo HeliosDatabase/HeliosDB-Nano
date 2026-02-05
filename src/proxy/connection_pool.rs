@@ -270,9 +270,17 @@ impl ConnectionPool {
     }
 
     /// Create a new connection
+    ///
+    /// In a full implementation, this would:
+    /// 1. Look up the node address from topology manager
+    /// 2. Create a TCP connection to the node
+    /// 3. Perform connection handshake/authentication
+    /// 4. Store the TcpStream in the PooledConnection
     async fn create_connection(&self, node_id: NodeId) -> Result<PooledConnection> {
-        // TODO: Implement actual connection creation
-        // For skeleton, we create a mock connection
+        // In production, this would use the topology manager to get the node address:
+        // let node = topology_manager().get_node(node_id.0)?;
+        // let addr = format!("{}:{}", node.client_addr);
+        // let stream = TcpStream::connect(&addr).await?;
 
         let now = chrono::Utc::now();
         let conn = PooledConnection {
@@ -291,14 +299,37 @@ impl ConnectionPool {
         Ok(conn)
     }
 
-    /// Validate a connection
+    /// Validate a connection is still usable
+    ///
+    /// In a full implementation, this would:
+    /// 1. Send a ping query (e.g., "SELECT 1")
+    /// 2. Check for response within timeout
+    /// 3. Mark connection as invalid if ping fails
     pub async fn validate_connection(&self, conn: &PooledConnection) -> Result<bool> {
-        // TODO: Implement actual validation (e.g., ping)
-        // For skeleton, always return true
+        // Check connection state
         if conn.state == ConnectionState::Closed {
             self.metrics.write().await.validation_failures += 1;
             return Ok(false);
         }
+
+        // Check connection age - recycle if too old
+        let age = chrono::Utc::now() - conn.created_at;
+        if age > chrono::Duration::from_std(self.config.max_lifetime).unwrap_or_default() {
+            self.metrics.write().await.connections_recycled += 1;
+            return Ok(false);
+        }
+
+        // Check idle timeout
+        let idle_time = chrono::Utc::now() - conn.last_used;
+        if idle_time > chrono::Duration::from_std(self.config.idle_timeout).unwrap_or_default() {
+            self.metrics.write().await.validation_failures += 1;
+            return Ok(false);
+        }
+
+        // In production: send ping query and check response
+        // let result = conn.stream.query("SELECT 1").await;
+        // if result.is_err() { return Ok(false); }
+
         Ok(true)
     }
 
