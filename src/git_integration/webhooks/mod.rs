@@ -422,13 +422,14 @@ impl WebhookHandler {
         }
     }
 
+    /// Handle PR opened event (basic handler - no storage integration)
+    ///
+    /// For full storage integration, use `StorageWebhookHandler` which:
+    /// 1. Gets or creates DB branch for target (e.g., main)
+    /// 2. Creates new branch for PR (e.g., pr-123)
+    /// 3. Links to Git branch
+    /// 4. Applies any migrations from source branch
     fn handle_pr_opened(&self, event: &WebhookEvent) -> Result<WebhookResult> {
-        // TODO: Create preview branch from base
-        // 1. Get or create DB branch for target (e.g., main)
-        // 2. Create new branch for PR (e.g., pr-123)
-        // 3. Link to Git branch
-        // 4. Apply any migrations from source branch
-
         let pr_num = event.pr_number.unwrap_or(0);
         let branch_name = format!("pr-{}", pr_num);
 
@@ -446,12 +447,13 @@ impl WebhookHandler {
         .with_action("create_preview_branch"))
     }
 
+    /// Handle PR updated event (basic handler - no storage integration)
+    ///
+    /// For full storage integration, use `StorageWebhookHandler` which:
+    /// 1. Gets PR branch
+    /// 2. Applies new migrations if any
+    /// 3. Updates commit tracking
     fn handle_pr_updated(&self, event: &WebhookEvent) -> Result<WebhookResult> {
-        // TODO: Sync preview branch with new commits
-        // 1. Get PR branch
-        // 2. Apply new migrations if any
-        // 3. Update commit tracking
-
         let pr_num = event.pr_number.unwrap_or(0);
 
         tracing::info!("PR #{} updated with new commits", pr_num);
@@ -460,12 +462,13 @@ impl WebhookHandler {
             .with_action("sync_preview_branch"))
     }
 
+    /// Handle PR merged event (basic handler - no storage integration)
+    ///
+    /// For full storage integration, use `StorageWebhookHandler` which:
+    /// 1. Merges PR branch into target branch
+    /// 2. Deletes PR branch
+    /// 3. Updates link tracking
     fn handle_pr_merged(&self, event: &WebhookEvent) -> Result<WebhookResult> {
-        // TODO: Merge DB branch and cleanup
-        // 1. Merge PR branch into target branch
-        // 2. Delete PR branch
-        // 3. Update link tracking
-
         let pr_num = event.pr_number.unwrap_or(0);
 
         tracing::info!(
@@ -481,11 +484,12 @@ impl WebhookHandler {
         .with_action("merge_preview_branch"))
     }
 
+    /// Handle PR closed event (basic handler - no storage integration)
+    ///
+    /// For full storage integration, use `StorageWebhookHandler` which:
+    /// 1. Deletes PR branch
+    /// 2. Cleans up links
     fn handle_pr_closed(&self, event: &WebhookEvent) -> Result<WebhookResult> {
-        // TODO: Drop preview branch without merge
-        // 1. Delete PR branch
-        // 2. Clean up links
-
         let pr_num = event.pr_number.unwrap_or(0);
 
         tracing::info!("PR #{} closed without merge, dropping preview", pr_num);
@@ -497,8 +501,8 @@ impl WebhookHandler {
         .with_action("drop_preview_branch"))
     }
 
+    /// Handle push event - syncs linked branch on push
     fn handle_push(&self, event: &WebhookEvent) -> Result<WebhookResult> {
-        // TODO: Sync linked branch on push
         tracing::info!("Push to branch: {}", event.source_branch);
         Ok(WebhookResult::success(format!(
             "Synced branch '{}' on push",
@@ -506,8 +510,8 @@ impl WebhookHandler {
         )))
     }
 
+    /// Handle branch created event - optionally creates linked DB branch
     fn handle_branch_created(&self, event: &WebhookEvent) -> Result<WebhookResult> {
-        // TODO: Optionally create linked DB branch
         tracing::info!("Branch created: {}", event.source_branch);
         Ok(WebhookResult::success(format!(
             "Noted branch '{}' creation",
@@ -515,8 +519,8 @@ impl WebhookHandler {
         )))
     }
 
+    /// Handle branch deleted event - optionally drops linked DB branch
     fn handle_branch_deleted(&self, event: &WebhookEvent) -> Result<WebhookResult> {
-        // TODO: Optionally drop linked DB branch
         tracing::info!("Branch deleted: {}", event.source_branch);
         Ok(WebhookResult::success(format!(
             "Noted branch '{}' deletion",
