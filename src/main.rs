@@ -895,6 +895,7 @@ fn check_server_status(pid_file: PathBuf) -> Result<()> {
 // ========== HA Helper Functions ==========
 
 /// Handles for HA components
+#[allow(dead_code)]
 #[derive(Default)]
 struct HAHandles {
     #[allow(dead_code)]

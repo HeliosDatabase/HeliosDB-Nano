@@ -40,12 +40,11 @@ pub mod webhooks;
 
 use crate::storage::{
     BranchId, BranchManager, SnapshotId,
-    GIT_LINK_PREFIX, GIT_COMMIT_PREFIX, GIT_CONFIG_KEY,
+    GIT_CONFIG_KEY,
 };
 use crate::{Error, Result};
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use parking_lot::RwLock;

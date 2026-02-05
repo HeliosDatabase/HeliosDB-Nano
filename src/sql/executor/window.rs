@@ -4,8 +4,8 @@
 //! Window functions operate over a set of rows (a "window" or "partition") and
 //! return a value for each row based on its position within that partition.
 
-use crate::{Result, Error, Tuple, Schema, Value};
-use crate::sql::logical_plan::{LogicalExpr, WindowFunctionType, WindowFrame, WindowFrameBound, WindowFrameType};
+use crate::{Result, Tuple, Schema, Value};
+use crate::sql::logical_plan::{LogicalExpr, WindowFunctionType, WindowFrame, WindowFrameBound};
 use crate::sql::Evaluator;
 use super::PhysicalOperator;
 use std::sync::Arc;
@@ -564,7 +564,23 @@ impl WindowOperator {
                     }
                     crate::sql::AggregateFunction::JsonAgg => {
                         // JSON aggregation - return array of values
+                        Value::Array(values.clone())
+                    }
+                    crate::sql::AggregateFunction::ArrayAgg => {
+                        // ARRAY_AGG - return array of values
                         Value::Array(values)
+                    }
+                    crate::sql::AggregateFunction::StringAgg { delimiter } => {
+                        // STRING_AGG - concatenate strings
+                        let strings: Vec<String> = values
+                            .into_iter()
+                            .filter_map(|v| match v {
+                                Value::Null => None,
+                                Value::String(s) => Some(s),
+                                other => Some(other.to_string()),
+                            })
+                            .collect();
+                        Value::String(strings.join(delimiter))
                     }
                 }
             })

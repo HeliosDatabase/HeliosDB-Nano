@@ -19,11 +19,11 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
-use crate::storage::{BranchId, StorageEngine, BranchManager};
+use crate::storage::{StorageEngine, BranchManager};
 use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 // ============================================================================
 // Time-Travel Diff Target Types
@@ -491,9 +491,9 @@ impl<'a> DiffEngine<'a> {
         // For now, compare table existence and schemas
         // In full implementation, would use time-travel to get schemas at branch points
         let mut table_diffs = Vec::new();
-        let mut tables_added = 0;
-        let mut tables_removed = 0;
-        let mut tables_modified = 0;
+        let tables_added = 0;
+        let tables_removed = 0;
+        let tables_modified = 0;
 
         // Get source and target branch metadata
         if let Some(ref bm) = self.branch_manager {
@@ -588,8 +588,8 @@ impl<'a> DiffEngine<'a> {
         let schema = self.diff_schema(source, target)?;
 
         let mut data_changes = Vec::new();
-        let mut total_rows_added = 0u64;
-        let mut total_rows_removed = 0u64;
+        let total_rows_added = 0u64;
+        let total_rows_removed = 0u64;
 
         // Determine which tables to compare
         let tables_to_diff: Vec<String> = if let Some(specific_tables) = tables {

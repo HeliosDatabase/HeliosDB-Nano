@@ -13,7 +13,7 @@
 #![allow(unused_variables)]
 
 use crate::{Error, Result};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 

@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use super::{Tenant, TenantError, TenantQuotas};
+use super::{TenantError, TenantQuotas};
 
 /// Usage metrics for a tenant
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

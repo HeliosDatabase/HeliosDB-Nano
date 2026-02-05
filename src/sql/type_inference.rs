@@ -103,6 +103,18 @@ impl TypeInference for LogicalExpr {
                         // JSON_AGG always returns Jsonb
                         Ok(DataType::Jsonb)
                     }
+                    AggregateFunction::ArrayAgg => {
+                        // ARRAY_AGG returns an array of the input type
+                        if args.is_empty() {
+                            return Ok(DataType::Array(Box::new(DataType::Text)));
+                        }
+                        let elem_type = args[0].infer_type(schema)?;
+                        Ok(DataType::Array(Box::new(elem_type)))
+                    }
+                    AggregateFunction::StringAgg { .. } => {
+                        // STRING_AGG always returns Text
+                        Ok(DataType::Text)
+                    }
                 }
             }
 
@@ -269,6 +281,15 @@ impl TypeInference for LogicalExpr {
                                 }
                             }
                             crate::sql::AggregateFunction::JsonAgg => Ok(DataType::Jsonb),
+                            crate::sql::AggregateFunction::ArrayAgg => {
+                                if args.is_empty() {
+                                    Ok(DataType::Array(Box::new(DataType::Text)))
+                                } else {
+                                    let elem_type = args[0].infer_type(schema)?;
+                                    Ok(DataType::Array(Box::new(elem_type)))
+                                }
+                            }
+                            crate::sql::AggregateFunction::StringAgg { .. } => Ok(DataType::Text),
                         }
                     }
                 }
@@ -314,7 +335,9 @@ impl TypeInference for LogicalExpr {
                     // Other aggregates can return NULL if no rows match
                     AggregateFunction::Sum | AggregateFunction::Avg |
                     AggregateFunction::Min | AggregateFunction::Max |
-                    AggregateFunction::JsonAgg => true,
+                    AggregateFunction::JsonAgg |
+                    AggregateFunction::ArrayAgg |
+                    AggregateFunction::StringAgg { .. } => true,
                 }
             }
 
@@ -445,8 +468,12 @@ fn coerce_binary_types(left: DataType, right: DataType, op: &BinaryOperator) -> 
             Ok(DataType::Boolean)
         }
 
-        // String operators
-        BinaryOperator::Like | BinaryOperator::NotLike => {
+        // String pattern matching operators
+        BinaryOperator::Like | BinaryOperator::NotLike |
+        BinaryOperator::ILike | BinaryOperator::NotILike |
+        BinaryOperator::RegexMatch | BinaryOperator::RegexIMatch |
+        BinaryOperator::NotRegexMatch | BinaryOperator::NotRegexIMatch |
+        BinaryOperator::SimilarTo | BinaryOperator::NotSimilarTo => {
             Ok(DataType::Boolean)
         }
 

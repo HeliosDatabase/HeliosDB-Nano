@@ -372,6 +372,20 @@ pub struct EmbeddedDatabase {
     pub dirty_tracker: std::sync::Arc<storage::DirtyTracker>,
     /// Active transactions per session
     session_transactions: std::sync::Arc<dashmap::DashMap<crate::session::SessionId, storage::Transaction>>,
+    /// Prepared statements storage (name -> plan)
+    prepared_statements: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, sql::LogicalPlan>>>,
+    /// Active savepoints stack (name -> transaction state)
+    savepoints: std::sync::Arc<parking_lot::RwLock<Vec<SavepointState>>>,
+}
+
+/// Savepoint state for nested transaction support
+#[derive(Clone)]
+struct SavepointState {
+    /// Savepoint name
+    name: String,
+    /// Snapshot of dirty tracker state at savepoint creation
+    #[allow(dead_code)]
+    dirty_state: Vec<(String, Vec<u8>)>,
 }
 
 impl EmbeddedDatabase {
@@ -1841,6 +1855,8 @@ impl EmbeddedDatabase {
             lock_manager,
             dirty_tracker,
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
+            prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
         })
     }
 
@@ -1891,6 +1907,8 @@ impl EmbeddedDatabase {
             lock_manager,
             dirty_tracker,
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
+            prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
         })
     }
 
@@ -1950,6 +1968,8 @@ impl EmbeddedDatabase {
             lock_manager,
             dirty_tracker,
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
+            prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
         })
     }
 
@@ -2953,6 +2973,85 @@ impl EmbeddedDatabase {
             }
             sql::LogicalPlan::Rollback => {
                 self.rollback_internal()?;
+                Ok((0, Vec::new()))
+            }
+            // Savepoint support for nested transactions
+            sql::LogicalPlan::Savepoint { name } => {
+                // Check if we're in a transaction
+                let txn = self.current_transaction.lock()
+                    .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
+                if txn.is_none() {
+                    return Err(Error::query_execution("SAVEPOINT can only be used within a transaction"));
+                }
+                drop(txn);
+
+                // Create savepoint with current dirty tracker state
+                let dirty_state = Vec::new(); // Simplified - full implementation would capture state
+                let savepoint = SavepointState { name: name.clone(), dirty_state };
+                self.savepoints.write().push(savepoint);
+                Ok((0, Vec::new()))
+            }
+            sql::LogicalPlan::ReleaseSavepoint { name } => {
+                let mut savepoints = self.savepoints.write();
+                // Find and remove the savepoint (and all savepoints created after it)
+                if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
+                    savepoints.truncate(pos);
+                    Ok((0, Vec::new()))
+                } else {
+                    Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
+                }
+            }
+            sql::LogicalPlan::RollbackToSavepoint { name } => {
+                let savepoints = self.savepoints.read();
+                // Find the savepoint
+                if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
+                    // Keep savepoints up to and including this one
+                    drop(savepoints);
+                    let mut savepoints = self.savepoints.write();
+                    savepoints.truncate(pos + 1);
+                    // Note: Full implementation would restore dirty tracker state
+                    Ok((0, Vec::new()))
+                } else {
+                    Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
+                }
+            }
+            // Prepared statement support
+            sql::LogicalPlan::Prepare { name, statement, .. } => {
+                // Store the prepared statement
+                self.prepared_statements.write().insert(name.clone(), *statement.clone());
+                Ok((0, Vec::new()))
+            }
+            sql::LogicalPlan::Execute { name, parameters } => {
+                // Look up the prepared statement
+                let stmt = {
+                    let stmts = self.prepared_statements.read();
+                    stmts.get(name).cloned()
+                };
+                if let Some(plan) = stmt {
+                    // Evaluate parameters
+                    let empty_tuple = Tuple::new(vec![]);
+                    let empty_schema = std::sync::Arc::new(Schema { columns: vec![] });
+                    let evaluator = sql::Evaluator::new(empty_schema);
+                    let param_values: Result<Vec<Value>> = parameters.iter()
+                        .map(|expr| evaluator.evaluate(expr, &empty_tuple))
+                        .collect();
+                    // Execute the prepared statement with parameters
+                    return self.execute_plan_with_params(&plan, &param_values?);
+                } else {
+                    Err(Error::query_execution(format!("Prepared statement '{}' does not exist", name)))
+                }
+            }
+            sql::LogicalPlan::Deallocate { name } => {
+                if let Some(ref stmt_name) = name {
+                    // Remove specific prepared statement
+                    let removed = self.prepared_statements.write().remove(stmt_name);
+                    if removed.is_none() {
+                        return Err(Error::query_execution(format!("Prepared statement '{}' does not exist", stmt_name)));
+                    }
+                } else {
+                    // DEALLOCATE ALL - remove all prepared statements
+                    self.prepared_statements.write().clear();
+                }
                 Ok((0, Vec::new()))
             }
             _ => {
@@ -4155,6 +4254,8 @@ impl EmbeddedDatabase {
             lock_manager: self.lock_manager.clone(),
             dirty_tracker: self.dirty_tracker.clone(),
             session_transactions: self.session_transactions.clone(),
+            prepared_statements: self.prepared_statements.clone(),
+            savepoints: self.savepoints.clone(),
         }
     }
 

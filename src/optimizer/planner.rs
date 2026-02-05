@@ -335,6 +335,12 @@ impl Planner {
             LogicalPlan::StartTransaction |
             LogicalPlan::Commit |
             LogicalPlan::Rollback |
+            LogicalPlan::Savepoint { .. } |
+            LogicalPlan::ReleaseSavepoint { .. } |
+            LogicalPlan::RollbackToSavepoint { .. } |
+            LogicalPlan::Prepare { .. } |
+            LogicalPlan::Execute { .. } |
+            LogicalPlan::Deallocate { .. } |
             LogicalPlan::SetConstraints { .. } |
             LogicalPlan::Union { .. } |
             LogicalPlan::Intersect { .. } |

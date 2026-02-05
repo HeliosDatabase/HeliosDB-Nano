@@ -4,7 +4,7 @@
 //! The logical plan is a tree of operators that represents the semantics
 //! of a query without specifying how it should be executed.
 
-use crate::{Schema, DataType, Value, Column};
+use crate::{Schema, DataType, Value};
 use serde::{Serialize, Deserialize};
 use std::sync::Arc;
 
@@ -563,6 +563,50 @@ pub enum LogicalPlan {
     /// Rollback the current transaction
     Rollback,
 
+    /// Create a savepoint within a transaction
+    Savepoint {
+        /// Savepoint name
+        name: String,
+    },
+
+    /// Release (commit) a savepoint
+    ReleaseSavepoint {
+        /// Savepoint name
+        name: String,
+    },
+
+    /// Rollback to a savepoint
+    RollbackToSavepoint {
+        /// Savepoint name
+        name: String,
+    },
+
+    // === Prepared Statements ===
+
+    /// Prepare a statement for later execution
+    Prepare {
+        /// Statement name
+        name: String,
+        /// Parameter data types (optional)
+        param_types: Vec<DataType>,
+        /// The statement to prepare
+        statement: Box<LogicalPlan>,
+    },
+
+    /// Execute a prepared statement
+    Execute {
+        /// Statement name
+        name: String,
+        /// Parameter values
+        parameters: Vec<LogicalExpr>,
+    },
+
+    /// Deallocate (drop) a prepared statement
+    Deallocate {
+        /// Statement name (None = ALL)
+        name: Option<String>,
+    },
+
     /// SET CONSTRAINTS - change deferral mode for constraints/triggers
     SetConstraints {
         /// Constraint/trigger names (empty = ALL)
@@ -948,9 +992,25 @@ pub enum BinaryOperator {
     And,
     Or,
 
-    // String
+    // String pattern matching
     Like,
     NotLike,
+    /// Case-insensitive LIKE
+    ILike,
+    /// Case-insensitive NOT LIKE
+    NotILike,
+    /// Regular expression match (POSIX ~)
+    RegexMatch,
+    /// Case-insensitive regex match (~*)
+    RegexIMatch,
+    /// Negated regex match (!~)
+    NotRegexMatch,
+    /// Negated case-insensitive regex match (!~*)
+    NotRegexIMatch,
+    /// SQL standard SIMILAR TO
+    SimilarTo,
+    /// Negated SIMILAR TO
+    NotSimilarTo,
 
     // Vector similarity operators (pgvector compatible)
     /// L2 distance (Euclidean): <->
@@ -990,7 +1050,7 @@ pub enum UnaryOperator {
 }
 
 /// Aggregate function
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AggregateFunction {
     Count,
     Sum,
@@ -998,6 +1058,10 @@ pub enum AggregateFunction {
     Min,
     Max,
     JsonAgg,
+    /// ARRAY_AGG - collect values into an array
+    ArrayAgg,
+    /// STRING_AGG(value, delimiter) - concatenate strings with delimiter
+    StringAgg { delimiter: String },
 }
 
 /// Join type
@@ -1477,7 +1541,14 @@ impl LogicalPlan {
             LogicalPlan::StartTransaction => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::Commit => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::Rollback => Arc::new(Schema { columns: vec![] }),
+            LogicalPlan::Savepoint { .. } => Arc::new(Schema { columns: vec![] }),
+            LogicalPlan::ReleaseSavepoint { .. } => Arc::new(Schema { columns: vec![] }),
+            LogicalPlan::RollbackToSavepoint { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::SetConstraints { .. } => Arc::new(Schema { columns: vec![] }),
+            // Prepared statements - no output schema for DDL
+            LogicalPlan::Prepare { .. } => Arc::new(Schema { columns: vec![] }),
+            LogicalPlan::Execute { .. } => Arc::new(Schema { columns: vec![] }),
+            LogicalPlan::Deallocate { .. } => Arc::new(Schema { columns: vec![] }),
             // Procedural statements - no output schema for DDL
             LogicalPlan::CreateFunction { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::CreateProcedure { .. } => Arc::new(Schema { columns: vec![] }),

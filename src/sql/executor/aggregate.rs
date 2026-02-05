@@ -366,6 +366,22 @@ impl AggregateOperator {
 
                         Ok(Value::Json(json!(json_values).to_string()))
                     }
+                    AggregateFunction::ArrayAgg => {
+                        // ARRAY_AGG collects all values into an array
+                        Ok(Value::Array(values))
+                    }
+                    AggregateFunction::StringAgg { delimiter } => {
+                        // STRING_AGG concatenates string values with delimiter
+                        let strings: Vec<String> = values
+                            .into_iter()
+                            .filter_map(|v| match v {
+                                Value::Null => None,
+                                Value::String(s) => Some(s),
+                                other => Some(other.to_string()),
+                            })
+                            .collect();
+                        Ok(Value::String(strings.join(delimiter)))
+                    }
                 }
             }
             _ => Err(Error::query_execution("Expected aggregate function expression")),

@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use crate::{Result, Error, Tuple};
+use crate::{Result, Tuple};
 
 /// Cached query result
 #[derive(Debug, Clone)]

@@ -441,7 +441,49 @@ impl<'a> Planner<'a> {
             // Transaction control statements
             Statement::StartTransaction { .. } => Ok(LogicalPlan::StartTransaction),
             Statement::Commit { .. } => Ok(LogicalPlan::Commit),
-            Statement::Rollback { .. } => Ok(LogicalPlan::Rollback),
+            Statement::Rollback { savepoint, .. } => {
+                if let Some(sp) = savepoint {
+                    Ok(LogicalPlan::RollbackToSavepoint { name: sp.value.clone() })
+                } else {
+                    Ok(LogicalPlan::Rollback)
+                }
+            }
+            Statement::Savepoint { name } => {
+                Ok(LogicalPlan::Savepoint { name: name.value.clone() })
+            }
+            Statement::ReleaseSavepoint { name } => {
+                Ok(LogicalPlan::ReleaseSavepoint { name: name.value.clone() })
+            }
+            // Prepared statements
+            Statement::Prepare { name, data_types, statement, .. } => {
+                let param_types: Vec<DataType> = data_types.iter()
+                    .filter_map(|dt| self.sql_data_type_to_data_type(dt).ok())
+                    .collect();
+                let inner_plan = self.statement_to_plan(*statement.clone())?;
+                Ok(LogicalPlan::Prepare {
+                    name: name.to_string(),
+                    param_types,
+                    statement: Box::new(inner_plan),
+                })
+            }
+            Statement::Execute { name, parameters, .. } => {
+                let params: Result<Vec<LogicalExpr>> = parameters.iter()
+                    .map(|e| self.expr_to_logical(e))
+                    .collect();
+                Ok(LogicalPlan::Execute {
+                    name: name.to_string(),
+                    parameters: params?,
+                })
+            }
+            Statement::Deallocate { name, .. } => {
+                let name_str = name.to_string();
+                let stmt_name = if name_str.to_uppercase() == "ALL" {
+                    None
+                } else {
+                    Some(name_str)
+                };
+                Ok(LogicalPlan::Deallocate { name: stmt_name })
+            }
             // Procedural statements
             Statement::CreateFunction(cf) => self.create_function_to_plan(cf),
             Statement::CreateProcedure { or_alter, name, params, body } => {
@@ -1257,6 +1299,12 @@ impl<'a> Planner<'a> {
                 }
 
                 let func_name = func.name.to_string().to_uppercase();
+
+                // Handle STRING_AGG specially as it has a delimiter argument
+                if func_name == "STRING_AGG" {
+                    return self.parse_string_agg(func);
+                }
+
                 let aggr_fun = match func_name.as_str() {
                     "COUNT" => Some(AggregateFunction::Count),
                     "SUM" => Some(AggregateFunction::Sum),
@@ -1264,6 +1312,7 @@ impl<'a> Planner<'a> {
                     "MIN" => Some(AggregateFunction::Min),
                     "MAX" => Some(AggregateFunction::Max),
                     "JSON_AGG" => Some(AggregateFunction::JsonAgg),
+                    "ARRAY_AGG" => Some(AggregateFunction::ArrayAgg),
                     _ => None,
                 };
 
@@ -1310,9 +1359,58 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// Parse STRING_AGG(value, delimiter) aggregate function
+    fn parse_string_agg(&self, func: &sqlparser::ast::Function) -> Result<Option<LogicalExpr>> {
+        // Extract args from function
+        let args = match &func.args {
+            sqlparser::ast::FunctionArguments::List(arg_list) => {
+                let parsed_args: Result<Vec<_>> = arg_list.args.iter()
+                    .map(|arg| {
+                        match arg {
+                            sqlparser::ast::FunctionArg::Unnamed(func_arg_expr) => {
+                                match func_arg_expr {
+                                    sqlparser::ast::FunctionArgExpr::Expr(expr) => {
+                                        self.expr_to_logical(&expr)
+                                    }
+                                    _ => Err(Error::query_execution("STRING_AGG requires value expressions"))
+                                }
+                            }
+                            _ => Err(Error::query_execution("Named function args not supported"))
+                        }
+                    })
+                    .collect();
+                parsed_args?
+            }
+            _ => return Err(Error::query_execution("STRING_AGG requires arguments")),
+        };
+
+        if args.len() != 2 {
+            return Err(Error::query_execution("STRING_AGG requires exactly 2 arguments: value and delimiter"));
+        }
+
+        // Extract delimiter from second argument (must be a literal string)
+        let delimiter = match &args[1] {
+            LogicalExpr::Literal(crate::Value::String(s)) => s.clone(),
+            _ => return Err(Error::query_execution("STRING_AGG delimiter must be a string literal")),
+        };
+
+        let distinct = match &func.args {
+            sqlparser::ast::FunctionArguments::List(arg_list) => {
+                matches!(arg_list.duplicate_treatment, Some(sqlparser::ast::DuplicateTreatment::Distinct))
+            }
+            _ => false,
+        };
+
+        Ok(Some(LogicalExpr::AggregateFunction {
+            fun: AggregateFunction::StringAgg { delimiter },
+            args: vec![args[0].clone()], // Only the value expression
+            distinct,
+        }))
+    }
+
     /// Parse a window function expression
     fn parse_window_function(&self, func: &sqlparser::ast::Function) -> Result<LogicalExpr> {
-        use super::logical_plan::{WindowFunctionType, WindowFrame, WindowFrameType, WindowFrameBound};
+        use super::logical_plan::{WindowFunctionType, WindowFrame, WindowFrameType};
 
         let func_name = func.name.to_string().to_uppercase();
 
@@ -1553,6 +1651,55 @@ impl<'a> Planner<'a> {
                     BinaryOperator::NotLike
                 } else {
                     BinaryOperator::Like
+                };
+
+                Ok(LogicalExpr::BinaryExpr {
+                    left: Box::new(left_expr),
+                    op,
+                    right: Box::new(right_expr),
+                })
+            }
+
+            Expr::ILike { negated, expr, pattern, .. } => {
+                let left_expr = self.expr_to_logical(expr)?;
+                let right_expr = self.expr_to_logical(pattern)?;
+                let op = if *negated {
+                    BinaryOperator::NotILike
+                } else {
+                    BinaryOperator::ILike
+                };
+
+                Ok(LogicalExpr::BinaryExpr {
+                    left: Box::new(left_expr),
+                    op,
+                    right: Box::new(right_expr),
+                })
+            }
+
+            Expr::SimilarTo { negated, expr, pattern, .. } => {
+                let left_expr = self.expr_to_logical(expr)?;
+                let right_expr = self.expr_to_logical(pattern)?;
+                let op = if *negated {
+                    BinaryOperator::NotSimilarTo
+                } else {
+                    BinaryOperator::SimilarTo
+                };
+
+                Ok(LogicalExpr::BinaryExpr {
+                    left: Box::new(left_expr),
+                    op,
+                    right: Box::new(right_expr),
+                })
+            }
+
+            Expr::RLike { negated, expr, pattern, .. } => {
+                // RLike is MySQL's regex syntax
+                let left_expr = self.expr_to_logical(expr)?;
+                let right_expr = self.expr_to_logical(pattern)?;
+                let op = if *negated {
+                    BinaryOperator::NotRegexMatch
+                } else {
+                    BinaryOperator::RegexMatch
                 };
 
                 Ok(LogicalExpr::BinaryExpr {

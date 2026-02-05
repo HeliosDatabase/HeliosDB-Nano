@@ -490,6 +490,55 @@ impl Evaluator {
             "array_position" => self.array_position(&arg_values),
             "cardinality" => self.array_cardinality(&arg_values),
 
+            // String functions
+            "upper" => self.func_upper(&arg_values),
+            "lower" => self.func_lower(&arg_values),
+            "length" | "char_length" | "character_length" => self.func_length(&arg_values),
+            "substr" | "substring" => self.func_substr(&arg_values),
+            "trim" => self.func_trim(&arg_values, None),
+            "ltrim" => self.func_trim(&arg_values, Some("left")),
+            "rtrim" => self.func_trim(&arg_values, Some("right")),
+            "btrim" => self.func_trim(&arg_values, Some("both")),
+            "concat" => self.func_concat(&arg_values),
+            "concat_ws" => self.func_concat_ws(&arg_values),
+            "left" => self.func_left(&arg_values),
+            "right" => self.func_right(&arg_values),
+            "repeat" => self.func_repeat(&arg_values),
+            "replace" => self.func_replace(&arg_values),
+            "reverse" => self.func_reverse(&arg_values),
+            "position" | "strpos" => self.func_position(&arg_values),
+            "split_part" => self.func_split_part(&arg_values),
+            "initcap" => self.func_initcap(&arg_values),
+            "lpad" => self.func_lpad(&arg_values),
+            "rpad" => self.func_rpad(&arg_values),
+
+            // Math functions
+            "abs" => self.func_abs(&arg_values),
+            "round" => self.func_round(&arg_values),
+            "ceil" | "ceiling" => self.func_ceil(&arg_values),
+            "floor" => self.func_floor(&arg_values),
+            "trunc" | "truncate" => self.func_trunc(&arg_values),
+            "sqrt" => self.func_sqrt(&arg_values),
+            "power" | "pow" => self.func_power(&arg_values),
+            "mod" => self.func_mod(&arg_values),
+            "sign" => self.func_sign(&arg_values),
+            "greatest" => self.func_greatest(&arg_values),
+            "least" => self.func_least(&arg_values),
+            "random" => self.func_random(&arg_values),
+            "pi" => Ok(Value::Float8(std::f64::consts::PI)),
+            "exp" => self.func_exp(&arg_values),
+            "ln" | "log" => self.func_ln(&arg_values),
+            "log10" => self.func_log10(&arg_values),
+            "sin" => self.func_sin(&arg_values),
+            "cos" => self.func_cos(&arg_values),
+            "tan" => self.func_tan(&arg_values),
+            "asin" => self.func_asin(&arg_values),
+            "acos" => self.func_acos(&arg_values),
+            "atan" => self.func_atan(&arg_values),
+            "atan2" => self.func_atan2(&arg_values),
+            "degrees" => self.func_degrees(&arg_values),
+            "radians" => self.func_radians(&arg_values),
+
             _ => Err(Error::query_execution(format!(
                 "Unknown scalar function: {}",
                 fun
@@ -1426,13 +1475,22 @@ impl Evaluator {
             BinaryOperator::Like => self.like_op(left, right, false),
             BinaryOperator::NotLike => self.like_op(left, right, true),
 
+            // Case-insensitive LIKE (ILIKE)
+            BinaryOperator::ILike => self.ilike_op(left, right, false),
+            BinaryOperator::NotILike => self.ilike_op(left, right, true),
+
+            // Regular expression matching
+            BinaryOperator::RegexMatch => self.regex_op(left, right, false, false),
+            BinaryOperator::RegexIMatch => self.regex_op(left, right, false, true),
+            BinaryOperator::NotRegexMatch => self.regex_op(left, right, true, false),
+            BinaryOperator::NotRegexIMatch => self.regex_op(left, right, true, true),
+
+            // SQL SIMILAR TO (uses SQL regex syntax)
+            BinaryOperator::SimilarTo => self.similar_to_op(left, right, false),
+            BinaryOperator::NotSimilarTo => self.similar_to_op(left, right, true),
+
             // Modulo operator
             BinaryOperator::Modulo => self.arithmetic_modulo(left, right),
-
-            _ => Err(Error::query_execution(format!(
-                "Binary operator not yet implemented: {:?}",
-                op
-            ))),
         }
     }
 
@@ -3117,6 +3175,164 @@ impl Evaluator {
         regex
     }
 
+    /// ILIKE pattern matching operator (case-insensitive LIKE)
+    fn ilike_op(&self, left: &Value, right: &Value, negated: bool) -> Result<Value> {
+        // Handle NULL values
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(Value::Null);
+        }
+
+        // Get string values
+        let text = match left {
+            Value::String(s) => s.to_lowercase(),
+            _ => return Err(Error::query_execution(format!(
+                "ILIKE requires string operand, got {:?}", left
+            ))),
+        };
+
+        let pattern = match right {
+            Value::String(s) => s.to_lowercase(),
+            _ => return Err(Error::query_execution(format!(
+                "ILIKE pattern must be a string, got {:?}", right
+            ))),
+        };
+
+        // Convert SQL LIKE pattern to regex
+        let regex_pattern = self.like_pattern_to_regex(&pattern);
+
+        let result = match regex::Regex::new(&regex_pattern) {
+            Ok(re) => re.is_match(&text),
+            Err(e) => return Err(Error::query_execution(format!(
+                "Invalid ILIKE pattern '{}': {}", pattern, e
+            ))),
+        };
+
+        Ok(Value::Boolean(if negated { !result } else { result }))
+    }
+
+    /// Regular expression matching operator (POSIX ~, ~*, !~, !~*)
+    fn regex_op(&self, left: &Value, right: &Value, negated: bool, case_insensitive: bool) -> Result<Value> {
+        // Handle NULL values
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(Value::Null);
+        }
+
+        // Get string values
+        let text = match left {
+            Value::String(s) => s.as_str(),
+            _ => return Err(Error::query_execution(format!(
+                "Regex match requires string operand, got {:?}", left
+            ))),
+        };
+
+        let pattern = match right {
+            Value::String(s) => s.as_str(),
+            _ => return Err(Error::query_execution(format!(
+                "Regex pattern must be a string, got {:?}", right
+            ))),
+        };
+
+        // Build regex with optional case-insensitivity
+        let regex_pattern = if case_insensitive {
+            format!("(?i){}", pattern)
+        } else {
+            pattern.to_string()
+        };
+
+        let result = match regex::Regex::new(&regex_pattern) {
+            Ok(re) => re.is_match(text),
+            Err(e) => return Err(Error::query_execution(format!(
+                "Invalid regex pattern '{}': {}", pattern, e
+            ))),
+        };
+
+        Ok(Value::Boolean(if negated { !result } else { result }))
+    }
+
+    /// SQL SIMILAR TO pattern matching
+    /// SIMILAR TO uses SQL regex syntax: % -> .*, _ -> ., | for alternation
+    fn similar_to_op(&self, left: &Value, right: &Value, negated: bool) -> Result<Value> {
+        // Handle NULL values
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(Value::Null);
+        }
+
+        // Get string values
+        let text = match left {
+            Value::String(s) => s.as_str(),
+            _ => return Err(Error::query_execution(format!(
+                "SIMILAR TO requires string operand, got {:?}", left
+            ))),
+        };
+
+        let pattern = match right {
+            Value::String(s) => s.as_str(),
+            _ => return Err(Error::query_execution(format!(
+                "SIMILAR TO pattern must be a string, got {:?}", right
+            ))),
+        };
+
+        // Convert SQL SIMILAR TO pattern to regex
+        let regex_pattern = self.similar_to_pattern_to_regex(pattern);
+
+        let result = match regex::Regex::new(&regex_pattern) {
+            Ok(re) => re.is_match(text),
+            Err(e) => return Err(Error::query_execution(format!(
+                "Invalid SIMILAR TO pattern '{}': {}", pattern, e
+            ))),
+        };
+
+        Ok(Value::Boolean(if negated { !result } else { result }))
+    }
+
+    /// Convert SQL SIMILAR TO pattern to regex
+    /// % -> .*, _ -> ., | is kept, other regex chars need escaping
+    fn similar_to_pattern_to_regex(&self, pattern: &str) -> String {
+        let mut regex = String::with_capacity(pattern.len() * 2 + 2);
+        regex.push('^'); // Anchor at start
+
+        let mut chars = pattern.chars().peekable();
+        while let Some(c) = chars.next() {
+            match c {
+                // Escape character
+                '\\' => {
+                    if let Some(next) = chars.next() {
+                        if "^$.*+?{}[]|()\\".contains(next) {
+                            regex.push('\\');
+                        }
+                        regex.push(next);
+                    }
+                }
+                // SQL wildcards
+                '%' => regex.push_str(".*"),
+                '_' => regex.push('.'),
+                // SIMILAR TO allows | for alternation and () for grouping
+                '|' | '(' | ')' => regex.push(c),
+                // Character class
+                '[' => {
+                    regex.push('[');
+                    // Copy until closing ]
+                    while let Some(inner) = chars.next() {
+                        regex.push(inner);
+                        if inner == ']' {
+                            break;
+                        }
+                    }
+                }
+                // Escape other regex special characters
+                '^' | '$' | '.' | '*' | '+' | '?' | '{' | '}' => {
+                    regex.push('\\');
+                    regex.push(c);
+                }
+                // Regular character
+                _ => regex.push(c),
+            }
+        }
+
+        regex.push('$'); // Anchor at end
+        regex
+    }
+
     /// Modulo operator
     fn arithmetic_modulo(&self, left: &Value, right: &Value) -> Result<Value> {
         match (left, right) {
@@ -3145,6 +3361,859 @@ impl Evaluator {
                 "Modulo requires integer operands, got {:?} % {:?}", left, right
             ))),
         }
+    }
+
+    // ========== String Functions ==========
+
+    /// UPPER(string) - convert to uppercase
+    fn func_upper(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("UPPER requires exactly one argument"));
+        }
+        match &args[0] {
+            Value::Null => Ok(Value::Null),
+            Value::String(s) => Ok(Value::String(s.to_uppercase())),
+            _ => Err(Error::query_execution("UPPER requires a string argument")),
+        }
+    }
+
+    /// LOWER(string) - convert to lowercase
+    fn func_lower(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("LOWER requires exactly one argument"));
+        }
+        match &args[0] {
+            Value::Null => Ok(Value::Null),
+            Value::String(s) => Ok(Value::String(s.to_lowercase())),
+            _ => Err(Error::query_execution("LOWER requires a string argument")),
+        }
+    }
+
+    /// LENGTH(string) - get string length in characters
+    fn func_length(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("LENGTH requires exactly one argument"));
+        }
+        match &args[0] {
+            Value::Null => Ok(Value::Null),
+            Value::String(s) => Ok(Value::Int4(s.chars().count() as i32)),
+            Value::Bytes(b) => Ok(Value::Int4(b.len() as i32)),
+            _ => Err(Error::query_execution("LENGTH requires a string argument")),
+        }
+    }
+
+    /// SUBSTR(string, start [, length]) - extract substring (1-based indexing)
+    fn func_substr(&self, args: &[Value]) -> Result<Value> {
+        if args.len() < 2 || args.len() > 3 {
+            return Err(Error::query_execution("SUBSTR requires 2 or 3 arguments"));
+        }
+
+        let s = match &args[0] {
+            Value::Null => return Ok(Value::Null),
+            Value::String(s) => s,
+            _ => return Err(Error::query_execution("SUBSTR first argument must be a string")),
+        };
+
+        let start = match &args[1] {
+            Value::Int2(n) => *n as i64,
+            Value::Int4(n) => *n as i64,
+            Value::Int8(n) => *n,
+            _ => return Err(Error::query_execution("SUBSTR start must be an integer")),
+        };
+
+        // SQL uses 1-based indexing
+        let start_idx = if start < 1 { 0 } else { (start - 1) as usize };
+        let chars: Vec<char> = s.chars().collect();
+
+        let result = if args.len() == 3 {
+            let length = match &args[2] {
+                Value::Int2(n) => *n as usize,
+                Value::Int4(n) => *n as usize,
+                Value::Int8(n) => *n as usize,
+                _ => return Err(Error::query_execution("SUBSTR length must be an integer")),
+            };
+            chars.iter().skip(start_idx).take(length).collect::<String>()
+        } else {
+            chars.iter().skip(start_idx).collect::<String>()
+        };
+
+        Ok(Value::String(result))
+    }
+
+    /// TRIM([LEADING|TRAILING|BOTH] [characters] FROM string) or TRIM(string [, characters])
+    fn func_trim(&self, args: &[Value], mode: Option<&str>) -> Result<Value> {
+        if args.is_empty() || args.len() > 2 {
+            return Err(Error::query_execution("TRIM requires 1 or 2 arguments"));
+        }
+
+        let s = match &args[0] {
+            Value::Null => return Ok(Value::Null),
+            Value::String(s) => s.as_str(),
+            _ => return Err(Error::query_execution("TRIM argument must be a string")),
+        };
+
+        let chars_to_trim: &[char] = if args.len() > 1 {
+            match &args[1] {
+                Value::String(chars) => &chars.chars().collect::<Vec<_>>(),
+                _ => &[' '],
+            }
+        } else {
+            &[' ']
+        };
+
+        let result = match mode {
+            Some("left") => s.trim_start_matches(chars_to_trim),
+            Some("right") => s.trim_end_matches(chars_to_trim),
+            _ => s.trim_matches(chars_to_trim),
+        };
+
+        Ok(Value::String(result.to_string()))
+    }
+
+    /// CONCAT(str1, str2, ...) - concatenate strings
+    fn func_concat(&self, args: &[Value]) -> Result<Value> {
+        let mut result = String::new();
+        for arg in args {
+            match arg {
+                Value::Null => {} // NULL is treated as empty string in CONCAT
+                Value::String(s) => result.push_str(s),
+                other => result.push_str(&other.to_string()),
+            }
+        }
+        Ok(Value::String(result))
+    }
+
+    /// CONCAT_WS(separator, str1, str2, ...) - concatenate with separator
+    fn func_concat_ws(&self, args: &[Value]) -> Result<Value> {
+        if args.is_empty() {
+            return Err(Error::query_execution("CONCAT_WS requires at least one argument"));
+        }
+
+        let sep = match &args[0] {
+            Value::Null => return Ok(Value::Null),
+            Value::String(s) => s.clone(),
+            other => other.to_string(),
+        };
+
+        let parts: Vec<String> = args[1..].iter()
+            .filter_map(|arg| match arg {
+                Value::Null => None,
+                Value::String(s) => Some(s.clone()),
+                other => Some(other.to_string()),
+            })
+            .collect();
+
+        Ok(Value::String(parts.join(&sep)))
+    }
+
+    /// LEFT(string, n) - get first n characters
+    fn func_left(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::query_execution("LEFT requires exactly 2 arguments"));
+        }
+        let s = match &args[0] {
+            Value::Null => return Ok(Value::Null),
+            Value::String(s) => s,
+            _ => return Err(Error::query_execution("LEFT first argument must be a string")),
+        };
+        let n = match &args[1] {
+            Value::Int2(n) => *n as usize,
+            Value::Int4(n) => *n as usize,
+            Value::Int8(n) => *n as usize,
+            _ => return Err(Error::query_execution("LEFT second argument must be an integer")),
+        };
+        Ok(Value::String(s.chars().take(n).collect()))
+    }
+
+    /// RIGHT(string, n) - get last n characters
+    fn func_right(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::query_execution("RIGHT requires exactly 2 arguments"));
+        }
+        let s = match &args[0] {
+            Value::Null => return Ok(Value::Null),
+            Value::String(s) => s,
+            _ => return Err(Error::query_execution("RIGHT first argument must be a string")),
+        };
+        let n = match &args[1] {
+            Value::Int2(n) => *n as usize,
+            Value::Int4(n) => *n as usize,
+            Value::Int8(n) => *n as usize,
+            _ => return Err(Error::query_execution("RIGHT second argument must be an integer")),
+        };
+        let chars: Vec<char> = s.chars().collect();
+        let skip = chars.len().saturating_sub(n);
+        Ok(Value::String(chars.into_iter().skip(skip).collect()))
+    }
+
+    /// REPEAT(string, n) - repeat string n times
+    fn func_repeat(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::query_execution("REPEAT requires exactly 2 arguments"));
+        }
+        let s = match &args[0] {
+            Value::Null => return Ok(Value::Null),
+            Value::String(s) => s,
+            _ => return Err(Error::query_execution("REPEAT first argument must be a string")),
+        };
+        let n = match &args[1] {
+            Value::Int2(n) => *n as usize,
+            Value::Int4(n) => *n as usize,
+            Value::Int8(n) => *n as usize,
+            _ => return Err(Error::query_execution("REPEAT second argument must be an integer")),
+        };
+        Ok(Value::String(s.repeat(n)))
+    }
+
+    /// REPLACE(string, from, to) - replace all occurrences
+    fn func_replace(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 3 {
+            return Err(Error::query_execution("REPLACE requires exactly 3 arguments"));
+        }
+        let s = match &args[0] {
+            Value::Null => return Ok(Value::Null),
+            Value::String(s) => s,
+            _ => return Err(Error::query_execution("REPLACE first argument must be a string")),
+        };
+        let from = match &args[1] {
+            Value::String(s) => s,
+            _ => return Err(Error::query_execution("REPLACE second argument must be a string")),
+        };
+        let to = match &args[2] {
+            Value::String(s) => s,
+            _ => return Err(Error::query_execution("REPLACE third argument must be a string")),
+        };
+        Ok(Value::String(s.replace(from.as_str(), to.as_str())))
+    }
+
+    /// REVERSE(string) - reverse string
+    fn func_reverse(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("REVERSE requires exactly one argument"));
+        }
+        match &args[0] {
+            Value::Null => Ok(Value::Null),
+            Value::String(s) => Ok(Value::String(s.chars().rev().collect())),
+            _ => Err(Error::query_execution("REVERSE requires a string argument")),
+        }
+    }
+
+    /// POSITION(substring IN string) or STRPOS(string, substring) - find position (1-based)
+    fn func_position(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::query_execution("POSITION/STRPOS requires exactly 2 arguments"));
+        }
+        let (haystack, needle) = match (&args[0], &args[1]) {
+            (Value::Null, _) | (_, Value::Null) => return Ok(Value::Null),
+            (Value::String(h), Value::String(n)) => (h, n),
+            _ => return Err(Error::query_execution("POSITION/STRPOS requires string arguments")),
+        };
+        match haystack.find(needle.as_str()) {
+            Some(pos) => Ok(Value::Int4((pos + 1) as i32)), // 1-based
+            None => Ok(Value::Int4(0)),
+        }
+    }
+
+    /// SPLIT_PART(string, delimiter, field) - split string and get nth part (1-based)
+    fn func_split_part(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 3 {
+            return Err(Error::query_execution("SPLIT_PART requires exactly 3 arguments"));
+        }
+        let s = match &args[0] {
+            Value::Null => return Ok(Value::Null),
+            Value::String(s) => s,
+            _ => return Err(Error::query_execution("SPLIT_PART first argument must be a string")),
+        };
+        let delim = match &args[1] {
+            Value::String(s) => s,
+            _ => return Err(Error::query_execution("SPLIT_PART second argument must be a string")),
+        };
+        let field = match &args[2] {
+            Value::Int2(n) => *n as usize,
+            Value::Int4(n) => *n as usize,
+            Value::Int8(n) => *n as usize,
+            _ => return Err(Error::query_execution("SPLIT_PART third argument must be an integer")),
+        };
+        if field == 0 {
+            return Err(Error::query_execution("SPLIT_PART field number must be >= 1"));
+        }
+        let parts: Vec<&str> = s.split(delim.as_str()).collect();
+        match parts.get(field - 1) {
+            Some(part) => Ok(Value::String(part.to_string())),
+            None => Ok(Value::String(String::new())),
+        }
+    }
+
+    /// INITCAP(string) - capitalize first letter of each word
+    fn func_initcap(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("INITCAP requires exactly one argument"));
+        }
+        match &args[0] {
+            Value::Null => Ok(Value::Null),
+            Value::String(s) => {
+                let mut result = String::with_capacity(s.len());
+                let mut capitalize_next = true;
+                for c in s.chars() {
+                    if c.is_whitespace() || !c.is_alphanumeric() {
+                        result.push(c);
+                        capitalize_next = true;
+                    } else if capitalize_next {
+                        result.extend(c.to_uppercase());
+                        capitalize_next = false;
+                    } else {
+                        result.extend(c.to_lowercase());
+                    }
+                }
+                Ok(Value::String(result))
+            }
+            _ => Err(Error::query_execution("INITCAP requires a string argument")),
+        }
+    }
+
+    /// LPAD(string, length [, fill]) - left-pad string to length
+    fn func_lpad(&self, args: &[Value]) -> Result<Value> {
+        if args.len() < 2 || args.len() > 3 {
+            return Err(Error::query_execution("LPAD requires 2 or 3 arguments"));
+        }
+        let s = match &args[0] {
+            Value::Null => return Ok(Value::Null),
+            Value::String(s) => s,
+            _ => return Err(Error::query_execution("LPAD first argument must be a string")),
+        };
+        let length = match &args[1] {
+            Value::Int2(n) => *n as usize,
+            Value::Int4(n) => *n as usize,
+            Value::Int8(n) => *n as usize,
+            _ => return Err(Error::query_execution("LPAD second argument must be an integer")),
+        };
+        let fill = if args.len() > 2 {
+            match &args[2] {
+                Value::String(f) => f.clone(),
+                _ => " ".to_string(),
+            }
+        } else {
+            " ".to_string()
+        };
+
+        let char_count = s.chars().count();
+        if char_count >= length {
+            return Ok(Value::String(s.chars().take(length).collect()));
+        }
+
+        let pad_len = length - char_count;
+        let fill_chars: Vec<char> = fill.chars().collect();
+        let mut result = String::with_capacity(length);
+        for i in 0..pad_len {
+            result.push(fill_chars[i % fill_chars.len()]);
+        }
+        result.push_str(s);
+        Ok(Value::String(result))
+    }
+
+    /// RPAD(string, length [, fill]) - right-pad string to length
+    fn func_rpad(&self, args: &[Value]) -> Result<Value> {
+        if args.len() < 2 || args.len() > 3 {
+            return Err(Error::query_execution("RPAD requires 2 or 3 arguments"));
+        }
+        let s = match &args[0] {
+            Value::Null => return Ok(Value::Null),
+            Value::String(s) => s,
+            _ => return Err(Error::query_execution("RPAD first argument must be a string")),
+        };
+        let length = match &args[1] {
+            Value::Int2(n) => *n as usize,
+            Value::Int4(n) => *n as usize,
+            Value::Int8(n) => *n as usize,
+            _ => return Err(Error::query_execution("RPAD second argument must be an integer")),
+        };
+        let fill = if args.len() > 2 {
+            match &args[2] {
+                Value::String(f) => f.clone(),
+                _ => " ".to_string(),
+            }
+        } else {
+            " ".to_string()
+        };
+
+        let char_count = s.chars().count();
+        if char_count >= length {
+            return Ok(Value::String(s.chars().take(length).collect()));
+        }
+
+        let pad_len = length - char_count;
+        let fill_chars: Vec<char> = fill.chars().collect();
+        let mut result = s.clone();
+        for i in 0..pad_len {
+            result.push(fill_chars[i % fill_chars.len()]);
+        }
+        Ok(Value::String(result))
+    }
+
+    // ========== Math Functions ==========
+
+    /// Helper to extract a float from a Value
+    fn value_to_f64(&self, val: &Value) -> Result<f64> {
+        match val {
+            Value::Int2(n) => Ok(*n as f64),
+            Value::Int4(n) => Ok(*n as f64),
+            Value::Int8(n) => Ok(*n as f64),
+            Value::Float4(f) => Ok(*f as f64),
+            Value::Float8(f) => Ok(*f),
+            Value::Numeric(s) => s.parse::<f64>()
+                .map_err(|_| Error::query_execution("Invalid numeric value")),
+            _ => Err(Error::query_execution("Expected numeric value")),
+        }
+    }
+
+    /// ABS(x) - absolute value
+    fn func_abs(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("ABS requires exactly one argument"));
+        }
+        match &args[0] {
+            Value::Null => Ok(Value::Null),
+            Value::Int2(n) => Ok(Value::Int2(n.abs())),
+            Value::Int4(n) => Ok(Value::Int4(n.abs())),
+            Value::Int8(n) => Ok(Value::Int8(n.abs())),
+            Value::Float4(f) => Ok(Value::Float4(f.abs())),
+            Value::Float8(f) => Ok(Value::Float8(f.abs())),
+            Value::Numeric(s) => {
+                if let Ok(d) = s.parse::<Decimal>() {
+                    Ok(Value::Numeric(d.abs().to_string()))
+                } else {
+                    Err(Error::query_execution("Invalid numeric value"))
+                }
+            }
+            _ => Err(Error::query_execution("ABS requires a numeric argument")),
+        }
+    }
+
+    /// ROUND(x [, precision]) - round to precision decimal places
+    fn func_round(&self, args: &[Value]) -> Result<Value> {
+        if args.is_empty() || args.len() > 2 {
+            return Err(Error::query_execution("ROUND requires 1 or 2 arguments"));
+        }
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+
+        let precision = if args.len() > 1 {
+            match &args[1] {
+                Value::Int2(n) => *n as i32,
+                Value::Int4(n) => *n,
+                Value::Int8(n) => *n as i32,
+                _ => 0,
+            }
+        } else {
+            0
+        };
+
+        match &args[0] {
+            Value::Int2(n) => Ok(Value::Int2(*n)),
+            Value::Int4(n) => Ok(Value::Int4(*n)),
+            Value::Int8(n) => Ok(Value::Int8(*n)),
+            Value::Float4(f) => {
+                let factor = 10_f32.powi(precision);
+                Ok(Value::Float4((f * factor).round() / factor))
+            }
+            Value::Float8(f) => {
+                let factor = 10_f64.powi(precision);
+                Ok(Value::Float8((f * factor).round() / factor))
+            }
+            Value::Numeric(s) => {
+                if let Ok(d) = s.parse::<Decimal>() {
+                    Ok(Value::Numeric(d.round_dp(precision as u32).to_string()))
+                } else {
+                    Err(Error::query_execution("Invalid numeric value"))
+                }
+            }
+            _ => Err(Error::query_execution("ROUND requires a numeric argument")),
+        }
+    }
+
+    /// CEIL(x) - smallest integer >= x
+    fn func_ceil(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("CEIL requires exactly one argument"));
+        }
+        match &args[0] {
+            Value::Null => Ok(Value::Null),
+            Value::Int2(n) => Ok(Value::Int2(*n)),
+            Value::Int4(n) => Ok(Value::Int4(*n)),
+            Value::Int8(n) => Ok(Value::Int8(*n)),
+            Value::Float4(f) => Ok(Value::Float8((*f as f64).ceil())),
+            Value::Float8(f) => Ok(Value::Float8(f.ceil())),
+            Value::Numeric(s) => {
+                if let Ok(d) = s.parse::<Decimal>() {
+                    Ok(Value::Numeric(d.ceil().to_string()))
+                } else {
+                    Err(Error::query_execution("Invalid numeric value"))
+                }
+            }
+            _ => Err(Error::query_execution("CEIL requires a numeric argument")),
+        }
+    }
+
+    /// FLOOR(x) - largest integer <= x
+    fn func_floor(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("FLOOR requires exactly one argument"));
+        }
+        match &args[0] {
+            Value::Null => Ok(Value::Null),
+            Value::Int2(n) => Ok(Value::Int2(*n)),
+            Value::Int4(n) => Ok(Value::Int4(*n)),
+            Value::Int8(n) => Ok(Value::Int8(*n)),
+            Value::Float4(f) => Ok(Value::Float8((*f as f64).floor())),
+            Value::Float8(f) => Ok(Value::Float8(f.floor())),
+            Value::Numeric(s) => {
+                if let Ok(d) = s.parse::<Decimal>() {
+                    Ok(Value::Numeric(d.floor().to_string()))
+                } else {
+                    Err(Error::query_execution("Invalid numeric value"))
+                }
+            }
+            _ => Err(Error::query_execution("FLOOR requires a numeric argument")),
+        }
+    }
+
+    /// TRUNC(x [, precision]) - truncate toward zero
+    fn func_trunc(&self, args: &[Value]) -> Result<Value> {
+        if args.is_empty() || args.len() > 2 {
+            return Err(Error::query_execution("TRUNC requires 1 or 2 arguments"));
+        }
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+
+        let precision = if args.len() > 1 {
+            match &args[1] {
+                Value::Int2(n) => *n as i32,
+                Value::Int4(n) => *n,
+                Value::Int8(n) => *n as i32,
+                _ => 0,
+            }
+        } else {
+            0
+        };
+
+        match &args[0] {
+            Value::Int2(n) => Ok(Value::Int2(*n)),
+            Value::Int4(n) => Ok(Value::Int4(*n)),
+            Value::Int8(n) => Ok(Value::Int8(*n)),
+            Value::Float4(f) => {
+                let factor = 10_f32.powi(precision);
+                Ok(Value::Float4((f * factor).trunc() / factor))
+            }
+            Value::Float8(f) => {
+                let factor = 10_f64.powi(precision);
+                Ok(Value::Float8((f * factor).trunc() / factor))
+            }
+            Value::Numeric(s) => {
+                if let Ok(d) = s.parse::<Decimal>() {
+                    Ok(Value::Numeric(d.trunc_with_scale(precision as u32).to_string()))
+                } else {
+                    Err(Error::query_execution("Invalid numeric value"))
+                }
+            }
+            _ => Err(Error::query_execution("TRUNC requires a numeric argument")),
+        }
+    }
+
+    /// SQRT(x) - square root
+    fn func_sqrt(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("SQRT requires exactly one argument"));
+        }
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+        let x = self.value_to_f64(&args[0])?;
+        if x < 0.0 {
+            return Err(Error::query_execution("SQRT of negative number"));
+        }
+        Ok(Value::Float8(x.sqrt()))
+    }
+
+    /// POWER(x, y) - x raised to power y
+    fn func_power(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::query_execution("POWER requires exactly 2 arguments"));
+        }
+        if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+            return Ok(Value::Null);
+        }
+        let x = self.value_to_f64(&args[0])?;
+        let y = self.value_to_f64(&args[1])?;
+        Ok(Value::Float8(x.powf(y)))
+    }
+
+    /// MOD(x, y) - modulo (same as x % y)
+    fn func_mod(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::query_execution("MOD requires exactly 2 arguments"));
+        }
+        self.arithmetic_modulo(&args[0], &args[1])
+    }
+
+    /// SIGN(x) - returns -1, 0, or 1
+    fn func_sign(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("SIGN requires exactly one argument"));
+        }
+        match &args[0] {
+            Value::Null => Ok(Value::Null),
+            Value::Int2(n) => Ok(Value::Int4(n.signum() as i32)),
+            Value::Int4(n) => Ok(Value::Int4(n.signum())),
+            Value::Int8(n) => Ok(Value::Int4(n.signum() as i32)),
+            Value::Float4(f) => {
+                if f.is_nan() { Ok(Value::Float8(f64::NAN)) }
+                else if *f > 0.0 { Ok(Value::Int4(1)) }
+                else if *f < 0.0 { Ok(Value::Int4(-1)) }
+                else { Ok(Value::Int4(0)) }
+            }
+            Value::Float8(f) => {
+                if f.is_nan() { Ok(Value::Float8(f64::NAN)) }
+                else if *f > 0.0 { Ok(Value::Int4(1)) }
+                else if *f < 0.0 { Ok(Value::Int4(-1)) }
+                else { Ok(Value::Int4(0)) }
+            }
+            _ => Err(Error::query_execution("SIGN requires a numeric argument")),
+        }
+    }
+
+    /// GREATEST(val1, val2, ...) - returns the largest value
+    fn func_greatest(&self, args: &[Value]) -> Result<Value> {
+        if args.is_empty() {
+            return Err(Error::query_execution("GREATEST requires at least one argument"));
+        }
+        let mut result = &args[0];
+        for arg in &args[1..] {
+            if matches!(arg, Value::Null) {
+                continue;
+            }
+            if matches!(result, Value::Null) {
+                result = arg;
+                continue;
+            }
+            if self.compare_values_internal(arg, result)?.is_gt() {
+                result = arg;
+            }
+        }
+        Ok(result.clone())
+    }
+
+    /// LEAST(val1, val2, ...) - returns the smallest value
+    fn func_least(&self, args: &[Value]) -> Result<Value> {
+        if args.is_empty() {
+            return Err(Error::query_execution("LEAST requires at least one argument"));
+        }
+        let mut result = &args[0];
+        for arg in &args[1..] {
+            if matches!(arg, Value::Null) {
+                continue;
+            }
+            if matches!(result, Value::Null) {
+                result = arg;
+                continue;
+            }
+            if self.compare_values_internal(arg, result)?.is_lt() {
+                result = arg;
+            }
+        }
+        Ok(result.clone())
+    }
+
+    /// Helper for comparing values (returns Ordering)
+    fn compare_values_internal(&self, left: &Value, right: &Value) -> Result<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        match (left, right) {
+            (Value::Int2(a), Value::Int2(b)) => Ok(a.cmp(b)),
+            (Value::Int4(a), Value::Int4(b)) => Ok(a.cmp(b)),
+            (Value::Int8(a), Value::Int8(b)) => Ok(a.cmp(b)),
+            (Value::Float4(a), Value::Float4(b)) => Ok(a.partial_cmp(b).unwrap_or(Ordering::Equal)),
+            (Value::Float8(a), Value::Float8(b)) => Ok(a.partial_cmp(b).unwrap_or(Ordering::Equal)),
+            (Value::String(a), Value::String(b)) => Ok(a.cmp(b)),
+            // Cross-type numeric comparison
+            (Value::Int4(a), Value::Int8(b)) => Ok((*a as i64).cmp(b)),
+            (Value::Int8(a), Value::Int4(b)) => Ok(a.cmp(&(*b as i64))),
+            (Value::Int4(a), Value::Float8(b)) => Ok((*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)),
+            (Value::Float8(a), Value::Int4(b)) => Ok(a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)),
+            _ => Ok(Ordering::Equal),
+        }
+    }
+
+    /// RANDOM() - returns random value between 0 and 1
+    fn func_random(&self, args: &[Value]) -> Result<Value> {
+        if !args.is_empty() {
+            return Err(Error::query_execution("RANDOM takes no arguments"));
+        }
+        use std::time::{SystemTime, UNIX_EPOCH};
+        let seed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        // Simple LCG random number generator
+        let random = ((seed.wrapping_mul(1103515245).wrapping_add(12345)) as f64) / (u64::MAX as f64);
+        Ok(Value::Float8(random.abs()))
+    }
+
+    /// EXP(x) - e raised to power x
+    fn func_exp(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("EXP requires exactly one argument"));
+        }
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+        let x = self.value_to_f64(&args[0])?;
+        Ok(Value::Float8(x.exp()))
+    }
+
+    /// LN(x) or LOG(x) - natural logarithm
+    fn func_ln(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("LN requires exactly one argument"));
+        }
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+        let x = self.value_to_f64(&args[0])?;
+        if x <= 0.0 {
+            return Err(Error::query_execution("LN of non-positive number"));
+        }
+        Ok(Value::Float8(x.ln()))
+    }
+
+    /// LOG10(x) - base-10 logarithm
+    fn func_log10(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("LOG10 requires exactly one argument"));
+        }
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+        let x = self.value_to_f64(&args[0])?;
+        if x <= 0.0 {
+            return Err(Error::query_execution("LOG10 of non-positive number"));
+        }
+        Ok(Value::Float8(x.log10()))
+    }
+
+    /// SIN(x) - sine (x in radians)
+    fn func_sin(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("SIN requires exactly one argument"));
+        }
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+        let x = self.value_to_f64(&args[0])?;
+        Ok(Value::Float8(x.sin()))
+    }
+
+    /// COS(x) - cosine (x in radians)
+    fn func_cos(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("COS requires exactly one argument"));
+        }
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+        let x = self.value_to_f64(&args[0])?;
+        Ok(Value::Float8(x.cos()))
+    }
+
+    /// TAN(x) - tangent (x in radians)
+    fn func_tan(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("TAN requires exactly one argument"));
+        }
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+        let x = self.value_to_f64(&args[0])?;
+        Ok(Value::Float8(x.tan()))
+    }
+
+    /// ASIN(x) - arcsine (result in radians)
+    fn func_asin(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("ASIN requires exactly one argument"));
+        }
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+        let x = self.value_to_f64(&args[0])?;
+        if x < -1.0 || x > 1.0 {
+            return Err(Error::query_execution("ASIN argument out of range [-1, 1]"));
+        }
+        Ok(Value::Float8(x.asin()))
+    }
+
+    /// ACOS(x) - arccosine (result in radians)
+    fn func_acos(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("ACOS requires exactly one argument"));
+        }
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+        let x = self.value_to_f64(&args[0])?;
+        if x < -1.0 || x > 1.0 {
+            return Err(Error::query_execution("ACOS argument out of range [-1, 1]"));
+        }
+        Ok(Value::Float8(x.acos()))
+    }
+
+    /// ATAN(x) - arctangent (result in radians)
+    fn func_atan(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("ATAN requires exactly one argument"));
+        }
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+        let x = self.value_to_f64(&args[0])?;
+        Ok(Value::Float8(x.atan()))
+    }
+
+    /// ATAN2(y, x) - arctangent of y/x
+    fn func_atan2(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 2 {
+            return Err(Error::query_execution("ATAN2 requires exactly 2 arguments"));
+        }
+        if matches!(args[0], Value::Null) || matches!(args[1], Value::Null) {
+            return Ok(Value::Null);
+        }
+        let y = self.value_to_f64(&args[0])?;
+        let x = self.value_to_f64(&args[1])?;
+        Ok(Value::Float8(y.atan2(x)))
+    }
+
+    /// DEGREES(x) - convert radians to degrees
+    fn func_degrees(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("DEGREES requires exactly one argument"));
+        }
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+        let x = self.value_to_f64(&args[0])?;
+        Ok(Value::Float8(x.to_degrees()))
+    }
+
+    /// RADIANS(x) - convert degrees to radians
+    fn func_radians(&self, args: &[Value]) -> Result<Value> {
+        if args.len() != 1 {
+            return Err(Error::query_execution("RADIANS requires exactly one argument"));
+        }
+        if matches!(args[0], Value::Null) {
+            return Ok(Value::Null);
+        }
+        let x = self.value_to_f64(&args[0])?;
+        Ok(Value::Float8(x.to_radians()))
     }
 }
 

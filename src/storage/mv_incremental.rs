@@ -972,6 +972,8 @@ impl IncrementalRefresher {
                     AggregateFunction::Min => Value::Null,
                     AggregateFunction::Max => Value::Null,
                     AggregateFunction::JsonAgg => Value::Json("[]".to_string()),
+                    AggregateFunction::ArrayAgg => Value::Array(vec![]),
+                    AggregateFunction::StringAgg { .. } => Value::String(String::new()),
                 };
                 values.push(initial);
             } else {
