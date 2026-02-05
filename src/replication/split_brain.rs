@@ -153,6 +153,8 @@ pub struct SplitBrainProtector {
     shutdown_tx: broadcast::Sender<()>,
     /// Event channel for state changes
     event_tx: mpsc::Sender<ProtectionEvent>,
+    /// Current LSN (from WAL store)
+    current_lsn: Arc<AtomicU64>,
 }
 
 /// Events from the protection system
@@ -170,6 +172,8 @@ pub enum ProtectionEvent {
     ElectionStarted { term: u64, reason: VoteReason },
     /// Election completed
     ElectionCompleted { winner: Option<Uuid>, term: u64 },
+    /// Election needed (signal to coordinator to start election)
+    ElectionNeeded { reason: VoteReason },
 }
 
 impl SplitBrainProtector {
@@ -201,6 +205,7 @@ impl SplitBrainProtector {
             is_running: Arc::new(AtomicBool::new(false)),
             shutdown_tx,
             event_tx,
+            current_lsn: Arc::new(AtomicU64::new(0)),
         };
 
         (protector, event_rx)
@@ -234,12 +239,70 @@ impl SplitBrainProtector {
     /// Connect to an observer node
     async fn connect_to_observer(&self, addr: SocketAddr) -> Result<()> {
         let conn = ReplicationConnection::connect(addr, Duration::from_secs(5)).await?;
-        let (msg_tx, _msg_rx) = mpsc::channel(100);
+        let (msg_tx, mut msg_rx) = mpsc::channel::<Message>(100);
 
         self.observer_connections.write().await.insert(addr, msg_tx);
         tracing::info!("Connected to observer at {}", addr);
 
-        // TODO: Start connection handler task
+        // Start connection handler task
+        let vote_state = self.vote_state.clone();
+        let term = self.term.clone();
+        let fencing_token = self.fencing_token.clone();
+        let event_tx = self.event_tx.clone();
+        let is_running = self.is_running.clone();
+
+        tokio::spawn(async move {
+            while is_running.load(Ordering::SeqCst) {
+                // Receive responses from the observer
+                match tokio::time::timeout(Duration::from_secs(30), msg_rx.recv()).await {
+                    Ok(Some(msg)) => {
+                        match msg.header.msg_type {
+                            MessageType::VoteResponse => {
+                                if let Ok(response) = bincode::deserialize::<VoteResponsePayload>(&msg.payload) {
+                                    if response.vote_granted {
+                                        let mut state = vote_state.write().await;
+                                        if response.term == state.term {
+                                            state.votes_received.insert(response.voter_id);
+                                            tracing::info!(
+                                                "Received vote from {} for term {} (total: {})",
+                                                response.voter_id,
+                                                response.term,
+                                                state.votes_received.len()
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                            MessageType::FencingToken => {
+                                if let Ok(payload) = bincode::deserialize::<FencingTokenPayload>(&msg.payload) {
+                                    let current_token = fencing_token.load(Ordering::SeqCst);
+                                    if payload.token > current_token {
+                                        fencing_token.store(payload.token, Ordering::SeqCst);
+                                        tracing::info!(
+                                            "Updated fencing token: {} -> {}",
+                                            current_token,
+                                            payload.token
+                                        );
+                                    }
+                                }
+                            }
+                            _ => {
+                                tracing::trace!("Received message type: {:?}", msg.header.msg_type);
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!("Observer connection closed");
+                        break;
+                    }
+                    Err(_) => {
+                        // Timeout - keep waiting
+                        continue;
+                    }
+                }
+            }
+            tracing::debug!("Connection handler for {:?} stopped", addr);
+        });
 
         Ok(())
     }
@@ -253,6 +316,7 @@ impl SplitBrainProtector {
         let observer_connections = self.observer_connections.clone();
         let interval = self.config.heartbeat_interval;
         let is_running = self.is_running.clone();
+        let current_lsn = self.current_lsn.clone();
 
         tokio::spawn(async move {
             let mut timer = tokio::time::interval(interval);
@@ -261,11 +325,12 @@ impl SplitBrainProtector {
                 timer.tick().await;
 
                 let current_role = *role.read().await;
+                let lsn = current_lsn.load(Ordering::SeqCst);
                 let heartbeat = super::transport::HeartbeatPayload {
                     node_id,
                     role: current_role,
-                    current_lsn: 0, // TODO: Get from WAL
-                    flush_lsn: 0,
+                    current_lsn: lsn,
+                    flush_lsn: lsn,
                     apply_lsn: None,
                     timestamp_ms: chrono::Utc::now().timestamp_millis() as u64,
                     lag_bytes: 0,
@@ -332,7 +397,11 @@ impl SplitBrainProtector {
                                 reason: "Heartbeat timeout".to_string(),
                             }).await;
 
-                            // TODO: Start election
+                            // Signal that an election should start
+                            // The actual election is coordinated through request_votes()
+                            let _ = event_tx.send(ProtectionEvent::ElectionNeeded {
+                                reason: VoteReason::PrimaryFailure,
+                            }).await;
                         }
                     }
                 }
@@ -373,7 +442,7 @@ impl SplitBrainProtector {
         let vote_request = VoteRequestPayload {
             candidate_id: self.node_id,
             term: new_term,
-            last_lsn: 0, // TODO: Get current LSN
+            last_lsn: self.current_lsn.load(Ordering::SeqCst),
             previous_primary: *self.known_primary.read().await,
             reason,
         };
@@ -383,17 +452,54 @@ impl SplitBrainProtector {
 
         let msg = Message::new(MessageType::VoteRequest, Bytes::from(payload), 0);
 
-        // Send to all nodes
-        let mut votes_received = 1; // Self vote
+        // Send vote requests to all observers
         let connections = self.observer_connections.read().await;
+        let observer_count = connections.len();
 
         for (addr, tx) in connections.iter() {
-            if tx.send(msg.clone()).await.is_ok() {
-                // TODO: Wait for response with timeout
-                // For now, assume vote granted
-                votes_received += 1;
+            if let Err(e) = tx.send(msg.clone()).await {
+                tracing::warn!("Failed to send vote request to {}: {}", addr, e);
             }
         }
+        drop(connections);
+
+        // Wait for votes with timeout
+        let vote_timeout = self.config.vote_timeout;
+        let start = Instant::now();
+
+        loop {
+            // Check if we have enough votes
+            let vote_state = self.vote_state.read().await;
+            let votes_received = vote_state.votes_received.len();
+
+            if votes_received >= self.config.quorum_size {
+                tracing::info!(
+                    "Quorum reached: {} votes (needed: {})",
+                    votes_received,
+                    self.config.quorum_size
+                );
+                break;
+            }
+
+            // Check for timeout
+            if start.elapsed() >= vote_timeout {
+                tracing::warn!(
+                    "Vote timeout after {:?}, received {} of {} required votes",
+                    start.elapsed(),
+                    votes_received,
+                    self.config.quorum_size
+                );
+                break;
+            }
+
+            drop(vote_state);
+
+            // Brief pause before checking again
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        // Final vote count
+        let votes_received = self.vote_state.read().await.votes_received.len();
 
         // Check if we won
         let won = votes_received >= self.config.quorum_size;
@@ -458,6 +564,16 @@ impl SplitBrainProtector {
         }
 
         Ok(())
+    }
+
+    /// Update the current LSN (called by WAL store on writes)
+    pub fn update_current_lsn(&self, lsn: u64) {
+        self.current_lsn.store(lsn, Ordering::SeqCst);
+    }
+
+    /// Get the current LSN
+    pub fn get_current_lsn(&self) -> u64 {
+        self.current_lsn.load(Ordering::SeqCst)
     }
 
     /// Handle incoming vote request

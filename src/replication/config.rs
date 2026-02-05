@@ -195,6 +195,14 @@ pub struct WalStreamingConfig {
     /// Checkpoint interval
     #[serde(default = "default_checkpoint_interval")]
     pub checkpoint_interval: Duration,
+
+    /// Heartbeat interval for standby monitoring
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval: Duration,
+
+    /// Heartbeat timeout before marking standby as disconnected
+    #[serde(default = "default_heartbeat_timeout")]
+    pub heartbeat_timeout: Duration,
 }
 
 impl Default for WalStreamingConfig {
@@ -206,6 +214,8 @@ impl Default for WalStreamingConfig {
             batch_size: default_batch_size(),
             enable_compression: true,
             checkpoint_interval: default_checkpoint_interval(),
+            heartbeat_interval: default_heartbeat_interval(),
+            heartbeat_timeout: default_heartbeat_timeout(),
         }
     }
 }
@@ -902,6 +912,14 @@ fn default_true() -> bool {
 
 fn default_checkpoint_interval() -> Duration {
     Duration::from_secs(300) // 5 minutes
+}
+
+fn default_heartbeat_interval() -> Duration {
+    Duration::from_secs(1)
+}
+
+fn default_heartbeat_timeout() -> Duration {
+    Duration::from_secs(10)
 }
 
 fn default_health_check_interval() -> Duration {

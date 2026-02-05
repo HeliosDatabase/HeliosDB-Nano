@@ -603,25 +603,53 @@ impl Node256 {
 
 // Implement common operations on ArtNode enum
 impl ArtNode {
-    /// Get the header for any node type
+    /// Get the header for any non-leaf node type.
+    ///
+    /// # Panics
+    /// Panics if called on a Leaf node. Use `try_header()` for a safe alternative.
     pub fn header(&self) -> &NodeHeader {
         match self {
             ArtNode::Node4(n) => &n.header,
             ArtNode::Node16(n) => &n.header,
             ArtNode::Node48(n) => &n.header,
             ArtNode::Node256(n) => &n.header,
-            ArtNode::Leaf(_) => panic!("Leaf nodes don't have headers"),
+            ArtNode::Leaf(_) => panic!("Leaf nodes don't have headers - use try_header() for safe access"),
         }
     }
 
-    /// Get mutable header for any node type
+    /// Get mutable header for any non-leaf node type.
+    ///
+    /// # Panics
+    /// Panics if called on a Leaf node. Use `try_header_mut()` for a safe alternative.
     pub fn header_mut(&mut self) -> &mut NodeHeader {
         match self {
             ArtNode::Node4(n) => &mut n.header,
             ArtNode::Node16(n) => &mut n.header,
             ArtNode::Node48(n) => &mut n.header,
             ArtNode::Node256(n) => &mut n.header,
-            ArtNode::Leaf(_) => panic!("Leaf nodes don't have headers"),
+            ArtNode::Leaf(_) => panic!("Leaf nodes don't have headers - use try_header_mut() for safe access"),
+        }
+    }
+
+    /// Safely get the header for any node type (returns None for Leaf nodes)
+    pub fn try_header(&self) -> Option<&NodeHeader> {
+        match self {
+            ArtNode::Node4(n) => Some(&n.header),
+            ArtNode::Node16(n) => Some(&n.header),
+            ArtNode::Node48(n) => Some(&n.header),
+            ArtNode::Node256(n) => Some(&n.header),
+            ArtNode::Leaf(_) => None,
+        }
+    }
+
+    /// Safely get mutable header for any node type (returns None for Leaf nodes)
+    pub fn try_header_mut(&mut self) -> Option<&mut NodeHeader> {
+        match self {
+            ArtNode::Node4(n) => Some(&mut n.header),
+            ArtNode::Node16(n) => Some(&mut n.header),
+            ArtNode::Node48(n) => Some(&mut n.header),
+            ArtNode::Node256(n) => Some(&mut n.header),
+            ArtNode::Leaf(_) => None,
         }
     }
 

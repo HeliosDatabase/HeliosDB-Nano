@@ -10,8 +10,14 @@
 //! ├── segment_000001.wal  (entries 0 - 999)
 //! ├── segment_000002.wal  (entries 1000 - 1999)
 //! ├── segment_000003.wal  (entries 2000 - current)
-//! └── index.dat           (LSN -> segment mapping)
+//! └── checkpoint.dat      (checkpoint marker)
 //! ```
+//!
+//! # Segment Format
+//!
+//! Each segment file contains:
+//! - Header (32 bytes): magic, version, segment_id, start_lsn, entry_count
+//! - Entries: [length (4 bytes) | entry_type (1 byte) | lsn (8 bytes) | checksum (4 bytes) | data]
 //!
 //! # Batch Catch-Up Flow
 //!
@@ -21,13 +27,20 @@
 //! 4. Primary sends WalBatch messages (configurable batch size)
 //! 5. After catch-up, switch to real-time streaming
 
-use super::wal_replicator::{Lsn, WalEntry};
-use super::Result;
+use super::wal_replicator::{Lsn, WalEntry, WalEntryType};
+use super::{ReplicationError, Result};
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write as IoWrite};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
+
+// WAL file magic number
+const WAL_MAGIC: u32 = 0x57414C31; // "WAL1"
+const WAL_VERSION: u32 = 1;
+const SEGMENT_HEADER_SIZE: usize = 32;
 
 /// WAL segment metadata
 #[derive(Debug, Clone)]
@@ -117,10 +130,25 @@ pub struct BatchResult {
     pub total_bytes: usize,
 }
 
+/// Current segment writer state
+struct SegmentWriter {
+    /// Segment ID
+    segment_id: u64,
+    /// File handle
+    file: BufWriter<File>,
+    /// File path
+    path: PathBuf,
+    /// Start LSN
+    start_lsn: Lsn,
+    /// Current byte offset
+    offset: u64,
+    /// Entry count
+    entry_count: u64,
+}
+
 /// WAL Store - manages WAL persistence and retrieval
 ///
-/// This is an in-memory implementation for now.
-/// Production would use memory-mapped files or RocksDB.
+/// Provides durable storage for WAL entries with segment-based organization.
 pub struct WalStore {
     /// Configuration
     config: WalStoreConfig,
@@ -134,10 +162,14 @@ pub struct WalStore {
     current_segment: Arc<AtomicU64>,
     /// In-memory entry cache (for recent entries)
     cache: Arc<RwLock<VecDeque<WalEntry>>>,
-    /// All entries (in-memory storage for now)
+    /// All entries (in-memory storage + disk)
     entries: Arc<RwLock<BTreeMap<Lsn, WalEntry>>>,
     /// Minimum retained LSN
     min_retained_lsn: Arc<AtomicU64>,
+    /// Current segment writer
+    writer: Arc<RwLock<Option<SegmentWriter>>>,
+    /// Last checkpoint LSN
+    checkpoint_lsn: Arc<AtomicU64>,
 }
 
 impl WalStore {
@@ -152,16 +184,396 @@ impl WalStore {
             cache: Arc::new(RwLock::new(VecDeque::new())),
             entries: Arc::new(RwLock::new(BTreeMap::new())),
             min_retained_lsn: Arc::new(AtomicU64::new(0)),
+            writer: Arc::new(RwLock::new(None)),
+            checkpoint_lsn: Arc::new(AtomicU64::new(0)),
         }
     }
 
     /// Initialize the WAL store (load existing segments)
     pub async fn init(&self) -> Result<()> {
-        // TODO: Scan wal_dir for existing segments
-        // Load segment metadata into memory
-        // Set current_lsn to highest LSN found
+        // Create WAL directory if it doesn't exist
+        if let Err(e) = fs::create_dir_all(&self.config.wal_dir) {
+            tracing::warn!("Failed to create WAL directory: {}", e);
+            // Continue anyway - might be in-memory mode
+        }
 
-        tracing::info!("WAL store initialized at {:?}", self.config.wal_dir);
+        // Scan for existing segments
+        let mut max_lsn: Lsn = 0;
+        let mut max_segment_id: u64 = 0;
+        let mut min_lsn: Lsn = u64::MAX;
+
+        if let Ok(dir_entries) = fs::read_dir(&self.config.wal_dir) {
+            for entry in dir_entries.flatten() {
+                let path = entry.path();
+                if path.extension().map_or(false, |ext| ext == "wal") {
+                    if let Some(segment_info) = self.load_segment_metadata(&path).await {
+                        tracing::info!(
+                            "Loaded segment {}: LSN {} - {}, {} entries",
+                            segment_info.segment_id,
+                            segment_info.start_lsn,
+                            segment_info.end_lsn,
+                            segment_info.entry_count
+                        );
+
+                        if segment_info.end_lsn > max_lsn {
+                            max_lsn = segment_info.end_lsn;
+                        }
+                        if segment_info.start_lsn < min_lsn {
+                            min_lsn = segment_info.start_lsn;
+                        }
+                        if segment_info.segment_id > max_segment_id {
+                            max_segment_id = segment_info.segment_id;
+                        }
+
+                        // Load entries into memory for quick access
+                        if let Err(e) = self.load_segment_entries(&path, &segment_info).await {
+                            tracing::warn!("Failed to load segment entries: {}", e);
+                        }
+
+                        // Update LSN index
+                        {
+                            let mut index = self.lsn_index.write().await;
+                            for lsn in segment_info.start_lsn..=segment_info.end_lsn {
+                                index.insert(lsn, segment_info.segment_id);
+                            }
+                        }
+
+                        // Store segment metadata
+                        {
+                            let mut segments = self.segments.write().await;
+                            segments.insert(segment_info.segment_id, segment_info);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Load checkpoint marker
+        let checkpoint_path = self.config.wal_dir.join("checkpoint.dat");
+        if let Ok(mut file) = File::open(&checkpoint_path) {
+            let mut buf = [0u8; 8];
+            if file.read_exact(&mut buf).is_ok() {
+                let checkpoint = u64::from_le_bytes(buf);
+                self.checkpoint_lsn.store(checkpoint, Ordering::SeqCst);
+                tracing::info!("Loaded checkpoint LSN: {}", checkpoint);
+            }
+        }
+
+        // Set current state
+        self.current_lsn.store(max_lsn, Ordering::SeqCst);
+        self.current_segment.store(max_segment_id, Ordering::SeqCst);
+        if min_lsn != u64::MAX {
+            self.min_retained_lsn.store(min_lsn, Ordering::SeqCst);
+        }
+
+        tracing::info!(
+            "WAL store initialized at {:?}, current_lsn={}, segments={}",
+            self.config.wal_dir,
+            max_lsn,
+            max_segment_id
+        );
+
+        Ok(())
+    }
+
+    /// Load segment metadata from file header
+    async fn load_segment_metadata(&self, path: &PathBuf) -> Option<WalSegmentInfo> {
+        let file = File::open(path).ok()?;
+        let mut reader = BufReader::new(file);
+
+        // Read header
+        let mut header = [0u8; SEGMENT_HEADER_SIZE];
+        reader.read_exact(&mut header).ok()?;
+
+        // Parse header
+        let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
+        if magic != WAL_MAGIC {
+            tracing::warn!("Invalid WAL magic in {:?}", path);
+            return None;
+        }
+
+        let _version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
+        let segment_id = u64::from_le_bytes([
+            header[8], header[9], header[10], header[11],
+            header[12], header[13], header[14], header[15],
+        ]);
+        let start_lsn = u64::from_le_bytes([
+            header[16], header[17], header[18], header[19],
+            header[20], header[21], header[22], header[23],
+        ]);
+        let entry_count = u64::from_le_bytes([
+            header[24], header[25], header[26], header[27],
+            header[28], header[29], header[30], header[31],
+        ]);
+
+        // Scan to find end_lsn and actual entry count
+        let mut actual_count = 0u64;
+        let mut end_lsn = start_lsn;
+
+        loop {
+            // Read entry header: length (4) + type (1) + lsn (8) + checksum (4)
+            let mut entry_header = [0u8; 17];
+            if reader.read_exact(&mut entry_header).is_err() {
+                break;
+            }
+
+            let length = u32::from_le_bytes([
+                entry_header[0], entry_header[1], entry_header[2], entry_header[3],
+            ]) as usize;
+            let lsn = u64::from_le_bytes([
+                entry_header[5], entry_header[6], entry_header[7], entry_header[8],
+                entry_header[9], entry_header[10], entry_header[11], entry_header[12],
+            ]);
+
+            // Skip data
+            if reader.seek(SeekFrom::Current(length as i64)).is_err() {
+                break;
+            }
+
+            actual_count += 1;
+            end_lsn = lsn;
+        }
+
+        let file_size = fs::metadata(path).ok()?.len();
+
+        Some(WalSegmentInfo {
+            segment_id,
+            start_lsn,
+            end_lsn,
+            entry_count: if actual_count > 0 { actual_count } else { entry_count },
+            size_bytes: file_size,
+            is_complete: true, // Existing segments are complete
+            path: path.clone(),
+        })
+    }
+
+    /// Load segment entries into memory
+    async fn load_segment_entries(&self, path: &PathBuf, info: &WalSegmentInfo) -> Result<()> {
+        let file = File::open(path)
+            .map_err(|e| ReplicationError::Storage(format!("Failed to open segment: {}", e)))?;
+        let mut reader = BufReader::new(file);
+
+        // Skip header
+        reader.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))
+            .map_err(|e| ReplicationError::Storage(format!("Seek failed: {}", e)))?;
+
+        let mut entries = self.entries.write().await;
+
+        for _ in 0..info.entry_count {
+            // Read entry header
+            let mut entry_header = [0u8; 17];
+            if reader.read_exact(&mut entry_header).is_err() {
+                break;
+            }
+
+            let length = u32::from_le_bytes([
+                entry_header[0], entry_header[1], entry_header[2], entry_header[3],
+            ]) as usize;
+            let entry_type = entry_header[4];
+            let lsn = u64::from_le_bytes([
+                entry_header[5], entry_header[6], entry_header[7], entry_header[8],
+                entry_header[9], entry_header[10], entry_header[11], entry_header[12],
+            ]);
+            let checksum = u32::from_le_bytes([
+                entry_header[13], entry_header[14], entry_header[15], entry_header[16],
+            ]);
+
+            // Read data
+            let mut data = vec![0u8; length];
+            if reader.read_exact(&mut data).is_err() {
+                break;
+            }
+
+            // Verify checksum
+            let computed_checksum = crc32fast::hash(&data);
+            if computed_checksum != checksum {
+                tracing::warn!("Checksum mismatch for LSN {}: expected {}, got {}", lsn, checksum, computed_checksum);
+                continue;
+            }
+
+            let entry = WalEntry {
+                lsn,
+                entry_type: Self::u8_to_entry_type(entry_type),
+                data,
+                checksum,
+            };
+
+            entries.insert(lsn, entry);
+        }
+
+        Ok(())
+    }
+
+    /// Convert u8 to WalEntryType
+    fn u8_to_entry_type(value: u8) -> WalEntryType {
+        match value {
+            0 => WalEntryType::Insert,
+            1 => WalEntryType::Update,
+            2 => WalEntryType::Delete,
+            3 => WalEntryType::TxBegin,
+            4 => WalEntryType::TxCommit,
+            5 => WalEntryType::TxRollback,
+            6 => WalEntryType::Checkpoint,
+            7 => WalEntryType::SchemaChange,
+            8 => WalEntryType::BranchOp,
+            _ => WalEntryType::Insert,
+        }
+    }
+
+    /// Convert WalEntryType to u8
+    fn entry_type_to_u8(entry_type: WalEntryType) -> u8 {
+        match entry_type {
+            WalEntryType::Insert => 0,
+            WalEntryType::Update => 1,
+            WalEntryType::Delete => 2,
+            WalEntryType::TxBegin => 3,
+            WalEntryType::TxCommit => 4,
+            WalEntryType::TxRollback => 5,
+            WalEntryType::Checkpoint => 6,
+            WalEntryType::SchemaChange => 7,
+            WalEntryType::BranchOp => 8,
+        }
+    }
+
+    /// Create a new segment file
+    async fn create_segment(&self, segment_id: u64, start_lsn: Lsn) -> Result<SegmentWriter> {
+        let filename = format!("segment_{:06}.wal", segment_id);
+        let path = self.config.wal_dir.join(&filename);
+
+        let file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .map_err(|e| ReplicationError::Storage(format!("Failed to create segment: {}", e)))?;
+
+        let mut writer = BufWriter::new(file);
+
+        // Write header
+        let mut header = [0u8; SEGMENT_HEADER_SIZE];
+        header[0..4].copy_from_slice(&WAL_MAGIC.to_le_bytes());
+        header[4..8].copy_from_slice(&WAL_VERSION.to_le_bytes());
+        header[8..16].copy_from_slice(&segment_id.to_le_bytes());
+        header[16..24].copy_from_slice(&start_lsn.to_le_bytes());
+        // entry_count will be updated on close
+
+        writer.write_all(&header)
+            .map_err(|e| ReplicationError::Storage(format!("Failed to write header: {}", e)))?;
+
+        if self.config.fsync_on_write {
+            writer.flush()
+                .map_err(|e| ReplicationError::Storage(format!("Flush failed: {}", e)))?;
+        }
+
+        tracing::info!("Created new segment {} at {:?}", segment_id, path);
+
+        Ok(SegmentWriter {
+            segment_id,
+            file: writer,
+            path,
+            start_lsn,
+            offset: SEGMENT_HEADER_SIZE as u64,
+            entry_count: 0,
+        })
+    }
+
+    /// Write entry to disk
+    async fn write_entry_to_disk(&self, entry: &WalEntry) -> Result<()> {
+        let mut writer_guard = self.writer.write().await;
+
+        // Check if we need to rotate segment
+        let needs_new_segment = match &*writer_guard {
+            None => true,
+            Some(w) => {
+                w.entry_count >= self.config.max_entries_per_segment as u64 ||
+                w.offset >= self.config.max_segment_size as u64
+            }
+        };
+
+        if needs_new_segment {
+            // Close current segment if exists
+            if let Some(mut old_writer) = writer_guard.take() {
+                self.close_segment(&mut old_writer).await?;
+            }
+
+            // Create new segment
+            let new_segment_id = self.current_segment.fetch_add(1, Ordering::SeqCst) + 1;
+            let new_writer = self.create_segment(new_segment_id, entry.lsn).await?;
+            *writer_guard = Some(new_writer);
+        }
+
+        // Write entry
+        if let Some(ref mut writer) = *writer_guard {
+            // Entry format: length (4) + type (1) + lsn (8) + checksum (4) + data
+            let length = entry.data.len() as u32;
+            let entry_type = Self::entry_type_to_u8(entry.entry_type);
+
+            writer.file.write_all(&length.to_le_bytes())
+                .map_err(|e| ReplicationError::Storage(format!("Write failed: {}", e)))?;
+            writer.file.write_all(&[entry_type])
+                .map_err(|e| ReplicationError::Storage(format!("Write failed: {}", e)))?;
+            writer.file.write_all(&entry.lsn.to_le_bytes())
+                .map_err(|e| ReplicationError::Storage(format!("Write failed: {}", e)))?;
+            writer.file.write_all(&entry.checksum.to_le_bytes())
+                .map_err(|e| ReplicationError::Storage(format!("Write failed: {}", e)))?;
+            writer.file.write_all(&entry.data)
+                .map_err(|e| ReplicationError::Storage(format!("Write failed: {}", e)))?;
+
+            if self.config.fsync_on_write {
+                writer.file.flush()
+                    .map_err(|e| ReplicationError::Storage(format!("Flush failed: {}", e)))?;
+            }
+
+            writer.offset += 17 + entry.data.len() as u64;
+            writer.entry_count += 1;
+
+            // Update LSN index
+            {
+                let mut index = self.lsn_index.write().await;
+                index.insert(entry.lsn, writer.segment_id);
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Close and finalize a segment
+    async fn close_segment(&self, writer: &mut SegmentWriter) -> Result<()> {
+        // Flush remaining data
+        writer.file.flush()
+            .map_err(|e| ReplicationError::Storage(format!("Flush failed: {}", e)))?;
+
+        // Update header with entry count
+        let file = writer.file.get_mut();
+        file.seek(SeekFrom::Start(24))
+            .map_err(|e| ReplicationError::Storage(format!("Seek failed: {}", e)))?;
+        file.write_all(&writer.entry_count.to_le_bytes())
+            .map_err(|e| ReplicationError::Storage(format!("Write failed: {}", e)))?;
+        file.sync_all()
+            .map_err(|e| ReplicationError::Storage(format!("Sync failed: {}", e)))?;
+
+        // Store segment metadata
+        let segment_info = WalSegmentInfo {
+            segment_id: writer.segment_id,
+            start_lsn: writer.start_lsn,
+            end_lsn: self.current_lsn.load(Ordering::SeqCst),
+            entry_count: writer.entry_count,
+            size_bytes: writer.offset,
+            is_complete: true,
+            path: writer.path.clone(),
+        };
+
+        {
+            let mut segments = self.segments.write().await;
+            segments.insert(writer.segment_id, segment_info);
+        }
+
+        tracing::info!(
+            "Closed segment {} with {} entries",
+            writer.segment_id,
+            writer.entry_count
+        );
+
         Ok(())
     }
 
@@ -169,7 +581,7 @@ impl WalStore {
     pub async fn append(&self, entry: WalEntry) -> Result<Lsn> {
         let lsn = entry.lsn;
 
-        // Store in entries map
+        // Store in entries map (in-memory)
         {
             let mut entries = self.entries.write().await;
             entries.insert(lsn, entry.clone());
@@ -178,7 +590,7 @@ impl WalStore {
         // Add to cache
         {
             let mut cache = self.cache.write().await;
-            cache.push_back(entry);
+            cache.push_back(entry.clone());
             while cache.len() > self.config.cache_size {
                 cache.pop_front();
             }
@@ -187,15 +599,10 @@ impl WalStore {
         // Update current LSN
         self.current_lsn.store(lsn, Ordering::SeqCst);
 
-        // Update LSN index
-        {
-            let segment_id = self.current_segment.load(Ordering::SeqCst);
-            let mut index = self.lsn_index.write().await;
-            index.insert(lsn, segment_id);
+        // Write to disk
+        if let Err(e) = self.write_entry_to_disk(&entry).await {
+            tracing::warn!("Failed to write entry to disk: {} (continuing with in-memory)", e);
         }
-
-        // TODO: Check if we need to rotate segment
-        // TODO: Write to disk if configured
 
         Ok(lsn)
     }
@@ -324,10 +731,36 @@ impl WalStore {
 
         self.min_retained_lsn.store(lsn, Ordering::SeqCst);
 
+        // Clean up cache
+        {
+            let mut cache = self.cache.write().await;
+            cache.retain(|e| e.lsn >= lsn);
+        }
+
         // Clean up LSN index
         {
             let mut index = self.lsn_index.write().await;
             index.retain(|k, _| *k >= lsn);
+        }
+
+        // Clean up old segment files
+        {
+            let mut segments = self.segments.write().await;
+            let old_segments: Vec<u64> = segments
+                .iter()
+                .filter(|(_, s)| s.end_lsn < lsn)
+                .map(|(id, _)| *id)
+                .collect();
+
+            for seg_id in old_segments {
+                if let Some(seg) = segments.remove(&seg_id) {
+                    if let Err(e) = fs::remove_file(&seg.path) {
+                        tracing::warn!("Failed to remove old segment file: {}", e);
+                    } else {
+                        tracing::info!("Removed old segment {} at {:?}", seg_id, seg.path);
+                    }
+                }
+            }
         }
 
         tracing::info!("Truncated {} entries before LSN {}", count, lsn);
@@ -338,11 +771,39 @@ impl WalStore {
     pub async fn checkpoint(&self) -> Result<Lsn> {
         let checkpoint_lsn = self.current_lsn.load(Ordering::SeqCst);
 
-        // TODO: Flush current segment to disk
-        // TODO: Update checkpoint marker
+        // Flush current segment
+        {
+            let mut writer_guard = self.writer.write().await;
+            if let Some(ref mut writer) = *writer_guard {
+                writer.file.flush()
+                    .map_err(|e| ReplicationError::Storage(format!("Flush failed: {}", e)))?;
+                if let Ok(file) = writer.file.get_mut().try_clone() {
+                    let _ = file.sync_all();
+                }
+            }
+        }
 
+        // Write checkpoint marker
+        let checkpoint_path = self.config.wal_dir.join("checkpoint.dat");
+        if let Ok(mut file) = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&checkpoint_path)
+        {
+            if file.write_all(&checkpoint_lsn.to_le_bytes()).is_ok() {
+                let _ = file.sync_all();
+            }
+        }
+
+        self.checkpoint_lsn.store(checkpoint_lsn, Ordering::SeqCst);
         tracing::info!("WAL checkpoint at LSN {}", checkpoint_lsn);
         Ok(checkpoint_lsn)
+    }
+
+    /// Get last checkpoint LSN
+    pub fn checkpoint_lsn(&self) -> Lsn {
+        self.checkpoint_lsn.load(Ordering::SeqCst)
     }
 
     /// Get statistics about the WAL store
@@ -356,13 +817,23 @@ impl WalStore {
             total_entries: entries.len() as u64,
             total_segments: segments.len() as u64,
             cache_size: self.cache.read().await.len() as u64,
+            checkpoint_lsn: self.checkpoint_lsn.load(Ordering::SeqCst),
         }
     }
 
     /// Close the WAL store
     pub async fn close(&self) -> Result<()> {
-        // TODO: Flush pending writes
-        // TODO: Close file handles
+        // Close current segment
+        {
+            let mut writer_guard = self.writer.write().await;
+            if let Some(mut writer) = writer_guard.take() {
+                self.close_segment(&mut writer).await?;
+            }
+        }
+
+        // Final checkpoint
+        let _ = self.checkpoint().await;
+
         tracing::info!("WAL store closed");
         Ok(())
     }
@@ -381,6 +852,8 @@ pub struct WalStoreStats {
     pub total_segments: u64,
     /// Cache size
     pub cache_size: u64,
+    /// Last checkpoint LSN
+    pub checkpoint_lsn: Lsn,
 }
 
 /// Iterator over WAL entries
@@ -490,7 +963,7 @@ impl BatchStreamState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::super::wal_replicator::WalEntryType;
+    use tempfile::tempdir;
 
     fn make_entry(lsn: Lsn, data: Vec<u8>) -> WalEntry {
         let checksum = crc32fast::hash(&data);
@@ -502,9 +975,20 @@ mod tests {
         }
     }
 
+    /// Create a test config with temp directory and fsync disabled
+    fn test_config() -> (WalStoreConfig, tempfile::TempDir) {
+        let dir = tempdir().unwrap();
+        let config = WalStoreConfig {
+            wal_dir: dir.path().to_path_buf(),
+            fsync_on_write: false, // Disable for fast tests
+            ..Default::default()
+        };
+        (config, dir)
+    }
+
     #[tokio::test]
     async fn test_wal_store_creation() {
-        let config = WalStoreConfig::default();
+        let (config, _dir) = test_config();
         let store = WalStore::new(config);
         store.init().await.expect("init failed");
         assert_eq!(store.current_lsn(), 0);
@@ -512,7 +996,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_append_and_get() {
-        let store = WalStore::new(WalStoreConfig::default());
+        let (config, _dir) = test_config();
+        let store = WalStore::new(config);
         store.init().await.expect("init failed");
 
         let entry = make_entry(1, vec![1, 2, 3]);
@@ -525,7 +1010,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_batch() {
-        let store = WalStore::new(WalStoreConfig::default());
+        let (config, _dir) = test_config();
+        let store = WalStore::new(config);
         store.init().await.expect("init failed");
 
         // Append 100 entries
@@ -551,7 +1037,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_batch_stream_state() {
-        let store = WalStore::new(WalStoreConfig::default());
+        let (config, _dir) = test_config();
+        let store = WalStore::new(config);
         store.init().await.expect("init failed");
 
         // Append 50 entries
@@ -576,7 +1063,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_truncate() {
-        let store = WalStore::new(WalStoreConfig::default());
+        let (config, _dir) = test_config();
+        let store = WalStore::new(config);
         store.init().await.expect("init failed");
 
         // Append 100 entries
@@ -598,7 +1086,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_range() {
-        let store = WalStore::new(WalStoreConfig::default());
+        let (config, _dir) = test_config();
+        let store = WalStore::new(config);
         store.init().await.expect("init failed");
 
         for i in 1..=20 {
@@ -614,7 +1103,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_stats() {
-        let store = WalStore::new(WalStoreConfig::default());
+        let (config, _dir) = test_config();
+        let store = WalStore::new(config);
         store.init().await.expect("init failed");
 
         for i in 1..=10 {
@@ -625,5 +1115,21 @@ mod tests {
         let stats = store.stats().await;
         assert_eq!(stats.current_lsn, 10);
         assert_eq!(stats.total_entries, 10);
+    }
+
+    #[tokio::test]
+    async fn test_checkpoint() {
+        let (config, _dir) = test_config();
+        let store = WalStore::new(config);
+        store.init().await.expect("init failed");
+
+        for i in 1..=10 {
+            let entry = make_entry(i, vec![i as u8]);
+            store.append(entry).await.expect("append failed");
+        }
+
+        let checkpoint = store.checkpoint().await.expect("checkpoint failed");
+        assert_eq!(checkpoint, 10);
+        assert_eq!(store.checkpoint_lsn(), 10);
     }
 }

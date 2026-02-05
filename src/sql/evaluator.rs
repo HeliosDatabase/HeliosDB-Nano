@@ -1648,6 +1648,9 @@ impl Evaluator {
                 }
             }
 
+            // Boolean comparisons (false < true)
+            (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
+
             // Timestamp comparisons
             (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
             (Value::Date(a), Value::Date(b)) => a.cmp(b),

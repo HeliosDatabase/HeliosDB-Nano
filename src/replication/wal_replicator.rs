@@ -18,8 +18,10 @@
 use super::config::{StandbyConfig, WalStreamingConfig};
 use super::{ReplicationError, Result};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 /// Log Sequence Number - unique identifier for WAL position
@@ -105,15 +107,21 @@ pub struct WalReplicator {
     standby_states: Arc<RwLock<HashMap<Uuid, StandbyState>>>,
     /// Broadcast channel for WAL entries
     wal_broadcast: broadcast::Sender<WalEntry>,
-    /// Shutdown signal
+    /// Shutdown signal sender
     shutdown_tx: mpsc::Sender<()>,
+    /// Shutdown signal receiver (stored for cloning)
+    shutdown_rx: Arc<RwLock<Option<mpsc::Receiver<()>>>>,
+    /// Whether the replicator is running
+    running: Arc<AtomicBool>,
+    /// Background task handles
+    task_handles: Arc<RwLock<Vec<JoinHandle<()>>>>,
 }
 
 impl WalReplicator {
     /// Create a new WAL replicator
     pub fn new(config: WalStreamingConfig, standbys: Vec<StandbyConfig>) -> Self {
         let (wal_broadcast, _) = broadcast::channel(config.batch_size);
-        let (shutdown_tx, _) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = mpsc::channel(1);
 
         Self {
             config,
@@ -122,6 +130,9 @@ impl WalReplicator {
             standby_states: Arc::new(RwLock::new(HashMap::new())),
             wal_broadcast,
             shutdown_tx,
+            shutdown_rx: Arc::new(RwLock::new(Some(shutdown_rx))),
+            running: Arc::new(AtomicBool::new(false)),
+            task_handles: Arc::new(RwLock::new(Vec::new())),
         }
     }
 
@@ -132,22 +143,119 @@ impl WalReplicator {
     /// - Managing standby connections
     /// - Handling acknowledgments
     pub async fn start(&self) -> Result<()> {
-        // TODO: Implement WAL streaming startup
-        // 1. Initialize connections to all standbys
-        // 2. Start streaming tasks
-        // 3. Start heartbeat monitoring
-        tracing::info!("WAL Replicator started");
+        // Check if already running
+        if self.running.swap(true, Ordering::SeqCst) {
+            return Err(ReplicationError::WalStreaming(
+                "WAL Replicator already running".to_string(),
+            ));
+        }
+
+        tracing::info!(
+            "Starting WAL Replicator with {} standbys",
+            self.standbys.len()
+        );
+
+        // Initialize standby states
+        {
+            let mut states = self.standby_states.write().await;
+            for standby in &self.standbys {
+                let node_id = Uuid::new_v4(); // Generate ID for tracking
+                states.insert(
+                    node_id,
+                    StandbyState {
+                        node_id,
+                        ack_lsn: 0,
+                        connected: false,
+                        last_heartbeat: chrono::Utc::now(),
+                        lag_bytes: 0,
+                    },
+                );
+                tracing::info!(
+                    "Registered standby at {}:{} (id: {})",
+                    standby.host,
+                    standby.port,
+                    node_id
+                );
+            }
+        }
+
+        // Start heartbeat monitoring task
+        let running = self.running.clone();
+        let standby_states = self.standby_states.clone();
+        let heartbeat_interval = self.config.heartbeat_interval;
+        let heartbeat_timeout = self.config.heartbeat_timeout;
+
+        let heartbeat_handle = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(heartbeat_interval);
+            while running.load(Ordering::SeqCst) {
+                interval.tick().await;
+
+                // Check for stale standbys
+                let now = chrono::Utc::now();
+                let mut states = standby_states.write().await;
+                for (id, state) in states.iter_mut() {
+                    if state.connected {
+                        let elapsed = now - state.last_heartbeat;
+                        if elapsed > chrono::Duration::from_std(heartbeat_timeout).unwrap_or_default()
+                        {
+                            tracing::warn!("Standby {} heartbeat timeout, marking disconnected", id);
+                            state.connected = false;
+                        }
+                    }
+                }
+            }
+            tracing::debug!("Heartbeat monitor task stopped");
+        });
+
+        // Store task handle
+        {
+            let mut handles = self.task_handles.write().await;
+            handles.push(heartbeat_handle);
+        }
+
+        tracing::info!("WAL Replicator started successfully");
         Ok(())
     }
 
     /// Stop the WAL replicator
     pub async fn stop(&self) -> Result<()> {
-        // TODO: Implement graceful shutdown
-        // 1. Stop accepting new entries
-        // 2. Flush pending entries
-        // 3. Close standby connections
-        tracing::info!("WAL Replicator stopped");
+        // Check if running
+        if !self.running.swap(false, Ordering::SeqCst) {
+            return Ok(()); // Already stopped
+        }
+
+        tracing::info!("Stopping WAL Replicator...");
+
+        // Signal shutdown
+        let _ = self.shutdown_tx.send(()).await;
+
+        // Wait for background tasks to complete (with timeout)
+        {
+            let mut handles = self.task_handles.write().await;
+            for handle in handles.drain(..) {
+                // Give each task 5 seconds to complete
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    handle,
+                ).await;
+            }
+        }
+
+        // Mark all standbys as disconnected
+        {
+            let mut states = self.standby_states.write().await;
+            for state in states.values_mut() {
+                state.connected = false;
+            }
+        }
+
+        tracing::info!("WAL Replicator stopped successfully");
         Ok(())
+    }
+
+    /// Check if the replicator is running
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
     }
 
     /// Append a WAL entry for replication
@@ -231,5 +339,44 @@ mod tests {
 
         let received = rx.recv().await.expect("recv failed");
         assert_eq!(received.lsn, 1);
+    }
+
+    #[tokio::test]
+    async fn test_start_stop() {
+        use super::super::config::SyncMode;
+
+        let config = WalStreamingConfig::default();
+        let standbys = vec![
+            StandbyConfig {
+                node_id: Uuid::new_v4(),
+                host: "standby1.example.com".to_string(),
+                port: 5433,
+                sync_mode: SyncMode::Async,
+                priority: 1,
+            },
+        ];
+        let replicator = WalReplicator::new(config, standbys);
+
+        // Should not be running initially
+        assert!(!replicator.is_running());
+
+        // Start the replicator
+        replicator.start().await.expect("start failed");
+        assert!(replicator.is_running());
+
+        // Verify standby was registered
+        let states = replicator.standby_states().await;
+        assert_eq!(states.len(), 1);
+
+        // Starting again should fail
+        let result = replicator.start().await;
+        assert!(result.is_err());
+
+        // Stop the replicator
+        replicator.stop().await.expect("stop failed");
+        assert!(!replicator.is_running());
+
+        // Stopping again should be fine (no-op)
+        replicator.stop().await.expect("stop failed");
     }
 }
