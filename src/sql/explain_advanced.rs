@@ -128,6 +128,8 @@ impl PlanVersionManager {
     }
 
     /// Get version history timeline
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: Loop `i` ranges from `1..events.len()`, so `i-1` and `i` are always in bounds
     pub fn get_timeline(&self, query_hash: &str) -> Timeline {
         let versions = self.get_versions(query_hash);
 
@@ -286,6 +288,8 @@ impl PlanDiff {
     }
 
     /// Compute tree diff between two plan nodes recursively
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: All child indexing is bounded by old_children_len/new_children_len and min_children
     fn compute_tree_diff(old: &PlanNode, new: &PlanNode, path: &str) -> Vec<StructureChange> {
         let mut changes = Vec::new();
 
@@ -475,6 +479,8 @@ impl PlanDiff {
     }
 
     /// Visualize diff as side-by-side comparison
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: String slicing at `..55` is guarded by `len() > 58` check
     pub fn visualize_diff(&self) -> String {
         let mut output = String::new();
 

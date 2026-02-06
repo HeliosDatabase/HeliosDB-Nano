@@ -23,6 +23,9 @@ use rand::thread_rng;
 ///
 /// # Returns
 /// Trained codebook with optimal centroids
+// SAFETY: Vector dimensions are validated against config.dimension before any slicing.
+// Sub-vector slicing uses sq_idx * subvector_dim which is bounded by config.dimension.
+#[allow(clippy::indexing_slicing)]
 pub fn train_codebook(
     config: &ProductQuantizerConfig,
     training_vectors: &[Vector],
@@ -98,6 +101,10 @@ pub fn train_codebook(
 ///
 /// # Returns
 /// K centroids learned from data
+// SAFETY: Indices into `data` and `centroids` are bounded by data.len() and k respectively,
+// which are validated at function entry. Cluster indices come from find_nearest_centroid
+// which returns values in 0..centroids.len().
+#[allow(clippy::indexing_slicing)]
 fn kmeans(data: &[Vector], k: usize, max_iterations: usize) -> PqResult<Vec<Vector>> {
     if data.is_empty() {
         return Err(PqError::TrainingError("No data provided".to_string()));
@@ -190,6 +197,9 @@ fn kmeans(data: &[Vector], k: usize, max_iterations: usize) -> PqResult<Vec<Vect
 /// 1. Choose first centroid uniformly at random
 /// 2. For remaining centroids, choose points with probability proportional
 ///    to squared distance from nearest existing centroid
+// SAFETY: All indices into `data` are bounded by data.len() which is validated non-empty.
+// Centroid indices are bounded by the centroids vec length which grows up to k.
+#[allow(clippy::indexing_slicing)]
 fn kmeans_plus_plus_init(
     data: &[Vector],
     k: usize,
@@ -317,6 +327,9 @@ fn find_nearest_centroid(point: &[f32], centroids: &[Vector]) -> usize {
 }
 
 /// Compute mean of a set of points
+// SAFETY: `indices` contains valid indices into `data` (populated by enumerate over data).
+// `dim` iterates over data[idx] elements which have uniform dimension validated by caller.
+#[allow(clippy::indexing_slicing)]
 fn compute_mean(data: &[Vector], indices: &[usize], dimension: usize) -> Vector {
     let mut mean = vec![0.0; dimension];
     let count = indices.len() as f32;

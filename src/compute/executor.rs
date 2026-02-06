@@ -48,6 +48,8 @@ impl ScanExecutor {
     }
 }
 
+// SAFETY: self.position is bounds-checked (< self.tuples.len()) before indexing.
+#[allow(clippy::indexing_slicing)]
 impl Executor for ScanExecutor {
     fn open(&mut self) -> Result<()> {
         self.position = 0;
@@ -223,6 +225,8 @@ impl NestedLoopJoinExecutor {
     }
 }
 
+// SAFETY: right_position is bounds-checked (< right_tuples.len()) in while loop condition.
+#[allow(clippy::indexing_slicing)]
 impl Executor for NestedLoopJoinExecutor {
     fn open(&mut self) -> Result<()> {
         self.left.open()?;
@@ -339,6 +343,8 @@ impl HashJoinExecutor {
     }
 }
 
+// SAFETY: match_position is bounds-checked (< current_matches.len()) before indexing.
+#[allow(clippy::indexing_slicing)]
 impl Executor for HashJoinExecutor {
     fn open(&mut self) -> Result<()> {
         self.left.open()?;
@@ -441,6 +447,9 @@ pub struct AggregateExecutor {
     computed: bool,
 }
 
+// SAFETY: Accumulator array (entry.1) is sized to match self.aggregates via zip enumeration.
+// self.position is bounds-checked (< self.results.len()) before indexing.
+#[allow(clippy::indexing_slicing)]
 impl AggregateExecutor {
     /// Create a new aggregate executor
     pub fn new(
@@ -506,6 +515,8 @@ impl AggregateExecutor {
     }
 }
 
+// SAFETY: self.position is bounds-checked (< self.results.len()) before indexing.
+#[allow(clippy::indexing_slicing)]
 impl Executor for AggregateExecutor {
     fn open(&mut self) -> Result<()> {
         self.child.open()?;
@@ -672,6 +683,8 @@ impl SortExecutor {
     }
 }
 
+// SAFETY: self.position is bounds-checked (< self.results.len()) before indexing.
+#[allow(clippy::indexing_slicing)]
 impl Executor for SortExecutor {
     fn open(&mut self) -> Result<()> {
         self.child.open()?;

@@ -45,6 +45,7 @@ impl AzureOpenAiProvider {
 
 #[async_trait]
 impl LlmProvider for AzureOpenAiProvider {
+    #[allow(clippy::unnecessary_literal_bound)]
     fn name(&self) -> &str {
         "azure"
     }
@@ -63,6 +64,9 @@ impl LlmProvider for AzureOpenAiProvider {
         }])
     }
 
+    // SAFETY: All JSON indexing uses serde_json::Value which returns Value::Null for missing keys,
+    // never panics. String slicing in SSE parsing is bounds-checked by find() positions.
+    #[allow(clippy::indexing_slicing)]
     async fn chat(&self, request: LlmRequest) -> ProviderResult<LlmResponse> {
         // Build request body (same as OpenAI)
         let mut body = serde_json::json!({
@@ -153,6 +157,9 @@ impl LlmProvider for AzureOpenAiProvider {
         })
     }
 
+    // SAFETY: All JSON indexing uses serde_json::Value which returns Value::Null for missing keys.
+    // String slicing in SSE buffer parsing is bounds-checked by find() positions.
+    #[allow(clippy::indexing_slicing)]
     async fn chat_stream(
         &self,
         request: LlmRequest,
@@ -258,8 +265,8 @@ impl LlmProvider for AzureOpenAiProvider {
                                                         }),
                                                         tool_calls: delta.get("tool_calls").and_then(|tc| {
                                                             tc.as_array().map(|arr| {
-                                                                arr.iter().enumerate().filter_map(|(i, t)| {
-                                                                    Some(super::ToolCallDelta {
+                                                                arr.iter().enumerate().map(|(i, t)| {
+                                                                    super::ToolCallDelta {
                                                                         index: t.get("index").and_then(|idx| idx.as_u64()).unwrap_or(i as u64) as usize,
                                                                         id: t.get("id").and_then(|id| id.as_str()).map(|s| s.to_string()),
                                                                         call_type: t.get("type").and_then(|ct| ct.as_str()).map(|s| s.to_string()),
@@ -269,7 +276,7 @@ impl LlmProvider for AzureOpenAiProvider {
                                                                                 arguments: f.get("arguments").and_then(|a| a.as_str()).map(|s| s.to_string()),
                                                                             }
                                                                         }),
-                                                                    })
+                                                                    }
                                                                 }).collect()
                                                             })
                                                         }),

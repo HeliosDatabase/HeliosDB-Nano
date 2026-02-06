@@ -322,6 +322,8 @@ impl WebhookHandler {
     }
 
     /// Validate GitHub webhook signature (HMAC-SHA256)
+    // SAFETY: signature[7..] is guarded by starts_with("sha256=") check (7 bytes prefix).
+    #[allow(clippy::indexing_slicing)]
     pub fn validate_github_signature(&self, payload: &[u8], signature: &str) -> Result<bool> {
         let Some(ref secret) = self.config.github_secret else {
             // No secret configured, skip validation
@@ -354,6 +356,9 @@ impl WebhookHandler {
     }
 
     /// Compute HMAC-SHA256 using sha2 crate
+    // SAFETY: k_ipad/k_opad indices bounded by BLOCK_SIZE constant (64).
+    // key.len() <= BLOCK_SIZE after conditional hashing.
+    #[allow(clippy::indexing_slicing)]
     fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
         use sha2::{Digest, Sha256};
 

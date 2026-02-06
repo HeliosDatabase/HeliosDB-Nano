@@ -303,6 +303,8 @@ impl OptimizationEngine {
         rewrites
     }
 
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: `tables[0]` and `tables[1]` are guarded by `tables.len() >= 2` checks
     fn suggest_materialized_views(&self, tables: &[String], has_join: bool) -> Vec<MaterializedViewRecommendation> {
         let mut views = Vec::new();
 
@@ -377,6 +379,8 @@ impl OptimizationEngine {
         strategies
     }
 
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: `tables[0]` and `tables[1]` are guarded by `tables.len() >= 2` check
     fn suggest_denormalization(&self, tables: &[String]) -> Vec<DenormalizationOpportunity> {
         let mut opportunities = Vec::new();
 

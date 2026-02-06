@@ -356,6 +356,8 @@ impl BloomFilter {
     }
 
     /// Apply delta bits - OR the bits_mask to the word at word_idx
+    // SAFETY: word_idx is bounds-checked (< self.bits.len()) before indexing.
+    #[allow(clippy::indexing_slicing)]
     pub fn apply_delta_bits(&mut self, word_idx: usize, bits_mask: u64) {
         if word_idx < self.bits.len() {
             self.bits[word_idx] |= bits_mask;
@@ -373,6 +375,8 @@ impl BloomFilter {
     }
 
     /// Merge another bloom filter (union)
+    // SAFETY: Loop index bounded by other.bits (same length after config check).
+    #[allow(clippy::indexing_slicing)]
     pub fn merge(&mut self, other: &BloomFilter) -> Result<(), &'static str> {
         if self.num_bits != other.num_bits || self.num_hashes != other.num_hashes {
             return Err("Cannot merge bloom filters with different configurations");
@@ -410,6 +414,9 @@ impl BloomFilter {
     }
 
     /// Set a bit in the filter
+    // SAFETY: index is derived from get_bit_index which uses modulo self.num_bits,
+    // and num_bits <= self.bits.len() * 64, so word_index is always in bounds.
+    #[allow(clippy::indexing_slicing)]
     fn set_bit(&mut self, index: usize) {
         let word_index = index / 64;
         let bit_index = index % 64;
@@ -417,6 +424,9 @@ impl BloomFilter {
     }
 
     /// Get a bit from the filter
+    // SAFETY: index is derived from get_bit_index which uses modulo self.num_bits,
+    // and num_bits <= self.bits.len() * 64, so word_index is always in bounds.
+    #[allow(clippy::indexing_slicing)]
     fn get_bit(&self, index: usize) -> bool {
         let word_index = index / 64;
         let bit_index = index % 64;

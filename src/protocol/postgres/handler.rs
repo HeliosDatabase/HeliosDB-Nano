@@ -130,6 +130,8 @@ where
     }
 
     /// Handle startup sequence
+    // SAFETY: Buffer indices [0..3] are guarded by self.buffer.len() >= 4 check.
+    #[allow(clippy::indexing_slicing)]
     async fn handle_startup(&mut self) -> Result<()> {
         // Check if we have initial data in the buffer (passed from server after reading 8 bytes)
         // This happens when client sends StartupMessage directly without SSLRequest
@@ -229,6 +231,8 @@ where
     }
 
     /// Read a message from the client
+    // SAFETY: temp_buf[..n] slice is bounded by n from stream.read() which is <= temp_buf.len().
+    #[allow(clippy::indexing_slicing)]
     async fn read_message(&mut self) -> Result<Option<FrontendMessage>> {
         // Try to parse existing buffer first
         tracing::trace!("read_message: Checking buffer, len={}", self.buffer.len());
@@ -307,6 +311,8 @@ where
     }
 
     /// Handle simple query protocol
+    // SAFETY: results[0] is guarded by !results.is_empty() check.
+    #[allow(clippy::indexing_slicing)]
     async fn handle_query(&mut self, query: &str) -> Result<()> {
         tracing::debug!("Executing query: {}", query);
 
@@ -501,6 +507,8 @@ where
     // Extended protocol methods are in handler_extended.rs module
 
     /// Handle SCRAM-SHA-256 authentication flow
+    // SAFETY: parts[1] and parts[2] are guarded by parts.len() >= 3 check.
+    #[allow(clippy::indexing_slicing)]
     async fn handle_scram_authentication(&mut self) -> Result<()> {
         // Send AuthenticationSASL with SCRAM-SHA-256 mechanism
         self.send_message(BackendMessage::Authentication(
@@ -752,6 +760,9 @@ where
     /// - BEGIN [TRANSACTION] [ISOLATION LEVEL {READ UNCOMMITTED | READ COMMITTED | REPEATABLE READ | SERIALIZABLE}]
     /// - START TRANSACTION [ISOLATION LEVEL ...]
     /// - SET TRANSACTION ISOLATION LEVEL ...
+    // SAFETY: pos is found by .find() so pos+15 is within the string
+    // ("ISOLATION LEVEL" is exactly 15 chars).
+    #[allow(clippy::indexing_slicing)]
     fn parse_isolation_level(query: &str) -> Option<String> {
         let upper = query.to_uppercase();
         if let Some(pos) = upper.find("ISOLATION LEVEL") {

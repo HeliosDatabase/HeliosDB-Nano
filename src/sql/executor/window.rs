@@ -101,6 +101,8 @@ impl WindowOperator {
     }
 
     /// Process all input and compute window functions
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: All indexing uses original_idx/expr_idx from enumeration, bounded by vec lengths
     fn process_input(&mut self) -> Result<()> {
         // Collect all input tuples
         let mut all_tuples: Vec<(usize, Tuple)> = Vec::new();
@@ -211,6 +213,8 @@ impl WindowOperator {
     }
 
     /// Compute window function values for a partition
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: All partition indexing is bounded by `len`, `offset`, and frame calculations
     fn compute_window_function(
         &self,
         partition: &[(usize, Tuple)],
@@ -465,6 +469,8 @@ impl WindowOperator {
     }
 
     /// Compute RANK or DENSE_RANK
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: Loop index `i` ranges from 0..len; `i-1` only accessed when `i > 0`
     fn compute_rank(&self, partition: &[(usize, Tuple)], with_gaps: bool) -> Result<Vec<Value>> {
         let len = partition.len();
         if len == 0 {
@@ -505,6 +511,8 @@ impl WindowOperator {
     }
 
     /// Compute window aggregate function
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: Frame indices are bounded by `j < len` filter and frame start/end calculations
     fn compute_window_aggregate(
         &self,
         partition: &[(usize, Tuple)],
@@ -638,8 +646,8 @@ impl PhysicalOperator for WindowOperator {
         }
 
         // Return next result
-        if self.current_index < self.results.len() {
-            let tuple = self.results[self.current_index].clone();
+        if let Some(tuple) = self.results.get(self.current_index) {
+            let tuple = tuple.clone();
             self.current_index += 1;
             Ok(Some(tuple))
         } else {

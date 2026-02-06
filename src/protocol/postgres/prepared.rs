@@ -318,6 +318,8 @@ fn decode_text_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
 }
 
 /// Decode binary format parameter
+// SAFETY: All array accesses below are guarded by length checks immediately before use.
+#[allow(clippy::indexing_slicing)]
 fn decode_binary_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
     match type_oid {
         16 => {

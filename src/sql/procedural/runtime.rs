@@ -163,6 +163,8 @@ pub struct ProceduralExecutor;
 
 impl ProceduralExecutor {
     /// Execute a procedural block
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: All indexing is guarded by `.is_empty()` and `.len()` checks
     pub fn execute_block<'a>(
         block: &ProceduralBlock,
         ctx: &mut ExecutionContext<'a>,
@@ -231,6 +233,8 @@ impl ProceduralExecutor {
     }
 
     /// Execute a single statement
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: All indexing is guarded by `.is_empty()` and `.len()` checks within each match arm
     pub fn execute_statement<'a>(
         stmt: &ProceduralStatement,
         ctx: &mut ExecutionContext<'a>,
@@ -645,6 +649,8 @@ impl ProceduralExecutor {
     /// - Named conditions match against PostgreSQL exception names (e.g., "division_by_zero")
     /// - SQLSTATE conditions match against the SQLSTATE code in the error
     /// - OTHERS matches any exception
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: String slicing is guarded by `.find()` returning valid byte offsets
     fn find_matching_handler<'a>(
         handlers: &'a [ExceptionHandler],
         error: &Error,

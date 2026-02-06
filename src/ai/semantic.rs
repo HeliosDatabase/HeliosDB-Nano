@@ -712,8 +712,8 @@ impl SemanticSearch {
                     for text in texts {
                         let emb = self.generate_embedding(text);
                         for (i, v) in emb.iter().enumerate() {
-                            if i < avg.len() {
-                                avg[i] += v / texts.len() as f32;
+                            if let Some(slot) = avg.get_mut(i) {
+                                *slot += v / texts.len() as f32;
                             }
                         }
                     }
@@ -741,7 +741,10 @@ impl SemanticSearch {
         for (i, token) in tokens.iter().enumerate() {
             let hash = hash_string_to_u64(token);
             let idx = (hash as usize) % self.config.dimensions;
-            embedding[idx] += 1.0 / (i + 1) as f32;
+            // SAFETY: idx is always < self.config.dimensions due to modulo above
+            if let Some(slot) = embedding.get_mut(idx) {
+                *slot += 1.0 / (i + 1) as f32;
+            }
         }
 
         // Normalize
@@ -764,8 +767,7 @@ impl SemanticSearch {
         let mut all_results = Vec::new();
 
         if let Some(ref index) = self.vector_index {
-            let stores = request.stores.as_ref()
-                .map(|s| s.clone())
+            let stores = request.stores.clone()
                 .unwrap_or_else(|| vec![self.config.default_store.clone()]);
 
             for store in stores {
@@ -804,11 +806,11 @@ impl SemanticSearch {
         }
 
         // If no vector index, fall back to document store similarity
-        if all_results.is_empty() && !vectors.is_empty() {
+        if let (true, Some(first_vec)) = (all_results.is_empty(), vectors.first()) {
             let doc_store = self.document_store.read();
             for (doc_id, doc) in doc_store.iter() {
                 if let Some(ref doc_vec) = doc.vector {
-                    let score = cosine_similarity(&vectors[0], doc_vec);
+                    let score = cosine_similarity(first_vec, doc_vec);
                     all_results.push(SearchResult {
                         id: doc_id.clone(),
                         score,
@@ -902,7 +904,7 @@ impl SemanticSearch {
         request: &SemanticSearchRequest,
     ) -> Result<Vec<SearchResult>, SearchError> {
         // For multi-modal, we embed both text and image and combine
-        let vectors = self.embed_queries(&[query.clone()]).await?;
+        let vectors = self.embed_queries(std::slice::from_ref(query)).await?;
         self.vector_search(&vectors, request).await
     }
 
@@ -975,9 +977,9 @@ impl SemanticSearch {
             FilterOperator::IsNotNull => !value.is_null(),
             FilterOperator::Between => {
                 if let serde_json::Value::Array(arr) = &filter.value {
-                    if arr.len() == 2 {
-                        let gte = matches!(compare_json_values(value, &arr[0]), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal));
-                        let lte = matches!(compare_json_values(value, &arr[1]), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal));
+                    if let (Some(low), Some(high)) = (arr.first(), arr.get(1)) {
+                        let gte = matches!(compare_json_values(value, low), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal));
+                        let lte = matches!(compare_json_values(value, high), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal));
                         gte && lte
                     } else {
                         false

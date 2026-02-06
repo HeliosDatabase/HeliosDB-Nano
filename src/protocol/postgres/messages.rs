@@ -261,6 +261,8 @@ pub struct FieldDescription {
 
 impl FrontendMessage {
     /// Parse a frontend message from bytes
+    // SAFETY: Buffer offsets are validated (buf.len() >= 5) before indexing buf[0..4].
+    #[allow(clippy::indexing_slicing)]
     pub fn parse(buf: &mut BytesMut) -> Result<Option<Self>> {
         // Check if we have enough bytes for message type and length
         if buf.len() < 5 {
@@ -307,6 +309,8 @@ impl FrontendMessage {
     }
 
     /// Parse startup message (special case - no message type byte)
+    // SAFETY: Buffer length checked (>= 4) before indexing buf[0..3].
+    #[allow(clippy::indexing_slicing)]
     pub fn parse_startup(buf: &mut BytesMut) -> Result<Option<Self>> {
         if buf.len() < 4 {
             return Ok(None);
@@ -665,7 +669,7 @@ fn write_cstring(buf: &mut BytesMut, s: &str) {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 

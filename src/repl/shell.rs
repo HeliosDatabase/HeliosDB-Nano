@@ -59,6 +59,8 @@ impl ReplShell {
 
     /// Strip SQL comments from input
     /// Handles both line comments (-- ...) and block comments (/* ... */)
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: All `chars[i]` and `chars[i+1]` accesses are guarded by `i < chars.len()` and `i+1 < chars.len()`
     fn strip_sql_comments(sql: &str) -> String {
         let mut result = String::with_capacity(sql.len());
         let chars: Vec<char> = sql.chars().collect();

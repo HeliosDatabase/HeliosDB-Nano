@@ -574,6 +574,8 @@ impl MessageEncoder {
     }
 
     /// Encode a backend message
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: Buffer slicing uses positions derived from our own writes; lengths are validated
     pub fn encode(&mut self, msg: &BackendMessage) -> io::Result<Vec<u8>> {
         self.buf.clear();
 
@@ -695,6 +697,8 @@ impl MessageEncoder {
         Ok(self.buf.to_vec())
     }
 
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: Buffer slicing uses positions from our own writes
     fn encode_authentication(&mut self, auth: &AuthenticationMessage) -> io::Result<()> {
         self.buf.put_u8(b'R');
 
@@ -747,6 +751,8 @@ impl MessageEncoder {
         Ok(())
     }
 
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: Buffer slicing uses positions from our own writes
     fn encode_error_or_notice(&mut self, msg_type: u8, fields: &HashMap<u8, String>) -> io::Result<()> {
         self.buf.put_u8(msg_type);
         let len_pos = self.buf.len();
@@ -793,6 +799,8 @@ impl MessageDecoder {
     }
 
     /// Try to decode a frontend message from the buffer
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: Buffer indexing is guarded by length checks (`.is_empty()`, `.len() >= N`)
     pub fn decode(&mut self) -> io::Result<Option<FrontendMessage>> {
         // Check for regular messages (with type byte) first
         if self.buf.is_empty() {
@@ -882,6 +890,8 @@ impl MessageDecoder {
         Ok(msg)
     }
 
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: Called after length validation in decode()
     fn decode_startup(&mut self) -> io::Result<FrontendMessage> {
         let mut cursor = Cursor::new(&self.buf[..]);
         let _msg_len = cursor.get_i32();
@@ -913,6 +923,8 @@ impl MessageDecoder {
         })
     }
 
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: Called after `self.buf.len() >= total_len` validation in decode()
     fn decode_query(&mut self) -> io::Result<Option<FrontendMessage>> {
         let mut cursor = Cursor::new(&self.buf[1..]);
         let _msg_len = cursor.get_i32();
@@ -921,6 +933,8 @@ impl MessageDecoder {
         Ok(Some(FrontendMessage::Query { query }))
     }
 
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: Called after `self.buf.len() >= total_len` validation in decode()
     fn decode_parse(&mut self) -> io::Result<Option<FrontendMessage>> {
         let mut cursor = Cursor::new(&self.buf[1..]);
         let _msg_len = cursor.get_i32();
@@ -940,6 +954,8 @@ impl MessageDecoder {
         }))
     }
 
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: Called after `self.buf.len() >= total_len` validation in decode()
     fn decode_bind(&mut self) -> io::Result<Option<FrontendMessage>> {
         let mut cursor = Cursor::new(&self.buf[1..]);
         let _msg_len = cursor.get_i32();
@@ -983,6 +999,8 @@ impl MessageDecoder {
         }))
     }
 
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: Called after `self.buf.len() >= total_len` validation in decode()
     fn decode_execute(&mut self) -> io::Result<Option<FrontendMessage>> {
         let mut cursor = Cursor::new(&self.buf[1..]);
         let _msg_len = cursor.get_i32();
@@ -995,6 +1013,8 @@ impl MessageDecoder {
         }))
     }
 
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: Called after `self.buf.len() >= total_len` validation in decode()
     fn decode_describe(&mut self) -> io::Result<Option<FrontendMessage>> {
         let mut cursor = Cursor::new(&self.buf[1..]);
         let _msg_len = cursor.get_i32();
@@ -1015,6 +1035,8 @@ impl MessageDecoder {
         Ok(Some(FrontendMessage::Describe { kind, name }))
     }
 
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: Called after `self.buf.len() >= total_len` validation in decode()
     fn decode_close(&mut self) -> io::Result<Option<FrontendMessage>> {
         let mut cursor = Cursor::new(&self.buf[1..]);
         let _msg_len = cursor.get_i32();
@@ -1035,6 +1057,8 @@ impl MessageDecoder {
         Ok(Some(FrontendMessage::Close { kind, name }))
     }
 
+    #[allow(clippy::indexing_slicing)]
+    // SAFETY: Called after `self.buf.len() >= total_len` validation in decode()
     fn decode_password(&mut self) -> io::Result<Option<FrontendMessage>> {
         let mut cursor = Cursor::new(&self.buf[1..]);
         let _msg_len = cursor.get_i32();

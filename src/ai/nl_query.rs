@@ -24,41 +24,51 @@ use super::sandbox::{QuerySandbox, SandboxConfig, SandboxResult};
 // Static Lazy Regex Patterns
 // ============================================================================
 
+// SAFETY: All regex patterns below are compile-time string literals that are known to be valid.
+// expect() is appropriate here because invalid patterns represent programming errors, not runtime failures.
+
 /// Pattern to extract SQL from LLM response
+#[allow(clippy::expect_used)]
 static RE_SQL_BLOCK: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"```(?:sql)?\s*([\s\S]*?)```").expect("Invalid SQL_BLOCK regex")
 });
 
 /// Pattern to match SELECT statement
+#[allow(clippy::expect_used)]
 static RE_SELECT: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?is)(SELECT\s+[\s\S]+?)(?:;|$)").expect("Invalid SELECT regex")
 });
 
 /// Pattern to detect aggregation keywords
+#[allow(clippy::expect_used)]
 static RE_AGGREGATION: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\b(count|sum|avg|average|total|minimum|maximum|min|max|group)\b")
         .expect("Invalid AGGREGATION regex")
 });
 
 /// Pattern to detect comparison keywords
+#[allow(clippy::expect_used)]
 static RE_COMPARISON: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\b(greater|less|more|fewer|equal|between|above|below|at least|at most)\b")
         .expect("Invalid COMPARISON regex")
 });
 
 /// Pattern to detect time-related keywords
+#[allow(clippy::expect_used)]
 static RE_TIME: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\b(today|yesterday|last|this|next|week|month|year|recent|latest|oldest)\b")
         .expect("Invalid TIME regex")
 });
 
 /// Pattern to detect sorting keywords
+#[allow(clippy::expect_used)]
 static RE_SORTING: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\b(top|bottom|first|last|highest|lowest|best|worst|most|least|order)\b")
         .expect("Invalid SORTING regex")
 });
 
 /// Pattern to detect limit keywords
+#[allow(clippy::expect_used)]
 static RE_LIMIT: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\b(top\s+\d+|\d+\s+(?:results?|rows?|records?)|limit|first\s+\d+)\b")
         .expect("Invalid LIMIT regex")

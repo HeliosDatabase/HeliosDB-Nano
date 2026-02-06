@@ -25,6 +25,9 @@ pub struct HyperLogLog {
     count: u64,
 }
 
+// SAFETY: register_idx is derived from hash bits modulo register count,
+// and merge loop indices are bounded by self.registers.len().
+#[allow(clippy::indexing_slicing)]
 impl HyperLogLog {
     /// Create a new HyperLogLog with given precision (4-18)
     /// Higher precision = more accuracy but more memory

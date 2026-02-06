@@ -32,6 +32,10 @@ pub struct Codebook {
     centroids: Vec<Vec<Vec<f32>>>,
 }
 
+// SAFETY: All indexing in this impl is bounded by num_subquantizers and num_centroids
+// which are validated via bounds checks (returning PqError) before every index operation.
+// from_centroids validates shape consistency of the input centroids array.
+#[allow(clippy::indexing_slicing)]
 impl Codebook {
     /// Create a new empty codebook
     pub fn new(

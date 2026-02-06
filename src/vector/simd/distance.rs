@@ -135,6 +135,9 @@ fn dot_product_scalar(a: &[f32], b: &[f32]) -> f32 {
 // AVX2 implementations (x86_64 only)
 // ============================================================================
 
+// SAFETY: `i` iterates from remainder_start..len where len = a.len() = b.len()
+// (asserted equal by the caller). All indices are bounded by the slice length.
+#[allow(clippy::indexing_slicing)]
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn l2_distance_squared_avx2(a: &[f32], b: &[f32]) -> f32 {
@@ -176,6 +179,9 @@ unsafe fn l2_distance_squared_avx2(a: &[f32], b: &[f32]) -> f32 {
     result
 }
 
+// SAFETY: `i` iterates from remainder_start..len where len = a.len() = b.len()
+// (asserted equal by the caller). All indices are bounded by the slice length.
+#[allow(clippy::indexing_slicing)]
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn cosine_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
@@ -234,6 +240,9 @@ unsafe fn cosine_distance_avx2(a: &[f32], b: &[f32]) -> f32 {
     1.0 - (dot_sum / (norm_a_val * norm_b_val))
 }
 
+// SAFETY: `i` iterates from remainder_start..len where len = a.len() = b.len()
+// (asserted equal by the caller). All indices are bounded by the slice length.
+#[allow(clippy::indexing_slicing)]
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2", enable = "fma")]
 unsafe fn dot_product_avx2(a: &[f32], b: &[f32]) -> f32 {

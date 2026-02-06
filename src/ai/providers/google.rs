@@ -114,6 +114,7 @@ impl GoogleProvider {
 
 #[async_trait]
 impl LlmProvider for GoogleProvider {
+    #[allow(clippy::unnecessary_literal_bound)]
     fn name(&self) -> &str {
         "google"
     }
@@ -122,6 +123,9 @@ impl LlmProvider for GoogleProvider {
         Ok(Self::available_models())
     }
 
+    // SAFETY: All JSON indexing uses serde_json::Value which returns Value::Null for missing keys,
+    // never panics. String slicing in SSE parsing is bounds-checked by find() positions.
+    #[allow(clippy::indexing_slicing)]
     async fn chat(&self, request: LlmRequest) -> ProviderResult<LlmResponse> {
         let model = request.model.as_deref().unwrap_or(&self.default_model);
         let (system_instruction, contents) = Self::convert_messages(&request.messages);
@@ -242,6 +246,9 @@ impl LlmProvider for GoogleProvider {
         })
     }
 
+    // SAFETY: All JSON indexing uses serde_json::Value which returns Value::Null for missing keys.
+    // String slicing in SSE buffer parsing is bounds-checked by find() positions.
+    #[allow(clippy::indexing_slicing)]
     async fn chat_stream(
         &self,
         request: LlmRequest,

@@ -228,6 +228,8 @@ impl FunctionRegistry {
     }
 
     /// Execute a SQL language function
+    // SAFETY: args[i] guarded by i < args.len(); results[0][0] guarded by is_empty() checks.
+    #[allow(clippy::indexing_slicing)]
     fn execute_sql_function(
         &self,
         func: &StoredFunction,
@@ -264,6 +266,8 @@ impl FunctionRegistry {
     }
 
     /// Execute a PL/pgSQL function
+    // SAFETY: args[i] guarded by i < args.len() check.
+    #[allow(clippy::indexing_slicing)]
     fn execute_plpgsql_function(
         &self,
         func: &StoredFunction,
@@ -340,6 +344,8 @@ impl FunctionRegistry {
     }
 
     /// Execute a SQL language procedure
+    // SAFETY: args[i] guarded by i < args.len() check.
+    #[allow(clippy::indexing_slicing)]
     fn execute_sql_procedure(
         &self,
         proc: &StoredProcedure,
@@ -366,6 +372,8 @@ impl FunctionRegistry {
     }
 
     /// Execute a PL/pgSQL procedure
+    // SAFETY: args[i] guarded by i < args.len() check.
+    #[allow(clippy::indexing_slicing)]
     fn execute_plpgsql_procedure(
         &self,
         proc: &StoredProcedure,

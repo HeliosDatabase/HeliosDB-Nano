@@ -133,6 +133,7 @@ impl AnthropicProvider {
 
 #[async_trait]
 impl LlmProvider for AnthropicProvider {
+    #[allow(clippy::unnecessary_literal_bound)]
     fn name(&self) -> &str {
         "anthropic"
     }
@@ -141,6 +142,9 @@ impl LlmProvider for AnthropicProvider {
         Ok(Self::available_models())
     }
 
+    // SAFETY: All JSON indexing uses serde_json::Value which returns Value::Null for missing keys,
+    // never panics. String slicing in SSE parsing is bounds-checked by find() positions.
+    #[allow(clippy::indexing_slicing)]
     async fn chat(&self, request: LlmRequest) -> ProviderResult<LlmResponse> {
         let model = request.model.as_deref().unwrap_or(&self.default_model);
         let (system_prompt, messages) = Self::convert_messages(&request.messages);
@@ -243,6 +247,9 @@ impl LlmProvider for AnthropicProvider {
         })
     }
 
+    // SAFETY: All JSON indexing uses serde_json::Value which returns Value::Null for missing keys.
+    // String slicing in SSE buffer parsing is bounds-checked by find() positions.
+    #[allow(clippy::indexing_slicing)]
     async fn chat_stream(
         &self,
         request: LlmRequest,

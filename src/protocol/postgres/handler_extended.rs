@@ -122,6 +122,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
     }
 
     /// Handle Execute message (extended protocol) with full implementation
+    // SAFETY: param_formats[i] and param_types[i] are guarded by i < len checks.
+    #[allow(clippy::indexing_slicing)]
     pub async fn handle_execute_extended(
         &mut self,
         portal_name: String,

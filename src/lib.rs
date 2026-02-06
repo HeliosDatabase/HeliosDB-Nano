@@ -2316,7 +2316,9 @@ impl EmbeddedDatabase {
                             // Find column index
                             let col_index = evaluator.schema().get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
-                            tuple.values[col_index] = new_value;
+                            if let Some(slot) = tuple.values.get_mut(col_index) {
+                                *slot = new_value;
+                            }
                         }
 
                         let row_id = tuple.row_id.unwrap_or(0);
@@ -2466,7 +2468,7 @@ impl EmbeddedDatabase {
                     let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
                     if !key.starts_with(prefix_bytes) {
-                        if !key.is_empty() && key[0] > prefix_bytes[0] {
+                        if !key.is_empty() && key.first() > prefix_bytes.first() {
                             break;
                         }
                         continue;
@@ -2592,7 +2594,7 @@ impl EmbeddedDatabase {
 
                 match col_idx {
                     Some(idx) => {
-                        if schema.columns[idx].primary_key && !cascade {
+                        if schema.get_column_at(idx).map_or(false, |c| c.primary_key) && !cascade {
                             return Err(Error::query_execution(format!(
                                 "Cannot drop primary key column '{}' without CASCADE", column_name
                             )));
@@ -2794,7 +2796,7 @@ impl EmbeddedDatabase {
         let columns = returning_columns.as_ref()?;
 
         // Handle RETURNING * (return all columns)
-        if columns.len() == 1 && columns[0] == "*" {
+        if columns.len() == 1 && columns.first().map_or(false, |c| c == "*") {
             return Some(tuple.clone());
         }
 
@@ -2806,8 +2808,8 @@ impl EmbeddedDatabase {
                 return Some(tuple.clone());
             }
             if let Some(col_idx) = schema.get_column_index(col_name) {
-                if col_idx < tuple.values.len() {
-                    projected_values.push(tuple.values[col_idx].clone());
+                if let Some(val) = tuple.values.get(col_idx) {
+                    projected_values.push(val.clone());
                 } else {
                     projected_values.push(Value::Null);
                 }
@@ -2918,7 +2920,9 @@ impl EmbeddedDatabase {
                             let new_value = evaluator.evaluate(value_expr, &tuple)?;
                             let col_index = evaluator.schema().get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
-                            tuple.values[col_index] = new_value;
+                            if let Some(slot) = tuple.values.get_mut(col_index) {
+                                *slot = new_value;
+                            }
                         }
 
                         let row_id = tuple.row_id.unwrap_or(0);
@@ -4303,15 +4307,9 @@ impl EmbeddedDatabase {
                     .position(|c| &c.name == col_name);
 
                 if let Some(idx) = col_idx {
-                    if idx < tuple.values.len() {
-                        let actual_value = &tuple.values[idx];
-                        if actual_value != expected_value {
-                            matches = false;
-                            break;
-                        }
-                    } else {
-                        matches = false;
-                        break;
+                    match tuple.values.get(idx) {
+                        Some(actual_value) if actual_value == expected_value => {}
+                        _ => { matches = false; break; }
                     }
                 } else {
                     matches = false;
@@ -4351,15 +4349,9 @@ impl EmbeddedDatabase {
                     .position(|c| &c.name == col_name);
 
                 if let Some(idx) = col_idx {
-                    if idx < tuple.values.len() {
-                        let actual_value = &tuple.values[idx];
-                        if actual_value != expected_value {
-                            matches = false;
-                            break;
-                        }
-                    } else {
-                        matches = false;
-                        break;
+                    match tuple.values.get(idx) {
+                        Some(actual_value) if actual_value == expected_value => {}
+                        _ => { matches = false; break; }
                     }
                 } else {
                     matches = false;
@@ -4396,14 +4388,9 @@ impl EmbeddedDatabase {
             for (fk_col, parent_val) in fk_columns.iter().zip(parent_values.iter()) {
                 let col_idx = schema.columns.iter().position(|c| &c.name == fk_col);
                 if let Some(idx) = col_idx {
-                    if idx < tuple.values.len() {
-                        if &tuple.values[idx] != parent_val {
-                            matches = false;
-                            break;
-                        }
-                    } else {
-                        matches = false;
-                        break;
+                    match tuple.values.get(idx) {
+                        Some(val) if val == parent_val => {}
+                        _ => { matches = false; break; }
                     }
                 } else {
                     matches = false;
@@ -4450,14 +4437,9 @@ impl EmbeddedDatabase {
             for (fk_col, parent_val) in fk_columns.iter().zip(parent_values.iter()) {
                 let col_idx = schema.columns.iter().position(|c| &c.name == fk_col);
                 if let Some(idx) = col_idx {
-                    if idx < tuple.values.len() {
-                        if &tuple.values[idx] != parent_val {
-                            matches = false;
-                            break;
-                        }
-                    } else {
-                        matches = false;
-                        break;
+                    match tuple.values.get(idx) {
+                        Some(val) if val == parent_val => {}
+                        _ => { matches = false; break; }
                     }
                 } else {
                     matches = false;
@@ -4471,8 +4453,8 @@ impl EmbeddedDatabase {
                     let mut new_values = tuple.values.clone();
                     for fk_col in fk_columns {
                         if let Some(idx) = schema.columns.iter().position(|c| &c.name == fk_col) {
-                            if idx < new_values.len() {
-                                new_values[idx] = Value::Null;
+                            if let Some(slot) = new_values.get_mut(idx) {
+                                *slot = Value::Null;
                             }
                         }
                     }
@@ -4599,15 +4581,9 @@ impl EmbeddedDatabase {
                     .position(|c| &c.name == col_name);
 
                 if let Some(idx) = col_idx {
-                    if idx < tuple.values.len() {
-                        let actual_value = &tuple.values[idx];
-                        if actual_value != expected_value {
-                            matches = false;
-                            break;
-                        }
-                    } else {
-                        matches = false;
-                        break;
+                    match tuple.values.get(idx) {
+                        Some(actual_value) if actual_value == expected_value => {}
+                        _ => { matches = false; break; }
                     }
                 } else {
                     matches = false;

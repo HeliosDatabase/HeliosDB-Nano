@@ -15,70 +15,93 @@ use std::collections::HashSet;
 // Static Lazy Regex Patterns (compiled once, reused safely)
 // ============================================================================
 
+// SAFETY: All regex patterns below are compile-time string literals that are known to be valid.
+// expect() is appropriate here because invalid patterns represent programming errors, not runtime failures.
+
 // Query normalization patterns
+#[allow(clippy::expect_used)]
 static RE_LINE_COMMENTS: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"--[^\n]*").expect("Invalid LINE_COMMENTS regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_BLOCK_COMMENTS: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"/\*[\s\S]*?\*/").expect("Invalid BLOCK_COMMENTS regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_WHITESPACE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"\s+").expect("Invalid WHITESPACE regex pattern")
 });
 
 // Table detection patterns
+#[allow(clippy::expect_used)]
 static RE_FROM_TABLE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)").expect("Invalid FROM_TABLE regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_JOIN_TABLE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\bJOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)").expect("Invalid JOIN_TABLE regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_INTO_TABLE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\bINTO\s+([a-zA-Z_][a-zA-Z0-9_]*)").expect("Invalid INTO_TABLE regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_UPDATE_TABLE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\bUPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)").expect("Invalid UPDATE_TABLE regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_TABLE_KEYWORD: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\bTABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)").expect("Invalid TABLE_KEYWORD regex pattern")
 });
 
 // SQL injection detection patterns
+#[allow(clippy::expect_used)]
 static RE_INJECTION_MULTI_STMT: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i);\s*(DROP|DELETE|TRUNCATE|ALTER|GRANT|REVOKE)")
         .expect("Invalid INJECTION_MULTI_STMT regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_INJECTION_OR_EQUALS: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)'\s*OR\s+'?\d*'?\s*=\s*'?\d*'?")
         .expect("Invalid INJECTION_OR_EQUALS regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_INJECTION_COMMENT: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)'\s*;\s*--").expect("Invalid INJECTION_COMMENT regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_INJECTION_UNION: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)UNION\s+(ALL\s+)?SELECT").expect("Invalid INJECTION_UNION regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_INJECTION_OUTFILE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)INTO\s+OUTFILE").expect("Invalid INJECTION_OUTFILE regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_INJECTION_LOAD_FILE: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)LOAD_FILE\s*\(").expect("Invalid INJECTION_LOAD_FILE regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_INJECTION_SLEEP: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)SLEEP\s*\(").expect("Invalid INJECTION_SLEEP regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_INJECTION_BENCHMARK: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)BENCHMARK\s*\(").expect("Invalid INJECTION_BENCHMARK regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_INJECTION_EXEC: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)EXEC\s*\(").expect("Invalid INJECTION_EXEC regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_INJECTION_HEX: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"0x[0-9a-fA-F]{10,}").expect("Invalid INJECTION_HEX regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_INJECTION_CHAR: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)CHAR\s*\(\s*\d+\s*\)").expect("Invalid INJECTION_CHAR regex pattern")
 });
+#[allow(clippy::expect_used)]
 static RE_INJECTION_CONCAT: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)CONCAT\s*\([^)]*'[^)]*\)").expect("Invalid INJECTION_CONCAT regex pattern")
 });

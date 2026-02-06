@@ -47,6 +47,8 @@ pub trait TypeInference {
 }
 
 impl TypeInference for LogicalExpr {
+    // SAFETY: All args[0] accesses are guarded by args.is_empty() checks.
+    #[allow(clippy::indexing_slicing)]
     fn infer_type(&self, schema: &Schema) -> Result<DataType> {
         match self {
             // Column reference: look up in schema

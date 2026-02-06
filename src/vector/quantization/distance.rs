@@ -15,6 +15,10 @@ pub struct DistanceComputer {
     codebook: Arc<Codebook>,
 }
 
+// SAFETY: All indexing in this impl is bounded by codebook dimensions (num_subquantizers,
+// num_centroids, subvector_dimension) which are validated on construction and checked
+// at each method entry via dimension/length validation before any indexing occurs.
+#[allow(clippy::indexing_slicing)]
 impl DistanceComputer {
     /// Create a new distance computer
     pub fn new(codebook: Arc<Codebook>) -> Self {

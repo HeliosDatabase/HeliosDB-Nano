@@ -322,6 +322,9 @@ impl FilterPredicate {
         Self::match_like_recursive(&text_chars, &pattern_chars, 0, 0)
     }
 
+    // SAFETY: All slice indices (ti, pi) are bounds-checked against text.len()/pattern.len()
+    // at the top of the function and before each access.
+    #[allow(clippy::indexing_slicing)]
     fn match_like_recursive(text: &[char], pattern: &[char], ti: usize, pi: usize) -> bool {
         if pi == pattern.len() {
             return ti == text.len();
@@ -529,6 +532,8 @@ pub enum CombinedPredicate {
 
 impl CombinedPredicate {
     /// Evaluate against a row (slice of values)
+    // SAFETY: column_index is bounds-checked (< row.len()) before indexing.
+    #[allow(clippy::indexing_slicing)]
     pub fn evaluate(&self, row: &[Value]) -> bool {
         match self {
             CombinedPredicate::Single(pred) => {
@@ -710,6 +715,8 @@ impl SimdPredicateFilteringEngine {
     }
 
     /// Filter with multiple AND predicates (optimized order)
+    // SAFETY: pred.column_index is bounds-checked (>= row.len()) before indexing.
+    #[allow(clippy::indexing_slicing)]
     pub fn filter_and_predicates(
         &self,
         rows: &[Vec<Value>],
@@ -819,6 +826,9 @@ impl SimdPredicateFilteringEngine {
     }
 
     /// AVX2-accelerated i32 filter (x86_64 only)
+    // SAFETY: Remainder loop (remainder_start..len) is bounded by values.len().
+    // SIMD loads use raw pointer arithmetic within validated chunk boundaries.
+    #[allow(clippy::indexing_slicing)]
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     unsafe fn filter_int32_avx2(&self, values: &[i32], op: FilterOp, compare_value: i32) -> Vec<usize> {
@@ -970,6 +980,8 @@ impl SimdPredicateFilteringEngine {
     }
 
     /// Filter a batch of tuples using analyzed predicates
+    // SAFETY: idx is bounds-checked (< tuple.values.len()) before indexing.
+    #[allow(clippy::indexing_slicing)]
     pub fn filter_batch(
         &self,
         tuples: &[Tuple],

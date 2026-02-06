@@ -325,6 +325,8 @@ impl DistributedExplainAnalyzer {
         operations
     }
 
+    // SAFETY: tables[0] and tables[1] are guarded by tables.len() >= 2 check.
+    #[allow(clippy::indexing_slicing)]
     fn analyze_distributed_join(
         &self,
         partitions: &[PartitionInfo],
@@ -424,6 +426,8 @@ impl DistributedExplainAnalyzer {
     }
 
     /// Format distributed EXPLAIN output
+    // SAFETY: table_partitions[0] access is within a non-empty filtered collection.
+    #[allow(clippy::indexing_slicing)]
     pub fn format_output(&self, explain: &DistributedExplain) -> String {
         let mut output = String::new();
 

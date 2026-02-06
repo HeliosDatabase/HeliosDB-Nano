@@ -118,10 +118,13 @@ impl OllamaProvider {
 
 #[async_trait]
 impl LlmProvider for OllamaProvider {
+    #[allow(clippy::unnecessary_literal_bound)]
     fn name(&self) -> &str {
         "ollama"
     }
 
+    // SAFETY: All JSON indexing uses serde_json::Value which returns Value::Null for missing keys.
+    #[allow(clippy::indexing_slicing)]
     async fn list_models(&self) -> ProviderResult<Vec<ModelInfo>> {
         // Try to fetch from Ollama API
         let client = reqwest::Client::new();
@@ -160,6 +163,8 @@ impl LlmProvider for OllamaProvider {
         }
     }
 
+    // SAFETY: All JSON indexing uses serde_json::Value which returns Value::Null for missing keys.
+    #[allow(clippy::indexing_slicing)]
     async fn chat(&self, request: LlmRequest) -> ProviderResult<LlmResponse> {
         let model = request.model.as_deref().unwrap_or(&self.default_model);
 
@@ -248,6 +253,9 @@ impl LlmProvider for OllamaProvider {
         })
     }
 
+    // SAFETY: All JSON indexing uses serde_json::Value which returns Value::Null for missing keys.
+    // String slicing in NDJSON buffer parsing is bounds-checked by find() positions.
+    #[allow(clippy::indexing_slicing)]
     async fn chat_stream(
         &self,
         request: LlmRequest,
