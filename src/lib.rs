@@ -70,6 +70,7 @@
     clippy::nursery,
     clippy::cargo,
 )]
+#![allow(clippy::cargo_common_metadata)] // No readme needed for internal packages
 
 // Allow certain pedantic lints that are too strict or conflict with our style
 #![allow(
@@ -103,12 +104,9 @@
     clippy::map_unwrap_or,
     clippy::needless_borrow,
     clippy::format_push_string,
-    clippy::needless_lifetimes,
     clippy::default_trait_access,
     clippy::empty_line_after_doc_comments,
     clippy::needless_pass_by_value,
-    clippy::match_single_binding,
-    clippy::only_used_in_recursion,
     clippy::wildcard_enum_match_arm,
     clippy::match_wildcard_for_single_variants,
     clippy::suboptimal_flops,
@@ -116,7 +114,6 @@
     clippy::ref_option,
     clippy::needless_collect,
     clippy::bool_to_int_with_if,
-    clippy::needless_borrowed_reference,
     clippy::useless_format,
     clippy::used_underscore_binding,
     clippy::str_to_string,
@@ -1209,7 +1206,13 @@ impl EmbeddedDatabase {
                 let update_count = updates.len() as u64;
                 // Buffer updates in transaction write set for ACID guarantees
                 // Updates are only visible after transaction commits
-                txn.update_tuples(table_name, updates.clone())?;
+                // Use branch-aware keys so updates on branches don't pollute main
+                for (row_id, tuple) in &updates {
+                    let key = self.storage.branch_aware_data_key(table_name, *row_id);
+                    let value = bincode::serialize(tuple)
+                        .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+                    txn.put(key, value)?;
+                }
 
                 // Update storage quota tracking (UPDATEs may change storage size)
                 if let Some(context) = self.tenant_manager.get_current_context() {
@@ -1413,16 +1416,29 @@ impl EmbeddedDatabase {
                 }
 
                 // Calculate storage to reclaim before deleting
-                let mut storage_reclaimed: u64 = 0;
-                if let Some(context) = self.tenant_manager.get_current_context() {
-                    // Estimate storage from deleted row count (rough approximation)
-                    storage_reclaimed = (row_ids_to_delete.len() as u64) * 256; // avg tuple size
-                }
+                let storage_reclaimed: u64 = if self.tenant_manager.get_current_context().is_some() {
+                    (row_ids_to_delete.len() as u64) * 256
+                } else {
+                    0
+                };
 
                 let delete_count = row_ids_to_delete.len() as u64;
                 // Buffer deletions in transaction write set for ACID guarantees
                 // Deletions are only visible after transaction commits
-                txn.delete_tuples(table_name, row_ids_to_delete)?;
+                // Use branch-aware keys so deletes on branches don't affect main
+                if let Some(branch_id) = self.storage.get_current_branch_id() {
+                    // Branch delete: write tombstone markers (bdel: keys)
+                    for row_id in &row_ids_to_delete {
+                        let delete_key = format!("bdel:{}:{}:{}", branch_id, table_name, row_id).into_bytes();
+                        txn.put(delete_key, vec![])?;
+                    }
+                } else {
+                    // Main branch: actual key deletion
+                    for row_id in &row_ids_to_delete {
+                        let key = format!("data:{}:{}", table_name, row_id).into_bytes();
+                        txn.delete(key)?;
+                    }
+                }
 
                 // Update storage quota tracking (reclaim deleted storage)
                 if let Some(context) = self.tenant_manager.get_current_context() {
@@ -2594,7 +2610,7 @@ impl EmbeddedDatabase {
 
                 match col_idx {
                     Some(idx) => {
-                        if schema.get_column_at(idx).map_or(false, |c| c.primary_key) && !cascade {
+                        if schema.get_column_at(idx).is_some_and(|c| c.primary_key) && !cascade {
                             return Err(Error::query_execution(format!(
                                 "Cannot drop primary key column '{}' without CASCADE", column_name
                             )));
@@ -2796,7 +2812,7 @@ impl EmbeddedDatabase {
         let columns = returning_columns.as_ref()?;
 
         // Handle RETURNING * (return all columns)
-        if columns.len() == 1 && columns.first().map_or(false, |c| c == "*") {
+        if columns.len() == 1 && columns.first().is_some_and(|c| c == "*") {
             return Some(tuple.clone());
         }
 
@@ -3060,7 +3076,7 @@ impl EmbeddedDatabase {
                         .map(|expr| evaluator.evaluate(expr, &empty_tuple))
                         .collect();
                     // Execute the prepared statement with parameters
-                    return self.execute_plan_with_params(&plan, &param_values?);
+                    self.execute_plan_with_params(&plan, &param_values?)
                 } else {
                     Err(Error::query_execution(format!("Prepared statement '{}' does not exist", name)))
                 }
@@ -4880,12 +4896,14 @@ impl EmbeddedDatabase {
     ///
     /// Gracefully stops the worker and waits for any in-progress refreshes to complete.
     pub async fn stop_auto_refresh(&self) -> Result<()> {
-        let mut worker_guard = self.auto_refresh_worker.write();
-        if let Some(ref mut worker) = *worker_guard {
+        let worker = {
+            let mut worker_guard = self.auto_refresh_worker.write();
+            worker_guard.take()
+        };
+        if let Some(mut worker) = worker {
             worker.stop().await?;
             tracing::info!("Materialized view auto-refresh worker stopped");
         }
-        *worker_guard = None;
         Ok(())
     }
 
@@ -4928,7 +4946,7 @@ pub struct Transaction<'a> {
     db: &'a EmbeddedDatabase,
 }
 
-impl<'a> Transaction<'a> {
+impl Transaction<'_> {
     /// Commit the transaction
     ///
     /// Atomically applies all buffered writes to the database.

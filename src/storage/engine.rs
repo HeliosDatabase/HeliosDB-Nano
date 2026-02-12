@@ -913,7 +913,7 @@ impl StorageEngine {
         // Persist counter
         let counter_key = format!("meta:counter:{}", table);
         let counter_value = (max_row_id + 1).to_le_bytes();
-        self.db.put(counter_key.as_bytes(), &counter_value)
+        self.db.put(counter_key.as_bytes(), counter_value)
             .map_err(|e| Error::storage(format!("Failed to persist counter: {}", e)))?;
 
         // Sync if requested
@@ -4169,7 +4169,7 @@ impl StorageEngine {
     }
 
     /// Get current branch ID if a non-main branch is active
-    fn get_current_branch_id(&self) -> Option<u64> {
+    pub fn get_current_branch_id(&self) -> Option<u64> {
         let branch_name = self.current_branch.lock().clone()?;
 
         // Handle "main" branch specially
