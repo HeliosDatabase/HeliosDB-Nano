@@ -5,10 +5,14 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tokio::sync::Semaphore;
+use tracing::{error, info, warn};
 
 use super::session::Session;
 use crate::{EmbeddedDatabase, Error};
+
+/// Default maximum connections for the wire protocol server
+const DEFAULT_MAX_CONNECTIONS: usize = 256;
 
 /// PostgreSQL wire protocol server
 pub struct PgServer {
@@ -18,6 +22,10 @@ pub struct PgServer {
     db: Arc<EmbeddedDatabase>,
     /// Next session ID
     next_session_id: Arc<AtomicU32>,
+    /// Connection limiter
+    connection_limiter: Arc<Semaphore>,
+    /// Max connections (for logging)
+    max_connections: usize,
 }
 
 impl PgServer {
@@ -31,7 +39,7 @@ impl PgServer {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::{EmbeddedDatabase, network::PgServer};
+    /// use heliosdb_nano::{EmbeddedDatabase, network::PgServer};
     /// use std::sync::Arc;
     ///
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
@@ -46,6 +54,19 @@ impl PgServer {
             address: address.into(),
             db,
             next_session_id: Arc::new(AtomicU32::new(1)),
+            connection_limiter: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
+            max_connections: DEFAULT_MAX_CONNECTIONS,
+        }
+    }
+
+    /// Create a new server with a custom connection limit
+    pub fn with_max_connections(address: impl Into<String>, db: Arc<EmbeddedDatabase>, max_connections: usize) -> Self {
+        Self {
+            address: address.into(),
+            db,
+            next_session_id: Arc::new(AtomicU32::new(1)),
+            connection_limiter: Arc::new(Semaphore::new(max_connections)),
+            max_connections,
         }
     }
 
@@ -58,7 +79,7 @@ impl PgServer {
             .await
             .map_err(|e| Error::protocol(format!("Failed to bind to {}: {}", self.address, e)))?;
 
-        info!("HeliosDB PostgreSQL server listening on {}", self.address);
+        info!("HeliosDB PostgreSQL server listening on {} (max_connections: {})", self.address, self.max_connections);
         let parts: Vec<&str> = self.address.split(':').collect();
         let host = parts.first().unwrap_or(&"localhost");
         let port = parts.get(1).unwrap_or(&"5432");
@@ -74,6 +95,16 @@ impl PgServer {
                 }
             };
 
+            // Enforce connection limit
+            let permit = match Arc::clone(&self.connection_limiter).try_acquire_owned() {
+                Ok(permit) => permit,
+                Err(_) => {
+                    warn!("Connection limit reached ({}), rejecting {}", self.max_connections, addr);
+                    drop(stream);
+                    continue;
+                }
+            };
+
             // Generate session ID
             let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
 
@@ -82,8 +113,9 @@ impl PgServer {
             // Create session
             let session = Session::new(Arc::clone(&self.db), session_id);
 
-            // Spawn handler task
+            // Spawn handler task (permit released when task completes)
             tokio::spawn(async move {
+                let _permit = permit;
                 if let Err(e) = session.handle_connection(stream).await {
                     error!("Session {} error: {}", session_id, e);
                 }
@@ -107,7 +139,7 @@ impl PgServer {
             .await
             .map_err(|e| Error::protocol(format!("Failed to bind to {}: {}", self.address, e)))?;
 
-        info!("HeliosDB PostgreSQL server listening on {}", self.address);
+        info!("HeliosDB PostgreSQL server listening on {} (max_connections: {})", self.address, self.max_connections);
         let parts: Vec<&str> = self.address.split(':').collect();
         let host = parts.first().unwrap_or(&"localhost");
         let port = parts.get(1).unwrap_or(&"5432");
@@ -128,6 +160,16 @@ impl PgServer {
                         }
                     };
 
+                    // Enforce connection limit
+                    let permit = match Arc::clone(&self.connection_limiter).try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            warn!("Connection limit reached ({}), rejecting {}", self.max_connections, addr);
+                            drop(stream);
+                            continue;
+                        }
+                    };
+
                     // Generate session ID
                     let session_id = self.next_session_id.fetch_add(1, Ordering::SeqCst);
 
@@ -136,8 +178,9 @@ impl PgServer {
                     // Create session
                     let session = Session::new(Arc::clone(&self.db), session_id);
 
-                    // Spawn handler task
+                    // Spawn handler task (permit released when task completes)
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = session.handle_connection(stream).await {
                             error!("Session {} error: {}", session_id, e);
                         }

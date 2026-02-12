@@ -424,9 +424,17 @@ impl MVScheduler {
             // Spawn refresh tasks
             for task in tasks_to_run {
                 let scheduler = self.clone();
-                tokio::spawn(async move {
+                let handle = tokio::spawn(async move {
                     if let Err(e) = scheduler.execute_refresh(task).await {
                         error!("Failed to execute refresh task: {}", e);
+                    }
+                });
+                // Spawn a watcher to log panics from the refresh task
+                tokio::spawn(async move {
+                    if let Err(e) = handle.await {
+                        if e.is_panic() {
+                            error!("MV refresh task panicked: {}", e);
+                        }
                     }
                 });
             }

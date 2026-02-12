@@ -294,8 +294,22 @@ impl Session {
 
         let mut responses = Vec::new();
 
-        // Execute query
-        match self.execute_sql(query).await {
+        // Execute query with optional timeout from config
+        let result = if let Some(timeout_ms) = self.db.query_timeout_ms() {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(timeout_ms),
+                self.execute_sql(query),
+            ).await {
+                Ok(result) => result,
+                Err(_) => Err(Error::query_execution(format!(
+                    "Query cancelled: exceeded timeout of {}ms", timeout_ms
+                ))),
+            }
+        } else {
+            self.execute_sql(query).await
+        };
+
+        match result {
             Ok(QueryResult::Rows { schema, rows }) => {
                 // Send row description
                 let fields = schema_to_row_description(&schema);

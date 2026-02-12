@@ -8,6 +8,7 @@ use super::handler::PgConnectionHandler;
 use super::auth::{AuthManager, AuthMethod};
 use super::ssl::{SslConfig, SslNegotiator, SslMode, SecureConnection};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use std::sync::Arc;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -86,6 +87,7 @@ pub struct PgServer {
     database: Arc<EmbeddedDatabase>,
     auth_manager: Arc<AuthManager>,
     ssl_negotiator: Option<Arc<SslNegotiator>>,
+    connection_limiter: Arc<Semaphore>,
 }
 
 impl PgServer {
@@ -103,11 +105,14 @@ impl PgServer {
             None
         };
 
+        let connection_limiter = Arc::new(Semaphore::new(config.max_connections));
+
         Ok(Self {
             config,
             database,
             auth_manager,
             ssl_negotiator,
+            connection_limiter,
         })
     }
 
@@ -124,11 +129,14 @@ impl PgServer {
             None
         };
 
+        let connection_limiter = Arc::new(Semaphore::new(config.max_connections));
+
         Ok(Self {
             config,
             database,
             auth_manager: Arc::new(auth_manager),
             ssl_negotiator,
+            connection_limiter,
         })
     }
 
@@ -151,14 +159,25 @@ impl PgServer {
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
+                    // Enforce max_connections via semaphore
+                    let permit = match Arc::clone(&self.connection_limiter).try_acquire_owned() {
+                        Ok(permit) => permit,
+                        Err(_) => {
+                            tracing::warn!("Connection limit reached ({}), rejecting {}", self.config.max_connections, addr);
+                            drop(stream);
+                            continue;
+                        }
+                    };
+
                     tracing::debug!("Accepted connection from {}", addr);
 
                     let database = Arc::clone(&self.database);
                     let auth_manager = Arc::clone(&self.auth_manager);
                     let ssl_negotiator = self.ssl_negotiator.clone();
 
-                    // Spawn a new task for each connection
+                    // Spawn a new task for each connection (permit released on drop)
                     tokio::spawn(async move {
+                        let _permit = permit;
                         if let Err(e) = Self::handle_connection(stream, database, auth_manager, ssl_negotiator).await {
                             tracing::error!("Connection error from {}: {}", addr, e);
                         }

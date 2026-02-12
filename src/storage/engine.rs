@@ -27,7 +27,7 @@ use std::cell::RefCell;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use parking_lot::RwLock;
 use tracing::{debug, error, info, warn};
 
@@ -103,6 +103,10 @@ pub struct StorageEngine {
     /// Row-level result cache for frequently accessed rows
     /// LRU cache with TTL for single-row lookups
     row_cache: Arc<super::RowCache>,
+    /// Approximate data bytes written (for memory limit enforcement)
+    data_bytes_written: Arc<AtomicU64>,
+    /// Memory limit in bytes (0 = unlimited)
+    memory_limit_bytes: u64,
 }
 
 impl StorageEngine {
@@ -362,10 +366,21 @@ impl StorageEngine {
             dict_manager: Arc::new(DictionaryManager::new()),
             art_index_manager: Arc::new(ArtIndexManager::new()),
             row_cache: Arc::new(super::RowCache::new()),
+            data_bytes_written: Arc::new(AtomicU64::new(0)),
+            memory_limit_bytes: 0, // Unlimited for disk-backed mode
         };
 
         // Load counters from storage
         engine.load_counters()?;
+
+        // Replay WAL entries for crash recovery
+        if engine.wal.is_some() {
+            match engine.replay_wal() {
+                Ok(0) => debug!("WAL clean, no entries to replay"),
+                Ok(count) => info!("WAL crash recovery: replayed {} entries", count),
+                Err(e) => warn!("WAL replay failed (data may be incomplete): {}", e),
+            }
+        }
 
         Ok(engine)
     }
@@ -505,6 +520,9 @@ impl StorageEngine {
             dict_manager: Arc::new(DictionaryManager::new()),
             art_index_manager: Arc::new(ArtIndexManager::new()),
             row_cache: Arc::new(super::RowCache::new()),
+            data_bytes_written: Arc::new(AtomicU64::new(0)),
+            // Default 4GB limit for in-memory mode (configurable via resource_quotas)
+            memory_limit_bytes: config.resource_quotas.memory_limit_per_user_mb * 1024 * 1024,
         })
     }
 
@@ -987,6 +1005,19 @@ impl StorageEngine {
 
     /// Put a value (basic put, no MVCC yet)
     pub fn put(&self, key: &Key, value: &[u8]) -> Result<()> {
+        // Enforce memory limit (primarily for in-memory mode)
+        if self.memory_limit_bytes > 0 {
+            let write_size = (key.len() + value.len()) as u64;
+            let current = self.data_bytes_written.fetch_add(write_size, Ordering::Relaxed);
+            if current + write_size > self.memory_limit_bytes {
+                self.data_bytes_written.fetch_sub(write_size, Ordering::Relaxed);
+                return Err(Error::storage(format!(
+                    "Memory limit exceeded ({} MB). Increase resource_quotas.memory_limit_per_user_mb or use disk-backed mode.",
+                    self.memory_limit_bytes / (1024 * 1024)
+                )));
+            }
+        }
+
         // Encrypt if encryption is enabled
         let data = if let Some(km) = &self.key_manager {
             crypto::encrypt(km.key(), value)?

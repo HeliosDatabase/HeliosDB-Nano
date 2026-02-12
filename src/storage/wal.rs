@@ -417,7 +417,21 @@ impl WriteAheadLog {
                 let batch_timeout = wal.batch_timeout;
 
                 let handle = thread::spawn(move || {
-                    Self::group_commit_loop(db_clone, queue, current_lsn_clone, batch_timeout);
+                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        Self::group_commit_loop(db_clone, queue, current_lsn_clone, batch_timeout);
+                    })) {
+                        Ok(()) => {}
+                        Err(panic_info) => {
+                            let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                s.to_string()
+                            } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                                s.clone()
+                            } else {
+                                "unknown panic".to_string()
+                            };
+                            error!("WAL group commit thread panicked: {}", msg);
+                        }
+                    }
                 });
 
                 if let Some(thread_handle) = &commit_thread {

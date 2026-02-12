@@ -2047,6 +2047,11 @@ impl EmbeddedDatabase {
     /// # Ok(())
     /// # }
     /// ```
+    /// Get the configured query timeout in milliseconds (None = unlimited)
+    pub fn query_timeout_ms(&self) -> Option<u64> {
+        self.config.storage.query_timeout_ms
+    }
+
     pub fn execute(&self, sql: &str) -> Result<u64> {
         use crate::error::LockResultExt;
 
