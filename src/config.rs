@@ -231,6 +231,18 @@ pub struct StorageConfig {
     /// Controls the visibility of concurrent transaction changes.
     /// Default: ReadCommitted (standard PostgreSQL default)
     pub transaction_isolation: TransactionIsolation,
+    /// Slow query log threshold in milliseconds (None to disable)
+    ///
+    /// Queries exceeding this threshold are logged at WARN level with their
+    /// SQL text (truncated to 200 chars), duration, and row count.
+    ///
+    /// Default: Some(1000) (1 second)
+    #[serde(default = "default_slow_query_threshold")]
+    pub slow_query_threshold_ms: Option<u64>,
+}
+
+fn default_slow_query_threshold() -> Option<u64> {
+    Some(1000)
 }
 
 impl Default for StorageConfig {
@@ -246,6 +258,7 @@ impl Default for StorageConfig {
             query_timeout_ms: None, // Unlimited by default
             statement_timeout_ms: None, // Unlimited by default
             transaction_isolation: TransactionIsolation::ReadCommitted, // PostgreSQL default
+            slow_query_threshold_ms: Some(1000), // 1 second default
         }
     }
 }

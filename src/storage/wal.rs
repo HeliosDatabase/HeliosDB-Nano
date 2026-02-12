@@ -26,6 +26,7 @@ pub enum WalOperation {
     /// Insert a tuple into a table
     Insert {
         table: String,
+        key: Vec<u8>,
         tuple: Vec<u8>,
     },
     /// Update a tuple in a table
@@ -1199,6 +1200,7 @@ mod tests {
         let lsn1 = wal
             .append(WalOperation::Insert {
                 table: "users".to_string(),
+                key: b"data:users:1".to_vec(),
                 tuple: vec![1, 2, 3],
             })
             .unwrap();
@@ -1229,6 +1231,7 @@ mod tests {
 
         wal.append(WalOperation::Insert {
             table: "test".to_string(),
+            key: b"data:test:1".to_vec(),
             tuple: vec![1, 2, 3],
         })
         .unwrap();
@@ -1249,6 +1252,7 @@ mod tests {
         for i in 0..5 {
             wal.append(WalOperation::Insert {
                 table: "test".to_string(),
+                key: format!("data:test:{}", i).into_bytes(),
                 tuple: vec![i],
             })
             .unwrap();
@@ -1273,6 +1277,7 @@ mod tests {
             let wal = WriteAheadLog::open(Arc::clone(&db), WalSyncMode::Sync).unwrap();
             wal.append(WalOperation::Insert {
                 table: "test".to_string(),
+                key: b"data:test:1".to_vec(),
                 tuple: vec![1, 2, 3],
             })
             .unwrap();
@@ -1287,6 +1292,7 @@ mod tests {
         let lsn = wal
             .append(WalOperation::Insert {
                 table: "test".to_string(),
+                key: b"data:test:2".to_vec(),
                 tuple: vec![4, 5, 6],
             })
             .unwrap();
@@ -1305,6 +1311,7 @@ mod tests {
             let lsn = wal
                 .append(WalOperation::Insert {
                     table: "test".to_string(),
+                    key: b"data:test:1".to_vec(),
                     tuple: vec![1, 2, 3],
                 })
                 .unwrap();

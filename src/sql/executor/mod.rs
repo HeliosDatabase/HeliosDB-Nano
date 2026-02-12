@@ -278,12 +278,28 @@ impl<'a> Executor<'a> {
 
     /// Execute a logical plan and return all results
     pub fn execute(&mut self, plan: &LogicalPlan) -> Result<Vec<Tuple>> {
+        let build_start = Instant::now();
         let mut operator = self.plan_to_operator(plan)?;
-        let mut results = Vec::new();
+        let build_elapsed = build_start.elapsed();
+        tracing::debug!(
+            phase = "operator_build",
+            duration_us = build_elapsed.as_micros() as u64,
+            plan_type = %plan.plan_type_name(),
+            "Physical operator tree built"
+        );
 
+        let exec_start = Instant::now();
+        let mut results = Vec::new();
         while let Some(tuple) = operator.next()? {
             results.push(tuple);
         }
+        let exec_elapsed = exec_start.elapsed();
+        tracing::debug!(
+            phase = "operator_exec",
+            duration_us = exec_elapsed.as_micros() as u64,
+            rows = results.len(),
+            "Operator execution complete"
+        );
 
         Ok(results)
     }

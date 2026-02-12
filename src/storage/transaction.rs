@@ -383,6 +383,7 @@ impl Transaction {
 
     /// Commit the transaction with a specific timestamp
     pub fn commit_with_timestamp(self, commit_ts: u64) -> Result<()> {
+        let commit_start = std::time::Instant::now();
         let write_count = self.write_set.len();
         let lock_count = self.acquired_locks.read().len();
 
@@ -479,6 +480,7 @@ impl Transaction {
             session_id = ?self.session_id,
             commit_ts = commit_ts,
             write_count = write_count,
+            duration_us = commit_start.elapsed().as_micros() as u64,
             "Transaction committed successfully"
         );
 

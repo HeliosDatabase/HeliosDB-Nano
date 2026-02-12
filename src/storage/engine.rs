@@ -377,7 +377,19 @@ impl StorageEngine {
         if engine.wal.is_some() {
             match engine.replay_wal() {
                 Ok(0) => debug!("WAL clean, no entries to replay"),
-                Ok(count) => info!("WAL crash recovery: replayed {} entries", count),
+                Ok(count) => {
+                    info!("WAL crash recovery: replayed {} entries", count);
+                    // Truncate replayed WAL entries to prevent duplicate replay on next restart.
+                    // Insert operations generate new row_ids during replay, so re-replaying
+                    // already-committed entries would create duplicate rows.
+                    if let Some(wal) = &engine.wal {
+                        let wal_guard = wal.read();
+                        let current_lsn = wal_guard.current_lsn();
+                        if let Err(e) = wal_guard.truncate(current_lsn) {
+                            warn!("Failed to truncate WAL after replay: {}", e);
+                        }
+                    }
+                }
                 Err(e) => warn!("WAL replay failed (data may be incomplete): {}", e),
             }
         }
@@ -1069,7 +1081,7 @@ impl StorageEngine {
     /// This is used when INSERT is done through a transaction (txn.put()) which
     /// bypasses the normal StorageEngine::put() WAL logging. Call this after
     /// txn.put() to ensure the insert is replicated to standbys.
-    pub fn log_data_insert(&self, table_name: &str, tuple_data: &[u8]) -> Result<()> {
+    pub fn log_data_insert(&self, table_name: &str, key: &[u8], tuple_data: &[u8]) -> Result<()> {
         // Skip during replay to avoid re-logging
         if self.is_replaying.load(Ordering::Acquire) {
             return Ok(());
@@ -1079,6 +1091,7 @@ impl StorageEngine {
             let wal = wal.read();
             wal.append(WalOperation::Insert {
                 table: table_name.to_string(),
+                key: key.to_vec(),
                 tuple: tuple_data.to_vec(),
             })?;
         }
@@ -1269,7 +1282,7 @@ impl StorageEngine {
             self.put(&key, &value)?;
 
             // Log to WAL for durability/replication
-            self.log_data_insert(table_name, &value)?;
+            self.log_data_insert(table_name, &key, &value)?;
 
             // Skip delta tracking in bulk load mode for improved performance
             if !bulk_mode {
@@ -1299,6 +1312,7 @@ impl StorageEngine {
     /// Returns a vector of tuples. In the future, this should return an iterator
     /// to avoid loading all data into memory at once.
     pub fn scan_table(&self, table_name: &str) -> Result<Vec<Tuple>> {
+        let scan_start = std::time::Instant::now();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
 
@@ -1389,6 +1403,13 @@ impl StorageEngine {
             }
         }
 
+        tracing::debug!(
+            phase = "storage_scan",
+            table = table_name,
+            rows = tuples.len(),
+            duration_us = scan_start.elapsed().as_micros() as u64,
+            "Table scan complete"
+        );
         Ok(tuples)
     }
 
@@ -2919,9 +2940,9 @@ impl StorageEngine {
         info!("apply_wal_operation: Processing {:?}", std::mem::discriminant(&operation));
 
         match operation {
-            WalOperation::Insert { table, tuple } => {
-                // For insert operations, the tuple is already serialized
-                // We need to generate a new row ID and store it
+            WalOperation::Insert { table, key, tuple } => {
+                // Use the original key stored in the WAL entry for idempotent replay.
+                // RocksDB put is idempotent: same key overwrites, preventing duplicates.
                 let catalog = Catalog::new(self);
 
                 // Check if table exists before inserting
@@ -2930,13 +2951,10 @@ impl StorageEngine {
                     return Ok(());
                 }
 
-                let row_id = catalog.next_row_id(&table)?;
-                let key = format!("data:{}:{}", table, row_id).into_bytes();
-
-                // Write directly to DB (encryption happens in put())
+                // Write directly to DB using the original key
                 self.put(&key, &tuple)?;
 
-                debug!("Replayed insert: table={}, row_id={}", table, row_id);
+                debug!("Replayed insert: table={}, key_len={}", table, key.len());
                 Ok(())
             }
 
@@ -3249,16 +3267,13 @@ impl StorageEngine {
     /// or Err if there was an error preparing the operation.
     fn apply_wal_operation_to_batch(&self, operation: &WalOperation, batch: &mut WriteBatch) -> Result<bool> {
         match operation {
-            WalOperation::Insert { table, tuple } => {
-                // Check if table exists before inserting
+            WalOperation::Insert { table, key, tuple } => {
+                // Use the original key for idempotent replay (RocksDB put overwrites).
                 let catalog = Catalog::new(self);
                 if catalog.get_table_schema(table).is_err() {
                     debug!("Skipping insert for non-existent table: {}", table);
                     return Ok(false);
                 }
-
-                let row_id = catalog.next_row_id(table)?;
-                let key = format!("data:{}:{}", table, row_id).into_bytes();
 
                 // Encrypt if needed
                 let data = if let Some(km) = &self.key_manager {
@@ -3267,8 +3282,8 @@ impl StorageEngine {
                     tuple.clone()
                 };
 
-                batch.put(&key, &data);
-                debug!("Batched insert: table={}, row_id={}", table, row_id);
+                batch.put(key, &data);
+                debug!("Batched insert: table={}, key_len={}", table, key.len());
                 Ok(true)
             }
 
@@ -3459,7 +3474,7 @@ impl StorageEngine {
         self.put(&key, &value)?;
 
         // Log to WAL for durability/replication
-        self.log_data_insert(table_name, &value)?;
+        self.log_data_insert(table_name, &key, &value)?;
 
         // Write versioned copy (for time-travel queries)
         self.snapshot_manager.write_version(table_name, row_id, timestamp, &value)?;

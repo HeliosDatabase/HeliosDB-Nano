@@ -1289,6 +1289,36 @@ impl std::fmt::Display for DiffLevel {
 }
 
 impl LogicalPlan {
+    /// Get the variant name for tracing/debugging
+    pub fn plan_type_name(&self) -> &'static str {
+        match self {
+            Self::Scan { .. } => "Scan",
+            Self::FilteredScan { .. } => "FilteredScan",
+            Self::Filter { .. } => "Filter",
+            Self::Project { .. } => "Project",
+            Self::Aggregate { .. } => "Aggregate",
+            Self::Sort { .. } => "Sort",
+            Self::Limit { .. } => "Limit",
+            Self::Join { .. } => "Join",
+            Self::Insert { .. } => "Insert",
+            Self::Update { .. } => "Update",
+            Self::Delete { .. } => "Delete",
+            Self::CreateTable { .. } => "CreateTable",
+            Self::DropTable { .. } => "DropTable",
+            Self::CreateIndex { .. } => "CreateIndex",
+            Self::Explain { .. } => "Explain",
+            Self::Union { .. } => "Union",
+            Self::Intersect { .. } => "Intersect",
+            Self::Except { .. } => "Except",
+            Self::With { .. } => "CTE",
+            Self::Truncate { .. } => "Truncate",
+            Self::CreateBranch { .. } => "CreateBranch",
+            Self::MergeBranch { .. } => "MergeBranch",
+            Self::SystemView { .. } => "SystemView",
+            _ => "Other",
+        }
+    }
+
     /// Get the schema of this plan's output
     pub fn schema(&self) -> Arc<Schema> {
         match self {

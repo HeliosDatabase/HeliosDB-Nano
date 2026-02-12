@@ -1325,6 +1325,17 @@ impl SystemViewRegistry {
             "integer",
         ));
 
+        // Slow query threshold
+        results.push(Self::setting_tuple(
+            "slow_query_threshold_ms",
+            &config.storage.slow_query_threshold_ms.map_or("disabled".to_string(), |v| v.to_string()),
+            "ms",
+            "Query Execution",
+            "Queries exceeding this threshold are logged at WARN level",
+            "user",
+            "integer",
+        ));
+
         // Cache size
         results.push(Self::setting_tuple(
             "cache_size",

@@ -1029,7 +1029,7 @@ impl EmbeddedDatabase {
                     txn.put(key.clone(), val.clone())?;
 
                     // Log to WAL for replication (txn.put bypasses normal WAL logging)
-                    self.storage.log_data_insert(table_name, &val)?;
+                    self.storage.log_data_insert(table_name, &key, &val)?;
 
                     count += 1;
 
@@ -1211,7 +1211,10 @@ impl EmbeddedDatabase {
                     let key = self.storage.branch_aware_data_key(table_name, *row_id);
                     let value = bincode::serialize(tuple)
                         .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
-                    txn.put(key, value)?;
+                    txn.put(key.clone(), value.clone())?;
+
+                    // Log to WAL for crash recovery (txn.put bypasses normal WAL logging)
+                    self.storage.log_data_update(table_name, &key, &value)?;
                 }
 
                 // Update storage quota tracking (UPDATEs may change storage size)
@@ -1436,7 +1439,10 @@ impl EmbeddedDatabase {
                     // Main branch: actual key deletion
                     for row_id in &row_ids_to_delete {
                         let key = format!("data:{}:{}", table_name, row_id).into_bytes();
-                        txn.delete(key)?;
+                        txn.delete(key.clone())?;
+
+                        // Log to WAL for crash recovery (txn.delete bypasses normal WAL logging)
+                        self.storage.log_data_delete(table_name, &key)?;
                     }
                 }
 
@@ -2052,8 +2058,27 @@ impl EmbeddedDatabase {
         self.config.storage.query_timeout_ms
     }
 
+    /// Log slow queries at WARN level if they exceed the configured threshold
+    fn log_slow_query(&self, sql: &str, elapsed: std::time::Duration, rows: u64) {
+        if let Some(threshold) = self.config.storage.slow_query_threshold_ms {
+            let elapsed_ms = elapsed.as_millis() as u64;
+            if elapsed_ms >= threshold {
+                tracing::warn!(
+                    duration_ms = elapsed_ms,
+                    rows = rows,
+                    "Slow query ({}ms, {} rows): {:.200}",
+                    elapsed_ms,
+                    rows,
+                    sql
+                );
+            }
+        }
+    }
+
     pub fn execute(&self, sql: &str) -> Result<u64> {
         use crate::error::LockResultExt;
+
+        let start = std::time::Instant::now();
 
         // Check if this is a transaction control statement
         if Self::is_transaction_control(sql) {
@@ -2067,17 +2092,21 @@ impl EmbeddedDatabase {
             txn_lock.is_some()
         };
 
-        if has_active_txn {
+        let result = if has_active_txn {
             // Execute within existing transaction context
             let txn_lock = self.current_transaction.lock()
                 .map_lock_err("Failed to acquire transaction lock for execute")?;
             let txn_ref = txn_lock.as_ref()
                 .ok_or_else(|| Error::transaction("Transaction lock in invalid state"))?;
-            return self.execute_in_transaction(sql, txn_ref);
-        }
+            self.execute_in_transaction(sql, txn_ref)
+        } else {
+            // No active transaction - create implicit transaction
+            self.execute_with_implicit_transaction(sql)
+        };
 
-        // No active transaction - create implicit transaction
-        self.execute_with_implicit_transaction(sql)
+        let rows = result.as_ref().copied().unwrap_or(0);
+        self.log_slow_query(sql, start.elapsed(), rows);
+        result
     }
 
     /// Execute a SQL statement with RETURNING clause support
@@ -2120,17 +2149,23 @@ impl EmbeddedDatabase {
     /// Execute SQL with an implicit transaction (auto-commit)
     fn execute_with_implicit_transaction(&self, sql: &str) -> Result<u64> {
         // Begin implicit transaction
+        let txn_start = std::time::Instant::now();
         let txn = self.storage.begin_transaction()?;
+        tracing::trace!(phase = "txn_begin", duration_us = txn_start.elapsed().as_micros() as u64, "Transaction started");
 
         // Execute the query within transaction context
+        let exec_start = std::time::Instant::now();
         let result = self.execute_in_transaction(sql, &txn);
+        tracing::debug!(phase = "execute", duration_us = exec_start.elapsed().as_micros() as u64, "Query executed");
 
         // Commit or rollback based on result
         match result {
             Ok(count) => {
+                let commit_start = std::time::Instant::now();
                 txn.commit()?;
                 // Increment LSN to track transaction commits
                 self.storage.increment_lsn();
+                tracing::debug!(phase = "txn_commit", duration_us = commit_start.elapsed().as_micros() as u64, rows = count, "Transaction committed");
                 Ok(count)
             }
             Err(e) => {
@@ -2149,13 +2184,19 @@ impl EmbeddedDatabase {
         }
 
         // 2. Parse SQL
+        let parse_start = std::time::Instant::now();
         let parser = sql::Parser::new();
         let statement = parser.parse_one(sql)?;
+        let parse_elapsed = parse_start.elapsed();
+        tracing::debug!(phase = "parse", duration_us = parse_elapsed.as_micros() as u64, "SQL parsed");
 
-        // 2. Create logical plan with catalog access
+        // 3. Create logical plan with catalog access
+        let plan_start = std::time::Instant::now();
         let catalog = self.storage.catalog();
         let planner = sql::Planner::with_catalog(&catalog);
         let plan = planner.statement_to_plan(statement)?;
+        let plan_elapsed = plan_start.elapsed();
+        tracing::debug!(phase = "plan", duration_us = plan_elapsed.as_micros() as u64, "Logical plan created");
 
         // 3. Execute plan based on type
         match &plan {
@@ -3132,6 +3173,8 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
+        let start = std::time::Instant::now();
+
         // Note: Parameter binding not yet implemented
         // 1. Parse SQL
         let parser = sql::Parser::new();
@@ -3150,6 +3193,8 @@ impl EmbeddedDatabase {
         let mut executor = sql::Executor::with_storage(&self.storage)
             .with_timeout(self.config.storage.query_timeout_ms);
         let results = executor.execute(&plan)?;
+
+        self.log_slow_query(sql, start.elapsed(), results.len() as u64);
         Ok(results)
     }
 
@@ -4430,7 +4475,10 @@ impl EmbeddedDatabase {
         let txn = self.storage.begin_transaction()?;
         for row_id in row_ids_to_delete {
             let key = self.storage.branch_aware_data_key(table_name, row_id);
-            txn.delete(key)?;
+            txn.delete(key.clone())?;
+
+            // Log to WAL for crash recovery
+            self.storage.log_data_delete(table_name, &key)?;
         }
         txn.commit()?;
 
@@ -4490,7 +4538,10 @@ impl EmbeddedDatabase {
         for (row_id, new_tuple) in rows_to_update {
             let key = self.storage.branch_aware_data_key(table_name, row_id);
             let val = bincode::serialize(&new_tuple).map_err(|e| Error::storage(e.to_string()))?;
-            txn.put(key, val)?;
+            txn.put(key.clone(), val.clone())?;
+
+            // Log to WAL for crash recovery
+            self.storage.log_data_update(table_name, &key, &val)?;
         }
         txn.commit()?;
 

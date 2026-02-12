@@ -273,6 +273,7 @@ impl Session {
             ]);
         }
 
+        let query_start = std::time::Instant::now();
         debug!("Executing query: {}", query);
 
         // Handle empty query
@@ -347,6 +348,14 @@ impl Session {
                 responses.push(self.create_error_response("42000", &e.to_string()));
             }
         }
+
+        // Log query timing
+        let elapsed = query_start.elapsed();
+        debug!(
+            session = self.session_id,
+            duration_us = elapsed.as_micros() as u64,
+            "Query completed"
+        );
 
         // Send ready for query
         responses.push(BackendMessage::ReadyForQuery {
