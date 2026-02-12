@@ -5,7 +5,7 @@ members = [
 ]
 
 [package]
-name = "heliosdb-lite"
+name = "heliosdb-nano"
 version = "3.6.0"
 edition = "2021"
 authors = ["HeliosDB Team"]
@@ -16,11 +16,11 @@ keywords = ["database", "postgresql", "vector-database", "embedded", "encryption
 categories = ["database", "embedded"]
 
 [lib]
-name = "heliosdb_lite"
+name = "heliosdb_nano"
 path = "src/lib.rs"
 
 [[bin]]
-name = "heliosdb-lite"
+name = "heliosdb-nano"
 path = "src/main.rs"
 
 [dependencies]
