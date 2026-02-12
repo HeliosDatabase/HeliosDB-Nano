@@ -107,9 +107,48 @@ pub struct StorageEngine {
     data_bytes_written: Arc<AtomicU64>,
     /// Memory limit in bytes (0 = unlimited)
     memory_limit_bytes: u64,
+    /// Write counter for periodic disk space check (every 1000 writes)
+    write_counter: Arc<AtomicU64>,
+    /// Database path for disk space checks (None for in-memory)
+    db_path: Option<std::path::PathBuf>,
 }
 
+/// Minimum free disk space threshold (100 MB)
+const MIN_DISK_SPACE_BYTES: u64 = 100 * 1024 * 1024;
+
 impl StorageEngine {
+    /// Check available disk space and return error if below threshold.
+    /// Uses /proc/mounts + statvfs syscall via std to avoid libc dependency.
+    fn check_disk_space(path: &std::path::Path) -> Result<()> {
+        // Read available space from /proc filesystem (Linux-specific, safe fallback)
+        let output = std::process::Command::new("df")
+            .arg("--output=avail")
+            .arg("-B1") // bytes
+            .arg(path)
+            .output();
+
+        match output {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                // Second line contains the available bytes
+                if let Some(avail_str) = stdout.lines().nth(1) {
+                    if let Ok(available_bytes) = avail_str.trim().parse::<u64>() {
+                        if available_bytes < MIN_DISK_SPACE_BYTES {
+                            return Err(Error::storage(format!(
+                                "Insufficient disk space: {} MB available (minimum {} MB required). \
+                                 Free disk space or use VACUUM to reclaim storage.",
+                                available_bytes / (1024 * 1024),
+                                MIN_DISK_SPACE_BYTES / (1024 * 1024)
+                            )));
+                        }
+                    }
+                }
+            }
+            _ => {} // If df fails, skip the check rather than blocking writes
+        }
+        Ok(())
+    }
+
     /// Extract table name from a storage key
     ///
     /// Storage keys follow the format: `data:{table_name}:{row_id}`
@@ -184,6 +223,7 @@ impl StorageEngine {
 
     /// Open a storage engine
     pub fn open(path: impl AsRef<Path>, config: &Config) -> Result<Self> {
+        let db_path = path.as_ref().to_path_buf();
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.set_compression_type(match config.storage.compression {
@@ -368,6 +408,8 @@ impl StorageEngine {
             row_cache: Arc::new(super::RowCache::new()),
             data_bytes_written: Arc::new(AtomicU64::new(0)),
             memory_limit_bytes: 0, // Unlimited for disk-backed mode
+            write_counter: Arc::new(AtomicU64::new(0)),
+            db_path: Some(db_path),
         };
 
         // Load counters from storage
@@ -535,6 +577,8 @@ impl StorageEngine {
             data_bytes_written: Arc::new(AtomicU64::new(0)),
             // Default 4GB limit for in-memory mode (configurable via resource_quotas)
             memory_limit_bytes: config.resource_quotas.memory_limit_per_user_mb * 1024 * 1024,
+            write_counter: Arc::new(AtomicU64::new(0)),
+            db_path: None, // No disk space check for in-memory mode
         })
     }
 
@@ -1017,6 +1061,14 @@ impl StorageEngine {
 
     /// Put a value (basic put, no MVCC yet)
     pub fn put(&self, key: &Key, value: &[u8]) -> Result<()> {
+        // Periodic disk space check (every 1000 writes) for disk-backed mode
+        if let Some(ref db_path) = self.db_path {
+            let count = self.write_counter.fetch_add(1, Ordering::Relaxed);
+            if count % 1000 == 0 {
+                Self::check_disk_space(db_path)?;
+            }
+        }
+
         // Enforce memory limit (primarily for in-memory mode)
         if self.memory_limit_bytes > 0 {
             let write_size = (key.len() + value.len()) as u64;

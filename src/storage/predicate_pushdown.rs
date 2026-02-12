@@ -655,6 +655,12 @@ impl PredicatePushdownManager {
     pub fn register_zone_maps(&self, table_name: String, zone_map: TableZoneMap) {
         self.zone_maps.write().insert(table_name, zone_map);
     }
+
+    /// Remove bloom filters and zone maps for a dropped table
+    pub fn remove_table(&self, table_name: &str) {
+        self.bloom_filters.write().remove(table_name);
+        self.zone_maps.write().remove(table_name);
+    }
 }
 
 impl Default for PredicatePushdownManager {

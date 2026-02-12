@@ -26,6 +26,8 @@ pub struct PgServer {
     connection_limiter: Arc<Semaphore>,
     /// Max connections (for logging)
     max_connections: usize,
+    /// Idle connection timeout in seconds (0 = no timeout)
+    idle_timeout_secs: u64,
 }
 
 impl PgServer {
@@ -56,6 +58,7 @@ impl PgServer {
             next_session_id: Arc::new(AtomicU32::new(1)),
             connection_limiter: Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS)),
             max_connections: DEFAULT_MAX_CONNECTIONS,
+            idle_timeout_secs: 300, // Default 5 minutes
         }
     }
 
@@ -67,7 +70,14 @@ impl PgServer {
             next_session_id: Arc::new(AtomicU32::new(1)),
             connection_limiter: Arc::new(Semaphore::new(max_connections)),
             max_connections,
+            idle_timeout_secs: 300,
         }
+    }
+
+    /// Set idle connection timeout in seconds (0 = no timeout)
+    pub fn with_idle_timeout(mut self, secs: u64) -> Self {
+        self.idle_timeout_secs = secs;
+        self
     }
 
     /// Run the server
@@ -111,7 +121,8 @@ impl PgServer {
             info!("New connection from {} (session {})", addr, session_id);
 
             // Create session
-            let session = Session::new(Arc::clone(&self.db), session_id);
+            let session = Session::new(Arc::clone(&self.db), session_id)
+                        .with_idle_timeout(self.idle_timeout_secs);
 
             // Spawn handler task (permit released when task completes)
             tokio::spawn(async move {
@@ -176,7 +187,8 @@ impl PgServer {
                     info!("New connection from {} (session {})", addr, session_id);
 
                     // Create session
-                    let session = Session::new(Arc::clone(&self.db), session_id);
+                    let session = Session::new(Arc::clone(&self.db), session_id)
+                        .with_idle_timeout(self.idle_timeout_secs);
 
                     // Spawn handler task (permit released when task completes)
                     tokio::spawn(async move {

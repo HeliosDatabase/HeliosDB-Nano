@@ -5,7 +5,7 @@
 
 #[cfg(test)]
 mod decimal_tests {
-    use heliosdb_lite::EmbeddedDatabase;
+    use heliosdb_nano::EmbeddedDatabase;
 
     /// Create an in-memory test database
     fn create_test_db() -> EmbeddedDatabase {

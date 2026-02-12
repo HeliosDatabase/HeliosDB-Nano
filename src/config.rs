@@ -245,6 +245,10 @@ fn default_slow_query_threshold() -> Option<u64> {
     Some(1000)
 }
 
+fn default_idle_timeout_secs() -> u64 {
+    300 // 5 minutes
+}
+
 impl Default for StorageConfig {
     fn default() -> Self {
         Self {
@@ -469,6 +473,9 @@ pub struct ServerConfig {
     pub oracle_port: Option<u16>,
     /// Maximum connections
     pub max_connections: usize,
+    /// Idle connection timeout in seconds (0 = no timeout, default 300s = 5 min)
+    #[serde(default = "default_idle_timeout_secs")]
+    pub idle_timeout_secs: u64,
     /// TLS enabled
     pub tls_enabled: bool,
     /// TLS certificate path
@@ -484,6 +491,7 @@ impl Default for ServerConfig {
             port: 5432,
             oracle_port: Some(1521), // Enable Oracle protocol by default
             max_connections: 100,
+            idle_timeout_secs: default_idle_timeout_secs(),
             tls_enabled: false,
             tls_cert_path: None,
             tls_key_path: None,

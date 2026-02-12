@@ -36,8 +36,8 @@ pub struct Session {
     transaction_status: TransactionStatus,
     /// Authentication state
     auth_state: AuthState,
-    // SQL security validator (optional - would require heliosdb-protocols dependency)
-    // sql_validator: heliosdb_protocols::sql_security::SqlSecurityValidator,
+    /// Idle connection timeout (0 = no timeout)
+    idle_timeout_secs: u64,
 }
 
 /// Authentication state
@@ -81,8 +81,14 @@ impl Session {
             portals: HashMap::new(),
             transaction_status: TransactionStatus::Idle,
             auth_state: AuthState::Unauthenticated,
-            // sql_validator: heliosdb_protocols::sql_security::SqlSecurityValidator::new(),
+            idle_timeout_secs: 0, // Default: no idle timeout (set via with_idle_timeout)
         }
+    }
+
+    /// Set idle connection timeout in seconds (0 = no timeout)
+    pub fn with_idle_timeout(mut self, secs: u64) -> Self {
+        self.idle_timeout_secs = secs;
+        self
     }
 
     /// Handle a client connection
@@ -92,8 +98,24 @@ impl Session {
         let mut buf = vec![0u8; 8192];
 
         loop {
-            // Read data from client
-            let n = match stream.read(&mut buf).await {
+            // Read data from client with optional idle timeout
+            let read_result = if self.idle_timeout_secs > 0 {
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(self.idle_timeout_secs),
+                    stream.read(&mut buf),
+                ).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        info!("Session {} idle timeout ({}s), disconnecting",
+                            self.session_id, self.idle_timeout_secs);
+                        return Ok(());
+                    }
+                }
+            } else {
+                stream.read(&mut buf).await
+            };
+
+            let n = match read_result {
                 Ok(0) => {
                     // Connection closed
                     info!("Session {} closed by client", self.session_id);

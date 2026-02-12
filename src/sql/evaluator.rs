@@ -2993,6 +2993,38 @@ impl Evaluator {
             (Value::Float4(a), Value::Float8(b)) => (*a as f64) == *b,
             (Value::Float8(a), Value::Float4(b)) => *a == (*b as f64),
 
+            // Numeric (DECIMAL) cross-type comparisons — Numeric stores decimal as String
+            (Value::Numeric(a), Value::Float8(b)) => {
+                a.parse::<f64>().is_ok_and(|a| a == *b)
+            }
+            (Value::Float8(a), Value::Numeric(b)) => {
+                b.parse::<f64>().is_ok_and(|b| *a == b)
+            }
+            (Value::Numeric(a), Value::Float4(b)) => {
+                a.parse::<f64>().is_ok_and(|a| a == f64::from(*b))
+            }
+            (Value::Float4(a), Value::Numeric(b)) => {
+                b.parse::<f64>().is_ok_and(|b| f64::from(*a) == b)
+            }
+            (Value::Numeric(a), Value::Int2(b)) => {
+                a.parse::<Decimal>().is_ok_and(|a| a == Decimal::from(*b))
+            }
+            (Value::Int2(a), Value::Numeric(b)) => {
+                b.parse::<Decimal>().is_ok_and(|b| Decimal::from(*a) == b)
+            }
+            (Value::Numeric(a), Value::Int4(b)) => {
+                a.parse::<Decimal>().is_ok_and(|a| a == Decimal::from(*b))
+            }
+            (Value::Int4(a), Value::Numeric(b)) => {
+                b.parse::<Decimal>().is_ok_and(|b| Decimal::from(*a) == b)
+            }
+            (Value::Numeric(a), Value::Int8(b)) => {
+                a.parse::<Decimal>().is_ok_and(|a| a == Decimal::from(*b))
+            }
+            (Value::Int8(a), Value::Numeric(b)) => {
+                b.parse::<Decimal>().is_ok_and(|b| Decimal::from(*a) == b)
+            }
+
             // Null comparisons (SQL: NULL = anything is false, not NULL)
             (Value::Null, _) | (_, Value::Null) => false,
 
@@ -3979,11 +4011,66 @@ impl Evaluator {
             (Value::Float4(a), Value::Float4(b)) => Ok(a.partial_cmp(b).unwrap_or(Ordering::Equal)),
             (Value::Float8(a), Value::Float8(b)) => Ok(a.partial_cmp(b).unwrap_or(Ordering::Equal)),
             (Value::String(a), Value::String(b)) => Ok(a.cmp(b)),
-            // Cross-type numeric comparison
+            (Value::Numeric(a), Value::Numeric(b)) => Ok(a.cmp(b)),
+
+            // Cross-type integer comparisons
+            (Value::Int2(a), Value::Int4(b)) => Ok((*a as i32).cmp(b)),
+            (Value::Int4(a), Value::Int2(b)) => Ok(a.cmp(&(*b as i32))),
+            (Value::Int2(a), Value::Int8(b)) => Ok((*a as i64).cmp(b)),
+            (Value::Int8(a), Value::Int2(b)) => Ok(a.cmp(&(*b as i64))),
             (Value::Int4(a), Value::Int8(b)) => Ok((*a as i64).cmp(b)),
             (Value::Int8(a), Value::Int4(b)) => Ok(a.cmp(&(*b as i64))),
+
+            // Int to Float comparisons
             (Value::Int4(a), Value::Float8(b)) => Ok((*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)),
             (Value::Float8(a), Value::Int4(b)) => Ok(a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)),
+            (Value::Int8(a), Value::Float8(b)) => Ok((*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)),
+            (Value::Float8(a), Value::Int8(b)) => Ok(a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)),
+            (Value::Float4(a), Value::Float8(b)) => Ok((*a as f64).partial_cmp(b).unwrap_or(Ordering::Equal)),
+            (Value::Float8(a), Value::Float4(b)) => Ok(a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal)),
+
+            // Numeric (DECIMAL) cross-type comparisons — Numeric stores decimal as String
+            (Value::Numeric(a), Value::Float8(b)) => {
+                let af = a.parse::<f64>().unwrap_or(0.0);
+                Ok(af.partial_cmp(b).unwrap_or(Ordering::Equal))
+            }
+            (Value::Float8(a), Value::Numeric(b)) => {
+                let bf = b.parse::<f64>().unwrap_or(0.0);
+                Ok(a.partial_cmp(&bf).unwrap_or(Ordering::Equal))
+            }
+            (Value::Numeric(a), Value::Float4(b)) => {
+                let af = a.parse::<f64>().unwrap_or(0.0);
+                Ok(af.partial_cmp(&f64::from(*b)).unwrap_or(Ordering::Equal))
+            }
+            (Value::Float4(a), Value::Numeric(b)) => {
+                let bf = b.parse::<f64>().unwrap_or(0.0);
+                Ok(f64::from(*a).partial_cmp(&bf).unwrap_or(Ordering::Equal))
+            }
+            (Value::Numeric(a), Value::Int4(b)) => {
+                let ad = a.parse::<Decimal>().unwrap_or_default();
+                Ok(ad.cmp(&Decimal::from(*b)))
+            }
+            (Value::Int4(a), Value::Numeric(b)) => {
+                let bd = b.parse::<Decimal>().unwrap_or_default();
+                Ok(Decimal::from(*a).cmp(&bd))
+            }
+            (Value::Numeric(a), Value::Int8(b)) => {
+                let ad = a.parse::<Decimal>().unwrap_or_default();
+                Ok(ad.cmp(&Decimal::from(*b)))
+            }
+            (Value::Int8(a), Value::Numeric(b)) => {
+                let bd = b.parse::<Decimal>().unwrap_or_default();
+                Ok(Decimal::from(*a).cmp(&bd))
+            }
+            (Value::Numeric(a), Value::Int2(b)) => {
+                let ad = a.parse::<Decimal>().unwrap_or_default();
+                Ok(ad.cmp(&Decimal::from(*b)))
+            }
+            (Value::Int2(a), Value::Numeric(b)) => {
+                let bd = b.parse::<Decimal>().unwrap_or_default();
+                Ok(Decimal::from(*a).cmp(&bd))
+            }
+
             _ => Ok(Ordering::Equal),
         }
     }

@@ -2457,8 +2457,16 @@ impl EmbeddedDatabase {
                 let exists = catalog.table_exists(name)?;
 
                 if exists {
-                    // Drop the table
+                    // Drop the table (schema, data, ART indexes, stats)
                     catalog.drop_table(name)?;
+
+                    // Clean up triggers for this table
+                    if let Err(e) = self.trigger_registry.drop_table_triggers(name) {
+                        tracing::warn!("Failed to clean up triggers for dropped table '{}': {}", name, e);
+                    }
+
+                    // Clean up bloom filters and zone maps
+                    self.storage.predicate_pushdown().remove_table(name);
 
                     // Log to WAL for replication
                     if let Err(e) = self.storage.log_drop_table(name) {
