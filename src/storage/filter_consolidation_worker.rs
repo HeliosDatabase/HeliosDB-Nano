@@ -373,7 +373,9 @@ impl FilterConsolidationWorker {
                     table_map.blocks.push(BlockZoneMap::new(new_block_id, first_row_id));
                 }
 
-                let block_map = &mut table_map.blocks[block_idx];
+                let Some(block_map) = table_map.blocks.get_mut(block_idx) else {
+                    continue;
+                };
 
                 for update in &zone_delta.column_updates {
                     if update.is_null {

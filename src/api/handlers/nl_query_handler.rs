@@ -448,9 +448,7 @@ pub async fn nl_execute(
     // Build response
     let (columns, column_types, rows) = if tuples.is_empty() {
         (vec![], vec![], vec![])
-    } else {
-        // Infer columns from first tuple
-        let first = &tuples[0];
+    } else if let Some(first) = tuples.first() {
         let cols: Vec<String> = (0..first.values.len())
             .map(|i| format!("column_{}", i))
             .collect();
@@ -468,6 +466,8 @@ pub async fn nl_execute(
         }).collect();
 
         (cols, types, rows)
+    } else {
+        (vec![], vec![], vec![])
     };
 
     let total_time = total_start.elapsed().as_millis() as u64;
@@ -962,7 +962,7 @@ fn extract_conditions_from_sql(sql: &str) -> Vec<String> {
 
         let where_clause = after[..end].trim();
         // Split by AND/OR
-        for part in where_clause.split(|c: char| c == '(' || c == ')') {
+        for part in where_clause.split(['(', ')']) {
             let trimmed = part.trim();
             if !trimmed.is_empty() && !trimmed.eq_ignore_ascii_case("AND") && !trimmed.eq_ignore_ascii_case("OR") {
                 conditions.push(trimmed.to_string());

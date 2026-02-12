@@ -440,6 +440,7 @@ impl BloomFilter {
     }
 
     /// Hash a Value into a hasher
+    #[allow(clippy::self_only_used_in_recursion)]
     fn hash_value(&self, value: &Value, hasher: &mut DefaultHasher) {
         match value {
             Value::Null => 0u8.hash(hasher),

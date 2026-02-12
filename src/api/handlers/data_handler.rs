@@ -209,7 +209,7 @@ pub async fn query_data(
     // Check if there are more results
     let has_more = results.len() > params.limit as usize;
     let actual_results = if has_more {
-        &results[..params.limit as usize]
+        results.get(..params.limit as usize).unwrap_or(&results)
     } else {
         &results[..]
     };

@@ -455,6 +455,7 @@ impl AdaptiveRadixTree {
     }
 
     /// Internal recursive get
+    #[allow(clippy::self_only_used_in_recursion)]
     fn get_recursive(&self, node: &ArtNode, key: &[u8], depth: usize) -> Option<RowId> {
         match node {
             ArtNode::Leaf(leaf) => {
@@ -683,7 +684,7 @@ impl<'a> ArtIterator<'a> {
 }
 
 #[allow(clippy::indexing_slicing)] // SAFETY: node child indexing bounded by node type invariants
-impl<'a> Iterator for ArtIterator<'a> {
+impl Iterator for ArtIterator<'_> {
     type Item = (Vec<u8>, RowId);
 
     fn next(&mut self) -> Option<Self::Item> {

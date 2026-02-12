@@ -581,12 +581,11 @@ impl AdaptiveParallelFilter {
 
             // Move towards best with some exploration
             let current = self.optimal_chunk.load(Ordering::Relaxed);
-            let new_chunk = if best > current {
-                (current + best) / 2
-            } else if best < current {
-                (current + best) / 2
-            } else {
-                current
+            let new_chunk = match best.cmp(&current) {
+                std::cmp::Ordering::Greater | std::cmp::Ordering::Less => {
+                    usize::midpoint(current, best)
+                }
+                std::cmp::Ordering::Equal => current,
             };
 
             self.optimal_chunk.store(new_chunk.max(64).min(4096), Ordering::Relaxed);

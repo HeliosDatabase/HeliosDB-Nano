@@ -108,8 +108,8 @@ fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
     }
 
     let mut result = 0u8;
-    for i in 0..a.len() {
-        result |= a[i] ^ b[i];
+    for (x, y) in a.iter().zip(b.iter()) {
+        result |= x ^ y;
     }
 
     result == 0

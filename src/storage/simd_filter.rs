@@ -553,7 +553,7 @@ impl CombinedPredicate {
     pub fn get_column_indices(&self) -> Vec<usize> {
         let mut indices = Vec::new();
         self.collect_column_indices(&mut indices);
-        indices.sort();
+        indices.sort_unstable();
         indices.dedup();
         indices
     }
@@ -883,8 +883,7 @@ impl SimdPredicateFilteringEngine {
 
         // Handle remainder with scalar
         let remainder_start = chunks * 8;
-        for i in remainder_start..len {
-            let val = values[i];
+        for (i, &val) in values.iter().enumerate().skip(remainder_start) {
             let matches = match op {
                 FilterOp::Eq => val == compare_value,
                 FilterOp::NotEq => val != compare_value,

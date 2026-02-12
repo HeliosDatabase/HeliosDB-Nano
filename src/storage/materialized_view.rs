@@ -239,14 +239,16 @@ impl<'a> MaterializedViewCatalog<'a> {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(prefix) {
-                if !key.is_empty() && key[0] > prefix[0] {
-                    break;
+                if let (Some(&k), Some(&p)) = (key.first(), prefix.first()) {
+                    if k > p {
+                        break;
+                    }
                 }
                 continue;
             }
 
             // Extract view name from key
-            let view_name = String::from_utf8_lossy(&key[prefix.len()..]).to_string();
+            let view_name = String::from_utf8_lossy(key.get(prefix.len()..).unwrap_or_default()).to_string();
             views.push(view_name);
         }
 

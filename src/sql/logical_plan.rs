@@ -1295,7 +1295,7 @@ impl LogicalPlan {
             LogicalPlan::Scan { schema, projection, .. } => {
                 if let Some(indices) = projection {
                     let columns: Vec<_> = indices.iter()
-                        .map(|&i| schema.columns[i].clone())
+                        .filter_map(|&i| schema.columns.get(i).cloned())
                         .collect();
                     Arc::new(Schema { columns })
                 } else {
@@ -1305,7 +1305,7 @@ impl LogicalPlan {
             LogicalPlan::FilteredScan { schema, projection, .. } => {
                 if let Some(indices) = projection {
                     let columns: Vec<_> = indices.iter()
-                        .map(|&i| schema.columns[i].clone())
+                        .filter_map(|&i| schema.columns.get(i).cloned())
                         .collect();
                     Arc::new(Schema { columns })
                 } else {

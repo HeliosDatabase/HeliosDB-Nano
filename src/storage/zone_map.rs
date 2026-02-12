@@ -475,7 +475,9 @@ impl TableZoneMap {
             self.stats.total_blocks += 1;
         }
 
-        self.blocks[block_idx].add_row(row_id, values);
+        if let Some(block) = self.blocks.get_mut(block_idx) {
+            block.add_row(row_id, values);
+        }
     }
 
     /// Get blocks that might match an equality predicate

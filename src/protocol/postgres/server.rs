@@ -13,7 +13,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 /// Default PostgreSQL listen address (0.0.0.0:5432)
 const DEFAULT_PG_ADDRESS: SocketAddr = SocketAddr::new(
-    IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
+    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
     5432
 );
 

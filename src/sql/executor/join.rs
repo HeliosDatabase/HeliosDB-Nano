@@ -129,7 +129,8 @@ impl PhysicalOperator for NestedLoopJoinOperator {
             // Try to find a matching right tuple
             while self.right_index < self.right_tuples.len() {
                 let right_idx = self.right_index;
-                let right_tuple = &self.right_tuples[right_idx];
+                let right_tuple = self.right_tuples.get(right_idx)
+                    .ok_or_else(|| Error::query_execution("Right tuple index out of bounds"))?;
                 self.right_index += 1;
 
                 // Combine left and right tuples
@@ -155,7 +156,9 @@ impl PhysicalOperator for NestedLoopJoinOperator {
                     self.left_matched = true;
                     // Mark right tuple as matched (for RIGHT/FULL joins)
                     if matches!(self.join_type, JoinType::Right | JoinType::Full) {
-                        self.right_matched[right_idx] = true;
+                        if let Some(matched) = self.right_matched.get_mut(right_idx) {
+                            *matched = true;
+                        }
                     }
                     return Ok(Some(combined_tuple));
                 }
@@ -188,8 +191,9 @@ impl NestedLoopJoinOperator {
             let idx = self.unmatched_right_index;
             self.unmatched_right_index += 1;
 
-            if !self.right_matched[idx] {
-                let right_tuple = &self.right_tuples[idx];
+            if !self.right_matched.get(idx).copied().unwrap_or(false) {
+                let right_tuple = self.right_tuples.get(idx)
+                    .ok_or_else(|| Error::query_execution("Right tuple index out of bounds"))?;
                 return Ok(Some(self.join_with_nulls_left(right_tuple)));
             }
         }
@@ -490,7 +494,8 @@ impl HashJoinOperator {
 
             // If we have pending matches for current left tuple, emit them
             if self.match_index < self.current_matches.len() {
-                let right_tuple = &self.current_matches[self.match_index];
+                let right_tuple = self.current_matches.get(self.match_index)
+                    .ok_or_else(|| Error::query_execution("Match index out of bounds"))?;
                 self.match_index += 1;
 
                 let left_tuple = self.current_left_tuple.as_ref()

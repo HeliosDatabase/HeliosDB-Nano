@@ -126,13 +126,14 @@ mod ring_provider {
             }
 
             let mut key = [0u8; 32];
-            key.copy_from_slice(&key_bytes[0..32]);
+            key.copy_from_slice(key_bytes.get(0..32).ok_or_else(|| Error::encryption("Derived key too short"))?);
             Ok(key)
         }
 
         fn random_bytes(&self, output: &mut [u8]) {
             use ring::rand::{SecureRandom, SystemRandom};
             let rng = SystemRandom::new();
+            #[allow(clippy::expect_used)]
             rng.fill(output).expect("System RNG failure");
         }
     }
@@ -315,6 +316,7 @@ pub fn init_provider() -> Result<()> {
 ///
 /// Panics if `init_provider()` was not called first.
 pub fn provider() -> &'static dyn CryptoProvider {
+    #[allow(clippy::expect_used)]
     GLOBAL_PROVIDER
         .get()
         .expect("Crypto provider not initialized. Call init_provider() first.")

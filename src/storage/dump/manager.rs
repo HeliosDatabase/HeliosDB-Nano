@@ -559,7 +559,6 @@ impl DumpManager {
         // Open file in append or create mode
         let file = if append && output_path.exists() {
             OpenOptions::new()
-                .write(true)
                 .append(true)
                 .open(output_path)
                 .map_err(|e| Error::storage(format!("Failed to open dump file: {}", e)))?
@@ -973,7 +972,9 @@ impl DumpManager {
             if bytes_read == 0 {
                 break;
             }
-            hasher.update(&buffer[..bytes_read]);
+            if let Some(data) = buffer.get(..bytes_read) {
+                hasher.update(data);
+            }
         }
 
         Ok(format!("{:08x}", hasher.finalize()))

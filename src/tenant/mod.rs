@@ -23,8 +23,8 @@ pub use expression::{RLSExpressionEvaluator, evaluate_rls_expression};
 
 // Thread-local for current tenant ID (used by SQL functions like current_tenant())
 thread_local! {
-    static CURRENT_TENANT_ID: RefCell<Option<Uuid>> = RefCell::new(None);
-    static CURRENT_USER_ID: RefCell<Option<String>> = RefCell::new(None);
+    static CURRENT_TENANT_ID: RefCell<Option<Uuid>> = const { RefCell::new(None) };
+    static CURRENT_USER_ID: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 /// Get current tenant ID from thread-local storage (for SQL functions)
@@ -159,7 +159,7 @@ impl Plan {
     }
 
     /// Mark as default plan
-    pub fn as_default(mut self) -> Self {
+    pub fn as_default(&mut self) -> &mut Self {
         self.is_default = true;
         self
     }

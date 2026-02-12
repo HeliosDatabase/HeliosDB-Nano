@@ -1008,7 +1008,7 @@ impl ProceduralParser {
 
         // Check for single quotes
         if self.peek_char() == Some('\'') {
-            return Ok(self.parse_string_literal()?);
+            return self.parse_string_literal();
         }
 
         Err(Error::sql_parse("Expected function body delimiter"))
@@ -1320,7 +1320,7 @@ impl ProceduralParser {
 
         if remaining.starts_with(&upper_keyword) {
             let after = remaining.chars().nth(upper_keyword.len());
-            if after.map_or(true, |c| !c.is_alphanumeric()) {
+            if after.is_none_or(|c| !c.is_alphanumeric()) {
                 self.pos += keyword.len();
                 return true;
             }
@@ -1334,7 +1334,7 @@ impl ProceduralParser {
 
         if remaining.starts_with(&upper_keyword) {
             let after = remaining.chars().nth(upper_keyword.len());
-            after.map_or(true, |c| !c.is_alphanumeric())
+            after.is_none_or(|c| !c.is_alphanumeric())
         } else {
             false
         }

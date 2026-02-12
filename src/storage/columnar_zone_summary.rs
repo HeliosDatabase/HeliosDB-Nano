@@ -70,6 +70,7 @@ impl HyperLogLog {
         // Apply corrections
         if raw_estimate <= 2.5 * m {
             // Small range correction
+            #[allow(clippy::naive_bytecount)]
             let zeros = self.registers.iter().filter(|&&r| r == 0).count() as f64;
             if zeros > 0.0 {
                 (m * (m / zeros).ln()) as u64
@@ -469,6 +470,7 @@ impl ColumnZoneSummary {
         }
     }
 
+    #[allow(clippy::float_cmp)]
     fn values_equal(a: &Value, b: &Value) -> bool {
         match (a, b) {
             (Value::Int8(a), Value::Int8(b)) => a == b,

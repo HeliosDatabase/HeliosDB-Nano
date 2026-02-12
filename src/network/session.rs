@@ -107,7 +107,7 @@ impl Session {
             };
 
             // Add data to decoder buffer
-            self.decoder.buffer_data(&buf[..n]);
+            self.decoder.buffer_data(buf.get(..n).unwrap_or(&buf));
 
             // Process all available messages
             loop {
@@ -214,7 +214,7 @@ impl Session {
         // For MVP, accept any password (or configure specific credentials)
         let auth = SimpleAuth::new("postgres".to_string(), "postgres".to_string());
 
-        if !auth.verify(username, &password) && !(username == "postgres" || username == "helios") {
+        if !(auth.verify(username, &password) || username == "postgres" || username == "helios") {
             return Ok(vec![
                 self.create_error_response("28P01", "Authentication failed"),
                 BackendMessage::ReadyForQuery { status: TransactionStatus::Idle },
@@ -562,10 +562,10 @@ impl Session {
             let rows = self.db.query(query, &param_refs)?;
 
             // Get schema from first row or create empty schema
-            let schema = if !rows.is_empty() {
+            let schema = if let Some(first_row) = rows.first() {
                 // In a real implementation, we'd get the schema from the planner
                 // For now, create a simple schema based on the first row
-                self.infer_schema(&rows[0])
+                self.infer_schema(first_row)
             } else {
                 crate::Schema::new(vec![])
             };

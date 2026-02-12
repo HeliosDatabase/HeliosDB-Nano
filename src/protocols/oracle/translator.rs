@@ -116,21 +116,22 @@ impl OracleTranslator {
                 ));
             }
 
-            let expr = args[0];
+            let expr = match args.first() {
+                Some(e) => e,
+                None => return Err(Error::query_execution("DECODE missing expression")),
+            };
             let mut case_expr = format!("CASE");
 
             // Process value/result pairs
             let mut i = 1;
-            while i + 1 < args.len() {
-                let value = args[i];
-                let result_val = args[i + 1];
+            while let (Some(value), Some(result_val)) = (args.get(i), args.get(i + 1)) {
                 case_expr.push_str(&format!(" WHEN {} = {} THEN {}", expr, value, result_val));
                 i += 2;
             }
 
             // Handle default value if present
-            if i < args.len() {
-                case_expr.push_str(&format!(" ELSE {}", args[i]));
+            if let Some(default_val) = args.get(i) {
+                case_expr.push_str(&format!(" ELSE {}", default_val));
             }
 
             case_expr.push_str(" END");

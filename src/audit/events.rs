@@ -82,7 +82,7 @@ impl AuditEvent {
         }
         hasher.update(self.query.as_bytes());
         hasher.update(self.affected_rows.to_le_bytes());
-        hasher.update(&[if self.success { 1u8 } else { 0u8 }]);
+        hasher.update([if self.success { 1u8 } else { 0u8 }]);
         if let Some(error) = &self.error {
             hasher.update(error.as_bytes());
         }

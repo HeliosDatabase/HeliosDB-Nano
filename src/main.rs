@@ -9,7 +9,7 @@
     clippy::manual_string_new,
 )]
 
-use heliosdb_lite::{Config, EmbeddedDatabase, Result, Error};
+use heliosdb_nano::{Config, EmbeddedDatabase, Result, Error};
 use std::path::PathBuf;
 use tracing::info;
 use clap::{Parser, Subcommand};
@@ -36,6 +36,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Start the database server
     Start {
@@ -274,20 +275,20 @@ async fn main() -> Result<()> {
                 start_server(resolved_data_dir, port, listen, config, dump_on_shutdown, tls_cert, tls_key, auth, password, ha_config).await
             }
         }
-        Commands::Stop { pid_file } => {
+        Commands::Stop { ref pid_file } => {
             stop_server(pid_file)
         }
-        Commands::Status { pid_file } => {
+        Commands::Status { ref pid_file } => {
             check_server_status(pid_file)
         }
-        Commands::Init { data_dir } => {
+        Commands::Init { ref data_dir } => {
             init_database(data_dir)
         }
         Commands::Repl { data_dir, memory, dump_on_shutdown, dump_file } => {
             run_repl(data_dir, memory, dump_on_shutdown, dump_file)
         }
         Commands::Dump { output, data_dir, append, compression, connection, verbose } => {
-            use heliosdb_lite::cli::DumpCommand;
+            use heliosdb_nano::cli::DumpCommand;
             let cmd = DumpCommand {
                 output,
                 append,
@@ -300,7 +301,7 @@ async fn main() -> Result<()> {
             cmd.execute()
         }
         Commands::Restore { input, target, verify, connection, verbose } => {
-            use heliosdb_lite::cli::RestoreCommand;
+            use heliosdb_nano::cli::RestoreCommand;
             let cmd = RestoreCommand {
                 input,
                 target,
@@ -313,6 +314,7 @@ async fn main() -> Result<()> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_server(
     data_dir: PathBuf,
     port: u16,
@@ -325,11 +327,11 @@ async fn start_server(
     password: Option<String>,
     ha_config: HAConfig,
 ) -> Result<()> {
-    use heliosdb_lite::protocol::postgres::server::{PgServer, PgServerConfig};
-    use heliosdb_lite::protocol::postgres::auth::{AuthMethod, AuthManager};
-    use heliosdb_lite::protocol::postgres::ssl::{SslConfig, SslMode};
-    use heliosdb_lite::protocol::postgres::{InMemoryPasswordStore, SharedPasswordStore, PasswordStore};
-    use heliosdb_lite::storage::{DumpManager, DumpOptions, DumpMode, DumpCompressionType};
+    use heliosdb_nano::protocol::postgres::server::{PgServer, PgServerConfig};
+    use heliosdb_nano::protocol::postgres::auth::{AuthMethod, AuthManager};
+    use heliosdb_nano::protocol::postgres::ssl::{SslConfig, SslMode};
+    use heliosdb_nano::protocol::postgres::{InMemoryPasswordStore, SharedPasswordStore, PasswordStore};
+    use heliosdb_nano::storage::{DumpManager, DumpOptions, DumpMode, DumpCompressionType};
     use std::sync::Arc;
     use std::net::SocketAddr;
     use std::time::Instant;
@@ -347,7 +349,7 @@ async fn start_server(
 
     // Load config
     let _db_config = if let Some(ref path) = config_path {
-        println!("[1/4] Loading configuration from {path:?}...");
+        println!("[1/4] Loading configuration from {}...", path.display());
         Config::from_file(path.clone())?
     } else {
         println!("[1/4] Using default configuration...");
@@ -355,7 +357,7 @@ async fn start_server(
     };
 
     // Open database
-    println!("[2/4] Initializing database at {data_dir:?}...");
+    println!("[2/4] Initializing database at {}...", data_dir.display());
     let db = Arc::new(EmbeddedDatabase::new(&data_dir)?);
     println!("      Database initialized successfully");
 
@@ -382,7 +384,7 @@ async fn start_server(
 
     // Build server config
     let mut pg_config = PgServerConfig::with_address(pg_addr)
-        .with_auth_method(auth_method.clone())
+        .with_auth_method(auth_method)
         .with_max_connections(100);
 
     // Configure TLS if specified
@@ -420,7 +422,7 @@ async fn start_server(
     }
 
     // Create PostgreSQL server with appropriate auth configuration
-    let pg_server = if !matches!(auth_method, AuthMethod::Trust) {
+    let pg_server = if matches!(auth_method, AuthMethod::CleartextPassword | AuthMethod::Md5 | AuthMethod::ScramSha256) {
         if let Some(ref pwd) = password {
             // Create password store with default users
             let mut store = InMemoryPasswordStore::new();
@@ -449,7 +451,7 @@ async fn start_server(
     println!("    Node.js:    pg.connect({{ host: '{listen}', port: {port} }})");
     println!("    JDBC:       jdbc:postgresql://{listen}:{port}/heliosdb");
     println!();
-    println!("  For REPL mode (single-user):  heliosdb-lite repl -d {data_dir:?}");
+    println!("  For REPL mode (single-user):  heliosdb-lite repl -d {}", data_dir.display());
     println!();
     println!("  Press Ctrl+C to shut down");
     println!("────────────────────────────────────────────────────────────────");
@@ -506,7 +508,7 @@ async fn start_server(
             tables: None,
             verbose: false,
             connection: None,
-            format: heliosdb_lite::storage::DumpOutputFormat::Binary,
+            format: heliosdb_nano::storage::DumpOutputFormat::Binary,
         };
 
         match dump_manager.dump(&options, db.as_ref()) {
@@ -529,16 +531,16 @@ async fn start_server(
     Ok(())
 }
 
-fn init_database(data_dir: PathBuf) -> Result<()> {
+fn init_database(data_dir: &PathBuf) -> Result<()> {
     println!();
     println!("Initializing new HeliosDB-Lite database...");
-    println!("  Location: {data_dir:?}");
+    println!("  Location: {}", data_dir.display());
 
     // Create directory
-    std::fs::create_dir_all(&data_dir)?;
+    std::fs::create_dir_all(data_dir)?;
 
     // Initialize database
-    let db = EmbeddedDatabase::new(&data_dir)?;
+    let db = EmbeddedDatabase::new(data_dir)?;
 
     // Close database
     db.close()?;
@@ -547,16 +549,16 @@ fn init_database(data_dir: PathBuf) -> Result<()> {
     println!("Database initialized successfully!");
     println!();
     println!("Next steps:");
-    println!("  Start server:    heliosdb-lite start -d {data_dir:?}");
-    println!("  Start REPL:      heliosdb-lite repl -d {data_dir:?}");
+    println!("  Start server:    heliosdb-lite start -d {}", data_dir.display());
+    println!("  Start REPL:      heliosdb-lite repl -d {}", data_dir.display());
     println!();
 
     Ok(())
 }
 
 fn run_repl(data_dir: PathBuf, memory: bool, dump_on_shutdown: bool, dump_file: Option<PathBuf>) -> Result<()> {
-    use heliosdb_lite::repl::{ReplShell, ReplConfig};
-    use heliosdb_lite::storage::{DumpManager, DumpOptions, DumpMode, DumpCompressionType};
+    use heliosdb_nano::repl::{ReplShell, ReplConfig};
+    use heliosdb_nano::storage::{DumpManager, DumpOptions, DumpMode, DumpCompressionType};
     use colored::Colorize;
 
     // Open database with user-friendly output
@@ -565,7 +567,7 @@ fn run_repl(data_dir: PathBuf, memory: bool, dump_on_shutdown: bool, dump_file: 
         println!("  Note: Data will be lost when you exit.");
         EmbeddedDatabase::new_in_memory()?
     } else {
-        println!("Starting REPL with persistent storage at {data_dir:?}...");
+        println!("Starting REPL with persistent storage at {}...", data_dir.display());
         EmbeddedDatabase::new(&data_dir)?
     };
 
@@ -595,7 +597,7 @@ fn run_repl(data_dir: PathBuf, memory: bool, dump_on_shutdown: bool, dump_file: 
             tables: None,
             verbose: false,
             connection: None,
-            format: heliosdb_lite::storage::DumpOutputFormat::Binary,
+            format: heliosdb_nano::storage::DumpOutputFormat::Binary,
         };
 
         // Perform dump using the shell's database reference
@@ -617,6 +619,7 @@ fn run_repl(data_dir: PathBuf, memory: bool, dump_on_shutdown: bool, dump_file: 
     result
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn start_server_daemon(
     data_dir: PathBuf,
     port: u16,
@@ -765,7 +768,7 @@ async fn start_server_daemon(
     }
 }
 
-fn stop_server(pid_file: PathBuf) -> Result<()> {
+fn stop_server(pid_file: &PathBuf) -> Result<()> {
     if !pid_file.exists() {
         return Err(Error::io(format!(
             "PID file not found: {}. Server may not be running.",
@@ -773,7 +776,7 @@ fn stop_server(pid_file: PathBuf) -> Result<()> {
         )));
     }
 
-    let pid_str = std::fs::read_to_string(&pid_file)
+    let pid_str = std::fs::read_to_string(pid_file)
         .map_err(|e| Error::io(format!("Failed to read PID file: {e}")))?;
 
     let pid = pid_str.trim().parse::<i32>()
@@ -817,7 +820,7 @@ fn stop_server(pid_file: PathBuf) -> Result<()> {
             }
 
             // Remove PID file
-            std::fs::remove_file(&pid_file)
+            std::fs::remove_file(pid_file)
                 .map_err(|e| Error::io(format!("Failed to remove PID file: {e}")))?;
 
             println!("Server stopped successfully");
@@ -833,14 +836,14 @@ fn stop_server(pid_file: PathBuf) -> Result<()> {
     }
 }
 
-fn check_server_status(pid_file: PathBuf) -> Result<()> {
+fn check_server_status(pid_file: &PathBuf) -> Result<()> {
     if !pid_file.exists() {
         println!("Status: NOT RUNNING");
         println!("PID file not found: {}", pid_file.display());
         return Ok(());
     }
 
-    let pid_str = std::fs::read_to_string(&pid_file)
+    let pid_str = std::fs::read_to_string(pid_file)
         .map_err(|e| Error::io(format!("Failed to read PID file: {e}")))?;
 
     let pid = pid_str.trim().parse::<i32>()
@@ -908,9 +911,9 @@ async fn start_ha_components(
     ha_config: &HAConfig,
     listen: &str,
     port: u16,
-    storage: std::sync::Arc<heliosdb_lite::storage::StorageEngine>,
+    storage: std::sync::Arc<heliosdb_nano::storage::StorageEngine>,
 ) -> Result<HAHandles> {
-    use heliosdb_lite::replication::{
+    use heliosdb_nano::replication::{
         streaming::{StreamingServer, StreamingServerConfig, StreamingClient, StreamingClientConfig},
         wal_store::{WalStore, WalStoreConfig},
         wal_applicator::WalApplicator,
@@ -1013,7 +1016,7 @@ async fn start_ha_components(
             // Extract hostname from primary_host (format: "host:replication_port")
             // Query forwarding connects to primary's postgres port, not replication port
             {
-                use heliosdb_lite::replication::query_forwarder::init_query_forwarder;
+                use heliosdb_nano::replication::query_forwarder::init_query_forwarder;
                 let primary_hostname = primary_host.split(':').next().unwrap_or(primary_host);
                 // Primary's postgres port - use environment variable or default to 5432
                 let primary_pg_port = std::env::var("HELIOSDB_PRIMARY_PG_PORT")

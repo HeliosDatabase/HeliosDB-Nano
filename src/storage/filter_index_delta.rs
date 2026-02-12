@@ -672,7 +672,7 @@ pub struct BulkLoadGuard<'a> {
     tracker: &'a FilterIndexDeltaTracker,
 }
 
-impl<'a> BulkLoadGuard<'a> {
+impl BulkLoadGuard<'_> {
     /// Get the number of rows affected during suspension
     pub fn rows_affected(&self) -> u64 {
         self.info.rows_affected.load(Ordering::Relaxed)
@@ -689,7 +689,7 @@ impl<'a> BulkLoadGuard<'a> {
     }
 }
 
-impl<'a> Drop for BulkLoadGuard<'a> {
+impl Drop for BulkLoadGuard<'_> {
     fn drop(&mut self) {
         let rows_affected = self.info.rows_affected.load(Ordering::Relaxed);
 

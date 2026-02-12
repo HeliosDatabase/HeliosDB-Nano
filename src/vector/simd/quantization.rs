@@ -97,7 +97,7 @@ pub fn compute_distance_table(
 
 // SAFETY: `m` iterates 0..num_subquantizers which matches codes.len() (asserted by caller).
 // `table_offset = m * codebook_size + code` is bounded by distance_table.len() (asserted by caller).
-#[allow(clippy::indexing_slicing)]
+#[allow(clippy::indexing_slicing, clippy::needless_range_loop)]
 #[inline]
 fn asymmetric_distance_scalar(
     codes: &[u8],
@@ -122,7 +122,7 @@ fn asymmetric_distance_scalar(
 
 // SAFETY: All indices bounded by num_subquantizers, codebook_size, and codes.len()
 // which are validated by the calling function via assertions.
-#[allow(clippy::indexing_slicing)]
+#[allow(clippy::indexing_slicing, clippy::needless_range_loop)]
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn asymmetric_distance_avx2(
@@ -202,7 +202,7 @@ unsafe fn horizontal_sum_avx2(v: std::arch::x86_64::__m256) -> f32 {
 // SAFETY: `m` iterates 0..num_subquantizers; `offset + subvector_dim` is bounded by
 // vector.len() which equals num_subquantizers * subvector_dim (validated by caller).
 // codebooks[m] is bounded by num_subquantizers.
-#[allow(clippy::indexing_slicing)]
+#[allow(clippy::indexing_slicing, clippy::needless_range_loop)]
 pub fn encode_vector_simd(
     vector: &[f32],
     codebooks: &[Vec<Vec<f32>>],

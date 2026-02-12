@@ -436,7 +436,7 @@ pub struct DiffEngine<'a> {
     branch_manager: Option<Arc<BranchManager>>,
 }
 
-impl<'a> Default for DiffEngine<'a> {
+impl Default for DiffEngine<'_> {
     fn default() -> Self {
         Self::new()
     }

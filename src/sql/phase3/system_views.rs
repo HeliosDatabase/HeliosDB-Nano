@@ -2321,7 +2321,7 @@ impl SystemViewRegistry {
 
         for table_name in &tables {
             if let Some(stats) = catalog.get_compression_stats(table_name)? {
-                for (_col_name, col_stats) in &stats.column_stats {
+                for col_stats in stats.column_stats.values() {
                     let codec_name = format!("{:?}", col_stats.codec);
                     match codec_name.as_str() {
                         "ALP" => {

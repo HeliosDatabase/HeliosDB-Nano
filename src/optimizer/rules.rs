@@ -13,7 +13,7 @@ use std::collections::HashSet;
 /// Trait for optimization rules
 pub trait OptimizationRule: Send + Sync {
     /// Get the name of this rule
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
 
     /// Apply the rule to a logical plan
     /// Returns Some(new_plan) if the rule was applied, None if not applicable
@@ -130,7 +130,7 @@ impl SelectionPushdownRule {
 }
 
 impl OptimizationRule for SelectionPushdownRule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "SelectionPushdown"
     }
 
@@ -320,7 +320,7 @@ impl ProjectionPruningRule {
 }
 
 impl OptimizationRule for ProjectionPruningRule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "ProjectionPruning"
     }
 
@@ -366,7 +366,7 @@ impl JoinReorderingRule {
 }
 
 impl OptimizationRule for JoinReorderingRule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "JoinReordering"
     }
 
@@ -483,7 +483,7 @@ impl IndexSelectionRule {
 }
 
 impl OptimizationRule for IndexSelectionRule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "IndexSelection"
     }
 
@@ -583,12 +583,12 @@ impl ConstantFoldingRule {
     }
 
     /// Try to fold an expression to a constant
-    fn fold_expr(&self, expr: LogicalExpr) -> Result<LogicalExpr> {
+    fn fold_expr(expr: LogicalExpr) -> Result<LogicalExpr> {
         match expr {
             LogicalExpr::BinaryExpr { left, op, right } => {
                 // Recursively fold children
-                let left = self.fold_expr(*left)?;
-                let right = self.fold_expr(*right)?;
+                let left = Self::fold_expr(*left)?;
+                let right = Self::fold_expr(*right)?;
 
                 // If both sides are literals, try to evaluate
                 if let (LogicalExpr::Literal(left_val), LogicalExpr::Literal(right_val)) = (&left, &right) {
@@ -645,7 +645,7 @@ impl ConstantFoldingRule {
                 })
             }
             LogicalExpr::UnaryExpr { op, expr } => {
-                let expr = self.fold_expr(*expr)?;
+                let expr = Self::fold_expr(*expr)?;
 
                 if let LogicalExpr::Literal(val) = &expr {
                     match op {
@@ -679,7 +679,7 @@ impl ConstantFoldingRule {
     fn fold_plan(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
         match plan {
             LogicalPlan::Filter { input, predicate } => {
-                let folded_predicate = self.fold_expr(predicate)?;
+                let folded_predicate = Self::fold_expr(predicate)?;
                 Ok(LogicalPlan::Filter {
                     input,
                     predicate: folded_predicate,
@@ -687,7 +687,7 @@ impl ConstantFoldingRule {
             }
             LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => {
                 let folded_exprs: Result<Vec<_>> = exprs.into_iter()
-                    .map(|e| self.fold_expr(e))
+                    .map(|e| Self::fold_expr(e))
                     .collect();
                 Ok(LogicalPlan::Project {
                     input,
@@ -703,7 +703,7 @@ impl ConstantFoldingRule {
 }
 
 impl OptimizationRule for ConstantFoldingRule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "ConstantFolding"
     }
 
@@ -768,7 +768,7 @@ impl StorageFilterPushdownRule {
     }
 
     /// Check if a predicate can be pushed to storage level
-    fn can_push_predicate(&self, predicate: &LogicalExpr) -> bool {
+    fn can_push_predicate(predicate: &LogicalExpr) -> bool {
         match predicate {
             // Simple column comparisons can be pushed
             LogicalExpr::BinaryExpr { left, op, right } => {
@@ -790,11 +790,11 @@ impl StorageFilterPushdownRule {
                     }
                     // AND predicates can be pushed if all parts can be pushed
                     BinaryOperator::And => {
-                        self.can_push_predicate(left) && self.can_push_predicate(right)
+                        Self::can_push_predicate(left) && Self::can_push_predicate(right)
                     }
                     // OR predicates are more complex but can still be pushed
                     BinaryOperator::Or => {
-                        self.can_push_predicate(left) && self.can_push_predicate(right)
+                        Self::can_push_predicate(left) && Self::can_push_predicate(right)
                     }
                     // LIKE can be pushed for prefix patterns
                     BinaryOperator::Like => {
@@ -875,8 +875,8 @@ impl StorageFilterPushdownRule {
         let mut pushable = Vec::new();
         let mut remaining = Vec::new();
 
-        self.collect_conjuncts(predicate, &mut |p| {
-            if self.can_push_predicate(p) {
+        Self::collect_conjuncts(predicate, &mut |p| {
+            if Self::can_push_predicate(p) {
                 pushable.push(p.clone());
             } else {
                 remaining.push(p.clone());
@@ -886,13 +886,13 @@ impl StorageFilterPushdownRule {
         (pushable, remaining)
     }
 
-    fn collect_conjuncts<F>(&self, expr: &LogicalExpr, collector: &mut F)
+    fn collect_conjuncts<F>(expr: &LogicalExpr, collector: &mut F)
     where
         F: FnMut(&LogicalExpr),
     {
         if let LogicalExpr::BinaryExpr { left, op: BinaryOperator::And, right } = expr {
-            self.collect_conjuncts(left, collector);
-            self.collect_conjuncts(right, collector);
+            Self::collect_conjuncts(left, collector);
+            Self::collect_conjuncts(right, collector);
         } else {
             collector(expr);
         }
@@ -916,7 +916,7 @@ impl StorageFilterPushdownRule {
 }
 
 impl OptimizationRule for StorageFilterPushdownRule {
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "StorageFilterPushdown"
     }
 
@@ -932,7 +932,7 @@ impl OptimizationRule for StorageFilterPushdownRule {
         if let LogicalPlan::Filter { input, predicate } = plan {
             if let LogicalPlan::Scan { table_name, alias, schema, projection, as_of } = *input {
                 // Check if predicate can be pushed down
-                if !self.can_push_predicate(&predicate) {
+                if !Self::can_push_predicate(&predicate) {
                     // Cannot push - return original
                     return Ok(Some(LogicalPlan::Filter {
                         input: Box::new(LogicalPlan::Scan {
@@ -1048,14 +1048,14 @@ mod tests {
             right: Box::new(LogicalExpr::Literal(Value::Int4(5))),
         };
 
-        let folded = rule.fold_expr(expr).unwrap();
+        let folded = ConstantFoldingRule::fold_expr(expr).unwrap();
 
         assert!(matches!(folded, LogicalExpr::Literal(Value::Int4(15))));
     }
 
     #[test]
     fn test_constant_folding_boolean() {
-        let rule = ConstantFoldingRule::new();
+        let _rule = ConstantFoldingRule::new();
 
         let expr = LogicalExpr::BinaryExpr {
             left: Box::new(LogicalExpr::Literal(Value::Boolean(true))),
@@ -1063,7 +1063,7 @@ mod tests {
             right: Box::new(LogicalExpr::Literal(Value::Boolean(false))),
         };
 
-        let folded = rule.fold_expr(expr).unwrap();
+        let folded = ConstantFoldingRule::fold_expr(expr).unwrap();
 
         assert!(matches!(folded, LogicalExpr::Literal(Value::Boolean(false))));
     }

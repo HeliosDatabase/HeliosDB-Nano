@@ -1431,7 +1431,7 @@ impl MetaCommand {
 
             // v2.1 Feature commands
             MetaCommand::SetVariable(name, value) => {
-                println!("{}", format!("Set {} = {}", name.cyan(), value.yellow()));
+                println!("Set {} = {}", name.cyan(), value.yellow());
                 println!("{}", "Note: Use SQL SET command for persistent settings".dimmed());
                 println!("  {}", format!("SET {} = {};", name, value).cyan());
                 Ok(MetaCommandResult::Continue)
@@ -2271,7 +2271,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
             MetaCommand::SessionDelete(id) => {
                 match db.delete_agent_session(&id) {
-                    Ok(_) => {
+                    Ok(()) => {
                         println!("{}: {}", "Session deleted".green(), id.cyan());
                     }
                     Err(e) => {
@@ -2316,7 +2316,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
             MetaCommand::SessionClear(id) => {
                 match db.clear_agent_messages(&id) {
-                    Ok(_) => {
+                    Ok(()) => {
                         println!("{}: {}", "Session cleared".green(), id.cyan());
                     }
                     Err(e) => {
@@ -2489,7 +2489,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
             MetaCommand::VectorDelete(name) => {
                 match db.delete_vector_store(&name) {
-                    Ok(_) => {
+                    Ok(()) => {
                         println!("{}: Vector store '{}' deleted", "Success".green(), name.cyan());
                     }
                     Err(e) => {
@@ -2984,7 +2984,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                         // Write to file
                         match std::fs::write(&output_file, dump_content) {
-                            Ok(_) => {
+                            Ok(()) => {
                                 println!("{}: Dump completed successfully", "Success".green());
                                 println!("  Tables: {}", tables.len().to_string().cyan());
                                 println!("  Rows: {}", total_rows.to_string().cyan());
@@ -3520,7 +3520,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
             MetaCommand::TenantPlanCreate { ref name, ref tier_id, ref storage_mb, ref max_connections, ref max_qps } => {
                 // Auto-generate ID from name: lowercase, replace spaces with hyphens
-                let id = name.to_lowercase().replace(' ', "-").replace('_', "-");
+                let id = name.to_lowercase().replace([' ', '_'], "-");
 
                 let plan = crate::tenant::Plan::new(
                     &id,
@@ -3535,7 +3535,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 );
 
                 match db.tenant_manager.plan_manager.create_plan(plan) {
-                    Ok(_) => {
+                    Ok(()) => {
                         println!("{}: Plan '{}' created (ID: {})", "Success".green(), name.cyan(), id.dimmed());
                         println!("  Tier: {}", tier_id);
                         println!("  Storage: {}", Self::format_storage(*storage_mb * 1024 * 1024));
@@ -3639,7 +3639,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
             MetaCommand::TenantPlanEnable(plan_id) => {
                 match db.tenant_manager.plan_manager.enable_plan(&plan_id) {
-                    Ok(_) => {
+                    Ok(()) => {
                         println!("{}: Plan '{}' enabled", "Success".green(), plan_id.cyan());
                         println!("{}", "New tenants can now be assigned to this plan.".dimmed());
                     }
@@ -3655,7 +3655,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 let tenant_count = db.tenant_manager.get_tenants_by_plan(&plan_id).len();
 
                 match db.tenant_manager.plan_manager.disable_plan(&plan_id) {
-                    Ok(_) => {
+                    Ok(()) => {
                         println!("{}: Plan '{}' disabled", "Success".green(), plan_id.cyan());
                         if tenant_count > 0 {
                             println!("{}", format!("  {} existing tenant(s) will keep this plan.", tenant_count).yellow());
@@ -3995,9 +3995,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 let events = cdc_log.map(|log| log.changes).unwrap_or_default();
                 match serde_json::to_string_pretty(&events) {
                     Ok(json_data) => {
-                        match std::fs::write(&filename, json_data) {
-                            Ok(_) => {
-                                println!("{}: Exported {} events to '{}'", "Success".green(), events.len(), filename.cyan());
+                        let filename_display = filename.cyan();
+                        match std::fs::write(filename, json_data) {
+                            Ok(()) => {
+                                println!("{}: Exported {} events to '{}'", "Success".green(), events.len(), filename_display);
                                 println!();
                             }
                             Err(e) => {
@@ -4043,7 +4044,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                             println!();
 
                             match db.tenant_manager.start_migration(tenant_id, target_t.id) {
-                                Ok(_) => {
+                                Ok(()) => {
                                     println!("{}: Migration initiated", "Success".green());
                                     println!();
                                     println!("{}", "Migration Status:".bold());
@@ -4152,7 +4153,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         };
 
                         match db.tenant_manager.update_resource_limits(t.id, limits.clone()) {
-                            Ok(_) => {
+                            Ok(()) => {
                                 println!("{}: Custom quotas set for '{}'", "Success".green(), t.name.cyan());
                                 println!();
                                 println!("{}", "New Limits:".bold());
@@ -4904,7 +4905,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
         let table_name = if let Some(from_idx) = query_upper.find("FROM") {
             let after_from = &query[from_idx + 5..];
             after_from.split_whitespace().next()
-                .map(|s| s.trim_end_matches(|c| c == ',' || c == ';'))
+                .map(|s| s.trim_end_matches([',', ';']))
         } else {
             None
         };

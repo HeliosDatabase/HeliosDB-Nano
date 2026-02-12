@@ -173,7 +173,9 @@ impl QueryExecutorAdapter for LiteQueryExecutorAdapter {
 
         // Create planner and convert to logical plan
         let planner = Planner::new();
-        let plan = planner.statement_to_plan(statements[0].clone())?;
+        let first_stmt = statements.first()
+            .ok_or_else(|| Error::sql_parse("Empty query"))?;
+        let plan = planner.statement_to_plan(first_stmt.clone())?;
 
         // Check if this is a DDL/DML statement that needs special handling
         let rows = match &plan {
@@ -262,7 +264,9 @@ impl QueryExecutorAdapter for LiteQueryExecutorAdapter {
 
         // Create planner and convert to logical plan
         let planner = Planner::new();
-        let plan = planner.statement_to_plan(statements[0].clone())?;
+        let first_stmt = statements.first()
+            .ok_or_else(|| Error::sql_parse("Empty query"))?;
+        let plan = planner.statement_to_plan(first_stmt.clone())?;
 
         // Count parameters (simple implementation - could be enhanced)
         let param_count = sql.matches('$').count();

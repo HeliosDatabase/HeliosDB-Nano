@@ -576,7 +576,9 @@ impl SnapshotManager {
                     // Decode the actual timestamp from the index value
                     if value.len() >= 8 {
                         let actual_ts = u64::from_be_bytes(
-                            value[0..8].try_into()
+                            value.get(0..8)
+                                .ok_or_else(|| Error::storage("Timestamp bytes too short"))?
+                                .try_into()
                                 .map_err(|e| Error::storage(format!("Invalid timestamp bytes: {}", e)))?
                         );
 
@@ -683,7 +685,7 @@ impl SnapshotManager {
         // Store the actual timestamp as the value (8 bytes, big-endian)
         let timestamp_bytes = timestamp.to_be_bytes();
 
-        self.db.put(index_key.as_bytes(), &timestamp_bytes)
+        self.db.put(index_key.as_bytes(), timestamp_bytes)
             .map_err(|e| Error::storage(format!("Failed to create reverse index: {}", e)))
     }
 
@@ -949,10 +951,10 @@ impl SnapshotManager {
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 // Parse key: v:{table}:{row_id}:{timestamp}
                 let parts: Vec<&str> = key_str.split(':').collect();
-                if parts.len() >= 4 {
+                if let (Some(p2), Some(p3)) = (parts.get(2), parts.get(3)) {
                     if let (Ok(row_id), Ok(ts)) = (
-                        parts[2].parse::<u64>(),
-                        parts[3].parse::<u64>(),
+                        p2.parse::<u64>(),
+                        p3.parse::<u64>(),
                     ) {
                         // Check if timestamp is within range
                         if ts >= start_ts && ts <= end_ts {

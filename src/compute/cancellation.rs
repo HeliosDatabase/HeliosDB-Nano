@@ -497,7 +497,7 @@ impl<'a> QueryGuard<'a> {
     }
 }
 
-impl<'a> Drop for QueryGuard<'a> {
+impl Drop for QueryGuard<'_> {
     fn drop(&mut self) {
         if self.auto_cleanup {
             // If we're dropping without explicit completion, assume failure

@@ -78,7 +78,9 @@ impl RLSExpressionEvaluator {
             Expr::CompoundIdentifier(idents) => {
                 // Handle table.column references - preserve the table qualifier for JOIN disambiguation
                 if idents.len() >= 2 {
-                    let table_alias = idents[idents.len() - 2].value.clone();
+                    let table_alias = idents.get(idents.len() - 2)
+                        .ok_or_else(|| Error::query_execution("Invalid compound identifier"))?
+                        .value.clone();
                     let column_name = idents.last()
                         .ok_or_else(|| Error::query_execution("Empty compound identifier"))?
                         .value.clone();
@@ -414,7 +416,7 @@ impl RLSExpressionEvaluator {
                 }
 
                 // Evaluate the argument to get the setting name
-                let setting_name_val = self.evaluate_expr(&args[0], tuple)?;
+                let setting_name_val = self.evaluate_expr(args.first().ok_or_else(|| Error::query_execution("current_setting() requires exactly 1 argument"))?, tuple)?;
                 let setting_name = match setting_name_val {
                     Value::String(s) => s,
                     _ => return Err(Error::query_execution("current_setting() argument must be a string")),

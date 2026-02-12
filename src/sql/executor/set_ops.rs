@@ -96,7 +96,8 @@ impl UnionOperator {
 impl PhysicalOperator for UnionOperator {
     fn next(&mut self) -> Result<Option<Tuple>> {
         if self.position < self.results.len() {
-            let tuple = self.results[self.position].clone();
+            let tuple = self.results.get(self.position).cloned()
+                .ok_or_else(|| crate::Error::query_execution("Union index out of bounds"))?;
             self.position += 1;
             Ok(Some(tuple))
         } else {
@@ -195,7 +196,8 @@ impl IntersectOperator {
 impl PhysicalOperator for IntersectOperator {
     fn next(&mut self) -> Result<Option<Tuple>> {
         if self.position < self.results.len() {
-            let tuple = self.results[self.position].clone();
+            let tuple = self.results.get(self.position).cloned()
+                .ok_or_else(|| crate::Error::query_execution("Intersect index out of bounds"))?;
             self.position += 1;
             Ok(Some(tuple))
         } else {
@@ -275,13 +277,12 @@ impl ExceptOperator {
 
             for left_tuple in left_tuples {
                 let hash = hash_tuple(&left_tuple);
-                if !seen.contains(&hash) {
+                if seen.insert(hash) {
                     // Check if tuple exists in right
                     let in_right = right_hashes.contains(&hash) &&
                         right_tuples.iter().any(|t| tuples_equal(t, &left_tuple));
 
                     if !in_right {
-                        seen.insert(hash);
                         results.push(left_tuple);
                     }
                 }
@@ -299,7 +300,8 @@ impl ExceptOperator {
 impl PhysicalOperator for ExceptOperator {
     fn next(&mut self) -> Result<Option<Tuple>> {
         if self.position < self.results.len() {
-            let tuple = self.results[self.position].clone();
+            let tuple = self.results.get(self.position).cloned()
+                .ok_or_else(|| crate::Error::query_execution("Except index out of bounds"))?;
             self.position += 1;
             Ok(Some(tuple))
         } else {

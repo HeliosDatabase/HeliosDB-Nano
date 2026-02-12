@@ -159,8 +159,11 @@ fn format_datatype(dt: &DataType) -> String {
 // Hex encoding dependency
 mod hex {
     pub fn encode(bytes: &[u8]) -> String {
+        use std::fmt::Write;
         bytes.iter()
-            .map(|b| format!("{:02x}", b))
-            .collect()
+            .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+                let _ = write!(acc, "{:02x}", b);
+                acc
+            })
     }
 }

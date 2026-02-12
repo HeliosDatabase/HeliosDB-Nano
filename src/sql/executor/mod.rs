@@ -298,11 +298,11 @@ impl<'a> Executor<'a> {
         match expr {
             LogicalExpr::InSubquery { expr: inner_expr, subquery, negated } => {
                 // Execute the subquery to get the list of values
-                let mut subquery_executor = Executor::new();
-                if let Some(storage) = self.storage {
-                    subquery_executor = Executor::with_storage(storage);
-                }
-                subquery_executor = subquery_executor.with_parameters(self.parameters.clone());
+                let mut subquery_executor = if let Some(storage) = self.storage {
+                    Executor::with_storage(storage)
+                } else {
+                    Executor::new()
+                }.with_parameters(self.parameters.clone());
 
                 let results = subquery_executor.execute(subquery)?;
 
@@ -325,11 +325,11 @@ impl<'a> Executor<'a> {
             }
             LogicalExpr::Exists { subquery, negated } => {
                 // Execute the subquery to check if any rows exist
-                let mut subquery_executor = Executor::new();
-                if let Some(storage) = self.storage {
-                    subquery_executor = Executor::with_storage(storage);
-                }
-                subquery_executor = subquery_executor.with_parameters(self.parameters.clone());
+                let mut subquery_executor = if let Some(storage) = self.storage {
+                    Executor::with_storage(storage)
+                } else {
+                    Executor::new()
+                }.with_parameters(self.parameters.clone());
 
                 let results = subquery_executor.execute(subquery)?;
 
@@ -473,7 +473,7 @@ impl<'a> Executor<'a> {
                                 // Reference the appended window column by name
                                 LogicalExpr::Column {
                                     table: None,
-                                    name: aliases[i].clone(),
+                                    name: aliases.get(i).cloned().unwrap_or_default(),
                                 }
                             } else {
                                 expr.clone()
@@ -776,7 +776,7 @@ impl<'a> Executor<'a> {
     }
 }
 
-impl<'a> Default for Executor<'a> {
+impl Default for Executor<'_> {
     fn default() -> Self {
         Self::new()
     }

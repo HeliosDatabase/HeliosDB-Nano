@@ -395,7 +395,7 @@ impl CostEstimator {
     fn estimate_filter_cost(&self, input: &LogicalPlan, predicate: &LogicalExpr) -> Result<f64> {
         let cardinality = self.estimate_cardinality(input)?;
         // Cost of evaluating predicate on each row
-        let eval_cost = cardinality * self.params.cpu_tuple_cost * self.estimate_expr_complexity(predicate);
+        let eval_cost = cardinality * self.params.cpu_tuple_cost * Self::estimate_expr_complexity(predicate);
         Ok(eval_cost)
     }
 
@@ -434,7 +434,7 @@ impl CostEstimator {
                     _ => {
                         // For comparison operators, try to use column statistics
                         if let LogicalExpr::Column { name, .. } = left.as_ref() {
-                            if let Some(table_name) = self.extract_table_name(plan) {
+                            if let Some(table_name) = Self::extract_table_name(plan) {
                                 if let Some(stats) = self.stats.get_table_stats(&table_name) {
                                     if let Some(col_stats) = stats.get_column_stats(name) {
                                         return Ok(col_stats.estimate_selectivity(op));
@@ -462,58 +462,58 @@ impl CostEstimator {
     }
 
     /// Estimate expression complexity (for cost calculation)
-    fn estimate_expr_complexity(&self, expr: &LogicalExpr) -> f64 {
+    fn estimate_expr_complexity(expr: &LogicalExpr) -> f64 {
         match expr {
             LogicalExpr::Column { .. } | LogicalExpr::Literal(_) => 1.0,
             LogicalExpr::BinaryExpr { left, right, .. } => {
-                2.0 + self.estimate_expr_complexity(left) + self.estimate_expr_complexity(right)
+                2.0 + Self::estimate_expr_complexity(left) + Self::estimate_expr_complexity(right)
             }
             LogicalExpr::UnaryExpr { expr, .. } => {
-                1.5 + self.estimate_expr_complexity(expr)
+                1.5 + Self::estimate_expr_complexity(expr)
             }
             LogicalExpr::ScalarFunction { args, .. } => {
                 let arg_complexity: f64 = args.iter()
-                    .map(|arg| self.estimate_expr_complexity(arg))
+                    .map(|arg| Self::estimate_expr_complexity(arg))
                     .sum();
                 5.0 + arg_complexity // Functions are more expensive
             }
             LogicalExpr::AggregateFunction { args, .. } => {
                 let arg_complexity: f64 = args.iter()
-                    .map(|arg| self.estimate_expr_complexity(arg))
+                    .map(|arg| Self::estimate_expr_complexity(arg))
                     .sum();
                 10.0 + arg_complexity // Aggregates are expensive
             }
             LogicalExpr::Case { when_then, else_result, .. } => {
                 let when_cost: f64 = when_then.iter()
                     .map(|(cond, result)| {
-                        self.estimate_expr_complexity(cond) + self.estimate_expr_complexity(result)
+                        Self::estimate_expr_complexity(cond) + Self::estimate_expr_complexity(result)
                     })
                     .sum();
                 let else_cost = else_result.as_ref()
-                    .map(|e| self.estimate_expr_complexity(e))
+                    .map(|e| Self::estimate_expr_complexity(e))
                     .unwrap_or(0.0);
                 3.0 + when_cost + else_cost
             }
             LogicalExpr::Cast { expr, .. } => {
-                2.0 + self.estimate_expr_complexity(expr)
+                2.0 + Self::estimate_expr_complexity(expr)
             }
             LogicalExpr::IsNull { expr, .. } => {
-                1.5 + self.estimate_expr_complexity(expr)
+                1.5 + Self::estimate_expr_complexity(expr)
             }
             LogicalExpr::Between { expr, low, high, .. } => {
-                3.0 + self.estimate_expr_complexity(expr)
-                    + self.estimate_expr_complexity(low)
-                    + self.estimate_expr_complexity(high)
+                3.0 + Self::estimate_expr_complexity(expr)
+                    + Self::estimate_expr_complexity(low)
+                    + Self::estimate_expr_complexity(high)
             }
             LogicalExpr::InList { expr, list, .. } => {
                 let list_cost: f64 = list.iter()
-                    .map(|e| self.estimate_expr_complexity(e))
+                    .map(|e| Self::estimate_expr_complexity(e))
                     .sum();
-                2.0 + self.estimate_expr_complexity(expr) + list_cost
+                2.0 + Self::estimate_expr_complexity(expr) + list_cost
             }
             LogicalExpr::InSubquery { expr, .. } => {
                 // Subqueries are expensive - estimate high cost
-                100.0 + self.estimate_expr_complexity(expr)
+                100.0 + Self::estimate_expr_complexity(expr)
             }
             LogicalExpr::Exists { .. } => {
                 // EXISTS subqueries are expensive
@@ -521,18 +521,18 @@ impl CostEstimator {
             }
             LogicalExpr::NewRow { .. } | LogicalExpr::OldRow { .. } => 1.0, // Similar to column access
             LogicalExpr::ArraySubscript { array, index } => {
-                3.0 + self.estimate_expr_complexity(array) + self.estimate_expr_complexity(index)
+                3.0 + Self::estimate_expr_complexity(array) + Self::estimate_expr_complexity(index)
             }
             LogicalExpr::WindowFunction { args, partition_by, order_by, .. } => {
                 // Window functions are expensive due to partitioning and sorting
                 let arg_cost: f64 = args.iter()
-                    .map(|e| self.estimate_expr_complexity(e))
+                    .map(|e| Self::estimate_expr_complexity(e))
                     .sum();
                 let partition_cost: f64 = partition_by.iter()
-                    .map(|e| self.estimate_expr_complexity(e))
+                    .map(|e| Self::estimate_expr_complexity(e))
                     .sum();
                 let order_cost: f64 = order_by.iter()
-                    .map(|(e, _)| self.estimate_expr_complexity(e))
+                    .map(|(e, _)| Self::estimate_expr_complexity(e))
                     .sum();
                 50.0 + arg_cost + partition_cost + order_cost
             }
@@ -541,14 +541,14 @@ impl CostEstimator {
     }
 
     /// Extract table name from a plan (for statistics lookup)
-    fn extract_table_name(&self, plan: &LogicalPlan) -> Option<String> {
+    fn extract_table_name(plan: &LogicalPlan) -> Option<String> {
         match plan {
             LogicalPlan::Scan { table_name, .. } => Some(table_name.clone()),
             LogicalPlan::Filter { input, .. } |
             LogicalPlan::Project { input, .. } |
             LogicalPlan::Sort { input, .. } |
             LogicalPlan::Limit { input, .. } |
-            LogicalPlan::Aggregate { input, .. } => self.extract_table_name(input),
+            LogicalPlan::Aggregate { input, .. } => Self::extract_table_name(input),
             _ => None,
         }
     }

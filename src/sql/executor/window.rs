@@ -488,10 +488,8 @@ impl WindowOperator {
                 let prev_vals: Vec<Value> = partition[i - 1]
                     .1
                     .values
-                    .iter()
-                    .cloned()
-                    .collect();
-                let curr_vals: Vec<Value> = partition[i].1.values.iter().cloned().collect();
+                    .to_vec();
+                let curr_vals: Vec<Value> = partition[i].1.values.to_vec();
 
                 if prev_vals != curr_vals {
                     if with_gaps {

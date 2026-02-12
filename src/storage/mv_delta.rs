@@ -381,8 +381,10 @@ impl DeltaTracker {
                 // Check if key matches our prefix
                 if !key.starts_with(prefix_bytes) {
                     // Optimization: break if we've passed the prefix
-                    if !key.is_empty() && key[0] > prefix_bytes[0] {
-                        break;
+                    if let (Some(&k), Some(&p)) = (key.first(), prefix_bytes.first()) {
+                        if k > p {
+                            break;
+                        }
                     }
                     continue;
                 }
@@ -420,8 +422,10 @@ impl DeltaTracker {
                     .map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
                 if !key.starts_with(prefix_bytes) {
-                    if !key.is_empty() && key[0] > prefix_bytes[0] {
-                        break;
+                    if let (Some(&k), Some(&p)) = (key.first(), prefix_bytes.first()) {
+                        if k > p {
+                            break;
+                        }
                     }
                     continue;
                 }
@@ -454,8 +458,10 @@ impl DeltaTracker {
                 .map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(prefix) {
-                if !key.is_empty() && key[0] > prefix[0] {
-                    break;
+                if let (Some(&k), Some(&p)) = (key.first(), prefix.first()) {
+                    if k > p {
+                        break;
+                    }
                 }
                 continue;
             }

@@ -165,9 +165,9 @@ impl ProceduralExecutor {
     /// Execute a procedural block
     #[allow(clippy::indexing_slicing)]
     // SAFETY: All indexing is guarded by `.is_empty()` and `.len()` checks
-    pub fn execute_block<'a>(
+    pub fn execute_block(
         block: &ProceduralBlock,
-        ctx: &mut ExecutionContext<'a>,
+        ctx: &mut ExecutionContext<'_>,
     ) -> Result<()> {
         // Push new scope for this block
         ctx.push_scope();
@@ -235,9 +235,9 @@ impl ProceduralExecutor {
     /// Execute a single statement
     #[allow(clippy::indexing_slicing)]
     // SAFETY: All indexing is guarded by `.is_empty()` and `.len()` checks within each match arm
-    pub fn execute_statement<'a>(
+    pub fn execute_statement(
         stmt: &ProceduralStatement,
-        ctx: &mut ExecutionContext<'a>,
+        ctx: &mut ExecutionContext<'_>,
     ) -> Result<()> {
         match stmt {
             ProceduralStatement::Assignment { target, value } => {

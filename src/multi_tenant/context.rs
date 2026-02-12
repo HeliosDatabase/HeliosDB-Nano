@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::{Tenant, TenantManager, TenantError, TenantStatus};
 
 thread_local! {
-    static CURRENT_TENANT: RefCell<Option<TenantContext>> = RefCell::new(None);
+    static CURRENT_TENANT: RefCell<Option<TenantContext>> = const { RefCell::new(None) };
 }
 
 /// Tenant context for current request/operation
@@ -310,7 +310,7 @@ impl TenantResolver {
             return Err(TenantError::InvalidId("Invalid API key format".to_string()));
         }
 
-        let tenant_id = parts[0];
+        let tenant_id = parts.first().ok_or_else(|| TenantError::InvalidId("Invalid API key format".to_string()))?;
         let tenant = self.manager.get_tenant(tenant_id)
             .ok_or_else(|| TenantError::NotFound(tenant_id.to_string()))?;
 
@@ -455,7 +455,7 @@ impl TenantResolver {
             return Err(TenantError::InvalidId("Cannot determine tenant from host".to_string()));
         }
 
-        let tenant_id = parts[0];
+        let tenant_id = parts.first().ok_or_else(|| TenantError::InvalidId("Cannot determine tenant from host".to_string()))?;
         let tenant = self.manager.get_tenant(tenant_id)
             .ok_or_else(|| TenantError::NotFound(tenant_id.to_string()))?;
 
@@ -467,11 +467,11 @@ impl TenantResolver {
         // Path format: /tenants/{tenant_id}/...
         let parts: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
 
-        if parts.len() < 2 || parts[0] != "tenants" {
+        if parts.len() < 2 || parts.first() != Some(&"tenants") {
             return Err(TenantError::InvalidId("Invalid path format".to_string()));
         }
 
-        let tenant_id = parts[1];
+        let tenant_id = parts.get(1).ok_or_else(|| TenantError::InvalidId("Invalid path format".to_string()))?;
         let tenant = self.manager.get_tenant(tenant_id)
             .ok_or_else(|| TenantError::NotFound(tenant_id.to_string()))?;
 

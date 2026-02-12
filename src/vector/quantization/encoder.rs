@@ -38,7 +38,10 @@ impl Encoder {
         for sq_idx in 0..num_subquantizers {
             let start = sq_idx * subvector_dim;
             let end = start + subvector_dim;
-            let subvector = &vector[start..end];
+            let subvector = vector.get(start..end).ok_or(PqError::DimensionMismatch {
+                expected: end,
+                actual: vector.len(),
+            })?;
 
             // Find nearest centroid for this sub-vector
             let code = self.codebook.find_nearest_centroid(sq_idx, subvector)?;

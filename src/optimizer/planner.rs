@@ -430,8 +430,8 @@ impl Planner {
         // 2. Both tables are very small (heuristic: assume <100 rows)
 
         // Check if join condition contains equality
-        let has_equality = on.as_ref().map_or(false, |expr| {
-            self.contains_equality(expr)
+        let has_equality = on.as_ref().is_some_and(|expr| {
+            Self::contains_equality(expr)
         });
 
         // If no equality predicate, must use nested loop
@@ -448,7 +448,7 @@ impl Planner {
     }
 
     /// Check if an expression contains an equality operator
-    fn contains_equality(&self, expr: &LogicalExpr) -> bool {
+    fn contains_equality(expr: &LogicalExpr) -> bool {
         use crate::sql::logical_plan::BinaryOperator;
 
         match expr {
@@ -456,7 +456,7 @@ impl Planner {
                 match op {
                     BinaryOperator::Eq => true,
                     BinaryOperator::And => {
-                        self.contains_equality(left) || self.contains_equality(right)
+                        Self::contains_equality(left) || Self::contains_equality(right)
                     }
                     _ => false,
                 }
@@ -467,11 +467,11 @@ impl Planner {
 
     /// Explain the physical plan in human-readable format
     pub fn explain(&self, plan: &PhysicalPlan) -> String {
-        self.explain_recursive(plan, 0)
+        Self::explain_recursive(plan, 0)
     }
 
     /// Recursively format physical plan with indentation
-    fn explain_recursive(&self, plan: &PhysicalPlan, depth: usize) -> String {
+    fn explain_recursive(plan: &PhysicalPlan, depth: usize) -> String {
         let indent = "  ".repeat(depth);
         match plan {
             PhysicalPlan::TableScan { table_name, projection, as_of, .. } => {
@@ -486,36 +486,36 @@ impl Planner {
                 format!("{}TableScan: {}{}{}", indent, table_name, proj_str, as_of_str)
             }
             PhysicalPlan::Filter { input, .. } => {
-                format!("{}Filter\n{}", indent, self.explain_recursive(input, depth + 1))
+                format!("{}Filter\n{}", indent, Self::explain_recursive(input, depth + 1))
             }
             PhysicalPlan::Projection { input, exprs, .. } => {
                 format!("{}Projection ({} columns)\n{}",
-                    indent, exprs.len(), self.explain_recursive(input, depth + 1))
+                    indent, exprs.len(), Self::explain_recursive(input, depth + 1))
             }
             PhysicalPlan::HashJoin { left, right, join_type, .. } => {
                 format!("{}HashJoin ({:?})\n{}\n{}",
                     indent, join_type,
-                    self.explain_recursive(left, depth + 1),
-                    self.explain_recursive(right, depth + 1))
+                    Self::explain_recursive(left, depth + 1),
+                    Self::explain_recursive(right, depth + 1))
             }
             PhysicalPlan::NestedLoopJoin { left, right, join_type, .. } => {
                 format!("{}NestedLoopJoin ({:?})\n{}\n{}",
                     indent, join_type,
-                    self.explain_recursive(left, depth + 1),
-                    self.explain_recursive(right, depth + 1))
+                    Self::explain_recursive(left, depth + 1),
+                    Self::explain_recursive(right, depth + 1))
             }
             PhysicalPlan::HashAggregate { input, group_by, aggr_exprs, .. } => {
                 format!("{}HashAggregate (group_by: {}, aggr: {})\n{}",
                     indent, group_by.len(), aggr_exprs.len(),
-                    self.explain_recursive(input, depth + 1))
+                    Self::explain_recursive(input, depth + 1))
             }
             PhysicalPlan::Sort { input, exprs, .. } => {
                 format!("{}Sort ({} columns)\n{}",
-                    indent, exprs.len(), self.explain_recursive(input, depth + 1))
+                    indent, exprs.len(), Self::explain_recursive(input, depth + 1))
             }
             PhysicalPlan::Limit { input, limit, offset } => {
                 format!("{}Limit ({}, offset={})\n{}",
-                    indent, limit, offset, self.explain_recursive(input, depth + 1))
+                    indent, limit, offset, Self::explain_recursive(input, depth + 1))
             }
         }
     }

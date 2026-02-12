@@ -168,12 +168,8 @@ pub(super) fn handle_create_index(
                             let training_vectors: Vec<crate::vector::Vector> = tuples
                                 .iter()
                                 .filter_map(|tuple| {
-                                    if col_idx < tuple.values.len() {
-                                        if let crate::Value::Vector(ref vec) = tuple.values[col_idx] {
-                                            Some(vec.clone())
-                                        } else {
-                                            None
-                                        }
+                                    if let Some(crate::Value::Vector(ref vec)) = tuple.values.get(col_idx) {
+                                        Some(vec.clone())
                                     } else {
                                         None
                                     }
@@ -310,8 +306,10 @@ pub(super) fn handle_truncate(
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(prefix_bytes) {
-                if !key.is_empty() && key[0] > prefix_bytes[0] {
-                    break;
+                if let (Some(&k), Some(&p)) = (key.first(), prefix_bytes.first()) {
+                    if k > p {
+                        break;
+                    }
                 }
                 continue;
             }

@@ -486,7 +486,7 @@ impl WriteAheadLog {
         batch.put(key.as_bytes(), &data);
 
         // Update last LSN marker
-        batch.put(b"wal:last_lsn", &lsn.to_le_bytes());
+        batch.put(b"wal:last_lsn", lsn.to_le_bytes());
 
         // Write atomically
         self.db
@@ -767,7 +767,7 @@ impl WriteAheadLog {
             }
 
             // Update last LSN marker
-            batch.put(b"wal:last_lsn", &last_lsn.to_le_bytes());
+            batch.put(b"wal:last_lsn", last_lsn.to_le_bytes());
 
             // Flush batch with fsync
             let mut write_opts = WriteOptions::default();
@@ -1020,11 +1020,7 @@ impl WriteAheadLog {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let cutoff_time = if current_time > retention_seconds {
-            current_time - retention_seconds
-        } else {
-            0
-        };
+        let cutoff_time = current_time.saturating_sub(retention_seconds);
 
         let cutoff_time_micros = cutoff_time * 1_000_000;
 

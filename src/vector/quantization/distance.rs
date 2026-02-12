@@ -97,6 +97,7 @@ impl DistanceComputer {
         let mut table = vec![vec![0.0_f32; num_centroids]; num_subquantizers];
 
         // For each sub-quantizer
+        #[allow(clippy::needless_range_loop)]
         for sq_idx in 0..num_subquantizers {
             let start = sq_idx * subvector_dim;
             let end = start + subvector_dim;
@@ -141,6 +142,7 @@ impl DistanceComputer {
         let mut distance_squared = 0.0_f32;
 
         // Sum up pre-computed squared distances
+        #[allow(clippy::needless_range_loop)]
         for sq_idx in 0..num_subquantizers {
             let code = quantized.codes[sq_idx] as usize;
             if code >= distance_table[sq_idx].len() {

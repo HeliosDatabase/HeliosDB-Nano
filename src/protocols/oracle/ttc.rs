@@ -152,7 +152,7 @@ impl TtcMessage {
     /// Parse TTC message from bytes
     pub fn parse(data: &[u8]) -> io::Result<Self> {
         let header = TtcHeader::parse(data)?;
-        let payload = data[TtcHeader::SIZE..].to_vec();
+        let payload = data.get(TtcHeader::SIZE..).unwrap_or(&[]).to_vec();
 
         Ok(Self { header, payload })
     }
@@ -197,7 +197,7 @@ impl TtcParse {
         };
 
         // Remaining bytes are SQL text
-        let sql_bytes: Vec<u8> = data[cursor.position() as usize..].to_vec();
+        let sql_bytes: Vec<u8> = data.get(cursor.position() as usize..).unwrap_or(&[]).to_vec();
         let sql = String::from_utf8_lossy(&sql_bytes).to_string();
 
         Ok(Self {
@@ -327,7 +327,7 @@ impl TtcLogon {
         if let Some(start) = text_upper.find(field_name) {
             let start = start + field_name.len();
             let end = text_upper[start..]
-                .find(|c: char| c == ')' || c == ' ' || c == ';')
+                .find([')', ' ', ';'])
                 .map(|pos| start + pos)
                 .unwrap_or(text.len());
             return Some(text[start..end].to_string());

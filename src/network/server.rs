@@ -146,7 +146,7 @@ impl PgServer {
                 }
 
                 // Shutdown signal received
-                _ = &mut shutdown => {
+                () = &mut shutdown => {
                     info!("Shutdown signal received, stopping server");
                     break;
                 }

@@ -942,7 +942,7 @@ fn handle_show_branches(
         // Return materialized result
         Ok(Box::new(MaterializedOperator::new(tuples, schema)))
     } else {
-        return Err(Error::execution("No storage engine available"));
+        Err(Error::execution("No storage engine available"))
     }
 }
 

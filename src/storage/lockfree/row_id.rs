@@ -50,10 +50,10 @@ thread_local! {
     static PARTITION_ID: Cell<u16> = Cell::new(allocate_partition_id());
 
     /// Thread-local sequence counter
-    static SEQUENCE: Cell<u16> = Cell::new(0);
+    static SEQUENCE: Cell<u16> = const { Cell::new(0) };
 
     /// Last timestamp used (to detect clock regression)
-    static LAST_TIMESTAMP: Cell<u32> = Cell::new(0);
+    static LAST_TIMESTAMP: Cell<u32> = const { Cell::new(0) };
 }
 
 /// Allocate a unique partition ID for the current thread
@@ -63,6 +63,7 @@ fn allocate_partition_id() -> u16 {
 
 /// Get current timestamp in seconds since Unix epoch
 #[inline]
+#[allow(clippy::expect_used)]
 fn current_timestamp() -> u32 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -128,31 +129,35 @@ impl HierarchicalRowIdGenerator {
                 let current_ts = current_timestamp().saturating_sub(self.epoch_offset);
                 let last = last_ts.get();
 
-                if current_ts > last {
-                    // New second - reset sequence
-                    last_ts.set(current_ts);
-                    seq.set(1);
-                    (current_ts, 0u16)
-                } else if current_ts == last {
-                    // Same second - increment sequence
-                    let s = seq.get();
-                    if s == u16::MAX {
-                        // Sequence overflow - wait for next second
-                        // This is extremely rare (65536 IDs/sec/thread)
-                        std::thread::sleep(std::time::Duration::from_millis(1));
-                        let new_ts = current_timestamp().saturating_sub(self.epoch_offset);
-                        last_ts.set(new_ts);
+                match current_ts.cmp(&last) {
+                    std::cmp::Ordering::Greater => {
+                        // New second - reset sequence
+                        last_ts.set(current_ts);
                         seq.set(1);
-                        (new_ts, 0u16)
-                    } else {
-                        seq.set(s + 1);
-                        (current_ts, s)
+                        (current_ts, 0u16)
                     }
-                } else {
-                    // Clock went backwards - use last timestamp + increment sequence
-                    let s = seq.get();
-                    seq.set(s.wrapping_add(1));
-                    (last, s)
+                    std::cmp::Ordering::Equal => {
+                        // Same second - increment sequence
+                        let s = seq.get();
+                        if s == u16::MAX {
+                            // Sequence overflow - wait for next second
+                            // This is extremely rare (65536 IDs/sec/thread)
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                            let new_ts = current_timestamp().saturating_sub(self.epoch_offset);
+                            last_ts.set(new_ts);
+                            seq.set(1);
+                            (new_ts, 0u16)
+                        } else {
+                            seq.set(s + 1);
+                            (current_ts, s)
+                        }
+                    }
+                    std::cmp::Ordering::Less => {
+                        // Clock went backwards - use last timestamp + increment sequence
+                        let s = seq.get();
+                        seq.set(s.wrapping_add(1));
+                        (last, s)
+                    }
                 }
             })
         });
@@ -275,20 +280,18 @@ impl BatchRowIdAllocator {
         let state = self.allocators.entry(table.to_string())
             .or_insert_with(|| BatchState::new(1, self.batch_size));
 
-        loop {
-            let current = state.current.fetch_add(1, Ordering::Relaxed);
-            let batch_end = state.batch_end.load(Ordering::Acquire);
+        let current = state.current.fetch_add(1, Ordering::Relaxed);
+        let batch_end = state.batch_end.load(Ordering::Acquire);
 
-            if current < batch_end {
-                return current;
-            }
-
-            // Need new batch
-            let new_start = state.next_batch.fetch_add(self.batch_size, Ordering::SeqCst);
-            state.batch_end.store(new_start + self.batch_size, Ordering::Release);
-            state.current.store(new_start + 1, Ordering::Release);
-            return new_start;
+        if current < batch_end {
+            return current;
         }
+
+        // Need new batch
+        let new_start = state.next_batch.fetch_add(self.batch_size, Ordering::SeqCst);
+        state.batch_end.store(new_start + self.batch_size, Ordering::Release);
+        state.current.store(new_start + 1, Ordering::Release);
+        new_start
     }
 
     /// Get maximum allocated ID for table (for checkpointing)

@@ -174,10 +174,11 @@ impl GinIndex {
         }
 
         // Start with rows containing the first key
-        let mut result: HashSet<u64> = self.index.get(&keys[0])?.iter().copied().collect();
+        let first_key = keys.first()?;
+        let mut result: HashSet<u64> = self.index.get(first_key)?.iter().copied().collect();
 
         // Intersect with rows containing each subsequent key
-        for key in &keys[1..] {
+        for key in keys.get(1..).unwrap_or_default() {
             if let Some(row_set) = self.index.get(key) {
                 result.retain(|row_id| row_set.contains(row_id));
             } else {

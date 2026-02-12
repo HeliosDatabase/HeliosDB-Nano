@@ -283,7 +283,7 @@ impl ExplainPlanner {
         let start = std::time::Instant::now();
 
         // Convert logical plan to plan tree
-        let plan_node = self.plan_to_node(plan, 0)?;
+        let plan_node = self.plan_to_node(plan)?;
 
         // Calculate total cost and rows
         let total_cost = self.calculate_total_cost(&plan_node);
@@ -337,7 +337,7 @@ impl ExplainPlanner {
     }
 
     /// Convert logical plan to plan node tree
-    fn plan_to_node(&self, plan: &LogicalPlan, depth: usize) -> Result<PlanNode> {
+    fn plan_to_node(&self, plan: &LogicalPlan) -> Result<PlanNode> {
         match plan {
             LogicalPlan::Scan { table_name, schema, projection, .. } => {
                 let mut details = HashMap::new();
@@ -366,7 +366,7 @@ impl ExplainPlanner {
             }
 
             LogicalPlan::Filter { input, predicate } => {
-                let input_node = self.plan_to_node(input, depth + 1)?;
+                let input_node = self.plan_to_node(input)?;
 
                 // Estimate selectivity from predicate using statistics
                 let selectivity = self.estimate_predicate_selectivity(predicate);
@@ -386,7 +386,7 @@ impl ExplainPlanner {
             }
 
             LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => {
-                let input_node = self.plan_to_node(input, depth + 1)?;
+                let input_node = self.plan_to_node(input)?;
 
                 let mut details = HashMap::new();
                 details.insert("expressions".to_string(), format!("{}", exprs.len()));
@@ -413,7 +413,7 @@ impl ExplainPlanner {
             }
 
             LogicalPlan::Aggregate { input, group_by, aggr_exprs, having } => {
-                let input_node = self.plan_to_node(input, depth + 1)?;
+                let input_node = self.plan_to_node(input)?;
 
                 let mut details = HashMap::new();
                 details.insert("group_by".to_string(), format!("{}", group_by.len()));
@@ -435,8 +435,8 @@ impl ExplainPlanner {
             }
 
             LogicalPlan::Join { left, right, join_type, on, lateral } => {
-                let left_node = self.plan_to_node(left, depth + 1)?;
-                let right_node = self.plan_to_node(right, depth + 1)?;
+                let left_node = self.plan_to_node(left)?;
+                let right_node = self.plan_to_node(right)?;
 
                 let mut details = HashMap::new();
                 details.insert("type".to_string(), format!("{:?}", join_type));
@@ -465,7 +465,7 @@ impl ExplainPlanner {
             }
 
             LogicalPlan::Sort { input, exprs, asc } => {
-                let input_node = self.plan_to_node(input, depth + 1)?;
+                let input_node = self.plan_to_node(input)?;
 
                 let mut details = HashMap::new();
                 details.insert("keys".to_string(), format!("{}", exprs.len()));
@@ -485,7 +485,7 @@ impl ExplainPlanner {
             }
 
             LogicalPlan::Limit { input, limit, offset } => {
-                let input_node = self.plan_to_node(input, depth + 1)?;
+                let input_node = self.plan_to_node(input)?;
 
                 let mut details = HashMap::new();
                 details.insert("limit".to_string(), limit.to_string());
@@ -767,6 +767,7 @@ impl ExplainPlanner {
         steps
     }
 
+    #[allow(clippy::self_only_used_in_recursion)]
     fn walkthrough_recursive(&self, node: &PlanNode, step: usize, steps: &mut Vec<String>) {
         // Process children first (bottom-up execution)
         for (i, child) in node.children.iter().enumerate() {
@@ -1093,6 +1094,7 @@ impl ExplainPlanner {
         result
     }
 
+    #[allow(clippy::self_only_used_in_recursion)]
     fn format_plan_node(&self, node: &PlanNode, depth: usize) -> String {
         let indent = "  ".repeat(depth);
         let mut result = String::new();

@@ -1235,6 +1235,7 @@ impl<'a> Planner<'a> {
 
     /// Extract a meaningful alias from an expression
     /// Falls back to col_{index} if no meaningful name can be extracted
+    #[allow(clippy::self_only_used_in_recursion)]
     fn extract_expr_alias(&self, expr: &Expr, index: usize) -> String {
         match expr {
             // Simple column reference: use column name
@@ -2628,7 +2629,7 @@ impl<'a> Planner<'a> {
 
         // Parse REFERENCING clause for transition tables
         let transition_tables: Vec<TransitionTable> = referencing.iter()
-            .filter_map(|r| {
+            .map(|r| {
                 // TriggerReferencing has refer_type (OLD/NEW), is_table flag, and transition_relation_name
                 // transition_relation_name is an ObjectName - use it directly or provide default
                 let alias = {
@@ -2646,10 +2647,10 @@ impl<'a> Planner<'a> {
 
                 match r.refer_type {
                     sqlparser::ast::TriggerReferencingType::OldTable => {
-                        Some(TransitionTable::OldTable { alias })
+                        TransitionTable::OldTable { alias }
                     }
                     sqlparser::ast::TriggerReferencingType::NewTable => {
-                        Some(TransitionTable::NewTable { alias })
+                        TransitionTable::NewTable { alias }
                     }
                 }
             })
@@ -2846,7 +2847,7 @@ impl<'a> Planner<'a> {
     }
 }
 
-impl<'a> Default for Planner<'a> {
+impl Default for Planner<'_> {
     fn default() -> Self {
         Self::new()
     }

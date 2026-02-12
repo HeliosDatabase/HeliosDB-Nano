@@ -219,7 +219,7 @@ impl TnsConnect {
         // Simple parser for SERVICE_NAME
         if let Some(start) = data.find("SERVICE_NAME=") {
             let start = start + 13; // Length of "SERVICE_NAME="
-            if let Some(end) = data[start..].find(|c| c == ')' || c == ' ') {
+            if let Some(end) = data[start..].find([')', ' ']) {
                 return Some(data[start..start + end].to_string());
             }
         }
@@ -347,7 +347,7 @@ impl TnsData {
 
         let mut cursor = Cursor::new(data);
         let flags = cursor.get_u16();
-        let payload = data[2..].to_vec();
+        let payload = data.get(2..).unwrap_or(&[]).to_vec();
 
         Ok(Self {
             flags,
@@ -403,7 +403,12 @@ impl TnsPacket {
             ));
         }
 
-        let payload = data[TnsHeader::SIZE..header.length as usize].to_vec();
+        let payload = data.get(TnsHeader::SIZE..header.length as usize)
+            .ok_or_else(|| io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "TNS packet payload out of bounds",
+            ))?
+            .to_vec();
 
         Ok(Self { header, payload })
     }

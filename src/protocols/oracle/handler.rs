@@ -107,7 +107,7 @@ impl OracleProtocolHandler {
 
         // Update connection parameters
         self.sdu_size = connect.sdu_size.min(8192); // Cap at 8KB
-        self.tdu_size = connect.tdu_size.min(65535); // Cap at 64KB
+        self.tdu_size = connect.tdu_size;
         self.state = ConnectionState::Connected;
 
         // Send TNS Accept packet
@@ -286,8 +286,11 @@ impl OracleProtocolHandler {
         let mut rows_fetched = 0;
         let max_rows = fetch_msg.num_rows as usize;
 
-        while rows_fetched < max_rows && cursor.fetch_position < cursor.results.len() {
-            let tuple = &cursor.results[cursor.fetch_position];
+        while rows_fetched < max_rows {
+            let tuple = match cursor.results.get(cursor.fetch_position) {
+                Some(t) => t,
+                None => break,
+            };
             let num_columns = tuple.values.len() as u16;
 
             builder.write_row_header(num_columns);
@@ -322,8 +325,8 @@ impl OracleProtocolHandler {
     /// Handle close cursor request
     fn handle_close_cursor(&mut self, payload: &[u8]) -> Result<Vec<u8>> {
         // Extract cursor ID from payload (simplified)
-        let cursor_id = if payload.len() >= 2 {
-            u16::from_be_bytes([payload[0], payload[1]])
+        let cursor_id = if let (Some(&b0), Some(&b1)) = (payload.first(), payload.get(1)) {
+            u16::from_be_bytes([b0, b1])
         } else {
             return self.error_response("ORA-01001", "Invalid cursor");
         };

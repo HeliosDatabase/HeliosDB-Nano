@@ -179,9 +179,12 @@ impl ContentAddressedStore {
 /// Hex encoding module for display purposes
 mod hex {
     pub fn encode(bytes: &[u8]) -> String {
-        bytes.iter()
-            .map(|b| format!("{:02x}", b))
-            .collect()
+        use std::fmt::Write;
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = write!(s, "{:02x}", b);
+        }
+        s
     }
 }
 

@@ -200,7 +200,7 @@ impl CommitTracker {
             }
 
             // Extract SHA from key
-            let sha_bytes = &key[GIT_COMMIT_PREFIX.len()..];
+            let sha_bytes = key.get(GIT_COMMIT_PREFIX.len()..).unwrap_or_default();
             if let Ok(sha) = std::str::from_utf8(sha_bytes) {
                 if sha.starts_with(abbreviated) {
                     matches.push(sha.to_string());
@@ -210,7 +210,7 @@ impl CommitTracker {
 
         match matches.len() {
             0 => Ok(None),
-            1 => Ok(Some(matches.into_iter().next().expect("checked length"))),
+            1 => Ok(Some(matches.into_iter().next().unwrap_or_default())),
             _ => Err(Error::storage(format!(
                 "Ambiguous commit SHA '{}': {} matches",
                 abbreviated, matches.len()

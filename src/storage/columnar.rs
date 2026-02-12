@@ -79,7 +79,10 @@ impl ColumnBatch {
             self.values.push(Value::Null);
         }
 
-        self.values[offset] = value;
+        if let Some(slot) = self.values.get_mut(offset) {
+            *slot = value;
+        }
+
         true
     }
 

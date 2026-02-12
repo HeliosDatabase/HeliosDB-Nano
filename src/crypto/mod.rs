@@ -94,8 +94,10 @@ pub fn decrypt(key: &EncryptionKey, ciphertext_with_nonce: &[u8]) -> Result<Vec<
     }
 
     // Extract nonce (first 12 bytes)
-    let nonce_bytes = &ciphertext_with_nonce[0..12];
-    let ciphertext = &ciphertext_with_nonce[12..];
+    let nonce_bytes = ciphertext_with_nonce.get(0..12)
+        .ok_or_else(|| Error::encryption("Ciphertext too short for nonce"))?;
+    let ciphertext = ciphertext_with_nonce.get(12..)
+        .ok_or_else(|| Error::encryption("Ciphertext too short for data"))?;
 
     let cipher = Aes256Gcm::new(key.into());
     let nonce = AesNonce::from_slice(nonce_bytes);
@@ -131,7 +133,7 @@ pub fn derive_key_from_password(password: &str, salt: &[u8]) -> Result<Encryptio
     }
 
     let mut key = [0u8; 32];
-    key.copy_from_slice(&key_bytes[0..32]);
+    key.copy_from_slice(key_bytes.get(0..32).ok_or_else(|| Error::encryption("Derived key too short"))?);
 
     Ok(key)
 }

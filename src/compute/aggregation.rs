@@ -10,7 +10,7 @@ pub trait AggregateFunction: Send {
     fn init_state(&self) -> Box<dyn AggregateState>;
 
     /// Get function name
-    fn name(&self) -> &str;
+    fn name(&self) -> &'static str;
 }
 
 /// Aggregate state
@@ -34,7 +34,7 @@ impl AggregateFunction for CountFunction {
         Box::new(CountState { count: 0 })
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "COUNT"
     }
 }
@@ -76,7 +76,7 @@ impl AggregateFunction for SumFunction {
         Box::new(SumState { sum: None })
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "SUM"
     }
 }
@@ -119,7 +119,7 @@ impl AggregateFunction for AvgFunction {
         Box::new(AvgState { sum: 0.0, count: 0 })
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "AVG"
     }
 }
@@ -168,7 +168,7 @@ impl AggregateFunction for MinFunction {
         Box::new(MinState { min: None })
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "MIN"
     }
 }
@@ -214,7 +214,7 @@ impl AggregateFunction for MaxFunction {
         Box::new(MaxState { max: None })
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "MAX"
     }
 }
@@ -264,7 +264,7 @@ impl AggregateFunction for StddevFunction {
         })
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "STDDEV"
     }
 }
@@ -325,7 +325,7 @@ impl AggregateFunction for VarianceFunction {
         })
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "VARIANCE"
     }
 }
@@ -444,7 +444,7 @@ impl AggregateFunction for JsonAggFunction {
         })
     }
 
-    fn name(&self) -> &str {
+    fn name(&self) -> &'static str {
         "JSON_AGG"
     }
 }

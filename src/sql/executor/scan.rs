@@ -59,7 +59,8 @@ impl PhysicalOperator for ScanOperator {
             return Ok(None);
         }
 
-        let tuple = self.tuples[self.current_index].clone();
+        let tuple = self.tuples.get(self.current_index).cloned()
+            .ok_or_else(|| Error::query_execution("Scan index out of bounds"))?;
         self.current_index += 1;
 
         // Apply projection if specified
@@ -79,7 +80,7 @@ impl PhysicalOperator for ScanOperator {
     fn schema(&self) -> Arc<Schema> {
         if let Some(indices) = &self.projection {
             let columns: Vec<_> = indices.iter()
-                .map(|&i| self.schema.columns[i].clone())
+                .filter_map(|&i| self.schema.columns.get(i).cloned())
                 .collect();
             Arc::new(Schema { columns })
         } else {
@@ -133,7 +134,7 @@ impl VectorScanOperator {
     #[allow(dead_code)]
     pub fn current_distance(&self) -> Option<f32> {
         if self.current_index > 0 && self.current_index <= self.results.len() {
-            Some(self.results[self.current_index - 1].1)
+            self.results.get(self.current_index - 1).map(|r| r.1)
         } else {
             None
         }
@@ -146,7 +147,8 @@ impl PhysicalOperator for VectorScanOperator {
             return Ok(None);
         }
 
-        let tuple = self.tuples[self.current_index].clone();
+        let tuple = self.tuples.get(self.current_index).cloned()
+            .ok_or_else(|| Error::query_execution("Vector scan index out of bounds"))?;
         self.current_index += 1;
 
         Ok(Some(tuple))
@@ -184,7 +186,8 @@ impl PhysicalOperator for MaterializedOperator {
             return Ok(None);
         }
 
-        let tuple = self.tuples[self.current_index].clone();
+        let tuple = self.tuples.get(self.current_index).cloned()
+            .ok_or_else(|| Error::query_execution("Materialized index out of bounds"))?;
         self.current_index += 1;
 
         Ok(Some(tuple))

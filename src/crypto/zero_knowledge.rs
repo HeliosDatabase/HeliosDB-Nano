@@ -336,7 +336,8 @@ impl ZeroKnowledgeSession {
         for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
             let hex_byte = std::str::from_utf8(chunk)
                 .map_err(|_| Error::encryption("Invalid hex string"))?;
-            key[i] = u8::from_str_radix(hex_byte, 16)
+            let dest = key.get_mut(i).ok_or_else(|| Error::encryption("Key index out of bounds"))?;
+            *dest = u8::from_str_radix(hex_byte, 16)
                 .map_err(|_| Error::encryption(format!("Invalid hex byte: {}", hex_byte)))?;
         }
 
@@ -477,11 +478,7 @@ impl TimestampValidator {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        let diff = if request_timestamp_secs > now {
-            request_timestamp_secs - now
-        } else {
-            now - request_timestamp_secs
-        };
+        let diff = request_timestamp_secs.abs_diff(now);
 
         diff <= self.max_skew_secs
     }

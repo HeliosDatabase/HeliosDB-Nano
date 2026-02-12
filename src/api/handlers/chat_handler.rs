@@ -552,7 +552,7 @@ pub async fn create_chat_completion_stream(
     }).collect();
 
     let model = req.model.clone().unwrap_or_else(|| "heliosdb-default".to_string());
-    let chunk_id = format!("chatcmpl-{}", uuid::Uuid::new_v4().to_string().replace("-", "")[..24].to_string());
+    let chunk_id = format!("chatcmpl-{}", &uuid::Uuid::new_v4().to_string().replace("-", "")[..24]);
     let created = chrono::Utc::now().timestamp();
 
     // Try to create the stream from the database

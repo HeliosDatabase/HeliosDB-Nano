@@ -250,7 +250,7 @@ impl PlanDiff {
             .map(|f| (f.name.clone(), f))
             .collect();
 
-        for (name, _) in &new_features {
+        for name in new_features.keys() {
             if !old_features.contains_key(name) {
                 feature_changes.push(FeatureChange {
                     feature_name: name.clone(),
@@ -259,7 +259,7 @@ impl PlanDiff {
             }
         }
 
-        for (name, _) in &old_features {
+        for name in old_features.keys() {
             if !new_features.contains_key(name) {
                 feature_changes.push(FeatureChange {
                     feature_name: name.clone(),

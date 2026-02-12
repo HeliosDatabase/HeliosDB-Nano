@@ -156,7 +156,7 @@ impl AggregateOperator {
         // Filter output tuples based on HAVING clause if present
         if let Some(having_expr) = having {
             // Rewrite HAVING expression to replace aggregate functions with column references
-            let rewritten_having = Self::rewrite_having_expr(&having_expr, &group_by, &aggr_exprs);
+            let rewritten_having = Self::rewrite_having_expr(&having_expr, &aggr_exprs);
 
             let having_evaluator = crate::sql::Evaluator::new(schema.clone());
             output_tuples = output_tuples.into_iter()
@@ -205,7 +205,9 @@ impl AggregateOperator {
                     ));
                 }
 
-                let arg_expr = &args[0];
+                let arg_expr = args.first().ok_or_else(|| Error::query_execution(
+                    "Aggregate function has no arguments"
+                ))?;
 
                 // Special case: COUNT(*)
                 if matches!(fun, AggregateFunction::Count) && matches!(arg_expr, LogicalExpr::Wildcard) {
@@ -392,7 +394,6 @@ impl AggregateOperator {
     /// This allows the HAVING clause to reference already-computed aggregate values
     fn rewrite_having_expr(
         expr: &crate::sql::LogicalExpr,
-        group_by: &[crate::sql::LogicalExpr],
         aggr_exprs: &[crate::sql::LogicalExpr],
     ) -> crate::sql::LogicalExpr {
         use crate::sql::LogicalExpr;
@@ -416,15 +417,15 @@ impl AggregateOperator {
             }
             LogicalExpr::BinaryExpr { left, op, right } => {
                 LogicalExpr::BinaryExpr {
-                    left: Box::new(Self::rewrite_having_expr(left, group_by, aggr_exprs)),
+                    left: Box::new(Self::rewrite_having_expr(left, aggr_exprs)),
                     op: *op,
-                    right: Box::new(Self::rewrite_having_expr(right, group_by, aggr_exprs)),
+                    right: Box::new(Self::rewrite_having_expr(right, aggr_exprs)),
                 }
             }
             LogicalExpr::UnaryExpr { op, expr: inner_expr } => {
                 LogicalExpr::UnaryExpr {
                     op: *op,
-                    expr: Box::new(Self::rewrite_having_expr(inner_expr, group_by, aggr_exprs)),
+                    expr: Box::new(Self::rewrite_having_expr(inner_expr, aggr_exprs)),
                 }
             }
             // For other expression types, just clone them
@@ -439,7 +440,8 @@ impl PhysicalOperator for AggregateOperator {
             return Ok(None);
         }
 
-        let tuple = self.output_tuples[self.current_index].clone();
+        let tuple = self.output_tuples.get(self.current_index).cloned()
+            .ok_or_else(|| Error::query_execution("Aggregate index out of bounds"))?;
         self.current_index += 1;
         Ok(Some(tuple))
     }
@@ -536,7 +538,8 @@ impl PhysicalOperator for SortOperator {
             return Ok(None);
         }
 
-        let tuple = self.sorted_tuples[self.current_index].clone();
+        let tuple = self.sorted_tuples.get(self.current_index).cloned()
+            .ok_or_else(|| Error::query_execution("Sort index out of bounds"))?;
         self.current_index += 1;
         Ok(Some(tuple))
     }

@@ -444,7 +444,7 @@ impl Transaction {
                                         reverse_ts
                                     );
                                     let ts_bytes = commit_ts.to_be_bytes();
-                                    batch.put(v_idx_key.as_bytes(), &ts_bytes);
+                                    batch.put(v_idx_key.as_bytes(), ts_bytes);
                                 }
                             }
                         }
@@ -580,10 +580,11 @@ impl Transaction {
         // 1. Update existing tuples from write set and handle tombstones
         let mut i = 0;
         while i < tuples.len() {
-            if let Some(row_id) = tuples[i].row_id {
+            let current_row_id = tuples.get(i).and_then(|t| t.row_id);
+            if let Some(row_id) = current_row_id {
                 handled_row_ids.insert(row_id);
                 let key = format!("{}{}", prefix, row_id).into_bytes();
-                
+
                 if let Some(entry) = self.write_set.get(&key) {
                     match entry.value() {
                         Some(data) => {
@@ -591,7 +592,9 @@ impl Transaction {
                             let mut updated_tuple: Tuple = bincode::deserialize(data)
                                 .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
                             updated_tuple.row_id = Some(row_id);
-                            tuples[i] = updated_tuple;
+                            if let Some(slot) = tuples.get_mut(i) {
+                                *slot = updated_tuple;
+                            }
                             i += 1;
                         }
                         None => {

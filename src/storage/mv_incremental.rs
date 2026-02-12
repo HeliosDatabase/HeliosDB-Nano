@@ -931,6 +931,7 @@ impl IncrementalRefresher {
     }
 
     /// Extract table name from logical plan
+    #[allow(clippy::self_only_used_in_recursion)]
     fn extract_table_name(&self, plan: &LogicalPlan) -> Result<String> {
         match plan {
             LogicalPlan::Scan { table_name, .. } => Ok(table_name.clone()),

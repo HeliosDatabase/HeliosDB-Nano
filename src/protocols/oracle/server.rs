@@ -124,7 +124,8 @@ async fn handle_connection(mut socket: TcpStream, storage: Arc<StorageEngine>) -
         tracing::debug!("Received {} bytes from client", n);
 
         // Parse TNS packet
-        let packet = match TnsPacket::parse(&buffer[..n]) {
+        let recv_data = buffer.get(..n).ok_or_else(|| Error::io("Buffer read out of bounds"))?;
+        let packet = match TnsPacket::parse(recv_data) {
             Ok(pkt) => pkt,
             Err(e) => {
                 tracing::error!("Failed to parse TNS packet: {}", e);

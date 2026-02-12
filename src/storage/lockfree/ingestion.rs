@@ -713,6 +713,7 @@ impl LockFreeIngestionEngine {
         shutdown: Arc<AtomicBool>,
         apply_callback: Arc<RwLock<Option<Box<dyn Fn(&str, u64, Option<&[u8]>) + Send + Sync>>>>,
     ) -> JoinHandle<()> {
+        #[allow(clippy::expect_used)]
         thread::Builder::new()
             .name("lockfree-commit-worker".to_string())
             .spawn(move || {

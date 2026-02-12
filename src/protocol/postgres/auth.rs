@@ -279,10 +279,10 @@ impl ScramAuthState {
         let client_signature = scram_hmac_sha256(stored_key, auth_message.as_bytes());
 
         // Calculate client key: ClientProof XOR ClientSignature
-        let mut client_key = vec![0u8; client_proof.len()];
-        for i in 0..client_proof.len() {
-            client_key[i] = client_proof[i] ^ client_signature[i];
-        }
+        let client_key: Vec<u8> = client_proof.iter()
+            .zip(client_signature.iter())
+            .map(|(a, b)| a ^ b)
+            .collect();
 
         // Verify: H(ClientKey) should equal StoredKey
         let computed_stored_key = scram_h(&client_key);
@@ -393,8 +393,8 @@ fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
     }
 
     let mut result = 0u8;
-    for i in 0..a.len() {
-        result |= a[i] ^ b[i];
+    for (x, y) in a.iter().zip(b.iter()) {
+        result |= x ^ y;
     }
 
     result == 0

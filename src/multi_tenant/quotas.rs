@@ -104,7 +104,7 @@ impl RateLimiter {
         if let Some(window) = windows.get(tenant_id) {
             let elapsed = Instant::now().duration_since(window.window_start);
             if elapsed < self.window_size {
-                return self.window_size - elapsed;
+                return self.window_size.saturating_sub(elapsed);
             }
         }
         Duration::from_secs(0)

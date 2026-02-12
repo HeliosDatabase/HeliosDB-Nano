@@ -339,7 +339,7 @@ impl WebhookHandler {
 
         // Compute HMAC-SHA256
         let computed = Self::hmac_sha256(secret.as_bytes(), payload);
-        let computed_hex = hex::encode(&computed);
+        let computed_hex = hex::encode(computed);
 
         // Constant-time comparison to prevent timing attacks
         if computed_hex.len() != expected_hex.len() {
@@ -391,14 +391,14 @@ impl WebhookHandler {
 
         // Inner hash: H(k_ipad || message)
         let mut inner_hasher = Sha256::new();
-        inner_hasher.update(&k_ipad);
+        inner_hasher.update(k_ipad);
         inner_hasher.update(message);
         let inner_hash = inner_hasher.finalize();
 
         // Outer hash: H(k_opad || inner_hash)
         let mut outer_hasher = Sha256::new();
-        outer_hasher.update(&k_opad);
-        outer_hasher.update(&inner_hash);
+        outer_hasher.update(k_opad);
+        outer_hasher.update(inner_hash);
 
         let result = outer_hasher.finalize();
         let mut output = [0u8; 32];

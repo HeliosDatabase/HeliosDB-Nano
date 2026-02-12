@@ -38,8 +38,8 @@ impl MaterializedViewParser {
                 continue;
             }
 
-            let key = parts[0].to_lowercase();
-            let value = parts[1].trim_matches('\'').trim_matches('"');
+            let key = parts.first().map(|s| s.to_lowercase()).unwrap_or_default();
+            let value = parts.get(1).map(|s| s.trim_matches('\'').trim_matches('"')).unwrap_or_default();
 
             match key.as_str() {
                 "auto_refresh" => {

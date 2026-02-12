@@ -383,7 +383,7 @@ impl AutoRefreshWorker {
 
             // Wait for interval or command
             tokio::select! {
-                _ = tokio::time::sleep(Duration::from_secs(interval_seconds)) => {
+                () = tokio::time::sleep(Duration::from_secs(interval_seconds)) => {
                     // Periodic check
                     Self::perform_staleness_check(
                         &config,

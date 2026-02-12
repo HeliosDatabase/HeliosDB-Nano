@@ -440,13 +440,13 @@ impl WebUIRenderer {
 
         html.push_str("    <div class=\"plan-container\">\n");
         html.push_str("      <h2>Query Execution Plan</h2>\n");
-        html.push_str(&self.render_plan_node(&output.plan, 0));
+        html.push_str(&Self::render_plan_node(&output.plan));
         html.push_str("    </div>\n");
 
         html
     }
 
-    fn render_plan_node(&self, node: &super::explain::PlanNode, depth: usize) -> String {
+    fn render_plan_node(node: &super::explain::PlanNode) -> String {
         let mut html = String::new();
 
         html.push_str("      <div class=\"plan-node fade-in\">\n");
@@ -465,7 +465,7 @@ impl WebUIRenderer {
         }
 
         for child in &node.children {
-            html.push_str(&self.render_plan_node(child, depth + 1));
+            html.push_str(&Self::render_plan_node(child));
         }
 
         html.push_str("      </div>\n");
@@ -590,14 +590,14 @@ impl WebUIRenderer {
         svg.push_str("    </style>\n");
         svg.push_str("  </defs>\n");
 
-        svg.push_str(&self.render_svg_node(&output.plan, 400, 50, 0));
+        svg.push_str(&Self::render_svg_node(&output.plan, 400, 50));
 
         svg.push_str("</svg>\n");
 
         svg
     }
 
-    fn render_svg_node(&self, node: &super::explain::PlanNode, x: i32, y: i32, depth: usize) -> String {
+    fn render_svg_node(node: &super::explain::PlanNode, x: i32, y: i32) -> String {
         let mut svg = String::new();
 
         // Draw node rectangle
@@ -632,7 +632,7 @@ impl WebUIRenderer {
             ));
 
             // Recursively draw child
-            svg.push_str(&self.render_svg_node(child, child_x, child_y, depth + 1));
+            svg.push_str(&Self::render_svg_node(child, child_x, child_y));
         }
 
         svg

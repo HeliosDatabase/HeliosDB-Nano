@@ -271,10 +271,14 @@ impl InteractiveQueryTuner {
             .ok_or_else(|| Error::Storage("Modification not found".to_string()))?;
 
         // Mark as applied
-        session.modifications[mod_idx].applied = true;
+        session.modifications.get_mut(mod_idx)
+            .ok_or_else(|| Error::Storage("Modification index out of bounds".to_string()))?
+            .applied = true;
 
         // Calculate new performance
-        let impact = &session.modifications[mod_idx].impact;
+        let impact = &session.modifications.get(mod_idx)
+            .ok_or_else(|| Error::Storage("Modification index out of bounds".to_string()))?
+            .impact;
         let last_snapshot = session.performance_history.last()
             .ok_or_else(|| Error::Storage("No performance history".to_string()))?;
 
@@ -304,11 +308,15 @@ impl InteractiveQueryTuner {
             .position(|m| m.modification_id == modification_id)
             .ok_or_else(|| Error::Storage("Modification not found".to_string()))?;
 
-        if !session.modifications[mod_idx].can_rollback {
+        if !session.modifications.get(mod_idx)
+            .ok_or_else(|| Error::Storage("Modification index out of bounds".to_string()))?
+            .can_rollback {
             return Err(Error::Storage("Modification cannot be rolled back".to_string()));
         }
 
-        session.modifications[mod_idx].applied = false;
+        session.modifications.get_mut(mod_idx)
+            .ok_or_else(|| Error::Storage("Modification index out of bounds".to_string()))?
+            .applied = false;
 
         // Remove the performance snapshot for this modification
         session.performance_history.retain(|s| s.query_version != format!("mod_{}", modification_id));

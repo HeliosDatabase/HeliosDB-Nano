@@ -754,10 +754,14 @@ impl Eq for Value {}
 // Add hex crate to Cargo.toml for Bytes display
 // For now, use a simple implementation
 mod hex {
+    use std::fmt::Write;
+
     pub fn encode(bytes: &[u8]) -> String {
-        bytes.iter()
-            .map(|b| format!("{:02x}", b))
-            .collect()
+        let mut s = String::with_capacity(bytes.len() * 2);
+        for b in bytes {
+            let _ = write!(s, "{:02x}", b);
+        }
+        s
     }
 }
 

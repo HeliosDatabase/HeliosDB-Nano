@@ -309,7 +309,9 @@ fn infer_schema_from_tuples(tuples: &[Tuple]) -> Result<Schema, ApiError> {
     }
 
     // For now, create generic column names
-    let first_tuple = &tuples[0];
+    let Some(first_tuple) = tuples.first() else {
+        return Ok(Schema::new(vec![]));
+    };
     let columns: Vec<crate::Column> = first_tuple.values.iter().enumerate()
         .map(|(idx, value)| {
             let data_type = match value {

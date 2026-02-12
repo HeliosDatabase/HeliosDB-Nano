@@ -1446,12 +1446,12 @@ impl SystemViewRegistry {
 
         // Sort by transaction_id for consistent ordering
         results.sort_by(|a, b| {
-            let tx_a = match &a.values[0] {
-                Value::Int8(v) => *v,
+            let tx_a = match a.values.first() {
+                Some(Value::Int8(v)) => *v,
                 _ => 0,
             };
-            let tx_b = match &b.values[0] {
-                Value::Int8(v) => *v,
+            let tx_b = match b.values.first() {
+                Some(Value::Int8(v)) => *v,
                 _ => 0,
             };
             tx_a.cmp(&tx_b)
@@ -1482,12 +1482,12 @@ impl SystemViewRegistry {
 
         // Sort by SCN for consistent ordering
         results.sort_by(|a, b| {
-            let scn_a = match &a.values[0] {
-                Value::Int8(v) => *v,
+            let scn_a = match a.values.first() {
+                Some(Value::Int8(v)) => *v,
                 _ => 0,
             };
-            let scn_b = match &b.values[0] {
-                Value::Int8(v) => *v,
+            let scn_b = match b.values.first() {
+                Some(Value::Int8(v)) => *v,
                 _ => 0,
             };
             scn_a.cmp(&scn_b)

@@ -193,7 +193,7 @@ GNTvYWQXgmFnJnXpQpPqCBbPqJQXLd2jJmMQ==
         }
 
         // Generate using OpenSSL if available
-        if let Ok(()) = Self::generate_self_signed(cert_path, key_path, "localhost") {
+        if matches!(Self::generate_self_signed(cert_path, key_path, "localhost"), Ok(())) {
             return Ok((cert_path.to_string(), key_path.to_string()));
         }
 

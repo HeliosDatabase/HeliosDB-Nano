@@ -416,6 +416,7 @@ impl BatchedCommitWorker {
     ///
     /// Panics if the receiver has already been taken by another worker.
     pub fn new(coordinator: Arc<WriteCoordinator>) -> Self {
+        #[allow(clippy::expect_used)]
         let receiver = coordinator
             .take_receiver()
             .expect("Receiver already taken by another worker");

@@ -247,7 +247,8 @@ impl Exporter {
         }
 
         let mut output = String::new();
-        let columns: Vec<&String> = rows[0].keys().collect();
+        let Some(first_row) = rows.first() else { return String::new() };
+        let columns: Vec<&String> = first_row.keys().collect();
 
         // Headers
         if self.options.headers {
@@ -297,7 +298,8 @@ impl Exporter {
             return String::new();
         }
 
-        let columns: Vec<&String> = rows[0].keys().collect();
+        let Some(first_row) = rows.first() else { return String::new() };
+        let columns: Vec<&String> = first_row.keys().collect();
         let col_names = columns.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ");
 
         let mut statements = Vec::new();
@@ -478,7 +480,8 @@ impl Importer {
             return Vec::new();
         }
 
-        let columns: Vec<&String> = rows[0].keys().collect();
+        let Some(first_row) = rows.first() else { return Vec::new() };
+        let columns: Vec<&String> = first_row.keys().collect();
         let col_names = columns.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ");
 
         rows.iter()

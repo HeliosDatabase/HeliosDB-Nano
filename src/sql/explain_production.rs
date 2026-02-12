@@ -543,7 +543,7 @@ fn percentile(sorted_values: &[f64], p: f64) -> f64 {
     }
 
     let idx = ((p / 100.0) * (sorted_values.len() - 1) as f64) as usize;
-    sorted_values[idx]
+    sorted_values.get(idx).copied().unwrap_or(0.0)
 }
 
 #[cfg(test)]

@@ -117,7 +117,8 @@ impl KeyManager {
         for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
             let hex_byte = std::str::from_utf8(chunk)
                 .map_err(|_| Error::encryption("Invalid hex string"))?;
-            key[i] = u8::from_str_radix(hex_byte, 16)
+            let dest = key.get_mut(i).ok_or_else(|| Error::encryption("Key index out of bounds"))?;
+            *dest = u8::from_str_radix(hex_byte, 16)
                 .map_err(|_| Error::encryption(format!("Invalid hex byte: {}", hex_byte)))?;
         }
 
@@ -164,7 +165,7 @@ impl KeyManager {
 
     /// Export key as hex string (use carefully!)
     pub fn export_as_hex(&self) -> String {
-        hex::encode(&*self.key)
+        hex::encode(&self.key)
     }
 
     /// Rotate to a new key
@@ -180,7 +181,7 @@ impl KeyManager {
         use chrono::Utc;
 
         // Generate key IDs (SHA256 hashes of keys)
-        let old_key_id = Self::compute_key_id(&*self.key);
+        let old_key_id = Self::compute_key_id(&self.key);
         let new_key_id = Self::compute_key_id(&new_key);
 
         // Store current key as backup for legacy data decryption
@@ -208,7 +209,7 @@ impl KeyManager {
         hasher.update(key);
         let result = hasher.finalize();
 
-        hex::encode(&result[0..8]) // Use first 64 bits for ID
+        hex::encode(result.get(0..8).unwrap_or(&result)) // Use first 64 bits for ID
     }
 
     /// Get previous key for legacy data decryption during rotation

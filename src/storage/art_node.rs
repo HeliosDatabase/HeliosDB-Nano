@@ -618,7 +618,7 @@ impl ArtNode {
             ArtNode::Node16(n) => &n.header,
             ArtNode::Node48(n) => &n.header,
             ArtNode::Node256(n) => &n.header,
-            ArtNode::Leaf(_) => panic!("Leaf nodes don't have headers - use try_header() for safe access"),
+            ArtNode::Leaf(_) => unreachable!("Leaf nodes don't have headers - use try_header() for safe access"),
         }
     }
 
@@ -632,7 +632,7 @@ impl ArtNode {
             ArtNode::Node16(n) => &mut n.header,
             ArtNode::Node48(n) => &mut n.header,
             ArtNode::Node256(n) => &mut n.header,
-            ArtNode::Leaf(_) => panic!("Leaf nodes don't have headers - use try_header_mut() for safe access"),
+            ArtNode::Leaf(_) => unreachable!("Leaf nodes don't have headers - use try_header_mut() for safe access"),
         }
     }
 

@@ -168,7 +168,7 @@ pub enum PredicateOp {
 
 impl PredicateOp {
     /// Convert to zone map range operation
-    pub fn to_range_op(&self) -> Option<RangeOp> {
+    pub fn to_range_op(self) -> Option<RangeOp> {
         match self {
             PredicateOp::Eq => Some(RangeOp::Eq),
             PredicateOp::NotEq => Some(RangeOp::NotEq),
@@ -181,7 +181,7 @@ impl PredicateOp {
     }
 
     /// Convert to SIMD filter operation
-    pub fn to_filter_op(&self) -> Option<FilterOp> {
+    pub fn to_filter_op(self) -> Option<FilterOp> {
         match self {
             PredicateOp::Eq => Some(FilterOp::Eq),
             PredicateOp::NotEq => Some(FilterOp::NotEq),
@@ -565,7 +565,7 @@ impl PredicatePushdownManager {
         // Build candidate rows
         let candidate_rows: Vec<Vec<Value>> = candidate_indices
             .iter()
-            .map(|&idx| tuples[idx].values.to_vec())
+            .filter_map(|&idx| tuples.get(idx).map(|t| t.values.to_vec()))
             .collect();
 
         // Apply SIMD filtering
@@ -593,7 +593,9 @@ impl PredicatePushdownManager {
         // Collect matching tuples
         let matching_tuples: Vec<Tuple> = result.matched_indices
             .iter()
-            .map(|&idx| tuples[candidate_indices[idx]].clone())
+            .filter_map(|&idx| {
+                candidate_indices.get(idx).and_then(|&ci| tuples.get(ci)).cloned()
+            })
             .collect();
 
         if result.matched_count < result.total_count && limit.is_some() {
