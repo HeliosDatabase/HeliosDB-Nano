@@ -7,7 +7,7 @@
 //! - Multiple aggregate functions
 //! - COUNT(DISTINCT)
 
-use heliosdb_lite::{EmbeddedDatabase, Result, Value};
+use heliosdb_nano::{EmbeddedDatabase, Result, Value};
 
 fn main() -> Result<()> {
     println!("=== HeliosDB Lite Complex Query Demonstration ===\n");

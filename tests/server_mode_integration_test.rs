@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio_postgres::NoTls;
-use heliosdb_lite::{EmbeddedDatabase, protocol::postgres::server::{PgServer, PgServerConfig}};
+use heliosdb_nano::{EmbeddedDatabase, protocol::postgres::server::{PgServer, PgServerConfig}};
 
 // Run with: cargo test --test server_mode_integration_test --lib
 

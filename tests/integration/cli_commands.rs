@@ -4,7 +4,7 @@
 
 #![cfg(test)]
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
+use heliosdb_nano::{EmbeddedDatabase, Result};
 use tempfile::TempDir;
 
 #[test]

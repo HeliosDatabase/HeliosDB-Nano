@@ -9,7 +9,7 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_lite::{
+use heliosdb_nano::{
     Config,
     storage::{StorageEngine, BranchOptions},
     Tuple, Value,
@@ -76,7 +76,7 @@ fn test_create_branch_as_of_timestamp_string() {
 
     // Create branch using AS OF TIMESTAMP
     let resolved = snapshot_mgr.resolve_as_of(
-        &heliosdb_lite::sql::logical_plan::AsOfClause::Timestamp(timestamp_str)
+        &heliosdb_nano::sql::logical_plan::AsOfClause::Timestamp(timestamp_str)
     );
 
     // Should resolve successfully to snapshot 100
@@ -111,7 +111,7 @@ fn test_create_branch_as_of_transaction() {
 
     // Resolve using AS OF TRANSACTION
     let resolved = snapshot_mgr.resolve_as_of(
-        &heliosdb_lite::sql::logical_plan::AsOfClause::Transaction(txn_id)
+        &heliosdb_nano::sql::logical_plan::AsOfClause::Transaction(txn_id)
     ).unwrap();
 
     assert_eq!(resolved, 200);
@@ -143,7 +143,7 @@ fn test_create_branch_as_of_scn() {
 
     // Resolve using AS OF SCN
     let resolved = snapshot_mgr.resolve_as_of(
-        &heliosdb_lite::sql::logical_plan::AsOfClause::Scn(scn)
+        &heliosdb_nano::sql::logical_plan::AsOfClause::Scn(scn)
     ).unwrap();
 
     assert_eq!(resolved, 300);
@@ -172,7 +172,7 @@ fn test_invalid_timestamp_returns_error() {
 
     // Try to resolve non-existent timestamp
     let result = snapshot_mgr.resolve_as_of(
-        &heliosdb_lite::sql::logical_plan::AsOfClause::Timestamp(
+        &heliosdb_nano::sql::logical_plan::AsOfClause::Timestamp(
             "2099-12-31 23:59:59".to_string()
         )
     );
@@ -190,7 +190,7 @@ fn test_invalid_transaction_returns_error() {
 
     // Try to resolve non-existent transaction
     let result = snapshot_mgr.resolve_as_of(
-        &heliosdb_lite::sql::logical_plan::AsOfClause::Transaction(999999)
+        &heliosdb_nano::sql::logical_plan::AsOfClause::Transaction(999999)
     );
 
     // Should fail - transaction doesn't exist
@@ -206,7 +206,7 @@ fn test_invalid_scn_returns_error() {
 
     // Try to resolve non-existent SCN
     let result = snapshot_mgr.resolve_as_of(
-        &heliosdb_lite::sql::logical_plan::AsOfClause::Scn(999999)
+        &heliosdb_nano::sql::logical_plan::AsOfClause::Scn(999999)
     );
 
     // Should fail - SCN doesn't exist
@@ -318,7 +318,7 @@ fn test_timestamp_format_variations() {
 
     for format in formats {
         let result = snapshot_mgr.resolve_as_of(
-            &heliosdb_lite::sql::logical_plan::AsOfClause::Timestamp(format.to_string())
+            &heliosdb_nano::sql::logical_plan::AsOfClause::Timestamp(format.to_string())
         );
 
         // Should either resolve or fail gracefully (depending on whether snapshot exists)

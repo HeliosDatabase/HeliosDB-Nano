@@ -13,14 +13,14 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_lite::{Config, Column, DataType, Schema, Tuple, Value};
-use heliosdb_lite::storage::{
+use heliosdb_nano::{Config, Column, DataType, Schema, Tuple, Value};
+use heliosdb_nano::storage::{
     StorageEngine, MaterializedViewCatalog, MaterializedViewMetadata,
     AutoRefreshWorker, AutoRefreshConfig, AutoRefreshPolicy,
     MVScheduler, SchedulerConfig, Priority,
     MvSystemViews,
 };
-use heliosdb_lite::sql::LogicalPlan;
+use heliosdb_nano::sql::LogicalPlan;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -229,7 +229,7 @@ fn test_refresh_history_schema() {
 
 #[test]
 fn test_status_to_tuple_conversion() {
-    use heliosdb_lite::storage::AutoRefreshStatus;
+    use heliosdb_nano::storage::AutoRefreshStatus;
 
     let status = AutoRefreshStatus {
         mv_name: "test_mv".to_string(),
@@ -261,7 +261,7 @@ fn test_status_to_tuple_conversion() {
 
 #[test]
 fn test_cpu_usage_to_tuple_conversion() {
-    use heliosdb_lite::storage::CpuUsageInfo;
+    use heliosdb_nano::storage::CpuUsageInfo;
 
     let cpu_info = CpuUsageInfo {
         current_cpu_percent: 45.5,

@@ -1,6 +1,6 @@
-use heliosdb_lite::EmbeddedDatabase;
+use heliosdb_nano::EmbeddedDatabase;
 
-fn main() -> heliosdb_lite::Result<()> {
+fn main() -> heliosdb_nano::Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
 
     // Create a sales table

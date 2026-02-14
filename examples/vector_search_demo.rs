@@ -7,7 +7,7 @@
 //! - Performing similarity searches with different distance metrics
 //! - Using HNSW indexes for efficient k-NN queries
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
+use heliosdb_nano::{EmbeddedDatabase, Result};
 
 fn main() -> Result<()> {
     println!("HeliosDB Lite - Vector Search Demo\n");

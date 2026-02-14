@@ -2,7 +2,7 @@
 //!
 //! Tests for VECTOR data type, similarity operators, and HNSW indexes.
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
+use heliosdb_nano::{EmbeddedDatabase, Result};
 
 #[test]
 fn test_create_table_with_vector() -> Result<()> {

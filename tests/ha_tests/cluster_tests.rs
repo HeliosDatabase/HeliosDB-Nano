@@ -7,7 +7,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 #[cfg(feature = "ha-tier1")]
-use heliosdb_lite::replication::{
+use heliosdb_nano::replication::{
     streaming::{StreamingClient, StreamingClientConfig, StreamingClientState, StreamingServer, StreamingServerConfig},
     transport::{NodeRole, SyncModeConfig},
     wal_store::{WalStore, WalStoreConfig},
@@ -68,7 +68,7 @@ async fn test_wal_store_basic_operations() {
     assert_eq!(range[4].lsn, 7);
 
     // Get batch
-    use heliosdb_lite::replication::wal_store::BatchRequest;
+    use heliosdb_nano::replication::wal_store::BatchRequest;
     let batch = store.get_batch(BatchRequest {
         from_lsn: 0,
         to_lsn: Some(10),
@@ -97,7 +97,7 @@ async fn test_wal_store_batch_streaming() {
     }
 
     // Use BatchStreamState for streaming
-    use heliosdb_lite::replication::wal_store::BatchStreamState;
+    use heliosdb_nano::replication::wal_store::BatchStreamState;
     let mut state = BatchStreamState::new(0, Some(100));
     state.request.max_entries = 20;
 

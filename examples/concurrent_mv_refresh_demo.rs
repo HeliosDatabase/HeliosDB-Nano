@@ -8,8 +8,8 @@
 //! cargo run --example concurrent_mv_refresh_demo
 //! ```
 
-use heliosdb_lite::{Config, StorageEngine, Column, DataType, Schema, Tuple, Value};
-use heliosdb_lite::sql::{LogicalPlan, Executor};
+use heliosdb_nano::{Config, StorageEngine, Column, DataType, Schema, Tuple, Value};
+use heliosdb_nano::sql::{LogicalPlan, Executor};
 use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -80,7 +80,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Column::new("count", DataType::Int4),
     ]);
 
-    let metadata = heliosdb_lite::storage::MaterializedViewMetadata::new(
+    let metadata = heliosdb_nano::storage::MaterializedViewMetadata::new(
         "sales_summary".to_string(),
         "SELECT region, SUM(amount), COUNT(*) FROM sales GROUP BY region".to_string(),
         query_plan_bytes,

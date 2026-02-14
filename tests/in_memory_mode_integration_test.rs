@@ -6,7 +6,7 @@
 //! - Transaction isolation
 //! - Multi-threaded concurrent access
 
-use heliosdb_lite::{EmbeddedDatabase, Result, Value};
+use heliosdb_nano::{EmbeddedDatabase, Result, Value};
 use std::sync::Arc;
 use std::thread;
 
@@ -54,7 +54,7 @@ fn test_in_memory_transaction_commit() -> Result<()> {
     db.execute("CREATE TABLE data (id INT)")?;
     
     // Use the session API for transactions
-    let session_id = db.create_session("test_user", heliosdb_lite::session::IsolationLevel::ReadCommitted)?;
+    let session_id = db.create_session("test_user", heliosdb_nano::session::IsolationLevel::ReadCommitted)?;
     
     db.begin_transaction_for_session(session_id)?;
     db.execute_in_session(session_id, "INSERT INTO data VALUES (1)")?;
@@ -73,7 +73,7 @@ fn test_in_memory_transaction_rollback() -> Result<()> {
     db.execute("CREATE TABLE data (id INT)")?;
     db.execute("INSERT INTO data VALUES (1)")?;
     
-    let session_id = db.create_session("test_user", heliosdb_lite::session::IsolationLevel::ReadCommitted)?;
+    let session_id = db.create_session("test_user", heliosdb_nano::session::IsolationLevel::ReadCommitted)?;
     
     db.begin_transaction_for_session(session_id)?;
     db.execute_in_session(session_id, "INSERT INTO data VALUES (2)")?;
@@ -119,7 +119,7 @@ fn test_in_memory_concurrent_writes() -> Result<()> {
         let db_clone = db.clone();
         handles.push(thread::spawn(move || {
             // Each thread inserts a unique row
-            let session = db_clone.create_session(&format!("user_{}", i), heliosdb_lite::session::IsolationLevel::ReadCommitted).unwrap();
+            let session = db_clone.create_session(&format!("user_{}", i), heliosdb_nano::session::IsolationLevel::ReadCommitted).unwrap();
             db_clone.execute_in_session(session, &format!("INSERT INTO concurrent VALUES ({})", i)).unwrap();
         }));
     }

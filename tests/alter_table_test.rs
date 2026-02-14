@@ -2,7 +2,7 @@
 //!
 //! Tests ADD COLUMN, DROP COLUMN, RENAME COLUMN, and RENAME TABLE
 
-use heliosdb_lite::{Config, EmbeddedDatabase, Value};
+use heliosdb_nano::{Config, EmbeddedDatabase, Value};
 
 fn create_test_db() -> EmbeddedDatabase {
     let config = Config::in_memory();

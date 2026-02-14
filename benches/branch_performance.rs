@@ -7,7 +7,7 @@
 //! - GC performance
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use heliosdb_lite::{Config, storage::{StorageEngine, BranchOptions, MergeStrategy}};
+use heliosdb_nano::{Config, storage::{StorageEngine, BranchOptions, MergeStrategy}};
 
 fn bench_branch_creation(c: &mut Criterion) {
     let mut group = c.benchmark_group("branch_creation");

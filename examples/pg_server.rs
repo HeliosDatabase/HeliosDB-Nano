@@ -3,7 +3,7 @@
 //! Run with: cargo run --example pg_server
 //! Connect with: psql -h localhost -p 5432 -U postgres
 
-use heliosdb_lite::{EmbeddedDatabase, network::PgServer};
+use heliosdb_nano::{EmbeddedDatabase, network::PgServer};
 use std::sync::Arc;
 use tracing_subscriber;
 
@@ -11,7 +11,7 @@ use tracing_subscriber;
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize logging
     tracing_subscriber::fmt()
-        .with_env_filter("info,heliosdb_lite=debug")
+        .with_env_filter("info,heliosdb_nano=debug")
         .init();
 
     // Create in-memory database

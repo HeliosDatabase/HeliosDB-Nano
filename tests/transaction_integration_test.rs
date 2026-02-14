@@ -7,7 +7,7 @@
 //! 4. Rollback on error works correctly
 //! 5. Read-your-own-writes semantics are preserved
 
-use heliosdb_lite::{EmbeddedDatabase, Value, Result};
+use heliosdb_nano::{EmbeddedDatabase, Value, Result};
 
 #[test]
 fn test_auto_commit_insert() -> Result<()> {

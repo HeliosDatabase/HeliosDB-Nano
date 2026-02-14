@@ -6,12 +6,12 @@
 //! - Time-travel queries
 //! - Materialized views with auto-refresh
 
-use heliosdb_lite::*;
+use heliosdb_nano::*;
 
 #[test]
 fn test_product_quantization_end_to_end() {
-    use heliosdb_lite::vector::quantization::{ProductQuantizer, ProductQuantizerConfig};
-    use heliosdb_lite::vector::Vector;
+    use heliosdb_nano::vector::quantization::{ProductQuantizer, ProductQuantizerConfig};
+    use heliosdb_nano::vector::Vector;
 
     // Configuration for 128-dimensional vectors
     let config = ProductQuantizerConfig::default_for_dimension(128).unwrap();
@@ -53,7 +53,7 @@ fn test_product_quantization_end_to_end() {
 
 #[test]
 fn test_quantized_hnsw_integration() {
-    use heliosdb_lite::vector::{QuantizedHnswIndex, QuantizedHnswConfig, Vector};
+    use heliosdb_nano::vector::{QuantizedHnswIndex, QuantizedHnswConfig, Vector};
 
     // Create config for 128D vectors
     let config = QuantizedHnswConfig::default_for_dimension(128).unwrap();
@@ -97,7 +97,7 @@ fn test_quantized_hnsw_integration() {
 
 #[test]
 fn test_branching_sql_parsing() {
-    use heliosdb_lite::sql::phase3::BranchingParser;
+    use heliosdb_nano::sql::phase3::BranchingParser;
 
     // Test CREATE BRANCH
     let plan = BranchingParser::parse_create_branch(
@@ -123,7 +123,7 @@ fn test_branching_sql_parsing() {
 
 #[test]
 fn test_materialized_view_parsing() {
-    use heliosdb_lite::sql::phase3::MaterializedViewParser;
+    use heliosdb_nano::sql::phase3::MaterializedViewParser;
 
     // Test MV options parsing
     let options_str = "auto_refresh=true, max_cpu_percent=15, threshold_dml_rate=100";
@@ -136,8 +136,8 @@ fn test_materialized_view_parsing() {
 
 #[test]
 fn test_pq_accuracy() {
-    use heliosdb_lite::vector::quantization::{ProductQuantizer, ProductQuantizerConfig};
-    use heliosdb_lite::vector::Vector;
+    use heliosdb_nano::vector::quantization::{ProductQuantizer, ProductQuantizerConfig};
+    use heliosdb_nano::vector::Vector;
 
     // Test that PQ maintains high accuracy for similar vectors
     let config = ProductQuantizerConfig {
@@ -184,8 +184,8 @@ fn test_pq_accuracy() {
 
 #[test]
 fn test_pq_batch_performance() {
-    use heliosdb_lite::vector::quantization::{ProductQuantizer, ProductQuantizerConfig};
-    use heliosdb_lite::vector::Vector;
+    use heliosdb_nano::vector::quantization::{ProductQuantizer, ProductQuantizerConfig};
+    use heliosdb_nano::vector::Vector;
     use std::time::Instant;
 
     let config = ProductQuantizerConfig::default_for_dimension(768).unwrap();

@@ -5,7 +5,7 @@
 //! - Common test fixtures
 //! - Test utilities and assertions
 
-use heliosdb_lite::{EmbeddedDatabase, Result, Value, Tuple};
+use heliosdb_nano::{EmbeddedDatabase, Result, Value, Tuple};
 use rand::Rng;
 
 /// Test data generator

@@ -11,8 +11,8 @@
 //! **CRITICAL**: These tests verify that no tenant can access another tenant's data.
 //! Any failure in RLS tests indicates a SECURITY VULNERABILITY.
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
-use heliosdb_lite::tenant::{
+use heliosdb_nano::{EmbeddedDatabase, Result};
+use heliosdb_nano::tenant::{
     TenantManager, IsolationMode, RLSCommand, ChangeType,
     ResourceLimits, TenantContext, MigrationState
 };

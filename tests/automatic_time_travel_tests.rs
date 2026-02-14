@@ -13,8 +13,8 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_lite::{Config, StorageEngine, Tuple, Value, Schema, Column, DataType};
-use heliosdb_lite::sql::{LogicalPlan, AsOfClause, Executor};
+use heliosdb_nano::{Config, StorageEngine, Tuple, Value, Schema, Column, DataType};
+use heliosdb_nano::sql::{LogicalPlan, AsOfClause, Executor};
 use std::sync::Arc;
 
 /// Helper to create a simple schema
@@ -325,7 +325,7 @@ fn test_force_versioning_when_disabled() {
 #[test]
 fn test_automatic_gc_integration() {
     // Test that automatic versioning triggers GC
-    use heliosdb_lite::storage::GcConfig;
+    use heliosdb_nano::storage::GcConfig;
 
     let config = Config::in_memory();
     let engine = StorageEngine::open_in_memory(&config)

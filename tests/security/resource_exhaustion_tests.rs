@@ -3,7 +3,7 @@
 //! Tests to verify that the database handles resource-intensive operations
 //! gracefully and doesn't allow denial-of-service attacks.
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
+use heliosdb_nano::{EmbeddedDatabase, Result};
 
 #[test]
 fn test_large_query_result_set() {

@@ -4,8 +4,8 @@
 //!
 //! Run with: cargo run --example audit_demo
 
-use heliosdb_lite::{EmbeddedDatabase, Config};
-use heliosdb_lite::audit::{AuditLogger, AuditConfig, AuditQuery, OperationType};
+use heliosdb_nano::{EmbeddedDatabase, Config};
+use heliosdb_nano::audit::{AuditLogger, AuditConfig, AuditQuery, OperationType};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -17,7 +17,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::in_memory();
     let db = EmbeddedDatabase::new_in_memory()?;
     let storage = Arc::new(
-        heliosdb_lite::storage::StorageEngine::open_in_memory(&config)?
+        heliosdb_nano::storage::StorageEngine::open_in_memory(&config)?
     );
     println!("   Database created\n");
 

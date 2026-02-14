@@ -6,7 +6,7 @@
 //! - Execute (execute bound statements)
 //! - Describe (introspect statements/portals)
 
-use heliosdb_lite::{
+use heliosdb_nano::{
     EmbeddedDatabase,
     protocol::postgres::{
         PgServerBuilder, AuthMethod,
@@ -334,12 +334,12 @@ fn test_schema_derivation() {
     db.execute("INSERT INTO users VALUES (2, 'Bob', 'bob@example.com')").unwrap();
 
     // Parse a SELECT query and verify schema derivation
-    let parser = heliosdb_lite::sql::Parser::new();
+    let parser = heliosdb_nano::sql::Parser::new();
     let statement = parser.parse_one("SELECT id, name FROM users WHERE id = $1").unwrap();
 
     // Create planner with catalog
     let catalog = db.storage.catalog();
-    let planner = heliosdb_lite::sql::planner::Planner::with_catalog(&catalog);
+    let planner = heliosdb_nano::sql::planner::Planner::with_catalog(&catalog);
 
     // Convert to logical plan
     let logical_plan = planner.statement_to_plan(statement).unwrap();
@@ -355,8 +355,8 @@ fn test_schema_derivation() {
     // assert_eq!(schema.columns[1].name, "name");
 
     // Verify column types
-    assert_eq!(schema.columns[0].data_type, heliosdb_lite::DataType::Int4);
-    assert_eq!(schema.columns[1].data_type, heliosdb_lite::DataType::Text);
+    assert_eq!(schema.columns[0].data_type, heliosdb_nano::DataType::Int4);
+    assert_eq!(schema.columns[1].data_type, heliosdb_nano::DataType::Text);
 }
 
 /// Test that non-SELECT statements don't derive schemas
@@ -365,9 +365,9 @@ fn test_non_select_schema() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE TABLE test (id INT)").unwrap();
 
-    let parser = heliosdb_lite::sql::Parser::new();
+    let parser = heliosdb_nano::sql::Parser::new();
     let catalog = db.storage.catalog();
-    let planner = heliosdb_lite::sql::planner::Planner::with_catalog(&catalog);
+    let planner = heliosdb_nano::sql::planner::Planner::with_catalog(&catalog);
 
     // INSERT statement
     let insert = parser.parse_one("INSERT INTO test VALUES (1)").unwrap();
@@ -397,9 +397,9 @@ fn test_complex_query_schema() {
     db.execute("CREATE TABLE orders (order_id INT, user_id INT, amount FLOAT8)").unwrap();
     db.execute("CREATE TABLE users (user_id INT, name TEXT)").unwrap();
 
-    let parser = heliosdb_lite::sql::Parser::new();
+    let parser = heliosdb_nano::sql::Parser::new();
     let catalog = db.storage.catalog();
-    let planner = heliosdb_lite::sql::planner::Planner::with_catalog(&catalog);
+    let planner = heliosdb_nano::sql::planner::Planner::with_catalog(&catalog);
 
     // Test aggregate query
     let agg = parser.parse_one("SELECT user_id, COUNT(*), SUM(amount) FROM orders GROUP BY user_id").unwrap();

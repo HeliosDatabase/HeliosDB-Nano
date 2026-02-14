@@ -7,8 +7,8 @@
 //! - Large dataset operations
 //! - Memory usage
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
-use heliosdb_lite::crypto::{encrypt, decrypt, derive_key_from_password, EncryptionKey};
+use heliosdb_nano::{EmbeddedDatabase, Result};
+use heliosdb_nano::crypto::{encrypt, decrypt, derive_key_from_password, EncryptionKey};
 use std::time::{Instant, Duration};
 
 mod test_helpers;

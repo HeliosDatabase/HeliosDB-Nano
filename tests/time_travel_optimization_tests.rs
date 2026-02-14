@@ -8,7 +8,7 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_lite::storage::time_travel::SnapshotManager;
+use heliosdb_nano::storage::time_travel::SnapshotManager;
 use rocksdb::DB;
 use std::sync::Arc;
 use tempfile::tempdir;

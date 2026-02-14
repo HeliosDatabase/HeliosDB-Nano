@@ -8,7 +8,7 @@
 //! - Task rescheduling on failure
 //! - Base table change triggers
 
-use heliosdb_lite::{
+use heliosdb_nano::{
     Config, EmbeddedDatabase, Schema, Column, DataType,
     storage::{
         MVScheduler, SchedulerConfig, Priority, CpuMonitor,

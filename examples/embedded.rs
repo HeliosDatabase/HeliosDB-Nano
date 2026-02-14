@@ -1,6 +1,6 @@
 //! Example: Embedded database usage
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
+use heliosdb_nano::{EmbeddedDatabase, Result};
 
 fn main() -> Result<()> {
     println!("HeliosDB Lite - Embedded Example\n");

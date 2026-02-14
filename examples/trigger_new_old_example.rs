@@ -2,11 +2,11 @@
 //
 // This example shows how to use NEW and OLD to access row data in trigger bodies
 
-use heliosdb_lite::sql::{LogicalExpr, Evaluator, triggers::TriggerRowContext};
-use heliosdb_lite::{Schema, Column, DataType, Tuple, Value, ColumnStorageMode};
+use heliosdb_nano::sql::{LogicalExpr, Evaluator, triggers::TriggerRowContext};
+use heliosdb_nano::{Schema, Column, DataType, Tuple, Value, ColumnStorageMode};
 use std::sync::Arc;
 
-fn main() -> heliosdb_lite::Result<()> {
+fn main() -> heliosdb_nano::Result<()> {
     println!("NEW and OLD Context Variables in Triggers\n");
     println!("==========================================\n");
 

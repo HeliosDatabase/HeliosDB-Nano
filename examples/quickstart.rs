@@ -2,7 +2,7 @@
 //!
 //! This example demonstrates the basic CRUD operations and features of HeliosDB Lite.
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
+use heliosdb_nano::{EmbeddedDatabase, Result};
 
 fn main() -> Result<()> {
     println!("🚀 HeliosDB Lite - Quickstart Example\n");

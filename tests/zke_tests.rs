@@ -2,7 +2,7 @@
 //!
 //! Tests for client-side encryption with per-request keys.
 
-use heliosdb_lite::{
+use heliosdb_nano::{
     ZkeKeyDerivation, ZeroKnowledgeSession, ZkeConfig, ZkeRequestContext,
     NonceTracker, TimestampValidator, ZkeDerivedKeys,
 };

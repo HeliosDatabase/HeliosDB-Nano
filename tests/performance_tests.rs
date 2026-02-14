@@ -4,7 +4,7 @@
 
 mod test_helpers;
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
+use heliosdb_nano::{EmbeddedDatabase, Result};
 use test_helpers::*;
 use std::time::Duration;
 

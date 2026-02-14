@@ -9,15 +9,15 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_lite::{
+use heliosdb_nano::{
     Config, StorageEngine, Schema, Column, DataType, Tuple, Value,
     Result,
 };
-use heliosdb_lite::storage::{
+use heliosdb_nano::storage::{
     IncrementalRefresher, DeltaTracker, RefreshStrategy,
     MaterializedViewMetadata,
 };
-use heliosdb_lite::sql::LogicalPlan;
+use heliosdb_nano::sql::LogicalPlan;
 use std::sync::Arc;
 
 #[test]
@@ -68,7 +68,7 @@ fn test_delta_tracker_delete() -> Result<()> {
     assert_eq!(deltas.len(), 1);
 
     if let Some(delta) = deltas.first() {
-        assert!(matches!(delta.operation, heliosdb_lite::storage::DeltaOperation::Delete { .. }));
+        assert!(matches!(delta.operation, heliosdb_nano::storage::DeltaOperation::Delete { .. }));
     }
 
     Ok(())
@@ -93,7 +93,7 @@ fn test_delta_tracker_update() -> Result<()> {
     assert_eq!(deltas.len(), 1);
 
     if let Some(delta) = deltas.first() {
-        assert!(matches!(delta.operation, heliosdb_lite::storage::DeltaOperation::Update { .. }));
+        assert!(matches!(delta.operation, heliosdb_nano::storage::DeltaOperation::Update { .. }));
     }
 
     Ok(())
@@ -400,9 +400,9 @@ fn test_delta_operations_equality() {
         values: vec![Value::Int4(2)],
     };
 
-    let insert1 = heliosdb_lite::storage::DeltaOperation::Insert { tuple: tuple1.clone() };
-    let insert2 = heliosdb_lite::storage::DeltaOperation::Insert { tuple: tuple1.clone() };
-    let insert3 = heliosdb_lite::storage::DeltaOperation::Insert { tuple: tuple2.clone() };
+    let insert1 = heliosdb_nano::storage::DeltaOperation::Insert { tuple: tuple1.clone() };
+    let insert2 = heliosdb_nano::storage::DeltaOperation::Insert { tuple: tuple1.clone() };
+    let insert3 = heliosdb_nano::storage::DeltaOperation::Insert { tuple: tuple2.clone() };
 
     assert_eq!(insert1, insert2);
     assert_ne!(insert1, insert3);
@@ -412,7 +412,7 @@ fn test_delta_operations_equality() {
 fn test_refresh_result_structure() {
     use std::time::Duration;
 
-    let result = heliosdb_lite::storage::RefreshResult {
+    let result = heliosdb_nano::storage::RefreshResult {
         strategy_used: RefreshStrategy::Incremental,
         rows_inserted: 10,
         rows_updated: 5,

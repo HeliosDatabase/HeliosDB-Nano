@@ -1,6 +1,6 @@
 //! Advanced SQL query tests for complex GROUP BY, HAVING, and JOIN scenarios
 
-use heliosdb_lite::{EmbeddedDatabase, Result, Value};
+use heliosdb_nano::{EmbeddedDatabase, Result, Value};
 
 #[test]
 fn test_complex_group_by_with_having() -> Result<()> {

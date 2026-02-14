@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use heliosdb_lite::sync::{
+use heliosdb_nano::sync::{
     ConflictChangeEntry as ChangeEntry, ConflictChangeOperation as ChangeOperation,
     ConflictDetector, ConflictResolutionV2 as ConflictResolution, VectorClock,
 };

@@ -1,6 +1,6 @@
 //! Test INSERT with CAST expressions and vector auto-detection
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
+use heliosdb_nano::{EmbeddedDatabase, Result};
 
 #[test]
 fn test_insert_vector_with_cast() -> Result<()> {

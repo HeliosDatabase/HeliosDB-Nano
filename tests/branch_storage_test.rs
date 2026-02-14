@@ -2,7 +2,7 @@
 //!
 //! Tests the copy-on-write branch storage backend.
 
-use heliosdb_lite::{Config, storage::{StorageEngine, BranchOptions}};
+use heliosdb_nano::{Config, storage::{StorageEngine, BranchOptions}};
 
 #[test]
 fn test_create_and_list_branches() {

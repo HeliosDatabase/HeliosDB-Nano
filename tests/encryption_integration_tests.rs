@@ -8,7 +8,7 @@
 //! - Performance overhead
 //! - Concurrent encryption operations
 
-use heliosdb_lite::crypto::{encrypt, decrypt, derive_key_from_password, EncryptionKey};
+use heliosdb_nano::crypto::{encrypt, decrypt, derive_key_from_password, EncryptionKey};
 use std::time::Instant;
 
 #[test]

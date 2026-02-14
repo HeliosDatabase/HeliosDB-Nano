@@ -2,13 +2,13 @@
 //!
 //! Comprehensive tests for SCRAM-SHA-256 authentication implementation
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
-use heliosdb_lite::protocol::postgres::{
+use heliosdb_nano::{EmbeddedDatabase, Result};
+use heliosdb_nano::protocol::postgres::{
     AuthManager, AuthMethod, ScramAuthState,
     InMemoryPasswordStore, SharedPasswordStore, PasswordStore,
     password_store::ScramCredentials,
 };
-use heliosdb_lite::protocol::postgres::auth::{
+use heliosdb_nano::protocol::postgres::auth::{
     scram_hi, scram_hmac_sha256, scram_h,
     scram_salted_password, scram_client_key, scram_stored_key, scram_server_key,
     prepare_scram_credentials,

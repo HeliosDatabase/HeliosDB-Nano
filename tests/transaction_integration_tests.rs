@@ -3,7 +3,7 @@
 // Tests for the transaction context integration in query execution.
 // Validates ACID guarantees, error handling, and transaction control.
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
+use heliosdb_nano::{EmbeddedDatabase, Result};
 
 #[test]
 fn test_implicit_transaction_commit() {

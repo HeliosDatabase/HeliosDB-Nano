@@ -41,8 +41,8 @@
 //! - `VerifyCA`: Require SSL and verify client certificate against CA
 //! - `VerifyFull`: Require SSL and verify client certificate with hostname
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
-use heliosdb_lite::protocol::postgres::{
+use heliosdb_nano::{EmbeddedDatabase, Result};
+use heliosdb_nano::protocol::postgres::{
     PgServerBuilder, SslConfig, SslMode, CertificateManager,
     AuthMethod, AuthManager, InMemoryPasswordStore, SharedPasswordStore, PasswordStore
 };
@@ -53,7 +53,7 @@ use tracing_subscriber;
 async fn main() -> Result<()> {
     // Initialize logging
     tracing_subscriber::fmt()
-        .with_env_filter("info,heliosdb_lite=debug")
+        .with_env_filter("info,heliosdb_nano=debug")
         .init();
 
     println!("HeliosDB-Lite PostgreSQL SSL/TLS Server");
@@ -134,7 +134,7 @@ async fn main() -> Result<()> {
 
     // Build server with SSL and SCRAM authentication
     let addr: std::net::SocketAddr = "127.0.0.1:5432".parse()
-        .map_err(|e| heliosdb_lite::Error::config(format!("Invalid address: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::config(format!("Invalid address: {}", e)))?;
     let server = PgServerBuilder::new()
         .address(addr)
         .auth_manager(auth_manager)

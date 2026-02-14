@@ -3,7 +3,7 @@
 //! This test suite simulates various crash scenarios and verifies that the WAL
 //! provides proper durability guarantees.
 
-use heliosdb_lite::{
+use heliosdb_nano::{
     Error, Result,
     storage::{
         WriteAheadLog, WalOperation, WalSyncMode,

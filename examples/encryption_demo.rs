@@ -4,13 +4,13 @@
 //!
 //! Run with: cargo run --example encryption_demo
 
-use heliosdb_lite::{Config, KeySource, Result};
+use heliosdb_nano::{Config, KeySource, Result};
 
 fn main() -> Result<()> {
     println!("=== HeliosDB Lite - Encryption Demo ===\n");
 
     // Generate a random encryption key for this demo
-    let km = heliosdb_lite::crypto::KeyManager::generate_random();
+    let km = heliosdb_nano::crypto::KeyManager::generate_random();
     let hex_key = km.export_as_hex();
 
     println!("Generated encryption key: {}\n", &hex_key[..32]); // Show first 32 chars
@@ -26,7 +26,7 @@ fn main() -> Result<()> {
     config.encryption.key_source =
         KeySource::Environment("DEMO_ENCRYPTION_KEY".to_string());
 
-    let storage = heliosdb_lite::storage::StorageEngine::open_in_memory(&config)?;
+    let storage = heliosdb_nano::storage::StorageEngine::open_in_memory(&config)?;
 
     if storage.is_encrypted() {
         println!("   ✓ Encryption enabled");
@@ -40,39 +40,39 @@ fn main() -> Result<()> {
     println!("2. Creating table with encrypted data...");
     let catalog = storage.catalog();
 
-    let schema = heliosdb_lite::Schema::new(vec![
-        heliosdb_lite::Column {
+    let schema = heliosdb_nano::Schema::new(vec![
+        heliosdb_nano::Column {
             name: "id".to_string(),
-            data_type: heliosdb_lite::DataType::Int4,
+            data_type: heliosdb_nano::DataType::Int4,
             nullable: false,
             primary_key: true,
             source_table: None,
             source_table_name: None,
             default_expr: None,
             unique: false,
-            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
         },
-        heliosdb_lite::Column {
+        heliosdb_nano::Column {
             name: "ssn".to_string(),
-            data_type: heliosdb_lite::DataType::Text,
+            data_type: heliosdb_nano::DataType::Text,
             nullable: false,
             primary_key: false,
             source_table: None,
             source_table_name: None,
             default_expr: None,
             unique: false,
-            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
         },
-        heliosdb_lite::Column {
+        heliosdb_nano::Column {
             name: "credit_card".to_string(),
-            data_type: heliosdb_lite::DataType::Text,
+            data_type: heliosdb_nano::DataType::Text,
             nullable: false,
             primary_key: false,
             source_table: None,
             source_table_name: None,
             default_expr: None,
             unique: false,
-            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
         },
     ]);
 
@@ -82,16 +82,16 @@ fn main() -> Result<()> {
 
     // Insert encrypted data
     println!("3. Inserting sensitive data (automatically encrypted)...");
-    storage.insert_tuple("sensitive_data", heliosdb_lite::Tuple::new(vec![
-        heliosdb_lite::Value::Int4(1),
-        heliosdb_lite::Value::String("123-45-6789".to_string()),
-        heliosdb_lite::Value::String("4111-1111-1111-1111".to_string()),
+    storage.insert_tuple("sensitive_data", heliosdb_nano::Tuple::new(vec![
+        heliosdb_nano::Value::Int4(1),
+        heliosdb_nano::Value::String("123-45-6789".to_string()),
+        heliosdb_nano::Value::String("4111-1111-1111-1111".to_string()),
     ]))?;
 
-    storage.insert_tuple("sensitive_data", heliosdb_lite::Tuple::new(vec![
-        heliosdb_lite::Value::Int4(2),
-        heliosdb_lite::Value::String("987-65-4321".to_string()),
-        heliosdb_lite::Value::String("5500-0000-0000-0004".to_string()),
+    storage.insert_tuple("sensitive_data", heliosdb_nano::Tuple::new(vec![
+        heliosdb_nano::Value::Int4(2),
+        heliosdb_nano::Value::String("987-65-4321".to_string()),
+        heliosdb_nano::Value::String("5500-0000-0000-0004".to_string()),
     ]))?;
 
     println!("   ✓ Inserted 2 records");
@@ -114,13 +114,13 @@ fn main() -> Result<()> {
         let cc = &tuple.values[2];
 
         // Mask sensitive data for display
-        let ssn_masked = if let heliosdb_lite::Value::String(s) = ssn {
+        let ssn_masked = if let heliosdb_nano::Value::String(s) = ssn {
             format!("***-**-{}", &s[s.len()-4..])
         } else {
             "???".to_string()
         };
 
-        let cc_masked = if let heliosdb_lite::Value::String(s) = cc {
+        let cc_masked = if let heliosdb_nano::Value::String(s) = cc {
             format!("****-****-****-{}", &s[s.len()-4..])
         } else {
             "???".to_string()
@@ -133,14 +133,14 @@ fn main() -> Result<()> {
 
     // Demonstrate wrong key fails
     println!("6. Demonstrating that wrong key cannot decrypt...");
-    let wrong_key = heliosdb_lite::crypto::KeyManager::generate_random();
+    let wrong_key = heliosdb_nano::crypto::KeyManager::generate_random();
 
     // Encrypt some test data with the original key
     let test_data = b"sensitive information";
-    let encrypted = heliosdb_lite::crypto::encrypt(km.key(), test_data)?;
+    let encrypted = heliosdb_nano::crypto::encrypt(km.key(), test_data)?;
 
     // Try to decrypt with wrong key
-    let decrypt_result = heliosdb_lite::crypto::decrypt(wrong_key.key(), &encrypted);
+    let decrypt_result = heliosdb_nano::crypto::decrypt(wrong_key.key(), &encrypted);
     match decrypt_result {
         Ok(_) => println!("   ✗ WARNING: Decryption with wrong key succeeded (should not happen!)"),
         Err(_) => println!("   ✓ Decryption with wrong key failed (expected)"),
@@ -153,10 +153,10 @@ fn main() -> Result<()> {
     // Encrypted writes
     let start = std::time::Instant::now();
     for i in 0..1000 {
-        storage.insert_tuple("sensitive_data", heliosdb_lite::Tuple::new(vec![
-            heliosdb_lite::Value::Int4(1000 + i),
-            heliosdb_lite::Value::String(format!("SSN-{}", i)),
-            heliosdb_lite::Value::String(format!("CC-{}", i)),
+        storage.insert_tuple("sensitive_data", heliosdb_nano::Tuple::new(vec![
+            heliosdb_nano::Value::Int4(1000 + i),
+            heliosdb_nano::Value::String(format!("SSN-{}", i)),
+            heliosdb_nano::Value::String(format!("CC-{}", i)),
         ]))?;
     }
     let encrypted_duration = start.elapsed();
@@ -165,16 +165,16 @@ fn main() -> Result<()> {
     // Unencrypted writes for comparison
     let mut unencrypted_config = Config::in_memory();
     unencrypted_config.encryption.enabled = false;
-    let unencrypted_storage = heliosdb_lite::storage::StorageEngine::open_in_memory(&unencrypted_config)?;
+    let unencrypted_storage = heliosdb_nano::storage::StorageEngine::open_in_memory(&unencrypted_config)?;
     let catalog2 = unencrypted_storage.catalog();
     catalog2.create_table("sensitive_data", schema)?;
 
     let start = std::time::Instant::now();
     for i in 0..1000 {
-        unencrypted_storage.insert_tuple("sensitive_data", heliosdb_lite::Tuple::new(vec![
-            heliosdb_lite::Value::Int4(1000 + i),
-            heliosdb_lite::Value::String(format!("SSN-{}", i)),
-            heliosdb_lite::Value::String(format!("CC-{}", i)),
+        unencrypted_storage.insert_tuple("sensitive_data", heliosdb_nano::Tuple::new(vec![
+            heliosdb_nano::Value::Int4(1000 + i),
+            heliosdb_nano::Value::String(format!("SSN-{}", i)),
+            heliosdb_nano::Value::String(format!("CC-{}", i)),
         ]))?;
     }
     let unencrypted_duration = start.elapsed();

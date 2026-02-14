@@ -16,8 +16,8 @@
 //! - jsonb_typeof
 //! - jsonb_path_query
 
-use heliosdb_lite::{Value, Tuple, Schema, Column, DataType, Result};
-use heliosdb_lite::sql::{Evaluator, LogicalExpr, BinaryOperator};
+use heliosdb_nano::{Value, Tuple, Schema, Column, DataType, Result};
+use heliosdb_nano::sql::{Evaluator, LogicalExpr, BinaryOperator};
 use serde_json::json;
 use std::sync::Arc;
 

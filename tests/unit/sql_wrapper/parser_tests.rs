@@ -1,6 +1,6 @@
 // SQL Wrapper Parser Tests for Phase 3
 
-use heliosdb_lite::sql::parser::*;
+use heliosdb_nano::sql::parser::*;
 use sqlparser::ast::{Statement, Expr};
 
 #[test]

@@ -8,7 +8,7 @@
 //! - Production APIs (8+ tests)
 //! Total: 65+ tests
 
-use heliosdb_lite::sql::{
+use heliosdb_nano::sql::{
     TransactionExplainAnalyzer, IsolationLevel, LockType,
     DistributedExplainAnalyzer,
     OptimizationEngine,
@@ -151,9 +151,9 @@ fn test_txn_15_cost_category() {
     // Should be medium or high due to multiple write locks
     assert!(matches!(
         result.transaction_cost.cost_category,
-        heliosdb_lite::sql::explain_transaction::CostCategory::Medium |
-        heliosdb_lite::sql::explain_transaction::CostCategory::High |
-        heliosdb_lite::sql::explain_transaction::CostCategory::VeryHigh
+        heliosdb_nano::sql::explain_transaction::CostCategory::Medium |
+        heliosdb_nano::sql::explain_transaction::CostCategory::High |
+        heliosdb_nano::sql::explain_transaction::CostCategory::VeryHigh
     ));
 }
 
@@ -288,7 +288,7 @@ fn test_dist_09_distributed_aggregation() {
 
     // Aggregation should produce shuffle operations
     assert!(result.network_operations.iter()
-        .any(|op| matches!(op.operation_type, heliosdb_lite::sql::explain_distributed::NetworkOpType::Shuffle)));
+        .any(|op| matches!(op.operation_type, heliosdb_nano::sql::explain_distributed::NetworkOpType::Shuffle)));
 }
 
 #[test]
@@ -403,10 +403,10 @@ fn test_opt_06_mv_refresh_strategy() {
         // Should have a defined refresh strategy
         assert!(matches!(
             mv.refresh_strategy,
-            heliosdb_lite::sql::explain_optimizer::RefreshStrategy::OnDemand |
-            heliosdb_lite::sql::explain_optimizer::RefreshStrategy::Scheduled |
-            heliosdb_lite::sql::explain_optimizer::RefreshStrategy::Incremental |
-            heliosdb_lite::sql::explain_optimizer::RefreshStrategy::RealTime
+            heliosdb_nano::sql::explain_optimizer::RefreshStrategy::OnDemand |
+            heliosdb_nano::sql::explain_optimizer::RefreshStrategy::Scheduled |
+            heliosdb_nano::sql::explain_optimizer::RefreshStrategy::Incremental |
+            heliosdb_nano::sql::explain_optimizer::RefreshStrategy::RealTime
         ));
     }
 }
@@ -425,7 +425,7 @@ fn test_opt_08_range_partitioning() {
     let result = engine.analyze("SELECT", &["users".to_string()], false, false).unwrap();
 
     let has_range = result.partition_strategies.iter()
-        .any(|p| matches!(p.strategy_type, heliosdb_lite::sql::explain_optimizer::PartitionType::Range));
+        .any(|p| matches!(p.strategy_type, heliosdb_nano::sql::explain_optimizer::PartitionType::Range));
     assert!(has_range);
 }
 
@@ -435,7 +435,7 @@ fn test_opt_09_hash_partitioning() {
     let result = engine.analyze("SELECT", &["users".to_string()], false, false).unwrap();
 
     let has_hash = result.partition_strategies.iter()
-        .any(|p| matches!(p.strategy_type, heliosdb_lite::sql::explain_optimizer::PartitionType::Hash));
+        .any(|p| matches!(p.strategy_type, heliosdb_nano::sql::explain_optimizer::PartitionType::Hash));
     assert!(has_hash);
 }
 
@@ -496,10 +496,10 @@ fn test_opt_15_recommendation_levels() {
         // Should have a recommendation
         assert!(matches!(
             analysis.recommendation,
-            heliosdb_lite::sql::explain_optimizer::Recommendation::HighlyRecommended |
-            heliosdb_lite::sql::explain_optimizer::Recommendation::Recommended |
-            heliosdb_lite::sql::explain_optimizer::Recommendation::Conditional |
-            heliosdb_lite::sql::explain_optimizer::Recommendation::NotRecommended
+            heliosdb_nano::sql::explain_optimizer::Recommendation::HighlyRecommended |
+            heliosdb_nano::sql::explain_optimizer::Recommendation::Recommended |
+            heliosdb_nano::sql::explain_optimizer::Recommendation::Conditional |
+            heliosdb_nano::sql::explain_optimizer::Recommendation::NotRecommended
         ));
     }
 }
@@ -704,7 +704,7 @@ fn test_api_03_bulk_analysis() {
             "SELECT * FROM products".to_string(),
         ],
         mode: "standard".to_string(),
-        output_format: heliosdb_lite::sql::explain_api::BulkOutputFormat::Summary,
+        output_format: heliosdb_nano::sql::explain_api::BulkOutputFormat::Summary,
     };
 
     let response = service.bulk_analysis(request).unwrap();
@@ -721,7 +721,7 @@ fn test_api_04_bulk_max_queries() {
     let request = BulkAnalysisRequest {
         queries,
         mode: "standard".to_string(),
-        output_format: heliosdb_lite::sql::explain_api::BulkOutputFormat::Summary,
+        output_format: heliosdb_nano::sql::explain_api::BulkOutputFormat::Summary,
     };
 
     let result = service.bulk_analysis(request);
@@ -730,7 +730,7 @@ fn test_api_04_bulk_max_queries() {
 
 #[test]
 fn test_api_05_scheduled_job() {
-    use heliosdb_lite::sql::explain_api::*;
+    use heliosdb_nano::sql::explain_api::*;
 
     let service = ExplainApiService::new();
     let job = ScheduledExplainJob {
@@ -756,7 +756,7 @@ fn test_api_05_scheduled_job() {
 
 #[test]
 fn test_api_06_generate_report() {
-    use heliosdb_lite::sql::explain_api::*;
+    use heliosdb_nano::sql::explain_api::*;
 
     let service = ExplainApiService::new();
     let request = ReportRequest {

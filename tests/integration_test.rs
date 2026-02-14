@@ -2,7 +2,7 @@
 //!
 //! These tests verify that the complete SQL execution pipeline works end-to-end.
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
+use heliosdb_nano::{EmbeddedDatabase, Result};
 
 #[test]
 fn test_database_creation() -> Result<()> {
@@ -237,7 +237,7 @@ fn test_where_clause_equality() -> Result<()> {
     let results = db.query("SELECT * FROM users WHERE id = 2", &[])?;
     assert_eq!(results.len(), 1, "Should return exactly 1 row");
     // Verify it's Bob (id=2)
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::Int4(2));
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::Int4(2));
 
     Ok(())
 }
@@ -295,9 +295,9 @@ fn test_order_by_ascending() -> Result<()> {
     assert_eq!(results.len(), 3, "Should return 3 rows");
 
     // Verify order: Bob (25), Alice (30), Charlie (35)
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::Int4(2)); // Bob's id
-    assert_eq!(results[1].get(0).unwrap(), &heliosdb_lite::Value::Int4(1)); // Alice's id
-    assert_eq!(results[2].get(0).unwrap(), &heliosdb_lite::Value::Int4(3)); // Charlie's id
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::Int4(2)); // Bob's id
+    assert_eq!(results[1].get(0).unwrap(), &heliosdb_nano::Value::Int4(1)); // Alice's id
+    assert_eq!(results[2].get(0).unwrap(), &heliosdb_nano::Value::Int4(3)); // Charlie's id
 
     Ok(())
 }
@@ -317,9 +317,9 @@ fn test_order_by_descending() -> Result<()> {
     assert_eq!(results.len(), 3, "Should return 3 rows");
 
     // Verify order: Charlie (35), Alice (30), Bob (25)
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::Int4(3)); // Charlie's id
-    assert_eq!(results[1].get(0).unwrap(), &heliosdb_lite::Value::Int4(1)); // Alice's id
-    assert_eq!(results[2].get(0).unwrap(), &heliosdb_lite::Value::Int4(2)); // Bob's id
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::Int4(3)); // Charlie's id
+    assert_eq!(results[1].get(0).unwrap(), &heliosdb_nano::Value::Int4(1)); // Alice's id
+    assert_eq!(results[2].get(0).unwrap(), &heliosdb_nano::Value::Int4(2)); // Bob's id
 
     Ok(())
 }
@@ -339,9 +339,9 @@ fn test_order_by_string() -> Result<()> {
     assert_eq!(results.len(), 3, "Should return 3 rows");
 
     // Verify order: Alice, Bob, Charlie (alphabetical)
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::Int4(1)); // Alice's id
-    assert_eq!(results[1].get(0).unwrap(), &heliosdb_lite::Value::Int4(2)); // Bob's id
-    assert_eq!(results[2].get(0).unwrap(), &heliosdb_lite::Value::Int4(3)); // Charlie's id
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::Int4(1)); // Alice's id
+    assert_eq!(results[1].get(0).unwrap(), &heliosdb_nano::Value::Int4(2)); // Bob's id
+    assert_eq!(results[2].get(0).unwrap(), &heliosdb_nano::Value::Int4(3)); // Charlie's id
 
     Ok(())
 }
@@ -362,8 +362,8 @@ fn test_order_by_with_limit() -> Result<()> {
     assert_eq!(results.len(), 2, "Should return 2 rows");
 
     // Verify order: Dave (40), Charlie (35)
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::Int4(4)); // Dave's id
-    assert_eq!(results[1].get(0).unwrap(), &heliosdb_lite::Value::Int4(3)); // Charlie's id
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::Int4(4)); // Dave's id
+    assert_eq!(results[1].get(0).unwrap(), &heliosdb_nano::Value::Int4(3)); // Charlie's id
 
     Ok(())
 }
@@ -382,12 +382,12 @@ fn test_count_aggregate() -> Result<()> {
     let results = db.query("SELECT COUNT(*) FROM users", &[])?;
     assert_eq!(results.len(), 1, "Should return 1 row");
     assert_eq!(results[0].len(), 1, "Should have 1 column");
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::Int8(3));
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::Int8(3));
 
     // Test COUNT(column)
     let results = db.query("SELECT COUNT(name) FROM users", &[])?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::Int8(3));
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::Int8(3));
 
     Ok(())
 }
@@ -405,12 +405,12 @@ fn test_sum_avg_aggregate() -> Result<()> {
     // Test SUM
     let results = db.query("SELECT SUM(age) FROM users", &[])?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::Int8(90)); // 30+20+40=90
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::Int8(90)); // 30+20+40=90
 
     // Test AVG
     let results = db.query("SELECT AVG(age) FROM users", &[])?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::Float8(30.0)); // 90/3=30.0
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::Float8(30.0)); // 90/3=30.0
 
     Ok(())
 }
@@ -428,22 +428,22 @@ fn test_min_max_aggregate() -> Result<()> {
     // Test MIN
     let results = db.query("SELECT MIN(age) FROM users", &[])?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::Int4(25));
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::Int4(25));
 
     // Test MAX
     let results = db.query("SELECT MAX(age) FROM users", &[])?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::Int4(35));
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::Int4(35));
 
     // Test MIN on strings
     let results = db.query("SELECT MIN(name) FROM users", &[])?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::String("Alice".to_string()));
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::String("Alice".to_string()));
 
     // Test MAX on strings
     let results = db.query("SELECT MAX(name) FROM users", &[])?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::String("Charlie".to_string()));
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::String("Charlie".to_string()));
 
     Ok(())
 }
@@ -466,23 +466,23 @@ fn test_group_by() -> Result<()> {
     // Results should be sorted by dept (BTreeMap ordering)
     // Engineering comes before Sales alphabetically
     assert_eq!(results[0].len(), 2, "Each row should have 2 columns (dept, count)");
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::String("Engineering".to_string()));
-    assert_eq!(results[0].get(1).unwrap(), &heliosdb_lite::Value::Int8(2));
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::String("Engineering".to_string()));
+    assert_eq!(results[0].get(1).unwrap(), &heliosdb_nano::Value::Int8(2));
 
-    assert_eq!(results[1].get(0).unwrap(), &heliosdb_lite::Value::String("Sales".to_string()));
-    assert_eq!(results[1].get(1).unwrap(), &heliosdb_lite::Value::Int8(2));
+    assert_eq!(results[1].get(0).unwrap(), &heliosdb_nano::Value::String("Sales".to_string()));
+    assert_eq!(results[1].get(1).unwrap(), &heliosdb_nano::Value::Int8(2));
 
     // Test GROUP BY with SUM
     let results = db.query("SELECT dept, SUM(salary) FROM employees GROUP BY dept", &[])?;
     assert_eq!(results.len(), 2);
-    assert_eq!(results[0].get(1).unwrap(), &heliosdb_lite::Value::Int8(220)); // Engineering: 100+120
-    assert_eq!(results[1].get(1).unwrap(), &heliosdb_lite::Value::Int8(170)); // Sales: 80+90
+    assert_eq!(results[0].get(1).unwrap(), &heliosdb_nano::Value::Int8(220)); // Engineering: 100+120
+    assert_eq!(results[1].get(1).unwrap(), &heliosdb_nano::Value::Int8(170)); // Sales: 80+90
 
     // Test GROUP BY with AVG
     let results = db.query("SELECT dept, AVG(salary) FROM employees GROUP BY dept", &[])?;
     assert_eq!(results.len(), 2);
-    assert_eq!(results[0].get(1).unwrap(), &heliosdb_lite::Value::Float8(110.0)); // Engineering: 220/2
-    assert_eq!(results[1].get(1).unwrap(), &heliosdb_lite::Value::Float8(85.0)); // Sales: 170/2
+    assert_eq!(results[0].get(1).unwrap(), &heliosdb_nano::Value::Float8(110.0)); // Engineering: 220/2
+    assert_eq!(results[1].get(1).unwrap(), &heliosdb_nano::Value::Float8(85.0)); // Sales: 170/2
 
     Ok(())
 }
@@ -501,12 +501,12 @@ fn test_count_distinct() -> Result<()> {
     // Test COUNT(DISTINCT age) - should be 2 (25 and 30)
     let results = db.query("SELECT COUNT(DISTINCT age) FROM users", &[])?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::Int8(2));
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::Int8(2));
 
     // Compare with COUNT(age) - should be 4
     let results = db.query("SELECT COUNT(age) FROM users", &[])?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::Int8(4));
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::Int8(4));
 
     Ok(())
 }
@@ -526,11 +526,11 @@ fn test_multiple_aggregates() -> Result<()> {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].len(), 5, "Should have 5 columns");
 
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::Int8(3)); // COUNT(*)
-    assert_eq!(results[0].get(1).unwrap(), &heliosdb_lite::Value::Int4(20)); // MIN(age)
-    assert_eq!(results[0].get(2).unwrap(), &heliosdb_lite::Value::Int4(40)); // MAX(age)
-    assert_eq!(results[0].get(3).unwrap(), &heliosdb_lite::Value::Float8(30.0)); // AVG(age)
-    assert_eq!(results[0].get(4).unwrap(), &heliosdb_lite::Value::Int8(90)); // SUM(age)
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::Int8(3)); // COUNT(*)
+    assert_eq!(results[0].get(1).unwrap(), &heliosdb_nano::Value::Int4(20)); // MIN(age)
+    assert_eq!(results[0].get(2).unwrap(), &heliosdb_nano::Value::Int4(40)); // MAX(age)
+    assert_eq!(results[0].get(3).unwrap(), &heliosdb_nano::Value::Float8(30.0)); // AVG(age)
+    assert_eq!(results[0].get(4).unwrap(), &heliosdb_nano::Value::Int8(90)); // SUM(age)
 
     Ok(())
 }
@@ -552,7 +552,7 @@ fn test_update_all_rows() -> Result<()> {
     // Verify all rows were updated
     let results = db.query("SELECT * FROM users", &[])?;
     for row in &results {
-        assert_eq!(row.get(2).unwrap(), &heliosdb_lite::Value::Int4(40));
+        assert_eq!(row.get(2).unwrap(), &heliosdb_nano::Value::Int4(40));
     }
 
     Ok(())
@@ -575,11 +575,11 @@ fn test_update_with_where() -> Result<()> {
     // Verify only Bob was updated
     let results = db.query("SELECT * FROM users WHERE id = 2", &[])?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].get(2).unwrap(), &heliosdb_lite::Value::Int4(26));
+    assert_eq!(results[0].get(2).unwrap(), &heliosdb_nano::Value::Int4(26));
 
     // Verify others were not updated
     let alice = db.query("SELECT * FROM users WHERE id = 1", &[])?;
-    assert_eq!(alice[0].get(2).unwrap(), &heliosdb_lite::Value::Int4(30));
+    assert_eq!(alice[0].get(2).unwrap(), &heliosdb_nano::Value::Int4(30));
 
     Ok(())
 }
@@ -598,8 +598,8 @@ fn test_update_multiple_columns() -> Result<()> {
 
     // Verify both columns were updated
     let results = db.query("SELECT * FROM users WHERE id = 1", &[])?;
-    assert_eq!(results[0].get(1).unwrap(), &heliosdb_lite::Value::String("Alicia".to_string()));
-    assert_eq!(results[0].get(2).unwrap(), &heliosdb_lite::Value::Int4(31));
+    assert_eq!(results[0].get(1).unwrap(), &heliosdb_nano::Value::String("Alicia".to_string()));
+    assert_eq!(results[0].get(2).unwrap(), &heliosdb_nano::Value::Int4(31));
 
     Ok(())
 }
@@ -645,8 +645,8 @@ fn test_delete_with_where() -> Result<()> {
 
     // Verify Alice and Charlie remain
     let ids: Vec<_> = results.iter().map(|r| r.get(0).unwrap()).collect();
-    assert!(ids.contains(&&heliosdb_lite::Value::Int4(1)));
-    assert!(ids.contains(&&heliosdb_lite::Value::Int4(3)));
+    assert!(ids.contains(&&heliosdb_nano::Value::Int4(1)));
+    assert!(ids.contains(&&heliosdb_nano::Value::Int4(3)));
 
     Ok(())
 }
@@ -669,7 +669,7 @@ fn test_delete_with_complex_where() -> Result<()> {
     // Verify only Bob remains
     let results = db.query("SELECT * FROM users", &[])?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_lite::Value::Int4(2)); // Bob's id
+    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::Int4(2)); // Bob's id
 
     Ok(())
 }
@@ -692,7 +692,7 @@ fn test_select_distinct_removes_duplicates() -> Result<()> {
 
     let customers: Vec<String> = results.iter()
         .map(|r| match r.get(0).unwrap() {
-            heliosdb_lite::Value::String(s) => s.clone(),
+            heliosdb_nano::Value::String(s) => s.clone(),
             _ => panic!("Expected string value"),
         })
         .collect();
@@ -895,7 +895,7 @@ fn test_having_clause_count() -> Result<()> {
 
     // Verify it's Alice
     let customer_name = match results[0].get(0).unwrap() {
-        heliosdb_lite::Value::String(s) => s.clone(),
+        heliosdb_nano::Value::String(s) => s.clone(),
         _ => panic!("Expected string value"),
     };
     assert_eq!(customer_name, "Alice");

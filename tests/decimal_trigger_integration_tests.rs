@@ -5,7 +5,7 @@
 
 #[cfg(test)]
 mod decimal_trigger_integration_tests {
-    use heliosdb_lite::{EmbeddedDatabase, Value, DataType};
+    use heliosdb_nano::{EmbeddedDatabase, Value, DataType};
 
     /// Create an in-memory test database
     fn create_test_db() -> EmbeddedDatabase {

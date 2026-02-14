@@ -6,7 +6,7 @@
 //! - Multi-table operations
 //! - Error recovery scenarios
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
+use heliosdb_nano::{EmbeddedDatabase, Result};
 
 mod test_helpers;
 use test_helpers::*;

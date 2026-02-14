@@ -2,7 +2,7 @@
 //!
 //! Tests subqueries in FROM clause (derived tables)
 
-use heliosdb_lite::{Config, EmbeddedDatabase};
+use heliosdb_nano::{Config, EmbeddedDatabase};
 
 fn create_test_db() -> EmbeddedDatabase {
     let config = Config::in_memory();

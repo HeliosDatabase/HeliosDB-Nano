@@ -1,6 +1,6 @@
 //! Tests for SQL EXPLAIN and EXPLAIN ANALYZE statements
 
-use heliosdb_lite::EmbeddedDatabase;
+use heliosdb_nano::EmbeddedDatabase;
 
 #[test]
 fn test_explain_simple_select() {
@@ -20,7 +20,7 @@ fn test_explain_simple_select() {
     let plan_text: String = result.iter()
         .map(|row| {
             match &row.values[0] {
-                heliosdb_lite::Value::String(s) => s.clone(),
+                heliosdb_nano::Value::String(s) => s.clone(),
                 _ => String::new(),
             }
         })
@@ -49,7 +49,7 @@ fn test_explain_analyze_select() {
     let plan_text: String = result.iter()
         .map(|row| {
             match &row.values[0] {
-                heliosdb_lite::Value::String(s) => s.clone(),
+                heliosdb_nano::Value::String(s) => s.clone(),
                 _ => String::new(),
             }
         })
@@ -80,7 +80,7 @@ fn test_explain_insert() {
     let plan_text: String = result.iter()
         .map(|row| {
             match &row.values[0] {
-                heliosdb_lite::Value::String(s) => s.clone(),
+                heliosdb_nano::Value::String(s) => s.clone(),
                 _ => String::new(),
             }
         })
@@ -106,7 +106,7 @@ fn test_explain_with_filter() {
     let plan_text: String = result.iter()
         .map(|row| {
             match &row.values[0] {
-                heliosdb_lite::Value::String(s) => s.clone(),
+                heliosdb_nano::Value::String(s) => s.clone(),
                 _ => String::new(),
             }
         })

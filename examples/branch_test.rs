@@ -1,8 +1,8 @@
-use heliosdb_lite::EmbeddedDatabase;
+use heliosdb_nano::EmbeddedDatabase;
 
 fn main() {
     // Enable tracing
-    std::env::set_var("RUST_LOG", "heliosdb_lite::storage::engine=debug");
+    std::env::set_var("RUST_LOG", "heliosdb_nano::storage::engine=debug");
     tracing_subscriber::fmt::init();
     
     let db = EmbeddedDatabase::new_in_memory().expect("Failed to create DB");

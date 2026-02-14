@@ -22,7 +22,7 @@
 //! "
 //! ```
 
-use heliosdb_lite::{EmbeddedDatabase, protocol::postgres::{PgServerBuilder, AuthMethod}};
+use heliosdb_nano::{EmbeddedDatabase, protocol::postgres::{PgServerBuilder, AuthMethod}};
 use std::sync::Arc;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -32,7 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "info,heliosdb_lite=debug".into()),
+                .unwrap_or_else(|_| "info,heliosdb_nano=debug".into()),
         )
         .with(tracing_subscriber::fmt::layer())
         .init();

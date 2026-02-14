@@ -62,6 +62,10 @@ The initial report (2026-02-11) contained multiple inaccuracies. Deep code audit
 | 8 | No slow query log | Configurable threshold (default 1s), WARN-level tracing |
 | 9 | No performance tracing | Structured spans across parse→plan→execute→storage→commit pipeline |
 | 10 | WAL not truncated after replay | Post-replay truncation prevents stale WAL growth |
+| 11 | DROP TABLE didn't check MV dependencies | Warns when dropping a table used by materialized views |
+| 12 | No Drop impl for EmbeddedDatabase | `Drop` trait stops auto-refresh worker, clears sessions/state |
+| 13 | Old crate name in 91 test files | Renamed `heliosdb_lite` → `heliosdb_nano` across 392 occurrences |
+| 14 | No dump/restore multi-table round-trip test | Added multi-table + incremental dump integration tests |
 
 ---
 
@@ -72,14 +76,13 @@ The initial report (2026-02-11) contained multiple inaccuracies. Deep code audit
 | # | Issue | Impact | Effort |
 |---|-------|--------|--------|
 | 1 | **Lock contention at scale** | Degradation >100 concurrent users | Architectural |
-| 2 | **No disk space check before writes** | Silent corruption on full disk | 1 day |
 
 ### Tier 2 — Operational
 
 | # | Issue | Impact | Effort |
 |---|-------|--------|--------|
-| 3 | **Type coercion edge cases** | Some implicit casts may fail in executor | 3 days |
-| 4 | **No automated backup verification** | Backup integrity untested | 2 days |
+| 2 | **No automated backup verification** | Backup integrity untested | 2 days |
+| 3 | **No SQL parser fuzz testing** | Unknown edge case crashes | 2 days |
 
 ---
 
@@ -109,9 +112,10 @@ The initial report (2026-02-11) contained multiple inaccuracies. Deep code audit
 
 | Test | Status | Notes |
 |------|--------|-------|
-| `tests/decimal_tests.rs::test_decimal_in_list` | FAILS | Pre-existing, unrelated |
+| `tests/decimal_tests.rs` (38 tests) | PASS | Fixed: crate rename + DECIMAL type coercion |
 | All 978 lib tests | PASS | Verified 2026-02-12 |
 | `tests/crash_recovery_e2e_test.rs` (4 tests) | PASS | INSERT/UPDATE/DELETE/multi-table crash recovery |
+| `tests/integration/dump_restore.rs` (8 tests) | PASS | Full, multi-table, incremental, compressed, SQL format, checksum, metadata |
 
 ---
 
@@ -127,7 +131,7 @@ The initial report (2026-02-11) contained multiple inaccuracies. Deep code audit
 - [x] ~~WAL logging for UPDATE/DELETE DML paths~~ DONE
 - [x] ~~WAL truncation after successful replay~~ DONE
 - [ ] Add fsync verification for WAL writes (confirm `sync_mode` is honored)
-- [ ] Verify dump/restore round-trip with production-size data
+- [x] ~~Verify dump/restore round-trip (multi-table + incremental)~~ DONE — 8 integration tests
 
 ### Phase 2 — "Stability" (Week 3-4)
 
@@ -135,8 +139,11 @@ The initial report (2026-02-11) contained multiple inaccuracies. Deep code audit
 - [x] ~~Query timeout in sessions~~ DONE
 - [x] ~~Unwrap audit: 0 unwrap() in production paths~~ DONE (all in test-only code)
 - [ ] Fuzz test the SQL parser (`cargo-fuzz` with random SQL inputs)
-- [ ] Add disk space check before writes
-- [ ] Connection idle timeout + auto-cleanup
+- [x] ~~Disk space pre-flight check (every 1000 writes, 100MB threshold)~~ DONE
+- [x] ~~Connection idle timeout (default 300s, configurable)~~ DONE
+- [x] ~~Drop impl for EmbeddedDatabase (clean shutdown, worker stop)~~ DONE
+- [x] ~~DROP TABLE MV dependency check (warns about stale views)~~ DONE
+- [x] ~~Crate rename: heliosdb_lite → heliosdb_nano across 91 test files~~ DONE
 
 ### Phase 3 — "Observability" (Week 5-6)
 
@@ -146,7 +153,7 @@ The initial report (2026-02-11) contained multiple inaccuracies. Deep code audit
 - [x] ~~/health endpoint~~ EXISTS
 - [x] ~~Audit logging~~ EXISTS
 - [ ] Add Grafana dashboard template using existing Prometheus metrics
-- [ ] Verify type coercion edge cases in executor
+- [x] ~~DECIMAL cross-type coercion (Numeric ↔ Float/Int in equality + ordering)~~ DONE
 
 ### Phase 4 — "Operational Maturity" (Week 7-8)
 

@@ -8,10 +8,10 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_lite::{Config, StorageEngine, Tuple, Value, Schema, Column, DataType};
-use heliosdb_lite::sql::{LogicalPlan, Executor};
-use heliosdb_lite::sql::logical_plan::AsOfClause;
-use heliosdb_lite::sql::system_views::SystemViewRegistry;
+use heliosdb_nano::{Config, StorageEngine, Tuple, Value, Schema, Column, DataType};
+use heliosdb_nano::sql::{LogicalPlan, Executor};
+use heliosdb_nano::sql::logical_plan::AsOfClause;
+use heliosdb_nano::sql::system_views::SystemViewRegistry;
 use std::sync::Arc;
 
 /// Helper to create a test storage engine with sample data

@@ -3,7 +3,7 @@
 //! Demonstrates how to use the TriggerRegistry for managing trigger definitions
 //! in HeliosDB-Lite.
 
-use heliosdb_lite::{
+use heliosdb_nano::{
     EmbeddedDatabase, Result, Value,
     sql::{
         TriggerRegistry, TriggerDefinition, TriggerContext,
@@ -136,11 +136,11 @@ fn main() -> Result<()> {
     println!();
 
     // Example 8: Test depth limit
-    println!("8. Testing maximum depth limit ({})", heliosdb_lite::sql::MAX_TRIGGER_DEPTH);
+    println!("8. Testing maximum depth limit ({})", heliosdb_nano::sql::MAX_TRIGGER_DEPTH);
     let mut context = TriggerContext::new();
 
     // Fill to max depth
-    for i in 0..heliosdb_lite::sql::MAX_TRIGGER_DEPTH {
+    for i in 0..heliosdb_nano::sql::MAX_TRIGGER_DEPTH {
         context.enter(&format!("trigger_{}", i))?;
     }
     println!("   Reached maximum depth: {}", context.depth());

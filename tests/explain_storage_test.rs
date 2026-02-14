@@ -1,6 +1,6 @@
 //! Test for EXPLAIN STORAGE FORMAT JSON functionality
 
-use heliosdb_lite::EmbeddedDatabase;
+use heliosdb_nano::EmbeddedDatabase;
 
 #[test]
 fn test_explain_storage_format_json() {

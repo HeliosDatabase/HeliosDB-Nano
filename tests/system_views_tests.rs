@@ -6,7 +6,7 @@
 //! - v2.0 feature views
 //! - v2.1 feature views
 
-use heliosdb_lite::{
+use heliosdb_nano::{
     Config, StorageEngine, Schema, Column, DataType, Value, Tuple,
     sql::{SystemViewRegistry, SessionRegistry, ProtocolType},
 };
@@ -117,7 +117,7 @@ fn test_pg_indexes_vector_indexes() {
     storage.catalog().create_table("documents", schema).unwrap();
 
     // Create vector index
-    use heliosdb_lite::vector::DistanceMetric;
+    use heliosdb_nano::vector::DistanceMetric;
     storage.vector_indexes().create_index(
         "doc_embedding_idx".to_string(),
         "documents".to_string(),
@@ -159,7 +159,7 @@ fn test_pg_attribute_column_metadata() {
             source_table_name: None,
             default_expr: None,
             unique: false,
-            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
         },
         Column {
             name: "name".to_string(),
@@ -170,7 +170,7 @@ fn test_pg_attribute_column_metadata() {
             source_table_name: None,
             default_expr: None,
             unique: false,
-            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
         },
         Column {
             name: "age".to_string(),
@@ -181,7 +181,7 @@ fn test_pg_attribute_column_metadata() {
             source_table_name: None,
             default_expr: None,
             unique: false,
-            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
         },
     ]);
 
@@ -428,7 +428,7 @@ fn test_pg_branches_database_branching() {
     let storage = StorageEngine::open_in_memory(&config).unwrap();
 
     // Create a test branch
-    use heliosdb_lite::storage::BranchOptions;
+    use heliosdb_nano::storage::BranchOptions;
     storage.create_branch(
         "feature_branch",
         Some("main"),
@@ -475,8 +475,8 @@ fn test_pg_matviews_materialized_views() {
     ])).unwrap();
 
     // Create a materialized view
-    use heliosdb_lite::sql::LogicalPlan;
-    use heliosdb_lite::storage::MaterializedViewMetadata;
+    use heliosdb_nano::sql::LogicalPlan;
+    use heliosdb_nano::storage::MaterializedViewMetadata;
     use std::sync::Arc;
 
     let query_plan = LogicalPlan::Scan {
@@ -614,7 +614,7 @@ fn test_pg_compression_stats() {
     storage.catalog().create_table("compressed_table", schema).unwrap();
 
     // Set compression config
-    use heliosdb_lite::storage::compression::CompressionConfig;
+    use heliosdb_nano::storage::compression::CompressionConfig;
     use std::collections::HashMap;
     let compression_config = CompressionConfig {
         enabled: true,
@@ -626,7 +626,7 @@ fn test_pg_compression_stats() {
     storage.catalog().set_compression_config("compressed_table", &compression_config).unwrap();
 
     // Set mock compression stats
-    use heliosdb_lite::storage::compression::CompressionStats;
+    use heliosdb_nano::storage::compression::CompressionStats;
     let stats = CompressionStats {
         total_original_size: 10000,
         total_compressed_size: 2500,
@@ -700,7 +700,7 @@ fn test_execute_nonexistent_view() {
 fn test_view_categories() {
     let registry = SystemViewRegistry::new();
 
-    use heliosdb_lite::sql::ViewCategory;
+    use heliosdb_nano::sql::ViewCategory;
 
     let core_views = registry.list_views_by_category(ViewCategory::Core);
     assert!(core_views.len() >= 6, "Should have at least 6 core views");
@@ -738,7 +738,7 @@ fn test_integration_full_workflow() {
     ])).unwrap();
 
     // Create vector index
-    use heliosdb_lite::vector::DistanceMetric;
+    use heliosdb_nano::vector::DistanceMetric;
     storage.vector_indexes().create_index(
         "products_embedding_idx".to_string(),
         "products".to_string(),
@@ -748,7 +748,7 @@ fn test_integration_full_workflow() {
     ).unwrap();
 
     // Create branch
-    use heliosdb_lite::storage::BranchOptions;
+    use heliosdb_nano::storage::BranchOptions;
     storage.create_branch(
         "dev_branch",
         Some("main"),

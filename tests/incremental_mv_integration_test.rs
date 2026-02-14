@@ -8,7 +8,7 @@
 //! 5. REFRESH MATERIALIZED VIEW (applies incremental changes)
 //! 6. Verify results
 
-use heliosdb_lite::{Config, EmbeddedDatabase, Result};
+use heliosdb_nano::{Config, EmbeddedDatabase, Result};
 
 #[test]
 fn test_incremental_mv_full_integration() -> Result<()> {
@@ -44,7 +44,7 @@ fn test_incremental_mv_full_integration() -> Result<()> {
 
     // Verify the new completed order is present
     let order_4_present = result.iter().any(|tuple| {
-        tuple.values.len() >= 1 && tuple.values[0] == heliosdb_lite::Value::Int4(4)
+        tuple.values.len() >= 1 && tuple.values[0] == heliosdb_nano::Value::Int4(4)
     });
     assert!(order_4_present, "New completed order (ID 4) should be in materialized view");
 

@@ -1,7 +1,7 @@
 // Test error handling for unsupported trigger features
-// Compile with: rustc --edition 2021 test_trigger_errors.rs -L target/debug/deps --extern heliosdb_lite=target/debug/libheliosdb_lite.rlib
+// Compile with: rustc --edition 2021 test_trigger_errors.rs -L target/debug/deps --extern heliosdb_nano=target/debug/libheliosdb_nano.rlib
 
-use heliosdb_lite::sql::{Parser, Planner};
+use heliosdb_nano::sql::{Parser, Planner};
 
 fn main() {
     println!("=== HeliosDB Trigger Error Handling Test ===\n");

@@ -3,8 +3,8 @@
 //! This test suite validates the production behavior of the auto-refresh
 //! background worker with real materialized views and storage.
 
-use heliosdb_lite::{Config, Column, DataType, Schema};
-use heliosdb_lite::storage::{
+use heliosdb_nano::{Config, Column, DataType, Schema};
+use heliosdb_nano::storage::{
     StorageEngine,
     MaterializedViewCatalog,
     MaterializedViewMetadata,
@@ -13,7 +13,7 @@ use heliosdb_lite::storage::{
     MVScheduler,
     SchedulerConfig,
 };
-use heliosdb_lite::sql::LogicalPlan;
+use heliosdb_nano::sql::LogicalPlan;
 use std::sync::Arc;
 use tokio::time::Duration;
 

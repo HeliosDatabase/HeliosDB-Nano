@@ -4,8 +4,8 @@
 
 #![cfg(test)]
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
-use heliosdb_lite::session::IsolationLevel;
+use heliosdb_nano::{EmbeddedDatabase, Result};
+use heliosdb_nano::session::IsolationLevel;
 use crate::test_helpers::*;
 use std::sync::{Arc, Barrier};
 use std::thread;

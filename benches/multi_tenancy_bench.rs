@@ -12,7 +12,7 @@
 use criterion::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput
 };
-use heliosdb_lite::tenant::{
+use heliosdb_nano::tenant::{
     TenantManager, IsolationMode, RLSCommand, ChangeType,
     ResourceLimits, TenantContext
 };

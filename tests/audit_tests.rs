@@ -1,6 +1,6 @@
 //! Audit logging integration tests
 
-use heliosdb_lite::{EmbeddedDatabase, Config, audit::{AuditLogger, AuditConfig, AuditQuery, OperationType}};
+use heliosdb_nano::{EmbeddedDatabase, Config, audit::{AuditLogger, AuditConfig, AuditQuery, OperationType}};
 use std::sync::Arc;
 
 #[tokio::test]
@@ -10,7 +10,7 @@ async fn test_audit_logger_basic() {
 
     // Get storage reference
     let storage = Arc::new(
-        heliosdb_lite::storage::StorageEngine::open_in_memory(&config).unwrap()
+        heliosdb_nano::storage::StorageEngine::open_in_memory(&config).unwrap()
     );
 
     let audit_config = AuditConfig::default();
@@ -48,7 +48,7 @@ async fn test_audit_logger_basic() {
 async fn test_audit_query_builder() {
     let config = Config::in_memory();
     let storage = Arc::new(
-        heliosdb_lite::storage::StorageEngine::open_in_memory(&config).unwrap()
+        heliosdb_nano::storage::StorageEngine::open_in_memory(&config).unwrap()
     );
 
     let audit_config = AuditConfig::default();
@@ -76,7 +76,7 @@ async fn test_audit_query_builder() {
 async fn test_audit_config_filtering() {
     let config = Config::in_memory();
     let storage = Arc::new(
-        heliosdb_lite::storage::StorageEngine::open_in_memory(&config).unwrap()
+        heliosdb_nano::storage::StorageEngine::open_in_memory(&config).unwrap()
     );
 
     // Config that only logs DDL
@@ -105,7 +105,7 @@ async fn test_audit_config_filtering() {
 
 #[tokio::test]
 async fn test_audit_checksum_verification() {
-    use heliosdb_lite::audit::{AuditEvent, AuditMetadata};
+    use heliosdb_nano::audit::{AuditEvent, AuditMetadata};
 
     let metadata = AuditMetadata::default();
     let event = AuditEvent::new(
@@ -167,7 +167,7 @@ async fn test_query_truncation() {
 async fn test_error_logging() {
     let config = Config::in_memory();
     let storage = Arc::new(
-        heliosdb_lite::storage::StorageEngine::open_in_memory(&config).unwrap()
+        heliosdb_nano::storage::StorageEngine::open_in_memory(&config).unwrap()
     );
 
     let audit_config = AuditConfig::default();

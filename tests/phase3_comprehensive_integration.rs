@@ -16,8 +16,8 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_lite::{Config, Column, DataType, Schema, Tuple, Value};
-use heliosdb_lite::storage::{
+use heliosdb_nano::{Config, Column, DataType, Schema, Tuple, Value};
+use heliosdb_nano::storage::{
     StorageEngine, BranchOptions, MaterializedViewCatalog, MaterializedViewMetadata,
     MVScheduler, SchedulerConfig, Priority, AutoRefreshWorker, AutoRefreshConfig,
     MvSystemViews,

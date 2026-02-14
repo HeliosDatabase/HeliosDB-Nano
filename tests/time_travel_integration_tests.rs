@@ -8,10 +8,10 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_lite::{Config, StorageEngine, Tuple, Value, Schema, Column, DataType};
-use heliosdb_lite::sql::LogicalPlan;
-use heliosdb_lite::sql::logical_plan::AsOfClause;
-use heliosdb_lite::sql::Executor;
+use heliosdb_nano::{Config, StorageEngine, Tuple, Value, Schema, Column, DataType};
+use heliosdb_nano::sql::LogicalPlan;
+use heliosdb_nano::sql::logical_plan::AsOfClause;
+use heliosdb_nano::sql::Executor;
 use std::sync::Arc;
 
 /// Helper to create a test storage engine with sample data
@@ -354,7 +354,7 @@ fn test_multiple_tables_time_travel() {
 
 #[test]
 fn test_snapshot_gc() {
-    use heliosdb_lite::storage::{SnapshotManager, GcConfig};
+    use heliosdb_nano::storage::{SnapshotManager, GcConfig};
 
     let config = Config::in_memory();
     let engine = StorageEngine::open_in_memory(&config)

@@ -6,7 +6,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 #[cfg(feature = "ha-tier1")]
-use heliosdb_lite::replication::{
+use heliosdb_nano::replication::{
     split_brain::{
         ClusterNode, ObserverConfig, ProtectionEvent, ProtectionState,
         SplitBrainProtector,

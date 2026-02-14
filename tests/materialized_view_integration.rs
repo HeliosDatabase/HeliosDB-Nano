@@ -2,7 +2,7 @@
 //!
 //! Tests for CREATE/REFRESH/DROP MATERIALIZED VIEW using the public API.
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
+use heliosdb_nano::{EmbeddedDatabase, Result};
 
 #[test]
 fn test_create_materialized_view() -> Result<()> {

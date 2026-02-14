@@ -1,7 +1,7 @@
 //! Example: Encryption usage
 
-use heliosdb_lite::crypto::{encrypt, decrypt, derive_key_from_password};
-use heliosdb_lite::Result;
+use heliosdb_nano::crypto::{encrypt, decrypt, derive_key_from_password};
+use heliosdb_nano::Result;
 
 fn main() -> Result<()> {
     println!("HeliosDB Lite - Encryption Example\n");

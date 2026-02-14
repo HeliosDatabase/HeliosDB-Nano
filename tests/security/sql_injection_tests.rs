@@ -3,7 +3,7 @@
 //! Tests to verify that the SQL parser and executor are resistant to
 //! common SQL injection attack patterns.
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
+use heliosdb_nano::{EmbeddedDatabase, Result};
 
 #[test]
 fn test_sql_injection_classic_attack() {

@@ -9,8 +9,8 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_lite::{Config, StorageEngine, Value, Tuple, Column, DataType, Schema};
-use heliosdb_lite::storage::{MvDeltaTracker, MvDeltaOperation, MvDelta};
+use heliosdb_nano::{Config, StorageEngine, Value, Tuple, Column, DataType, Schema};
+use heliosdb_nano::storage::{MvDeltaTracker, MvDeltaOperation, MvDelta};
 use std::sync::Arc;
 use std::time::{SystemTime, Duration};
 

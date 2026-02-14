@@ -3,7 +3,7 @@
 //! Demonstrates the usage of SIMD-accelerated vector operations and
 //! shows how to check for available CPU features.
 
-use heliosdb_lite::vector::simd;
+use heliosdb_nano::vector::simd;
 
 fn main() {
     println!("=== SIMD Vector Operations Demo ===\n");

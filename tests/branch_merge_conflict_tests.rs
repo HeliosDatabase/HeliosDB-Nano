@@ -12,7 +12,7 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_lite::{
+use heliosdb_nano::{
     Config,
     storage::{StorageEngine, BranchOptions, MergeStrategy},
 };
@@ -232,7 +232,7 @@ fn test_merge_branch_state_update() {
 
     // Verify dev is Active
     let dev_before = engine.get_branch("dev").unwrap();
-    assert!(matches!(dev_before.state, heliosdb_lite::storage::BranchState::Active));
+    assert!(matches!(dev_before.state, heliosdb_nano::storage::BranchState::Active));
 
     // Merge dev into main
     engine.merge_branch("dev", "main", MergeStrategy::Auto).unwrap();
@@ -241,7 +241,7 @@ fn test_merge_branch_state_update() {
     let dev_after = engine.get_branch("dev").unwrap();
     assert!(matches!(
         dev_after.state,
-        heliosdb_lite::storage::BranchState::Merged { .. }
+        heliosdb_nano::storage::BranchState::Merged { .. }
     ));
 }
 

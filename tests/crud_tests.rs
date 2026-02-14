@@ -4,7 +4,7 @@
 
 mod test_helpers;
 
-use heliosdb_lite::{EmbeddedDatabase, Result, Value};
+use heliosdb_nano::{EmbeddedDatabase, Result, Value};
 use test_helpers::*;
 
 // ============================================================================

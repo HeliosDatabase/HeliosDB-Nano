@@ -2,8 +2,8 @@
 //!
 //! Tests SSL/TLS encryption for PostgreSQL wire protocol connections.
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
-use heliosdb_lite::protocol::postgres::{
+use heliosdb_nano::{EmbeddedDatabase, Result};
+use heliosdb_nano::protocol::postgres::{
     PgServerBuilder, SslConfig, SslMode, CertificateManager, AuthMethod
 };
 use std::sync::Arc;
@@ -35,7 +35,7 @@ async fn create_ssl_server(
 
     // Build server
     let addr: SocketAddr = format!("127.0.0.1:{}", port).parse()
-        .map_err(|e| heliosdb_lite::Error::config(format!("Invalid address: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::config(format!("Invalid address: {}", e)))?;
 
     let server = PgServerBuilder::new()
         .address(addr)
@@ -62,19 +62,19 @@ async fn send_ssl_request(stream: &mut TcpStream) -> Result<bool> {
     // Send SSL request message
     // Length (8 bytes total)
     stream.write_i32(8).await
-        .map_err(|e| heliosdb_lite::Error::network(format!("Write failed: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::network(format!("Write failed: {}", e)))?;
 
     // SSL request code
     stream.write_i32(SSL_REQUEST_CODE).await
-        .map_err(|e| heliosdb_lite::Error::network(format!("Write failed: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::network(format!("Write failed: {}", e)))?;
 
     stream.flush().await
-        .map_err(|e| heliosdb_lite::Error::network(format!("Flush failed: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::network(format!("Flush failed: {}", e)))?;
 
     // Read response (should be 'S' or 'N')
     let mut response = [0u8; 1];
     stream.read_exact(&mut response).await
-        .map_err(|e| heliosdb_lite::Error::network(format!("Read failed: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::network(format!("Read failed: {}", e)))?;
 
     Ok(response[0] == b'S')
 }
@@ -86,7 +86,7 @@ async fn test_ssl_mode_allow_accepts_ssl_request() -> Result<()> {
 
     // Connect to server
     let mut stream = TcpStream::connect(addr).await
-        .map_err(|e| heliosdb_lite::Error::network(format!("Connection failed: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::network(format!("Connection failed: {}", e)))?;
 
     // Send SSL request
     let ssl_accepted = send_ssl_request(&mut stream).await?;
@@ -112,7 +112,7 @@ async fn test_ssl_mode_disable_rejects_ssl_request() -> Result<()> {
     );
 
     let addr: SocketAddr = "127.0.0.1:15433".parse()
-        .map_err(|e| heliosdb_lite::Error::config(format!("Invalid address: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::config(format!("Invalid address: {}", e)))?;
 
     let server = PgServerBuilder::new()
         .address(addr)
@@ -133,7 +133,7 @@ async fn test_ssl_mode_disable_rejects_ssl_request() -> Result<()> {
 
     // Connect to server
     let mut stream = TcpStream::connect(server_addr).await
-        .map_err(|e| heliosdb_lite::Error::network(format!("Connection failed: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::network(format!("Connection failed: {}", e)))?;
 
     // Send SSL request
     let ssl_accepted = send_ssl_request(&mut stream).await?;
@@ -151,7 +151,7 @@ async fn test_ssl_mode_require() -> Result<()> {
 
     // Connect to server
     let mut stream = TcpStream::connect(addr).await
-        .map_err(|e| heliosdb_lite::Error::network(format!("Connection failed: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::network(format!("Connection failed: {}", e)))?;
 
     // Send SSL request
     let ssl_accepted = send_ssl_request(&mut stream).await?;
@@ -190,7 +190,7 @@ async fn test_certificate_generation() -> Result<()> {
     use tempfile::TempDir;
 
     let temp_dir = TempDir::new()
-        .map_err(|e| heliosdb_lite::Error::io(format!("Temp dir creation failed: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::io(format!("Temp dir creation failed: {}", e)))?;
 
     let cert_path = temp_dir.path().join("test.crt");
     let key_path = temp_dir.path().join("test.key");
@@ -235,7 +235,7 @@ async fn test_ssl_negotiation_protocol() -> Result<()> {
 
     // Connect to server
     let mut stream = TcpStream::connect(addr).await
-        .map_err(|e| heliosdb_lite::Error::network(format!("Connection failed: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::network(format!("Connection failed: {}", e)))?;
 
     // Manually construct SSL request message
     let mut request = Vec::new();
@@ -244,14 +244,14 @@ async fn test_ssl_negotiation_protocol() -> Result<()> {
 
     // Send request
     stream.write_all(&request).await
-        .map_err(|e| heliosdb_lite::Error::network(format!("Write failed: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::network(format!("Write failed: {}", e)))?;
     stream.flush().await
-        .map_err(|e| heliosdb_lite::Error::network(format!("Flush failed: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::network(format!("Flush failed: {}", e)))?;
 
     // Read response
     let mut response = [0u8; 1];
     stream.read_exact(&mut response).await
-        .map_err(|e| heliosdb_lite::Error::network(format!("Read failed: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::network(format!("Read failed: {}", e)))?;
 
     // Verify response is 'S' (SSL accepted)
     assert_eq!(response[0], b'S', "Expected SSL acceptance response");
@@ -266,7 +266,7 @@ async fn test_server_builder_with_ssl() -> Result<()> {
 
     let db = Arc::new(EmbeddedDatabase::new_in_memory()?);
     let addr: SocketAddr = "127.0.0.1:15436".parse()
-        .map_err(|e| heliosdb_lite::Error::config(format!("Invalid address: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::config(format!("Invalid address: {}", e)))?;
 
     let ssl_config = SslConfig::new(
         SslMode::Prefer,
@@ -292,7 +292,7 @@ async fn test_ssl_test_builder_method() -> Result<()> {
 
     let db = Arc::new(EmbeddedDatabase::new_in_memory()?);
     let addr: SocketAddr = "127.0.0.1:15437".parse()
-        .map_err(|e| heliosdb_lite::Error::config(format!("Invalid address: {}", e)))?;
+        .map_err(|e| heliosdb_nano::Error::config(format!("Invalid address: {}", e)))?;
 
     let server = PgServerBuilder::new()
         .address(addr)

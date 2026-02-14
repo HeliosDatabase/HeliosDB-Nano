@@ -3,13 +3,13 @@
 //! Compares performance between full recomputation and incremental refresh.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use heliosdb_lite::{
+use heliosdb_nano::{
     Config, StorageEngine, Schema, Column, DataType, Tuple, Value,
 };
-use heliosdb_lite::storage::{
+use heliosdb_nano::storage::{
     IncrementalRefresher, DeltaTracker, MaterializedViewMetadata,
 };
-use heliosdb_lite::sql::LogicalPlan;
+use heliosdb_nano::sql::LogicalPlan;
 use std::sync::Arc;
 
 fn setup_test_data(storage: &StorageEngine, num_rows: usize) {

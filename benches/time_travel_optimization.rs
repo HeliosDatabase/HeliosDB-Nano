@@ -4,7 +4,7 @@
 //! for AS OF TIMESTAMP queries.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use heliosdb_lite::storage::time_travel::SnapshotManager;
+use heliosdb_nano::storage::time_travel::SnapshotManager;
 use rocksdb::DB;
 use std::sync::Arc;
 use tempfile::tempdir;

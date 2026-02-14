@@ -2,7 +2,7 @@
 //!
 //! Tests dictionary encoding, content-addressed storage, and columnar storage.
 
-use heliosdb_lite::{EmbeddedDatabase, Config, Value};
+use heliosdb_nano::{EmbeddedDatabase, Config, Value};
 
 fn test_db() -> EmbeddedDatabase {
     let mut config = Config::default();

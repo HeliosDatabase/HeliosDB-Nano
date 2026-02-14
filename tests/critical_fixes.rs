@@ -1,5 +1,5 @@
 /// Integration tests for critical user-blocking fixes
-use heliosdb_lite::EmbeddedDatabase;
+use heliosdb_nano::EmbeddedDatabase;
 
 #[test]
 fn test_jsonb_type_support() {

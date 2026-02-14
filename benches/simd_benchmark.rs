@@ -3,7 +3,7 @@
 //! Measures speedup of SIMD-accelerated vector operations compared to scalar baseline.
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use heliosdb_lite::vector::simd;
+use heliosdb_nano::vector::simd;
 use rand::Rng;
 
 /// Generate random vector of given size
@@ -165,7 +165,7 @@ fn bench_batch_distances(c: &mut Criterion) {
 
 /// Benchmark Product Quantization distance computation
 fn bench_pq_distance(c: &mut Criterion) {
-    use heliosdb_lite::vector::simd::quantization;
+    use heliosdb_nano::vector::simd::quantization;
 
     let mut group = c.benchmark_group("pq_asymmetric_distance");
 

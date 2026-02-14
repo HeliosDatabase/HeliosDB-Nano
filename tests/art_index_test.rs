@@ -9,8 +9,8 @@
 
 #![allow(clippy::unwrap_used)]
 
-use heliosdb_lite::{Config, Value};
-use heliosdb_lite::storage::{StorageEngine, ArtIndexType};
+use heliosdb_nano::{Config, Value};
+use heliosdb_nano::storage::{StorageEngine, ArtIndexType};
 
 /// Test automatic PK index creation
 #[test]
@@ -20,29 +20,29 @@ fn test_pk_index_auto_creation() {
     let catalog = storage.catalog();
 
     // Create a table with a primary key
-    let schema = heliosdb_lite::Schema {
+    let schema = heliosdb_nano::Schema {
         columns: vec![
-            heliosdb_lite::Column {
+            heliosdb_nano::Column {
                 name: "id".to_string(),
-                data_type: heliosdb_lite::DataType::Int4,
+                data_type: heliosdb_nano::DataType::Int4,
                 nullable: false,
                 primary_key: true,
                 source_table: None,
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-                storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
-            heliosdb_lite::Column {
+            heliosdb_nano::Column {
                 name: "name".to_string(),
-                data_type: heliosdb_lite::DataType::Text,
+                data_type: heliosdb_nano::DataType::Text,
                 nullable: true,
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-                storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
         ],
     };
@@ -70,29 +70,29 @@ fn test_unique_index_auto_creation() {
     let catalog = storage.catalog();
 
     // Create a table with a unique column
-    let schema = heliosdb_lite::Schema {
+    let schema = heliosdb_nano::Schema {
         columns: vec![
-            heliosdb_lite::Column {
+            heliosdb_nano::Column {
                 name: "id".to_string(),
-                data_type: heliosdb_lite::DataType::Int4,
+                data_type: heliosdb_nano::DataType::Int4,
                 nullable: false,
                 primary_key: true,
                 source_table: None,
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-                storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
-            heliosdb_lite::Column {
+            heliosdb_nano::Column {
                 name: "email".to_string(),
-                data_type: heliosdb_lite::DataType::Text,
+                data_type: heliosdb_nano::DataType::Text,
                 nullable: false,
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
                 default_expr: None,
                 unique: true,  // UNIQUE constraint
-                storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
         ],
     };
@@ -116,18 +116,18 @@ fn test_index_drop_on_table_drop() {
     let catalog = storage.catalog();
 
     // Create table with PK
-    let schema = heliosdb_lite::Schema {
+    let schema = heliosdb_nano::Schema {
         columns: vec![
-            heliosdb_lite::Column {
+            heliosdb_nano::Column {
                 name: "id".to_string(),
-                data_type: heliosdb_lite::DataType::Int4,
+                data_type: heliosdb_nano::DataType::Int4,
                 nullable: false,
                 primary_key: true,
                 source_table: None,
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-                storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
         ],
     };
@@ -153,29 +153,29 @@ fn test_art_indexes_system_view() {
     let catalog = storage.catalog();
 
     // Create table with PK and UNIQUE
-    let schema = heliosdb_lite::Schema {
+    let schema = heliosdb_nano::Schema {
         columns: vec![
-            heliosdb_lite::Column {
+            heliosdb_nano::Column {
                 name: "id".to_string(),
-                data_type: heliosdb_lite::DataType::Int4,
+                data_type: heliosdb_nano::DataType::Int4,
                 nullable: false,
                 primary_key: true,
                 source_table: None,
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-                storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
-            heliosdb_lite::Column {
+            heliosdb_nano::Column {
                 name: "email".to_string(),
-                data_type: heliosdb_lite::DataType::Text,
+                data_type: heliosdb_nano::DataType::Text,
                 nullable: false,
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
                 default_expr: None,
                 unique: true,
-                storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
         ],
     };
@@ -210,29 +210,29 @@ fn test_art_manager_stats() {
     let catalog = storage.catalog();
 
     // Create table with PK and UNIQUE
-    let schema = heliosdb_lite::Schema {
+    let schema = heliosdb_nano::Schema {
         columns: vec![
-            heliosdb_lite::Column {
+            heliosdb_nano::Column {
                 name: "id".to_string(),
-                data_type: heliosdb_lite::DataType::Int4,
+                data_type: heliosdb_nano::DataType::Int4,
                 nullable: false,
                 primary_key: true,
                 source_table: None,
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-                storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
-            heliosdb_lite::Column {
+            heliosdb_nano::Column {
                 name: "code".to_string(),
-                data_type: heliosdb_lite::DataType::Text,
+                data_type: heliosdb_nano::DataType::Text,
                 nullable: false,
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
                 default_expr: None,
                 unique: true,
-                storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
         ],
     };
@@ -251,7 +251,7 @@ fn test_art_manager_stats() {
 /// Test basic ART node types
 #[test]
 fn test_art_node_basic_operations() {
-    use heliosdb_lite::storage::art_index::AdaptiveRadixTree;
+    use heliosdb_nano::storage::art_index::AdaptiveRadixTree;
 
     // Create a manual ART index
     let mut art = AdaptiveRadixTree::new(
@@ -288,7 +288,7 @@ fn test_art_node_basic_operations() {
 /// Test ART with numeric keys
 #[test]
 fn test_art_numeric_keys() {
-    use heliosdb_lite::storage::art_index::AdaptiveRadixTree;
+    use heliosdb_nano::storage::art_index::AdaptiveRadixTree;
 
     let mut art = AdaptiveRadixTree::new(
         "test_idx",
@@ -315,7 +315,7 @@ fn test_art_numeric_keys() {
 /// Test ART iteration
 #[test]
 fn test_art_iteration() {
-    use heliosdb_lite::storage::art_index::AdaptiveRadixTree;
+    use heliosdb_nano::storage::art_index::AdaptiveRadixTree;
 
     let mut art = AdaptiveRadixTree::new(
         "test_idx",
@@ -343,7 +343,7 @@ fn test_art_iteration() {
 /// Test ART range scan
 #[test]
 fn test_art_range_scan() {
-    use heliosdb_lite::storage::art_index::AdaptiveRadixTree;
+    use heliosdb_nano::storage::art_index::AdaptiveRadixTree;
 
     let mut art = AdaptiveRadixTree::new(
         "test_idx",
@@ -368,7 +368,7 @@ fn test_art_range_scan() {
 /// Test ART prefix scan
 #[test]
 fn test_art_prefix_scan() {
-    use heliosdb_lite::storage::art_index::AdaptiveRadixTree;
+    use heliosdb_nano::storage::art_index::AdaptiveRadixTree;
 
     let mut art = AdaptiveRadixTree::new(
         "test_idx",
@@ -396,7 +396,7 @@ fn test_art_prefix_scan() {
 /// Test ART node growth (Node4 -> Node16 -> Node48 -> Node256)
 #[test]
 fn test_art_node_growth() {
-    use heliosdb_lite::storage::art_index::AdaptiveRadixTree;
+    use heliosdb_nano::storage::art_index::AdaptiveRadixTree;
 
     let mut art = AdaptiveRadixTree::new(
         "test_idx",

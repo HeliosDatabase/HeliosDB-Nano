@@ -12,7 +12,7 @@
 //! cargo run --example mv_scheduler_demo
 //! ```
 
-use heliosdb_lite::{
+use heliosdb_nano::{
     EmbeddedDatabase, Config,
     storage::{MVScheduler, SchedulerConfig, Priority},
 };

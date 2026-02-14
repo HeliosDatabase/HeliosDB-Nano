@@ -6,8 +6,8 @@
 //! 3. Error handling - cleanup on failures
 //! 4. Data integrity - no data loss or corruption
 
-use heliosdb_lite::{Config, StorageEngine, Column, DataType, Schema, Tuple, Value, Error};
-use heliosdb_lite::sql::{LogicalPlan, Executor};
+use heliosdb_nano::{Config, StorageEngine, Column, DataType, Schema, Tuple, Value, Error};
+use heliosdb_nano::sql::{LogicalPlan, Executor};
 use std::sync::Arc;
 
 #[test]
@@ -69,7 +69,7 @@ fn test_concurrent_mv_refresh_basic() {
         Column::new("total_value", DataType::Int8),
     ]);
 
-    let metadata = heliosdb_lite::storage::MaterializedViewMetadata::new(
+    let metadata = heliosdb_nano::storage::MaterializedViewMetadata::new(
         "order_summary".to_string(),
         "SELECT SUM(value) FROM orders".to_string(),
         query_plan_bytes,
@@ -140,7 +140,7 @@ fn test_concurrent_mv_refresh_no_old_data() {
 
     let query_plan_bytes = bincode::serialize(&query_plan).unwrap();
 
-    let metadata = heliosdb_lite::storage::MaterializedViewMetadata::new(
+    let metadata = heliosdb_nano::storage::MaterializedViewMetadata::new(
         "test_view".to_string(),
         "SELECT COUNT(*) FROM test".to_string(),
         query_plan_bytes,
@@ -186,7 +186,7 @@ fn test_concurrent_mv_refresh_multiple_times() {
 
     let query_plan_bytes = bincode::serialize(&query_plan).unwrap();
 
-    let metadata = heliosdb_lite::storage::MaterializedViewMetadata::new(
+    let metadata = heliosdb_nano::storage::MaterializedViewMetadata::new(
         "multi_view".to_string(),
         "SELECT SUM(x) FROM data".to_string(),
         query_plan_bytes,
@@ -255,7 +255,7 @@ fn test_concurrent_refresh_preserves_schema() {
 
     let query_plan_bytes = bincode::serialize(&query_plan).unwrap();
 
-    let metadata = heliosdb_lite::storage::MaterializedViewMetadata::new(
+    let metadata = heliosdb_nano::storage::MaterializedViewMetadata::new(
         "user_view".to_string(),
         "SELECT name, age, score FROM users".to_string(),
         query_plan_bytes,
@@ -298,7 +298,7 @@ fn test_concurrent_refresh_preserves_schema() {
     assert_eq!(data[1].values[2], Value::Float8(87.3));
 
     // Get table schema and verify it matches
-    let data_table = heliosdb_lite::storage::MaterializedViewCatalog::mv_data_table_name("user_view");
+    let data_table = heliosdb_nano::storage::MaterializedViewCatalog::mv_data_table_name("user_view");
     let stored_schema = storage.catalog()
         .get_table_schema(&data_table)
         .expect("Failed to get schema");
@@ -336,7 +336,7 @@ fn test_concurrent_vs_nonconcurrent_refresh() {
 
         let query_plan_bytes = bincode::serialize(&query_plan).unwrap();
 
-        let metadata = heliosdb_lite::storage::MaterializedViewMetadata::new(
+        let metadata = heliosdb_nano::storage::MaterializedViewMetadata::new(
             name.to_string(),
             "SELECT COUNT(*) FROM test".to_string(),
             query_plan_bytes,

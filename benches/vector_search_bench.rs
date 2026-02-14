@@ -3,7 +3,7 @@
 //! Benchmarks for HNSW index performance with different dataset sizes.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use heliosdb_lite::vector::{HnswConfig, HnswIndex, DistanceMetric};
+use heliosdb_nano::vector::{HnswConfig, HnswIndex, DistanceMetric};
 
 fn generate_random_vector(dim: usize, seed: u64) -> Vec<f32> {
     use std::collections::hash_map::RandomState;
@@ -89,7 +89,7 @@ fn benchmark_vector_distances(c: &mut Criterion) {
             dim,
             |b, _| {
                 b.iter(|| {
-                    let dist = heliosdb_lite::vector::l2_distance(
+                    let dist = heliosdb_nano::vector::l2_distance(
                         black_box(&v1),
                         black_box(&v2)
                     );
@@ -103,7 +103,7 @@ fn benchmark_vector_distances(c: &mut Criterion) {
             dim,
             |b, _| {
                 b.iter(|| {
-                    let dist = heliosdb_lite::vector::cosine_distance(
+                    let dist = heliosdb_nano::vector::cosine_distance(
                         black_box(&v1),
                         black_box(&v2)
                     );
@@ -117,7 +117,7 @@ fn benchmark_vector_distances(c: &mut Criterion) {
             dim,
             |b, _| {
                 b.iter(|| {
-                    let dist = heliosdb_lite::vector::inner_product_distance(
+                    let dist = heliosdb_nano::vector::inner_product_distance(
                         black_box(&v1),
                         black_box(&v2)
                     );

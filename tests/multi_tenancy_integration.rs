@@ -8,8 +8,8 @@
 //! - Context switching
 //! - Cross-tenant data isolation
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
-use heliosdb_lite::tenant::{IsolationMode, TenantContext, RLSCommand, ChangeType, ResourceLimits};
+use heliosdb_nano::{EmbeddedDatabase, Result};
+use heliosdb_nano::tenant::{IsolationMode, TenantContext, RLSCommand, ChangeType, ResourceLimits};
 
 // ============================================================================
 // Test Utilities

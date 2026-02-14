@@ -2,7 +2,7 @@
 //!
 //! Comprehensive tests to verify timeout enforcement across all operators.
 
-use heliosdb_lite::{EmbeddedDatabase, Config};
+use heliosdb_nano::{EmbeddedDatabase, Config};
 use std::time::{Duration, Instant};
 
 #[test]

@@ -2,7 +2,7 @@
 
 #[cfg(test)]
 mod system_views_tests {
-    use heliosdb_lite::storage::engine::StorageEngine;
+    use heliosdb_nano::storage::engine::StorageEngine;
     use tempfile::TempDir;
 
     async fn setup_test_db() -> (StorageEngine, TempDir) {

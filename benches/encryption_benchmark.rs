@@ -3,24 +3,24 @@
 //! Measures the performance overhead of transparent data encryption.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use heliosdb_lite::{Config, Column, DataType, Schema, Tuple, Value};
+use heliosdb_nano::{Config, Column, DataType, Schema, Tuple, Value};
 
-fn setup_encrypted_storage() -> heliosdb_lite::storage::StorageEngine {
+fn setup_encrypted_storage() -> heliosdb_nano::storage::StorageEngine {
     let hex_key = generate_random_hex_key();
     std::env::set_var("BENCH_ENCRYPTION_KEY", &hex_key);
 
     let mut config = Config::in_memory();
     config.encryption.enabled = true;
     config.encryption.key_source =
-        heliosdb_lite::config::KeySource::Environment("BENCH_ENCRYPTION_KEY".to_string());
+        heliosdb_nano::config::KeySource::Environment("BENCH_ENCRYPTION_KEY".to_string());
 
-    heliosdb_lite::storage::StorageEngine::open_in_memory(&config)
+    heliosdb_nano::storage::StorageEngine::open_in_memory(&config)
         .expect("Failed to open encrypted storage")
 }
 
-fn setup_unencrypted_storage() -> heliosdb_lite::storage::StorageEngine {
+fn setup_unencrypted_storage() -> heliosdb_nano::storage::StorageEngine {
     let config = Config::in_memory();
-    heliosdb_lite::storage::StorageEngine::open_in_memory(&config)
+    heliosdb_nano::storage::StorageEngine::open_in_memory(&config)
         .expect("Failed to open unencrypted storage")
 }
 
@@ -265,20 +265,20 @@ fn benchmark_crypto_primitives(c: &mut Criterion) {
             size,
             |b, _| {
                 b.iter(|| {
-                    heliosdb_lite::crypto::encrypt(&key, black_box(&plaintext)).unwrap()
+                    heliosdb_nano::crypto::encrypt(&key, black_box(&plaintext)).unwrap()
                 });
             },
         );
 
         // Pre-encrypt for decrypt benchmark
-        let ciphertext = heliosdb_lite::crypto::encrypt(&key, &plaintext).unwrap();
+        let ciphertext = heliosdb_nano::crypto::encrypt(&key, &plaintext).unwrap();
 
         group.bench_with_input(
             BenchmarkId::new("decrypt", size),
             size,
             |b, _| {
                 b.iter(|| {
-                    heliosdb_lite::crypto::decrypt(&key, black_box(&ciphertext)).unwrap()
+                    heliosdb_nano::crypto::decrypt(&key, black_box(&ciphertext)).unwrap()
                 });
             },
         );

@@ -4,8 +4,8 @@
 
 #[cfg(test)]
 mod tests {
-    use heliosdb_lite::storage::VectorIndexManager;
-    use heliosdb_lite::vector::{DistanceMetric, ProductQuantizerConfig};
+    use heliosdb_nano::storage::VectorIndexManager;
+    use heliosdb_nano::vector::{DistanceMetric, ProductQuantizerConfig};
 
     fn generate_random_vectors(count: usize, dimension: usize) -> Vec<Vec<f32>> {
         use rand::Rng;

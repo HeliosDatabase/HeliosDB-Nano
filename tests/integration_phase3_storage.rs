@@ -2,11 +2,11 @@
 //!
 //! Tests the full execution path from SQL -> Parser -> Planner -> Executor -> Storage
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
+use heliosdb_nano::{EmbeddedDatabase, Result};
 
 /// Helper to execute SQL and get results using EmbeddedDatabase
 /// This uses the full SQL execution path including Phase 3 extensions
-fn execute_sql(db: &EmbeddedDatabase, sql: &str) -> Result<Vec<heliosdb_lite::Tuple>> {
+fn execute_sql(db: &EmbeddedDatabase, sql: &str) -> Result<Vec<heliosdb_nano::Tuple>> {
     db.query(sql, &[])
 }
 
@@ -32,7 +32,7 @@ fn test_branch_create_and_list() {
     // Verify branch names include 'dev'
     let branch_names: Vec<String> = results.iter()
         .map(|t| match &t.values[0] {
-            heliosdb_lite::Value::String(s) => s.clone(),
+            heliosdb_nano::Value::String(s) => s.clone(),
             _ => String::new(),
         })
         .collect();
@@ -56,7 +56,7 @@ fn test_branch_drop() {
     let results = execute_sql(&db, "SELECT * FROM pg_database_branches()").unwrap();
     let branch_names: Vec<String> = results.iter()
         .map(|t| match &t.values[0] {
-            heliosdb_lite::Value::String(s) => s.clone(),
+            heliosdb_nano::Value::String(s) => s.clone(),
             _ => String::new(),
         })
         .collect();
@@ -228,7 +228,7 @@ fn test_system_view_pg_mv_staleness() {
 
     // Verify view name is correct
     match &results[0].values[0] {
-        heliosdb_lite::Value::String(name) => {
+        heliosdb_nano::Value::String(name) => {
             assert_eq!(name, "data_summary", "MV name should be 'data_summary'");
         }
         _ => panic!("Expected String value for view name"),
@@ -247,7 +247,7 @@ fn test_branch_with_options() {
     let results = execute_sql(&db, "SELECT * FROM pg_database_branches()").unwrap();
     let branch_names: Vec<String> = results.iter()
         .map(|t| match &t.values[0] {
-            heliosdb_lite::Value::String(s) => s.clone(),
+            heliosdb_nano::Value::String(s) => s.clone(),
             _ => String::new(),
         })
         .collect();

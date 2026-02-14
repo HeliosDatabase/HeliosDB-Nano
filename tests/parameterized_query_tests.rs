@@ -10,7 +10,7 @@
 //! - Parameters in aggregates and JOINs
 //! - SQL injection prevention
 
-use heliosdb_lite::{EmbeddedDatabase, Value};
+use heliosdb_nano::{EmbeddedDatabase, Value};
 
 #[test]
 fn test_select_with_single_parameter() {

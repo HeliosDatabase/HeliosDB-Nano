@@ -3,10 +3,10 @@
 //! Demonstrates the 5 core optimization rules with before/after comparisons.
 //! Shows expected performance improvements of 2-10x for different query patterns.
 
-use heliosdb_lite::optimizer::{Optimizer, OptimizerConfig};
-use heliosdb_lite::optimizer::cost::{StatsCatalog, TableStats, ColumnStats};
-use heliosdb_lite::sql::logical_plan::*;
-use heliosdb_lite::{Schema, Column, DataType, Value};
+use heliosdb_nano::optimizer::{Optimizer, OptimizerConfig};
+use heliosdb_nano::optimizer::cost::{StatsCatalog, TableStats, ColumnStats};
+use heliosdb_nano::sql::logical_plan::*;
+use heliosdb_nano::{Schema, Column, DataType, Value};
 use std::sync::Arc;
 
 fn main() {
@@ -128,7 +128,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
             Column {
                 name: "name".to_string(),
@@ -139,7 +139,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
             Column {
                 name: "email".to_string(),
@@ -150,7 +150,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
             Column {
                 name: "age".to_string(),
@@ -161,7 +161,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
             Column {
                 name: "status".to_string(),
@@ -172,7 +172,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
         ],
     });
@@ -188,7 +188,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
             Column {
                 name: "user_id".to_string(),
@@ -199,7 +199,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
             Column {
                 name: "amount".to_string(),
@@ -210,7 +210,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
             Column {
                 name: "order_date".to_string(),
@@ -221,7 +221,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_lite::ColumnStorageMode::Default,
+            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
         ],
     });

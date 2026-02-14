@@ -9,7 +9,7 @@
 //! - Concurrent operations
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use heliosdb_lite::sync::{
+use heliosdb_nano::sync::{
     ChangeLogImpl, ChangeType, ConflictChangeEntry, ConflictChangeOperation, ConflictDetector,
     ConflictResolutionV2 as ConflictResolution, RowDelta, SyncClient, SyncConfig, SyncServer,
     VectorClock,
@@ -51,7 +51,7 @@ fn create_change_entry(
 
 fn create_row_delta(table: &str, row_id: u64, data_size: usize) -> RowDelta {
     use chrono::Utc;
-    use heliosdb_lite::sync::Operation;
+    use heliosdb_nano::sync::Operation;
 
     let mut delta = RowDelta {
         table: table.to_string(),
@@ -541,7 +541,7 @@ fn bench_serialization(c: &mut Criterion) {
         data: vec![0u8; 1024],
     };
 
-    let change_log_entry = heliosdb_lite::sync::ChangeEntry::new(
+    let change_log_entry = heliosdb_nano::sync::ChangeEntry::new(
         100,
         1,
         change.clone(),
@@ -560,7 +560,7 @@ fn bench_serialization(c: &mut Criterion) {
     let serialized = change_log_entry.serialize().expect("Serialization failed");
     group.bench_function("deserialize_change_entry", |b| {
         b.iter(|| {
-            let entry = heliosdb_lite::sync::ChangeEntry::deserialize(black_box(&serialized));
+            let entry = heliosdb_nano::sync::ChangeEntry::deserialize(black_box(&serialized));
             black_box(entry)
         });
     });

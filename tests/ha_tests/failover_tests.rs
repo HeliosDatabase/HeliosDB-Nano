@@ -6,7 +6,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 #[cfg(feature = "ha-tier1")]
-use heliosdb_lite::replication::{
+use heliosdb_nano::replication::{
     split_brain::{
         ClusterNode, ObserverConfig, ProtectionEvent, ProtectionState, SplitBrainProtector,
     },
@@ -164,7 +164,7 @@ async fn test_fencing_token_update() {
 
     // Simulate receiving a higher fencing token from new primary
     let new_primary_id = Uuid::new_v4();
-    let payload = heliosdb_lite::replication::transport::FencingTokenPayload {
+    let payload = heliosdb_nano::replication::transport::FencingTokenPayload {
         token: 5,
         issuer_id: new_primary_id,
         term: 2,
@@ -233,7 +233,7 @@ async fn test_primary_stepdown_on_higher_token() {
 
     // Receive higher fencing token from another node claiming primary
     let usurper_id = Uuid::new_v4();
-    let payload = heliosdb_lite::replication::transport::FencingTokenPayload {
+    let payload = heliosdb_nano::replication::transport::FencingTokenPayload {
         token: 10, // Much higher than our 1
         issuer_id: usurper_id,
         term: 5,

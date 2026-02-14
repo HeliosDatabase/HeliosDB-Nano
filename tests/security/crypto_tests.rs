@@ -2,7 +2,7 @@
 //!
 //! Tests to verify the correctness and security of cryptographic operations.
 
-use heliosdb_lite::crypto::{encrypt, decrypt, derive_key_from_password, EncryptionKey};
+use heliosdb_nano::crypto::{encrypt, decrypt, derive_key_from_password, EncryptionKey};
 
 #[test]
 fn test_encryption_decryption_roundtrip() {

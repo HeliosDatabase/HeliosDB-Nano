@@ -7,7 +7,7 @@
 //! - Event metadata handling
 //! - Tamper detection via checksums
 
-use heliosdb_lite::audit::{AuditEvent, OperationType, AuditMetadata};
+use heliosdb_nano::audit::{AuditEvent, OperationType, AuditMetadata};
 
 #[test]
 fn test_audit_event_creation() {
@@ -425,14 +425,14 @@ fn test_audit_event_special_characters() {
 
 #[test]
 fn test_audit_initialization() {
-    use heliosdb_lite::{Config, storage::StorageEngine};
+    use heliosdb_nano::{Config, storage::StorageEngine};
 
     let config = Config::in_memory();
     let storage = StorageEngine::open_in_memory(&config)
         .expect("Failed to create storage engine");
 
     // Initialize audit tables
-    let result = heliosdb_lite::audit::initialize_audit_tables(&storage);
+    let result = heliosdb_nano::audit::initialize_audit_tables(&storage);
     assert!(result.is_ok(), "Audit table initialization should succeed");
 
     // Verify audit log table exists
@@ -450,15 +450,15 @@ fn test_audit_initialization() {
 
 #[test]
 fn test_audit_initialization_idempotent() {
-    use heliosdb_lite::{Config, storage::StorageEngine};
+    use heliosdb_nano::{Config, storage::StorageEngine};
 
     let config = Config::in_memory();
     let storage = StorageEngine::open_in_memory(&config)
         .expect("Failed to create storage engine");
 
     // Initialize twice
-    let result1 = heliosdb_lite::audit::initialize_audit_tables(&storage);
-    let result2 = heliosdb_lite::audit::initialize_audit_tables(&storage);
+    let result1 = heliosdb_nano::audit::initialize_audit_tables(&storage);
+    let result2 = heliosdb_nano::audit::initialize_audit_tables(&storage);
 
     assert!(result1.is_ok());
     assert!(result2.is_ok(), "Second initialization should be idempotent");

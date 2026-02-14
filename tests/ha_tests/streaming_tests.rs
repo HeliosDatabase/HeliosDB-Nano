@@ -7,7 +7,7 @@ use std::time::Duration;
 use uuid::Uuid;
 
 #[cfg(feature = "ha-tier1")]
-use heliosdb_lite::replication::{
+use heliosdb_nano::replication::{
     streaming::{StreamingClient, StreamingClientConfig, StreamingClientState, StreamingServer, StreamingServerConfig},
     transport::SyncModeConfig,
     wal_store::{WalStore, WalStoreConfig, BatchRequest, BatchStreamState},

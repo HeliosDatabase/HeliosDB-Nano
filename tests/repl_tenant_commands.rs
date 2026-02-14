@@ -17,7 +17,7 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_lite::repl::commands::MetaCommand;
+use heliosdb_nano::repl::commands::MetaCommand;
 
 // ============================================================================
 // Command Parsing Tests

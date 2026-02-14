@@ -2,7 +2,7 @@
 //!
 //! Tests for vector similarity search via SQL layer
 
-use heliosdb_lite::{EmbeddedDatabase, Result};
+use heliosdb_nano::{EmbeddedDatabase, Result};
 
 /// Test CREATE INDEX ... USING hnsw syntax
 #[test]

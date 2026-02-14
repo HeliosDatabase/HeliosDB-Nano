@@ -6,7 +6,7 @@
 //! - Vector search with quantized indexes
 //! - Persistence and recovery
 
-use heliosdb_lite::{HeliosDB, Result};
+use heliosdb_nano::{HeliosDB, Result};
 
 #[test]
 fn test_create_pq_index_sql() -> Result<()> {

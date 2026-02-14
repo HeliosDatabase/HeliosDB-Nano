@@ -249,6 +249,17 @@ impl AutoRefreshWorker {
         Ok(())
     }
 
+    /// Send stop signal to the background worker (non-blocking, sync-safe).
+    ///
+    /// This is safe to call from `Drop` impls. The worker will stop on its next loop iteration.
+    /// For graceful shutdown with waiting, use `stop()` instead.
+    pub fn request_stop(&self) {
+        if let Some(tx) = &self.command_tx {
+            let _ = tx.send(WorkerCommand::Stop);
+        }
+        *self.is_running.lock() = false;
+    }
+
     /// Stop the background worker gracefully
     ///
     /// Waits for in-flight refreshes to complete before shutting down.

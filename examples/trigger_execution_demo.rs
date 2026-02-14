@@ -3,7 +3,7 @@
 //! This example demonstrates how trigger execution is integrated into DML operations.
 //! It shows the execution flow for INSERT, UPDATE, and DELETE with BEFORE and AFTER triggers.
 
-use heliosdb_lite::{EmbeddedDatabase, Result, sql};
+use heliosdb_nano::{EmbeddedDatabase, Result, sql};
 
 fn main() -> Result<()> {
     println!("========================================");

@@ -8,8 +8,8 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_lite::{Config, storage::StorageEngine};
-use heliosdb_lite::protocols::{
+use heliosdb_nano::{Config, storage::StorageEngine};
+use heliosdb_nano::protocols::{
     ServerManager,
     ServerManagerConfig,
     oracle::OracleServerConfig,
@@ -118,7 +118,7 @@ fn test_oracle_server_custom_config() {
 #[test]
 fn test_protocol_module_exports() {
     // This test ensures all exports are available
-    use heliosdb_lite::protocols::{
+    use heliosdb_nano::protocols::{
         // Adapters
         StorageAdapter,
         QueryExecutorAdapter,
@@ -146,7 +146,7 @@ fn test_protocol_module_exports() {
 
 #[test]
 fn test_storage_adapter_integration() {
-    use heliosdb_lite::protocols::{LiteStorageAdapter, StorageAdapter};
+    use heliosdb_nano::protocols::{LiteStorageAdapter, StorageAdapter};
 
     let config = Config::in_memory();
     let engine = Arc::new(StorageEngine::open_in_memory(&config).unwrap());
@@ -164,7 +164,7 @@ fn test_storage_adapter_integration() {
 
 #[test]
 fn test_query_executor_adapter_integration() {
-    use heliosdb_lite::protocols::{LiteQueryExecutorAdapter, QueryExecutorAdapter};
+    use heliosdb_nano::protocols::{LiteQueryExecutorAdapter, QueryExecutorAdapter};
 
     let config = Config::in_memory();
     let engine = Arc::new(StorageEngine::open_in_memory(&config).unwrap());
@@ -187,7 +187,7 @@ fn test_query_executor_adapter_integration() {
 
 #[test]
 fn test_connection_pool_integration() {
-    use heliosdb_lite::protocols::{ConnectionPool, PoolConfig};
+    use heliosdb_nano::protocols::{ConnectionPool, PoolConfig};
     use std::time::Duration;
 
     let pool_config = PoolConfig {

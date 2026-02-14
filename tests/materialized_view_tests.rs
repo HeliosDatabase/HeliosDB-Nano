@@ -12,7 +12,7 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_lite::{Config, Database, Result, Value, Column, DataType, Schema};
+use heliosdb_nano::{Config, Database, Result, Value, Column, DataType, Schema};
 
 #[test]
 fn test_create_materialized_view_basic() -> Result<()> {

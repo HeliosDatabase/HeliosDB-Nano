@@ -12,7 +12,7 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_lite::{Config, EmbeddedDatabase};
+use heliosdb_nano::{Config, EmbeddedDatabase};
 
 #[test]
 fn test_create_branch_sql() {

@@ -13,8 +13,8 @@
 //! - Range scan: O(k + m) where m is result count
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-use heliosdb_lite::storage::art_index::AdaptiveRadixTree;
-use heliosdb_lite::storage::ArtIndexType;
+use heliosdb_nano::storage::art_index::AdaptiveRadixTree;
+use heliosdb_nano::storage::ArtIndexType;
 use rand::Rng;
 
 /// Generate random string key of given length
@@ -284,8 +284,8 @@ fn bench_prefix_scan(c: &mut Criterion) {
 
 /// Benchmark key encoding for different value types
 fn bench_key_encoding(c: &mut Criterion) {
-    use heliosdb_lite::storage::ArtIndexManager;
-    use heliosdb_lite::Value;
+    use heliosdb_nano::storage::ArtIndexManager;
+    use heliosdb_nano::Value;
 
     let mut group = c.benchmark_group("art_key_encoding");
 

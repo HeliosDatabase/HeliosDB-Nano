@@ -3,7 +3,7 @@
 //! Tests branch data isolation across both persistent and in-memory storage modes.
 //! Ensures metadata properties and data isolation work correctly regardless of storage mode.
 
-use heliosdb_lite::{Config, storage::{StorageEngine, BranchOptions}};
+use heliosdb_nano::{Config, storage::{StorageEngine, BranchOptions}};
 use std::path::PathBuf;
 use tempfile::TempDir;
 
