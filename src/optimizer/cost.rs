@@ -511,6 +511,10 @@ impl CostEstimator {
                     .sum();
                 2.0 + Self::estimate_expr_complexity(expr) + list_cost
             }
+            LogicalExpr::InSet { expr, values, .. } => {
+                // HashSet lookup is O(1) per value, so cost is just the expr + constant per entry
+                2.0 + Self::estimate_expr_complexity(expr) + values.len() as f64
+            }
             LogicalExpr::InSubquery { expr, .. } => {
                 // Subqueries are expensive - estimate high cost
                 100.0 + Self::estimate_expr_complexity(expr)

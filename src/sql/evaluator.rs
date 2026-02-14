@@ -245,6 +245,15 @@ impl Evaluator {
                 Ok(Value::Boolean(result))
             }
 
+            LogicalExpr::InSet { expr, values, negated } => {
+                let value = self.evaluate(expr, tuple)?;
+                if matches!(value, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let found = values.contains(&value);
+                Ok(Value::Boolean(if *negated { !found } else { found }))
+            }
+
             LogicalExpr::InSubquery { .. } => {
                 // Subquery evaluation requires executor context
                 // This should be handled at the executor level, not evaluator

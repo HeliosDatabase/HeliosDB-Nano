@@ -150,6 +150,7 @@ impl Config {
             storage: StorageConfig {
                 path: None,
                 memory_only: true,
+                wal_enabled: false, // No WAL needed for in-memory mode
                 ..Default::default()
             },
             audit: crate::audit::AuditConfig::default(),

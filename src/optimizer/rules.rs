@@ -232,6 +232,9 @@ impl ProjectionPruningRule {
                     Self::collect_used_columns(item, columns);
                 }
             }
+            LogicalExpr::InSet { expr, .. } => {
+                Self::collect_used_columns(expr, columns);
+            }
             LogicalExpr::InSubquery { expr, .. } => {
                 // Collect from the main expression; subquery columns are independent
                 Self::collect_used_columns(expr, columns);

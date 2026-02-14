@@ -1489,6 +1489,117 @@ impl StorageEngine {
         Ok(tuples)
     }
 
+    /// Count rows in a table without deserializing tuples (fast COUNT(*) path).
+    /// Only counts key prefixes matching `data:{table_name}:` — no deserialization.
+    pub fn count_table_rows(&self, table_name: &str) -> Result<usize> {
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.db.iterator_opt(
+            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
+            read_opts,
+        );
+        let mut count = 0usize;
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if key.starts_with(prefix_bytes) {
+                count += 1;
+            } else {
+                break;
+            }
+        }
+        tracing::debug!(
+            phase = "count_fast_path",
+            table = table_name,
+            count = count,
+            "COUNT(*) fast path completed"
+        );
+        Ok(count)
+    }
+
+    /// Scan table with a row limit (for LIMIT pushdown).
+    /// Returns at most `limit` rows, avoiding full table materialization.
+    pub fn scan_table_with_limit(&self, table_name: &str, limit: usize) -> Result<Vec<Tuple>> {
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let catalog = Catalog::new(self);
+        let schema = catalog.get_table_schema(table_name)?;
+        let mut tuples = Vec::with_capacity(limit);
+
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.db.iterator_opt(
+            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
+            read_opts,
+        );
+        for item in iter {
+            if tuples.len() >= limit {
+                break;
+            }
+            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if key.starts_with(prefix_bytes) {
+                let value = if let Some(km) = &self.key_manager {
+                    crypto::decrypt(km.key(), &raw_value)?
+                } else {
+                    raw_value.to_vec()
+                };
+                let mut tuple: Tuple = bincode::deserialize(&value)
+                    .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+                if let Ok(key_str) = std::str::from_utf8(&key) {
+                    if let Some(row_id_str) = key_str.strip_prefix(&prefix) {
+                        if let Ok(rid) = row_id_str.parse::<u64>() {
+                            tuple.row_id = Some(rid);
+                        }
+                    }
+                }
+                // Resolve per-column storage references
+                for (idx, column) in schema.columns.iter().enumerate() {
+                    if idx >= tuple.values.len() {
+                        break;
+                    }
+                    #[allow(clippy::indexing_slicing)]
+                    match column.storage_mode {
+                        ColumnStorageMode::Dictionary => {
+                            if let Some(crate::Value::DictRef { dict_id }) = tuple.values.get(idx) {
+                                let dict_id = *dict_id;
+                                let s = self.dict_manager.decode(&self.db, table_name, &column.name, dict_id)?;
+                                if let Some(val) = tuple.values.get_mut(idx) {
+                                    *val = crate::Value::String(s);
+                                }
+                            }
+                        }
+                        ColumnStorageMode::ContentAddressed => {
+                            if let Some(crate::Value::CasRef { hash }) = tuple.values.get(idx) {
+                                let hash = hash.clone();
+                                let resolved = ContentAddressedStore::resolve(&self.db, &hash, &column.data_type)?;
+                                if let Some(val) = tuple.values.get_mut(idx) {
+                                    *val = resolved;
+                                }
+                            }
+                        }
+                        ColumnStorageMode::Columnar => {
+                            if matches!(tuple.values.get(idx), Some(crate::Value::ColumnarRef)) {
+                                if let Some(row_id) = tuple.row_id {
+                                    if let Some(val) = ColumnarStore::get(&self.db, table_name, &column.name, row_id)? {
+                                        if let Some(slot) = tuple.values.get_mut(idx) {
+                                            *slot = val;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        ColumnStorageMode::Default => {}
+                    }
+                }
+                tuples.push(tuple);
+            } else if !tuples.is_empty() {
+                break;
+            }
+        }
+        Ok(tuples)
+    }
+
     /// Look up a single row by primary key value using the ART index.
     ///
     /// This is significantly faster than a full table scan for point lookups

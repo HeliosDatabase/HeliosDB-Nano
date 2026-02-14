@@ -59,8 +59,10 @@ impl PhysicalOperator for ScanOperator {
             return Ok(None);
         }
 
-        let tuple = self.tuples.get(self.current_index).cloned()
-            .ok_or_else(|| Error::query_execution("Scan index out of bounds"))?;
+        let tuple = std::mem::take(
+            self.tuples.get_mut(self.current_index)
+                .ok_or_else(|| Error::query_execution("Scan index out of bounds"))?
+        );
         self.current_index += 1;
 
         // Apply projection if specified

@@ -821,6 +821,7 @@ impl EmbeddedDatabase {
                 // Initialize trigger context for cascading detection
                 let mut trigger_context = sql::TriggerContext::new();
                 let trigger_event = sql::logical_plan::TriggerEvent::Insert;
+                let has_triggers = self.trigger_registry.has_triggers_for_table(table_name);
 
                 // Collect tuples for RETURNING clause
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
@@ -937,11 +938,10 @@ impl EmbeddedDatabase {
                     let final_values_vec = final_values?;
                     let tuple = Tuple::new(final_values_vec.clone());
 
-                    // Validate foreign key constraints (IMMEDIATE mode)
+                    // Validate foreign key constraints via ART index (O(1) lookup)
                     let table_constraints = catalog.load_table_constraints(table_name)?;
                     for fk in &table_constraints.foreign_keys {
                         if fk.enforcement == sql::ConstraintEnforcement::Immediate {
-                            // Get FK column values from the tuple
                             let fk_values: Vec<Value> = fk.columns.iter()
                                 .map(|col_name| {
                                     schema.columns.iter()
@@ -950,19 +950,22 @@ impl EmbeddedDatabase {
                                         .unwrap_or(Value::Null)
                                 })
                                 .collect();
-
-                            // Skip validation if any FK column is NULL
                             if fk_values.iter().any(|v| matches!(v, Value::Null)) {
                                 continue;
                             }
-
-                            // Check if referenced row exists
-                            let exists = self.check_foreign_key_exists(
-                                &fk.references_table,
-                                &fk.references_columns,
-                                &fk_values,
-                            )?;
-
+                            // Try ART PK index lookup on referenced table (O(1))
+                            let key = crate::storage::ArtIndexManager::encode_key(&fk_values);
+                            let ref_pk = self.storage.art_indexes().get_pk_index(&fk.references_table);
+                            let exists = if let Some(pk_index) = ref_pk {
+                                pk_index.contains(&key)
+                            } else {
+                                // No ART index — fall back to scan
+                                self.check_foreign_key_exists(
+                                    &fk.references_table,
+                                    &fk.references_columns,
+                                    &fk_values,
+                                )?
+                            };
                             if !exists {
                                 return Err(Error::constraint_violation(format!(
                                     "Foreign key constraint '{}' violated: referenced row in table '{}' does not exist",
@@ -989,67 +992,50 @@ impl EmbeddedDatabase {
                         }
                     }
 
-                    // Validate UNIQUE constraints (including PRIMARY KEY)
-                    for unique in &table_constraints.unique_constraints {
-                        // Get unique column values from the tuple being inserted
-                        let unique_values: Vec<Value> = unique.columns.iter()
-                            .filter_map(|col_name| {
-                                schema.columns.iter()
-                                    .position(|c| &c.name == col_name)
-                                    .and_then(|idx| final_values_vec.get(idx).cloned())
-                            })
-                            .collect();
-
-                        // Skip validation if any unique column is NULL (NULL is always unique)
-                        if unique_values.iter().any(|v| matches!(v, Value::Null)) {
-                            continue;
+                    // Validate UNIQUE constraints via ART index (O(1) lookup instead of O(N) table scan)
+                    if !table_constraints.unique_constraints.is_empty() {
+                        let mut col_values_map = std::collections::HashMap::new();
+                        for (i, col) in schema.columns.iter().enumerate() {
+                            if let Some(v) = final_values_vec.get(i) {
+                                col_values_map.insert(col.name.clone(), v.clone());
+                            }
                         }
-
-                        // Check if a row with these values already exists
-                        let duplicate_exists = self.check_unique_violation(
-                            table_name,
-                            &unique.columns,
-                            &unique_values,
-                        )?;
-
-                        if duplicate_exists {
-                            let constraint_type = if unique.is_primary_key { "PRIMARY KEY" } else { "UNIQUE" };
-                            return Err(Error::constraint_violation(format!(
-                                "{} constraint '{}' violated: duplicate value for column(s) ({})",
-                                constraint_type, unique.name, unique.columns.join(", ")
-                            )));
+                        if let Err(e) = self.storage.art_indexes().check_unique_constraints(table_name, &col_values_map) {
+                            return Err(Error::constraint_violation(e.to_string()));
                         }
                     }
 
-                    // Execute BEFORE INSERT triggers
-                    let row_context = sql::triggers::TriggerRowContext::for_insert(tuple.clone());
-                    let db_ref = self.clone_for_trigger();
-                    let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
-                        db_ref.execute_plan_internal(stmt)?;
-                        Ok(())
-                    };
+                    // Execute BEFORE INSERT triggers (skip if no triggers for this table)
+                    if has_triggers {
+                        let row_context = sql::triggers::TriggerRowContext::for_insert(tuple.clone());
+                        let db_ref = self.clone_for_trigger();
+                        let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                            db_ref.execute_plan_internal(stmt)?;
+                            Ok(())
+                        };
 
-                    let action = self.trigger_registry.execute_triggers(
-                        table_name,
-                        &trigger_event,
-                        &sql::logical_plan::TriggerTiming::Before,
-                        &row_context,
-                        &mut trigger_context,
-                        Some(std::sync::Arc::new(schema.clone())),
-                        &mut executor_fn,
-                    )?;
+                        let action = self.trigger_registry.execute_triggers(
+                            table_name,
+                            &trigger_event,
+                            &sql::logical_plan::TriggerTiming::Before,
+                            &row_context,
+                            &mut trigger_context,
+                            Some(std::sync::Arc::new(schema.clone())),
+                            &mut executor_fn,
+                        )?;
 
-                    // Handle trigger action
-                    match action {
-                        sql::triggers::TriggerAction::Abort(msg) => {
-                            return Err(Error::query_execution(format!("INSERT aborted by trigger: {}", msg)));
-                        }
-                        sql::triggers::TriggerAction::Skip => {
-                            // INSTEAD OF trigger - skip the insert
-                            continue;
-                        }
-                        sql::triggers::TriggerAction::Continue => {
-                            // Continue with insert
+                        // Handle trigger action
+                        match action {
+                            sql::triggers::TriggerAction::Abort(msg) => {
+                                return Err(Error::query_execution(format!("INSERT aborted by trigger: {}", msg)));
+                            }
+                            sql::triggers::TriggerAction::Skip => {
+                                // INSTEAD OF trigger - skip the insert
+                                continue;
+                            }
+                            sql::triggers::TriggerAction::Continue => {
+                                // Continue with insert
+                            }
                         }
                     }
 
@@ -1061,8 +1047,10 @@ impl EmbeddedDatabase {
                     let val = bincode::serialize(&tuple).map_err(|e| Error::storage(e.to_string()))?;
                     txn.put(key.clone(), val.clone())?;
 
-                    // Log to WAL for replication (txn.put bypasses normal WAL logging)
-                    self.storage.log_data_insert(table_name, &key, &val)?;
+                    // Log to WAL for replication (skip in memory-only mode)
+                    if self.storage.is_wal_enabled() {
+                        self.storage.log_data_insert(table_name, &key, &val)?;
+                    }
 
                     // Update ART index for PK/unique constraint lookups
                     {
@@ -1091,10 +1079,8 @@ impl EmbeddedDatabase {
 
                     // Update storage quota tracking
                     if let Some(context) = self.tenant_manager.get_current_context() {
-                        // Calculate approximate storage size (tuple + overhead)
-                        let tuple_size = bincode::serialize(&tuple)
-                            .map(|bytes| bytes.len() as u64)
-                            .unwrap_or(256); // fallback estimate
+                        // Use already-serialized val length (avoid double serialization)
+                        let tuple_size = val.len() as u64;
 
                         // Get current storage and add new tuple size
                         if let Some(current_quota) = self.tenant_manager.get_quota_tracking(context.tenant_id) {
@@ -1120,20 +1106,26 @@ impl EmbeddedDatabase {
                         );
                     }
 
-                    // Execute AFTER INSERT triggers
-                    let action = self.trigger_registry.execute_triggers(
-                        table_name,
-                        &trigger_event,
-                        &sql::logical_plan::TriggerTiming::After,
-                        &row_context,
-                        &mut trigger_context,
-                        Some(std::sync::Arc::new(schema.clone())),
-                        &mut executor_fn,
-                    )?;
-
-                    // Handle AFTER trigger action
-                    if let sql::triggers::TriggerAction::Abort(msg) = action {
-                        return Err(Error::query_execution(format!("INSERT aborted by AFTER trigger: {}", msg)));
+                    // Execute AFTER INSERT triggers (skip if no triggers)
+                    if has_triggers {
+                        let row_context = sql::triggers::TriggerRowContext::for_insert(tuple.clone());
+                        let db_ref = self.clone_for_trigger();
+                        let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                            db_ref.execute_plan_internal(stmt)?;
+                            Ok(())
+                        };
+                        let action = self.trigger_registry.execute_triggers(
+                            table_name,
+                            &trigger_event,
+                            &sql::logical_plan::TriggerTiming::After,
+                            &row_context,
+                            &mut trigger_context,
+                            Some(std::sync::Arc::new(schema.clone())),
+                            &mut executor_fn,
+                        )?;
+                        if let sql::triggers::TriggerAction::Abort(msg) = action {
+                            return Err(Error::query_execution(format!("INSERT aborted by AFTER trigger: {}", msg)));
+                        }
                     }
                 }
                 // Return count (RETURNING clause results handled separately)
@@ -1151,6 +1143,7 @@ impl EmbeddedDatabase {
                 let mut trigger_context = sql::TriggerContext::new();
                 let updated_columns: Vec<String> = assignments.iter().map(|(col, _)| col.clone()).collect();
                 let trigger_event = sql::logical_plan::TriggerEvent::Update(Some(updated_columns));
+                let has_triggers = self.trigger_registry.has_triggers_for_table(table_name);
 
                 // Use branch-aware scan to get tuples (includes main + branch overrides - deleted)
                 let tuples = self.storage.scan_table_branch_aware(table_name)?;
@@ -1178,35 +1171,37 @@ impl EmbeddedDatabase {
                                 .ok_or_else(|| Error::internal("column index out of bounds"))? = new_value;
                         }
 
-                        // Execute BEFORE UPDATE triggers
-                        let row_context = sql::triggers::TriggerRowContext::for_update(old_tuple.clone(), new_tuple.clone());
-                        let db_ref = self.clone_for_trigger();
-                        let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
-                            db_ref.execute_plan_internal(stmt)?;
-                            Ok(())
-                        };
+                        // Execute BEFORE UPDATE triggers (skip if no triggers)
+                        if has_triggers {
+                            let row_context = sql::triggers::TriggerRowContext::for_update(old_tuple.clone(), new_tuple.clone());
+                            let db_ref = self.clone_for_trigger();
+                            let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                                db_ref.execute_plan_internal(stmt)?;
+                                Ok(())
+                            };
 
-                        let action = self.trigger_registry.execute_triggers(
-                            table_name,
-                            &trigger_event,
-                            &sql::logical_plan::TriggerTiming::Before,
-                            &row_context,
-                            &mut trigger_context,
-                            Some(evaluator.schema().clone()),
-                            &mut executor_fn,
-                        )?;
+                            let action = self.trigger_registry.execute_triggers(
+                                table_name,
+                                &trigger_event,
+                                &sql::logical_plan::TriggerTiming::Before,
+                                &row_context,
+                                &mut trigger_context,
+                                Some(evaluator.schema().clone()),
+                                &mut executor_fn,
+                            )?;
 
-                        // Handle trigger action
-                        match action {
-                            sql::triggers::TriggerAction::Abort(msg) => {
-                                return Err(Error::query_execution(format!("UPDATE aborted by trigger: {}", msg)));
-                            }
-                            sql::triggers::TriggerAction::Skip => {
-                                // INSTEAD OF trigger - skip this update
-                                continue;
-                            }
-                            sql::triggers::TriggerAction::Continue => {
-                                // Continue with update
+                            // Handle trigger action
+                            match action {
+                                sql::triggers::TriggerAction::Abort(msg) => {
+                                    return Err(Error::query_execution(format!("UPDATE aborted by trigger: {}", msg)));
+                                }
+                                sql::triggers::TriggerAction::Skip => {
+                                    // INSTEAD OF trigger - skip this update
+                                    continue;
+                                }
+                                sql::triggers::TriggerAction::Continue => {
+                                    // Continue with update
+                                }
                             }
                         }
 
@@ -1231,20 +1226,28 @@ impl EmbeddedDatabase {
                             );
                         }
 
-                        // Execute AFTER UPDATE triggers
-                        let action = self.trigger_registry.execute_triggers(
-                            table_name,
-                            &trigger_event,
-                            &sql::logical_plan::TriggerTiming::After,
-                            &row_context,
-                            &mut trigger_context,
-                            Some(evaluator.schema().clone()),
-                            &mut executor_fn,
-                        )?;
+                        // Execute AFTER UPDATE triggers (skip if no triggers)
+                        if has_triggers {
+                            let row_context = sql::triggers::TriggerRowContext::for_update(old_tuple.clone(), new_tuple.clone());
+                            let db_ref = self.clone_for_trigger();
+                            let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                                db_ref.execute_plan_internal(stmt)?;
+                                Ok(())
+                            };
+                            let action = self.trigger_registry.execute_triggers(
+                                table_name,
+                                &trigger_event,
+                                &sql::logical_plan::TriggerTiming::After,
+                                &row_context,
+                                &mut trigger_context,
+                                Some(evaluator.schema().clone()),
+                                &mut executor_fn,
+                            )?;
 
-                        // Handle AFTER trigger action
-                        if let sql::triggers::TriggerAction::Abort(msg) = action {
-                            return Err(Error::query_execution(format!("UPDATE aborted by AFTER trigger: {}", msg)));
+                            // Handle AFTER trigger action
+                            if let sql::triggers::TriggerAction::Abort(msg) = action {
+                                return Err(Error::query_execution(format!("UPDATE aborted by AFTER trigger: {}", msg)));
+                            }
                         }
                     }
                 }
@@ -1259,8 +1262,10 @@ impl EmbeddedDatabase {
                         .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
                     txn.put(key.clone(), value.clone())?;
 
-                    // Log to WAL for crash recovery (txn.put bypasses normal WAL logging)
-                    self.storage.log_data_update(table_name, &key, &value)?;
+                    // Log to WAL for crash recovery (skip in memory-only mode)
+                    if self.storage.is_wal_enabled() {
+                        self.storage.log_data_update(table_name, &key, &value)?;
+                    }
 
                     // Invalidate row cache (stale after update)
                     self.storage.row_cache().invalidate(table_name, *row_id);
@@ -1311,6 +1316,7 @@ impl EmbeddedDatabase {
                 // Initialize trigger context
                 let mut trigger_context = sql::TriggerContext::new();
                 let trigger_event = sql::logical_plan::TriggerEvent::Delete;
+                let has_triggers = self.trigger_registry.has_triggers_for_table(table_name);
 
                 // Use branch-aware scan to get tuples (includes main + branch overrides - deleted)
                 let tuples = self.storage.scan_table_branch_aware(table_name)?;
@@ -1332,35 +1338,37 @@ impl EmbeddedDatabase {
                     };
 
                     if matches {
-                        // Execute BEFORE DELETE triggers
-                        let row_context = sql::triggers::TriggerRowContext::for_delete(tuple.clone());
-                        let db_ref = self.clone_for_trigger();
-                        let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
-                            db_ref.execute_plan_internal(stmt)?;
-                            Ok(())
-                        };
+                        // Execute BEFORE DELETE triggers (skip if no triggers)
+                        if has_triggers {
+                            let row_context = sql::triggers::TriggerRowContext::for_delete(tuple.clone());
+                            let db_ref = self.clone_for_trigger();
+                            let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                                db_ref.execute_plan_internal(stmt)?;
+                                Ok(())
+                            };
 
-                        let action = self.trigger_registry.execute_triggers(
-                            table_name,
-                            &trigger_event,
-                            &sql::logical_plan::TriggerTiming::Before,
-                            &row_context,
-                            &mut trigger_context,
-                            Some(evaluator.schema().clone()),
-                            &mut executor_fn,
-                        )?;
+                            let action = self.trigger_registry.execute_triggers(
+                                table_name,
+                                &trigger_event,
+                                &sql::logical_plan::TriggerTiming::Before,
+                                &row_context,
+                                &mut trigger_context,
+                                Some(evaluator.schema().clone()),
+                                &mut executor_fn,
+                            )?;
 
-                        // Handle trigger action
-                        match action {
-                            sql::triggers::TriggerAction::Abort(msg) => {
-                                return Err(Error::query_execution(format!("DELETE aborted by trigger: {}", msg)));
-                            }
-                            sql::triggers::TriggerAction::Skip => {
-                                // INSTEAD OF trigger - skip this delete
-                                continue;
-                            }
-                            sql::triggers::TriggerAction::Continue => {
-                                // Continue with delete
+                            // Handle trigger action
+                            match action {
+                                sql::triggers::TriggerAction::Abort(msg) => {
+                                    return Err(Error::query_execution(format!("DELETE aborted by trigger: {}", msg)));
+                                }
+                                sql::triggers::TriggerAction::Skip => {
+                                    // INSTEAD OF trigger - skip this delete
+                                    continue;
+                                }
+                                sql::triggers::TriggerAction::Continue => {
+                                    // Continue with delete
+                                }
                             }
                         }
 
@@ -1449,20 +1457,28 @@ impl EmbeddedDatabase {
                             }
                         }
 
-                        // Execute AFTER DELETE triggers
-                        let action = self.trigger_registry.execute_triggers(
-                            table_name,
-                            &trigger_event,
-                            &sql::logical_plan::TriggerTiming::After,
-                            &row_context,
-                            &mut trigger_context,
-                            Some(evaluator.schema().clone()),
-                            &mut executor_fn,
-                        )?;
+                        // Execute AFTER DELETE triggers (skip if no triggers)
+                        if has_triggers {
+                            let row_context = sql::triggers::TriggerRowContext::for_delete(tuple.clone());
+                            let db_ref = self.clone_for_trigger();
+                            let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                                db_ref.execute_plan_internal(stmt)?;
+                                Ok(())
+                            };
+                            let action = self.trigger_registry.execute_triggers(
+                                table_name,
+                                &trigger_event,
+                                &sql::logical_plan::TriggerTiming::After,
+                                &row_context,
+                                &mut trigger_context,
+                                Some(evaluator.schema().clone()),
+                                &mut executor_fn,
+                            )?;
 
-                        // Handle AFTER trigger action
-                        if let sql::triggers::TriggerAction::Abort(msg) = action {
-                            return Err(Error::query_execution(format!("DELETE aborted by AFTER trigger: {}", msg)));
+                            // Handle AFTER trigger action
+                            if let sql::triggers::TriggerAction::Abort(msg) = action {
+                                return Err(Error::query_execution(format!("DELETE aborted by AFTER trigger: {}", msg)));
+                            }
                         }
                     }
                 }
@@ -1493,8 +1509,10 @@ impl EmbeddedDatabase {
                         let key = format!("data:{}:{}", table_name, row_id).into_bytes();
                         txn.delete(key.clone())?;
 
-                        // Log to WAL for crash recovery (txn.delete bypasses normal WAL logging)
-                        self.storage.log_data_delete(table_name, &key)?;
+                        // Log to WAL for crash recovery (skip in memory-only mode)
+                        if self.storage.is_wal_enabled() {
+                            self.storage.log_data_delete(table_name, &key)?;
+                        }
 
                         // Invalidate row cache (row deleted)
                         self.storage.row_cache().invalidate(table_name, *row_id);

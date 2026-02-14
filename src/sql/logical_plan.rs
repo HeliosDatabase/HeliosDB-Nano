@@ -838,6 +838,16 @@ pub enum LogicalExpr {
         negated: bool,
     },
 
+    /// IN set (HashSet for O(1) membership test, used for large IN lists)
+    InSet {
+        /// Expression to test
+        expr: Box<LogicalExpr>,
+        /// Set of values for fast lookup
+        values: std::collections::HashSet<crate::Value>,
+        /// True for NOT IN, false for IN
+        negated: bool,
+    },
+
     /// IN subquery: expr IN (SELECT ...)
     InSubquery {
         /// Expression to test

@@ -195,6 +195,11 @@ impl TypeInference for LogicalExpr {
                 Ok(DataType::Boolean)
             }
 
+            // IN set (HashSet-based): always boolean
+            LogicalExpr::InSet { .. } => {
+                Ok(DataType::Boolean)
+            }
+
             // IN subquery: always returns boolean
             LogicalExpr::InSubquery { .. } => {
                 Ok(DataType::Boolean)
@@ -375,6 +380,9 @@ impl TypeInference for LogicalExpr {
 
             // IN list: never nullable (always returns boolean)
             LogicalExpr::InList { .. } => false,
+
+            // IN set (HashSet-based): never nullable (always returns boolean)
+            LogicalExpr::InSet { .. } => false,
 
             // IN subquery: never nullable (always returns boolean)
             LogicalExpr::InSubquery { .. } => false,

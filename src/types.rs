@@ -389,6 +389,12 @@ pub struct Tuple {
     pub branch_id: Option<u64>,
 }
 
+impl Default for Tuple {
+    fn default() -> Self {
+        Self { values: vec![], row_id: None, branch_id: None }
+    }
+}
+
 impl Tuple {
     /// Create a new tuple
     pub fn new(values: Vec<Value>) -> Self {

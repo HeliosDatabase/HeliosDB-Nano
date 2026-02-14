@@ -410,6 +410,15 @@ impl TriggerRegistry {
     ///
     /// # Returns
     ///
+    /// Check if any triggers exist for a table (cheap check, no cloning)
+    pub fn has_triggers_for_table(&self, table_name: &str) -> bool {
+        if let Ok(triggers) = self.triggers.read() {
+            triggers.values().any(|t| t.table_name == table_name)
+        } else {
+            false
+        }
+    }
+
     /// Vector of all trigger definitions for the table
     pub fn get_triggers_for_table(&self, table_name: &str) -> Result<Vec<TriggerDefinition>> {
         let triggers = self.triggers.read()

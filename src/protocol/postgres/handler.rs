@@ -50,9 +50,9 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
 
         Self {
             stream: BufWriter::new(stream),
-            database,
+            database: database.clone(),
             auth_manager,
-            catalog: PgCatalog::new(),
+            catalog: PgCatalog::with_database(database),
             prepared_statements: PreparedStatementManager::new(),
             authenticated: false,
             transaction_status: TransactionStatus::Idle,
@@ -78,9 +78,9 @@ impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
 
         Self {
             stream: BufWriter::new(stream),
-            database,
+            database: database.clone(),
             auth_manager,
-            catalog: PgCatalog::new(),
+            catalog: PgCatalog::with_database(database),
             prepared_statements: PreparedStatementManager::new(),
             authenticated: false,
             transaction_status: TransactionStatus::Idle,
@@ -850,28 +850,33 @@ pub(super) fn datatype_to_size(dt: &crate::DataType) -> i16 {
     }
 }
 
-/// Convert Tuple to PostgreSQL wire format values
+/// Convert Tuple to PostgreSQL wire format values.
+/// Uses itoa/ryu for fast numeric formatting (avoids String allocation per value).
 pub(super) fn tuple_to_pg_values(tuple: &Tuple) -> Vec<Option<Vec<u8>>> {
     tuple.values.iter().map(|val| {
         match val {
             Value::Null => None,
             Value::Boolean(b) => Some(if *b { b"t" } else { b"f" }.to_vec()),
-            Value::Int2(i) => Some(i.to_string().into_bytes()),
-            Value::Int4(i) => Some(i.to_string().into_bytes()),
-            Value::Int8(i) => Some(i.to_string().into_bytes()),
-            Value::Float4(f) => Some(f.to_string().into_bytes()),
-            Value::Float8(f) => Some(f.to_string().into_bytes()),
+            Value::Int2(i) => Some(itoa::Buffer::new().format(*i).as_bytes().to_vec()),
+            Value::Int4(i) => Some(itoa::Buffer::new().format(*i).as_bytes().to_vec()),
+            Value::Int8(i) => Some(itoa::Buffer::new().format(*i).as_bytes().to_vec()),
+            Value::Float4(f) => Some(ryu::Buffer::new().format(*f).as_bytes().to_vec()),
+            Value::Float8(f) => Some(ryu::Buffer::new().format(*f).as_bytes().to_vec()),
             Value::String(s) => Some(s.as_bytes().to_vec()),
             Value::Bytes(b) => Some(b.clone()),
             Value::Json(j) => Some(j.to_string().into_bytes()),
             Value::Timestamp(ts) => Some(ts.to_rfc3339().into_bytes()),
             Value::Vector(v) => {
                 // Format as PostgreSQL array: {1.0,2.0,3.0}
-                let arr_str = format!("{{{}}}", v.iter()
-                    .map(|x| x.to_string())
-                    .collect::<Vec<_>>()
-                    .join(","));
-                Some(arr_str.into_bytes())
+                let mut buf = String::with_capacity(v.len() * 8 + 2);
+                buf.push('{');
+                let mut ryu_buf = ryu::Buffer::new();
+                for (i, x) in v.iter().enumerate() {
+                    if i > 0 { buf.push(','); }
+                    buf.push_str(ryu_buf.format(*x));
+                }
+                buf.push('}');
+                Some(buf.into_bytes())
             }
             _ => Some(val.to_string().into_bytes()),
         }
