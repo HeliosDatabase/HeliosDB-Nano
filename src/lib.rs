@@ -419,29 +419,34 @@ struct SavepointState {
     dirty_state: Vec<(String, Vec<u8>)>,
 }
 
+/// Case-insensitive prefix check without allocating a new String.
+#[inline]
+fn starts_with_icase(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len()
+        && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
+
 impl EmbeddedDatabase {
-    /// Check if a SQL statement is a transaction control statement
+    /// Check if a SQL statement is a transaction control statement (zero-allocation)
     fn is_transaction_control(sql: &str) -> bool {
-        // Strip trailing semicolon and whitespace for matching
-        let trimmed = sql.trim().trim_end_matches(';').trim().to_uppercase();
-        trimmed.starts_with("BEGIN") ||
-        trimmed.starts_with("START TRANSACTION") ||
-        trimmed == "COMMIT" ||
-        trimmed == "ROLLBACK"
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        starts_with_icase(trimmed, "BEGIN") ||
+        starts_with_icase(trimmed, "START TRANSACTION") ||
+        trimmed.eq_ignore_ascii_case("COMMIT") ||
+        trimmed.eq_ignore_ascii_case("ROLLBACK")
     }
 
     /// Handle transaction control statements (BEGIN, COMMIT, ROLLBACK)
     fn handle_transaction_control(&self, sql: &str) -> Result<u64> {
-        // Strip trailing semicolon and whitespace for matching
-        let trimmed = sql.trim().trim_end_matches(';').trim().to_uppercase();
+        let trimmed = sql.trim().trim_end_matches(';').trim();
 
-        if trimmed.starts_with("BEGIN") || trimmed.starts_with("START TRANSACTION") {
+        if starts_with_icase(trimmed, "BEGIN") || starts_with_icase(trimmed, "START TRANSACTION") {
             self.begin_transaction_internal()?;
             Ok(0)
-        } else if trimmed == "COMMIT" {
+        } else if trimmed.eq_ignore_ascii_case("COMMIT") {
             self.commit_internal()?;
             Ok(0)
-        } else if trimmed == "ROLLBACK" {
+        } else if trimmed.eq_ignore_ascii_case("ROLLBACK") {
             self.rollback_internal()?;
             Ok(0)
         } else {
@@ -1145,8 +1150,16 @@ impl EmbeddedDatabase {
                 let trigger_event = sql::logical_plan::TriggerEvent::Update(Some(updated_columns));
                 let has_triggers = self.trigger_registry.has_triggers_for_table(table_name);
 
-                // Use branch-aware scan to get tuples (includes main + branch overrides - deleted)
-                let tuples = self.storage.scan_table_branch_aware(table_name)?;
+                // Try PK point lookup optimization: if WHERE is `pk_col = literal`,
+                // fetch only the matching row instead of scanning the entire table
+                let tuples = if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema) {
+                    match self.storage.get_row_by_pk(table_name, &pk_value)? {
+                        Some(tuple) => vec![tuple],
+                        None => vec![],
+                    }
+                } else {
+                    self.storage.scan_table_branch_aware(table_name)?
+                };
                 let mut updates: Vec<(u64, Tuple)> = Vec::new();
 
                 for old_tuple in tuples {
@@ -1318,8 +1331,15 @@ impl EmbeddedDatabase {
                 let trigger_event = sql::logical_plan::TriggerEvent::Delete;
                 let has_triggers = self.trigger_registry.has_triggers_for_table(table_name);
 
-                // Use branch-aware scan to get tuples (includes main + branch overrides - deleted)
-                let tuples = self.storage.scan_table_branch_aware(table_name)?;
+                // Try PK point lookup optimization for DELETE WHERE pk_col = literal
+                let tuples = if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema_arc) {
+                    match self.storage.get_row_by_pk(table_name, &pk_value)? {
+                        Some(tuple) => vec![tuple],
+                        None => vec![],
+                    }
+                } else {
+                    self.storage.scan_table_branch_aware(table_name)?
+                };
                 let mut row_ids_to_delete: Vec<u64> = Vec::new();
 
                 // Collect tuples for RETURNING clause (must be done before deletion)
@@ -1691,8 +1711,8 @@ impl EmbeddedDatabase {
                 let db_clone = self.clone_for_trigger();
                 let sql_executor = |sql: &str| -> Result<Vec<Vec<Value>>> {
                     // Detect if this is a SELECT query or DML
-                    let sql_upper = sql.trim().to_uppercase();
-                    if sql_upper.starts_with("SELECT") || sql_upper.starts_with("WITH") {
+                    let sql_trimmed = sql.trim();
+                    if starts_with_icase(sql_trimmed, "SELECT") || starts_with_icase(sql_trimmed, "WITH") {
                         let tuples = db_clone.query(sql, &[])?;
                         Ok(tuples.iter().map(|t| t.values.clone()).collect())
                     } else {
@@ -4978,8 +4998,31 @@ impl EmbeddedDatabase {
         Ok(count)
     }
 
+    /// Extract PK value from a simple WHERE clause like `pk_col = literal` or `literal = pk_col`.
+    /// Returns None if the predicate is not a simple PK equality or no PK column exists.
+    fn try_extract_pk_value(selection: Option<&sql::LogicalExpr>, schema: &Schema) -> Option<Value> {
+        let predicate = selection?;
+        let pk_col = schema.columns.iter().find(|c| c.primary_key)?;
+
+        if let sql::LogicalExpr::BinaryExpr { left, op: sql::BinaryOperator::Eq, right } = predicate {
+            match (left.as_ref(), right.as_ref()) {
+                (sql::LogicalExpr::Column { name, .. }, sql::LogicalExpr::Literal(val))
+                    if name == &pk_col.name => Some(val.clone()),
+                (sql::LogicalExpr::Literal(val), sql::LogicalExpr::Column { name, .. })
+                    if name == &pk_col.name => Some(val.clone()),
+                _ => None,
+            }
+        } else {
+            None
+        }
+    }
+
     /// Apply RLS policies to a query plan by injecting Filter operators
     fn apply_rls_to_plan(&self, plan: sql::LogicalPlan) -> Result<sql::LogicalPlan> {
+        // Early exit: skip RLS tree walk when no tenant context is set (common case)
+        if self.tenant_manager.get_current_context().is_none() {
+            return Ok(plan);
+        }
         self.apply_rls_to_plan_recursive(plan)
     }
 

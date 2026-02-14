@@ -4,6 +4,13 @@
 //! client messages and generates appropriate responses.
 
 use crate::{Result, Error, EmbeddedDatabase, Tuple, Value, Schema};
+
+/// Case-insensitive prefix check without allocating a new String.
+#[inline]
+fn starts_with_icase(s: &str, prefix: &str) -> bool {
+    s.len() >= prefix.len()
+        && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+}
 use super::messages::{
     FrontendMessage, BackendMessage, AuthenticationMessage,
     TransactionStatus, FieldDescription,
@@ -328,12 +335,12 @@ where
             return Ok(());
         }
 
-        // Handle transaction commands
-        let query_upper = query.trim().to_uppercase();
-        if query_upper == "BEGIN" || query_upper.starts_with("BEGIN ") || query_upper == "START TRANSACTION" || query_upper.starts_with("START TRANSACTION ") {
+        // Handle transaction commands (case-insensitive without allocation)
+        let trimmed = query.trim();
+        if trimmed.eq_ignore_ascii_case("BEGIN") || starts_with_icase(trimmed, "BEGIN ") || trimmed.eq_ignore_ascii_case("START TRANSACTION") || starts_with_icase(trimmed, "START TRANSACTION ") {
             // Parse isolation level if specified
             // Supported: BEGIN [TRANSACTION] [ISOLATION LEVEL {READ UNCOMMITTED | READ COMMITTED | REPEATABLE READ | SERIALIZABLE}]
-            let isolation_level = Self::parse_isolation_level(&query_upper);
+            let isolation_level = Self::parse_isolation_level(trimmed);
 
             // Check if already in a transaction - PostgreSQL behavior is to warn but continue
             if self.transaction_status == TransactionStatus::InTransaction {
@@ -357,9 +364,9 @@ where
             self.send_command_complete("BEGIN").await?;
             self.send_ready_for_query().await?;
             return Ok(());
-        } else if query_upper.starts_with("SET TRANSACTION ISOLATION LEVEL ") || query_upper.starts_with("SET SESSION CHARACTERISTICS") {
+        } else if starts_with_icase(trimmed, "SET TRANSACTION ISOLATION LEVEL ") || starts_with_icase(trimmed, "SET SESSION CHARACTERISTICS") {
             // SET TRANSACTION ISOLATION LEVEL is valid before any queries in a transaction
-            let level = Self::parse_isolation_level(&query_upper);
+            let level = Self::parse_isolation_level(trimmed);
             if level.is_some() {
                 self.send_command_complete("SET").await?;
             } else {
@@ -368,7 +375,7 @@ where
             }
             self.send_ready_for_query().await?;
             return Ok(());
-        } else if query_upper == "COMMIT" {
+        } else if trimmed.eq_ignore_ascii_case("COMMIT") {
             // Handle commit even if no transaction active (PostgreSQL warns but succeeds)
             if self.transaction_status == TransactionStatus::InTransaction {
                 self.database.commit()?;
@@ -383,7 +390,7 @@ where
             self.send_command_complete("COMMIT").await?;
             self.send_ready_for_query().await?;
             return Ok(());
-        } else if query_upper == "ROLLBACK" {
+        } else if trimmed.eq_ignore_ascii_case("ROLLBACK") {
             // Handle rollback even if no transaction active (PostgreSQL warns but succeeds)
             if self.transaction_status == TransactionStatus::InTransaction {
                 self.database.rollback()?;
@@ -408,13 +415,13 @@ where
             use crate::replication::query_forwarder::{query_forwarder, ForwardedResult};
 
             if ha_state().is_read_only() {
-                let is_write = query_upper.starts_with("INSERT")
-                    || query_upper.starts_with("UPDATE")
-                    || query_upper.starts_with("DELETE")
-                    || query_upper.starts_with("CREATE")
-                    || query_upper.starts_with("DROP")
-                    || query_upper.starts_with("ALTER")
-                    || query_upper.starts_with("TRUNCATE");
+                let is_write = starts_with_icase(trimmed, "INSERT")
+                    || starts_with_icase(trimmed, "UPDATE")
+                    || starts_with_icase(trimmed, "DELETE")
+                    || starts_with_icase(trimmed, "CREATE")
+                    || starts_with_icase(trimmed, "DROP")
+                    || starts_with_icase(trimmed, "ALTER")
+                    || starts_with_icase(trimmed, "TRUNCATE");
 
                 if is_write {
                     // Check sync mode - only forward in Sync or SemiSync mode
@@ -489,7 +496,7 @@ where
         }
 
         // Execute query through database
-        let is_select = query_upper.starts_with("SELECT");
+        let is_select = starts_with_icase(trimmed, "SELECT");
 
         if is_select {
             let results = self.database.query(query, &[])?;
@@ -749,18 +756,18 @@ where
 
     /// Get command tag for a query
     pub(super) fn get_command_tag(&self, query: &str, affected: u64) -> String {
-        let query_upper = query.trim().to_uppercase();
-        if query_upper.starts_with("INSERT") {
+        let trimmed = query.trim();
+        if starts_with_icase(trimmed, "INSERT") {
             format!("INSERT 0 {}", affected)
-        } else if query_upper.starts_with("UPDATE") {
+        } else if starts_with_icase(trimmed, "UPDATE") {
             format!("UPDATE {}", affected)
-        } else if query_upper.starts_with("DELETE") {
+        } else if starts_with_icase(trimmed, "DELETE") {
             format!("DELETE {}", affected)
-        } else if query_upper.starts_with("CREATE TABLE") {
+        } else if starts_with_icase(trimmed, "CREATE TABLE") {
             "CREATE TABLE".to_string()
-        } else if query_upper.starts_with("DROP TABLE") {
+        } else if starts_with_icase(trimmed, "DROP TABLE") {
             "DROP TABLE".to_string()
-        } else if query_upper.starts_with("CREATE INDEX") {
+        } else if starts_with_icase(trimmed, "CREATE INDEX") {
             "CREATE INDEX".to_string()
         } else {
             format!("OK {}", affected)
@@ -777,20 +784,20 @@ where
     // ("ISOLATION LEVEL" is exactly 15 chars).
     #[allow(clippy::indexing_slicing)]
     fn parse_isolation_level(query: &str) -> Option<String> {
-        let upper = query.to_uppercase();
-        if let Some(pos) = upper.find("ISOLATION LEVEL") {
-            let rest = &upper[pos + 15..].trim();
-            if rest.starts_with("READ UNCOMMITTED") {
-                Some("READ UNCOMMITTED".to_string())
-            } else if rest.starts_with("READ COMMITTED") {
-                Some("READ COMMITTED".to_string())
-            } else if rest.starts_with("REPEATABLE READ") {
-                Some("REPEATABLE READ".to_string())
-            } else if rest.starts_with("SERIALIZABLE") {
-                Some("SERIALIZABLE".to_string())
-            } else {
-                None
-            }
+        // Find "ISOLATION LEVEL" case-insensitively without allocating
+        let query_bytes = query.as_bytes();
+        let needle = b"ISOLATION LEVEL";
+        let pos = query_bytes.windows(needle.len())
+            .position(|w| w.eq_ignore_ascii_case(needle))?;
+        let rest = query[pos + needle.len()..].trim();
+        if starts_with_icase(rest, "READ UNCOMMITTED") {
+            Some("READ UNCOMMITTED".to_string())
+        } else if starts_with_icase(rest, "READ COMMITTED") {
+            Some("READ COMMITTED".to_string())
+        } else if starts_with_icase(rest, "REPEATABLE READ") {
+            Some("REPEATABLE READ".to_string())
+        } else if starts_with_icase(rest, "SERIALIZABLE") {
+            Some("SERIALIZABLE".to_string())
         } else {
             None
         }

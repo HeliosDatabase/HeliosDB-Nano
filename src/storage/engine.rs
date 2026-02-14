@@ -1402,11 +1402,11 @@ impl StorageEngine {
         // Use total_order_seek to bypass prefix bloom filter for full table scans
         let mut read_opts = ReadOptions::default();
         read_opts.set_total_order_seek(true);
-        let iter = self.db.iterator_opt(IteratorMode::Start, read_opts);
+        let iter = self.db.iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
         for item in iter {
             let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
-            // Check if key starts with our prefix
+            // Check if key starts with our prefix (break when past it)
             if key.starts_with(prefix_bytes) {
                 // Decrypt if encryption is enabled
                 let value = if let Some(km) = &self.key_manager {
@@ -1473,8 +1473,8 @@ impl StorageEngine {
                 }
 
                 tuples.push(tuple);
-            } else if key.first() > prefix_bytes.first() {
-                // Optimization: break early if we've passed the prefix range
+            } else {
+                // Past the prefix range — stop iterating
                 break;
             }
         }

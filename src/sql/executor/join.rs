@@ -586,10 +586,10 @@ impl HashJoinOperator {
     /// might find the wrong column (e.g., finding employees.id instead of departments.id).
     fn evaluate_join_condition(&self, left: &Tuple, right: &Tuple) -> Result<bool> {
         if let Some(condition) = &self.on_condition {
-            // For pure equi-joins, the hash lookup already confirmed the keys match.
-            // We skip re-evaluation because the combined schema may have duplicate
-            // column names, causing the evaluator to match the wrong column.
-            if is_equi_join(&self.on_condition) {
+            // The hash join now only receives equi-join conditions (equality predicates).
+            // The hash lookup already confirmed the keys match, so skip re-evaluation
+            // which can fail due to duplicate column names in the combined schema.
+            if is_pure_equi_join(&self.on_condition) {
                 return Ok(true);
             }
 
@@ -756,53 +756,129 @@ pub(super) fn handle_join(
         )?));
     }
 
-    // Use HashJoin for equi-joins (with equality conditions)
-    // Fall back to NestedLoopJoin for non-equi joins or cross joins
-    if is_equi_join(on) {
-        Ok(Box::new(HashJoinOperator::new(
-            left_op,
-            right_op,
-            join_type.clone(),
-            on.clone(),
-            timeout_ctx,
-        )?))
-    } else {
-        Ok(Box::new(NestedLoopJoinOperator::new(
-            left_op,
-            right_op,
-            join_type.clone(),
-            on.clone(),
-            timeout_ctx,
-        )?))
+    // Split compound ON conditions into equi-join keys and residual filters.
+    // This allows hash join even when the condition mixes equality and non-equality predicates.
+    match on {
+        None => {
+            // Cross join — use hash join with empty key
+            Ok(Box::new(HashJoinOperator::new(
+                left_op,
+                right_op,
+                join_type.clone(),
+                None,
+                timeout_ctx,
+            )?))
+        }
+        Some(condition) => {
+            let (equi_part, residual_part) = split_join_condition(condition);
+
+            if equi_part.is_some() {
+                // Use hash join on equi-join keys
+                let mut join_op: Box<dyn PhysicalOperator> = Box::new(HashJoinOperator::new(
+                    left_op,
+                    right_op,
+                    join_type.clone(),
+                    equi_part,
+                    timeout_ctx,
+                )?);
+
+                // Apply residual filter on top if present
+                if let Some(residual) = residual_part {
+                    join_op = Box::new(super::filter::FilterOperator::new(
+                        join_op,
+                        residual,
+                        vec![],
+                    ));
+                }
+
+                Ok(join_op)
+            } else {
+                // No equi-join keys — fall back to nested loop
+                Ok(Box::new(NestedLoopJoinOperator::new(
+                    left_op,
+                    right_op,
+                    join_type.clone(),
+                    on.clone(),
+                    timeout_ctx,
+                )?))
+            }
+        }
     }
 }
 
-/// Check if a join condition is an equi-join (uses only equality predicates)
+/// Split a join condition into equi-join predicates and residual filters.
 ///
-/// Returns true if the condition contains only equality comparisons (=)
-/// combined with AND, which allows efficient hash join implementation.
-fn is_equi_join(condition: &Option<crate::sql::LogicalExpr>) -> bool {
+/// Walks the AND chain and classifies each predicate:
+/// - Equality (`=`) predicates → equi-join part (used for hash join keys)
+/// - Everything else → residual part (applied as post-join filter)
+///
+/// Returns `(equi_part, residual_part)` where each is `Option<LogicalExpr>`.
+fn split_join_condition(
+    condition: &crate::sql::LogicalExpr,
+) -> (Option<crate::sql::LogicalExpr>, Option<crate::sql::LogicalExpr>) {
+    let mut equi_parts = Vec::new();
+    let mut residual_parts = Vec::new();
+
+    collect_and_terms(condition, &mut equi_parts, &mut residual_parts);
+
+    let equi = combine_with_and(equi_parts);
+    let residual = combine_with_and(residual_parts);
+
+    (equi, residual)
+}
+
+/// Check if a join condition is purely equi-join (only equality + AND).
+/// Used internally by HashJoinOperator to skip redundant condition re-evaluation.
+fn is_pure_equi_join(condition: &Option<crate::sql::LogicalExpr>) -> bool {
+    use crate::sql::{LogicalExpr, BinaryOperator};
+
+    fn check(expr: &LogicalExpr) -> bool {
+        match expr {
+            LogicalExpr::BinaryExpr { op: BinaryOperator::Eq, .. } => true,
+            LogicalExpr::BinaryExpr { left, op: BinaryOperator::And, right } => {
+                check(left) && check(right)
+            }
+            _ => false,
+        }
+    }
+
     match condition {
-        None => true, // Cross join - can use hash join with empty key
-        Some(expr) => is_equi_join_expr(expr),
+        None => true,
+        Some(expr) => check(expr),
     }
 }
 
-/// Recursively check if an expression is suitable for equi-join
-fn is_equi_join_expr(expr: &crate::sql::LogicalExpr) -> bool {
+/// Recursively collect AND-connected terms into equi-join and residual buckets
+fn collect_and_terms(
+    expr: &crate::sql::LogicalExpr,
+    equi: &mut Vec<crate::sql::LogicalExpr>,
+    residual: &mut Vec<crate::sql::LogicalExpr>,
+) {
     use crate::sql::{LogicalExpr, BinaryOperator};
 
     match expr {
-        LogicalExpr::BinaryExpr { left, op, right } => {
-            match op {
-                BinaryOperator::Eq => true, // Equality is perfect for hash join
-                BinaryOperator::And => {
-                    // Both sides must be equi-joins
-                    is_equi_join_expr(left) && is_equi_join_expr(right)
-                }
-                _ => false, // Other operators require nested loop
-            }
+        LogicalExpr::BinaryExpr { left, op: BinaryOperator::And, right } => {
+            collect_and_terms(left, equi, residual);
+            collect_and_terms(right, equi, residual);
         }
-        _ => false, // Complex expressions require nested loop
+        LogicalExpr::BinaryExpr { op: BinaryOperator::Eq, .. } => {
+            equi.push(expr.clone());
+        }
+        _ => {
+            residual.push(expr.clone());
+        }
     }
+}
+
+/// Combine a list of predicates with AND
+fn combine_with_and(parts: Vec<crate::sql::LogicalExpr>) -> Option<crate::sql::LogicalExpr> {
+    use crate::sql::{LogicalExpr, BinaryOperator};
+
+    parts.into_iter().reduce(|left, right| {
+        LogicalExpr::BinaryExpr {
+            left: Box::new(left),
+            op: BinaryOperator::And,
+            right: Box::new(right),
+        }
+    })
 }

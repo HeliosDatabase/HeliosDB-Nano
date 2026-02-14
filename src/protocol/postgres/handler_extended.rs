@@ -183,8 +183,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         tracing::debug!("Executing query: {}", executed_query);
 
         // Execute query
-        let query_upper = executed_query.trim().to_uppercase();
-        let is_select = query_upper.starts_with("SELECT");
+        let is_select = {
+            let t = executed_query.trim();
+            t.len() >= 6 && t.as_bytes()[..6].eq_ignore_ascii_case(b"SELECT")
+        };
 
         if is_select {
             // SELECT query - return result set

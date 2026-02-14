@@ -54,59 +54,14 @@ impl AggregateOperator {
         let input_schema = input.schema();
         let evaluator = crate::sql::Evaluator::with_parameters(input_schema.clone(), parameters);
 
-        // Collect all input tuples (with timeout checking)
-        let mut tuples = Vec::new();
-        while let Some(tuple) = input.next()? {
-            // Check timeout during materialization (blocking operation)
-            if let Some(ref ctx) = timeout_ctx {
-                ctx.check_timeout()?;
-            }
-            tuples.push(tuple);
-        }
-
-        // Group tuples by GROUP BY expressions
-        use std::collections::BTreeMap;
-        use crate::Value;
-
-        let mut groups: BTreeMap<GroupKey, Vec<Tuple>> = BTreeMap::new();
-
-        if group_by.is_empty() {
-            // No GROUP BY - single group containing all tuples
-            let key = GroupKey(vec![]); // Empty key for single group
-            groups.insert(key, tuples);
+        // Streaming fast path: no GROUP BY and all aggregates are streamable
+        let mut output_tuples = if group_by.is_empty() && Self::all_streamable(&aggr_exprs) {
+            let result = Self::streaming_aggregate(&mut input, &aggr_exprs, &evaluator, &timeout_ctx)?;
+            vec![Tuple::new(result)]
         } else {
-            // Group tuples by GROUP BY expressions
-            for tuple in tuples {
-                // Evaluate GROUP BY expressions to create group key
-                let key: Result<Vec<Value>> = group_by.iter()
-                    .map(|expr| evaluator.evaluate(expr, &tuple))
-                    .collect();
-                let key = GroupKey(key?);
-
-                groups.entry(key).or_insert_with(Vec::new).push(tuple);
-            }
-        }
-
-        // Compute aggregates for each group (with timeout checking)
-        let mut output_tuples = Vec::new();
-        for (group_key, group_tuples) in groups {
-            // Check timeout during aggregate computation (can be expensive)
-            if let Some(ref ctx) = timeout_ctx {
-                ctx.check_timeout()?;
-            }
-
-            // Evaluate aggregate expressions
-            let aggr_values: Result<Vec<Value>> = aggr_exprs.iter()
-                .map(|expr| Self::evaluate_aggregate(expr, &group_tuples, &evaluator))
-                .collect();
-            let mut aggr_values = aggr_values?;
-
-            // Combine group key + aggregate values
-            let mut output_values = group_key.0; // Unwrap GroupKey
-            output_values.append(&mut aggr_values);
-
-            output_tuples.push(Tuple::new(output_values));
-        }
+            // Standard materialization path
+            Self::materialized_aggregate(&mut input, &group_by, &aggr_exprs, &evaluator, &timeout_ctx)?
+        };
 
         // Build output schema: GROUP BY columns + aggregate columns
         use crate::DataType;
@@ -430,6 +385,260 @@ impl AggregateOperator {
             }
             // For other expression types, just clone them
             _ => expr.clone(),
+        }
+    }
+
+    /// Check if all aggregate expressions can be computed in a single streaming pass
+    fn all_streamable(aggr_exprs: &[crate::sql::LogicalExpr]) -> bool {
+        use crate::sql::{LogicalExpr, AggregateFunction};
+        aggr_exprs.iter().all(|expr| {
+            matches!(expr,
+                LogicalExpr::AggregateFunction { fun, distinct: false, .. }
+                if matches!(fun,
+                    AggregateFunction::Count | AggregateFunction::Sum |
+                    AggregateFunction::Avg | AggregateFunction::Min | AggregateFunction::Max
+                )
+            )
+        })
+    }
+
+    /// Compute aggregates in a single streaming pass (no GROUP BY, no DISTINCT).
+    /// Avoids materializing all input tuples — O(1) memory instead of O(N).
+    fn streaming_aggregate(
+        input: &mut Box<dyn PhysicalOperator>,
+        aggr_exprs: &[crate::sql::LogicalExpr],
+        evaluator: &crate::sql::Evaluator,
+        timeout_ctx: &Option<TimeoutContext>,
+    ) -> Result<Vec<crate::Value>> {
+        use crate::sql::{LogicalExpr, AggregateFunction};
+        use crate::Value;
+
+        // Initialize accumulators for each aggregate expression
+        let mut accumulators: Vec<StreamingAccumulator> = aggr_exprs.iter().map(|expr| {
+            if let LogicalExpr::AggregateFunction { fun, .. } = expr {
+                match fun {
+                    AggregateFunction::Count => StreamingAccumulator::Count(0),
+                    AggregateFunction::Sum => StreamingAccumulator::Sum(SumState::Empty),
+                    AggregateFunction::Avg => StreamingAccumulator::Avg { sum: 0.0, count: 0 },
+                    AggregateFunction::Min => StreamingAccumulator::Min(None),
+                    AggregateFunction::Max => StreamingAccumulator::Max(None),
+                    _ => StreamingAccumulator::Count(0), // unreachable due to all_streamable check
+                }
+            } else {
+                StreamingAccumulator::Count(0) // unreachable
+            }
+        }).collect();
+
+        // Process input tuples one at a time
+        while let Some(tuple) = input.next()? {
+            if let Some(ref ctx) = timeout_ctx {
+                ctx.check_timeout()?;
+            }
+
+            // Update each accumulator
+            for (i, expr) in aggr_exprs.iter().enumerate() {
+                if let LogicalExpr::AggregateFunction { args, .. } = expr {
+                    let arg_expr = args.first().ok_or_else(|| Error::query_execution(
+                        "Aggregate function has no arguments"
+                    ))?;
+
+                    // COUNT(*) doesn't need to evaluate the arg
+                    let val = if matches!(arg_expr, LogicalExpr::Wildcard) {
+                        Value::Null // sentinel — COUNT(*) counts all rows
+                    } else {
+                        evaluator.evaluate(arg_expr, &tuple)?
+                    };
+
+                    if let Some(acc) = accumulators.get_mut(i) {
+                        acc.update(&val, matches!(arg_expr, LogicalExpr::Wildcard))?;
+                    }
+                }
+            }
+        }
+
+        // Finalize accumulators into result values
+        accumulators.into_iter().map(|acc| acc.finalize()).collect()
+    }
+
+    /// Standard materialization path for GROUP BY queries
+    fn materialized_aggregate(
+        input: &mut Box<dyn PhysicalOperator>,
+        group_by: &[crate::sql::LogicalExpr],
+        aggr_exprs: &[crate::sql::LogicalExpr],
+        evaluator: &crate::sql::Evaluator,
+        timeout_ctx: &Option<TimeoutContext>,
+    ) -> Result<Vec<Tuple>> {
+        use std::collections::BTreeMap;
+        use crate::Value;
+
+        // Collect all input tuples
+        let mut tuples = Vec::new();
+        while let Some(tuple) = input.next()? {
+            if let Some(ref ctx) = timeout_ctx {
+                ctx.check_timeout()?;
+            }
+            tuples.push(tuple);
+        }
+
+        // Group tuples
+        let mut groups: BTreeMap<GroupKey, Vec<Tuple>> = BTreeMap::new();
+        if group_by.is_empty() {
+            let key = GroupKey(vec![]);
+            groups.insert(key, tuples);
+        } else {
+            for tuple in tuples {
+                let key: Result<Vec<Value>> = group_by.iter()
+                    .map(|expr| evaluator.evaluate(expr, &tuple))
+                    .collect();
+                let key = GroupKey(key?);
+                groups.entry(key).or_insert_with(Vec::new).push(tuple);
+            }
+        }
+
+        // Compute aggregates for each group
+        let mut output_tuples = Vec::new();
+        for (group_key, group_tuples) in groups {
+            if let Some(ref ctx) = timeout_ctx {
+                ctx.check_timeout()?;
+            }
+            let aggr_values: Result<Vec<Value>> = aggr_exprs.iter()
+                .map(|expr| Self::evaluate_aggregate(expr, &group_tuples, evaluator))
+                .collect();
+            let mut aggr_values = aggr_values?;
+            let mut output_values = group_key.0;
+            output_values.append(&mut aggr_values);
+            output_tuples.push(Tuple::new(output_values));
+        }
+
+        Ok(output_tuples)
+    }
+}
+
+/// Running sum state that preserves type (integer vs decimal)
+enum SumState {
+    Empty,
+    Int(i64),
+    Decimal(rust_decimal::Decimal),
+}
+
+/// Streaming accumulator for single-pass aggregation
+enum StreamingAccumulator {
+    Count(i64),
+    Sum(SumState),
+    Avg { sum: f64, count: u64 },
+    Min(Option<crate::Value>),
+    Max(Option<crate::Value>),
+}
+
+impl StreamingAccumulator {
+    fn update(&mut self, val: &crate::Value, is_wildcard: bool) -> Result<()> {
+        use crate::Value;
+        match self {
+            Self::Count(ref mut c) => {
+                // COUNT(*) counts all rows; COUNT(expr) skips NULLs
+                if is_wildcard || !matches!(val, Value::Null) {
+                    *c += 1;
+                }
+            }
+            Self::Sum(ref mut state) => {
+                if matches!(val, Value::Null) { return Ok(()); }
+                match val {
+                    Value::Int2(i) => match state {
+                        SumState::Empty => *state = SumState::Int(*i as i64),
+                        SumState::Int(s) => *s += *i as i64,
+                        SumState::Decimal(s) => *s += rust_decimal::Decimal::from(*i),
+                    },
+                    Value::Int4(i) => match state {
+                        SumState::Empty => *state = SumState::Int(*i as i64),
+                        SumState::Int(s) => *s += *i as i64,
+                        SumState::Decimal(s) => *s += rust_decimal::Decimal::from(*i),
+                    },
+                    Value::Int8(i) => match state {
+                        SumState::Empty => *state = SumState::Int(*i),
+                        SumState::Int(s) => *s += *i,
+                        SumState::Decimal(s) => *s += rust_decimal::Decimal::from(*i),
+                    },
+                    Value::Float4(f) => {
+                        let dec = rust_decimal::Decimal::try_from(*f as f64).unwrap_or_default();
+                        match state {
+                            SumState::Empty => *state = SumState::Decimal(dec),
+                            SumState::Int(s) => *state = SumState::Decimal(rust_decimal::Decimal::from(*s) + dec),
+                            SumState::Decimal(s) => *s += dec,
+                        }
+                    }
+                    Value::Float8(f) => {
+                        let dec = rust_decimal::Decimal::try_from(*f).unwrap_or_default();
+                        match state {
+                            SumState::Empty => *state = SumState::Decimal(dec),
+                            SumState::Int(s) => *state = SumState::Decimal(rust_decimal::Decimal::from(*s) + dec),
+                            SumState::Decimal(s) => *s += dec,
+                        }
+                    }
+                    Value::Numeric(n) => {
+                        let dec = n.parse::<rust_decimal::Decimal>().unwrap_or_default();
+                        match state {
+                            SumState::Empty => *state = SumState::Decimal(dec),
+                            SumState::Int(s) => *state = SumState::Decimal(rust_decimal::Decimal::from(*s) + dec),
+                            SumState::Decimal(s) => *s += dec,
+                        }
+                    }
+                    _ => return Err(Error::query_execution("SUM requires numeric values")),
+                }
+            }
+            Self::Avg { ref mut sum, ref mut count } => {
+                if matches!(val, Value::Null) { return Ok(()); }
+                match val {
+                    Value::Int2(i) => { *sum += *i as f64; *count += 1; }
+                    Value::Int4(i) => { *sum += *i as f64; *count += 1; }
+                    Value::Int8(i) => { *sum += *i as f64; *count += 1; }
+                    Value::Float4(f) => { *sum += *f as f64; *count += 1; }
+                    Value::Float8(f) => { *sum += *f; *count += 1; }
+                    Value::Numeric(n) => {
+                        if let Ok(f) = n.parse::<f64>() { *sum += f; *count += 1; }
+                    }
+                    _ => return Err(Error::query_execution("AVG requires numeric values")),
+                }
+            }
+            Self::Min(ref mut current) => {
+                if matches!(val, Value::Null) { return Ok(()); }
+                match current {
+                    None => *current = Some(val.clone()),
+                    Some(c) => {
+                        if compare_values(val, c) == std::cmp::Ordering::Less {
+                            *current = Some(val.clone());
+                        }
+                    }
+                }
+            }
+            Self::Max(ref mut current) => {
+                if matches!(val, Value::Null) { return Ok(()); }
+                match current {
+                    None => *current = Some(val.clone()),
+                    Some(c) => {
+                        if compare_values(val, c) == std::cmp::Ordering::Greater {
+                            *current = Some(val.clone());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finalize(self) -> Result<crate::Value> {
+        use crate::Value;
+        match self {
+            Self::Count(c) => Ok(Value::Int8(c)),
+            Self::Sum(state) => match state {
+                SumState::Empty => Ok(Value::Null),
+                SumState::Int(s) => Ok(Value::Int8(s)),
+                SumState::Decimal(s) => Ok(Value::Numeric(format!("{s}"))),
+            },
+            Self::Avg { sum, count } => {
+                if count == 0 { Ok(Value::Null) } else { Ok(Value::Float8(sum / count as f64)) }
+            }
+            Self::Min(v) => v.ok_or_else(|| Error::query_execution("MIN on empty set")),
+            Self::Max(v) => v.ok_or_else(|| Error::query_execution("MAX on empty set")),
         }
     }
 }

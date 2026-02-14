@@ -595,9 +595,12 @@ impl Session {
     /// Execute SQL query with parameters
     async fn execute_sql_with_params(&self, query: &str, params: &[Value]) -> Result<QueryResult, Error> {
         // Determine if this is a query or a command
-        let query_upper = query.trim().to_uppercase();
+        let trimmed = query.trim();
+        let is_query = trimmed.len() >= 6
+            && (trimmed.as_bytes()[..6].eq_ignore_ascii_case(b"SELECT")
+                || (trimmed.len() >= 4 && trimmed.as_bytes()[..4].eq_ignore_ascii_case(b"WITH")));
 
-        if query_upper.starts_with("SELECT") || query_upper.starts_with("WITH") {
+        if is_query {
             // Query - return rows
             // Convert Value params to &dyn Display for the query method
             let param_refs: Vec<&dyn std::fmt::Display> = params
@@ -628,15 +631,15 @@ impl Session {
                 self.db.execute(query)?
             };
 
-            let operation = if query_upper.starts_with("INSERT") {
+            let operation = if trimmed.len() >= 6 && trimmed.as_bytes()[..6].eq_ignore_ascii_case(b"INSERT") {
                 "INSERT 0"
-            } else if query_upper.starts_with("UPDATE") {
+            } else if trimmed.len() >= 6 && trimmed.as_bytes()[..6].eq_ignore_ascii_case(b"UPDATE") {
                 "UPDATE"
-            } else if query_upper.starts_with("DELETE") {
+            } else if trimmed.len() >= 6 && trimmed.as_bytes()[..6].eq_ignore_ascii_case(b"DELETE") {
                 "DELETE"
-            } else if query_upper.starts_with("CREATE") {
+            } else if trimmed.len() >= 6 && trimmed.as_bytes()[..6].eq_ignore_ascii_case(b"CREATE") {
                 "CREATE TABLE"
-            } else if query_upper.starts_with("DROP") {
+            } else if trimmed.len() >= 4 && trimmed.as_bytes()[..4].eq_ignore_ascii_case(b"DROP") {
                 "DROP TABLE"
             } else {
                 "OK"
