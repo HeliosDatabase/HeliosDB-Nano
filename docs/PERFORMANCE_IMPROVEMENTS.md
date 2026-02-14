@@ -109,6 +109,37 @@
 | Commit | 314ms (37.4%) | 319ms (22.1%) | +5ms |
 | Other | 1.1ms (0.1%) | 1.2ms (0.1%) | +0.1ms |
 
+## PG Wire Protocol Optimization (Over-the-Wire Benchmark)
+
+| # | Improvement | Description |
+|---|-------------|-------------|
+| 6 | **RowCache** | LRU cache for hot rows, integrated into `get_row_by_pk()` with DML invalidation |
+| 7 | **PG Protocol: TCP_NODELAY** | Disable Nagle's algorithm on accepted connections for low-latency responses |
+| 8 | **PG Protocol: BufWriter** | Wrap TcpStream in `tokio::io::BufWriter` to batch all writes into memory |
+| 9 | **PG Protocol: Single Flush** | Only flush at `ReadyForQuery` (end of response cycle), not per message |
+
+### Over-the-Wire Results (psycopg2, TCP, 10K rows)
+
+| Query | Before (ms) | After (ms) | Speedup |
+|-------|-------------|------------|---------|
+| PK lookup (cold) | 19.04 | 0.76 | **25.1x** |
+| PK lookup (hot) | 59.97 | 0.39 | **153.8x** |
+| PK lookup x100 | 6,027 | 39.24 | **153.6x** |
+| SELECT * (full scan) | 83.91 | 25.41 | **3.3x** |
+| COUNT(*) | 61.01 | 13.11 | **4.7x** |
+| GROUP BY | 62.96 | 13.09 | **4.8x** |
+| ORDER BY DESC | 91.54 | 29.93 | **3.1x** |
+| INNER JOIN | 79.97 | 20.48 | **3.9x** |
+| UPDATE (single) | 65.90 | 9.44 | **7.0x** |
+| Batch INSERT (1000) | 123,844 | 39,039 | **3.2x** |
+| Repeated query x100 | 6,292 | 1,163 | **5.4x** |
+| CREATE + DROP TABLE | 105.02 | 10.29 | **10.2x** |
+
+**Protocol overhead reduced from ~60ms to ~0.4ms per query (150x improvement).**
+
+The 0.39ms over-the-wire hot PK lookup is now within 2.3x of the in-engine 173μs,
+confirming that protocol overhead is no longer the bottleneck.
+
 ## Notes
 
 - The slight slowdown in some operations (-2-4%) is due to ART index maintenance overhead during INSERT/UPDATE/DELETE. Each DML now also updates the ART index, adding a small cost per write in exchange for dramatically faster PK lookups.

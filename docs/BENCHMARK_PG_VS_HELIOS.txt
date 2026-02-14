@@ -1,27 +1,8 @@
-HeliosDB Nano vs PostgreSQL — Performance Benchmark
-=======================================================
+HeliosDB Nano vs PostgreSQL — Performance Benchmark (Post-Optimization)
+=========================================================================
 
-[1/6] Connecting to PostgreSQL...
-  Connected: 127.0.0.1:5434/benchdb
-
-[2/6] Connecting to HeliosDB Nano...
-  Connected: 127.0.0.1:15440
-
-[3/6] Setting up schema...
-
-[4/6] Loading test data...
-  [PG] Loading 10000 rows into bench_main...
-  [PG] Loading 5000 rows into bench_orders...
-  [PG] Data loaded.
-  [HD] Loading 10000 rows into bench_main...
-  [HD] Loading 5000 rows into bench_orders...
-  [HD] Data loaded.
-
-[5/6] Running benchmarks (PostgreSQL)...
-
-[5/6] Running benchmarks (HeliosDB)...
-
-[6/6] Results:
+Protocol optimization applied: TCP_NODELAY + BufWriter + single flush at ReadyForQuery
+(Ported from HeliosDB Full edition's PG wire protocol implementation)
 
 =========================================================================================================
   HeliosDB Nano vs PostgreSQL 13 — Performance Benchmark
@@ -32,78 +13,114 @@ HeliosDB Nano vs PostgreSQL — Performance Benchmark
 
   Query                            PostgreSQL     HeliosDB      Ratio     Winner
   ------------------------------ ------------ ------------ ---------- ----------
-  PK lookup (cold)                     0.28ms      19.04ms      0.01x PostgreSQL
-  PK lookup (hot)                      0.06ms      59.97ms      0.00x PostgreSQL
-  PK lookup x100 (varied)              5.51ms    6026.98ms      0.00x PostgreSQL
-  SELECT * (full scan)                 7.48ms      83.91ms      0.09x PostgreSQL
-  SELECT WHERE age > 60                2.16ms      71.52ms      0.03x PostgreSQL
-  SELECT LIMIT 10                      0.06ms      58.02ms      0.00x PostgreSQL
-  SELECT proj+filter                   2.72ms      69.50ms      0.04x PostgreSQL
-  COUNT(*)                             0.39ms      61.01ms      0.01x PostgreSQL
-  AVG/SUM/MIN/MAX                      1.00ms      63.00ms      0.02x PostgreSQL
-  GROUP BY category                    1.87ms      62.96ms      0.03x PostgreSQL
-  GROUP BY + HAVING                    1.68ms      61.00ms      0.03x PostgreSQL
-  ORDER BY score DESC                  8.47ms      91.54ms      0.09x PostgreSQL
-  ORDER BY (multi-col)                15.44ms     117.08ms      0.13x PostgreSQL
-  INNER JOIN                           0.71ms      79.97ms      0.01x PostgreSQL
-  LEFT JOIN                            0.54ms      79.98ms      0.01x PostgreSQL
-  IN (subquery)                        2.05ms     331.27ms      0.01x PostgreSQL
-  INSERT single + commit               3.54ms     157.98ms      0.02x PostgreSQL
-  UPDATE single + commit               0.46ms      65.90ms      0.01x PostgreSQL
-  Batch INSERT (1000 rows)            57.62ms  123843.96ms      0.00x PostgreSQL
-  Repeated query x100                 49.25ms    6291.98ms      0.01x PostgreSQL
-  CREATE + DROP TABLE                  9.25ms     105.02ms      0.09x PostgreSQL
+  PK lookup (cold)                     0.54ms       0.76ms      0.72x PostgreSQL
+  PK lookup (hot)                      0.05ms       0.39ms      0.14x PostgreSQL
+  PK lookup x100 (varied)              5.47ms      39.24ms      0.14x PostgreSQL
+  SELECT * (full scan)                 7.79ms      25.41ms      0.31x PostgreSQL
+  SELECT WHERE age > 60                2.71ms      14.08ms      0.19x PostgreSQL
+  SELECT LIMIT 10                      0.06ms      11.80ms      0.01x PostgreSQL
+  SELECT proj+filter                   3.11ms      14.12ms      0.22x PostgreSQL
+  COUNT(*)                             0.56ms      13.11ms      0.04x PostgreSQL
+  AVG/SUM/MIN/MAX                      1.37ms      15.47ms      0.09x PostgreSQL
+  GROUP BY category                    2.56ms      13.09ms      0.20x PostgreSQL
+  GROUP BY + HAVING                    1.87ms      17.38ms      0.11x PostgreSQL
+  ORDER BY score DESC                  7.91ms      29.93ms      0.26x PostgreSQL
+  ORDER BY (multi-col)                15.53ms      43.32ms      0.36x PostgreSQL
+  INNER JOIN                           0.74ms      20.48ms      0.04x PostgreSQL
+  LEFT JOIN                            0.55ms      22.01ms      0.02x PostgreSQL
+  IN (subquery)                        2.07ms     242.82ms      0.01x PostgreSQL
+  INSERT single + commit               0.42ms      57.45ms      0.01x PostgreSQL
+  UPDATE single + commit               0.46ms       9.44ms      0.05x PostgreSQL
+  Batch INSERT (1000 rows)            50.91ms   39038.82ms      0.00x PostgreSQL
+  Repeated query x100                 51.08ms    1163.01ms      0.04x PostgreSQL
+  CREATE + DROP TABLE                  2.92ms      10.29ms      0.28x PostgreSQL
   ------------------------------ ------------ ------------ ---------- ----------
 
   Summary: PostgreSQL wins 21/21, HeliosDB wins 0/21, ties 0/21
+
+=========================================================================================================
+  Improvement vs Pre-Optimization Baseline
+=========================================================================================================
+
+  Query                          Before (ms)  After (ms)   Speedup
+  ------------------------------ ----------- ----------- ---------
+  PK lookup (cold)                    19.04        0.76     25.1x
+  PK lookup (hot)                     59.97        0.39    153.8x
+  PK lookup x100 (varied)          6026.98       39.24    153.6x
+  SELECT * (full scan)                83.91       25.41      3.3x
+  SELECT WHERE age > 60               71.52       14.08      5.1x
+  SELECT LIMIT 10                     58.02       11.80      4.9x
+  SELECT proj+filter                  69.50       14.12      4.9x
+  COUNT(*)                            61.01       13.11      4.7x
+  AVG/SUM/MIN/MAX                     63.00       15.47      4.1x
+  GROUP BY category                   62.96       13.09      4.8x
+  GROUP BY + HAVING                   61.00       17.38      3.5x
+  ORDER BY score DESC                 91.54       29.93      3.1x
+  ORDER BY (multi-col)               117.08       43.32      2.7x
+  INNER JOIN                          79.97       20.48      3.9x
+  LEFT JOIN                           79.98       22.01      3.6x
+  IN (subquery)                      331.27      242.82      1.4x
+  INSERT single + commit             157.98       57.45      2.7x
+  UPDATE single + commit              65.90        9.44      7.0x
+  Batch INSERT (1000 rows)       123843.96    39038.82      3.2x
+  Repeated query x100              6291.98     1163.01      5.4x
+  CREATE + DROP TABLE                105.02       10.29     10.2x
+  ------------------------------ ----------- ----------- ---------
+
+  Protocol overhead: 59.97ms → 0.39ms (153.8x reduction)
 
 =========================================================================================================
   Feature Analysis
 =========================================================================================================
 
   [ART Index + RowCache] — ART index for O(k) PK lookups + RowCache for hot-row caching
-    PK lookup (cold)               PG=0.28ms  HD=19.04ms  → PostgreSQL 68.5x faster
-    PK lookup (hot)                PG=0.06ms  HD=59.97ms  → PostgreSQL 951.3x faster
-    PK lookup x100 (varied)        PG=5.51ms  HD=6026.98ms  → PostgreSQL 1094.8x faster
+    PK lookup (cold)               PG=0.54ms  HD=0.76ms  → PostgreSQL 1.4x faster
+    PK lookup (hot)                PG=0.05ms  HD=0.39ms  → PostgreSQL 7.3x faster
+    PK lookup x100 (varied)        PG=5.47ms  HD=39.24ms  → PostgreSQL 7.2x faster
 
   [Plan/Parse Cache] — LRU caches for parsed ASTs (512) and logical plans (256)
-    Repeated query x100            PG=49.25ms  HD=6291.98ms  → PostgreSQL 127.7x faster
+    Repeated query x100            PG=51.08ms  HD=1163.01ms  → PostgreSQL 22.8x faster
 
   [Batch Commit] — Single-transaction bulk inserts amortize commit overhead
-    Batch INSERT (1000 rows)       PG=57.62ms  HD=123843.96ms  → PostgreSQL 2149.4x faster
+    Batch INSERT (1000 rows)       PG=50.91ms  HD=39038.82ms  → PostgreSQL 766.8x faster
 
   [Read Performance] — Full scans, filters, aggregations
-    SELECT * (full scan)           PG=7.48ms  HD=83.91ms  → PostgreSQL 11.2x faster
-    SELECT WHERE age > 60          PG=2.16ms  HD=71.52ms  → PostgreSQL 33.1x faster
-    SELECT LIMIT 10                PG=0.06ms  HD=58.02ms  → PostgreSQL 958.0x faster
-    SELECT proj+filter             PG=2.72ms  HD=69.50ms  → PostgreSQL 25.5x faster
-    COUNT(*)                       PG=0.39ms  HD=61.01ms  → PostgreSQL 154.9x faster
-    AVG/SUM/MIN/MAX                PG=1.00ms  HD=63.00ms  → PostgreSQL 63.3x faster
+    SELECT * (full scan)           PG=7.79ms  HD=25.41ms  → PostgreSQL 3.3x faster
+    SELECT WHERE age > 60          PG=2.71ms  HD=14.08ms  → PostgreSQL 5.2x faster
+    SELECT LIMIT 10                PG=0.06ms  HD=11.80ms  → PostgreSQL 182.3x faster
+    SELECT proj+filter             PG=3.11ms  HD=14.12ms  → PostgreSQL 4.5x faster
+    COUNT(*)                       PG=0.56ms  HD=13.11ms  → PostgreSQL 23.2x faster
+    AVG/SUM/MIN/MAX                PG=1.37ms  HD=15.47ms  → PostgreSQL 11.3x faster
 
   [Advanced Queries] — GROUP BY, ORDER BY, JOINs, subqueries
-    GROUP BY category              PG=1.87ms  HD=62.96ms  → PostgreSQL 33.6x faster
-    GROUP BY + HAVING              PG=1.68ms  HD=61.00ms  → PostgreSQL 36.3x faster
-    ORDER BY score DESC            PG=8.47ms  HD=91.54ms  → PostgreSQL 10.8x faster
-    INNER JOIN                     PG=0.71ms  HD=79.97ms  → PostgreSQL 113.4x faster
-    LEFT JOIN                      PG=0.54ms  HD=79.98ms  → PostgreSQL 148.0x faster
-    IN (subquery)                  PG=2.05ms  HD=331.27ms  → PostgreSQL 161.4x faster
+    GROUP BY category              PG=2.56ms  HD=13.09ms  → PostgreSQL 5.1x faster
+    GROUP BY + HAVING              PG=1.87ms  HD=17.38ms  → PostgreSQL 9.3x faster
+    ORDER BY score DESC            PG=7.91ms  HD=29.93ms  → PostgreSQL 3.8x faster
+    INNER JOIN                     PG=0.74ms  HD=20.48ms  → PostgreSQL 27.8x faster
+    LEFT JOIN                      PG=0.55ms  HD=22.01ms  → PostgreSQL 40.1x faster
+    IN (subquery)                  PG=2.07ms  HD=242.82ms  → PostgreSQL 117.4x faster
 
   [Write Performance] — Single-row DML with commit
-    INSERT single + commit         PG=3.54ms  HD=157.98ms  → PostgreSQL 44.6x faster
-    UPDATE single + commit         PG=0.46ms  HD=65.90ms  → PostgreSQL 141.9x faster
+    INSERT single + commit         PG=0.42ms  HD=57.45ms  → PostgreSQL 135.5x faster
+    UPDATE single + commit         PG=0.46ms  HD=9.44ms  → PostgreSQL 20.7x faster
 
   [DDL] — Schema operations
-    CREATE + DROP TABLE            PG=9.25ms  HD=105.02ms  → PostgreSQL 11.4x faster
+    CREATE + DROP TABLE            PG=2.92ms  HD=10.29ms  → PostgreSQL 3.5x faster
 
 =========================================================================================================
   Protocol Overhead Analysis
 =========================================================================================================
 
-  HeliosDB minimum query time: 19.04ms (protocol + connection overhead)
-  PostgreSQL minimum query time: 0.06ms
+  HeliosDB minimum query time: 0.39ms (protocol + connection overhead)
+  PostgreSQL minimum query time: 0.05ms
 
-  NOTE: HeliosDB Nano is an embedded database optimized for in-process use.
-  The ~19ms floor per query reflects PG wire protocol overhead (TCP + framing).
+  Optimization applied:
+    1. TCP_NODELAY on accepted connections (disables Nagle's algorithm)
+    2. BufWriter wrapping on TcpStream (batches all writes in memory)
+    3. Single flush() at ReadyForQuery (one TCP packet per response cycle)
+
+  Result: Protocol overhead reduced from ~60ms to ~0.4ms per query (150x improvement)
+
   Internal engine benchmarks (cargo test --test pipeline_performance_test) show:
     - PK point lookup:  406μs (cold) / 173μs (hot with RowCache)
     - Full scan 10K:    7.1ms
@@ -111,8 +128,7 @@ HeliosDB Nano vs PostgreSQL — Performance Benchmark
     - GROUP BY:         6.8ms
     - INNER JOIN:       11.0ms
 
-  For fair comparison, HeliosDB should be used as an embedded library (no network),
-  or the PG wire protocol server should be optimized for connection pooling and
-  prepared statements to amortize the per-query protocol overhead.
+  The 0.39ms over-the-wire hot PK lookup is now within 2.3x of the in-engine 0.17ms,
+  confirming that protocol overhead is no longer the bottleneck.
 
 =========================================================================================================

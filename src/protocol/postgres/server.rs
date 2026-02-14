@@ -159,6 +159,11 @@ impl PgServer {
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
+                    // Disable Nagle's algorithm for low-latency query responses
+                    if let Err(e) = stream.set_nodelay(true) {
+                        tracing::warn!("Failed to set TCP_NODELAY for {}: {}", addr, e);
+                    }
+
                     // Enforce max_connections via semaphore
                     let permit = match Arc::clone(&self.connection_limiter).try_acquire_owned() {
                         Ok(permit) => permit,

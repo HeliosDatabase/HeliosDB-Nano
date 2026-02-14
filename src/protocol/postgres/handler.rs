@@ -13,12 +13,16 @@ use super::catalog::PgCatalog;
 use super::prepared::PreparedStatementManager;
 use super::ssl::SecureConnection;
 use bytes::BytesMut;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 use std::sync::Arc;
 
 /// PostgreSQL connection handler
-pub struct PgConnectionHandler<S = TcpStream> {
+///
+/// Uses `BufWriter` to batch all write_all() calls into a single TCP packet,
+/// flushed once at the end of each response cycle (ReadyForQuery). Combined
+/// with TCP_NODELAY on the socket, this minimizes both syscalls and latency.
+pub struct PgConnectionHandler<S = BufWriter<TcpStream>> {
     stream: S,
     pub(super) database: Arc<EmbeddedDatabase>,
     auth_manager: Arc<AuthManager>,
@@ -31,8 +35,8 @@ pub struct PgConnectionHandler<S = TcpStream> {
     scram_state: Option<ScramAuthState>,
 }
 
-impl PgConnectionHandler<TcpStream> {
-    /// Create a new connection handler with TcpStream
+impl PgConnectionHandler<BufWriter<TcpStream>> {
+    /// Create a new connection handler with TcpStream (wrapped in BufWriter)
     pub fn new(
         stream: TcpStream,
         database: Arc<EmbeddedDatabase>,
@@ -45,7 +49,7 @@ impl PgConnectionHandler<TcpStream> {
         }
 
         Self {
-            stream,
+            stream: BufWriter::new(stream),
             database,
             auth_manager,
             catalog: PgCatalog::new(),
@@ -59,8 +63,8 @@ impl PgConnectionHandler<TcpStream> {
     }
 }
 
-impl PgConnectionHandler<SecureConnection<TcpStream>> {
-    /// Create a new connection handler with SecureConnection
+impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
+    /// Create a new connection handler with SecureConnection (wrapped in BufWriter)
     pub fn new_with_stream(
         stream: SecureConnection<TcpStream>,
         database: Arc<EmbeddedDatabase>,
@@ -73,7 +77,7 @@ impl PgConnectionHandler<SecureConnection<TcpStream>> {
         }
 
         Self {
-            stream,
+            stream: BufWriter::new(stream),
             database,
             auth_manager,
             catalog: PgCatalog::new(),
@@ -180,6 +184,7 @@ where
                     self.send_message(BackendMessage::Authentication(
                         AuthenticationMessage::CleartextPassword
                     )).await?;
+                    self.flush().await?; // Client must read challenge before responding
 
                     // Wait for password message
                     if let Some(FrontendMessage::PasswordMessage { password }) = self.read_message().await? {
@@ -514,6 +519,7 @@ where
         self.send_message(BackendMessage::Authentication(
             AuthenticationMessage::ScramSha256
         )).await?;
+        self.flush().await?; // Client must read challenge before responding
 
         // Wait for client-first-message (SASL initial response)
         let client_first = match self.read_message().await? {
@@ -565,6 +571,7 @@ where
                 data: server_first.as_bytes().to_vec(),
             }
         )).await?;
+        self.flush().await?; // Client must read continue before responding
 
         // Wait for client-final-message
         let client_final = match self.read_message().await? {
@@ -683,15 +690,20 @@ where
         Ok(())
     }
 
-    /// Send a backend message
+    /// Send a backend message (write only, no flush).
+    /// Caller is responsible for flushing at the end of a response cycle.
     pub(super) async fn send_message(&mut self, msg: BackendMessage) -> Result<()> {
         let mut buf = BytesMut::new();
         msg.encode(&mut buf);
         self.stream.write_all(&buf).await
             .map_err(|e| Error::network(format!("Failed to send message: {}", e)))?;
-        self.stream.flush().await
-            .map_err(|e| Error::network(format!("Failed to flush stream: {}", e)))?;
         Ok(())
+    }
+
+    /// Flush all buffered writes to the client.
+    async fn flush(&mut self) -> Result<()> {
+        self.stream.flush().await
+            .map_err(|e| Error::network(format!("Failed to flush stream: {}", e)))
     }
 
     /// Send authentication OK
@@ -707,11 +719,12 @@ where
         }).await
     }
 
-    /// Send ready for query
+    /// Send ready for query (flushes all buffered writes)
     async fn send_ready_for_query(&mut self) -> Result<()> {
         self.send_message(BackendMessage::ReadyForQuery {
             status: self.transaction_status,
-        }).await
+        }).await?;
+        self.flush().await
     }
 
     /// Send command complete
