@@ -255,9 +255,13 @@ impl StorageEngine {
         opts.set_block_based_table_factory(&block_opts);
 
         opts.set_write_buffer_size(write_buffer_size);
-        // Additional performance tuning
+        // Write path performance tuning
         opts.set_max_write_buffer_number(4); // Allow more concurrent memtables
+        opts.set_min_write_buffer_number_to_merge(2); // Merge memtables before flush (reduces write amp)
         opts.set_level_zero_file_num_compaction_trigger(4);
+        opts.set_max_background_jobs(4); // Concurrent compaction/flush threads
+        opts.set_bytes_per_sync(1048576); // Sync every 1MB to reduce fsync overhead
+        opts.set_enable_pipelined_write(true); // Pipeline WAL + memtable writes
 
         let db = DB::open(&opts, path)
             .map_err(|e| Error::storage(format!("Failed to open RocksDB: {}", e)))?;
@@ -448,6 +452,13 @@ impl StorageEngine {
 
         let mut opts = Options::default();
         opts.create_if_missing(true);
+        // In-memory optimizations: maximize write speed, minimize fsync
+        opts.set_write_buffer_size(64 * 1024 * 1024); // 64MB write buffer (large for in-memory)
+        opts.set_max_write_buffer_number(4);
+        opts.set_min_write_buffer_number_to_merge(2);
+        opts.set_level_zero_file_num_compaction_trigger(8); // Delay compaction
+        opts.set_max_background_jobs(2);
+        opts.set_enable_pipelined_write(true);
 
         let db = DB::open(&opts, temp_dir.path())
             .map_err(|e| Error::storage(format!("Failed to open in-memory RocksDB: {}", e)))?;
@@ -1336,6 +1347,19 @@ impl StorageEngine {
             // Log to WAL for durability/replication
             self.log_data_insert(table_name, &key, &value)?;
 
+            // Update ART index for PK/unique constraint indexes
+            {
+                let mut col_values = std::collections::HashMap::new();
+                for (i, col) in schema.columns.iter().enumerate() {
+                    if let Some(v) = tuple.values.get(i) {
+                        col_values.insert(col.name.clone(), v.clone());
+                    }
+                }
+                if let Err(e) = self.art_index_manager.on_insert(table_name, row_id, &col_values) {
+                    tracing::debug!("ART index insert for table '{}': {}", table_name, e);
+                }
+            }
+
             // Skip delta tracking in bulk load mode for improved performance
             if !bulk_mode {
                 // Record delta for incremental MV refresh
@@ -1463,6 +1487,117 @@ impl StorageEngine {
             "Table scan complete"
         );
         Ok(tuples)
+    }
+
+    /// Look up a single row by primary key value using the ART index.
+    ///
+    /// This is significantly faster than a full table scan for point lookups
+    /// because it uses the ART index to find the row_id, then does a direct
+    /// key-value lookup in RocksDB instead of iterating over all rows.
+    ///
+    /// Returns `Ok(Some(tuple))` if found, `Ok(None)` if no matching row exists.
+    pub fn get_row_by_pk(&self, table_name: &str, pk_value: &crate::Value) -> Result<Option<Tuple>> {
+        let lookup_start = std::time::Instant::now();
+
+        // Get the PK index for this table
+        let pk_index = match self.art_index_manager.get_pk_index(table_name) {
+            Some(idx) => idx,
+            None => return Ok(None), // No PK index, can't do point lookup
+        };
+
+        // Encode the PK value to the ART key format
+        let key = super::art_manager::ArtIndexManager::encode_key(&[pk_value.clone()]);
+
+        // Look up the row_id in the ART index
+        let row_id = match pk_index.get(&key) {
+            Some(rid) => rid,
+            None => {
+                tracing::debug!(
+                    phase = "index_lookup",
+                    table = table_name,
+                    duration_us = lookup_start.elapsed().as_micros() as u64,
+                    "PK index lookup: no match"
+                );
+                return Ok(None);
+            }
+        };
+
+        // Check row cache before going to storage
+        if let Some(cached) = self.row_cache.get(table_name, row_id) {
+            tracing::debug!(
+                phase = "index_lookup",
+                table = table_name,
+                duration_us = lookup_start.elapsed().as_micros() as u64,
+                cache = "hit",
+                "PK point lookup: row cache hit"
+            );
+            return Ok(Some(cached));
+        }
+
+        // Construct the storage key and fetch directly
+        let storage_key = self.branch_aware_data_key(table_name, row_id);
+        let raw_value = match self.get(&storage_key)? {
+            Some(v) => v,
+            None => return Ok(None), // Key in index but not in storage (shouldn't happen)
+        };
+
+        // Deserialize the tuple
+        let mut tuple: Tuple = bincode::deserialize(&raw_value)
+            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+        tuple.row_id = Some(row_id);
+
+        // Resolve per-column storage references
+        let catalog = Catalog::new(self);
+        if let Ok(schema) = catalog.get_table_schema(table_name) {
+            for (idx, column) in schema.columns.iter().enumerate() {
+                if idx >= tuple.values.len() {
+                    break;
+                }
+                match column.storage_mode {
+                    ColumnStorageMode::Dictionary => {
+                        if let Some(crate::Value::DictRef { dict_id }) = tuple.values.get(idx) {
+                            let dict_id = *dict_id;
+                            let s = self.dict_manager.decode(&self.db, table_name, &column.name, dict_id)?;
+                            if let Some(val) = tuple.values.get_mut(idx) {
+                                *val = crate::Value::String(s);
+                            }
+                        }
+                    }
+                    ColumnStorageMode::ContentAddressed => {
+                        if let Some(crate::Value::CasRef { hash }) = tuple.values.get(idx) {
+                            let hash = hash.clone();
+                            let resolved = ContentAddressedStore::resolve(&self.db, &hash, &column.data_type)?;
+                            if let Some(val) = tuple.values.get_mut(idx) {
+                                *val = resolved;
+                            }
+                        }
+                    }
+                    ColumnStorageMode::Columnar => {
+                        if matches!(tuple.values.get(idx), Some(crate::Value::ColumnarRef)) {
+                            if let Some(val) = ColumnarStore::get(&self.db, table_name, &column.name, row_id)? {
+                                if let Some(slot) = tuple.values.get_mut(idx) {
+                                    *slot = val;
+                                }
+                            }
+                        }
+                    }
+                    ColumnStorageMode::Default => {}
+                }
+            }
+        }
+
+        // Populate row cache with resolved tuple
+        self.row_cache.put(table_name, row_id, tuple.clone());
+
+        tracing::debug!(
+            phase = "index_lookup",
+            table = table_name,
+            duration_us = lookup_start.elapsed().as_micros() as u64,
+            cache = "miss",
+            "PK point lookup: fetched from storage, cached"
+        );
+
+        Ok(Some(tuple))
     }
 
     /// Scan table with storage-level predicate pushdown filtering
@@ -3528,6 +3663,19 @@ impl StorageEngine {
         // Log to WAL for durability/replication
         self.log_data_insert(table_name, &key, &value)?;
 
+        // Update ART index for PK/unique constraint indexes
+        {
+            let mut col_values = std::collections::HashMap::new();
+            for (i, col) in schema.columns.iter().enumerate() {
+                if let Some(v) = tuple.values.get(i) {
+                    col_values.insert(col.name.clone(), v.clone());
+                }
+            }
+            if let Err(e) = self.art_index_manager.on_insert(table_name, row_id, &col_values) {
+                tracing::debug!("ART index insert for table '{}': {}", table_name, e);
+            }
+        }
+
         // Write versioned copy (for time-travel queries)
         self.snapshot_manager.write_version(table_name, row_id, timestamp, &value)?;
 
@@ -4650,6 +4798,9 @@ impl StorageEngine {
                 }
             }
 
+            // Invalidate row cache entry (stale after update)
+            self.row_cache.invalidate(table_name, row_id);
+
             update_count += 1;
         }
 
@@ -4748,6 +4899,9 @@ impl StorageEngine {
                     }
                 }
 
+                // Invalidate row cache entry (row deleted)
+                self.row_cache.invalidate(table_name, *row_id);
+
                 delete_count += 1;
             }
 
@@ -4815,6 +4969,9 @@ impl StorageEngine {
                     self.filter_delta_tracker.on_delete(table_name, row_id, tuple, schema);
                 }
             }
+
+            // Invalidate row cache entry (row deleted on branch)
+            self.row_cache.invalidate(table_name, row_id);
 
             delete_count += 1;
         }

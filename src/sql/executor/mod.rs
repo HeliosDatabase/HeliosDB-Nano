@@ -418,6 +418,90 @@ impl<'a> Executor<'a> {
         }
     }
 
+    /// Try to use PK ART index for a point lookup when we have Filter(Scan) with `pk_col = literal`.
+    /// Returns Some(operator) if successful, None if not applicable.
+    fn try_index_point_lookup(
+        &self,
+        input: &LogicalPlan,
+        predicate: &crate::sql::LogicalExpr,
+    ) -> Result<Option<Box<dyn PhysicalOperator>>> {
+        use crate::sql::LogicalExpr;
+        use crate::sql::BinaryOperator;
+
+        // Only works with a Scan input and storage available
+        let storage = match self.storage {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        let (table_name, alias, schema, projection, as_of) = match input {
+            LogicalPlan::Scan { table_name, alias, schema, projection, as_of } => {
+                (table_name, alias, schema, projection, as_of)
+            }
+            _ => return Ok(None),
+        };
+
+        // Skip time-travel queries (need snapshot logic)
+        if as_of.is_some() {
+            return Ok(None);
+        }
+
+        // Find the PK column
+        let pk_col = match schema.columns.iter().find(|c| c.primary_key) {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        // Check if predicate is `pk_col = literal` or `literal = pk_col`
+        let pk_value = match predicate {
+            LogicalExpr::BinaryExpr { left, op: BinaryOperator::Eq, right } => {
+                match (left.as_ref(), right.as_ref()) {
+                    (LogicalExpr::Column { name, .. }, LogicalExpr::Literal(val))
+                        if name == &pk_col.name => Some(val.clone()),
+                    (LogicalExpr::Literal(val), LogicalExpr::Column { name, .. })
+                        if name == &pk_col.name => Some(val.clone()),
+                    // Handle parameterized query: pk_col = $1
+                    (LogicalExpr::Column { name, .. }, LogicalExpr::Parameter { index })
+                        if name == &pk_col.name => {
+                        self.parameters.get(index.saturating_sub(1)).cloned()
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        };
+
+        let pk_value = match pk_value {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        // Try the ART index lookup
+        let tuple = storage.get_row_by_pk(table_name, &pk_value)?;
+
+        // Build schema with source_table set for JOIN disambiguation
+        let source_alias = alias.as_deref().unwrap_or(table_name);
+        let mut schema_cols = schema.columns.clone();
+        for col in &mut schema_cols {
+            col.source_table = Some(source_alias.to_string());
+            col.source_table_name = Some(table_name.clone());
+        }
+        let actual_schema = Arc::new(Schema { columns: schema_cols });
+
+        let tuples = match tuple {
+            Some(t) => vec![t],
+            None => vec![],
+        };
+
+        Ok(Some(Box::new(scan::ScanOperator::new(
+            table_name.clone(),
+            actual_schema,
+            projection.clone(),
+            tuples,
+            self.parameters.clone(),
+        ).with_timeout(self.timeout_ctx()))))
+    }
+
     /// Convert a logical plan to a physical operator
     pub(crate) fn plan_to_operator(&mut self, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
         match plan {
@@ -428,6 +512,10 @@ impl<'a> Executor<'a> {
                 scan::handle_filtered_scan(self, plan)
             }
             LogicalPlan::Filter { input, predicate } => {
+                // Try PK index-based point lookup for Filter(Scan) with equality predicate
+                if let Some(result) = self.try_index_point_lookup(input, predicate)? {
+                    return Ok(result);
+                }
                 let input_op = self.plan_to_operator(input)?;
                 // Materialize any IN subqueries before creating the filter
                 let materialized_predicate = self.materialize_subqueries(predicate)?;

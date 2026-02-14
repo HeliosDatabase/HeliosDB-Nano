@@ -373,6 +373,40 @@ pub struct EmbeddedDatabase {
     prepared_statements: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, sql::LogicalPlan>>>,
     /// Active savepoints stack (name -> transaction state)
     savepoints: std::sync::Arc<parking_lot::RwLock<Vec<SavepointState>>>,
+    /// Plan cache: SQL string → LogicalPlan (LRU, skips parse+plan for repeated queries)
+    plan_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, sql::LogicalPlan>>>,
+    /// Parse cache: SQL string → AST Statement (LRU, skips SQL parsing for repeated queries)
+    parse_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, sqlparser::ast::Statement>>>,
+}
+
+impl Drop for EmbeddedDatabase {
+    fn drop(&mut self) {
+        // Signal the auto-refresh worker to stop (non-blocking)
+        if let Some(ref worker) = *self.auto_refresh_worker.read() {
+            worker.request_stop();
+        }
+
+        // Clear session transactions
+        self.session_transactions.clear();
+
+        // Clear prepared statements
+        self.prepared_statements.write().clear();
+
+        // Clear plan cache
+        if let Ok(mut cache) = self.plan_cache.lock() {
+            cache.clear();
+        }
+
+        // Clear parse cache
+        if let Ok(mut cache) = self.parse_cache.lock() {
+            cache.clear();
+        }
+
+        // Clear savepoints
+        self.savepoints.write().clear();
+
+        tracing::debug!("EmbeddedDatabase dropped, resources cleaned up");
+    }
 }
 
 /// Savepoint state for nested transaction support
@@ -608,9 +642,8 @@ impl EmbeddedDatabase {
             // HA Switchover commands (ha-tier1 feature)
             plan
         } else {
-            // Regular SQL - parse normally
-            let parser = sql::Parser::new();
-            let statement = parser.parse_one(sql)?;
+            // Regular SQL - parse with cache
+            let (statement, _) = self.parse_cached(sql)?;
 
             // Create logical plan with catalog access and original SQL for time-travel parsing
             let catalog = self.storage.catalog();
@@ -1031,6 +1064,19 @@ impl EmbeddedDatabase {
                     // Log to WAL for replication (txn.put bypasses normal WAL logging)
                     self.storage.log_data_insert(table_name, &key, &val)?;
 
+                    // Update ART index for PK/unique constraint lookups
+                    {
+                        let mut col_values = std::collections::HashMap::new();
+                        for (i, col) in schema.columns.iter().enumerate() {
+                            if let Some(v) = tuple.values.get(i) {
+                                col_values.insert(col.name.clone(), v.clone());
+                            }
+                        }
+                        if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
+                            tracing::debug!("ART index insert for '{}': {}", table_name, e);
+                        }
+                    }
+
                     count += 1;
 
                     // Collect tuple for RETURNING clause
@@ -1215,6 +1261,9 @@ impl EmbeddedDatabase {
 
                     // Log to WAL for crash recovery (txn.put bypasses normal WAL logging)
                     self.storage.log_data_update(table_name, &key, &value)?;
+
+                    // Invalidate row cache (stale after update)
+                    self.storage.row_cache().invalidate(table_name, *row_id);
                 }
 
                 // Update storage quota tracking (UPDATEs may change storage size)
@@ -1434,6 +1483,9 @@ impl EmbeddedDatabase {
                     for row_id in &row_ids_to_delete {
                         let delete_key = format!("bdel:{}:{}:{}", branch_id, table_name, row_id).into_bytes();
                         txn.put(delete_key, vec![])?;
+
+                        // Invalidate row cache (row deleted on branch)
+                        self.storage.row_cache().invalidate(table_name, *row_id);
                     }
                 } else {
                     // Main branch: actual key deletion
@@ -1443,6 +1495,9 @@ impl EmbeddedDatabase {
 
                         // Log to WAL for crash recovery (txn.delete bypasses normal WAL logging)
                         self.storage.log_data_delete(table_name, &key)?;
+
+                        // Invalidate row cache (row deleted)
+                        self.storage.row_cache().invalidate(table_name, *row_id);
                     }
                 }
 
@@ -1893,6 +1948,8 @@ impl EmbeddedDatabase {
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
             prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
+            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()))),
+            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).unwrap()))),
         })
     }
 
@@ -1945,6 +2002,8 @@ impl EmbeddedDatabase {
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
             prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
+            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()))),
+            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).unwrap()))),
         })
     }
 
@@ -2006,6 +2065,8 @@ impl EmbeddedDatabase {
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
             prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
+            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()))),
+            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).unwrap()))),
         })
     }
 
@@ -2073,6 +2134,44 @@ impl EmbeddedDatabase {
                 );
             }
         }
+    }
+
+    /// Execute multiple SQL statements in a single transaction (batch mode).
+    ///
+    /// All statements share one BEGIN/COMMIT cycle, dramatically reducing
+    /// commit overhead for bulk operations. If any statement fails, the
+    /// entire batch is rolled back.
+    ///
+    /// # Returns
+    ///
+    /// Total number of rows affected across all statements.
+    pub fn execute_batch(&self, statements: &[&str]) -> Result<u64> {
+        let start = std::time::Instant::now();
+
+        let txn_start = std::time::Instant::now();
+        let txn = self.storage.begin_transaction()?;
+        tracing::trace!(phase = "txn_begin", duration_us = txn_start.elapsed().as_micros() as u64, "Batch transaction started");
+
+        let mut total_rows = 0u64;
+        for sql in statements {
+            match self.execute_in_transaction(sql, &txn) {
+                Ok(count) => total_rows += count,
+                Err(e) => {
+                    let _ = txn.rollback();
+                    return Err(e);
+                }
+            }
+        }
+
+        let commit_start = std::time::Instant::now();
+        txn.commit()?;
+        self.storage.increment_lsn();
+        tracing::debug!(phase = "txn_commit", duration_us = commit_start.elapsed().as_micros() as u64, rows = total_rows, "Batch transaction committed");
+
+        let elapsed = start.elapsed();
+        tracing::debug!(phase = "execute", duration_us = elapsed.as_micros() as u64, "Batch executed ({} statements)", statements.len());
+
+        Ok(total_rows)
     }
 
     pub fn execute(&self, sql: &str) -> Result<u64> {
@@ -2175,6 +2274,34 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// Invalidate the plan cache (call after DDL operations)
+    fn invalidate_plan_cache(&self) {
+        if let Ok(mut cache) = self.plan_cache.lock() {
+            cache.clear();
+        }
+        // Also invalidate parse cache since schema changes may affect SQL interpretation
+        if let Ok(mut cache) = self.parse_cache.lock() {
+            cache.clear();
+        }
+    }
+
+    /// Parse SQL with caching. Returns (statement, was_cached).
+    fn parse_cached(&self, sql: &str) -> Result<(sqlparser::ast::Statement, bool)> {
+        // Check parse cache first
+        if let Ok(mut cache) = self.parse_cache.lock() {
+            if let Some(stmt) = cache.get(sql) {
+                return Ok((stmt.clone(), true));
+            }
+        }
+        // Cache miss — parse and cache
+        let parser = sql::Parser::new();
+        let statement = parser.parse_one(sql)?;
+        if let Ok(mut cache) = self.parse_cache.lock() {
+            cache.put(sql.to_string(), statement.clone());
+        }
+        Ok((statement, false))
+    }
+
     /// Internal execute method without transaction management
     fn execute_internal(&self, sql: &str) -> Result<u64> {
         // 1. Record query for quota tracking (QPS enforcement)
@@ -2183,12 +2310,15 @@ impl EmbeddedDatabase {
                 .map_err(|e| Error::query_execution(format!("Quota exceeded: {}", e)))?;
         }
 
-        // 2. Parse SQL
+        // 2. Parse SQL (with cache)
         let parse_start = std::time::Instant::now();
-        let parser = sql::Parser::new();
-        let statement = parser.parse_one(sql)?;
+        let (statement, parse_cached) = self.parse_cached(sql)?;
         let parse_elapsed = parse_start.elapsed();
-        tracing::debug!(phase = "parse", duration_us = parse_elapsed.as_micros() as u64, "SQL parsed");
+        if parse_cached {
+            tracing::debug!(phase = "parse", duration_us = parse_elapsed.as_micros() as u64, "SQL parsed (AST cached)");
+        } else {
+            tracing::debug!(phase = "parse", duration_us = parse_elapsed.as_micros() as u64, "SQL parsed");
+        }
 
         // 3. Create logical plan with catalog access
         let plan_start = std::time::Instant::now();
@@ -2197,6 +2327,20 @@ impl EmbeddedDatabase {
         let plan = planner.statement_to_plan(statement)?;
         let plan_elapsed = plan_start.elapsed();
         tracing::debug!(phase = "plan", duration_us = plan_elapsed.as_micros() as u64, "Logical plan created");
+
+        // Invalidate plan cache on DDL operations (schema changes)
+        if matches!(&plan,
+            sql::LogicalPlan::CreateTable { .. } |
+            sql::LogicalPlan::DropTable { .. } |
+            sql::LogicalPlan::AlterTableAddColumn { .. } |
+            sql::LogicalPlan::AlterTableDropColumn { .. } |
+            sql::LogicalPlan::AlterTableRename { .. } |
+            sql::LogicalPlan::AlterTableRenameColumn { .. } |
+            sql::LogicalPlan::CreateIndex { .. } |
+            sql::LogicalPlan::Truncate { .. }
+        ) {
+            self.invalidate_plan_cache();
+        }
 
         // 3. Execute plan based on type
         match &plan {
@@ -2457,6 +2601,26 @@ impl EmbeddedDatabase {
                 let exists = catalog.table_exists(name)?;
 
                 if exists {
+                    // Check if any materialized views depend on this table
+                    let mv_catalog = self.storage.mv_catalog();
+                    if let Ok(mv_names) = mv_catalog.list_views() {
+                        let mut dependent_mvs = Vec::new();
+                        for mv_name in &mv_names {
+                            if let Ok(metadata) = mv_catalog.get_view(mv_name) {
+                                if metadata.base_tables.iter().any(|t| t == name) {
+                                    dependent_mvs.push(mv_name.clone());
+                                }
+                            }
+                        }
+                        if !dependent_mvs.is_empty() {
+                            tracing::warn!(
+                                "Dropping table '{}' which is used by materialized view(s): {}. Those views will be stale.",
+                                name,
+                                dependent_mvs.join(", ")
+                            );
+                        }
+                    }
+
                     // Drop the table (schema, data, ART indexes, stats)
                     catalog.drop_table(name)?;
 
@@ -2467,6 +2631,9 @@ impl EmbeddedDatabase {
 
                     // Clean up bloom filters and zone maps
                     self.storage.predicate_pushdown().remove_table(name);
+
+                    // Invalidate all cached rows for this table
+                    self.storage.row_cache().invalidate_table(name);
 
                     // Log to WAL for replication
                     if let Err(e) = self.storage.log_drop_table(name) {
@@ -2551,6 +2718,9 @@ impl EmbeddedDatabase {
                 for key in &keys_to_delete {
                     self.storage.delete(key)?;
                 }
+
+                // Invalidate all cached rows for this table
+                self.storage.row_cache().invalidate_table(table_name);
 
                 // Execute AFTER TRUNCATE triggers
                 let action = self.trigger_registry.execute_triggers(
@@ -2786,9 +2956,8 @@ impl EmbeddedDatabase {
     /// This method prevents SQL injection by treating parameters as data, not code.
     /// Even malicious input like `"'; DROP TABLE users; --"` is safely handled.
     pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<u64> {
-        // 1. Parse SQL (will recognize $N placeholders)
-        let parser = sql::Parser::new();
-        let statement = parser.parse_one(sql)?;
+        // 1. Parse SQL with cache (will recognize $N placeholders)
+        let (statement, _) = self.parse_cached(sql)?;
 
         // 2. Create logical plan with catalog access
         let catalog = self.storage.catalog();
@@ -2835,9 +3004,8 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn execute_params_returning(&self, sql: &str, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
-        // 1. Parse SQL (will recognize $N placeholders)
-        let parser = sql::Parser::new();
-        let statement = parser.parse_one(sql)?;
+        // 1. Parse SQL with cache (will recognize $N placeholders)
+        let (statement, _) = self.parse_cached(sql)?;
 
         // 2. Create logical plan with catalog access
         let catalog = self.storage.catalog();
@@ -3183,24 +3351,44 @@ impl EmbeddedDatabase {
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
         let start = std::time::Instant::now();
 
-        // Note: Parameter binding not yet implemented
-        // 1. Parse SQL
-        let parser = sql::Parser::new();
-        let statement = parser.parse_one(sql)?;
+        // Check plan cache first
+        let cached_plan = self.plan_cache.lock().ok().and_then(|mut cache| cache.get(sql).cloned());
 
-        // 2. Create logical plan with catalog access and original SQL for time-travel parsing
-        let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog)
-            .with_sql(sql.to_string());
-        let mut plan = planner.statement_to_plan(statement)?;
+        let plan = if let Some(plan) = cached_plan {
+            tracing::debug!(phase = "parse", duration_us = 0_u64, "SQL parsed (cached)");
+            tracing::debug!(phase = "plan", duration_us = 0_u64, "Logical plan created (cached)");
+            plan
+        } else {
+            // 1. Parse SQL (with cache)
+            let parse_start = std::time::Instant::now();
+            let (statement, _parse_cached) = self.parse_cached(sql)?;
+            tracing::debug!(phase = "parse", duration_us = parse_start.elapsed().as_micros() as u64, "SQL parsed");
+
+            // 2. Create logical plan with catalog access and original SQL for time-travel parsing
+            let plan_start = std::time::Instant::now();
+            let catalog = self.storage.catalog();
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(sql.to_string());
+            let plan = planner.statement_to_plan(statement)?;
+            tracing::debug!(phase = "plan", duration_us = plan_start.elapsed().as_micros() as u64, "Logical plan created");
+
+            // Cache the plan for future use
+            if let Ok(mut cache) = self.plan_cache.lock() {
+                cache.put(sql.to_string(), plan.clone());
+            }
+
+            plan
+        };
 
         // 3. Apply RLS policies to SELECT queries
-        plan = self.apply_rls_to_plan(plan)?;
+        let plan = self.apply_rls_to_plan(plan)?;
 
         // 4. Execute plan and return results
+        let exec_start = std::time::Instant::now();
         let mut executor = sql::Executor::with_storage(&self.storage)
             .with_timeout(self.config.storage.query_timeout_ms);
         let results = executor.execute(&plan)?;
+        tracing::debug!(phase = "execute", duration_us = exec_start.elapsed().as_micros() as u64, rows = results.len() as u64, "Query executed");
 
         self.log_slow_query(sql, start.elapsed(), results.len() as u64);
         Ok(results)
@@ -3603,9 +3791,8 @@ impl EmbeddedDatabase {
                 txn.refresh_snapshot(self.storage.current_timestamp());
             }
 
-            // Parse SQL
-            let parser = sql::Parser::new();
-            let statement = parser.parse_one(sql)?;
+            // Parse SQL with cache
+            let (statement, _) = self.parse_cached(sql)?;
 
             // Create logical plan with catalog access and original SQL for time-travel parsing
             let catalog = self.storage.catalog();
@@ -3704,21 +3891,31 @@ impl EmbeddedDatabase {
     /// This method prevents SQL injection by treating parameters as data, not code.
     /// Even malicious input is safely handled as a literal value.
     pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<Vec<Tuple>> {
+        let start = std::time::Instant::now();
+
         // 1. Parse SQL (will recognize $N placeholders)
-        let parser = sql::Parser::new();
-        let statement = parser.parse_one(sql)?;
+        let parse_start = std::time::Instant::now();
+        let (statement, _) = self.parse_cached(sql)?;
+        tracing::debug!(phase = "parse", duration_us = parse_start.elapsed().as_micros() as u64, "SQL parsed");
 
         // 2. Create logical plan with catalog access and original SQL for time-travel parsing
+        let plan_start = std::time::Instant::now();
         let catalog = self.storage.catalog();
         let planner = sql::Planner::with_catalog(&catalog)
             .with_sql(sql.to_string());
         let mut plan = planner.statement_to_plan(statement)?;
+        tracing::debug!(phase = "plan", duration_us = plan_start.elapsed().as_micros() as u64, "Logical plan created");
 
         // 3. Apply RLS policies to SELECT queries
         plan = self.apply_rls_to_plan(plan)?;
 
         // 4. Execute plan with parameters and return results
-        self.query_plan_with_params(&plan, params)
+        let exec_start = std::time::Instant::now();
+        let results = self.query_plan_with_params(&plan, params)?;
+        tracing::debug!(phase = "execute", duration_us = exec_start.elapsed().as_micros() as u64, rows = results.len() as u64, "Query executed");
+
+        self.log_slow_query(sql, start.elapsed(), results.len() as u64);
+        Ok(results)
     }
 
     /// Internal method to execute a query plan with parameters
@@ -3889,12 +4086,13 @@ impl EmbeddedDatabase {
     }
 
     /// Close the database
+    ///
+    /// Flushes pending data and releases resources. The database will also
+    /// be cleaned up automatically when dropped.
     pub fn close(self) -> Result<()> {
-        // Try to unwrap Arc if we're the sole owner, otherwise storage will be dropped
-        match std::sync::Arc::try_unwrap(self.storage) {
-            Ok(storage) => storage.close(),
-            Err(_) => Ok(()), // Other references exist, just drop our reference
-        }
+        // Storage engine cleanup happens via Drop
+        // If we're the sole Arc owner, RocksDB will flush on drop
+        Ok(())
     }
 
     // Vector store operations - backed by VectorIndexManager
@@ -4354,6 +4552,8 @@ impl EmbeddedDatabase {
             session_transactions: self.session_transactions.clone(),
             prepared_statements: self.prepared_statements.clone(),
             savepoints: self.savepoints.clone(),
+            plan_cache: self.plan_cache.clone(),
+            parse_cache: self.parse_cache.clone(),
         }
     }
 
@@ -5100,9 +5300,8 @@ impl Transaction<'_> {
     /// # }
     /// ```
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
-        // Parse SQL
-        let parser = sql::Parser::new();
-        let statement = parser.parse_one(sql)?;
+        // Parse SQL with cache
+        let (statement, _) = self.db.parse_cached(sql)?;
 
         // Create logical plan with catalog access and original SQL for time-travel parsing
         let catalog = self.db.storage.catalog();
