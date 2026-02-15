@@ -540,14 +540,20 @@ impl HashJoinOperator {
 
                     // Lookup in hash table
                     if let Some(matches) = self.hash_table.get(&key) {
-                        // Found matches - filter by full join condition
-                        let filtered_matches: Vec<Tuple> = matches.iter()
-                            .filter(|right_tuple| {
-                                self.evaluate_join_condition(&left_tuple, right_tuple)
-                                    .unwrap_or(false)
-                            })
-                            .cloned()
-                            .collect();
+                        // For pure equi-joins, hash lookup already confirmed match —
+                        // skip per-tuple filter and clone directly
+                        let is_equi = is_pure_equi_join(&self.on_condition);
+                        let filtered_matches: Vec<Tuple> = if is_equi {
+                            matches.clone()
+                        } else {
+                            matches.iter()
+                                .filter(|right_tuple| {
+                                    self.evaluate_join_condition(&left_tuple, right_tuple)
+                                        .unwrap_or(false)
+                                })
+                                .cloned()
+                                .collect()
+                        };
 
                         if !filtered_matches.is_empty() {
                             // Mark key as matched (for RIGHT/FULL joins)
@@ -648,22 +654,25 @@ impl HashJoinOperator {
 
     /// Join two tuples (concatenate values)
     fn join_tuples(left: &Tuple, right: &Tuple) -> Tuple {
-        let mut values = left.values.clone();
-        values.extend(right.values.clone());
+        let mut values = Vec::with_capacity(left.values.len() + right.values.len());
+        values.extend_from_slice(&left.values);
+        values.extend_from_slice(&right.values);
         Tuple::new(values)
     }
 
     /// Join left tuple with NULLs (for unmatched left tuple in LEFT/FULL join)
     fn join_with_nulls_right(&self, left: &Tuple) -> Tuple {
-        let mut values = left.values.clone();
-        values.extend(vec![crate::Value::Null; self.right_column_count]);
+        let mut values = Vec::with_capacity(left.values.len() + self.right_column_count);
+        values.extend_from_slice(&left.values);
+        values.resize(values.len() + self.right_column_count, crate::Value::Null);
         Tuple::new(values)
     }
 
     /// Join right tuple with NULLs (for unmatched right tuple in RIGHT/FULL join)
     fn join_with_nulls_left(&self, right: &Tuple) -> Tuple {
-        let mut values = vec![crate::Value::Null; self.left_column_count];
-        values.extend(right.values.clone());
+        let mut values = Vec::with_capacity(self.left_column_count + right.values.len());
+        values.resize(self.left_column_count, crate::Value::Null);
+        values.extend_from_slice(&right.values);
         Tuple::new(values)
     }
 

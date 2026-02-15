@@ -1607,6 +1607,18 @@ impl StorageEngine {
     ///
     /// Returns `Ok(Some(tuple))` if found, `Ok(None)` if no matching row exists.
     pub fn get_row_by_pk(&self, table_name: &str, pk_value: &crate::Value) -> Result<Option<Tuple>> {
+        // Fetch schema internally for callers that don't have it
+        let catalog = Catalog::new(self);
+        let schema = catalog.get_table_schema(table_name).ok();
+        self.get_row_by_pk_inner(table_name, pk_value, schema.as_ref())
+    }
+
+    /// PK point lookup using a pre-fetched schema (avoids redundant catalog lookup)
+    pub fn get_row_by_pk_with_schema(&self, table_name: &str, pk_value: &crate::Value, schema: &crate::Schema) -> Result<Option<Tuple>> {
+        self.get_row_by_pk_inner(table_name, pk_value, Some(schema))
+    }
+
+    fn get_row_by_pk_inner(&self, table_name: &str, pk_value: &crate::Value, schema: Option<&crate::Schema>) -> Result<Option<Tuple>> {
         let lookup_start = std::time::Instant::now();
 
         // Get the PK index for this table
@@ -1657,8 +1669,7 @@ impl StorageEngine {
         tuple.row_id = Some(row_id);
 
         // Resolve per-column storage references
-        let catalog = Catalog::new(self);
-        if let Ok(schema) = catalog.get_table_schema(table_name) {
+        if let Some(schema) = schema {
             for (idx, column) in schema.columns.iter().enumerate() {
                 if idx >= tuple.values.len() {
                     break;

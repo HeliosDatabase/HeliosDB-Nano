@@ -502,16 +502,17 @@ impl<'a> Executor<'a> {
             None => return Ok(None),
         };
 
-        // Try the ART index lookup
-        let tuple = storage.get_row_by_pk(table_name, &pk_value)?;
+        // Try the ART index lookup (pass pre-fetched schema to avoid redundant catalog lookup)
+        let tuple = storage.get_row_by_pk_with_schema(table_name, &pk_value, schema)?;
 
         // Build schema with source_table set for JOIN disambiguation
         let source_alias = alias.as_deref().unwrap_or(table_name);
-        let mut schema_cols = schema.columns.clone();
-        for col in &mut schema_cols {
-            col.source_table = Some(source_alias.to_string());
-            col.source_table_name = Some(table_name.clone());
-        }
+        let schema_cols: Vec<_> = schema.columns.iter().map(|col| {
+            let mut c = col.clone();
+            c.source_table = Some(source_alias.to_string());
+            c.source_table_name = Some(table_name.clone());
+            c
+        }).collect();
         let actual_schema = Arc::new(Schema { columns: schema_cols });
 
         let tuples = match tuple {
