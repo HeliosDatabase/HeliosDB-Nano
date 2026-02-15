@@ -373,8 +373,8 @@ pub struct EmbeddedDatabase {
     prepared_statements: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, sql::LogicalPlan>>>,
     /// Active savepoints stack (name -> transaction state)
     savepoints: std::sync::Arc<parking_lot::RwLock<Vec<SavepointState>>>,
-    /// Plan cache: SQL string → LogicalPlan (LRU, skips parse+plan for repeated queries)
-    plan_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, sql::LogicalPlan>>>,
+    /// Plan cache: SQL string → Arc<LogicalPlan> (LRU, skips parse+plan for repeated queries)
+    plan_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<sql::LogicalPlan>>>>,
     /// Parse cache: SQL string → AST Statement (LRU, skips SQL parsing for repeated queries)
     parse_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, sqlparser::ast::Statement>>>,
 }
@@ -3389,13 +3389,13 @@ impl EmbeddedDatabase {
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
         let start = std::time::Instant::now();
 
-        // Check plan cache first
-        let cached_plan = self.plan_cache.lock().ok().and_then(|mut cache| cache.get(sql).cloned());
+        // Check plan cache first (Arc::clone is O(1) vs deep clone)
+        let cached_plan = self.plan_cache.lock().ok().and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone));
 
-        let plan = if let Some(plan) = cached_plan {
+        let plan = if let Some(arc_plan) = cached_plan {
             tracing::debug!(phase = "parse", duration_us = 0_u64, "SQL parsed (cached)");
             tracing::debug!(phase = "plan", duration_us = 0_u64, "Logical plan created (cached)");
-            plan
+            (*arc_plan).clone()
         } else {
             // 1. Parse SQL (with cache)
             let parse_start = std::time::Instant::now();
@@ -3410,9 +3410,9 @@ impl EmbeddedDatabase {
             let plan = planner.statement_to_plan(statement)?;
             tracing::debug!(phase = "plan", duration_us = plan_start.elapsed().as_micros() as u64, "Logical plan created");
 
-            // Cache the plan for future use
+            // Cache the plan wrapped in Arc for cheap future clones
             if let Ok(mut cache) = self.plan_cache.lock() {
-                cache.put(sql.to_string(), plan.clone());
+                cache.put(sql.to_string(), std::sync::Arc::new(plan.clone()));
             }
 
             plan

@@ -19,7 +19,7 @@ use super::auth::{AuthManager, AuthMethod, ScramAuthState};
 use super::catalog::PgCatalog;
 use super::prepared::PreparedStatementManager;
 use super::ssl::SecureConnection;
-use bytes::BytesMut;
+use bytes::{BytesMut, BufMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 use std::sync::Arc;
@@ -40,6 +40,7 @@ pub struct PgConnectionHandler<S = BufWriter<TcpStream>> {
     buffer: BytesMut,
     username: Option<String>,
     scram_state: Option<ScramAuthState>,
+    write_buf: BytesMut,
 }
 
 impl PgConnectionHandler<BufWriter<TcpStream>> {
@@ -66,6 +67,7 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
             buffer,
             username: None,
             scram_state: None,
+            write_buf: BytesMut::with_capacity(4096),
         }
     }
 }
@@ -94,6 +96,7 @@ impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
             buffer,
             username: None,
             scram_state: None,
+            write_buf: BytesMut::with_capacity(4096),
         }
     }
 }
@@ -644,10 +647,9 @@ where
         let fields = schema_to_field_descriptions(&schema);
         self.send_message(BackendMessage::RowDescription { fields }).await?;
 
-        // Send DataRows
+        // Send DataRows (direct encoding avoids intermediate Vec allocations)
         for row in &rows {
-            let values = tuple_to_pg_values(row);
-            self.send_message(BackendMessage::DataRow { values }).await?;
+            self.send_data_row_direct(row).await?;
         }
 
         // Send CommandComplete
@@ -700,9 +702,110 @@ where
     /// Send a backend message (write only, no flush).
     /// Caller is responsible for flushing at the end of a response cycle.
     pub(super) async fn send_message(&mut self, msg: BackendMessage) -> Result<()> {
-        let mut buf = BytesMut::new();
-        msg.encode(&mut buf);
-        self.stream.write_all(&buf).await
+        self.write_buf.clear();
+        msg.encode(&mut self.write_buf);
+        self.stream.write_all(&self.write_buf).await
+            .map_err(|e| Error::network(format!("Failed to send message: {}", e)))?;
+        Ok(())
+    }
+
+    /// Encode and send a DataRow directly from a Tuple, avoiding intermediate Vec allocations.
+    /// Uses length-prefix backpatching: writes placeholder, encodes values, then patches the length.
+    #[allow(clippy::indexing_slicing)] // length_pos and count_pos are set by us, always valid
+    async fn send_data_row_direct(&mut self, tuple: &Tuple) -> Result<()> {
+        self.write_buf.clear();
+        self.write_buf.put_u8(b'D');
+
+        // Reserve space for message length (4 bytes) — will be backpatched
+        let length_pos = self.write_buf.len();
+        self.write_buf.put_i32(0);
+
+        // Column count
+        self.write_buf.put_i16(tuple.values.len() as i16);
+
+        // Encode each value directly into the buffer
+        let mut itoa_buf = itoa::Buffer::new();
+        let mut ryu_buf = ryu::Buffer::new();
+        for val in &tuple.values {
+            match val {
+                Value::Null => {
+                    self.write_buf.put_i32(-1);
+                }
+                Value::Boolean(b) => {
+                    self.write_buf.put_i32(1);
+                    self.write_buf.put_u8(if *b { b't' } else { b'f' });
+                }
+                Value::Int2(i) => {
+                    let s = itoa_buf.format(*i);
+                    self.write_buf.put_i32(s.len() as i32);
+                    self.write_buf.put_slice(s.as_bytes());
+                }
+                Value::Int4(i) => {
+                    let s = itoa_buf.format(*i);
+                    self.write_buf.put_i32(s.len() as i32);
+                    self.write_buf.put_slice(s.as_bytes());
+                }
+                Value::Int8(i) => {
+                    let s = itoa_buf.format(*i);
+                    self.write_buf.put_i32(s.len() as i32);
+                    self.write_buf.put_slice(s.as_bytes());
+                }
+                Value::Float4(f) => {
+                    let s = ryu_buf.format(*f);
+                    self.write_buf.put_i32(s.len() as i32);
+                    self.write_buf.put_slice(s.as_bytes());
+                }
+                Value::Float8(f) => {
+                    let s = ryu_buf.format(*f);
+                    self.write_buf.put_i32(s.len() as i32);
+                    self.write_buf.put_slice(s.as_bytes());
+                }
+                Value::String(s) => {
+                    self.write_buf.put_i32(s.len() as i32);
+                    self.write_buf.put_slice(s.as_bytes());
+                }
+                Value::Bytes(b) => {
+                    self.write_buf.put_i32(b.len() as i32);
+                    self.write_buf.put_slice(b);
+                }
+                Value::Json(j) => {
+                    let s = j.to_string();
+                    self.write_buf.put_i32(s.len() as i32);
+                    self.write_buf.put_slice(s.as_bytes());
+                }
+                Value::Timestamp(ts) => {
+                    let s = ts.to_rfc3339();
+                    self.write_buf.put_i32(s.len() as i32);
+                    self.write_buf.put_slice(s.as_bytes());
+                }
+                Value::Vector(v) => {
+                    // Format as PostgreSQL array: {1.0,2.0,3.0}
+                    // Reserve length slot, write content, backpatch
+                    let val_length_pos = self.write_buf.len();
+                    self.write_buf.put_i32(0);
+                    self.write_buf.put_u8(b'{');
+                    for (i, x) in v.iter().enumerate() {
+                        if i > 0 { self.write_buf.put_u8(b','); }
+                        let s = ryu_buf.format(*x);
+                        self.write_buf.put_slice(s.as_bytes());
+                    }
+                    self.write_buf.put_u8(b'}');
+                    let val_len = (self.write_buf.len() - val_length_pos - 4) as i32;
+                    self.write_buf[val_length_pos..val_length_pos + 4].copy_from_slice(&val_len.to_be_bytes());
+                }
+                _ => {
+                    let s = val.to_string();
+                    self.write_buf.put_i32(s.len() as i32);
+                    self.write_buf.put_slice(s.as_bytes());
+                }
+            }
+        }
+
+        // Backpatch the message length (excludes the type byte, includes itself)
+        let msg_len = (self.write_buf.len() - length_pos) as i32;
+        self.write_buf[length_pos..length_pos + 4].copy_from_slice(&msg_len.to_be_bytes());
+
+        self.stream.write_all(&self.write_buf).await
             .map_err(|e| Error::network(format!("Failed to send message: {}", e)))?;
         Ok(())
     }

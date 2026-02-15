@@ -272,7 +272,7 @@ async fn main() -> Result<()> {
             if daemon {
                 start_server_daemon(resolved_data_dir, port, listen, config, pid_file, tls_cert, tls_key, auth, password, ha_config).await
             } else {
-                start_server(resolved_data_dir, port, listen, config, dump_on_shutdown, tls_cert, tls_key, auth, password, ha_config).await
+                start_server(resolved_data_dir, port, listen, config, memory, dump_on_shutdown, tls_cert, tls_key, auth, password, ha_config).await
             }
         }
         Commands::Stop { ref pid_file } => {
@@ -320,6 +320,7 @@ async fn start_server(
     port: u16,
     listen: String,
     config_path: Option<PathBuf>,
+    memory_mode: bool,
     dump_on_shutdown: bool,
     tls_cert: Option<PathBuf>,
     tls_key: Option<PathBuf>,
@@ -356,9 +357,14 @@ async fn start_server(
         Config::default()
     };
 
-    // Open database
-    println!("[2/4] Initializing database at {}...", data_dir.display());
-    let db = Arc::new(EmbeddedDatabase::new(&data_dir)?);
+    // Open database (in-memory mode avoids disk I/O for all operations)
+    let db = if memory_mode {
+        println!("[2/4] Initializing in-memory database...");
+        Arc::new(EmbeddedDatabase::new_in_memory()?)
+    } else {
+        println!("[2/4] Initializing database at {}...", data_dir.display());
+        Arc::new(EmbeddedDatabase::new(&data_dir)?)
+    };
     println!("      Database initialized successfully");
 
     // Configure PostgreSQL server

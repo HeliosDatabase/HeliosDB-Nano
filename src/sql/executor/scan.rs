@@ -352,7 +352,8 @@ pub(super) fn handle_scan(
             } else {
                 // Normal scan (current data) with branch isolation
                 // Use actual_table_name to support materialized views
-                storage.scan_table_branch_aware(&actual_table_name)?
+                // Pass pre-fetched schema to avoid duplicate lookup inside scan_table
+                storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?
             };
 
             // Set source_table (alias) and source_table_name (actual) on each column for JOIN disambiguation

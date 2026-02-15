@@ -1388,13 +1388,16 @@ impl StorageEngine {
     /// Returns a vector of tuples. In the future, this should return an iterator
     /// to avoid loading all data into memory at once.
     pub fn scan_table(&self, table_name: &str) -> Result<Vec<Tuple>> {
+        let catalog = Catalog::new(self);
+        let schema = catalog.get_table_schema(table_name)?;
+        self.scan_table_with_schema(table_name, &schema)
+    }
+
+    /// Scan all rows in a table using a pre-fetched schema (avoids duplicate schema lookup).
+    pub fn scan_table_with_schema(&self, table_name: &str, schema: &crate::Schema) -> Result<Vec<Tuple>> {
         let scan_start = std::time::Instant::now();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
-
-        // Get table schema for storage mode resolution
-        let catalog = Catalog::new(self);
-        let schema = catalog.get_table_schema(table_name)?;
 
         let mut tuples = Vec::new();
 
@@ -1408,16 +1411,13 @@ impl StorageEngine {
 
             // Check if key starts with our prefix (break when past it)
             if key.starts_with(prefix_bytes) {
-                // Decrypt if encryption is enabled
-                let value = if let Some(km) = &self.key_manager {
-                    crypto::decrypt(km.key(), &raw_value)?
+                // Deserialize tuple (decrypt first if encryption is enabled)
+                let mut tuple: Tuple = if let Some(km) = &self.key_manager {
+                    let decrypted = crypto::decrypt(km.key(), &raw_value)?;
+                    bincode::deserialize(&decrypted)
                 } else {
-                    raw_value.to_vec()
-                };
-
-                // Deserialize tuple directly (RocksDB handles decompression at block level)
-                let mut tuple: Tuple = bincode::deserialize(&value)
-                    .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+                    bincode::deserialize(&raw_value)
+                }.map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
 
                 // Extract row_id from key (key format: "data:{table_name}:{row_id}")
                 let mut row_id = 0u64;
@@ -1539,13 +1539,12 @@ impl StorageEngine {
             }
             let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
             if key.starts_with(prefix_bytes) {
-                let value = if let Some(km) = &self.key_manager {
-                    crypto::decrypt(km.key(), &raw_value)?
+                let mut tuple: Tuple = if let Some(km) = &self.key_manager {
+                    let decrypted = crypto::decrypt(km.key(), &raw_value)?;
+                    bincode::deserialize(&decrypted)
                 } else {
-                    raw_value.to_vec()
-                };
-                let mut tuple: Tuple = bincode::deserialize(&value)
-                    .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+                    bincode::deserialize(&raw_value)
+                }.map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
                 if let Ok(key_str) = std::str::from_utf8(&key) {
                     if let Some(row_id_str) = key_str.strip_prefix(&prefix) {
                         if let Ok(rid) = row_id_str.parse::<u64>() {
@@ -1795,15 +1794,13 @@ impl StorageEngine {
                 .map_err(|e| Error::storage(format!("Failed to read row: {}", e)))?
                 .ok_or_else(|| Error::storage("Row disappeared during migration"))?;
 
-            // Decrypt if needed
-            let value = if let Some(km) = &self.key_manager {
-                crypto::decrypt(km.key(), &raw_value)?
+            // Deserialize (decrypt first if needed)
+            let mut tuple: Tuple = if let Some(km) = &self.key_manager {
+                let decrypted = crypto::decrypt(km.key(), &raw_value)?;
+                bincode::deserialize(&decrypted)
             } else {
-                raw_value.to_vec()
-            };
-
-            let mut tuple: Tuple = bincode::deserialize(&value)
-                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+                bincode::deserialize(&raw_value)
+            }.map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
 
             if col_idx >= tuple.values.len() {
                 continue;
@@ -1966,15 +1963,13 @@ impl StorageEngine {
                 .map_err(|e| Error::storage(format!("Failed to read row: {}", e)))?
                 .ok_or_else(|| Error::storage("Row disappeared during update"))?;
 
-            // Decrypt if needed
-            let value = if let Some(km) = &self.key_manager {
-                crypto::decrypt(km.key(), &raw_value)?
+            // Deserialize (decrypt first if needed)
+            let mut tuple: Tuple = if let Some(km) = &self.key_manager {
+                let decrypted = crypto::decrypt(km.key(), &raw_value)?;
+                bincode::deserialize(&decrypted)
             } else {
-                raw_value.to_vec()
-            };
-
-            let mut tuple: Tuple = bincode::deserialize(&value)
-                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+                bincode::deserialize(&raw_value)
+            }.map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
 
             // Append the new column value
             tuple.values.push(default_value.clone());
@@ -2038,15 +2033,13 @@ impl StorageEngine {
                 .map_err(|e| Error::storage(format!("Failed to read row: {}", e)))?
                 .ok_or_else(|| Error::storage("Row disappeared during update"))?;
 
-            // Decrypt if needed
-            let value = if let Some(km) = &self.key_manager {
-                crypto::decrypt(km.key(), &raw_value)?
+            // Deserialize (decrypt first if needed)
+            let mut tuple: Tuple = if let Some(km) = &self.key_manager {
+                let decrypted = crypto::decrypt(km.key(), &raw_value)?;
+                bincode::deserialize(&decrypted)
             } else {
-                raw_value.to_vec()
-            };
-
-            let mut tuple: Tuple = bincode::deserialize(&value)
-                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+                bincode::deserialize(&raw_value)
+            }.map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
 
             // Remove the column value if it exists
             if col_idx < tuple.values.len() {
@@ -4588,12 +4581,19 @@ impl StorageEngine {
     /// Child branch data overrides parent branch data.
     /// Delete markers from any branch in the chain hide that row.
     pub fn scan_table_branch_aware(&self, table_name: &str) -> Result<Vec<Tuple>> {
+        let catalog = Catalog::new(self);
+        let schema = catalog.get_table_schema(table_name)?;
+        self.scan_table_branch_aware_with_schema(table_name, &schema)
+    }
+
+    /// Branch-aware scan using a pre-fetched schema (avoids duplicate schema lookup).
+    pub fn scan_table_branch_aware_with_schema(&self, table_name: &str, schema: &crate::Schema) -> Result<Vec<Tuple>> {
         // Get current branch name
         let branch_name = self.current_branch.lock().clone();
 
         // If branch is "main" or None, use standard scan
         if branch_name.is_none() || branch_name.as_deref() == Some("main") {
-            return self.scan_table(table_name);
+            return self.scan_table_with_schema(table_name, schema);
         }
 
         // Non-main branch - must resolve to a valid branch ID
@@ -4607,9 +4607,6 @@ impl StorageEngine {
                 )));
             }
         };
-
-        let catalog = Catalog::new(self);
-        let schema = catalog.get_table_schema(table_name)?;
 
         // Get the full branch chain (from oldest ancestor to current)
         let branch_chain = self.get_branch_chain(branch_id)?;

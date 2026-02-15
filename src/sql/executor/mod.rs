@@ -35,6 +35,23 @@ pub use aggregate::{AggregateOperator, SortOperator};
 pub use window::WindowOperator;
 pub use set_ops::{UnionOperator, IntersectOperator, ExceptOperator};
 
+/// Create a schema for COUNT(*) fast path results (single Int8 column).
+fn count_star_schema() -> Arc<Schema> {
+    Arc::new(Schema {
+        columns: vec![crate::Column {
+            name: "agg_0".to_string(),
+            data_type: crate::DataType::Int8,
+            nullable: false,
+            primary_key: false,
+            source_table: None,
+            source_table_name: None,
+            default_expr: None,
+            unique: false,
+            storage_mode: crate::ColumnStorageMode::Default,
+        }],
+    })
+}
+
 /// DualScan operator for SELECT without FROM
 ///
 /// Returns a single row with no columns, used as input for
@@ -706,20 +723,47 @@ impl<'a> Executor<'a> {
                                 let result_tuple = crate::Tuple::new(vec![crate::Value::Int8(count as i64)]);
                                 return Ok(Box::new(MaterializedOperator::new(
                                     vec![result_tuple],
-                                    std::sync::Arc::new(crate::Schema {
-                                        columns: vec![crate::Column {
-                                            name: "agg_0".to_string(),
-                                            data_type: crate::DataType::Int8,
-                                            nullable: false,
-                                            primary_key: false,
-                                            source_table: None,
-                                            source_table_name: None,
-                                            default_expr: None,
-                                            unique: false,
-                                            storage_mode: crate::ColumnStorageMode::Default,
-                                        }],
-                                    }),
+                                    count_star_schema(),
                                 )));
+                            }
+                        }
+
+                        // Fast path: COUNT(*) with Filter(Scan) — scan + filter + count without materializing
+                        if let LogicalPlan::Filter { input: filter_input, predicate } = input.as_ref() {
+                            let scan_table_filtered = match filter_input.as_ref() {
+                                LogicalPlan::Scan { table_name, .. } => Some((table_name.as_str(), filter_input.as_ref())),
+                                LogicalPlan::Project { input: inner, .. } => {
+                                    if let LogicalPlan::Scan { table_name, .. } = inner.as_ref() {
+                                        Some((table_name.as_str(), filter_input.as_ref()))
+                                    } else {
+                                        None
+                                    }
+                                }
+                                _ => None,
+                            };
+                            if let Some((table_name, scan_plan)) = scan_table_filtered {
+                                if let Some(storage) = self.storage {
+                                    // Build scan operator to get schema, then iterate + filter + count
+                                    let mut scan_op = self.plan_to_operator(&Box::new(scan_plan.clone()))?;
+                                    let schema = scan_op.schema();
+                                    let evaluator = crate::sql::Evaluator::with_parameters(schema, self.parameters.clone());
+                                    let _ = table_name; // used for debug context
+                                    let mut count: i64 = 0;
+                                    while let Some(tuple) = scan_op.next()? {
+                                        if let Some(ref ctx) = self.timeout_ctx {
+                                            ctx.check_timeout()?;
+                                        }
+                                        let result = evaluator.evaluate(predicate, &tuple)?;
+                                        if matches!(result, crate::Value::Boolean(true)) {
+                                            count += 1;
+                                        }
+                                    }
+                                    let result_tuple = crate::Tuple::new(vec![crate::Value::Int8(count)]);
+                                    return Ok(Box::new(MaterializedOperator::new(
+                                        vec![result_tuple],
+                                        count_star_schema(),
+                                    )));
+                                }
                             }
                         }
                     }
