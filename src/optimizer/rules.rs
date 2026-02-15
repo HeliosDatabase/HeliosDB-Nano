@@ -116,6 +116,205 @@ impl SelectionPushdownRule {
         Ok(Some(current))
     }
 
+    /// Push filter predicates through a join.
+    ///
+    /// Splits AND conjuncts and classifies each by which side of the join it
+    /// references. Predicates that only touch the left side push below as
+    /// Filter(left), those touching only the right side push below as
+    /// Filter(right), and cross-table predicates remain above the join.
+    fn push_through_join(
+        &self,
+        join_node: Box<LogicalPlan>,
+        predicate: LogicalExpr,
+    ) -> Result<Option<LogicalPlan>> {
+        if let LogicalPlan::Join { left, right, join_type, on, lateral } = *join_node {
+            // Collect table names/aliases reachable from each side
+            let left_tables = Self::collect_table_refs(&left);
+            let right_tables = Self::collect_table_refs(&right);
+
+            // Split predicate into AND conjuncts
+            let conjuncts = Self::extract_conjuncts(&predicate);
+
+            let mut left_preds = Vec::new();
+            let mut right_preds = Vec::new();
+            let mut remaining_preds = Vec::new();
+
+            for conjunct in conjuncts {
+                let refs = Self::extract_column_table_refs(&conjunct);
+
+                // If no table qualifiers, can't push down safely
+                if refs.is_empty() {
+                    remaining_preds.push(conjunct);
+                    continue;
+                }
+
+                let touches_left = refs.iter().any(|r| left_tables.contains(r));
+                let touches_right = refs.iter().any(|r| right_tables.contains(r));
+
+                match (touches_left, touches_right) {
+                    (true, false) => left_preds.push(conjunct),
+                    (false, true) => {
+                        // For LEFT/FULL joins, pushing filters to the right side changes semantics
+                        if matches!(join_type, crate::sql::JoinType::Inner | crate::sql::JoinType::Right) {
+                            right_preds.push(conjunct);
+                        } else {
+                            remaining_preds.push(conjunct);
+                        }
+                    }
+                    _ => remaining_preds.push(conjunct), // Cross-table or ambiguous
+                }
+            }
+
+            // Only proceed if we can push at least one predicate down
+            if left_preds.is_empty() && right_preds.is_empty() {
+                return Ok(None);
+            }
+
+            // Wrap left input with pushed-down filters
+            let new_left = if left_preds.is_empty() {
+                left
+            } else {
+                let combined = Self::combine_conjuncts(left_preds);
+                Box::new(LogicalPlan::Filter {
+                    input: left,
+                    predicate: combined,
+                })
+            };
+
+            // Wrap right input with pushed-down filters
+            let new_right = if right_preds.is_empty() {
+                right
+            } else {
+                let combined = Self::combine_conjuncts(right_preds);
+                Box::new(LogicalPlan::Filter {
+                    input: right,
+                    predicate: combined,
+                })
+            };
+
+            // Reconstruct join
+            let new_join = LogicalPlan::Join {
+                left: new_left,
+                right: new_right,
+                join_type,
+                on,
+                lateral,
+            };
+
+            // If remaining predicates exist, wrap with Filter
+            if remaining_preds.is_empty() {
+                Ok(Some(new_join))
+            } else {
+                let combined = Self::combine_conjuncts(remaining_preds);
+                Ok(Some(LogicalPlan::Filter {
+                    input: Box::new(new_join),
+                    predicate: combined,
+                }))
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Collect all table names and aliases reachable from a plan subtree
+    fn collect_table_refs(plan: &LogicalPlan) -> HashSet<String> {
+        let mut refs = HashSet::new();
+        Self::collect_table_refs_inner(plan, &mut refs);
+        refs
+    }
+
+    fn collect_table_refs_inner(plan: &LogicalPlan, refs: &mut HashSet<String>) {
+        match plan {
+            LogicalPlan::Scan { table_name, alias, .. } => {
+                refs.insert(table_name.clone());
+                if let Some(a) = alias {
+                    refs.insert(a.clone());
+                }
+            }
+            LogicalPlan::Filter { input, .. } => Self::collect_table_refs_inner(input, refs),
+            LogicalPlan::Project { input, .. } => Self::collect_table_refs_inner(input, refs),
+            LogicalPlan::Join { left, right, .. } => {
+                Self::collect_table_refs_inner(left, refs);
+                Self::collect_table_refs_inner(right, refs);
+            }
+            LogicalPlan::Sort { input, .. } => Self::collect_table_refs_inner(input, refs),
+            LogicalPlan::Limit { input, .. } => Self::collect_table_refs_inner(input, refs),
+            LogicalPlan::Aggregate { input, .. } => Self::collect_table_refs_inner(input, refs),
+            _ => {}
+        }
+    }
+
+    /// Extract all table references from column expressions in a predicate
+    fn extract_column_table_refs(expr: &LogicalExpr) -> HashSet<String> {
+        let mut refs = HashSet::new();
+        Self::extract_column_table_refs_inner(expr, &mut refs);
+        refs
+    }
+
+    fn extract_column_table_refs_inner(expr: &LogicalExpr, refs: &mut HashSet<String>) {
+        match expr {
+            LogicalExpr::Column { table: Some(t), .. } => {
+                refs.insert(t.clone());
+            }
+            LogicalExpr::BinaryExpr { left, right, .. } => {
+                Self::extract_column_table_refs_inner(left, refs);
+                Self::extract_column_table_refs_inner(right, refs);
+            }
+            LogicalExpr::UnaryExpr { expr, .. } => {
+                Self::extract_column_table_refs_inner(expr, refs);
+            }
+            LogicalExpr::IsNull { expr, .. } => {
+                Self::extract_column_table_refs_inner(expr, refs);
+            }
+            LogicalExpr::InList { expr, list, .. } => {
+                Self::extract_column_table_refs_inner(expr, refs);
+                for item in list {
+                    Self::extract_column_table_refs_inner(item, refs);
+                }
+            }
+            LogicalExpr::Between { expr, low, high, .. } => {
+                Self::extract_column_table_refs_inner(expr, refs);
+                Self::extract_column_table_refs_inner(low, refs);
+                Self::extract_column_table_refs_inner(high, refs);
+            }
+            LogicalExpr::Case { expr, when_then, else_result } => {
+                if let Some(op) = expr {
+                    Self::extract_column_table_refs_inner(op, refs);
+                }
+                for (w, t) in when_then {
+                    Self::extract_column_table_refs_inner(w, refs);
+                    Self::extract_column_table_refs_inner(t, refs);
+                }
+                if let Some(e) = else_result {
+                    Self::extract_column_table_refs_inner(e, refs);
+                }
+            }
+            LogicalExpr::ScalarFunction { args, .. } | LogicalExpr::AggregateFunction { args, .. } => {
+                for arg in args {
+                    Self::extract_column_table_refs_inner(arg, refs);
+                }
+            }
+            _ => {} // Literals, parameters, wildcards, etc.
+        }
+    }
+
+    /// Combine conjuncts with AND
+    fn combine_conjuncts(mut conjuncts: Vec<LogicalExpr>) -> LogicalExpr {
+        debug_assert!(!conjuncts.is_empty());
+        if conjuncts.len() == 1 {
+            return conjuncts.remove(0);
+        }
+        let mut result = conjuncts.remove(0);
+        for conjunct in conjuncts {
+            result = LogicalExpr::BinaryExpr {
+                left: Box::new(result),
+                op: BinaryOperator::And,
+                right: Box::new(conjunct),
+            };
+        }
+        result
+    }
+
     /// Extract AND conjuncts from a predicate
     fn extract_conjuncts(expr: &LogicalExpr) -> Vec<LogicalExpr> {
         match expr {
@@ -149,6 +348,11 @@ impl OptimizationRule for SelectionPushdownRule {
                 // Try to merge with inner filter
                 if matches!(&*input, LogicalPlan::Filter { .. }) {
                     return self.merge_filters(input, predicate);
+                }
+
+                // Try to push filter through join
+                if matches!(&*input, LogicalPlan::Join { .. }) {
+                    return self.push_through_join(input, predicate);
                 }
 
                 // Try to split AND conjuncts

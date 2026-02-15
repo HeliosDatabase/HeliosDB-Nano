@@ -2157,6 +2157,19 @@ impl EmbeddedDatabase {
         self.config.storage.query_timeout_ms
     }
 
+    /// Check if a logical plan contains a JOIN node (used to skip optimizer for simple queries)
+    fn plan_contains_join(plan: &sql::LogicalPlan) -> bool {
+        match plan {
+            sql::LogicalPlan::Join { .. } => true,
+            sql::LogicalPlan::Filter { input, .. }
+            | sql::LogicalPlan::Project { input, .. }
+            | sql::LogicalPlan::Sort { input, .. }
+            | sql::LogicalPlan::Limit { input, .. }
+            | sql::LogicalPlan::Aggregate { input, .. } => Self::plan_contains_join(input),
+            _ => false,
+        }
+    }
+
     /// Log slow queries at WARN level if they exceed the configured threshold
     fn log_slow_query(&self, sql: &str, elapsed: std::time::Duration, rows: u64) {
         if let Some(threshold) = self.config.storage.slow_query_threshold_ms {
@@ -3389,39 +3402,80 @@ impl EmbeddedDatabase {
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
         let start = std::time::Instant::now();
 
-        // Check plan cache first (Arc::clone is O(1) vs deep clone)
+        // Check plan cache first (Arc::clone is O(1))
         let cached_plan = self.plan_cache.lock().ok().and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone));
 
-        let plan = if let Some(arc_plan) = cached_plan {
+        if let Some(arc_plan) = cached_plan {
             tracing::debug!(phase = "parse", duration_us = 0_u64, "SQL parsed (cached)");
             tracing::debug!(phase = "plan", duration_us = 0_u64, "Logical plan created (cached)");
-            (*arc_plan).clone()
-        } else {
-            // 1. Parse SQL (with cache)
-            let parse_start = std::time::Instant::now();
-            let (statement, _parse_cached) = self.parse_cached(sql)?;
-            tracing::debug!(phase = "parse", duration_us = parse_start.elapsed().as_micros() as u64, "SQL parsed");
 
-            // 2. Create logical plan with catalog access and original SQL for time-travel parsing
-            let plan_start = std::time::Instant::now();
-            let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog)
-                .with_sql(sql.to_string());
-            let plan = planner.statement_to_plan(statement)?;
-            tracing::debug!(phase = "plan", duration_us = plan_start.elapsed().as_micros() as u64, "Logical plan created");
-
-            // Cache the plan wrapped in Arc for cheap future clones
-            if let Ok(mut cache) = self.plan_cache.lock() {
-                cache.put(sql.to_string(), std::sync::Arc::new(plan.clone()));
+            // Fast path: no RLS context → execute directly from Arc (no deep clone)
+            if self.tenant_manager.get_current_context().is_none() {
+                let exec_start = std::time::Instant::now();
+                let mut executor = sql::Executor::with_storage(&self.storage)
+                    .with_timeout(self.config.storage.query_timeout_ms);
+                let results = executor.execute(&arc_plan)?;
+                tracing::debug!(phase = "execute", duration_us = exec_start.elapsed().as_micros() as u64, rows = results.len() as u64, "Query executed");
+                self.log_slow_query(sql, start.elapsed(), results.len() as u64);
+                return Ok(results);
             }
 
+            // Slow path: RLS active → need owned plan for mutation
+            let plan = self.apply_rls_to_plan((*arc_plan).clone())?;
+            let exec_start = std::time::Instant::now();
+            let mut executor = sql::Executor::with_storage(&self.storage)
+                .with_timeout(self.config.storage.query_timeout_ms);
+            let results = executor.execute(&plan)?;
+            tracing::debug!(phase = "execute", duration_us = exec_start.elapsed().as_micros() as u64, rows = results.len() as u64, "Query executed");
+            self.log_slow_query(sql, start.elapsed(), results.len() as u64);
+            return Ok(results);
+        }
+
+        // Cache miss: parse, plan, optimize, cache, execute
+        // 1. Parse SQL (with cache)
+        let parse_start = std::time::Instant::now();
+        let (statement, _parse_cached) = self.parse_cached(sql)?;
+        tracing::debug!(phase = "parse", duration_us = parse_start.elapsed().as_micros() as u64, "SQL parsed");
+
+        // 2. Create logical plan
+        let plan_start = std::time::Instant::now();
+        let catalog = self.storage.catalog();
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_sql(sql.to_string());
+        let plan = planner.statement_to_plan(statement)?;
+        tracing::debug!(phase = "plan", duration_us = plan_start.elapsed().as_micros() as u64, "Logical plan created");
+
+        // 3. Optimize plan (predicate pushdown, constant folding, etc.)
+        // Only run optimizer for plans that benefit from it (contain JOINs)
+        let plan = if Self::plan_contains_join(&plan) {
+            let opt_start = std::time::Instant::now();
+            let stats = optimizer::cost::StatsCatalog::new();
+            let rules: Vec<Box<dyn optimizer::rules::OptimizationRule>> = vec![
+                Box::new(optimizer::rules::ConstantFoldingRule::new()),
+                Box::new(optimizer::rules::SelectionPushdownRule::new()),
+                Box::new(optimizer::rules::ProjectionPruningRule::new()),
+            ];
+            let opt = optimizer::Optimizer::with_rules(
+                stats,
+                rules,
+                optimizer::OptimizerConfig::default(),
+            );
+            let optimized = opt.optimize_recursive(plan)?;
+            tracing::debug!(phase = "optimize", duration_us = opt_start.elapsed().as_micros() as u64, "Plan optimized");
+            optimized
+        } else {
             plan
         };
 
-        // 3. Apply RLS policies to SELECT queries
+        // 4. Cache the optimized plan
+        if let Ok(mut cache) = self.plan_cache.lock() {
+            cache.put(sql.to_string(), std::sync::Arc::new(plan.clone()));
+        }
+
+        // 5. Apply RLS policies
         let plan = self.apply_rls_to_plan(plan)?;
 
-        // 4. Execute plan and return results
+        // 6. Execute
         let exec_start = std::time::Instant::now();
         let mut executor = sql::Executor::with_storage(&self.storage)
             .with_timeout(self.config.storage.query_timeout_ms);
