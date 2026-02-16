@@ -748,14 +748,11 @@ pub(super) fn handle_join(
     on: &Option<crate::sql::LogicalExpr>,
     lateral: bool,
 ) -> Result<Box<dyn PhysicalOperator>> {
-    let left_op = executor.plan_to_operator(left)?;
-    let right_op = executor.plan_to_operator(right)?;
-    let timeout_ctx = executor.timeout_ctx();
-
     // LATERAL joins require nested loop join (right side depends on left row)
     if lateral {
-        // LATERAL joins always use nested loop join because the right side
-        // must be re-evaluated for each row from the left side
+        let left_op = executor.plan_to_operator(left)?;
+        let right_op = executor.plan_to_operator(right)?;
+        let timeout_ctx = executor.timeout_ctx();
         return Ok(Box::new(NestedLoopJoinOperator::new(
             left_op,
             right_op,
@@ -764,6 +761,15 @@ pub(super) fn handle_join(
             timeout_ctx,
         )?));
     }
+
+    // Note: Index-Nested-Loop Join is available via try_index_nested_loop_join()
+    // but is currently disabled as hash join + predicate pushdown is faster for
+    // small-to-medium tables (individual RocksDB lookups are slower than batch scans).
+    // Enable with cardinality-based cost estimation in the future.
+
+    let left_op = executor.plan_to_operator(left)?;
+    let right_op = executor.plan_to_operator(right)?;
+    let timeout_ctx = executor.timeout_ctx();
 
     // Split compound ON conditions into equi-join keys and residual filters.
     // This allows hash join even when the condition mixes equality and non-equality predicates.
@@ -813,6 +819,189 @@ pub(super) fn handle_join(
             }
         }
     }
+}
+
+/// Try to use Index-Nested-Loop Join when the right table has an ART index on the join column.
+///
+/// Returns `Some(operator)` if INLJ is applicable, `None` otherwise (falls back to hash join).
+fn try_index_nested_loop_join(
+    executor: &mut Executor,
+    left: &crate::sql::LogicalPlan,
+    right: &crate::sql::LogicalPlan,
+    join_type: &crate::sql::JoinType,
+    condition: &crate::sql::LogicalExpr,
+) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    use crate::storage::art_manager::ArtIndexManager;
+
+    // Phase 1: Check eligibility (immutable borrow of executor/storage)
+    let (right_table, right_schema, index_name, left_join_col) = {
+        let storage = match executor.storage() {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+
+        // Extract the right table name and schema from a Scan or Filter(Scan) node
+        let (right_table, right_alias, right_schema) = match extract_scan_info(right) {
+            Some(info) => info,
+            None => return Ok(None),
+        };
+
+        // Extract equi-join column pair from condition (simple case: single equality)
+        let (left_col, right_col) = match extract_equi_columns(condition) {
+            Some(pair) => pair,
+            None => return Ok(None),
+        };
+
+        // Determine which column belongs to the right table
+        let right_join_col = if column_matches_table(&right_col, &right_table, right_alias.as_deref()) {
+            right_col.1.clone()
+        } else if column_matches_table(&left_col, &right_table, right_alias.as_deref()) {
+            left_col.1.clone()
+        } else {
+            return Ok(None);
+        };
+
+        // Check if there's an ART index on the right table's join column
+        let index_name = match storage.art_indexes().find_column_index(&right_table, &right_join_col) {
+            Some(name) => name,
+            None => return Ok(None),
+        };
+
+        // Determine which column is the left key
+        let left_join_col = if column_matches_table(&right_col, &right_table, right_alias.as_deref()) {
+            left_col.clone()
+        } else {
+            right_col.clone()
+        };
+
+        (right_table, right_schema, index_name, left_join_col)
+    }; // Immutable borrow of executor dropped here
+
+    // Phase 2: Build left operator (mutable borrow of executor)
+    let mut left_op = executor.plan_to_operator(left)?;
+    let left_schema = left_op.schema();
+
+    // Find the column index of the join key in left tuples
+    let left_key_idx = match find_column_index(&left_schema, left_join_col.0.as_deref(), &left_join_col.1) {
+        Some(idx) => idx,
+        None => return Ok(None),
+    };
+
+    // Build output schema (left + right)
+    let mut output_columns = left_schema.columns.clone();
+    output_columns.extend(right_schema.columns.clone());
+    let output_schema = Arc::new(Schema { columns: output_columns });
+
+    let right_col_count = right_schema.columns.len();
+    let is_left_join = matches!(join_type, crate::sql::JoinType::Left);
+
+    // Phase 3: Execute INLJ (immutable borrow of executor/storage again)
+    let storage = executor.storage()
+        .ok_or_else(|| Error::query_execution("Storage unavailable for INLJ"))?;
+
+    let mut result_tuples = Vec::new();
+
+    while let Some(left_tuple) = left_op.next()? {
+        // Extract join key value from left tuple
+        let key_value = match left_tuple.values.get(left_key_idx) {
+            Some(v) if !matches!(v, crate::Value::Null) => v.clone(),
+            _ => {
+                if is_left_join {
+                    let mut combined_values = left_tuple.values.clone();
+                    combined_values.resize(combined_values.len() + right_col_count, crate::Value::Null);
+                    result_tuples.push(Tuple { values: combined_values, row_id: None, branch_id: None });
+                }
+                continue;
+            }
+        };
+
+        // Encode the key for ART lookup
+        let encoded_key = ArtIndexManager::encode_key(&[key_value]);
+
+        // Look up all matching row_ids from the ART index
+        let matching_row_ids = storage.art_indexes().index_get_all(&index_name, &encoded_key);
+
+        if matching_row_ids.is_empty() {
+            if is_left_join {
+                let mut combined_values = left_tuple.values.clone();
+                combined_values.resize(combined_values.len() + right_col_count, crate::Value::Null);
+                result_tuples.push(Tuple { values: combined_values, row_id: None, branch_id: None });
+            }
+            continue;
+        }
+
+        // Fetch each matching right row and combine
+        for row_id in matching_row_ids {
+            if let Some(right_tuple) = storage.get_row_by_id(&right_table, row_id, &right_schema)? {
+                let mut combined_values = Vec::with_capacity(left_tuple.values.len() + right_tuple.values.len());
+                combined_values.extend_from_slice(&left_tuple.values);
+                combined_values.extend_from_slice(&right_tuple.values);
+                result_tuples.push(Tuple { values: combined_values, row_id: None, branch_id: None });
+            }
+        }
+    }
+
+    Ok(Some(Box::new(super::MaterializedOperator::new(result_tuples, output_schema))))
+}
+
+/// Extract table name, alias, and schema from a Scan or Filter(Scan) plan node
+fn extract_scan_info(plan: &crate::sql::LogicalPlan) -> Option<(String, Option<String>, Arc<Schema>)> {
+    match plan {
+        crate::sql::LogicalPlan::Scan { table_name, alias, schema, .. } => {
+            Some((table_name.clone(), alias.clone(), schema.clone()))
+        }
+        crate::sql::LogicalPlan::Filter { input, .. } => extract_scan_info(input),
+        crate::sql::LogicalPlan::Project { input, .. } => extract_scan_info(input),
+        _ => None,
+    }
+}
+
+/// Extract column pair from a simple equi-join condition: col1 = col2
+/// Returns (table_option, column_name) for each side
+fn extract_equi_columns(condition: &crate::sql::LogicalExpr) -> Option<((Option<String>, String), (Option<String>, String))> {
+    use crate::sql::{LogicalExpr, BinaryOperator};
+
+    match condition {
+        LogicalExpr::BinaryExpr { left, op: BinaryOperator::Eq, right } => {
+            match (left.as_ref(), right.as_ref()) {
+                (LogicalExpr::Column { table: lt, name: ln }, LogicalExpr::Column { table: rt, name: rn }) => {
+                    Some(((lt.clone(), ln.clone()), (rt.clone(), rn.clone())))
+                }
+                _ => None,
+            }
+        }
+        // For compound AND conditions, try the first equality
+        LogicalExpr::BinaryExpr { left, op: BinaryOperator::And, .. } => {
+            extract_equi_columns(left)
+        }
+        _ => None,
+    }
+}
+
+/// Check if a (table, column) pair refers to the given table name or alias
+fn column_matches_table(col: &(Option<String>, String), table_name: &str, alias: Option<&str>) -> bool {
+    match &col.0 {
+        Some(qualifier) => qualifier == table_name || alias.is_some_and(|a| a == qualifier),
+        None => false,
+    }
+}
+
+/// Find the index of a column in a schema by optional table qualifier and column name
+fn find_column_index(schema: &Schema, table: Option<&str>, name: &str) -> Option<usize> {
+    // Try exact match with table qualifier first
+    if let Some(tbl) = table {
+        for (i, col) in schema.columns.iter().enumerate() {
+            if col.name == name {
+                if let Some(ref src) = col.source_table_name {
+                    if src == tbl {
+                        return Some(i);
+                    }
+                }
+            }
+        }
+    }
+    // Fall back to name-only match
+    schema.columns.iter().position(|c| c.name == name)
 }
 
 /// Split a join condition into equi-join predicates and residual filters.

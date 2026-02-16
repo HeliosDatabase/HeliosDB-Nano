@@ -1618,6 +1618,69 @@ impl StorageEngine {
         self.get_row_by_pk_inner(table_name, pk_value, Some(schema))
     }
 
+    /// Fetch a row directly by its row_id (for index-nested-loop join)
+    pub fn get_row_by_id(&self, table_name: &str, row_id: u64, schema: &crate::Schema) -> Result<Option<Tuple>> {
+        // Check row cache first
+        if let Some(cached) = self.row_cache.get(table_name, row_id) {
+            return Ok(Some(cached));
+        }
+
+        // Construct the storage key and fetch directly
+        let storage_key = self.branch_aware_data_key(table_name, row_id);
+        let raw_value = match self.get(&storage_key)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        // Deserialize the tuple
+        let mut tuple: Tuple = bincode::deserialize(&raw_value)
+            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+        tuple.row_id = Some(row_id);
+
+        // Resolve per-column storage references
+        for (idx, column) in schema.columns.iter().enumerate() {
+            if idx >= tuple.values.len() {
+                break;
+            }
+            #[allow(clippy::indexing_slicing)]
+            match column.storage_mode {
+                ColumnStorageMode::Dictionary => {
+                    if let Some(crate::Value::DictRef { dict_id }) = tuple.values.get(idx) {
+                        let dict_id = *dict_id;
+                        let s = self.dict_manager.decode(&self.db, table_name, &column.name, dict_id)?;
+                        if let Some(val) = tuple.values.get_mut(idx) {
+                            *val = crate::Value::String(s);
+                        }
+                    }
+                }
+                ColumnStorageMode::ContentAddressed => {
+                    if let Some(crate::Value::CasRef { hash }) = tuple.values.get(idx) {
+                        let hash = hash.clone();
+                        let resolved = ContentAddressedStore::resolve(&self.db, &hash, &column.data_type)?;
+                        if let Some(val) = tuple.values.get_mut(idx) {
+                            *val = resolved;
+                        }
+                    }
+                }
+                ColumnStorageMode::Columnar => {
+                    if matches!(tuple.values.get(idx), Some(crate::Value::ColumnarRef)) {
+                        if let Some(val) = ColumnarStore::get(&self.db, table_name, &column.name, row_id)? {
+                            if let Some(slot) = tuple.values.get_mut(idx) {
+                                *slot = val;
+                            }
+                        }
+                    }
+                }
+                ColumnStorageMode::Default => {}
+            }
+        }
+
+        // Populate row cache
+        self.row_cache.put(table_name, row_id, tuple.clone());
+
+        Ok(Some(tuple))
+    }
+
     fn get_row_by_pk_inner(&self, table_name: &str, pk_value: &crate::Value, schema: Option<&crate::Schema>) -> Result<Option<Tuple>> {
         let lookup_start = std::time::Instant::now();
 

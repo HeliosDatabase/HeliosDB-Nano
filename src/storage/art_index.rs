@@ -237,11 +237,17 @@ impl AdaptiveRadixTree {
     /// Insert into a specific node
     fn insert_into_node(&mut self, mut node: ArtNode, key: &[u8], value: RowId, depth: usize) -> ArtResult<ArtNode> {
         // Handle leaf node
-        if let ArtNode::Leaf(ref leaf) = node {
-            // If same key, this is a duplicate (already checked above)
-            // Create a new inner node
-            let existing_key = &leaf.key;
-            let existing_value = leaf.value;
+        if let ArtNode::Leaf(ref mut leaf) = node {
+            // Same key - add value to multi-value leaf (for non-unique indexes)
+            if leaf.matches(key) {
+                leaf.push_value(value);
+                return Ok(node);
+            }
+
+            // Different key - create a new inner node
+            // Take ownership of key and values (avoids clone since leaf is being replaced)
+            let existing_key = std::mem::take(&mut leaf.key);
+            let (primary, extra) = leaf.take_values();
 
             // Find the common prefix length
             let mut prefix_len = 0;
@@ -263,18 +269,20 @@ impl AdaptiveRadixTree {
             // Add both leaves as children (or store value at node if key exhausted)
             let new_depth = depth + prefix_len;
             if new_depth < existing_key.len() {
-                let existing_leaf = ArtNode::Leaf(LeafNode::new(existing_key.clone(), existing_value));
-                new_node.add_child(existing_key[new_depth], existing_leaf);
+                let child_byte = existing_key[new_depth];
+                let existing_leaf = ArtNode::Leaf(LeafNode::from_values(existing_key, primary, extra));
+                new_node.add_child(child_byte, existing_leaf);
             } else {
-                // Existing key ends at this node - store value here
-                new_node.header.value = Some(existing_value);
+                // Existing key ends at this node - store all values here
+                new_node.header.values.push(primary);
+                new_node.header.values.extend(extra);
             }
             if new_depth < key.len() {
                 let new_leaf = ArtNode::Leaf(LeafNode::new(key.to_vec(), value));
                 new_node.add_child(key[new_depth], new_leaf);
             } else {
-                // New key ends at this node - store value here
-                new_node.header.value = Some(value);
+                // New key ends at this node - add value here
+                new_node.header.values.push(value);
             }
 
             self.stats.node4_count += 1;
@@ -306,7 +314,7 @@ impl AdaptiveRadixTree {
         if new_depth >= key.len() {
             // Key exhausted at inner node - store value here
             if self.index_type == ArtIndexType::PrimaryKey || self.index_type == ArtIndexType::Unique {
-                if node.header().value.is_some() {
+                if !node.header().values.is_empty() {
                     return Err(ArtIndexError::DuplicateKey(format!(
                         "Key already exists in {} index '{}'",
                         if self.index_type == ArtIndexType::PrimaryKey { "primary key" } else { "unique" },
@@ -314,8 +322,7 @@ impl AdaptiveRadixTree {
                     )));
                 }
             }
-            node.header_mut().value = Some(value);
-            self.size += 1;
+            node.header_mut().values.push(value);
             return Ok(node);
         }
 
@@ -440,7 +447,7 @@ impl AdaptiveRadixTree {
             self.stats.leaf_count += 1;
         } else {
             // Key exhausted at this node - store value in header
-            new_parent.header.value = Some(value);
+            new_parent.header.values.push(value);
         }
 
         self.stats.node4_count += 1;
@@ -460,7 +467,7 @@ impl AdaptiveRadixTree {
         match node {
             ArtNode::Leaf(leaf) => {
                 if leaf.matches(key) {
-                    Some(leaf.value)
+                    Some(leaf.value())
                 } else {
                     None
                 }
@@ -479,13 +486,57 @@ impl AdaptiveRadixTree {
 
                 let new_depth = depth + prefix_len;
                 if new_depth >= key.len() {
-                    // Key exhausted at inner node - return stored value if any
-                    return header.value;
+                    // Key exhausted at inner node - return first stored value if any
+                    return header.values.first().copied();
                 }
 
                 let next_byte = key[new_depth];
                 let child = node.get_child(next_byte)?;
                 self.get_recursive(child, key, new_depth + 1)
+            }
+        }
+    }
+
+    /// Get all values for a key (for non-unique indexes with multiple row IDs)
+    pub fn get_all(&self, key: &[u8]) -> Vec<RowId> {
+        let Some(node) = self.root.as_ref() else {
+            return Vec::new();
+        };
+        self.get_all_recursive(node, key, 0)
+    }
+
+    /// Internal recursive get_all
+    #[allow(clippy::self_only_used_in_recursion)]
+    fn get_all_recursive(&self, node: &ArtNode, key: &[u8], depth: usize) -> Vec<RowId> {
+        match node {
+            ArtNode::Leaf(leaf) => {
+                if leaf.matches(key) {
+                    leaf.all_values()
+                } else {
+                    Vec::new()
+                }
+            }
+            _ => {
+                let header = node.header();
+                let prefix_len = header.prefix_len as usize;
+                let prefix = header.get_prefix();
+
+                for i in 0..prefix_len.min(MAX_PREFIX_LEN) {
+                    if depth + i >= key.len() || prefix[i] != key[depth + i] {
+                        return Vec::new();
+                    }
+                }
+
+                let new_depth = depth + prefix_len;
+                if new_depth >= key.len() {
+                    return header.values.clone();
+                }
+
+                let next_byte = key[new_depth];
+                let Some(child) = node.get_child(next_byte) else {
+                    return Vec::new();
+                };
+                self.get_all_recursive(child, key, new_depth + 1)
             }
         }
     }
@@ -518,12 +569,19 @@ impl AdaptiveRadixTree {
         Ok(removed_value)
     }
 
-    /// Internal recursive remove
+    /// Internal recursive remove (removes ALL values for the key)
     fn remove_recursive(&mut self, node: ArtNode, key: &[u8], depth: usize) -> ArtResult<(Option<ArtNode>, Option<RowId>)> {
         match node {
             ArtNode::Leaf(leaf) => {
                 if leaf.matches(key) {
-                    Ok((None, Some(leaf.value)))
+                    let first_value = Some(leaf.value());
+                    let count = leaf.values_count() as u64;
+                    // Adjust size for extra values beyond the first (first is handled by caller)
+                    if count > 1 {
+                        self.size -= count - 1;
+                        self.stats.key_count = self.size;
+                    }
+                    Ok((None, first_value))
                 } else {
                     Ok((Some(ArtNode::Leaf(leaf)), None))
                 }
@@ -542,9 +600,15 @@ impl AdaptiveRadixTree {
 
                 let new_depth = depth + prefix_len;
                 if new_depth >= key.len() {
-                    // Key exhausted at inner node - remove value here if present
-                    let value = inner.header_mut().value.take();
-                    return Ok((Some(inner), value));
+                    // Key exhausted at inner node - remove all values here
+                    let values = std::mem::take(&mut inner.header_mut().values);
+                    let first_value = values.first().copied();
+                    // Adjust size for extra values beyond the first
+                    if values.len() > 1 {
+                        self.size -= (values.len() - 1) as u64;
+                        self.stats.key_count = self.size;
+                    }
+                    return Ok((Some(inner), first_value));
                 }
 
                 let next_byte = key[new_depth];
@@ -620,6 +684,139 @@ impl AdaptiveRadixTree {
         }
     }
 
+    /// Remove a specific row_id value for a key (for non-unique indexes)
+    /// Only removes the leaf/node if no values remain
+    pub fn remove_value(&mut self, key: &[u8], row_id: RowId) -> ArtResult<bool> {
+        self.stats.delete_count += 1;
+
+        if self.root.is_none() {
+            return Ok(false);
+        }
+
+        let root = self.root.take()
+            .ok_or_else(|| ArtIndexError::Internal("Missing root node during remove_value".to_string()))?;
+        let (new_root, removed) = self.remove_value_recursive(root, key, row_id, 0)?;
+        self.root = new_root;
+
+        if removed {
+            self.size -= 1;
+            self.stats.key_count = self.size;
+        }
+
+        Ok(removed)
+    }
+
+    /// Internal recursive remove_value - removes a specific row_id from a key's values
+    fn remove_value_recursive(&mut self, node: ArtNode, key: &[u8], row_id: RowId, depth: usize) -> ArtResult<(Option<ArtNode>, bool)> {
+        match node {
+            ArtNode::Leaf(mut leaf) => {
+                if leaf.matches(key) {
+                    let (removed, now_empty) = leaf.remove_value(row_id);
+                    if removed && now_empty {
+                        // No values left - remove the leaf entirely
+                        self.stats.leaf_count -= 1;
+                        Ok((None, true))
+                    } else if removed {
+                        Ok((Some(ArtNode::Leaf(leaf)), true))
+                    } else {
+                        Ok((Some(ArtNode::Leaf(leaf)), false))
+                    }
+                } else {
+                    Ok((Some(ArtNode::Leaf(leaf)), false))
+                }
+            }
+            mut inner => {
+                let header = inner.header();
+                let prefix_len = header.prefix_len as usize;
+                let prefix = header.get_prefix().to_vec();
+
+                for i in 0..prefix_len.min(MAX_PREFIX_LEN) {
+                    if depth + i >= key.len() || prefix[i] != key[depth + i] {
+                        return Ok((Some(inner), false));
+                    }
+                }
+
+                let new_depth = depth + prefix_len;
+                if new_depth >= key.len() {
+                    // Key exhausted at inner node - remove specific value
+                    let values = &mut inner.header_mut().values;
+                    if let Some(pos) = values.iter().position(|&v| v == row_id) {
+                        values.swap_remove(pos);
+                        return Ok((Some(inner), true));
+                    }
+                    return Ok((Some(inner), false));
+                }
+
+                let next_byte = key[new_depth];
+
+                let removed = match &mut inner {
+                    ArtNode::Node4(n) => {
+                        if let Some(idx) = n.find_child_index(next_byte) {
+                            let child = n.children[idx].take()
+                                .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node4 child".to_string()))?;
+                            let (new_child, removed) = self.remove_value_recursive(child, key, row_id, new_depth + 1)?;
+                            if new_child.is_some() {
+                                n.children[idx] = new_child;
+                            } else {
+                                n.remove_child(next_byte);
+                            }
+                            removed
+                        } else {
+                            false
+                        }
+                    }
+                    ArtNode::Node16(n) => {
+                        if let Some(idx) = n.find_child_index(next_byte) {
+                            let child = n.children[idx].take()
+                                .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node16 child".to_string()))?;
+                            let (new_child, removed) = self.remove_value_recursive(child, key, row_id, new_depth + 1)?;
+                            if new_child.is_some() {
+                                n.children[idx] = new_child;
+                            } else {
+                                n.remove_child(next_byte);
+                            }
+                            removed
+                        } else {
+                            false
+                        }
+                    }
+                    ArtNode::Node48(n) => {
+                        let idx = n.child_index[next_byte as usize];
+                        if idx != 255 {
+                            let child = n.children[idx as usize].take()
+                                .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node48 child".to_string()))?;
+                            let (new_child, removed) = self.remove_value_recursive(child, key, row_id, new_depth + 1)?;
+                            if new_child.is_some() {
+                                n.children[idx as usize] = new_child;
+                            } else {
+                                n.remove_child(next_byte);
+                            }
+                            removed
+                        } else {
+                            false
+                        }
+                    }
+                    ArtNode::Node256(n) => {
+                        if let Some(child) = n.children[next_byte as usize].take() {
+                            let (new_child, removed) = self.remove_value_recursive(child, key, row_id, new_depth + 1)?;
+                            n.children[next_byte as usize] = new_child;
+                            if n.children[next_byte as usize].is_none() {
+                                n.header.num_children -= 1;
+                            }
+                            removed
+                        } else {
+                            false
+                        }
+                    }
+                    ArtNode::Leaf(_) => unreachable!(),
+                };
+
+                let final_node = self.maybe_shrink_node(inner);
+                Ok((Some(final_node), removed))
+            }
+        }
+    }
+
     /// Shrink a node if it has too few children
     fn maybe_shrink_node(&mut self, node: ArtNode) -> ArtNode {
         match node {
@@ -669,8 +866,8 @@ impl AdaptiveRadixTree {
 pub struct ArtIterator<'a> {
     /// Stack of nodes to visit (node, key_prefix)
     stack: VecDeque<(&'a ArtNode, Vec<u8>)>,
-    /// Pending value from inner node (if any)
-    pending_inner_value: Option<(Vec<u8>, RowId)>,
+    /// Pending values to yield (from multi-value leaves or inner nodes)
+    pending_values: VecDeque<(Vec<u8>, RowId)>,
 }
 
 impl<'a> ArtIterator<'a> {
@@ -679,7 +876,7 @@ impl<'a> ArtIterator<'a> {
         if let Some(root) = &tree.root {
             stack.push_back((root, Vec::new()));
         }
-        Self { stack, pending_inner_value: None }
+        Self { stack, pending_values: VecDeque::new() }
     }
 }
 
@@ -688,27 +885,39 @@ impl Iterator for ArtIterator<'_> {
     type Item = (Vec<u8>, RowId);
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Return pending inner value first
-        if let Some(item) = self.pending_inner_value.take() {
+        if let Some(item) = self.pending_values.pop_front() {
             return Some(item);
         }
 
         while let Some((node, key_prefix)) = self.stack.pop_front() {
             match node {
                 ArtNode::Leaf(leaf) => {
-                    return Some((leaf.key.clone(), leaf.value));
+                    // Fast path: single value (common case for unique indexes)
+                    if leaf.values_count() == 1 {
+                        return Some((leaf.key.clone(), leaf.value()));
+                    }
+                    // Multi-value: queue all values
+                    for v in leaf.values_iter() {
+                        self.pending_values.push_back((leaf.key.clone(), v));
+                    }
+                    if let Some(item) = self.pending_values.pop_front() {
+                        return Some(item);
+                    }
                 }
                 ArtNode::Node4(n) => {
-                    // Build key with node's prefix
                     let mut node_key = key_prefix.clone();
                     node_key.extend_from_slice(n.header.get_prefix());
 
-                    // Check for value at this inner node
-                    if let Some(value) = n.header.value {
-                        self.pending_inner_value = Some((node_key.clone(), value));
+                    if let Some(&value) = n.header.values.first() {
+                        if n.header.values.len() == 1 {
+                            self.pending_values.push_back((node_key.clone(), value));
+                        } else {
+                            for &v in &n.header.values {
+                                self.pending_values.push_back((node_key.clone(), v));
+                            }
+                        }
                     }
 
-                    // Collect children to push in reverse order
                     let children: Vec<_> = n.iter_children().collect();
                     for (byte, child) in children.into_iter().rev() {
                         let mut child_key = node_key.clone();
@@ -716,16 +925,16 @@ impl Iterator for ArtIterator<'_> {
                         self.stack.push_front((child, child_key));
                     }
 
-                    if self.pending_inner_value.is_some() {
-                        return self.pending_inner_value.take();
+                    if let Some(item) = self.pending_values.pop_front() {
+                        return Some(item);
                     }
                 }
                 ArtNode::Node16(n) => {
                     let mut node_key = key_prefix.clone();
                     node_key.extend_from_slice(n.header.get_prefix());
 
-                    if let Some(value) = n.header.value {
-                        self.pending_inner_value = Some((node_key.clone(), value));
+                    for &v in &n.header.values {
+                        self.pending_values.push_back((node_key.clone(), v));
                     }
 
                     let children: Vec<_> = n.iter_children().collect();
@@ -735,16 +944,16 @@ impl Iterator for ArtIterator<'_> {
                         self.stack.push_front((child, child_key));
                     }
 
-                    if self.pending_inner_value.is_some() {
-                        return self.pending_inner_value.take();
+                    if let Some(item) = self.pending_values.pop_front() {
+                        return Some(item);
                     }
                 }
                 ArtNode::Node48(n) => {
                     let mut node_key = key_prefix.clone();
                     node_key.extend_from_slice(n.header.get_prefix());
 
-                    if let Some(value) = n.header.value {
-                        self.pending_inner_value = Some((node_key.clone(), value));
+                    for &v in &n.header.values {
+                        self.pending_values.push_back((node_key.clone(), v));
                     }
 
                     let children: Vec<_> = n.iter_children().collect();
@@ -754,16 +963,16 @@ impl Iterator for ArtIterator<'_> {
                         self.stack.push_front((child, child_key));
                     }
 
-                    if self.pending_inner_value.is_some() {
-                        return self.pending_inner_value.take();
+                    if let Some(item) = self.pending_values.pop_front() {
+                        return Some(item);
                     }
                 }
                 ArtNode::Node256(n) => {
                     let mut node_key = key_prefix.clone();
                     node_key.extend_from_slice(n.header.get_prefix());
 
-                    if let Some(value) = n.header.value {
-                        self.pending_inner_value = Some((node_key.clone(), value));
+                    for &v in &n.header.values {
+                        self.pending_values.push_back((node_key.clone(), v));
                     }
 
                     let children: Vec<_> = n.iter_children().collect();
@@ -773,8 +982,8 @@ impl Iterator for ArtIterator<'_> {
                         self.stack.push_front((child, child_key));
                     }
 
-                    if self.pending_inner_value.is_some() {
-                        return self.pending_inner_value.take();
+                    if let Some(item) = self.pending_values.pop_front() {
+                        return Some(item);
                     }
                 }
             }
@@ -968,6 +1177,111 @@ mod tests {
         assert_eq!(tree.get(b"/api"), Some(1));
         assert_eq!(tree.get(b"/api/v1"), Some(2));
         assert_eq!(tree.get(b"/api/v1/users"), Some(3));
+        assert_eq!(tree.len(), 3);
+    }
+
+    #[test]
+    fn test_multi_value_insert() {
+        // Non-unique (Manual) index should support multiple row_ids per key
+        let mut tree = AdaptiveRadixTree::new("idx", "orders", vec!["user_id".to_string()], ArtIndexType::Manual);
+
+        // Insert same key with different row_ids
+        tree.insert(b"user42", 100).unwrap();
+        tree.insert(b"user42", 200).unwrap();
+        tree.insert(b"user42", 300).unwrap();
+
+        // get() returns first value
+        assert_eq!(tree.get(b"user42"), Some(100));
+
+        // get_all() returns all values
+        let all = tree.get_all(b"user42");
+        assert_eq!(all.len(), 3);
+        assert!(all.contains(&100));
+        assert!(all.contains(&200));
+        assert!(all.contains(&300));
+
+        // len() counts total entries
+        assert_eq!(tree.len(), 3);
+    }
+
+    #[test]
+    fn test_multi_value_remove_specific() {
+        let mut tree = AdaptiveRadixTree::new("idx", "orders", vec!["user_id".to_string()], ArtIndexType::Manual);
+
+        tree.insert(b"user42", 100).unwrap();
+        tree.insert(b"user42", 200).unwrap();
+        tree.insert(b"user42", 300).unwrap();
+
+        // Remove specific row_id
+        assert!(tree.remove_value(b"user42", 200).unwrap());
+
+        let all = tree.get_all(b"user42");
+        assert_eq!(all.len(), 2);
+        assert!(all.contains(&100));
+        assert!(!all.contains(&200));
+        assert!(all.contains(&300));
+        assert_eq!(tree.len(), 2);
+
+        // Remove non-existent row_id
+        assert!(!tree.remove_value(b"user42", 999).unwrap());
+
+        // Remove remaining values
+        assert!(tree.remove_value(b"user42", 100).unwrap());
+        assert!(tree.remove_value(b"user42", 300).unwrap());
+
+        assert_eq!(tree.get(b"user42"), None);
+        assert_eq!(tree.len(), 0);
+    }
+
+    #[test]
+    fn test_multi_value_iteration() {
+        let mut tree = AdaptiveRadixTree::new("idx", "orders", vec!["user_id".to_string()], ArtIndexType::Manual);
+
+        tree.insert(b"key_a", 1).unwrap();
+        tree.insert(b"key_a", 2).unwrap();
+        tree.insert(b"key_b", 3).unwrap();
+        tree.insert(b"key_b", 4).unwrap();
+        tree.insert(b"key_b", 5).unwrap();
+
+        let results: Vec<_> = tree.iter().collect();
+        assert_eq!(results.len(), 5);
+
+        // All key_a values present
+        let key_a_vals: Vec<_> = results.iter().filter(|(k, _)| k == b"key_a").map(|(_, v)| *v).collect();
+        assert_eq!(key_a_vals.len(), 2);
+        assert!(key_a_vals.contains(&1));
+        assert!(key_a_vals.contains(&2));
+
+        // All key_b values present
+        let key_b_vals: Vec<_> = results.iter().filter(|(k, _)| k == b"key_b").map(|(_, v)| *v).collect();
+        assert_eq!(key_b_vals.len(), 3);
+    }
+
+    #[test]
+    fn test_multi_value_fk_index() {
+        // Simulate FK index behavior
+        let mut tree = AdaptiveRadixTree::new("idx", "orders", vec!["user_id".to_string()], ArtIndexType::ForeignKey);
+
+        // Multiple orders for same user
+        tree.insert(b"\x00\x00\x00\x2a", 1).unwrap(); // user_id=42, row 1
+        tree.insert(b"\x00\x00\x00\x2a", 2).unwrap(); // user_id=42, row 2
+        tree.insert(b"\x00\x00\x00\x2a", 3).unwrap(); // user_id=42, row 3
+        tree.insert(b"\x00\x00\x00\x01", 4).unwrap(); // user_id=1, row 4
+
+        // All 4 entries stored
+        assert_eq!(tree.len(), 4);
+
+        // Lookup by key
+        let user42_orders = tree.get_all(b"\x00\x00\x00\x2a");
+        assert_eq!(user42_orders.len(), 3);
+
+        let user1_orders = tree.get_all(b"\x00\x00\x00\x01");
+        assert_eq!(user1_orders.len(), 1);
+
+        // Remove specific order
+        tree.remove_value(b"\x00\x00\x00\x2a", 2).unwrap();
+        let user42_orders = tree.get_all(b"\x00\x00\x00\x2a");
+        assert_eq!(user42_orders.len(), 2);
         assert_eq!(tree.len(), 3);
     }
 }

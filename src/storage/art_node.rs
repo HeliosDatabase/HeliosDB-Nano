@@ -21,8 +21,9 @@ pub struct NodeHeader {
     pub prefix_len: u32,
     /// Compressed prefix bytes
     pub prefix: [u8; MAX_PREFIX_LEN],
-    /// Optional value stored at this inner node (for keys that end here)
-    pub value: Option<RowId>,
+    /// Values stored at this inner node (for keys that end here)
+    /// Multiple values supported for non-unique indexes
+    pub values: Vec<RowId>,
 }
 
 impl Default for NodeHeader {
@@ -31,7 +32,7 @@ impl Default for NodeHeader {
             num_children: 0,
             prefix_len: 0,
             prefix: [0u8; MAX_PREFIX_LEN],
-            value: None,
+            values: Vec::new(),
         }
     }
 }
@@ -77,19 +78,83 @@ pub enum ArtNode {
     Leaf(LeafNode),
 }
 
-/// Leaf node containing the actual value
+/// Leaf node containing the actual value(s)
+///
+/// Optimized for the common single-value case: primary value is stored inline
+/// (no heap allocation). Additional values for non-unique indexes spill to `extra`.
 #[derive(Debug, Clone)]
 pub struct LeafNode {
     /// The full key for this leaf
     pub key: Vec<u8>,
-    /// The row ID value
-    pub value: RowId,
+    /// Primary row ID value (always present, stored inline — no heap allocation)
+    primary: RowId,
+    /// Additional row IDs for non-unique indexes (empty Vec = no heap allocation)
+    extra: Vec<RowId>,
 }
 
 impl LeafNode {
-    /// Create a new leaf node
+    /// Create a new leaf node with a single value
     pub fn new(key: Vec<u8>, value: RowId) -> Self {
-        Self { key, value }
+        Self { key, primary: value, extra: Vec::new() }
+    }
+
+    /// Create a leaf node from multiple values (e.g., during node splitting)
+    pub fn from_values(key: Vec<u8>, primary: RowId, extra: Vec<RowId>) -> Self {
+        Self { key, primary, extra }
+    }
+
+    /// Get the first (primary) value
+    pub fn value(&self) -> RowId {
+        self.primary
+    }
+
+    /// Get the total number of values
+    pub fn values_count(&self) -> usize {
+        1 + self.extra.len()
+    }
+
+    /// Add an additional value (for non-unique indexes)
+    pub fn push_value(&mut self, value: RowId) {
+        self.extra.push(value);
+    }
+
+    /// Iterate over all values
+    pub fn values_iter(&self) -> impl Iterator<Item = RowId> + '_ {
+        std::iter::once(self.primary).chain(self.extra.iter().copied())
+    }
+
+    /// Collect all values into a Vec
+    pub fn all_values(&self) -> Vec<RowId> {
+        let mut v = Vec::with_capacity(1 + self.extra.len());
+        v.push(self.primary);
+        v.extend_from_slice(&self.extra);
+        v
+    }
+
+    /// Take all values out, leaving the leaf empty (primary=0, extra cleared)
+    /// Returns (primary, extra_values)
+    pub fn take_values(&mut self) -> (RowId, Vec<RowId>) {
+        let primary = self.primary;
+        self.primary = 0;
+        (primary, std::mem::take(&mut self.extra))
+    }
+
+    /// Remove a specific row_id. Returns true if found and removed.
+    /// If the primary value is removed, it's replaced by one from `extra`.
+    /// Returns (removed, now_empty) — caller should delete leaf if now_empty.
+    pub fn remove_value(&mut self, row_id: RowId) -> (bool, bool) {
+        if self.primary == row_id {
+            if let Some(replacement) = self.extra.pop() {
+                self.primary = replacement;
+                return (true, false);
+            }
+            return (true, true); // Last value removed
+        }
+        if let Some(pos) = self.extra.iter().position(|&v| v == row_id) {
+            self.extra.swap_remove(pos);
+            return (true, false);
+        }
+        (false, false)
     }
 
     /// Check if the key matches

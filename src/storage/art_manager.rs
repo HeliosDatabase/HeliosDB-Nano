@@ -520,6 +520,31 @@ impl ArtIndexManager {
             .collect()
     }
 
+    /// Find an index for a specific column in a table (returns index name if found)
+    pub fn find_column_index(&self, table: &str, column: &str) -> Option<String> {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        for idx in indexes.values() {
+            if idx.table() == table && idx.columns().len() == 1 {
+                if let Some(col) = idx.columns().first() {
+                    if col == column {
+                        return Some(idx.name().to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Look up all row_ids for a key in a named index (avoids cloning the entire tree)
+    pub fn index_get_all(&self, index_name: &str, key: &[u8]) -> Vec<RowId> {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(idx) = indexes.get(index_name) {
+            idx.get_all(key)
+        } else {
+            Vec::new()
+        }
+    }
+
     /// List indexes for a specific table
     pub fn list_table_indexes(&self, table: &str) -> Vec<(String, ArtIndexType, Vec<String>)> {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
@@ -783,7 +808,16 @@ impl ArtIndexManager {
 
             if values.len() == columns.len() {
                 let key = Self::encode_key(&values);
-                let _ = index.remove(&key);
+                match index.index_type() {
+                    ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
+                        // Unique indexes: remove entire key entry
+                        let _ = index.remove(&key);
+                    }
+                    ArtIndexType::ForeignKey | ArtIndexType::Manual => {
+                        // Non-unique indexes: remove only the specific row_id
+                        let _ = index.remove_value(&key, row_id);
+                    }
+                }
             }
         }
 
