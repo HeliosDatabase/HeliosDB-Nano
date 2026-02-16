@@ -377,6 +377,8 @@ pub struct EmbeddedDatabase {
     plan_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<sql::LogicalPlan>>>>,
     /// Parse cache: SQL string → AST Statement (LRU, skips SQL parsing for repeated queries)
     parse_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, sqlparser::ast::Statement>>>,
+    /// Query result cache: SQL string → cached results (invalidated on DML per-table)
+    result_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<Vec<Tuple>>>>>,
 }
 
 impl Drop for EmbeddedDatabase {
@@ -564,6 +566,11 @@ impl EmbeddedDatabase {
         if let Some(context) = self.tenant_manager.get_current_context() {
             self.tenant_manager.record_query(context.tenant_id)
                 .map_err(|e| Error::query_execution(format!("Quota exceeded: {}", e)))?;
+        }
+
+        // Fast path: simple INSERT with literal values (skips full SQL parsing)
+        if let Some(result) = self.try_fast_insert(sql) {
+            return result;
         }
 
         // Check if this is a Phase 3 branching statement (before trying to parse with sqlparser)
@@ -1988,6 +1995,7 @@ impl EmbeddedDatabase {
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()))),
             parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).unwrap()))),
+            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(128).unwrap()))),
         })
     }
 
@@ -2042,6 +2050,7 @@ impl EmbeddedDatabase {
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()))),
             parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).unwrap()))),
+            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(128).unwrap()))),
         })
     }
 
@@ -2105,6 +2114,7 @@ impl EmbeddedDatabase {
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()))),
             parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).unwrap()))),
+            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(128).unwrap()))),
         })
     }
 
@@ -2254,6 +2264,11 @@ impl EmbeddedDatabase {
             self.execute_with_implicit_transaction(sql)
         };
 
+        // Invalidate result cache on successful DML (any data modification)
+        if result.is_ok() {
+            self.invalidate_result_cache();
+        }
+
         let rows = result.as_ref().copied().unwrap_or(0);
         self.log_slow_query(sql, start.elapsed(), rows);
         result
@@ -2334,6 +2349,351 @@ impl EmbeddedDatabase {
         if let Ok(mut cache) = self.parse_cache.lock() {
             cache.clear();
         }
+        // Also invalidate result cache since schema changes affect query results
+        self.invalidate_result_cache();
+    }
+
+    /// Invalidate all cached query results (called on any DML operation)
+    fn invalidate_result_cache(&self) {
+        if let Ok(mut cache) = self.result_cache.lock() {
+            cache.clear();
+        }
+    }
+
+    /// Fast path for simple INSERT statements.
+    ///
+    /// Detects `INSERT INTO <table> (<cols>) VALUES (<vals>)` and bypasses
+    /// full SQL parsing + planning when:
+    /// - Statement has simple literal values only (no expressions/subqueries)
+    /// - No RETURNING, ON CONFLICT, or DEFAULT keywords
+    /// - No RLS enforcement active for the table
+    /// - No triggers defined for the table
+    ///
+    /// Returns `None` to fall through to the normal path for anything complex.
+    #[allow(clippy::indexing_slicing)] // validated indices
+    fn try_fast_insert(&self, sql: &str) -> Option<Result<u64>> {
+        let trimmed = sql.trim();
+
+        // Quick prefix check (case-insensitive, avoid allocation)
+        if trimmed.len() < 20 || !trimmed.as_bytes().get(..6)?.eq_ignore_ascii_case(b"INSERT") {
+            return None;
+        }
+
+        // Bail on complex features (case-insensitive substring check)
+        let upper = trimmed.to_ascii_uppercase();
+        if upper.contains("RETURNING") || upper.contains("ON CONFLICT")
+            || upper.contains("DEFAULT") || upper.contains("SELECT") {
+            return None;
+        }
+
+        // Parse: INSERT INTO <table> (<col1>, <col2>, ...) VALUES (<val1>, <val2>, ...)
+        // Find "INTO " after INSERT
+        let after_insert = trimmed.get(6..)?.trim_start();
+        if !after_insert.as_bytes().get(..4)?.eq_ignore_ascii_case(b"INTO") {
+            return None;
+        }
+        let after_into = after_insert.get(4..)?.trim_start();
+
+        // Extract table name (until '(' or whitespace)
+        let table_end = after_into.find(|c: char| c == '(' || c.is_whitespace())?;
+        let table_name = after_into.get(..table_end)?.trim();
+        if table_name.is_empty() {
+            return None;
+        }
+        let rest = after_into.get(table_end..)?.trim_start();
+
+        // Extract column list: (<col1>, <col2>, ...)
+        if !rest.starts_with('(') {
+            return None;
+        }
+        let col_end = rest.find(')')?;
+        let col_list_str = rest.get(1..col_end)?;
+        let columns: Vec<&str> = col_list_str.split(',').map(|s| s.trim()).collect();
+        if columns.is_empty() || columns.iter().any(|c| c.is_empty()) {
+            return None;
+        }
+
+        // Find VALUES keyword
+        let after_cols = rest.get(col_end + 1..)?.trim_start();
+        if after_cols.len() < 6 || !after_cols.as_bytes().get(..6)?.eq_ignore_ascii_case(b"VALUES") {
+            return None;
+        }
+        let values_rest = after_cols.get(6..)?.trim_start();
+
+        // Extract values: (<val1>, <val2>, ...)
+        if !values_rest.starts_with('(') {
+            return None;
+        }
+        // Find matching closing paren (handle nested strings with single quotes)
+        let values_inner = values_rest.get(1..)?;
+        let close_idx = Self::find_closing_paren(values_inner)?;
+        let values_str = values_inner.get(..close_idx)?;
+
+        // Check nothing significant after the closing paren
+        let after_values = values_inner.get(close_idx + 1..)?.trim();
+        if !after_values.is_empty() && after_values != ";" {
+            return None; // ON CONFLICT, RETURNING, or multi-row VALUES
+        }
+
+        // Check RLS — skip fast path if RLS is active
+        if self.tenant_manager.should_apply_rls(table_name, "INSERT") {
+            return None;
+        }
+
+        // Check triggers — skip fast path if triggers exist
+        if self.trigger_registry.has_triggers_for_table(table_name) {
+            return None;
+        }
+
+        // Get schema (from cache or RocksDB)
+        let catalog = self.storage.catalog();
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(s) => s,
+            Err(_) => return None, // Table doesn't exist — let normal path handle error
+        };
+
+        // Resolve column indices and target types
+        if columns.len() != Self::fast_parse_value_count(values_str) {
+            return None; // Column/value count mismatch
+        }
+
+        let mut target_types = Vec::with_capacity(columns.len());
+        let mut col_indices = Vec::with_capacity(columns.len());
+        for col_name in &columns {
+            match schema.get_column_index(col_name) {
+                Some(idx) => {
+                    col_indices.push(idx);
+                    match schema.get_column_at(idx) {
+                        Some(col) => target_types.push(col.data_type.clone()),
+                        None => return None,
+                    }
+                }
+                None => return None, // Unknown column — let normal path handle error
+            }
+        }
+
+        // Parse value literals
+        let values = match Self::fast_parse_values(values_str, &target_types) {
+            Some(v) => v,
+            None => return None, // Complex expression — fall through to normal path
+        };
+
+        // Build ordered tuple (columns may be in non-schema order)
+        let mut tuple_values = vec![Value::Null; schema.columns.len()];
+        for (i, &col_idx) in col_indices.iter().enumerate() {
+            if let Some(val) = values.get(i) {
+                if col_idx < tuple_values.len() {
+                    tuple_values[col_idx] = val.clone();
+                }
+            }
+        }
+
+        let tuple = Tuple::new(tuple_values);
+        // Use fast INSERT (skip WAL fsync + snapshot versioning) when on main branch
+        if self.storage.get_current_branch_id().is_none() {
+            Some(self.storage.insert_tuple_fast(table_name, tuple, &schema).map(|_| 1))
+        } else {
+            Some(self.storage.insert_tuple_branch_aware_with_schema(table_name, tuple, &schema).map(|_| 1))
+        }
+    }
+
+    /// Find the closing ')' in a string, respecting single-quoted strings
+    fn find_closing_paren(s: &str) -> Option<usize> {
+        let mut in_string = false;
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_string {
+                if b == b'\'' {
+                    // Check for escaped quote ''
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    in_string = false;
+                }
+            } else if b == b'\'' {
+                in_string = true;
+            } else if b == b')' {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Quick count of comma-separated values (respecting quoted strings)
+    fn fast_parse_value_count(s: &str) -> usize {
+        if s.trim().is_empty() {
+            return 0;
+        }
+        let mut count = 1;
+        let mut in_string = false;
+        let bytes = s.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_string {
+                if b == b'\'' {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2;
+                        continue;
+                    }
+                    in_string = false;
+                }
+            } else if b == b'\'' {
+                in_string = true;
+            } else if b == b',' {
+                count += 1;
+            }
+            i += 1;
+        }
+        count
+    }
+
+    /// Parse comma-separated literal values with type hints.
+    /// Returns None for any non-literal value (expressions, function calls, etc.)
+    fn fast_parse_values(s: &str, target_types: &[DataType]) -> Option<Vec<Value>> {
+        let mut values = Vec::with_capacity(target_types.len());
+        let mut remaining = s;
+        let mut type_idx = 0;
+
+        while !remaining.is_empty() && type_idx < target_types.len() {
+            remaining = remaining.trim_start();
+            if remaining.is_empty() {
+                break;
+            }
+
+            let (value, rest) = Self::fast_parse_one_value(remaining, &target_types[type_idx])?;
+            values.push(value);
+            type_idx += 1;
+
+            // Skip comma separator
+            let rest = rest.trim_start();
+            if rest.starts_with(',') {
+                remaining = rest.get(1..)?;
+            } else {
+                remaining = rest;
+            }
+        }
+
+        if values.len() == target_types.len() {
+            Some(values)
+        } else {
+            None
+        }
+    }
+
+    /// Parse a single literal value, returning (Value, remaining_str)
+    fn fast_parse_one_value<'a>(s: &'a str, target_type: &DataType) -> Option<(Value, &'a str)> {
+        let s = s.trim_start();
+        if s.is_empty() {
+            return None;
+        }
+
+        let first = s.as_bytes().first()?;
+
+        // String literal: 'value'
+        if *first == b'\'' {
+            let inner = s.get(1..)?;
+            let mut end = 0;
+            let bytes = inner.as_bytes();
+            let mut result = String::new();
+            while end < bytes.len() {
+                if bytes[end] == b'\'' {
+                    if end + 1 < bytes.len() && bytes[end + 1] == b'\'' {
+                        result.push('\'');
+                        end += 2;
+                        continue;
+                    }
+                    // End of string
+                    let rest = inner.get(end + 1..)?;
+                    return Some((Value::String(result), rest));
+                }
+                result.push(bytes[end] as char);
+                end += 1;
+            }
+            return None; // Unterminated string
+        }
+
+        // NULL
+        if s.len() >= 4 && s.as_bytes().get(..4)?.eq_ignore_ascii_case(b"NULL") {
+            let rest = s.get(4..)?;
+            // Make sure NULL isn't part of a longer identifier
+            if rest.is_empty() || rest.starts_with(',') || rest.starts_with(')') || rest.starts_with(' ') {
+                return Some((Value::Null, rest));
+            }
+        }
+
+        // Boolean: true/false
+        if s.len() >= 4 && s.as_bytes().get(..4)?.eq_ignore_ascii_case(b"TRUE") {
+            let rest = s.get(4..)?;
+            if rest.is_empty() || rest.starts_with(',') || rest.starts_with(')') || rest.starts_with(' ') {
+                return Some((Value::Boolean(true), rest));
+            }
+        }
+        if s.len() >= 5 && s.as_bytes().get(..5)?.eq_ignore_ascii_case(b"FALSE") {
+            let rest = s.get(5..)?;
+            if rest.is_empty() || rest.starts_with(',') || rest.starts_with(')') || rest.starts_with(' ') {
+                return Some((Value::Boolean(false), rest));
+            }
+        }
+
+        // Number: integer or float (possibly negative)
+        if first.is_ascii_digit() || *first == b'-' || *first == b'+' || *first == b'.' {
+            let end = s.find(|c: char| c == ',' || c == ')' || c == ' ')
+                .unwrap_or(s.len());
+            let num_str = s.get(..end)?.trim();
+            let rest = s.get(end..)?;
+
+            // Parse based on target type
+            let value = match target_type {
+                DataType::Int4 => {
+                    let n: i32 = num_str.parse().ok()?;
+                    Value::Int4(n)
+                }
+                DataType::Int8 => {
+                    let n: i64 = num_str.parse().ok()?;
+                    Value::Int8(n)
+                }
+                DataType::Float4 => {
+                    let f: f32 = num_str.parse().ok()?;
+                    Value::Float4(f)
+                }
+                DataType::Float8 => {
+                    let f: f64 = num_str.parse().ok()?;
+                    Value::Float8(f)
+                }
+                DataType::Numeric => {
+                    // Try integer first, then float
+                    if let Ok(n) = num_str.parse::<i64>() {
+                        Value::Int8(n)
+                    } else if let Ok(f) = num_str.parse::<f64>() {
+                        Value::Float8(f)
+                    } else {
+                        return None;
+                    }
+                }
+                _ => {
+                    // For INTEGER (which maps to Int4), try int
+                    if num_str.contains('.') {
+                        let f: f64 = num_str.parse().ok()?;
+                        Value::Float8(f)
+                    } else if let Ok(n) = num_str.parse::<i32>() {
+                        Value::Int4(n)
+                    } else if let Ok(n) = num_str.parse::<i64>() {
+                        Value::Int8(n)
+                    } else {
+                        return None;
+                    }
+                }
+            };
+            return Some((value, rest));
+        }
+
+        // Not a recognized literal — bail to normal parser
+        None
     }
 
     /// Parse SQL with caching. Returns (statement, was_cached).
@@ -2517,7 +2877,7 @@ impl EmbeddedDatabase {
                         }
                     }
 
-                    self.storage.insert_tuple_branch_aware(table_name, tuple)?;
+                    self.storage.insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)?;
                     count += 1;
                 }
                 Ok(count)
@@ -3176,7 +3536,7 @@ impl EmbeddedDatabase {
                     }
 
                     let tuple = Tuple::new(tuple_values);
-                    self.storage.insert_tuple_branch_aware(table_name, tuple)?;
+                    self.storage.insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)?;
                     count += 1;
                 }
                 Ok((count, Vec::new()))
@@ -3402,7 +3762,16 @@ impl EmbeddedDatabase {
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
         let start = std::time::Instant::now();
 
-        // Check plan cache first (Arc::clone is O(1))
+        // Check result cache first (returns cached query results for identical SQL)
+        if let Some(cached_results) = self.result_cache.lock().ok()
+            .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone))
+        {
+            tracing::debug!(phase = "result_cache", "Result cache hit");
+            self.log_slow_query(sql, start.elapsed(), cached_results.len() as u64);
+            return Ok((*cached_results).clone());
+        }
+
+        // Check plan cache (Arc::clone is O(1))
         let cached_plan = self.plan_cache.lock().ok().and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone));
 
         if let Some(arc_plan) = cached_plan {
@@ -3417,6 +3786,10 @@ impl EmbeddedDatabase {
                 let results = executor.execute(&arc_plan)?;
                 tracing::debug!(phase = "execute", duration_us = exec_start.elapsed().as_micros() as u64, rows = results.len() as u64, "Query executed");
                 self.log_slow_query(sql, start.elapsed(), results.len() as u64);
+                // Cache the results for future identical queries
+                if let Ok(mut cache) = self.result_cache.lock() {
+                    cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
+                }
                 return Ok(results);
             }
 
@@ -3445,9 +3818,8 @@ impl EmbeddedDatabase {
         let plan = planner.statement_to_plan(statement)?;
         tracing::debug!(phase = "plan", duration_us = plan_start.elapsed().as_micros() as u64, "Logical plan created");
 
-        // 3. Optimize plan (predicate pushdown, constant folding, etc.)
-        // Only run optimizer for plans that benefit from it (contain JOINs)
-        let plan = if Self::plan_contains_join(&plan) {
+        // 3. Optimize plan (predicate pushdown, constant folding, projection pruning)
+        let plan = {
             let opt_start = std::time::Instant::now();
             let stats = optimizer::cost::StatsCatalog::new();
             let rules: Vec<Box<dyn optimizer::rules::OptimizationRule>> = vec![
@@ -3463,8 +3835,6 @@ impl EmbeddedDatabase {
             let optimized = opt.optimize_recursive(plan)?;
             tracing::debug!(phase = "optimize", duration_us = opt_start.elapsed().as_micros() as u64, "Plan optimized");
             optimized
-        } else {
-            plan
         };
 
         // 4. Cache the optimized plan
@@ -3483,6 +3853,12 @@ impl EmbeddedDatabase {
         tracing::debug!(phase = "execute", duration_us = exec_start.elapsed().as_micros() as u64, rows = results.len() as u64, "Query executed");
 
         self.log_slow_query(sql, start.elapsed(), results.len() as u64);
+
+        // Cache the results for future identical queries
+        if let Ok(mut cache) = self.result_cache.lock() {
+            cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
+        }
+
         Ok(results)
     }
 
@@ -4646,6 +5022,7 @@ impl EmbeddedDatabase {
             savepoints: self.savepoints.clone(),
             plan_cache: self.plan_cache.clone(),
             parse_cache: self.parse_cache.clone(),
+            result_cache: self.result_cache.clone(),
         }
     }
 

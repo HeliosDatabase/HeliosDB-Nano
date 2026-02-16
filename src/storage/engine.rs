@@ -111,6 +111,8 @@ pub struct StorageEngine {
     write_counter: Arc<AtomicU64>,
     /// Database path for disk space checks (None for in-memory)
     db_path: Option<std::path::PathBuf>,
+    /// In-memory schema cache (avoids repeated RocksDB get + bincode deserialize)
+    schema_cache: Arc<parking_lot::Mutex<std::collections::HashMap<String, crate::Schema>>>,
 }
 
 /// Minimum free disk space threshold (100 MB)
@@ -414,6 +416,7 @@ impl StorageEngine {
             memory_limit_bytes: 0, // Unlimited for disk-backed mode
             write_counter: Arc::new(AtomicU64::new(0)),
             db_path: Some(db_path),
+            schema_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         };
 
         // Load counters from storage
@@ -590,12 +593,33 @@ impl StorageEngine {
             memory_limit_bytes: config.resource_quotas.memory_limit_per_user_mb * 1024 * 1024,
             write_counter: Arc::new(AtomicU64::new(0)),
             db_path: None, // No disk space check for in-memory mode
+            schema_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
     /// Get configuration
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    /// Get a cached schema, or look it up and cache it
+    pub fn get_cached_schema(&self, table_name: &str) -> Option<crate::Schema> {
+        self.schema_cache.lock().get(table_name).cloned()
+    }
+
+    /// Cache a schema for a table
+    pub fn cache_schema(&self, table_name: &str, schema: crate::Schema) {
+        self.schema_cache.lock().insert(table_name.to_string(), schema);
+    }
+
+    /// Invalidate a cached schema (call on DDL changes)
+    pub fn invalidate_schema_cache(&self, table_name: &str) {
+        self.schema_cache.lock().remove(table_name);
+    }
+
+    /// Clear all cached schemas (call on bulk DDL operations)
+    pub fn clear_schema_cache(&self) {
+        self.schema_cache.lock().clear();
     }
 
     /// Get database statistics
@@ -1093,24 +1117,15 @@ impl StorageEngine {
             }
         }
 
-        // Encrypt if encryption is enabled
-        let data = if let Some(km) = &self.key_manager {
-            crypto::encrypt(km.key(), value)?
+        // Encrypt if encryption is enabled, otherwise write directly (no copy)
+        if let Some(km) = &self.key_manager {
+            let data = crypto::encrypt(km.key(), value)?;
+            self.db.put(key, data)
+                .map_err(|e| Error::storage(format!("Put failed: {}", e)))
         } else {
-            value.to_vec()
-        };
-
-        // WAL logging is handled explicitly by callers:
-        // - INSERT: log_data_insert() called after txn.put()
-        // - UPDATE: log_data_update() called after put() in update_tuples_branch_aware()
-        // - DELETE: delete() method handles WAL logging
-        // - DDL: create_table/drop_table handle their own WAL logging
-        //
-        // Skip WAL logging here to avoid duplicate/incorrect entries (e.g., UPDATE being logged as INSERT)
-
-        // Then write to main database
-        self.db.put(key, data)
-            .map_err(|e| Error::storage(format!("Put failed: {}", e)))
+            self.db.put(key, value)
+                .map_err(|e| Error::storage(format!("Put failed: {}", e)))
+        }
     }
 
     /// Delete a key
@@ -3817,12 +3832,16 @@ impl StorageEngine {
     /// while also writing the current version for fast non-time-travel access.
     pub fn insert_tuple_versioned(&self, table_name: &str, tuple: Tuple) -> Result<u64> {
         let catalog = Catalog::new(self);
+        let schema = catalog.get_table_schema(table_name)?;
+        self.insert_tuple_versioned_with_schema(table_name, tuple, &schema)
+    }
+
+    /// Insert a tuple with a pre-fetched schema (avoids redundant schema lookup)
+    pub fn insert_tuple_versioned_with_schema(&self, table_name: &str, tuple: Tuple, schema: &crate::Schema) -> Result<u64> {
+        let catalog = Catalog::new(self);
 
         // Get next row ID
         let row_id = catalog.next_row_id(table_name)?;
-
-        // Get table schema for compression
-        let schema = catalog.get_table_schema(table_name)?;
 
         // Check bulk load mode early - skip some operations if enabled
         let bulk_mode = self.is_bulk_load_mode();
@@ -3883,6 +3902,42 @@ impl StorageEngine {
                     self.speculative_filter_manager.on_insert(table_name, &col.name, value);
                 }
             }
+        }
+
+        Ok(row_id)
+    }
+
+    /// Fast-path INSERT: writes data + ART index only.
+    ///
+    /// Skips: WAL logging (RocksDB's own WAL handles crash recovery),
+    /// snapshot versioning (time-travel), delta tracking (MV/SMFI).
+    /// Used for batch INSERTs via the SQL fast-path where per-row
+    /// fsync and time-travel overhead is not justified.
+    pub fn insert_tuple_fast(&self, table_name: &str, tuple: Tuple, schema: &crate::Schema) -> Result<u64> {
+        let row_id = self.next_row_id_volatile(table_name);
+
+        let value = bincode::serialize(&tuple)
+            .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+
+        let key = Self::build_data_key(table_name, row_id);
+        self.put(&key, &value)?;
+
+        // ART index update (needed for unique constraint enforcement)
+        {
+            let mut col_values = std::collections::HashMap::new();
+            for (i, col) in schema.columns.iter().enumerate() {
+                if let Some(v) = tuple.values.get(i) {
+                    col_values.insert(col.name.clone(), v.clone());
+                }
+            }
+            if let Err(e) = self.art_index_manager.on_insert(table_name, row_id, &col_values) {
+                tracing::debug!("ART index insert for table '{}': {}", table_name, e);
+            }
+        }
+
+        // Periodically persist row counter (every 64 inserts) for crash safety
+        if row_id % 64 == 0 {
+            let _ = self.flush_row_counter(table_name);
         }
 
         Ok(row_id)
@@ -4016,6 +4071,32 @@ impl StorageEngine {
         }
 
         Ok(next)
+    }
+
+    /// Get next row ID without persisting to RocksDB/WAL.
+    ///
+    /// Only updates the in-memory atomic counter. The caller must
+    /// call `flush_row_counter()` after the batch to persist the
+    /// final counter value. Used by the fast INSERT path.
+    pub fn next_row_id_volatile(&self, table_name: &str) -> u64 {
+        let counter = self.row_counters.entry(table_name.to_string())
+            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
+        counter.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// Persist the current row counter value for a table.
+    ///
+    /// Called after a batch of volatile row ID allocations to ensure
+    /// the counter survives a crash.
+    pub fn flush_row_counter(&self, table_name: &str) -> Result<()> {
+        let counter = self.row_counters.entry(table_name.to_string())
+            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
+        let current = counter.load(Ordering::SeqCst);
+
+        let key = format!("counter:{}", table_name).into_bytes();
+        let value = bincode::serialize(&current)
+            .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
+        self.put_internal(&key, &value)
     }
 }
 
@@ -4799,12 +4880,19 @@ impl StorageEngine {
     /// When a branch is active, writes to branch-specific storage.
     /// Data written to a branch is isolated from the main branch.
     pub fn insert_tuple_branch_aware(&self, table_name: &str, tuple: Tuple) -> Result<u64> {
+        let catalog = Catalog::new(self);
+        let schema = catalog.get_table_schema(table_name)?;
+        self.insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)
+    }
+
+    /// Insert a tuple with branch isolation and a pre-fetched schema
+    pub fn insert_tuple_branch_aware_with_schema(&self, table_name: &str, tuple: Tuple, schema: &crate::Schema) -> Result<u64> {
         // Get current branch name
         let branch_name = self.current_branch.lock().clone();
 
         // If branch is "main" or None, use standard versioned insert
         if branch_name.is_none() || branch_name.as_deref() == Some("main") {
-            return self.insert_tuple_versioned(table_name, tuple);
+            return self.insert_tuple_versioned_with_schema(table_name, tuple, schema);
         }
 
         // Non-main branch - must resolve to a valid branch ID
@@ -4823,9 +4911,6 @@ impl StorageEngine {
 
         // Get next row ID (shared across branches for consistency)
         let row_id = catalog.next_row_id(table_name)?;
-
-        // Get table schema
-        let schema = catalog.get_table_schema(table_name)?;
 
         // Serialize tuple directly (RocksDB LZ4 handles compression at block level)
         let value = bincode::serialize(&tuple)

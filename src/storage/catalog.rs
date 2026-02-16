@@ -46,6 +46,9 @@ impl<'a> Catalog<'a> {
 
         self.storage.put(&key, &value)?;
 
+        // Update in-memory schema cache
+        self.storage.cache_schema(table_name, schema.clone());
+
         // Initialize row counter to 0
         let counter_key = Self::table_counter_key(table_name);
         let counter_value = bincode::serialize(&0u64)
@@ -99,17 +102,27 @@ impl<'a> Catalog<'a> {
     /// If not found, it checks if it exists as a materialized view and
     /// returns the MV's schema if found.
     pub fn get_table_schema(&self, table_name: &str) -> Result<Schema> {
+        // Check in-memory cache first
+        if let Some(schema) = self.storage.get_cached_schema(table_name) {
+            return Ok(schema);
+        }
+
         let key = Self::table_metadata_key(table_name);
         match self.storage.get(&key)? {
             Some(data) => {
-                bincode::deserialize(&data)
-                    .map_err(|e| Error::storage(format!("Failed to deserialize schema: {}", e)))
+                let schema: Schema = bincode::deserialize(&data)
+                    .map_err(|e| Error::storage(format!("Failed to deserialize schema: {}", e)))?;
+                // Cache for future lookups
+                self.storage.cache_schema(table_name, schema.clone());
+                Ok(schema)
             }
             None => {
                 // Table not found, check if it's a materialized view
                 let mv_catalog = self.storage.mv_catalog();
                 if mv_catalog.view_exists(table_name)? {
                     let mv_metadata = mv_catalog.get_view(table_name)?;
+                    // Cache MV schema too
+                    self.storage.cache_schema(table_name, mv_metadata.schema.clone());
                     Ok(mv_metadata.schema)
                 } else {
                     Err(Error::query_execution(format!(
@@ -142,6 +155,9 @@ impl<'a> Catalog<'a> {
 
         self.storage.put(&key, &value)?;
 
+        // Update in-memory schema cache
+        self.storage.cache_schema(table_name, schema.clone());
+
         Ok(())
     }
 
@@ -166,6 +182,9 @@ impl<'a> Catalog<'a> {
         // Invalidate statistics cache
         let cache = self.storage.statistics_cache();
         cache.invalidate(table_name)?;
+
+        // Invalidate schema cache
+        self.storage.invalidate_schema_cache(table_name);
 
         // Delete schema metadata
         let key = Self::table_metadata_key(table_name);
@@ -364,6 +383,10 @@ impl<'a> Catalog<'a> {
 
         let old_compression_stats_key = Self::compression_stats_key(old_name);
         self.storage.delete(&old_compression_stats_key)?;
+
+        // Update schema cache: remove old, add new
+        self.storage.invalidate_schema_cache(old_name);
+        self.storage.cache_schema(new_name, schema);
 
         Ok(())
     }
