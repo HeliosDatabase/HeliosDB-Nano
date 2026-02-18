@@ -4,7 +4,7 @@
 //! The logical plan is a tree of operators that represents the semantics
 //! of a query without specifying how it should be executed.
 
-use crate::{Schema, DataType, Value};
+use crate::{Schema, DataType, Value, Column};
 use serde::{Serialize, Deserialize};
 use std::sync::Arc;
 

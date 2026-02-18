@@ -22,7 +22,7 @@ COPY benches ./benches
 COPY crates ./crates
 
 # Build final binary with needed features
-RUN cargo build --release --features "encryption,vector-search"
+RUN cargo build --release --features "encryption,vector-search,ha-tier1"
 
 # Runtime stage
 FROM debian:trixie-slim AS runtime
@@ -40,7 +40,7 @@ RUN useradd -r -s /bin/false heliosdb
 RUN mkdir -p /data && chown heliosdb:heliosdb /data
 
 # Copy binary from builder
-COPY --from=builder /build/target/release/heliosdb-lite /usr/local/bin/
+COPY --from=builder /build/target/release/heliosdb-nano /usr/local/bin/heliosdb-lite
 
 # Set permissions
 RUN chmod +x /usr/local/bin/heliosdb-lite
