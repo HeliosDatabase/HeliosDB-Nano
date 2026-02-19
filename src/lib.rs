@@ -573,6 +573,11 @@ impl EmbeddedDatabase {
             return result;
         }
 
+        // Fast path: simple UPDATE with PK WHERE clause (skips full SQL parsing)
+        if let Some(result) = self.try_fast_update(sql) {
+            return result;
+        }
+
         // Check if this is a Phase 3 branching statement (before trying to parse with sqlparser)
         let plan = if sql::Parser::is_create_branch(sql) {
             // Parse CREATE DATABASE BRANCH statement
@@ -965,11 +970,10 @@ impl EmbeddedDatabase {
                             if fk_values.iter().any(|v| matches!(v, Value::Null)) {
                                 continue;
                             }
-                            // Try ART PK index lookup on referenced table (O(1))
+                            // Try ART PK index lookup on referenced table (O(1), zero-copy)
                             let key = crate::storage::ArtIndexManager::encode_key(&fk_values);
-                            let ref_pk = self.storage.art_indexes().get_pk_index(&fk.references_table);
-                            let exists = if let Some(pk_index) = ref_pk {
-                                pk_index.contains(&key)
+                            let exists = if let Some(found) = self.storage.art_indexes().pk_index_contains(&fk.references_table, &key) {
+                                found
                             } else {
                                 // No ART index — fall back to scan
                                 self.check_foreign_key_exists(
@@ -2497,6 +2501,300 @@ impl EmbeddedDatabase {
         }
     }
 
+    /// Fast path for simple UPDATE: `UPDATE table SET col = literal WHERE pk_col = literal`
+    /// Returns None to fall through to normal path for complex UPDATE statements.
+    fn try_fast_update(&self, sql: &str) -> Option<Result<u64>> {
+        let trimmed = sql.trim();
+
+        // Quick prefix check
+        if trimmed.len() < 20 || !trimmed.as_bytes().get(..6)?.eq_ignore_ascii_case(b"UPDATE") {
+            return None;
+        }
+
+        // Bail on complex features
+        let upper = trimmed.to_ascii_uppercase();
+        if upper.contains("RETURNING") || upper.contains("JOIN")
+            || upper.contains("FROM") || upper.contains("SELECT")
+            || upper.contains("CASE") || upper.contains("COALESCE") {
+            return None;
+        }
+
+        // Parse: UPDATE <table> SET <col> = <val> WHERE <pk_col> = <pk_val>
+        let after_update = trimmed.get(6..)?.trim_start();
+
+        // Extract table name (until whitespace)
+        let table_end = after_update.find(|c: char| c.is_whitespace())?;
+        let table_name = after_update.get(..table_end)?.trim();
+        if table_name.is_empty() {
+            return None;
+        }
+        let rest = after_update.get(table_end..)?.trim_start();
+
+        // Expect SET keyword
+        if rest.len() < 3 || !rest.as_bytes().get(..3)?.eq_ignore_ascii_case(b"SET") {
+            return None;
+        }
+        let after_set = rest.get(3..)?.trim_start();
+
+        // Find WHERE keyword (case-insensitive)
+        let where_pos = {
+            let upper_rest = after_set.to_ascii_uppercase();
+            let pos = upper_rest.find("WHERE")?;
+            // Ensure WHERE is word-bounded (preceded by whitespace)
+            if pos == 0 { return None; }
+            let prev = after_set.as_bytes().get(pos - 1)?;
+            if !prev.is_ascii_whitespace() { return None; }
+            pos
+        };
+
+        let set_clause = after_set.get(..where_pos)?.trim();
+        let where_clause = after_set.get(where_pos + 5..)?.trim();
+
+        // Parse SET clause: col = value (single assignment only for fast path)
+        if set_clause.contains(',') {
+            return None; // Multiple columns — fall through
+        }
+        let eq_pos = set_clause.find('=')?;
+        let set_col = set_clause.get(..eq_pos)?.trim();
+        let set_val_str = set_clause.get(eq_pos + 1..)?.trim();
+        if set_col.is_empty() || set_val_str.is_empty() {
+            return None;
+        }
+
+        // Parse WHERE clause: pk_col = pk_value
+        // Strip trailing semicolon if present
+        let where_clause = where_clause.strip_suffix(';').unwrap_or(where_clause).trim();
+        // Bail on complex WHERE (AND, OR, etc.)
+        let where_upper = where_clause.to_ascii_uppercase();
+        if where_upper.contains("AND") || where_upper.contains("OR")
+            || where_upper.contains("IN") || where_upper.contains("BETWEEN") {
+            return None;
+        }
+        let weq_pos = where_clause.find('=')?;
+        let pk_col = where_clause.get(..weq_pos)?.trim();
+        let pk_val_str = where_clause.get(weq_pos + 1..)?.trim();
+        if pk_col.is_empty() || pk_val_str.is_empty() {
+            return None;
+        }
+
+        // Check RLS
+        if self.tenant_manager.should_apply_rls(table_name, "UPDATE") {
+            return None;
+        }
+
+        // Check triggers
+        if self.trigger_registry.has_triggers_for_table(table_name) {
+            return None;
+        }
+
+        // Check branch — skip fast path on branches
+        if self.storage.get_current_branch_id().is_some() {
+            return None;
+        }
+
+        // Get schema
+        let catalog = self.storage.catalog();
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+
+        // Verify WHERE column is the PK
+        let pk_col_idx = schema.get_column_index(pk_col)?;
+        let pk_column = schema.get_column_at(pk_col_idx)?;
+        if !pk_column.primary_key {
+            return None; // WHERE not on PK — fall through
+        }
+
+        // Verify SET column exists
+        let set_col_idx = schema.get_column_index(set_col)?;
+        let set_column = schema.get_column_at(set_col_idx)?;
+
+        // Check for FK constraints on the table (skip fast path if present)
+        if self.storage.art_indexes().has_fk(table_name) {
+            return None; // FK validation needed — fall through
+        }
+
+        // Parse PK value
+        let (pk_value, _) = Self::fast_parse_one_value(pk_val_str, &pk_column.data_type)?;
+
+        // Look up the existing row by PK (needed for both literal and expression SET)
+        let existing_row = match self.storage.get_row_by_pk_with_schema(table_name, &pk_value, &schema) {
+            Ok(Some(row)) => row,
+            Ok(None) => return Some(Ok(0)), // No matching row
+            Err(e) => return Some(Err(e)),
+        };
+
+        let row_id = existing_row.row_id.unwrap_or(0);
+        if row_id == 0 {
+            return None; // No row_id — can't do fast update
+        }
+
+        // Parse SET value: try literal first, then simple expression (col +/- literal)
+        let new_value = if let Some((val, _)) = Self::fast_parse_one_value(set_val_str, &set_column.data_type) {
+            val
+        } else if let Some(val) = Self::fast_eval_simple_expr(set_val_str, set_col, set_col_idx, &existing_row) {
+            val
+        } else {
+            return None; // Complex expression — fall through to normal path
+        };
+
+        // Check NOT NULL constraint
+        if !set_column.nullable && matches!(new_value, Value::Null) {
+            return Some(Err(Error::constraint_violation(format!(
+                "Column '{}' cannot be null", set_col
+            ))));
+        }
+
+        // Build updated tuple
+        let mut new_values = existing_row.values.clone();
+        if set_col_idx < new_values.len() {
+            new_values[set_col_idx] = new_value;
+        } else {
+            return None;
+        }
+
+        let new_tuple = Tuple::new(new_values);
+
+        // Use fast update storage path
+        Some(self.storage.update_tuple_fast(table_name, row_id, new_tuple, &existing_row, &schema))
+    }
+
+    /// Fast path for SELECT: `SELECT * FROM table WHERE pk_col = literal`
+    /// Bypasses full SQL parsing, planning, and optimization for simple PK lookups.
+    fn try_fast_select(&self, sql: &str) -> Option<Result<Vec<Tuple>>> {
+        let trimmed = sql.trim();
+
+        // Quick prefix check
+        if trimmed.len() < 20 || !trimmed.as_bytes().get(..6)?.eq_ignore_ascii_case(b"SELECT") {
+            return None;
+        }
+
+        let after_select = trimmed.get(6..)?.trim_start();
+
+        // Only handle SELECT * (not column lists, expressions, aliases)
+        if !after_select.starts_with('*') {
+            return None;
+        }
+        let after_star = after_select.get(1..)?.trim_start();
+
+        // Expect FROM keyword
+        if after_star.len() < 4 || !after_star.as_bytes().get(..4)?.eq_ignore_ascii_case(b"FROM") {
+            return None;
+        }
+        let after_from = after_star.get(4..)?.trim_start();
+
+        // Extract table name (until whitespace)
+        let table_end = after_from.find(|c: char| c.is_whitespace())?;
+        let table_name = after_from.get(..table_end)?.trim();
+        if table_name.is_empty() {
+            return None;
+        }
+        let rest = after_from.get(table_end..)?.trim_start();
+
+        // Expect WHERE keyword
+        if rest.len() < 5 || !rest.as_bytes().get(..5)?.eq_ignore_ascii_case(b"WHERE") {
+            return None;
+        }
+        let where_clause = rest.get(5..)?.trim_start();
+
+        // Bail on complex WHERE
+        let upper = where_clause.to_ascii_uppercase();
+        if upper.contains("AND") || upper.contains("OR")
+            || upper.contains("JOIN") || upper.contains("ORDER")
+            || upper.contains("GROUP") || upper.contains("LIMIT") {
+            return None;
+        }
+
+        // Parse WHERE: col = value
+        let where_clause = where_clause.strip_suffix(';').unwrap_or(where_clause).trim();
+        let eq_pos = where_clause.find('=')?;
+        let pk_col = where_clause.get(..eq_pos)?.trim();
+        let pk_val_str = where_clause.get(eq_pos + 1..)?.trim();
+        if pk_col.is_empty() || pk_val_str.is_empty() {
+            return None;
+        }
+
+        // Check RLS
+        if self.tenant_manager.should_apply_rls(table_name, "SELECT") {
+            return None;
+        }
+
+        // Get schema
+        let catalog = self.storage.catalog();
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+
+        // Verify WHERE column is the PK
+        let pk_col_idx = schema.get_column_index(pk_col)?;
+        let pk_column = schema.get_column_at(pk_col_idx)?;
+        if !pk_column.primary_key {
+            return None; // Not a PK lookup — fall through to normal path
+        }
+
+        // Parse PK value
+        let (pk_value, _) = Self::fast_parse_one_value(pk_val_str, &pk_column.data_type)?;
+
+        // Direct PK lookup via ART index + RocksDB
+        match self.storage.get_row_by_pk_with_schema(table_name, &pk_value, &schema) {
+            Ok(Some(row)) => Some(Ok(vec![row])),
+            Ok(None) => Some(Ok(vec![])),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// Evaluate simple expressions like `col + 0.01`, `col - 5`, `col * 2`, `col || 'suffix'`
+    /// Returns None for anything more complex.
+    fn fast_eval_simple_expr(expr: &str, col_name: &str, col_idx: usize, row: &Tuple) -> Option<Value> {
+        let expr = expr.trim();
+
+        // Check for pattern: col_name <op> literal
+        // The column name must appear at the start
+        if !expr.starts_with(col_name) {
+            return None;
+        }
+        let after_col = expr.get(col_name.len()..)?.trim_start();
+        if after_col.is_empty() {
+            return None;
+        }
+
+        // Get current value from the row
+        let current = row.values.get(col_idx)?;
+
+        // Determine operator
+        let (op, operand_str) = if let Some(rest) = after_col.strip_prefix('+') {
+            ('+', rest.trim())
+        } else if let Some(rest) = after_col.strip_prefix('-') {
+            ('-', rest.trim())
+        } else if let Some(rest) = after_col.strip_prefix('*') {
+            ('*', rest.trim())
+        } else {
+            return None;
+        };
+
+        // Parse the operand as a number
+        match (current, op) {
+            (Value::Int2(v), '+') => { let n: i16 = operand_str.parse().ok()?; Some(Value::Int2(v.checked_add(n)?)) }
+            (Value::Int2(v), '-') => { let n: i16 = operand_str.parse().ok()?; Some(Value::Int2(v.checked_sub(n)?)) }
+            (Value::Int2(v), '*') => { let n: i16 = operand_str.parse().ok()?; Some(Value::Int2(v.checked_mul(n)?)) }
+            (Value::Int4(v), '+') => { let n: i32 = operand_str.parse().ok()?; Some(Value::Int4(v.checked_add(n)?)) }
+            (Value::Int4(v), '-') => { let n: i32 = operand_str.parse().ok()?; Some(Value::Int4(v.checked_sub(n)?)) }
+            (Value::Int4(v), '*') => { let n: i32 = operand_str.parse().ok()?; Some(Value::Int4(v.checked_mul(n)?)) }
+            (Value::Int8(v), '+') => { let n: i64 = operand_str.parse().ok()?; Some(Value::Int8(v.checked_add(n)?)) }
+            (Value::Int8(v), '-') => { let n: i64 = operand_str.parse().ok()?; Some(Value::Int8(v.checked_sub(n)?)) }
+            (Value::Int8(v), '*') => { let n: i64 = operand_str.parse().ok()?; Some(Value::Int8(v.checked_mul(n)?)) }
+            (Value::Float4(v), '+') => { let n: f32 = operand_str.parse().ok()?; Some(Value::Float4(v + n)) }
+            (Value::Float4(v), '-') => { let n: f32 = operand_str.parse().ok()?; Some(Value::Float4(v - n)) }
+            (Value::Float4(v), '*') => { let n: f32 = operand_str.parse().ok()?; Some(Value::Float4(v * n)) }
+            (Value::Float8(v), '+') => { let n: f64 = operand_str.parse().ok()?; Some(Value::Float8(v + n)) }
+            (Value::Float8(v), '-') => { let n: f64 = operand_str.parse().ok()?; Some(Value::Float8(v - n)) }
+            (Value::Float8(v), '*') => { let n: f64 = operand_str.parse().ok()?; Some(Value::Float8(v * n)) }
+            _ => None,
+        }
+    }
+
     /// Find the closing ')' in a string, respecting single-quoted strings
     fn find_closing_paren(s: &str) -> Option<usize> {
         let mut in_string = false;
@@ -3769,6 +4067,13 @@ impl EmbeddedDatabase {
             tracing::debug!(phase = "result_cache", "Result cache hit");
             self.log_slow_query(sql, start.elapsed(), cached_results.len() as u64);
             return Ok((*cached_results).clone());
+        }
+
+        // Fast path: SELECT * FROM table WHERE pk = literal (skips full SQL parsing)
+        if let Some(result) = self.try_fast_select(sql) {
+            let results = result?;
+            self.log_slow_query(sql, start.elapsed(), results.len() as u64);
+            return Ok(results);
         }
 
         // Check plan cache (Arc::clone is O(1))

@@ -71,6 +71,10 @@ struct Portal {
 impl Session {
     /// Create a new session
     pub fn new(db: Arc<EmbeddedDatabase>, session_id: u32) -> Self {
+        // Pre-warm schema cache to eliminate cold lookup penalty
+        if let Err(e) = db.storage.prewarm_schema_cache() {
+            tracing::warn!("Failed to pre-warm schema cache: {}", e);
+        }
         Self {
             db,
             session_id,

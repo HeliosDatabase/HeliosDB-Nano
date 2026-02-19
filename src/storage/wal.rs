@@ -531,6 +531,28 @@ impl WriteAheadLog {
         Ok(lsn)
     }
 
+    /// Append a WAL entry without fsync (for DDL operations where metadata
+    /// is already crash-safe in RocksDB). Saves ~1ms per DDL operation.
+    pub fn append_nosync(&self, operation: WalOperation) -> Result<u64> {
+        let lsn = self.next_lsn();
+        let entry = WalEntry::new(lsn, operation);
+        let data = entry.serialize()?;
+
+        let mut batch = WriteBatch::default();
+        let key = format!("wal:entries:{:020}", lsn);
+        batch.put(key.as_bytes(), &data);
+        batch.put(b"wal:last_lsn", lsn.to_le_bytes());
+
+        // Write without fsync
+        let mut nosync_opts = WriteOptions::default();
+        nosync_opts.set_sync(false);
+        self.db
+            .write_opt(batch, &nosync_opts)
+            .map_err(|e| Error::storage(format!("Failed to append WAL entry: {}", e)))?;
+
+        Ok(lsn)
+    }
+
     /// Append a WAL entry and wait for synchronous replication acknowledgement
     ///
     /// This method appends the operation to WAL and then blocks until standbys

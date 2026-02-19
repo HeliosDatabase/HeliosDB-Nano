@@ -545,6 +545,30 @@ impl ArtIndexManager {
         }
     }
 
+    /// PK index point lookup without cloning the tree (~50μs saved vs get_pk_index)
+    pub fn pk_index_lookup(&self, table: &str, key: &[u8]) -> Option<RowId> {
+        let pk_name = {
+            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
+            pk_indexes.get(table).cloned()
+        };
+        pk_name.and_then(|name| {
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            indexes.get(&name).and_then(|idx| idx.get(key))
+        })
+    }
+
+    /// Check if a PK value exists without cloning the tree
+    pub fn pk_index_contains(&self, table: &str, key: &[u8]) -> Option<bool> {
+        let pk_name = {
+            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
+            pk_indexes.get(table).cloned()
+        };
+        pk_name.map(|name| {
+            let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+            indexes.get(&name).map_or(false, |idx| idx.contains(key))
+        })
+    }
+
     /// List indexes for a specific table
     pub fn list_table_indexes(&self, table: &str) -> Vec<(String, ArtIndexType, Vec<String>)> {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
@@ -851,6 +875,12 @@ impl ArtIndexManager {
     pub fn index_stats(&self, name: &str) -> Option<ArtIndexStats> {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
         indexes.get(name).map(|idx| idx.stats().clone())
+    }
+
+    /// Check if a table has foreign key indexes
+    pub fn has_fk(&self, table: &str) -> bool {
+        let fk_indexes = self.fk_indexes.read().unwrap_or_else(|e| e.into_inner());
+        fk_indexes.get(table).map_or(false, |v| !v.is_empty())
     }
 
     /// Check if a table has a primary key

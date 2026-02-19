@@ -186,43 +186,37 @@ impl<'a> Catalog<'a> {
         // Invalidate schema cache
         self.storage.invalidate_schema_cache(table_name);
 
-        // Delete schema metadata
-        let key = Self::table_metadata_key(table_name);
-        self.storage.delete(&key)?;
+        // Batch-delete all metadata keys in a single RocksDB write
+        {
+            let mut batch = rocksdb::WriteBatch::default();
+            batch.delete(Self::table_metadata_key(table_name));
+            batch.delete(Self::table_counter_key(table_name));
+            batch.delete(Self::compression_config_key(table_name));
+            batch.delete(Self::compression_stats_key(table_name));
+            self.storage.db.write(batch)
+                .map_err(|e| crate::Error::storage(format!("Batch delete failed: {}", e)))?;
+        }
 
-        // Delete row counter
-        let counter_key = Self::table_counter_key(table_name);
-        self.storage.delete(&counter_key)?;
-
-        // Delete compression configuration
-        let compression_config_key = Self::compression_config_key(table_name);
-        self.storage.delete(&compression_config_key)?;
-
-        // Delete compression statistics
-        let compression_stats_key = Self::compression_stats_key(table_name);
-        self.storage.delete(&compression_stats_key)?;
-
-        // Delete all data rows using prefix iteration
+        // Delete all data rows using prefix seek (jumps directly to table's key range)
         // Key format: data:{table_name}:{row_id}
         let data_prefix = format!("data:{}:", table_name);
         let prefix_bytes = data_prefix.as_bytes();
 
-        // Collect all keys to delete (we can't modify while iterating)
+        // Collect all keys to delete using prefix seek (O(rows_in_table), not O(all_keys))
         let mut keys_to_delete = Vec::new();
-        let iter = self.storage.db.iterator(rocksdb::IteratorMode::Start);
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(false); // Enable prefix-based seek
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
+            read_opts,
+        );
 
         for item in iter {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-
-            // Check if key starts with our data prefix
-            if key.starts_with(prefix_bytes) {
-                keys_to_delete.push(key.to_vec());
-            } else if let (Some(&k0), Some(&p0)) = (key.first(), prefix_bytes.first()) {
-                if k0 > p0 {
-                    // Optimization: break early if we've passed the prefix range
-                    break;
-                }
+            if !key.starts_with(prefix_bytes) {
+                break; // Past the prefix range
             }
+            keys_to_delete.push(key.to_vec());
         }
 
         // Delete all collected data row keys
@@ -243,20 +237,18 @@ impl<'a> Catalog<'a> {
         let prefix = b"meta:table:";
         let mut tables = Vec::new();
 
-        let iter = self.storage.db.iterator(rocksdb::IteratorMode::Start);
+        // Use prefix seek to jump directly to "meta:table:" range
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            read_opts,
+        );
         for item in iter {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-
             if !key.starts_with(prefix) {
-                if let (Some(&k0), Some(&p0)) = (key.first(), prefix.first()) {
-                    if k0 > p0 {
-                        break;
-                    }
-                }
-                continue;
+                break; // Past the prefix range
             }
-
-            // Extract table name from key
             let table_name = String::from_utf8_lossy(key.get(prefix.len()..).unwrap_or_default()).to_string();
             tables.push(table_name);
         }

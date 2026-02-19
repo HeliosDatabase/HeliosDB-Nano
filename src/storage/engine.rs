@@ -249,10 +249,15 @@ impl StorageEngine {
         block_opts.set_cache_index_and_filter_blocks(true); // Cache index/filter for faster lookups
         block_opts.set_pin_l0_filter_and_index_blocks_in_cache(true); // Pin L0 blocks
 
-        // Enable prefix compression for keys with common prefixes (data:table:, dict:, cas:, col:)
-        // The 5-byte prefix covers "data:" which is the most common key prefix
+        // Full bloom filter: 14 bits/key → 0.08% false positive rate (vs 1% at 10 bits)
+        // Full filter (not block-based) stored per SST file — optimal for point lookups
+        block_opts.set_bloom_filter(14.0, false);
+        // Whole-key filtering: bloom checks exact key, not just 5-byte "data:" prefix
+        // A prefix-only bloom matches ALL rows (zero selectivity for Get())
+        block_opts.set_whole_key_filtering(true);
+
+        // Prefix extractor still used for prefix-based iteration (table scans)
         opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(5));
-        block_opts.set_whole_key_filtering(false); // Use prefix bloom filter instead
 
         opts.set_block_based_table_factory(&block_opts);
 
@@ -463,6 +468,14 @@ impl StorageEngine {
         opts.set_max_background_jobs(2);
         opts.set_enable_pipelined_write(true);
 
+        // Bloom filter for point lookups (same config as disk-backed mode)
+        let mut block_opts = BlockBasedOptions::default();
+        block_opts.set_bloom_filter(14.0, false);
+        block_opts.set_whole_key_filtering(true);
+        block_opts.set_cache_index_and_filter_blocks(true);
+        opts.set_prefix_extractor(rocksdb::SliceTransform::create_fixed_prefix(5));
+        opts.set_block_based_table_factory(&block_opts);
+
         let db = DB::open(&opts, temp_dir.path())
             .map_err(|e| Error::storage(format!("Failed to open in-memory RocksDB: {}", e)))?;
 
@@ -620,6 +633,18 @@ impl StorageEngine {
     /// Clear all cached schemas (call on bulk DDL operations)
     pub fn clear_schema_cache(&self) {
         self.schema_cache.lock().clear();
+    }
+
+    /// Pre-warm schema cache by loading all table schemas into memory.
+    /// Eliminates first-query schema cache miss penalty (~250μs per table).
+    pub fn prewarm_schema_cache(&self) -> Result<()> {
+        let catalog = Catalog::new(self);
+        let tables = catalog.list_tables()?;
+        for table_name in &tables {
+            let _ = catalog.get_table_schema(table_name);
+        }
+        debug!("Pre-warmed schema cache with {} tables", tables.len());
+        Ok(())
     }
 
     /// Get database statistics
@@ -1699,17 +1724,11 @@ impl StorageEngine {
     fn get_row_by_pk_inner(&self, table_name: &str, pk_value: &crate::Value, schema: Option<&crate::Schema>) -> Result<Option<Tuple>> {
         let lookup_start = std::time::Instant::now();
 
-        // Get the PK index for this table
-        let pk_index = match self.art_index_manager.get_pk_index(table_name) {
-            Some(idx) => idx,
-            None => return Ok(None), // No PK index, can't do point lookup
-        };
-
         // Encode the PK value to the ART key format
         let key = super::art_manager::ArtIndexManager::encode_key(&[pk_value.clone()]);
 
-        // Look up the row_id in the ART index
-        let row_id = match pk_index.get(&key) {
+        // Look up the row_id in the ART index (zero-copy, no tree clone)
+        let row_id = match self.art_index_manager.pk_index_lookup(table_name, &key) {
             Some(rid) => rid,
             None => {
                 tracing::debug!(
@@ -2904,7 +2923,8 @@ impl StorageEngine {
             let schema_bytes = bincode::serialize(schema)
                 .map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
             let wal = wal.read();
-            wal.append(WalOperation::CreateTable {
+            // Use nosync for DDL — metadata is already crash-safe in RocksDB
+            wal.append_nosync(WalOperation::CreateTable {
                 table: table_name.to_string(),
                 schema: schema_bytes,
             })?;
@@ -2924,7 +2944,8 @@ impl StorageEngine {
 
         if let Some(wal) = &self.wal {
             let wal = wal.read();
-            wal.append(WalOperation::DropTable {
+            // Use nosync for DDL — metadata is already crash-safe in RocksDB
+            wal.append_nosync(WalOperation::DropTable {
                 table: table_name.to_string(),
             })?;
         }
@@ -3941,6 +3962,47 @@ impl StorageEngine {
         }
 
         Ok(row_id)
+    }
+
+    /// Fast UPDATE: overwrites a row in-place, updates ART indexes, invalidates row cache.
+    /// Skips WAL fsync, snapshot versioning, and MV delta tracking.
+    pub fn update_tuple_fast(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        new_tuple: Tuple,
+        old_tuple: &Tuple,
+        schema: &crate::Schema,
+    ) -> Result<u64> {
+        // Serialize new tuple
+        let value = bincode::serialize(&new_tuple)
+            .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+
+        // Overwrite the row in storage
+        let key = Self::build_data_key(table_name, row_id);
+        self.put(&key, &value)?;
+
+        // Update ART indexes: remove old entries, insert new entries
+        {
+            let mut old_col_values = std::collections::HashMap::new();
+            let mut new_col_values = std::collections::HashMap::new();
+            for (i, col) in schema.columns.iter().enumerate() {
+                if let Some(v) = old_tuple.values.get(i) {
+                    old_col_values.insert(col.name.clone(), v.clone());
+                }
+                if let Some(v) = new_tuple.values.get(i) {
+                    new_col_values.insert(col.name.clone(), v.clone());
+                }
+            }
+            if let Err(e) = self.art_index_manager.on_update(table_name, row_id, &old_col_values, &new_col_values) {
+                tracing::debug!("ART index update for table '{}': {}", table_name, e);
+            }
+        }
+
+        // Invalidate row cache for this row
+        self.row_cache.invalidate(table_name, row_id);
+
+        Ok(1)
     }
 
     /// Get snapshot manager

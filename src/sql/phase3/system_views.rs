@@ -2733,9 +2733,8 @@ impl SystemViewRegistry {
         let mut results = Vec::new();
 
         for (name, table, index_type, columns) in indexes {
-            // Get the index to access its stats
-            if let Some(idx) = art_manager.get_index(&name) {
-                let stats = idx.stats();
+            // Get stats without cloning the entire tree
+            if let Some(stats) = art_manager.index_stats(&name) {
                 let columns_str = columns.join(", ");
                 let node_count = stats.node4_count + stats.node16_count
                     + stats.node48_count + stats.node256_count;

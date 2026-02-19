@@ -256,7 +256,7 @@ impl Default for StorageConfig {
             path: Some(PathBuf::from("./heliosdb-data")),
             memory_only: false,
             wal_enabled: true,
-            wal_sync_mode: WalSyncModeConfig::Sync, // Safest default
+            wal_sync_mode: WalSyncModeConfig::Sync, // Safest default for single-user workloads
             cache_size: 512 * 1024 * 1024, // 512 MB
             compression: CompressionType::Zstd,
             time_travel_enabled: true, // Enable by default for zero-config transparency
