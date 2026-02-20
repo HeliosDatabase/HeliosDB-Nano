@@ -191,10 +191,13 @@ pub struct CpuMonitor {
 
 impl CpuMonitor {
     /// Create a new CPU monitor
+    ///
+    /// Uses `System::new()` instead of `new_all()` to avoid scanning all
+    /// processes at startup (which opens 1000+ FDs in multi-instance containers).
     pub fn new() -> Self {
         Self {
             last_cpu_usage: Arc::new(Mutex::new(0.0)),
-            system: Arc::new(Mutex::new(sysinfo::System::new_all())),
+            system: Arc::new(Mutex::new(sysinfo::System::new())),
         }
     }
 
@@ -202,12 +205,15 @@ impl CpuMonitor {
     ///
     /// This method refreshes system CPU information and calculates
     /// the average CPU usage across all cores.
+    ///
+    /// NOTE: This is a blocking operation (~200ms). In async contexts,
+    /// call via `tokio::task::spawn_blocking`.
     pub fn get_cpu_usage(&self) -> Result<f64> {
         let mut system = self.system.lock();
         system.refresh_cpu();
 
-        // Wait a bit for CPU measurements to stabilize
-        std::thread::sleep(Duration::from_millis(200));
+        // Brief pause for CPU measurements to stabilize, then re-sample
+        std::thread::sleep(Duration::from_millis(100));
         system.refresh_cpu();
 
         let cpus = system.cpus();
@@ -370,11 +376,18 @@ impl MVScheduler {
             let check_interval = self.config.lock().check_interval_secs;
             tokio::time::sleep(Duration::from_secs(check_interval)).await;
 
-            // Check CPU usage
-            let cpu_usage = match self.cpu_monitor.get_smoothed_cpu_usage() {
-                Ok(usage) => usage,
-                Err(e) => {
+            // Check CPU usage (blocking sysinfo call — run off the tokio runtime)
+            let monitor = self.cpu_monitor.clone();
+            let cpu_usage = match tokio::task::spawn_blocking(move || {
+                monitor.get_smoothed_cpu_usage()
+            }).await {
+                Ok(Ok(usage)) => usage,
+                Ok(Err(e)) => {
                     warn!("Failed to get CPU usage: {}", e);
+                    continue;
+                }
+                Err(e) => {
+                    warn!("CPU monitor task panicked: {}", e);
                     continue;
                 }
             };
@@ -629,12 +642,12 @@ impl MVScheduler {
         Ok(())
     }
 
-    /// Get current scheduler statistics
+    /// Get current scheduler statistics (non-blocking, uses cached CPU value)
     pub fn get_stats(&self) -> SchedulerStats {
         SchedulerStats {
             queue_size: self.refresh_queue.lock().len(),
             running_tasks: self.running_tasks.lock().len(),
-            cpu_usage: self.cpu_monitor.get_smoothed_cpu_usage().unwrap_or(0.0),
+            cpu_usage: *self.cpu_monitor.last_cpu_usage.lock(),
         }
     }
 }
