@@ -1586,6 +1586,26 @@ impl Evaluator {
                 }
             }
 
+            // UUID comparisons
+            (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
+            // String-to-UUID coercion (WHERE uuid_col = 'string-literal')
+            (Value::Uuid(a), Value::String(b)) => {
+                match uuid::Uuid::parse_str(b) {
+                    Ok(b_uuid) => a.cmp(&b_uuid),
+                    Err(_) => return Err(Error::query_execution(format!(
+                        "Cannot compare UUID with invalid UUID string '{}'", b
+                    ))),
+                }
+            }
+            (Value::String(a), Value::Uuid(b)) => {
+                match uuid::Uuid::parse_str(a) {
+                    Ok(a_uuid) => a_uuid.cmp(b),
+                    Err(_) => return Err(Error::query_execution(format!(
+                        "Cannot compare invalid UUID string '{}' with UUID", a
+                    ))),
+                }
+            }
+
             // Boolean comparisons (false < true)
             (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
 
@@ -2916,6 +2936,31 @@ impl Evaluator {
                 _ => Err(Error::query_execution(format!("Cannot cast {:?} to TIMESTAMP", value))),
             },
 
+            DataType::Uuid => match value {
+                Value::Uuid(u) => Ok(Value::Uuid(u)),
+                Value::String(s) => uuid::Uuid::parse_str(&s)
+                    .map(Value::Uuid)
+                    .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to UUID: {}", s, e))),
+                _ => Err(Error::query_execution(format!("Cannot cast {:?} to UUID", value))),
+            },
+
+            DataType::Bytea => match value {
+                Value::Bytes(b) => Ok(Value::Bytes(b)),
+                Value::String(s) => {
+                    // Support hex format: \x... or 0x...
+                    let trimmed = s.trim();
+                    if let Some(hex_str) = trimmed.strip_prefix("\\x").or_else(|| trimmed.strip_prefix("0x")) {
+                        hex::decode(hex_str)
+                            .map(Value::Bytes)
+                            .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to BYTEA: {}", s, e)))
+                    } else {
+                        // Raw string as bytes
+                        Ok(Value::Bytes(s.into_bytes()))
+                    }
+                }
+                _ => Err(Error::query_execution(format!("Cannot cast {:?} to BYTEA", value))),
+            },
+
             _ => Err(Error::query_execution(format!(
                 "CAST to {:?} not yet implemented",
                 target_type
@@ -2972,6 +3017,9 @@ impl Evaluator {
             (Value::Boolean(a), Value::Boolean(b)) => a == b,
             (Value::Numeric(a), Value::Numeric(b)) => a == b,
             (Value::Uuid(a), Value::Uuid(b)) => a == b,
+            // String-to-UUID coercion for IN lists and equality
+            (Value::Uuid(a), Value::String(b)) => uuid::Uuid::parse_str(b).is_ok_and(|b_uuid| *a == b_uuid),
+            (Value::String(a), Value::Uuid(b)) => uuid::Uuid::parse_str(a).is_ok_and(|a_uuid| a_uuid == *b),
             (Value::Date(a), Value::Date(b)) => a == b,
             (Value::Time(a), Value::Time(b)) => a == b,
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
@@ -4497,5 +4545,105 @@ mod tests {
         let result = evaluator.evaluate(&expr, &tuple)
             .expect("Failed to evaluate arithmetic expression");
         assert_eq!(result, Value::Int4(40));
+    }
+
+    #[test]
+    fn test_uuid_comparison_with_string() {
+        let uuid_val = uuid::Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000").unwrap();
+
+        // UUID schema with uuid PK column
+        let schema = Arc::new(Schema::new(vec![
+            Column {
+                name: "id".to_string(),
+                data_type: DataType::Uuid,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
+            },
+            Column {
+                name: "name".to_string(),
+                data_type: DataType::Text,
+                nullable: true,
+                primary_key: false,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
+            },
+        ]));
+
+        let evaluator = Evaluator::new(schema);
+        let tuple = Tuple::new(vec![
+            Value::Uuid(uuid_val),
+            Value::String("Alice".to_string()),
+        ]);
+
+        // UUID column = UUID string literal (the common case: WHERE id = '550e...')
+        let expr = LogicalExpr::BinaryExpr {
+            left: Box::new(LogicalExpr::Column { table: None, name: "id".to_string() }),
+            op: BinaryOperator::Eq,
+            right: Box::new(LogicalExpr::Literal(Value::String(
+                "550e8400-e29b-41d4-a716-446655440000".to_string(),
+            ))),
+        };
+        let result = evaluator.evaluate(&expr, &tuple)
+            .expect("UUID = String comparison should work");
+        assert_eq!(result, Value::Boolean(true));
+
+        // Non-matching UUID
+        let expr_neq = LogicalExpr::BinaryExpr {
+            left: Box::new(LogicalExpr::Column { table: None, name: "id".to_string() }),
+            op: BinaryOperator::Eq,
+            right: Box::new(LogicalExpr::Literal(Value::String(
+                "00000000-0000-0000-0000-000000000000".to_string(),
+            ))),
+        };
+        let result_neq = evaluator.evaluate(&expr_neq, &tuple)
+            .expect("UUID = String comparison should work");
+        assert_eq!(result_neq, Value::Boolean(false));
+
+        // UUID = UUID direct comparison
+        let expr_uuid = LogicalExpr::BinaryExpr {
+            left: Box::new(LogicalExpr::Column { table: None, name: "id".to_string() }),
+            op: BinaryOperator::Eq,
+            right: Box::new(LogicalExpr::Literal(Value::Uuid(uuid_val))),
+        };
+        let result_uuid = evaluator.evaluate(&expr_uuid, &tuple)
+            .expect("UUID = UUID comparison should work");
+        assert_eq!(result_uuid, Value::Boolean(true));
+    }
+
+    #[test]
+    fn test_uuid_cast() {
+        let schema = test_schema();
+        let evaluator = Evaluator::new(schema);
+        let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
+
+        // String to UUID cast
+        let result = evaluator.cast_value(
+            Value::String(uuid_str.to_string()),
+            &DataType::Uuid,
+        ).expect("String to UUID cast should work");
+        assert!(matches!(result, Value::Uuid(_)));
+
+        // UUID to UUID cast (identity)
+        let uuid_val = uuid::Uuid::parse_str(uuid_str).unwrap();
+        let result2 = evaluator.cast_value(
+            Value::Uuid(uuid_val),
+            &DataType::Uuid,
+        ).expect("UUID to UUID cast should work");
+        assert_eq!(result2, Value::Uuid(uuid_val));
+
+        // Invalid UUID string
+        let result3 = evaluator.cast_value(
+            Value::String("not-a-uuid".to_string()),
+            &DataType::Uuid,
+        );
+        assert!(result3.is_err());
     }
 }

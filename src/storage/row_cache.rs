@@ -146,6 +146,8 @@ pub struct RowCache {
     cache: RwLock<LruCache<RowCacheKey, CachedRow>>,
     /// Tables with active invalidation (recently written)
     hot_tables: RwLock<HashSet<String>>,
+    /// Last time hot_tables was reset (auto-resets every 60s)
+    hot_tables_last_reset: RwLock<Instant>,
     /// Configuration
     config: RowCacheConfig,
     /// Statistics
@@ -167,6 +169,7 @@ impl RowCache {
         Self {
             cache: RwLock::new(LruCache::new(cache_size)),
             hot_tables: RwLock::new(HashSet::new()),
+            hot_tables_last_reset: RwLock::new(Instant::now()),
             config,
             stats: RwLock::new(RowCacheStats::default()),
         }
@@ -349,10 +352,19 @@ impl RowCache {
         self.cache.read().is_empty()
     }
 
-    /// Mark a table as "hot" (recently written to)
+    /// Mark a table as "hot" (recently written to).
+    /// Auto-resets the hot set every 60 seconds to prevent unbounded growth.
     fn mark_table_hot(&self, table: &str) {
-        let mut hot_tables = self.hot_tables.write();
-        hot_tables.insert(table.to_string());
+        let should_reset = self.hot_tables_last_reset.read().elapsed() > Duration::from_secs(60);
+        if should_reset {
+            let mut hot_tables = self.hot_tables.write();
+            hot_tables.clear();
+            hot_tables.insert(table.to_string());
+            *self.hot_tables_last_reset.write() = Instant::now();
+        } else {
+            let mut hot_tables = self.hot_tables.write();
+            hot_tables.insert(table.to_string());
+        }
     }
 
     /// Get TTL for a table based on its hotness

@@ -235,6 +235,9 @@ impl FilterConsolidationWorker {
                                 };
                                 let mut h = history.lock();
                                 h.push(entry);
+                                if h.len() > 1000 {
+                                    h.remove(0);
+                                }
                             }
                         }
                     }

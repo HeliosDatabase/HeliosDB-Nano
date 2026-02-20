@@ -378,20 +378,35 @@ impl CachedStatistics {
     }
 }
 
-/// Mutation tracking for adaptive TTL
+/// Mutation tracking for adaptive TTL with automatic decay.
+/// Counts are halved when total mutations exceed 10,000 to prevent
+/// counter saturation that would pin all tables to min_ttl.
 #[derive(Debug, Default)]
 struct MutationTracker {
     /// Mutation counts per table
     counts: HashMap<String, u64>,
+    /// Running total across all tables (for decay trigger)
+    total: u64,
 }
 
 impl MutationTracker {
     fn new() -> Self {
-        Self { counts: HashMap::new() }
+        Self { counts: HashMap::new(), total: 0 }
     }
 
     fn increment(&mut self, table_name: &str) {
         *self.counts.entry(table_name.to_string()).or_insert(0) += 1;
+        self.total += 1;
+
+        // Decay: halve all counts when total exceeds threshold
+        if self.total > 10_000 {
+            for count in self.counts.values_mut() {
+                *count /= 2;
+            }
+            // Remove zero entries to bound HashMap size
+            self.counts.retain(|_, v| *v > 0);
+            self.total = self.counts.values().sum();
+        }
     }
 
     fn get(&self, table_name: &str) -> u64 {
