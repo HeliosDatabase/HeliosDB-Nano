@@ -14,6 +14,7 @@ description = "PostgreSQL-compatible embedded database with TDE + ZKE encryption
 repository = "https://github.com/heliosdb/heliosdb"
 keywords = ["database", "postgresql", "vector-database", "embedded", "encryption"]
 categories = ["database", "embedded"]
+readme = "README.md"
 
 [lib]
 name = "heliosdb_nano"

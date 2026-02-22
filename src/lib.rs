@@ -1997,9 +1997,9 @@ impl EmbeddedDatabase {
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
             prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
-            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()))),
-            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).unwrap()))),
-            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(128).unwrap()))),
+            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero")))),
+            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).expect("512 is non-zero")))),
+            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(128).expect("128 is non-zero")))),
         })
     }
 
@@ -2052,9 +2052,9 @@ impl EmbeddedDatabase {
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
             prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
-            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()))),
-            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).unwrap()))),
-            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(128).unwrap()))),
+            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero")))),
+            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).expect("512 is non-zero")))),
+            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(128).expect("128 is non-zero")))),
         })
     }
 
@@ -2116,9 +2116,9 @@ impl EmbeddedDatabase {
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
             prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
-            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).unwrap()))),
-            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).unwrap()))),
-            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(128).unwrap()))),
+            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero")))),
+            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).expect("512 is non-zero")))),
+            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(128).expect("128 is non-zero")))),
         })
     }
 
