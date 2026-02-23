@@ -13,14 +13,14 @@
 #
 # Usage: ./demo_rag_workflow.sh
 #
-# Requirements: HeliosDB-Lite binary compiled (target/release/heliosdb-lite)
+# Requirements: HeliosDB-Lite binary compiled (target/release/heliosdb-nano)
 
 set -e
 
 # Configuration
-BINARY="./target/release/heliosdb-lite"
+BINARY="./target/release/heliosdb-nano"
 if [ ! -f "$BINARY" ]; then
-    BINARY="./target/debug/heliosdb-lite"
+    BINARY="./target/debug/heliosdb-nano"
 fi
 
 # Colors
@@ -35,7 +35,7 @@ NC='\033[0m'
 
 # Check binary exists
 if [ ! -f "$BINARY" ]; then
-    echo -e "${RED}Error: heliosdb-lite binary not found${NC}"
+    echo -e "${RED}Error: heliosdb-nano binary not found${NC}"
     echo "Build with: cargo build --release"
     exit 1
 fi

@@ -38,7 +38,7 @@ def get_binary_path() -> Path:
     }
     arch = arch_map.get(arch, arch)
 
-    binary_name = f"heliosdb-lite-{platform_name}-{arch}"
+    binary_name = f"heliosdb-nano-{platform_name}-{arch}"
     if platform_name == "windows":
         binary_name += ".exe"
 
@@ -60,7 +60,7 @@ def get_binary_path() -> Path:
         # Try to find any binary (for development/testing)
         binaries_dir = package_dir / "binaries"
         if binaries_dir.exists():
-            available = list(binaries_dir.glob("heliosdb-lite-*"))
+            available = list(binaries_dir.glob("heliosdb-nano-*"))
             if available:
                 raise RuntimeError(
                     f"Binary for {platform_name}-{arch} not found. "
@@ -105,7 +105,7 @@ def get_binary_version() -> Optional[str]:
             timeout=5,
         )
         if result.returncode == 0:
-            # Parse version from output (e.g., "heliosdb-lite 3.0.0")
+            # Parse version from output (e.g., "heliosdb-nano 3.0.0")
             version_line = result.stdout.strip()
             if version_line:
                 parts = version_line.split()

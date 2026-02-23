@@ -4,7 +4,7 @@
 # Tests: CTEs, Transactions, Encryption, Materialized Views, System Functions
 # Run: ./test_advanced_features.sh
 
-BINARY="./target/release/heliosdb-lite"
+BINARY="./target/release/heliosdb-nano"
 TEST_DB="test_advanced.db"
 
 GREEN='\033[0;32m'

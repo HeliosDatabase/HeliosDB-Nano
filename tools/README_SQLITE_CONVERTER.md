@@ -294,7 +294,7 @@ ERROR: Row count mismatch for table 'users': SQLite=1000, HeliosDB=999
 
 ## Support
 
-- **Issues**: https://github.com/heliosdb/heliosdb-lite/issues
+- **Issues**: https://github.com/heliosdb/heliosdb-nano/issues
 - **Documentation**: https://docs.heliosdb.com/conversion
 - **Email**: support@heliosdb.com
 

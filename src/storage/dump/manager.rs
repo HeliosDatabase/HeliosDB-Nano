@@ -270,7 +270,7 @@ impl DumpManager {
             .map_err(|e| Error::storage(format!("Failed to write header: {}", e)))?;
         writeln!(writer, "-- Generated: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
             .map_err(|e| Error::storage(format!("Failed to write header: {}", e)))?;
-        writeln!(writer, "-- Database: heliosdb-lite\n")
+        writeln!(writer, "-- Database: heliosdb-nano\n")
             .map_err(|e| Error::storage(format!("Failed to write header: {}", e)))?;
 
         let tables = db.list_tables()?;

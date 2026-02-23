@@ -5,7 +5,7 @@ This document demonstrates an interactive REPL session with HeliosDB Lite.
 ## Starting the REPL
 
 ```bash
-$ heliosdb-lite repl --memory
+$ heliosdb-nano repl --memory
 
 HeliosDB Lite v0.1.0
 PostgreSQL-compatible embedded database
@@ -267,7 +267,7 @@ ERROR: Column 'invalid_column' does not exist
 $ mkdir mydb
 
 # Start REPL with persistent storage
-$ heliosdb-lite repl -d mydb
+$ heliosdb-nano repl -d mydb
 
 HeliosDB Lite v0.1.0
 PostgreSQL-compatible embedded database
@@ -284,7 +284,7 @@ heliosdb> \q
 Goodbye!
 
 # Restart REPL - data is still there!
-$ heliosdb-lite repl -d mydb
+$ heliosdb-nano repl -d mydb
 
 heliosdb> SELECT * FROM persistent_data;
 ┌────┬──────────────────────┐

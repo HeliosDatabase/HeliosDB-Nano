@@ -431,7 +431,7 @@ impl ReplShell {
         println!();
 
         println!("Mode: {} (single-user, direct access)", "REPL".bold().yellow());
-        println!("      For multi-user access, use: {} {}", "heliosdb-lite start".cyan(), "--help".dimmed());
+        println!("      For multi-user access, use: {} {}", "heliosdb-nano start".cyan(), "--help".dimmed());
         println!();
 
         println!("Commands: {} help | {} list tables | {} system views | {} quit",

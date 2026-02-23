@@ -11,7 +11,7 @@ BLUE='\033[0;34m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-BINARY="./target/release/heliosdb-lite"
+BINARY="./target/release/heliosdb-nano"
 
 # Check if binary exists
 if [ ! -f "$BINARY" ]; then

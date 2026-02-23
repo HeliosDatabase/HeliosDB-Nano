@@ -89,11 +89,11 @@ check_prerequisites() {
     fi
 
     # Check HeliosDB
-    if ! command -v heliosdb-lite &> /dev/null; then
+    if ! command -v heliosdb-nano &> /dev/null; then
         log_error "HeliosDB not found. Please install HeliosDB v3.0.0+"
         missing_deps=1
     else
-        local heliosdb_version=$(heliosdb-lite --version 2>/dev/null || echo "unknown")
+        local heliosdb_version=$(heliosdb-nano --version 2>/dev/null || echo "unknown")
         log_success "HeliosDB found: $heliosdb_version"
     fi
 
@@ -775,7 +775,7 @@ EOF
 
     # Initialize HeliosDB
     mkdir -p "$heliosdb_data"
-    heliosdb-lite init "$heliosdb_data" 2>&1 | tee "$backup_dir/heliosdb_init.log"
+    heliosdb-nano init "$heliosdb_data" 2>&1 | tee "$backup_dir/heliosdb_init.log"
 
     log_success "HeliosDB initialized: $heliosdb_data"
     log_info "Configuration: $config_file"
@@ -790,7 +790,7 @@ import_to_heliosdb() {
     log_info "Starting HeliosDB server..."
 
     # Start HeliosDB in background
-    heliosdb-lite start \
+    heliosdb-nano start \
         --config "$config_file" \
         --port "$HELIOSDB_PORT" \
         --data "$heliosdb_data" \
@@ -979,7 +979,7 @@ If you need to rollback:
 
 \`\`\`bash
 # Stop HeliosDB
-heliosdb-lite stop
+heliosdb-nano stop
 
 # Restore SQLite backup
 cp $backup_dir/database_backup.sqlite $source_db

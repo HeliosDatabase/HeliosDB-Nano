@@ -3,7 +3,7 @@
 
 set -e
 
-BINARY="./target/release/heliosdb-lite"
+BINARY="./target/release/heliosdb-nano"
 
 echo "========================================"
 echo "Testing New Features"

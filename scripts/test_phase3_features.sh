@@ -6,7 +6,7 @@
 
 set -e
 
-BINARY="./target/release/heliosdb-lite"
+BINARY="./target/release/heliosdb-nano"
 DB_FILE="heliosdb_test.db"
 
 # Colors for output

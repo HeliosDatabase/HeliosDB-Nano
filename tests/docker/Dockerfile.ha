@@ -49,11 +49,11 @@ RUN useradd -r -s /bin/false heliosdb
 RUN mkdir -p /data /config /scripts && chown -R heliosdb:heliosdb /data /config
 
 # Copy binaries from builder
-COPY --from=builder /build/target/release/heliosdb-lite /usr/local/bin/
+COPY --from=builder /build/target/release/heliosdb-nano /usr/local/bin/
 COPY --from=builder /build/target/release/heliosdb-proxy /usr/local/bin/
 
 # Set permissions
-RUN chmod +x /usr/local/bin/heliosdb-lite /usr/local/bin/heliosdb-proxy
+RUN chmod +x /usr/local/bin/heliosdb-nano /usr/local/bin/heliosdb-proxy
 
 # Copy entrypoint script
 COPY tests/docker/entrypoint.sh /entrypoint.sh
@@ -82,4 +82,4 @@ HEALTHCHECK --interval=10s --timeout=5s --start-period=30s --retries=3 \
 
 # Entrypoint
 ENTRYPOINT ["/entrypoint.sh"]
-CMD ["heliosdb-lite"]
+CMD ["heliosdb-nano"]

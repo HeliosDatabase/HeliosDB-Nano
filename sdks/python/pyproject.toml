@@ -67,10 +67,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/heliosdb/heliosdb-lite"
+Homepage = "https://github.com/heliosdb/heliosdb-nano"
 Documentation = "https://docs.heliosdb.io/python"
-Repository = "https://github.com/heliosdb/heliosdb-lite"
-Issues = "https://github.com/heliosdb/heliosdb-lite/issues"
+Repository = "https://github.com/heliosdb/heliosdb-nano"
+Issues = "https://github.com/heliosdb/heliosdb-nano/issues"
 
 [tool.hatch.build.targets.sdist]
 include = [

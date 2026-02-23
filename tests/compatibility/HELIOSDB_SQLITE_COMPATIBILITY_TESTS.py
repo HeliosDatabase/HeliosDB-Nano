@@ -61,8 +61,8 @@ def heliosdb_server():
 
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    # Find heliosdb-lite binary
-    binary_path = shutil.which("heliosdb-lite") or "./target/release/heliosdb-lite"
+    # Find heliosdb-nano binary
+    binary_path = shutil.which("heliosdb-nano") or "./target/release/heliosdb-nano"
     if not os.path.exists(binary_path):
         pytest.skip(f"HeliosDB binary not found at {binary_path}")
 

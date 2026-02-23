@@ -4,7 +4,7 @@
 # Tests: CREATE TABLE, INSERT, SELECT, UPDATE, DELETE, DROP, TRUNCATE
 # Run: ./test_core_sql.sh
 
-BINARY="./target/release/heliosdb-lite"
+BINARY="./target/release/heliosdb-nano"
 TEST_DB="test_core_sql.db"
 
 # Colors

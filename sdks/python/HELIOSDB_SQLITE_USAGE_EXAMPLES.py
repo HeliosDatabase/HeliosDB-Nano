@@ -222,8 +222,8 @@ def example_4_multi_mode_usage():
 
     # Mode 2: Daemon (requires running server)
     print("\n--- Daemon Mode ---")
-    print("  Note: Requires heliosdb-lite server running on port 5432")
-    print("  Start with: heliosdb-lite start --port 5432 --daemon")
+    print("  Note: Requires heliosdb-nano server running on port 5432")
+    print("  Start with: heliosdb-nano start --port 5432 --daemon")
     try:
         conn_daemon = sqlite3.connect(
             ':memory:',

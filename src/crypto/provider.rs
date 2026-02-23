@@ -13,10 +13,10 @@
 //!
 //! ```toml
 //! # Default (non-FIPS)
-//! heliosdb-lite = { version = "3.5", features = ["encryption"] }
+//! heliosdb-nano = { version = "3.5", features = ["encryption"] }
 //!
 //! # FIPS 140-3 compliant
-//! heliosdb-lite = { version = "3.5", default-features = false, features = ["fips", "encryption"] }
+//! heliosdb-nano = { version = "3.5", default-features = false, features = ["fips", "encryption"] }
 //! ```
 
 use crate::{Error, Result};

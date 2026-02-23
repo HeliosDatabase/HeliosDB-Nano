@@ -4,7 +4,7 @@
 # Tests: FSST, ALP, Compression Config, Statistics
 # Run: ./test_compression.sh
 
-BINARY="./target/release/heliosdb-lite"
+BINARY="./target/release/heliosdb-nano"
 TEST_DB="test_compression.db"
 
 GREEN='\033[0;32m'

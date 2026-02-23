@@ -2,7 +2,7 @@
 
 [![PyPI Version](https://img.shields.io/pypi/v/heliosdb-sqlite.svg)](https://pypi.org/project/heliosdb-sqlite/)
 [![Python Versions](https://img.shields.io/pypi/pyversions/heliosdb-sqlite.svg)](https://pypi.org/project/heliosdb-sqlite/)
-[![License](https://img.shields.io/pypi/l/heliosdb-sqlite.svg)](https://github.com/heliosdb/heliosdb-lite/blob/main/LICENSE)
+[![License](https://img.shields.io/pypi/l/heliosdb-sqlite.svg)](https://github.com/heliosdb/heliosdb-nano/blob/main/LICENSE)
 [![Downloads](https://img.shields.io/pypi/dm/heliosdb-sqlite.svg)](https://pypi.org/project/heliosdb-sqlite/)
 
 **SQLite-compatible interface for HeliosDB-Lite** - A drop-in replacement for Python's `sqlite3` module with enhanced features including vector search, encryption, and time-travel queries.
@@ -308,8 +308,8 @@ finally:
 
 - **Full Documentation**: https://docs.heliosdb.io/sqlite-compat
 - **API Reference**: https://docs.heliosdb.io/sqlite-compat/api
-- **Examples**: https://github.com/heliosdb/heliosdb-lite/tree/main/examples
-- **HeliosDB-Lite Docs**: https://github.com/heliosdb/heliosdb-lite
+- **Examples**: https://github.com/heliosdb/heliosdb-nano/tree/main/examples
+- **HeliosDB-Lite Docs**: https://github.com/heliosdb/heliosdb-nano
 
 ---
 
@@ -348,13 +348,13 @@ pip install heliosdb-sqlite --no-binary heliosdb-sqlite
 
 ## Contributing
 
-Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/heliosdb/heliosdb-lite/blob/main/CONTRIBUTING.md) for guidelines.
+Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/heliosdb/heliosdb-nano/blob/main/CONTRIBUTING.md) for guidelines.
 
 ### Development Setup
 
 ```bash
-git clone https://github.com/heliosdb/heliosdb-lite.git
-cd heliosdb-lite/sdks/python-sqlite
+git clone https://github.com/heliosdb/heliosdb-nano.git
+cd heliosdb-nano/sdks/python-sqlite
 
 # Install in development mode
 pip install -e ".[dev]"
@@ -374,14 +374,14 @@ mypy heliosdb_sqlite/
 
 ## License
 
-Apache License 2.0 - see [LICENSE](https://github.com/heliosdb/heliosdb-lite/blob/main/LICENSE) for details.
+Apache License 2.0 - see [LICENSE](https://github.com/heliosdb/heliosdb-nano/blob/main/LICENSE) for details.
 
 ---
 
 ## Support
 
-- **GitHub Issues**: https://github.com/heliosdb/heliosdb-lite/issues
-- **Discussions**: https://github.com/heliosdb/heliosdb-lite/discussions
+- **GitHub Issues**: https://github.com/heliosdb/heliosdb-nano/issues
+- **Discussions**: https://github.com/heliosdb/heliosdb-nano/discussions
 - **Discord**: https://discord.gg/heliosdb
 - **Email**: support@heliosdb.io
 
@@ -399,4 +399,4 @@ Built on top of:
 
 **Made with ❤️ for developers who need production-grade embedded databases**
 
-[⭐ Star us on GitHub](https://github.com/heliosdb/heliosdb-lite)
+[⭐ Star us on GitHub](https://github.com/heliosdb/heliosdb-nano)

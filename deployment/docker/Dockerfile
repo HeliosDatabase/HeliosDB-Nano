@@ -40,10 +40,10 @@ RUN useradd -r -s /bin/false heliosdb
 RUN mkdir -p /data && chown heliosdb:heliosdb /data
 
 # Copy binary from builder
-COPY --from=builder /build/target/release/heliosdb-nano /usr/local/bin/heliosdb-lite
+COPY --from=builder /build/target/release/heliosdb-nano /usr/local/bin/heliosdb-nano
 
 # Set permissions
-RUN chmod +x /usr/local/bin/heliosdb-lite
+RUN chmod +x /usr/local/bin/heliosdb-nano
 
 # Switch to non-root user
 USER heliosdb
@@ -61,5 +61,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/health || exit 1
 
 # Default command - start server listening on all interfaces
-ENTRYPOINT ["heliosdb-lite"]
+ENTRYPOINT ["heliosdb-nano"]
 CMD ["start", "--data-dir", "/data", "--listen", "0.0.0.0", "--port", "5432"]

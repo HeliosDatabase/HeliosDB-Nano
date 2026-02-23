@@ -132,7 +132,7 @@ RocksDB Storage
 
 1. **Application** uses standard sqlite3 API calls
 2. **Wrapper** intercepts calls and routes to HeliosDB-Lite
-3. **Embedded mode** spawns `heliosdb-lite repl` process per query
+3. **Embedded mode** spawns `heliosdb-nano repl` process per query
 4. **Daemon mode** uses PostgreSQL protocol to persistent server
 5. **Results** parsed and returned in sqlite3-compatible format
 
@@ -330,7 +330,7 @@ This runs 10 example scenarios covering:
 ## Requirements
 
 - Python 3.8+
-- HeliosDB-Lite binary (`heliosdb-lite`) in PATH
+- HeliosDB-Lite binary (`heliosdb-nano`) in PATH
 - Optional: `psycopg2` for daemon mode
 
 ## Deployment Modes
@@ -353,7 +353,7 @@ conn = sqlite3.connect('myapp.db', mode='embedded')
 
 ```bash
 # Start server first
-heliosdb-lite start --port 5432 --daemon
+heliosdb-nano start --port 5432 --daemon
 ```
 
 ```python
@@ -453,11 +453,11 @@ Most limitations have HeliosDB-native alternatives:
 
 ### Common Issues
 
-**Issue:** `heliosdb-lite: command not found`
+**Issue:** `heliosdb-nano: command not found`
 
 **Solution:** Install HeliosDB-Lite and ensure it's in PATH
 ```bash
-export PATH="/path/to/heliosdb-lite:$PATH"
+export PATH="/path/to/heliosdb-nano:$PATH"
 ```
 
 ---
@@ -475,9 +475,9 @@ conn = sqlite3.connect('myapp.db', timeout=30.0)
 
 **Solution:** Ensure server is running
 ```bash
-heliosdb-lite status
+heliosdb-nano status
 # If not running:
-heliosdb-lite start --port 5432 --daemon
+heliosdb-nano start --port 5432 --daemon
 ```
 
 ---

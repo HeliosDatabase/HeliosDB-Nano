@@ -582,7 +582,7 @@ class SQLiteToHeliosDBConverter:
             ):
                 raise Exception("Failed to create HeliosDB directory")
 
-            # Connect to HeliosDB (using subprocess to call heliosdb-lite)
+            # Connect to HeliosDB (using subprocess to call heliosdb-nano)
             self.heliosdb_conn = self._connect_heliosdb()
 
             # Extract schema
@@ -640,7 +640,7 @@ class SQLiteToHeliosDBConverter:
     def _connect_heliosdb(self) -> Any:
         """Connect to HeliosDB database."""
         # For now, return a mock connection
-        # In production, this would use heliosdb-lite Python bindings
+        # In production, this would use heliosdb-nano Python bindings
         logger.info(f"Connecting to HeliosDB: {self.heliosdb_path}")
 
         # Simulate connection by creating a wrapper

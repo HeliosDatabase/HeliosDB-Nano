@@ -14,7 +14,7 @@ NC='\033[0m' # No Color
 # Configuration
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-HELIOSDB_BINARY="$PROJECT_ROOT/target/release/heliosdb-lite"
+HELIOSDB_BINARY="$PROJECT_ROOT/target/release/heliosdb-nano"
 TEST_RESULTS_DIR="$SCRIPT_DIR/test-results"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 

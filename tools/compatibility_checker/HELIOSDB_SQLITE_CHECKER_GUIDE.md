@@ -573,7 +573,7 @@ CREATE TABLE legacy (id INTEGER PRIMARY KEY AUTOINCREMENT);
 
 If you encounter false positives, please report them:
 
-1. Create an issue at https://github.com/heliosdb/heliosdb-lite/issues
+1. Create an issue at https://github.com/heliosdb/heliosdb-nano/issues
 2. Include:
    - Code snippet causing false positive
    - Why it's a false positive
@@ -695,7 +695,7 @@ firefox report.html
 - **Migration Guide**: `/home/claude/HeliosDB-Lite/docs/migration/MIGRATION.md`
 - **HeliosDB Documentation**: https://docs.heliosdb.com/lite
 - **Source Code**: `/home/claude/HeliosDB-Lite/tools/compatibility_checker/`
-- **Issue Tracker**: https://github.com/heliosdb/heliosdb-lite/issues
+- **Issue Tracker**: https://github.com/heliosdb/heliosdb-nano/issues
 
 ---
 
@@ -704,7 +704,7 @@ firefox report.html
 For questions or issues:
 - **Email**: support@heliosdb.com
 - **Discord**: https://discord.gg/heliosdb
-- **GitHub Issues**: https://github.com/heliosdb/heliosdb-lite/issues
+- **GitHub Issues**: https://github.com/heliosdb/heliosdb-nano/issues
 
 ---
 

@@ -4,7 +4,7 @@
 # Tests: Audit logging configuration, DDL/DML/SELECT logging, JSON format, tamper detection
 # Run: ./test_audit.sh
 
-BINARY="./target/release/heliosdb-lite"
+BINARY="./target/release/heliosdb-nano"
 TEST_DB="test_audit.db"
 
 GREEN='\033[0;32m'

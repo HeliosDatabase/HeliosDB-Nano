@@ -79,7 +79,7 @@ class BuildHeliosDBExtension(build_ext):
             "--manifest-path",
             str(CARGO_MANIFEST),
             "--bin",
-            "heliosdb-lite",
+            "heliosdb-nano",
         ]
 
         # Add target triple for cross-compilation if needed
@@ -115,12 +115,12 @@ class BuildHeliosDBExtension(build_ext):
         arch = arch_map.get(arch, arch)
 
         # Binary name
-        binary_name = f"heliosdb-lite-{platform_name}-{arch}"
+        binary_name = f"heliosdb-nano-{platform_name}-{arch}"
         if platform_name == "windows":
-            source_binary = TARGET_DIR / "heliosdb-lite.exe"
+            source_binary = TARGET_DIR / "heliosdb-nano.exe"
             binary_name += ".exe"
         else:
-            source_binary = TARGET_DIR / "heliosdb-lite"
+            source_binary = TARGET_DIR / "heliosdb-nano"
 
         if not source_binary.exists():
             raise FileNotFoundError(
@@ -226,14 +226,14 @@ if __name__ == "__main__":
         maintainer="HeliosDB Team",
         maintainer_email="team@heliosdb.io",
         # URLs
-        url="https://github.com/heliosdb/heliosdb-lite",
+        url="https://github.com/heliosdb/heliosdb-nano",
         project_urls={
-            "Homepage": "https://github.com/heliosdb/heliosdb-lite",
+            "Homepage": "https://github.com/heliosdb/heliosdb-nano",
             "Documentation": "https://docs.heliosdb.io/sqlite-compat",
-            "Repository": "https://github.com/heliosdb/heliosdb-lite",
-            "Source Code": "https://github.com/heliosdb/heliosdb-lite/tree/main/sdks/python-sqlite",
-            "Issues": "https://github.com/heliosdb/heliosdb-lite/issues",
-            "Changelog": "https://github.com/heliosdb/heliosdb-lite/blob/main/CHANGELOG.md",
+            "Repository": "https://github.com/heliosdb/heliosdb-nano",
+            "Source Code": "https://github.com/heliosdb/heliosdb-nano/tree/main/sdks/python-sqlite",
+            "Issues": "https://github.com/heliosdb/heliosdb-nano/issues",
+            "Changelog": "https://github.com/heliosdb/heliosdb-nano/blob/main/CHANGELOG.md",
             "Discord": "https://discord.gg/heliosdb",
         },
         # License

@@ -12,7 +12,7 @@ start() {
         pid=$(cat "$PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
             echo "Server already running (PID: $pid)"
-            echo "URL: http://localhost:$PORT/heliosdb-lite/"
+            echo "URL: http://localhost:$PORT/heliosdb-nano/"
             return 1
         fi
         rm -f "$PID_FILE"
@@ -41,7 +41,7 @@ start() {
         fi
         if ss -tuln | grep -q ":$PORT "; then
             echo "Server started (PID: $pid)"
-            echo "URL: http://localhost:$PORT/heliosdb-lite/"
+            echo "URL: http://localhost:$PORT/heliosdb-nano/"
             echo "Log: $LOG_FILE"
             return 0
         fi
@@ -81,7 +81,7 @@ status() {
         pid=$(cat "$PID_FILE")
         if kill -0 "$pid" 2>/dev/null; then
             echo "Server running (PID: $pid)"
-            echo "URL: http://localhost:$PORT/heliosdb-lite/"
+            echo "URL: http://localhost:$PORT/heliosdb-nano/"
             echo "Log: $LOG_FILE"
             echo ""
             echo "Recent log:"

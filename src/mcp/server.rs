@@ -132,7 +132,7 @@ impl McpServer {
                 }),
             },
             server_info: ServerInfo {
-                name: "heliosdb-lite".to_string(),
+                name: "heliosdb-nano".to_string(),
                 version: env!("CARGO_PKG_VERSION").to_string(),
             },
         };

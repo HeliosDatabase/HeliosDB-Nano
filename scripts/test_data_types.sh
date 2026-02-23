@@ -4,7 +4,7 @@
 # Tests: INT, TEXT, FLOAT, BOOLEAN, JSON, UUID, TIMESTAMP, VECTOR, ARRAY
 # Run: ./test_data_types.sh
 
-BINARY="./target/release/heliosdb-lite"
+BINARY="./target/release/heliosdb-nano"
 TEST_DB="test_data_types.db"
 
 GREEN='\033[0;32m'

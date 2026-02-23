@@ -387,7 +387,7 @@ python -c "import heliosdb_sqlite; print(heliosdb_sqlite.version)"
 ## Key Implementation Highlights
 
 ### 1. Multi-Mode Architecture
-- **Embedded mode**: Spawns `heliosdb-lite repl` per query
+- **Embedded mode**: Spawns `heliosdb-nano repl` per query
 - **Daemon mode**: Persistent PostgreSQL protocol connection
 - **Hybrid mode**: Dynamic switching between modes
 

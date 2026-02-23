@@ -32,11 +32,11 @@ setup(
     description="Drop-in sqlite3 replacement for HeliosDB-Lite with advanced features",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/heliosdb/heliosdb-lite",
+    url="https://github.com/heliosdb/heliosdb-nano",
     project_urls={
-        "Bug Tracker": "https://github.com/heliosdb/heliosdb-lite/issues",
-        "Documentation": "https://github.com/heliosdb/heliosdb-lite/tree/main/sdks/python",
-        "Source Code": "https://github.com/heliosdb/heliosdb-lite",
+        "Bug Tracker": "https://github.com/heliosdb/heliosdb-nano/issues",
+        "Documentation": "https://github.com/heliosdb/heliosdb-nano/tree/main/sdks/python",
+        "Source Code": "https://github.com/heliosdb/heliosdb-nano",
     },
     packages=find_packages(include=['heliosdb_sqlite', 'heliosdb_sqlite.*']),
     classifiers=[

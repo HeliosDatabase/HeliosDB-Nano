@@ -4,7 +4,7 @@
 # Tests: Encryption at rest, key management, rotation, vector data, transactions
 # Run: ./test_encryption.sh
 
-BINARY="./target/release/heliosdb-lite"
+BINARY="./target/release/heliosdb-nano"
 TEST_DIR="./test_encryption_temp"
 TEST_DB="$TEST_DIR/encrypted.db"
 

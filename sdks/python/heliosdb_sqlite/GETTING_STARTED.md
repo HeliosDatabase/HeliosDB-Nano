@@ -27,10 +27,10 @@ cp -r heliosdb_sqlite /path/to/your/project/
 
 ```bash
 # Verify HeliosDB-Lite is installed
-heliosdb-lite --version
+heliosdb-nano --version
 
 # If not, add to PATH
-export PATH="/path/to/heliosdb-lite:$PATH"
+export PATH="/path/to/heliosdb-nano:$PATH"
 ```
 
 ## 30-Second Quick Start
@@ -232,7 +232,7 @@ conn = sqlite3.connect('app.db')
 
 ```bash
 # Start server first
-heliosdb-lite start --port 5432 --daemon
+heliosdb-nano start --port 5432 --daemon
 ```
 
 ```python
@@ -266,18 +266,18 @@ conn.switch_to_server(port=5432)
 
 ## Troubleshooting
 
-### "heliosdb-lite: command not found"
+### "heliosdb-nano: command not found"
 
 **Solution:**
 ```bash
-# Find heliosdb-lite
-which heliosdb-lite
+# Find heliosdb-nano
+which heliosdb-nano
 
 # Add to PATH
-export PATH="/path/to/heliosdb-lite:$PATH"
+export PATH="/path/to/heliosdb-nano:$PATH"
 
 # Or install
-cargo install heliosdb-lite  # If from source
+cargo install heliosdb-nano  # If from source
 ```
 
 ### "Connection timeout"
@@ -293,10 +293,10 @@ conn = sqlite3.connect('app.db', timeout=30.0)
 **Solution:**
 ```bash
 # Check server status
-heliosdb-lite status
+heliosdb-nano status
 
 # Start server if needed
-heliosdb-lite start --port 5432 --daemon
+heliosdb-nano start --port 5432 --daemon
 ```
 
 ## Next Steps

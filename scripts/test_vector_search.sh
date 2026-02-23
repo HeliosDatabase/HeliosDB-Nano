@@ -4,7 +4,7 @@
 # Tests: VECTOR columns, HNSW indexes, similarity search, KNN, PQ compression
 # Run: ./test_vector_search.sh
 
-BINARY="./target/release/heliosdb-lite"
+BINARY="./target/release/heliosdb-nano"
 TEST_DB="test_vector_search.db"
 
 GREEN='\033[0;32m'

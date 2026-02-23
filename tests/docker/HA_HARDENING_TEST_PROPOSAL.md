@@ -207,7 +207,7 @@ THEN:
 ```
 TEST: Primary killed by OOM killer
 GIVEN: Primary under memory pressure
-WHEN: OOM killer terminates heliosdb-lite
+WHEN: OOM killer terminates heliosdb-nano
 THEN:
   - Same behavior as SIGKILL
   - Failover proceeds automatically

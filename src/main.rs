@@ -28,7 +28,7 @@ struct HAConfig {
 }
 
 #[derive(Parser)]
-#[command(name = "heliosdb-lite")]
+#[command(name = "heliosdb-nano")]
 #[command(about = "PostgreSQL-compatible database with vector search and encryption", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -457,7 +457,7 @@ async fn start_server(
     println!("    Node.js:    pg.connect({{ host: '{listen}', port: {port} }})");
     println!("    JDBC:       jdbc:postgresql://{listen}:{port}/heliosdb");
     println!();
-    println!("  For REPL mode (single-user):  heliosdb-lite repl -d {}", data_dir.display());
+    println!("  For REPL mode (single-user):  heliosdb-nano repl -d {}", data_dir.display());
     println!();
     println!("  Press Ctrl+C to shut down");
     println!("────────────────────────────────────────────────────────────────");
@@ -555,8 +555,8 @@ fn init_database(data_dir: &PathBuf) -> Result<()> {
     println!("Database initialized successfully!");
     println!();
     println!("Next steps:");
-    println!("  Start server:    heliosdb-lite start -d {}", data_dir.display());
-    println!("  Start REPL:      heliosdb-lite repl -d {}", data_dir.display());
+    println!("  Start server:    heliosdb-nano start -d {}", data_dir.display());
+    println!("  Start REPL:      heliosdb-nano repl -d {}", data_dir.display());
     println!();
 
     Ok(())
@@ -656,7 +656,7 @@ async fn start_server_daemon(
                         .unwrap_or(false)
                     {
                         return Err(Error::io(format!(
-                            "Server is already running (PID: {pid}). Use 'heliosdb-lite stop' to stop it."
+                            "Server is already running (PID: {pid}). Use 'heliosdb-nano stop' to stop it."
                         )));
                     }
                 }
@@ -761,8 +761,8 @@ async fn start_server_daemon(
         println!("    psql -h {listen} -p {port}");
         println!();
         println!("  Management commands:");
-        println!("    heliosdb-lite status     Check server status");
-        println!("    heliosdb-lite stop       Stop the server");
+        println!("    heliosdb-nano status     Check server status");
+        println!("    heliosdb-nano stop       Stop the server");
         println!();
 
         Ok(())

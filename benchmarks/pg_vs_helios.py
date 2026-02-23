@@ -589,7 +589,7 @@ def main():
         print(f"  Connected: {HELIOS_CONFIG['host']}:{HELIOS_CONFIG['port']}")
     except Exception as e:
         print(f"  FAILED: {e}")
-        print("  Make sure HeliosDB is running: ./target/release/heliosdb-lite start --memory --port 15440 --auth trust")
+        print("  Make sure HeliosDB is running: ./target/release/heliosdb-nano start --memory --port 15440 --auth trust")
         sys.exit(1)
 
     # ── Setup Schema ──

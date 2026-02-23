@@ -66,7 +66,7 @@ prepare_standby() {
 
 # Build command based on role
 build_command() {
-    local cmd="heliosdb-lite start"
+    local cmd="heliosdb-nano start"
     cmd="$cmd --data-dir $HELIOSDB_DATA_DIR"
     cmd="$cmd --listen 0.0.0.0"
     cmd="$cmd --port $HELIOSDB_PORT"
@@ -127,7 +127,7 @@ trap 'echo "Received SIGTERM, shutting down..."; kill -TERM $PID 2>/dev/null' SI
 trap 'echo "Received SIGINT, shutting down..."; kill -INT $PID 2>/dev/null' SIGINT
 
 # Check if custom command provided
-if [ "$1" = "heliosdb-lite" ] || [ "$1" = "heliosdb-proxy" ]; then
+if [ "$1" = "heliosdb-nano" ] || [ "$1" = "heliosdb-proxy" ]; then
     # Prepare standby nodes (wait for primary) - must be done before build_command
     if [ "$HELIOSDB_ROLE" = "standby" ]; then
         prepare_standby

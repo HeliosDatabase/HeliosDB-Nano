@@ -178,15 +178,15 @@ main() {
     echo -e "${GREEN}✓ curl found${NC}"
 
     # Check if binary exists
-    if [ ! -f "./target/debug/heliosdb-lite" ] && [ ! -f "./target/release/heliosdb-lite" ]; then
-        echo -e "${RED}Error: heliosdb-lite binary not found${NC}"
+    if [ ! -f "./target/debug/heliosdb-nano" ] && [ ! -f "./target/release/heliosdb-nano" ]; then
+        echo -e "${RED}Error: heliosdb-nano binary not found${NC}"
         echo "Build with: cargo build"
         exit 1
     fi
 
-    BINARY="./target/debug/heliosdb-lite"
-    if [ -f "./target/release/heliosdb-lite" ]; then
-        BINARY="./target/release/heliosdb-lite"
+    BINARY="./target/debug/heliosdb-nano"
+    if [ -f "./target/release/heliosdb-nano" ]; then
+        BINARY="./target/release/heliosdb-nano"
     fi
     echo -e "${GREEN}✓ Binary found: $BINARY${NC}"
 

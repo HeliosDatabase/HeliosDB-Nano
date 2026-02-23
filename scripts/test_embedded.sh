@@ -8,7 +8,7 @@ echo "HeliosDB Lite - Embedded Mode Test Suite"
 echo "========================================="
 echo ""
 
-BINARY="./target/release/heliosdb-lite"
+BINARY="./target/release/heliosdb-nano"
 
 # Build if not exists
 if [ ! -f "$BINARY" ]; then

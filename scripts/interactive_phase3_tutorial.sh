@@ -21,7 +21,7 @@ MAGENTA='\033[0;35m'
 NC='\033[0m' # No Color
 
 # Database binary
-DB="./target/release/heliosdb-lite"
+DB="./target/release/heliosdb-nano"
 DB_FILE="tutorial.db"
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -566,7 +566,7 @@ section "Next Steps"
 cat << 'EOF'
 
 1. TRY THE REPL
-   $ ./target/release/heliosdb-lite repl
+   $ ./target/release/heliosdb-nano repl
 
    Then try:
    CREATE TABLE test (id INT, value TEXT);

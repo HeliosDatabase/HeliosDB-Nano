@@ -11,7 +11,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-BINARY="$SCRIPT_DIR/heliosdb-lite"
+BINARY="$SCRIPT_DIR/heliosdb-nano"
 TEST_DIR="/tmp/heliosdb-git-test"
 DB_PATH="$TEST_DIR/testdb"
 

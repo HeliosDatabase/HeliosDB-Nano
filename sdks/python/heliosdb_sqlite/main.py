@@ -599,7 +599,7 @@ class Connection:
         import subprocess
         import os
         import fcntl
-        cmd = ['heliosdb-lite', 'repl'] + self._heliosdb_args
+        cmd = ['heliosdb-nano', 'repl'] + self._heliosdb_args
 
         try:
             self._heliosdb_process = subprocess.Popen(
@@ -1145,7 +1145,7 @@ class Connection:
         # Start server daemon
         data_dir = self._data_dir or str(Path(self.database).parent / 'heliosdb-data')
         cmd = [
-            'heliosdb-lite', 'start',
+            'heliosdb-nano', 'start',
             '--data-dir', data_dir,
             '--port', str(port),
             '--daemon'

@@ -4,7 +4,7 @@
 # Run with: ./test_plsql.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HELIOS_CLI="${SCRIPT_DIR}/../../target/release/heliosdb-lite"
+HELIOS_CLI="${SCRIPT_DIR}/../../target/release/heliosdb-nano"
 
 # Colors for output
 RED='\033[0;31m'

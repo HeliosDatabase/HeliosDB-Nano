@@ -10,7 +10,7 @@
 //! {
 //!   "mcpServers": {
 //!     "heliosdb": {
-//!       "command": "heliosdb-lite",
+//!       "command": "heliosdb-nano",
 //!       "args": ["mcp-server", "--db", "./mydb"],
 //!       "env": {}
 //!     }

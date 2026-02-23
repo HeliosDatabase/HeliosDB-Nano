@@ -4,7 +4,7 @@
 # Tests: CREATE/DROP MV, REFRESH, Incremental Refresh, Auto-refresh, Staleness Tracking
 # Run: ./test_materialized_views.sh
 
-BINARY="./target/release/heliosdb-lite"
+BINARY="./target/release/heliosdb-nano"
 TEST_DB="test_materialized_views.db"
 
 GREEN='\033[0;32m'

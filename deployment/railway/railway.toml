@@ -6,7 +6,7 @@ builder = "dockerfile"
 dockerfilePath = "deployment/docker/Dockerfile"
 
 [deploy]
-startCommand = "heliosdb-lite start --mode server --port $PORT"
+startCommand = "heliosdb-nano start --mode server --port $PORT"
 healthcheckPath = "/health"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"

@@ -63,7 +63,7 @@ Tests to verify cryptographic implementation correctness and security:
 ### Run All Security Tests
 
 ```bash
-# From heliosdb-lite directory
+# From heliosdb-nano directory
 cargo test --test sql_injection_tests --test resource_exhaustion_tests --test crypto_tests
 ```
 

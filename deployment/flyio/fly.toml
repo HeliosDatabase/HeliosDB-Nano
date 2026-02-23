@@ -1,7 +1,7 @@
 # Fly.io deployment configuration for HeliosDB-Lite
 # Deploy with: fly deploy
 
-app = "heliosdb-lite"
+app = "heliosdb-nano"
 primary_region = "iad"
 kill_signal = "SIGINT"
 kill_timeout = 30

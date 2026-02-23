@@ -121,7 +121,7 @@ cargo run --example audit_demo
 
 ## Documentation
 
-See `/home/claude/HeliosDB/heliosdb-lite/docs/AUDIT_LOGGING.md` for complete documentation.
+See `/home/claude/HeliosDB/heliosdb-nano/docs/AUDIT_LOGGING.md` for complete documentation.
 
 ## Future Enhancements
 

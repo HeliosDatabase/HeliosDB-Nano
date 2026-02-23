@@ -8,7 +8,7 @@ echo "HeliosDB Lite - Server Mode Test Suite"
 echo "========================================"
 echo ""
 
-BINARY="./target/release/heliosdb-lite"
+BINARY="./target/release/heliosdb-nano"
 PORT=15432  # Use high port to avoid conflicts
 TEST_DIR="/tmp/heliosdb-test-$$"
 

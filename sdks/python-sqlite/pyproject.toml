@@ -133,14 +133,14 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/heliosdb/heliosdb-lite"
+Homepage = "https://github.com/heliosdb/heliosdb-nano"
 Documentation = "https://docs.heliosdb.io/sqlite-compat"
-Repository = "https://github.com/heliosdb/heliosdb-lite"
-"Source Code" = "https://github.com/heliosdb/heliosdb-lite/tree/main/sdks/python-sqlite"
-Issues = "https://github.com/heliosdb/heliosdb-lite/issues"
-Changelog = "https://github.com/heliosdb/heliosdb-lite/blob/main/CHANGELOG.md"
+Repository = "https://github.com/heliosdb/heliosdb-nano"
+"Source Code" = "https://github.com/heliosdb/heliosdb-nano/tree/main/sdks/python-sqlite"
+Issues = "https://github.com/heliosdb/heliosdb-nano/issues"
+Changelog = "https://github.com/heliosdb/heliosdb-nano/blob/main/CHANGELOG.md"
 Discord = "https://discord.gg/heliosdb"
-"Bug Tracker" = "https://github.com/heliosdb/heliosdb-lite/issues"
+"Bug Tracker" = "https://github.com/heliosdb/heliosdb-nano/issues"
 
 [project.scripts]
 # Console scripts / entry points

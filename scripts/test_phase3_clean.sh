@@ -4,7 +4,7 @@
 # Tests all Phase 3 features with fresh database for each test
 # Run: ./test_phase3_clean.sh
 
-BINARY="./target/release/heliosdb-lite"
+BINARY="./target/release/heliosdb-nano"
 TEST_DB="heliosdb_test.db"
 
 # Colors

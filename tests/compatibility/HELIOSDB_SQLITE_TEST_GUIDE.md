@@ -78,7 +78,7 @@ Ensure HeliosDB-Lite binary is built:
 cd /path/to/HeliosDB-Lite
 cargo build --release
 
-# Binary will be at: ./target/release/heliosdb-lite
+# Binary will be at: ./target/release/heliosdb-nano
 ```
 
 ---
@@ -611,7 +611,7 @@ Tests appear to hang without completing
 
 **Solutions:**
 - Use timeout marker: `@pytest.mark.timeout(30)`
-- Kill zombie processes: `pkill -9 heliosdb-lite`
+- Kill zombie processes: `pkill -9 heliosdb-nano`
 - Check for database locks: `fuser test.db`
 
 #### 5. Flaky Tests

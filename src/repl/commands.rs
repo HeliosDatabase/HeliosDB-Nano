@@ -1450,7 +1450,7 @@ impl MetaCommand {
 
             MetaCommand::ServerStart => {
                 println!("{}", "Server mode not available in REPL".yellow());
-                println!("{}", "Use: heliosdb-lite start --config config.toml".dimmed());
+                println!("{}", "Use: heliosdb-nano start --config config.toml".dimmed());
                 Ok(MetaCommandResult::Continue)
             }
 
@@ -1466,7 +1466,7 @@ impl MetaCommand {
                 println!("  Server: {}", "Not running".dimmed());
                 println!();
                 println!("{}", "To start server:".dimmed());
-                println!("  {}", "heliosdb-lite start --port 5432".cyan());
+                println!("  {}", "heliosdb-nano start --port 5432".cyan());
                 println!();
                 Ok(MetaCommandResult::Continue)
             }
@@ -1552,7 +1552,7 @@ impl MetaCommand {
                 if config.map(|c| c.config_path.is_some()).unwrap_or(false) {
                     println!("{}", "Use \\config reload to reload from file".dimmed());
                 } else {
-                    println!("{}", "Start REPL with --config to enable reload: heliosdb-lite repl --config config.toml".dimmed());
+                    println!("{}", "Start REPL with --config to enable reload: heliosdb-nano repl --config config.toml".dimmed());
                 }
                 println!();
                 Ok(MetaCommandResult::Continue)
@@ -1583,7 +1583,7 @@ impl MetaCommand {
                                 println!("{}", format!("Failed to reload configuration: {}", e).red());
                                 if cfg.config_path.is_none() {
                                     println!("{}", "No configuration file path set.".yellow());
-                                    println!("{}", "Start REPL with: heliosdb-lite repl --config config.toml".dimmed());
+                                    println!("{}", "Start REPL with: heliosdb-nano repl --config config.toml".dimmed());
                                 }
                                 Ok(MetaCommandResult::Continue)
                             }
@@ -1591,7 +1591,7 @@ impl MetaCommand {
                     }
                     None => {
                         println!("{}", "Configuration context not available.".yellow());
-                        println!("{}", "Restart REPL with: heliosdb-lite repl --config config.toml".dimmed());
+                        println!("{}", "Restart REPL with: heliosdb-nano repl --config config.toml".dimmed());
                         Ok(MetaCommandResult::Continue)
                     }
                 }
@@ -2934,7 +2934,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         let mut dump_content = String::new();
                         dump_content.push_str("-- HeliosDB Lite Database Dump\n");
                         dump_content.push_str(&format!("-- Generated: {}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")));
-                        dump_content.push_str("-- Database: heliosdb-lite\n\n");
+                        dump_content.push_str("-- Database: heliosdb-nano\n\n");
 
                         let mut total_rows = 0;
                         let mut dump_lines = 0;
@@ -4393,8 +4393,8 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 println!("{}:", "To enable replication".dimmed());
                 println!("  1. Build with: cargo build --features ha-tier1");
                 println!("  2. Configure replication in config.toml");
-                println!("  3. Start primary: heliosdb-lite start --role primary");
-                println!("  4. Start standby: heliosdb-lite start --role standby --primary <host:port>");
+                println!("  3. Start primary: heliosdb-nano start --role primary");
+                println!("  4. Start standby: heliosdb-nano start --role standby --primary <host:port>");
                 println!();
 
                 Ok(MetaCommandResult::Continue)

@@ -99,7 +99,7 @@ rows = cursor.fetchall()
 Connection._execute_embedded()
     ↓
 1. Create temp SQL file with bound parameters
-2. Launch: heliosdb-lite repl --data-dir <path>
+2. Launch: heliosdb-nano repl --data-dir <path>
 3. Redirect stdin from SQL file
 4. Capture stdout/stderr
 5. Parse REPL output into structured results
@@ -133,7 +133,7 @@ Connection (starts in embedded)
     ↓
 conn.switch_to_server(port=5432)
     ↓
-1. Start heliosdb-lite daemon
+1. Start heliosdb-nano daemon
 2. Switch Connection._mode to 'daemon'
 3. Future queries use PostgreSQL protocol
     ↓
