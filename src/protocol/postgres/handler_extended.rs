@@ -389,14 +389,52 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     Ok(Some(schema))
                 }
             }
-            // INSERT, UPDATE, DELETE with RETURNING clause would go here
-            // For now, we don't support RETURNING clause schema derivation
-            Statement::Insert(_) |
-            Statement::Update { .. } |
-            Statement::Delete(_) => {
-                // Non-SELECT statements don't return result sets
-                // (unless they have RETURNING clause - not implemented yet)
-                Ok(None)
+            // INSERT, UPDATE, DELETE - check for RETURNING clause
+            Statement::Insert(ref insert) => {
+                if insert.returning.is_some() {
+                    // Has RETURNING clause - derive schema
+                    let catalog = self.database.storage.catalog();
+                    let planner = crate::sql::planner::Planner::with_catalog(&catalog);
+                    let plan = planner.statement_to_plan(statement.clone())?;
+                    if let crate::sql::LogicalPlan::Insert { table_name, returning: Some(ref items), .. } = plan {
+                        let table_schema = catalog.get_table_schema(&table_name)?;
+                        Ok(Some(crate::EmbeddedDatabase::returning_schema(&table_schema, items)))
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+            Statement::Update { ref returning, .. } => {
+                if returning.is_some() {
+                    let catalog = self.database.storage.catalog();
+                    let planner = crate::sql::planner::Planner::with_catalog(&catalog);
+                    let plan = planner.statement_to_plan(statement.clone())?;
+                    if let crate::sql::LogicalPlan::Update { table_name, returning: Some(ref items), .. } = plan {
+                        let table_schema = catalog.get_table_schema(&table_name)?;
+                        Ok(Some(crate::EmbeddedDatabase::returning_schema(&table_schema, items)))
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                }
+            }
+            Statement::Delete(ref del) => {
+                if del.returning.is_some() {
+                    let catalog = self.database.storage.catalog();
+                    let planner = crate::sql::planner::Planner::with_catalog(&catalog);
+                    let plan = planner.statement_to_plan(statement.clone())?;
+                    if let crate::sql::LogicalPlan::Delete { table_name, returning: Some(ref items), .. } = plan {
+                        let table_schema = catalog.get_table_schema(&table_name)?;
+                        Ok(Some(crate::EmbeddedDatabase::returning_schema(&table_schema, items)))
+                    } else {
+                        Ok(None)
+                    }
+                } else {
+                    Ok(None)
+                }
             }
             // DDL statements (CREATE, DROP, ALTER) don't return results
             Statement::CreateTable(_) |

@@ -500,6 +500,13 @@ where
 
         // Execute query through database
         let is_select = starts_with_icase(trimmed, "SELECT");
+        let is_dml_returning = !is_select && {
+            let upper = trimmed.to_uppercase();
+            (starts_with_icase(trimmed, "INSERT")
+                || starts_with_icase(trimmed, "UPDATE")
+                || starts_with_icase(trimmed, "DELETE"))
+                && upper.contains("RETURNING")
+        };
 
         if is_select {
             let results = self.database.query(query, &[])?;
@@ -509,6 +516,25 @@ where
                 Schema::new(vec![])
             };
             self.send_query_result(schema, results).await?;
+        } else if is_dml_returning {
+            // DML with RETURNING clause - returns rows like a query
+            let (affected, tuples) = self.database.execute_returning(query)?;
+            if tuples.is_empty() {
+                // No rows returned - send command complete with count
+                let tag = self.get_command_tag(query, affected);
+                self.send_command_complete(&tag).await?;
+            } else {
+                // Derive schema from plan for proper column names
+                let schema = self.derive_returning_schema(query)
+                    .unwrap_or_else(|_| {
+                        if let Some(first) = tuples.first() {
+                            first.schema()
+                        } else {
+                            Schema::new(vec![])
+                        }
+                    });
+                self.send_query_result(schema, tuples).await?;
+            }
         } else {
             let affected = self.database.execute(query)?;
             let tag = self.get_command_tag(query, affected);
@@ -855,6 +881,36 @@ where
             position: None,
         }).await?;
         self.send_ready_for_query().await
+    }
+
+    /// Derive schema for a DML statement with RETURNING clause
+    fn derive_returning_schema(&self, sql: &str) -> Result<Schema> {
+        let catalog = self.database.storage.catalog();
+        let planner = crate::sql::planner::Planner::with_catalog(&catalog)
+            .with_sql(sql.to_string());
+        let (statement, _) = self.database.parse_cached(sql)?;
+        let plan = planner.statement_to_plan(statement)?;
+
+        // Extract table name and returning items from the plan
+        let (table_name, returning_items) = match &plan {
+            crate::sql::LogicalPlan::Insert { table_name, returning, .. } => {
+                (table_name.as_str(), returning.as_ref())
+            }
+            crate::sql::LogicalPlan::Update { table_name, returning, .. } => {
+                (table_name.as_str(), returning.as_ref())
+            }
+            crate::sql::LogicalPlan::Delete { table_name, returning, .. } => {
+                (table_name.as_str(), returning.as_ref())
+            }
+            _ => return Err(crate::Error::query_execution("Not a DML statement")),
+        };
+
+        if let Some(items) = returning_items {
+            let table_schema = catalog.get_table_schema(table_name)?;
+            Ok(crate::EmbeddedDatabase::returning_schema(&table_schema, items))
+        } else {
+            Ok(Schema::new(vec![]))
+        }
     }
 
     /// Get command tag for a query

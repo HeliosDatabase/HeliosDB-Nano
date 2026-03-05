@@ -157,23 +157,9 @@ impl<'a> Planner<'a> {
                     Error::query_execution("INSERT statement missing source query")
                 )?;
                 // Extract RETURNING clause if present
-                let returning = insert.returning.as_ref().map(|ret_items| {
-                    ret_items.iter()
-                        .filter_map(|item| {
-                            // Extract column name from SelectItem
-                            match item {
-                                sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(ident)) => {
-                                    Some(ident.value.clone())
-                                }
-                                sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
-                                    // For aliased expressions, use the alias
-                                    Some(alias.value.clone())
-                                }
-                                _ => None,
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                });
+                let returning = insert.returning.as_ref()
+                    .map(|ret_items| self.convert_returning(ret_items))
+                    .transpose()?;
                 self.insert_to_plan(table_name, columns, source, returning)
             }
             Statement::CreateTable(create_table) => {
@@ -233,24 +219,10 @@ impl<'a> Planner<'a> {
             }
             Statement::Update { table, assignments, selection, returning, .. } => {
                 // Extract RETURNING clause if present
-                let returning_cols = returning.as_ref().map(|ret_items| {
-                    ret_items.iter()
-                        .filter_map(|item| {
-                            // Extract column name from SelectItem
-                            match item {
-                                sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(ident)) => {
-                                    Some(ident.value.clone())
-                                }
-                                sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
-                                    // For aliased expressions, use the alias
-                                    Some(alias.value.clone())
-                                }
-                                _ => None,
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                });
-                self.update_to_plan(table, assignments, selection, returning_cols)
+                let returning_items = returning.as_ref()
+                    .map(|ret_items| self.convert_returning(ret_items))
+                    .transpose()?;
+                self.update_to_plan(table, assignments, selection, returning_items)
             }
             Statement::Delete(delete_stmt) => {
                 // Extract table from FromTable enum
@@ -273,23 +245,9 @@ impl<'a> Planner<'a> {
                     }
                 };
                 // Extract RETURNING clause if present
-                let returning = delete_stmt.returning.as_ref().map(|ret_items| {
-                    ret_items.iter()
-                        .filter_map(|item| {
-                            // Extract column name from SelectItem
-                            match item {
-                                sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(ident)) => {
-                                    Some(ident.value.clone())
-                                }
-                                sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
-                                    // For aliased expressions, use the alias
-                                    Some(alias.value.clone())
-                                }
-                                _ => None,
-                            }
-                        })
-                        .collect::<Vec<_>>()
-                });
+                let returning = delete_stmt.returning.as_ref()
+                    .map(|ret_items| self.convert_returning(ret_items))
+                    .transpose()?;
                 self.delete_to_plan(table, delete_stmt.selection.clone(), returning)
             }
             Statement::CreateIndex(create_index) => {
@@ -2017,7 +1975,7 @@ impl<'a> Planner<'a> {
         table_name: String,
         columns: Vec<sqlparser::ast::Ident>,
         source: Box<Query>,
-        returning: Option<Vec<String>>,
+        returning: Option<Vec<ReturningItem>>,
     ) -> Result<LogicalPlan> {
         // Extract VALUES from query
         if let SetExpr::Values(values) = *source.body {
@@ -2475,7 +2433,7 @@ impl<'a> Planner<'a> {
         table: sqlparser::ast::TableWithJoins,
         assignments: Vec<sqlparser::ast::Assignment>,
         selection: Option<Expr>,
-        returning: Option<Vec<String>>,
+        returning: Option<Vec<ReturningItem>>,
     ) -> Result<LogicalPlan> {
         // Get table name
         let table_name = match &table.relation {
@@ -2516,12 +2474,43 @@ impl<'a> Planner<'a> {
         })
     }
 
+    /// Convert RETURNING clause SelectItems to ReturningItems
+    fn convert_returning(&self, items: &[sqlparser::ast::SelectItem]) -> Result<Vec<ReturningItem>> {
+        items.iter()
+            .map(|item| {
+                match item {
+                    sqlparser::ast::SelectItem::Wildcard(_) => {
+                        Ok(ReturningItem::Wildcard)
+                    }
+                    sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(ident)) => {
+                        Ok(ReturningItem::Column(ident.value.clone()))
+                    }
+                    sqlparser::ast::SelectItem::UnnamedExpr(expr) => {
+                        // Expression without alias - generate alias from expression text
+                        let logical_expr = self.expr_to_logical(expr)?;
+                        let alias = format!("{expr}");
+                        Ok(ReturningItem::Expression { expr: logical_expr, alias })
+                    }
+                    sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
+                        let logical_expr = self.expr_to_logical(expr)?;
+                        Ok(ReturningItem::Expression { expr: logical_expr, alias: alias.value.clone() })
+                    }
+                    sqlparser::ast::SelectItem::QualifiedWildcard(name, _) => {
+                        // table.* - treat as wildcard (single-table DML context)
+                        let _ = name;
+                        Ok(ReturningItem::Wildcard)
+                    }
+                }
+            })
+            .collect()
+    }
+
     /// Convert DELETE statement to logical plan
     fn delete_to_plan(
         &self,
         table: sqlparser::ast::TableWithJoins,
         selection: Option<Expr>,
-        returning: Option<Vec<String>>,
+        returning: Option<Vec<ReturningItem>>,
     ) -> Result<LogicalPlan> {
         // Get table name
         let table_name = match &table.relation {

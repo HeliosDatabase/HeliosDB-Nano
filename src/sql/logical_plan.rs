@@ -76,6 +76,24 @@ pub enum TransitionTable {
     NewTable { alias: String },
 }
 
+/// A single item in a RETURNING clause
+///
+/// Represents one expression in `RETURNING expr1, expr2, ...`
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum ReturningItem {
+    /// Wildcard (`RETURNING *`) - return all columns
+    Wildcard,
+    /// A simple column reference (`RETURNING col_name`)
+    Column(String),
+    /// An arbitrary expression with an alias (`RETURNING expr AS alias`)
+    Expression {
+        /// The expression to evaluate
+        expr: LogicalExpr,
+        /// The output column name/alias
+        alias: String,
+    },
+}
+
 /// Trigger type: Regular or Constraint
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TriggerType {
@@ -262,8 +280,8 @@ pub enum LogicalPlan {
         columns: Option<Vec<String>>,
         /// Values to insert
         values: Vec<Vec<LogicalExpr>>,
-        /// RETURNING clause (column names to return)
-        returning: Option<Vec<String>>,
+        /// RETURNING clause (expressions to return from affected rows)
+        returning: Option<Vec<ReturningItem>>,
     },
 
     /// Create table
@@ -301,8 +319,8 @@ pub enum LogicalPlan {
         assignments: Vec<(String, LogicalExpr)>,
         /// Optional WHERE clause
         selection: Option<LogicalExpr>,
-        /// RETURNING clause (column names to return)
-        returning: Option<Vec<String>>,
+        /// RETURNING clause (expressions to return from affected rows)
+        returning: Option<Vec<ReturningItem>>,
     },
 
     /// Delete rows
@@ -311,8 +329,8 @@ pub enum LogicalPlan {
         table_name: String,
         /// Optional WHERE clause
         selection: Option<LogicalExpr>,
-        /// RETURNING clause (column names to return)
-        returning: Option<Vec<String>>,
+        /// RETURNING clause (expressions to return from affected rows)
+        returning: Option<Vec<ReturningItem>>,
     },
 
     /// Create index
