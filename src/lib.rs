@@ -3599,6 +3599,38 @@ impl EmbeddedDatabase {
                 self.storage.rename_table(table_name, new_table_name)?;
                 Ok(0)
             }
+            sql::LogicalPlan::Savepoint { ref name } => {
+                let txn = self.current_transaction.lock()
+                    .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
+                if txn.is_none() {
+                    return Err(Error::query_execution("SAVEPOINT can only be used within a transaction"));
+                }
+                drop(txn);
+                let savepoint = SavepointState { name: name.clone(), dirty_state: Vec::new() };
+                self.savepoints.write().push(savepoint);
+                Ok(0)
+            }
+            sql::LogicalPlan::ReleaseSavepoint { ref name } => {
+                let mut savepoints = self.savepoints.write();
+                if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
+                    savepoints.truncate(pos);
+                    Ok(0)
+                } else {
+                    Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
+                }
+            }
+            sql::LogicalPlan::RollbackToSavepoint { ref name } => {
+                let savepoints = self.savepoints.read();
+                if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
+                    drop(savepoints);
+                    let mut savepoints = self.savepoints.write();
+                    savepoints.truncate(pos + 1);
+                    tracing::warn!("ROLLBACK TO SAVEPOINT '{}': savepoint stack restored, but data changes are not undone (limitation)", name);
+                    Ok(0)
+                } else {
+                    Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
+                }
+            }
             _ => {
                 // For query plans, use executor
                 let mut executor = sql::Executor::with_storage(&self.storage)
@@ -4018,9 +4050,10 @@ impl EmbeddedDatabase {
                 }
                 drop(txn);
 
-                // Create savepoint with current dirty tracker state
-                let dirty_state = Vec::new(); // Simplified - full implementation would capture state
-                let savepoint = SavepointState { name: name.clone(), dirty_state };
+                // Create savepoint - tracks savepoint stack for RELEASE/ROLLBACK TO
+                // Note: data rollback on ROLLBACK TO is not yet implemented;
+                // only the savepoint stack is managed.
+                let savepoint = SavepointState { name: name.clone(), dirty_state: Vec::new() };
                 self.savepoints.write().push(savepoint);
                 Ok((0, Vec::new()))
             }
@@ -4042,7 +4075,10 @@ impl EmbeddedDatabase {
                     drop(savepoints);
                     let mut savepoints = self.savepoints.write();
                     savepoints.truncate(pos + 1);
-                    // Note: Full implementation would restore dirty tracker state
+                    // Limitation: only savepoint stack is restored; data changes
+                    // made after this savepoint are NOT undone. A full implementation
+                    // would require RocksDB transaction-level savepoint support.
+                    tracing::warn!("ROLLBACK TO SAVEPOINT '{}': savepoint stack restored, but data changes are not undone (limitation)", name);
                     Ok((0, Vec::new()))
                 } else {
                     Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
@@ -4518,6 +4554,9 @@ impl EmbeddedDatabase {
             self.storage.increment_lsn();
         }
 
+        // Invalidate result cache since committed data may affect cached query results
+        self.invalidate_result_cache();
+
         session.active_txn = None;
         session.stats.transactions_committed += 1;
         Ok(())
@@ -4548,6 +4587,9 @@ impl EmbeddedDatabase {
         if let Some((_, txn)) = self.session_transactions.remove(&session_id) {
             txn.rollback()?;
         }
+
+        // Invalidate result cache since rollback changes visible data state
+        self.invalidate_result_cache();
 
         session.active_txn = None;
         session.stats.transactions_aborted += 1;
@@ -7288,10 +7330,8 @@ mod tests {
             )
             .unwrap();
         assert_eq!(results.len(), 6);
-        // NOTE: RANK compares full tuple values (not just ORDER BY columns) for tie detection.
-        // Since Bob and Charlie have different names/ids despite same salary, they are NOT
-        // considered tied. This is a known implementation limitation.
-        // TODO: RANK should compare only ORDER BY column values for tie detection.
+        // RANK compares only ORDER BY columns for tie detection.
+        // Employees with the same salary get the same rank.
         let ranks: Vec<(i64, i64)> = results
             .iter()
             .map(|r| {
@@ -7310,9 +7350,9 @@ mod tests {
         // 120000 => rank 1
         let rank_120k: Vec<i64> = ranks.iter().filter(|(s, _)| *s == 120000).map(|(_, r)| *r).collect();
         assert!(rank_120k.iter().all(|r| *r == 1), "120000 should have rank 1");
-        // All 6 ranks should be present (no ties detected in current impl)
+        // Ties detected: employees with same salary share a rank, so fewer than 6 distinct ranks
         let all_ranks: std::collections::HashSet<i64> = ranks.iter().map(|(_, r)| *r).collect();
-        assert_eq!(all_ranks.len(), 6, "Current impl: all ranks are unique (no tie detection)");
+        assert_eq!(all_ranks.len(), 5, "RANK correctly detects ties on ORDER BY columns");
     }
 
     #[test]
@@ -7337,18 +7377,14 @@ mod tests {
                 _ => panic!("expected Int8"),
             })
             .collect();
-        // NOTE: The current implementation compares full tuple values for tie
-        // detection (compute_rank compares all columns, not just ORDER BY columns).
-        // Each row has a different id, so no "ties" are detected.
-        // TODO: RANK should compare only ORDER BY columns, not entire rows.
-        //       Expected per SQL standard: [1, 2, 2, 4]
+        // RANK compares only ORDER BY columns: score=100 rank 1, score=90 rank 2 (tied),
+        // score=80 rank 4 (gap after 2 tied rows)
         let mut sorted_ranks = ranks.clone();
         sorted_ranks.sort();
         assert_eq!(
             sorted_ranks,
-            vec![1, 2, 3, 4],
-            "Current behavior: RANK compares full rows so no ties detected. \
-             TODO: should be [1, 2, 2, 4] per SQL standard."
+            vec![1, 2, 2, 4],
+            "RANK correctly detects ties per SQL standard"
         );
     }
 
@@ -7374,16 +7410,14 @@ mod tests {
                 _ => panic!("expected Int8"),
             })
             .collect();
-        // TODO: DENSE_RANK should compare only ORDER BY columns.
-        // Current behavior: compares full rows => no ties => 1,2,3,4
-        // Expected per SQL standard: [1, 2, 2, 3] (no gaps for ties)
+        // DENSE_RANK compares only ORDER BY columns: score=100 rank 1,
+        // score=90 rank 2 (tied, no gap), score=80 rank 3
         let mut sorted_ranks = ranks.clone();
         sorted_ranks.sort();
         assert_eq!(
             sorted_ranks,
-            vec![1, 2, 3, 4],
-            "Current behavior: DENSE_RANK compares full rows. \
-             TODO: should be [1, 2, 2, 3] per SQL standard."
+            vec![1, 2, 2, 3],
+            "DENSE_RANK correctly detects ties per SQL standard (no gaps)"
         );
     }
 
@@ -8445,10 +8479,8 @@ mod tests {
     }
 
     #[test]
-    fn test_window_count_star_returns_zero_bug() {
-        // TODO: COUNT(*) OVER() returns 0 because the aggregate window path uses
-        // `args.first()` which is None for COUNT(*). The filter_map then drops
-        // every row, giving count=0. This should be fixed to count all rows.
+    fn test_window_count_star_over() {
+        // COUNT(*) OVER() counts all rows in the partition
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
         db.execute("INSERT INTO t (id, val) VALUES (1, 10)").unwrap();
@@ -8458,19 +8490,19 @@ mod tests {
             .query("SELECT id, COUNT(*) OVER () FROM t", &[])
             .unwrap();
         assert_eq!(results.len(), 3);
-        // Current buggy behavior: COUNT(*) returns 0
+        // COUNT(*) counts all rows including those with NULLs
         for row in &results {
             assert_eq!(
                 row.get(1).unwrap(),
-                &Value::Int8(0),
-                "COUNT(*) OVER() currently returns 0 (bug: should be 3)"
+                &Value::Int8(3),
+                "COUNT(*) OVER() should count all rows"
             );
         }
     }
 
     #[test]
-    fn test_window_count_column_includes_non_nulls() {
-        // COUNT(col) should count only non-NULL values
+    fn test_window_count_column_excludes_nulls() {
+        // COUNT(col) counts only non-NULL values per SQL standard
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
         db.execute("INSERT INTO t (id, val) VALUES (1, 10)").unwrap();
@@ -8481,14 +8513,11 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 3);
         for row in &results {
-            // COUNT(val) counts non-NULL values. Current impl counts ALL values
-            // including NULL (returns 3 not 2), because the code counts values.len()
-            // which includes NULL entries from evaluate().
-            // TODO: COUNT(col) should skip NULLs per SQL standard (should return 2).
+            // COUNT(val) should return 2 (only non-NULL values)
             assert_eq!(
                 row.get(1).unwrap(),
-                &Value::Int8(3),
-                "COUNT(val) currently counts all rows including NULLs (should be 2)"
+                &Value::Int8(2),
+                "COUNT(col) should exclude NULLs per SQL standard"
             );
         }
     }

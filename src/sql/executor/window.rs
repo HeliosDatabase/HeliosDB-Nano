@@ -133,6 +133,7 @@ impl WindowOperator {
                     &sorted_partition,
                     &window_expr.fun,
                     &window_expr.args,
+                    &window_expr.order_by,
                     &window_expr.frame,
                     !window_expr.order_by.is_empty(),
                 )?;
@@ -220,6 +221,7 @@ impl WindowOperator {
         partition: &[(usize, Tuple)],
         fun: &WindowFunctionType,
         args: &[LogicalExpr],
+        order_by: &[(LogicalExpr, bool)],
         frame: &Option<WindowFrame>,
         has_order_by: bool,
     ) -> Result<Vec<Value>> {
@@ -233,17 +235,17 @@ impl WindowOperator {
 
             WindowFunctionType::Rank => {
                 // RANK: rank with gaps for ties
-                self.compute_rank(partition, true)
+                self.compute_rank(partition, order_by, true)
             }
 
             WindowFunctionType::DenseRank => {
                 // DENSE_RANK: rank without gaps for ties
-                self.compute_rank(partition, false)
+                self.compute_rank(partition, order_by, false)
             }
 
             WindowFunctionType::PercentRank => {
                 // PERCENT_RANK: (rank - 1) / (total_rows - 1)
-                let ranks = self.compute_rank(partition, true)?;
+                let ranks = self.compute_rank(partition, order_by, true)?;
                 if len <= 1 {
                     return Ok(vec![Value::Float8(0.0); len]);
                 }
@@ -471,7 +473,7 @@ impl WindowOperator {
     /// Compute RANK or DENSE_RANK
     #[allow(clippy::indexing_slicing)]
     // SAFETY: Loop index `i` ranges from 0..len; `i-1` only accessed when `i > 0`
-    fn compute_rank(&self, partition: &[(usize, Tuple)], with_gaps: bool) -> Result<Vec<Value>> {
+    fn compute_rank(&self, partition: &[(usize, Tuple)], order_by: &[(LogicalExpr, bool)], with_gaps: bool) -> Result<Vec<Value>> {
         let len = partition.len();
         if len == 0 {
             return Ok(vec![]);
@@ -483,13 +485,13 @@ impl WindowOperator {
 
         for i in 0..len {
             if i > 0 {
-                // Check if current row has same order key as previous
-                // For simplicity, compare all values (rows are already sorted)
-                let prev_vals: Vec<Value> = partition[i - 1]
-                    .1
-                    .values
-                    .to_vec();
-                let curr_vals: Vec<Value> = partition[i].1.values.to_vec();
+                // Compare only ORDER BY expression values, not full tuple
+                let prev_vals: Vec<Value> = order_by.iter()
+                    .map(|(expr, _)| self.evaluator.evaluate(expr, &partition[i - 1].1).unwrap_or(Value::Null))
+                    .collect();
+                let curr_vals: Vec<Value> = order_by.iter()
+                    .map(|(expr, _)| self.evaluator.evaluate(expr, &partition[i].1).unwrap_or(Value::Null))
+                    .collect();
 
                 if prev_vals != curr_vals {
                     if with_gaps {
@@ -528,16 +530,25 @@ impl WindowOperator {
                 let frame_end = self.get_frame_end(i, len, frame, has_order_by);
 
                 // Collect values in frame
-                let values: Vec<Value> = (frame_start..=frame_end)
-                    .filter(|&j| j < len)
-                    .filter_map(|j| {
-                        expr.map(|e| self.evaluator.evaluate(e, &partition[j].1).unwrap_or(Value::Null))
-                    })
-                    .collect();
+                // For COUNT(*), expr is None — count all rows in the frame
+                let values: Vec<Value> = if let Some(e) = expr {
+                    (frame_start..=frame_end)
+                        .filter(|&j| j < len)
+                        .map(|j| self.evaluator.evaluate(e, &partition[j].1).unwrap_or(Value::Null))
+                        .collect()
+                } else {
+                    // No expression (COUNT(*)) — placeholder per row in frame
+                    (frame_start..=frame_end)
+                        .filter(|&j| j < len)
+                        .map(|_| Value::Int8(1))
+                        .collect()
+                };
 
                 match aggr {
                     crate::sql::AggregateFunction::Count => {
-                        Value::Int8(values.len() as i64)
+                        // COUNT(col) excludes NULLs; COUNT(*) placeholders are never NULL
+                        let non_null = values.iter().filter(|v| !matches!(v, Value::Null)).count();
+                        Value::Int8(non_null as i64)
                     }
                     crate::sql::AggregateFunction::Sum => {
                         let sum: f64 = values
