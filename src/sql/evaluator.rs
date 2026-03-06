@@ -1518,7 +1518,9 @@ impl Evaluator {
             (Value::Numeric(a), Value::Numeric(b)) => {
                 match (a.parse::<Decimal>(), b.parse::<Decimal>()) {
                     (Ok(a_dec), Ok(b_dec)) => a_dec.cmp(&b_dec),
-                    _ => Ordering::Equal, // If parsing fails, treat as equal
+                    _ => return Err(Error::query_execution(format!(
+                        "Cannot compare invalid NUMERIC values '{}' and '{}'", a, b
+                    ))),
                 }
             }
 
@@ -1526,37 +1528,49 @@ impl Evaluator {
             (Value::Numeric(a), Value::Int2(b)) => {
                 match a.parse::<Decimal>() {
                     Ok(a_dec) => a_dec.cmp(&Decimal::from(*b)),
-                    Err(_) => Ordering::Equal,
+                    Err(_) => return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison", a
+                    ))),
                 }
             }
             (Value::Int2(a), Value::Numeric(b)) => {
                 match b.parse::<Decimal>() {
                     Ok(b_dec) => Decimal::from(*a).cmp(&b_dec),
-                    Err(_) => Ordering::Equal,
+                    Err(_) => return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison", b
+                    ))),
                 }
             }
             (Value::Numeric(a), Value::Int4(b)) => {
                 match a.parse::<Decimal>() {
                     Ok(a_dec) => a_dec.cmp(&Decimal::from(*b)),
-                    Err(_) => Ordering::Equal,
+                    Err(_) => return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison", a
+                    ))),
                 }
             }
             (Value::Int4(a), Value::Numeric(b)) => {
                 match b.parse::<Decimal>() {
                     Ok(b_dec) => Decimal::from(*a).cmp(&b_dec),
-                    Err(_) => Ordering::Equal,
+                    Err(_) => return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison", b
+                    ))),
                 }
             }
             (Value::Numeric(a), Value::Int8(b)) => {
                 match a.parse::<Decimal>() {
                     Ok(a_dec) => a_dec.cmp(&Decimal::from(*b)),
-                    Err(_) => Ordering::Equal,
+                    Err(_) => return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison", a
+                    ))),
                 }
             }
             (Value::Int8(a), Value::Numeric(b)) => {
                 match b.parse::<Decimal>() {
                     Ok(b_dec) => Decimal::from(*a).cmp(&b_dec),
-                    Err(_) => Ordering::Equal,
+                    Err(_) => return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison", b
+                    ))),
                 }
             }
 
@@ -1564,25 +1578,33 @@ impl Evaluator {
             (Value::Numeric(a), Value::Float4(b)) => {
                 match a.parse::<f64>() {
                     Ok(a_f) => a_f.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal),
-                    Err(_) => Ordering::Equal,
+                    Err(_) => return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison", a
+                    ))),
                 }
             }
             (Value::Float4(a), Value::Numeric(b)) => {
                 match b.parse::<f64>() {
                     Ok(b_f) => (*a as f64).partial_cmp(&b_f).unwrap_or(Ordering::Equal),
-                    Err(_) => Ordering::Equal,
+                    Err(_) => return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison", b
+                    ))),
                 }
             }
             (Value::Numeric(a), Value::Float8(b)) => {
                 match a.parse::<f64>() {
                     Ok(a_f) => a_f.partial_cmp(b).unwrap_or(Ordering::Equal),
-                    Err(_) => Ordering::Equal,
+                    Err(_) => return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison", a
+                    ))),
                 }
             }
             (Value::Float8(a), Value::Numeric(b)) => {
                 match b.parse::<f64>() {
                     Ok(b_f) => a.partial_cmp(&b_f).unwrap_or(Ordering::Equal),
-                    Err(_) => Ordering::Equal,
+                    Err(_) => return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison", b
+                    ))),
                 }
             }
 
@@ -1635,7 +1657,7 @@ impl Evaluator {
         match (left, right) {
             (Value::Int4(a), Value::Int4(b)) => {
                 let result = op(*a as i64, *b as i64);
-                Ok(Value::Int4(result as i32))
+                Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
             (Value::Int8(a), Value::Int8(b)) => Ok(Value::Int8(op(*a, *b))),
             _ => Err(Error::query_execution(format!(
@@ -1706,7 +1728,7 @@ impl Evaluator {
             // Existing Int/Float operations
             (Value::Int4(a), Value::Int4(b)) => {
                 let result = (*a as i64) + (*b as i64);
-                Ok(Value::Int4(result as i32))
+                Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
             (Value::Int8(a), Value::Int8(b)) => Ok(Value::Int8(a + b)),
             (Value::Float4(a), Value::Float4(b)) => Ok(Value::Float4(a + b)),
@@ -1725,11 +1747,20 @@ impl Evaluator {
             (Value::Float4(a), Value::Float8(b)) => Ok(Value::Float8((*a as f64) + b)),
             (Value::Float8(a), Value::Float4(b)) => Ok(Value::Float8(a + (*b as f64))),
             // Int2 coercion
-            (Value::Int2(a), Value::Int4(b)) => Ok(Value::Int4((*a as i32) + b)),
-            (Value::Int4(a), Value::Int2(b)) => Ok(Value::Int4(a + (*b as i32))),
+            (Value::Int2(a), Value::Int4(b)) => {
+                let result = (*a as i64) + (*b as i64);
+                Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
+            }
+            (Value::Int4(a), Value::Int2(b)) => {
+                let result = (*a as i64) + (*b as i64);
+                Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
+            }
             (Value::Int2(a), Value::Int8(b)) => Ok(Value::Int8((*a as i64) + b)),
             (Value::Int8(a), Value::Int2(b)) => Ok(Value::Int8(a + (*b as i64))),
-            (Value::Int2(a), Value::Int2(b)) => Ok(Value::Int2(a + b)),
+            (Value::Int2(a), Value::Int2(b)) => {
+                let result = (*a as i32) + (*b as i32);
+                Ok(i16::try_from(result).map_or(Value::Int4(result), Value::Int2))
+            }
             (Value::Int2(a), Value::Float4(b)) => Ok(Value::Float4((*a as f32) + b)),
             (Value::Float4(a), Value::Int2(b)) => Ok(Value::Float4(a + (*b as f32))),
             (Value::Int2(a), Value::Float8(b)) => Ok(Value::Float8((*a as f64) + b)),
@@ -1827,7 +1858,7 @@ impl Evaluator {
             // Existing Int/Float operations
             (Value::Int4(a), Value::Int4(b)) => {
                 let result = (*a as i64) - (*b as i64);
-                Ok(Value::Int4(result as i32))
+                Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
             (Value::Int8(a), Value::Int8(b)) => Ok(Value::Int8(a - b)),
             (Value::Float4(a), Value::Float4(b)) => Ok(Value::Float4(a - b)),
@@ -1846,11 +1877,20 @@ impl Evaluator {
             (Value::Float4(a), Value::Float8(b)) => Ok(Value::Float8((*a as f64) - b)),
             (Value::Float8(a), Value::Float4(b)) => Ok(Value::Float8(a - (*b as f64))),
             // Int2 coercion
-            (Value::Int2(a), Value::Int4(b)) => Ok(Value::Int4((*a as i32) - b)),
-            (Value::Int4(a), Value::Int2(b)) => Ok(Value::Int4(a - (*b as i32))),
+            (Value::Int2(a), Value::Int4(b)) => {
+                let result = (*a as i64) - (*b as i64);
+                Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
+            }
+            (Value::Int4(a), Value::Int2(b)) => {
+                let result = (*a as i64) - (*b as i64);
+                Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
+            }
             (Value::Int2(a), Value::Int8(b)) => Ok(Value::Int8((*a as i64) - b)),
             (Value::Int8(a), Value::Int2(b)) => Ok(Value::Int8(a - (*b as i64))),
-            (Value::Int2(a), Value::Int2(b)) => Ok(Value::Int2(a - b)),
+            (Value::Int2(a), Value::Int2(b)) => {
+                let result = (*a as i32) - (*b as i32);
+                Ok(i16::try_from(result).map_or(Value::Int4(result), Value::Int2))
+            }
             (Value::Int2(a), Value::Float4(b)) => Ok(Value::Float4((*a as f32) - b)),
             (Value::Float4(a), Value::Int2(b)) => Ok(Value::Float4(a - (*b as f32))),
             (Value::Int2(a), Value::Float8(b)) => Ok(Value::Float8((*a as f64) - b)),
@@ -1950,7 +1990,7 @@ impl Evaluator {
             // Existing Int/Float operations
             (Value::Int4(a), Value::Int4(b)) => {
                 let result = (*a as i64) * (*b as i64);
-                Ok(Value::Int4(result as i32))
+                Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
             (Value::Int8(a), Value::Int8(b)) => Ok(Value::Int8(a * b)),
             (Value::Float4(a), Value::Float4(b)) => Ok(Value::Float4(a * b)),
@@ -1969,11 +2009,20 @@ impl Evaluator {
             (Value::Float4(a), Value::Float8(b)) => Ok(Value::Float8((*a as f64) * b)),
             (Value::Float8(a), Value::Float4(b)) => Ok(Value::Float8(a * (*b as f64))),
             // Int2 coercion
-            (Value::Int2(a), Value::Int4(b)) => Ok(Value::Int4((*a as i32) * b)),
-            (Value::Int4(a), Value::Int2(b)) => Ok(Value::Int4(a * (*b as i32))),
+            (Value::Int2(a), Value::Int4(b)) => {
+                let result = (*a as i64) * (*b as i64);
+                Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
+            }
+            (Value::Int4(a), Value::Int2(b)) => {
+                let result = (*a as i64) * (*b as i64);
+                Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
+            }
             (Value::Int2(a), Value::Int8(b)) => Ok(Value::Int8((*a as i64) * b)),
             (Value::Int8(a), Value::Int2(b)) => Ok(Value::Int8(a * (*b as i64))),
-            (Value::Int2(a), Value::Int2(b)) => Ok(Value::Int2(a * b)),
+            (Value::Int2(a), Value::Int2(b)) => {
+                let result = (*a as i32) * (*b as i32);
+                Ok(i16::try_from(result).map_or(Value::Int4(result), Value::Int2))
+            }
             (Value::Int2(a), Value::Float4(b)) => Ok(Value::Float4((*a as f32) * b)),
             (Value::Float4(a), Value::Int2(b)) => Ok(Value::Float4(a * (*b as f32))),
             (Value::Int2(a), Value::Float8(b)) => Ok(Value::Float8((*a as f64) * b)),
@@ -2045,7 +2094,7 @@ impl Evaluator {
             // Existing Int/Float operations
             (Value::Int4(a), Value::Int4(b)) => {
                 let result = (*a as i64) / (*b as i64);
-                Ok(Value::Int4(result as i32))
+                Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
             (Value::Int8(a), Value::Int8(b)) => Ok(Value::Int8(a / b)),
             (Value::Float4(a), Value::Float4(b)) => Ok(Value::Float4(a / b)),
@@ -2064,11 +2113,20 @@ impl Evaluator {
             (Value::Float4(a), Value::Float8(b)) => Ok(Value::Float8((*a as f64) / b)),
             (Value::Float8(a), Value::Float4(b)) => Ok(Value::Float8(a / (*b as f64))),
             // Int2 coercion
-            (Value::Int2(a), Value::Int4(b)) => Ok(Value::Int4((*a as i32) / b)),
-            (Value::Int4(a), Value::Int2(b)) => Ok(Value::Int4(a / (*b as i32))),
+            (Value::Int2(a), Value::Int4(b)) => {
+                let result = (*a as i64) / (*b as i64);
+                Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
+            }
+            (Value::Int4(a), Value::Int2(b)) => {
+                let result = (*a as i64) / (*b as i64);
+                Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
+            }
             (Value::Int2(a), Value::Int8(b)) => Ok(Value::Int8((*a as i64) / b)),
             (Value::Int8(a), Value::Int2(b)) => Ok(Value::Int8(a / (*b as i64))),
-            (Value::Int2(a), Value::Int2(b)) => Ok(Value::Int2(a / b)),
+            (Value::Int2(a), Value::Int2(b)) => {
+                let result = (*a as i32) / (*b as i32);
+                Ok(i16::try_from(result).map_or(Value::Int4(result), Value::Int2))
+            }
             (Value::Int2(a), Value::Float4(b)) => Ok(Value::Float4((*a as f32) / b)),
             (Value::Float4(a), Value::Int2(b)) => Ok(Value::Float4(a / (*b as f32))),
             (Value::Int2(a), Value::Float8(b)) => Ok(Value::Float8((*a as f64) / b)),
@@ -4068,7 +4126,14 @@ impl Evaluator {
             (Value::Float4(a), Value::Float4(b)) => Ok(a.partial_cmp(b).unwrap_or(Ordering::Equal)),
             (Value::Float8(a), Value::Float8(b)) => Ok(a.partial_cmp(b).unwrap_or(Ordering::Equal)),
             (Value::String(a), Value::String(b)) => Ok(a.cmp(b)),
-            (Value::Numeric(a), Value::Numeric(b)) => Ok(a.cmp(b)),
+            (Value::Numeric(a), Value::Numeric(b)) => {
+                match (a.parse::<Decimal>(), b.parse::<Decimal>()) {
+                    (Ok(a_dec), Ok(b_dec)) => Ok(a_dec.cmp(&b_dec)),
+                    _ => Err(Error::query_execution(format!(
+                        "Cannot compare invalid NUMERIC values '{}' and '{}'", a, b
+                    ))),
+                }
+            }
 
             // Cross-type integer comparisons
             (Value::Int2(a), Value::Int4(b)) => Ok((*a as i32).cmp(b)),
@@ -4088,43 +4153,63 @@ impl Evaluator {
 
             // Numeric (DECIMAL) cross-type comparisons — Numeric stores decimal as String
             (Value::Numeric(a), Value::Float8(b)) => {
-                let af = a.parse::<f64>().unwrap_or(0.0);
+                let af = a.parse::<f64>().map_err(|_| Error::query_execution(format!(
+                    "Invalid NUMERIC value '{}' in comparison", a
+                )))?;
                 Ok(af.partial_cmp(b).unwrap_or(Ordering::Equal))
             }
             (Value::Float8(a), Value::Numeric(b)) => {
-                let bf = b.parse::<f64>().unwrap_or(0.0);
+                let bf = b.parse::<f64>().map_err(|_| Error::query_execution(format!(
+                    "Invalid NUMERIC value '{}' in comparison", b
+                )))?;
                 Ok(a.partial_cmp(&bf).unwrap_or(Ordering::Equal))
             }
             (Value::Numeric(a), Value::Float4(b)) => {
-                let af = a.parse::<f64>().unwrap_or(0.0);
+                let af = a.parse::<f64>().map_err(|_| Error::query_execution(format!(
+                    "Invalid NUMERIC value '{}' in comparison", a
+                )))?;
                 Ok(af.partial_cmp(&f64::from(*b)).unwrap_or(Ordering::Equal))
             }
             (Value::Float4(a), Value::Numeric(b)) => {
-                let bf = b.parse::<f64>().unwrap_or(0.0);
+                let bf = b.parse::<f64>().map_err(|_| Error::query_execution(format!(
+                    "Invalid NUMERIC value '{}' in comparison", b
+                )))?;
                 Ok(f64::from(*a).partial_cmp(&bf).unwrap_or(Ordering::Equal))
             }
             (Value::Numeric(a), Value::Int4(b)) => {
-                let ad = a.parse::<Decimal>().unwrap_or_default();
+                let ad = a.parse::<Decimal>().map_err(|_| Error::query_execution(format!(
+                    "Invalid NUMERIC value '{}' in comparison", a
+                )))?;
                 Ok(ad.cmp(&Decimal::from(*b)))
             }
             (Value::Int4(a), Value::Numeric(b)) => {
-                let bd = b.parse::<Decimal>().unwrap_or_default();
+                let bd = b.parse::<Decimal>().map_err(|_| Error::query_execution(format!(
+                    "Invalid NUMERIC value '{}' in comparison", b
+                )))?;
                 Ok(Decimal::from(*a).cmp(&bd))
             }
             (Value::Numeric(a), Value::Int8(b)) => {
-                let ad = a.parse::<Decimal>().unwrap_or_default();
+                let ad = a.parse::<Decimal>().map_err(|_| Error::query_execution(format!(
+                    "Invalid NUMERIC value '{}' in comparison", a
+                )))?;
                 Ok(ad.cmp(&Decimal::from(*b)))
             }
             (Value::Int8(a), Value::Numeric(b)) => {
-                let bd = b.parse::<Decimal>().unwrap_or_default();
+                let bd = b.parse::<Decimal>().map_err(|_| Error::query_execution(format!(
+                    "Invalid NUMERIC value '{}' in comparison", b
+                )))?;
                 Ok(Decimal::from(*a).cmp(&bd))
             }
             (Value::Numeric(a), Value::Int2(b)) => {
-                let ad = a.parse::<Decimal>().unwrap_or_default();
+                let ad = a.parse::<Decimal>().map_err(|_| Error::query_execution(format!(
+                    "Invalid NUMERIC value '{}' in comparison", a
+                )))?;
                 Ok(ad.cmp(&Decimal::from(*b)))
             }
             (Value::Int2(a), Value::Numeric(b)) => {
-                let bd = b.parse::<Decimal>().unwrap_or_default();
+                let bd = b.parse::<Decimal>().map_err(|_| Error::query_execution(format!(
+                    "Invalid NUMERIC value '{}' in comparison", b
+                )))?;
                 Ok(Decimal::from(*a).cmp(&bd))
             }
 
