@@ -2,7 +2,7 @@
 
 **PostgreSQL-compatible embedded database with vector search, encryption, git-like branching, time-travel queries, and 50+ enterprise features.**
 
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+[![License](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org)
 [![Version](https://img.shields.io/badge/version-3.7.0-green.svg)](Cargo.toml)
 
@@ -821,4 +821,4 @@ cargo bench --bench branch_performance
 
 ## License
 
-Apache-2.0
+AGPL-3.0-only (GNU Affero General Public License v3)

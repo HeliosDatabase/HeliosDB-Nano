@@ -2,7 +2,7 @@
   "name": "n8n-nodes-heliosdb",
   "version": "3.0.0",
   "description": "n8n nodes for HeliosDB-Lite - AI-native embedded database",
-  "license": "Apache-2.0",
+  "license": "AGPL-3.0-only",
   "homepage": "https://github.com/heliosdb/heliosdb-lite",
   "repository": {
     "type": "git",

@@ -222,9 +222,9 @@ if __name__ == "__main__":
         long_description_content_type="text/markdown",
         # Author information
         author="HeliosDB Team",
-        author_email="team@heliosdb.io",
+        author_email="support@heliosdb.com",
         maintainer="HeliosDB Team",
-        maintainer_email="team@heliosdb.io",
+        maintainer_email="support@heliosdb.com",
         # URLs
         url="https://github.com/heliosdb/heliosdb-nano",
         project_urls={
@@ -237,7 +237,7 @@ if __name__ == "__main__":
             "Discord": "https://discord.gg/heliosdb",
         },
         # License
-        license="Apache-2.0",
+        license="AGPL-3.0-only",
         license_files=["LICENSE"],
         # Python version support
         python_requires=">=3.8",
@@ -304,7 +304,7 @@ if __name__ == "__main__":
             "Intended Audience :: Science/Research",
             "Intended Audience :: Information Technology",
             # License
-            "License :: OSI Approved :: Apache Software License",
+            "License :: OSI Approved :: GNU Affero General Public License v3",
             # Operating Systems
             "Operating System :: OS Independent",
             "Operating System :: POSIX :: Linux",

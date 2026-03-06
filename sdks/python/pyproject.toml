@@ -7,9 +7,9 @@ name = "heliosdb"
 version = "3.0.0"
 description = "Official Python SDK for HeliosDB-Lite - AI-native embedded database"
 readme = "README.md"
-license = "Apache-2.0"
+license = "AGPL-3.0-only"
 authors = [
-    { name = "HeliosDB Team", email = "team@heliosdb.io" }
+    { name = "HeliosDB Team", email = "support@heliosdb.com" }
 ]
 keywords = [
     "database",
@@ -25,7 +25,7 @@ keywords = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
     "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.9",

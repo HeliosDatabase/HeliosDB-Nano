@@ -4,6 +4,7 @@
   "description": "HeliosDB-Lite integration for VS Code - AI-native database with vector search, branching, and agent memory",
   "version": "2.8.0",
   "publisher": "heliosdb",
+  "license": "AGPL-3.0-only",
   "icon": "images/icon.png",
   "repository": {
     "type": "git",

@@ -10,12 +10,12 @@ name = "heliosdb-sqlite"
 version = "3.0.0"
 description = "SQLite-compatible interface for HeliosDB-Lite with vector search, encryption, and time-travel queries"
 readme = "README.md"
-license = {text = "Apache-2.0"}
+license = {text = "AGPL-3.0-only"}
 authors = [
-    {name = "HeliosDB Team", email = "team@heliosdb.io"}
+    {name = "HeliosDB Team", email = "support@heliosdb.com"}
 ]
 maintainers = [
-    {name = "HeliosDB Team", email = "team@heliosdb.io"}
+    {name = "HeliosDB Team", email = "support@heliosdb.com"}
 ]
 keywords = [
     "sqlite",
@@ -43,7 +43,7 @@ classifiers = [
     "Intended Audience :: Information Technology",
 
     # License
-    "License :: OSI Approved :: Apache Software License",
+    "License :: OSI Approved :: GNU Affero General Public License v3",
 
     # Operating Systems
     "Operating System :: OS Independent",

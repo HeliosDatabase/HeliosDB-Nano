@@ -38,8 +38,8 @@
     "sql",
     "typescript"
   ],
-  "author": "HeliosDB Team <team@heliosdb.io>",
-  "license": "Apache-2.0",
+  "author": "HeliosDB Team <support@heliosdb.com>",
+  "license": "AGPL-3.0-only",
   "repository": {
     "type": "git",
     "url": "https://github.com/heliosdb/heliosdb-lite"
