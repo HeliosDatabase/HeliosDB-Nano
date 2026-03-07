@@ -263,15 +263,15 @@ impl WindowOperator {
 
             WindowFunctionType::CumeDist => {
                 // CUME_DIST: count of rows <= current row / total rows
+                // Compare using ORDER BY keys (not args, which are empty for CUME_DIST)
                 let mut result = Vec::with_capacity(len);
                 for i in 0..len {
-                    // Count rows with same or lower order key values
                     let current_keys: Vec<Value> = partition
                         .get(i)
                         .map(|(_, t)| t)
                         .map(|t| {
-                            args.iter()
-                                .map(|e| self.evaluator.evaluate(e, t).unwrap_or(Value::Null))
+                            order_by.iter()
+                                .map(|(e, _)| self.evaluator.evaluate(e, t).unwrap_or(Value::Null))
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -279,9 +279,9 @@ impl WindowOperator {
                     let count = partition
                         .iter()
                         .filter(|(_, t)| {
-                            let keys: Vec<Value> = args
+                            let keys: Vec<Value> = order_by
                                 .iter()
-                                .map(|e| self.evaluator.evaluate(e, t).unwrap_or(Value::Null))
+                                .map(|(e, _)| self.evaluator.evaluate(e, t).unwrap_or(Value::Null))
                                 .collect();
                             // Lexicographic comparison of keys
                             compare_value_vecs(&keys, &current_keys) != std::cmp::Ordering::Greater
@@ -551,11 +551,12 @@ impl WindowOperator {
                         Value::Int8(non_null as i64)
                     }
                     crate::sql::AggregateFunction::Sum => {
-                        let sum: f64 = values
-                            .iter()
-                            .filter_map(|v| value_to_f64(v))
-                            .sum();
-                        Value::Float8(sum)
+                        let nums: Vec<f64> = values.iter().filter_map(|v| value_to_f64(v)).collect();
+                        if nums.is_empty() {
+                            Value::Null
+                        } else {
+                            Value::Float8(nums.iter().sum())
+                        }
                     }
                     crate::sql::AggregateFunction::Avg => {
                         let nums: Vec<f64> = values.iter().filter_map(|v| value_to_f64(v)).collect();

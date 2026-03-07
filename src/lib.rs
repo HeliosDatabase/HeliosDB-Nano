@@ -416,9 +416,10 @@ impl Drop for EmbeddedDatabase {
 struct SavepointState {
     /// Savepoint name
     name: String,
-    /// Snapshot of dirty tracker state at savepoint creation
-    #[allow(dead_code)]
-    dirty_state: Vec<(String, Vec<u8>)>,
+    /// Snapshot of the transaction write set at savepoint creation time.
+    /// Used by ROLLBACK TO SAVEPOINT to undo data changes made after the savepoint.
+    /// Contains all (key, value) pairs from the write set when the savepoint was created.
+    write_set_snapshot: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 }
 
 /// Case-insensitive prefix check without allocating a new String.
@@ -568,14 +569,25 @@ impl EmbeddedDatabase {
                 .map_err(|e| Error::query_execution(format!("Quota exceeded: {}", e)))?;
         }
 
+        // Skip fast paths when savepoints are active. Fast paths write directly to
+        // storage (bypassing the transaction write set), which means ROLLBACK TO
+        // SAVEPOINT cannot undo those writes. When savepoints are active, we force
+        // all DML through the normal path which buffers writes in the transaction
+        // write set for proper savepoint rollback support.
+        let has_savepoints = !self.savepoints.read().is_empty();
+
         // Fast path: simple INSERT with literal values (skips full SQL parsing)
-        if let Some(result) = self.try_fast_insert(sql) {
-            return result;
+        if !has_savepoints {
+            if let Some(result) = self.try_fast_insert(sql) {
+                return result;
+            }
         }
 
         // Fast path: simple UPDATE with PK WHERE clause (skips full SQL parsing)
-        if let Some(result) = self.try_fast_update(sql) {
-            return result;
+        if !has_savepoints {
+            if let Some(result) = self.try_fast_update(sql) {
+                return result;
+            }
         }
 
         // Check if this is a Phase 3 branching statement (before trying to parse with sqlparser)
@@ -2898,18 +2910,23 @@ impl EmbeddedDatabase {
             let mut end = 0;
             let bytes = inner.as_bytes();
             let mut result = String::new();
+            let mut seg_start = 0; // start of current non-quote segment
             while end < bytes.len() {
                 if bytes[end] == b'\'' {
+                    // Flush the segment before this quote as a UTF-8 slice
+                    if seg_start < end {
+                        result.push_str(inner.get(seg_start..end)?);
+                    }
                     if end + 1 < bytes.len() && bytes[end + 1] == b'\'' {
                         result.push('\'');
                         end += 2;
+                        seg_start = end;
                         continue;
                     }
                     // End of string
                     let rest = inner.get(end + 1..)?;
                     return Some((Value::String(result), rest));
                 }
-                result.push(bytes[end] as char);
                 end += 1;
             }
             return None; // Unterminated string
@@ -3431,6 +3448,19 @@ impl EmbeddedDatabase {
                 // Invalidate all cached rows for this table
                 self.storage.row_cache().invalidate_table(table_name);
 
+                // Clear ART index entries for this table so that stale PK/UNIQUE
+                // values do not block re-insertion of the same values.
+                // Skip clearing if user-created branches exist (exclude the
+                // auto-created "main" branch). Branch data uses separate key
+                // prefixes and does not share the ART index, but as a safety
+                // measure we skip clearing when user branches exist.
+                let has_user_branches = self.storage.list_branches()
+                    .map(|b| b.iter().any(|br| br.name != "main"))
+                    .unwrap_or(false);
+                if !has_user_branches {
+                    self.storage.art_indexes().clear_table_indexes(table_name);
+                }
+
                 // Execute AFTER TRUNCATE triggers
                 let action = self.trigger_registry.execute_triggers(
                     table_name,
@@ -3602,11 +3632,15 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::Savepoint { ref name } => {
                 let txn = self.current_transaction.lock()
                     .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
-                if txn.is_none() {
-                    return Err(Error::query_execution("SAVEPOINT can only be used within a transaction"));
-                }
+                let write_set_snapshot = match txn.as_ref() {
+                    Some(t) => t.savepoint_snapshot(),
+                    None => return Err(Error::query_execution("SAVEPOINT can only be used within a transaction")),
+                };
                 drop(txn);
-                let savepoint = SavepointState { name: name.clone(), dirty_state: Vec::new() };
+                let savepoint = SavepointState {
+                    name: name.clone(),
+                    write_set_snapshot,
+                };
                 self.savepoints.write().push(savepoint);
                 Ok(0)
             }
@@ -3622,10 +3656,21 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::RollbackToSavepoint { ref name } => {
                 let savepoints = self.savepoints.read();
                 if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
+                    let snapshot = savepoints.get(pos)
+                        .map(|s| s.write_set_snapshot.clone());
                     drop(savepoints);
+
+                    if let Some(snapshot) = snapshot {
+                        let txn = self.current_transaction.lock()
+                            .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
+                        if let Some(t) = txn.as_ref() {
+                            t.rollback_to_savepoint(&snapshot);
+                        }
+                        drop(txn);
+                    }
+
                     let mut savepoints = self.savepoints.write();
                     savepoints.truncate(pos + 1);
-                    tracing::warn!("ROLLBACK TO SAVEPOINT '{}': savepoint stack restored, but data changes are not undone (limitation)", name);
                     Ok(0)
                 } else {
                     Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
@@ -4042,18 +4087,19 @@ impl EmbeddedDatabase {
             }
             // Savepoint support for nested transactions
             sql::LogicalPlan::Savepoint { name } => {
-                // Check if we're in a transaction
+                // Check if we're in a transaction and snapshot the write set
                 let txn = self.current_transaction.lock()
                     .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
-                if txn.is_none() {
-                    return Err(Error::query_execution("SAVEPOINT can only be used within a transaction"));
-                }
+                let write_set_snapshot = match txn.as_ref() {
+                    Some(t) => t.savepoint_snapshot(),
+                    None => return Err(Error::query_execution("SAVEPOINT can only be used within a transaction")),
+                };
                 drop(txn);
 
-                // Create savepoint - tracks savepoint stack for RELEASE/ROLLBACK TO
-                // Note: data rollback on ROLLBACK TO is not yet implemented;
-                // only the savepoint stack is managed.
-                let savepoint = SavepointState { name: name.clone(), dirty_state: Vec::new() };
+                let savepoint = SavepointState {
+                    name: name.clone(),
+                    write_set_snapshot,
+                };
                 self.savepoints.write().push(savepoint);
                 Ok((0, Vec::new()))
             }
@@ -4071,14 +4117,23 @@ impl EmbeddedDatabase {
                 let savepoints = self.savepoints.read();
                 // Find the savepoint
                 if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
-                    // Keep savepoints up to and including this one
+                    let snapshot = savepoints.get(pos)
+                        .map(|s| s.write_set_snapshot.clone());
                     drop(savepoints);
+
+                    // Rollback the transaction write set to the savepoint state
+                    if let Some(snapshot) = snapshot {
+                        let txn = self.current_transaction.lock()
+                            .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
+                        if let Some(t) = txn.as_ref() {
+                            t.rollback_to_savepoint(&snapshot);
+                        }
+                        drop(txn);
+                    }
+
+                    // Keep savepoints up to and including this one
                     let mut savepoints = self.savepoints.write();
                     savepoints.truncate(pos + 1);
-                    // Limitation: only savepoint stack is restored; data changes
-                    // made after this savepoint are NOT undone. A full implementation
-                    // would require RocksDB transaction-level savepoint support.
-                    tracing::warn!("ROLLBACK TO SAVEPOINT '{}': savepoint stack restored, but data changes are not undone (limitation)", name);
                     Ok((0, Vec::new()))
                 } else {
                     Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
@@ -6383,9 +6438,8 @@ mod tests {
     }
 
     #[test]
-    fn test_savepoint_rollback_to_is_stub() {
-        // Test that ROLLBACK TO SAVEPOINT is a stub (does not actually undo writes)
-        // even when accessed through the working path.
+    fn test_savepoint_rollback_to_undoes_inserts() {
+        // ROLLBACK TO SAVEPOINT now undoes INSERTs that went through the transaction write set.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE sp_stub (id INT, val TEXT)").unwrap();
 
@@ -6404,12 +6458,11 @@ mod tests {
         db.execute("COMMIT").unwrap();
 
         let rows = db.query("SELECT * FROM sp_stub", &[]).unwrap();
-        // TODO: Even when ROLLBACK TO SAVEPOINT succeeds syntactically, it does not
-        // actually undo writes. The implementation only manipulates the savepoint name
-        // stack without capturing/restoring transaction write set state.
-        // Correct behavior: 0 rows. Current behavior: 1 row (INSERT persists).
-        assert_eq!(rows.len(), 1,
-            "KNOWN LIMITATION: ROLLBACK TO SAVEPOINT is a stub; writes persist");
+        // ROLLBACK TO SAVEPOINT now correctly undoes INSERTs that go through
+        // the transaction write set. The INSERT is removed from the write set
+        // before COMMIT applies it, so 0 rows are committed.
+        assert_eq!(rows.len(), 0,
+            "ROLLBACK TO SAVEPOINT should undo INSERTs via transaction write set");
     }
 
     #[test]
@@ -8062,13 +8115,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(results.len(), 3);
-        // SUM of all NULLs: filter_map drops NULLs, sum of empty = 0.0
-        // Standard SQL would return NULL, but current impl returns 0.0
+        // SQL standard: SUM of all NULLs returns NULL
         for row in &results {
             let sum_val = row.get(2).unwrap();
             assert!(
-                matches!(sum_val, Value::Float8(v) if v.abs() < 0.01) || matches!(sum_val, Value::Null),
-                "SUM of all NULLs should be 0.0 or NULL, got {:?}",
+                matches!(sum_val, Value::Null),
+                "SUM of all NULLs should be NULL (SQL standard), got {:?}",
                 sum_val
             );
         }

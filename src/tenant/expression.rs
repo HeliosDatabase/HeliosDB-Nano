@@ -275,6 +275,16 @@ impl RLSExpressionEvaluator {
             }
 
             LogicalExpr::BinaryExpr { left, op, right } => {
+                // AND/OR require short-circuit evaluation with SQL three-valued logic.
+                match op {
+                    BinaryOperator::And => {
+                        return self.evaluate_and_short_circuit(left, right, tuple);
+                    }
+                    BinaryOperator::Or => {
+                        return self.evaluate_or_short_circuit(left, right, tuple);
+                    }
+                    _ => {}
+                }
                 let left_val = self.evaluate_expr(left, tuple)?;
                 let right_val = self.evaluate_expr(right, tuple)?;
                 self.evaluate_binary_op(&left_val, op, &right_val)
@@ -348,17 +358,8 @@ impl RLSExpressionEvaluator {
                 _ => Err(Error::query_execution(format!("Cannot compare {:?} >= {:?}", left, right))),
             },
 
-            BinaryOperator::And => {
-                let l = self.value_to_bool(left)?;
-                let r = self.value_to_bool(right)?;
-                Ok(Value::Boolean(l && r))
-            }
-
-            BinaryOperator::Or => {
-                let l = self.value_to_bool(left)?;
-                let r = self.value_to_bool(right)?;
-                Ok(Value::Boolean(l || r))
-            }
+            BinaryOperator::And => Self::three_valued_and(left, right),
+            BinaryOperator::Or => Self::three_valued_or(left, right),
 
             _ => Err(Error::query_execution(format!(
                 "Operator {:?} not supported in RLS",
@@ -375,9 +376,15 @@ impl RLSExpressionEvaluator {
                 Ok(Value::Boolean(!b))
             }
             crate::sql::UnaryOperator::Minus => match val {
-                Value::Int8(i) => Ok(Value::Int8(-i)),
-                Value::Int4(i) => Ok(Value::Int4(-i)),
-                Value::Int2(i) => Ok(Value::Int2(-i)),
+                Value::Int8(i) => i.checked_neg()
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT negation")),
+                Value::Int4(i) => i.checked_neg()
+                    .map(Value::Int4)
+                    .ok_or_else(|| Error::query_execution("integer overflow: INT negation")),
+                Value::Int2(i) => i.checked_neg()
+                    .map(Value::Int2)
+                    .ok_or_else(|| Error::query_execution("integer overflow: SMALLINT negation")),
                 Value::Float8(f) => Ok(Value::Float8(-f)),
                 Value::Float4(f) => Ok(Value::Float4(-f)),
                 _ => Err(Error::query_execution(format!("Cannot negate {:?}", val))),
@@ -393,6 +400,111 @@ impl RLSExpressionEvaluator {
             _ => Err(Error::query_execution(format!(
                 "Expected boolean value, got {:?}",
                 val
+            ))),
+        }
+    }
+
+    /// Convert a value to `Option<bool>` for SQL three-valued logic.
+    fn to_tri_bool(value: &Value) -> Result<Option<bool>> {
+        match value {
+            Value::Boolean(b) => Ok(Some(*b)),
+            Value::Null => Ok(None),
+            _ => Err(Error::query_execution(format!(
+                "Cannot convert {:?} to boolean", value
+            ))),
+        }
+    }
+
+    /// SQL three-valued AND on two already-evaluated values.
+    fn three_valued_and(left: &Value, right: &Value) -> Result<Value> {
+        let l = Self::to_tri_bool(left)?;
+        let r = Self::to_tri_bool(right)?;
+        match (l, r) {
+            (Some(false), _) | (_, Some(false)) => Ok(Value::Boolean(false)),
+            (Some(true), Some(true)) => Ok(Value::Boolean(true)),
+            _ => Ok(Value::Null),
+        }
+    }
+
+    /// SQL three-valued OR on two already-evaluated values.
+    fn three_valued_or(left: &Value, right: &Value) -> Result<Value> {
+        let l = Self::to_tri_bool(left)?;
+        let r = Self::to_tri_bool(right)?;
+        match (l, r) {
+            (Some(true), _) | (_, Some(true)) => Ok(Value::Boolean(true)),
+            (Some(false), Some(false)) => Ok(Value::Boolean(false)),
+            _ => Ok(Value::Null),
+        }
+    }
+
+    /// Short-circuit AND evaluation with SQL three-valued NULL logic.
+    fn evaluate_and_short_circuit(
+        &self,
+        left: &LogicalExpr,
+        right: &LogicalExpr,
+        tuple: &Tuple,
+    ) -> Result<Value> {
+        let left_val = self.evaluate_expr(left, tuple)?;
+        match &left_val {
+            Value::Boolean(false) => Ok(Value::Boolean(false)),
+            Value::Boolean(true) => {
+                let right_val = self.evaluate_expr(right, tuple)?;
+                match &right_val {
+                    Value::Boolean(b) => Ok(Value::Boolean(*b)),
+                    Value::Null => Ok(Value::Null),
+                    _ => Err(Error::query_execution(format!(
+                        "Cannot convert {:?} to boolean", right_val
+                    ))),
+                }
+            }
+            Value::Null => {
+                let right_val = self.evaluate_expr(right, tuple)?;
+                match &right_val {
+                    Value::Boolean(false) => Ok(Value::Boolean(false)),
+                    Value::Boolean(true) | Value::Null => Ok(Value::Null),
+                    _ => Err(Error::query_execution(format!(
+                        "Cannot convert {:?} to boolean", right_val
+                    ))),
+                }
+            }
+            _ => Err(Error::query_execution(format!(
+                "Cannot convert {:?} to boolean", left_val
+            ))),
+        }
+    }
+
+    /// Short-circuit OR evaluation with SQL three-valued NULL logic.
+    fn evaluate_or_short_circuit(
+        &self,
+        left: &LogicalExpr,
+        right: &LogicalExpr,
+        tuple: &Tuple,
+    ) -> Result<Value> {
+        let left_val = self.evaluate_expr(left, tuple)?;
+        match &left_val {
+            Value::Boolean(true) => Ok(Value::Boolean(true)),
+            Value::Boolean(false) => {
+                let right_val = self.evaluate_expr(right, tuple)?;
+                match &right_val {
+                    Value::Boolean(b) => Ok(Value::Boolean(*b)),
+                    Value::Null => Ok(Value::Null),
+                    _ => Err(Error::query_execution(format!(
+                        "Cannot convert {:?} to boolean", right_val
+                    ))),
+                }
+            }
+            Value::Null => {
+                let right_val = self.evaluate_expr(right, tuple)?;
+                match &right_val {
+                    Value::Boolean(true) => Ok(Value::Boolean(true)),
+                    Value::Boolean(false) | Value::Null => Ok(Value::Null),
+                    _ => Err(Error::query_execution(format!(
+                        "Cannot convert {:?} to boolean", right_val
+                    ))),
+                }
+            }
+            _ => Err(Error::query_execution(format!(
+                "Cannot convert {:?} to boolean", left_val
             ))),
         }
     }

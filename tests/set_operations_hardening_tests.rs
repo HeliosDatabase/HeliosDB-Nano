@@ -785,37 +785,31 @@ fn test_union_order_by_column_name() {
 fn test_union_order_by_ordinal_position() {
     let db = create_test_db().unwrap();
 
-    // ORDER BY 1 (ordinal position)
-    // NOTE: HeliosDB Nano treats ORDER BY 1 as ORDER BY the literal integer 1,
-    // not as ordinal position reference. This is a known deviation from SQL standard.
+    // ORDER BY 1 (ordinal position) - standard SQL feature
     let result = db.query(
         "SELECT 30 AS val UNION SELECT 10 UNION SELECT 20 ORDER BY 1",
         &[],
     );
-    match result {
-        Ok(rows) => {
-            assert_eq!(rows.len(), 3, "Should return 3 rows regardless of sort behavior");
-            let vals: Vec<i64> = rows.iter().filter_map(|r| get_int_value(r, 0)).collect();
-            // Document actual behavior: ordinal ORDER BY may not sort
-            let mut sorted_vals = vals.clone();
-            sorted_vals.sort();
-            if vals == sorted_vals {
-                println!("ORDER BY 1 correctly sorts by ordinal position");
-            } else {
-                println!(
-                    "ORDER BY 1 does NOT sort by ordinal position (known limitation). Got: {:?}",
-                    vals
-                );
-            }
-            // Verify all values are present regardless of order
-            let mut check = vals;
-            check.sort();
-            assert_eq!(check, vec![10, 20, 30], "All values should be present");
-        }
-        Err(e) => {
-            println!("UNION ORDER BY ordinal error: {}", e);
-        }
-    }
+    let rows = result.expect("ORDER BY ordinal position should work");
+    assert_eq!(rows.len(), 3, "Should return 3 rows");
+    let vals: Vec<i64> = rows.iter().filter_map(|r| get_int_value(r, 0)).collect();
+    assert_eq!(vals, vec![10, 20, 30], "ORDER BY 1 should sort by first column ascending");
+
+    // ORDER BY 1 DESC
+    let result = db.query(
+        "SELECT 30 AS val UNION SELECT 10 UNION SELECT 20 ORDER BY 1 DESC",
+        &[],
+    );
+    let rows = result.expect("ORDER BY ordinal position DESC should work");
+    let vals: Vec<i64> = rows.iter().filter_map(|r| get_int_value(r, 0)).collect();
+    assert_eq!(vals, vec![30, 20, 10], "ORDER BY 1 DESC should sort by first column descending");
+
+    // ORDER BY with out-of-range ordinal should error
+    let result = db.query(
+        "SELECT 1 AS val UNION SELECT 2 ORDER BY 5",
+        &[],
+    );
+    assert!(result.is_err(), "ORDER BY with out-of-range ordinal should return an error");
 }
 
 #[test]

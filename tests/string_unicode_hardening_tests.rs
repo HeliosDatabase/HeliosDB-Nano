@@ -77,10 +77,7 @@ mod string_unicode_hardening {
 
     #[test]
     fn test_insert_and_select_chinese_characters() {
-        // Known issue: multi-byte UTF-8 characters may be re-encoded through the
-        // storage layer, resulting in a different string representation on retrieval.
-        // This test verifies the INSERT/SELECT round-trip does not crash and returns
-        // a non-empty string.
+        // Multi-byte UTF-8 characters must survive the INSERT/storage/SELECT round-trip.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE uni_zh (id INT PRIMARY KEY, txt TEXT)")
             .unwrap();
@@ -91,15 +88,14 @@ mod string_unicode_hardening {
             .unwrap();
         assert_eq!(rows.len(), 1);
         match rows[0].get(0).unwrap() {
-            Value::String(s) => assert!(!s.is_empty(), "Chinese text should round-trip to non-empty string"),
+            Value::String(s) => assert_eq!(s, "\u{4F60}\u{597D}\u{4E16}\u{754C}", "Chinese text must round-trip exactly"),
             other => panic!("Expected String, got {:?}", other),
         }
     }
 
     #[test]
     fn test_insert_and_select_arabic_characters() {
-        // Known issue: multi-byte UTF-8 characters may be re-encoded through the
-        // storage layer. This test verifies the round-trip does not crash.
+        // Multi-byte UTF-8 characters must survive the INSERT/storage/SELECT round-trip.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE uni_ar (id INT PRIMARY KEY, txt TEXT)")
             .unwrap();
@@ -110,7 +106,7 @@ mod string_unicode_hardening {
             .unwrap();
         assert_eq!(rows.len(), 1);
         match rows[0].get(0).unwrap() {
-            Value::String(s) => assert!(!s.is_empty(), "Arabic text should round-trip to non-empty string"),
+            Value::String(s) => assert_eq!(s, "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}", "Arabic text must round-trip exactly"),
             other => panic!("Expected String, got {:?}", other),
         }
     }
@@ -164,10 +160,7 @@ mod string_unicode_hardening {
 
     #[test]
     fn test_emoji_insert_select_roundtrip() {
-        // Known issue: multi-byte Unicode (emoji) may be re-encoded through the
-        // storage layer, so LIKE with the original emoji may not match. This test
-        // verifies that INSERT/SELECT of emoji data does not crash and that both
-        // rows are retrievable.
+        // Multi-byte Unicode (emoji) must survive the INSERT/storage/SELECT round-trip.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE uni_emoji (id INT PRIMARY KEY, msg TEXT)")
             .unwrap();
@@ -176,16 +169,18 @@ mod string_unicode_hardening {
         db.execute("INSERT INTO uni_emoji (id, msg) VALUES (2, 'No emoji here')")
             .unwrap();
 
-        // Verify both rows are stored and retrievable
+        // Verify both rows are stored and retrievable with exact content
         let rows = db
-            .query("SELECT msg FROM uni_emoji", &[])
+            .query("SELECT id, msg FROM uni_emoji ORDER BY id", &[])
             .unwrap();
         assert_eq!(rows.len(), 2);
-        for row in &rows {
-            match row.get(0).unwrap() {
-                Value::String(s) => assert!(!s.is_empty()),
-                other => panic!("Expected String, got {:?}", other),
-            }
+        match rows[0].get(1).unwrap() {
+            Value::String(s) => assert_eq!(s, "Hello \u{1F600}\u{1F389}", "Emoji text must round-trip exactly"),
+            other => panic!("Expected String, got {:?}", other),
+        }
+        match rows[1].get(1).unwrap() {
+            Value::String(s) => assert_eq!(s, "No emoji here"),
+            other => panic!("Expected String, got {:?}", other),
         }
     }
 
@@ -214,10 +209,7 @@ mod string_unicode_hardening {
 
     #[test]
     fn test_unicode_in_where_clause_equality() {
-        // Known issue: multi-byte characters (like e-acute 0xC3 0xA9 in UTF-8) may
-        // be re-encoded through the storage layer, so WHERE equality with the original
-        // Unicode literal may not match. This test verifies the query does not crash
-        // and that ASCII WHERE still works after Unicode inserts.
+        // Multi-byte characters must survive storage and match in WHERE clauses.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE uni_where (id INT PRIMARY KEY, name TEXT)")
             .unwrap();
@@ -226,7 +218,7 @@ mod string_unicode_hardening {
         db.execute("INSERT INTO uni_where (id, name) VALUES (2, 'cafe')")
             .unwrap();
 
-        // ASCII equality should still work
+        // ASCII equality should work
         let rows = db
             .query("SELECT id FROM uni_where WHERE name = 'cafe'", &[])
             .unwrap();
@@ -234,6 +226,17 @@ mod string_unicode_hardening {
         match rows[0].get(0).unwrap() {
             Value::Int4(n) => assert_eq!(*n, 2),
             Value::Int8(n) => assert_eq!(*n, 2),
+            other => panic!("Expected integer, got {:?}", other),
+        }
+
+        // Unicode equality must also work after round-trip through storage
+        let rows = db
+            .query("SELECT id FROM uni_where WHERE name = 'caf\u{00E9}'", &[])
+            .unwrap();
+        assert_eq!(rows.len(), 1, "Unicode WHERE equality must match after storage round-trip");
+        match rows[0].get(0).unwrap() {
+            Value::Int4(n) => assert_eq!(*n, 1),
+            Value::Int8(n) => assert_eq!(*n, 1),
             other => panic!("Expected integer, got {:?}", other),
         }
     }

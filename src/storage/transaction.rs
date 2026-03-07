@@ -569,6 +569,50 @@ impl Transaction {
         self.snapshot = Snapshot::new(new_ts);
     }
 
+    /// Create a snapshot of the current write set for savepoint support.
+    ///
+    /// Returns a copy of all key-value pairs currently in the write set.
+    /// This snapshot can later be passed to `rollback_to_savepoint()` to
+    /// restore the write set to this state.
+    pub fn savepoint_snapshot(&self) -> Vec<(Key, Option<Vec<u8>>)> {
+        self.write_set
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect()
+    }
+
+    /// Rollback the write set to a previously captured savepoint snapshot.
+    ///
+    /// This removes any keys added after the savepoint was created and
+    /// restores any keys that were modified to their values at savepoint time.
+    /// Keys that existed at savepoint time but were deleted after are restored.
+    ///
+    /// # Arguments
+    /// * `snapshot` - The write set snapshot captured at savepoint creation time
+    pub fn rollback_to_savepoint(&self, snapshot: &[(Key, Option<Vec<u8>>)]) {
+        // Build a set of keys that existed at savepoint time for quick lookup
+        let snapshot_keys: std::collections::HashSet<&Key> = snapshot.iter()
+            .map(|(k, _)| k)
+            .collect();
+
+        // Remove keys that were added after the savepoint
+        let current_keys: Vec<Key> = self.write_set
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+
+        for key in &current_keys {
+            if !snapshot_keys.contains(key) {
+                self.write_set.remove(key);
+            }
+        }
+
+        // Restore keys to their savepoint values (handles modifications and re-inserts)
+        for (key, value) in snapshot {
+            self.write_set.insert(key.clone(), value.clone());
+        }
+    }
+
     /// Merge a set of tuples with the transaction's write set
     ///
     /// This ensures "read-your-own-writes" consistency for scans.
@@ -634,6 +678,7 @@ impl Transaction {
         
         Ok(tuples)
     }
+
 }
 
 #[cfg(test)]

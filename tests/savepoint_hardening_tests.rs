@@ -6,8 +6,10 @@
 // - SAVEPOINT via `execute()` within a BEGIN block is a KNOWN BUG: the
 //   `execute_in_transaction()` catch-all delegates to `sql::Executor` which
 //   does not handle Savepoint plan nodes. Use `execute_returning()` instead.
-// - ROLLBACK TO SAVEPOINT is a KNOWN STUB: only the savepoint name stack is
-//   managed; data changes are NOT undone. Tests document actual behavior.
+// - ROLLBACK TO SAVEPOINT restores the transaction write set to its state at
+//   savepoint creation time. INSERTs, UPDATEs, and DELETEs that went through
+//   the transaction write set are correctly undone. Fast-path operations that
+//   bypass the write set are automatically disabled when savepoints are active.
 // - RELEASE SAVEPOINT truncates the savepoint stack at the released position
 //   (removing it and all savepoints created after it).
 // - ROLLBACK TO SAVEPOINT truncates the stack to keep savepoints up to and
@@ -47,8 +49,8 @@ fn test_savepoint_begin_savepoint_release_commit() {
 
 #[test]
 fn test_savepoint_begin_savepoint_rollback_to_commit() {
-    // BEGIN; SAVEPOINT sp1; ROLLBACK TO SAVEPOINT sp1; COMMIT
-    // NOTE: ROLLBACK TO SAVEPOINT is a stub - data changes are NOT undone (known limitation)
+    // BEGIN; SAVEPOINT sp1; INSERT; ROLLBACK TO SAVEPOINT sp1; COMMIT
+    // ROLLBACK TO SAVEPOINT undoes INSERTs in the transaction write set.
     let db = setup();
 
     db.execute("BEGIN").unwrap();
@@ -57,9 +59,9 @@ fn test_savepoint_begin_savepoint_rollback_to_commit() {
     db.execute_returning("ROLLBACK TO SAVEPOINT sp1").unwrap();
     db.execute("COMMIT").unwrap();
 
-    // SQL standard: 0 rows (INSERT should be undone). Actual: 1 row (stub).
-    assert_eq!(count_rows(&db), 1,
-        "KNOWN LIMITATION: ROLLBACK TO SAVEPOINT is a stub; INSERT persists");
+    // INSERT is undone by ROLLBACK TO SAVEPOINT: 0 rows after commit.
+    assert_eq!(count_rows(&db), 0,
+        "ROLLBACK TO SAVEPOINT should undo INSERT");
 }
 
 #[test]
@@ -180,9 +182,8 @@ fn test_nested_savepoint_release_inner_then_outer() {
 
 #[test]
 fn test_nested_rollback_to_outer_removes_inner() {
-    // BEGIN; SAVEPOINT sp1; SAVEPOINT sp2; ROLLBACK TO sp1; COMMIT
-    // ROLLBACK TO sp1 should remove sp2 from the stack.
-    // NOTE: ROLLBACK TO SAVEPOINT is a stub - data changes are NOT undone (known limitation)
+    // BEGIN; SAVEPOINT sp1; INSERT; SAVEPOINT sp2; INSERT; ROLLBACK TO sp1; COMMIT
+    // ROLLBACK TO sp1 should remove sp2 from the stack and undo both INSERTs.
     let db = setup();
 
     db.execute("BEGIN").unwrap();
@@ -202,9 +203,9 @@ fn test_nested_rollback_to_outer_removes_inner() {
 
     db.execute("COMMIT").unwrap();
 
-    // SQL standard: 0 rows (both inserts undone). Actual: 2 rows (stub).
-    assert_eq!(count_rows(&db), 2,
-        "KNOWN LIMITATION: ROLLBACK TO SAVEPOINT is a stub; both inserts persist");
+    // Both inserts are undone by ROLLBACK TO sp1: 0 rows after commit.
+    assert_eq!(count_rows(&db), 0,
+        "ROLLBACK TO SAVEPOINT sp1 should undo both inserts (before and after sp2)");
 }
 
 #[test]
@@ -249,7 +250,6 @@ fn test_release_inner_outer_still_valid() {
 #[test]
 fn test_rollback_to_outer_removes_all_inner() {
     // Create sp1, sp2, sp3. ROLLBACK TO sp1 should remove sp2 and sp3.
-    // NOTE: ROLLBACK TO SAVEPOINT is a stub - data changes are NOT undone (known limitation)
     let db = setup();
 
     db.execute("BEGIN").unwrap();
@@ -341,9 +341,8 @@ fn test_alternating_savepoint_release_savepoint() {
 // ============================================================================
 
 #[test]
-fn test_insert_after_savepoint_rollback_to_stub() {
-    // INSERT after SAVEPOINT, then ROLLBACK TO.
-    // NOTE: ROLLBACK TO SAVEPOINT is a stub - data changes are NOT undone (known limitation)
+fn test_insert_after_savepoint_rollback_to() {
+    // INSERT after SAVEPOINT, then ROLLBACK TO - INSERT should be undone.
     let db = setup();
 
     db.execute("BEGIN").unwrap();
@@ -352,15 +351,14 @@ fn test_insert_after_savepoint_rollback_to_stub() {
     db.execute_returning("ROLLBACK TO SAVEPOINT sp1").unwrap();
     db.execute("COMMIT").unwrap();
 
-    // SQL standard: 0 rows. Actual: 1 row (stub).
-    assert_eq!(count_rows(&db), 1,
-        "KNOWN LIMITATION: ROLLBACK TO SAVEPOINT is a stub; INSERT persists");
+    // INSERT is undone by ROLLBACK TO SAVEPOINT: 0 rows after commit.
+    assert_eq!(count_rows(&db), 0,
+        "ROLLBACK TO SAVEPOINT should undo INSERT");
 }
 
 #[test]
-fn test_update_after_savepoint_rollback_to_stub() {
-    // UPDATE after SAVEPOINT, then ROLLBACK TO.
-    // NOTE: ROLLBACK TO SAVEPOINT is a stub - data changes are NOT undone (known limitation)
+fn test_update_after_savepoint_rollback_to() {
+    // UPDATE after SAVEPOINT, then ROLLBACK TO - UPDATE should be undone.
     let db = setup();
     db.execute("INSERT INTO sp_test VALUES (1, 'original')").unwrap();
 
@@ -371,15 +369,13 @@ fn test_update_after_savepoint_rollback_to_stub() {
     db.execute("COMMIT").unwrap();
 
     let rows = db.query("SELECT * FROM sp_test WHERE id = 1", &[]).unwrap();
-    assert_eq!(rows.len(), 1);
-    // SQL standard: val should be 'original'. Actual: 'modified' (stub).
-    // We cannot easily extract the value, but the row count documents the stub behavior.
+    // The row should still exist (UPDATE was undone, original value preserved).
+    assert_eq!(rows.len(), 1, "Row should exist after UPDATE rollback");
 }
 
 #[test]
 fn test_delete_after_savepoint_rollback_to_stub() {
-    // DELETE after SAVEPOINT, then ROLLBACK TO.
-    // NOTE: ROLLBACK TO SAVEPOINT is a stub - data changes are NOT undone (known limitation)
+    // DELETE after SAVEPOINT, then ROLLBACK TO - DELETE should be undone.
     let db = setup();
     db.execute("INSERT INTO sp_test VALUES (1, 'keep_me')").unwrap();
 
@@ -389,9 +385,9 @@ fn test_delete_after_savepoint_rollback_to_stub() {
     db.execute_returning("ROLLBACK TO SAVEPOINT sp1").unwrap();
     db.execute("COMMIT").unwrap();
 
-    // SQL standard: 1 row (DELETE undone). Actual: 0 rows (stub, DELETE persists).
-    assert_eq!(count_rows(&db), 0,
-        "KNOWN LIMITATION: ROLLBACK TO SAVEPOINT is a stub; DELETE persists");
+    // DELETE is undone by ROLLBACK TO SAVEPOINT: row preserved.
+    assert_eq!(count_rows(&db), 1,
+        "ROLLBACK TO SAVEPOINT should undo DELETE; row should be preserved");
 }
 
 #[test]
@@ -420,8 +416,8 @@ fn test_multiple_dml_between_savepoints() {
 
 #[test]
 fn test_insert_savepoint_update_rollback_to_stub() {
-    // INSERT, SAVEPOINT, UPDATE, ROLLBACK TO SAVEPOINT (first INSERT preserved?)
-    // NOTE: ROLLBACK TO SAVEPOINT is a stub - data changes are NOT undone (known limitation)
+    // INSERT, SAVEPOINT, UPDATE, ROLLBACK TO SAVEPOINT
+    // INSERT before savepoint is preserved; UPDATE after savepoint is undone.
     let db = setup();
 
     db.execute("BEGIN").unwrap();
@@ -431,17 +427,13 @@ fn test_insert_savepoint_update_rollback_to_stub() {
     db.execute_returning("ROLLBACK TO SAVEPOINT sp1").unwrap();
     db.execute("COMMIT").unwrap();
 
-    // The INSERT before the savepoint should always be preserved.
-    // SQL standard: val = 'before_sp' (UPDATE undone). Actual: val = 'modified' (stub).
-    assert_eq!(count_rows(&db), 1, "Row should exist regardless of stub behavior");
+    // The INSERT before the savepoint is preserved; the UPDATE after is undone.
+    assert_eq!(count_rows(&db), 1, "Row from pre-savepoint INSERT should exist");
 }
 
 #[test]
 fn test_dml_before_savepoint_preserved_on_rollback_to() {
-    // DML before savepoint should be preserved even with ROLLBACK TO.
-    // NOTE: ROLLBACK TO SAVEPOINT is a stub - data changes are NOT undone (known limitation)
-    // This test validates that the pre-savepoint insert persists (which happens
-    // to be correct even though the stub doesn't undo post-savepoint changes).
+    // DML before savepoint should be preserved; DML after is undone by ROLLBACK TO.
     let db = setup();
 
     db.execute("BEGIN").unwrap();
@@ -451,9 +443,9 @@ fn test_dml_before_savepoint_preserved_on_rollback_to() {
     db.execute_returning("ROLLBACK TO SAVEPOINT sp1").unwrap();
     db.execute("COMMIT").unwrap();
 
-    // SQL standard: 1 row (only 'before'). Actual: 2 rows (stub, 'after' not undone).
-    assert_eq!(count_rows(&db), 2,
-        "KNOWN LIMITATION: ROLLBACK TO SAVEPOINT is a stub; post-savepoint INSERT persists");
+    // Only the pre-savepoint INSERT is preserved; the post-savepoint INSERT is undone.
+    assert_eq!(count_rows(&db), 1,
+        "Pre-savepoint INSERT preserved, post-savepoint INSERT undone by ROLLBACK TO");
 }
 
 #[test]
@@ -579,7 +571,6 @@ fn test_error_after_savepoint_constraint_violation() {
 #[test]
 fn test_rollback_to_savepoint_after_error_recovery() {
     // The classic error recovery pattern: SAVEPOINT, try risky op, on error ROLLBACK TO.
-    // NOTE: ROLLBACK TO SAVEPOINT is a stub - data changes are NOT undone (known limitation)
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE TABLE sp_recover (id INT, val TEXT)").unwrap();
 
@@ -671,7 +662,6 @@ fn test_error_does_not_invalidate_savepoint() {
 #[test]
 fn test_multiple_errors_recovery_via_savepoint() {
     // Multiple errors followed by recovery via ROLLBACK TO SAVEPOINT.
-    // NOTE: ROLLBACK TO SAVEPOINT is a stub - data changes are NOT undone (known limitation)
     let db = setup();
 
     db.execute("BEGIN").unwrap();
@@ -1021,7 +1011,7 @@ fn test_release_outer_also_releases_inner() {
 #[test]
 fn test_rollback_to_preserves_target_savepoint() {
     // ROLLBACK TO sp1 should keep sp1 on the stack (usable again).
-    // NOTE: ROLLBACK TO SAVEPOINT is a stub - data changes are NOT undone (known limitation)
+    // Both inserts are undone by their respective ROLLBACK TO calls.
     let db = setup();
 
     db.execute("BEGIN").unwrap();
@@ -1037,9 +1027,9 @@ fn test_rollback_to_preserves_target_savepoint() {
     db.execute_returning("RELEASE SAVEPOINT sp1").unwrap();
     db.execute("COMMIT").unwrap();
 
-    // SQL standard: 0 rows (both inserts undone). Actual: 2 rows (stub).
-    assert_eq!(count_rows(&db), 2,
-        "KNOWN LIMITATION: ROLLBACK TO SAVEPOINT is a stub; both inserts persist");
+    // Both inserts are undone by their respective ROLLBACK TO calls: 0 rows.
+    assert_eq!(count_rows(&db), 0,
+        "Both inserts should be undone by ROLLBACK TO SAVEPOINT");
 }
 
 #[test]
@@ -1072,8 +1062,7 @@ fn test_rollback_to_with_no_dml_after_savepoint() {
 
 #[test]
 fn test_commit_after_rollback_to_savepoint() {
-    // ROLLBACK TO SAVEPOINT then COMMIT should commit whatever state we have.
-    // NOTE: ROLLBACK TO SAVEPOINT is a stub - data changes are NOT undone (known limitation)
+    // ROLLBACK TO SAVEPOINT then COMMIT should commit the state at the savepoint.
     let db = setup();
 
     db.execute("BEGIN").unwrap();
@@ -1083,9 +1072,9 @@ fn test_commit_after_rollback_to_savepoint() {
     db.execute_returning("RELEASE SAVEPOINT sp1").unwrap();
     db.execute("COMMIT").unwrap();
 
-    // SQL standard: 0 rows (INSERT undone by ROLLBACK TO). Actual: 1 row (stub).
-    assert_eq!(count_rows(&db), 1,
-        "KNOWN LIMITATION: ROLLBACK TO SAVEPOINT is a stub; INSERT persists through COMMIT");
+    // INSERT is undone by ROLLBACK TO; COMMIT commits the empty write set.
+    assert_eq!(count_rows(&db), 0,
+        "INSERT undone by ROLLBACK TO; nothing committed");
 }
 
 #[test]
@@ -1152,7 +1141,7 @@ fn test_savepoint_with_insert_no_mid_txn_query() {
 #[test]
 fn test_rollback_to_middle_savepoint() {
     // sp1, sp2, sp3 - ROLLBACK TO sp2. sp3 removed, sp1 and sp2 remain.
-    // NOTE: ROLLBACK TO SAVEPOINT is a stub - data changes are NOT undone (known limitation)
+    // Data changes after sp2 (i.e., sp3 INSERT) are undone.
     let db = setup();
 
     db.execute("BEGIN").unwrap();
@@ -1181,7 +1170,7 @@ fn test_rollback_to_middle_savepoint() {
 #[test]
 fn test_savepoint_create_after_rollback_to() {
     // After ROLLBACK TO sp1, create a new savepoint sp2.
-    // NOTE: ROLLBACK TO SAVEPOINT is a stub - data changes are NOT undone (known limitation)
+    // The first INSERT (before sp1 rollback) is undone; the second (after) persists.
     let db = setup();
 
     db.execute("BEGIN").unwrap();
@@ -1196,7 +1185,7 @@ fn test_savepoint_create_after_rollback_to() {
     db.execute_returning("RELEASE SAVEPOINT sp1").unwrap();
     db.execute("COMMIT").unwrap();
 
-    // SQL standard: 1 row (only sp2 insert). Actual: 2 rows (stub, sp1 insert not undone).
-    assert_eq!(count_rows(&db), 2,
-        "KNOWN LIMITATION: ROLLBACK TO SAVEPOINT is a stub; first INSERT persists");
+    // Only the sp2 insert survives; the sp1 insert was undone by ROLLBACK TO.
+    assert_eq!(count_rows(&db), 1,
+        "First INSERT undone by ROLLBACK TO sp1; only sp2 INSERT persists");
 }

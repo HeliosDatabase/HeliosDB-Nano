@@ -1160,8 +1160,16 @@ impl IncrementalRefresher {
     /// Add two values
     fn add_values(&self, left: &Value, right: &Value) -> Result<Value> {
         match (left, right) {
-            (Value::Int4(a), Value::Int4(b)) => Ok(Value::Int4(a + b)),
-            (Value::Int8(a), Value::Int8(b)) => Ok(Value::Int8(a + b)),
+            (Value::Int4(a), Value::Int4(b)) => {
+                a.checked_add(*b)
+                    .map(Value::Int4)
+                    .ok_or_else(|| Error::query_execution("integer overflow: INT addition"))
+            }
+            (Value::Int8(a), Value::Int8(b)) => {
+                a.checked_add(*b)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition"))
+            }
             (Value::Float8(a), Value::Float8(b)) => Ok(Value::Float8(a + b)),
             _ => Err(Error::query_execution("Cannot add incompatible types")),
         }
@@ -1170,8 +1178,16 @@ impl IncrementalRefresher {
     /// Subtract two values
     fn subtract_values(&self, left: &Value, right: &Value) -> Result<Value> {
         match (left, right) {
-            (Value::Int4(a), Value::Int4(b)) => Ok(Value::Int4(a - b)),
-            (Value::Int8(a), Value::Int8(b)) => Ok(Value::Int8(a - b)),
+            (Value::Int4(a), Value::Int4(b)) => {
+                a.checked_sub(*b)
+                    .map(Value::Int4)
+                    .ok_or_else(|| Error::query_execution("integer overflow: INT subtraction"))
+            }
+            (Value::Int8(a), Value::Int8(b)) => {
+                a.checked_sub(*b)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction"))
+            }
             (Value::Float8(a), Value::Float8(b)) => Ok(Value::Float8(a - b)),
             _ => Err(Error::query_execution("Cannot subtract incompatible types")),
         }

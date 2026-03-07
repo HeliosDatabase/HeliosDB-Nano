@@ -322,9 +322,24 @@ fn test_int8_max_value_arithmetic() {
     let val = get_int_value(&rows[0], 0);
     assert_eq!(val, Some(9223372036854775807_i64), "MAX BIGINT + 0 should remain MAX");
 
-    // Note: Adding 1 to MAX causes a panic (overflow in debug mode) in the evaluator,
-    // which is a known limitation. In production (release mode) it would wrap silently.
-    // We do not test val + 1 here to avoid a panic.
+    // Adding 1 to MAX should return an overflow error, not panic
+    let result = db.query("SELECT val + 1 AS result FROM bigint_arith WHERE id = 1", &[]);
+    assert!(result.is_err(), "BIGINT MAX + 1 should return an overflow error");
+    let err_msg = format!("{}", result.unwrap_err());
+    assert!(err_msg.contains("overflow"), "Error should mention overflow, got: {}", err_msg);
+
+    // Subtracting 1 from MIN should also return an overflow error
+    db.execute("INSERT INTO bigint_arith (id, val) VALUES (2, -9223372036854775808)").unwrap();
+    let result = db.query("SELECT val - 1 AS result FROM bigint_arith WHERE id = 2", &[]);
+    assert!(result.is_err(), "BIGINT MIN - 1 should return an overflow error");
+
+    // Multiplying large values should return an overflow error
+    let result = db.query("SELECT val * 2 AS result FROM bigint_arith WHERE id = 1", &[]);
+    assert!(result.is_err(), "BIGINT MAX * 2 should return an overflow error");
+
+    // Division edge case: INT_MIN / -1 overflows
+    let result = db.query("SELECT val / -1 AS result FROM bigint_arith WHERE id = 2", &[]);
+    assert!(result.is_err(), "BIGINT MIN / -1 should return an overflow error");
 }
 
 // ============================================================================
@@ -1232,33 +1247,17 @@ fn test_not_equals_with_null() {
     db.execute("INSERT INTO neq_null (id, val) VALUES (2, 20)").unwrap();
     db.execute("INSERT INTO neq_null (id, val) VALUES (3, NULL)").unwrap();
 
-    // val != 10 involving NULL rows: the engine raises "Cannot compare Null and Int4(10)"
-    // rather than treating NULL != 10 as UNKNOWN. Either error or excluding NULL rows is valid.
-    let result = db.query("SELECT id FROM neq_null WHERE val != 10 ORDER BY id", &[]);
-    match result {
-        Ok(rows) => {
-            // If it succeeds, NULL rows should be excluded
-            assert!(rows.len() >= 1, "Should find non-NULL rows != 10");
-        }
-        Err(e) => {
-            // Error on NULL comparison is a known behavior
-            assert!(e.to_string().contains("Null"), "Error should mention Null comparison");
-        }
-    }
+    // val != 10 with NULL rows: NULL != 10 yields NULL (falsy in WHERE), so
+    // the NULL row is excluded. SQL three-valued logic is handled by compare_values.
+    let rows = db.query("SELECT id FROM neq_null WHERE val != 10 ORDER BY id", &[]).unwrap();
+    assert_eq!(rows.len(), 1, "val != 10 should exclude NULL rows and id=1, leaving only id=2");
+    assert_eq!(get_int_value(&rows[0], 0), Some(2));
 
-    // Work around NULL comparison error by only querying non-NULL rows via subquery or
-    // direct IS NOT NULL. Note: AND short-circuit may not prevent the NULL comparison error.
-    let result2 = db.query("SELECT id FROM neq_null WHERE val IS NOT NULL AND val != 10 ORDER BY id", &[]);
-    match result2 {
-        Ok(rows) => {
-            assert_eq!(rows.len(), 1, "After excluding NULLs, val != 10 should find id=2");
-            assert_eq!(get_int_value(&rows[0], 0), Some(2));
-        }
-        Err(e) => {
-            // Engine may still evaluate val != 10 on NULL rows despite IS NOT NULL guard
-            assert!(e.to_string().contains("Null"), "Error should mention Null: {}", e);
-        }
-    }
+    // AND short-circuit evaluation: `val IS NOT NULL` is false for the NULL row,
+    // so `val != 10` is never evaluated for that row.
+    let rows2 = db.query("SELECT id FROM neq_null WHERE val IS NOT NULL AND val != 10 ORDER BY id", &[]).unwrap();
+    assert_eq!(rows2.len(), 1, "IS NOT NULL AND val != 10 should find id=2");
+    assert_eq!(get_int_value(&rows2[0], 0), Some(2));
 }
 
 #[test]

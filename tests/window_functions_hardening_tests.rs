@@ -6,7 +6,6 @@
 //!
 //! Known engine behaviors documented in tests:
 //! - COUNT(*) OVER() was historically broken (empty args -> 0) but is now fixed.
-//! - SUM of all-NULL column returns 0.0 instead of SQL-standard NULL.
 //! - LAST_VALUE with ORDER BY uses default frame (UNBOUNDED PRECEDING..CURRENT ROW),
 //!   so it returns the current row value rather than the partition's last value.
 //! - LAG/LEAD with a literal default value (3rd argument) is supported.
@@ -896,12 +895,6 @@ mod window_functions_hardening {
     #[test]
     fn test_cume_dist() {
         // CUME_DIST() OVER (ORDER BY val) = count of rows <= current / total rows
-        //
-        // KNOWN LIMITATION: The CUME_DIST implementation compares on `args` (the
-        // function arguments, which are empty for CUME_DIST()) instead of the
-        // ORDER BY keys.  With empty args all rows compare as equal, so every
-        // row gets CUME_DIST = N/N = 1.0.
-        //
         // SQL standard expects: 0.25, 0.50, 0.75, 1.0 for 4 distinct values.
         let d = db();
         d.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
@@ -916,11 +909,11 @@ mod window_functions_hardening {
         ).unwrap();
         assert_eq!(rows.len(), 4);
         let cds: Vec<f64> = rows.iter().map(|r| to_f64(r.get(1).unwrap())).collect();
-        // Current engine behavior: all rows return 1.0 (bug: args empty, not ORDER BY keys)
-        for (i, cd) in cds.iter().enumerate() {
-            assert!((cd - 1.0).abs() < 0.01,
-                "CUME_DIST row {} should be 1.0 (current engine behavior), got {}", i, cd);
-        }
+        // SQL-standard CUME_DIST: (count of rows <= current) / total_rows
+        assert!((cds[0] - 0.25).abs() < 0.01, "CUME_DIST row 0 should be 0.25, got {}", cds[0]);
+        assert!((cds[1] - 0.50).abs() < 0.01, "CUME_DIST row 1 should be 0.50, got {}", cds[1]);
+        assert!((cds[2] - 0.75).abs() < 0.01, "CUME_DIST row 2 should be 0.75, got {}", cds[2]);
+        assert!((cds[3] - 1.00).abs() < 0.01, "CUME_DIST row 3 should be 1.00, got {}", cds[3]);
     }
 
     #[test]
@@ -972,14 +965,12 @@ mod window_functions_hardening {
             &[],
         ).unwrap();
         assert_eq!(rows.len(), 3);
-        // KNOWN ENGINE BEHAVIOR: SUM of all NULLs returns 0.0 (not NULL).
-        // SQL standard would return NULL.
+        // SQL standard: SUM of all NULLs returns NULL.
         for row in &rows {
             let sum_val = row.get(1).unwrap();
             assert!(
-                matches!(sum_val, Value::Float8(v) if v.abs() < 0.01)
-                    || matches!(sum_val, Value::Null),
-                "SUM of all NULLs should be 0.0 (engine) or NULL (standard), got {:?}",
+                matches!(sum_val, Value::Null),
+                "SUM of all NULLs should be NULL (SQL standard), got {:?}",
                 sum_val
             );
         }

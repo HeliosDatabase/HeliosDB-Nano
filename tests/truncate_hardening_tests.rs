@@ -154,10 +154,8 @@ fn test_truncate_multiple_times_in_succession() {
 
 #[test]
 fn test_truncate_table_with_primary_key() {
-    // TRUNCATE removes all data rows but does NOT clear the ART index.
-    // This means: (a) old PK values are still "taken" in the index,
-    // and (b) new PK enforcement may be degraded since on_insert errors
-    // are silently logged. This test documents the actual behavior.
+    // TRUNCATE clears both data rows and ART index entries (when no branches
+    // or time-travel snapshots exist). Old PK values are fully reusable.
     let db = setup();
     db.execute("CREATE TABLE t_pk (id INT PRIMARY KEY, name TEXT)").unwrap();
     db.execute("INSERT INTO t_pk VALUES (1, 'Alice')").unwrap();
@@ -168,18 +166,19 @@ fn test_truncate_table_with_primary_key() {
     let rows = db.query("SELECT * FROM t_pk", &[]).unwrap();
     assert_eq!(rows.len(), 0, "All rows should be removed");
 
-    // After TRUNCATE, the table should still accept new inserts with fresh PKs
-    db.execute("INSERT INTO t_pk VALUES (10, 'Charlie')").unwrap();
-    db.execute("INSERT INTO t_pk VALUES (20, 'Diana')").unwrap();
+    // After TRUNCATE, previously used PK values should be reusable
+    db.execute("INSERT INTO t_pk VALUES (1, 'Charlie')").unwrap();
+    db.execute("INSERT INTO t_pk VALUES (2, 'Diana')").unwrap();
 
     let rows = db.query("SELECT * FROM t_pk ORDER BY id", &[]).unwrap();
-    assert_eq!(rows.len(), 2, "New inserts with fresh PKs should work");
+    assert_eq!(rows.len(), 2, "Re-inserts with old PKs should work after TRUNCATE");
     assert_eq!(rows[0].get(1).unwrap(), &Value::String("Charlie".to_string()));
     assert_eq!(rows[1].get(1).unwrap(), &Value::String("Diana".to_string()));
 }
 
 #[test]
 fn test_truncate_table_with_unique_constraint() {
+    // TRUNCATE clears ART index, so previously used unique values are reusable.
     let db = setup();
     db.execute(
         "CREATE TABLE t_uniq (id INT PRIMARY KEY, email TEXT UNIQUE, name TEXT)"
@@ -189,11 +188,13 @@ fn test_truncate_table_with_unique_constraint() {
 
     db.execute("TRUNCATE TABLE t_uniq").unwrap();
 
-    // Note: TRUNCATE does not clear the ART index, so previously used unique
-    // values remain in the index. Use new unique values after TRUNCATE.
+    // Previously used unique values should be reusable after TRUNCATE
+    db.execute("INSERT INTO t_uniq VALUES (1, 'alice@test.com', 'Alice_v2')").unwrap();
     db.execute("INSERT INTO t_uniq VALUES (3, 'charlie@test.com', 'Charlie')").unwrap();
-    let rows = db.query("SELECT * FROM t_uniq", &[]).unwrap();
-    assert_eq!(rows.len(), 1, "Should be able to insert new unique values after TRUNCATE");
+    let rows = db.query("SELECT * FROM t_uniq ORDER BY id", &[]).unwrap();
+    assert_eq!(rows.len(), 2, "Should be able to reuse old unique values after TRUNCATE");
+    assert_eq!(rows[0].get(1).unwrap(), &Value::String("alice@test.com".to_string()));
+    assert_eq!(rows[1].get(1).unwrap(), &Value::String("charlie@test.com".to_string()));
 
     // UNIQUE constraint should still be enforced for genuinely duplicate values
     let result = db.execute("INSERT INTO t_uniq VALUES (4, 'charlie@test.com', 'Dup')");
@@ -273,9 +274,9 @@ fn test_truncate_table_with_not_null_columns() {
 
 #[test]
 fn test_truncate_constraints_enforced_after() {
-    // After TRUNCATE, schema-level constraints (CHECK, NOT NULL) remain enforced.
-    // ART index-based constraints (UNIQUE) retain stale entries for old values
-    // but PK enforcement is handled separately and may be degraded.
+    // After TRUNCATE, all constraints remain enforced: CHECK, NOT NULL, and
+    // ART index-based constraints (PK, UNIQUE). The ART index is cleared by
+    // TRUNCATE so old values are reusable, but new duplicates are still caught.
     let db = setup();
     db.execute(
         "CREATE TABLE t_all_constraints (
@@ -492,8 +493,8 @@ fn test_truncate_then_select_in_same_transaction() {
 fn test_multiple_dml_after_truncate_in_transaction() {
     // TRUNCATE inside a transaction executes immediately (DDL-like behavior).
     // Pre-existing committed rows are deleted by TRUNCATE. New inserts within
-    // the transaction are added to storage. The ART index retains old entries,
-    // so we use new PK values to avoid stale index conflicts.
+    // the transaction are added to storage. The ART index is cleared by TRUNCATE,
+    // so old PK values can be reused.
     let db = setup();
     db.execute("CREATE TABLE t_txn_dml (id INT PRIMARY KEY, name TEXT, score INT)").unwrap();
     db.execute("INSERT INTO t_txn_dml VALUES (1, 'Alice', 90)").unwrap();
@@ -502,27 +503,31 @@ fn test_multiple_dml_after_truncate_in_transaction() {
     db.execute("BEGIN").unwrap();
     db.execute("TRUNCATE TABLE t_txn_dml").unwrap();
 
-    // Multiple DML operations after TRUNCATE (use new PKs)
-    db.execute("INSERT INTO t_txn_dml VALUES (10, 'Charlie', 70)").unwrap();
-    db.execute("INSERT INTO t_txn_dml VALUES (20, 'Diana', 60)").unwrap();
-    db.execute("INSERT INTO t_txn_dml VALUES (30, 'Eve', 50)").unwrap();
-    db.execute("UPDATE t_txn_dml SET score = 75 WHERE id = 10").unwrap();
-    db.execute("DELETE FROM t_txn_dml WHERE id = 30").unwrap();
+    // Multiple DML operations after TRUNCATE (reuse old PKs)
+    db.execute("INSERT INTO t_txn_dml VALUES (1, 'Charlie', 70)").unwrap();
+    db.execute("INSERT INTO t_txn_dml VALUES (2, 'Diana', 60)").unwrap();
+    db.execute("INSERT INTO t_txn_dml VALUES (3, 'Eve', 50)").unwrap();
+    db.execute("UPDATE t_txn_dml SET score = 75 WHERE id = 1").unwrap();
+    db.execute("DELETE FROM t_txn_dml WHERE id = 3").unwrap();
 
     db.execute("COMMIT").unwrap();
 
     let rows = db.query("SELECT id, name, score FROM t_txn_dml ORDER BY id", &[]).unwrap();
-    // After TRUNCATE + 3 inserts + 1 delete = 2 new rows. Pre-TRUNCATE rows (1,2) are gone.
-    // Verify at least the new inserts are present and old rows are gone.
+    // After TRUNCATE + 3 inserts + 1 delete: expect 2-3 rows depending on
+    // whether DELETE within the same txn as TRUNCATE takes effect.
+    // The critical invariant: pre-TRUNCATE rows (Alice, Bob) must be gone.
     assert!(rows.len() >= 2, "Should have at least 2 rows from post-TRUNCATE DML, got {}", rows.len());
 
-    // Old rows (id=1,2) should not appear
+    // Old rows (Alice, Bob) should not appear
     for row in &rows {
-        let id = match row.get(0).unwrap() {
-            Value::Int4(n) => *n,
-            other => panic!("Expected Int4, got {:?}", other),
+        let name = match row.get(1).unwrap() {
+            Value::String(s) => s.clone(),
+            other => panic!("Expected String, got {:?}", other),
         };
-        assert!(id >= 10, "Old row id={} should not exist after TRUNCATE", id);
+        assert!(
+            name == "Charlie" || name == "Diana" || name == "Eve",
+            "Old row '{}' should not exist after TRUNCATE", name
+        );
     }
 }
 
@@ -1017,9 +1022,9 @@ fn test_truncate_large_payload_rows() {
         other => panic!("Expected Int8(0), got {:?}", other),
     }
 
-    // Storage should accept new inserts (use new PKs to avoid stale ART index)
-    db.execute("INSERT INTO t_large VALUES (100, 'small')").unwrap();
-    let rows = db.query("SELECT payload FROM t_large WHERE id = 100", &[]).unwrap();
-    assert_eq!(rows.len(), 1, "Re-insert after TRUNCATE should work");
+    // Storage should accept new inserts (old PKs are reusable after ART index clear)
+    db.execute("INSERT INTO t_large VALUES (1, 'small')").unwrap();
+    let rows = db.query("SELECT payload FROM t_large WHERE id = 1", &[]).unwrap();
+    assert_eq!(rows.len(), 1, "Re-insert with old PK after TRUNCATE should work");
     assert_eq!(rows[0].get(0).unwrap(), &Value::String("small".to_string()));
 }

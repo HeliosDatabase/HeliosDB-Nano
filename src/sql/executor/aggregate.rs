@@ -229,12 +229,15 @@ impl AggregateOperator {
                             // Sum as Int64 for integer values
                             let mut sum = 0i64;
                             for val in values {
-                                match val {
-                                    Value::Int2(i) => sum += i as i64,
-                                    Value::Int4(i) => sum += i as i64,
-                                    Value::Int8(i) => sum += i,
+                                #[allow(clippy::cast_lossless)]
+                                let addend: i64 = match val {
+                                    Value::Int2(i) => i as i64,
+                                    Value::Int4(i) => i as i64,
+                                    Value::Int8(i) => i,
                                     _ => return Err(Error::query_execution("SUM requires numeric values")),
-                                }
+                                };
+                                sum = sum.checked_add(addend)
+                                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT SUM"))?;
                             }
                             Ok(Value::Int8(sum))
                         }

@@ -654,8 +654,33 @@ impl<'a> Planner<'a> {
 
         // Handle ORDER BY
         if let Some(order_by) = &query.order_by {
+            // Get the output schema so we can resolve ordinal positions (ORDER BY 1, 2, etc.)
+            let output_schema = plan.schema();
+            let num_output_cols = output_schema.columns.len();
+
             let exprs: Result<Vec<_>> = order_by.exprs.iter()
-                .map(|order_by_expr| self.expr_to_logical(&order_by_expr.expr))
+                .map(|order_by_expr| {
+                    // Check if this is an ordinal position (literal integer)
+                    if let Expr::Value(sqlparser::ast::Value::Number(n, _)) = &order_by_expr.expr {
+                        if let Ok(ordinal) = n.parse::<usize>() {
+                            if ordinal >= 1 && ordinal <= num_output_cols {
+                                // Replace with column reference to the Nth output column (1-indexed)
+                                let col = &output_schema.columns[ordinal - 1];
+                                return Ok(LogicalExpr::Column {
+                                    table: None,
+                                    name: col.name.clone(),
+                                });
+                            } else if ordinal >= 1 {
+                                return Err(Error::query_execution(format!(
+                                    "ORDER BY position {} is not in select list (select list has {} columns)",
+                                    ordinal, num_output_cols
+                                )));
+                            }
+                            // ordinal == 0: fall through to treat as literal
+                        }
+                    }
+                    self.expr_to_logical(&order_by_expr.expr)
+                })
                 .collect();
             let asc: Vec<_> = order_by.exprs.iter()
                 .map(|order_by_expr| order_by_expr.asc.unwrap_or(true))
@@ -767,8 +792,34 @@ impl<'a> Planner<'a> {
         if has_aggregates {
             let group_by = if let sqlparser::ast::GroupByExpr::Expressions(group_by_exprs, _) = &select.group_by {
                 if !group_by_exprs.is_empty() {
+                    let num_select_items = select.projection.len();
                     let group_by: Result<Vec<_>> = group_by_exprs.iter()
-                        .map(|expr| self.expr_to_logical(expr))
+                        .map(|expr| {
+                            // Check if this is an ordinal position (literal integer)
+                            if let Expr::Value(sqlparser::ast::Value::Number(n, _)) = expr {
+                                if let Ok(ordinal) = n.parse::<usize>() {
+                                    if ordinal >= 1 && ordinal <= num_select_items {
+                                        // Resolve to the Nth SELECT list expression (1-indexed)
+                                        let select_item = &select.projection[ordinal - 1];
+                                        let resolved_expr = match select_item {
+                                            SelectItem::UnnamedExpr(e) => e,
+                                            SelectItem::ExprWithAlias { expr: e, .. } => e,
+                                            _ => return Err(Error::query_execution(format!(
+                                                "GROUP BY position {} refers to a wildcard or unsupported select item",
+                                                ordinal
+                                            ))),
+                                        };
+                                        return self.expr_to_logical(resolved_expr);
+                                    } else if ordinal >= 1 {
+                                        return Err(Error::query_execution(format!(
+                                            "GROUP BY position {} is not in select list (select list has {} columns)",
+                                            ordinal, num_select_items
+                                        )));
+                                    }
+                                }
+                            }
+                            self.expr_to_logical(expr)
+                        })
                         .collect();
                     group_by?
                 } else {

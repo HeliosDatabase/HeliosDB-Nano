@@ -111,6 +111,19 @@ impl Evaluator {
             }
 
             LogicalExpr::BinaryExpr { left, op, right } => {
+                // AND/OR require short-circuit evaluation with SQL three-valued logic.
+                // We must not evaluate the right side if the left side already
+                // determines the result (e.g., `val IS NOT NULL AND val != 10`
+                // must skip `val != 10` when `val IS NOT NULL` is false).
+                match op {
+                    super::BinaryOperator::And => {
+                        return self.evaluate_and_short_circuit(left, right, tuple);
+                    }
+                    super::BinaryOperator::Or => {
+                        return self.evaluate_or_short_circuit(left, right, tuple);
+                    }
+                    _ => {}
+                }
                 let left_val = self.evaluate(left, tuple)?;
                 let right_val = self.evaluate(right, tuple)?;
                 self.evaluate_binary_op(&left_val, op, &right_val)
@@ -1362,17 +1375,9 @@ impl Evaluator {
             BinaryOperator::Gt => self.compare_values(left, right, |cmp| cmp.is_gt()),
             BinaryOperator::GtEq => self.compare_values(left, right, |cmp| cmp.is_ge()),
 
-            // Logical operators
-            BinaryOperator::And => {
-                let left_bool = self.to_boolean(left)?;
-                let right_bool = self.to_boolean(right)?;
-                Ok(Value::Boolean(left_bool && right_bool))
-            }
-            BinaryOperator::Or => {
-                let left_bool = self.to_boolean(left)?;
-                let right_bool = self.to_boolean(right)?;
-                Ok(Value::Boolean(left_bool || right_bool))
-            }
+            // Logical operators - SQL three-valued logic for NULL
+            BinaryOperator::And => Self::three_valued_and(left, right),
+            BinaryOperator::Or => Self::three_valued_or(left, right),
 
             // Arithmetic operators
             BinaryOperator::Plus => self.arithmetic_add(left, right),
@@ -1450,9 +1455,15 @@ impl Evaluator {
                 Ok(Value::Boolean(!bool_val))
             }
             UnaryOperator::Minus => match value {
-                Value::Int2(i) => Ok(Value::Int2(-i)),
-                Value::Int4(i) => Ok(Value::Int4(-i)),
-                Value::Int8(i) => Ok(Value::Int8(-i)),
+                Value::Int2(i) => i.checked_neg()
+                    .map(Value::Int2)
+                    .ok_or_else(|| Error::query_execution("integer overflow: SMALLINT negation")),
+                Value::Int4(i) => i.checked_neg()
+                    .map(Value::Int4)
+                    .ok_or_else(|| Error::query_execution("integer overflow: INT negation")),
+                Value::Int8(i) => i.checked_neg()
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT negation")),
                 Value::Float4(f) => Ok(Value::Float4(-f)),
                 Value::Float8(f) => Ok(Value::Float8(-f)),
                 Value::Numeric(n) => {
@@ -1751,11 +1762,23 @@ impl Evaluator {
                 let result = (*a as i64) + (*b as i64);
                 Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
-            (Value::Int8(a), Value::Int8(b)) => Ok(Value::Int8(a + b)),
+            (Value::Int8(a), Value::Int8(b)) => {
+                a.checked_add(*b)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition"))
+            }
             (Value::Float4(a), Value::Float4(b)) => Ok(Value::Float4(a + b)),
             (Value::Float8(a), Value::Float8(b)) => Ok(Value::Float8(a + b)),
-            (Value::Int4(a), Value::Int8(b)) => Ok(Value::Int8((*a as i64) + b)),
-            (Value::Int8(a), Value::Int4(b)) => Ok(Value::Int8(a + (*b as i64))),
+            (Value::Int4(a), Value::Int8(b)) => {
+                (*a as i64).checked_add(*b)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition"))
+            }
+            (Value::Int8(a), Value::Int4(b)) => {
+                a.checked_add(*b as i64)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition"))
+            }
             // Cross-type Float/Int coercion
             (Value::Float4(a), Value::Int4(b)) => Ok(Value::Float4(a + (*b as f32))),
             (Value::Int4(a), Value::Float4(b)) => Ok(Value::Float4((*a as f32) + b)),
@@ -1776,8 +1799,16 @@ impl Evaluator {
                 let result = (*a as i64) + (*b as i64);
                 Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
-            (Value::Int2(a), Value::Int8(b)) => Ok(Value::Int8((*a as i64) + b)),
-            (Value::Int8(a), Value::Int2(b)) => Ok(Value::Int8(a + (*b as i64))),
+            (Value::Int2(a), Value::Int8(b)) => {
+                (*a as i64).checked_add(*b)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition"))
+            }
+            (Value::Int8(a), Value::Int2(b)) => {
+                a.checked_add(*b as i64)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition"))
+            }
             (Value::Int2(a), Value::Int2(b)) => {
                 let result = (*a as i32) + (*b as i32);
                 Ok(i16::try_from(result).map_or(Value::Int4(result), Value::Int2))
@@ -1885,11 +1916,23 @@ impl Evaluator {
                 let result = (*a as i64) - (*b as i64);
                 Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
-            (Value::Int8(a), Value::Int8(b)) => Ok(Value::Int8(a - b)),
+            (Value::Int8(a), Value::Int8(b)) => {
+                a.checked_sub(*b)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction"))
+            }
             (Value::Float4(a), Value::Float4(b)) => Ok(Value::Float4(a - b)),
             (Value::Float8(a), Value::Float8(b)) => Ok(Value::Float8(a - b)),
-            (Value::Int4(a), Value::Int8(b)) => Ok(Value::Int8((*a as i64) - b)),
-            (Value::Int8(a), Value::Int4(b)) => Ok(Value::Int8(a - (*b as i64))),
+            (Value::Int4(a), Value::Int8(b)) => {
+                (*a as i64).checked_sub(*b)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction"))
+            }
+            (Value::Int8(a), Value::Int4(b)) => {
+                a.checked_sub(*b as i64)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction"))
+            }
             // Cross-type Float/Int coercion
             (Value::Float4(a), Value::Int4(b)) => Ok(Value::Float4(a - (*b as f32))),
             (Value::Int4(a), Value::Float4(b)) => Ok(Value::Float4((*a as f32) - b)),
@@ -1910,8 +1953,16 @@ impl Evaluator {
                 let result = (*a as i64) - (*b as i64);
                 Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
-            (Value::Int2(a), Value::Int8(b)) => Ok(Value::Int8((*a as i64) - b)),
-            (Value::Int8(a), Value::Int2(b)) => Ok(Value::Int8(a - (*b as i64))),
+            (Value::Int2(a), Value::Int8(b)) => {
+                (*a as i64).checked_sub(*b)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction"))
+            }
+            (Value::Int8(a), Value::Int2(b)) => {
+                a.checked_sub(*b as i64)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction"))
+            }
             (Value::Int2(a), Value::Int2(b)) => {
                 let result = (*a as i32) - (*b as i32);
                 Ok(i16::try_from(result).map_or(Value::Int4(result), Value::Int2))
@@ -2021,11 +2072,23 @@ impl Evaluator {
                 let result = (*a as i64) * (*b as i64);
                 Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
-            (Value::Int8(a), Value::Int8(b)) => Ok(Value::Int8(a * b)),
+            (Value::Int8(a), Value::Int8(b)) => {
+                a.checked_mul(*b)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT multiplication"))
+            }
             (Value::Float4(a), Value::Float4(b)) => Ok(Value::Float4(a * b)),
             (Value::Float8(a), Value::Float8(b)) => Ok(Value::Float8(a * b)),
-            (Value::Int4(a), Value::Int8(b)) => Ok(Value::Int8((*a as i64) * b)),
-            (Value::Int8(a), Value::Int4(b)) => Ok(Value::Int8(a * (*b as i64))),
+            (Value::Int4(a), Value::Int8(b)) => {
+                (*a as i64).checked_mul(*b)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT multiplication"))
+            }
+            (Value::Int8(a), Value::Int4(b)) => {
+                a.checked_mul(*b as i64)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT multiplication"))
+            }
             // Cross-type Float/Int coercion
             (Value::Float4(a), Value::Int4(b)) => Ok(Value::Float4(a * (*b as f32))),
             (Value::Int4(a), Value::Float4(b)) => Ok(Value::Float4((*a as f32) * b)),
@@ -2046,8 +2109,16 @@ impl Evaluator {
                 let result = (*a as i64) * (*b as i64);
                 Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
-            (Value::Int2(a), Value::Int8(b)) => Ok(Value::Int8((*a as i64) * b)),
-            (Value::Int8(a), Value::Int2(b)) => Ok(Value::Int8(a * (*b as i64))),
+            (Value::Int2(a), Value::Int8(b)) => {
+                (*a as i64).checked_mul(*b)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT multiplication"))
+            }
+            (Value::Int8(a), Value::Int2(b)) => {
+                a.checked_mul(*b as i64)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT multiplication"))
+            }
             (Value::Int2(a), Value::Int2(b)) => {
                 let result = (*a as i32) * (*b as i32);
                 Ok(i16::try_from(result).map_or(Value::Int4(result), Value::Int2))
@@ -2129,11 +2200,23 @@ impl Evaluator {
                 let result = (*a as i64) / (*b as i64);
                 Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
-            (Value::Int8(a), Value::Int8(b)) => Ok(Value::Int8(a / b)),
+            (Value::Int8(a), Value::Int8(b)) => {
+                a.checked_div(*b)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT division"))
+            }
             (Value::Float4(a), Value::Float4(b)) => Ok(Value::Float4(a / b)),
             (Value::Float8(a), Value::Float8(b)) => Ok(Value::Float8(a / b)),
-            (Value::Int4(a), Value::Int8(b)) => Ok(Value::Int8((*a as i64) / b)),
-            (Value::Int8(a), Value::Int4(b)) => Ok(Value::Int8(a / (*b as i64))),
+            (Value::Int4(a), Value::Int8(b)) => {
+                (*a as i64).checked_div(*b)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT division"))
+            }
+            (Value::Int8(a), Value::Int4(b)) => {
+                a.checked_div(*b as i64)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT division"))
+            }
             // Cross-type Float/Int coercion
             (Value::Float4(a), Value::Int4(b)) => Ok(Value::Float4(a / (*b as f32))),
             (Value::Int4(a), Value::Float4(b)) => Ok(Value::Float4((*a as f32) / b)),
@@ -2154,8 +2237,16 @@ impl Evaluator {
                 let result = (*a as i64) / (*b as i64);
                 Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
-            (Value::Int2(a), Value::Int8(b)) => Ok(Value::Int8((*a as i64) / b)),
-            (Value::Int8(a), Value::Int2(b)) => Ok(Value::Int8(a / (*b as i64))),
+            (Value::Int2(a), Value::Int8(b)) => {
+                (*a as i64).checked_div(*b)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT division"))
+            }
+            (Value::Int8(a), Value::Int2(b)) => {
+                a.checked_div(*b as i64)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT division"))
+            }
             (Value::Int2(a), Value::Int2(b)) => {
                 let result = (*a as i32) / (*b as i32);
                 Ok(i16::try_from(result).map_or(Value::Int4(result), Value::Int2))
@@ -2179,6 +2270,146 @@ impl Evaluator {
             _ => Err(Error::query_execution(format!(
                 "Cannot convert {:?} to boolean",
                 value
+            ))),
+        }
+    }
+
+    /// Convert a value to an `Option<bool>` for SQL three-valued logic.
+    /// Returns `None` for NULL, `Some(true/false)` for booleans.
+    fn to_tri_bool(value: &Value) -> Result<Option<bool>> {
+        match value {
+            Value::Boolean(b) => Ok(Some(*b)),
+            Value::Null => Ok(None),
+            _ => Err(Error::query_execution(format!(
+                "Cannot convert {:?} to boolean",
+                value
+            ))),
+        }
+    }
+
+    /// SQL three-valued AND on two already-evaluated values.
+    ///
+    /// Truth table:
+    /// - false AND anything = false
+    /// - true  AND true     = true
+    /// - true  AND false    = false
+    /// - true  AND NULL     = NULL
+    /// - NULL  AND false    = false
+    /// - NULL  AND true     = NULL
+    /// - NULL  AND NULL     = NULL
+    fn three_valued_and(left: &Value, right: &Value) -> Result<Value> {
+        let l = Self::to_tri_bool(left)?;
+        let r = Self::to_tri_bool(right)?;
+        match (l, r) {
+            (Some(false), _) | (_, Some(false)) => Ok(Value::Boolean(false)),
+            (Some(true), Some(true)) => Ok(Value::Boolean(true)),
+            _ => Ok(Value::Null), // At least one NULL and neither is false
+        }
+    }
+
+    /// SQL three-valued OR on two already-evaluated values.
+    ///
+    /// Truth table:
+    /// - true  OR anything = true
+    /// - false OR false    = false
+    /// - false OR true     = true
+    /// - false OR NULL     = NULL
+    /// - NULL  OR true     = true
+    /// - NULL  OR false    = NULL
+    /// - NULL  OR NULL     = NULL
+    fn three_valued_or(left: &Value, right: &Value) -> Result<Value> {
+        let l = Self::to_tri_bool(left)?;
+        let r = Self::to_tri_bool(right)?;
+        match (l, r) {
+            (Some(true), _) | (_, Some(true)) => Ok(Value::Boolean(true)),
+            (Some(false), Some(false)) => Ok(Value::Boolean(false)),
+            _ => Ok(Value::Null), // At least one NULL and neither is true
+        }
+    }
+
+    /// Short-circuit AND evaluation with SQL three-valued NULL logic.
+    ///
+    /// Evaluates the left side first. If left is definitively false, returns
+    /// false without evaluating the right side (preventing errors like
+    /// comparing NULL values on the right side).
+    fn evaluate_and_short_circuit(
+        &self,
+        left: &LogicalExpr,
+        right: &LogicalExpr,
+        tuple: &Tuple,
+    ) -> Result<Value> {
+        let left_val = self.evaluate(left, tuple)?;
+        match &left_val {
+            // false AND anything = false (short-circuit)
+            Value::Boolean(false) => Ok(Value::Boolean(false)),
+            // true AND right = right (must evaluate right)
+            Value::Boolean(true) => {
+                let right_val = self.evaluate(right, tuple)?;
+                match &right_val {
+                    Value::Boolean(b) => Ok(Value::Boolean(*b)),
+                    Value::Null => Ok(Value::Null),
+                    _ => Err(Error::query_execution(format!(
+                        "Cannot convert {:?} to boolean", right_val
+                    ))),
+                }
+            }
+            // NULL AND right: must evaluate right to check for false
+            // NULL AND false = false, NULL AND true = NULL, NULL AND NULL = NULL
+            Value::Null => {
+                let right_val = self.evaluate(right, tuple)?;
+                match &right_val {
+                    Value::Boolean(false) => Ok(Value::Boolean(false)),
+                    Value::Boolean(true) | Value::Null => Ok(Value::Null),
+                    _ => Err(Error::query_execution(format!(
+                        "Cannot convert {:?} to boolean", right_val
+                    ))),
+                }
+            }
+            _ => Err(Error::query_execution(format!(
+                "Cannot convert {:?} to boolean", left_val
+            ))),
+        }
+    }
+
+    /// Short-circuit OR evaluation with SQL three-valued NULL logic.
+    ///
+    /// Evaluates the left side first. If left is definitively true, returns
+    /// true without evaluating the right side.
+    fn evaluate_or_short_circuit(
+        &self,
+        left: &LogicalExpr,
+        right: &LogicalExpr,
+        tuple: &Tuple,
+    ) -> Result<Value> {
+        let left_val = self.evaluate(left, tuple)?;
+        match &left_val {
+            // true OR anything = true (short-circuit)
+            Value::Boolean(true) => Ok(Value::Boolean(true)),
+            // false OR right = right (must evaluate right)
+            Value::Boolean(false) => {
+                let right_val = self.evaluate(right, tuple)?;
+                match &right_val {
+                    Value::Boolean(b) => Ok(Value::Boolean(*b)),
+                    Value::Null => Ok(Value::Null),
+                    _ => Err(Error::query_execution(format!(
+                        "Cannot convert {:?} to boolean", right_val
+                    ))),
+                }
+            }
+            // NULL OR right: must evaluate right to check for true
+            // NULL OR true = true, NULL OR false = NULL, NULL OR NULL = NULL
+            Value::Null => {
+                let right_val = self.evaluate(right, tuple)?;
+                match &right_val {
+                    Value::Boolean(true) => Ok(Value::Boolean(true)),
+                    Value::Boolean(false) | Value::Null => Ok(Value::Null),
+                    _ => Err(Error::query_execution(format!(
+                        "Cannot convert {:?} to boolean", right_val
+                    ))),
+                }
+            }
+            _ => Err(Error::query_execution(format!(
+                "Cannot convert {:?} to boolean", left_val
             ))),
         }
     }
@@ -3453,24 +3684,34 @@ impl Evaluator {
         match (left, right) {
             (Value::Int2(a), Value::Int2(b)) => {
                 if *b == 0 { return Err(Error::query_execution("Division by zero")); }
-                Ok(Value::Int2(a % b))
+                a.checked_rem(*b)
+                    .map(Value::Int2)
+                    .ok_or_else(|| Error::query_execution("integer overflow: SMALLINT modulo"))
             }
             (Value::Int4(a), Value::Int4(b)) => {
                 if *b == 0 { return Err(Error::query_execution("Division by zero")); }
-                Ok(Value::Int4(a % b))
+                a.checked_rem(*b)
+                    .map(Value::Int4)
+                    .ok_or_else(|| Error::query_execution("integer overflow: INT modulo"))
             }
             (Value::Int8(a), Value::Int8(b)) => {
                 if *b == 0 { return Err(Error::query_execution("Division by zero")); }
-                Ok(Value::Int8(a % b))
+                a.checked_rem(*b)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT modulo"))
             }
             // Cross-type integer modulo
             (Value::Int4(a), Value::Int8(b)) => {
                 if *b == 0 { return Err(Error::query_execution("Division by zero")); }
-                Ok(Value::Int8(*a as i64 % b))
+                (*a as i64).checked_rem(*b)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT modulo"))
             }
             (Value::Int8(a), Value::Int4(b)) => {
                 if *b == 0 { return Err(Error::query_execution("Division by zero")); }
-                Ok(Value::Int8(a % *b as i64))
+                a.checked_rem(*b as i64)
+                    .map(Value::Int8)
+                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT modulo"))
             }
             _ => Err(Error::query_execution(format!(
                 "Modulo requires integer operands, got {:?} % {:?}", left, right

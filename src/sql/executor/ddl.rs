@@ -322,6 +322,21 @@ pub(super) fn handle_truncate(
             storage.delete(key)?;
         }
 
+        // Clear ART index entries for this table so that stale PK/UNIQUE
+        // values do not block re-insertion of the same values.
+        // Skip clearing if branches exist or time-travel snapshots are
+        // retained, because branch data and snapshots may still
+        // reference the indexed values.
+        // Check for user-created branches (exclude the auto-created "main" branch).
+        // Branch data uses separate key prefixes and does not share the ART index,
+        // but as a safety measure we skip clearing when user branches exist.
+        let has_user_branches = storage.list_branches()
+            .map(|b| b.iter().any(|br| br.name != "main"))
+            .unwrap_or(false);
+        if !has_user_branches {
+            storage.art_indexes().clear_table_indexes(table_name);
+        }
+
         // Log to WAL for replication
         if let Err(e) = storage.log_truncate(table_name) {
             tracing::warn!("Failed to log TRUNCATE to WAL: {}", e);

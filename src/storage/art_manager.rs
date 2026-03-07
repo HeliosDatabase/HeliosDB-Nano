@@ -862,6 +862,21 @@ impl ArtIndexManager {
         Ok(())
     }
 
+    /// Clear all index data for a table without removing the index structures.
+    ///
+    /// This is used by TRUNCATE TABLE to reset index contents while keeping
+    /// the PK/FK/UNIQUE/Manual index registrations intact. After clearing,
+    /// the indexes are empty but still exist, so new inserts will correctly
+    /// populate them.
+    pub fn clear_table_indexes(&self, table: &str) {
+        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+        for index in indexes.values_mut() {
+            if index.table() == table {
+                index.clear();
+            }
+        }
+    }
+
     // =========================================================================
     // STATISTICS
     // =========================================================================

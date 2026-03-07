@@ -483,7 +483,7 @@ impl ColumnZoneSummary {
 
     fn value_diff(a: &Value, b: &Value) -> Option<f64> {
         match (a, b) {
-            (Value::Int8(a), Value::Int8(b)) => Some((*a - *b) as f64),
+            (Value::Int8(a), Value::Int8(b)) => a.checked_sub(*b).map(|v| v as f64),
             (Value::Float8(a), Value::Float8(b)) => Some(*a - *b),
             _ => None,
         }
