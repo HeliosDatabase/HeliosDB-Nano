@@ -705,8 +705,13 @@ impl<'a> Executor<'a> {
                     if let crate::sql::LogicalExpr::AggregateFunction {
                         fun: crate::sql::logical_plan::AggregateFunction::Count,
                         distinct: false,
+                        args,
                         ..
                     } = &aggr_exprs[0] {
+                    // Only use fast path for COUNT(*), not COUNT(col)
+                    // COUNT(col) needs to evaluate per-row to skip NULLs
+                    let is_count_star = args.first().map_or(false, |a| matches!(a, crate::sql::LogicalExpr::Wildcard));
+                    if is_count_star {
                         let scan_table = match input.as_ref() {
                             LogicalPlan::Scan { table_name, .. } => Some(table_name.as_str()),
                             LogicalPlan::Project { input: inner, .. } => {
@@ -767,6 +772,7 @@ impl<'a> Executor<'a> {
                                 }
                             }
                         }
+                    } // end if is_count_star
                     }
                 }
                 let input_op = self.plan_to_operator(input)?;

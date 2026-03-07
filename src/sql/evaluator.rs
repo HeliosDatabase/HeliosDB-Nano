@@ -1379,6 +1379,10 @@ impl Evaluator {
             BinaryOperator::Minus => self.arithmetic_subtract(left, right),
             BinaryOperator::Multiply => self.arithmetic_multiply(left, right),
             BinaryOperator::Divide => {
+                // SQL standard: NULL / x or x / NULL = NULL
+                if matches!(left, Value::Null) || matches!(right, Value::Null) {
+                    return Ok(Value::Null);
+                }
                 // Check for division by zero
                 if self.is_zero(right) {
                     return Err(Error::query_execution("Division by zero"));
@@ -1438,6 +1442,10 @@ impl Evaluator {
 
         match op {
             UnaryOperator::Not => {
+                // SQL standard: NOT NULL = NULL (three-valued logic)
+                if matches!(value, Value::Null) {
+                    return Ok(Value::Null);
+                }
                 let bool_val = self.to_boolean(value)?;
                 Ok(Value::Boolean(!bool_val))
             }
@@ -1474,6 +1482,11 @@ impl Evaluator {
         F: FnOnce(std::cmp::Ordering) -> bool,
     {
         use std::cmp::Ordering;
+
+        // SQL standard: any comparison with NULL yields NULL (three-valued logic)
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(Value::Null);
+        }
 
         let ordering = match (left, right) {
             // Same type comparisons
@@ -1654,6 +1667,10 @@ impl Evaluator {
     where
         F: Fn(i64, i64) -> i64,
     {
+        // SQL standard: NULL op anything = NULL
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(Value::Null);
+        }
         match (left, right) {
             (Value::Int4(a), Value::Int4(b)) => {
                 let result = op(*a as i64, *b as i64);
@@ -1669,6 +1686,10 @@ impl Evaluator {
 
     /// Addition operator with support for Numeric precision
     fn arithmetic_add(&self, left: &Value, right: &Value) -> Result<Value> {
+        // SQL standard: NULL + anything = NULL
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(Value::Null);
+        }
         match (left, right) {
             // Numeric + Numeric: preserve precision
             (Value::Numeric(a), Value::Numeric(b)) => {
@@ -1800,6 +1821,10 @@ impl Evaluator {
 
     /// Subtraction operator with support for Numeric precision
     fn arithmetic_subtract(&self, left: &Value, right: &Value) -> Result<Value> {
+        // SQL standard: NULL - anything = NULL
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(Value::Null);
+        }
         match (left, right) {
             // Numeric - Numeric: preserve precision
             (Value::Numeric(a), Value::Numeric(b)) => {
@@ -1932,6 +1957,10 @@ impl Evaluator {
 
     /// Multiplication operator with support for Numeric precision
     fn arithmetic_multiply(&self, left: &Value, right: &Value) -> Result<Value> {
+        // SQL standard: NULL * anything = NULL
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(Value::Null);
+        }
         match (left, right) {
             // Numeric * Numeric: preserve precision
             (Value::Numeric(a), Value::Numeric(b)) => {
@@ -2036,6 +2065,10 @@ impl Evaluator {
 
     /// Division operator with support for Numeric precision
     fn arithmetic_divide(&self, left: &Value, right: &Value) -> Result<Value> {
+        // SQL standard: NULL / anything = NULL
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(Value::Null);
+        }
         match (left, right) {
             // Numeric / Numeric: preserve precision
             (Value::Numeric(a), Value::Numeric(b)) => {
@@ -3413,6 +3446,10 @@ impl Evaluator {
 
     /// Modulo operator
     fn arithmetic_modulo(&self, left: &Value, right: &Value) -> Result<Value> {
+        // SQL standard: NULL % anything = NULL
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(Value::Null);
+        }
         match (left, right) {
             (Value::Int2(a), Value::Int2(b)) => {
                 if *b == 0 { return Err(Error::query_execution("Division by zero")); }

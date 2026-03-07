@@ -263,14 +263,16 @@ impl AggregateOperator {
                         Ok(Value::Float8(avg))
                     }
                     AggregateFunction::Min => {
-                        values.into_iter()
+                        // SQL standard: MIN on empty set returns NULL
+                        Ok(values.into_iter()
                             .min_by(|a, b| compare_values(a, b))
-                            .ok_or_else(|| Error::query_execution("MIN on empty set"))
+                            .unwrap_or(Value::Null))
                     }
                     AggregateFunction::Max => {
-                        values.into_iter()
+                        // SQL standard: MAX on empty set returns NULL
+                        Ok(values.into_iter()
                             .max_by(|a, b| compare_values(a, b))
-                            .ok_or_else(|| Error::query_execution("MAX on empty set"))
+                            .unwrap_or(Value::Null))
                     }
                     AggregateFunction::JsonAgg => {
                         // JSON_AGG collects all values into a JSON array
@@ -637,8 +639,9 @@ impl StreamingAccumulator {
             Self::Avg { sum, count } => {
                 if count == 0 { Ok(Value::Null) } else { Ok(Value::Float8(sum / count as f64)) }
             }
-            Self::Min(v) => v.ok_or_else(|| Error::query_execution("MIN on empty set")),
-            Self::Max(v) => v.ok_or_else(|| Error::query_execution("MAX on empty set")),
+            // SQL standard: MIN/MAX on empty set returns NULL
+            Self::Min(v) => Ok(v.unwrap_or(Value::Null)),
+            Self::Max(v) => Ok(v.unwrap_or(Value::Null)),
         }
     }
 }

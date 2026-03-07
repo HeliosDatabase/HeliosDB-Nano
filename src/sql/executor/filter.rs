@@ -57,6 +57,8 @@ impl PhysicalOperator for FilterOperator {
                     match result {
                         crate::Value::Boolean(true) => return Ok(Some(tuple)),
                         crate::Value::Boolean(false) => continue, // Skip this tuple
+                        // SQL standard: NULL predicates are falsy (three-valued logic)
+                        crate::Value::Null => continue,
                         _ => {
                             return Err(Error::query_execution(format!(
                                 "Filter predicate must evaluate to boolean, got: {:?}",
