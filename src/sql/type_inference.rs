@@ -525,6 +525,21 @@ fn coerce_binary_types(left: DataType, right: DataType, op: &BinaryOperator) -> 
             Ok(DataType::Boolean)
         }
 
+        // String concatenation: || operator
+        // If either operand is an array, treat as array concatenation
+        // Otherwise returns text
+        BinaryOperator::StringConcat => {
+            match (&left, &right) {
+                (DataType::Array(elem), DataType::Array(_)) => {
+                    Ok(DataType::Array(elem.clone()))
+                }
+                (DataType::Array(elem), _) | (_, DataType::Array(elem)) => {
+                    Ok(DataType::Array(elem.clone()))
+                }
+                _ => Ok(DataType::Text),
+            }
+        }
+
         // Array operators
         BinaryOperator::ArrayConcat => {
             // Both operands must be arrays of compatible types

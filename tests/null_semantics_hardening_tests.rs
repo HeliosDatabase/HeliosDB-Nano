@@ -951,18 +951,15 @@ mod null_semantics_hardening_tests {
     }
 
     #[test]
-    fn test_concat_operator_not_supported() {
-        // KNOWN LIMITATION: The || (StringConcat) operator is not supported.
+    fn test_concat_operator_with_null() {
         // SQL standard: NULL || 'text' = NULL.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE str1 (id INT, val TEXT)").unwrap();
         db.execute("INSERT INTO str1 VALUES (1, NULL)").unwrap();
 
-        let result = db.query("SELECT val || ' suffix' FROM str1", &[]);
-        assert!(
-            result.is_err(),
-            "KNOWN LIMITATION: || operator is not supported"
-        );
+        let rows = db.query("SELECT val || ' suffix' FROM str1", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &Value::Null);
     }
 
     #[test]

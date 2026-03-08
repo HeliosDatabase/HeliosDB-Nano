@@ -1159,6 +1159,302 @@ impl EmbeddedDatabase {
                 // Return count (RETURNING clause results handled separately)
                 Ok(count)
             }
+            sql::LogicalPlan::InsertSelect { table_name, columns, source, returning } => {
+                // Execute the source SELECT plan to get rows
+                let mut executor = sql::Executor::with_storage(&self.storage)
+                    .with_timeout(self.config.storage.query_timeout_ms);
+                let source_rows = executor.execute(source)?;
+
+                let catalog = self.storage.catalog();
+                let schema = catalog.get_table_schema(table_name)?;
+                let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema {
+                    columns: vec![],
+                }));
+                let empty_tuple = Tuple::new(vec![]);
+
+                // Build column index mapping for INSERT with explicit column list
+                let column_indices: Option<Vec<usize>> = columns.as_ref().map(|cols| {
+                    cols.iter()
+                        .filter_map(|col_name| schema.get_column_index(col_name))
+                        .collect()
+                });
+
+                // Pre-parse default expressions for columns
+                let default_exprs: Vec<Option<sql::LogicalExpr>> = schema.columns.iter()
+                    .map(|col| {
+                        col.default_expr.as_ref().and_then(|json| {
+                            serde_json::from_str(json).ok()
+                        })
+                    })
+                    .collect();
+
+                // Initialize trigger context
+                let mut trigger_context = sql::TriggerContext::new();
+                let trigger_event = sql::logical_plan::TriggerEvent::Insert;
+                let has_triggers = self.trigger_registry.has_triggers_for_table(table_name);
+
+                let has_returning = returning.is_some();
+                let mut returned_tuples: Vec<Tuple> = Vec::new();
+
+                // Auto-suspend SMFI tracking for bulk inserts
+                let bulk_threshold = self.storage.smfi_bulk_load_threshold();
+                let _smfi_guard = if source_rows.len() >= bulk_threshold {
+                    Some(self.storage.suspend_smfi_for_bulk_load(
+                        table_name,
+                        storage::BulkLoadReason::MultiRowInsert,
+                    ))
+                } else {
+                    None
+                };
+
+                let mut count = 0u64;
+                for source_row in &source_rows {
+                    // Initialize tuple values for ALL columns (use None as placeholder)
+                    let mut tuple_values: Vec<Option<Value>> = vec![None; schema.columns.len()];
+
+                    // Fill in provided values from the source row
+                    for (val_idx, value) in source_row.values.iter().enumerate() {
+                        let target_col_idx = if let Some(ref indices) = column_indices {
+                            if val_idx >= indices.len() {
+                                return Err(Error::query_execution(
+                                    "More values than columns specified"
+                                ));
+                            }
+                            *indices.get(val_idx).ok_or_else(|| Error::internal("column index out of bounds"))?
+                        } else {
+                            val_idx
+                        };
+
+                        let target_col = schema.get_column_at(target_col_idx)
+                            .ok_or_else(|| Error::query_execution(format!(
+                                "Too many values for INSERT: table has {} columns",
+                                schema.columns.len()
+                            )))?;
+
+                        let target_type = &target_col.data_type;
+                        let mut val = value.clone();
+
+                        // Auto-cast if needed
+                        let needs_cast = match (&val, target_type) {
+                            (Value::Null, _) => false,
+                            (Value::Vector(_), DataType::Vector(_)) => false,
+                            (Value::String(_), DataType::Vector(_)) => true,
+                            (Value::String(_), DataType::Json | DataType::Jsonb) => true,
+                            (Value::Int4(_), DataType::Int4) => false,
+                            (Value::Int8(_), DataType::Int8) => false,
+                            (Value::Float4(_), DataType::Float4) => false,
+                            (Value::Float8(_), DataType::Float8) => false,
+                            (Value::String(_), DataType::Text | DataType::Varchar(_)) => false,
+                            (Value::Boolean(_), DataType::Boolean) => false,
+                            (Value::Json(_), DataType::Json | DataType::Jsonb) => false,
+                            _ => true,
+                        };
+
+                        if needs_cast {
+                            val = evaluator.cast_value(val, target_type)?;
+                        }
+
+                        // Enforce NOT NULL constraint
+                        if let Some(target_col_ref) = schema.get_column_at(target_col_idx) {
+                            if matches!(val, Value::Null) && !target_col_ref.nullable {
+                                return Err(Error::constraint_violation(format!(
+                                    "NOT NULL constraint violated: cannot insert NULL into column '{}'",
+                                    target_col_ref.name
+                                )));
+                            }
+                        }
+
+                        let tv = tuple_values.get_mut(target_col_idx)
+                            .ok_or_else(|| Error::internal("column index out of bounds"))?;
+                        *tv = Some(val);
+                    }
+
+                    // Fill in missing columns with defaults or NULL
+                    let final_values: Result<Vec<Value>> = tuple_values
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, opt_val)| {
+                            if let Some(val) = opt_val {
+                                Ok(val)
+                            } else {
+                                let col = schema.get_column_at(idx)
+                                    .ok_or_else(|| Error::internal("column index out of bounds"))?;
+                                if let Some(ref default_expr) = default_exprs.get(idx).and_then(|d| d.as_ref()) {
+                                    let mut value = evaluator.evaluate(default_expr, &empty_tuple)?;
+                                    if value.data_type() != col.data_type {
+                                        value = evaluator.cast_value(value, &col.data_type)?;
+                                    }
+                                    Ok(value)
+                                } else if col.nullable {
+                                    Ok(Value::Null)
+                                } else {
+                                    Err(Error::query_execution(format!(
+                                        "Column '{}' does not have a default value and is not nullable",
+                                        col.name
+                                    )))
+                                }
+                            }
+                        })
+                        .collect();
+
+                    let final_values_vec = final_values?;
+                    let tuple = Tuple::new(final_values_vec.clone());
+
+                    // Validate foreign key constraints
+                    let table_constraints = catalog.load_table_constraints(table_name)?;
+                    for fk in &table_constraints.foreign_keys {
+                        if fk.enforcement == sql::ConstraintEnforcement::Immediate {
+                            let fk_values: Vec<Value> = fk.columns.iter()
+                                .map(|col_name| {
+                                    schema.columns.iter()
+                                        .position(|c| &c.name == col_name)
+                                        .and_then(|idx| final_values_vec.get(idx).cloned())
+                                        .unwrap_or(Value::Null)
+                                })
+                                .collect();
+                            if fk_values.iter().any(|v| matches!(v, Value::Null)) {
+                                continue;
+                            }
+                            let key = crate::storage::ArtIndexManager::encode_key(&fk_values);
+                            let exists = if let Some(found) = self.storage.art_indexes().pk_index_contains(&fk.references_table, &key) {
+                                found
+                            } else {
+                                self.check_foreign_key_exists(
+                                    &fk.references_table,
+                                    &fk.references_columns,
+                                    &fk_values,
+                                )?
+                            };
+                            if !exists {
+                                return Err(Error::constraint_violation(format!(
+                                    "Foreign key constraint '{}' violated: referenced row in table '{}' does not exist",
+                                    fk.name, fk.references_table
+                                )));
+                            }
+                        }
+                    }
+
+                    // Validate CHECK constraints
+                    for check in &table_constraints.check_constraints {
+                        let check_result = self.evaluate_check_constraint(
+                            &check.expression,
+                            &schema,
+                            &final_values_vec,
+                        )?;
+
+                        if !check_result {
+                            return Err(Error::constraint_violation(format!(
+                                "CHECK constraint '{}' violated: expression '{}' evaluated to false",
+                                check.name, check.expression
+                            )));
+                        }
+                    }
+
+                    // Validate UNIQUE constraints
+                    if !table_constraints.unique_constraints.is_empty() {
+                        for uc in &table_constraints.unique_constraints {
+                            let uc_values: Vec<Value> = uc.columns.iter()
+                                .map(|col_name| {
+                                    schema.columns.iter()
+                                        .position(|c| &c.name == col_name)
+                                        .and_then(|idx| final_values_vec.get(idx).cloned())
+                                        .unwrap_or(Value::Null)
+                                })
+                                .collect();
+                            if uc_values.iter().any(|v| matches!(v, Value::Null)) {
+                                continue;
+                            }
+                            let key = crate::storage::ArtIndexManager::encode_key(&uc_values);
+                            if let Some(true) = self.storage.art_indexes().pk_index_contains(table_name, &key) {
+                                return Err(Error::constraint_violation(format!(
+                                    "UNIQUE constraint '{}' violated: duplicate value for columns ({})",
+                                    uc.name,
+                                    uc.columns.join(", ")
+                                )));
+                            }
+                        }
+                    }
+
+                    // Execute BEFORE INSERT triggers
+                    if has_triggers {
+                        let row_context = sql::triggers::TriggerRowContext::for_insert(tuple.clone());
+                        let db_ref = self.clone_for_trigger();
+                        let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                            db_ref.execute_plan_internal(stmt)?;
+                            Ok(())
+                        };
+                        let action = self.trigger_registry.execute_triggers(
+                            table_name,
+                            &trigger_event,
+                            &sql::logical_plan::TriggerTiming::Before,
+                            &row_context,
+                            &mut trigger_context,
+                            Some(std::sync::Arc::new(schema.clone())),
+                            &mut executor_fn,
+                        )?;
+                        // Handle trigger action
+                        match action {
+                            sql::triggers::TriggerAction::Abort(msg) => {
+                                return Err(Error::query_execution(format!("INSERT aborted by trigger: {}", msg)));
+                            }
+                            sql::triggers::TriggerAction::Skip => {
+                                continue;
+                            }
+                            sql::triggers::TriggerAction::Continue => {}
+                        }
+                    }
+
+                    // Insert the tuple
+                    let row_id = self.storage.insert_tuple_branch_aware_with_schema(table_name, tuple.clone(), &schema)?;
+
+                    // Update ART index
+                    {
+                        let mut col_values = std::collections::HashMap::new();
+                        for (i, col) in schema.columns.iter().enumerate() {
+                            if let Some(v) = final_values_vec.get(i) {
+                                col_values.insert(col.name.clone(), v.clone());
+                            }
+                        }
+                        if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
+                            tracing::debug!("ART index insert for '{}': {}", table_name, e);
+                        }
+                    }
+
+                    count += 1;
+
+                    // Collect tuple for RETURNING clause
+                    if has_returning {
+                        let mut returned_tuple = tuple.clone();
+                        returned_tuple.row_id = Some(row_id);
+                        if let Some(projected) = Self::project_returning_columns(&returned_tuple, &schema, returning) {
+                            returned_tuples.push(projected);
+                        }
+                    }
+
+                    // Execute AFTER INSERT triggers
+                    if has_triggers {
+                        let row_context = sql::triggers::TriggerRowContext::for_insert(tuple.clone());
+                        let db_ref = self.clone_for_trigger();
+                        let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                            db_ref.execute_plan_internal(stmt)?;
+                            Ok(())
+                        };
+                        let action = self.trigger_registry.execute_triggers(
+                            table_name,
+                            &trigger_event,
+                            &sql::logical_plan::TriggerTiming::After,
+                            &row_context,
+                            &mut trigger_context,
+                            Some(std::sync::Arc::new(schema.clone())),
+                            &mut executor_fn,
+                        )?;
+                        if let sql::triggers::TriggerAction::Abort(msg) = action {
+                            return Err(Error::query_execution(format!("INSERT aborted by AFTER trigger: {}", msg)));
+                        }
+                    }
+                }
+                Ok(count)
+            }
             sql::LogicalPlan::Update { table_name, assignments, selection, returning } => {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
@@ -1937,6 +2233,13 @@ impl EmbeddedDatabase {
 
                 Ok(0)
             }
+            sql::LogicalPlan::AlterTableMulti { operations } => {
+                let mut total_rows = 0u64;
+                for sub_plan in operations {
+                    total_rows += self.execute_alter_table_op(sub_plan)?;
+                }
+                Ok(total_rows)
+            }
             _ => {
                 // For other operations (TRUNCATE, CREATE INDEX, etc.), use executor
                 let mut executor = sql::Executor::with_storage(&self.storage)
@@ -1952,6 +2255,7 @@ impl EmbeddedDatabase {
                     sql::LogicalPlan::Sort { .. } |
                     sql::LogicalPlan::Limit { .. } |
                     sql::LogicalPlan::With { .. } |
+                    sql::LogicalPlan::TableFunction { .. } |
                     sql::LogicalPlan::SystemView { .. }
                 );
                 let _ = is_select; // Results handled by execute_returning
@@ -2373,6 +2677,147 @@ impl EmbeddedDatabase {
     fn invalidate_result_cache(&self) {
         if let Ok(mut cache) = self.result_cache.lock() {
             cache.clear();
+        }
+    }
+
+    /// Execute a single ALTER TABLE operation from its logical plan.
+    ///
+    /// This is used by the `AlterTableMulti` handler to execute each sub-operation
+    /// sequentially, and also serves as the shared implementation for ALTER TABLE
+    /// execution across different code paths.
+    fn execute_alter_table_op(&self, plan: &sql::LogicalPlan) -> Result<u64> {
+        match plan {
+            sql::LogicalPlan::AlterTableAddColumn { table_name, column_def, if_not_exists } => {
+                let catalog = self.storage.catalog();
+                let mut schema = catalog.get_table_schema(table_name)?;
+
+                if schema.columns.iter().any(|c| c.name == column_def.name) {
+                    if *if_not_exists {
+                        return Ok(0);
+                    }
+                    return Err(Error::query_execution(format!(
+                        "Column '{}' already exists in table '{}'", column_def.name, table_name
+                    )));
+                }
+
+                let new_column = Column {
+                    name: column_def.name.clone(),
+                    data_type: column_def.data_type.clone(),
+                    nullable: !column_def.not_null,
+                    primary_key: column_def.primary_key,
+                    source_table: None,
+                    source_table_name: Some(table_name.clone()),
+                    default_expr: column_def.default.as_ref().map(|e| format!("{:?}", e)),
+                    unique: column_def.unique,
+                    storage_mode: column_def.storage_mode,
+                };
+
+                schema.columns.push(new_column);
+                catalog.update_table_schema(table_name, &schema)?;
+
+                let rows_updated = self.storage.add_column_to_rows(
+                    table_name,
+                    &column_def.default,
+                )?;
+
+                tracing::info!(
+                    "Added column '{}' to table '{}', updated {} rows",
+                    column_def.name, table_name, rows_updated
+                );
+
+                Ok(rows_updated as u64)
+            }
+            sql::LogicalPlan::AlterTableDropColumn { table_name, column_name, if_exists, cascade } => {
+                let catalog = self.storage.catalog();
+                let mut schema = catalog.get_table_schema(table_name)?;
+
+                let col_idx = schema.columns.iter()
+                    .position(|c| c.name == *column_name);
+
+                match col_idx {
+                    Some(idx) => {
+                        let is_pk = schema.get_column_at(idx)
+                            .ok_or_else(|| Error::internal("column index out of bounds"))?
+                            .primary_key;
+                        if is_pk && !cascade {
+                            return Err(Error::query_execution(format!(
+                                "Cannot drop primary key column '{}' without CASCADE", column_name
+                            )));
+                        }
+
+                        schema.columns.remove(idx);
+                        catalog.update_table_schema(table_name, &schema)?;
+
+                        let rows_updated = self.storage.drop_column_from_rows(table_name, idx)?;
+
+                        tracing::info!(
+                            "Dropped column '{}' from table '{}', updated {} rows",
+                            column_name, table_name, rows_updated
+                        );
+
+                        Ok(rows_updated as u64)
+                    }
+                    None => {
+                        if *if_exists {
+                            Ok(0)
+                        } else {
+                            Err(Error::query_execution(format!(
+                                "Column '{}' does not exist in table '{}'", column_name, table_name
+                            )))
+                        }
+                    }
+                }
+            }
+            sql::LogicalPlan::AlterTableRenameColumn { table_name, old_column_name, new_column_name } => {
+                let catalog = self.storage.catalog();
+                let mut schema = catalog.get_table_schema(table_name)?;
+
+                if schema.columns.iter().any(|c| c.name == *new_column_name) {
+                    return Err(Error::query_execution(format!(
+                        "Column '{}' already exists in table '{}'", new_column_name, table_name
+                    )));
+                }
+
+                let col_idx = schema.columns.iter()
+                    .position(|c| c.name == *old_column_name)
+                    .ok_or_else(|| Error::query_execution(format!(
+                        "Column '{}' does not exist in table '{}'", old_column_name, table_name
+                    )))?;
+
+                schema.get_column_at_mut(col_idx)
+                    .ok_or_else(|| Error::internal("column index out of bounds"))?
+                    .name = new_column_name.clone();
+                catalog.update_table_schema(table_name, &schema)?;
+
+                tracing::info!(
+                    "Renamed column '{}' to '{}' in table '{}'",
+                    old_column_name, new_column_name, table_name
+                );
+
+                Ok(0)
+            }
+            sql::LogicalPlan::AlterTableRename { table_name, new_table_name } => {
+                let catalog = self.storage.catalog();
+
+                if catalog.get_table_schema(new_table_name).is_ok() {
+                    return Err(Error::query_execution(format!(
+                        "Table '{}' already exists", new_table_name
+                    )));
+                }
+
+                self.storage.rename_table(table_name, new_table_name)?;
+
+                tracing::info!(
+                    "Renamed table '{}' to '{}'",
+                    table_name, new_table_name
+                );
+
+                Ok(0)
+            }
+            _ => Err(Error::internal(format!(
+                "execute_alter_table_op called with non-ALTER plan: {:?}",
+                plan.plan_type_name()
+            ))),
         }
     }
 
@@ -3062,6 +3507,7 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::AlterTableDropColumn { .. } |
             sql::LogicalPlan::AlterTableRename { .. } |
             sql::LogicalPlan::AlterTableRenameColumn { .. } |
+            sql::LogicalPlan::AlterTableMulti { .. } |
             sql::LogicalPlan::CreateIndex { .. } |
             sql::LogicalPlan::Truncate { .. }
         ) {
@@ -3188,6 +3634,140 @@ impl EmbeddedDatabase {
                                 return Err(Error::query_execution(format!(
                                     "Row-Level Security policy violation: inserted row does not satisfy WITH CHECK expression"
                                 )));
+                            }
+                        }
+                    }
+
+                    self.storage.insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)?;
+                    count += 1;
+                }
+                Ok(count)
+            }
+            sql::LogicalPlan::InsertSelect { table_name, columns, source, returning: _ } => {
+                // Execute source SELECT plan to get rows
+                let mut executor = sql::Executor::with_storage(&self.storage)
+                    .with_timeout(self.config.storage.query_timeout_ms);
+                let source_rows = executor.execute(source)?;
+
+                // Check for RLS enforcement
+                let rls_enforced = self.tenant_manager.should_apply_rls(table_name, "INSERT");
+                let rls_check = if rls_enforced {
+                    self.tenant_manager.get_rls_conditions(table_name, "INSERT")
+                } else {
+                    None
+                };
+
+                let catalog = self.storage.catalog();
+                let schema = catalog.get_table_schema(table_name)?;
+                let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema {
+                    columns: vec![],
+                }));
+                let empty_tuple = Tuple::new(vec![]);
+
+                let column_indices: Option<Vec<usize>> = columns.as_ref().map(|cols| {
+                    cols.iter()
+                        .filter_map(|col_name| schema.get_column_index(col_name))
+                        .collect()
+                });
+
+                let default_exprs: Vec<Option<sql::LogicalExpr>> = schema.columns.iter()
+                    .map(|col| {
+                        col.default_expr.as_ref().and_then(|json| {
+                            serde_json::from_str(json).ok()
+                        })
+                    })
+                    .collect();
+
+                let mut count = 0u64;
+                for source_row in &source_rows {
+                    let mut tuple_values: Vec<Option<Value>> = vec![None; schema.columns.len()];
+
+                    for (val_idx, value) in source_row.values.iter().enumerate() {
+                        let target_col_idx = if let Some(ref indices) = column_indices {
+                            if val_idx >= indices.len() {
+                                return Err(Error::query_execution("More values than columns specified"));
+                            }
+                            *indices.get(val_idx).ok_or_else(|| Error::internal("column index out of bounds"))?
+                        } else {
+                            val_idx
+                        };
+
+                        let target_col = schema.get_column_at(target_col_idx)
+                            .ok_or_else(|| Error::query_execution(format!(
+                                "Too many values for INSERT: table has {} columns",
+                                schema.columns.len()
+                            )))?;
+
+                        let target_type = &target_col.data_type;
+                        let mut val = value.clone();
+
+                        let needs_cast = match (&val, target_type) {
+                            (Value::Null, _) => false,
+                            (Value::Vector(_), DataType::Vector(_)) => false,
+                            (Value::String(_), DataType::Vector(_)) => true,
+                            (Value::String(_), DataType::Json | DataType::Jsonb) => true,
+                            (Value::Int4(_), DataType::Int4) => false,
+                            (Value::Int8(_), DataType::Int8) => false,
+                            (Value::Float4(_), DataType::Float4) => false,
+                            (Value::Float8(_), DataType::Float8) => false,
+                            (Value::String(_), DataType::Text | DataType::Varchar(_)) => false,
+                            (Value::Boolean(_), DataType::Boolean) => false,
+                            (Value::Json(_), DataType::Json | DataType::Jsonb) => false,
+                            _ => true,
+                        };
+
+                        if needs_cast {
+                            val = evaluator.cast_value(val, target_type)?;
+                        }
+
+                        let tv = tuple_values.get_mut(target_col_idx)
+                            .ok_or_else(|| Error::internal("column index out of bounds"))?;
+                        *tv = Some(val);
+                    }
+
+                    let final_values: Result<Vec<Value>> = tuple_values
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, opt_val)| {
+                            if let Some(val) = opt_val {
+                                Ok(val)
+                            } else {
+                                let col = schema.get_column_at(idx)
+                                    .ok_or_else(|| Error::internal("column index out of bounds"))?;
+                                if let Some(ref default_expr) = default_exprs.get(idx).and_then(|d| d.as_ref()) {
+                                    let mut value = evaluator.evaluate(default_expr, &empty_tuple)?;
+                                    if value.data_type() != col.data_type {
+                                        value = evaluator.cast_value(value, &col.data_type)?;
+                                    }
+                                    Ok(value)
+                                } else if col.nullable {
+                                    Ok(Value::Null)
+                                } else {
+                                    Err(Error::query_execution(format!(
+                                        "Column '{}' does not have a default value and is not nullable",
+                                        col.name
+                                    )))
+                                }
+                            }
+                        })
+                        .collect();
+
+                    let tuple = Tuple::new(final_values?);
+
+                    // Validate RLS
+                    if let Some((_, with_check)) = &rls_check {
+                        if let Some(ref with_check_expr) = with_check {
+                            let tenant_context = self.tenant_manager.get_current_context();
+                            let rls_evaluator = tenant::RLSExpressionEvaluator::new(
+                                std::sync::Arc::new(schema.clone()),
+                                tenant_context
+                            );
+                            let expr = rls_evaluator.parse(with_check_expr)?;
+                            let satisfies_policy = rls_evaluator.evaluate(&expr, &tuple)?;
+                            if !satisfies_policy {
+                                return Err(Error::query_execution(
+                                    "Row-Level Security policy violation: inserted row does not satisfy WITH CHECK expression"
+                                ));
                             }
                         }
                     }
@@ -3629,6 +4209,13 @@ impl EmbeddedDatabase {
                 self.storage.rename_table(table_name, new_table_name)?;
                 Ok(0)
             }
+            sql::LogicalPlan::AlterTableMulti { operations } => {
+                let mut total_rows = 0u64;
+                for sub_plan in operations {
+                    total_rows += self.execute_alter_table_op(sub_plan)?;
+                }
+                Ok(total_rows)
+            }
             sql::LogicalPlan::Savepoint { ref name } => {
                 let txn = self.current_transaction.lock()
                     .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
@@ -3968,6 +4555,78 @@ impl EmbeddedDatabase {
 
                     let tuple = Tuple::new(tuple_values);
                     // Collect tuple for RETURNING clause before inserting
+                    if has_returning {
+                        if let Some(projected) = Self::project_returning_columns(&tuple, &schema, returning) {
+                            returned_tuples.push(projected);
+                        }
+                    }
+                    self.storage.insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)?;
+                    count += 1;
+                }
+                Ok((count, returned_tuples))
+            }
+            sql::LogicalPlan::InsertSelect { table_name, columns, source, returning } => {
+                // Execute source SELECT plan
+                let mut executor = sql::Executor::with_storage(&self.storage)
+                    .with_timeout(self.config.storage.query_timeout_ms);
+                let source_rows = executor.execute(source)?;
+
+                let catalog = self.storage.catalog();
+                let schema = catalog.get_table_schema(table_name)?;
+                let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema { columns: vec![] }));
+
+                let column_indices: Option<Vec<usize>> = columns.as_ref().map(|cols| {
+                    cols.iter()
+                        .filter_map(|col_name| schema.get_column_index(col_name))
+                        .collect()
+                });
+
+                let has_returning = returning.is_some();
+                let mut returned_tuples: Vec<Tuple> = Vec::new();
+                let mut count = 0u64;
+
+                for source_row in &source_rows {
+                    let mut tuple_values: Vec<Value> = Vec::new();
+
+                    for (val_idx, value) in source_row.values.iter().enumerate() {
+                        let target_col_idx = if let Some(ref indices) = column_indices {
+                            *indices.get(val_idx).ok_or_else(|| Error::internal("column index out of bounds"))?
+                        } else {
+                            val_idx
+                        };
+
+                        let target_col = schema.get_column_at(target_col_idx)
+                            .ok_or_else(|| Error::query_execution(format!(
+                                "Too many values for INSERT: table has {} columns",
+                                schema.columns.len()
+                            )))?;
+
+                        let target_type = &target_col.data_type;
+                        let mut val = value.clone();
+
+                        let needs_cast = match (&val, target_type) {
+                            (Value::Null, _) => false,
+                            (Value::Vector(_), DataType::Vector(_)) => false,
+                            (Value::String(_), DataType::Vector(_)) => true,
+                            (Value::String(_), DataType::Json | DataType::Jsonb) => true,
+                            (Value::Int4(_), DataType::Int4) => false,
+                            (Value::Int8(_), DataType::Int8) => false,
+                            (Value::Float4(_), DataType::Float4) => false,
+                            (Value::Float8(_), DataType::Float8) => false,
+                            (Value::String(_), DataType::Text | DataType::Varchar(_)) => false,
+                            (Value::Boolean(_), DataType::Boolean) => false,
+                            (Value::Json(_), DataType::Json | DataType::Jsonb) => false,
+                            _ => true,
+                        };
+
+                        if needs_cast {
+                            val = evaluator.cast_value(val, target_type)?;
+                        }
+
+                        tuple_values.push(val);
+                    }
+
+                    let tuple = Tuple::new(tuple_values);
                     if has_returning {
                         if let Some(projected) = Self::project_returning_columns(&tuple, &schema, returning) {
                             returned_tuples.push(projected);
@@ -10539,8 +11198,6 @@ mod tests {
     #[test]
     fn test_recursive_cte_string_concatenation() {
         // Recursive CTE building strings: 'a', 'aa', 'aaa', etc.
-        // NOTE: The string concatenation operator (||) is not yet implemented
-        // in HeliosDB Nano. This test documents that limitation.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
         let sql = "\
@@ -10551,30 +11208,15 @@ mod tests {
             ) \
             SELECT s, len FROM strs ORDER BY len";
 
-        match db.query(sql, &[]) {
-            Ok(rows) => {
-                // If string concatenation becomes supported, verify results
-                assert_eq!(rows.len(), 5, "Expected 5 rows, got {}", rows.len());
-                let expected = ["a", "aa", "aaa", "aaaa", "aaaaa"];
-                for (i, row) in rows.iter().enumerate() {
-                    let s = row.get(0).unwrap();
-                    assert_eq!(
-                        s, &Value::String(expected[i].to_string()),
-                        "Row {} should be '{}', got {:?}", i, expected[i], s
-                    );
-                }
-            }
-            Err(e) => {
-                // NOTE: StringConcat operator (||) is not yet supported.
-                let err_msg = e.to_string();
-                assert!(
-                    err_msg.contains("StringConcat") ||
-                    err_msg.contains("not yet supported") ||
-                    err_msg.contains("not implemented") ||
-                    err_msg.contains("concat"),
-                    "Expected StringConcat-related error, got: {}", err_msg
-                );
-            }
+        let rows = db.query(sql, &[]).unwrap();
+        assert_eq!(rows.len(), 5, "Expected 5 rows, got {}", rows.len());
+        let expected = ["a", "aa", "aaa", "aaaa", "aaaaa"];
+        for (i, row) in rows.iter().enumerate() {
+            let s = row.get(0).unwrap();
+            assert_eq!(
+                s, &Value::String(expected[i].to_string()),
+                "Row {} should be '{}', got {:?}", i, expected[i], s
+            );
         }
     }
 

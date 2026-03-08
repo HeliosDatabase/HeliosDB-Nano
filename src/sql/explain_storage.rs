@@ -409,6 +409,7 @@ impl StorageFeatureCollector {
                 Self::extract_tables_recursive(query, tables);
             }
             LogicalPlan::Insert { table_name, .. }
+            | LogicalPlan::InsertSelect { table_name, .. }
             | LogicalPlan::Update { table_name, .. }
             | LogicalPlan::Delete { table_name, .. } => {
                 if !tables.contains(table_name) {

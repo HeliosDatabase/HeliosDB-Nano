@@ -300,6 +300,7 @@ impl Planner {
             // DML/DDL operations - not supported in physical planner
             // These are handled directly by the executor
             LogicalPlan::Insert { .. } |
+            LogicalPlan::InsertSelect { .. } |
             LogicalPlan::Update { .. } |
             LogicalPlan::Delete { .. } |
             LogicalPlan::CreateTable { .. } |
@@ -345,9 +346,11 @@ impl Planner {
             LogicalPlan::Union { .. } |
             LogicalPlan::Intersect { .. } |
             LogicalPlan::Except { .. } |
+            LogicalPlan::AlterTableMulti { .. } |
+            LogicalPlan::TableFunction { .. } |
             LogicalPlan::DualScan => {
                 return Err(Error::internal(
-                    "DML/DDL/CTE/TRIGGER/EXPLAIN/Transaction/Procedural/SetOps/DualScan operations should be executed directly, not planned"
+                    "DML/DDL/CTE/TRIGGER/EXPLAIN/Transaction/Procedural/SetOps/TableFunction/DualScan operations should be executed directly, not planned"
                 ));
             }
 

@@ -893,7 +893,8 @@ where
 
         // Extract table name and returning items from the plan
         let (table_name, returning_items) = match &plan {
-            crate::sql::LogicalPlan::Insert { table_name, returning, .. } => {
+            crate::sql::LogicalPlan::Insert { table_name, returning, .. }
+            | crate::sql::LogicalPlan::InsertSelect { table_name, returning, .. } => {
                 (table_name.as_str(), returning.as_ref())
             }
             crate::sql::LogicalPlan::Update { table_name, returning, .. } => {

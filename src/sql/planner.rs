@@ -32,6 +32,20 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use super::phase3::materialized_views::MaterializedViewParser;
 
+/// Information about an aggregate plan needed to rewrite ORDER BY expressions.
+/// Contains the aggregate expressions and the corresponding output aliases from the
+/// wrapping Project layer, plus GROUP BY expressions and their aliases.
+struct AggregateInfo {
+    /// The aggregate expressions from the Aggregate plan (e.g., SUM(val), COUNT(*))
+    aggr_exprs: Vec<LogicalExpr>,
+    /// The output aliases for each aggregate (from the Project layer)
+    aggr_aliases: Vec<String>,
+    /// The GROUP BY expressions from the Aggregate plan
+    group_by_exprs: Vec<LogicalExpr>,
+    /// The output aliases for each GROUP BY column (from the Project layer)
+    group_by_aliases: Vec<String>,
+}
+
 /// Query planner
 pub struct Planner<'a> {
     catalog: Option<&'a Catalog<'a>>,
@@ -39,6 +53,8 @@ pub struct Planner<'a> {
     original_sql: Option<String>,
     /// CTE schemas in scope (name -> schema) - uses RefCell for interior mutability
     cte_schemas: RefCell<HashMap<String, Arc<Schema>>>,
+    /// Named window definitions in scope (name -> WindowSpec) from WINDOW clause
+    named_windows: RefCell<HashMap<String, sqlparser::ast::WindowSpec>>,
 }
 
 impl<'a> Planner<'a> {
@@ -48,6 +64,7 @@ impl<'a> Planner<'a> {
             catalog: None,
             original_sql: None,
             cte_schemas: RefCell::new(HashMap::new()),
+            named_windows: RefCell::new(HashMap::new()),
         }
     }
 
@@ -57,6 +74,7 @@ impl<'a> Planner<'a> {
             catalog: Some(catalog),
             original_sql: None,
             cte_schemas: RefCell::new(HashMap::new()),
+            named_windows: RefCell::new(HashMap::new()),
         }
     }
 
@@ -79,6 +97,93 @@ impl<'a> Planner<'a> {
     /// Clear all CTEs from scope
     fn clear_ctes(&self) {
         self.cte_schemas.borrow_mut().clear();
+    }
+
+    /// Look up a named window definition by name
+    fn get_named_window(&self, name: &str) -> Option<sqlparser::ast::WindowSpec> {
+        self.named_windows.borrow().get(name).cloned()
+    }
+
+    /// Populate the named window definitions from a SELECT's WINDOW clause.
+    fn populate_named_windows(
+        &self,
+        named_window_defs: &[sqlparser::ast::NamedWindowDefinition],
+    ) -> Result<()> {
+        use sqlparser::ast::NamedWindowExpr;
+        self.named_windows.borrow_mut().clear();
+        for def in named_window_defs {
+            let name = def.0.value.clone();
+            let spec = match &def.1 {
+                NamedWindowExpr::WindowSpec(spec) => {
+                    if let Some(ref parent_name) = spec.window_name {
+                        let parent_spec =
+                            self.get_named_window(&parent_name.value).ok_or_else(|| {
+                                Error::query_execution(format!(
+                                    "Window \"{}\" references undefined window \"{}\"",
+                                    name, parent_name.value
+                                ))
+                            })?;
+                        Self::merge_window_specs(&parent_spec, spec)?
+                    } else {
+                        spec.clone()
+                    }
+                }
+                NamedWindowExpr::NamedWindow(ref_ident) => {
+                    self.get_named_window(&ref_ident.value).ok_or_else(|| {
+                        Error::query_execution(format!(
+                            "Window \"{}\" references undefined window \"{}\"",
+                            name, ref_ident.value
+                        ))
+                    })?
+                }
+            };
+            self.named_windows.borrow_mut().insert(name, spec);
+        }
+        Ok(())
+    }
+
+    /// Merge a parent window spec with a child spec (window inheritance).
+    fn merge_window_specs(
+        parent: &sqlparser::ast::WindowSpec,
+        child: &sqlparser::ast::WindowSpec,
+    ) -> Result<sqlparser::ast::WindowSpec> {
+        if !parent.partition_by.is_empty() && !child.partition_by.is_empty() {
+            return Err(Error::query_execution(
+                "Cannot override PARTITION BY of referenced window",
+            ));
+        }
+        if !parent.order_by.is_empty() && !child.order_by.is_empty() {
+            return Err(Error::query_execution(
+                "Cannot override ORDER BY of referenced window",
+            ));
+        }
+        if parent.window_frame.is_some() && child.window_frame.is_some() {
+            return Err(Error::query_execution(
+                "Cannot override window frame of referenced window",
+            ));
+        }
+        Ok(sqlparser::ast::WindowSpec {
+            window_name: None,
+            partition_by: if child.partition_by.is_empty() {
+                parent.partition_by.clone()
+            } else {
+                child.partition_by.clone()
+            },
+            order_by: if child.order_by.is_empty() {
+                parent.order_by.clone()
+            } else {
+                child.order_by.clone()
+            },
+            window_frame: child
+                .window_frame
+                .clone()
+                .or_else(|| parent.window_frame.clone()),
+        })
+    }
+
+    /// Clear named window definitions from scope
+    fn clear_named_windows(&self) {
+        self.named_windows.borrow_mut().clear();
     }
 
     /// Parse a data type string into a DataType
@@ -658,6 +763,11 @@ impl<'a> Planner<'a> {
             let output_schema = plan.schema();
             let num_output_cols = output_schema.columns.len();
 
+            // Extract aggregate info from the plan if it's a Project over an Aggregate.
+            // This is needed to rewrite ORDER BY aggregate expressions (e.g., ORDER BY SUM(val))
+            // to column references that the Sort operator can evaluate.
+            let aggregate_info = Self::extract_aggregate_info(&plan);
+
             let exprs: Result<Vec<_>> = order_by.exprs.iter()
                 .map(|order_by_expr| {
                     // Check if this is an ordinal position (literal integer)
@@ -679,7 +789,15 @@ impl<'a> Planner<'a> {
                             // ordinal == 0: fall through to treat as literal
                         }
                     }
-                    self.expr_to_logical(&order_by_expr.expr)
+                    let logical_expr = self.expr_to_logical(&order_by_expr.expr)?;
+
+                    // If the ORDER BY expression contains aggregate functions and
+                    // we have an aggregate plan, rewrite them to column references
+                    if let Some(ref info) = aggregate_info {
+                        Ok(Self::rewrite_order_by_aggregates(&logical_expr, info))
+                    } else {
+                        Ok(logical_expr)
+                    }
                 })
                 .collect();
             let asc: Vec<_> = order_by.exprs.iter()
@@ -784,8 +902,19 @@ impl<'a> Planner<'a> {
             };
         }
 
+        // Populate named window definitions from the WINDOW clause before processing
+        // projections, so that OVER w references can be resolved during expression planning.
+        if !select.named_window.is_empty() {
+            self.populate_named_windows(&select.named_window)?;
+        }
+
         // Check if we have aggregate functions (even without GROUP BY)
-        let aggr_exprs = self.extract_aggregate_exprs(&select.projection)?;
+        // Collect from both SELECT and HAVING so all referenced aggregates are computed.
+        let mut aggr_exprs = self.extract_aggregate_exprs(&select.projection)?;
+        if let Some(having_expr) = &select.having {
+            let having_logical = self.expr_to_logical(having_expr)?;
+            Self::collect_aggregates_from_logical(&having_logical, &mut aggr_exprs);
+        }
         let has_aggregates = !aggr_exprs.is_empty();
 
         // Handle GROUP BY or implicit aggregation (when aggregates are present without GROUP BY)
@@ -843,25 +972,46 @@ impl<'a> Planner<'a> {
                 having,
             };
 
-            // Add a Project layer to apply user-defined aliases
+            // Add a Project layer to evaluate post-aggregate expressions and apply aliases.
             // The Aggregate operator outputs: group_0, group_1, ..., agg_0, agg_1, ...
-            // We need to rename these to the user's aliases (e.g., COUNT(*) as user_count)
-            let (proj_exprs, aliases) = self.select_items_to_exprs(&select.projection, &plan)?;
+            // For each SELECT item, we rewrite the full expression tree so that:
+            //   - AggregateFunction nodes become Column refs to agg_N
+            //   - Column refs matching GROUP BY become Column refs to group_N
+            // This allows expressions like SUM(a) + SUM(b), CAST(AVG(x) AS INT), etc.
+            let (_proj_exprs, aliases) = self.select_items_to_exprs(&select.projection, &plan)?;
             let distinct = select.distinct.is_some();
 
-            // Build column references to aggregate output columns
+            // Build rewritten projection expressions for each SELECT item
             let mut output_exprs = Vec::new();
-            for (i, _) in group_by.iter().enumerate() {
-                output_exprs.push(LogicalExpr::Column {
-                    table: None,
-                    name: format!("group_{}", i),
-                });
-            }
-            for (i, _) in aggr_exprs.iter().enumerate() {
-                output_exprs.push(LogicalExpr::Column {
-                    table: None,
-                    name: format!("agg_{}", i),
-                });
+            for item in &select.projection {
+                match item {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
+                        let logical = self.expr_to_logical(expr)?;
+                        let rewritten = Self::rewrite_expr_replace_aggregates(
+                            &logical, &aggr_exprs, &group_by,
+                        );
+                        output_exprs.push(rewritten);
+                    }
+                    SelectItem::Wildcard(_) => {
+                        // Expand wildcard: group columns + aggregate columns
+                        for (i, _) in group_by.iter().enumerate() {
+                            output_exprs.push(LogicalExpr::Column {
+                                table: None,
+                                name: format!("group_{}", i),
+                            });
+                        }
+                        for (i, _) in aggr_exprs.iter().enumerate() {
+                            output_exprs.push(LogicalExpr::Column {
+                                table: None,
+                                name: format!("agg_{}", i),
+                            });
+                        }
+                    }
+                    _ => {
+                        // Unsupported select item in aggregate context — pass through
+                        output_exprs.push(LogicalExpr::Literal(Value::Null));
+                    }
+                }
             }
 
             plan = LogicalPlan::Project {
@@ -897,6 +1047,9 @@ impl<'a> Planner<'a> {
                 distinct_on,
             };
         }
+
+        // Clean up named window definitions after processing the SELECT
+        self.clear_named_windows();
 
         Ok(plan)
     }
@@ -1005,11 +1158,58 @@ impl<'a> Planner<'a> {
         Ok(plan)
     }
 
+    /// Extract function arguments from `TableFunctionArgs` to `Vec<LogicalExpr>`
+    fn extract_table_function_args(&self, tf_args: &sqlparser::ast::TableFunctionArgs) -> Result<Vec<LogicalExpr>> {
+        let mut logical_args = Vec::new();
+        for arg in &tf_args.args {
+            match arg {
+                sqlparser::ast::FunctionArg::Unnamed(arg_expr) => {
+                    match arg_expr {
+                        sqlparser::ast::FunctionArgExpr::Expr(e) => {
+                            logical_args.push(self.expr_to_logical(e)?);
+                        }
+                        _ => {
+                            return Err(Error::query_execution(
+                                "Unsupported function argument type in table function"
+                            ));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(Error::query_execution(
+                        "Named arguments are not supported in table functions"
+                    ));
+                }
+            }
+        }
+        Ok(logical_args)
+    }
+
+    /// Check if a table name is a known table-valued function
+    fn is_table_function(name: &str) -> bool {
+        matches!(name.to_lowercase().as_str(), "generate_series" | "unnest")
+    }
+
     /// Convert a TableFactor to a plan
     fn table_factor_to_plan(&self, table_factor: &TableFactor) -> Result<LogicalPlan> {
         match table_factor {
-            TableFactor::Table { name, alias, .. } => {
+            TableFactor::Table { name, alias, args, .. } => {
                 let table_name = name.to_string();
+
+                // Check if this is a table-valued function call (e.g., generate_series(1, 10))
+                // In sqlparser, FROM generate_series(1, 10) is parsed as Table with args
+                if let Some(tf_args) = args {
+                    let lower_name = table_name.to_lowercase();
+                    if Self::is_table_function(&lower_name) {
+                        let logical_args = self.extract_table_function_args(tf_args)?;
+                        let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+                        return Ok(LogicalPlan::TableFunction {
+                            function_name: lower_name,
+                            args: logical_args,
+                            alias: table_alias,
+                        });
+                    }
+                }
 
                 // Check if this is a CTE reference first
                 if let Some(cte_schema) = self.get_cte_schema(&table_name) {
@@ -1110,12 +1310,63 @@ impl<'a> Planner<'a> {
                 Ok(subquery_plan)
             }
             TableFactor::TableFunction { expr, alias } => {
-                // Handle table functions like generate_series(), unnest(), etc.
-                // For now, return an error for unsupported table functions
-                Err(Error::query_execution(format!(
-                    "Table function '{}' not yet supported",
-                    expr
-                )))
+                // Handle TABLE(expr) syntax
+                match expr {
+                    Expr::Function(func) => {
+                        let func_name = func.name.to_string().to_lowercase();
+                        if Self::is_table_function(&func_name) {
+                            let mut logical_args = Vec::new();
+                            if let sqlparser::ast::FunctionArguments::List(ref arg_list) = func.args {
+                                for arg in &arg_list.args {
+                                    match arg {
+                                        sqlparser::ast::FunctionArg::Unnamed(arg_expr) => {
+                                            if let sqlparser::ast::FunctionArgExpr::Expr(e) = arg_expr {
+                                                logical_args.push(self.expr_to_logical(e)?);
+                                            } else {
+                                                return Err(Error::query_execution(
+                                                    "Unsupported function argument in TABLE() expression"
+                                                ));
+                                            }
+                                        }
+                                        _ => {
+                                            return Err(Error::query_execution(
+                                                "Named arguments not supported in TABLE() expression"
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                            let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+                            Ok(LogicalPlan::TableFunction {
+                                function_name: func_name,
+                                args: logical_args,
+                                alias: table_alias,
+                            })
+                        } else {
+                            Err(Error::query_execution(format!(
+                                "Table function '{}' not supported",
+                                func_name
+                            )))
+                        }
+                    }
+                    _ => Err(Error::query_execution(format!(
+                        "Table function expression '{}' not supported",
+                        expr
+                    )))
+                }
+            }
+            TableFactor::UNNEST { alias, array_exprs, .. } => {
+                // Handle UNNEST(ARRAY[...]) syntax
+                let mut logical_args = Vec::new();
+                for expr in array_exprs {
+                    logical_args.push(self.expr_to_logical(expr)?);
+                }
+                let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+                Ok(LogicalPlan::TableFunction {
+                    function_name: "unnest".to_string(),
+                    args: logical_args,
+                    alias: table_alias,
+                })
             }
             other => Err(Error::query_execution(format!(
                 "Unsupported table expression: {:?}",
@@ -1297,16 +1548,127 @@ impl<'a> Planner<'a> {
         }
     }
 
-    /// Extract aggregate expressions from SELECT items
+    /// Extract aggregate info from the plan if it's a Project over an Aggregate.
+    /// Returns None if the plan is not an aggregate query.
+    fn extract_aggregate_info(plan: &LogicalPlan) -> Option<AggregateInfo> {
+        if let LogicalPlan::Project { input, aliases, .. } = plan {
+            if let LogicalPlan::Aggregate { group_by, aggr_exprs, .. } = input.as_ref() {
+                let num_groups = group_by.len();
+                let num_aggs = aggr_exprs.len();
+
+                // The Project aliases are ordered: group columns first, then aggregate columns.
+                // aliases[0..num_groups] -> GROUP BY aliases
+                // aliases[num_groups..num_groups+num_aggs] -> aggregate aliases
+                let group_by_aliases: Vec<String> = aliases.iter()
+                    .take(num_groups)
+                    .cloned()
+                    .collect();
+                let aggr_aliases: Vec<String> = aliases.iter()
+                    .skip(num_groups)
+                    .take(num_aggs)
+                    .cloned()
+                    .collect();
+
+                return Some(AggregateInfo {
+                    aggr_exprs: aggr_exprs.clone(),
+                    aggr_aliases,
+                    group_by_exprs: group_by.clone(),
+                    group_by_aliases,
+                });
+            }
+        }
+        None
+    }
+
+    /// Rewrite an ORDER BY expression by replacing aggregate function references
+    /// with column references to the corresponding output alias.
+    /// For example, `SUM(val)` becomes `Column { name: "total" }` if that aggregate
+    /// has alias "total" in the output schema.
+    /// Also handles GROUP BY column references that need remapping.
+    fn rewrite_order_by_aggregates(expr: &LogicalExpr, info: &AggregateInfo) -> LogicalExpr {
+        match expr {
+            LogicalExpr::AggregateFunction { fun, args, distinct } => {
+                // Find this aggregate in the plan's aggregate expressions
+                for (i, aggr_expr) in info.aggr_exprs.iter().enumerate() {
+                    if let LogicalExpr::AggregateFunction {
+                        fun: aggr_fun, args: aggr_args, distinct: aggr_distinct
+                    } = aggr_expr {
+                        if fun == aggr_fun && args == aggr_args && distinct == aggr_distinct {
+                            // Found a match - replace with column reference to the output alias
+                            if let Some(alias) = info.aggr_aliases.get(i) {
+                                return LogicalExpr::Column {
+                                    table: None,
+                                    name: alias.clone(),
+                                };
+                            }
+                        }
+                    }
+                }
+                // No match found - keep as-is (may fail at evaluation, but that's expected
+                // for aggregates not in SELECT list)
+                expr.clone()
+            }
+            LogicalExpr::BinaryExpr { left, op, right } => {
+                LogicalExpr::BinaryExpr {
+                    left: Box::new(Self::rewrite_order_by_aggregates(left, info)),
+                    op: *op,
+                    right: Box::new(Self::rewrite_order_by_aggregates(right, info)),
+                }
+            }
+            LogicalExpr::UnaryExpr { op, expr: inner } => {
+                LogicalExpr::UnaryExpr {
+                    op: *op,
+                    expr: Box::new(Self::rewrite_order_by_aggregates(inner, info)),
+                }
+            }
+            LogicalExpr::Cast { expr: inner, data_type } => {
+                LogicalExpr::Cast {
+                    expr: Box::new(Self::rewrite_order_by_aggregates(inner, info)),
+                    data_type: data_type.clone(),
+                }
+            }
+            LogicalExpr::ScalarFunction { fun, args } => {
+                let rewritten_args: Vec<_> = args.iter()
+                    .map(|a| Self::rewrite_order_by_aggregates(a, info))
+                    .collect();
+                LogicalExpr::ScalarFunction {
+                    fun: fun.clone(),
+                    args: rewritten_args,
+                }
+            }
+            // For column references in an aggregate context, check if they match
+            // a GROUP BY expression and remap to the output alias
+            LogicalExpr::Column { table, name } => {
+                for (i, group_expr) in info.group_by_exprs.iter().enumerate() {
+                    if group_expr == expr {
+                        if let Some(alias) = info.group_by_aliases.get(i) {
+                            return LogicalExpr::Column {
+                                table: None,
+                                name: alias.clone(),
+                            };
+                        }
+                    }
+                }
+                expr.clone()
+            }
+            // All other expression types: return as-is
+            _ => expr.clone(),
+        }
+    }
+
+    /// Extract aggregate expressions from SELECT items (deep walk).
+    ///
+    /// Walks each SELECT expression tree to find ALL aggregate function nodes,
+    /// even when nested inside arithmetic, CASE, CAST, etc.
+    /// Returns a deduplicated list of aggregate expressions.
     fn extract_aggregate_exprs(&self, items: &[SelectItem]) -> Result<Vec<LogicalExpr>> {
-        let mut aggr_exprs = Vec::new();
+        let mut aggr_exprs: Vec<LogicalExpr> = Vec::new();
 
         for item in items {
             match item {
                 SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
-                    if let Some(aggr) = self.extract_aggregate_from_expr(expr)? {
-                        aggr_exprs.push(aggr);
-                    }
+                    let logical = self.expr_to_logical(expr)?;
+                    Self::collect_aggregates_from_logical(&logical, &mut aggr_exprs);
                 }
                 _ => {}
             }
@@ -1315,7 +1677,174 @@ impl<'a> Planner<'a> {
         Ok(aggr_exprs)
     }
 
-    /// Extract aggregate function from an expression
+    /// Recursively walk a LogicalExpr tree and collect all AggregateFunction nodes.
+    /// Deduplicates by PartialEq comparison.
+    fn collect_aggregates_from_logical(expr: &LogicalExpr, out: &mut Vec<LogicalExpr>) {
+        match expr {
+            LogicalExpr::AggregateFunction { .. } => {
+                if !out.iter().any(|existing| existing == expr) {
+                    out.push(expr.clone());
+                }
+            }
+            LogicalExpr::BinaryExpr { left, right, .. } => {
+                Self::collect_aggregates_from_logical(left, out);
+                Self::collect_aggregates_from_logical(right, out);
+            }
+            LogicalExpr::UnaryExpr { expr: inner, .. } => {
+                Self::collect_aggregates_from_logical(inner, out);
+            }
+            LogicalExpr::Cast { expr: inner, .. } => {
+                Self::collect_aggregates_from_logical(inner, out);
+            }
+            LogicalExpr::Case { expr: base, when_then, else_result } => {
+                if let Some(base_expr) = base {
+                    Self::collect_aggregates_from_logical(base_expr, out);
+                }
+                for (when_expr, then_expr) in when_then {
+                    Self::collect_aggregates_from_logical(when_expr, out);
+                    Self::collect_aggregates_from_logical(then_expr, out);
+                }
+                if let Some(else_expr) = else_result {
+                    Self::collect_aggregates_from_logical(else_expr, out);
+                }
+            }
+            LogicalExpr::IsNull { expr: inner, .. } => {
+                Self::collect_aggregates_from_logical(inner, out);
+            }
+            LogicalExpr::Between { expr: inner, low, high, .. } => {
+                Self::collect_aggregates_from_logical(inner, out);
+                Self::collect_aggregates_from_logical(low, out);
+                Self::collect_aggregates_from_logical(high, out);
+            }
+            LogicalExpr::InList { expr: inner, list, .. } => {
+                Self::collect_aggregates_from_logical(inner, out);
+                for item in list {
+                    Self::collect_aggregates_from_logical(item, out);
+                }
+            }
+            LogicalExpr::ScalarFunction { args, .. } => {
+                for arg in args {
+                    Self::collect_aggregates_from_logical(arg, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Rewrite a LogicalExpr tree, replacing AggregateFunction nodes with
+    /// Column references to the pre-computed aggregate output columns (agg_0, agg_1, ...).
+    /// Also replaces column references that match GROUP BY expressions with group_N references.
+    fn rewrite_expr_replace_aggregates(
+        expr: &LogicalExpr,
+        aggr_exprs: &[LogicalExpr],
+        group_by: &[LogicalExpr],
+    ) -> LogicalExpr {
+        // First check if the entire expression matches a GROUP BY expression.
+        // This handles cases like `id % 2` in both SELECT and GROUP BY, where
+        // the whole expression should map to `group_N` rather than recursing into parts.
+        for (i, gb_expr) in group_by.iter().enumerate() {
+            if gb_expr == expr {
+                return LogicalExpr::Column {
+                    table: None,
+                    name: format!("group_{}", i),
+                };
+            }
+        }
+
+        match expr {
+            LogicalExpr::AggregateFunction { .. } => {
+                for (i, aggr) in aggr_exprs.iter().enumerate() {
+                    if aggr == expr {
+                        return LogicalExpr::Column {
+                            table: None,
+                            name: format!("agg_{}", i),
+                        };
+                    }
+                }
+                expr.clone()
+            }
+            LogicalExpr::Column { name, .. } => {
+                for (i, gb_expr) in group_by.iter().enumerate() {
+                    if gb_expr == expr {
+                        return LogicalExpr::Column {
+                            table: None,
+                            name: format!("group_{}", i),
+                        };
+                    }
+                    if let LogicalExpr::Column { name: gb_name, .. } = gb_expr {
+                        if gb_name == name {
+                            return LogicalExpr::Column {
+                                table: None,
+                                name: format!("group_{}", i),
+                            };
+                        }
+                    }
+                }
+                expr.clone()
+            }
+            LogicalExpr::BinaryExpr { left, op, right } => {
+                LogicalExpr::BinaryExpr {
+                    left: Box::new(Self::rewrite_expr_replace_aggregates(left, aggr_exprs, group_by)),
+                    op: *op,
+                    right: Box::new(Self::rewrite_expr_replace_aggregates(right, aggr_exprs, group_by)),
+                }
+            }
+            LogicalExpr::UnaryExpr { op, expr: inner } => {
+                LogicalExpr::UnaryExpr {
+                    op: *op,
+                    expr: Box::new(Self::rewrite_expr_replace_aggregates(inner, aggr_exprs, group_by)),
+                }
+            }
+            LogicalExpr::Cast { expr: inner, data_type } => {
+                LogicalExpr::Cast {
+                    expr: Box::new(Self::rewrite_expr_replace_aggregates(inner, aggr_exprs, group_by)),
+                    data_type: data_type.clone(),
+                }
+            }
+            LogicalExpr::Case { expr: base, when_then, else_result } => {
+                LogicalExpr::Case {
+                    expr: base.as_ref().map(|e| Box::new(Self::rewrite_expr_replace_aggregates(e, aggr_exprs, group_by))),
+                    when_then: when_then.iter().map(|(w, t)| {
+                        (
+                            Self::rewrite_expr_replace_aggregates(w, aggr_exprs, group_by),
+                            Self::rewrite_expr_replace_aggregates(t, aggr_exprs, group_by),
+                        )
+                    }).collect(),
+                    else_result: else_result.as_ref().map(|e| Box::new(Self::rewrite_expr_replace_aggregates(e, aggr_exprs, group_by))),
+                }
+            }
+            LogicalExpr::IsNull { expr: inner, is_null } => {
+                LogicalExpr::IsNull {
+                    expr: Box::new(Self::rewrite_expr_replace_aggregates(inner, aggr_exprs, group_by)),
+                    is_null: *is_null,
+                }
+            }
+            LogicalExpr::Between { expr: inner, low, high, negated } => {
+                LogicalExpr::Between {
+                    expr: Box::new(Self::rewrite_expr_replace_aggregates(inner, aggr_exprs, group_by)),
+                    low: Box::new(Self::rewrite_expr_replace_aggregates(low, aggr_exprs, group_by)),
+                    high: Box::new(Self::rewrite_expr_replace_aggregates(high, aggr_exprs, group_by)),
+                    negated: *negated,
+                }
+            }
+            LogicalExpr::InList { expr: inner, list, negated } => {
+                LogicalExpr::InList {
+                    expr: Box::new(Self::rewrite_expr_replace_aggregates(inner, aggr_exprs, group_by)),
+                    list: list.iter().map(|e| Self::rewrite_expr_replace_aggregates(e, aggr_exprs, group_by)).collect(),
+                    negated: *negated,
+                }
+            }
+            LogicalExpr::ScalarFunction { fun, args } => {
+                LogicalExpr::ScalarFunction {
+                    fun: fun.clone(),
+                    args: args.iter().map(|a| Self::rewrite_expr_replace_aggregates(a, aggr_exprs, group_by)).collect(),
+                }
+            }
+            _ => expr.clone(),
+        }
+    }
+
+    /// Extract aggregate function from an expression (used by expr_to_logical for Function nodes)
     fn extract_aggregate_from_expr(&self, expr: &Expr) -> Result<Option<LogicalExpr>> {
         match expr {
             Expr::Function(func) => {
@@ -1495,49 +2024,55 @@ impl<'a> Planner<'a> {
             Error::query_execution("Window function requires OVER clause")
         })?;
 
-        // Parse window specification
-        let (partition_by, order_by, frame) = match over {
-            sqlparser::ast::WindowType::WindowSpec(spec) => {
-                // Parse PARTITION BY
-                let partition_by: Vec<LogicalExpr> = spec.partition_by.iter()
-                    .filter_map(|expr| self.expr_to_logical(expr).ok())
-                    .collect();
-
-                // Parse ORDER BY
-                let order_by: Vec<(LogicalExpr, bool)> = spec.order_by.iter()
-                    .filter_map(|order_expr| {
-                        self.expr_to_logical(&order_expr.expr).ok().map(|expr| {
-                            let ascending = order_expr.asc.unwrap_or(true);
-                            (expr, ascending)
-                        })
-                    })
-                    .collect();
-
-                // Parse window frame if present
-                let frame = spec.window_frame.as_ref().map(|wf| {
-                    let frame_type = match wf.units {
-                        sqlparser::ast::WindowFrameUnits::Rows => WindowFrameType::Rows,
-                        sqlparser::ast::WindowFrameUnits::Range => WindowFrameType::Range,
-                        sqlparser::ast::WindowFrameUnits::Groups => WindowFrameType::Groups,
-                    };
-
-                    let start = Self::parse_frame_bound(&wf.start_bound);
-                    let end = wf.end_bound.as_ref().map(Self::parse_frame_bound);
-
-                    WindowFrame {
-                        frame_type,
-                        start,
-                        end,
-                    }
-                });
-
-                (partition_by, order_by, frame)
-            }
-            sqlparser::ast::WindowType::NamedWindow(_name) => {
-                // Named window references not yet supported
-                return Err(Error::query_execution("Named window references not yet supported"));
+        // Resolve the window specification: either inline or from a named window reference
+        let resolved_spec: Option<sqlparser::ast::WindowSpec>;
+        let spec_ref = match over {
+            sqlparser::ast::WindowType::WindowSpec(spec) => spec,
+            sqlparser::ast::WindowType::NamedWindow(name) => {
+                resolved_spec = Some(
+                    self.get_named_window(&name.value).ok_or_else(|| {
+                        Error::query_execution(format!(
+                            "Window \"{}\" is not defined",
+                            name.value
+                        ))
+                    })?,
+                );
+                resolved_spec.as_ref().ok_or_else(|| {
+                    Error::query_execution("Internal error resolving named window")
+                })?
             }
         };
+
+        // Parse window specification fields from the resolved spec
+        let partition_by: Vec<LogicalExpr> = spec_ref.partition_by.iter()
+            .filter_map(|expr| self.expr_to_logical(expr).ok())
+            .collect();
+
+        let order_by: Vec<(LogicalExpr, bool)> = spec_ref.order_by.iter()
+            .filter_map(|order_expr| {
+                self.expr_to_logical(&order_expr.expr).ok().map(|expr| {
+                    let ascending = order_expr.asc.unwrap_or(true);
+                    (expr, ascending)
+                })
+            })
+            .collect();
+
+        let frame = spec_ref.window_frame.as_ref().map(|wf| {
+            let frame_type = match wf.units {
+                sqlparser::ast::WindowFrameUnits::Rows => WindowFrameType::Rows,
+                sqlparser::ast::WindowFrameUnits::Range => WindowFrameType::Range,
+                sqlparser::ast::WindowFrameUnits::Groups => WindowFrameType::Groups,
+            };
+
+            let start = Self::parse_frame_bound(&wf.start_bound);
+            let end = wf.end_bound.as_ref().map(Self::parse_frame_bound);
+
+            WindowFrame {
+                frame_type,
+                start,
+                end,
+            }
+        });
 
         Ok(LogicalExpr::WindowFunction {
             fun: window_fun,
@@ -1987,6 +2522,8 @@ impl<'a> Planner<'a> {
             // PostgreSQL vector operators
             SqlBinaryOp::Spaceship => Ok(BinaryOperator::VectorCosineDistance),
             SqlBinaryOp::HashArrow => Ok(BinaryOperator::VectorInnerProduct),
+            // String concatenation operator: ||
+            SqlBinaryOp::StringConcat => Ok(BinaryOperator::StringConcat),
             // Vector similarity operators (pgvector compatible)
             SqlBinaryOp::Custom(op_str) => {
                 match op_str.as_str() {
@@ -2051,7 +2588,42 @@ impl<'a> Planner<'a> {
                 returning,
             })
         } else {
-            Err(Error::query_execution("INSERT ... SELECT not yet supported"))
+            // INSERT ... SELECT: plan the source query
+            let column_names = if columns.is_empty() {
+                None
+            } else {
+                Some(columns.iter().map(|c| c.value.clone()).collect::<Vec<String>>())
+            };
+
+            let source_plan = self.query_to_plan(*source)?;
+
+            // Validate column count: SELECT output columns must match target columns
+            let source_col_count = source_plan.schema().columns.len();
+            if let Some(ref cols) = column_names {
+                // Explicit column list specified
+                if source_col_count != cols.len() {
+                    return Err(Error::query_execution(format!(
+                        "INSERT ... SELECT column count mismatch: {} target columns but SELECT returns {} columns",
+                        cols.len(), source_col_count
+                    )));
+                }
+            } else if let Some(catalog) = self.catalog {
+                // No explicit column list - validate against table schema
+                let table_schema = catalog.get_table_schema(&table_name)?;
+                if source_col_count != table_schema.columns.len() {
+                    return Err(Error::query_execution(format!(
+                        "INSERT ... SELECT column count mismatch: table '{}' has {} columns but SELECT returns {} columns",
+                        table_name, table_schema.columns.len(), source_col_count
+                    )));
+                }
+            }
+
+            Ok(LogicalPlan::InsertSelect {
+                table_name,
+                columns: column_names,
+                source: Box::new(source_plan),
+                returning,
+            })
         }
     }
 
@@ -2200,8 +2772,6 @@ impl<'a> Planner<'a> {
         table_name: String,
         operations: Vec<sqlparser::ast::AlterTableOperation>,
     ) -> Result<LogicalPlan> {
-        use sqlparser::ast::AlterTableOperation;
-
         // Check if operations are empty
         if operations.is_empty() {
             return Err(Error::query_execution(
@@ -2209,38 +2779,51 @@ impl<'a> Planner<'a> {
             ));
         }
 
-        // Currently we only support a single operation per ALTER TABLE
-        if operations.len() > 1 {
-            return Err(Error::query_execution(
-                "Multiple ALTER TABLE operations in single statement not yet supported"
-            ));
+        // Single operation: return directly (no wrapper needed)
+        if operations.len() == 1 {
+            let operation = operations.into_iter().next()
+                .ok_or_else(|| Error::query_execution("ALTER TABLE requires an operation"))?;
+            return self.alter_table_single_op_to_plan(table_name, operation);
         }
 
-        let operation = operations.first()
-            .ok_or_else(|| Error::query_execution("ALTER TABLE requires an operation"))?;
+        // Multiple operations: plan each individually, wrap in AlterTableMulti
+        let mut plans = Vec::with_capacity(operations.len());
+        for operation in operations {
+            plans.push(self.alter_table_single_op_to_plan(table_name.clone(), operation)?);
+        }
+        Ok(LogicalPlan::AlterTableMulti { operations: plans })
+    }
+
+    /// Convert a single ALTER TABLE operation to a logical plan node
+    fn alter_table_single_op_to_plan(
+        &self,
+        table_name: String,
+        operation: sqlparser::ast::AlterTableOperation,
+    ) -> Result<LogicalPlan> {
+        use sqlparser::ast::AlterTableOperation;
 
         match operation {
             AlterTableOperation::AddColumn { column_def, if_not_exists, .. } => {
-                let col_def = self.sql_column_def_to_column_def(column_def)?;
+                let col_def = self.sql_column_def_to_column_def(&column_def)?;
                 Ok(LogicalPlan::AlterTableAddColumn {
                     table_name,
                     column_def: col_def,
-                    if_not_exists: *if_not_exists,
+                    if_not_exists,
                 })
             }
             AlterTableOperation::DropColumn { column_name, if_exists, cascade } => {
                 Ok(LogicalPlan::AlterTableDropColumn {
                     table_name,
-                    column_name: column_name.value.clone(),
-                    if_exists: *if_exists,
-                    cascade: *cascade,
+                    column_name: column_name.value,
+                    if_exists,
+                    cascade,
                 })
             }
             AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
                 Ok(LogicalPlan::AlterTableRenameColumn {
                     table_name,
-                    old_column_name: old_column_name.value.clone(),
-                    new_column_name: new_column_name.value.clone(),
+                    old_column_name: old_column_name.value,
+                    new_column_name: new_column_name.value,
                 })
             }
             AlterTableOperation::RenameTable { table_name: new_name } => {
@@ -2250,8 +2833,7 @@ impl<'a> Planner<'a> {
                 })
             }
             _ => Err(Error::query_execution(format!(
-                "Unsupported ALTER TABLE operation: {:?}",
-                operation
+                "Unsupported ALTER TABLE operation: {operation:?}",
             ))),
         }
     }

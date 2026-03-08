@@ -235,6 +235,18 @@ impl QueryExecutorAdapter for LiteQueryExecutorAdapter {
                 }
                 vec![]
             }
+            LogicalPlan::InsertSelect { table_name, source, .. } => {
+                // Execute the source SELECT to get rows, then insert each one
+                let mut executor = Executor::with_storage(&self.storage);
+                if let Some(timeout) = *self.timeout_ms.read() {
+                    executor = executor.with_timeout(Some(timeout));
+                }
+                let rows = executor.execute(source)?;
+                for row in &rows {
+                    self.storage.insert_tuple(table_name, row.clone())?;
+                }
+                vec![]
+            }
             _ => {
                 // Regular query execution through executor
                 let mut executor = Executor::with_storage(&self.storage);

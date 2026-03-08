@@ -293,6 +293,16 @@ impl Optimizer {
                     offset,
                 }
             }
+            // InsertSelect - optimize the source sub-plan
+            LogicalPlan::InsertSelect { table_name, columns, source, returning } => {
+                let optimized_source = self.optimize_recursive(*source)?;
+                LogicalPlan::InsertSelect {
+                    table_name,
+                    columns,
+                    source: Box::new(optimized_source),
+                    returning,
+                }
+            }
             // Leaf nodes - no recursion needed
             other => other,
         };

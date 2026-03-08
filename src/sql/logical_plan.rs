@@ -284,6 +284,18 @@ pub enum LogicalPlan {
         returning: Option<Vec<ReturningItem>>,
     },
 
+    /// Insert from a SELECT query (INSERT INTO ... SELECT ...)
+    InsertSelect {
+        /// Target table name
+        table_name: String,
+        /// Target column names (if specified)
+        columns: Option<Vec<String>>,
+        /// Source SELECT query plan
+        source: Box<LogicalPlan>,
+        /// RETURNING clause (expressions to return from affected rows)
+        returning: Option<Vec<ReturningItem>>,
+    },
+
     /// Create table
     CreateTable {
         /// Table name
@@ -402,6 +414,12 @@ pub enum LogicalPlan {
         new_table_name: String,
     },
 
+    /// Multiple ALTER TABLE operations in a single statement
+    AlterTableMulti {
+        /// The individual ALTER TABLE operations to execute sequentially
+        operations: Vec<LogicalPlan>,
+    },
+
     // === Phase 3: Database Branching ===
 
     /// Create a database branch
@@ -513,6 +531,21 @@ pub enum LogicalPlan {
         name: String,
         /// Arguments (for function-like views)
         args: Vec<LogicalExpr>,
+    },
+
+    // === Table Functions ===
+
+    /// Table-valued function (e.g., generate_series, unnest)
+    ///
+    /// Produces a virtual table from a function call in the FROM clause.
+    /// For example: `SELECT * FROM generate_series(1, 10)`
+    TableFunction {
+        /// Function name (e.g., "generate_series", "unnest")
+        function_name: String,
+        /// Evaluated arguments as logical expressions
+        args: Vec<LogicalExpr>,
+        /// Optional alias for the virtual table
+        alias: Option<String>,
     },
 
     /// Common Table Expression (WITH clause)
@@ -1069,6 +1102,10 @@ pub enum BinaryOperator {
     // Array operators (PostgreSQL compatible)
     /// Array concatenation: ||
     ArrayConcat,
+
+    // String operators
+    /// String concatenation: ||
+    StringConcat,
 }
 
 /// Unary operator
@@ -1330,7 +1367,7 @@ impl LogicalPlan {
             Self::Sort { .. } => "Sort",
             Self::Limit { .. } => "Limit",
             Self::Join { .. } => "Join",
-            Self::Insert { .. } => "Insert",
+            Self::Insert { .. } | Self::InsertSelect { .. } => "Insert",
             Self::Update { .. } => "Update",
             Self::Delete { .. } => "Delete",
             Self::CreateTable { .. } => "CreateTable",
@@ -1345,6 +1382,8 @@ impl LogicalPlan {
             Self::CreateBranch { .. } => "CreateBranch",
             Self::MergeBranch { .. } => "MergeBranch",
             Self::SystemView { .. } => "SystemView",
+            Self::TableFunction { .. } => "TableFunction",
+            Self::AlterTableMulti { .. } => "AlterTableMulti",
             _ => "Other",
         }
     }
@@ -1414,7 +1453,7 @@ impl LogicalPlan {
                 columns.extend(right.schema().columns.clone());
                 Arc::new(Schema { columns })
             }
-            LogicalPlan::Insert { .. } => {
+            LogicalPlan::Insert { .. } | LogicalPlan::InsertSelect { .. } => {
                 // Insert doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
             }
@@ -1458,6 +1497,10 @@ impl LogicalPlan {
             }
             LogicalPlan::AlterTableRename { .. } => {
                 // ALTER TABLE RENAME doesn't have output schema
+                Arc::new(Schema { columns: vec![] })
+            }
+            LogicalPlan::AlterTableMulti { .. } => {
+                // ALTER TABLE with multiple operations doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
             }
             LogicalPlan::CreateBranch { .. } => {
@@ -1565,6 +1608,28 @@ impl LogicalPlan {
                     // Fallback to empty schema if view not found
                     Arc::new(Schema { columns: vec![] })
                 }
+            }
+            LogicalPlan::TableFunction { function_name, .. } => {
+                // Table functions produce a virtual table with a single column
+                use crate::DataType;
+                let col_name = match function_name.as_str() {
+                    "generate_series" => "generate_series",
+                    "unnest" => "unnest",
+                    _ => function_name.as_str(),
+                };
+                Arc::new(Schema {
+                    columns: vec![crate::Column {
+                        name: col_name.to_string(),
+                        data_type: DataType::Int8,
+                        nullable: false,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: Default::default(),
+                    }],
+                })
             }
             LogicalPlan::With { query, .. } => {
                 // With clause returns the schema of the inner query

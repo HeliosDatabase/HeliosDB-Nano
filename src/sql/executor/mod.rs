@@ -27,7 +27,7 @@ pub mod window;
 pub mod set_ops;
 
 // Re-export operators for public API
-pub use scan::{ScanOperator, VectorScanOperator, MaterializedOperator};
+pub use scan::{ScanOperator, VectorScanOperator, MaterializedOperator, GenerateSeriesOperator, UnnestOperator};
 pub use filter::FilterOperator;
 pub use project::{ProjectOperator, LimitOperator};
 pub use join::{NestedLoopJoinOperator, HashJoinOperator};
@@ -537,6 +537,9 @@ impl<'a> Executor<'a> {
             }
             LogicalPlan::FilteredScan { .. } => {
                 scan::handle_filtered_scan(self, plan)
+            }
+            LogicalPlan::TableFunction { .. } => {
+                scan::handle_table_function(self, plan)
             }
             LogicalPlan::Filter { input, predicate } => {
                 // Try PK index-based point lookup for Filter(Scan) with equality predicate

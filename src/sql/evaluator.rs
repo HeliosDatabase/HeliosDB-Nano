@@ -1418,6 +1418,9 @@ impl Evaluator {
             // Array operators
             BinaryOperator::ArrayConcat => self.array_concat_op(left, right),
 
+            // String concatenation: ||
+            BinaryOperator::StringConcat => self.string_concat_op(left, right),
+
             // String pattern matching (LIKE)
             BinaryOperator::Like => self.like_op(left, right, false),
             BinaryOperator::NotLike => self.like_op(left, right, true),
@@ -3440,6 +3443,69 @@ impl Evaluator {
                 "Array concatenation requires arrays or array-compatible types, got {:?} || {:?}",
                 left, right
             ))),
+        }
+    }
+
+    /// String concatenation operator: ||
+    /// Per SQL standard: if either operand is NULL, the result is NULL.
+    /// Non-string types are cast to their string representation (PostgreSQL behavior).
+    /// If either operand is an array, delegates to array concatenation instead.
+    fn string_concat_op(&self, left: &Value, right: &Value) -> Result<Value> {
+        // If either operand is an array, delegate to array concatenation
+        if matches!(left, Value::Array(_)) || matches!(right, Value::Array(_)) {
+            return self.array_concat_op(left, right);
+        }
+        // SQL standard: NULL || anything = NULL
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let left_str = Self::value_to_concat_string(left);
+        let right_str = Self::value_to_concat_string(right);
+        Ok(Value::String(format!("{}{}", left_str, right_str)))
+    }
+
+    /// Convert a Value to its string representation for concatenation.
+    /// Unlike Display, this returns the raw value without quoting.
+    fn value_to_concat_string(value: &Value) -> String {
+        match value {
+            Value::Null => String::new(),
+            Value::Boolean(b) => b.to_string(),
+            Value::Int2(i) => i.to_string(),
+            Value::Int4(i) => i.to_string(),
+            Value::Int8(i) => i.to_string(),
+            Value::Float4(f) => f.to_string(),
+            Value::Float8(f) => f.to_string(),
+            Value::Numeric(n) => n.clone(),
+            Value::String(s) => s.clone(),
+            Value::Bytes(b) => format!("\\x{}", hex::encode(b)),
+            Value::Uuid(u) => u.to_string(),
+            Value::Timestamp(ts) => ts.to_rfc3339(),
+            Value::Date(d) => d.format("%Y-%m-%d").to_string(),
+            Value::Time(t) => t.format("%H:%M:%S%.f").to_string(),
+            Value::Interval(micros) => {
+                let total_secs = micros / 1_000_000;
+                let days = total_secs / 86400;
+                let hours = (total_secs % 86400) / 3600;
+                let mins = (total_secs % 3600) / 60;
+                let secs = total_secs % 60;
+                if days > 0 {
+                    format!("{} days {:02}:{:02}:{:02}", days, hours, mins, secs)
+                } else {
+                    format!("{:02}:{:02}:{:02}", hours, mins, secs)
+                }
+            }
+            Value::Json(j) => j.clone(),
+            Value::Array(arr) => {
+                let elems: Vec<String> = arr.iter().map(|v| Self::value_to_concat_string(v)).collect();
+                format!("{{{}}}", elems.join(","))
+            }
+            Value::Vector(vec) => format!("[{}]", vec.iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(",")),
+            Value::DictRef { dict_id } => format!("<dict:{}>", dict_id),
+            Value::CasRef { hash } => format!("<cas:{}>", hex::encode(&hash[..8])),
+            Value::ColumnarRef => "<columnar>".to_string(),
         }
     }
 

@@ -1,16 +1,13 @@
 //! Aggregate function hardening tests for HeliosDB Nano
 //!
 //! Covers edge cases in: COUNT, SUM, AVG, MIN, MAX with empty tables,
-//! NULL values, DISTINCT, GROUP BY, HAVING, and mixed expressions.
+//! NULL values, DISTINCT, GROUP BY, HAVING, mixed expressions, and
+//! aggregate expressions (arithmetic on aggregates, CASE/CAST wrapping aggregates).
 //!
 //! The engine implements SQL-standard aggregate NULL handling:
 //! - MIN/MAX on empty set or all-NULL input returns NULL
 //! - COUNT(col) skips NULLs; COUNT(*) counts all rows
-//! - Aggregate expressions inside CASE/CAST/arithmetic are not yet supported
-//!   when the aggregate appears as a nested sub-expression of a non-aggregate
-//!   expression in the SELECT list
-//! - HAVING with compound conditions (AND/OR) or aggregates not in SELECT
-//!   may not filter correctly
+//! - Aggregate expressions: SUM(a)+SUM(b), CAST(AVG(x) AS INT), CASE WHEN COUNT(*)>0, etc.
 
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod aggregate_hardening {
@@ -696,78 +693,78 @@ mod aggregate_hardening {
     // 7. Mixed aggregates and expressions
     // ========================================================================
 
-    /// SUM(a) + SUM(b) in a single SELECT. The engine does not currently support
-    /// aggregate functions used as sub-expressions in arithmetic. This test
-    /// documents that the query returns an error.
+    /// SUM(a) + SUM(b) in a single SELECT - arithmetic on aggregate results.
     #[test]
-    fn test_sum_plus_sum_not_yet_supported() {
+    fn test_sum_plus_sum() {
         let d = db();
         d.execute("CREATE TABLE mix_sum2 (id INT, a INT, b INT)").unwrap();
         d.execute("INSERT INTO mix_sum2 VALUES (1, 10, 100)").unwrap();
         d.execute("INSERT INTO mix_sum2 VALUES (2, 20, 200)").unwrap();
 
-        let result = d.query("SELECT SUM(a) + SUM(b) FROM mix_sum2", &[]);
-        // Currently errors: aggregate inside binary expression not implemented
-        assert!(result.is_err(),
-            "SUM(a) + SUM(b) is not yet supported (aggregate inside expression)");
+        let rows = d.query("SELECT SUM(a) + SUM(b) FROM mix_sum2", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        // SUM(a) = 30, SUM(b) = 300, total = 330
+        assert_eq!(to_i64(rows[0].get(0).unwrap()), 330);
     }
 
-    /// Aggregate inside CASE expression is not yet supported.
+    /// Aggregate inside CASE expression.
     #[test]
-    fn test_aggregate_in_case_not_yet_supported() {
+    fn test_aggregate_in_case() {
         let d = db();
         d.execute("CREATE TABLE mix_case (id INT, val INT)").unwrap();
         d.execute("INSERT INTO mix_case VALUES (1, 10)").unwrap();
 
-        let result = d.query(
+        let rows = d.query(
             "SELECT CASE WHEN COUNT(*) > 0 THEN 'yes' ELSE 'no' END FROM mix_case",
             &[]
-        );
-        assert!(result.is_err(),
-            "Aggregate inside CASE expression is not yet supported");
+        ).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("yes".to_string()));
     }
 
-    /// CAST(AVG(col) AS INTEGER) is not yet supported because the aggregate
-    /// appears as a nested sub-expression inside CAST.
+    /// CAST(AVG(col) AS INTEGER) - aggregate inside CAST.
     #[test]
-    fn test_cast_avg_not_yet_supported() {
+    fn test_cast_avg() {
         let d = db();
         d.execute("CREATE TABLE mix_cast (id INT, val INT)").unwrap();
         d.execute("INSERT INTO mix_cast VALUES (1, 10)").unwrap();
         d.execute("INSERT INTO mix_cast VALUES (2, 20)").unwrap();
 
-        let result = d.query("SELECT CAST(AVG(val) AS INTEGER) FROM mix_cast", &[]);
-        assert!(result.is_err(),
-            "CAST(AVG(col) AS INTEGER) is not yet supported (aggregate inside CAST)");
+        let rows = d.query("SELECT CAST(AVG(val) AS INTEGER) FROM mix_cast", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        // AVG(val) = 15.0, CAST to INTEGER = 15
+        assert_eq!(to_i64(rows[0].get(0).unwrap()), 15);
     }
 
-    /// SUM(val * 2) and SUM(val) * 2 -- the first works (expression inside aggregate)
-    /// but the second fails (aggregate inside expression).
+    /// SUM(val * 2) and SUM(val) * 2 -- both work.
+    /// The first has an expression inside the aggregate.
+    /// The second has an aggregate inside an expression (now supported).
     #[test]
-    fn test_sum_with_expression_inside_aggregate() {
+    fn test_sum_with_expression_inside_and_outside_aggregate() {
         let d = db();
         d.execute("CREATE TABLE mix_arith (id INT, val INT)").unwrap();
         d.execute("INSERT INTO mix_arith VALUES (1, 10)").unwrap();
         d.execute("INSERT INTO mix_arith VALUES (2, 20)").unwrap();
         d.execute("INSERT INTO mix_arith VALUES (3, 30)").unwrap();
 
-        // SUM(val * 2) works: expression inside aggregate is fine
+        // SUM(val * 2) works: expression inside aggregate
         let rows = d.query("SELECT SUM(val * 2) FROM mix_arith", &[]).unwrap();
         assert_eq!(to_i64(rows[0].get(0).unwrap()), 120,
             "SUM(val * 2) = 20+40+60 = 120");
     }
 
+    /// SUM(val) * 2 - aggregate inside expression (now supported).
     #[test]
-    fn test_aggregate_outside_expression_not_yet_supported() {
+    fn test_aggregate_outside_expression() {
         let d = db();
         d.execute("CREATE TABLE mix_arith2 (id INT, val INT)").unwrap();
         d.execute("INSERT INTO mix_arith2 VALUES (1, 10)").unwrap();
         d.execute("INSERT INTO mix_arith2 VALUES (2, 20)").unwrap();
 
-        // SUM(val) * 2 fails: aggregate as sub-expression of binary op
-        let result = d.query("SELECT SUM(val) * 2 FROM mix_arith2", &[]);
-        assert!(result.is_err(),
-            "SUM(val) * 2 is not yet supported (aggregate inside binary expression)");
+        let rows = d.query("SELECT SUM(val) * 2 FROM mix_arith2", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        // SUM(val) = 30, 30 * 2 = 60
+        assert_eq!(to_i64(rows[0].get(0).unwrap()), 60);
     }
 
     // ========================================================================
@@ -904,10 +901,9 @@ mod aggregate_hardening {
         assert_eq!(to_i64(rows[2].get(1).unwrap()), 30);
     }
 
-    /// ORDER BY SUM(val) DESC does not correctly sort by the aggregate result.
-    /// This test documents the known limitation.
+    /// ORDER BY SUM(val) DESC correctly sorts rows by the aggregate result.
     #[test]
-    fn test_order_by_aggregate_does_not_sort_correctly() {
+    fn test_order_by_aggregate_sorts_correctly() {
         let d = db();
         d.execute("CREATE TABLE gb_ord2 (grp TEXT, val INT)").unwrap();
         d.execute("INSERT INTO gb_ord2 VALUES ('C', 30)").unwrap();
@@ -915,20 +911,20 @@ mod aggregate_hardening {
         d.execute("INSERT INTO gb_ord2 VALUES ('B', 20)").unwrap();
         d.execute("INSERT INTO gb_ord2 VALUES ('A', 5)").unwrap();
 
-        // The query executes but ORDER BY SUM(val) DESC does not reorder rows
-        let result = d.query(
+        // ORDER BY SUM(val) DESC should sort by aggregate descending: C=30, B=20, A=15
+        let rows = d.query(
             "SELECT grp, SUM(val) FROM gb_ord2 GROUP BY grp ORDER BY SUM(val) DESC",
             &[]
-        );
-        assert!(result.is_ok(),
-            "ORDER BY aggregate should execute without error even if sorting is incorrect");
-        let rows = result.unwrap();
-        assert_eq!(rows.len(), 3, "Should still return all 3 groups");
+        ).unwrap();
+        assert_eq!(rows.len(), 3, "Should return all 3 groups");
 
-        // Verify the aggregate values are correct regardless of order
-        let mut sums: Vec<i64> = rows.iter().map(|r| to_i64(r.get(1).unwrap())).collect();
-        sums.sort();
-        assert_eq!(sums, vec![15, 20, 30], "All aggregate sums should be present");
+        // Verify ordering: C (30), B (20), A (15)
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("C".to_string()));
+        assert_eq!(to_i64(rows[0].get(1).unwrap()), 30);
+        assert_eq!(rows[1].get(0).unwrap(), &Value::String("B".to_string()));
+        assert_eq!(to_i64(rows[1].get(1).unwrap()), 20);
+        assert_eq!(rows[2].get(0).unwrap(), &Value::String("A".to_string()));
+        assert_eq!(to_i64(rows[2].get(1).unwrap()), 15);
     }
 
     #[test]
@@ -969,5 +965,403 @@ mod aggregate_hardening {
             "MIN on text should return lexicographically smallest");
         assert_eq!(rows[0].get(1).unwrap(), &Value::String("cherry".to_string()),
             "MAX on text should return lexicographically largest");
+    }
+
+    // ========================================================================
+    // Aggregate Expressions: arithmetic, CAST, CASE wrapping aggregate results
+    // ========================================================================
+
+    /// SUM(a) + SUM(b) - arithmetic on two aggregate results
+    #[test]
+    fn test_aggregate_expr_sum_plus_sum() {
+        let d = db();
+        d.execute("CREATE TABLE agg_expr1 (a INT, b INT)").unwrap();
+        d.execute("INSERT INTO agg_expr1 VALUES (10, 1)").unwrap();
+        d.execute("INSERT INTO agg_expr1 VALUES (20, 2)").unwrap();
+        d.execute("INSERT INTO agg_expr1 VALUES (30, 3)").unwrap();
+
+        let rows = d.query("SELECT SUM(a) + SUM(b) FROM agg_expr1", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        // SUM(a) = 60, SUM(b) = 6, total = 66
+        assert_eq!(to_i64(rows[0].get(0).unwrap()), 66);
+    }
+
+    /// COUNT(*) * 2 - arithmetic with literal on aggregate
+    #[test]
+    fn test_aggregate_expr_count_times_literal() {
+        let d = db();
+        d.execute("CREATE TABLE agg_expr2 (id INT)").unwrap();
+        d.execute("INSERT INTO agg_expr2 VALUES (1)").unwrap();
+        d.execute("INSERT INTO agg_expr2 VALUES (2)").unwrap();
+        d.execute("INSERT INTO agg_expr2 VALUES (3)").unwrap();
+        d.execute("INSERT INTO agg_expr2 VALUES (4)").unwrap();
+
+        let rows = d.query("SELECT COUNT(*) * 2 FROM agg_expr2", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        // COUNT(*) = 4, 4 * 2 = 8
+        assert_eq!(to_i64(rows[0].get(0).unwrap()), 8);
+    }
+
+    /// CAST(AVG(val) AS INTEGER) - cast wrapping an aggregate
+    #[test]
+    fn test_aggregate_expr_cast_avg_as_integer() {
+        let d = db();
+        d.execute("CREATE TABLE agg_expr3 (val INT)").unwrap();
+        d.execute("INSERT INTO agg_expr3 VALUES (10)").unwrap();
+        d.execute("INSERT INTO agg_expr3 VALUES (20)").unwrap();
+        d.execute("INSERT INTO agg_expr3 VALUES (33)").unwrap();
+
+        let rows = d.query("SELECT CAST(AVG(val) AS INTEGER) FROM agg_expr3", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        // AVG(val) = 21.0, CAST to INTEGER = 21
+        assert_eq!(to_i64(rows[0].get(0).unwrap()), 21);
+    }
+
+    /// SUM(val) / COUNT(val) - manual average using two aggregates
+    #[test]
+    fn test_aggregate_expr_manual_average() {
+        let d = db();
+        d.execute("CREATE TABLE agg_expr4 (val INT)").unwrap();
+        d.execute("INSERT INTO agg_expr4 VALUES (10)").unwrap();
+        d.execute("INSERT INTO agg_expr4 VALUES (20)").unwrap();
+        d.execute("INSERT INTO agg_expr4 VALUES (30)").unwrap();
+
+        let rows = d.query("SELECT SUM(val) / COUNT(val) FROM agg_expr4", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        // SUM(val) = 60, COUNT(val) = 3, 60 / 3 = 20
+        assert_eq!(to_i64(rows[0].get(0).unwrap()), 20);
+    }
+
+    /// CASE WHEN COUNT(*) > 0 THEN 'yes' ELSE 'no' END - CASE on aggregate
+    #[test]
+    fn test_aggregate_expr_case_on_count() {
+        let d = db();
+        d.execute("CREATE TABLE agg_expr5 (id INT)").unwrap();
+        d.execute("INSERT INTO agg_expr5 VALUES (1)").unwrap();
+
+        let rows = d.query(
+            "SELECT CASE WHEN COUNT(*) > 0 THEN 'yes' ELSE 'no' END FROM agg_expr5",
+            &[],
+        ).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("yes".to_string()));
+    }
+
+    /// CASE WHEN COUNT(*) > 0 on empty table
+    #[test]
+    fn test_aggregate_expr_case_on_count_empty() {
+        let d = db();
+        d.execute("CREATE TABLE agg_expr5b (id INT)").unwrap();
+
+        let rows = d.query(
+            "SELECT CASE WHEN COUNT(*) > 0 THEN 'yes' ELSE 'no' END FROM agg_expr5b",
+            &[],
+        ).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("no".to_string()));
+    }
+
+    /// Multiple aggregate expressions in the same SELECT
+    #[test]
+    fn test_aggregate_expr_multiple_expressions() {
+        let d = db();
+        d.execute("CREATE TABLE agg_expr6 (val INT)").unwrap();
+        d.execute("INSERT INTO agg_expr6 VALUES (5)").unwrap();
+        d.execute("INSERT INTO agg_expr6 VALUES (15)").unwrap();
+        d.execute("INSERT INTO agg_expr6 VALUES (25)").unwrap();
+
+        let rows = d.query(
+            "SELECT SUM(val) * 2, COUNT(*) + 1, MAX(val) - MIN(val) FROM agg_expr6",
+            &[],
+        ).unwrap();
+        assert_eq!(rows.len(), 1);
+        // SUM(val) = 45, 45 * 2 = 90
+        assert_eq!(to_i64(rows[0].get(0).unwrap()), 90);
+        // COUNT(*) = 3, 3 + 1 = 4
+        assert_eq!(to_i64(rows[0].get(1).unwrap()), 4);
+        // MAX(val) = 25, MIN(val) = 5, 25 - 5 = 20
+        assert_eq!(to_i64(rows[0].get(2).unwrap()), 20);
+    }
+
+    /// Aggregate expression with GROUP BY
+    #[test]
+    fn test_aggregate_expr_with_group_by() {
+        let d = db();
+        d.execute("CREATE TABLE agg_expr7 (dept TEXT, salary INT)").unwrap();
+        d.execute("INSERT INTO agg_expr7 VALUES ('eng', 100)").unwrap();
+        d.execute("INSERT INTO agg_expr7 VALUES ('eng', 200)").unwrap();
+        d.execute("INSERT INTO agg_expr7 VALUES ('sales', 50)").unwrap();
+        d.execute("INSERT INTO agg_expr7 VALUES ('sales', 150)").unwrap();
+
+        let rows = d.query(
+            "SELECT dept, SUM(salary) * 2 FROM agg_expr7 GROUP BY dept ORDER BY dept",
+            &[],
+        ).unwrap();
+        assert_eq!(rows.len(), 2);
+        // eng: SUM(salary) = 300, 300 * 2 = 600
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("eng".to_string()));
+        assert_eq!(to_i64(rows[0].get(1).unwrap()), 600);
+        // sales: SUM(salary) = 200, 200 * 2 = 400
+        assert_eq!(rows[1].get(0).unwrap(), &Value::String("sales".to_string()));
+        assert_eq!(to_i64(rows[1].get(1).unwrap()), 400);
+    }
+
+    /// Aggregate expression with HAVING
+    #[test]
+    fn test_aggregate_expr_with_having() {
+        let d = db();
+        d.execute("CREATE TABLE agg_expr8 (dept TEXT, salary INT)").unwrap();
+        d.execute("INSERT INTO agg_expr8 VALUES ('eng', 100)").unwrap();
+        d.execute("INSERT INTO agg_expr8 VALUES ('eng', 200)").unwrap();
+        d.execute("INSERT INTO agg_expr8 VALUES ('eng', 300)").unwrap();
+        d.execute("INSERT INTO agg_expr8 VALUES ('sales', 50)").unwrap();
+
+        let rows = d.query(
+            "SELECT dept, SUM(salary) + COUNT(*) FROM agg_expr8 GROUP BY dept HAVING COUNT(*) > 1",
+            &[],
+        ).unwrap();
+        assert_eq!(rows.len(), 1);
+        // Only eng has COUNT(*) > 1. SUM(salary) = 600, COUNT(*) = 3, result = 603
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("eng".to_string()));
+        assert_eq!(to_i64(rows[0].get(1).unwrap()), 603);
+    }
+
+    /// SUM(val) * 2 - simple multiply on aggregate
+    #[test]
+    fn test_aggregate_expr_sum_times_two() {
+        let d = db();
+        d.execute("CREATE TABLE agg_expr9 (val INT)").unwrap();
+        d.execute("INSERT INTO agg_expr9 VALUES (7)").unwrap();
+        d.execute("INSERT INTO agg_expr9 VALUES (13)").unwrap();
+
+        let rows = d.query("SELECT SUM(val) * 2 FROM agg_expr9", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        // SUM(val) = 20, 20 * 2 = 40
+        assert_eq!(to_i64(rows[0].get(0).unwrap()), 40);
+    }
+
+    /// Deduplicated aggregate: same aggregate used twice in different expressions
+    #[test]
+    fn test_aggregate_expr_same_agg_twice() {
+        let d = db();
+        d.execute("CREATE TABLE agg_expr10 (val INT)").unwrap();
+        d.execute("INSERT INTO agg_expr10 VALUES (10)").unwrap();
+        d.execute("INSERT INTO agg_expr10 VALUES (20)").unwrap();
+
+        let rows = d.query(
+            "SELECT SUM(val) + SUM(val), SUM(val) * 3 FROM agg_expr10",
+            &[],
+        ).unwrap();
+        assert_eq!(rows.len(), 1);
+        // SUM(val) = 30, 30 + 30 = 60
+        assert_eq!(to_i64(rows[0].get(0).unwrap()), 60);
+        // 30 * 3 = 90
+        assert_eq!(to_i64(rows[0].get(1).unwrap()), 90);
+    }
+
+    // ========================================================================
+    // ORDER BY aggregate tests
+    // ========================================================================
+
+    #[test]
+    fn test_order_by_count_star_desc() {
+        let d = db();
+        d.execute("CREATE TABLE ob_cnt (dept TEXT, emp TEXT)").unwrap();
+        d.execute("INSERT INTO ob_cnt VALUES ('Sales', 'Alice')").unwrap();
+        d.execute("INSERT INTO ob_cnt VALUES ('Sales', 'Bob')").unwrap();
+        d.execute("INSERT INTO ob_cnt VALUES ('Sales', 'Carol')").unwrap();
+        d.execute("INSERT INTO ob_cnt VALUES ('Eng', 'Dave')").unwrap();
+        d.execute("INSERT INTO ob_cnt VALUES ('Eng', 'Eve')").unwrap();
+        d.execute("INSERT INTO ob_cnt VALUES ('HR', 'Frank')").unwrap();
+
+        let rows = d.query(
+            "SELECT dept, COUNT(*) FROM ob_cnt GROUP BY dept ORDER BY COUNT(*) DESC",
+            &[]
+        ).unwrap();
+        assert_eq!(rows.len(), 3);
+
+        // Sales=3, Eng=2, HR=1
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("Sales".to_string()));
+        assert_eq!(to_i64(rows[0].get(1).unwrap()), 3);
+        assert_eq!(rows[1].get(0).unwrap(), &Value::String("Eng".to_string()));
+        assert_eq!(to_i64(rows[1].get(1).unwrap()), 2);
+        assert_eq!(rows[2].get(0).unwrap(), &Value::String("HR".to_string()));
+        assert_eq!(to_i64(rows[2].get(1).unwrap()), 1);
+    }
+
+    #[test]
+    fn test_order_by_sum_asc() {
+        let d = db();
+        d.execute("CREATE TABLE ob_sum (grp TEXT, val INT)").unwrap();
+        d.execute("INSERT INTO ob_sum VALUES ('X', 100)").unwrap();
+        d.execute("INSERT INTO ob_sum VALUES ('Y', 10)").unwrap();
+        d.execute("INSERT INTO ob_sum VALUES ('Z', 50)").unwrap();
+        d.execute("INSERT INTO ob_sum VALUES ('X', 200)").unwrap();
+        d.execute("INSERT INTO ob_sum VALUES ('Y', 20)").unwrap();
+
+        let rows = d.query(
+            "SELECT grp, SUM(val) FROM ob_sum GROUP BY grp ORDER BY SUM(val) ASC",
+            &[]
+        ).unwrap();
+        assert_eq!(rows.len(), 3);
+
+        // Y=30, Z=50, X=300
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("Y".to_string()));
+        assert_eq!(to_i64(rows[0].get(1).unwrap()), 30);
+        assert_eq!(rows[1].get(0).unwrap(), &Value::String("Z".to_string()));
+        assert_eq!(to_i64(rows[1].get(1).unwrap()), 50);
+        assert_eq!(rows[2].get(0).unwrap(), &Value::String("X".to_string()));
+        assert_eq!(to_i64(rows[2].get(1).unwrap()), 300);
+    }
+
+    #[test]
+    fn test_order_by_avg_desc() {
+        let d = db();
+        d.execute("CREATE TABLE ob_avg (team TEXT, score INT)").unwrap();
+        d.execute("INSERT INTO ob_avg VALUES ('A', 90)").unwrap();
+        d.execute("INSERT INTO ob_avg VALUES ('A', 80)").unwrap();
+        d.execute("INSERT INTO ob_avg VALUES ('B', 100)").unwrap();
+        d.execute("INSERT INTO ob_avg VALUES ('B', 60)").unwrap();
+        d.execute("INSERT INTO ob_avg VALUES ('C', 70)").unwrap();
+        d.execute("INSERT INTO ob_avg VALUES ('C', 70)").unwrap();
+
+        let rows = d.query(
+            "SELECT team, AVG(score) FROM ob_avg GROUP BY team ORDER BY AVG(score) DESC",
+            &[]
+        ).unwrap();
+        assert_eq!(rows.len(), 3);
+
+        // A: avg=85, B: avg=80, C: avg=70
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("A".to_string()));
+        let avg_a = to_f64(rows[0].get(1).unwrap());
+        assert!((avg_a - 85.0).abs() < 0.01, "A avg should be 85, got {}", avg_a);
+
+        assert_eq!(rows[1].get(0).unwrap(), &Value::String("B".to_string()));
+        let avg_b = to_f64(rows[1].get(1).unwrap());
+        assert!((avg_b - 80.0).abs() < 0.01, "B avg should be 80, got {}", avg_b);
+
+        assert_eq!(rows[2].get(0).unwrap(), &Value::String("C".to_string()));
+        let avg_c = to_f64(rows[2].get(1).unwrap());
+        assert!((avg_c - 70.0).abs() < 0.01, "C avg should be 70, got {}", avg_c);
+    }
+
+    #[test]
+    fn test_order_by_aggregate_alias() {
+        let d = db();
+        d.execute("CREATE TABLE ob_alias (dept TEXT, salary INT)").unwrap();
+        d.execute("INSERT INTO ob_alias VALUES ('Eng', 120)").unwrap();
+        d.execute("INSERT INTO ob_alias VALUES ('Eng', 100)").unwrap();
+        d.execute("INSERT INTO ob_alias VALUES ('Sales', 80)").unwrap();
+        d.execute("INSERT INTO ob_alias VALUES ('HR', 90)").unwrap();
+
+        // ORDER BY alias "total" instead of repeating SUM(salary)
+        let rows = d.query(
+            "SELECT dept, SUM(salary) AS total FROM ob_alias GROUP BY dept ORDER BY total DESC",
+            &[]
+        ).unwrap();
+        assert_eq!(rows.len(), 3);
+
+        // Eng=220, HR=90, Sales=80
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("Eng".to_string()));
+        assert_eq!(to_i64(rows[0].get(1).unwrap()), 220);
+        assert_eq!(rows[1].get(0).unwrap(), &Value::String("HR".to_string()));
+        assert_eq!(to_i64(rows[1].get(1).unwrap()), 90);
+        assert_eq!(rows[2].get(0).unwrap(), &Value::String("Sales".to_string()));
+        assert_eq!(to_i64(rows[2].get(1).unwrap()), 80);
+    }
+
+    #[test]
+    fn test_order_by_aggregate_with_having() {
+        let d = db();
+        d.execute("CREATE TABLE ob_hav (cat TEXT, amt INT)").unwrap();
+        d.execute("INSERT INTO ob_hav VALUES ('A', 10)").unwrap();
+        d.execute("INSERT INTO ob_hav VALUES ('A', 20)").unwrap();
+        d.execute("INSERT INTO ob_hav VALUES ('B', 5)").unwrap();
+        d.execute("INSERT INTO ob_hav VALUES ('B', 3)").unwrap();
+        d.execute("INSERT INTO ob_hav VALUES ('C', 50)").unwrap();
+        d.execute("INSERT INTO ob_hav VALUES ('C', 40)").unwrap();
+        d.execute("INSERT INTO ob_hav VALUES ('D', 1)").unwrap();
+
+        // HAVING filters groups where SUM(amt) < 10, then ORDER BY SUM(amt) DESC
+        // A=30, B=8 (filtered), C=90, D=1 (filtered)
+        let rows = d.query(
+            "SELECT cat, SUM(amt) FROM ob_hav GROUP BY cat HAVING SUM(amt) >= 10 ORDER BY SUM(amt) DESC",
+            &[]
+        ).unwrap();
+        assert_eq!(rows.len(), 2, "B (sum=8) and D (sum=1) should be filtered out by HAVING");
+
+        // C=90, A=30
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("C".to_string()));
+        assert_eq!(to_i64(rows[0].get(1).unwrap()), 90);
+        assert_eq!(rows[1].get(0).unwrap(), &Value::String("A".to_string()));
+        assert_eq!(to_i64(rows[1].get(1).unwrap()), 30);
+    }
+
+    #[test]
+    fn test_order_by_multiple_with_aggregate() {
+        let d = db();
+        d.execute("CREATE TABLE ob_multi (region TEXT, dept TEXT, val INT)").unwrap();
+        d.execute("INSERT INTO ob_multi VALUES ('East', 'Sales', 10)").unwrap();
+        d.execute("INSERT INTO ob_multi VALUES ('East', 'Sales', 20)").unwrap();
+        d.execute("INSERT INTO ob_multi VALUES ('East', 'Eng', 50)").unwrap();
+        d.execute("INSERT INTO ob_multi VALUES ('West', 'Sales', 30)").unwrap();
+        d.execute("INSERT INTO ob_multi VALUES ('West', 'Eng', 40)").unwrap();
+
+        // ORDER BY region ASC, then by SUM(val) DESC within each region
+        let rows = d.query(
+            "SELECT region, dept, SUM(val) FROM ob_multi GROUP BY region, dept ORDER BY region ASC, SUM(val) DESC",
+            &[]
+        ).unwrap();
+        assert_eq!(rows.len(), 4);
+
+        // East groups: Eng=50, Sales=30 (sorted by SUM DESC)
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("East".to_string()));
+        assert_eq!(rows[0].get(1).unwrap(), &Value::String("Eng".to_string()));
+        assert_eq!(to_i64(rows[0].get(2).unwrap()), 50);
+
+        assert_eq!(rows[1].get(0).unwrap(), &Value::String("East".to_string()));
+        assert_eq!(rows[1].get(1).unwrap(), &Value::String("Sales".to_string()));
+        assert_eq!(to_i64(rows[1].get(2).unwrap()), 30);
+
+        // West groups: Eng=40, Sales=30 (sorted by SUM DESC)
+        assert_eq!(rows[2].get(0).unwrap(), &Value::String("West".to_string()));
+        assert_eq!(rows[2].get(1).unwrap(), &Value::String("Eng".to_string()));
+        assert_eq!(to_i64(rows[2].get(2).unwrap()), 40);
+
+        assert_eq!(rows[3].get(0).unwrap(), &Value::String("West".to_string()));
+        assert_eq!(rows[3].get(1).unwrap(), &Value::String("Sales".to_string()));
+        assert_eq!(to_i64(rows[3].get(2).unwrap()), 30);
+    }
+
+    #[test]
+    fn test_order_by_min_max_aggregate() {
+        let d = db();
+        d.execute("CREATE TABLE ob_minmax (grp TEXT, val INT)").unwrap();
+        d.execute("INSERT INTO ob_minmax VALUES ('A', 5)").unwrap();
+        d.execute("INSERT INTO ob_minmax VALUES ('A', 15)").unwrap();
+        d.execute("INSERT INTO ob_minmax VALUES ('B', 1)").unwrap();
+        d.execute("INSERT INTO ob_minmax VALUES ('B', 100)").unwrap();
+        d.execute("INSERT INTO ob_minmax VALUES ('C', 10)").unwrap();
+        d.execute("INSERT INTO ob_minmax VALUES ('C', 20)").unwrap();
+
+        // ORDER BY MIN(val) ASC
+        let rows = d.query(
+            "SELECT grp, MIN(val), MAX(val) FROM ob_minmax GROUP BY grp ORDER BY MIN(val) ASC",
+            &[]
+        ).unwrap();
+        assert_eq!(rows.len(), 3);
+
+        // B: min=1, A: min=5, C: min=10
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("B".to_string()));
+        assert_eq!(to_i64(rows[0].get(1).unwrap()), 1);
+        assert_eq!(to_i64(rows[0].get(2).unwrap()), 100);
+
+        assert_eq!(rows[1].get(0).unwrap(), &Value::String("A".to_string()));
+        assert_eq!(to_i64(rows[1].get(1).unwrap()), 5);
+        assert_eq!(to_i64(rows[1].get(2).unwrap()), 15);
+
+        assert_eq!(rows[2].get(0).unwrap(), &Value::String("C".to_string()));
+        assert_eq!(to_i64(rows[2].get(1).unwrap()), 10);
+        assert_eq!(to_i64(rows[2].get(2).unwrap()), 20);
     }
 }

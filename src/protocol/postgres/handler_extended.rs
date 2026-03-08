@@ -396,7 +396,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     let catalog = self.database.storage.catalog();
                     let planner = crate::sql::planner::Planner::with_catalog(&catalog);
                     let plan = planner.statement_to_plan(statement.clone())?;
-                    if let crate::sql::LogicalPlan::Insert { table_name, returning: Some(ref items), .. } = plan {
+                    if let crate::sql::LogicalPlan::Insert { table_name, returning: Some(ref items), .. }
+                        | crate::sql::LogicalPlan::InsertSelect { table_name, returning: Some(ref items), .. } = plan {
                         let table_schema = catalog.get_table_schema(&table_name)?;
                         Ok(Some(crate::EmbeddedDatabase::returning_schema(&table_schema, items)))
                     } else {

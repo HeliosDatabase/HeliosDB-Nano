@@ -558,6 +558,243 @@ pub(super) fn handle_filtered_scan(
     }
 }
 
+/// Generate series operator
+///
+/// Produces sequential integer values from start to stop (inclusive),
+/// with an optional step value. Implements PostgreSQL's `generate_series` function.
+///
+/// Examples:
+/// - `generate_series(1, 5)` produces: 1, 2, 3, 4, 5
+/// - `generate_series(1, 10, 2)` produces: 1, 3, 5, 7, 9
+/// - `generate_series(5, 1, -1)` produces: 5, 4, 3, 2, 1
+pub struct GenerateSeriesOperator {
+    /// Current value in the series
+    current: i64,
+    /// End value (inclusive)
+    stop: i64,
+    /// Step increment
+    step: i64,
+    /// Whether the series has been exhausted
+    exhausted: bool,
+    /// Output schema
+    schema: Arc<Schema>,
+}
+
+impl GenerateSeriesOperator {
+    /// Create a new generate_series operator
+    pub fn new(start: i64, stop: i64, step: i64, schema: Arc<Schema>) -> Self {
+        // Series is immediately exhausted if step direction doesn't match range direction
+        let exhausted = if step == 0 {
+            true // Zero step would be infinite loop
+        } else if step > 0 {
+            start > stop
+        } else {
+            start < stop
+        };
+
+        Self {
+            current: start,
+            stop,
+            step,
+            exhausted,
+            schema,
+        }
+    }
+}
+
+impl PhysicalOperator for GenerateSeriesOperator {
+    fn next(&mut self) -> Result<Option<Tuple>> {
+        if self.exhausted {
+            return Ok(None);
+        }
+
+        let value = self.current;
+
+        // Advance to next value
+        self.current = self.current.saturating_add(self.step);
+
+        // Check if we've passed the stop value
+        if self.step > 0 && self.current > self.stop {
+            self.exhausted = true;
+        } else if self.step < 0 && self.current < self.stop {
+            self.exhausted = true;
+        }
+
+        Ok(Some(Tuple::new(vec![crate::Value::Int8(value)])))
+    }
+
+    fn schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+}
+
+/// Unnest operator
+///
+/// Expands an array expression into a set of rows.
+/// Implements PostgreSQL's `unnest` function.
+pub struct UnnestOperator {
+    /// Pre-materialized values to return
+    values: Vec<crate::Value>,
+    /// Current index
+    current_index: usize,
+    /// Output schema
+    schema: Arc<Schema>,
+}
+
+impl UnnestOperator {
+    /// Create a new unnest operator from pre-evaluated values
+    pub fn new(values: Vec<crate::Value>, schema: Arc<Schema>) -> Self {
+        Self {
+            values,
+            current_index: 0,
+            schema,
+        }
+    }
+}
+
+impl PhysicalOperator for UnnestOperator {
+    fn next(&mut self) -> Result<Option<Tuple>> {
+        if self.current_index >= self.values.len() {
+            return Ok(None);
+        }
+
+        let value = self.values.get(self.current_index).cloned()
+            .ok_or_else(|| Error::query_execution("Unnest index out of bounds"))?;
+        self.current_index += 1;
+
+        Ok(Some(Tuple::new(vec![value])))
+    }
+
+    fn schema(&self) -> Arc<Schema> {
+        self.schema.clone()
+    }
+}
+
+/// Build a table function schema with source table information
+fn build_table_function_schema(col_name: &str, alias: &Option<String>) -> Arc<Schema> {
+    let source_name = alias.as_deref().unwrap_or(col_name);
+    Arc::new(Schema {
+        columns: vec![crate::Column {
+            name: col_name.to_string(),
+            data_type: crate::DataType::Int8,
+            nullable: false,
+            primary_key: false,
+            source_table: Some(source_name.to_string()),
+            source_table_name: Some(col_name.to_string()),
+            default_expr: None,
+            unique: false,
+            storage_mode: crate::ColumnStorageMode::Default,
+        }],
+    })
+}
+
+/// Evaluate a LogicalExpr argument to an i64 value for table functions
+fn eval_table_function_arg(expr: &crate::sql::LogicalExpr, params: &[crate::Value]) -> Result<i64> {
+    use crate::sql::LogicalExpr;
+    match expr {
+        LogicalExpr::Literal(crate::Value::Int4(v)) => Ok(i64::from(*v)),
+        LogicalExpr::Literal(crate::Value::Int8(v)) => Ok(*v),
+        LogicalExpr::Literal(crate::Value::Int2(v)) => Ok(i64::from(*v)),
+        LogicalExpr::Literal(crate::Value::Float4(v)) => Ok(*v as i64),
+        LogicalExpr::Literal(crate::Value::Float8(v)) => Ok(*v as i64),
+        LogicalExpr::UnaryExpr { op: crate::sql::UnaryOperator::Minus, expr: inner } => {
+            let val = eval_table_function_arg(inner, params)?;
+            Ok(-val)
+        }
+        LogicalExpr::Parameter { index } => {
+            if *index == 0 || *index > params.len() {
+                return Err(Error::query_execution(format!(
+                    "Parameter ${} out of range", index
+                )));
+            }
+            match &params[*index - 1] {
+                crate::Value::Int4(v) => Ok(i64::from(*v)),
+                crate::Value::Int8(v) => Ok(*v),
+                crate::Value::Int2(v) => Ok(i64::from(*v)),
+                other => Err(Error::query_execution(format!(
+                    "Expected integer parameter for table function, got {:?}", other
+                ))),
+            }
+        }
+        other => {
+            Err(Error::query_execution(format!(
+                "Table function argument must be a literal integer, got {:?}", other
+            )))
+        }
+    }
+}
+
+/// Handle TableFunction logical plan node
+pub(super) fn handle_table_function(
+    executor: &Executor,
+    plan: &LogicalPlan,
+) -> Result<Box<dyn PhysicalOperator>> {
+    if let LogicalPlan::TableFunction { function_name, args, alias } = plan {
+        match function_name.as_str() {
+            "generate_series" => {
+                if args.len() < 2 || args.len() > 3 {
+                    return Err(Error::query_execution(
+                        "generate_series requires 2 or 3 arguments: generate_series(start, stop[, step])"
+                    ));
+                }
+                let params = executor.parameters();
+                let start = eval_table_function_arg(args.first()
+                    .ok_or_else(|| Error::query_execution("Missing start argument"))?, params)?;
+                let stop = eval_table_function_arg(args.get(1)
+                    .ok_or_else(|| Error::query_execution("Missing stop argument"))?, params)?;
+                let step = if let Some(step_expr) = args.get(2) {
+                    let s = eval_table_function_arg(step_expr, params)?;
+                    if s == 0 {
+                        return Err(Error::query_execution(
+                            "generate_series step cannot be zero"
+                        ));
+                    }
+                    s
+                } else {
+                    1
+                };
+
+                let schema = build_table_function_schema("generate_series", alias);
+                Ok(Box::new(GenerateSeriesOperator::new(start, stop, step, schema)))
+            }
+            "unnest" => {
+                if args.is_empty() {
+                    return Err(Error::query_execution(
+                        "unnest requires at least one argument"
+                    ));
+                }
+                // For unnest, we expect array literal expressions
+                // Arrays are parsed as Literal(Value::Array(...)) by the planner
+                let mut values = Vec::new();
+                for arg in args {
+                    match arg {
+                        crate::sql::LogicalExpr::Literal(crate::Value::Array(arr)) => {
+                            values.extend(arr.iter().cloned());
+                        }
+                        crate::sql::LogicalExpr::Literal(v) => {
+                            // Single literal value treated as single-element array
+                            values.push(v.clone());
+                        }
+                        _ => {
+                            return Err(Error::query_execution(
+                                "UNNEST argument must be an array expression"
+                            ));
+                        }
+                    }
+                }
+
+                let schema = build_table_function_schema("unnest", alias);
+                Ok(Box::new(UnnestOperator::new(values, schema)))
+            }
+            _ => Err(Error::query_execution(format!(
+                "Unknown table function: {}", function_name
+            ))),
+        }
+    } else {
+        Err(Error::query_execution("Expected TableFunction plan node"))
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
