@@ -34,6 +34,7 @@ fn test_wal_integrity_verification_clean() {
     for i in 0..100 {
         wal.append(WalOperation::Insert {
             table: "test".to_string(),
+            key: vec![],
             tuple: vec![i],
         })
         .unwrap();
@@ -70,6 +71,7 @@ fn test_crash_recovery_basic() {
         for i in 0..50 {
             wal.append(WalOperation::Insert {
                 table: "users".to_string(),
+                key: vec![],
                 tuple: vec![i],
             })
             .unwrap();
@@ -105,6 +107,7 @@ fn test_crash_recovery_partial_replay() {
     for i in 0..100 {
         wal.append(WalOperation::Insert {
             table: "test".to_string(),
+            key: vec![],
             tuple: vec![i],
         })
         .unwrap();
@@ -129,6 +132,7 @@ fn test_crash_recovery_multiple_crashes() {
         for i in 0..25 {
             wal.append(WalOperation::Insert {
                 table: "test".to_string(),
+                key: vec![],
                 tuple: vec![i],
             })
             .unwrap();
@@ -174,6 +178,7 @@ fn test_wal_rotation() {
     for i in 0..100 {
         wal.append(WalOperation::Insert {
             table: "test".to_string(),
+            key: vec![],
             tuple: vec![i; 1000], // Large tuples
         })
         .unwrap();
@@ -202,6 +207,7 @@ fn test_wal_cleanup_by_time() {
     for i in 0..50 {
         wal.append(WalOperation::Insert {
             table: "test".to_string(),
+            key: vec![],
             tuple: vec![i],
         })
         .unwrap();
@@ -214,6 +220,7 @@ fn test_wal_cleanup_by_time() {
     for i in 50..100 {
         wal.append(WalOperation::Insert {
             table: "test".to_string(),
+            key: vec![],
             tuple: vec![i],
         })
         .unwrap();
@@ -237,6 +244,7 @@ fn test_wal_cleanup_respects_minimum() {
     for i in 0..100 {
         wal.append(WalOperation::Insert {
             table: "test".to_string(),
+            key: vec![],
             tuple: vec![i],
         })
         .unwrap();
@@ -265,6 +273,7 @@ fn test_wal_metrics() {
     for i in 0..50 {
         wal.append(WalOperation::Insert {
             table: "test".to_string(),
+            key: vec![],
             tuple: vec![i; 100],
         })
         .unwrap();
@@ -292,6 +301,7 @@ fn test_wal_transaction_operations() {
     wal.append(WalOperation::Begin { tx_id }).unwrap();
     wal.append(WalOperation::Insert {
         table: "users".to_string(),
+        key: vec![],
         tuple: vec![1, 2, 3],
     })
     .unwrap();
@@ -332,6 +342,7 @@ fn test_wal_table_operations() {
 
     wal.append(WalOperation::Insert {
         table: "users".to_string(),
+        key: vec![],
         tuple: vec![10, 20, 30],
     })
     .unwrap();
@@ -370,6 +381,7 @@ fn test_wal_sync_mode_changes() {
     // Write with sync mode
     wal.append(WalOperation::Insert {
         table: "test".to_string(),
+        key: vec![],
         tuple: vec![1, 2, 3],
     })
     .unwrap();
@@ -388,6 +400,7 @@ fn test_wal_flush_operations() {
     for i in 0..10 {
         wal.append(WalOperation::Insert {
             table: "test".to_string(),
+            key: vec![],
             tuple: vec![i],
         })
         .unwrap();
@@ -410,6 +423,7 @@ fn test_wal_truncate() {
     for i in 0..100 {
         wal.append(WalOperation::Insert {
             table: "test".to_string(),
+            key: vec![],
             tuple: vec![i],
         })
         .unwrap();
@@ -440,6 +454,7 @@ fn test_wal_concurrent_operations() {
                 wal_clone
                     .append(WalOperation::Insert {
                         table: format!("table_{}", thread_id),
+                        key: vec![],
                         tuple: vec![i],
                     })
                     .unwrap();
@@ -473,6 +488,7 @@ fn test_wal_large_entries() {
     for i in 0..10 {
         wal.append(WalOperation::Insert {
             table: "large_table".to_string(),
+            key: vec![],
             tuple: large_data.clone(),
         })
         .unwrap();
@@ -499,6 +515,7 @@ fn test_wal_recovery_after_truncate() {
         for i in 0..100 {
             wal.append(WalOperation::Insert {
                 table: "test".to_string(),
+                key: vec![],
                 tuple: vec![i],
             })
             .unwrap();
@@ -532,6 +549,7 @@ fn test_wal_metrics_after_cleanup() {
     for i in 0..100 {
         wal.append(WalOperation::Insert {
             table: "test".to_string(),
+            key: vec![],
             tuple: vec![i; 100],
         })
         .unwrap();
@@ -572,6 +590,7 @@ fn test_wal_all_sync_modes() {
         for i in 0..10 {
             wal.append(WalOperation::Insert {
                 table: "test".to_string(),
+                key: vec![],
                 tuple: vec![i],
             })
             .unwrap();

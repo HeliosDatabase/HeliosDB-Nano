@@ -7045,7 +7045,8 @@ impl Transaction<'_> {
         // For SELECT queries, we need to see our own writes
         // This is handled by the transaction's get() method which checks the write set first
         let mut executor = sql::Executor::with_storage(&self.db.storage)
-            .with_timeout(self.db.config.storage.query_timeout_ms);
+            .with_timeout(self.db.config.storage.query_timeout_ms)
+            .with_transaction(&self.tx);
 
         executor.execute(&plan)
     }
