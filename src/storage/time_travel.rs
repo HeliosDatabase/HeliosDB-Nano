@@ -592,7 +592,31 @@ impl SnapshotManager {
             }
         }
 
-        // No version found - fallback to checking if there are any versions at all
+        // No MVCC version entry found at or before this snapshot.
+        // Check if ANY version entries exist for this row. If none exist at all,
+        // the row was written through a non-versioned path (fast insert) and should
+        // be visible to all snapshots (it predates MVCC tracking).
+        let any_prefix = format!("v_idx:{}:{}:", table_name, row_id);
+        let any_iter = self.db.iterator(rocksdb::IteratorMode::From(
+            any_prefix.as_bytes(),
+            rocksdb::Direction::Forward
+        ));
+        let has_any_versions = any_iter
+            .take(1)
+            .filter_map(|item| item.ok())
+            .any(|(k, _)| k.starts_with(any_prefix.as_bytes()));
+
+        if !has_any_versions {
+            // No MVCC versions at all — row was written via non-versioned path.
+            // Read from the data key directly (pre-MVCC data visible to all snapshots).
+            let data_key = format!("data:{}:{}", table_name, row_id);
+            return self.db.get(data_key.as_bytes())
+                .map_err(|e| Error::storage(format!("Failed to read data key fallback: {}", e)))
+                .map(|opt| opt.map(|v| v.to_vec()));
+        }
+
+        // Versions exist but none at or before our snapshot — row was created
+        // after our snapshot started. Not visible to this transaction.
         Ok(None)
     }
 

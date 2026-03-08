@@ -223,6 +223,10 @@ impl<'a> MaterializedViewCatalog<'a> {
             catalog.drop_table(&data_table)?;
         }
 
+        // Invalidate schema cache for the view name itself (may have been cached
+        // by catalog.get_table_schema() which falls back to MV lookup)
+        self.storage.invalidate_schema_cache(view_name);
+
         tracing::info!("Successfully dropped materialized view '{}'", view_name);
         Ok(())
     }

@@ -50,10 +50,17 @@ impl SelectionPushdownRule {
         filter_pred: LogicalExpr,
     ) -> Result<Option<LogicalPlan>> {
         if let LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } = *project {
-            // Create filter below projection
+            // Rewrite the filter predicate: replace column references that use
+            // projection aliases with the underlying projection expressions.
+            // This ensures the predicate is valid against the input schema
+            // (e.g., turning `total > 200` into `agg_0 > 200` when pushed
+            // below a projection that aliases agg_0 AS total).
+            let rewritten_pred = Self::rewrite_predicate_for_pushdown(&filter_pred, &exprs, &aliases);
+
+            // Create filter below projection with rewritten predicate
             let new_filter = LogicalPlan::Filter {
                 input,
-                predicate: filter_pred,
+                predicate: rewritten_pred,
             };
 
             // Recreate projection on top
@@ -66,6 +73,94 @@ impl SelectionPushdownRule {
             }))
         } else {
             Ok(None)
+        }
+    }
+
+    /// Rewrite a filter predicate for pushdown below a projection.
+    ///
+    /// Replaces column references that match projection aliases with
+    /// the corresponding projection expressions, so the predicate
+    /// is valid against the projection's input schema.
+    fn rewrite_predicate_for_pushdown(
+        pred: &LogicalExpr,
+        proj_exprs: &[LogicalExpr],
+        proj_aliases: &[String],
+    ) -> LogicalExpr {
+        match pred {
+            LogicalExpr::Column { table: None, name } => {
+                // Check if this column name matches a projection alias
+                if let Some(idx) = proj_aliases.iter().position(|a| a == name) {
+                    if let Some(expr) = proj_exprs.get(idx) {
+                        return expr.clone();
+                    }
+                }
+                pred.clone()
+            }
+            LogicalExpr::BinaryExpr { left, op, right } => {
+                LogicalExpr::BinaryExpr {
+                    left: Box::new(Self::rewrite_predicate_for_pushdown(left, proj_exprs, proj_aliases)),
+                    op: op.clone(),
+                    right: Box::new(Self::rewrite_predicate_for_pushdown(right, proj_exprs, proj_aliases)),
+                }
+            }
+            LogicalExpr::UnaryExpr { op, expr } => {
+                LogicalExpr::UnaryExpr {
+                    op: *op,
+                    expr: Box::new(Self::rewrite_predicate_for_pushdown(expr, proj_exprs, proj_aliases)),
+                }
+            }
+            LogicalExpr::IsNull { expr, is_null } => {
+                LogicalExpr::IsNull {
+                    expr: Box::new(Self::rewrite_predicate_for_pushdown(expr, proj_exprs, proj_aliases)),
+                    is_null: *is_null,
+                }
+            }
+            LogicalExpr::Between { expr, low, high, negated } => {
+                LogicalExpr::Between {
+                    expr: Box::new(Self::rewrite_predicate_for_pushdown(expr, proj_exprs, proj_aliases)),
+                    low: Box::new(Self::rewrite_predicate_for_pushdown(low, proj_exprs, proj_aliases)),
+                    high: Box::new(Self::rewrite_predicate_for_pushdown(high, proj_exprs, proj_aliases)),
+                    negated: *negated,
+                }
+            }
+            LogicalExpr::InList { expr, list, negated } => {
+                LogicalExpr::InList {
+                    expr: Box::new(Self::rewrite_predicate_for_pushdown(expr, proj_exprs, proj_aliases)),
+                    list: list.iter()
+                        .map(|e| Self::rewrite_predicate_for_pushdown(e, proj_exprs, proj_aliases))
+                        .collect(),
+                    negated: *negated,
+                }
+            }
+            LogicalExpr::Case { expr: case_expr, when_then, else_result } => {
+                LogicalExpr::Case {
+                    expr: case_expr.as_ref().map(|o| Box::new(Self::rewrite_predicate_for_pushdown(o, proj_exprs, proj_aliases))),
+                    when_then: when_then.iter()
+                        .map(|(w, t)| (
+                            Self::rewrite_predicate_for_pushdown(w, proj_exprs, proj_aliases),
+                            Self::rewrite_predicate_for_pushdown(t, proj_exprs, proj_aliases),
+                        ))
+                        .collect(),
+                    else_result: else_result.as_ref().map(|e| Box::new(Self::rewrite_predicate_for_pushdown(e, proj_exprs, proj_aliases))),
+                }
+            }
+            LogicalExpr::ScalarFunction { fun, args } => {
+                LogicalExpr::ScalarFunction {
+                    fun: fun.clone(),
+                    args: args.iter()
+                        .map(|a| Self::rewrite_predicate_for_pushdown(a, proj_exprs, proj_aliases))
+                        .collect(),
+                }
+            }
+            LogicalExpr::Cast { expr, data_type } => {
+                LogicalExpr::Cast {
+                    expr: Box::new(Self::rewrite_predicate_for_pushdown(expr, proj_exprs, proj_aliases)),
+                    data_type: data_type.clone(),
+                }
+            }
+            // For all other expression types (literals, wildcards, subqueries,
+            // table-qualified columns, etc.), return as-is
+            _ => pred.clone(),
         }
     }
 

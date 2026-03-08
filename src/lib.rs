@@ -563,28 +563,41 @@ impl EmbeddedDatabase {
     ///
     /// Number of rows affected
     fn execute_in_transaction(&self, sql: &str, txn: &storage::Transaction) -> Result<u64> {
+        self.execute_in_transaction_inner(sql, txn, false)
+    }
+
+    /// Execute within transaction context, skipping fast paths.
+    /// Used by `Transaction::execute()` and session transactions to ensure
+    /// writes go through the transaction write set (not directly to storage).
+    fn execute_in_transaction_no_fast_path(&self, sql: &str, txn: &storage::Transaction) -> Result<u64> {
+        self.execute_in_transaction_inner(sql, txn, true)
+    }
+
+    fn execute_in_transaction_inner(&self, sql: &str, txn: &storage::Transaction, skip_fast_paths: bool) -> Result<u64> {
         // Record query for quota tracking (QPS enforcement)
         if let Some(context) = self.tenant_manager.get_current_context() {
             self.tenant_manager.record_query(context.tenant_id)
                 .map_err(|e| Error::query_execution(format!("Quota exceeded: {}", e)))?;
         }
 
-        // Skip fast paths when savepoints are active. Fast paths write directly to
-        // storage (bypassing the transaction write set), which means ROLLBACK TO
-        // SAVEPOINT cannot undo those writes. When savepoints are active, we force
-        // all DML through the normal path which buffers writes in the transaction
-        // write set for proper savepoint rollback support.
+        // Skip fast paths when:
+        // 1. Savepoints are active (fast paths bypass write set, breaking rollback)
+        // 2. Explicit/session transactions (fast paths bypass write set, breaking commit/rollback)
+        // 3. Active session transactions exist (fast paths skip MVCC versioning,
+        //    breaking snapshot isolation for other sessions)
         let has_savepoints = !self.savepoints.read().is_empty();
+        let has_session_txns = !self.session_transactions.is_empty();
+        let use_fast_paths = !skip_fast_paths && !has_savepoints && !has_session_txns;
 
         // Fast path: simple INSERT with literal values (skips full SQL parsing)
-        if !has_savepoints {
+        if use_fast_paths {
             if let Some(result) = self.try_fast_insert(sql) {
                 return result;
             }
         }
 
         // Fast path: simple UPDATE with PK WHERE clause (skips full SQL parsing)
-        if !has_savepoints {
+        if use_fast_paths {
             if let Some(result) = self.try_fast_update(sql) {
                 return result;
             }
@@ -680,6 +693,17 @@ impl EmbeddedDatabase {
                 .with_sql(sql.to_string());
             planner.statement_to_plan(statement)?
         };
+
+        // Invalidate plan cache on DDL operations that affect schema (including MV operations)
+        if matches!(&plan,
+            sql::LogicalPlan::CreateTable { .. } |
+            sql::LogicalPlan::DropTable { .. } |
+            sql::LogicalPlan::CreateMaterializedView { .. } |
+            sql::LogicalPlan::DropMaterializedView { .. } |
+            sql::LogicalPlan::Truncate { .. }
+        ) {
+            self.invalidate_plan_cache();
+        }
 
         // Execute plan based on type
         match &plan {
@@ -1660,6 +1684,8 @@ impl EmbeddedDatabase {
                     self.storage.scan_table_branch_aware(table_name)?
                 };
                 let mut row_ids_to_delete: Vec<u64> = Vec::new();
+                // Track deleted tuples for ART index cleanup
+                let mut deleted_tuples: Vec<(u64, Tuple)> = Vec::new();
 
                 // Collect tuples for RETURNING clause (must be done before deletion)
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
@@ -1771,6 +1797,7 @@ impl EmbeddedDatabase {
                             }
 
                             row_ids_to_delete.push(row_id);
+                            deleted_tuples.push((row_id, tuple.clone()));
 
                             // Collect tuple for RETURNING clause before deletion
                             if has_returning {
@@ -1866,6 +1893,19 @@ impl EmbeddedDatabase {
                         let _ = self.tenant_manager.update_storage_usage(context.tenant_id, new_storage);
                     }
                 }
+                // Update ART indexes for deleted rows
+                for (row_id, tuple) in &deleted_tuples {
+                    let mut col_values = std::collections::HashMap::new();
+                    for (i, col) in schema_arc.columns.iter().enumerate() {
+                        if let Some(v) = tuple.values.get(i) {
+                            col_values.insert(col.name.clone(), v.clone());
+                        }
+                    }
+                    if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
+                        tracing::debug!("ART index delete for table '{}': {}", table_name, e);
+                    }
+                }
+
                 let _ = returned_tuples; // RETURNING clause results handled separately
 
                 Ok(delete_count)
@@ -3351,6 +3391,15 @@ impl EmbeddedDatabase {
 
         // String literal: 'value'
         if *first == b'\'' {
+            // Reject string literals for numeric/boolean target types — bail to
+            // the normal parser which will produce a proper type mismatch error
+            match target_type {
+                DataType::Int2 | DataType::Int4 | DataType::Int8
+                | DataType::Float4 | DataType::Float8
+                | DataType::Boolean => return None,
+                _ => {}
+            }
+
             let inner = s.get(1..)?;
             let mut end = 0;
             let bytes = inner.as_bytes();
@@ -3509,7 +3558,9 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::AlterTableRenameColumn { .. } |
             sql::LogicalPlan::AlterTableMulti { .. } |
             sql::LogicalPlan::CreateIndex { .. } |
-            sql::LogicalPlan::Truncate { .. }
+            sql::LogicalPlan::Truncate { .. } |
+            sql::LogicalPlan::CreateMaterializedView { .. } |
+            sql::LogicalPlan::DropMaterializedView { .. }
         ) {
             self.invalidate_plan_cache();
         }
@@ -3861,6 +3912,7 @@ impl EmbeddedDatabase {
                 // Use branch-aware scan to get tuples (includes main + branch overrides - deleted)
                 let tuples = self.storage.scan_table_branch_aware(table_name)?;
                 let mut row_ids_to_delete: Vec<u64> = Vec::new();
+                let mut deleted_tuples: Vec<(u64, Tuple)> = Vec::new();
 
                 for tuple in tuples {
                     // Check if tuple matches WHERE clause (if provided)
@@ -3891,7 +3943,21 @@ impl EmbeddedDatabase {
                     if where_matches && rls_matches {
                         if let Some(row_id) = tuple.row_id {
                             row_ids_to_delete.push(row_id);
+                            deleted_tuples.push((row_id, tuple.clone()));
                         }
+                    }
+                }
+
+                // Update ART indexes for deleted rows
+                for (row_id, tuple) in &deleted_tuples {
+                    let mut col_values = std::collections::HashMap::new();
+                    for (i, col) in schema.columns.iter().enumerate() {
+                        if let Some(v) = tuple.values.get(i) {
+                            col_values.insert(col.name.clone(), v.clone());
+                        }
+                    }
+                    if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
+                        tracing::debug!("ART index delete for table '{}': {}", table_name, e);
                     }
                 }
 
@@ -4699,6 +4765,7 @@ impl EmbeddedDatabase {
                 // Use branch-aware scan to read tuples
                 let tuples = self.storage.scan_table_branch_aware(table_name)?;
                 let mut row_ids_to_delete: Vec<u64> = Vec::new();
+                let mut deleted_tuples: Vec<(u64, Tuple)> = Vec::new();
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
                 let has_returning = returning.is_some();
 
@@ -4723,7 +4790,21 @@ impl EmbeddedDatabase {
 
                         if let Some(row_id) = tuple.row_id {
                             row_ids_to_delete.push(row_id);
+                            deleted_tuples.push((row_id, tuple.clone()));
                         }
+                    }
+                }
+
+                // Update ART indexes for deleted rows
+                for (row_id, tuple) in &deleted_tuples {
+                    let mut col_values = std::collections::HashMap::new();
+                    for (i, col) in schema.columns.iter().enumerate() {
+                        if let Some(v) = tuple.values.get(i) {
+                            col_values.insert(col.name.clone(), v.clone());
+                        }
+                    }
+                    if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
+                        tracing::debug!("ART index delete for table '{}': {}", table_name, e);
                     }
                 }
 
@@ -5335,15 +5416,26 @@ impl EmbeddedDatabase {
         session.stats.queries_executed += 1;
         
         // Check if session has an active transaction
-        if let Some(mut txn) = self.session_transactions.get_mut(&session_id) {
-            // For READ COMMITTED, each statement gets a fresh snapshot
+        if self.session_transactions.contains_key(&session_id) {
+            // For READ COMMITTED, each statement gets a fresh snapshot.
+            // Hold the DashMap write guard only briefly for the mutable refresh.
             if session.isolation_level == crate::session::IsolationLevel::ReadCommitted {
-                txn.refresh_snapshot(self.storage.current_timestamp());
+                if let Some(mut txn) = self.session_transactions.get_mut(&session_id) {
+                    txn.refresh_snapshot(self.storage.current_timestamp());
+                }
             }
 
-            self.execute_in_transaction(sql, &txn)
+            // Use a read guard (shared) during execution to avoid blocking
+            // other sessions that may hash to the same DashMap shard
+            let txn = self.session_transactions.get(&session_id)
+                .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
+
+            // Skip fast paths for session transactions — writes must go through
+            // the transaction write set for proper isolation and rollback support
+            self.execute_in_transaction_no_fast_path(sql, &txn)
         } else {
-            // Implicit transaction
+            // Implicit transaction — skip fast paths since session-based execution
+            // requires MVCC versioning for proper isolation across sessions
             let txn = storage::Transaction::new_with_session(
                 self.storage.db.clone(),
                 self.storage.next_timestamp(),
@@ -5353,8 +5445,8 @@ impl EmbeddedDatabase {
                 self.lock_manager.clone(),
                 self.dirty_tracker.clone(),
             )?;
-            
-            let result = self.execute_in_transaction(sql, &txn);
+
+            let result = self.execute_in_transaction_no_fast_path(sql, &txn);
             
             match result {
                 Ok(count) => {
@@ -5392,11 +5484,19 @@ impl EmbeddedDatabase {
         session.stats.queries_executed += 1;
         
         // Check if session has an active transaction
-        if let Some(mut txn) = self.session_transactions.get_mut(&session_id) {
-            // For READ COMMITTED, each statement gets a fresh snapshot
+        if self.session_transactions.contains_key(&session_id) {
+            // For READ COMMITTED, each statement gets a fresh snapshot.
+            // Hold the DashMap write guard only briefly for the mutable refresh.
             if session.isolation_level == crate::session::IsolationLevel::ReadCommitted {
-                txn.refresh_snapshot(self.storage.current_timestamp());
+                if let Some(mut txn) = self.session_transactions.get_mut(&session_id) {
+                    txn.refresh_snapshot(self.storage.current_timestamp());
+                }
             }
+
+            // Use a read guard (shared) during execution to avoid blocking
+            // other sessions that may hash to the same DashMap shard
+            let txn = self.session_transactions.get(&session_id)
+                .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
 
             // Parse SQL with cache
             let (statement, _) = self.parse_cached(sql)?;
@@ -6889,9 +6989,10 @@ impl Transaction<'_> {
     /// # }
     /// ```
     pub fn execute(&self, sql: &str) -> Result<u64> {
-        // Execute within transaction context using the database's execute_in_transaction helper
-        // The transaction parameter ensures writes go to the transaction's write set
-        self.db.execute_in_transaction(sql, &self.tx)
+        // Execute within transaction context, skipping fast paths.
+        // Fast paths write directly to storage (bypassing the transaction write set),
+        // which would make rollback impossible and break isolation guarantees.
+        self.db.execute_in_transaction_no_fast_path(sql, &self.tx)
     }
 
     /// Query within transaction context

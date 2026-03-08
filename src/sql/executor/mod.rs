@@ -472,6 +472,13 @@ impl<'a> Executor<'a> {
             return Ok(None);
         }
 
+        // Skip when a transaction is active — PK index lookup reads the current
+        // value from storage, bypassing MVCC snapshot isolation. The transaction
+        // path in the scan operator uses scan_table_at_snapshot() instead.
+        if self.transaction.is_some() {
+            return Ok(None);
+        }
+
         // Find the PK column
         let pk_col = match schema.columns.iter().find(|c| c.primary_key) {
             Some(c) => c,
