@@ -1,9 +1,9 @@
 //! Materialized View SQL Parser
 //!
-//! Parses SQL for materialized views with Phase 3 options:
-//! - CREATE MATERIALIZED VIEW ... WITH (auto_refresh = true, ...)
-//! - REFRESH MATERIALIZED VIEW [CONCURRENTLY] ...
-//! - DROP MATERIALIZED VIEW [IF EXISTS] ...
+//! Parses SQL for materialized views with Phase 3 `options`:
+//! - `CREATE MATERIALIZED VIEW ... WITH (auto_refresh = true, ...)`
+//! - `REFRESH MATERIALIZED VIEW [CONCURRENTLY] ...`
+//! - `DROP MATERIALIZED VIEW [IF EXISTS] ...`
 
 use crate::{Result, Error};
 use super::super::logical_plan::{LogicalPlan, MaterializedViewOption};

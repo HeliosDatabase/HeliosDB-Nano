@@ -21,3 +21,6 @@ data/
 
 # Generated certificates
 certs/
+
+# Runtime files
+heliosdb.pid

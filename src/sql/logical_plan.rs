@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use super::explain_options::ExplainOptions;
 
-/// Helper module for Arc<Schema> serialization
+/// Helper module for `Arc<Schema>` serialization
 mod arc_schema_serde {
     use super::*;
     use serde::{Deserializer, Serializer};
@@ -944,7 +944,7 @@ pub enum LogicalExpr {
         column: String,
     },
 
-    /// Array subscript operator: arr[index]
+    /// Array subscript operator: `arr[index]`
     ArraySubscript {
         /// Array expression
         array: Box<LogicalExpr>,

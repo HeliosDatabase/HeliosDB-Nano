@@ -36,7 +36,7 @@
 //! ## Protocol Reference
 //!
 //! This implementation follows the PostgreSQL Frontend/Backend Protocol:
-//! https://www.postgresql.org/docs/current/protocol.html
+//! <https://www.postgresql.org/docs/current/protocol.html>
 //!
 //! ## Supported Message Types
 //!

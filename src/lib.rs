@@ -1,4 +1,4 @@
-//! # HeliosDB Lite
+//! # HeliosDB Nano
 //!
 //! A PostgreSQL-compatible embedded database with vector search, encryption, and multi-tenancy.
 //!
@@ -15,7 +15,7 @@
 //! ## Quick Start
 //!
 //! ```rust
-//! use heliosdb_lite::EmbeddedDatabase;
+//! use heliosdb_nano::EmbeddedDatabase;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // Create in-memory database
@@ -36,7 +36,7 @@
 //!
 //! ## Architecture
 //!
-//! HeliosDB Lite uses only open-source components with zero proprietary IP:
+//! HeliosDB Nano uses only open-source components:
 //!
 //! - **Storage**: RocksDB (LSM-tree)
 //! - **Columnar**: Apache Arrow
@@ -373,7 +373,7 @@ pub struct EmbeddedDatabase {
     prepared_statements: std::sync::Arc<parking_lot::RwLock<std::collections::HashMap<String, sql::LogicalPlan>>>,
     /// Active savepoints stack (name -> transaction state)
     savepoints: std::sync::Arc<parking_lot::RwLock<Vec<SavepointState>>>,
-    /// Plan cache: SQL string → Arc<LogicalPlan> (LRU, skips parse+plan for repeated queries)
+    /// Plan cache: SQL string → `Arc<LogicalPlan>` (LRU, skips parse+plan for repeated queries)
     plan_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<sql::LogicalPlan>>>>,
     /// Parse cache: SQL string → AST Statement (LRU, skips SQL parsing for repeated queries)
     parse_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, sqlparser::ast::Statement>>>,

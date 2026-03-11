@@ -308,10 +308,10 @@ impl Parser {
     /// Parse REFRESH MATERIALIZED VIEW statement
     ///
     /// Syntax:
-    /// - REFRESH MATERIALIZED VIEW <name>
-    /// - REFRESH MATERIALIZED VIEW CONCURRENTLY <name>
-    /// - REFRESH MATERIALIZED VIEW <name> INCREMENTALLY
-    /// - REFRESH MATERIALIZED VIEW CONCURRENTLY <name> INCREMENTALLY
+    /// - REFRESH MATERIALIZED VIEW `<name>`
+    /// - REFRESH MATERIALIZED VIEW CONCURRENTLY `<name>`
+    /// - REFRESH MATERIALIZED VIEW `<name>` INCREMENTALLY
+    /// - REFRESH MATERIALIZED VIEW CONCURRENTLY `<name>` INCREMENTALLY
     ///
     /// Returns: (view_name, concurrent, incremental)
     pub fn parse_refresh_materialized_view_sql(sql: &str) -> Result<(String, bool, bool)> {
@@ -364,8 +364,8 @@ impl Parser {
     /// Parse DROP MATERIALIZED VIEW statement
     ///
     /// Syntax:
-    /// - DROP MATERIALIZED VIEW <name>
-    /// - DROP MATERIALIZED VIEW IF EXISTS <name>
+    /// - DROP MATERIALIZED VIEW `<name>`
+    /// - DROP MATERIALIZED VIEW IF EXISTS `<name>`
     pub fn parse_drop_materialized_view_sql(sql: &str) -> Result<(String, bool)> {
         let cleaned = sql.trim().to_string();
 
@@ -402,11 +402,11 @@ impl Parser {
     /// Parse ALTER MATERIALIZED VIEW statement
     ///
     /// Syntax:
-    /// - ALTER MATERIALIZED VIEW <name> SET (option = value, ...)
+    /// - ALTER MATERIALIZED VIEW `<name>` SET (option = value, ...)
     ///
     /// Supported options:
-    /// - staleness_threshold = <seconds>
-    /// - max_cpu_percent = <percent>
+    /// - staleness_threshold = `<seconds>`
+    /// - max_cpu_percent = `<percent>`
     /// - refresh_strategy = 'manual' | 'auto' | 'incremental'
     /// - priority = <0-10>
     /// - incremental_enabled = true | false
@@ -513,7 +513,7 @@ impl Parser {
 
     /// Check if SQL is an ALTER TABLE ALTER COLUMN SET STORAGE statement
     ///
-    /// Syntax: ALTER TABLE <table> ALTER COLUMN <column> SET STORAGE <mode>
+    /// Syntax: ALTER TABLE `<table>` ALTER COLUMN `<column>` SET STORAGE `<mode>`
     pub fn is_alter_column_storage(sql: &str) -> bool {
         let upper = sql.trim().to_uppercase();
         upper.starts_with("ALTER TABLE") &&
@@ -523,7 +523,7 @@ impl Parser {
 
     /// Parse ALTER TABLE ALTER COLUMN SET STORAGE statement
     ///
-    /// Syntax: ALTER TABLE <table_name> ALTER COLUMN <column_name> SET STORAGE <mode>
+    /// Syntax: ALTER TABLE `<table_name>` ALTER COLUMN `<column_name>` SET STORAGE `<mode>`
     ///
     /// Supported storage modes:
     /// - DEFAULT: Standard row-oriented storage
@@ -1141,9 +1141,9 @@ impl Parser {
     /// Parse CREATE DATABASE BRANCH statement
     ///
     /// Syntax variations:
-    /// - CREATE DATABASE BRANCH <name> FROM <parent> AS OF NOW
-    /// - CREATE BRANCH <name> AS OF NOW
-    /// - CREATE DATABASE BRANCH <name> WITH (option = value)
+    /// - CREATE DATABASE BRANCH `<name>` FROM `<parent>` AS OF NOW
+    /// - CREATE BRANCH `<name>` AS OF NOW
+    /// - CREATE DATABASE BRANCH `<name>` WITH (option = value)
     pub fn parse_create_branch_sql(sql: &str) -> Result<(String, Option<String>, String, Option<String>)> {
         let cleaned = sql.trim().to_string();
         let upper = cleaned.to_uppercase();
@@ -1228,8 +1228,8 @@ impl Parser {
     /// Parse DROP DATABASE BRANCH statement
     ///
     /// Syntax variations:
-    /// - DROP DATABASE BRANCH <name>
-    /// - DROP BRANCH [IF EXISTS] <name>
+    /// - DROP DATABASE BRANCH `<name>`
+    /// - DROP BRANCH [IF EXISTS] `<name>`
     pub fn parse_drop_branch_sql(sql: &str) -> Result<(String, bool)> {
         let cleaned = sql.trim().to_string();
         let upper = cleaned.to_uppercase();
@@ -1266,8 +1266,8 @@ impl Parser {
     /// Parse MERGE DATABASE BRANCH statement
     ///
     /// Syntax:
-    /// - MERGE DATABASE BRANCH <source> INTO <target> [WITH options]
-    /// - MERGE BRANCH <source> INTO <target> [WITH options]
+    /// - MERGE DATABASE BRANCH `<source>` INTO `<target>` [WITH options]
+    /// - MERGE BRANCH `<source>` INTO `<target>` [WITH options]
     pub fn parse_merge_branch_sql(sql: &str) -> Result<(String, String, Option<String>)> {
         let cleaned = sql.trim().to_string();
         let upper = cleaned.to_uppercase();
@@ -1325,8 +1325,8 @@ impl Parser {
     /// Parse USE BRANCH statement
     ///
     /// Syntax:
-    /// - USE BRANCH <name>
-    /// - USE DATABASE BRANCH <name>
+    /// - USE BRANCH `<name>`
+    /// - USE DATABASE BRANCH `<name>`
     pub fn parse_use_branch_sql(sql: &str) -> Result<String> {
         let cleaned = sql.trim().to_string();
         let upper = cleaned.to_uppercase();

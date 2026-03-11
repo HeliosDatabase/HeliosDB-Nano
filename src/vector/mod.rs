@@ -2,7 +2,7 @@
 //!
 //! HNSW index using published research (no proprietary algorithms).
 //! Based on "Efficient and robust approximate nearest neighbor search using
-//! Hierarchical Navigable Small World graphs" (https://arxiv.org/abs/1603.09320)
+//! Hierarchical Navigable Small World graphs" (<https://arxiv.org/abs/1603.09320>)
 
 pub mod hnsw_index;
 pub mod quantization;

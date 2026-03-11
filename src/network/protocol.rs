@@ -1,6 +1,6 @@
 //! PostgreSQL wire protocol v3 message parsing and encoding
 //!
-//! Reference: https://www.postgresql.org/docs/current/protocol.html
+//! Reference: <https://www.postgresql.org/docs/current/protocol.html>
 
 use bytes::{Buf, BufMut, BytesMut};
 use std::collections::HashMap;
@@ -238,7 +238,7 @@ pub mod error_fields {
 }
 
 /// PostgreSQL SQLSTATE error codes
-/// Reference: https://www.postgresql.org/docs/current/errcodes-appendix.html
+/// Reference: <https://www.postgresql.org/docs/current/errcodes-appendix.html>
 #[allow(dead_code)]
 pub mod sqlstate {
     // Class 00 - Successful Completion

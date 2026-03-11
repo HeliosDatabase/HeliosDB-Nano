@@ -15,7 +15,7 @@ pub struct TimeTravelParser;
 impl TimeTravelParser {
     /// Parse AS OF clause from table reference
     ///
-    /// Called when parser encounters: FROM table AS OF <clause>
+    /// Called when parser encounters: `FROM table AS OF <clause>`
     pub fn parse_as_of_clause(clause_str: &str) -> Result<AsOfClause> {
         let trimmed = clause_str.trim().to_uppercase();
 

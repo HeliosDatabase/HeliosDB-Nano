@@ -18,17 +18,17 @@ pub enum MetaCommand {
     Quit,
     /// \h or \help - Show help
     Help,
-    /// \h <category> - Show help for specific category
+    /// \h `<category>` - Show help for specific category
     HelpCategory(String),
     /// \d - List all tables
     ListTables,
-    /// \d <table> - Describe table schema
+    /// \d `<table>` - Describe table schema
     DescribeTable(String),
     /// \dt - List tables with details
     ListTablesDetailed,
     /// \dS - List system views (dictionary tables)
     ListSystemViews,
-    /// \dS <view> - Describe system view schema
+    /// \dS `<view>` - Describe system view schema
     DescribeSystemView(String),
     /// \timing - Toggle timing display
     ToggleTiming,
@@ -42,21 +42,21 @@ pub enum MetaCommand {
     // v2.0 Feature Commands
     /// \branches - List database branches
     ListBranches,
-    /// \use <branch> - Switch to database branch
+    /// \use `<branch>` - Switch to database branch
     UseBranch(String),
     /// \snapshots - List time-travel snapshots
     ListSnapshots,
     /// \dmv - List materialized views
     ListMaterializedViews,
-    /// \dmv <view> - Describe materialized view
+    /// \dmv `<view>` - Describe materialized view
     DescribeMaterializedView(String),
     /// \compression - Show compression statistics
     ShowCompression,
-    /// \compression <table> - Show compression stats for table
+    /// \compression `<table>` - Show compression stats for table
     ShowCompressionTable(String),
 
     // v2.1 Feature Commands
-    /// \set <var> <value> - Set REPL variable
+    /// \set `<var>` `<value>` - Set REPL variable
     SetVariable(String, String),
     /// \set - Show all variables
     ShowVariables,
@@ -70,19 +70,19 @@ pub enum MetaCommand {
     SslStatus,
     /// \user list - List users
     UserList,
-    /// \user add <name> - Add user
+    /// \user add `<name>` - Add user
     UserAdd(String),
-    /// \user remove <name> - Remove user
+    /// \user remove `<name>` - Remove user
     UserRemove(String),
-    /// \password <user> - Change user password
+    /// \password `<user>` - Change user password
     ChangePassword(String),
     /// \config - Show current configuration
     ShowConfig,
     /// \config reload - Reload configuration from file
     ConfigReload,
-    /// \optimize <table> - Show optimization recommendations
+    /// \optimize `<table>` - Show optimization recommendations
     OptimizeTable(String),
-    /// \indexes <table> - Show index recommendations
+    /// \indexes `<table>` - Show index recommendations
     ShowIndexes(String),
     /// \stats - Show database statistics
     ShowStats,
@@ -90,78 +90,78 @@ pub enum MetaCommand {
     // v2.6 AI Feature Commands
     /// \ai templates - List AI schema templates
     AiTemplates,
-    /// \ai template <name> - Show template details
+    /// \ai template `<name>` - Show template details
     AiTemplateDetails(String),
-    /// \ai infer <format> - Infer schema from clipboard/stdin
+    /// \ai infer `<format>` - Infer schema from clipboard/stdin
     AiInferSchema(String),
-    /// \ai generate <description> - Generate schema from description
+    /// \ai generate `<description>` - Generate schema from description
     AiGenerateSchema(String),
-    /// \ai optimize <table> - AI-powered optimization
+    /// \ai optimize `<table>` - AI-powered optimization
     AiOptimize(String),
     /// \ai models - List available AI models
     AiModels,
-    /// \ai embed <text> - Create embedding for text
+    /// \ai embed `<text>` - Create embedding for text
     AiEmbed(String),
-    /// \ai compare-schema <schema1> <schema2> - Compare two schemas
+    /// \ai compare-schema `<schema1>` `<schema2>` - Compare two schemas
     AiCompareSchema { schema1: String, schema2: String },
 
     // Agent Session Commands
     /// \sessions - List agent sessions
     ListSessions,
-    /// \session-new <name> - Create new session
+    /// \session-new `<name>` - Create new session
     SessionNew(String),
-    /// \session <id> - Show session details
+    /// \session `<id>` - Show session details
     SessionDetails(String),
-    /// \session-delete <id> - Delete session
+    /// \session-delete `<id>` - Delete session
     SessionDelete(String),
-    /// \chat <id> - Interactive chat with session
+    /// \chat `<id>` - Interactive chat with session
     ChatSession(String),
-    /// \session-clear <id> - Clear session messages
+    /// \session-clear `<id>` - Clear session messages
     SessionClear(String),
-    /// \session fork <id> <name> - Fork agent session
+    /// \session fork `<id>` `<name>` - Fork agent session
     SessionFork { id: String, name: String },
-    /// \session context <id> - Show session context
+    /// \session context `<id>` - Show session context
     SessionContext(String),
-    /// \session memory <id> <query> - Search session memory
+    /// \session memory `<id>` `<query>` - Search session memory
     SessionMemory { id: String, query: String },
-    /// \session summarize <id> - Summarize session
+    /// \session summarize `<id>` - Summarize session
     SessionSummarize(String),
 
     // Vector Management Commands
     /// \vectors - List vector stores
     ListVectors,
-    /// \vector <name> - Show vector store details
+    /// \vector `<name>` - Show vector store details
     VectorDetails(String),
-    /// \vector create <name> <dims> [metric] - Create vector store
+    /// \vector create `<name>` `<dims>` `[metric]` - Create vector store
     VectorCreate { name: String, dimensions: u32, metric: Option<String> },
-    /// \vector delete <name> - Delete vector store
+    /// \vector delete `<name>` - Delete vector store
     VectorDelete(String),
-    /// \vector stats <name> - Show vector statistics
+    /// \vector stats `<name>` - Show vector statistics
     VectorStats(String),
 
     // Document Management Commands
     /// \collections - List document collections
     ListCollections,
-    /// \collection <name> - Show collection details
+    /// \collection `<name>` - Show collection details
     CollectionDetails(String),
-    /// \docs <collection> - List documents in collection
+    /// \docs `<collection>` - List documents in collection
     ListDocumentsInCollection(String),
-    /// \doc <collection> <id> - Get document details
+    /// \doc `<collection>` `<id>` - Get document details
     DocumentDetails { collection: String, id: String },
-    /// \search-docs <query> - Search documents
+    /// \search-docs `<query>` - Search documents
     SearchDocuments(String),
-    /// \doc chunks <collection> <id> - Show document chunks
+    /// \doc chunks `<collection>` `<id>` - Show document chunks
     DocumentChunks { collection: String, id: String },
-    /// \doc rechunk <collection> <id> <size> - Re-chunk document
+    /// \doc rechunk `<collection>` `<id>` `<size>` - Re-chunk document
     DocumentRechunk { collection: String, id: String, chunk_size: usize },
-    /// \rag <collection> <query> [k] - RAG search
+    /// \rag `<collection>` `<query>` `[k]` - RAG search
     RagSearch { collection: String, query: String, k: usize },
 
     // Performance & Utility Commands
-    /// \explain [options] <query> - Show query execution plan with options
+    /// \explain `[options]` `<query>` - Show query execution plan with options
     /// Options: analyze, verbose, storage, ai, why_not, indexes, stats, format json|yaml|tree
     ExplainQueryWithOptions { query: String, options: ExplainOptions },
-    /// \profile <query> - Profile query execution
+    /// \profile `<query>` - Profile query execution
     ProfileQuery(String),
     /// \telemetry - Show database telemetry
     Telemetry,
@@ -173,19 +173,19 @@ pub enum MetaCommand {
     // v3.2 Multi-Tenancy Commands
     /// \tenants - List all tenants
     TenantList,
-    /// \tenant create <name> [plan] [isolation] - Create tenant with plan and isolation mode
+    /// \tenant create `<name>` `[plan]` `[isolation]` - Create tenant with plan and isolation mode
     TenantCreate { name: String, plan: Option<String>, isolation: Option<String> },
-    /// \tenant use <name|id> - Set current tenant context
+    /// \tenant use `<name|id>` - Set current tenant context
     TenantUse(String),
-    /// \tenant info <name|id> - Show tenant details
+    /// \tenant info `<name|id>` - Show tenant details
     TenantInfo(String),
     /// \tenant quota [name|id] - Show quota usage for tenant
     TenantQuota(Option<String>),
     /// \tenant plans - List available plans
     TenantPlansList,
-    /// \tenant plan info <plan> - Show plan details
+    /// \tenant plan info `<plan>` - Show plan details
     TenantPlanInfo(String),
-    /// \tenant plan create <name> <tier> <storage_mb> <conn> <qps> - Create plan (ID auto-generated)
+    /// \tenant plan create `<name>` `<tier>` `<storage_mb>` `<conn>` `<qps>` - Create plan (ID auto-generated)
     TenantPlanCreate {
         name: String,
         tier_id: u32,
@@ -193,23 +193,23 @@ pub enum MetaCommand {
         max_connections: usize,
         max_qps: usize,
     },
-    /// \tenant usage [name] - Show real-time usage statistics
+    /// \tenant usage `[name]` - Show real-time usage statistics
     TenantUsage(Option<String>),
-    /// \tenant plan edit <id> <field> <value> - Edit plan field
+    /// \tenant plan edit `<id>` `<field>` `<value>` - Edit plan field
     TenantPlanEdit {
         plan_id: String,
         field: String,
         value: String,
     },
-    /// \tenant plan enable <id> - Enable plan
+    /// \tenant plan enable `<id>` - Enable plan
     TenantPlanEnable(String),
-    /// \tenant plan disable <id> - Disable plan
+    /// \tenant plan disable `<id>` - Disable plan
     TenantPlanDisable(String),
-    /// \tenant plan delete <id> - Delete plan (downgrades tenants)
+    /// \tenant plan delete `<id>` - Delete plan (downgrades tenants)
     TenantPlanDelete(String),
-    /// \tenant plan <name|id> <plan> - Change tenant plan
+    /// \tenant plan `<name|id>` `<plan>` - Change tenant plan
     TenantPlan { tenant: String, plan: String },
-    /// \tenant delete <name|id> - Delete tenant
+    /// \tenant delete `<name|id>` - Delete tenant
     TenantDelete(String),
     /// \tenant current - Show current tenant context
     TenantCurrent,
@@ -217,32 +217,32 @@ pub enum MetaCommand {
     TenantClearContext,
 
     // v3.2 RLS Policy Commands
-    /// \tenant rls create <table> <policy> <expr> <cmd> - Create RLS policy
+    /// \tenant rls create `<table>` `<policy>` `<expr>` `<cmd>` - Create RLS policy
     TenantRlsCreate {
         table: String,
         policy: String,
         expression: String,
         command: String,
     },
-    /// \tenant rls list <table> - List RLS policies for table
+    /// \tenant rls list `<table>` - List RLS policies for table
     TenantRlsList(String),
-    /// \tenant rls delete <table> <policy> - Delete RLS policy
+    /// \tenant rls delete `<table>` `<policy>` - Delete RLS policy
     TenantRlsDelete { table: String, policy: String },
 
     // v3.2 CDC Commands
-    /// \tenant cdc show [limit] - Show CDC events
+    /// \tenant cdc show `[limit]` - Show CDC events
     TenantCdcShow(Option<usize>),
-    /// \tenant cdc export <file> - Export CDC events to file
+    /// \tenant cdc export `<file>` - Export CDC events to file
     TenantCdcExport(String),
 
     // v3.2 Migration Commands
-    /// \tenant migrate to <target> - Initiate tenant migration
+    /// \tenant migrate to `<target>` - Initiate tenant migration
     TenantMigrateTo(String),
-    /// \tenant migrate status [tenant] - Show migration status
+    /// \tenant migrate status `[tenant]` - Show migration status
     TenantMigrateStatus(Option<String>),
 
     // v3.2 Custom Quota Commands
-    /// \tenant quota set <tenant> <storage> <connections> <qps> - Set custom quotas
+    /// \tenant quota set `<tenant>` `<storage>` `<connections>` `<qps>` - Set custom quotas
     TenantQuotaSet {
         tenant: String,
         storage_mb: u64,
@@ -259,7 +259,7 @@ pub enum MetaCommand {
     Settings,
 
     // v3.4 Storage Maintenance Commands
-    /// \vacuum [table] - Manual compaction (optional: specific table)
+    /// \vacuum `[table]` - Manual compaction (optional: specific table)
     Vacuum(Option<String>),
 
     // v3.5 Replication Commands

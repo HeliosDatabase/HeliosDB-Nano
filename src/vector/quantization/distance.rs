@@ -73,12 +73,12 @@ impl DistanceComputer {
 
     /// Precompute distance table for a query (ADC optimization)
     ///
-    /// Creates a table of shape [M][K] where:
-    /// - M = number of sub-quantizers
-    /// - K = number of centroids per sub-quantizer
-    /// - table[i][j] = squared L2 distance between query sub-vector i and centroid j
+    /// Creates a table of shape `[M][K]` where:
+    /// - `M` = number of sub-quantizers
+    /// - `K` = number of centroids per sub-quantizer
+    /// - `table[i][j]` = squared L2 distance between query sub-vector i and centroid j
     ///
-    /// Complexity: O(M * K * D/M) = O(K * D)
+    /// Complexity: `O(M * K * D/M) = O(K * D)`
     ///
     /// After precomputation, distance to any database vector is just O(M) lookups.
     pub fn precompute_distance_table(&self, query: &Vector) -> PqResult<Vec<Vec<f32>>> {

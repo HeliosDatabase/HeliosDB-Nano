@@ -3,7 +3,7 @@
 //! This module implements the PostgreSQL wire protocol message format
 //! for both frontend (client) and backend (server) messages.
 //!
-//! Reference: https://www.postgresql.org/docs/current/protocol-message-formats.html
+//! Reference: <https://www.postgresql.org/docs/current/protocol-message-formats.html>
 
 #![allow(unused_variables)]
 

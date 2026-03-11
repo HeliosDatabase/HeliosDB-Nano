@@ -11,10 +11,30 @@ edition = "2021"
 authors = ["HeliosDB Team"]
 license = "AGPL-3.0-only"
 description = "PostgreSQL-compatible embedded database with TDE + ZKE encryption, HNSW vector search, Product Quantization, git-like branching, time-travel queries, materialized views, row-level security, and 50+ enterprise features"
-repository = "https://github.com/heliosdb/heliosdb"
+repository = "https://github.com/Dimensigon/HDB-HeliosDB-Nano"
+homepage = "https://github.com/Dimensigon/HDB-HeliosDB-Nano"
+documentation = "https://docs.rs/heliosdb-nano"
 keywords = ["database", "postgresql", "vector-database", "embedded", "encryption"]
-categories = ["database", "embedded"]
+categories = ["database-implementations"]
 readme = "README.md"
+exclude = [
+    "releases/",
+    "/sql/",
+    "docs/",
+    "tests/protocol_tests/venv/",
+    "tests/compatibility/",
+    "tests/security/",
+    "sdks/",
+    "integrations/",
+    "tools/",
+    "scripts/",
+    "heliosdb.pid",
+    "heliosdb-data/",
+    "data/",
+    "certs/",
+    ".idea/",
+    ".vscode/",
+]
 
 [lib]
 name = "heliosdb_nano"

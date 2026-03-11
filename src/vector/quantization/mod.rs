@@ -4,7 +4,7 @@
 //! by 8-16x while maintaining 95-98% search accuracy.
 //!
 //! Based on: "Product Quantization for Nearest Neighbor Search" (Jégou et al., CVPR 2011)
-//! Paper: https://lear.inrialpes.fr/pubs/2011/JDS11/jegou_searching_with_quantization.pdf
+//! Paper: <https://lear.inrialpes.fr/pubs/2011/JDS11/jegou_searching_with_quantization.pdf>
 
 pub mod product_quantizer;
 pub mod codebook;

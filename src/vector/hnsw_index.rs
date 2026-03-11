@@ -2,7 +2,7 @@
 //!
 //! Uses the hnsw_rs library which implements the HNSW algorithm
 //! from "Efficient and robust approximate nearest neighbor search using
-//! Hierarchical Navigable Small World graphs" (https://arxiv.org/abs/1603.09320)
+//! Hierarchical Navigable Small World graphs" (<https://arxiv.org/abs/1603.09320>)
 
 #![allow(clippy::similar_names)]
 #![allow(unused_variables)]

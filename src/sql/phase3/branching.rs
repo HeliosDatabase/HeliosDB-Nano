@@ -1,9 +1,9 @@
 //! Database Branching SQL Parser
 //!
 //! Parses SQL extensions for database branching:
-//! - CREATE DATABASE BRANCH <name> FROM <parent> AS OF <point>
-//! - DROP DATABASE BRANCH [IF EXISTS] <name>
-//! - MERGE DATABASE BRANCH <source> INTO <target>
+//! - `CREATE DATABASE BRANCH <name> FROM <parent> AS OF <point>`
+//! - `DROP DATABASE BRANCH [IF EXISTS] <name>`
+//! - `MERGE DATABASE BRANCH <source> INTO <target>`
 
 use crate::{Result, Error};
 use super::super::logical_plan::{
