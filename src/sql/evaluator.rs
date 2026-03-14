@@ -3094,7 +3094,11 @@ impl Evaluator {
                     // Parse as decimal and convert to f32
                     n.parse::<Decimal>()
                         .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to FLOAT4: {}", n, e)))
-                        .map(|dec| Value::Float4(dec.to_f32().unwrap_or(0.0)))
+                        .and_then(|dec| {
+                            dec.to_f32()
+                                .map(Value::Float4)
+                                .ok_or_else(|| Error::query_execution(format!("Cannot cast '{}' to FLOAT4: value out of range", n)))
+                        })
                 }
                 Value::String(s) => s.parse::<f32>()
                     .map(Value::Float4)
@@ -3112,7 +3116,11 @@ impl Evaluator {
                     // Parse as decimal and convert to f64
                     n.parse::<Decimal>()
                         .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to FLOAT8: {}", n, e)))
-                        .map(|dec| Value::Float8(dec.to_f64().unwrap_or(0.0)))
+                        .and_then(|dec| {
+                            dec.to_f64()
+                                .map(Value::Float8)
+                                .ok_or_else(|| Error::query_execution(format!("Cannot cast '{}' to FLOAT8: value out of range", n)))
+                        })
                 }
                 Value::String(s) => s.parse::<f64>()
                     .map(Value::Float8)

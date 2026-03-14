@@ -664,7 +664,7 @@ impl<'a> Executor<'a> {
                 };
                 if let Some((table_name, schema, projection)) = scan_info {
                     if let Some(storage) = self.storage {
-                        let fetch_count = *limit + *offset;
+                        let fetch_count = limit.saturating_add(*offset);
                         let tuples = storage.scan_table_with_limit(table_name, fetch_count)?;
                         let scan_op = Box::new(ScanOperator::new(
                             table_name.clone(), schema.clone(), projection.clone(), tuples, self.parameters.clone(),

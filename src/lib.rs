@@ -543,15 +543,11 @@ impl EmbeddedDatabase {
     ///
     /// **Fully Transactional:**
     /// - INSERT: Writes go to transaction write set via `txn.put()`
+    /// - UPDATE/DELETE: Writes go to transaction write set via `txn.put()`/`txn.delete()`
     /// - CREATE TABLE: Catalog operations (already atomic)
     ///
     /// **Limitations (Future Enhancement):**
-    /// - UPDATE/DELETE: Currently bypass transaction (execute directly on storage)
-    /// - TRUNCATE: Currently bypass transaction (execute directly on storage)
-    ///
-    /// These limitations are acceptable for v2.0 because:
-    /// 1. INSERT is the most common write operation
-    /// 2. UPDATE/DELETE still provide atomicity via RocksDB's atomic writes
+    /// - TRUNCATE: Currently bypasses transaction (executes directly on storage)
     /// 3. Full transaction support for all operations will be added in v2.1
     ///
     /// # Arguments
@@ -2280,6 +2276,40 @@ impl EmbeddedDatabase {
                 }
                 Ok(total_rows)
             }
+            sql::LogicalPlan::Savepoint { ref name } => {
+                let write_set_snapshot = txn.savepoint_snapshot();
+                let savepoint = SavepointState {
+                    name: name.clone(),
+                    write_set_snapshot,
+                };
+                self.savepoints.write().push(savepoint);
+                Ok(0)
+            }
+            sql::LogicalPlan::ReleaseSavepoint { ref name } => {
+                let mut savepoints = self.savepoints.write();
+                if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
+                    savepoints.truncate(pos);
+                    Ok(0)
+                } else {
+                    Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
+                }
+            }
+            sql::LogicalPlan::RollbackToSavepoint { ref name } => {
+                let savepoints = self.savepoints.read();
+                if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
+                    let snapshot = savepoints.get(pos)
+                        .map(|s| s.write_set_snapshot.clone());
+                    drop(savepoints);
+                    if let Some(snapshot) = snapshot {
+                        txn.rollback_to_savepoint(&snapshot);
+                    }
+                    let mut savepoints = self.savepoints.write();
+                    savepoints.truncate(pos + 1);
+                    Ok(0)
+                } else {
+                    Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
+                }
+            }
             _ => {
                 // For other operations (TRUNCATE, CREATE INDEX, etc.), use executor
                 let mut executor = sql::Executor::with_storage(&self.storage)
@@ -2618,7 +2648,7 @@ impl EmbeddedDatabase {
                 .map_lock_err("Failed to acquire transaction lock for execute")?;
             let txn_ref = txn_lock.as_ref()
                 .ok_or_else(|| Error::transaction("Transaction lock in invalid state"))?;
-            self.execute_in_transaction(sql, txn_ref)
+            self.execute_in_transaction_no_fast_path(sql, txn_ref)
         } else {
             // No active transaction - create implicit transaction
             self.execute_with_implicit_transaction(sql)
@@ -7084,36 +7114,28 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_savepoint_basic_via_execute_fails_in_transaction() {
-        // TODO BUG: execute_in_transaction does not handle LogicalPlan::Savepoint.
-        // SAVEPOINT within a BEGIN block via db.execute() should work but currently
-        // fails with "Operator not yet implemented: Savepoint".
-        // Fix: add Savepoint/ReleaseSavepoint/RollbackToSavepoint arms to
-        // execute_in_transaction's match block (around line 672 in lib.rs).
+    fn test_savepoint_basic_via_execute_works_in_transaction() {
+        // SAVEPOINT within a BEGIN block via db.execute() should work.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE sp_basic (id INT, val TEXT)").unwrap();
 
         db.execute("BEGIN").unwrap();
         let result = db.execute("SAVEPOINT s1");
-        // Current behavior: fails because execute_in_transaction catch-all
-        // delegates to sql::Executor which does not implement Savepoint
-        assert!(result.is_err(),
-            "BUG: SAVEPOINT via execute() in BEGIN block fails (not yet routed)");
-        let err = result.unwrap_err().to_string();
-        assert!(err.contains("not yet implemented"),
-            "Error should be 'not yet implemented', got: {}", err);
+        assert!(result.is_ok(),
+            "SAVEPOINT via execute() in BEGIN block should succeed, got: {:?}", result.err());
         db.execute("ROLLBACK").unwrap();
     }
 
     #[test]
-    fn test_savepoint_outside_transaction_errors() {
-        // SAVEPOINT outside a transaction should fail.
-        // Note: Currently this also fails with "not yet implemented" because
-        // without an active transaction, execute() takes the implicit transaction
-        // path which also dispatches to sql::Executor.
+    fn test_savepoint_outside_transaction_succeeds_in_implicit_txn() {
+        // SAVEPOINT outside an explicit transaction runs within an implicit
+        // transaction, so it succeeds (matching PostgreSQL behavior which
+        // issues a WARNING but does not error). The savepoint has no
+        // meaningful effect since the implicit transaction auto-commits.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let result = db.execute("SAVEPOINT s1");
-        assert!(result.is_err(), "SAVEPOINT outside transaction should fail");
+        assert!(result.is_ok(),
+            "SAVEPOINT in implicit transaction should succeed, got: {:?}", result.err());
     }
 
     #[test]
@@ -7144,15 +7166,11 @@ mod tests {
     #[test]
     fn test_savepoint_nonexistent_rollback_errors() {
         // ROLLBACK TO a savepoint that does not exist should fail.
-        // Currently fails with "not yet implemented" because execute_in_transaction
-        // does not handle RollbackToSavepoint.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE sp_noexist (id INT)").unwrap();
 
         db.execute("BEGIN").unwrap();
         let result = db.execute("ROLLBACK TO SAVEPOINT nonexistent");
-        // TODO BUG: Currently returns "not yet implemented" instead of
-        // "Savepoint 'nonexistent' does not exist"
         assert!(result.is_err(), "ROLLBACK TO nonexistent savepoint should fail");
         db.execute("ROLLBACK").unwrap();
     }
@@ -7160,13 +7178,10 @@ mod tests {
     #[test]
     fn test_savepoint_nonexistent_release_errors() {
         // RELEASE a savepoint that does not exist should fail.
-        // Currently fails with "not yet implemented" for the same reason.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
         db.execute("BEGIN").unwrap();
         let result = db.execute("RELEASE SAVEPOINT nonexistent");
-        // TODO BUG: Currently returns "not yet implemented" instead of
-        // "Savepoint 'nonexistent' does not exist"
         assert!(result.is_err(), "RELEASE nonexistent savepoint should fail");
         db.execute("ROLLBACK").unwrap();
     }
@@ -7776,14 +7791,11 @@ mod tests {
 
         let rows = db.query("SELECT val FROM upd_rb WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        // TODO: UPDATE currently bypasses transaction write set (known limitation).
-        // The update may persist even after rollback.
         let val = rows[0].get(0);
-        if val == Some(&Value::String("original".to_string())) {
+        assert_eq!(val, Some(&Value::String("original".to_string())),
+            "ROLLBACK should undo the UPDATE");
+        if true {
             // Correct behavior: rollback undid the update
-        } else {
-            assert_eq!(val, Some(&Value::String("changed".to_string())),
-                "KNOWN LIMITATION: UPDATE bypasses transaction, persists through rollback");
         }
     }
 
@@ -7799,15 +7811,8 @@ mod tests {
         db.execute("ROLLBACK").unwrap();
 
         let rows = db.query("SELECT * FROM del_rb", &[]).unwrap();
-        // TODO: DELETE currently bypasses transaction write set (known limitation).
-        // The delete may persist even after rollback.
-        if rows.len() == 1 {
-            // Correct behavior
-            assert_eq!(rows[0].get(1), Some(&Value::String("keep_me".to_string())));
-        } else {
-            assert_eq!(rows.len(), 0,
-                "KNOWN LIMITATION: DELETE bypasses transaction, persists through rollback");
-        }
+        assert_eq!(rows.len(), 1, "ROLLBACK should undo the DELETE");
+        assert_eq!(rows[0].get(1), Some(&Value::String("keep_me".to_string())));
     }
 
     #[test]
