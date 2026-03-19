@@ -1725,7 +1725,7 @@ impl StorageEngine {
         let lookup_start = std::time::Instant::now();
 
         // Encode the PK value to the ART key format
-        let key = super::art_manager::ArtIndexManager::encode_key(&[pk_value.clone()]);
+        let key = super::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(pk_value));
 
         // Look up the row_id in the ART index (zero-copy, no tree clone)
         let row_id = match self.art_index_manager.pk_index_lookup(table_name, &key) {

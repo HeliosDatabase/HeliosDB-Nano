@@ -321,6 +321,17 @@ impl<'a> Executor<'a> {
         Ok(results)
     }
 
+    /// Execute a plan and return both tuples and output column names.
+    pub fn execute_with_columns(&mut self, plan: &LogicalPlan) -> Result<(Vec<Tuple>, Vec<String>)> {
+        let mut operator = self.plan_to_operator(plan)?;
+        let columns: Vec<String> = operator.schema().columns.iter().map(|c| c.name.clone()).collect();
+        let mut results = Vec::with_capacity(256);
+        while let Some(tuple) = operator.next()? {
+            results.push(tuple);
+        }
+        Ok((results, columns))
+    }
+
     /// Materialize IN subqueries by executing them and converting to InList
     ///
     /// This allows the evaluator to handle IN expressions without needing
@@ -720,7 +731,7 @@ impl<'a> Executor<'a> {
                     } = &aggr_exprs[0] {
                     // Only use fast path for COUNT(*), not COUNT(col)
                     // COUNT(col) needs to evaluate per-row to skip NULLs
-                    let is_count_star = args.first().map_or(false, |a| matches!(a, crate::sql::LogicalExpr::Wildcard));
+                    let is_count_star = args.first().is_some_and(|a| matches!(a, crate::sql::LogicalExpr::Wildcard));
                     if is_count_star {
                         let scan_table = match input.as_ref() {
                             LogicalPlan::Scan { table_name, .. } => Some(table_name.as_str()),

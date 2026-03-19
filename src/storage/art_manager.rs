@@ -565,7 +565,7 @@ impl ArtIndexManager {
         };
         pk_name.map(|name| {
             let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
-            indexes.get(&name).map_or(false, |idx| idx.contains(key))
+            indexes.get(&name).is_some_and(|idx| idx.contains(key))
         })
     }
 
@@ -895,7 +895,7 @@ impl ArtIndexManager {
     /// Check if a table has foreign key indexes
     pub fn has_fk(&self, table: &str) -> bool {
         let fk_indexes = self.fk_indexes.read().unwrap_or_else(|e| e.into_inner());
-        fk_indexes.get(table).map_or(false, |v| !v.is_empty())
+        fk_indexes.get(table).is_some_and(|v| !v.is_empty())
     }
 
     /// Check if a table has a primary key

@@ -584,12 +584,10 @@ impl GenerateSeriesOperator {
     /// Create a new generate_series operator
     pub fn new(start: i64, stop: i64, step: i64, schema: Arc<Schema>) -> Self {
         // Series is immediately exhausted if step direction doesn't match range direction
-        let exhausted = if step == 0 {
-            true // Zero step would be infinite loop
-        } else if step > 0 {
-            start > stop
-        } else {
-            start < stop
+        let exhausted = match step.cmp(&0) {
+            std::cmp::Ordering::Equal => true, // Zero step would be infinite loop
+            std::cmp::Ordering::Greater => start > stop,
+            std::cmp::Ordering::Less => start < stop,
         };
 
         Self {

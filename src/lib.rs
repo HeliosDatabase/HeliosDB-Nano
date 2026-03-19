@@ -379,6 +379,9 @@ pub struct EmbeddedDatabase {
     parse_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, sqlparser::ast::Statement>>>,
     /// Query result cache: SQL string → cached results (invalidated on DML per-table)
     result_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<Vec<Tuple>>>>>,
+    /// ART index undo log for transaction rollback: (table, row_id, col_values)
+    /// Cleared on commit, replayed as on_delete on rollback
+    art_undo_log: std::sync::Arc<parking_lot::RwLock<Vec<(String, u64, std::collections::HashMap<String, Value>)>>>,
 }
 
 impl Drop for EmbeddedDatabase {
@@ -477,6 +480,8 @@ impl EmbeddedDatabase {
             .map_lock_err("Failed to acquire transaction lock for commit")?;
         if let Some(txn) = txn_ref.take() {
             txn.commit()?;
+            // Clear ART undo log (changes are now committed)
+            self.art_undo_log.write().clear();
             // Increment LSN to track transaction commits
             self.storage.increment_lsn();
             Ok(())
@@ -492,6 +497,13 @@ impl EmbeddedDatabase {
             .map_lock_err("Failed to acquire transaction lock for rollback")?;
         if let Some(txn) = txn_ref.take() {
             txn.rollback()?;
+            // Undo ART index insertions made during the transaction
+            let undo_entries: Vec<_> = self.art_undo_log.write().drain(..).collect();
+            for (table_name, row_id, col_values) in undo_entries {
+                if let Err(e) = self.storage.art_indexes().on_delete(&table_name, row_id, &col_values) {
+                    tracing::debug!("ART rollback for '{}' row {}: {}", table_name, row_id, e);
+                }
+            }
             Ok(())
         } else {
             Err(Error::transaction("No active transaction to rollback"))
@@ -547,7 +559,7 @@ impl EmbeddedDatabase {
     /// - CREATE TABLE: Catalog operations (already atomic)
     ///
     /// **Limitations (Future Enhancement):**
-    /// - TRUNCATE: Currently bypasses transaction (executes directly on storage)
+    /// - TRUNCATE: Buffers row deletes in write set (rollback-safe), but ART index rebuild on rollback is best-effort
     /// 3. Full transaction support for all operations will be added in v2.1
     ///
     /// # Arguments
@@ -1095,8 +1107,9 @@ impl EmbeddedDatabase {
                     let val = bincode::serialize(&tuple).map_err(|e| Error::storage(e.to_string()))?;
                     txn.put(key.clone(), val.clone())?;
 
-                    // Log to WAL for replication (skip in memory-only mode)
-                    if self.storage.is_wal_enabled() {
+                    // Log to WAL for replication (skip in explicit transactions —
+                    // WAL entries should only reflect committed changes)
+                    if !skip_fast_paths && self.storage.is_wal_enabled() {
                         self.storage.log_data_insert(table_name, &key, &val)?;
                     }
 
@@ -1110,6 +1123,10 @@ impl EmbeddedDatabase {
                         }
                         if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
                             tracing::debug!("ART index insert for '{}': {}", table_name, e);
+                        }
+                        // Track ART insertion for rollback (explicit transactions only)
+                        if skip_fast_paths {
+                            self.art_undo_log.write().push((table_name.clone(), row_id, col_values));
                         }
                     }
 
@@ -1385,7 +1402,7 @@ impl EmbeddedDatabase {
                                 continue;
                             }
                             let key = crate::storage::ArtIndexManager::encode_key(&uc_values);
-                            if let Some(true) = self.storage.art_indexes().pk_index_contains(table_name, &key) {
+                            if self.storage.art_indexes().pk_index_contains(table_name, &key) == Some(true) {
                                 return Err(Error::constraint_violation(format!(
                                     "UNIQUE constraint '{}' violated: duplicate value for columns ({})",
                                     uc.name,
@@ -1490,11 +1507,18 @@ impl EmbeddedDatabase {
                 let has_triggers = self.trigger_registry.has_triggers_for_table(table_name);
 
                 // Try PK point lookup optimization: if WHERE is `pk_col = literal`,
-                // fetch only the matching row instead of scanning the entire table
-                let tuples = if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema) {
-                    match self.storage.get_row_by_pk(table_name, &pk_value)? {
-                        Some(tuple) => vec![tuple],
-                        None => vec![],
+                // fetch only the matching row instead of scanning the entire table.
+                // Skip optimization on non-main branches: branch-inherited rows are stored
+                // under the main prefix (data:) but PK lookup uses branch prefix (bdata:).
+                let on_branch = self.storage.get_current_branch().is_some();
+                let tuples = if !on_branch {
+                    if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema) {
+                        match self.storage.get_row_by_pk(table_name, &pk_value)? {
+                            Some(tuple) => vec![tuple],
+                            None => vec![],
+                        }
+                    } else {
+                        self.storage.scan_table_branch_aware(table_name)?
                     }
                 } else {
                     self.storage.scan_table_branch_aware(table_name)?
@@ -1614,8 +1638,9 @@ impl EmbeddedDatabase {
                         .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
                     txn.put(key.clone(), value.clone())?;
 
-                    // Log to WAL for crash recovery (skip in memory-only mode)
-                    if self.storage.is_wal_enabled() {
+                    // Log to WAL for crash recovery (skip in explicit transactions —
+                    // WAL entries should only reflect committed changes)
+                    if !skip_fast_paths && self.storage.is_wal_enabled() {
                         self.storage.log_data_update(table_name, &key, &value)?;
                     }
 
@@ -1671,10 +1696,18 @@ impl EmbeddedDatabase {
                 let has_triggers = self.trigger_registry.has_triggers_for_table(table_name);
 
                 // Try PK point lookup optimization for DELETE WHERE pk_col = literal
-                let tuples = if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema_arc) {
-                    match self.storage.get_row_by_pk(table_name, &pk_value)? {
-                        Some(tuple) => vec![tuple],
-                        None => vec![],
+                // Skip optimization on non-main branches: branch-inherited rows are stored
+                // under the main prefix (data:) but PK lookup uses branch prefix (bdata:),
+                // so inherited rows would not be found.
+                let on_branch = self.storage.get_current_branch().is_some();
+                let tuples = if !on_branch {
+                    if let Some(pk_value) = Self::try_extract_pk_value(selection.as_ref(), &schema_arc) {
+                        match self.storage.get_row_by_pk(table_name, &pk_value)? {
+                            Some(tuple) => vec![tuple],
+                            None => vec![],
+                        }
+                    } else {
+                        self.storage.scan_table_branch_aware(table_name)?
                     }
                 } else {
                     self.storage.scan_table_branch_aware(table_name)?
@@ -1871,8 +1904,9 @@ impl EmbeddedDatabase {
                         let key = format!("data:{}:{}", table_name, row_id).into_bytes();
                         txn.delete(key.clone())?;
 
-                        // Log to WAL for crash recovery (skip in memory-only mode)
-                        if self.storage.is_wal_enabled() {
+                        // Log to WAL for crash recovery (skip in explicit transactions —
+                        // WAL entries should only reflect committed changes)
+                        if !skip_fast_paths && self.storage.is_wal_enabled() {
                             self.storage.log_data_delete(table_name, &key)?;
                         }
 
@@ -2310,8 +2344,28 @@ impl EmbeddedDatabase {
                     Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
                 }
             }
+            sql::LogicalPlan::Truncate { ref table_name } => {
+                // TRUNCATE within a transaction: buffer all row deletes in write set
+                // so they can be rolled back if the transaction is aborted
+                let catalog = self.storage.catalog();
+                let _schema = catalog.get_table_schema(table_name)?;
+                let rows = self.storage.scan_table(table_name)?;
+                let mut count = 0u64;
+                for tuple in &rows {
+                    if let Some(row_id) = tuple.row_id {
+                        let key = format!("data:{}:{}", table_name, row_id).into_bytes();
+                        txn.delete(key)?;
+                        // Invalidate row cache
+                        self.storage.row_cache().invalidate(table_name, row_id);
+                        count += 1;
+                    }
+                }
+                // Clear ART indexes for this table (will be rebuilt if transaction commits)
+                self.storage.art_indexes().clear_table_indexes(table_name);
+                Ok(count)
+            }
             _ => {
-                // For other operations (TRUNCATE, CREATE INDEX, etc.), use executor
+                // For other operations (CREATE INDEX, etc.), use executor
                 let mut executor = sql::Executor::with_storage(&self.storage)
                     .with_timeout(self.config.storage.query_timeout_ms);
                 let results = executor.execute(&plan)?;
@@ -2386,6 +2440,7 @@ impl EmbeddedDatabase {
             plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero")))),
             parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).expect("512 is non-zero")))),
             result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(128).expect("128 is non-zero")))),
+            art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
         })
     }
 
@@ -2441,6 +2496,7 @@ impl EmbeddedDatabase {
             plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero")))),
             parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).expect("512 is non-zero")))),
             result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(128).expect("128 is non-zero")))),
+            art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
         })
     }
 
@@ -2505,6 +2561,7 @@ impl EmbeddedDatabase {
             plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero")))),
             parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).expect("512 is non-zero")))),
             result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(128).expect("128 is non-zero")))),
+            art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
         })
     }
 
@@ -3004,10 +3061,7 @@ impl EmbeddedDatabase {
         }
 
         // Parse value literals
-        let values = match Self::fast_parse_values(values_str, &target_types) {
-            Some(v) => v,
-            None => return None, // Complex expression — fall through to normal path
-        };
+        let values = Self::fast_parse_values(values_str, &target_types)?;
 
         // Build ordered tuple (columns may be in non-schema order)
         let mut tuple_values = vec![Value::Null; schema.columns.len()];
@@ -3481,7 +3535,7 @@ impl EmbeddedDatabase {
 
         // Number: integer or float (possibly negative)
         if first.is_ascii_digit() || *first == b'-' || *first == b'+' || *first == b'.' {
-            let end = s.find(|c: char| c == ',' || c == ')' || c == ' ')
+            let end = s.find([',', ')', ' '])
                 .unwrap_or(s.len());
             let num_str = s.get(..end)?.trim();
             let rest = s.get(end..)?;
@@ -5106,6 +5160,38 @@ impl EmbeddedDatabase {
         Ok(results)
     }
 
+    /// Execute a query and return both result tuples and column names.
+    ///
+    /// Unlike `query()`, this returns the actual column names from the query
+    /// plan (e.g. table column names, aliases) instead of requiring the caller
+    /// to generate generic names.
+    pub fn query_with_columns(&self, sql: &str) -> Result<(Vec<Tuple>, Vec<String>)> {
+        let (statement, _) = self.parse_cached(sql)?;
+        let catalog = self.storage.catalog();
+        let planner = sql::Planner::with_catalog(&catalog)
+            .with_sql(sql.to_string());
+        let plan = planner.statement_to_plan(statement)?;
+
+        let plan = {
+            let stats = optimizer::cost::StatsCatalog::new();
+            let rules: Vec<Box<dyn optimizer::rules::OptimizationRule>> = vec![
+                Box::new(optimizer::rules::ConstantFoldingRule::new()),
+                Box::new(optimizer::rules::SelectionPushdownRule::new()),
+                Box::new(optimizer::rules::ProjectionPruningRule::new()),
+            ];
+            let opt = optimizer::Optimizer::with_rules(
+                stats,
+                rules,
+                optimizer::OptimizerConfig::default(),
+            );
+            opt.optimize_recursive(plan)?
+        };
+
+        let mut executor = sql::Executor::with_storage(&self.storage)
+            .with_timeout(self.config.storage.query_timeout_ms);
+        executor.execute_with_columns(&plan)
+    }
+
     /// Create a full dump of the database
     ///
     /// Creates a complete binary dump of all tables, schemas, and data.
@@ -6292,6 +6378,7 @@ impl EmbeddedDatabase {
             plan_cache: self.plan_cache.clone(),
             parse_cache: self.parse_cache.clone(),
             result_cache: self.result_cache.clone(),
+            art_undo_log: self.art_undo_log.clone(),
         }
     }
 
@@ -7754,28 +7841,11 @@ mod tests {
         db.execute("INSERT INTO pk_reuse VALUES (1, 'rolled_back')").unwrap();
         db.execute("ROLLBACK").unwrap();
 
-        // Same PK should be reusable
-        let result = db.execute("INSERT INTO pk_reuse VALUES (1, 'final')");
-        // TODO: If the rolled-back INSERT left behind storage artifacts, this could
-        // fail with a duplicate key error. Document current behavior.
-        if result.is_ok() {
-            // Use unique SQL to avoid result cache returning stale empty results
-            let rows = db.query("SELECT val FROM pk_reuse WHERE id = 1 AND 1=1", &[]).unwrap();
-            if rows.len() == 1 {
-                assert_eq!(rows[0].get(0), Some(&Value::String("final".to_string())));
-            } else {
-                // TODO BUG: query result cache may return stale results; or the
-                // INSERT succeeded but wasn't committed properly after rollback.
-                // The INSERT returned Ok but SELECT finds 0 rows.
-                assert_eq!(rows.len(), 0,
-                    "KNOWN LIMITATION: INSERT after ROLLBACK may not be visible (result cache or commit issue)");
-            }
-        } else {
-            // Current behavior: PK conflict because rolled-back data leaked to storage
-            let err = result.unwrap_err().to_string();
-            assert!(err.contains("duplicate") || err.contains("unique") || err.contains("exists"),
-                "KNOWN LIMITATION: rolled-back INSERT may leave PK artifacts: {}", err);
-        }
+        // Same PK should be reusable (ART undo log cleans up index on rollback)
+        db.execute("INSERT INTO pk_reuse VALUES (1, 'final')").unwrap();
+        let rows = db.query("SELECT val FROM pk_reuse WHERE id = 1", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0), Some(&Value::String("final".to_string())));
     }
 
     #[test]
@@ -14406,12 +14476,11 @@ mod tests {
         db.execute("INSERT INTO trunc_count VALUES (3)").unwrap();
 
         let count = db.execute("TRUNCATE TABLE trunc_count").unwrap();
-        // TRUNCATE goes through Executor path which returns 0 (not actual row count)
-        assert_eq!(count, 0, "TRUNCATE returns 0 via Executor path (DDL-like behavior)");
+        assert_eq!(count, 3, "TRUNCATE returns actual row count");
 
-        // Verify all rows are actually gone despite count being 0
+        // Verify all rows are actually gone
         let rows = db.query("SELECT * FROM trunc_count", &[]).unwrap();
-        assert_eq!(rows.len(), 0, "All rows should be removed even though execute returned 0");
+        assert_eq!(rows.len(), 0, "All rows should be removed");
     }
 
     #[test]
