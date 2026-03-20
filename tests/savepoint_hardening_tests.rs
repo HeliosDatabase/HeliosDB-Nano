@@ -910,53 +910,37 @@ fn test_savepoint_reuse_name_after_release() {
 // ============================================================================
 
 #[test]
-fn test_savepoint_via_execute_is_known_bug() {
-    // Document that execute() within a BEGIN block does NOT handle SAVEPOINT.
-    // This is a known routing bug: execute_in_transaction() falls through to
-    // sql::Executor which does not implement Savepoint plan nodes.
+fn test_savepoint_via_execute_works() {
+    // SAVEPOINT via execute() within a BEGIN block works correctly.
     let db = setup();
 
     db.execute("BEGIN").unwrap();
     let result = db.execute("SAVEPOINT sp1");
-    // Current behavior: fails with "not yet implemented" or similar
-    assert!(result.is_err(),
-        "KNOWN BUG: SAVEPOINT via execute() in BEGIN block fails (not routed to handler)");
+    assert!(result.is_ok(),
+        "SAVEPOINT via execute() in BEGIN block should succeed");
     db.execute("ROLLBACK").unwrap();
 }
 
 #[test]
-fn test_release_savepoint_via_execute_is_known_bug() {
-    // Document that RELEASE SAVEPOINT via execute() also does not work.
+fn test_release_savepoint_via_execute_works() {
+    // RELEASE SAVEPOINT via execute() works correctly.
     let db = setup();
 
     db.execute("BEGIN").unwrap();
-    // First create via execute_returning (which works)
-    db.execute_returning("SAVEPOINT sp1").unwrap();
-
-    // Try to release via execute() (which should fail due to same routing bug)
-    let result = db.execute("RELEASE SAVEPOINT sp1");
-    if result.is_err() {
-        // Known bug path - clean up via execute_returning
-        db.execute_returning("RELEASE SAVEPOINT sp1").unwrap();
-    }
+    db.execute("SAVEPOINT sp1").unwrap();
+    db.execute("RELEASE SAVEPOINT sp1").unwrap();
     db.execute("COMMIT").unwrap();
 }
 
 #[test]
-fn test_rollback_to_savepoint_via_execute_is_known_bug() {
-    // Document that ROLLBACK TO SAVEPOINT via execute() also does not work.
+fn test_rollback_to_savepoint_via_execute_works() {
+    // ROLLBACK TO SAVEPOINT via execute() works correctly.
     let db = setup();
 
     db.execute("BEGIN").unwrap();
-    db.execute_returning("SAVEPOINT sp1").unwrap();
+    db.execute("SAVEPOINT sp1").unwrap();
     db.execute("INSERT INTO sp_test VALUES (1, 'data')").unwrap();
-
-    // Try ROLLBACK TO via execute() (should fail due to routing bug)
-    let result = db.execute("ROLLBACK TO SAVEPOINT sp1");
-    if result.is_err() {
-        // Known bug path - use execute_returning instead
-        db.execute_returning("ROLLBACK TO SAVEPOINT sp1").unwrap();
-    }
+    db.execute("ROLLBACK TO SAVEPOINT sp1").unwrap();
     db.execute("COMMIT").unwrap();
 }
 

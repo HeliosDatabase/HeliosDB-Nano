@@ -1092,10 +1092,10 @@ impl StreamingClient {
             sequence,
         };
 
-        eprintln!("DEBUG: send_ack called for LSN={} type={:?}", lsn, ack_type);
+        tracing::debug!("send_ack called for LSN={} type={:?}", lsn, ack_type);
         tracing::info!("StreamingClient: Sending ACK for LSN={} type={:?} seq={}", lsn, ack_type, sequence);
         let result = conn.send_ack(ack).await;
-        eprintln!("DEBUG: send_ack result for LSN={}: {:?}", lsn, result.is_ok());
+        tracing::debug!("send_ack result for LSN={}: {:?}", lsn, result.is_ok());
         match &result {
             Ok(_) => tracing::info!("StreamingClient: ACK sent successfully for LSN={}", lsn),
             Err(e) => tracing::error!("StreamingClient: Failed to send ACK for LSN={}: {}", lsn, e),

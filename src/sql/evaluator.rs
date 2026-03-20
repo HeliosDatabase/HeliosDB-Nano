@@ -3008,10 +3008,10 @@ impl Evaluator {
 
             DataType::Int2 => match value {
                 Value::Int2(i) => Ok(Value::Int2(i)),
-                Value::Int4(i) => Ok(Value::Int2(i as i16)),
-                Value::Int8(i) => Ok(Value::Int2(i as i16)),
-                Value::Float4(f) => Ok(Value::Int2(f as i16)),
-                Value::Float8(f) => Ok(Value::Int2(f as i16)),
+                Value::Int4(i) => i16::try_from(i).map(Value::Int2).map_err(|_| Error::query_execution(format!("value out of range for SMALLINT: {}", i))),
+                Value::Int8(i) => i16::try_from(i).map(Value::Int2).map_err(|_| Error::query_execution(format!("value out of range for SMALLINT: {}", i))),
+                Value::Float4(f) => { let i = f as i64; i16::try_from(i).map(Value::Int2).map_err(|_| Error::query_execution(format!("value out of range for SMALLINT: {}", f))) },
+                Value::Float8(f) => { let i = f as i64; i16::try_from(i).map(Value::Int2).map_err(|_| Error::query_execution(format!("value out of range for SMALLINT: {}", f))) },
                 Value::Numeric(n) => {
                     // Parse as decimal, truncate to integer, then to i16
                     n.parse::<Decimal>()

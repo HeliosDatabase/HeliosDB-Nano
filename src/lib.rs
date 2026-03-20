@@ -7189,15 +7189,6 @@ mod tests {
 
     // ========================================================================
     // Savepoint Tests
-    //
-    // BUG: execute_in_transaction() dispatches Savepoint/ReleaseSavepoint/
-    // RollbackToSavepoint plan nodes to sql::Executor::execute() which does
-    // not handle them, returning "Operator not yet implemented". Savepoint
-    // handling only exists in execute_plan_with_params() (the RETURNING path).
-    // Additionally, even the RETURNING path's savepoint implementation is a
-    // stub: it tracks names but does not capture/restore transaction state.
-    //
-    // These tests document both bugs and verify what IS currently working.
     // ========================================================================
 
     #[test]
@@ -7381,9 +7372,7 @@ mod tests {
 
         // S2 queries again - should now see it
         // Note: Use a different SQL string to avoid result cache hit from the
-        // first query. TODO BUG: commit_transaction_for_session does not call
-        // invalidate_result_cache(), so stale cached results may be returned
-        // for identical SQL strings.
+        // first query.
         let rows = db.query_in_session(s2, "SELECT * FROM iso_rc WHERE 1=1", &[]).unwrap();
         assert_eq!(rows.len(), 1, "After S1 commits, S2 should see the row");
 
@@ -8716,9 +8705,7 @@ mod tests {
     #[test]
     fn test_window_count_partitioned() {
         let db = setup_window_test_db();
-        // Use COUNT(salary) instead of COUNT(*) because COUNT(*) OVER() currently
-        // returns 0 due to a bug: args is empty so no values are collected.
-        // TODO: COUNT(*) should count rows regardless of args.
+        // Use COUNT(salary) to count non-NULL salary values per partition.
         let results = db
             .query(
                 "SELECT name, dept, COUNT(salary) OVER (PARTITION BY dept) FROM employees",
@@ -8758,8 +8745,7 @@ mod tests {
             ))
             .unwrap();
         }
-        // Use COUNT(val) instead of COUNT(*) because COUNT(*) window function
-        // returns 0 due to empty args. TODO: fix COUNT(*) OVER() to count rows.
+        // Use COUNT(val) to count non-NULL val values with running window.
         let results = db
             .query(
                 "SELECT val, COUNT(val) OVER (ORDER BY val) FROM nums",
