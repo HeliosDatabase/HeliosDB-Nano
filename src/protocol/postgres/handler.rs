@@ -8,8 +8,12 @@ use crate::{Result, Error, EmbeddedDatabase, Tuple, Value, Schema};
 /// Case-insensitive prefix check without allocating a new String.
 #[inline]
 fn starts_with_icase(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len()
-        && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    // Safety: length is checked on the left side of &&
+    #[allow(clippy::indexing_slicing)]
+    {
+        s.len() >= prefix.len()
+            && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    }
 }
 use super::messages::{
     FrontendMessage, BackendMessage, AuthenticationMessage,

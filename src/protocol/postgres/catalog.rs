@@ -219,6 +219,8 @@ impl PgCatalog {
 
         // Build projected schema
         let projected_schema = Schema::new(
+            // Safety: col_indices validated against schema.columns.len() above
+            #[allow(clippy::indexing_slicing)]
             col_indices.iter().map(|&i| schema.columns[i].clone()).collect()
         );
 
@@ -279,6 +281,7 @@ impl PgCatalog {
         Self::like_match_recursive(&t_chars, &p_chars, 0, 0)
     }
 
+    #[allow(clippy::indexing_slicing)] // Safety: pi/ti bounds checked at function entry and before use
     fn like_match_recursive(text: &[char], pattern: &[char], ti: usize, pi: usize) -> bool {
         if pi == pattern.len() {
             return ti == text.len();

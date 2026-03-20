@@ -66,6 +66,7 @@ pub struct StreamingServerConfig {
 impl Default for StreamingServerConfig {
     fn default() -> Self {
         Self {
+            // SAFETY: valid const address
             listen_addr: "0.0.0.0:5433".parse().unwrap(),
             wal_config: WalStreamingConfig::default(),
             sync_mode: SyncModeConfig::Async,

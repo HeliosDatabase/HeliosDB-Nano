@@ -705,6 +705,8 @@ fn eval_table_function_arg(expr: &crate::sql::LogicalExpr, params: &[crate::Valu
                     "Parameter ${} out of range", index
                 )));
             }
+            // Safety: index validated in range 1..=params.len() above
+            #[allow(clippy::indexing_slicing)]
             match &params[*index - 1] {
                 crate::Value::Int4(v) => Ok(i64::from(*v)),
                 crate::Value::Int8(v) => Ok(*v),

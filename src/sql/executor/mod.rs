@@ -675,6 +675,7 @@ impl<'a> Executor<'a> {
                 };
                 if let Some((table_name, schema, projection)) = scan_info {
                     if let Some(storage) = self.storage {
+                    if self.get_cte(table_name).is_none() {
                         let fetch_count = limit.saturating_add(*offset);
                         let tuples = storage.scan_table_with_limit(table_name, fetch_count)?;
                         let scan_op = Box::new(ScanOperator::new(
@@ -703,6 +704,7 @@ impl<'a> Executor<'a> {
                             *offset,
                         ).with_timeout(self.timeout_ctx.clone())));
                     }
+                    }
                 }
                 let input_op = self.plan_to_operator(input)?;
                 Ok(Box::new(LimitOperator::new(
@@ -722,6 +724,7 @@ impl<'a> Executor<'a> {
             }
             LogicalPlan::Aggregate { input, group_by, aggr_exprs, having } => {
                 // Fast path: COUNT(*) with no GROUP BY, no HAVING, plain Scan input
+                #[allow(clippy::indexing_slicing)] // Safety: aggr_exprs.len() == 1 checked in condition
                 if group_by.is_empty() && having.is_none() && aggr_exprs.len() == 1 {
                     if let crate::sql::LogicalExpr::AggregateFunction {
                         fun: crate::sql::logical_plan::AggregateFunction::Count,
@@ -745,13 +748,15 @@ impl<'a> Executor<'a> {
                             _ => None,
                         };
                         if let Some(table_name) = scan_table {
-                            if let Some(storage) = self.storage {
-                                let count = storage.count_table_rows(table_name)?;
-                                let result_tuple = crate::Tuple::new(vec![crate::Value::Int8(count as i64)]);
-                                return Ok(Box::new(MaterializedOperator::new(
-                                    vec![result_tuple],
-                                    count_star_schema(),
-                                )));
+                            if self.get_cte(table_name).is_none() {
+                                if let Some(storage) = self.storage {
+                                    let count = storage.count_table_rows(table_name)?;
+                                    let result_tuple = crate::Tuple::new(vec![crate::Value::Int8(count as i64)]);
+                                    return Ok(Box::new(MaterializedOperator::new(
+                                        vec![result_tuple],
+                                        count_star_schema(),
+                                    )));
+                                }
                             }
                         }
 
@@ -769,27 +774,29 @@ impl<'a> Executor<'a> {
                                 _ => None,
                             };
                             if let Some((table_name, scan_plan)) = scan_table_filtered {
-                                if let Some(storage) = self.storage {
-                                    // Build scan operator to get schema, then iterate + filter + count
-                                    let mut scan_op = self.plan_to_operator(&Box::new(scan_plan.clone()))?;
-                                    let schema = scan_op.schema();
-                                    let evaluator = crate::sql::Evaluator::with_parameters(schema, self.parameters.clone());
-                                    let _ = table_name; // used for debug context
-                                    let mut count: i64 = 0;
-                                    while let Some(tuple) = scan_op.next()? {
-                                        if let Some(ref ctx) = self.timeout_ctx {
-                                            ctx.check_timeout()?;
+                                if self.get_cte(table_name).is_none() {
+                                    if let Some(_storage) = self.storage {
+                                        // Build scan operator to get schema, then iterate + filter + count
+                                        let mut scan_op = self.plan_to_operator(&Box::new(scan_plan.clone()))?;
+                                        let schema = scan_op.schema();
+                                        let evaluator = crate::sql::Evaluator::with_parameters(schema, self.parameters.clone());
+                                        let _ = table_name; // used for debug context
+                                        let mut count: i64 = 0;
+                                        while let Some(tuple) = scan_op.next()? {
+                                            if let Some(ref ctx) = self.timeout_ctx {
+                                                ctx.check_timeout()?;
+                                            }
+                                            let result = evaluator.evaluate(predicate, &tuple)?;
+                                            if matches!(result, crate::Value::Boolean(true)) {
+                                                count += 1;
+                                            }
                                         }
-                                        let result = evaluator.evaluate(predicate, &tuple)?;
-                                        if matches!(result, crate::Value::Boolean(true)) {
-                                            count += 1;
-                                        }
+                                        let result_tuple = crate::Tuple::new(vec![crate::Value::Int8(count)]);
+                                        return Ok(Box::new(MaterializedOperator::new(
+                                            vec![result_tuple],
+                                            count_star_schema(),
+                                        )));
                                     }
-                                    let result_tuple = crate::Tuple::new(vec![crate::Value::Int8(count)]);
-                                    return Ok(Box::new(MaterializedOperator::new(
-                                        vec![result_tuple],
-                                        count_star_schema(),
-                                    )));
                                 }
                             }
                         }

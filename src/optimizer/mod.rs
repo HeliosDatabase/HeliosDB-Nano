@@ -9,6 +9,8 @@ pub mod rules;
 pub mod planner;
 pub mod cost;
 
+use tracing::debug;
+
 use crate::sql::logical_plan::LogicalPlan;
 use crate::Result;
 use rules::{OptimizationRule, create_default_rules};
@@ -129,9 +131,9 @@ impl Optimizer {
             .unwrap_or(f64::MAX);
 
         if self.config.verbose {
-            eprintln!("=== Query Optimizer ===");
-            eprintln!("Initial cost: {:.2}", initial_cost);
-            eprintln!("Max passes: {}", self.config.max_passes);
+            debug!("=== Query Optimizer ===");
+            debug!("Initial cost: {:.2}", initial_cost);
+            debug!("Max passes: {}", self.config.max_passes);
         }
 
         // Apply optimization rules iteratively
@@ -141,7 +143,7 @@ impl Optimizer {
                 let elapsed = start_time.elapsed().as_millis() as u64;
                 if elapsed > self.config.timeout_ms {
                     if self.config.verbose {
-                        eprintln!("Optimization timeout after {} passes", pass_count);
+                        debug!("Optimization timeout after {} passes", pass_count);
                     }
                     break;
                 }
@@ -151,7 +153,7 @@ impl Optimizer {
             let mut plan_changed = false;
 
             if self.config.verbose {
-                eprintln!("\n--- Pass {} ---", pass_count);
+                debug!("--- Pass {} ---", pass_count);
             }
 
             // Apply each rule
@@ -173,7 +175,7 @@ impl Optimizer {
                         // Only accept if cost improved or stayed the same
                         if new_cost <= old_cost {
                             if self.config.verbose {
-                                eprintln!(
+                                debug!(
                                     "  Applied {}: cost {:.2} -> {:.2}",
                                     rule.name(),
                                     old_cost,
@@ -183,7 +185,7 @@ impl Optimizer {
                             current_plan = new_plan;
                             plan_changed = true;
                         } else if self.config.verbose {
-                            eprintln!(
+                            debug!(
                                 "  Rejected {}: cost would increase {:.2} -> {:.2}",
                                 rule.name(),
                                 old_cost,
@@ -197,7 +199,7 @@ impl Optimizer {
                     Err(e) => {
                         // Log error but continue optimization
                         if self.config.verbose {
-                            eprintln!("  Error applying {}: {}", rule.name(), e);
+                            debug!("  Error applying {}: {}", rule.name(), e);
                         }
                     }
                 }
@@ -206,7 +208,7 @@ impl Optimizer {
             // If no rules made changes, we're done
             if !plan_changed {
                 if self.config.verbose {
-                    eprintln!("No more optimizations possible");
+                    debug!("No more optimizations possible");
                 }
                 break;
             }
@@ -223,12 +225,12 @@ impl Optimizer {
                 0.0
             };
 
-            eprintln!("\n=== Optimization Complete ===");
-            eprintln!("Passes: {}", pass_count);
-            eprintln!("Initial cost: {:.2}", initial_cost);
-            eprintln!("Final cost: {:.2}", final_cost);
-            eprintln!("Improvement: {:.1}%", improvement);
-            eprintln!("Time: {:?}", start_time.elapsed());
+            debug!("=== Optimization Complete ===");
+            debug!("Passes: {}", pass_count);
+            debug!("Initial cost: {:.2}", initial_cost);
+            debug!("Final cost: {:.2}", final_cost);
+            debug!("Improvement: {:.1}%", improvement);
+            debug!("Time: {:?}", start_time.elapsed());
         }
 
         Ok(current_plan)

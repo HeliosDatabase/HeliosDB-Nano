@@ -775,6 +775,8 @@ impl<'a> Planner<'a> {
                         if let Ok(ordinal) = n.parse::<usize>() {
                             if ordinal >= 1 && ordinal <= num_output_cols {
                                 // Replace with column reference to the Nth output column (1-indexed)
+                                // Safety: ordinal validated in range 1..=num_output_cols above
+                                #[allow(clippy::indexing_slicing)]
                                 let col = &output_schema.columns[ordinal - 1];
                                 return Ok(LogicalExpr::Column {
                                     table: None,
@@ -929,6 +931,8 @@ impl<'a> Planner<'a> {
                                 if let Ok(ordinal) = n.parse::<usize>() {
                                     if ordinal >= 1 && ordinal <= num_select_items {
                                         // Resolve to the Nth SELECT list expression (1-indexed)
+                                        // Safety: ordinal validated in range 1..=num_select_items above
+                                        #[allow(clippy::indexing_slicing)]
                                         let select_item = &select.projection[ordinal - 1];
                                         let resolved_expr = match select_item {
                                             SelectItem::UnnamedExpr(e) => e,

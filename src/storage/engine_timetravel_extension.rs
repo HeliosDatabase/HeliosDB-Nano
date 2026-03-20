@@ -5,6 +5,7 @@
 use super::{StorageEngine, SnapshotManager};
 use crate::{Error, Result, Tuple};
 use rocksdb::{IteratorMode, ReadOptions};
+use tracing::debug;
 
 impl StorageEngine {
     /// Get a reference to the snapshot manager
@@ -142,7 +143,7 @@ impl StorageEngine {
         // Get current timestamp (for MVCC)
         let timestamp = self.next_timestamp();
 
-        eprintln!("DEBUG insert_tuple_versioned: table={}, row_id={}, timestamp={}", table_name, row_id, timestamp);
+        debug!("insert_tuple_versioned: table={}, row_id={}, timestamp={}", table_name, row_id, timestamp);
 
         // Write current version (for fast non-time-travel queries)
         // This ensures zero-performance overhead for normal queries

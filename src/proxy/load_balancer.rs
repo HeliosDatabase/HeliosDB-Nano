@@ -317,6 +317,7 @@ impl LoadBalancer {
             }
             RoutingStrategy::Random => {
                 use std::time::{SystemTime, UNIX_EPOCH};
+                // SAFETY: system time is always after UNIX_EPOCH
                 let seed = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap()

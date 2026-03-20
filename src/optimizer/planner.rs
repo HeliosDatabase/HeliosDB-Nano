@@ -8,6 +8,7 @@ use crate::sql::logical_plan::{LogicalPlan, LogicalExpr, JoinType, AsOfClause};
 use crate::optimizer::cost::CostEstimator;
 use crate::{Result, Error, Schema};
 use std::sync::Arc;
+use tracing::debug;
 
 /// Physical execution plan
 ///
@@ -169,7 +170,7 @@ impl Planner {
             // Table scan - direct conversion
             LogicalPlan::Scan { table_name, alias, schema, projection, as_of } => {
                 if self.verbose {
-                    eprintln!("Planning: TableScan({})", table_name);
+                    debug!("Planning: TableScan({})", table_name);
                 }
                 PhysicalPlan::TableScan {
                     table_name,
@@ -182,7 +183,7 @@ impl Planner {
             // Filtered scan - table scan with predicate pushed down to storage layer
             LogicalPlan::FilteredScan { table_name, alias: _, schema, projection, predicate, as_of } => {
                 if self.verbose {
-                    eprintln!("Planning: FilteredScan({})", table_name);
+                    debug!("Planning: FilteredScan({})", table_name);
                 }
                 let scan = PhysicalPlan::TableScan {
                     table_name,
@@ -204,7 +205,7 @@ impl Planner {
             // Filter - plan input, then add filter
             LogicalPlan::Filter { input, predicate } => {
                 if self.verbose {
-                    eprintln!("Planning: Filter");
+                    debug!("Planning: Filter");
                 }
                 let physical_input = self.plan_recursive(*input)?;
                 PhysicalPlan::Filter {
@@ -216,7 +217,7 @@ impl Planner {
             // Projection - plan input, then add projection
             LogicalPlan::Project { input, exprs, aliases, distinct: _, distinct_on: _ } => {
                 if self.verbose {
-                    eprintln!("Planning: Projection ({} columns)", exprs.len());
+                    debug!("Planning: Projection ({} columns)", exprs.len());
                 }
                 let physical_input = self.plan_recursive(*input)?;
                 PhysicalPlan::Projection {
@@ -236,7 +237,7 @@ impl Planner {
 
                 if use_hash_join {
                     if self.verbose {
-                        eprintln!("Planning: HashJoin ({:?})", join_type);
+                        debug!("Planning: HashJoin ({:?})", join_type);
                     }
                     PhysicalPlan::HashJoin {
                         left: Box::new(physical_left),
@@ -246,7 +247,7 @@ impl Planner {
                     }
                 } else {
                     if self.verbose {
-                        eprintln!("Planning: NestedLoopJoin ({:?})", join_type);
+                        debug!("Planning: NestedLoopJoin ({:?})", join_type);
                     }
                     PhysicalPlan::NestedLoopJoin {
                         left: Box::new(physical_left),
@@ -260,7 +261,7 @@ impl Planner {
             // Aggregation - use hash aggregation
             LogicalPlan::Aggregate { input, group_by, aggr_exprs, having } => {
                 if self.verbose {
-                    eprintln!("Planning: HashAggregate");
+                    debug!("Planning: HashAggregate");
                 }
                 let physical_input = self.plan_recursive(*input)?;
                 PhysicalPlan::HashAggregate {
@@ -274,7 +275,7 @@ impl Planner {
             // Sort - direct conversion
             LogicalPlan::Sort { input, exprs, asc } => {
                 if self.verbose {
-                    eprintln!("Planning: Sort");
+                    debug!("Planning: Sort");
                 }
                 let physical_input = self.plan_recursive(*input)?;
                 PhysicalPlan::Sort {
@@ -287,7 +288,7 @@ impl Planner {
             // Limit - direct conversion
             LogicalPlan::Limit { input, limit, offset } => {
                 if self.verbose {
-                    eprintln!("Planning: Limit({}, offset={})", limit, offset);
+                    debug!("Planning: Limit({}, offset={})", limit, offset);
                 }
                 let physical_input = self.plan_recursive(*input)?;
                 PhysicalPlan::Limit {
@@ -416,11 +417,11 @@ impl Planner {
             let nested_loop_cost = left_card * right_card;
 
             if self.verbose {
-                eprintln!("Join cost estimation:");
-                eprintln!("  Left cardinality: {:.0}", left_card);
-                eprintln!("  Right cardinality: {:.0}", right_card);
-                eprintln!("  Hash join cost: {:.2}", hash_join_cost);
-                eprintln!("  Nested loop cost: {:.2}", nested_loop_cost);
+                debug!("Join cost estimation:");
+                debug!("  Left cardinality: {:.0}", left_card);
+                debug!("  Right cardinality: {:.0}", right_card);
+                debug!("  Hash join cost: {:.2}", hash_join_cost);
+                debug!("  Nested loop cost: {:.2}", nested_loop_cost);
             }
 
             // Choose the algorithm with lower cost
@@ -440,7 +441,7 @@ impl Planner {
         // If no equality predicate, must use nested loop
         if !has_equality {
             if self.verbose {
-                eprintln!("Using nested loop join: no equality predicate");
+                debug!("Using nested loop join: no equality predicate");
             }
             return Ok(false);
         }

@@ -485,7 +485,7 @@ async fn start_server(
         result = pg_server.serve() => {
             // Server stopped (error or normal shutdown)
             if let Err(ref e) = result {
-                eprintln!("Server error: {e}");
+                tracing::error!("Server error: {e}");
             }
             result?;
         }
@@ -527,7 +527,7 @@ async fn start_server(
                 println!("  Output: {}", dump_path.display().to_string().cyan());
             }
             Err(e) => {
-                eprintln!("{} {}", "Failed to dump database on shutdown:".red(), e);
+                tracing::error!("Failed to dump database on shutdown: {e}");
             }
         }
     }
@@ -617,7 +617,7 @@ fn run_repl(data_dir: PathBuf, memory: bool, dump_on_shutdown: bool, dump_file: 
                 println!("  Output: {}", dump_path.display().to_string().cyan());
             }
             Err(e) => {
-                eprintln!("{} {}", "Failed to dump database:".red(), e);
+                tracing::error!("Failed to dump database: {e}");
             }
         }
     }

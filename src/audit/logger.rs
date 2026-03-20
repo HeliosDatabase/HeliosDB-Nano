@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::RwLock;
 use tokio::sync::mpsc;
+use tracing::error;
 
 /// Audit logger for database operations
 ///
@@ -61,7 +62,7 @@ impl AuditLogger {
                     if !buffer.is_empty() {
                         is_flushing_clone.store(true, Ordering::SeqCst);
                         if let Err(e) = Self::flush_events(&storage_clone, &mut buffer) {
-                            eprintln!("Failed to flush audit events: {}", e);
+                            error!("Failed to flush audit events: {}", e);
                         }
                         is_flushing_clone.store(false, Ordering::SeqCst);
                     }
@@ -76,7 +77,7 @@ impl AuditLogger {
             if !buffer.is_empty() {
                 is_flushing_clone.store(true, Ordering::SeqCst);
                 if let Err(e) = Self::flush_events(&storage_clone, &mut buffer) {
-                    eprintln!("Failed to flush remaining audit events: {}", e);
+                    error!("Failed to flush remaining audit events: {}", e);
                 }
                 is_flushing_clone.store(false, Ordering::SeqCst);
             }

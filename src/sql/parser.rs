@@ -1397,7 +1397,7 @@ impl Parser {
         // Extract node identifier - may be quoted or unquoted
         let node_id = if after_to.starts_with('\'') || after_to.starts_with('"') {
             // Quoted identifier
-            let quote_char = after_to.chars().next().unwrap();
+            let quote_char = if after_to.starts_with('\'') { '\'' } else { '"' };
             let end_quote = after_to[1..].find(quote_char)
                 .ok_or_else(|| Error::query_execution("Unterminated quote in node identifier"))?;
             after_to[1..=end_quote].to_string()
@@ -1435,7 +1435,7 @@ impl Parser {
         // Extract node identifier - may be quoted or unquoted
         let node_id = if after_check.starts_with('\'') || after_check.starts_with('"') {
             // Quoted identifier
-            let quote_char = after_check.chars().next().unwrap();
+            let quote_char = if after_check.starts_with('\'') { '\'' } else { '"' };
             let end_quote = after_check[1..].find(quote_char)
                 .ok_or_else(|| Error::query_execution("Unterminated quote in node identifier"))?;
             after_check[1..=end_quote].to_string()
@@ -1493,7 +1493,7 @@ impl Parser {
         let alias = if alias_part.to_uppercase() == "NULL" {
             None
         } else if alias_part.starts_with('\'') || alias_part.starts_with('"') {
-            let quote_char = alias_part.chars().next().unwrap();
+            let quote_char = if alias_part.starts_with('\'') { '\'' } else { '"' };
             let end_quote = alias_part[1..].find(quote_char)
                 .ok_or_else(|| Error::query_execution("Unterminated quote in alias"))?;
             Some(alias_part[1..=end_quote].to_string())
@@ -1504,7 +1504,7 @@ impl Parser {
         // Extract node identifier (after FOR)
         let after_for = cleaned[for_pos + 5..].trim();
         let node_id = if after_for.starts_with('\'') || after_for.starts_with('"') {
-            let quote_char = after_for.chars().next().unwrap();
+            let quote_char = if after_for.starts_with('\'') { '\'' } else { '"' };
             let end_quote = after_for[1..].find(quote_char)
                 .ok_or_else(|| Error::query_execution("Unterminated quote in node identifier"))?;
             after_for[1..=end_quote].to_string()

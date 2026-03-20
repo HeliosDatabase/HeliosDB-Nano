@@ -428,8 +428,10 @@ struct SavepointState {
 /// Case-insensitive prefix check without allocating a new String.
 #[inline]
 fn starts_with_icase(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len()
-        && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    // Safety: length is checked on the left side of &&
+    #[allow(clippy::indexing_slicing)]
+    { s.len() >= prefix.len()
+        && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()) }
 }
 
 impl EmbeddedDatabase {
@@ -2404,6 +2406,7 @@ impl EmbeddedDatabase {
     /// # Ok(())
     /// # }
     /// ```
+    #[allow(clippy::expect_used)] // Safety: cache sizes are non-zero compile-time constants
     pub fn new(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let config = Config::default();
         let storage = std::sync::Arc::new(storage::StorageEngine::open(path.as_ref(), &config)?);
@@ -2458,6 +2461,7 @@ impl EmbeddedDatabase {
     /// # Ok(())
     /// # }
     /// ```
+    #[allow(clippy::expect_used)] // Safety: cache sizes are non-zero compile-time constants
     pub fn new_in_memory() -> Result<Self> {
         let config = Config::in_memory();
         let storage = std::sync::Arc::new(storage::StorageEngine::open_in_memory(&config)?);
@@ -2514,6 +2518,7 @@ impl EmbeddedDatabase {
     /// # Ok(())
     /// # }
     /// ```
+    #[allow(clippy::expect_used)] // Safety: cache sizes are non-zero compile-time constants
     pub fn with_config(config: Config) -> Result<Self> {
         let storage = std::sync::Arc::new(if config.storage.memory_only {
             storage::StorageEngine::open_in_memory(&config)?
@@ -3230,7 +3235,9 @@ impl EmbeddedDatabase {
         // Build updated tuple
         let mut new_values = existing_row.values.clone();
         if set_col_idx < new_values.len() {
-            new_values[set_col_idx] = new_value;
+            // Safety: bounds checked on the line above
+            #[allow(clippy::indexing_slicing)]
+            { new_values[set_col_idx] = new_value; }
         } else {
             return None;
         }
@@ -3377,6 +3384,7 @@ impl EmbeddedDatabase {
     }
 
     /// Find the closing ')' in a string, respecting single-quoted strings
+    #[allow(clippy::indexing_slicing)] // Safety: all accesses guarded by `i < bytes.len()`
     fn find_closing_paren(s: &str) -> Option<usize> {
         let mut in_string = false;
         let bytes = s.as_bytes();
@@ -3403,6 +3411,7 @@ impl EmbeddedDatabase {
     }
 
     /// Quick count of comma-separated values (respecting quoted strings)
+    #[allow(clippy::indexing_slicing)] // Safety: all accesses guarded by `i < bytes.len()`
     fn fast_parse_value_count(s: &str) -> usize {
         if s.trim().is_empty() {
             return 0;
@@ -3433,6 +3442,7 @@ impl EmbeddedDatabase {
 
     /// Parse comma-separated literal values with type hints.
     /// Returns None for any non-literal value (expressions, function calls, etc.)
+    #[allow(clippy::indexing_slicing)] // Safety: type_idx bounded by while condition
     fn fast_parse_values(s: &str, target_types: &[DataType]) -> Option<Vec<Value>> {
         let mut values = Vec::with_capacity(target_types.len());
         let mut remaining = s;
@@ -3465,6 +3475,7 @@ impl EmbeddedDatabase {
     }
 
     /// Parse a single literal value, returning (Value, remaining_str)
+    #[allow(clippy::indexing_slicing)] // Safety: all byte accesses guarded by `end < bytes.len()`
     fn fast_parse_one_value<'a>(s: &'a str, target_type: &DataType) -> Option<(Value, &'a str)> {
         let s = s.trim_start();
         if s.is_empty() {
@@ -11196,10 +11207,8 @@ mod tests {
 
     #[test]
     fn test_recursive_cte_with_limit() {
-        // NOTE: Recursive CTE with LIMIT currently fails because the planner
-        // wraps the With node outside the Limit node. When the Limit's inner
-        // query tries to scan 'nums', the CTE is not yet materialized, causing
-        // "Table 'nums' does not exist". This documents the current behavior.
+        // Recursive CTE with LIMIT: the LIMIT pushdown fast path must skip
+        // CTE-backed scans so the materialized CTE data is used instead.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
         let sql = "\
@@ -11210,29 +11219,15 @@ mod tests {
             ) \
             SELECT n FROM nums LIMIT 5";
 
-        match db.query(sql, &[]) {
-            Ok(rows) => {
-                // If this starts working, verify correct results
-                assert_eq!(rows.len(), 5, "LIMIT 5 should return 5 rows, got {}", rows.len());
-                for (i, row) in rows.iter().enumerate() {
-                    let val = row.get(0).unwrap();
-                    let expected = (i as i32) + 1;
-                    assert_eq!(
-                        val, &Value::Int4(expected),
-                        "LIMIT row {} should be {}, got {:?}", i, expected, val
-                    );
-                }
-            }
-            Err(e) => {
-                // BUG: LIMIT on recursive CTE fails because the CTE name is
-                // not visible when LIMIT wraps inside the With node hierarchy.
-                let err_msg = e.to_string();
-                assert!(
-                    err_msg.contains("does not exist") ||
-                    err_msg.contains("not found"),
-                    "Expected 'does not exist' error for CTE+LIMIT bug, got: {}", err_msg
-                );
-            }
+        let rows = db.query(sql, &[]).unwrap();
+        assert_eq!(rows.len(), 5, "LIMIT 5 should return 5 rows, got {}", rows.len());
+        for (i, row) in rows.iter().enumerate() {
+            let val = row.get(0).unwrap();
+            let expected = (i as i32) + 1;
+            assert_eq!(
+                val, &Value::Int4(expected),
+                "LIMIT row {} should be {}, got {:?}", i, expected, val
+            );
         }
     }
 
@@ -11419,10 +11414,8 @@ mod tests {
 
     #[test]
     fn test_recursive_cte_with_count_aggregate() {
-        // COUNT(*) on recursive CTE output.
-        // NOTE: COUNT(*) on recursive CTE currently returns 0 instead of the
-        // correct count. This is a known bug where the aggregate does not
-        // properly interact with the CTE materialization.
+        // COUNT(*) on recursive CTE output: the COUNT(*) fast path must skip
+        // CTE-backed scans so the materialized CTE rows are counted.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
         let sql = "\
@@ -11433,38 +11426,13 @@ mod tests {
             ) \
             SELECT COUNT(*) FROM nums";
 
-        match db.query(sql, &[]) {
-            Ok(rows) => {
-                assert_eq!(rows.len(), 1, "COUNT should return 1 row");
-                let val = rows[0].get(0).unwrap();
-                match val {
-                    Value::Int8(v) => {
-                        // BUG: COUNT(*) returns 0 instead of 20.
-                        // When fixed, change assertion to expect 20.
-                        if *v != 20 {
-                            assert_eq!(*v, 0,
-                                "BUG: COUNT(*) on recursive CTE returns 0 (expected 20), got {}", v);
-                        }
-                    }
-                    Value::Int4(v) => {
-                        if *v != 20 {
-                            assert_eq!(*v, 0,
-                                "BUG: COUNT(*) on recursive CTE returns 0 (expected 20), got {}", v);
-                        }
-                    }
-                    other => panic!("COUNT returned unexpected type: {:?}", other),
-                }
-            }
-            Err(e) => {
-                let err_msg = e.to_string();
-                assert!(
-                    err_msg.contains("not found") ||
-                    err_msg.contains("not implemented") ||
-                    err_msg.contains("aggregate") ||
-                    err_msg.contains("does not exist"),
-                    "Unexpected error in recursive CTE with COUNT: {}", err_msg
-                );
-            }
+        let rows = db.query(sql, &[]).unwrap();
+        assert_eq!(rows.len(), 1, "COUNT should return 1 row");
+        let val = rows[0].get(0).unwrap();
+        match val {
+            Value::Int8(v) => assert_eq!(*v, 20, "COUNT(*) should be 20, got {}", v),
+            Value::Int4(v) => assert_eq!(*v, 20, "COUNT(*) should be 20, got {}", v),
+            other => panic!("COUNT returned unexpected type: {:?}", other),
         }
     }
 

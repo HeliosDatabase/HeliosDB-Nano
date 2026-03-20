@@ -600,6 +600,8 @@ impl Session {
     async fn execute_sql_with_params(&self, query: &str, params: &[Value]) -> Result<QueryResult, Error> {
         // Determine if this is a query or a command
         let trimmed = query.trim();
+        // Safety: length checks on left side of && ensure slice bounds are valid
+        #[allow(clippy::indexing_slicing)]
         let is_query = trimmed.len() >= 6
             && (trimmed.as_bytes()[..6].eq_ignore_ascii_case(b"SELECT")
                 || (trimmed.len() >= 4 && trimmed.as_bytes()[..4].eq_ignore_ascii_case(b"WITH")));
@@ -635,6 +637,8 @@ impl Session {
                 self.db.execute(query)?
             };
 
+            // Safety: all length checks on left side of && ensure slice bounds are valid
+            #[allow(clippy::indexing_slicing)]
             let operation = if trimmed.len() >= 6 && trimmed.as_bytes()[..6].eq_ignore_ascii_case(b"INSERT") {
                 "INSERT 0"
             } else if trimmed.len() >= 6 && trimmed.as_bytes()[..6].eq_ignore_ascii_case(b"UPDATE") {
