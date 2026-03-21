@@ -4,8 +4,8 @@ version = "0.1.0"
 edition = "2021"
 description = "HeliosProxy - Intelligent connection router and failover manager for HeliosDB-Lite"
 license = "AGPL-3.0-only"
-authors = ["HeliosDB Team"]
-repository = "https://github.com/heliosdb/heliosdb-lite"
+authors = ["Daniel Moya <daniel.moya@dimensigon.com>"]
+repository = "https://github.com/Dimensigon/HDB-HeliosDB-Nano"
 keywords = ["database", "proxy", "failover", "load-balancer", "connection-pool"]
 categories = ["database", "network-programming"]
 
