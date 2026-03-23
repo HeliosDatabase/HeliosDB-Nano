@@ -335,7 +335,7 @@ fn convert_logical_referential_action(action: &sql::logical_plan::ReferentialAct
 /// # Examples
 ///
 /// ```rust,no_run
-/// use heliosdb_lite::EmbeddedDatabase;
+/// use heliosdb_nano::EmbeddedDatabase;
 ///
 /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// let db = EmbeddedDatabase::new("./mydb.helio")?;
@@ -2399,7 +2399,7 @@ impl EmbeddedDatabase {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::EmbeddedDatabase;
+    /// use heliosdb_nano::EmbeddedDatabase;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new("./data")?;
@@ -2454,7 +2454,7 @@ impl EmbeddedDatabase {
     /// # Examples
     ///
     /// ```rust
-    /// use heliosdb_lite::EmbeddedDatabase;
+    /// use heliosdb_nano::EmbeddedDatabase;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new_in_memory()?;
@@ -2509,7 +2509,7 @@ impl EmbeddedDatabase {
     /// # Examples
     ///
     /// ```rust
-    /// use heliosdb_lite::{EmbeddedDatabase, Config};
+    /// use heliosdb_nano::{EmbeddedDatabase, Config};
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let mut config = Config::in_memory();
@@ -2582,7 +2582,7 @@ impl EmbeddedDatabase {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::EmbeddedDatabase;
+    /// use heliosdb_nano::EmbeddedDatabase;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new("./data")?;
@@ -2687,6 +2687,29 @@ impl EmbeddedDatabase {
         Ok(total_rows)
     }
 
+    /// Execute a SQL statement (DDL or DML).
+    ///
+    /// Returns the number of rows affected. For DDL statements (CREATE, ALTER, DROP),
+    /// returns 0 on success. For DML statements (INSERT, UPDATE, DELETE), returns the
+    /// count of affected rows.
+    ///
+    /// # Arguments
+    ///
+    /// * `sql` - SQL statement to execute
+    ///
+    /// # Examples
+    ///
+    /// ```rust,no_run
+    /// use heliosdb_nano::EmbeddedDatabase;
+    ///
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let db = EmbeddedDatabase::new("./data")?;
+    /// db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")?;
+    /// let rows = db.execute("INSERT INTO users VALUES (1, 'Alice')")?;
+    /// assert_eq!(rows, 1);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn execute(&self, sql: &str) -> Result<u64> {
         use crate::error::LockResultExt;
 
@@ -2743,7 +2766,7 @@ impl EmbeddedDatabase {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::EmbeddedDatabase;
+    /// use heliosdb_nano::EmbeddedDatabase;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new_in_memory()?;
@@ -5037,7 +5060,7 @@ impl EmbeddedDatabase {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::EmbeddedDatabase;
+    /// use heliosdb_nano::EmbeddedDatabase;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new("./data")?;
@@ -5374,7 +5397,7 @@ impl EmbeddedDatabase {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::EmbeddedDatabase;
+    /// use heliosdb_nano::EmbeddedDatabase;
     /// use heliosdb_lite::session::IsolationLevel;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -5770,7 +5793,7 @@ impl EmbeddedDatabase {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::EmbeddedDatabase;
+    /// use heliosdb_nano::EmbeddedDatabase;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new("./data")?;
@@ -5802,7 +5825,7 @@ impl EmbeddedDatabase {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::EmbeddedDatabase;
+    /// use heliosdb_nano::EmbeddedDatabase;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new("./data")?;
@@ -5828,7 +5851,7 @@ impl EmbeddedDatabase {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::EmbeddedDatabase;
+    /// use heliosdb_nano::EmbeddedDatabase;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new("./data")?;
@@ -5856,7 +5879,7 @@ impl EmbeddedDatabase {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::EmbeddedDatabase;
+    /// use heliosdb_nano::EmbeddedDatabase;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new("./data")?;
@@ -5886,7 +5909,7 @@ impl EmbeddedDatabase {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::EmbeddedDatabase;
+    /// use heliosdb_nano::EmbeddedDatabase;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new("./data")?;
@@ -6727,7 +6750,7 @@ impl EmbeddedDatabase {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::EmbeddedDatabase;
+    /// use heliosdb_nano::EmbeddedDatabase;
     ///
     /// # #[tokio::main]
     /// # async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -6769,7 +6792,7 @@ impl EmbeddedDatabase {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::EmbeddedDatabase;
+    /// use heliosdb_nano::EmbeddedDatabase;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new_in_memory()?;
@@ -6969,7 +6992,7 @@ impl EmbeddedDatabase {
     /// # Examples
     ///
     /// ```rust,ignore
-    /// use heliosdb_lite::EmbeddedDatabase;
+    /// use heliosdb_nano::EmbeddedDatabase;
     ///
     /// #[tokio::main]
     /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -7103,7 +7126,7 @@ impl Transaction<'_> {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::EmbeddedDatabase;
+    /// use heliosdb_nano::EmbeddedDatabase;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new_in_memory()?;
@@ -7142,7 +7165,7 @@ impl Transaction<'_> {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::EmbeddedDatabase;
+    /// use heliosdb_nano::EmbeddedDatabase;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new_in_memory()?;

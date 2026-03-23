@@ -22,5 +22,15 @@ data/
 # Generated certificates
 certs/
 
+# Secrets and credentials
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+credentials*
+secrets*
+
 # Runtime files
 heliosdb.pid

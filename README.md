@@ -194,7 +194,7 @@ cargo build --release --features ha-full        # all HA features
 
 ## Building from Source
 
-**Prerequisites:** Rust 1.75+, C/C++ compiler (for RocksDB). Add clang + LLVM for FIPS builds.
+**Prerequisites:** Rust 1.85+, C/C++ compiler (for RocksDB). Add clang + LLVM for FIPS builds.
 
 ```bash
 # Default (ring crypto + encryption + vector search)

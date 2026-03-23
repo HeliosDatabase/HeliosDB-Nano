@@ -8,6 +8,7 @@ members = [
 name = "heliosdb-nano"
 version = "3.7.0"
 edition = "2021"
+rust-version = "1.85"
 authors = ["Daniel Moya <daniel.moya@dimensigon.com>"]
 license = "AGPL-3.0-only"
 description = "PostgreSQL-compatible embedded database with TDE + ZKE encryption, HNSW vector search, Product Quantization, git-like branching, time-travel queries, materialized views, row-level security, and 50+ enterprise features"
@@ -275,6 +276,18 @@ harness = false
 
 [[bench]]
 name = "art_index_bench"
+harness = false
+
+[[bench]]
+name = "multi_tenancy_bench"
+harness = false
+
+[[bench]]
+name = "mv_incremental_bench"
+harness = false
+
+[[bench]]
+name = "phase3_benchmarks"
 harness = false
 
 [profile.bench]
