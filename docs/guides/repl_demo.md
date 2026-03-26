@@ -1,13 +1,13 @@
-# HeliosDB Lite REPL Demo
+# HeliosDB Nano REPL Demo
 
-This document demonstrates an interactive REPL session with HeliosDB Lite.
+This document demonstrates an interactive REPL session with HeliosDB Nano.
 
 ## Starting the REPL
 
 ```bash
 $ heliosdb-nano repl --memory
 
-HeliosDB Lite v0.1.0
+HeliosDB Nano v3.7.0
 PostgreSQL-compatible embedded database
 
 Type \h for help, \q to quit
@@ -21,7 +21,7 @@ heliosdb>
 ```sql
 heliosdb> \h
 
-HeliosDB Lite REPL Commands
+HeliosDB Nano REPL Commands
 ════════════════════════════════════════════════════════════
 
 Meta Commands:
@@ -269,7 +269,7 @@ $ mkdir mydb
 # Start REPL with persistent storage
 $ heliosdb-nano repl -d mydb
 
-HeliosDB Lite v0.1.0
+HeliosDB Nano v3.7.0
 PostgreSQL-compatible embedded database
 
 Type \h for help, \q to quit
@@ -330,7 +330,7 @@ heliosdb> SELECT COUNT(*) FROM large_table;
 
 ## Conclusion
 
-The HeliosDB Lite REPL provides a powerful, user-friendly interface for:
+The HeliosDB Nano REPL provides a powerful, user-friendly interface for:
 - Interactive database development
 - Quick data exploration
 - Testing SQL queries

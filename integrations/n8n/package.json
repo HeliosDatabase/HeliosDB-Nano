@@ -1,12 +1,12 @@
 {
   "name": "n8n-nodes-heliosdb",
   "version": "3.0.0",
-  "description": "n8n nodes for HeliosDB-Lite - AI-native embedded database",
+  "description": "n8n nodes for HeliosDB Nano - AI-native embedded database",
   "license": "AGPL-3.0-only",
-  "homepage": "https://github.com/heliosdb/heliosdb-lite",
+  "homepage": "https://github.com/heliosdb/heliosdb-nano",
   "repository": {
     "type": "git",
-    "url": "https://github.com/heliosdb/heliosdb-lite"
+    "url": "https://github.com/heliosdb/heliosdb-nano"
   },
   "main": "dist/index.js",
   "scripts": {

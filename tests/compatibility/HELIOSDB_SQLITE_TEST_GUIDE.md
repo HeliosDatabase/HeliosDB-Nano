@@ -1,6 +1,6 @@
-# HeliosDB-Lite SQLite Compatibility Test Suite Guide
+# HeliosDB Nano SQLite Compatibility Test Suite Guide
 
-Comprehensive guide for running, interpreting, and extending the HeliosDB-Lite SQLite compatibility test suite.
+Comprehensive guide for running, interpreting, and extending the HeliosDB Nano SQLite compatibility test suite.
 
 ## Table of Contents
 
@@ -17,7 +17,7 @@ Comprehensive guide for running, interpreting, and extending the HeliosDB-Lite S
 
 ## Overview
 
-This test suite validates that HeliosDB-Lite can act as a drop-in replacement for SQLite by testing:
+This test suite validates that HeliosDB Nano can act as a drop-in replacement for SQLite by testing:
 
 - **All sqlite3 module functions** - Connection, cursor, execute operations
 - **SQL operations** - CRUD, JOINs, aggregates, transactions
@@ -70,12 +70,12 @@ pip install pytest-cov
 pip install matplotlib
 ```
 
-### Build HeliosDB-Lite
+### Build HeliosDB Nano
 
-Ensure HeliosDB-Lite binary is built:
+Ensure HeliosDB Nano binary is built:
 
 ```bash
-cd /path/to/HeliosDB-Lite
+cd /path/to/HeliosDB Nano
 cargo build --release
 
 # Binary will be at: ./target/release/heliosdb-nano
@@ -169,7 +169,7 @@ python HELIOSDB_SQLITE_BENCHMARK_SUITE.py --report-format console
 ```
 ========================= test session starts ==========================
 platform linux -- Python 3.9.7, pytest-7.4.0, pluggy-1.2.0
-rootdir: /home/user/HeliosDB-Lite/tests/compatibility
+rootdir: /home/user/HeliosDB Nano/tests/compatibility
 collected 42 items
 
 HELIOSDB_SQLITE_COMPATIBILITY_TESTS.py::TestConnectionMethods::test_memory_connection PASSED [  2%]

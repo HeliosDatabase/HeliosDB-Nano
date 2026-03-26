@@ -4,7 +4,7 @@
 set -e
 
 echo "========================================"
-echo "HeliosDB Lite - Server Mode Test Suite"
+echo "HeliosDB Nano - Server Mode Test Suite"
 echo "========================================"
 echo ""
 

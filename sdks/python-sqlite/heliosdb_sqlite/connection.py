@@ -13,7 +13,7 @@ from .exceptions import InterfaceError, ProgrammingError
 
 class Connection:
     """
-    Represents a connection to a HeliosDB-Lite database.
+    Represents a connection to a HeliosDB Nano database.
 
     This class is compatible with Python's sqlite3.Connection interface
     and can be used as a drop-in replacement.
@@ -48,7 +48,7 @@ class Connection:
         self._closed = False
         self._in_transaction = False
 
-        # TODO: Initialize actual HeliosDB-Lite connection
+        # TODO: Initialize actual HeliosDB Nano connection
         # This is a stub implementation for packaging
         self._connection_handle = None
 
@@ -204,7 +204,7 @@ def connect(
     **kwargs: Any,
 ) -> Connection:
     """
-    Open a connection to a HeliosDB-Lite database.
+    Open a connection to a HeliosDB Nano database.
 
     This function is compatible with sqlite3.connect() and can be used
     as a drop-in replacement.

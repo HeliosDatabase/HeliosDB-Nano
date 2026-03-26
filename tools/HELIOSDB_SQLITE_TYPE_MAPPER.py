@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-HeliosDB-Lite SQLite Type Mapper
-Bidirectional type conversion between SQLite and HeliosDB-Lite data types.
+HeliosDB Nano SQLite Type Mapper
+Bidirectional type conversion between SQLite and HeliosDB Nano data types.
 
 Handles type affinity, DECIMAL → FLOAT fallback with warnings,
 BLOB/binary handling, date/time conversions, and custom types.
@@ -43,14 +43,14 @@ class ConversionWarning:
 
 class TypeMapper:
     """
-    Bidirectional type mapper between SQLite and HeliosDB-Lite.
+    Bidirectional type mapper between SQLite and HeliosDB Nano.
 
     SQLite Type System:
     - Uses type affinity (INTEGER, TEXT, BLOB, REAL, NUMERIC)
     - Very flexible - any type name is valid
     - Type determined by affinity rules
 
-    HeliosDB-Lite Type System (PostgreSQL-compatible):
+    HeliosDB Nano Type System (PostgreSQL-compatible):
     - Boolean, Int2, Int4, Int8
     - Float4, Float8, Numeric
     - Varchar, Text, Char
@@ -155,7 +155,7 @@ class TypeMapper:
         sqlite_type: str
     ) -> Tuple[str, Optional[ConversionWarning]]:
         """
-        Convert SQLite type to HeliosDB-Lite type.
+        Convert SQLite type to HeliosDB Nano type.
 
         Args:
             sqlite_type: SQLite type name (e.g., 'VARCHAR(100)', 'INTEGER')
@@ -234,7 +234,7 @@ class TypeMapper:
         heliosdb_type: str
     ) -> Tuple[str, Optional[ConversionWarning]]:
         """
-        Convert HeliosDB-Lite type to SQLite type (for export).
+        Convert HeliosDB Nano type to SQLite type (for export).
 
         Args:
             heliosdb_type: HeliosDB type name (e.g., 'INT4', 'VARCHAR(100)')

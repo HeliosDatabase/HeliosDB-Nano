@@ -1,5 +1,5 @@
 #!/bin/bash
-# HeliosDB-Lite HA Failover Test Suite
+# HeliosDB Nano HA Failover Test Suite
 # Comprehensive testing of failover scenarios
 
 set -e
@@ -253,7 +253,7 @@ test_read_availability() {
 
 # Run all tests
 run_all_tests() {
-    header "HeliosDB-Lite HA Failover Test Suite"
+    header "HeliosDB Nano HA Failover Test Suite"
     echo ""
     log_info "Starting comprehensive failover testing..."
     echo ""

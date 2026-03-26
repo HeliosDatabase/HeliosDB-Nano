@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "name": "heliosdb-lite-api",
+  "name": "heliosdb-nano-api",
   "builds": [
     {
       "src": "api/**/*.ts",

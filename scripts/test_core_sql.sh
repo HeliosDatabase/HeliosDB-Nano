@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# HeliosDB-Lite Core SQL Operations Test Suite
+# HeliosDB Nano Core SQL Operations Test Suite
 # Tests: CREATE TABLE, INSERT, SELECT, UPDATE, DELETE, DROP, TRUNCATE
 # Run: ./test_core_sql.sh
 
@@ -18,7 +18,7 @@ PASSED=0
 FAILED=0
 
 echo "=========================================="
-echo "HeliosDB-Lite Core SQL Operations Test"
+echo "HeliosDB Nano Core SQL Operations Test"
 echo "=========================================="
 echo ""
 

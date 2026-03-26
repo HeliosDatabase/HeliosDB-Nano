@@ -6388,6 +6388,48 @@ impl EmbeddedDatabase {
         Err(Error::Generic("Agent memory summarization not yet implemented".to_string()))
     }
 
+    // --- Convenience API ---
+
+    /// Create an isolated database branch (copy-on-write).
+    pub fn create_branch(&self, name: &str) -> Result<u64> {
+        self.execute(&format!("CREATE BRANCH {name}"))
+    }
+
+    /// Switch the active branch.
+    pub fn switch_branch(&self, name: &str) -> Result<u64> {
+        self.execute(&format!("USE BRANCH {name}"))
+    }
+
+    /// Merge a branch into the current branch.
+    pub fn merge_branch(&self, source: &str) -> Result<u64> {
+        self.execute(&format!("MERGE BRANCH {source}"))
+    }
+
+    /// Drop a branch.
+    pub fn drop_branch(&self, name: &str) -> Result<u64> {
+        self.execute(&format!("DROP BRANCH {name}"))
+    }
+
+    /// List all branches.
+    pub fn list_branches(&self) -> Result<Vec<Tuple>> {
+        self.query("LIST BRANCHES", &[])
+    }
+
+    /// Return the query execution plan as a string.
+    pub fn explain(&self, sql: &str) -> Result<Vec<Tuple>> {
+        self.query(&format!("EXPLAIN {sql}"), &[])
+    }
+
+    /// Return the query execution plan with runtime statistics.
+    pub fn explain_analyze(&self, sql: &str) -> Result<Vec<Tuple>> {
+        self.query(&format!("EXPLAIN ANALYZE {sql}"), &[])
+    }
+
+    /// Refresh a materialized view.
+    pub fn refresh_materialized_view(&self, name: &str) -> Result<u64> {
+        self.execute(&format!("REFRESH MATERIALIZED VIEW {name}"))
+    }
+
     /// Clone database reference for trigger execution
     ///
     /// This creates a lightweight clone that shares the same storage and registries

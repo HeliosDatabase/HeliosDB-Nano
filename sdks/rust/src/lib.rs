@@ -1,6 +1,6 @@
 //! HeliosDB Rust Client
 //!
-//! A Rust client library for HeliosDB-Lite, the AI-native embedded database.
+//! A Rust client library for HeliosDB Nano, the AI-native embedded database.
 //!
 //! # Example
 //!

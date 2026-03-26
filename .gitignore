@@ -32,5 +32,11 @@ certs/
 credentials*
 secrets*
 
+# Release binaries
+releases/
+
+# Empty directories
+echo/
+
 # Runtime files
 heliosdb.pid

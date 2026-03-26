@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# HeliosDB-Lite Materialized Views Test Suite
+# HeliosDB Nano Materialized Views Test Suite
 # Tests: CREATE/DROP MV, REFRESH, Incremental Refresh, Auto-refresh, Staleness Tracking
 # Run: ./test_materialized_views.sh
 
@@ -17,7 +17,7 @@ PASSED=0
 FAILED=0
 
 echo "=========================================="
-echo "HeliosDB-Lite Materialized Views Test"
+echo "HeliosDB Nano Materialized Views Test"
 echo "=========================================="
 echo ""
 

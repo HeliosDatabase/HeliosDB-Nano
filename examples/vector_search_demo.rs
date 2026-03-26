@@ -1,6 +1,6 @@
 //! Vector search demonstration
 //!
-//! This example demonstrates how to use vector search capabilities in HeliosDB Lite.
+//! This example demonstrates how to use vector search capabilities in HeliosDB Nano.
 //! It shows:
 //! - Creating tables with VECTOR columns
 //! - Inserting vector data
@@ -10,7 +10,7 @@
 use heliosdb_nano::{EmbeddedDatabase, Result};
 
 fn main() -> Result<()> {
-    println!("HeliosDB Lite - Vector Search Demo\n");
+    println!("HeliosDB Nano - Vector Search Demo\n");
     println!("==================================\n");
 
     // Create an in-memory database

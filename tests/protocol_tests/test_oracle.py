@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Oracle Protocol Test Suite for HeliosDB-Lite
+Oracle Protocol Test Suite for HeliosDB Nano
 
 Tests Oracle wire protocol implementation with CRUD operations,
 session tracking, and Oracle-specific SQL features.

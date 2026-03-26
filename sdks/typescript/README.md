@@ -1,6 +1,6 @@
 # HeliosDB TypeScript SDK
 
-Official TypeScript/JavaScript SDK for HeliosDB-Lite - an AI-native embedded database with PostgreSQL compatibility, vector search, time-travel, and branching.
+Official TypeScript/JavaScript SDK for HeliosDB Nano - an AI-native embedded database with PostgreSQL compatibility, vector search, time-travel, and branching.
 
 ## Installation
 

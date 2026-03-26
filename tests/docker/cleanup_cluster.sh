@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# HeliosDB-Lite HA Cluster Cleanup Script
+# HeliosDB Nano HA Cluster Cleanup Script
 #
 # This script performs a complete cleanup:
 # 1. Stops all containers
@@ -51,7 +51,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --help|-h)
-            echo "HeliosDB-Lite HA Cluster Cleanup Script"
+            echo "HeliosDB Nano HA Cluster Cleanup Script"
             echo ""
             echo "Usage: $0 [options]"
             echo ""
@@ -120,7 +120,7 @@ confirm() {
 main() {
     log ""
     log "${BOLD}${BLUE}╔══════════════════════════════════════════════════════════════════════╗${NC}"
-    log "${BOLD}${BLUE}║          HeliosDB-Lite HA Cluster Cleanup                            ║${NC}"
+    log "${BOLD}${BLUE}║          HeliosDB Nano HA Cluster Cleanup                            ║${NC}"
     log "${BOLD}${BLUE}╚══════════════════════════════════════════════════════════════════════╝${NC}"
     log ""
 

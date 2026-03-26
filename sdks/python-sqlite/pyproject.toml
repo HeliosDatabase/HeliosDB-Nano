@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "heliosdb-sqlite"
 version = "3.0.0"
-description = "SQLite-compatible interface for HeliosDB-Lite with vector search, encryption, and time-travel queries"
+description = "SQLite-compatible interface for HeliosDB Nano with vector search, encryption, and time-travel queries"
 readme = "README.md"
 license = {text = "AGPL-3.0-only"}
 authors = [

@@ -1,7 +1,7 @@
 {
   "name": "@heliosdb/client",
   "version": "3.0.0",
-  "description": "Official TypeScript/JavaScript SDK for HeliosDB-Lite - AI-native embedded database",
+  "description": "Official TypeScript/JavaScript SDK for HeliosDB Nano - AI-native embedded database",
   "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
@@ -42,11 +42,11 @@
   "license": "AGPL-3.0-only",
   "repository": {
     "type": "git",
-    "url": "https://github.com/heliosdb/heliosdb-lite"
+    "url": "https://github.com/heliosdb/heliosdb-nano"
   },
-  "homepage": "https://github.com/heliosdb/heliosdb-lite#readme",
+  "homepage": "https://github.com/heliosdb/heliosdb-nano#readme",
   "bugs": {
-    "url": "https://github.com/heliosdb/heliosdb-lite/issues"
+    "url": "https://github.com/heliosdb/heliosdb-nano/issues"
   },
   "engines": {
     "node": ">=18.0.0"

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# HeliosDB-Lite Encryption Test Suite
+# HeliosDB Nano Encryption Test Suite
 # Tests: Encryption at rest, key management, rotation, vector data, transactions
 # Run: ./test_encryption.sh
 
@@ -19,7 +19,7 @@ PASSED=0
 FAILED=0
 
 echo "=========================================="
-echo "HeliosDB-Lite Encryption Test Suite"
+echo "HeliosDB Nano Encryption Test Suite"
 echo "=========================================="
 echo ""
 

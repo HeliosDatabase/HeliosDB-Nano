@@ -1,5 +1,5 @@
 #!/bin/bash
-# HeliosDB-Lite Cluster Monitor
+# HeliosDB Nano Cluster Monitor
 # Real-time health monitoring for HA cluster
 
 # Configuration (Docker defaults)
@@ -63,7 +63,7 @@ count_connections() {
 while true; do
     clear
     echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║              HeliosDB-Lite Cluster Monitor                           ║${NC}"
+    echo -e "${BLUE}║              HeliosDB Nano Cluster Monitor                           ║${NC}"
     echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "  ${CYAN}Timestamp:${NC} $(date '+%Y-%m-%d %H:%M:%S')"

@@ -1,6 +1,6 @@
 //! HeliosDB Proxy - Main Entry Point
 //!
-//! Standalone proxy binary for HeliosDB-Lite connection routing.
+//! Standalone proxy binary for HeliosDB Nano connection routing.
 
 use clap::Parser;
 use heliosdb_proxy::{config::ProxyConfig, server::ProxyServer, Result, VERSION};
@@ -10,7 +10,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 #[derive(Parser, Debug)]
 #[command(name = "heliosdb-proxy")]
 #[command(version = VERSION)]
-#[command(about = "HeliosDB Proxy - Intelligent connection router for HeliosDB-Lite")]
+#[command(about = "HeliosDB Proxy - Intelligent connection router for HeliosDB Nano")]
 struct Args {
     /// Configuration file path
     #[arg(short, long)]

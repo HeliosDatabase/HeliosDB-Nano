@@ -1,6 +1,6 @@
 # HeliosDB Retool Integration
 
-Connect HeliosDB-Lite to Retool for building internal tools with AI-native database capabilities.
+Connect HeliosDB Nano to Retool for building internal tools with AI-native database capabilities.
 
 ## Setup
 

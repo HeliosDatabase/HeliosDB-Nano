@@ -1,4 +1,4 @@
-// Package heliosdb provides a Go client for HeliosDB-Lite.
+// Package heliosdb provides a Go client for HeliosDB Nano.
 //
 // Example usage:
 //

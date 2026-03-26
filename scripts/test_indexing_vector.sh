@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# HeliosDB-Lite Indexing & Vector Search Test Suite
+# HeliosDB Nano Indexing & Vector Search Test Suite
 # Tests: CREATE INDEX, HNSW, GIN, B-Tree, Vector Similarity Search
 # Run: ./test_indexing_vector.sh
 
@@ -17,7 +17,7 @@ PASSED=0
 FAILED=0
 
 echo "=========================================="
-echo "HeliosDB-Lite Indexing & Vector Search Test"
+echo "HeliosDB Nano Indexing & Vector Search Test"
 echo "=========================================="
 echo ""
 

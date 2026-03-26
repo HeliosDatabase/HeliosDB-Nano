@@ -2,7 +2,7 @@
 """
 Setup script for heliosdb-sqlite package.
 
-This package provides a SQLite-compatible interface for HeliosDB-Lite,
+This package provides a SQLite-compatible interface for HeliosDB Nano,
 offering drop-in replacement functionality with enhanced features like
 vector search, encryption, and time-travel queries.
 
@@ -33,7 +33,7 @@ from setuptools.command.install import install
 PACKAGE_NAME = "heliosdb-sqlite"
 PACKAGE_VERSION = "3.0.0"
 PACKAGE_DESCRIPTION = (
-    "SQLite-compatible interface for HeliosDB-Lite with vector search, "
+    "SQLite-compatible interface for HeliosDB Nano with vector search, "
     "encryption, and time-travel queries"
 )
 
@@ -45,17 +45,17 @@ TARGET_DIR = HELIOSDB_ROOT / "target" / "release"
 
 
 class BuildHeliosDBExtension(build_ext):
-    """Custom build extension to compile HeliosDB-Lite binary."""
+    """Custom build extension to compile HeliosDB Nano binary."""
 
     def run(self) -> None:
-        """Build HeliosDB-Lite binary using Cargo."""
+        """Build HeliosDB Nano binary using Cargo."""
         if not CARGO_MANIFEST.exists():
             raise FileNotFoundError(
                 f"Cargo.toml not found at {CARGO_MANIFEST}. "
-                "Ensure HeliosDB-Lite repository structure is intact."
+                "Ensure HeliosDB Nano repository structure is intact."
             )
 
-        self.announce("Building HeliosDB-Lite binary with Cargo...", level=3)
+        self.announce("Building HeliosDB Nano binary with Cargo...", level=3)
 
         # Check for Rust toolchain
         try:
@@ -92,7 +92,7 @@ class BuildHeliosDBExtension(build_ext):
             self.announce(f"Running: {' '.join(cargo_args)}", level=3)
             subprocess.run(cargo_args, check=True, cwd=HELIOSDB_ROOT)
         except subprocess.CalledProcessError as e:
-            raise RuntimeError(f"Failed to build HeliosDB-Lite binary: {e}")
+            raise RuntimeError(f"Failed to build HeliosDB Nano binary: {e}")
 
         # Copy binary to package
         self._copy_binary_to_package()
@@ -152,14 +152,14 @@ class InstallWithBinaryCheck(install):
         self._verify_binary_installation()
 
     def _verify_binary_installation(self) -> None:
-        """Verify that HeliosDB-Lite binary was installed correctly."""
+        """Verify that HeliosDB Nano binary was installed correctly."""
         try:
             import heliosdb_sqlite
 
             binary_path = heliosdb_sqlite.get_binary_path()
             if not binary_path.exists():
                 self.warn(
-                    f"Warning: HeliosDB-Lite binary not found at {binary_path}. "
+                    f"Warning: HeliosDB Nano binary not found at {binary_path}. "
                     "Package may not function correctly."
                 )
             else:

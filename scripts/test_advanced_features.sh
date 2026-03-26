@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# HeliosDB-Lite Advanced Features Test Suite
+# HeliosDB Nano Advanced Features Test Suite
 # Tests: CTEs, Transactions, Encryption, Materialized Views, System Functions
 # Run: ./test_advanced_features.sh
 
@@ -17,7 +17,7 @@ PASSED=0
 FAILED=0
 
 echo "=========================================="
-echo "HeliosDB-Lite Advanced Features Test"
+echo "HeliosDB Nano Advanced Features Test"
 echo "=========================================="
 echo ""
 

@@ -1,7 +1,7 @@
 #!/bin/bash
 
 #═══════════════════════════════════════════════════════════════════════════
-# HeliosDB-Lite Phase 3 Interactive Tutorial
+# HeliosDB Nano Phase 3 Interactive Tutorial
 #
 # A guided walkthrough of time-travel queries, branches, and advanced features
 # with interactive pauses to understand each concept.
@@ -103,7 +103,7 @@ cat << 'EOF'
 
 ╔═══════════════════════════════════════════════════════════════════════════╗
 ║                                                                           ║
-║          🕐 HeliosDB-Lite Phase 3 Interactive Tutorial 🕐                ║
+║          🕐 HeliosDB Nano Phase 3 Interactive Tutorial 🕐                ║
 ║                                                                           ║
 ║                   Time-Travel & Branch Management                         ║
 ║                                                                           ║

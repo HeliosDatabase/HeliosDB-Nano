@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# HeliosDB-Lite Data Types Test Suite
+# HeliosDB Nano Data Types Test Suite
 # Tests: INT, TEXT, FLOAT, BOOLEAN, JSON, UUID, TIMESTAMP, VECTOR, ARRAY
 # Run: ./test_data_types.sh
 
@@ -17,7 +17,7 @@ PASSED=0
 FAILED=0
 
 echo "=========================================="
-echo "HeliosDB-Lite Data Types Test Suite"
+echo "HeliosDB Nano Data Types Test Suite"
 echo "=========================================="
 echo ""
 

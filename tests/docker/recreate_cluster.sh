@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# HeliosDB-Lite HA Cluster Recreation Script
+# HeliosDB Nano HA Cluster Recreation Script
 #
 # This script performs a clean cluster recreation:
 # 1. Stops and removes all containers
@@ -52,7 +52,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         --help|-h)
-            echo "HeliosDB-Lite HA Cluster Recreation Script"
+            echo "HeliosDB Nano HA Cluster Recreation Script"
             echo ""
             echo "Usage: $0 [options]"
             echo ""
@@ -125,7 +125,7 @@ wait_for_node() {
 main() {
     log ""
     log "${BOLD}${BLUE}╔══════════════════════════════════════════════════════════════════════╗${NC}"
-    log "${BOLD}${BLUE}║          HeliosDB-Lite HA Cluster Recreation                         ║${NC}"
+    log "${BOLD}${BLUE}║          HeliosDB Nano HA Cluster Recreation                         ║${NC}"
     log "${BOLD}${BLUE}╚══════════════════════════════════════════════════════════════════════╝${NC}"
     log ""
 

@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 fn main() {
     println!("=============================================================");
-    println!("HeliosDB-Lite Query Optimizer Demo");
+    println!("HeliosDB Nano Query Optimizer Demo");
     println!("=============================================================\n");
 
     // Setup

@@ -1,6 +1,6 @@
 //! SQL SET and SHOW command implementation
 //!
-//! Provides session-level and global settings management for HeliosDB Lite.
+//! Provides session-level and global settings management for HeliosDB Nano.
 
 use crate::{Result, Error};
 use std::collections::HashMap;

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# HeliosDB-Lite Phase 3 Feature Test Script (Clean Version)
+# HeliosDB Nano Phase 3 Feature Test Script (Clean Version)
 # Tests all Phase 3 features with fresh database for each test
 # Run: ./test_phase3_clean.sh
 
@@ -18,7 +18,7 @@ PASSED=0
 FAILED=0
 
 echo "=========================================="
-echo "HeliosDB-Lite Phase 3 Feature Test Suite"
+echo "HeliosDB Nano Phase 3 Feature Test Suite"
 echo "=========================================="
 echo ""
 

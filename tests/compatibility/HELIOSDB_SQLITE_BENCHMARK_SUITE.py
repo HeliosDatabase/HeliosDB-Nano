@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-HeliosDB-Lite vs SQLite Benchmark Suite
+HeliosDB Nano vs SQLite Benchmark Suite
 
-Performance comparison tests benchmarking HeliosDB-Lite against native SQLite.
+Performance comparison tests benchmarking HeliosDB Nano against native SQLite.
 Measures throughput, latency, memory usage, concurrent connection scaling,
 and generates comparison reports.
 
@@ -450,7 +450,7 @@ class BenchmarkReporter:
     ) -> str:
         """Generate Markdown format report"""
         lines = [
-            "# HeliosDB-Lite vs SQLite Performance Comparison",
+            "# HeliosDB Nano vs SQLite Performance Comparison",
             "",
             f"**Configuration:**",
             f"- Iterations: {config.iterations}",
@@ -655,7 +655,7 @@ def run_all_benchmarks(config: BenchmarkConfig) -> List[ComparisonResult]:
 def main():
     """Main entry point"""
     parser = argparse.ArgumentParser(
-        description="Benchmark HeliosDB-Lite vs SQLite performance"
+        description="Benchmark HeliosDB Nano vs SQLite performance"
     )
     parser.add_argument(
         "--iterations",

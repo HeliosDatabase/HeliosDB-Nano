@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-HeliosDB-Lite SQLite Compatibility Test Suite
+HeliosDB Nano SQLite Compatibility Test Suite
 
-Comprehensive pytest test suite validating HeliosDB-Lite acts as a drop-in
+Comprehensive pytest test suite validating HeliosDB Nano acts as a drop-in
 SQLite replacement. Tests all sqlite3 module functions, SQL operations,
 concurrency, transactions, error conditions, and data type preservation.
 

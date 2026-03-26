@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# HeliosDB-Lite HNSW Vector Search Demo
+# HeliosDB Nano HNSW Vector Search Demo
 #
 # Demonstrates high-performance vector similarity search using HNSW indexes.
 # Features:
@@ -42,7 +42,7 @@ fi
 
 echo -e "${CYAN}${BOLD}"
 echo "╔════════════════════════════════════════════════════════════════════╗"
-echo "║       HeliosDB-Lite HNSW Vector Search Demo                        ║"
+echo "║       HeliosDB Nano HNSW Vector Search Demo                        ║"
 echo "║       High-Performance Approximate Nearest Neighbor Search         ║"
 echo "╚════════════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"

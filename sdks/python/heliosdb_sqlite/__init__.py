@@ -2,7 +2,7 @@
 HeliosDB SQLite Compatibility Layer
 
 Drop-in replacement for Python's sqlite3 module that routes all operations
-to HeliosDB-Lite while maintaining 100% API compatibility.
+to HeliosDB Nano while maintaining 100% API compatibility.
 
 Usage:
     # Instead of:

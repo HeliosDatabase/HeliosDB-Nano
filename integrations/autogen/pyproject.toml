@@ -48,9 +48,9 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/heliosdb/heliosdb-lite"
+Homepage = "https://github.com/heliosdb/heliosdb-nano"
 Documentation = "https://heliosdb.dev/integrations/autogen"
-Repository = "https://github.com/heliosdb/heliosdb-lite"
+Repository = "https://github.com/heliosdb/heliosdb-nano"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/heliosdb_autogen"]

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Git Integration Test Script
-# Tests the git integration features of HeliosDB-Lite
+# Tests the git integration features of HeliosDB Nano
 
 set -e
 
@@ -16,7 +16,7 @@ TEST_DIR="/tmp/heliosdb-git-test"
 DB_PATH="$TEST_DIR/testdb"
 
 echo "========================================"
-echo "HeliosDB-Lite Git Integration Test"
+echo "HeliosDB Nano Git Integration Test"
 echo "========================================"
 
 # Cleanup previous test

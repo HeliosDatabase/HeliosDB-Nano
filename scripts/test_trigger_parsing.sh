@@ -6,8 +6,8 @@ echo ""
 
 # Create a Rust test program
 cat > /tmp/test_trigger_parser.rs << 'EOF'
-use heliosdb_lite::sql::{Parser, Planner};
-use heliosdb_lite::sql::logical_plan::{LogicalPlan, TriggerTiming, TriggerEvent, TriggerFor};
+use heliosdb_nano::sql::{Parser, Planner};
+use heliosdb_nano::sql::logical_plan::{LogicalPlan, TriggerTiming, TriggerEvent, TriggerFor};
 
 fn test_parse_trigger(sql: &str, expected_name: &str) {
     println!("\n=== Testing: {} ===", sql);
@@ -139,10 +139,10 @@ fn main() {
 EOF
 
 # Compile and run the test
-cd /home/claude/HeliosDB-Lite
+cd /home/claude/HeliosDB Nano
 echo "Compiling test program..."
 rustc --edition 2021 \
-    --extern heliosdb_lite=target/debug/libheliosdb_lite.rlib \
+    --extern heliosdb_nano=target/debug/libheliosdb_nano.rlib \
     -L target/debug/deps \
     /tmp/test_trigger_parser.rs \
     -o /tmp/test_trigger_parser 2>&1 | head -20

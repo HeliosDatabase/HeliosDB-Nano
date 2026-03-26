@@ -1,4 +1,4 @@
-# HeliosDB-Lite HA Cluster - Docker Compose
+# HeliosDB Nano HA Cluster - Docker Compose
 # 4-node cluster: 1 primary + 3 standbys (one per sync mode) + 1 observer
 #
 # Standby sync modes:

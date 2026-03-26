@@ -1,6 +1,6 @@
-# HeliosDB-Lite SQLite Compatibility Test Suite
+# HeliosDB Nano SQLite Compatibility Test Suite
 
-Comprehensive test suite validating HeliosDB-Lite as a drop-in SQLite replacement.
+Comprehensive test suite validating HeliosDB Nano as a drop-in SQLite replacement.
 
 ## Quick Start
 
@@ -10,7 +10,7 @@ Comprehensive test suite validating HeliosDB-Lite as a drop-in SQLite replacemen
 # Install dependencies
 pip install -r requirements.txt
 
-# Build HeliosDB-Lite
+# Build HeliosDB Nano
 cd ../..
 cargo build --release
 ```
@@ -111,7 +111,7 @@ See the full guide for GitLab CI, Jenkins, and other CI systems.
 
 - Python 3.7+
 - pytest 7.4.0+
-- HeliosDB-Lite binary (cargo build --release)
+- HeliosDB Nano binary (cargo build --release)
 - See requirements.txt for full list
 
 ## License

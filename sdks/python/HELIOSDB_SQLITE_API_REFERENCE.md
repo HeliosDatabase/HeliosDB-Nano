@@ -23,9 +23,9 @@ Version tuple of the heliosdb_sqlite module.
 ```python
 heliosdb_sqlite.sqlite_version
 ```
-Version string of the underlying database (HeliosDB-Lite compatible).
+Version string of the underlying database (HeliosDB Nano compatible).
 - Type: `str`
-- Example: `"3.45.0 (HeliosDB-Lite compatible)"`
+- Example: `"3.45.0 (HeliosDB Nano compatible)"`
 
 ```python
 heliosdb_sqlite.sqlite_version_info
@@ -94,7 +94,7 @@ heliosdb_sqlite.connect(
 ) -> Connection
 ```
 
-Open a connection to a HeliosDB-Lite database.
+Open a connection to a HeliosDB Nano database.
 
 **Parameters:**
 - `database` (str): Database file path, or `:memory:` for in-memory database

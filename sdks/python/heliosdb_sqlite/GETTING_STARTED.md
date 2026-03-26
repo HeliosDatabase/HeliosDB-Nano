@@ -11,7 +11,7 @@ pip install heliosdb-sqlite
 
 ### Option 2: Install from Source
 ```bash
-cd /home/claude/HeliosDB-Lite/sdks/python
+cd /home/claude/HeliosDB Nano/sdks/python
 pip install -e .
 ```
 
@@ -23,10 +23,10 @@ cp -r heliosdb_sqlite /path/to/your/project/
 ## Prerequisites
 
 1. **Python 3.8+** installed
-2. **HeliosDB-Lite binary** in your PATH
+2. **HeliosDB Nano binary** in your PATH
 
 ```bash
-# Verify HeliosDB-Lite is installed
+# Verify HeliosDB Nano is installed
 heliosdb-nano --version
 
 # If not, add to PATH

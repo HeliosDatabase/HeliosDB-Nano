@@ -1,7 +1,7 @@
 /**
  * HeliosDB Zapier Integration
  *
- * Provides Zapier triggers and actions for HeliosDB-Lite:
+ * Provides Zapier triggers and actions for HeliosDB Nano:
  * - Triggers: New row, Query results, Vector search match
  * - Actions: Execute query, Insert row, Vector search, Save to memory
  */
@@ -21,7 +21,7 @@ const authentication = {
       label: 'HeliosDB URL',
       type: 'string',
       required: true,
-      helpText: 'Your HeliosDB-Lite instance URL (e.g., https://your-instance.example.com)',
+      helpText: 'Your HeliosDB Nano instance URL (e.g., https://your-instance.example.com)',
     },
     {
       key: 'api_key',

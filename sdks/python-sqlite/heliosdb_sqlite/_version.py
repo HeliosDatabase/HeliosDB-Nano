@@ -3,7 +3,7 @@
 __version__ = "3.0.0"
 __version_info__ = (3, 0, 0)
 
-# HeliosDB-Lite binary version
+# HeliosDB Nano binary version
 __heliosdb_version__ = "3.0.0"
 
 # SQLite API compatibility version

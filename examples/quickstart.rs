@@ -1,11 +1,11 @@
-//! HeliosDB Lite Quickstart Example
+//! HeliosDB Nano Quickstart Example
 //!
-//! This example demonstrates the basic CRUD operations and features of HeliosDB Lite.
+//! This example demonstrates the basic CRUD operations and features of HeliosDB Nano.
 
 use heliosdb_nano::{EmbeddedDatabase, Result};
 
 fn main() -> Result<()> {
-    println!("🚀 HeliosDB Lite - Quickstart Example\n");
+    println!("🚀 HeliosDB Nano - Quickstart Example\n");
     println!("═══════════════════════════════════════\n");
 
     // Step 1: Create an in-memory database

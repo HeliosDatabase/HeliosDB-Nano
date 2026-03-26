@@ -55,7 +55,7 @@ dmypy.json
 *.whl
 *.tar.gz
 
-# HeliosDB-Lite specific
+# HeliosDB Nano specific
 *.db
 *.helio
 heliosdb-data/

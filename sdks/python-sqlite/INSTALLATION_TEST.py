@@ -133,7 +133,7 @@ class InstallationTester:
             return False
 
     def test_binary_availability(self) -> bool:
-        """Test that HeliosDB-Lite binary is available."""
+        """Test that HeliosDB Nano binary is available."""
         self.print_header("Test 4: Binary Availability")
 
         try:
@@ -148,7 +148,7 @@ class InstallationTester:
             self.print_info(f"Binary path: {binary_path}")
 
             if binary_path.exists():
-                self.print_success("HeliosDB-Lite binary found")
+                self.print_success("HeliosDB Nano binary found")
 
                 # Check if executable
                 if os.access(binary_path, os.X_OK):
@@ -167,7 +167,7 @@ class InstallationTester:
 
                 return True
             else:
-                self.print_failure("HeliosDB-Lite binary not found", f"Expected at: {binary_path}")
+                self.print_failure("HeliosDB Nano binary not found", f"Expected at: {binary_path}")
                 return False
 
         except Exception as e:

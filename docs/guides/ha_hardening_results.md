@@ -1,4 +1,4 @@
-# HeliosDB-Lite HA Hardening Test Results
+# HeliosDB Nano HA Hardening Test Results
 
 **Date:** 2026-01-25
 **Test Environment:** Docker HA Cluster (6 nodes)

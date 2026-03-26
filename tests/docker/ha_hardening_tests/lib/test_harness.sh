@@ -1,5 +1,5 @@
 #!/bin/bash
-# HeliosDB-Lite HA Hardening Test Harness
+# HeliosDB Nano HA Hardening Test Harness
 # Core library for all HA tests
 
 set -o pipefail

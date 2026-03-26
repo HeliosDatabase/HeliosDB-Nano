@@ -2,7 +2,7 @@
 name = "heliosdb-proxy"
 version = "0.1.0"
 edition = "2021"
-description = "HeliosProxy - Intelligent connection router and failover manager for HeliosDB-Lite"
+description = "HeliosProxy - Intelligent connection router and failover manager for HeliosDB Nano"
 license = "AGPL-3.0-only"
 authors = ["Daniel Moya <daniel.moya@dimensigon.com>"]
 repository = "https://github.com/Dimensigon/HDB-HeliosDB-Nano"
@@ -19,8 +19,8 @@ tr = []
 observability = ["dep:prometheus", "dep:opentelemetry"]
 
 [dependencies]
-# Core HeliosDB-Lite library (optional - for embedded mode)
-# heliosdb-lite = { path = "../..", features = ["ha-proxy"], optional = true }
+# Core HeliosDB Nano library (optional - for embedded mode)
+# heliosdb-nano = { path = "../..", features = ["ha-proxy"], optional = true }
 
 # Async runtime
 tokio = { version = "1", features = ["full"] }

@@ -2,7 +2,7 @@
 HeliosDB SQLite Warnings System
 ================================
 
-Provides custom warning classes and error handling for HeliosDB-Lite fallback mechanisms.
+Provides custom warning classes and error handling for HeliosDB Nano fallback mechanisms.
 Integrates with Python's warnings system and provides structured logging.
 
 This module defines:
@@ -227,7 +227,7 @@ class FallbackErrorHandler:
         "TRIGGER_NOT_SUPPORTED": FallbackWarning(
             feature="TRIGGER",
             severity=WarningSeverity.ERROR,
-            message="Database triggers are not supported in HeliosDB-Lite",
+            message="Database triggers are not supported in HeliosDB Nano",
             guidance=[
                 "Implement trigger logic in application code",
                 "Use ORM pre/post save hooks (e.g., Django signals, SQLAlchemy events)",
@@ -440,7 +440,7 @@ def warn_precision_loss(feature: str, details: Optional[str] = None):
 
 def warn_feature_not_supported(feature: str, alternative: Optional[str] = None):
     """Emit feature not supported warning"""
-    guidance = [f"Feature '{feature}' is not supported in HeliosDB-Lite"]
+    guidance = [f"Feature '{feature}' is not supported in HeliosDB Nano"]
     if alternative:
         guidance.append(f"Alternative: {alternative}")
 

@@ -75,7 +75,7 @@ class QueryResultImpl<T = Record<string, unknown>> implements QueryResult<T> {
 }
 
 /**
- * HeliosDB client for interacting with HeliosDB-Lite
+ * HeliosDB client for interacting with HeliosDB Nano
  *
  * @example
  * ```typescript

@@ -1,7 +1,7 @@
 """
 HeliosDB Python SDK
 
-Official Python client for HeliosDB-Lite - an AI-native embedded database with
+Official Python client for HeliosDB Nano - an AI-native embedded database with
 PostgreSQL compatibility, vector search, time-travel, and branching.
 
 Example usage:

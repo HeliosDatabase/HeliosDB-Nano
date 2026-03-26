@@ -1,7 +1,7 @@
-# HeliosDB-Lite Configuration File (v2.1)
+# HeliosDB Nano Configuration File (v2.1)
 #
 # This is a comprehensive example configuration file showing all available
-# options for HeliosDB-Lite. Copy this file to config.toml and customize
+# options for HeliosDB Nano. Copy this file to config.toml and customize
 # as needed for your deployment.
 
 # ============================================================================

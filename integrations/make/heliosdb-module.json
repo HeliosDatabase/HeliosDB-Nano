@@ -2,7 +2,7 @@
   "name": "heliosdb",
   "label": "HeliosDB",
   "version": "2.8.0",
-  "description": "Connect to HeliosDB-Lite - AI-native embedded database with vector search, branching, and agent memory.",
+  "description": "Connect to HeliosDB Nano - AI-native embedded database with vector search, branching, and agent memory.",
   "base_url": "{{connection.url}}",
   "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZD0iTTEyIDJDNi40OCAyIDIgNi40OCAyIDEyczQuNDggMTAgMTAgMTAgMTAtNC40OCAxMC0xMFMxNy41MiAyIDEyIDJ6bTAgMThjLTQuNDEgMC04LTMuNTktOC04czMuNTktOCA4LTggOCAzLjU5IDggOC0zLjU5IDgtOCA4eiIgZmlsbD0iIzQyODVGNCIvPjwvc3ZnPg==",
 
@@ -14,7 +14,7 @@
         "type": "text",
         "label": "HeliosDB URL",
         "required": true,
-        "help": "Your HeliosDB-Lite instance URL"
+        "help": "Your HeliosDB Nano instance URL"
       },
       {
         "name": "api_key",

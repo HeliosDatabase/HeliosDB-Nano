@@ -1,4 +1,4 @@
-# Python Requirements for HeliosDB-Lite Protocol Tests
+# Python Requirements for HeliosDB Nano Protocol Tests
 #
 # PostgreSQL protocol support
 psycopg2-binary>=2.9.9

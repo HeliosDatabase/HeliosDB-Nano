@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    println!("=== HeliosDB Lite Audit Logging Demo ===\n");
+    println!("=== HeliosDB Nano Audit Logging Demo ===\n");
 
     // 1. Create database
     println!("1. Creating database...");

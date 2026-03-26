@@ -6,7 +6,7 @@
 
 ## Overview
 
-The HeliosDB SQLite Compatibility Checker is a production-ready static analysis tool that automatically detects compatibility issues in SQLite code and schemas **BEFORE** migration to HeliosDB-Lite. This guide covers installation, usage, interpretation of results, fixing common issues, and CI/CD integration.
+The HeliosDB SQLite Compatibility Checker is a production-ready static analysis tool that automatically detects compatibility issues in SQLite code and schemas **BEFORE** migration to HeliosDB Nano. This guide covers installation, usage, interpretation of results, fixing common issues, and CI/CD integration.
 
 ## Table of Contents
 
@@ -32,7 +32,7 @@ The HeliosDB SQLite Compatibility Checker is a production-ready static analysis 
 ### Install Dependencies
 
 ```bash
-cd /home/claude/HeliosDB-Lite/tools/compatibility_checker
+cd /home/claude/HeliosDB Nano/tools/compatibility_checker
 
 # Install required packages
 pip install sqlparse
@@ -291,7 +291,7 @@ cursor.execute("SELECT * FROM users")
 
 **Fix** (Rust):
 ```rust
-use heliosdb_lite::EmbeddedDatabase;
+use heliosdb_nano::EmbeddedDatabase;
 
 let db = EmbeddedDatabase::new("mydb.db")?;
 let results = db.query("SELECT * FROM users", &[])?;
@@ -692,9 +692,9 @@ firefox report.html
 
 ## Additional Resources
 
-- **Migration Guide**: `/home/claude/HeliosDB-Lite/docs/migration/MIGRATION.md`
+- **Migration Guide**: `/home/claude/HeliosDB Nano/docs/migration/MIGRATION.md`
 - **HeliosDB Documentation**: https://docs.heliosdb.com/lite
-- **Source Code**: `/home/claude/HeliosDB-Lite/tools/compatibility_checker/`
+- **Source Code**: `/home/claude/HeliosDB Nano/tools/compatibility_checker/`
 - **Issue Tracker**: https://github.com/heliosdb/heliosdb-nano/issues
 
 ---

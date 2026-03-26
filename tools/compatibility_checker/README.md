@@ -4,7 +4,7 @@
 
 ## Overview
 
-The HeliosDB SQLite Compatibility Checker automatically detects compatibility issues in SQLite code and schemas **BEFORE** migration to HeliosDB-Lite, saving time and preventing runtime errors.
+The HeliosDB SQLite Compatibility Checker automatically detects compatibility issues in SQLite code and schemas **BEFORE** migration to HeliosDB Nano, saving time and preventing runtime errors.
 
 ## Features
 

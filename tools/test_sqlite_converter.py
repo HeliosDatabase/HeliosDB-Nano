@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Test script for SQLite ↔ HeliosDB-Lite converter.
+Test script for SQLite ↔ HeliosDB Nano converter.
 
 Demonstrates:
 - Transparent conversion on first connection
@@ -332,7 +332,7 @@ def test_value_conversion():
 def run_all_tests():
     """Run all converter tests."""
     print("\n" + "="*60)
-    print("HeliosDB-Lite SQLite Converter Test Suite")
+    print("HeliosDB Nano SQLite Converter Test Suite")
     print("="*60)
 
     # Create temporary directory for tests

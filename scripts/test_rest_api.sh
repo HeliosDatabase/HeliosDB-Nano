@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# HeliosDB-Lite REST API Comprehensive Test Script
+# HeliosDB Nano REST API Comprehensive Test Script
 #
 # Tests all REST API endpoints with proper validation, error handling,
 # and cleanup. Includes color-coded output and detailed test reporting.
@@ -151,7 +151,7 @@ wait_for_server() {
 # Main test execution
 main() {
     echo -e "${CYAN}╔════════════════════════════════════════════════╗${NC}"
-    echo -e "${CYAN}║  HeliosDB-Lite REST API Test Suite           ║${NC}"
+    echo -e "${CYAN}║  HeliosDB Nano REST API Test Suite           ║${NC}"
     echo -e "${CYAN}╚════════════════════════════════════════════════╝${NC}"
     echo ""
     echo -e "${YELLOW}Configuration:${NC}"
@@ -230,7 +230,7 @@ main() {
         version=$(echo "$response" | jq -r '.version')
         api_version=$(echo "$response" | jq -r '.api_version')
 
-        if [ "$name" = "HeliosDB-Lite" ] && [ -n "$version" ] && [ "$api_version" = "v1" ]; then
+        if [ "$name" = "HeliosDB Nano" ] && [ -n "$version" ] && [ "$api_version" = "v1" ]; then
             echo -e "${CYAN}  Name: $name, Version: $version, API: $api_version${NC}"
             test_passed
         else

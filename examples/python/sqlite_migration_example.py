@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Example: Migrating from SQLite to HeliosDB-Lite
+Example: Migrating from SQLite to HeliosDB Nano
 
 This example demonstrates how to use the SQLite converter in a real application.
 Scenarios covered:
@@ -318,7 +318,7 @@ def example_4_production_migration():
 def main():
     """Run all examples."""
     print("="*70)
-    print("SQLite to HeliosDB-Lite Migration Examples")
+    print("SQLite to HeliosDB Nano Migration Examples")
     print("="*70)
     print("\nThis script demonstrates various migration scenarios.")
     print("Note: Examples use mock databases for demonstration.")

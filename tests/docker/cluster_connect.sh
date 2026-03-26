@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# HeliosDB-Lite HA Cluster Connection Helper
+# HeliosDB Nano HA Cluster Connection Helper
 # ============================================================================
 #
 # This script provides ready-to-use connection commands for the HA cluster.
@@ -108,7 +108,7 @@ check_node() {
 # Show all connection examples
 show_examples() {
     echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║${NC} ${BOLD}HeliosDB-Lite HA Cluster Connection Helper${NC}"
+    echo -e "${BLUE}║${NC} ${BOLD}HeliosDB Nano HA Cluster Connection Helper${NC}"
     echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 
@@ -188,7 +188,7 @@ show_examples() {
 # Show status of all nodes
 show_all_status() {
     echo -e "${BLUE}╔══════════════════════════════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║${NC} ${BOLD}HeliosDB-Lite HA Cluster Status${NC}"
+    echo -e "${BLUE}║${NC} ${BOLD}HeliosDB Nano HA Cluster Status${NC}"
     echo -e "${BLUE}╚══════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
 

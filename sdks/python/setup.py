@@ -2,7 +2,7 @@
 Setup script for HeliosDB SQLite Compatibility Layer
 
 Provides drop-in replacement for Python's sqlite3 module that routes
-all operations to HeliosDB-Lite while maintaining 100% API compatibility.
+all operations to HeliosDB Nano while maintaining 100% API compatibility.
 
 Installation:
     pip install heliosdb-sqlite
@@ -29,7 +29,7 @@ setup(
     version=VERSION,
     author="HeliosDB Team",
     author_email="support@heliosdb.io",
-    description="Drop-in sqlite3 replacement for HeliosDB-Lite with advanced features",
+    description="Drop-in sqlite3 replacement for HeliosDB Nano with advanced features",
     long_description=long_description,
     long_description_content_type="text/markdown",
     url="https://github.com/heliosdb/heliosdb-nano",

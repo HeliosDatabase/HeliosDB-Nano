@@ -1,5 +1,5 @@
 #!/bin/bash
-# HeliosDB-Lite HA Failover Test Suite
+# HeliosDB Nano HA Failover Test Suite
 #
 # Tests various failover scenarios in a 3-node cluster
 #

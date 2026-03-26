@@ -410,7 +410,7 @@ def example_6_database_branching():
         print("  This enables safe experimentation and testing")
 
     except Exception as e:
-        print(f"  Note: Full branching requires HeliosDB-Lite with branching support: {e}")
+        print(f"  Note: Full branching requires HeliosDB Nano with branching support: {e}")
         print("  SQL: CREATE DATABASE BRANCH test_branch FROM main AS OF NOW")
 
     conn_main.close()
@@ -471,7 +471,7 @@ def example_7_time_travel():
         if row:
             print(f"  Historical quantity: {row[2]}")
     except Exception as e:
-        print(f"  Note: Time-travel requires HeliosDB-Lite with WAL: {e}")
+        print(f"  Note: Time-travel requires HeliosDB Nano with WAL: {e}")
         print("  SQL: SELECT * FROM inventory AS OF TIMESTAMP '2025-12-01 10:00:00'")
 
     # Query by transaction number

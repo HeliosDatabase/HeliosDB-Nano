@@ -1,4 +1,4 @@
-# Clippy configuration for HeliosDB-Lite
+# Clippy configuration for HeliosDB Nano
 
 # Allow unwrap and expect in test code
 # Tests are allowed to panic - it's their purpose

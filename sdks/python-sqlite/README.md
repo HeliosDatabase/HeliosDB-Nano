@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/pypi/l/heliosdb-sqlite.svg)](https://github.com/heliosdb/heliosdb-nano/blob/main/LICENSE)
 [![Downloads](https://img.shields.io/pypi/dm/heliosdb-sqlite.svg)](https://pypi.org/project/heliosdb-sqlite/)
 
-**SQLite-compatible interface for HeliosDB-Lite** - A drop-in replacement for Python's `sqlite3` module with enhanced features including vector search, encryption, and time-travel queries.
+**SQLite-compatible interface for HeliosDB Nano** - A drop-in replacement for Python's `sqlite3` module with enhanced features including vector search, encryption, and time-travel queries.
 
 ---
 
@@ -17,7 +17,7 @@
 - **Time-Travel Queries** - Access historical data with `AS OF TIMESTAMP`
 - **Database Branching** - Git-like workflows for schema changes
 - **PostgreSQL Types** - Extended type support (JSONB, UUID, VECTOR)
-- **Zero Dependencies** - Pure Python with bundled HeliosDB-Lite binary
+- **Zero Dependencies** - Pure Python with bundled HeliosDB Nano binary
 - **Cross-Platform** - Linux, macOS, Windows support
 
 ---
@@ -309,7 +309,7 @@ finally:
 - **Full Documentation**: https://docs.heliosdb.io/sqlite-compat
 - **API Reference**: https://docs.heliosdb.io/sqlite-compat/api
 - **Examples**: https://github.com/heliosdb/heliosdb-nano/tree/main/examples
-- **HeliosDB-Lite Docs**: https://github.com/heliosdb/heliosdb-nano
+- **HeliosDB Nano Docs**: https://github.com/heliosdb/heliosdb-nano
 
 ---
 
@@ -390,7 +390,7 @@ Apache License 2.0 - see [LICENSE](https://github.com/heliosdb/heliosdb-nano/blo
 ## Acknowledgments
 
 Built on top of:
-- **HeliosDB-Lite** - PostgreSQL-compatible embedded database
+- **HeliosDB Nano** - PostgreSQL-compatible embedded database
 - **RocksDB** - High-performance key-value store
 - **Apache Arrow** - Columnar data format
 - **HNSW** - Approximate nearest neighbor search

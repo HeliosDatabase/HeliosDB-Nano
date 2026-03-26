@@ -1,13 +1,13 @@
 //! Encryption Demo
 //!
-//! Demonstrates transparent data encryption in HeliosDB Lite.
+//! Demonstrates transparent data encryption in HeliosDB Nano.
 //!
 //! Run with: cargo run --example encryption_demo
 
 use heliosdb_nano::{Config, KeySource, Result};
 
 fn main() -> Result<()> {
-    println!("=== HeliosDB Lite - Encryption Demo ===\n");
+    println!("=== HeliosDB Nano - Encryption Demo ===\n");
 
     // Generate a random encryption key for this demo
     let km = heliosdb_nano::crypto::KeyManager::generate_random();

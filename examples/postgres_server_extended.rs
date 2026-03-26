@@ -1,6 +1,6 @@
 //! PostgreSQL server example with extended query protocol support
 //!
-//! This example demonstrates how to run HeliosDB-Lite as a PostgreSQL-compatible
+//! This example demonstrates how to run HeliosDB Nano as a PostgreSQL-compatible
 //! network server with full extended query protocol support (prepared statements).
 //!
 //! ## Usage
@@ -61,7 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build(db)?;
 
     println!("\n=======================================================");
-    println!("  HeliosDB-Lite PostgreSQL Server");
+    println!("  HeliosDB Nano PostgreSQL Server");
     println!("=======================================================");
     println!("  Address:        127.0.0.1:5432");
     println!("  Auth:           Trust (no password)");

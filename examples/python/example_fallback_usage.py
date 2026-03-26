@@ -1,9 +1,9 @@
 """
-Example: Using HeliosDB-Lite Feature Fallback System
+Example: Using HeliosDB Nano Feature Fallback System
 =====================================================
 
 This example demonstrates how to use the feature fallback system
-in a real-world application with HeliosDB-Lite.
+in a real-world application with HeliosDB Nano.
 
 Author: HeliosDB Team
 Version: 3.0.1
@@ -353,7 +353,7 @@ def main():
     """Run all examples"""
     print("\n")
     print("*" * 60)
-    print("* HeliosDB-Lite Feature Fallback System Examples")
+    print("* HeliosDB Nano Feature Fallback System Examples")
     print("* Version 3.0.1")
     print("*" * 60)
 

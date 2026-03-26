@@ -1,11 +1,11 @@
 #!/bin/bash
-# Security audit script for HeliosDB Lite
+# Security audit script for HeliosDB Nano
 # Runs comprehensive security checks
 
 set -e
 
 echo "========================================="
-echo "HeliosDB Lite Security Audit"
+echo "HeliosDB Nano Security Audit"
 echo "========================================="
 echo ""
 

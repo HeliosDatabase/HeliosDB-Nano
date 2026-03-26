@@ -2,7 +2,7 @@
 
 ## Overview
 
-The HeliosDB SQLite Compatibility Layer provides a drop-in replacement for Python's `sqlite3` module, routing all database operations to HeliosDB-Lite while maintaining 100% API compatibility. This enables existing Python applications to use HeliosDB's advanced features (vector search, branching, time-travel, encryption) without any code changes.
+The HeliosDB SQLite Compatibility Layer provides a drop-in replacement for Python's `sqlite3` module, routing all database operations to HeliosDB Nano while maintaining 100% API compatibility. This enables existing Python applications to use HeliosDB's advanced features (vector search, branching, time-travel, encryption) without any code changes.
 
 ## Architecture Diagram
 
@@ -50,7 +50,7 @@ The HeliosDB SQLite Compatibility Layer provides a drop-in replacement for Pytho
         │            │            │
         ▼            ▼            ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                    HeliosDB-Lite Core                           │
+│                    HeliosDB Nano Core                           │
 │                                                                   │
 │  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌──────────┐  │
 │  │    REPL    │  │ PostgreSQL │  │   Vector   │  │  Branch  │  │
@@ -87,11 +87,11 @@ rows = cursor.fetchall()
 
 **Flow:**
 1. `connect()` creates `Connection` object
-2. `Connection` initializes HeliosDB-Lite based on mode (embedded/daemon/hybrid)
+2. `Connection` initializes HeliosDB Nano based on mode (embedded/daemon/hybrid)
 3. `cursor()` creates `Cursor` object
 4. `execute()` binds parameters and routes to `Connection._execute_sql()`
 
-### 2. Wrapper → HeliosDB-Lite
+### 2. Wrapper → HeliosDB Nano
 
 #### Embedded Mode (Default)
 
@@ -140,7 +140,7 @@ conn.switch_to_server(port=5432)
 Seamless transition to daemon mode
 ```
 
-### 3. HeliosDB-Lite → Results
+### 3. HeliosDB Nano → Results
 
 ```
 HeliosDB REPL/Server
@@ -544,7 +544,7 @@ class TestHeliosDBSQLite(unittest.TestCase):
 
 ### Integration Tests
 
-Test with actual HeliosDB-Lite binary to ensure end-to-end compatibility.
+Test with actual HeliosDB Nano binary to ensure end-to-end compatibility.
 
 ## Summary
 
@@ -556,4 +556,4 @@ The HeliosDB SQLite Compatibility Layer provides:
 4. **Flexible Deployment**: Embedded, daemon, or hybrid modes
 5. **Production-Ready**: Full transaction support, error handling, thread safety
 
-This architecture enables smooth migration from SQLite to HeliosDB-Lite while preserving all existing application code and unlocking advanced database capabilities.
+This architecture enables smooth migration from SQLite to HeliosDB Nano while preserving all existing application code and unlocking advanced database capabilities.

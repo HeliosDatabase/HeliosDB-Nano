@@ -1,6 +1,6 @@
 openapi: 3.0.3
 info:
-  title: HeliosDB-Lite REST API
+  title: HeliosDB Nano REST API
   description: |
     PostgreSQL-compatible embedded database with vector search, time-travel, and branching.
 
@@ -18,7 +18,7 @@ info:
   version: 3.0.0
   contact:
     name: HeliosDB Team
-    url: https://github.com/heliosdb/heliosdb-lite
+    url: https://github.com/heliosdb/heliosdb-nano
   license:
     name: Apache 2.0
     url: https://www.apache.org/licenses/LICENSE-2.0

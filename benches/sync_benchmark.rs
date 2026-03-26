@@ -1,4 +1,4 @@
-//! Performance Benchmarks for HeliosDB-Lite v2.3.0 Sync Protocol
+//! Performance Benchmarks for HeliosDB Nano v2.3.0 Sync Protocol
 //!
 //! This benchmark suite measures the performance of critical sync operations:
 //! - Change log append operations

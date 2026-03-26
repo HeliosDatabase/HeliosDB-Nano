@@ -33,13 +33,15 @@ fn main() -> heliosdb_nano::Result<()> {
         println!("{:?}", row);
     }
 
-    // Parameterized queries
+    // Parameterized queries (bind actual values)
     use heliosdb_nano::Value;
     let rows = db.query_params("SELECT * FROM items WHERE id = $1", &[Value::Int4(1)])?;
 
     Ok(())
 }
 ```
+
+> **Note:** `query()` executes SQL directly. For user-supplied values, use `query_params()` with `$1`, `$2`, ... placeholders to prevent SQL injection.
 
 ## Feature Highlights
 

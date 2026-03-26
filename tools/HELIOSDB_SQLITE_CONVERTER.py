@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-HeliosDB-Lite SQLite Converter
-Transparent bidirectional conversion between SQLite and HeliosDB-Lite file formats.
+HeliosDB Nano SQLite Converter
+Transparent bidirectional conversion between SQLite and HeliosDB Nano file formats.
 
 This module provides automatic file format conversion on first connection,
 optional in-place conversion, and complete data integrity verification.
@@ -223,7 +223,7 @@ class SQLiteDetector:
 
 
 class HeliosDBFileFormat:
-    """Handle HeliosDB-Lite file format operations."""
+    """Handle HeliosDB Nano file format operations."""
 
     HELIOSDB_MAGIC = b'HELIO001'  # HeliosDB v1 format marker
     METADATA_KEY = b'meta:heliosdb:format'
@@ -231,7 +231,7 @@ class HeliosDBFileFormat:
     @staticmethod
     def is_heliosdb_file(file_path: Path) -> bool:
         """
-        Check if a directory contains a HeliosDB-Lite database.
+        Check if a directory contains a HeliosDB Nano database.
 
         Args:
             file_path: Path to database directory
@@ -484,7 +484,7 @@ class SchemaConverter:
 
 class SQLiteToHeliosDBConverter:
     """
-    Main converter for SQLite → HeliosDB-Lite conversion.
+    Main converter for SQLite → HeliosDB Nano conversion.
 
     Handles transparent conversion on first connection, optional in-place
     conversion, and complete data integrity verification.
@@ -973,7 +973,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(
-        description='Convert SQLite databases to HeliosDB-Lite format'
+        description='Convert SQLite databases to HeliosDB Nano format'
     )
     parser.add_argument(
         'sqlite_file',

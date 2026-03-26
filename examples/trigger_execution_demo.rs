@@ -7,7 +7,7 @@ use heliosdb_nano::{EmbeddedDatabase, Result, sql};
 
 fn main() -> Result<()> {
     println!("========================================");
-    println!("HeliosDB-Lite Trigger Execution Demo");
+    println!("HeliosDB Nano Trigger Execution Demo");
     println!("========================================\n");
 
     // Create an in-memory database

@@ -37,7 +37,7 @@ deactivate () {
 # unset irrelevant variables
 deactivate nondestructive
 
-VIRTUAL_ENV=/home/claude/HeliosDB-Lite/tests/protocol_tests/venv
+VIRTUAL_ENV=/home/app/Helios/Nano/tests/protocol_tests/venv
 export VIRTUAL_ENV
 
 _OLD_VIRTUAL_PATH="$PATH"

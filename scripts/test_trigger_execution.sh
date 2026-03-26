@@ -1,5 +1,5 @@
 #!/bin/bash
-# Test script for trigger execution in HeliosDB-Lite
+# Test script for trigger execution in HeliosDB Nano
 #
 # This script demonstrates trigger execution during DML operations:
 # - INSERT triggers (BEFORE and AFTER)
@@ -11,7 +11,7 @@
 set -e
 
 echo "=========================================="
-echo "HeliosDB-Lite Trigger Execution Test"
+echo "HeliosDB Nano Trigger Execution Test"
 echo "=========================================="
 echo
 

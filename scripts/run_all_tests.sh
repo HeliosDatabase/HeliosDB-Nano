@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# HeliosDB-Lite Comprehensive Test Suite Runner
+# HeliosDB Nano Comprehensive Test Suite Runner
 # Runs all feature test scripts and produces a summary report
 # Run: ./run_all_tests.sh
 
@@ -22,7 +22,7 @@ fi
 
 echo ""
 echo "=========================================="
-echo "HeliosDB-Lite Comprehensive Test Suite"
+echo "HeliosDB Nano Comprehensive Test Suite"
 echo "=========================================="
 echo "Binary: $BINARY"
 echo ""
@@ -120,7 +120,7 @@ echo ""
 
 # Exit with appropriate code
 if [ "$total_failed" -eq 0 ]; then
-    echo -e "${GREEN}✓ All HeliosDB-Lite features tested successfully!${NC}"
+    echo -e "${GREEN}✓ All HeliosDB Nano features tested successfully!${NC}"
     echo ""
     echo "Feature Completeness: 100%"
     echo "Architecture: Production Ready"

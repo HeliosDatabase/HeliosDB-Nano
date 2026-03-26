@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# Protocol Integration Test Runner for HeliosDB-Lite
+# Protocol Integration Test Runner for HeliosDB Nano
 #
 # This script runs comprehensive protocol tests for both PostgreSQL
 # and Oracle wire protocol implementations.
@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "=========================================="
-echo "HeliosDB-Lite Protocol Integration Tests"
+echo "HeliosDB Nano Protocol Integration Tests"
 echo "=========================================="
 echo ""
 

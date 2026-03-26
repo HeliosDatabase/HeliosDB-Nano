@@ -1,7 +1,7 @@
 {
   "name": "heliosdb-zapier",
   "version": "2.8.0",
-  "description": "Zapier integration for HeliosDB-Lite - AI-native embedded database",
+  "description": "Zapier integration for HeliosDB Nano - AI-native embedded database",
   "main": "index.js",
   "scripts": {
     "test": "zapier test",

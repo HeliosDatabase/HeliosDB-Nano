@@ -1,49 +1,42 @@
-//! Example: Embedded database usage
+//! HeliosDB Nano - Embedded Database Example
+//!
+//! Demonstrates basic embedded usage: create a table, insert rows,
+//! query data, and print results. No server required.
 
 use heliosdb_nano::{EmbeddedDatabase, Result};
 
 fn main() -> Result<()> {
-    println!("HeliosDB Lite - Embedded Example\n");
-
-    // Create in-memory database for this example
+    // Create an in-memory database (no files on disk)
     let db = EmbeddedDatabase::new_in_memory()?;
-    println!("✓ Database created (in-memory)");
 
-    // TODO: Implement SQL execution
-    println!("\n⚠ SQL execution not yet implemented");
-    println!("This is a placeholder example for Phase 1 development");
+    // Create a table
+    db.execute(
+        "CREATE TABLE products (id INT PRIMARY KEY, name TEXT NOT NULL, price INT NOT NULL)",
+    )?;
 
-    // When implemented, this will work:
-    /*
-    // Create table
-    db.execute("CREATE TABLE users (
-        id SERIAL PRIMARY KEY,
-        name TEXT NOT NULL,
-        email TEXT NOT NULL UNIQUE
-    )")?;
-    println!("✓ Table created");
+    // Insert rows
+    db.execute("INSERT INTO products (id, name, price) VALUES (1, 'Keyboard', 75)")?;
+    db.execute("INSERT INTO products (id, name, price) VALUES (2, 'Mouse', 40)")?;
+    db.execute("INSERT INTO products (id, name, price) VALUES (3, 'Monitor', 350)")?;
+    db.execute("INSERT INTO products (id, name, price) VALUES (4, 'Headset', 95)")?;
 
-    // Insert data
-    db.execute("INSERT INTO users (name, email) VALUES ($1, $2)",
-        &["Alice", "alice@example.com"])?;
-    db.execute("INSERT INTO users (name, email) VALUES ($1, $2)",
-        &["Bob", "bob@example.com"])?;
-    println!("✓ Data inserted");
-
-    // Query data
-    let results = db.query("SELECT * FROM users", &[])?;
-    println!("\n✓ Query results:");
-    for row in results {
+    // Query all rows
+    let rows = db.query("SELECT id, name, price FROM products ORDER BY price", &[])?;
+    println!("All products (by price):");
+    for row in &rows {
         println!("  {:?}", row);
     }
 
-    // Transaction example
-    let tx = db.begin_transaction()?;
-    tx.execute("UPDATE users SET name = $1 WHERE id = $2",
-        &["Alice Smith", &1])?;
-    tx.commit()?;
-    println!("\n✓ Transaction committed");
-    */
+    // Filtered query
+    let expensive = db.query("SELECT name, price FROM products WHERE price > 50", &[])?;
+    println!("\nProducts over 50:");
+    for row in &expensive {
+        println!("  {:?}", row);
+    }
+
+    // Aggregate
+    let total = db.query("SELECT COUNT(*), SUM(price) FROM products", &[])?;
+    println!("\nSummary: {:?}", total[0]);
 
     Ok(())
 }

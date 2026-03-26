@@ -1,4 +1,4 @@
-# HeliosDB-Lite HA Cluster Manual Testing Guide
+# HeliosDB Nano HA Cluster Manual Testing Guide
 
 This guide documents how to manually test the HA (High Availability) Tier 1 implementation.
 
@@ -15,7 +15,7 @@ The docker-compose cluster consists of:
 ### 1. Start the Cluster
 
 ```bash
-cd /home/app/HeliosDB-Lite/tests/docker
+cd /home/app/HeliosDB Nano/tests/docker
 
 # Start all nodes
 docker compose -f docker-compose.ha-cluster.yml up -d
@@ -114,7 +114,7 @@ docker logs heliosdb-standby2 2>&1 | grep -E "(Connected|primary|LSN)"
 
 ### Test 5: Monitor HA Status with System Views
 
-HeliosDB-Lite provides SQL system views for monitoring HA configuration and replication metrics:
+HeliosDB Nano provides SQL system views for monitoring HA configuration and replication metrics:
 
 #### Check Node Status (Primary or Standby)
 
@@ -188,7 +188,7 @@ Expected output columns:
 
 ### Test 6: Transparent Write Routing (HeliosProxy Feature)
 
-HeliosDB-Lite implements **Transparent Write Routing (TWR)** - an innovative feature that allows applications to connect to any node (primary or standby) and have writes automatically routed to the primary.
+HeliosDB Nano implements **Transparent Write Routing (TWR)** - an innovative feature that allows applications to connect to any node (primary or standby) and have writes automatically routed to the primary.
 
 #### Behavior by Sync Mode
 
@@ -423,7 +423,7 @@ Cannot resolve primary host 'primary:5433'
 The HA integration tests can be run directly:
 
 ```bash
-cd /home/app/HeliosDB-Lite
+cd /home/app/HeliosDB Nano
 cargo test --features ha-tier1 --test ha_integration
 ```
 

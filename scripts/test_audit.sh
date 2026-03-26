@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# HeliosDB-Lite Audit Logging Test Suite
+# HeliosDB Nano Audit Logging Test Suite
 # Tests: Audit logging configuration, DDL/DML/SELECT logging, JSON format, tamper detection
 # Run: ./test_audit.sh
 
@@ -17,7 +17,7 @@ PASSED=0
 FAILED=0
 
 echo "=========================================="
-echo "HeliosDB-Lite Audit Logging Test"
+echo "HeliosDB Nano Audit Logging Test"
 echo "=========================================="
 echo ""
 

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# HeliosDB-Lite Compression Test Suite
+# HeliosDB Nano Compression Test Suite
 # Tests: FSST, ALP, Compression Config, Statistics
 # Run: ./test_compression.sh
 
@@ -17,7 +17,7 @@ PASSED=0
 FAILED=0
 
 echo "=========================================="
-echo "HeliosDB-Lite Compression Test Suite"
+echo "HeliosDB Nano Compression Test Suite"
 echo "=========================================="
 echo ""
 

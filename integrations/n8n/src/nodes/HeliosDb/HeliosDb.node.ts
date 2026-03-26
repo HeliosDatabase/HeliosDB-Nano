@@ -14,7 +14,7 @@ export class HeliosDb implements INodeType {
     group: ['transform'],
     version: 1,
     subtitle: '={{$parameter["operation"]}}',
-    description: 'Interact with HeliosDB-Lite database',
+    description: 'Interact with HeliosDB Nano database',
     defaults: {
       name: 'HeliosDB',
     },

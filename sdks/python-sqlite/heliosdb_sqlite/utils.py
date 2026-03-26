@@ -9,13 +9,13 @@ from typing import Optional
 
 def get_binary_path() -> Path:
     """
-    Get the path to the HeliosDB-Lite binary.
+    Get the path to the HeliosDB Nano binary.
 
     The binary is extracted from the package on first use and cached
     in ~/.heliosdb/bin/ directory.
 
     Returns:
-        Path: Path to the HeliosDB-Lite binary
+        Path: Path to the HeliosDB Nano binary
 
     Raises:
         FileNotFoundError: If binary is not found in package or cache
@@ -68,7 +68,7 @@ def get_binary_path() -> Path:
                 )
 
         raise FileNotFoundError(
-            f"HeliosDB-Lite binary not found for {platform_name}-{arch}. "
+            f"HeliosDB Nano binary not found for {platform_name}-{arch}. "
             f"Expected at: {bundled_binary}\n"
             f"Your platform may not be supported, or you may need to build from source."
         )
@@ -85,14 +85,14 @@ def get_binary_path() -> Path:
 
 def get_binary_version() -> Optional[str]:
     """
-    Get the version of the HeliosDB-Lite binary.
+    Get the version of the HeliosDB Nano binary.
 
     Returns:
         Optional[str]: Version string, or None if unable to determine
 
     Example:
         >>> version = get_binary_version()
-        >>> print(f"HeliosDB-Lite binary version: {version}")
+        >>> print(f"HeliosDB Nano binary version: {version}")
     """
     import subprocess
 

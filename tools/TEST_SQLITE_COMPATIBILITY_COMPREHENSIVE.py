@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Comprehensive SQLite Compatibility Testing Framework for HeliosDB-Lite
+Comprehensive SQLite Compatibility Testing Framework for HeliosDB Nano
 
-This test suite validates all SQLite features against HeliosDB-Lite compatibility layer.
+This test suite validates all SQLite features against HeliosDB Nano compatibility layer.
 Tests cover: CRUD operations, data types, transactions, constraints, and advanced features.
 
 Usage:
     python TEST_SQLITE_COMPATIBILITY_COMPREHENSIVE.py
 
 Status: This demonstrates the test framework and API compatibility.
-When HeliosDB-Lite binary is available, actual compatibility testing will be executed.
+When HeliosDB Nano binary is available, actual compatibility testing will be executed.
 """
 
 import sys
@@ -861,7 +861,7 @@ class SQLiteCompatibilityTester:
     # ========== DECIMAL/NUMERIC TEST (NOW SUPPORTED!) ==========
 
     def test_decimal_type(self):
-        """Test DECIMAL type (now fully supported in HeliosDB-Lite v3.0.0+)"""
+        """Test DECIMAL type (now fully supported in HeliosDB Nano v3.0.0+)"""
         try:
             self.cursor.execute("CREATE TABLE test_decimal (value DECIMAL(10,2))")
             self.cursor.execute("INSERT INTO test_decimal VALUES (123.45)")
@@ -892,7 +892,7 @@ class SQLiteCompatibilityTester:
                   SELECT 1;
                 END
             """)
-            self.results.add_skip("TRIGGER", "Not supported in HeliosDB-Lite (use application logic)")
+            self.results.add_skip("TRIGGER", "Not supported in HeliosDB Nano (use application logic)")
             self.cursor.execute("DROP TABLE test_trig")
         except Exception as e:
             if "trigger" in str(e).lower():

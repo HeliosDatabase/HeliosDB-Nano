@@ -1,5 +1,5 @@
 #!/bin/bash
-# HeliosDB-Lite HA Cluster Test Script
+# HeliosDB Nano HA Cluster Test Script
 # Tests basic cluster functionality
 
 set -e
@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 echo "======================================"
-echo "HeliosDB-Lite HA Cluster Test Script"
+echo "HeliosDB Nano HA Cluster Test Script"
 echo "======================================"
 echo ""
 

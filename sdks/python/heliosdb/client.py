@@ -73,7 +73,7 @@ class HeliosDBConfig:
 
 class HeliosDB:
     """
-    Main HeliosDB client for interacting with HeliosDB-Lite.
+    Main HeliosDB client for interacting with HeliosDB Nano.
 
     Supports both embedded mode (local file) and server mode (REST API).
 

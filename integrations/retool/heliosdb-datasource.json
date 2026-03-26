@@ -12,7 +12,7 @@
         "type": "string",
         "required": true,
         "placeholder": "https://your-instance.example.com",
-        "description": "Your HeliosDB-Lite instance URL"
+        "description": "Your HeliosDB Nano instance URL"
       },
       {
         "name": "apiKey",

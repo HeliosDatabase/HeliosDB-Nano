@@ -4,7 +4,7 @@ use heliosdb_nano::crypto::{encrypt, decrypt, derive_key_from_password};
 use heliosdb_nano::Result;
 
 fn main() -> Result<()> {
-    println!("HeliosDB Lite - Encryption Example\n");
+    println!("HeliosDB Nano - Encryption Example\n");
 
     // Derive encryption key from password
     let password = "my-secure-password";
@@ -26,7 +26,7 @@ fn main() -> Result<()> {
     assert_eq!(plaintext, &decrypted[..]);
     println!("✓ Decryption verified - data matches!");
 
-    println!("\n💡 To use encryption with HeliosDB Lite:");
+    println!("\n💡 To use encryption with HeliosDB Nano:");
     println!("   1. Set HELIOSDB_ENCRYPTION_KEY environment variable");
     println!("   2. Or configure in heliosdb.toml:");
     println!("      [encryption]");

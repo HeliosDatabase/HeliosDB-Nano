@@ -1,6 +1,6 @@
 # HeliosDB Python SDK
 
-Official Python SDK for HeliosDB-Lite - an AI-native embedded database with PostgreSQL compatibility, vector search, time-travel, and branching.
+Official Python SDK for HeliosDB Nano - an AI-native embedded database with PostgreSQL compatibility, vector search, time-travel, and branching.
 
 ## Installation
 

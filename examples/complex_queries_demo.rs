@@ -1,6 +1,6 @@
 //! Complex SQL Query Demonstration
 //!
-//! This example demonstrates advanced SQL features in HeliosDB Lite:
+//! This example demonstrates advanced SQL features in HeliosDB Nano:
 //! - GROUP BY with aggregation
 //! - HAVING clauses
 //! - INNER JOINs
@@ -10,7 +10,7 @@
 use heliosdb_nano::{EmbeddedDatabase, Result, Value};
 
 fn main() -> Result<()> {
-    println!("=== HeliosDB Lite Complex Query Demonstration ===\n");
+    println!("=== HeliosDB Nano Complex Query Demonstration ===\n");
 
     let db = EmbeddedDatabase::new_in_memory()?;
 

@@ -2,7 +2,7 @@
 
 **Drop-in replacement for Python's `sqlite3` module with zero code changes required.**
 
-HeliosDB-Lite's SQLite compatibility layer enables existing Python applications to seamlessly use HeliosDB's advanced features (vector search, database branching, time-travel queries, encryption) while maintaining 100% API compatibility with the standard `sqlite3` module.
+HeliosDB Nano's SQLite compatibility layer enables existing Python applications to seamlessly use HeliosDB's advanced features (vector search, database branching, time-travel queries, encryption) while maintaining 100% API compatibility with the standard `sqlite3` module.
 
 ## Quick Start
 
@@ -38,7 +38,7 @@ conn.commit()
 conn.close()
 ```
 
-That's it! Your existing sqlite3 code now runs on HeliosDB-Lite with zero changes.
+That's it! Your existing sqlite3 code now runs on HeliosDB Nano with zero changes.
 
 ## Features
 
@@ -123,7 +123,7 @@ heliosdb_sqlite (sqlite3 API)
 │   Mode       Mode     │
 └───────────────────────┘
         ↓
-HeliosDB-Lite Core
+HeliosDB Nano Core
         ↓
 RocksDB Storage
 ```
@@ -131,7 +131,7 @@ RocksDB Storage
 ### How It Works
 
 1. **Application** uses standard sqlite3 API calls
-2. **Wrapper** intercepts calls and routes to HeliosDB-Lite
+2. **Wrapper** intercepts calls and routes to HeliosDB Nano
 3. **Embedded mode** spawns `heliosdb-nano repl` process per query
 4. **Daemon mode** uses PostgreSQL protocol to persistent server
 5. **Results** parsed and returned in sqlite3-compatible format
@@ -330,7 +330,7 @@ This runs 10 example scenarios covering:
 ## Requirements
 
 - Python 3.8+
-- HeliosDB-Lite binary (`heliosdb-nano`) in PATH
+- HeliosDB Nano binary (`heliosdb-nano`) in PATH
 - Optional: `psycopg2` for daemon mode
 
 ## Deployment Modes
@@ -455,7 +455,7 @@ Most limitations have HeliosDB-native alternatives:
 
 **Issue:** `heliosdb-nano: command not found`
 
-**Solution:** Install HeliosDB-Lite and ensure it's in PATH
+**Solution:** Install HeliosDB Nano and ensure it's in PATH
 ```bash
 export PATH="/path/to/heliosdb-nano:$PATH"
 ```
@@ -495,7 +495,7 @@ cursor.execute("SELECT * FROM users WHERE id = ?", 1)
 
 ## Contributing
 
-Contributions welcome! Please see main HeliosDB-Lite repository for guidelines.
+Contributions welcome! Please see main HeliosDB Nano repository for guidelines.
 
 ### Development Setup
 
@@ -514,13 +514,13 @@ python HELIOSDB_SQLITE_USAGE_EXAMPLES.py
 # Run specific example
 python -c "from HELIOSDB_SQLITE_USAGE_EXAMPLES import example_1_drop_in_replacement; example_1_drop_in_replacement()"
 
-# Integration tests (requires HeliosDB-Lite)
+# Integration tests (requires HeliosDB Nano)
 python -m pytest tests/integration/
 ```
 
 ## License
 
-MIT License - see main HeliosDB-Lite repository
+MIT License - see main HeliosDB Nano repository
 
 ## Support
 

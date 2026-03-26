@@ -1,4 +1,4 @@
-# Railway deployment configuration for HeliosDB-Lite
+# Railway deployment configuration for HeliosDB Nano
 # Deploy with: railway up
 
 [build]

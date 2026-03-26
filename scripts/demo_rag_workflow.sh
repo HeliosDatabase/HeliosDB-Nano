@@ -1,8 +1,8 @@
 #!/bin/bash
 #
-# HeliosDB-Lite RAG (Retrieval-Augmented Generation) Workflow Demo
+# HeliosDB Nano RAG (Retrieval-Augmented Generation) Workflow Demo
 #
-# This script demonstrates how to use HeliosDB-Lite as a vector database
+# This script demonstrates how to use HeliosDB Nano as a vector database
 # for RAG applications. It shows:
 #   1. Document storage with embeddings
 #   2. HNSW index for fast similarity search
@@ -13,7 +13,7 @@
 #
 # Usage: ./demo_rag_workflow.sh
 #
-# Requirements: HeliosDB-Lite binary compiled (target/release/heliosdb-nano)
+# Requirements: HeliosDB Nano binary compiled (target/release/heliosdb-nano)
 
 set -e
 
@@ -42,7 +42,7 @@ fi
 
 echo -e "${CYAN}${BOLD}"
 echo "╔════════════════════════════════════════════════════════════════════╗"
-echo "║          HeliosDB-Lite RAG Workflow Demo                          ║"
+echo "║          HeliosDB Nano RAG Workflow Demo                          ║"
 echo "║          Retrieval-Augmented Generation Example                    ║"
 echo "╚════════════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
@@ -74,7 +74,7 @@ EOF
 )
 
     # Display output (filtering some noise)
-    echo "$output" | grep -v "^HeliosDB Lite" | grep -v "^PostgreSQL-compatible" | \
+    echo "$output" | grep -v "^HeliosDB Nano" | grep -v "^PostgreSQL-compatible" | \
         grep -v "Type .h for help" | grep -v "^heliosdb>" | grep -v "^Goodbye" | \
         grep -v "^$" | head -40
     echo ""
@@ -85,7 +85,7 @@ section_header "1. DOCUMENT STORAGE WITH VECTOR EMBEDDINGS"
 # ============================================================================
 
 echo -e "${GREEN}In RAG applications, documents are stored with their vector embeddings.${NC}"
-echo -e "${GREEN}HeliosDB-Lite supports native VECTOR columns with configurable dimensions.${NC}"
+echo -e "${GREEN}HeliosDB Nano supports native VECTOR columns with configurable dimensions.${NC}"
 
 run_demo "Create Knowledge Base Schema" \
     "Creating a documents table with text content and 384-dim embeddings (typical for sentence-transformers)" \
@@ -139,7 +139,7 @@ section_header "4. SEMANTIC SIMILARITY SEARCH"
 # ============================================================================
 
 echo -e "${GREEN}The core of RAG: find documents similar to a user query using vector similarity.${NC}"
-echo -e "${GREEN}HeliosDB-Lite supports three distance metrics:${NC}"
+echo -e "${GREEN}HeliosDB Nano supports three distance metrics:${NC}"
 echo -e "${GREEN}  <=> Cosine distance (best for normalized embeddings)${NC}"
 echo -e "${GREEN}  <-> L2/Euclidean distance${NC}"
 echo -e "${GREEN}  <#> Inner product (negative dot product)${NC}"
@@ -168,7 +168,7 @@ section_header "5. METADATA FILTERING (Hybrid Search)"
 # ============================================================================
 
 echo -e "${GREEN}RAG often requires filtering by metadata before/during vector search.${NC}"
-echo -e "${GREEN}HeliosDB-Lite combines SQL WHERE clauses with vector operations.${NC}"
+echo -e "${GREEN}HeliosDB Nano combines SQL WHERE clauses with vector operations.${NC}"
 
 run_demo "Vector Search + Category Filter" \
     "Find similar documents within 'nlp' category only" \
@@ -246,7 +246,7 @@ echo "║                         DEMO COMPLETE                              ║
 echo "╚════════════════════════════════════════════════════════════════════╝"
 echo -e "${NC}"
 
-echo -e "${GREEN}${BOLD}HeliosDB-Lite RAG Capabilities Summary:${NC}"
+echo -e "${GREEN}${BOLD}HeliosDB Nano RAG Capabilities Summary:${NC}"
 echo ""
 echo -e "  ${BLUE}Vector Storage${NC}"
 echo "    - Native VECTOR(dim) type for any dimension"

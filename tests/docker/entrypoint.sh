@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# HeliosDB-Lite HA Entrypoint Script
+# HeliosDB Nano HA Entrypoint Script
 # Configures and starts the database based on role
 
 # Default values
@@ -16,7 +16,7 @@ set -e
 # Set RUST_LOG based on HELIOSDB_LOG_LEVEL
 export RUST_LOG="${HELIOSDB_LOG_LEVEL}"
 
-echo "Starting HeliosDB-Lite node..."
+echo "Starting HeliosDB Nano node..."
 echo "  Role: $HELIOSDB_ROLE"
 echo "  Node ID: ${HELIOSDB_NODE_ID:-auto}"
 echo "  Data dir: $HELIOSDB_DATA_DIR"

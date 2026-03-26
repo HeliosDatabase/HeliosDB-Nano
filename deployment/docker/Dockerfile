@@ -1,4 +1,4 @@
-# HeliosDB-Lite Production Dockerfile
+# HeliosDB Nano Production Dockerfile
 # Multi-stage build for minimal image size
 
 # Build stage

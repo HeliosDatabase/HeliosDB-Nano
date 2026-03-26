@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# HeliosDB-Lite Phase 3 Feature Test Script
+# HeliosDB Nano Phase 3 Feature Test Script
 # Tests all Phase 3 features that can be tested from REPL
 # Run: ./test_phase3_features.sh
 
@@ -23,7 +23,7 @@ FAILED=0
 rm -f "$DB_FILE"*
 
 echo "=========================================="
-echo "HeliosDB-Lite Phase 3 Feature Test Suite"
+echo "HeliosDB Nano Phase 3 Feature Test Suite"
 echo "=========================================="
 echo ""
 

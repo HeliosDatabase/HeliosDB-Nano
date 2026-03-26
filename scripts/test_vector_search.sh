@@ -1,6 +1,6 @@
 #!/bin/bash
 
-# HeliosDB-Lite Vector Search Test Suite
+# HeliosDB Nano Vector Search Test Suite
 # Tests: VECTOR columns, HNSW indexes, similarity search, KNN, PQ compression
 # Run: ./test_vector_search.sh
 
@@ -17,7 +17,7 @@ PASSED=0
 FAILED=0
 
 echo "=========================================="
-echo "HeliosDB-Lite Vector Search Test Suite"
+echo "HeliosDB Nano Vector Search Test Suite"
 echo "=========================================="
 echo ""
 

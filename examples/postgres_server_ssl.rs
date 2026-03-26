@@ -56,7 +56,7 @@ async fn main() -> Result<()> {
         .with_env_filter("info,heliosdb_nano=debug")
         .init();
 
-    println!("HeliosDB-Lite PostgreSQL SSL/TLS Server");
+    println!("HeliosDB Nano PostgreSQL SSL/TLS Server");
     println!("========================================\n");
 
     // Setup test certificates (auto-generates if not present)

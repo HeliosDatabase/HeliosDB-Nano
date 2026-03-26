@@ -1,6 +1,6 @@
 # Multi-Tenancy SQL Test Scripts
 
-This directory contains comprehensive SQL scripts for testing HeliosDB-Lite's multi-tenancy features with Row-Level Security (RLS) isolation.
+This directory contains comprehensive SQL scripts for testing HeliosDB Nano's multi-tenancy features with Row-Level Security (RLS) isolation.
 
 ## Scripts Overview
 
@@ -450,4 +450,4 @@ After running all scripts, you should observe:
 ---
 
 **Last Updated**: December 12, 2025
-**HeliosDB-Lite Version**: v3.2.0
+**HeliosDB Nano Version**: v3.7.0

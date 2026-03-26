@@ -1,6 +1,6 @@
-# HeliosDB-Lite HA Cluster Tutorial
+# HeliosDB Nano HA Cluster Tutorial
 
-This tutorial guides you through deploying a HeliosDB-Lite High Availability cluster and testing its innovative **Transparent Write Routing** feature.
+This tutorial guides you through deploying a HeliosDB Nano High Availability cluster and testing its innovative **Transparent Write Routing** feature.
 
 ## What You'll Learn
 
@@ -42,7 +42,7 @@ This tutorial guides you through deploying a HeliosDB-Lite High Availability clu
 ## Step 1: Start the HA Cluster
 
 ```bash
-cd /path/to/HeliosDB-Lite/tests/docker
+cd /path/to/HeliosDB Nano/tests/docker
 
 # Build images (first time only, or after code changes)
 docker compose -f docker-compose.ha-cluster.yml build

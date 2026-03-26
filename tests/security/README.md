@@ -1,6 +1,6 @@
 # Security Test Suite
 
-This directory contains comprehensive security tests for HeliosDB Lite.
+This directory contains comprehensive security tests for HeliosDB Nano.
 
 ## Test Coverage
 

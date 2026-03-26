@@ -1,7 +1,7 @@
 //! TriggerRegistry Example
 //!
 //! Demonstrates how to use the TriggerRegistry for managing trigger definitions
-//! in HeliosDB-Lite.
+//! in HeliosDB Nano.
 
 use heliosdb_nano::{
     EmbeddedDatabase, Result, Value,

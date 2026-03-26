@@ -1,4 +1,4 @@
-# HeliosDB-Lite HA Test Dockerfile
+# HeliosDB Nano HA Test Dockerfile
 # Builds with HA features for replication testing
 
 # Build stage

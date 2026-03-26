@@ -23,7 +23,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     db.execute("INSERT INTO users (id, name, email) VALUES (2, 'Bob', 'bob@example.com')")?;
     db.execute("INSERT INTO users (id, name, email) VALUES (3, 'Charlie', 'charlie@example.com')")?;
 
-    println!("HeliosDB Lite PostgreSQL Server");
+    println!("HeliosDB Nano PostgreSQL Server");
     println!("================================");
     println!();
     println!("Database initialized with sample data:");

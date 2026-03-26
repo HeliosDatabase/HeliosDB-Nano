@@ -1,6 +1,6 @@
-# HeliosDB-Lite Protocol Integration Tests
+# HeliosDB Nano Protocol Integration Tests
 
-This directory contains comprehensive protocol integration tests for HeliosDB-Lite, validating both PostgreSQL and Oracle wire protocol implementations.
+This directory contains comprehensive protocol integration tests for HeliosDB Nano, validating both PostgreSQL and Oracle wire protocol implementations.
 
 ## Overview
 
@@ -14,7 +14,7 @@ The test suite validates:
 ### Required Software
 
 - Python 3.8 or higher
-- HeliosDB-Lite server running with protocol support
+- HeliosDB Nano server running with protocol support
 - PostgreSQL client libraries (for psycopg2)
 - Oracle Instant Client (for oracledb)
 
@@ -180,7 +180,7 @@ WHERE protocol = 'Oracle';
 
 ```
 ==========================================
-HeliosDB-Lite Protocol Integration Tests
+HeliosDB Nano Protocol Integration Tests
 ==========================================
 
 Installing Python dependencies...

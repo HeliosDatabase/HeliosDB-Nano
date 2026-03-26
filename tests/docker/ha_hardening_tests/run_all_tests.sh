@@ -1,5 +1,5 @@
 #!/bin/bash
-# HeliosDB-Lite HA Hardening Tests - Master Runner
+# HeliosDB Nano HA Hardening Tests - Master Runner
 # Executes all Phase 1-4 tests autonomously
 
 set -o pipefail

@@ -1,6 +1,6 @@
 //! HeliosDB Proxy - Standalone Connection Router
 //!
-//! A standalone proxy for HeliosDB-Lite providing:
+//! A standalone proxy for HeliosDB Nano providing:
 //! - Connection pooling
 //! - Load balancing (read/write splitting)
 //! - Health monitoring

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-PostgreSQL Protocol Test Suite for HeliosDB-Lite
+PostgreSQL Protocol Test Suite for HeliosDB Nano
 
 Tests PostgreSQL wire protocol implementation with CRUD operations,
 session tracking, and protocol-specific features.

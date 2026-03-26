@@ -2,7 +2,7 @@
 HeliosDB SQLite Feature Handler
 ================================
 
-Provides intelligent fallback mechanisms for HeliosDB-Lite features not available in SQLite.
+Provides intelligent fallback mechanisms for HeliosDB Nano features not available in SQLite.
 Detects unsupported features and provides graceful degradation with clear warnings.
 
 This module is designed for production use and handles:
@@ -37,7 +37,7 @@ from HELIOSDB_SQLITE_WARNINGS import (
 
 
 class FeatureSupport(Enum):
-    """Feature support levels in HeliosDB-Lite"""
+    """Feature support levels in HeliosDB Nano"""
     FULLY_SUPPORTED = "fully_supported"
     PARTIAL_SUPPORT = "partial_support"
     FALLBACK_AVAILABLE = "fallback_available"
@@ -143,7 +143,7 @@ class HeliosDBFeatureHandler:
             support_level=FeatureSupport.FALLBACK_AVAILABLE,
             fallback_strategy=FallbackStrategy.UUID_REPLACEMENT,
             description="PostgreSQL SERIAL type (auto-incrementing INT4)",
-            guidance="HeliosDB-Lite partially supports SERIAL as INT4. Use UUID for guaranteed uniqueness across distributed systems.",
+            guidance="HeliosDB Nano partially supports SERIAL as INT4. Use UUID for guaranteed uniqueness across distributed systems.",
             performance_impact="UUID: Slightly larger storage and index overhead.",
             security_considerations="SERIAL without sequence may have gaps. UUID eliminates this concern."
         ),
@@ -161,7 +161,7 @@ class HeliosDBFeatureHandler:
             support_level=FeatureSupport.FULLY_SUPPORTED,
             fallback_strategy=None,
             description="PostgreSQL JSONB operators (@>, ->, ->>, etc.)",
-            guidance="Fully supported in HeliosDB-Lite v3.0+",
+            guidance="Fully supported in HeliosDB Nano v3.0+",
             performance_impact="Native support with GIN indexes",
             security_considerations=None
         ),
@@ -179,7 +179,7 @@ class HeliosDBFeatureHandler:
             support_level=FeatureSupport.FULLY_SUPPORTED,
             fallback_strategy=None,
             description="AS OF TIMESTAMP queries for historical data",
-            guidance="Fully supported in HeliosDB-Lite v3.0+ with MVCC",
+            guidance="Fully supported in HeliosDB Nano v3.0+ with MVCC",
             performance_impact="Minimal overhead with snapshot isolation",
             security_considerations=None
         ),
@@ -188,7 +188,7 @@ class HeliosDBFeatureHandler:
             support_level=FeatureSupport.FULLY_SUPPORTED,
             fallback_strategy=None,
             description="WITH clause for complex queries",
-            guidance="Fully supported in HeliosDB-Lite",
+            guidance="Fully supported in HeliosDB Nano",
             performance_impact="Optimized execution",
             security_considerations=None
         ),
@@ -357,7 +357,7 @@ class HeliosDBFeatureHandler:
 
             if self.warn_on_fallback:
                 warnings.warn(
-                    "CREATE TRIGGER detected. Triggers are not supported in HeliosDB-Lite. "
+                    "CREATE TRIGGER detected. Triggers are not supported in HeliosDB Nano. "
                     "Implement trigger logic in your application layer (ORM hooks, middleware, etc.).",
                     FeatureNotSupportedWarning,
                     stacklevel=2
@@ -446,7 +446,7 @@ class HeliosDBFeatureHandler:
             if self.warn_on_fallback:
                 warnings.warn(
                     "AUTOINCREMENT detected. Consider using UUID type for primary keys. "
-                    "HeliosDB-Lite SERIAL type provides auto-increment for INT4/INT8, but "
+                    "HeliosDB Nano SERIAL type provides auto-increment for INT4/INT8, but "
                     "UUIDs are better for distributed systems and avoid sequence gaps.",
                     FallbackStrategyWarning,
                     stacklevel=2

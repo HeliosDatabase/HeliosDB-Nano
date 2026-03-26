@@ -1,4 +1,4 @@
-# HeliosDB-Lite HA Hardening Test Proposal
+# HeliosDB Nano HA Hardening Test Proposal
 
 ## Objective
 

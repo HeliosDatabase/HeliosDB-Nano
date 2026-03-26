@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# HeliosDB-Lite HA Interactive Tutorial Script
+# HeliosDB Nano HA Interactive Tutorial Script
 #
 # This script provides interactive checkpoints for the HA tutorial.
 # Each checkpoint pauses to let users verify cluster status and data replication.
@@ -461,7 +461,7 @@ ORDER BY lag_ms ASC;
     echo -e "${GREEN}║                   TUTORIAL COMPLETED SUCCESSFULLY!                   ║${NC}"
     echo -e "${GREEN}╚══════════════════════════════════════════════════════════════════════╝${NC}"
     echo ""
-    print_info "You've completed the HeliosDB-Lite HA Interactive Tutorial!"
+    print_info "You've completed the HeliosDB Nano HA Interactive Tutorial!"
     print_info ""
     print_info "Key learnings:"
     print_info "  1. Sync mode guarantees zero data loss"
@@ -478,9 +478,9 @@ ORDER BY lag_ms ASC;
 
 # Full tutorial
 run_full_tutorial() {
-    print_header "HeliosDB-Lite HA Interactive Tutorial"
+    print_header "HeliosDB Nano HA Interactive Tutorial"
 
-    echo -e "${CYAN}Welcome to the HeliosDB-Lite High Availability Interactive Tutorial!${NC}"
+    echo -e "${CYAN}Welcome to the HeliosDB Nano High Availability Interactive Tutorial!${NC}"
     echo ""
     echo "This tutorial will guide you through:"
     echo "  1. Verifying cluster startup"
@@ -559,7 +559,7 @@ main() {
             run_full_tutorial
             ;;
         help|--help|-h)
-            echo "HeliosDB-Lite HA Interactive Tutorial"
+            echo "HeliosDB Nano HA Interactive Tutorial"
             echo ""
             echo "Usage: $0 [command]"
             echo ""

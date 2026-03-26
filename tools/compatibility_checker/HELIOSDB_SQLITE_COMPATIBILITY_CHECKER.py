@@ -4,7 +4,7 @@ HeliosDB SQLite Compatibility Checker
 ======================================
 
 A comprehensive static code and schema analyzer that detects SQLite-specific
-patterns and incompatibilities BEFORE migrating to HeliosDB-Lite.
+patterns and incompatibilities BEFORE migrating to HeliosDB Nano.
 
 Features:
 - Static code analysis for sqlite3 module usage
@@ -130,7 +130,7 @@ class CompatibilityReport:
 
 class SQLiteFeatureMatrix:
     """
-    Feature compatibility matrix between SQLite and HeliosDB-Lite
+    Feature compatibility matrix between SQLite and HeliosDB Nano
     Based on migration documentation and PostgreSQL compatibility
     """
 

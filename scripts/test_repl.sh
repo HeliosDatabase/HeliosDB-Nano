@@ -1,7 +1,7 @@
 #!/bin/bash
-# Test script for HeliosDB Lite REPL
+# Test script for HeliosDB Nano REPL
 
-echo "Testing HeliosDB Lite REPL..."
+echo "Testing HeliosDB Nano REPL..."
 echo
 
 # Build the binary

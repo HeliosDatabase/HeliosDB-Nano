@@ -1,4 +1,4 @@
-# Fly.io deployment configuration for HeliosDB-Lite
+# Fly.io deployment configuration for HeliosDB Nano
 # Deploy with: fly deploy
 
 app = "heliosdb-nano"

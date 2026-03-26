@@ -1,9 +1,9 @@
 """
 HELIOSDB_SQLITE_MAIN_LIBRARY.py
 
-Production-ready SQLite API compatibility layer for HeliosDB-Lite.
+Production-ready SQLite API compatibility layer for HeliosDB Nano.
 Provides 100% API compatibility with Python's sqlite3 module while routing
-all operations to HeliosDB-Lite's embedded REPL mode.
+all operations to HeliosDB Nano's embedded REPL mode.
 
 Architecture:
 - Drop-in replacement: No application code changes required
@@ -32,7 +32,7 @@ from pathlib import Path
 # Version constants (mimics sqlite3)
 version = "3.0.1"
 version_info = (3, 0, 1)
-sqlite_version = "3.45.0 (HeliosDB-Lite compatible)"
+sqlite_version = "3.45.0 (HeliosDB Nano compatible)"
 sqlite_version_info = (3, 45, 0)
 
 # Parse constants
@@ -571,7 +571,7 @@ class Connection:
             )
 
     def _initialize_heliosdb(self) -> None:
-        """Initialize HeliosDB-Lite connection based on mode."""
+        """Initialize HeliosDB Nano connection based on mode."""
         if self._mode == 'embedded':
             self._init_embedded_mode()
         elif self._mode == 'daemon':
@@ -656,7 +656,7 @@ class Connection:
 
     def _execute_sql(self, sql: str) -> Union[Dict, int]:
         """
-        Execute SQL through HeliosDB-Lite.
+        Execute SQL through HeliosDB Nano.
 
         Args:
             sql: SQL statement to execute
@@ -1029,7 +1029,7 @@ class Connection:
         """
         Create user-defined function.
 
-        Note: HeliosDB-Lite may not support UDFs in embedded mode.
+        Note: HeliosDB Nano may not support UDFs in embedded mode.
         This is provided for API compatibility.
 
         Args:
@@ -1037,7 +1037,7 @@ class Connection:
             num_params: Number of parameters
             func: Python function to register
         """
-        raise NotSupportedError("User-defined functions not yet supported in HeliosDB-Lite")
+        raise NotSupportedError("User-defined functions not yet supported in HeliosDB Nano")
 
     def create_aggregate(self, name: str, num_params: int, aggregate_class: type) -> None:
         """
@@ -1048,7 +1048,7 @@ class Connection:
             num_params: Number of parameters
             aggregate_class: Aggregate class
         """
-        raise NotSupportedError("User-defined aggregates not yet supported in HeliosDB-Lite")
+        raise NotSupportedError("User-defined aggregates not yet supported in HeliosDB Nano")
 
     def create_collation(self, name: str, callable_: Callable) -> None:
         """
@@ -1058,7 +1058,7 @@ class Connection:
             name: Collation name
             callable_: Comparison function
         """
-        raise NotSupportedError("Custom collations not yet supported in HeliosDB-Lite")
+        raise NotSupportedError("Custom collations not yet supported in HeliosDB Nano")
 
     def interrupt(self) -> None:
         """Interrupt long-running query."""
@@ -1085,7 +1085,7 @@ class Connection:
 
     def load_extension(self, path: str) -> None:
         """Load extension (not supported)."""
-        raise NotSupportedError("Extensions not supported in HeliosDB-Lite")
+        raise NotSupportedError("Extensions not supported in HeliosDB Nano")
 
     def iterdump(self) -> Iterator[str]:
         """
@@ -1133,7 +1133,7 @@ class Connection:
         """
         Switch from embedded mode to server mode.
 
-        This starts HeliosDB-Lite as a daemon and switches the connection
+        This starts HeliosDB Nano as a daemon and switches the connection
         to use the PostgreSQL protocol.
 
         Args:
@@ -1228,7 +1228,7 @@ def connect(
     **kwargs
 ) -> Connection:
     """
-    Open connection to HeliosDB-Lite database.
+    Open connection to HeliosDB Nano database.
 
     This is the main entry point for the sqlite3 compatibility API.
 

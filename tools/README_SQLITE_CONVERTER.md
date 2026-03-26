@@ -1,10 +1,10 @@
-# SQLite ↔ HeliosDB-Lite File Format Converter
+# SQLite ↔ HeliosDB Nano File Format Converter
 
-**Production-ready bidirectional conversion system for SQLite and HeliosDB-Lite databases**
+**Production-ready bidirectional conversion system for SQLite and HeliosDB Nano databases**
 
 ## Overview
 
-This converter provides transparent, automatic file format conversion between SQLite and HeliosDB-Lite with complete data integrity guarantees.
+This converter provides transparent, automatic file format conversion between SQLite and HeliosDB Nano with complete data integrity guarantees.
 
 ### Key Features
 
@@ -183,10 +183,10 @@ python3 test_sqlite_converter.py
 
 ## Production Usage
 
-### Integration with HeliosDB-Lite
+### Integration with HeliosDB Nano
 
 ```rust
-// In production, HeliosDB-Lite would integrate the Python converter
+// In production, HeliosDB Nano would integrate the Python converter
 // via PyO3 bindings or subprocess calls
 
 use std::process::Command;

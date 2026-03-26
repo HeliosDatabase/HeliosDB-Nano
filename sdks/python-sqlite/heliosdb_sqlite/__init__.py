@@ -1,5 +1,5 @@
 """
-HeliosDB-SQLite: SQLite-compatible interface for HeliosDB-Lite
+HeliosDB-SQLite: SQLite-compatible interface for HeliosDB Nano
 
 This package provides a drop-in replacement for Python's sqlite3 module,
 offering enhanced features including:
