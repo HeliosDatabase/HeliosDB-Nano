@@ -222,6 +222,12 @@ cargo test --test '*'           # ~800 integration tests
 | Wire protocol | PostgreSQL v3 |
 | HTTP server | Axum |
 
+## SDKs & Integrations
+
+Official client SDKs (Go, Python, TypeScript, Rust) and platform integrations (VS Code, Zapier, n8n, Retool, Make, AutoGen) are maintained in the shared repository:
+
+**[heliosdb-sdks](https://github.com/dimensigon/heliosdb-sdks)** — works with all HeliosDB editions.
+
 ## License
 
 [AGPL-3.0-only](LICENSE) (GNU Affero General Public License v3)
