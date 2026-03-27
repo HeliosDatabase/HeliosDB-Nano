@@ -382,6 +382,23 @@ where
             }
             self.send_ready_for_query().await?;
             return Ok(());
+        } else if starts_with_icase(trimmed, "SET ") && !starts_with_icase(trimmed, "SET TRANSACTION") && !starts_with_icase(trimmed, "SET SESSION") {
+            // Handle generic SET commands for client compatibility (e.g., SET client_encoding = 'UTF8')
+            // Accept silently - these configure client-side parameters
+            self.send_command_complete("SET").await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
+        } else if starts_with_icase(trimmed, "SHOW ") {
+            // Handle SHOW commands for client compatibility
+            let param = trimmed[5..].trim().trim_end_matches(';').trim();
+            let (col_name, value) = Self::resolve_show_parameter(param);
+            let schema = Schema::new(vec![
+                crate::Column::new(&col_name, crate::DataType::Text),
+            ]);
+            let row = Tuple::new(vec![Value::String(value)]);
+            self.send_query_result(schema, vec![row]).await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
         } else if trimmed.eq_ignore_ascii_case("COMMIT") {
             // Handle commit even if no transaction active (PostgreSQL warns but succeeds)
             if self.transaction_status == TransactionStatus::InTransaction {
@@ -947,6 +964,32 @@ where
     // SAFETY: pos is found by .find() so pos+15 is within the string
     // ("ISOLATION LEVEL" is exactly 15 chars).
     #[allow(clippy::indexing_slicing)]
+    /// Resolve a SHOW parameter name to (column_name, value).
+    /// Returns PostgreSQL-compatible values for common parameters.
+    fn resolve_show_parameter(param: &str) -> (String, String) {
+        let param_lower = param.to_lowercase();
+        let col = param_lower.clone();
+        let val = match param_lower.as_str() {
+            "server_version" => "16.0".to_string(),
+            "server_encoding" => "UTF8".to_string(),
+            "client_encoding" => "UTF8".to_string(),
+            "standard_conforming_strings" => "on".to_string(),
+            "transaction_isolation" | "transaction isolation level" =>
+                "read committed".to_string(),
+            "datestyle" => "ISO, MDY".to_string(),
+            "timezone" | "time zone" => "UTC".to_string(),
+            "integer_datetimes" => "on".to_string(),
+            "max_connections" => "100".to_string(),
+            "lc_collate" => "en_US.UTF-8".to_string(),
+            "lc_ctype" => "en_US.UTF-8".to_string(),
+            "search_path" => "\"$user\", public".to_string(),
+            "default_transaction_isolation" => "read committed".to_string(),
+            "is_superuser" => "on".to_string(),
+            _ => String::new(),
+        };
+        (col, val)
+    }
+
     fn parse_isolation_level(query: &str) -> Option<String> {
         // Find "ISOLATION LEVEL" case-insensitively without allocating
         let query_bytes = query.as_bytes();

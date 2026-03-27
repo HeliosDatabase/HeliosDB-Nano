@@ -561,6 +561,20 @@ impl Evaluator {
             "degrees" => self.func_degrees(&arg_values),
             "radians" => self.func_radians(&arg_values),
 
+            // PostgreSQL compatibility functions (SQLAlchemy, psql, pgAdmin, DBeaver)
+            "version" | "pg_catalog.version" => {
+                Ok(Value::String("PostgreSQL 16.0 (HeliosDB Nano 3.7.0)".to_string()))
+            }
+            "current_schema" => {
+                Ok(Value::String("public".to_string()))
+            }
+            "current_database" => {
+                Ok(Value::String("heliosdb".to_string()))
+            }
+            "current_user" | "session_user" => {
+                Ok(Value::String("heliosdb".to_string()))
+            }
+
             _ => Err(Error::query_execution(format!(
                 "Unknown scalar function: {}",
                 fun

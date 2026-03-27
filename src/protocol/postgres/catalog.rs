@@ -32,6 +32,29 @@ impl PgCatalog {
     pub fn handle_query(&self, query: &str) -> Result<Option<(Schema, Vec<Tuple>)>> {
         let query_lower = query.trim().to_lowercase();
 
+        // Handle SELECT version() - required by SQLAlchemy, psql, pgAdmin, DBeaver
+        if query_lower.contains("version()") {
+            return Ok(Some(self.query_version()?));
+        }
+
+        // Handle SELECT current_schema() - required by SQLAlchemy connection init
+        if query_lower.contains("current_schema()") {
+            return Ok(Some(Self::query_current_schema()?));
+        }
+
+        // Handle SELECT current_database() - required by SQLAlchemy / pgAdmin
+        if query_lower.contains("current_database()") {
+            return Ok(Some(Self::query_current_database()?));
+        }
+
+        // Handle SELECT current_user - required by various PG clients
+        if query_lower.contains("current_user")
+            && !query_lower.contains("current_user_id")
+            && (query_lower.starts_with("select") || query_lower.starts_with("show"))
+        {
+            return Ok(Some(Self::query_current_user()?));
+        }
+
         // Check for information_schema queries (table and column listing)
         let result = if query_lower.contains("information_schema") {
             if query_lower.contains("information_schema.columns") {
@@ -313,6 +336,44 @@ impl PgCatalog {
                 }
             }
         }
+    }
+
+    /// Return PostgreSQL-compatible version string
+    fn query_version(&self) -> Result<(Schema, Vec<Tuple>)> {
+        let schema = Schema::new(vec![
+            Column::new("version", DataType::Text),
+        ]);
+        let row = Tuple::new(vec![Value::String(
+            "PostgreSQL 16.0 (HeliosDB Nano 3.7.0)".to_string(),
+        )]);
+        Ok((schema, vec![row]))
+    }
+
+    /// Return current schema (always "public")
+    fn query_current_schema() -> Result<(Schema, Vec<Tuple>)> {
+        let schema = Schema::new(vec![
+            Column::new("current_schema", DataType::Text),
+        ]);
+        let row = Tuple::new(vec![Value::String("public".to_string())]);
+        Ok((schema, vec![row]))
+    }
+
+    /// Return current database name
+    fn query_current_database() -> Result<(Schema, Vec<Tuple>)> {
+        let schema = Schema::new(vec![
+            Column::new("current_database", DataType::Text),
+        ]);
+        let row = Tuple::new(vec![Value::String("heliosdb".to_string())]);
+        Ok((schema, vec![row]))
+    }
+
+    /// Return current user
+    fn query_current_user() -> Result<(Schema, Vec<Tuple>)> {
+        let schema = Schema::new(vec![
+            Column::new("current_user", DataType::Text),
+        ]);
+        let row = Tuple::new(vec![Value::String("heliosdb".to_string())]);
+        Ok((schema, vec![row]))
     }
 
     /// Query pg_type (type information)

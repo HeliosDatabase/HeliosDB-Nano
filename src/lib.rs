@@ -2367,9 +2367,11 @@ impl EmbeddedDatabase {
                 Ok(count)
             }
             _ => {
-                // For other operations (CREATE INDEX, etc.), use executor
+                // For other operations (CREATE INDEX, SELECT, etc.), use executor
+                // with transaction context so reads see uncommitted writes
                 let mut executor = sql::Executor::with_storage(&self.storage)
-                    .with_timeout(self.config.storage.query_timeout_ms);
+                    .with_timeout(self.config.storage.query_timeout_ms)
+                    .with_transaction(txn);
                 let results = executor.execute(&plan)?;
                 // Return results as tuples for SELECT queries, empty for DDL
                 let is_select = matches!(plan,
@@ -5084,6 +5086,35 @@ impl EmbeddedDatabase {
                 self.invalidate_result_cache();
                 self.log_slow_query(sql, start.elapsed(), tuples.len() as u64);
                 return Ok(tuples);
+            }
+        }
+
+        // If there's an active transaction, execute through the transaction
+        // so that uncommitted writes (in the write set) are visible to reads.
+        {
+            use crate::error::LockResultExt;
+            let has_active_txn = {
+                let txn_lock = self.current_transaction.lock()
+                    .map_lock_err("Failed to acquire transaction lock for query")?;
+                txn_lock.is_some()
+            };
+            if has_active_txn {
+                let txn_lock = self.current_transaction.lock()
+                    .map_lock_err("Failed to acquire transaction lock for query")?;
+                let txn_ref = txn_lock.as_ref()
+                    .ok_or_else(|| Error::transaction("Transaction lock in invalid state"))?;
+                // Parse and execute through transaction-aware executor
+                let (statement, _) = self.parse_cached(sql)?;
+                let catalog = self.storage.catalog();
+                let planner = sql::Planner::with_catalog(&catalog)
+                    .with_sql(sql.to_string());
+                let plan = planner.statement_to_plan(statement)?;
+                let mut executor = sql::Executor::with_storage(&self.storage)
+                    .with_timeout(self.config.storage.query_timeout_ms)
+                    .with_transaction(txn_ref);
+                let results = executor.execute(&plan)?;
+                self.log_slow_query(sql, start.elapsed(), results.len() as u64);
+                return Ok(results);
             }
         }
 
@@ -8173,6 +8204,84 @@ mod tests {
         assert!(result.is_err(), "ROLLBACK without active transaction should fail");
 
         db.destroy_session(s1).unwrap();
+    }
+
+    // ===================================================================
+    // Read-your-own-writes in transactions
+    // ===================================================================
+
+    #[test]
+    fn test_insert_visible_in_same_transaction() {
+        // INSERT data must be visible to subsequent SELECTs within the same transaction
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_ryow (id INT PRIMARY KEY, v TEXT)").unwrap();
+        db.begin().unwrap();
+        db.execute("INSERT INTO t_ryow VALUES (1, 'hello')").unwrap();
+        let rows = db.query("SELECT * FROM t_ryow", &[]).unwrap();
+        assert_eq!(rows.len(), 1, "INSERT must be visible to SELECT within the same transaction");
+        db.commit().unwrap();
+    }
+
+    #[test]
+    fn test_update_visible_in_same_transaction() {
+        // UPDATE changes must be visible to subsequent SELECTs within the same transaction
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_ryow2 (id INT PRIMARY KEY, v TEXT)").unwrap();
+        db.execute("INSERT INTO t_ryow2 VALUES (1, 'before')").unwrap();
+        db.begin().unwrap();
+        db.execute("UPDATE t_ryow2 SET v = 'after' WHERE id = 1").unwrap();
+        let rows = db.query("SELECT * FROM t_ryow2 WHERE id = 1", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        let val = &rows[0].values[1];
+        assert_eq!(val, &Value::String("after".to_string()),
+            "UPDATE must be visible to SELECT within the same transaction");
+        db.commit().unwrap();
+    }
+
+    #[test]
+    fn test_delete_visible_in_same_transaction() {
+        // DELETE must be reflected in subsequent SELECTs within the same transaction
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_ryow3 (id INT PRIMARY KEY, v TEXT)").unwrap();
+        db.execute("INSERT INTO t_ryow3 VALUES (1, 'gone')").unwrap();
+        db.begin().unwrap();
+        db.execute("DELETE FROM t_ryow3 WHERE id = 1").unwrap();
+        let rows = db.query("SELECT * FROM t_ryow3", &[]).unwrap();
+        assert_eq!(rows.len(), 0,
+            "DELETE must be reflected in SELECT within the same transaction");
+        db.commit().unwrap();
+    }
+
+    #[test]
+    fn test_multiple_inserts_visible_in_same_transaction() {
+        // Multiple INSERTs must all be visible before commit
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_ryow4 (id INT PRIMARY KEY, v TEXT)").unwrap();
+        db.begin().unwrap();
+        db.execute("INSERT INTO t_ryow4 VALUES (1, 'a')").unwrap();
+        db.execute("INSERT INTO t_ryow4 VALUES (2, 'b')").unwrap();
+        db.execute("INSERT INTO t_ryow4 VALUES (3, 'c')").unwrap();
+        let rows = db.query("SELECT * FROM t_ryow4", &[]).unwrap();
+        assert_eq!(rows.len(), 3,
+            "All INSERTs must be visible to SELECT within the same transaction");
+        db.commit().unwrap();
+    }
+
+    #[test]
+    fn test_rollback_hides_inserts() {
+        // After rollback, inserts must not be visible
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_ryow5 (id INT PRIMARY KEY, v TEXT)").unwrap();
+        db.begin().unwrap();
+        db.execute("INSERT INTO t_ryow5 VALUES (1, 'temp')").unwrap();
+        // Verify visible during transaction
+        let rows = db.query("SELECT * FROM t_ryow5", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        db.rollback().unwrap();
+        // After rollback, must be gone
+        let rows = db.query("SELECT * FROM t_ryow5", &[]).unwrap();
+        assert_eq!(rows.len(), 0,
+            "After ROLLBACK, inserted data must not be visible");
     }
 
     // ===================================================================
@@ -16179,5 +16288,54 @@ mod tests {
         assert_eq!(rows[0].get(1).unwrap(), &Value::Int8(3));
         assert_eq!(rows[1].get(0).unwrap(), &Value::String("Clothing".to_string()));
         assert_eq!(rows[1].get(1).unwrap(), &Value::Int8(3));
+    }
+
+    // ========================================================================
+    // PostgreSQL Compatibility Tests (SQLAlchemy / psql / pgAdmin / DBeaver)
+    // ========================================================================
+
+    #[test]
+    fn test_pg_compat_version() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        let rows = db.query("SELECT version()", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        let val = rows[0].get(0).unwrap();
+        match val {
+            Value::String(s) => {
+                assert!(s.contains("PostgreSQL"), "version() should mention PostgreSQL, got: {}", s);
+                assert!(s.contains("HeliosDB"), "version() should mention HeliosDB, got: {}", s);
+            }
+            other => panic!("Expected String, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pg_compat_pg_catalog_version() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        let rows = db.query("SELECT pg_catalog.version()", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        let val = rows[0].get(0).unwrap();
+        match val {
+            Value::String(s) => {
+                assert!(s.contains("PostgreSQL"), "pg_catalog.version() should mention PostgreSQL");
+            }
+            other => panic!("Expected String, got: {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_pg_compat_current_schema() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        let rows = db.query("SELECT current_schema()", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("public".to_string()));
+    }
+
+    #[test]
+    fn test_pg_compat_current_database() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        let rows = db.query("SELECT current_database()", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("heliosdb".to_string()));
     }
 }
