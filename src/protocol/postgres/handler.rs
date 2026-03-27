@@ -530,8 +530,26 @@ where
         };
 
         if is_select {
-            let results = self.database.query(query, &[])?;
-            let schema = if !results.is_empty() {
+            let (results, columns) = self.database.query_with_columns(query)?;
+            let schema = if !columns.is_empty() {
+                Schema::new(columns.iter().enumerate().map(|(i, name)| {
+                    let data_type = results.first()
+                        .and_then(|r| r.values.get(i))
+                        .map(Value::data_type)
+                        .unwrap_or(crate::DataType::Text);
+                    crate::Column {
+                        name: name.clone(),
+                        data_type,
+                        nullable: true,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: crate::ColumnStorageMode::Default,
+                    }
+                }).collect())
+            } else if !results.is_empty() {
                 results[0].schema()
             } else {
                 Schema::new(vec![])
@@ -820,10 +838,66 @@ where
                     self.write_buf.put_i32(s.len() as i32);
                     self.write_buf.put_slice(s.as_bytes());
                 }
+                Value::Numeric(n) => {
+                    self.write_buf.put_i32(n.len() as i32);
+                    self.write_buf.put_slice(n.as_bytes());
+                }
+                Value::Uuid(u) => {
+                    let s = u.to_string();
+                    self.write_buf.put_i32(s.len() as i32);
+                    self.write_buf.put_slice(s.as_bytes());
+                }
                 Value::Timestamp(ts) => {
                     let s = ts.to_rfc3339();
                     self.write_buf.put_i32(s.len() as i32);
                     self.write_buf.put_slice(s.as_bytes());
+                }
+                Value::Date(d) => {
+                    let s = d.format("%Y-%m-%d").to_string();
+                    self.write_buf.put_i32(s.len() as i32);
+                    self.write_buf.put_slice(s.as_bytes());
+                }
+                Value::Time(t) => {
+                    let s = t.format("%H:%M:%S%.f").to_string();
+                    self.write_buf.put_i32(s.len() as i32);
+                    self.write_buf.put_slice(s.as_bytes());
+                }
+                Value::Interval(micros) => {
+                    let total_secs = micros / 1_000_000;
+                    let days = total_secs / 86400;
+                    let hours = (total_secs % 86400) / 3600;
+                    let mins = (total_secs % 3600) / 60;
+                    let secs = total_secs % 60;
+                    let s = if days > 0 {
+                        format!("{} days {:02}:{:02}:{:02}", days, hours, mins, secs)
+                    } else {
+                        format!("{:02}:{:02}:{:02}", hours, mins, secs)
+                    };
+                    self.write_buf.put_i32(s.len() as i32);
+                    self.write_buf.put_slice(s.as_bytes());
+                }
+                Value::Array(arr) => {
+                    let val_length_pos = self.write_buf.len();
+                    self.write_buf.put_i32(0);
+                    self.write_buf.put_u8(b'{');
+                    for (i, v) in arr.iter().enumerate() {
+                        if i > 0 { self.write_buf.put_u8(b','); }
+                        match v {
+                            Value::String(s) => {
+                                self.write_buf.put_u8(b'"');
+                                self.write_buf.put_slice(s.as_bytes());
+                                self.write_buf.put_u8(b'"');
+                            }
+                            Value::Null => self.write_buf.put_slice(b"NULL"),
+                            other => {
+                                let s = other.to_string();
+                                self.write_buf.put_slice(s.as_bytes());
+                            }
+                        }
+                    }
+                    self.write_buf.put_u8(b'}');
+                    let val_len = (self.write_buf.len() - val_length_pos - 4) as i32;
+                    self.write_buf[val_length_pos..val_length_pos + 4].copy_from_slice(&val_len.to_be_bytes());
                 }
                 Value::Vector(v) => {
                     // Format as PostgreSQL array: {1.0,2.0,3.0}
@@ -840,10 +914,19 @@ where
                     let val_len = (self.write_buf.len() - val_length_pos - 4) as i32;
                     self.write_buf[val_length_pos..val_length_pos + 4].copy_from_slice(&val_len.to_be_bytes());
                 }
-                _ => {
-                    let s = val.to_string();
+                Value::DictRef { dict_id } => {
+                    let s = itoa_buf.format(*dict_id);
                     self.write_buf.put_i32(s.len() as i32);
                     self.write_buf.put_slice(s.as_bytes());
+                }
+                Value::CasRef { hash } => {
+                    let s = hex::encode(hash);
+                    self.write_buf.put_i32(s.len() as i32);
+                    self.write_buf.put_slice(s.as_bytes());
+                }
+                Value::ColumnarRef => {
+                    self.write_buf.put_i32(10);
+                    self.write_buf.put_slice(b"<columnar>");
                 }
             }
         }
@@ -1079,7 +1162,38 @@ pub(super) fn tuple_to_pg_values(tuple: &Tuple) -> Vec<Option<Vec<u8>>> {
             Value::String(s) => Some(s.as_bytes().to_vec()),
             Value::Bytes(b) => Some(b.clone()),
             Value::Json(j) => Some(j.to_string().into_bytes()),
+            Value::Numeric(n) => Some(n.as_bytes().to_vec()),
+            Value::Uuid(u) => Some(u.to_string().into_bytes()),
             Value::Timestamp(ts) => Some(ts.to_rfc3339().into_bytes()),
+            Value::Date(d) => Some(d.format("%Y-%m-%d").to_string().into_bytes()),
+            Value::Time(t) => Some(t.format("%H:%M:%S%.f").to_string().into_bytes()),
+            Value::Interval(micros) => {
+                let total_secs = micros / 1_000_000;
+                let days = total_secs / 86400;
+                let hours = (total_secs % 86400) / 3600;
+                let mins = (total_secs % 3600) / 60;
+                let secs = total_secs % 60;
+                let s = if days > 0 {
+                    format!("{} days {:02}:{:02}:{:02}", days, hours, mins, secs)
+                } else {
+                    format!("{:02}:{:02}:{:02}", hours, mins, secs)
+                };
+                Some(s.into_bytes())
+            }
+            Value::Array(arr) => {
+                let mut buf = String::with_capacity(arr.len() * 8 + 2);
+                buf.push('{');
+                for (i, v) in arr.iter().enumerate() {
+                    if i > 0 { buf.push(','); }
+                    match v {
+                        Value::String(s) => { buf.push('"'); buf.push_str(s); buf.push('"'); }
+                        Value::Null => buf.push_str("NULL"),
+                        other => buf.push_str(&other.to_string()),
+                    }
+                }
+                buf.push('}');
+                Some(buf.into_bytes())
+            }
             Value::Vector(v) => {
                 // Format as PostgreSQL array: {1.0,2.0,3.0}
                 let mut buf = String::with_capacity(v.len() * 8 + 2);
@@ -1092,7 +1206,9 @@ pub(super) fn tuple_to_pg_values(tuple: &Tuple) -> Vec<Option<Vec<u8>>> {
                 buf.push('}');
                 Some(buf.into_bytes())
             }
-            _ => Some(val.to_string().into_bytes()),
+            Value::DictRef { dict_id } => Some(itoa::Buffer::new().format(*dict_id).as_bytes().to_vec()),
+            Value::CasRef { hash } => Some(hex::encode(hash).into_bytes()),
+            Value::ColumnarRef => Some(b"<columnar>".to_vec()),
         }
     }).collect()
 }
