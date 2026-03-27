@@ -390,14 +390,43 @@ fn decode_binary_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
 
 /// Substitute parameters in SQL query
 pub fn substitute_parameters(sql: &str, params: &[Value]) -> Result<String> {
-    let mut result = sql.to_string();
+    if params.is_empty() {
+        return Ok(sql.to_string());
+    }
 
-    // Replace $1, $2, $3, etc. with actual values
-    // Note: This is a simple implementation. Production should use proper SQL parsing.
-    for (i, param) in params.iter().enumerate() {
-        let placeholder = format!("${}", i + 1);
-        let value_str = value_to_sql_literal(param);
-        result = result.replace(&placeholder, &value_str);
+    // Build result by scanning for $N placeholders character by character.
+    // This correctly handles $10+ (multi-digit) and $N::type cast syntax.
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut result = String::with_capacity(sql.len() + params.len() * 8);
+    let mut i = 0;
+
+    while i < len {
+        if bytes[i] == b'$' && i + 1 < len && bytes[i + 1].is_ascii_digit() {
+            // Parse the full parameter number (handles $1 through $999+)
+            let start = i + 1;
+            let mut end = start;
+            while end < len && bytes[end].is_ascii_digit() {
+                end += 1;
+            }
+            #[allow(clippy::indexing_slicing)]
+            let param_num: usize = sql[start..end].parse().unwrap_or(0);
+            if param_num >= 1 && param_num <= params.len() {
+                #[allow(clippy::indexing_slicing)]
+                result.push_str(&value_to_sql_literal(&params[param_num - 1]));
+            } else {
+                // Unknown parameter — keep as-is
+                #[allow(clippy::indexing_slicing)]
+                result.push_str(&sql[i..end]);
+            }
+            i = end;
+        } else {
+            // Safe: we advance by the full char length to handle UTF-8
+            #[allow(clippy::indexing_slicing)]
+            let ch = sql[i..].chars().next().unwrap_or(' ');
+            result.push(ch);
+            i += ch.len_utf8();
+        }
     }
 
     Ok(result)
@@ -513,6 +542,27 @@ mod tests {
 
         let result = substitute_parameters(sql, &params).unwrap();
         assert_eq!(result, "SELECT * FROM users WHERE id = 123 AND name = 'Alice'");
+    }
+
+    #[test]
+    fn test_substitute_parameters_10_plus() {
+        // Regression: $10 was incorrectly parsed as $1 + "0"
+        let sql = "INSERT INTO t VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)";
+        let params: Vec<Value> = (1..=11).map(|i| Value::Int4(i)).collect();
+        let result = substitute_parameters(sql, &params).unwrap();
+        assert_eq!(result, "INSERT INTO t VALUES (1,2,3,4,5,6,7,8,9,10,11)");
+    }
+
+    #[test]
+    fn test_substitute_parameters_with_cast() {
+        // $1::text should replace $1 and preserve ::text
+        let sql = "SELECT $1::text, $2::int";
+        let params = vec![
+            Value::String("hello".to_string()),
+            Value::Int4(42),
+        ];
+        let result = substitute_parameters(sql, &params).unwrap();
+        assert_eq!(result, "SELECT 'hello'::text, 42::int");
     }
 
     #[test]
