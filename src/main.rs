@@ -29,7 +29,7 @@ struct HAConfig {
 
 #[derive(Parser)]
 #[command(name = "heliosdb-nano")]
-#[command(about = "PostgreSQL-compatible database with vector search and encryption", long_about = None)]
+#[command(about = "PostgreSQL & MySQL compatible database with vector search and encryption", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -124,6 +124,15 @@ enum Commands {
         /// Node ID (UUID) - auto-generated if not provided
         #[arg(long)]
         node_id: Option<String>,
+
+        // ========== MySQL Protocol Options ==========
+        /// Enable MySQL protocol listener
+        #[arg(long)]
+        mysql: bool,
+
+        /// MySQL listen address (default: 127.0.0.1:3306, localhost-only for security)
+        #[arg(long, default_value = "127.0.0.1:3306")]
+        mysql_listen: String,
     },
 
     /// Stop a running server
@@ -227,7 +236,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { data_dir, memory, port, listen, config, daemon, pid_file, dump_on_shutdown, dump_schedule, tls_cert, tls_key, auth, password, replication_role, replication_port, primary_host, standby_hosts, observer_hosts, sync_mode, http_port, node_id } => {
+        Commands::Start { data_dir, memory, port, listen, config, daemon, pid_file, dump_on_shutdown, dump_schedule, tls_cert, tls_key, auth, password, replication_role, replication_port, primary_host, standby_hosts, observer_hosts, sync_mode, http_port, node_id, mysql, mysql_listen } => {
             // Validate that either --data-dir or --memory is specified
             if !memory && data_dir.is_none() {
                 return Err(Error::config(
@@ -272,7 +281,7 @@ async fn main() -> Result<()> {
             if daemon {
                 start_server_daemon(resolved_data_dir, port, listen, config, pid_file, tls_cert, tls_key, auth, password, ha_config).await
             } else {
-                start_server(resolved_data_dir, port, listen, config, memory, dump_on_shutdown, tls_cert, tls_key, auth, password, ha_config).await
+                start_server(resolved_data_dir, port, listen, config, memory, dump_on_shutdown, tls_cert, tls_key, auth, password, ha_config, mysql, mysql_listen).await
             }
         }
         Commands::Stop { ref pid_file } => {
@@ -327,6 +336,8 @@ async fn start_server(
     auth: String,
     password: Option<String>,
     ha_config: HAConfig,
+    mysql_enabled: bool,
+    mysql_listen: String,
 ) -> Result<()> {
     use heliosdb_nano::protocol::postgres::server::{PgServer, PgServerConfig};
     use heliosdb_nano::protocol::postgres::auth::{AuthMethod, AuthManager};
@@ -456,6 +467,14 @@ async fn start_server(
     println!("    Python:     psycopg2.connect(host='{listen}', port={port})");
     println!("    Node.js:    pg.connect({{ host: '{listen}', port: {port} }})");
     println!("    JDBC:       jdbc:postgresql://{listen}:{port}/heliosdb");
+    if mysql_enabled {
+        println!();
+        println!("    mysql:      mysql -h {} -P {}", mysql_listen.split(':').next().unwrap_or("127.0.0.1"),
+            mysql_listen.split(':').nth(1).unwrap_or("3306"));
+        println!("    PyMySQL:    pymysql.connect(host='{}', port={})",
+            mysql_listen.split(':').next().unwrap_or("127.0.0.1"),
+            mysql_listen.split(':').nth(1).unwrap_or("3306"));
+    }
     println!();
     println!("  For REPL mode (single-user):  heliosdb-nano repl -d {}", data_dir.display());
     println!();
@@ -480,6 +499,45 @@ async fn start_server(
     let health_server = start_health_server(http_addr);
     info!("Health endpoint at http://{}/health", http_addr);
 
+    // Start MySQL listener if enabled
+    let mysql_handle = if mysql_enabled {
+        let mysql_addr: SocketAddr = mysql_listen.parse()
+            .map_err(|e| Error::config(format!("Invalid MySQL listen address '{}': {}", mysql_listen, e)))?;
+        let mysql_db = Arc::clone(&db);
+        info!("MySQL protocol listening on {}", mysql_addr);
+        let conn_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1));
+        Some(tokio::spawn(async move {
+            let listener = match tokio::net::TcpListener::bind(mysql_addr).await {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("Failed to bind MySQL listener on {}: {}", mysql_addr, e);
+                    return;
+                }
+            };
+            loop {
+                match listener.accept().await {
+                    Ok((stream, addr)) => {
+                        tracing::debug!("MySQL connection from {}", addr);
+                        let db_clone = Arc::clone(&mysql_db);
+                        let conn_id = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tokio::spawn(async move {
+                            if let Err(e) = heliosdb_nano::protocol::mysql::handle_mysql_connection(
+                                db_clone, stream, conn_id
+                            ).await {
+                                tracing::debug!("MySQL connection error: {}", e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("MySQL accept error: {}", e);
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+
     // Start server with graceful shutdown handling
     tokio::select! {
         result = pg_server.serve() => {
@@ -495,6 +553,9 @@ async fn start_server(
         _ = tokio::signal::ctrl_c() => {
             println!();
             println!("{}", "Received shutdown signal...".yellow());
+            if let Some(h) = mysql_handle {
+                h.abort();
+            }
         }
     }
 
