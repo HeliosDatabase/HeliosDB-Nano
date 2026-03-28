@@ -4,9 +4,9 @@
 [![Documentation](https://docs.rs/heliosdb-nano/badge.svg)](https://docs.rs/heliosdb-nano)
 [![License](https://img.shields.io/crates/l/heliosdb-nano.svg)](LICENSE)
 
-**PostgreSQL-compatible embedded database for Rust** with HNSW vector search, AES-256-GCM encryption, git-like branching, time-travel queries, and 50+ enterprise features. Single binary, zero external dependencies.
+**PostgreSQL & MySQL compatible embedded database for Rust** with HNSW vector search, AES-256-GCM encryption, git-like branching, time-travel queries, and 50+ enterprise features. Single binary, zero external dependencies.
 
-HeliosDB Nano combines the simplicity of SQLite (embed it in your app) with PostgreSQL compatibility (connect with `psql`, any PG driver, or any ORM). Built on RocksDB + Apache Arrow.
+HeliosDB Nano combines the simplicity of SQLite (embed it in your app) with PostgreSQL and MySQL compatibility (connect with `psql`, `mysql`, any PG/MySQL driver, or any ORM). Built on RocksDB + Apache Arrow.
 
 ## Installation
 
@@ -42,6 +42,8 @@ fn main() -> heliosdb_nano::Result<()> {
 ```
 
 > **Note:** `query()` executes SQL directly. For user-supplied values, use `query_params()` with `$1`, `$2`, ... placeholders to prevent SQL injection.
+
+> HeliosDB Nano is the first embedded database with native PostgreSQL, MySQL, and SQLite API compatibility. Use your existing tools, drivers, and ORMs — zero migration required.
 
 ## Feature Highlights
 
@@ -157,6 +159,26 @@ psql -h 127.0.0.1 -p 5432
 
 Works with every PostgreSQL driver and ORM: libpq, psycopg2, JDBC, Npgsql, node-postgres, etc.
 
+### MySQL Protocol
+
+Enable the MySQL wire protocol for MySQL client/ORM compatibility:
+
+```bash
+# Enable MySQL alongside PostgreSQL
+heliosdb-nano start --data-dir ./mydata --mysql
+
+# MySQL on custom address
+heliosdb-nano start --data-dir ./mydata --mysql --mysql-listen 0.0.0.0:3306
+```
+
+Connect with any MySQL client:
+
+```bash
+mysql -h 127.0.0.1 -P 3306
+```
+
+Works with MySQL drivers and ORMs: PyMySQL, mysql-connector-python, JDBC (MySQL), Sequelize, SQLAlchemy, etc.
+
 ## REST API
 
 When running in server mode, an HTTP API is available on port 8080:
@@ -219,7 +241,7 @@ cargo test --test '*'           # ~800 integration tests
 | SQL parser | sqlparser-rs |
 | Vector index | HNSW (Hierarchical Navigable Small World) |
 | Encryption | AES-256-GCM / AWS-LC (FIPS) |
-| Wire protocol | PostgreSQL v3 |
+| Wire protocol | PostgreSQL v3 + MySQL v10 |
 | HTTP server | Axum |
 
 ## SDKs & Integrations
