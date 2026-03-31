@@ -1859,8 +1859,9 @@ impl<'a> Planner<'a> {
 
                 let func_name = func.name.to_string().to_uppercase();
 
-                // Handle STRING_AGG specially as it has a delimiter argument
-                if func_name == "STRING_AGG" {
+                // Handle STRING_AGG / GROUP_CONCAT specially as they have a delimiter argument
+                // GROUP_CONCAT is the MySQL alias for STRING_AGG (WordPress compatibility)
+                if func_name == "STRING_AGG" || func_name == "GROUP_CONCAT" {
                     return self.parse_string_agg(func);
                 }
 

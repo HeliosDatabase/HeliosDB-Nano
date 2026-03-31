@@ -19,6 +19,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
 
+use regex::Regex;
+
 use crate::{EmbeddedDatabase, Tuple, Value};
 
 // ============================================================================
@@ -562,6 +564,7 @@ pub struct MySqlHandler {
     in_transaction: bool,
     prepared_statements: HashMap<u32, PreparedStatement>,
     next_stmt_id: u32,
+    last_row_count: u64,
 }
 
 impl MySqlHandler {
@@ -589,6 +592,7 @@ impl MySqlHandler {
             in_transaction: false,
             prepared_statements: HashMap::new(),
             next_stmt_id: 1,
+            last_row_count: 0,
         }
     }
 
@@ -652,8 +656,9 @@ impl MySqlHandler {
                             _ => {
                                 error!("Command error: {}", e);
                                 let msg = e.to_string();
+                                let (code, state) = map_error_code(&msg);
                                 let _ = handler
-                                    .send_error(1064, "HY000", &msg)
+                                    .send_error(code, state, &msg)
                                     .await;
                             }
                         }
@@ -852,9 +857,12 @@ impl MySqlHandler {
     // ------------------------------------------------------------------
 
     async fn handle_com_query(&mut self, payload: Bytes) -> Result<()> {
-        let sql = String::from_utf8_lossy(&payload).to_string();
-        debug!("COM_QUERY: {}", sql);
+        let raw_sql = String::from_utf8_lossy(&payload).to_string();
+        debug!("COM_QUERY: {}", raw_sql);
 
+        // Apply MySQL-to-PostgreSQL SQL translation
+        let translated = super::translator::translate(&raw_sql);
+        let sql = translated.as_str();
         let trimmed = sql.trim();
         if trimmed.is_empty() {
             return self.send_ok(0, 0).await;
@@ -870,6 +878,11 @@ impl MySqlHandler {
             return self.handle_show(trimmed).await;
         }
 
+        // ---- DESCRIBE / DESC ----
+        if starts_with_icase(trimmed, "DESCRIBE ") || starts_with_icase(trimmed, "DESC ") {
+            return self.handle_describe(trimmed).await;
+        }
+
         // ---- Transaction control ----
         if starts_with_icase(trimmed, "BEGIN")
             || starts_with_icase(trimmed, "START TRANSACTION")
@@ -881,6 +894,16 @@ impl MySqlHandler {
         }
         if trimmed.eq_ignore_ascii_case("ROLLBACK") {
             return self.handle_rollback().await;
+        }
+
+        // ---- SELECT FOUND_ROWS() ----
+        {
+            let upper = trimmed.to_uppercase();
+            if upper.contains("FOUND_ROWS()") {
+                let cols = vec!["FOUND_ROWS()".to_string()];
+                let rows = vec![Tuple::new(vec![Value::Int8(self.last_row_count as i64)])];
+                return self.send_result_set(&cols, &rows).await;
+            }
         }
 
         // ---- SELECT / DML / DDL — delegate to EmbeddedDatabase ----
@@ -934,11 +957,13 @@ impl MySqlHandler {
     async fn execute_query(&mut self, sql: &str) -> Result<()> {
         match self.database.query_with_columns(sql) {
             Ok((rows, columns)) => {
+                self.last_row_count = rows.len() as u64;
                 self.send_result_set(&columns, &rows).await
             }
             Err(e) => {
                 let msg = e.to_string();
-                self.send_error(1064, "42000", &msg).await
+                let (code, state) = map_error_code(&msg);
+                self.send_error(code, state, &msg).await
             }
         }
     }
@@ -954,7 +979,8 @@ impl MySqlHandler {
             }
             Err(e) => {
                 let msg = e.to_string();
-                self.send_error(1064, "42000", &msg).await
+                let (code, state) = map_error_code(&msg);
+                self.send_error(code, state, &msg).await
             }
         }
     }
@@ -972,14 +998,24 @@ impl MySqlHandler {
 
         if upper.contains("TABLES") {
             // Query actual tables from the catalog.
-            let tables = self
+            let mut tables = self
                 .database
                 .storage
                 .catalog()
                 .list_tables()
                 .unwrap_or_default();
+
+            // SHOW TABLES LIKE 'pattern' — apply LIKE filter
+            if let Some(like_pattern) = extract_like_pattern(trimmed) {
+                tables.retain(|t| sql_like_match(t, &like_pattern));
+            }
+
             let refs: Vec<&str> = tables.iter().map(String::as_str).collect();
             return self.show_single_column("Tables_in_heliosdb", &refs).await;
+        }
+
+        if upper.contains("INDEX") || upper.contains("INDEXES") || upper.contains("KEYS") {
+            return self.handle_show_index(trimmed).await;
         }
 
         if upper.contains("COLUMNS") || upper.contains("FIELDS") {
@@ -1071,13 +1107,53 @@ impl MySqlHandler {
             None => return self.send_ok(0, 0).await,
         };
 
+        let ddl = self.generate_create_table_ddl(&table_name);
         let cols = vec!["Table".to_string(), "Create Table".to_string()];
-        let placeholder = format!("CREATE TABLE `{}` ( /* see DESCRIBE */ )", table_name);
         let row = Tuple::new(vec![
             Value::String(table_name),
-            Value::String(placeholder),
+            Value::String(ddl),
         ]);
         self.send_result_set(&cols, &[row]).await
+    }
+
+    /// Generate MySQL-compatible CREATE TABLE DDL from the catalog schema.
+    fn generate_create_table_ddl(&self, table_name: &str) -> String {
+        let schema = match self.database.storage.catalog().get_table_schema(table_name) {
+            Ok(s) => s,
+            Err(_) => {
+                return format!("CREATE TABLE `{}` (\n  /* schema not available */\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4", table_name);
+            }
+        };
+
+        let mut col_defs = Vec::new();
+        let mut pk_cols = Vec::new();
+
+        for col in &schema.columns {
+            let mysql_type = datatype_to_mysql(&col.data_type);
+            let nullable = if col.nullable { "" } else { " NOT NULL" };
+            let default = col.default_expr.as_ref().map_or(String::new(), |d| format!(" DEFAULT {}", d));
+            col_defs.push(format!("  `{}` {}{}{}", col.name, mysql_type, nullable, default));
+            if col.primary_key {
+                pk_cols.push(format!("`{}`", col.name));
+            }
+        }
+
+        if !pk_cols.is_empty() {
+            col_defs.push(format!("  PRIMARY KEY ({})", pk_cols.join(",")));
+        }
+
+        // Add UNIQUE constraints
+        for col in &schema.columns {
+            if col.unique && !col.primary_key {
+                col_defs.push(format!("  UNIQUE KEY `idx_{}_unique` (`{}`)", col.name, col.name));
+            }
+        }
+
+        format!(
+            "CREATE TABLE `{}` (\n{}\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+            table_name,
+            col_defs.join(",\n")
+        )
     }
 
     async fn handle_show_variables(&mut self, upper: &str) -> Result<()> {
@@ -1135,6 +1211,157 @@ impl MySqlHandler {
         self.send_result_set(&cols, &rows).await
     }
 
+    /// Handle SHOW INDEX FROM / SHOW INDEXES FROM / SHOW KEYS FROM.
+    ///
+    /// Returns MySQL-compatible index metadata columns. At minimum, returns the
+    /// primary key if one exists.
+    async fn handle_show_index(&mut self, sql: &str) -> Result<()> {
+        let table_name = sql
+            .to_uppercase()
+            .find("FROM ")
+            .and_then(|pos| {
+                let rest = sql.get(pos + 5..)?;
+                let name = rest.trim().trim_end_matches(';').trim();
+                let name = name.trim_matches('`');
+                Some(name.to_string())
+            });
+
+        let table_name = match table_name {
+            Some(t) => t,
+            None => return self.send_ok(0, 0).await,
+        };
+
+        let cols = vec![
+            "Table".to_string(),
+            "Non_unique".to_string(),
+            "Key_name".to_string(),
+            "Seq_in_index".to_string(),
+            "Column_name".to_string(),
+            "Collation".to_string(),
+            "Cardinality".to_string(),
+            "Sub_part".to_string(),
+            "Packed".to_string(),
+            "Null".to_string(),
+            "Index_type".to_string(),
+            "Comment".to_string(),
+            "Index_comment".to_string(),
+        ];
+
+        let mut rows: Vec<Tuple> = Vec::new();
+
+        // Try to read primary key info from catalog
+        if let Ok(schema) = self.database.storage.catalog().get_table_schema(&table_name) {
+            let mut seq = 1i64;
+            for col in &schema.columns {
+                if col.primary_key {
+                    rows.push(Tuple::new(vec![
+                        Value::String(table_name.clone()),       // Table
+                        Value::String("0".to_string()),          // Non_unique (0 = unique)
+                        Value::String("PRIMARY".to_string()),    // Key_name
+                        Value::String(seq.to_string()),          // Seq_in_index
+                        Value::String(col.name.clone()),         // Column_name
+                        Value::String("A".to_string()),          // Collation
+                        Value::String("0".to_string()),          // Cardinality
+                        Value::Null,                             // Sub_part
+                        Value::Null,                             // Packed
+                        Value::String(String::new()),            // Null
+                        Value::String("BTREE".to_string()),      // Index_type
+                        Value::String(String::new()),            // Comment
+                        Value::String(String::new()),            // Index_comment
+                    ]));
+                    seq += 1;
+                }
+            }
+
+            // Also add UNIQUE indexes
+            let mut unique_seq = 1i64;
+            for col in &schema.columns {
+                if col.unique && !col.primary_key {
+                    rows.push(Tuple::new(vec![
+                        Value::String(table_name.clone()),
+                        Value::String("0".to_string()),
+                        Value::String(format!("idx_{}_unique", col.name)),
+                        Value::String(unique_seq.to_string()),
+                        Value::String(col.name.clone()),
+                        Value::String("A".to_string()),
+                        Value::String("0".to_string()),
+                        Value::Null,
+                        Value::Null,
+                        if col.nullable { Value::String("YES".to_string()) } else { Value::String(String::new()) },
+                        Value::String("BTREE".to_string()),
+                        Value::String(String::new()),
+                        Value::String(String::new()),
+                    ]));
+                    unique_seq += 1;
+                }
+            }
+        }
+
+        self.send_result_set(&cols, &rows).await
+    }
+
+    /// Handle DESCRIBE / DESC table_name — equivalent to SHOW COLUMNS FROM.
+    async fn handle_describe(&mut self, sql: &str) -> Result<()> {
+        // Extract table name after DESCRIBE or DESC keyword
+        let table_name = if starts_with_icase(sql, "DESCRIBE ") {
+            sql.get(9..)
+        } else {
+            // DESC
+            sql.get(5..)
+        };
+
+        let table_name = match table_name {
+            Some(rest) => {
+                let name = rest.trim().trim_end_matches(';').trim().trim_matches('`');
+                if name.is_empty() {
+                    return self.send_ok(0, 0).await;
+                }
+                name.to_string()
+            }
+            None => return self.send_ok(0, 0).await,
+        };
+
+        let cols = vec![
+            "Field".to_string(),
+            "Type".to_string(),
+            "Null".to_string(),
+            "Key".to_string(),
+            "Default".to_string(),
+            "Extra".to_string(),
+        ];
+
+        let mut rows: Vec<Tuple> = Vec::new();
+
+        if let Ok(schema) = self.database.storage.catalog().get_table_schema(&table_name) {
+            for col in &schema.columns {
+                let mysql_type = datatype_to_mysql(&col.data_type);
+                let null_str = if col.nullable { "YES" } else { "NO" };
+                let key_str = if col.primary_key {
+                    "PRI"
+                } else if col.unique {
+                    "UNI"
+                } else {
+                    ""
+                };
+                let default_val = col.default_expr.clone().unwrap_or_default();
+
+                rows.push(Tuple::new(vec![
+                    Value::String(col.name.clone()),
+                    Value::String(mysql_type),
+                    Value::String(null_str.to_string()),
+                    Value::String(key_str.to_string()),
+                    if default_val.is_empty() { Value::Null } else { Value::String(default_val) },
+                    Value::String(String::new()),
+                ]));
+            }
+        } else {
+            let msg = format!("Table '{}' doesn't exist", table_name);
+            return self.send_error(1146, "42S02", &msg).await;
+        }
+
+        self.send_result_set(&cols, &rows).await
+    }
+
     /// Convenience: single-column result set.
     async fn show_single_column(&mut self, col_name: &str, values: &[&str]) -> Result<()> {
         let cols = vec![col_name.to_string()];
@@ -1172,8 +1399,9 @@ impl MySqlHandler {
     // ------------------------------------------------------------------
 
     async fn handle_stmt_prepare(&mut self, payload: Bytes) -> Result<()> {
-        let sql = String::from_utf8_lossy(&payload).to_string();
-        debug!("COM_STMT_PREPARE: {}", sql);
+        let raw_sql = String::from_utf8_lossy(&payload).to_string();
+        debug!("COM_STMT_PREPARE: {}", raw_sql);
+        let sql = super::translator::translate(&raw_sql);
 
         let stmt_id = self.next_stmt_id;
         self.next_stmt_id += 1;
@@ -1439,6 +1667,108 @@ fn value_to_mysql_string(v: &Value) -> String {
 }
 
 // ============================================================================
+// MySQL error code mapping
+// ============================================================================
+
+/// Map an error message to the appropriate MySQL error code and SQL state.
+fn map_error_code(err_msg: &str) -> (u16, &'static str) {
+    let lower = err_msg.to_lowercase();
+    if lower.contains("duplicate") || lower.contains("unique") || lower.contains("already exists") {
+        (1062, "23000") // ER_DUP_ENTRY
+    } else if lower.contains("does not exist") || lower.contains("not found") || lower.contains("doesn't exist") {
+        (1146, "42S02") // ER_NO_SUCH_TABLE
+    } else if lower.contains("unknown column") || (lower.contains("column") && lower.contains("not found")) {
+        (1054, "42S22") // ER_BAD_FIELD_ERROR
+    } else if lower.contains("syntax") || lower.contains("parse") {
+        (1064, "42000") // ER_PARSE_ERROR
+    } else if lower.contains("access denied") {
+        (1045, "28000") // ER_ACCESS_DENIED
+    } else if lower.contains("foreign key") || lower.contains("constraint") {
+        (1452, "23000") // ER_NO_REFERENCED_ROW_2
+    } else if lower.contains("null") && lower.contains("not null") {
+        (1048, "23000") // ER_BAD_NULL_ERROR
+    } else {
+        (1105, "HY000") // ER_UNKNOWN_ERROR
+    }
+}
+
+// ============================================================================
+// SQL LIKE pattern matching
+// ============================================================================
+
+/// Match a value against a SQL LIKE pattern.
+///
+/// Supports `%` (any sequence of characters) and `_` (any single character).
+fn sql_like_match(value: &str, pattern: &str) -> bool {
+    // Build regex by processing the pattern character-by-character:
+    // - `%` becomes `.*` (match any sequence)
+    // - `_` becomes `.`  (match any single char)
+    // - all other characters are regex-escaped
+    let mut regex_str = String::from("^");
+    for ch in pattern.chars() {
+        match ch {
+            '%' => regex_str.push_str(".*"),
+            '_' => regex_str.push('.'),
+            _ => {
+                // Escape regex-special characters
+                let escaped = regex::escape(&ch.to_string());
+                regex_str.push_str(&escaped);
+            }
+        }
+    }
+    regex_str.push('$');
+    Regex::new(&regex_str)
+        .map(|re| re.is_match(value))
+        .unwrap_or(false)
+}
+
+/// Extract the LIKE pattern from a SQL statement (e.g. `SHOW TABLES LIKE 'wp_%'`).
+fn extract_like_pattern(sql: &str) -> Option<String> {
+    let upper = sql.to_uppercase();
+    let pos = upper.find("LIKE ")?;
+    let rest = sql.get(pos + 5..)?.trim();
+    // Pattern is typically quoted with single quotes
+    if rest.starts_with('\'') {
+        let end = rest.get(1..)?.find('\'')?;
+        rest.get(1..end + 1).map(String::from)
+    } else {
+        // Unquoted — take until whitespace or semicolon
+        let end = rest.find(|c: char| c.is_whitespace() || c == ';').unwrap_or(rest.len());
+        rest.get(..end).map(String::from)
+    }
+}
+
+// ============================================================================
+// DataType → MySQL type string
+// ============================================================================
+
+/// Convert a Nano `DataType` to MySQL-compatible type string for DDL output.
+fn datatype_to_mysql(dt: &crate::DataType) -> String {
+    match dt {
+        crate::DataType::Boolean => "tinyint(1)".to_string(),
+        crate::DataType::Int2 => "smallint".to_string(),
+        crate::DataType::Int4 => "int".to_string(),
+        crate::DataType::Int8 => "bigint".to_string(),
+        crate::DataType::Float4 => "float".to_string(),
+        crate::DataType::Float8 => "double".to_string(),
+        crate::DataType::Numeric => "decimal(65,30)".to_string(),
+        crate::DataType::Varchar(Some(n)) => format!("varchar({})", n),
+        crate::DataType::Varchar(None) => "varchar(255)".to_string(),
+        crate::DataType::Text => "longtext".to_string(),
+        crate::DataType::Char(n) => format!("char({})", n),
+        crate::DataType::Bytea => "longblob".to_string(),
+        crate::DataType::Date => "date".to_string(),
+        crate::DataType::Time => "time".to_string(),
+        crate::DataType::Timestamp | crate::DataType::Timestamptz => "datetime".to_string(),
+        crate::DataType::Interval => "varchar(64)".to_string(),
+        crate::DataType::Uuid => "char(36)".to_string(),
+        crate::DataType::Json | crate::DataType::Jsonb => "json".to_string(),
+        crate::DataType::Array(_) => "json".to_string(),
+        _ => "varchar(255)".to_string(),
+    }
+}
+
+// ============================================================================
 // Authentication helpers (kept for future use / client-side testing)
 // ============================================================================
 
@@ -1614,5 +1944,98 @@ mod tests {
         assert!(starts_with_icase("SELECT * FROM t", "SELECT"));
         assert!(starts_with_icase("select * FROM t", "SELECT"));
         assert!(!starts_with_icase("INS", "INSERT"));
+    }
+
+    #[test]
+    fn test_map_error_code_duplicate() {
+        let (code, state) = map_error_code("duplicate key value violates unique constraint");
+        assert_eq!(code, 1062);
+        assert_eq!(state, "23000");
+    }
+
+    #[test]
+    fn test_map_error_code_not_found() {
+        let (code, state) = map_error_code("Table 'users' does not exist");
+        assert_eq!(code, 1146);
+        assert_eq!(state, "42S02");
+    }
+
+    #[test]
+    fn test_map_error_code_bad_field() {
+        let (code, state) = map_error_code("unknown column 'foo'");
+        assert_eq!(code, 1054);
+        assert_eq!(state, "42S22");
+    }
+
+    #[test]
+    fn test_map_error_code_syntax() {
+        let (code, state) = map_error_code("syntax error at or near 'WHERE'");
+        assert_eq!(code, 1064);
+        assert_eq!(state, "42000");
+    }
+
+    #[test]
+    fn test_map_error_code_unknown() {
+        let (code, state) = map_error_code("something went wrong");
+        assert_eq!(code, 1105);
+        assert_eq!(state, "HY000");
+    }
+
+    #[test]
+    fn test_sql_like_match_percent_wildcard() {
+        assert!(sql_like_match("wp_users", "wp_%"));
+        assert!(sql_like_match("wp_posts", "wp_%"));
+        assert!(!sql_like_match("users", "wp_%"));
+    }
+
+    #[test]
+    fn test_sql_like_match_underscore_wildcard() {
+        assert!(sql_like_match("ab", "a_"));
+        assert!(!sql_like_match("abc", "a_"));
+    }
+
+    #[test]
+    fn test_sql_like_match_exact() {
+        assert!(sql_like_match("users", "users"));
+        assert!(!sql_like_match("users", "posts"));
+    }
+
+    #[test]
+    fn test_sql_like_match_both_wildcards() {
+        assert!(sql_like_match("wp_options", "%options"));
+        assert!(sql_like_match("my_options", "%options"));
+        assert!(!sql_like_match("my_posts", "%options"));
+    }
+
+    #[test]
+    fn test_extract_like_pattern_quoted() {
+        let pat = extract_like_pattern("SHOW TABLES LIKE 'wp_%'");
+        assert_eq!(pat, Some("wp_%".to_string()));
+    }
+
+    #[test]
+    fn test_extract_like_pattern_none() {
+        let pat = extract_like_pattern("SHOW TABLES");
+        assert_eq!(pat, None);
+    }
+
+    #[test]
+    fn test_extract_like_pattern_unquoted() {
+        let pat = extract_like_pattern("SHOW TABLES LIKE wp_%");
+        assert_eq!(pat, Some("wp_%".to_string()));
+    }
+
+    #[test]
+    fn test_datatype_to_mysql_coverage() {
+        assert_eq!(datatype_to_mysql(&crate::DataType::Boolean), "tinyint(1)");
+        assert_eq!(datatype_to_mysql(&crate::DataType::Int4), "int");
+        assert_eq!(datatype_to_mysql(&crate::DataType::Int8), "bigint");
+        assert_eq!(datatype_to_mysql(&crate::DataType::Text), "longtext");
+        assert_eq!(datatype_to_mysql(&crate::DataType::Varchar(Some(100))), "varchar(100)");
+        assert_eq!(datatype_to_mysql(&crate::DataType::Varchar(None)), "varchar(255)");
+        assert_eq!(datatype_to_mysql(&crate::DataType::Json), "json");
+        assert_eq!(datatype_to_mysql(&crate::DataType::Uuid), "char(36)");
+        assert_eq!(datatype_to_mysql(&crate::DataType::Bytea), "longblob");
+        assert_eq!(datatype_to_mysql(&crate::DataType::Timestamp), "datetime");
     }
 }

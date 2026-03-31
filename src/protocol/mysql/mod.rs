@@ -18,5 +18,6 @@ pub mod handler;
 pub mod compatibility;
 pub mod extended;
 pub mod features;
+pub mod translator;
 
 pub use handler::{handle_mysql_connection, MySqlHandler, MySqlError};

@@ -5,7 +5,7 @@
 use crate::{Result, Error, Value, Tuple, Schema, DataType};
 use crate::tenant::{get_current_tenant_id, get_current_user_id};
 use super::LogicalExpr;
-use chrono::{Utc, Local};
+use chrono::{Utc, Local, Datelike, Timelike};
 use std::sync::Arc;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -561,6 +561,23 @@ impl Evaluator {
             "degrees" => self.func_degrees(&arg_values),
             "radians" => self.func_radians(&arg_values),
 
+            // MySQL date/time functions (WordPress compatibility)
+            "date_format" => self.func_date_format(&arg_values),
+            "date" => self.func_date_extract(&arg_values),
+            "year" => self.func_year(&arg_values),
+            "month" => self.func_month(&arg_values),
+            "day" | "dayofmonth" => self.func_day(&arg_values),
+            "date_add" | "adddate" => self.func_date_add(&arg_values),
+            "date_sub" | "subdate" => self.func_date_sub(&arg_values),
+            "datediff" => self.func_datediff(&arg_values),
+            "timestampdiff" => self.func_timestampdiff(&arg_values),
+            "unix_timestamp" => self.func_unix_timestamp(&arg_values),
+            "from_unixtime" => self.func_from_unixtime(&arg_values),
+
+            // MySQL string functions (WordPress plugin compatibility)
+            "locate" => self.func_locate(&arg_values),
+            "instr" => self.func_instr(&arg_values),
+
             // PostgreSQL compatibility functions (SQLAlchemy, psql, pgAdmin, DBeaver)
             "version" | "pg_catalog.version" => {
                 Ok(Value::String("PostgreSQL 16.0 (HeliosDB Nano 3.7.0)".to_string()))
@@ -580,6 +597,489 @@ impl Evaluator {
                 fun
             ))),
         }
+    }
+
+    // ---- MySQL date/time helper functions (WordPress compatibility) ----
+
+    /// Convert a Value to a `chrono::NaiveDateTime`, accepting Timestamp, Date, or String.
+    fn value_to_naive_datetime(val: &Value) -> Result<chrono::NaiveDateTime> {
+        match val {
+            Value::Timestamp(ts) => Ok(ts.naive_utc()),
+            Value::Date(d) => d.and_hms_opt(0, 0, 0)
+                .ok_or_else(|| Error::query_execution("Invalid date for datetime conversion")),
+            Value::String(s) => {
+                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
+                    .or_else(|e| {
+                        match chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                            Ok(d) => match d.and_hms_opt(0, 0, 0) {
+                                Some(ndt) => Ok(ndt),
+                                None => Err(e),
+                            },
+                            Err(e2) => Err(e2),
+                        }
+                    })
+                    .map_err(|e| Error::query_execution(format!("Cannot parse '{}' as datetime: {}", s, e)))
+            }
+            Value::Int8(epoch) => {
+                chrono::DateTime::from_timestamp(*epoch, 0)
+                    .map(|dt| dt.naive_utc())
+                    .ok_or_else(|| Error::query_execution(format!("Invalid unix timestamp: {}", epoch)))
+            }
+            Value::Int4(epoch) => {
+                chrono::DateTime::from_timestamp(i64::from(*epoch), 0)
+                    .map(|dt| dt.naive_utc())
+                    .ok_or_else(|| Error::query_execution(format!("Invalid unix timestamp: {}", epoch)))
+            }
+            Value::Null => Err(Error::query_execution("NULL datetime")),
+            _ => Err(Error::query_execution(format!(
+                "Cannot convert {:?} to datetime", val
+            ))),
+        }
+    }
+
+    /// Convert a Value to `chrono::NaiveDate`, accepting Date, Timestamp, or String.
+    fn value_to_naive_date(val: &Value) -> Result<chrono::NaiveDate> {
+        match val {
+            Value::Date(d) => Ok(*d),
+            Value::Timestamp(ts) => Ok(ts.date_naive()),
+            Value::String(s) => {
+                chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                    .or_else(|_| {
+                        // Also accept datetime strings — just take the date part
+                        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                            .map(|ndt| ndt.date())
+                    })
+                    .map_err(|e| Error::query_execution(format!("Cannot parse '{}' as date: {}", s, e)))
+            }
+            Value::Null => Err(Error::query_execution("NULL date")),
+            _ => Err(Error::query_execution(format!(
+                "Cannot convert {:?} to date", val
+            ))),
+        }
+    }
+
+    /// Convert MySQL format specifiers to chrono format specifiers.
+    ///
+    /// MySQL and chrono share some specifiers but differ on others.
+    /// Replacement order matters to avoid conflicts (e.g., MySQL `%i` = minutes,
+    /// chrono `%M` = minutes, but MySQL `%M` = month name).
+    fn mysql_format_to_chrono(format: &str) -> String {
+        // We process character by character to avoid replacement conflicts.
+        let mut result = String::with_capacity(format.len());
+        let mut chars = format.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '%' {
+                match chars.next() {
+                    Some('Y') => result.push_str("%Y"),  // 4-digit year
+                    Some('y') => result.push_str("%y"),  // 2-digit year
+                    Some('m') => result.push_str("%m"),  // month 01-12
+                    Some('c') => result.push_str("%-m"), // month 1-12 (no leading zero)
+                    Some('d') => result.push_str("%d"),  // day 01-31
+                    Some('e') => result.push_str("%-d"), // day 1-31 (no leading zero)
+                    Some('H') => result.push_str("%H"),  // hour 00-23
+                    Some('h') | Some('I') => result.push_str("%I"), // hour 01-12
+                    Some('i') => result.push_str("%M"),  // minutes 00-59 (MySQL %i → chrono %M)
+                    Some('s') | Some('S') => result.push_str("%S"), // seconds 00-59
+                    Some('p') => result.push_str("%p"),  // AM/PM
+                    Some('W') => result.push_str("%A"),  // full weekday name
+                    Some('a') => result.push_str("%a"),  // abbreviated weekday name
+                    Some('M') => result.push_str("%B"),  // full month name (MySQL %M → chrono %B)
+                    Some('b') => result.push_str("%b"),  // abbreviated month name
+                    Some('j') => result.push_str("%j"),  // day of year 001-366
+                    Some('w') => result.push_str("%w"),  // day of week 0=Sunday
+                    Some('T') => result.push_str("%H:%M:%S"), // time 24-hour
+                    Some('r') => result.push_str("%I:%M:%S %p"), // time 12-hour
+                    Some('%') => result.push('%'),        // literal %
+                    Some(other) => {
+                        // Unknown specifier — pass through as-is
+                        result.push('%');
+                        result.push(other);
+                    }
+                    None => result.push('%'), // trailing %
+                }
+            } else {
+                result.push(ch);
+            }
+        }
+        result
+    }
+
+    /// DATE_FORMAT(date, format) — format a timestamp using MySQL format specifiers.
+    fn func_date_format(&self, args: &[Value]) -> Result<Value> {
+        let [date_arg, fmt_arg] = args else {
+            return Err(Error::query_execution("DATE_FORMAT requires exactly 2 arguments"));
+        };
+        if matches!(date_arg, Value::Null) || matches!(fmt_arg, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let ndt = Self::value_to_naive_datetime(date_arg)?;
+        let format_str = match fmt_arg {
+            Value::String(s) => s,
+            _ => return Err(Error::query_execution("DATE_FORMAT second argument must be a format string")),
+        };
+        let chrono_fmt = Self::mysql_format_to_chrono(format_str);
+        Ok(Value::String(ndt.format(&chrono_fmt).to_string()))
+    }
+
+    /// DATE(timestamp) — extract the date part from a timestamp.
+    fn func_date_extract(&self, args: &[Value]) -> Result<Value> {
+        let [arg] = args else {
+            return Err(Error::query_execution("DATE() requires exactly 1 argument"));
+        };
+        if matches!(arg, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let d = Self::value_to_naive_date(arg)?;
+        Ok(Value::Date(d))
+    }
+
+    /// YEAR(date) — extract the year from a date/timestamp. Returns Int4.
+    fn func_year(&self, args: &[Value]) -> Result<Value> {
+        let [arg] = args else {
+            return Err(Error::query_execution("YEAR() requires exactly 1 argument"));
+        };
+        if matches!(arg, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let d = Self::value_to_naive_date(arg)?;
+        Ok(Value::Int4(d.year()))
+    }
+
+    /// MONTH(date) — extract the month (1-12) from a date/timestamp. Returns Int4.
+    fn func_month(&self, args: &[Value]) -> Result<Value> {
+        let [arg] = args else {
+            return Err(Error::query_execution("MONTH() requires exactly 1 argument"));
+        };
+        if matches!(arg, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let d = Self::value_to_naive_date(arg)?;
+        Ok(Value::Int4(d.month() as i32))
+    }
+
+    /// DAY(date) / DAYOFMONTH(date) — extract the day (1-31). Returns Int4.
+    fn func_day(&self, args: &[Value]) -> Result<Value> {
+        let [arg] = args else {
+            return Err(Error::query_execution("DAY() requires exactly 1 argument"));
+        };
+        if matches!(arg, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let d = Self::value_to_naive_date(arg)?;
+        Ok(Value::Int4(d.day() as i32))
+    }
+
+    /// Parse an interval from the second argument of DATE_ADD/DATE_SUB.
+    ///
+    /// Accepts either:
+    ///  - `Value::Interval(micros)` (already parsed by planner)
+    ///  - `Value::String("INTERVAL N UNIT")` or just `Value::String("N")`
+    ///    paired with an optional third argument for the unit
+    ///  - A numeric value (N) with a third argument for the unit string
+    fn parse_date_add_interval(args: &[Value]) -> Result<(i64, String)> {
+        let interval_arg = args.get(1).ok_or_else(|| Error::query_execution(
+            "DATE_ADD/DATE_SUB requires at least 2 arguments"
+        ))?;
+        let unit_arg = args.get(2);
+
+        // Case 1: Second arg is an Interval value (microseconds)
+        if let Value::Interval(micros) = interval_arg {
+            return Ok((*micros, String::new()));
+        }
+
+        // Case 2: Second arg is a string like "INTERVAL 1 DAY" or just the amount
+        if let Value::String(s) = interval_arg {
+            let trimmed = s.trim();
+            // Try parsing "INTERVAL N UNIT" format
+            let stripped = trimmed.strip_prefix("INTERVAL ").or_else(|| trimmed.strip_prefix("interval "));
+            if let Some(rest) = stripped {
+                let parts: Vec<&str> = rest.split_whitespace().collect();
+                if let (Some(amt_str), Some(unit_str)) = (parts.first(), parts.get(1)) {
+                    let amount: i64 = amt_str.parse()
+                        .map_err(|_| Error::query_execution(format!("Invalid interval amount: {}", amt_str)))?;
+                    return Ok((amount, unit_str.to_uppercase()));
+                }
+            }
+            // Try parsing a plain number with a third argument for the unit
+            if let Ok(amount) = trimmed.parse::<i64>() {
+                let unit = match unit_arg {
+                    Some(Value::String(u)) => u.to_uppercase(),
+                    _ => "DAY".to_string(),
+                };
+                return Ok((amount, unit));
+            }
+        }
+
+        // Case 3: Second arg is numeric (the interval amount), third is the unit
+        let amount = match interval_arg {
+            Value::Int2(n) => i64::from(*n),
+            Value::Int4(n) => i64::from(*n),
+            Value::Int8(n) => *n,
+            Value::Float8(f) => *f as i64,
+            _ => return Err(Error::query_execution(
+                "DATE_ADD/DATE_SUB second argument must be an interval, number, or string"
+            )),
+        };
+        let unit = match unit_arg {
+            Some(Value::String(u)) => u.to_uppercase(),
+            _ => "DAY".to_string(),
+        };
+        Ok((amount, unit))
+    }
+
+    /// Apply an interval (amount, unit) to a `NaiveDateTime`, returning a new datetime.
+    /// `sign` is 1 for DATE_ADD and -1 for DATE_SUB.
+    fn apply_interval(ndt: chrono::NaiveDateTime, amount: i64, unit: &str, sign: i64) -> Result<chrono::NaiveDateTime> {
+        let signed = amount * sign;
+        match unit {
+            "SECOND" => Ok(ndt + chrono::Duration::seconds(signed)),
+            "MINUTE" => Ok(ndt + chrono::Duration::minutes(signed)),
+            "HOUR"   => Ok(ndt + chrono::Duration::hours(signed)),
+            "DAY"    => Ok(ndt + chrono::Duration::days(signed)),
+            "WEEK"   => Ok(ndt + chrono::Duration::weeks(signed)),
+            "MONTH" => {
+                // Month arithmetic: shift the month, clamping the day if needed
+                let total_months = i64::from(ndt.year()) * 12 + i64::from(ndt.month0() as i32) + signed;
+                let new_year = (total_months / 12) as i32;
+                let new_month0 = total_months.rem_euclid(12) as u32;
+                let new_month = new_month0 + 1;
+                let max_day = Self::days_in_month(new_year, new_month);
+                let new_day = ndt.day().min(max_day);
+                chrono::NaiveDate::from_ymd_opt(new_year, new_month, new_day)
+                    .and_then(|d| d.and_hms_opt(ndt.hour(), ndt.minute(), ndt.second()))
+                    .ok_or_else(|| Error::query_execution("Date overflow in MONTH interval"))
+            }
+            "YEAR" => {
+                let new_year = ndt.year() + signed as i32;
+                let max_day = Self::days_in_month(new_year, ndt.month());
+                let new_day = ndt.day().min(max_day);
+                chrono::NaiveDate::from_ymd_opt(new_year, ndt.month(), new_day)
+                    .and_then(|d| d.and_hms_opt(ndt.hour(), ndt.minute(), ndt.second()))
+                    .ok_or_else(|| Error::query_execution("Date overflow in YEAR interval"))
+            }
+            "" => {
+                // Interval was already in microseconds; apply directly
+                Ok(ndt + chrono::Duration::microseconds(amount * sign))
+            }
+            _ => Err(Error::query_execution(format!("Unsupported interval unit: {}", unit))),
+        }
+    }
+
+    /// Return the number of days in a given month.
+    fn days_in_month(year: i32, month: u32) -> u32 {
+        match month {
+            1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+            4 | 6 | 9 | 11 => 30,
+            2 => {
+                if (year % 4 == 0 && year % 100 != 0) || (year % 400 == 0) {
+                    29
+                } else {
+                    28
+                }
+            }
+            _ => 30,
+        }
+    }
+
+    /// DATE_ADD(date, INTERVAL n unit) — add an interval to a date/timestamp.
+    fn func_date_add(&self, args: &[Value]) -> Result<Value> {
+        if args.len() < 2 || args.len() > 3 {
+            return Err(Error::query_execution(
+                "DATE_ADD requires 2 or 3 arguments: DATE_ADD(date, interval [, unit])"
+            ));
+        }
+        let date_arg = args.first().ok_or_else(|| Error::query_execution("DATE_ADD requires a date argument"))?;
+        let interval_arg = args.get(1).ok_or_else(|| Error::query_execution("DATE_ADD requires an interval argument"))?;
+        if matches!(date_arg, Value::Null) || matches!(interval_arg, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let ndt = Self::value_to_naive_datetime(date_arg)?;
+        let (amount, unit) = Self::parse_date_add_interval(args)?;
+        let result = Self::apply_interval(ndt, amount, &unit, 1)?;
+        Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(result, Utc)))
+    }
+
+    /// DATE_SUB(date, INTERVAL n unit) — subtract an interval from a date/timestamp.
+    fn func_date_sub(&self, args: &[Value]) -> Result<Value> {
+        if args.len() < 2 || args.len() > 3 {
+            return Err(Error::query_execution(
+                "DATE_SUB requires 2 or 3 arguments: DATE_SUB(date, interval [, unit])"
+            ));
+        }
+        let date_arg = args.first().ok_or_else(|| Error::query_execution("DATE_SUB requires a date argument"))?;
+        let interval_arg = args.get(1).ok_or_else(|| Error::query_execution("DATE_SUB requires an interval argument"))?;
+        if matches!(date_arg, Value::Null) || matches!(interval_arg, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let ndt = Self::value_to_naive_datetime(date_arg)?;
+        let (amount, unit) = Self::parse_date_add_interval(args)?;
+        let result = Self::apply_interval(ndt, amount, &unit, -1)?;
+        Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(result, Utc)))
+    }
+
+    /// DATEDIFF(date1, date2) — returns integer number of days between two dates.
+    fn func_datediff(&self, args: &[Value]) -> Result<Value> {
+        let [a, b] = args else {
+            return Err(Error::query_execution("DATEDIFF requires exactly 2 arguments"));
+        };
+        if matches!(a, Value::Null) || matches!(b, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let d1 = Self::value_to_naive_date(a)?;
+        let d2 = Self::value_to_naive_date(b)?;
+        let diff = (d1 - d2).num_days();
+        #[allow(clippy::cast_possible_truncation)]
+        Ok(Value::Int4(diff as i32))
+    }
+
+    /// TIMESTAMPDIFF(unit, start, end) — returns integer difference in specified unit.
+    fn func_timestampdiff(&self, args: &[Value]) -> Result<Value> {
+        let [unit_arg, start_arg, end_arg] = args else {
+            return Err(Error::query_execution(
+                "TIMESTAMPDIFF requires exactly 3 arguments: TIMESTAMPDIFF(unit, start, end)"
+            ));
+        };
+        let unit = match unit_arg {
+            Value::String(s) => s.to_uppercase(),
+            Value::Null => return Ok(Value::Null),
+            _ => return Err(Error::query_execution(
+                "TIMESTAMPDIFF first argument must be a unit string (SECOND, MINUTE, HOUR, DAY, MONTH, YEAR)"
+            )),
+        };
+        if matches!(start_arg, Value::Null) || matches!(end_arg, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let start = Self::value_to_naive_datetime(start_arg)?;
+        let end = Self::value_to_naive_datetime(end_arg)?;
+        let diff = match unit.as_str() {
+            "SECOND" => (end - start).num_seconds(),
+            "MINUTE" => (end - start).num_minutes(),
+            "HOUR"   => (end - start).num_hours(),
+            "DAY"    => (end - start).num_days(),
+            "WEEK"   => (end - start).num_weeks(),
+            "MONTH" => {
+                let months_end = i64::from(end.year()) * 12 + i64::from(end.month0() as i32);
+                let months_start = i64::from(start.year()) * 12 + i64::from(start.month0() as i32);
+                months_end - months_start
+            }
+            "YEAR" => i64::from(end.year() - start.year()),
+            _ => return Err(Error::query_execution(format!(
+                "TIMESTAMPDIFF unsupported unit: {}. Use SECOND, MINUTE, HOUR, DAY, MONTH, or YEAR", unit
+            ))),
+        };
+        #[allow(clippy::cast_possible_truncation)]
+        Ok(Value::Int8(diff))
+    }
+
+    /// UNIX_TIMESTAMP() — returns seconds since epoch (no args = now).
+    /// UNIX_TIMESTAMP(date) — converts a date/timestamp to seconds since epoch.
+    fn func_unix_timestamp(&self, args: &[Value]) -> Result<Value> {
+        if args.is_empty() {
+            return Ok(Value::Int8(Utc::now().timestamp()));
+        }
+        let [arg] = args else {
+            return Err(Error::query_execution("UNIX_TIMESTAMP requires 0 or 1 arguments"));
+        };
+        if matches!(arg, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let ndt = Self::value_to_naive_datetime(arg)?;
+        let ts: chrono::DateTime<Utc> = chrono::DateTime::from_naive_utc_and_offset(ndt, Utc);
+        Ok(Value::Int8(ts.timestamp()))
+    }
+
+    /// FROM_UNIXTIME(timestamp) — converts Unix timestamp (seconds) to datetime string.
+    fn func_from_unixtime(&self, args: &[Value]) -> Result<Value> {
+        if args.is_empty() || args.len() > 2 {
+            return Err(Error::query_execution(
+                "FROM_UNIXTIME requires 1 or 2 arguments: FROM_UNIXTIME(unix_ts [, format])"
+            ));
+        }
+        let ts_arg = args.first().ok_or_else(|| Error::query_execution("FROM_UNIXTIME requires an argument"))?;
+        if matches!(ts_arg, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let epoch = match ts_arg {
+            Value::Int2(n) => i64::from(*n),
+            Value::Int4(n) => i64::from(*n),
+            Value::Int8(n) => *n,
+            Value::Float8(f) => *f as i64,
+            Value::String(s) => s.parse::<i64>()
+                .map_err(|_| Error::query_execution(format!("Invalid unix timestamp: {}", s)))?,
+            _ => return Err(Error::query_execution("FROM_UNIXTIME argument must be numeric")),
+        };
+        let dt = chrono::DateTime::from_timestamp(epoch, 0)
+            .ok_or_else(|| Error::query_execution(format!("Invalid unix timestamp: {}", epoch)))?;
+        if let Some(fmt_arg) = args.get(1) {
+            // Optional format string (MySQL syntax)
+            if matches!(fmt_arg, Value::Null) {
+                return Ok(Value::Null);
+            }
+            let format_str = match fmt_arg {
+                Value::String(s) => s,
+                _ => return Err(Error::query_execution("FROM_UNIXTIME format must be a string")),
+            };
+            let chrono_fmt = Self::mysql_format_to_chrono(format_str);
+            Ok(Value::String(dt.naive_utc().format(&chrono_fmt).to_string()))
+        } else {
+            Ok(Value::Timestamp(dt))
+        }
+    }
+
+    // ---- MySQL string functions ----
+
+    /// LOCATE(substr, str [, pos]) — find position of substring (1-indexed, 0 if not found).
+    fn func_locate(&self, args: &[Value]) -> Result<Value> {
+        if args.len() < 2 || args.len() > 3 {
+            return Err(Error::query_execution(
+                "LOCATE requires 2 or 3 arguments: LOCATE(substr, str [, pos])"
+            ));
+        }
+        let needle_arg = args.first().ok_or_else(|| Error::query_execution("LOCATE requires arguments"))?;
+        let haystack_arg = args.get(1).ok_or_else(|| Error::query_execution("LOCATE requires 2 arguments"))?;
+        if matches!(needle_arg, Value::Null) || matches!(haystack_arg, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let needle = match needle_arg {
+            Value::String(s) => s.as_str(),
+            _ => return Err(Error::query_execution("LOCATE first argument must be a string")),
+        };
+        let haystack = match haystack_arg {
+            Value::String(s) => s.as_str(),
+            _ => return Err(Error::query_execution("LOCATE second argument must be a string")),
+        };
+        // Optional starting position (1-indexed)
+        let start_pos = if let Some(pos_arg) = args.get(2) {
+            match pos_arg {
+                Value::Null => return Ok(Value::Null),
+                Value::Int2(n) => (*n as usize).saturating_sub(1),
+                Value::Int4(n) => (*n as usize).saturating_sub(1),
+                Value::Int8(n) => (*n as usize).saturating_sub(1),
+                _ => return Err(Error::query_execution("LOCATE third argument must be an integer")),
+            }
+        } else {
+            0
+        };
+        if start_pos >= haystack.len() {
+            return Ok(Value::Int4(0));
+        }
+        // Use .get() to safely slice the haystack
+        let search_region = haystack.get(start_pos..).unwrap_or("");
+        match search_region.find(needle) {
+            Some(pos) => Ok(Value::Int4((pos + start_pos + 1) as i32)), // 1-indexed
+            None => Ok(Value::Int4(0)),
+        }
+    }
+
+    /// INSTR(str, substr) — same as LOCATE but with reversed argument order.
+    fn func_instr(&self, args: &[Value]) -> Result<Value> {
+        let [str_arg, substr_arg] = args else {
+            return Err(Error::query_execution("INSTR requires exactly 2 arguments"));
+        };
+        // INSTR(str, substr) is LOCATE(substr, str), so swap args
+        let swapped = [substr_arg.clone(), str_arg.clone()];
+        self.func_locate(&swapped)
     }
 
     /// jsonb_extract_path(json, path_elements...)
