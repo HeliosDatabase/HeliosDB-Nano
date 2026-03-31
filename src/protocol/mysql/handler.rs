@@ -14,7 +14,7 @@ use bytes::{Buf, BufMut, Bytes, BytesMut};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::ErrorKind;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{debug, error, info, warn};
@@ -565,6 +565,8 @@ pub struct MySqlHandler {
     prepared_statements: HashMap<u32, PreparedStatement>,
     next_stmt_id: u32,
     last_row_count: u64,
+    /// Last auto-generated ID from INSERT (for `SELECT LAST_INSERT_ID()`)
+    last_insert_id: u64,
 }
 
 impl MySqlHandler {
@@ -593,6 +595,7 @@ impl MySqlHandler {
             prepared_statements: HashMap::new(),
             next_stmt_id: 1,
             last_row_count: 0,
+            last_insert_id: 0,
         }
     }
 
@@ -906,6 +909,29 @@ impl MySqlHandler {
             }
         }
 
+        // ---- SELECT LAST_INSERT_ID() ----
+        {
+            let upper = trimmed.to_uppercase();
+            if upper.contains("LAST_INSERT_ID()") {
+                let cols = vec!["LAST_INSERT_ID()".to_string()];
+                let rows = vec![Tuple::new(vec![Value::Int8(self.last_insert_id as i64)])];
+                return self.send_result_set(&cols, &rows).await;
+            }
+        }
+
+        // ---- SELECT @@variable — MySQL session/global variables ----
+        if starts_with_icase(trimmed, "SELECT") && trimmed.contains("@@") {
+            return self.handle_select_variable(trimmed).await;
+        }
+
+        // ---- INFORMATION_SCHEMA queries — intercept before SQL parser ----
+        {
+            let lower = trimmed.to_lowercase();
+            if lower.contains("information_schema") {
+                return self.handle_information_schema(trimmed).await;
+            }
+        }
+
         // ---- SELECT / DML / DDL — delegate to EmbeddedDatabase ----
         let is_select = starts_with_icase(trimmed, "SELECT")
             || starts_with_icase(trimmed, "WITH")
@@ -973,15 +999,85 @@ impl MySqlHandler {
     // ------------------------------------------------------------------
 
     async fn execute_dml(&mut self, sql: &str) -> Result<()> {
+        // Track whether this is an INSERT to capture last_insert_id
+        let is_insert = starts_with_icase(sql.trim(), "INSERT");
+        let table_name = if is_insert {
+            Self::extract_insert_table(sql)
+        } else {
+            None
+        };
+
         match self.database.execute(sql) {
             Ok(affected) => {
-                self.send_ok(affected, 0).await
+                // After INSERT, try to capture the auto-generated ID
+                let insert_id = if is_insert && affected > 0 {
+                    if let Some(ref tbl) = table_name {
+                        self.query_last_serial_id(tbl)
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                if insert_id > 0 {
+                    self.last_insert_id = insert_id;
+                }
+                self.send_ok(affected, insert_id).await
             }
             Err(e) => {
                 let msg = e.to_string();
                 let (code, state) = map_error_code(&msg);
                 self.send_error(code, state, &msg).await
             }
+        }
+    }
+
+    /// Extract the table name from an INSERT statement.
+    fn extract_insert_table(sql: &str) -> Option<String> {
+        static INSERT_TABLE_RE: OnceLock<Regex> = OnceLock::new();
+        let re = INSERT_TABLE_RE.get_or_init(|| {
+            Regex::new(r#"(?i)\bINSERT\s+INTO\s+[`"]*(\w+)[`"]*"#)
+                .unwrap_or_else(|_| Regex::new("^$").expect("static regex"))
+        });
+        re.captures(sql).and_then(|c| c.get(1).map(|m| m.as_str().to_string()))
+    }
+
+    /// Query the current max primary-key (SERIAL) value for a table.
+    ///
+    /// After an INSERT into a table with a SERIAL/BIGSERIAL column, the
+    /// auto-generated sequence value is the maximum PK value. This matches
+    /// MySQL's `LAST_INSERT_ID()` semantics for single-row inserts.
+    fn query_last_serial_id(&self, table_name: &str) -> u64 {
+        // Find the PK column name from the catalog
+        let pk_col = match self.database.storage.catalog().get_table_schema(table_name) {
+            Ok(schema) => {
+                schema.columns.iter()
+                    .find(|c| c.primary_key)
+                    .map(|c| c.name.clone())
+            }
+            Err(_) => None,
+        };
+
+        let pk_col = match pk_col {
+            Some(c) => c,
+            None => return 0,
+        };
+
+        // Query MAX(pk_col) from the table
+        let query = format!("SELECT MAX(\"{}\") FROM \"{}\"", pk_col, table_name);
+        match self.database.query_with_columns(&query) {
+            Ok((rows, _)) => {
+                rows.first()
+                    .and_then(|r| r.values.first())
+                    .and_then(|v| match v {
+                        Value::Int4(n) => Some(*n as u64),
+                        Value::Int8(n) => Some(*n as u64),
+                        Value::Int2(n) => Some(*n as u64),
+                        _ => None,
+                    })
+                    .unwrap_or(0)
+            }
+            Err(_) => 0,
         }
     }
 
@@ -994,6 +1090,11 @@ impl MySqlHandler {
 
         if upper.contains("DATABASES") || upper.contains("SCHEMAS") {
             return self.show_single_column("Database", &["heliosdb"]).await;
+        }
+
+        // TABLE STATUS must be checked before TABLES to avoid false match
+        if upper.contains("TABLE STATUS") {
+            return self.handle_show_table_status(trimmed).await;
         }
 
         if upper.contains("TABLES") {
@@ -1295,6 +1396,166 @@ impl MySqlHandler {
                     unique_seq += 1;
                 }
             }
+        }
+
+        self.send_result_set(&cols, &rows).await
+    }
+
+    // ------------------------------------------------------------------
+    // SELECT @@variable — MySQL session/global variable queries
+    // ------------------------------------------------------------------
+
+    /// Handle `SELECT @@variable` queries from MySQL clients.
+    ///
+    /// MySQL clients (including PHP's `mysqli`) send these to probe server
+    /// capabilities and configuration.  We return sensible defaults without
+    /// hitting the SQL parser, which does not understand `@@` syntax.
+    async fn handle_select_variable(&mut self, sql: &str) -> Result<()> {
+        // Extract @@variable names from the query using a simple regex.
+        // Handles both @@session.var and @@global.var and @@var forms.
+        static VAR_RE: OnceLock<Regex> = OnceLock::new();
+        let re = VAR_RE.get_or_init(|| {
+            Regex::new(r"@@(?:session\.|global\.)?(\w+)")
+                .unwrap_or_else(|_| Regex::new("^$").expect("static regex"))
+        });
+
+        let mut col_names: Vec<String> = Vec::new();
+        let mut values: Vec<Value> = Vec::new();
+
+        for cap in re.captures_iter(sql) {
+            let full_match = cap.get(0).map_or("", |m| m.as_str());
+            let var_name = cap.get(1).map_or("", |m| m.as_str()).to_lowercase();
+
+            let val = match var_name.as_str() {
+                "version" => Value::String(SERVER_VERSION.to_string()),
+                "version_comment" => Value::String("HeliosDB Nano".to_string()),
+                "max_allowed_packet" => Value::Int8(67_108_864),
+                "character_set_client" | "character_set_connection"
+                | "character_set_results" | "character_set_server"
+                | "character_set_database" => Value::String("utf8mb4".to_string()),
+                "collation_connection" | "collation_server"
+                | "collation_database" => Value::String("utf8mb4_general_ci".to_string()),
+                "auto_increment_increment" | "auto_increment_offset" => Value::Int8(1),
+                "interactive_timeout" | "wait_timeout" => Value::Int8(28800),
+                "net_write_timeout" | "net_read_timeout" => Value::Int8(30),
+                "sql_mode" => Value::String(
+                    "ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION".to_string()
+                ),
+                "time_zone" | "system_time_zone" => Value::String("SYSTEM".to_string()),
+                "tx_isolation" | "transaction_isolation" => Value::String("REPEATABLE-READ".to_string()),
+                "autocommit" => Value::Int8(1),
+                "have_ssl" | "have_openssl" => Value::String("YES".to_string()),
+                "lower_case_table_names" => Value::Int8(0),
+                "sql_auto_is_null" => Value::Int8(0),
+                "last_insert_id" => Value::Int8(self.last_insert_id as i64),
+                _ => Value::String(String::new()),
+            };
+            col_names.push(full_match.to_string());
+            values.push(val);
+        }
+
+        if col_names.is_empty() {
+            // Fallback: return empty result
+            return self.send_ok(0, 0).await;
+        }
+
+        let row = Tuple::new(values);
+        self.send_result_set(&col_names, &[row]).await
+    }
+
+    // ------------------------------------------------------------------
+    // INFORMATION_SCHEMA queries
+    // ------------------------------------------------------------------
+
+    /// Handle queries against `information_schema.tables` and
+    /// `information_schema.columns`.
+    ///
+    /// These are routed through the PG catalog handler which already
+    /// supports both views.  If the catalog handler doesn't recognize
+    /// the query, we fall back to the normal SQL path.
+    async fn handle_information_schema(&mut self, sql: &str) -> Result<()> {
+        use crate::protocol::postgres::catalog::PgCatalog;
+
+        let catalog = PgCatalog::with_database(Arc::clone(&self.database));
+        match catalog.handle_query(sql) {
+            Ok(Some((schema, rows))) => {
+                let col_names: Vec<String> = schema.columns.iter()
+                    .map(|c| c.name.clone())
+                    .collect();
+                self.send_result_set(&col_names, &rows).await
+            }
+            Ok(None) => {
+                // Catalog handler didn't recognize it — try normal SQL
+                self.execute_query(sql).await
+            }
+            Err(e) => {
+                // Catalog handler errored — try normal SQL as fallback
+                debug!("information_schema catalog handler error: {}, falling back to SQL", e);
+                self.execute_query(sql).await
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // SHOW TABLE STATUS
+    // ------------------------------------------------------------------
+
+    /// Handle `SHOW TABLE STATUS` — returns table metadata in MySQL format.
+    async fn handle_show_table_status(&mut self, sql: &str) -> Result<()> {
+        let tables = self.database.storage.catalog().list_tables().unwrap_or_default();
+
+        let like_pattern = extract_like_pattern(sql);
+
+        let cols = vec![
+            "Name".to_string(),
+            "Engine".to_string(),
+            "Version".to_string(),
+            "Row_format".to_string(),
+            "Rows".to_string(),
+            "Avg_row_length".to_string(),
+            "Data_length".to_string(),
+            "Max_data_length".to_string(),
+            "Index_length".to_string(),
+            "Data_free".to_string(),
+            "Auto_increment".to_string(),
+            "Create_time".to_string(),
+            "Update_time".to_string(),
+            "Check_time".to_string(),
+            "Collation".to_string(),
+            "Checksum".to_string(),
+            "Create_options".to_string(),
+            "Comment".to_string(),
+        ];
+
+        let mut rows: Vec<Tuple> = Vec::new();
+        for table in &tables {
+            // Apply LIKE filter if present
+            if let Some(ref pat) = like_pattern {
+                if !sql_like_match(table, pat) {
+                    continue;
+                }
+            }
+
+            rows.push(Tuple::new(vec![
+                Value::String(table.clone()),                      // Name
+                Value::String("InnoDB".to_string()),               // Engine
+                Value::String("10".to_string()),                   // Version
+                Value::String("Dynamic".to_string()),              // Row_format
+                Value::Int8(0),                                    // Rows (estimate)
+                Value::Int8(0),                                    // Avg_row_length
+                Value::Int8(0),                                    // Data_length
+                Value::Int8(0),                                    // Max_data_length
+                Value::Int8(0),                                    // Index_length
+                Value::Int8(0),                                    // Data_free
+                Value::Null,                                       // Auto_increment
+                Value::Null,                                       // Create_time
+                Value::Null,                                       // Update_time
+                Value::Null,                                       // Check_time
+                Value::String("utf8mb4_general_ci".to_string()),   // Collation
+                Value::Null,                                       // Checksum
+                Value::String(String::new()),                      // Create_options
+                Value::String(String::new()),                      // Comment
+            ]));
         }
 
         self.send_result_set(&cols, &rows).await

@@ -717,7 +717,12 @@ impl EmbeddedDatabase {
 
         // Execute plan based on type
         match &plan {
-            sql::LogicalPlan::CreateTable { name, columns, constraints, .. } => {
+            sql::LogicalPlan::CreateTable { name, columns, constraints, if_not_exists, .. } => {
+                // Handle IF NOT EXISTS: silently succeed when table already exists
+                if *if_not_exists && self.storage.catalog().table_exists(name).unwrap_or(false) {
+                    return Ok(0);
+                }
+
                 let schema_columns: Vec<Column> = columns.iter().map(|col_def| {
                     // Serialize default expression to JSON for storage
                     let default_expr = col_def.default.as_ref().map(|expr| {
@@ -3687,7 +3692,12 @@ impl EmbeddedDatabase {
 
         // 3. Execute plan based on type
         match &plan {
-            sql::LogicalPlan::CreateTable { name, columns, .. } => {
+            sql::LogicalPlan::CreateTable { name, columns, if_not_exists, .. } => {
+                // Handle IF NOT EXISTS: silently succeed when table already exists
+                if *if_not_exists && self.storage.catalog().table_exists(name).unwrap_or(false) {
+                    return Ok(0);
+                }
+
                 // Convert ColumnDef to Column
                 let schema_columns: Vec<Column> = columns.iter().map(|col_def| {
                     Column {

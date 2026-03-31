@@ -19,7 +19,11 @@ fn init_regex(pattern: &str) -> Regex {
 pub fn translate(sql: &str) -> String {
     let mut result = sql.to_string();
 
-    // Apply transformations in order
+    // Apply transformations in order.
+    // Backslash escapes MUST be processed first — before backtick translation
+    // — so we can distinguish backslash-escaped quotes inside string literals
+    // from identifier delimiters.
+    result = translate_backslash_escapes(&result);
     result = translate_backticks(&result);
     result = translate_types(&result);
     result = translate_auto_increment(&result);
@@ -32,6 +36,99 @@ pub fn translate(sql: &str) -> String {
     result = translate_misc(&result);
 
     result
+}
+
+// ---------------------------------------------------------------------------
+// 0. Backslash escape normalization inside single-quoted string literals
+// ---------------------------------------------------------------------------
+
+/// Strip MySQL-style backslash escapes inside single-quoted strings.
+///
+/// MySQL's `mysqli_real_escape_string()` sends `\"` for double-quotes and
+/// `\\` for literal backslashes.  Standard MySQL strips the backslash on
+/// storage.  Without this step, HeliosDB stores the literal `\"`, which
+/// corrupts PHP serialized data (WordPress options, session tokens, etc.).
+///
+/// Handled sequences (inside single-quoted strings only):
+///   `\"` → `"`    (escaped double-quote)
+///   `\\` → `\`    (escaped backslash)
+///   `\n` → newline
+///   `\r` → carriage return
+///   `\t` → tab
+///   `\0` → NUL  (stripped — Postgres can't store NUL in text)
+///   `\'` left unchanged (already handled by the SQL parser as `''`)
+fn translate_backslash_escapes(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch == '\'' {
+            // Enter single-quoted string literal
+            out.push('\'');
+            loop {
+                match chars.next() {
+                    Some('\\') => {
+                        // Backslash inside a single-quoted string
+                        match chars.peek() {
+                            Some('"') => {
+                                // \" → "  (strip the backslash)
+                                out.push('"');
+                                chars.next();
+                            }
+                            Some('\\') => {
+                                // \\ → \  (one backslash)
+                                out.push('\\');
+                                chars.next();
+                            }
+                            Some('n') => {
+                                out.push('\n');
+                                chars.next();
+                            }
+                            Some('r') => {
+                                out.push('\r');
+                                chars.next();
+                            }
+                            Some('t') => {
+                                out.push('\t');
+                                chars.next();
+                            }
+                            Some('0') => {
+                                // \0 → strip (NUL not storable in PG text)
+                                chars.next();
+                            }
+                            Some('\'') => {
+                                // \' → '' (PostgreSQL-style escaped quote)
+                                out.push('\'');
+                                out.push('\'');
+                                chars.next();
+                            }
+                            _ => {
+                                // Unknown escape — keep backslash
+                                out.push('\\');
+                            }
+                        }
+                    }
+                    Some('\'') => {
+                        // Check for escaped quote ('')
+                        if chars.peek() == Some(&'\'') {
+                            out.push('\'');
+                            out.push('\'');
+                            chars.next();
+                        } else {
+                            out.push('\'');
+                            break;
+                        }
+                    }
+                    Some(c) => out.push(c),
+                    None => break,
+                }
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+
+    out
 }
 
 // ---------------------------------------------------------------------------
