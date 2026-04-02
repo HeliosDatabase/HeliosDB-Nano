@@ -561,7 +561,7 @@ mod tests {
     fn create_test_state() -> AppState {
         let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
         let query_registry = Arc::new(crate::compute::QueryRegistry::new());
-        AppState { db, query_registry }
+        AppState { db, query_registry, auth_bridge: None, oauth_registry: None, change_notifier: None }
     }
 
     #[tokio::test]

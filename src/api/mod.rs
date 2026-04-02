@@ -9,6 +9,10 @@ pub mod handlers;
 pub mod middleware;
 pub mod jwt;
 pub mod openapi;
+pub mod rest_executor;
+pub mod auth_bridge;
+pub mod oauth;
+pub mod change_notifier;
 
 // Re-exports for convenience
 pub use server::ApiServer;

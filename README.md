@@ -12,7 +12,7 @@ HeliosDB Nano combines the simplicity of SQLite (embed it in your app) with Post
 
 ```toml
 [dependencies]
-heliosdb-nano = "3.7"
+heliosdb-nano = "3.8"
 ```
 
 ## Quick Start

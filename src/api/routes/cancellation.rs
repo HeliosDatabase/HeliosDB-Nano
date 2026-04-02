@@ -117,7 +117,7 @@ mod tests {
     fn test_routes_creation() {
         let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
         let query_registry = Arc::new(QueryRegistry::new());
-        let state = AppState { db, query_registry };
+        let state = AppState { db, query_registry, auth_bridge: None, oauth_registry: None, change_notifier: None };
         let router: axum::Router<()> = routes().with_state(state);
         drop(router);
     }

@@ -5,6 +5,35 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.8.0] - 2026-04-02
+
+### Added
+- **Built-in Backend-as-a-Service layer** — REST API, Auth, OAuth, Realtime, Storage
+- REST API at `/rest/v1/{table}` with 19 PostgREST-compatible filter operators
+  (eq, neq, gt, gte, lt, lte, like, ilike, is, in, cs, cd, ov, fts, not, or, and)
+- Auth endpoints: `/auth/v1/signup`, `/auth/v1/token`, `/auth/v1/logout`,
+  `/auth/v1/refresh`, `/auth/v1/user` with JWT sessions and Argon2id hashing
+- OAuth2 support for Google and GitHub (`/auth/v1/authorize`, `/auth/v1/callback`)
+  with PKCE, automatic user creation, and provider linking
+- Realtime WebSocket at `/realtime/v1/websocket` with Phoenix-protocol
+  channel subscriptions and INSERT/UPDATE/DELETE change notifications
+- Row-Level Security enforcement on REST queries using JWT claims
+- `ChangeNotifier` broadcasts DML events to WebSocket subscribers
+- Auth persistence: `_auth_users` and `_auth_refresh_tokens` tables in DB
+- MySQL wire protocol with WordPress compatibility layer
+  (SQL translator, SHOW commands, AUTO_INCREMENT, ON DUPLICATE KEY, etc.)
+- 14 MySQL date/time functions (DATE_FORMAT, DATE_ADD, UNIX_TIMESTAMP, etc.)
+- MySQL `$10+` parameter substitution fix
+- 9 convenience methods on `EmbeddedDatabase` (branches, explain, refresh MV)
+
+### Fixed
+- Transaction read-your-writes (INSERT visible in same-transaction SELECT)
+- SQLAlchemy pg_catalog.version() compatibility
+- Column names (column_0 → real names) and quoted strings in PG wire protocol
+- CREATE TABLE IF NOT EXISTS errors when table exists
+- LAST_INSERT_ID() tracking per MySQL connection
+- Backslash-quote escaping for PHP serialize() compatibility
+
 ## [3.7.0] - 2026-03-21
 
 ### Added

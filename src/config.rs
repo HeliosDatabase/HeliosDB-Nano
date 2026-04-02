@@ -119,6 +119,9 @@ pub struct Config {
     /// Resource quota configuration (v3.1.0)
     #[serde(default)]
     pub resource_quotas: ResourceQuotaConfig,
+    /// BaaS REST API configuration (v3.2.0)
+    #[serde(default)]
+    pub api: ApiConfig,
 }
 
 impl Default for Config {
@@ -139,6 +142,7 @@ impl Default for Config {
             locks: LockConfig::default(),
             dump: DumpConfig::default(),
             resource_quotas: ResourceQuotaConfig::default(),
+            api: ApiConfig::default(),
         }
     }
 }
@@ -974,6 +978,87 @@ impl ResourceQuotaConfig {
         }
         Ok(())
     }
+}
+
+/// BaaS REST API configuration (v3.2.0)
+///
+/// Controls the PostgREST-compatible REST API layer that exposes tables
+/// as RESTful endpoints at `/rest/v1/`.
+///
+/// # Example (TOML)
+///
+/// ```toml
+/// [api]
+/// jwt_secret = "super-secret-key"
+/// anon_key = "eyJhbGciOi..."
+/// service_role_key = "eyJhbGciOi..."
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ApiConfig {
+    /// JWT secret used to sign and verify authentication tokens.
+    ///
+    /// If not set, a random 64-byte hex string is generated at startup.
+    pub jwt_secret: String,
+    /// Anonymous API key that grants unauthenticated read access.
+    pub anon_key: Option<String>,
+    /// Service-role API key that grants full admin access (bypasses RLS).
+    pub service_role_key: Option<String>,
+    /// OAuth2 provider configurations (Google, GitHub, etc.).
+    ///
+    /// # Example (TOML)
+    ///
+    /// ```toml
+    /// [[api.oauth_providers]]
+    /// name = "google"
+    /// client_id = "123456.apps.googleusercontent.com"
+    /// client_secret = "GOCSPX-..."
+    /// redirect_uri = "http://localhost:8080/auth/v1/callback"
+    ///
+    /// [[api.oauth_providers]]
+    /// name = "github"
+    /// client_id = "Iv1.abc123"
+    /// client_secret = "deadbeef..."
+    /// redirect_uri = "http://localhost:8080/auth/v1/callback"
+    /// ```
+    #[serde(default)]
+    pub oauth_providers: Vec<OAuthProviderConfig>,
+}
+
+/// Configuration for a single OAuth2 provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OAuthProviderConfig {
+    /// Provider name: `"google"` or `"github"`.
+    pub name: String,
+    /// OAuth2 Client ID issued by the provider.
+    pub client_id: String,
+    /// OAuth2 Client Secret issued by the provider.
+    pub client_secret: String,
+    /// The absolute URL the provider should redirect back to after authorization.
+    pub redirect_uri: String,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            jwt_secret: generate_random_secret(),
+            anon_key: None,
+            service_role_key: None,
+            oauth_providers: Vec::new(),
+        }
+    }
+}
+
+/// Generate a random 64-character hex string for use as a JWT secret.
+fn generate_random_secret() -> String {
+    use std::collections::hash_map::RandomState;
+    use std::hash::{BuildHasher, Hasher};
+
+    // Use two independent random hashers to get 128 bits of randomness
+    let s = RandomState::new();
+    let h1 = s.build_hasher().finish();
+    let h2 = RandomState::new().build_hasher().finish();
+    format!("{h1:016x}{h2:016x}{h1:016x}{h2:016x}")
 }
 
 #[cfg(test)]

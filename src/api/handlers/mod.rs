@@ -10,3 +10,7 @@ pub mod chat_handler;
 pub mod schema_handler;
 pub mod nl_query_handler;
 pub mod cancellation_handler;
+pub mod rest_handler;
+pub mod auth_handler;
+pub mod oauth_handler;
+pub mod ws_handler;

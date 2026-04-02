@@ -10,6 +10,7 @@ pub mod chat;
 pub mod schema;
 pub mod cancellation;
 pub mod webhooks;
+pub mod rest;
 
 use axum::Router;
 use crate::api::server::AppState;

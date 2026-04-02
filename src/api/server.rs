@@ -26,6 +26,9 @@ use crate::{EmbeddedDatabase, Result, Error};
 use crate::compute::QueryRegistry;
 use super::routes;
 use super::middleware::{AuthMiddleware, RateLimitMiddleware, rate_limit_middleware};
+use super::auth_bridge::AuthBridge;
+use super::change_notifier::ChangeNotifier;
+use super::oauth::OAuthRegistry;
 
 /// Shared application state
 #[derive(Clone)]
@@ -34,6 +37,12 @@ pub struct AppState {
     pub db: Arc<EmbeddedDatabase>,
     /// Query registry for tracking and cancelling running queries
     pub query_registry: Arc<QueryRegistry>,
+    /// Optional BaaS auth bridge (database-persisted authentication)
+    pub auth_bridge: Option<Arc<AuthBridge>>,
+    /// Optional OAuth2 provider registry (Google, GitHub, etc.)
+    pub oauth_registry: Option<Arc<OAuthRegistry>>,
+    /// Optional realtime change notifier for WebSocket subscriptions
+    pub change_notifier: Option<Arc<ChangeNotifier>>,
 }
 
 /// REST API Server
@@ -71,11 +80,15 @@ impl ApiServer {
     /// # }
     /// ```
     pub fn new(addr: SocketAddr, db: Arc<EmbeddedDatabase>) -> Self {
+        let change_notifier = Arc::new(ChangeNotifier::new(db.clone()));
         Self {
             addr,
             state: AppState {
                 db,
                 query_registry: Arc::new(QueryRegistry::new()),
+                auth_bridge: None,
+                oauth_registry: None,
+                change_notifier: Some(change_notifier),
             },
             auth_middleware: None,
             rate_limit_middleware: None,
@@ -90,7 +103,7 @@ impl ApiServer {
     ) -> Self {
         Self {
             addr,
-            state: AppState { db, query_registry },
+            state: AppState { db, query_registry, auth_bridge: None, oauth_registry: None, change_notifier: None },
             auth_middleware: None,
             rate_limit_middleware: None,
         }
@@ -147,6 +160,18 @@ impl ApiServer {
     /// ```
     pub fn with_rate_limiting(mut self, rate_limiter: RateLimitMiddleware) -> Self {
         self.rate_limit_middleware = Some(Arc::new(rate_limiter));
+        self
+    }
+
+    /// Enable the BaaS auth bridge (database-persisted user accounts + JWT).
+    pub fn with_auth_bridge(mut self, bridge: Arc<AuthBridge>) -> Self {
+        self.state.auth_bridge = Some(bridge);
+        self
+    }
+
+    /// Enable OAuth2 provider registry (Google, GitHub, etc.).
+    pub fn with_oauth_registry(mut self, registry: Arc<OAuthRegistry>) -> Self {
+        self.state.oauth_registry = Some(registry);
         self
     }
 
@@ -227,9 +252,26 @@ impl ApiServer {
             v1_router
         };
 
+        // Build PostgREST-compatible REST routes
+        let rest_router = routes::rest::routes();
+
+        // Build auth routes (public - no auth middleware required)
+        use super::handlers::{auth_handler, oauth_handler};
+        let auth_router: Router<AppState> = Router::new()
+            .route("/auth/v1/signup", axum::routing::post(auth_handler::signup))
+            .route("/auth/v1/token", axum::routing::post(auth_handler::signin))
+            .route("/auth/v1/logout", axum::routing::post(auth_handler::logout))
+            .route("/auth/v1/refresh", axum::routing::post(auth_handler::refresh))
+            .route("/auth/v1/user", axum::routing::get(auth_handler::get_user))
+            .route("/auth/v1/authorize", axum::routing::get(oauth_handler::authorize))
+            .route("/auth/v1/callback", axum::routing::get(oauth_handler::callback));
+
         // Build router with public and protected routes
         Router::new()
             .nest("/v1", v1_router)
+            .nest("/rest/v1", rest_router)
+            .merge(auth_router)
+            .route("/realtime/v1/websocket", axum::routing::get(super::handlers::ws_handler::ws_upgrade))
             .route("/health", axum::routing::get(health_check))
             .route("/version", axum::routing::get(version_info))
             .layer(base_middleware)
@@ -351,7 +393,7 @@ mod tests {
     fn test_app_state_creation() {
         let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
         let query_registry = Arc::new(QueryRegistry::new());
-        let state = AppState { db, query_registry };
+        let state = AppState { db, query_registry, auth_bridge: None, oauth_registry: None, change_notifier: None };
         assert!(Arc::strong_count(&state.db) >= 1);
     }
 

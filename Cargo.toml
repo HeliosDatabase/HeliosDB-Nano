@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "heliosdb-nano"
-version = "3.7.0"
+version = "3.8.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Daniel Moya <daniel.moya@dimensigon.com>"]
@@ -60,11 +60,12 @@ parquet = { version = "52" }
 tokio = { version = "1.40", features = ["full"] }
 async-trait = "0.1"
 reqwest = { version = "0.12", features = ["json", "stream"] }
+oauth2 = "4.4"
 futures = "0.3"
 async-stream = "0.3"
 
 # HTTP Server (for sync protocol v2.3.0)
-axum = "0.7"
+axum = { version = "0.7", features = ["ws"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["cors", "compression-gzip", "trace"] }
 
