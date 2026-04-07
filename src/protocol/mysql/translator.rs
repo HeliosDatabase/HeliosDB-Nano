@@ -33,6 +33,8 @@ pub fn translate(sql: &str) -> String {
     result = translate_insert_ignore(&result);
     result = translate_limit_offset(&result);
     result = translate_functions(&result);
+    result = translate_multi_table_delete(&result);
+    result = translate_key_indexes(&result);
     result = translate_misc(&result);
 
     result
@@ -170,8 +172,11 @@ fn translate_backticks(sql: &str) -> String {
                     }
                 }
             }
-            // Replace backtick with double-quote.
-            '`' => out.push('"'),
+            // Strip backticks entirely — WordPress identifiers are simple names.
+            // Double-quoted identifiers cause "table not found" because the PG parser
+            // treats them as case-sensitive quoted identifiers that don't match the
+            // stored (unquoted) table names.
+            '`' => {},
             _ => out.push(ch),
         }
     }
@@ -551,7 +556,117 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 }
 
 // ---------------------------------------------------------------------------
-// 10. Miscellaneous MySQL syntax
+// 10. Multi-table DELETE → single-table DELETE ... USING
+// ---------------------------------------------------------------------------
+
+/// Translate MySQL multi-table DELETE to PostgreSQL DELETE ... USING.
+///
+/// MySQL:  `DELETE t, tt FROM wp_terms AS t INNER JOIN wp_term_taxonomy AS tt
+///          ON t.term_id = tt.term_id WHERE tt.taxonomy = 'nav_menu'`
+/// PG:     `DELETE FROM wp_terms USING wp_term_taxonomy
+///          WHERE wp_terms.term_id = wp_term_taxonomy.term_id
+///          AND wp_term_taxonomy.taxonomy = 'nav_menu'`
+///
+/// Strategy: detect `DELETE <alias_list> FROM`, extract the first table as
+/// the target, convert the rest to USING with the JOIN condition merged into
+/// WHERE.
+fn translate_multi_table_delete(sql: &str) -> String {
+    // Match: DELETE <alias1>[, <alias2>...] FROM <table_spec> [JOIN ...] [WHERE ...]
+    static MULTI_DEL_RE: OnceLock<Regex> = OnceLock::new();
+    let re = MULTI_DEL_RE.get_or_init(|| {
+        init_regex(
+            r"(?i)^(\s*DELETE)\s+\w+(?:\s*,\s*\w+)*\s+FROM\s+(\w+)\s+(?:AS\s+)?(\w+)\s+((?:INNER\s+)?JOIN\s+(\w+)\s+(?:AS\s+)?(\w+)\s+ON\s+(.+?))\s+(WHERE\s+.+)$"
+        )
+    });
+
+    if let Some(caps) = re.captures(sql) {
+        // caps[2] = first real table name (e.g. wp_terms)
+        // caps[3] = first alias (e.g. t)
+        // caps[5] = second real table name (e.g. wp_term_taxonomy)
+        // caps[6] = second alias (e.g. tt)
+        // caps[7] = ON condition (e.g. t.term_id = tt.term_id)
+        // caps[8] = WHERE clause (e.g. WHERE tt.taxonomy = 'nav_menu')
+
+        let table1 = &caps[2];
+        let alias1 = &caps[3];
+        let table2 = &caps[5];
+        let alias2 = &caps[6];
+        let on_condition = &caps[7];
+        let where_clause = &caps[8];
+
+        // Replace aliases with real table names using word-boundary-aware regex
+        // to avoid partial matches (e.g., alias "t" must not match inside "tt").
+        // Process longer alias first to prevent substring collisions.
+        let mut aliases: Vec<(&str, &str)> = vec![(alias1, table1), (alias2, table2)];
+        aliases.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+
+        let mut combined = format!("{on_condition} ##SEP## {where_clause}");
+        for (alias, table) in &aliases {
+            let pattern = format!(r"\b{}\.", regex::escape(alias));
+            let alias_re = init_regex(&pattern);
+            combined = alias_re.replace_all(&combined, format!("{}.", table)).to_string();
+        }
+
+        // Split back into ON and WHERE parts
+        let parts: Vec<&str> = combined.splitn(2, " ##SEP## ").collect();
+        let on_fixed = parts.first().map_or("", |s| s.trim());
+        let where_full = parts.get(1).map_or("", |s| s.trim());
+
+        // Strip the "WHERE " prefix so we can combine conditions
+        let where_body = where_full
+            .strip_prefix("WHERE ")
+            .or_else(|| where_full.strip_prefix("where "))
+            .unwrap_or(where_full);
+
+        return format!(
+            "DELETE FROM {table1} USING {table2} WHERE {on_fixed} AND {where_body}"
+        );
+    }
+
+    sql.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// 11. KEY / UNIQUE KEY prefix indexes → strip from CREATE TABLE
+// ---------------------------------------------------------------------------
+
+/// Strip MySQL KEY and UNIQUE KEY index definitions from CREATE TABLE.
+///
+/// WordPress DDL includes:
+///   `KEY option_name (option_name(191))`         — prefix index with length
+///   `UNIQUE KEY email (email)`                    — named unique constraint
+///   `KEY idx_name (col1, col2)`                   — composite index
+///
+/// HeliosDB uses ART indexes automatically, so these are stripped.
+/// Note: UNIQUE KEY is also handled — uniqueness is enforced via ART indexes
+/// or column-level UNIQUE constraints, not via index definitions.
+fn translate_key_indexes(sql: &str) -> String {
+    // Only apply to CREATE TABLE statements
+    static CREATE_RE: OnceLock<Regex> = OnceLock::new();
+    let re = CREATE_RE.get_or_init(|| init_regex(r"(?i)^\s*CREATE\s+TABLE\b"));
+    if !re.is_match(sql) {
+        return sql.to_string();
+    }
+
+    // Remove lines matching:  KEY <name> (<columns>)  or  UNIQUE KEY <name> (<columns>)
+    // This handles prefix indexes like col(191) inside the parens.
+    static KEY_LINE_RE: OnceLock<Regex> = OnceLock::new();
+    let re = KEY_LINE_RE.get_or_init(|| {
+        init_regex(r"(?i),?\s*(?:UNIQUE\s+)?KEY\s+\w+\s*\([^)]+\)\s*,?")
+    });
+
+    let mut s = re.replace_all(sql, "").to_string();
+
+    // Clean up trailing commas before closing paren: `, )` → `)`
+    static TRAILING_COMMA_RE: OnceLock<Regex> = OnceLock::new();
+    let re = TRAILING_COMMA_RE.get_or_init(|| init_regex(r",\s*\)"));
+    s = re.replace_all(&s, ")").to_string();
+
+    s
+}
+
+// ---------------------------------------------------------------------------
+// 12. Miscellaneous MySQL syntax
 // ---------------------------------------------------------------------------
 
 fn translate_misc(sql: &str) -> String {
@@ -643,11 +758,12 @@ mod tests {
     }
 
     #[test]
-    fn test_backtick_to_double_quote() {
+    fn test_backtick_stripped() {
         let sql = "SELECT `id`, `name` FROM `wp_posts` WHERE `status` = 'publish'";
         let result = translate(sql);
-        assert!(!result.contains('`'), "Backticks should be replaced");
-        assert!(result.contains("\"id\""), "Should use double quotes");
+        assert!(!result.contains('`'), "Backticks should be stripped");
+        assert!(result.contains("id"), "Identifier should remain");
+        assert!(result.contains("wp_posts"), "Table name should remain");
         // String 'publish' should NOT be affected
         assert!(
             result.contains("'publish'"),
@@ -911,14 +1027,19 @@ mod tests {
         let sql = "SELECT `col` FROM t WHERE val = 'it`s a test'";
         let result = translate(sql);
         assert!(
-            result.contains("\"col\""),
-            "Backtick identifier converted: {result}"
+            result.contains("col"),
+            "Backtick identifier stripped: {result}"
         );
-        // The backtick inside the single-quoted string literal must be
-        // preserved as-is — it is not an identifier delimiter.
+        // Identifier backticks are stripped; the one inside the string literal
+        // is preserved (it lives inside single quotes, not an identifier).
         assert!(
             result.contains("'it`s a test'"),
             "Backtick inside string literal preserved: {result}"
+        );
+        // Verify the identifier `col` lost its backticks (SELECT col, not SELECT `col`)
+        assert!(
+            !result.contains("`col`"),
+            "Identifier backticks should be stripped: {result}"
         );
     }
 
@@ -950,5 +1071,112 @@ mod tests {
         let result = translate(sql);
         let count = result.matches("BYTEA").count();
         assert_eq!(count, 3, "All BLOB variants -> BYTEA: {result}");
+    }
+
+    #[test]
+    fn test_multi_table_delete() {
+        let sql = "DELETE t, tt FROM wp_terms AS t INNER JOIN wp_term_taxonomy AS tt ON t.term_id = tt.term_id WHERE tt.taxonomy = 'nav_menu'";
+        let result = translate(sql);
+        assert!(
+            result.contains("DELETE FROM wp_terms USING wp_term_taxonomy"),
+            "Should convert to DELETE ... USING: {result}"
+        );
+        assert!(
+            result.contains("wp_terms.term_id = wp_term_taxonomy.term_id"),
+            "Should replace aliases with real table names: {result}"
+        );
+        assert!(
+            !result.contains("INNER JOIN"),
+            "JOIN syntax should be removed: {result}"
+        );
+    }
+
+    #[test]
+    fn test_multi_table_delete_no_alias_keyword() {
+        let sql = "DELETE a, b FROM wp_terms a JOIN wp_term_taxonomy b ON a.term_id = b.term_id WHERE b.count = 0";
+        let result = translate(sql);
+        assert!(
+            result.contains("DELETE FROM wp_terms USING wp_term_taxonomy"),
+            "Should handle JOIN without AS keyword: {result}"
+        );
+    }
+
+    #[test]
+    fn test_key_index_stripped() {
+        let sql = "CREATE TABLE wp_options (
+  option_id BIGSERIAL NOT NULL,
+  option_name varchar(191) NOT NULL DEFAULT '',
+  PRIMARY KEY (option_id),
+  KEY option_name (option_name(191))
+)";
+        let result = translate(sql);
+        assert!(
+            !result.contains("KEY option_name"),
+            "KEY index should be stripped: {result}"
+        );
+        assert!(
+            result.contains("PRIMARY KEY"),
+            "PRIMARY KEY should be preserved: {result}"
+        );
+    }
+
+    #[test]
+    fn test_unique_key_stripped() {
+        let sql = "CREATE TABLE wp_users (
+  ID BIGSERIAL NOT NULL,
+  user_email varchar(100),
+  PRIMARY KEY (ID),
+  UNIQUE KEY user_email (user_email),
+  KEY user_login (user_login)
+)";
+        let result = translate(sql);
+        assert!(
+            !result.contains("UNIQUE KEY"),
+            "UNIQUE KEY should be stripped: {result}"
+        );
+        assert!(
+            !result.contains("KEY user_login"),
+            "KEY should be stripped: {result}"
+        );
+        assert!(
+            result.contains("PRIMARY KEY"),
+            "PRIMARY KEY should be preserved: {result}"
+        );
+    }
+
+    #[test]
+    fn test_key_index_no_false_positive() {
+        // Non-CREATE TABLE statements should not be affected
+        let sql = "SELECT * FROM t WHERE KEY = 'value'";
+        let result = translate(sql);
+        assert_eq!(result, sql, "Non-CREATE should be unchanged: {result}");
+    }
+
+    #[test]
+    fn test_wordpress_full_create_with_keys() {
+        let sql = "CREATE TABLE `wp_posts` (
+  `ID` bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
+  `post_title` text COLLATE utf8mb4_unicode_ci NOT NULL,
+  PRIMARY KEY (`ID`),
+  KEY `post_name` (`post_name`(191)),
+  KEY `type_status_date` (`post_type`,`post_status`,`post_date`,`ID`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci";
+        let result = translate(sql);
+        assert!(
+            !result.contains("KEY post_name"),
+            "KEY indexes should be stripped: {result}"
+        );
+        assert!(
+            !result.contains("KEY type_status_date"),
+            "Composite KEY indexes should be stripped: {result}"
+        );
+        assert!(
+            result.contains("PRIMARY KEY"),
+            "PRIMARY KEY should be preserved: {result}"
+        );
+        assert!(
+            result.contains("BIGSERIAL"),
+            "AUTO_INCREMENT should become BIGSERIAL: {result}"
+        );
     }
 }

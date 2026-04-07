@@ -14434,6 +14434,80 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_join_alias_column_resolution_in_where() {
+        // Regression: WordPress-style queries using table aliases in WHERE clause
+        // Error was: "Column 'tt.term_taxonomy_id' not found"
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+
+        // Simulate WordPress wp_term_taxonomy and wp_terms tables
+        db.execute("CREATE TABLE wp_term_taxonomy (term_taxonomy_id INT PRIMARY KEY, term_id INT, taxonomy TEXT)").unwrap();
+        db.execute("CREATE TABLE wp_terms (term_id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO wp_terms VALUES (1, 'Uncategorized')").unwrap();
+        db.execute("INSERT INTO wp_terms VALUES (2, 'News')").unwrap();
+        db.execute("INSERT INTO wp_term_taxonomy VALUES (1, 1, 'category')").unwrap();
+        db.execute("INSERT INTO wp_term_taxonomy VALUES (2, 2, 'category')").unwrap();
+        db.execute("INSERT INTO wp_term_taxonomy VALUES (3, 2, 'post_tag')").unwrap();
+
+        // WordPress exact query pattern: alias.column in SELECT + WHERE + ON
+        let rows = db.query(
+            "SELECT tt.term_taxonomy_id FROM wp_term_taxonomy AS tt \
+             INNER JOIN wp_terms AS t ON t.term_id = tt.term_id \
+             WHERE tt.taxonomy = 'category'",
+            &[],
+        ).expect("WordPress-style JOIN with aliased WHERE column should work");
+        assert_eq!(rows.len(), 2, "Should find 2 category rows");
+
+        // Also test alias.column in SELECT with multiple columns from both tables
+        let rows = db.query(
+            "SELECT t.name, tt.taxonomy FROM wp_term_taxonomy AS tt \
+             INNER JOIN wp_terms AS t ON t.term_id = tt.term_id \
+             WHERE tt.taxonomy = 'category' ORDER BY t.name",
+            &[],
+        ).expect("Multi-column aliased JOIN should work");
+        assert_eq!(rows.len(), 2);
+
+        // Simple two-table JOIN with aliases in WHERE
+        db.execute("CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE t2 (id INT PRIMARY KEY, t1_id INT, value TEXT)").unwrap();
+        db.execute("INSERT INTO t1 VALUES (1, 'Alice')").unwrap();
+        db.execute("INSERT INTO t2 VALUES (1, 1, 'hello')").unwrap();
+
+        let rows = db.query(
+            "SELECT a.name, b.value FROM t1 AS a INNER JOIN t2 AS b ON a.id = b.t1_id WHERE a.name = 'Alice'",
+            &[],
+        ).expect("JOIN with aliased WHERE column should work");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("Alice".to_string()));
+        assert_eq!(rows[0].get(1).unwrap(), &Value::String("hello".to_string()));
+
+        // Three-table JOIN with aliases (WordPress pattern: wp_term_relationships)
+        db.execute("CREATE TABLE wp_term_relationships (object_id INT, term_taxonomy_id INT)").unwrap();
+        db.execute("INSERT INTO wp_term_relationships VALUES (10, 1)").unwrap();
+        db.execute("INSERT INTO wp_term_relationships VALUES (20, 2)").unwrap();
+        db.execute("INSERT INTO wp_term_relationships VALUES (30, 3)").unwrap();
+
+        let rows = db.query(
+            "SELECT tr.object_id, tt.taxonomy, t.name \
+             FROM wp_term_relationships AS tr \
+             INNER JOIN wp_term_taxonomy AS tt ON tr.term_taxonomy_id = tt.term_taxonomy_id \
+             INNER JOIN wp_terms AS t ON t.term_id = tt.term_id \
+             WHERE tt.taxonomy = 'category'",
+            &[],
+        ).expect("Three-table WordPress-style JOIN should work");
+        assert_eq!(rows.len(), 2, "Should find 2 relationships with category taxonomy");
+
+        // Test ON condition with swapped column order (right alias on left side of equality)
+        // This was the exact trigger: ON t.term_id = tt.term_id where t is the right table
+        let rows = db.query(
+            "SELECT tt.term_taxonomy_id FROM wp_term_taxonomy AS tt \
+             INNER JOIN wp_terms AS t ON tt.term_id = t.term_id \
+             WHERE tt.taxonomy = 'category'",
+            &[],
+        ).expect("JOIN with swapped ON column order should work");
+        assert_eq!(rows.len(), 2, "Should still find 2 category rows with swapped ON order");
+    }
+
     // ========================================================================
     // TRUNCATE TABLE Tests
     // ========================================================================

@@ -2179,6 +2179,105 @@ impl Evaluator {
             (Value::Timestamp(a), Value::Date(b)) => a.date_naive().cmp(b),
             (Value::Date(a), Value::Timestamp(b)) => a.cmp(&b.date_naive()),
 
+            // String-to-Integer coercion (MySQL compatibility: WHERE int_col = '0')
+            (Value::String(a), Value::Int2(b)) => {
+                if let Ok(a_i) = a.parse::<i16>() {
+                    a_i.cmp(b)
+                } else {
+                    a.as_str().cmp(&b.to_string().as_str())
+                }
+            }
+            (Value::Int2(a), Value::String(b)) => {
+                if let Ok(b_i) = b.parse::<i16>() {
+                    a.cmp(&b_i)
+                } else {
+                    a.to_string().as_str().cmp(b.as_str())
+                }
+            }
+            (Value::String(a), Value::Int4(b)) => {
+                if let Ok(a_i) = a.parse::<i32>() {
+                    a_i.cmp(b)
+                } else {
+                    a.as_str().cmp(&b.to_string().as_str())
+                }
+            }
+            (Value::Int4(a), Value::String(b)) => {
+                if let Ok(b_i) = b.parse::<i32>() {
+                    a.cmp(&b_i)
+                } else {
+                    a.to_string().as_str().cmp(b.as_str())
+                }
+            }
+            (Value::String(a), Value::Int8(b)) => {
+                if let Ok(a_i) = a.parse::<i64>() {
+                    a_i.cmp(b)
+                } else {
+                    a.as_str().cmp(&b.to_string().as_str())
+                }
+            }
+            (Value::Int8(a), Value::String(b)) => {
+                if let Ok(b_i) = b.parse::<i64>() {
+                    a.cmp(&b_i)
+                } else {
+                    a.to_string().as_str().cmp(b.as_str())
+                }
+            }
+            // String-to-Float coercion
+            (Value::String(a), Value::Float4(b)) => {
+                if let Ok(a_f) = a.parse::<f32>() {
+                    a_f.partial_cmp(b).unwrap_or(Ordering::Equal)
+                } else {
+                    a.as_str().cmp(&b.to_string().as_str())
+                }
+            }
+            (Value::Float4(a), Value::String(b)) => {
+                if let Ok(b_f) = b.parse::<f32>() {
+                    a.partial_cmp(&b_f).unwrap_or(Ordering::Equal)
+                } else {
+                    a.to_string().as_str().cmp(b.as_str())
+                }
+            }
+            (Value::String(a), Value::Float8(b)) => {
+                if let Ok(a_f) = a.parse::<f64>() {
+                    a_f.partial_cmp(b).unwrap_or(Ordering::Equal)
+                } else {
+                    a.as_str().cmp(&b.to_string().as_str())
+                }
+            }
+            (Value::Float8(a), Value::String(b)) => {
+                if let Ok(b_f) = b.parse::<f64>() {
+                    a.partial_cmp(&b_f).unwrap_or(Ordering::Equal)
+                } else {
+                    a.to_string().as_str().cmp(b.as_str())
+                }
+            }
+            // Boolean-to-String coercion
+            (Value::Boolean(a), Value::String(b)) => {
+                let b_bool = matches!(b.as_str(), "1" | "true" | "TRUE" | "t" | "yes");
+                a.cmp(&b_bool)
+            }
+            (Value::String(a), Value::Boolean(b)) => {
+                let a_bool = matches!(a.as_str(), "1" | "true" | "TRUE" | "t" | "yes");
+                a_bool.cmp(b)
+            }
+            // Boolean-to-Integer coercion
+            (Value::Boolean(a), Value::Int4(b)) => {
+                let a_i = i32::from(*a);
+                a_i.cmp(b)
+            }
+            (Value::Int4(a), Value::Boolean(b)) => {
+                let b_i = i32::from(*b);
+                a.cmp(&b_i)
+            }
+            (Value::Boolean(a), Value::Int8(b)) => {
+                let a_i = i64::from(*a);
+                a_i.cmp(b)
+            }
+            (Value::Int8(a), Value::Boolean(b)) => {
+                let b_i = i64::from(*b);
+                a.cmp(&b_i)
+            }
+
             _ => {
                 return Err(Error::query_execution(format!(
                     "Cannot compare {:?} and {:?}",

@@ -2465,6 +2465,9 @@ impl<'a> Planner<'a> {
                 })
             }
 
+            // Parenthesized expressions: (expr) → unwrap and recurse
+            Expr::Nested(inner) => self.expr_to_logical(inner),
+
             _ => Err(Error::query_execution(format!(
                 "Expression not yet supported: {:?}",
                 expr
@@ -2847,6 +2850,13 @@ impl<'a> Planner<'a> {
     fn sql_column_def_to_column_def(&self, col: &SqlColumnDef) -> Result<ColumnDef> {
         let data_type = self.sql_data_type_to_data_type(&col.data_type)?;
 
+        // Detect SERIAL/BIGSERIAL/SMALLSERIAL types (parsed as Custom)
+        let is_serial = matches!(&col.data_type, SqlDataType::Custom(name, _)
+            if {
+                let n = name.to_string().to_uppercase();
+                n == "SERIAL" || n == "BIGSERIAL" || n == "SMALLSERIAL"
+            });
+
         let mut not_null = false;
         let mut primary_key = false;
         let mut unique = false;
@@ -2868,6 +2878,12 @@ impl<'a> Planner<'a> {
                 }
                 _ => {}
             }
+        }
+
+        // SERIAL columns auto-generate values: make them nullable internally
+        // so omitted columns get NULL, then the INSERT path fills via next_row_id.
+        if is_serial && default.is_none() {
+            not_null = false;
         }
 
         Ok(ColumnDef {

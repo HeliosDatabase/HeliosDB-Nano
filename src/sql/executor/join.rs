@@ -460,10 +460,19 @@ impl HashJoinOperator {
             LogicalExpr::BinaryExpr { left, op, right } => {
                 match op {
                     BinaryOperator::Eq => {
-                        // Single equality: extract the appropriate side
-                        let expr = if is_right_side { right } else { left };
-                        let value = evaluator.evaluate(expr, tuple)?;
-                        Ok(vec![value])
+                        // For ON a.x = b.x, the user may write the columns in either order:
+                        //   ON left_table.col = right_table.col
+                        //   ON right_table.col = left_table.col
+                        // First try the "natural" side (left expr for left eval, right for right),
+                        // and if that fails fall back to the other side.
+                        let (primary, fallback) = if is_right_side { (right, left) } else { (left, right) };
+                        match evaluator.evaluate(primary, tuple) {
+                            Ok(value) => Ok(vec![value]),
+                            Err(_) => {
+                                let value = evaluator.evaluate(fallback, tuple)?;
+                                Ok(vec![value])
+                            }
+                        }
                     }
                     BinaryOperator::And => {
                         // Composite key: a.x = b.x AND a.y = b.y
