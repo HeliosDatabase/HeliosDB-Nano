@@ -1004,7 +1004,7 @@ impl EmbeddedDatabase {
                         .collect();
 
                     let final_values_vec = final_values?;
-                    let tuple = Tuple::new(final_values_vec.clone());
+                    let mut tuple = Tuple::new(final_values_vec.clone());
 
                     // Validate foreign key constraints via ART index (O(1) lookup)
                     let table_constraints = catalog.load_table_constraints(table_name)?;
@@ -1109,6 +1109,25 @@ impl EmbeddedDatabase {
                     // Transactional insert (branch-aware)
                     let row_id = catalog.next_row_id(table_name)?;
                     let key = self.storage.branch_aware_data_key(table_name, row_id);
+
+                    // Fill NULL values in SERIAL/BIGSERIAL PK columns with the auto-generated row_id.
+                    // This makes LAST_INSERT_ID() and MAX(pk) return the correct value.
+                    for (i, col) in schema.columns.iter().enumerate() {
+                        if col.primary_key {
+                            if let Some(v) = tuple.values.get(i) {
+                                if matches!(v, Value::Null) {
+                                    if i < tuple.values.len() {
+                                        #[allow(clippy::indexing_slicing)]
+                                        match col.data_type {
+                                            DataType::Int2 => { tuple.values[i] = Value::Int2(row_id as i16); }
+                                            DataType::Int4 => { tuple.values[i] = Value::Int4(row_id as i32); }
+                                            DataType::Int8 | _ => { tuple.values[i] = Value::Int8(row_id as i64); }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
 
                     // Serialize tuple directly (RocksDB LZ4 handles compression at block level)
                     let val = bincode::serialize(&tuple).map_err(|e| Error::storage(e.to_string()))?;

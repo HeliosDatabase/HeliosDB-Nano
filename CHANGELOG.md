@@ -5,6 +5,17 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.8.2] - 2026-04-08
+
+### Fixed
+- SERIAL/BIGSERIAL columns now auto-fill with row_id when NULL on INSERT.
+  This was the root cause of LAST_INSERT_ID() returning 0 — the column
+  stayed NULL because only the storage-level row_id was generated, not the
+  SQL-level column value. MAX(pk) now returns the correct ID.
+- INNER JOIN cross-type hashing: Int4(1) and Int8(1) now hash identically
+  and compare equal in JoinKey, fixing empty results on SERIAL↔BIGSERIAL joins.
+- Prefix key indexes: nested-paren regex handles KEY meta_key(meta_key(191)).
+
 ## [3.8.1] - 2026-04-08
 
 ### Fixed
