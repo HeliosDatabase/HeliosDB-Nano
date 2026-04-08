@@ -1490,6 +1490,29 @@ impl<'a> Planner<'a> {
                         aliases.push(column.name.clone());
                     }
                 }
+                SelectItem::QualifiedWildcard(object_name, _) => {
+                    // Expand alias.* or table.* to all columns from that table
+                    let qualifier = object_name.0.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".");
+                    let schema = input.schema();
+                    let mut matched = false;
+                    for column in &schema.columns {
+                        // Match by source_table_name (alias or real table name)
+                        let col_table = column.source_table_name.as_deref().unwrap_or("");
+                        if col_table.eq_ignore_ascii_case(&qualifier) || column.name.starts_with(&format!("{}.", qualifier)) {
+                            exprs.push(LogicalExpr::Column { table: Some(qualifier.clone()), name: column.name.clone() });
+                            aliases.push(column.name.clone());
+                            matched = true;
+                        }
+                    }
+                    // If no columns matched by source_table, expand ALL columns
+                    // (fallback for when source_table isn't set)
+                    if !matched {
+                        for column in &schema.columns {
+                            exprs.push(LogicalExpr::Column { table: None, name: column.name.clone() });
+                            aliases.push(column.name.clone());
+                        }
+                    }
+                }
                 _ => return Err(Error::query_execution("SELECT item not supported")),
             }
         }

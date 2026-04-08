@@ -1157,15 +1157,16 @@ impl MySqlHandler {
     }
 
     async fn handle_show_columns(&mut self, sql: &str) -> Result<()> {
-        // Extract table name from "SHOW COLUMNS FROM <table>" or
-        // "SHOW FIELDS FROM <table>".
-        let table_name = sql
-            .to_uppercase()
+        let upper = sql.to_uppercase();
+        let is_full = upper.contains("FULL");
+
+        // Extract table name from "SHOW [FULL] COLUMNS FROM <table>"
+        let table_name = upper
             .find("FROM ")
             .and_then(|pos| {
                 let rest = sql.get(pos + 5..)?;
                 let name = rest.trim().trim_end_matches(';').trim();
-                let name = name.trim_matches('`');
+                let name = name.trim_matches('`').trim_matches('"');
                 Some(name.to_string())
             });
 
@@ -1174,21 +1175,67 @@ impl MySqlHandler {
             None => return self.send_ok(0, 0).await,
         };
 
-        // Use the database to query column information via information_schema
-        // style query.  If the table doesn't exist the query will error.
-        let describe_sql = format!(
-            "SELECT column_name, data_type, is_nullable, column_default \
-             FROM information_schema.columns WHERE table_name = '{}'",
-            table_name.replace('\'', "''")
-        );
-
-        // Fallback: try to describe via catalog directly
-        match self.database.query_with_columns(&describe_sql) {
-            Ok((rows, cols)) => self.send_result_set(&cols, &rows).await,
+        // Read schema from catalog directly for complete metadata
+        let schema = match self.database.storage.catalog().get_table_schema(&table_name) {
+            Ok(s) => s,
             Err(_) => {
-                // Minimal fallback: return empty column set
-                self.show_single_column("Field", &[]).await
+                return self.send_error(1146, "42S02",
+                    &format!("Table '{}' doesn't exist", table_name)).await;
             }
+        };
+
+        if is_full {
+            // SHOW FULL COLUMNS: Field, Type, Collation, Null, Key, Default, Extra, Privileges, Comment
+            let cols = vec![
+                "Field".to_string(), "Type".to_string(), "Collation".to_string(),
+                "Null".to_string(), "Key".to_string(), "Default".to_string(),
+                "Extra".to_string(), "Privileges".to_string(), "Comment".to_string(),
+            ];
+            let rows: Vec<Tuple> = schema.columns.iter().map(|c| {
+                let type_str = datatype_to_mysql(&c.data_type);
+                let null_str = if c.nullable { "YES" } else { "NO" };
+                let key_str = if c.primary_key { "PRI" } else if c.unique { "UNI" } else { "" };
+                let default_str = c.default_expr.as_deref().unwrap_or("NULL");
+                let extra = if c.primary_key && matches!(c.data_type, crate::DataType::Int4 | crate::DataType::Int8) {
+                    "auto_increment"
+                } else { "" };
+                Tuple::new(vec![
+                    Value::String(c.name.clone()),
+                    Value::String(type_str),
+                    Value::String("utf8mb4_unicode_ci".to_string()),
+                    Value::String(null_str.to_string()),
+                    Value::String(key_str.to_string()),
+                    Value::String(default_str.to_string()),
+                    Value::String(extra.to_string()),
+                    Value::String("select,insert,update,references".to_string()),
+                    Value::String(String::new()),
+                ])
+            }).collect();
+            self.send_result_set(&cols, &rows).await
+        } else {
+            // SHOW COLUMNS: Field, Type, Null, Key, Default, Extra
+            let cols = vec![
+                "Field".to_string(), "Type".to_string(), "Null".to_string(),
+                "Key".to_string(), "Default".to_string(), "Extra".to_string(),
+            ];
+            let rows: Vec<Tuple> = schema.columns.iter().map(|c| {
+                let type_str = datatype_to_mysql(&c.data_type);
+                let null_str = if c.nullable { "YES" } else { "NO" };
+                let key_str = if c.primary_key { "PRI" } else if c.unique { "UNI" } else { "" };
+                let default_str = c.default_expr.as_deref().unwrap_or("NULL");
+                let extra = if c.primary_key && matches!(c.data_type, crate::DataType::Int4 | crate::DataType::Int8) {
+                    "auto_increment"
+                } else { "" };
+                Tuple::new(vec![
+                    Value::String(c.name.clone()),
+                    Value::String(type_str),
+                    Value::String(null_str.to_string()),
+                    Value::String(key_str.to_string()),
+                    Value::String(default_str.to_string()),
+                    Value::String(extra.to_string()),
+                ])
+            }).collect();
+            self.send_result_set(&cols, &rows).await
         }
     }
 

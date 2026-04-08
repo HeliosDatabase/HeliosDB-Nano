@@ -5,6 +5,16 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.8.3] - 2026-04-08
+
+### Fixed
+- SELECT alias.* in JOINs: added QualifiedWildcard handling in planner so
+  `SELECT t.*, tt.* FROM wp_terms AS t JOIN wp_term_taxonomy AS tt ON ...`
+  correctly expands to all columns of each aliased table (13/15 → 15/15)
+- SHOW FULL COLUMNS: now returns all 9 MySQL fields including Collation
+  (utf8mb4_unicode_ci), Privileges, and Comment. WordPress wpdb::get_col_charset()
+  can now determine column charsets without falling back to bypass mode
+
 ## [3.8.2] - 2026-04-08
 
 ### Fixed
