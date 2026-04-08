@@ -991,6 +991,10 @@ impl EmbeddedDatabase {
                                         value = evaluator.cast_value(value, &col.data_type)?;
                                     }
                                     Ok(value)
+                                } else if col.primary_key {
+                                    // PK column omitted from INSERT — fill with NULL so
+                                    // the SERIAL auto-fill logic replaces it with row_id.
+                                    Ok(Value::Null)
                                 } else if col.nullable {
                                     Ok(Value::Null)
                                 } else {
@@ -1121,7 +1125,7 @@ impl EmbeddedDatabase {
                                         match col.data_type {
                                             DataType::Int2 => { tuple.values[i] = Value::Int2(row_id as i16); }
                                             DataType::Int4 => { tuple.values[i] = Value::Int4(row_id as i32); }
-                                            DataType::Int8 | _ => { tuple.values[i] = Value::Int8(row_id as i64); }
+                                            _ => { tuple.values[i] = Value::Int8(row_id as i64); }
                                         }
                                     }
                                 }
@@ -1348,6 +1352,10 @@ impl EmbeddedDatabase {
                                         value = evaluator.cast_value(value, &col.data_type)?;
                                     }
                                     Ok(value)
+                                } else if col.primary_key {
+                                    // PK column omitted from INSERT — fill with NULL so
+                                    // the SERIAL auto-fill logic replaces it with row_id.
+                                    Ok(Value::Null)
                                 } else if col.nullable {
                                     Ok(Value::Null)
                                 } else {
@@ -3940,6 +3948,10 @@ impl EmbeddedDatabase {
                                         value = evaluator.cast_value(value, &col.data_type)?;
                                     }
                                     Ok(value)
+                                } else if col.primary_key {
+                                    // PK column omitted from INSERT — fill with NULL so
+                                    // the SERIAL auto-fill logic replaces it with row_id.
+                                    Ok(Value::Null)
                                 } else if col.nullable {
                                     Ok(Value::Null)
                                 } else {

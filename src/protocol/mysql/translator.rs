@@ -318,23 +318,29 @@ fn translate_auto_increment(sql: &str) -> String {
 fn translate_charset_collation(sql: &str) -> String {
     let mut s = sql.to_string();
 
-    // CHARACTER SET <name>
-    static CHARSET_LONG_RE: OnceLock<Regex> = OnceLock::new();
-    let re = CHARSET_LONG_RE.get_or_init(|| init_regex(r"(?i)\s*CHARACTER\s+SET\s+\w+"));
-    s = re.replace_all(&s, "").to_string();
-
-    // CHARSET <name>  (short form, not preceded by DEFAULT word yet)
-    static CHARSET_SHORT_RE: OnceLock<Regex> = OnceLock::new();
-    let re = CHARSET_SHORT_RE.get_or_init(|| init_regex(r"(?i)\s*CHARSET\s*=?\s*\w+"));
+    // DEFAULT CHARACTER SET <name> (must be matched BEFORE bare CHARACTER SET)
+    static DEFAULT_CHARSET_LONG_RE: OnceLock<Regex> = OnceLock::new();
+    let re = DEFAULT_CHARSET_LONG_RE
+        .get_or_init(|| init_regex(r"(?i)\s*DEFAULT\s+CHARACTER\s+SET\s*=?\s*\w+"));
     s = re.replace_all(&s, "").to_string();
 
     // DEFAULT CHARSET=<name>
     static DEFAULT_CHARSET_RE: OnceLock<Regex> = OnceLock::new();
     let re =
-        DEFAULT_CHARSET_RE.get_or_init(|| init_regex(r"(?i)\s*DEFAULT\s+CHARSET\s*=\s*\w+"));
+        DEFAULT_CHARSET_RE.get_or_init(|| init_regex(r"(?i)\s*DEFAULT\s+CHARSET\s*=?\s*\w+"));
     s = re.replace_all(&s, "").to_string();
 
-    // COLLATE <name>  (with or without =)
+    // CHARACTER SET <name> (bare, without DEFAULT prefix)
+    static CHARSET_LONG_RE: OnceLock<Regex> = OnceLock::new();
+    let re = CHARSET_LONG_RE.get_or_init(|| init_regex(r"(?i)\s*CHARACTER\s+SET\s*=?\s*\w+"));
+    s = re.replace_all(&s, "").to_string();
+
+    // CHARSET <name> (short form)
+    static CHARSET_SHORT_RE: OnceLock<Regex> = OnceLock::new();
+    let re = CHARSET_SHORT_RE.get_or_init(|| init_regex(r"(?i)\s*CHARSET\s*=?\s*\w+"));
+    s = re.replace_all(&s, "").to_string();
+
+    // COLLATE <name> (with or without =)
     static COLLATE_RE: OnceLock<Regex> = OnceLock::new();
     let re = COLLATE_RE.get_or_init(|| init_regex(r"(?i)\s*COLLATE\s*=?\s*\w+"));
     s = re.replace_all(&s, "").to_string();
@@ -357,18 +363,21 @@ fn translate_on_duplicate_key(sql: &str) -> String {
         init_regex(r"(?i)\s+ON\s+DUPLICATE\s+KEY\s+UPDATE\s+(.+)$")
     });
 
+    // Strip the ON DUPLICATE KEY UPDATE clause entirely.
+    // The MySQL handler implements upsert semantics by catching duplicate-key
+    // errors and falling back to UPDATE (see handle_upsert_dml).
     if let Some(caps) = re.captures(sql) {
-        let set_clause = &caps[1];
-        // Replace VALUES(col) → EXCLUDED.col inside the SET clause.
-        let translated_set = translate_values_refs(set_clause);
         let prefix = &sql[..caps.get(0).map_or(0, |m| m.start())];
-        format!("{prefix} ON CONFLICT DO UPDATE SET {translated_set}")
+        prefix.to_string()
     } else {
         sql.to_string()
     }
 }
 
 /// Replace `VALUES(column_name)` references with `EXCLUDED.column_name`.
+///
+/// Kept for potential future use when planner gains ON CONFLICT support.
+#[allow(dead_code)]
 fn translate_values_refs(clause: &str) -> String {
     static VALUES_REF_RE: OnceLock<Regex> = OnceLock::new();
     let re = VALUES_REF_RE.get_or_init(|| init_regex(r"(?i)\bVALUES\s*\(\s*(\w+)\s*\)"));
@@ -728,13 +737,15 @@ mod tests {
     fn test_on_duplicate_key() {
         let sql = "INSERT INTO wp_options (option_name, option_value) VALUES ('siteurl', 'http://example.com') ON DUPLICATE KEY UPDATE option_value = VALUES(option_value)";
         let result = translate(sql);
+        // The translator now strips ON DUPLICATE KEY UPDATE entirely;
+        // upsert semantics are handled by the MySQL handler via try-insert/fallback-update.
         assert!(
-            result.contains("ON CONFLICT"),
-            "Should convert to ON CONFLICT: {result}"
+            !result.contains("ON DUPLICATE KEY"),
+            "Should strip ON DUPLICATE KEY UPDATE: {result}"
         );
         assert!(
-            result.contains("EXCLUDED."),
-            "Should use EXCLUDED: {result}"
+            result.contains("VALUES"),
+            "Should keep INSERT VALUES: {result}"
         );
     }
 

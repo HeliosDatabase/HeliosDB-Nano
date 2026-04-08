@@ -3864,6 +3864,23 @@ impl StorageEngine {
         // Get next row ID
         let row_id = catalog.next_row_id(table_name)?;
 
+        // Fill NULL PK columns with auto-generated row_id (SERIAL semantics)
+        let mut tuple = tuple;
+        for (i, col) in schema.columns.iter().enumerate() {
+            if col.primary_key {
+                if let Some(v) = tuple.values.get(i) {
+                    if matches!(v, crate::Value::Null) && i < tuple.values.len() {
+                        #[allow(clippy::indexing_slicing)]
+                        match col.data_type {
+                            crate::DataType::Int2 => { tuple.values[i] = crate::Value::Int2(row_id as i16); }
+                            crate::DataType::Int4 => { tuple.values[i] = crate::Value::Int4(row_id as i32); }
+                            _ => { tuple.values[i] = crate::Value::Int8(row_id as i64); }
+                        }
+                    }
+                }
+            }
+        }
+
         // Check bulk load mode early - skip some operations if enabled
         let bulk_mode = self.is_bulk_load_mode();
 
@@ -3936,6 +3953,23 @@ impl StorageEngine {
     /// fsync and time-travel overhead is not justified.
     pub fn insert_tuple_fast(&self, table_name: &str, tuple: Tuple, schema: &crate::Schema) -> Result<u64> {
         let row_id = self.next_row_id_volatile(table_name);
+
+        // Fill NULL PK columns with auto-generated row_id (SERIAL semantics)
+        let mut tuple = tuple;
+        for (i, col) in schema.columns.iter().enumerate() {
+            if col.primary_key {
+                if let Some(v) = tuple.values.get(i) {
+                    if matches!(v, crate::Value::Null) && i < tuple.values.len() {
+                        #[allow(clippy::indexing_slicing)]
+                        match col.data_type {
+                            crate::DataType::Int2 => { tuple.values[i] = crate::Value::Int2(row_id as i16); }
+                            crate::DataType::Int4 => { tuple.values[i] = crate::Value::Int4(row_id as i32); }
+                            _ => { tuple.values[i] = crate::Value::Int8(row_id as i64); }
+                        }
+                    }
+                }
+            }
+        }
 
         let value = bincode::serialize(&tuple)
             .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
@@ -4973,6 +5007,23 @@ impl StorageEngine {
 
         // Get next row ID (shared across branches for consistency)
         let row_id = catalog.next_row_id(table_name)?;
+
+        // Fill NULL PK columns with auto-generated row_id (SERIAL semantics)
+        let mut tuple = tuple;
+        for (i, col) in schema.columns.iter().enumerate() {
+            if col.primary_key {
+                if let Some(v) = tuple.values.get(i) {
+                    if matches!(v, crate::Value::Null) && i < tuple.values.len() {
+                        #[allow(clippy::indexing_slicing)]
+                        match col.data_type {
+                            crate::DataType::Int2 => { tuple.values[i] = crate::Value::Int2(row_id as i16); }
+                            crate::DataType::Int4 => { tuple.values[i] = crate::Value::Int4(row_id as i32); }
+                            _ => { tuple.values[i] = crate::Value::Int8(row_id as i64); }
+                        }
+                    }
+                }
+            }
+        }
 
         // Serialize tuple directly (RocksDB LZ4 handles compression at block level)
         let value = bincode::serialize(&tuple)

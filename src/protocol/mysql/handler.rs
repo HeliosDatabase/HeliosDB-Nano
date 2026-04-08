@@ -919,9 +919,24 @@ impl MySqlHandler {
             }
         }
 
+        // ---- SELECT VERSION() — return MySQL-compatible version ----
+        {
+            let upper = trimmed.to_uppercase();
+            if upper.contains("VERSION()") && !upper.contains("@@") {
+                let cols = vec!["VERSION()".to_string()];
+                let rows = vec![Tuple::new(vec![Value::String(SERVER_VERSION.to_string())])];
+                return self.send_result_set(&cols, &rows).await;
+            }
+        }
+
         // ---- SELECT @@variable — MySQL session/global variables ----
         if starts_with_icase(trimmed, "SELECT") && trimmed.contains("@@") {
             return self.handle_select_variable(trimmed).await;
+        }
+
+        // ---- USE database — SQL-level database switch ----
+        if starts_with_icase(trimmed, "USE ") {
+            return self.send_ok(0, 0).await;
         }
 
         // ---- INFORMATION_SCHEMA queries — intercept before SQL parser ----
@@ -940,6 +955,8 @@ impl MySqlHandler {
 
         if is_select {
             self.execute_query(trimmed).await
+        } else if raw_sql.to_uppercase().contains("ON DUPLICATE KEY UPDATE") {
+            self.handle_upsert_dml(trimmed, &raw_sql).await
         } else {
             self.execute_dml(trimmed).await
         }
@@ -1032,6 +1049,228 @@ impl MySqlHandler {
         }
     }
 
+    /// Handle INSERT ... ON DUPLICATE KEY UPDATE (MySQL upsert).
+    ///
+    /// The translator has already stripped the ON DUPLICATE KEY UPDATE clause,
+    /// so `translated_sql` is a plain INSERT.  We try the INSERT first; if it
+    /// fails with a duplicate-key error we build an UPDATE from the original
+    /// MySQL SQL and execute that instead.
+    async fn handle_upsert_dml(&mut self, translated_sql: &str, raw_sql: &str) -> Result<()> {
+        // Try the plain INSERT first
+        match self.database.execute(translated_sql) {
+            Ok(affected) => {
+                let table_name = Self::extract_insert_table(translated_sql);
+                let insert_id = if affected > 0 {
+                    if let Some(ref tbl) = table_name {
+                        self.query_last_serial_id(tbl)
+                    } else {
+                        0
+                    }
+                } else {
+                    0
+                };
+                if insert_id > 0 {
+                    self.last_insert_id = insert_id;
+                }
+                self.send_ok(affected, insert_id).await
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // Check if this is a duplicate key error
+                if msg.contains("duplicate key")
+                    || msg.contains("UNIQUE constraint")
+                    || msg.contains("PRIMARY KEY constraint")
+                {
+                    // Build an UPDATE from the ON DUPLICATE KEY UPDATE clause
+                    if let Some(update_sql) = Self::build_upsert_update(raw_sql) {
+                        let translated_update = super::translator::translate(&update_sql);
+                        match self.database.execute(&translated_update) {
+                            Ok(affected) => self.send_ok(affected, 0).await,
+                            Err(ue) => {
+                                let umsg = ue.to_string();
+                                let (code, state) = map_error_code(&umsg);
+                                self.send_error(code, state, &umsg).await
+                            }
+                        }
+                    } else {
+                        // Could not build UPDATE — report the original duplicate error
+                        let (code, state) = map_error_code(&msg);
+                        self.send_error(code, state, &msg).await
+                    }
+                } else {
+                    let (code, state) = map_error_code(&msg);
+                    self.send_error(code, state, &msg).await
+                }
+            }
+        }
+    }
+
+    /// Build an UPDATE statement from a MySQL INSERT ... ON DUPLICATE KEY UPDATE.
+    ///
+    /// Given: `INSERT INTO t (a, b, c) VALUES (1, 'x', 3) ON DUPLICATE KEY UPDATE b = VALUES(b), c = VALUES(c)`
+    /// Produce: `UPDATE t SET b = 'x', c = 3 WHERE a = 1`
+    /// (assuming `a` is the primary key)
+    fn build_upsert_update(raw_sql: &str) -> Option<String> {
+        let upper = raw_sql.to_uppercase();
+        let odk_pos = upper.find("ON DUPLICATE KEY UPDATE")?;
+
+        // Extract the SET clause from ON DUPLICATE KEY UPDATE
+        let set_part = raw_sql.get(odk_pos + 23..)?.trim();
+
+        // Extract table name
+        let table_name = Self::extract_insert_table(raw_sql)?;
+
+        // Extract column list and values from the INSERT part
+        let insert_part = &raw_sql[..odk_pos];
+        let (columns, values) = Self::extract_insert_columns_values(insert_part)?;
+
+        // Build a column -> value map for VALUES() references
+        let mut col_val_map = std::collections::HashMap::new();
+        for (i, col) in columns.iter().enumerate() {
+            if let Some(val) = values.get(i) {
+                col_val_map.insert(col.to_uppercase(), val.clone());
+            }
+        }
+
+        // Parse and resolve the SET assignments
+        let mut set_clauses = Vec::new();
+        for assignment in set_part.split(',') {
+            let parts: Vec<&str> = assignment.trim().splitn(2, '=').collect();
+            if parts.len() != 2 {
+                continue;
+            }
+            let col = parts[0].trim().trim_matches('`');
+            let expr = parts[1].trim();
+            let expr_upper = expr.to_uppercase();
+
+            // Resolve VALUES(col_name) references
+            if expr_upper.starts_with("VALUES(") || expr_upper.starts_with("VALUES (") {
+                let inner = expr.trim_end_matches(')');
+                let inner = inner.find('(').map(|p| &inner[p + 1..])?;
+                let ref_col = inner.trim().trim_matches('`').to_uppercase();
+                if let Some(val) = col_val_map.get(&ref_col) {
+                    set_clauses.push(format!("{} = {}", col, val));
+                }
+            } else {
+                set_clauses.push(format!("{} = {}", col, expr));
+            }
+        }
+
+        if set_clauses.is_empty() {
+            return None;
+        }
+
+        // Build WHERE clause from the first column (assumed to be PK)
+        // This is a simplification — the first column in the INSERT is typically the PK
+        // or UNIQUE key that caused the conflict
+        let where_clause = if let (Some(pk_col), Some(pk_val)) = (columns.first(), values.first()) {
+            format!("{} = {}", pk_col, pk_val)
+        } else {
+            return None;
+        };
+
+        Some(format!(
+            "UPDATE {} SET {} WHERE {}",
+            table_name,
+            set_clauses.join(", "),
+            where_clause
+        ))
+    }
+
+    /// Extract column names and value literals from an INSERT statement.
+    fn extract_insert_columns_values(insert_sql: &str) -> Option<(Vec<String>, Vec<String>)> {
+        // Find column list
+        let first_paren = insert_sql.find('(')?;
+        let first_close = insert_sql.find(')')?;
+        let col_str = insert_sql.get(first_paren + 1..first_close)?;
+        let columns: Vec<String> = col_str
+            .split(',')
+            .map(|c| c.trim().trim_matches('`').to_string())
+            .collect();
+
+        // Find VALUES
+        let upper = insert_sql.to_uppercase();
+        let values_pos = upper.find("VALUES")?;
+        let rest = insert_sql.get(values_pos + 6..)?.trim();
+        let val_open = rest.find('(')?;
+        // Find matching close paren (handle quoted strings)
+        let inner = rest.get(val_open + 1..)?;
+        let close_idx = Self::find_matching_close_paren(inner)?;
+        let val_str = inner.get(..close_idx)?;
+
+        // Split values respecting quoted strings
+        let values = Self::split_sql_values(val_str);
+
+        Some((columns, values))
+    }
+
+    /// Find matching close paren, respecting single-quoted strings.
+    fn find_matching_close_paren(s: &str) -> Option<usize> {
+        let mut depth = 0u32;
+        let mut in_quote = false;
+        for (i, ch) in s.char_indices() {
+            if in_quote {
+                if ch == '\'' {
+                    in_quote = false;
+                }
+                continue;
+            }
+            match ch {
+                '\'' => in_quote = true,
+                '(' => depth += 1,
+                ')' => {
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                    depth -= 1;
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Split comma-separated SQL values, respecting single-quoted strings.
+    fn split_sql_values(s: &str) -> Vec<String> {
+        let mut result = Vec::new();
+        let mut current = String::new();
+        let mut in_quote = false;
+        let mut depth = 0u32;
+
+        for ch in s.chars() {
+            if in_quote {
+                current.push(ch);
+                if ch == '\'' {
+                    in_quote = false;
+                }
+                continue;
+            }
+            match ch {
+                '\'' => {
+                    in_quote = true;
+                    current.push(ch);
+                }
+                '(' => {
+                    depth += 1;
+                    current.push(ch);
+                }
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    current.push(ch);
+                }
+                ',' if depth == 0 => {
+                    result.push(current.trim().to_string());
+                    current.clear();
+                }
+                _ => current.push(ch),
+            }
+        }
+        if !current.trim().is_empty() {
+            result.push(current.trim().to_string());
+        }
+        result
+    }
+
     /// Extract the table name from an INSERT statement.
     fn extract_insert_table(sql: &str) -> Option<String> {
         static INSERT_TABLE_RE: OnceLock<Regex> = OnceLock::new();
@@ -1067,7 +1306,7 @@ impl MySqlHandler {
         let query = format!("SELECT MAX({}) FROM {}", pk_col, table_name);
         match self.database.query_with_columns(&query) {
             Ok((rows, _)) => {
-                rows.first()
+                let result = rows.first()
                     .and_then(|r| r.values.first())
                     .and_then(|v| match v {
                         Value::Int4(n) => Some(*n as u64),
@@ -1075,9 +1314,14 @@ impl MySqlHandler {
                         Value::Int2(n) => Some(*n as u64),
                         _ => None,
                     })
-                    .unwrap_or(0)
+                    .unwrap_or(0);
+                tracing::debug!("query_last_serial_id({}): pk_col={}, result={}", table_name, pk_col, result);
+                result
             }
-            Err(_) => 0,
+            Err(e) => {
+                tracing::debug!("query_last_serial_id({}) error: {}", table_name, e);
+                0
+            }
         }
     }
 
@@ -1369,8 +1613,15 @@ impl MySqlHandler {
             .find("FROM ")
             .and_then(|pos| {
                 let rest = sql.get(pos + 5..)?;
-                let name = rest.trim().trim_end_matches(';').trim();
-                let name = name.trim_matches('`');
+                // Take only the first token (table name), stripping backticks,
+                // semicolons, and ignoring any trailing FROM db / WHERE clause.
+                let name = rest.trim();
+                let name = name.split_once(|c: char| c.is_whitespace() || c == ';')
+                    .map_or(name, |(first, _)| first);
+                let name = name.trim_matches('`').trim_matches('"');
+                if name.is_empty() { return None; }
+                // Strip database qualifier (db.table -> table)
+                let name = name.rsplit('.').next().unwrap_or(name);
                 Some(name.to_string())
             });
 
@@ -1378,6 +1629,7 @@ impl MySqlHandler {
             Some(t) => t,
             None => return self.send_ok(0, 0).await,
         };
+        tracing::debug!("handle_show_index: resolved table_name = '{}'", table_name);
 
         let cols = vec![
             "Table".to_string(),

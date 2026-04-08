@@ -5,6 +5,24 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.9.0] - 2026-04-08
+
+### Fixed (WordPress zero-drop-in milestone)
+- LAST_INSERT_ID: PK columns now auto-fill with row_id across ALL insert paths
+  (transactional, fast, versioned, branch-aware). Missing PK in INSERT column list
+  now generates NULL placeholder instead of erroring.
+- DEFAULT CHARSET/COLLATE: translator now handles `DEFAULT CHARACTER SET utf8mb4`
+  (with spaces) and `DEFAULT CHARSET=utf8mb4` (with equals) correctly
+- ON DUPLICATE KEY UPDATE: implemented upsert via INSERT-then-UPDATE-on-conflict
+  pattern in MySQL handler (planner lacks ON CONFLICT support, so handler detects
+  duplicate error and falls back to UPDATE)
+- SELECT VERSION(): MySQL handler now intercepts and returns MySQL-format
+  "8.0.35-HeliosDB-Nano" instead of falling through to PG evaluator
+- USE database: SQL-level `USE dbname` now accepted silently (was only handled
+  at binary protocol COM_INIT_DB level)
+- SHOW INDEX: fixed table name extraction to handle backtick-stripped and
+  database-qualified names
+
 ## [3.8.3] - 2026-04-08
 
 ### Fixed
