@@ -649,10 +649,10 @@ fn translate_key_indexes(sql: &str) -> String {
     }
 
     // Remove lines matching:  KEY <name> (<columns>)  or  UNIQUE KEY <name> (<columns>)
-    // This handles prefix indexes like col(191) inside the parens.
+    // Uses (?:[^()]*\([^)]*\))*[^)]* to handle nested parens like col(191)
     static KEY_LINE_RE: OnceLock<Regex> = OnceLock::new();
     let re = KEY_LINE_RE.get_or_init(|| {
-        init_regex(r"(?i),?\s*(?:UNIQUE\s+)?KEY\s+\w+\s*\([^)]+\)\s*,?")
+        init_regex(r"(?i),?\s*(?:UNIQUE\s+)?KEY\s+\w+\s*\((?:[^()]*\([^)]*\))*[^)]*\)\s*,?")
     });
 
     let mut s = re.replace_all(sql, "").to_string();

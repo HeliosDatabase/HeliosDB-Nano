@@ -1063,8 +1063,8 @@ impl MySqlHandler {
             None => return 0,
         };
 
-        // Query MAX(pk_col) from the table
-        let query = format!("SELECT MAX(\"{}\") FROM \"{}\"", pk_col, table_name);
+        // Query MAX(pk_col) — no double-quotes (they cause case-sensitive mismatch)
+        let query = format!("SELECT MAX({}) FROM {}", pk_col, table_name);
         match self.database.query_with_columns(&query) {
             Ok((rows, _)) => {
                 rows.first()

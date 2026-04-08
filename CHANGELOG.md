@@ -5,6 +5,18 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.8.1] - 2026-04-08
+
+### Fixed
+- LAST_INSERT_ID returns 0: query_last_serial_id used double-quoted identifiers
+  that caused case-sensitive mismatch with unquoted table names
+- INNER JOIN returns empty results: hash join key comparison failed across integer
+  widths (Int4 vs Int8). JoinKey now uses cross-type numeric coercion for both
+  Hash and PartialEq, so SERIAL(Int4) joins match BIGSERIAL(Int8)
+- Prefix key indexes `KEY col(191)`: regex didn't handle nested parentheses.
+  Fixed pattern to match `(col(191))` correctly
+- Backtick identifiers: strip entirely instead of converting to double-quotes
+
 ## [3.8.0] - 2026-04-02
 
 ### Added

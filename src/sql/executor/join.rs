@@ -269,9 +269,59 @@ pub struct HashJoinOperator {
     timeout_ctx: Option<TimeoutContext>,
 }
 
-/// Join key for hash table lookups
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// Join key for hash table lookups.
+///
+/// Implements custom PartialEq/Hash so that Int2(1), Int4(1), Int8(1) all
+/// match each other in the hash table. This is critical for JOINs where one
+/// side has SERIAL (Int4) and the other BIGSERIAL (Int8).
+#[derive(Debug, Clone)]
 struct JoinKey(Vec<crate::Value>);
+
+impl PartialEq for JoinKey {
+    fn eq(&self, other: &Self) -> bool {
+        if self.0.len() != other.0.len() {
+            return false;
+        }
+        self.0.iter().zip(other.0.iter()).all(|(a, b)| values_equal_for_join(a, b))
+    }
+}
+impl Eq for JoinKey {}
+
+impl std::hash::Hash for JoinKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.0.len().hash(state);
+        for v in &self.0 {
+            v.hash(state);
+        }
+    }
+}
+
+/// Compare two values for join equality, with cross-type numeric coercion.
+fn values_equal_for_join(a: &crate::Value, b: &crate::Value) -> bool {
+    use crate::Value;
+    match (a, b) {
+        (Value::Null, _) | (_, Value::Null) => false,
+        // Same type — direct compare
+        (Value::Int2(x), Value::Int2(y)) => x == y,
+        (Value::Int4(x), Value::Int4(y)) => x == y,
+        (Value::Int8(x), Value::Int8(y)) => x == y,
+        // Cross-type integer comparison
+        (Value::Int2(x), Value::Int4(y)) | (Value::Int4(y), Value::Int2(x)) => i64::from(*x) == i64::from(*y),
+        (Value::Int2(x), Value::Int8(y)) | (Value::Int8(y), Value::Int2(x)) => i64::from(*x) == *y,
+        (Value::Int4(x), Value::Int8(y)) | (Value::Int8(y), Value::Int4(x)) => i64::from(*x) == *y,
+        // String comparison
+        (Value::String(x), Value::String(y)) => x == y,
+        // Cross-type string/int (MySQL does this freely)
+        (Value::String(s), Value::Int4(n)) | (Value::Int4(n), Value::String(s)) => {
+            s.parse::<i32>().map_or(false, |parsed| parsed == *n)
+        }
+        (Value::String(s), Value::Int8(n)) | (Value::Int8(n), Value::String(s)) => {
+            s.parse::<i64>().map_or(false, |parsed| parsed == *n)
+        }
+        // Default: derived PartialEq
+        _ => a == b,
+    }
+}
 
 /// State machine for join execution
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

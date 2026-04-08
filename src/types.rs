@@ -677,24 +677,37 @@ impl Schema {
 /// but are never equal to anything (handled by PartialEq).
 impl Hash for Value {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Discriminant first to ensure different variants hash differently
-        std::mem::discriminant(self).hash(state);
-
+        // Numeric types hash to a common form so Int2(1), Int4(1), Int8(1)
+        // all hash identically. This is critical for hash joins where one
+        // side is SERIAL (Int4) and the other is BIGSERIAL (Int8).
         match self {
             Value::Null => {
-                // NULL has a consistent hash
-                0u8.hash(state);
+                0u8.hash(state); // consistent hash for NULL
             }
-            Value::Boolean(b) => b.hash(state),
-            Value::Int2(i) => i.hash(state),
-            Value::Int4(i) => i.hash(state),
-            Value::Int8(i) => i.hash(state),
+            Value::Boolean(b) => {
+                1u8.hash(state);
+                b.hash(state);
+            }
+            // All integer types hash as i64 so they match across widths
+            Value::Int2(i) => {
+                2u8.hash(state);
+                (*i as i64).hash(state);
+            }
+            Value::Int4(i) => {
+                2u8.hash(state);
+                (*i as i64).hash(state);
+            }
+            Value::Int8(i) => {
+                2u8.hash(state);
+                i.hash(state);
+            }
+            // All float types hash as f64 bits
             Value::Float4(f) => {
-                // Use bit representation for consistent hashing
-                f.to_bits().hash(state);
+                3u8.hash(state);
+                (*f as f64).to_bits().hash(state);
             }
             Value::Float8(f) => {
-                // Use bit representation for consistent hashing
+                3u8.hash(state);
                 f.to_bits().hash(state);
             }
             Value::Numeric(n) => {
