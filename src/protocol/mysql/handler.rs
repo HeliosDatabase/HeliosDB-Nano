@@ -1076,10 +1076,11 @@ impl MySqlHandler {
             }
             Err(e) => {
                 let msg = e.to_string();
-                // Check if this is a duplicate key error
-                if msg.contains("duplicate key")
-                    || msg.contains("UNIQUE constraint")
-                    || msg.contains("PRIMARY KEY constraint")
+                let msg_lower = msg.to_lowercase();
+                // Check if this is a duplicate key error (case-insensitive)
+                if msg_lower.contains("duplicate key")
+                    || msg_lower.contains("unique constraint")
+                    || msg_lower.contains("primary key constraint")
                 {
                     // Build an UPDATE from the ON DUPLICATE KEY UPDATE clause
                     if let Some(update_sql) = Self::build_upsert_update(raw_sql) {

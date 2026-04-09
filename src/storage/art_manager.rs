@@ -668,9 +668,46 @@ impl ArtIndexManager {
         Ok(())
     }
 
-    /// Check unique constraint before INSERT/UPDATE
+    /// Check unique constraint before INSERT/UPDATE.
+    ///
+    /// Also checks the PRIMARY KEY index (which is stored separately from
+    /// UNIQUE indexes) so that a single call covers both constraint kinds.
     pub fn check_unique_constraints(&self, table: &str, column_values: &HashMap<String, Value>) -> ArtResult<()> {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+
+        // --- Check PK index (stored separately in pk_indexes) ---
+        {
+            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(pk_name) = pk_indexes.get(table) {
+                if let Some(pk_index) = indexes.get(pk_name) {
+                    let columns = pk_index.columns();
+                    let mut has_null = false;
+                    let mut values = Vec::new();
+
+                    for col in columns {
+                        if let Some(v) = column_values.get(col) {
+                            if matches!(v, Value::Null) {
+                                has_null = true;
+                                break;
+                            }
+                            values.push(v.clone());
+                        }
+                    }
+
+                    if !has_null && values.len() == columns.len() {
+                        let key = Self::encode_key(&values);
+                        if pk_index.contains(&key) {
+                            return Err(ArtIndexError::DuplicateKey(format!(
+                                "Duplicate key value violates PRIMARY KEY constraint \"{}\"",
+                                pk_name
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        // --- Check UNIQUE indexes ---
         let unique_indexes = self.unique_indexes.read().unwrap_or_else(|e| e.into_inner());
 
         if let Some(unique_names) = unique_indexes.get(table) {

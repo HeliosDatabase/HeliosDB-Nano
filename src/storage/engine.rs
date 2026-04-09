@@ -1724,8 +1724,23 @@ impl StorageEngine {
     fn get_row_by_pk_inner(&self, table_name: &str, pk_value: &crate::Value, schema: Option<&crate::Schema>) -> Result<Option<Tuple>> {
         let lookup_start = std::time::Instant::now();
 
+        // Coerce the PK value to match the actual PK column type so that the ART
+        // key encoding is identical to the one produced at INSERT time.  Without
+        // this, e.g. Int4(1) encodes as 4 bytes while the stored Int8(1) uses 8.
+        let coerced: crate::Value;
+        let effective_pk = if let Some(s) = schema {
+            if let Some(pk_col) = s.columns.iter().find(|c| c.primary_key) {
+                coerced = Self::coerce_pk_value(pk_value, &pk_col.data_type);
+                &coerced
+            } else {
+                pk_value
+            }
+        } else {
+            pk_value
+        };
+
         // Encode the PK value to the ART key format
-        let key = super::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(pk_value));
+        let key = super::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(effective_pk));
 
         // Look up the row_id in the ART index (zero-copy, no tree clone)
         let row_id = match self.art_index_manager.pk_index_lookup(table_name, &key) {
@@ -1816,6 +1831,28 @@ impl StorageEngine {
         );
 
         Ok(Some(tuple))
+    }
+
+    /// Coerce a PK lookup value to the target column type so that the ART key
+    /// encoding matches what was stored at INSERT time.  For example, the SQL
+    /// parser produces `Int4(1)` for the literal `1`, but if the column is
+    /// `BIGSERIAL` (Int8) the stored ART key uses 8 bytes.  Without coercion
+    /// the 4-byte key will never match the 8-byte one.
+    fn coerce_pk_value(value: &crate::Value, target: &crate::DataType) -> crate::Value {
+        use crate::{DataType, Value};
+        match (value, target) {
+            // Widen small ints to Int8
+            (Value::Int2(v), DataType::Int8) => Value::Int8(i64::from(*v)),
+            (Value::Int4(v), DataType::Int8) => Value::Int8(i64::from(*v)),
+            // Widen Int2 to Int4
+            (Value::Int2(v), DataType::Int4) => Value::Int4(i32::from(*v)),
+            // Narrow (lossless for values that fit)
+            (Value::Int8(v), DataType::Int4) => Value::Int4(*v as i32),
+            (Value::Int8(v), DataType::Int2) => Value::Int2(*v as i16),
+            (Value::Int4(v), DataType::Int2) => Value::Int2(*v as i16),
+            // Already correct type or not an integer — return as-is
+            _ => value.clone(),
+        }
     }
 
     /// Scan table with storage-level predicate pushdown filtering
@@ -3971,23 +4008,42 @@ impl StorageEngine {
             }
         }
 
+        // Check PK/UNIQUE constraints BEFORE writing data to prevent duplicates
+        let col_values = {
+            let mut m = std::collections::HashMap::new();
+            for (i, col) in schema.columns.iter().enumerate() {
+                if let Some(v) = tuple.values.get(i) {
+                    m.insert(col.name.clone(), v.clone());
+                }
+            }
+            m
+        };
+
+        // Check PK constraint
+        let pk_cols: Vec<crate::Value> = schema.columns.iter().enumerate()
+            .filter(|(_, c)| c.primary_key)
+            .filter_map(|(i, _)| tuple.values.get(i).cloned())
+            .collect();
+        if !pk_cols.is_empty() {
+            if let Err(e) = self.art_index_manager.check_pk_constraint(table_name, &pk_cols) {
+                return Err(Error::constraint_violation(e.to_string()));
+            }
+        }
+
+        // Check UNIQUE constraints
+        if let Err(e) = self.art_index_manager.check_unique_constraints(table_name, &col_values) {
+            return Err(Error::constraint_violation(e.to_string()));
+        }
+
         let value = bincode::serialize(&tuple)
             .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
 
         let key = Self::build_data_key(table_name, row_id);
         self.put(&key, &value)?;
 
-        // ART index update (needed for unique constraint enforcement)
-        {
-            let mut col_values = std::collections::HashMap::new();
-            for (i, col) in schema.columns.iter().enumerate() {
-                if let Some(v) = tuple.values.get(i) {
-                    col_values.insert(col.name.clone(), v.clone());
-                }
-            }
-            if let Err(e) = self.art_index_manager.on_insert(table_name, row_id, &col_values) {
-                tracing::debug!("ART index insert for table '{}': {}", table_name, e);
-            }
+        // ART index update (constraint already verified above)
+        if let Err(e) = self.art_index_manager.on_insert(table_name, row_id, &col_values) {
+            tracing::debug!("ART index insert for table '{}': {}", table_name, e);
         }
 
         // Periodically persist row counter (every 64 inserts) for crash safety

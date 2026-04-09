@@ -16453,4 +16453,95 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("heliosdb".to_string()));
     }
+
+    // =====================================================================
+    // WordPress compatibility bug reproduction tests
+    // =====================================================================
+
+    #[test]
+    fn test_wp_bigint_eq_where_clause() {
+        // Bug 1: WHERE ID = 1 returns 0 rows but WHERE ID IN (1) works
+        // Root cause: Int4 literal vs Int8 PK type mismatch in ART index lookup
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE wp_posts (ID BIGSERIAL PRIMARY KEY, title TEXT)").unwrap();
+        db.execute("INSERT INTO wp_posts (title) VALUES ('hello')").unwrap();
+
+        // IN works (goes through evaluator with cross-type comparison)
+        let rows_in = db.query("SELECT * FROM wp_posts WHERE ID IN (1)", &[]).unwrap();
+        assert_eq!(rows_in.len(), 1, "IN (1) should find the row");
+
+        // Fast-path equality (SELECT * FROM t WHERE pk = literal)
+        let rows_eq = db.query("SELECT * FROM wp_posts WHERE ID = 1", &[]).unwrap();
+        assert_eq!(rows_eq.len(), 1, "fast-path WHERE ID = 1 should find the row");
+
+        // Force executor path: add ORDER BY to bypass try_fast_select
+        let rows_order = db.query("SELECT * FROM wp_posts WHERE ID = 1 ORDER BY ID", &[]).unwrap();
+        assert_eq!(rows_order.len(), 1, "executor-path WHERE ID = 1 ORDER BY should find the row");
+
+        // SELECT with column list (not SELECT *) to test yet another path
+        let rows_col = db.query("SELECT ID, title FROM wp_posts WHERE ID = 1", &[]).unwrap();
+        assert_eq!(rows_col.len(), 1, "SELECT cols WHERE ID = 1 should find the row");
+
+        // Int2 PK with Int4 literal
+        db.execute("CREATE TABLE t_small (id SMALLSERIAL PRIMARY KEY, val TEXT)").unwrap();
+        db.execute("INSERT INTO t_small (val) VALUES ('x')").unwrap();
+        let rows_small = db.query("SELECT * FROM t_small WHERE id = 1", &[]).unwrap();
+        assert_eq!(rows_small.len(), 1, "SMALLSERIAL PK with int4 literal should work");
+    }
+
+    #[test]
+    fn test_wp_last_insert_id_serial() {
+        // Bug 2: SERIAL auto-fill must produce a non-zero ID
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_serial (id BIGSERIAL PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t_serial (name) VALUES ('hello')").unwrap();
+        let rows = db.query("SELECT MAX(id) FROM t_serial", &[]).unwrap();
+        let max_id = rows[0].get(0).unwrap();
+        match max_id {
+            Value::Int8(n) => assert!(*n > 0, "SERIAL should auto-generate: got {}", n),
+            Value::Int4(n) => assert!(*n > 0, "SERIAL should auto-generate: got {}", n),
+            other => panic!("Unexpected type for MAX(id): {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_wp_duplicate_pk_error_message() {
+        // Bug 3: duplicate PK must produce an error containing keywords the handler matches.
+        // The fast-path insert was silently swallowing the ART duplicate error.
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_dup (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t_dup VALUES (1, 'a')").unwrap();
+        let result = db.execute("INSERT INTO t_dup VALUES (1, 'b')");
+        assert!(result.is_err(), "Duplicate PK insert must fail, but got Ok");
+        let msg = result.unwrap_err().to_string();
+        // The handler checks for "duplicate key", "UNIQUE constraint", or "PRIMARY KEY constraint"
+        let lower = msg.to_lowercase();
+        assert!(
+            lower.contains("duplicate") || lower.contains("unique") || lower.contains("primary key"),
+            "Duplicate PK error should contain recognizable keywords, got: {}", msg
+        );
+    }
+
+    #[test]
+    fn test_wp_duplicate_pk_no_data_corruption() {
+        // Verify that after a failed duplicate insert, only the original row exists
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_dup2 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t_dup2 VALUES (1, 'original')").unwrap();
+        let _ = db.execute("INSERT INTO t_dup2 VALUES (1, 'duplicate')");
+        let rows = db.query("SELECT * FROM t_dup2", &[]).unwrap();
+        assert_eq!(rows.len(), 1, "Only one row should exist after rejected duplicate");
+        assert_eq!(rows[0].get(1).unwrap(), &Value::String("original".to_string()),
+            "Original row must be preserved");
+    }
+
+    #[test]
+    fn test_wp_duplicate_unique_constraint() {
+        // Also test UNIQUE constraint enforcement through fast path
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_uq (id INT PRIMARY KEY, email TEXT UNIQUE)").unwrap();
+        db.execute("INSERT INTO t_uq VALUES (1, 'a@b.com')").unwrap();
+        let result = db.execute("INSERT INTO t_uq VALUES (2, 'a@b.com')");
+        assert!(result.is_err(), "Duplicate UNIQUE insert must fail");
+    }
 }

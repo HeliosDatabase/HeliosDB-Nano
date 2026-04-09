@@ -658,10 +658,11 @@ fn translate_key_indexes(sql: &str) -> String {
     }
 
     // Remove lines matching:  KEY <name> (<columns>)  or  UNIQUE KEY <name> (<columns>)
-    // Uses (?:[^()]*\([^)]*\))*[^)]* to handle nested parens like col(191)
+    // The (?:,|^)\s* anchor ensures KEY is at the start of a clause (after comma or
+    // line start), NOT inside a column name like "meta_key varchar(255)".
     static KEY_LINE_RE: OnceLock<Regex> = OnceLock::new();
     let re = KEY_LINE_RE.get_or_init(|| {
-        init_regex(r"(?i),?\s*(?:UNIQUE\s+)?KEY\s+\w+\s*\((?:[^()]*\([^)]*\))*[^)]*\)\s*,?")
+        init_regex(r"(?im),\s*(?:UNIQUE\s+)?KEY\s+\w+\s*\((?:[^()]*\([^)]*\))*[^)]*\)")
     });
 
     let mut s = re.replace_all(sql, "").to_string();

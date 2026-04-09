@@ -5,6 +5,20 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.9.1] - 2026-04-09
+
+### Fixed
+- KEY index regex matched inside column names (meta_key → corrupted DDL).
+  Regex now requires comma anchor so only standalone KEY definitions match.
+- Bigint equality: WHERE ID = 1 failed because Int4(1) literal didn't match
+  Int8 PK in ART index. Added PK type coercion in get_row_by_pk_inner().
+- Duplicate PK detection: insert_tuple_fast wrote data BEFORE checking
+  constraints, silently creating duplicates. Now checks PK+UNIQUE first.
+- check_unique_constraints() now covers pk_indexes (was only checking
+  unique_indexes, missing PK violations entirely).
+- ON DUPLICATE KEY handler: case-insensitive error detection for dup matching.
+- 5 new WordPress-specific regression tests.
+
 ## [3.9.0] - 2026-04-08
 
 ### Fixed (WordPress zero-drop-in milestone)

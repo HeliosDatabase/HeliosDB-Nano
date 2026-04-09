@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "heliosdb-nano"
-version = "3.9.0"
+version = "3.9.1"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Daniel Moya <daniel.moya@dimensigon.com>"]
