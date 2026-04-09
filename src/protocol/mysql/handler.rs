@@ -866,6 +866,9 @@ impl MySqlHandler {
         // Apply MySQL-to-PostgreSQL SQL translation
         let translated = super::translator::translate(&raw_sql);
         let sql = translated.as_str();
+        if translated != raw_sql {
+            debug!("Translated SQL: {}", sql);
+        }
         let trimmed = sql.trim();
         if trimmed.is_empty() {
             return self.send_ok(0, 0).await;
