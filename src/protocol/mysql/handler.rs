@@ -2053,11 +2053,12 @@ impl MySqlHandler {
         }
 
         // 2. Column definitions
-        // Try to infer types from first row; default to VarString.
+        // Infer types by scanning rows for the first non-NULL value per column.
+        // If all values are NULL, fall back to VarString (never send Null type).
         for (i, col_name) in columns.iter().enumerate() {
-            let col_type = rows
-                .first()
-                .and_then(|r| r.values.get(i))
+            let col_type = rows.iter()
+                .filter_map(|r| r.values.get(i))
+                .find(|v| !matches!(v, Value::Null))
                 .map(ColumnType::from_value)
                 .unwrap_or(ColumnType::VarString);
             self.send_column_def(col_name, col_type).await?;

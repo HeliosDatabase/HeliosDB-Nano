@@ -344,7 +344,7 @@ impl PgCatalog {
             Column::new("version", DataType::Text),
         ]);
         let row = Tuple::new(vec![Value::String(
-            "PostgreSQL 16.0 (HeliosDB Nano 3.9.1)".to_string(),
+            "PostgreSQL 16.0 (HeliosDB Nano 3.9.2)".to_string(),
         )]);
         Ok((schema, vec![row]))
     }

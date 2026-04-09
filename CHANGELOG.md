@@ -5,6 +5,15 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.9.2] - 2026-04-09
+
+### Fixed
+- MySQL wire protocol column type: bigint columns returned MYSQL_TYPE_NULL (type 6)
+  because column type was inferred from the first row's value (NULL for auto-generated
+  PK). Now scans all rows for first non-NULL value to determine correct type.
+  This was the root cause of insert_id=0, WHERE ID=N returning 0 rows, and all
+  content CRUD appearing to succeed but returning id=null.
+
 ## [3.9.1] - 2026-04-09
 
 ### Fixed
