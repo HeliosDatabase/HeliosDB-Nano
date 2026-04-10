@@ -2728,6 +2728,21 @@ impl<'a> Planner<'a> {
             }
         }
 
+        // Propagate table-level PRIMARY KEY constraint to column defs.
+        // WordPress uses `PRIMARY KEY (col)` at the table level, not inline.
+        // Without this, col.primary_key stays false and SERIAL auto-fill never fires.
+        for constraint in &constraints {
+            if let TableConstraint::PrimaryKey { columns: pk_cols, .. } = constraint {
+                for pk_col_name in pk_cols {
+                    if let Some(col_def) = column_defs.iter_mut().find(|c| c.name.eq_ignore_ascii_case(pk_col_name)) {
+                        col_def.primary_key = true;
+                        // Don't override not_null if already set to false by SERIAL detection
+                        // (SERIAL columns must stay nullable for auto-fill: INSERT NULL → row_id)
+                    }
+                }
+            }
+        }
+
         Ok(LogicalPlan::CreateTable {
             name,
             columns: column_defs,

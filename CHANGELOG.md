@@ -5,6 +5,16 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.9.3] - 2026-04-10
+
+### Fixed
+- **ROOT CAUSE of LAST_INSERT_ID=0 and all WordPress content creation failures:**
+  Table-level `PRIMARY KEY (col)` constraint (used by WordPress in all CREATE TABLE)
+  was not propagated to the column's `primary_key` flag. Only inline `col INT PRIMARY KEY`
+  was handled. The column was stored as a regular nullable BIGINT — no auto-fill,
+  no sequence, no insert_id. Fixed by propagating PK from table-level constraints
+  to column defs in the planner's create_table_to_plan().
+
 ## [3.9.2] - 2026-04-09
 
 ### Fixed
