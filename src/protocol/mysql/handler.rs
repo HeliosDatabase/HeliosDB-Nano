@@ -860,14 +860,26 @@ impl MySqlHandler {
     // ------------------------------------------------------------------
 
     async fn handle_com_query(&mut self, payload: Bytes) -> Result<()> {
-        let raw_sql = String::from_utf8_lossy(&payload).to_string();
-        debug!("COM_QUERY: {}", raw_sql);
+        // Strip trailing null bytes (some MySQL clients send NUL-terminated strings)
+        let raw_bytes = payload.as_ref();
+        let trimmed_bytes = if raw_bytes.last() == Some(&0) {
+            &raw_bytes[..raw_bytes.len() - 1]
+        } else {
+            raw_bytes
+        };
+        let raw_sql = String::from_utf8_lossy(trimmed_bytes).to_string();
 
         // Apply MySQL-to-PostgreSQL SQL translation
         let translated = super::translator::translate(&raw_sql);
         let sql = translated.as_str();
-        if translated != raw_sql {
-            debug!("Translated SQL: {}", sql);
+
+        // Always log CREATE TABLE translation at INFO level for diagnostics
+        let is_create = raw_sql.to_ascii_uppercase().contains("CREATE TABLE");
+        if is_create {
+            info!("MySQL DDL in:  {}", &raw_sql[..raw_sql.len().min(200)]);
+            info!("MySQL DDL out: {}", &sql[..sql.len().min(200)]);
+        } else if translated != raw_sql {
+            debug!("MySQL→PG: {}", &sql[..sql.len().min(200)]);
         }
         let trimmed = sql.trim();
         if trimmed.is_empty() {
