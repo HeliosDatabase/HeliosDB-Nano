@@ -2743,6 +2743,22 @@ impl<'a> Planner<'a> {
             }
         }
 
+        // Propagate table-level UNIQUE constraints to column defs (single-column only).
+        // WordPress uses `UNIQUE KEY name (col)` which the translator converts to
+        // `UNIQUE(col)`.  Setting col.unique = true lets the catalog schema reflect
+        // uniqueness, which SHOW INDEX and ON DUPLICATE KEY UPDATE rely on.
+        for constraint in &constraints {
+            if let TableConstraint::Unique { columns: uq_cols, .. } = constraint {
+                if uq_cols.len() == 1 {
+                    if let Some(uq_col_name) = uq_cols.first() {
+                        if let Some(col_def) = column_defs.iter_mut().find(|c| c.name.eq_ignore_ascii_case(uq_col_name)) {
+                            col_def.unique = true;
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(LogicalPlan::CreateTable {
             name,
             columns: column_defs,

@@ -603,52 +603,83 @@ fn translate_multi_table_delete(sql: &str) -> String {
         let on_condition = &caps[7];
         let where_clause = &caps[8];
 
-        // Replace aliases with real table names using word-boundary-aware regex
-        // to avoid partial matches (e.g., alias "t" must not match inside "tt").
-        // Process longer alias first to prevent substring collisions.
-        let mut aliases: Vec<(&str, &str)> = vec![(alias1, table1), (alias2, table2)];
-        aliases.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
-
-        let mut combined = format!("{on_condition} ##SEP## {where_clause}");
-        for (alias, table) in &aliases {
-            let pattern = format!(r"\b{}\.", regex::escape(alias));
-            let alias_re = init_regex(&pattern);
-            combined = alias_re.replace_all(&combined, format!("{}.", table)).to_string();
-        }
-
-        // Split back into ON and WHERE parts
-        let parts: Vec<&str> = combined.splitn(2, " ##SEP## ").collect();
-        let on_fixed = parts.first().map_or("", |s| s.trim());
-        let where_full = parts.get(1).map_or("", |s| s.trim());
-
-        // Strip the "WHERE " prefix so we can combine conditions
-        let where_body = where_full
+        // Strip the "WHERE " prefix from the WHERE clause
+        let where_body = where_clause.trim()
             .strip_prefix("WHERE ")
-            .or_else(|| where_full.strip_prefix("where "))
-            .unwrap_or(where_full);
+            .or_else(|| where_clause.trim().strip_prefix("where "))
+            .unwrap_or(where_clause.trim());
 
-        return format!(
-            "DELETE FROM {table1} USING {table2} WHERE {on_fixed} AND {where_body}"
+        // Build a common subquery FROM clause that uses the original aliases.
+        // This lets the ON and WHERE clauses use their original alias references.
+        let subquery_from = format!(
+            "{table1} AS {alias1} INNER JOIN {table2} AS {alias2} ON {on_condition}"
         );
+        let subquery_where = where_body;
+
+        // Find a join column from the ON condition for each table.
+        // ON condition looks like: t.term_id = tt.term_id
+        // We need to extract which column from alias1 and alias2 to use.
+        let (col1, col2) = extract_join_columns(on_condition, alias1, alias2);
+
+        // Generate two DELETE statements with IN subqueries:
+        //   DELETE FROM table1 WHERE col1 IN (SELECT alias1.col1 FROM ... WHERE ...)
+        //   DELETE FROM table2 WHERE col2 IN (SELECT alias2.col2 FROM ... WHERE ...)
+        let del1 = format!(
+            "DELETE FROM {table1} WHERE {col1} IN (SELECT {alias1}.{col1} FROM {subquery_from} WHERE {subquery_where})"
+        );
+        let del2 = format!(
+            "DELETE FROM {table2} WHERE {col2} IN (SELECT {alias2}.{col2} FROM {subquery_from} WHERE {subquery_where})"
+        );
+
+        return format!("{del1};{del2}");
     }
 
     sql.to_string()
 }
 
+/// Extract join column names from an ON condition like `t.term_id = tt.term_id`.
+///
+/// Returns (col_for_alias1, col_for_alias2).  Falls back to "id" if parsing fails.
+fn extract_join_columns(on_condition: &str, alias1: &str, alias2: &str) -> (String, String) {
+    // Split on '=' and look for alias.column patterns
+    let (mut col1, mut col2) = (String::from("id"), String::from("id"));
+
+    if let Some((lhs, rhs)) = on_condition.split_once('=') {
+        let lhs = lhs.trim();
+        let rhs = rhs.trim();
+
+        // Try to match alias1.col and alias2.col from either side
+        for token in &[lhs, rhs] {
+            if let Some(dot) = token.find('.') {
+                let prefix = token.get(..dot).unwrap_or("").trim();
+                let suffix = token.get(dot + 1..).unwrap_or("id").trim();
+                if prefix.eq_ignore_ascii_case(alias1) {
+                    col1 = suffix.to_string();
+                } else if prefix.eq_ignore_ascii_case(alias2) {
+                    col2 = suffix.to_string();
+                }
+            }
+        }
+    }
+
+    (col1, col2)
+}
+
 // ---------------------------------------------------------------------------
-// 11. KEY / UNIQUE KEY prefix indexes → strip from CREATE TABLE
+// 11. KEY / UNIQUE KEY prefix indexes → strip or convert in CREATE TABLE
 // ---------------------------------------------------------------------------
 
-/// Strip MySQL KEY and UNIQUE KEY index definitions from CREATE TABLE.
+/// Translate MySQL KEY and UNIQUE KEY index definitions in CREATE TABLE.
 ///
 /// WordPress DDL includes:
 ///   `KEY option_name (option_name(191))`         — prefix index with length
 ///   `UNIQUE KEY email (email)`                    — named unique constraint
 ///   `KEY idx_name (col1, col2)`                   — composite index
 ///
-/// HeliosDB uses ART indexes automatically, so these are stripped.
-/// Note: UNIQUE KEY is also handled — uniqueness is enforced via ART indexes
-/// or column-level UNIQUE constraints, not via index definitions.
+/// Plain KEY (non-unique indexes) are stripped — HeliosDB uses ART indexes.
+/// UNIQUE KEY is converted to a table-level UNIQUE constraint so that the
+/// planner can enforce uniqueness and `SHOW INDEX` can report them:
+///   `UNIQUE KEY option_name (option_name(191))` → `UNIQUE(option_name)`
 fn translate_key_indexes(sql: &str) -> String {
     // Only apply to CREATE TABLE statements
     static CREATE_RE: OnceLock<Regex> = OnceLock::new();
@@ -657,15 +688,28 @@ fn translate_key_indexes(sql: &str) -> String {
         return sql.to_string();
     }
 
-    // Remove lines matching:  KEY <name> (<columns>)  or  UNIQUE KEY <name> (<columns>)
-    // The (?:,|^)\s* anchor ensures KEY is at the start of a clause (after comma or
-    // line start), NOT inside a column name like "meta_key varchar(255)".
-    static KEY_LINE_RE: OnceLock<Regex> = OnceLock::new();
-    let re = KEY_LINE_RE.get_or_init(|| {
-        init_regex(r"(?im),\s*(?:UNIQUE\s+)?KEY\s+\w+\s*\((?:[^()]*\([^)]*\))*[^)]*\)")
+    // Step 1: Convert UNIQUE KEY to UNIQUE(...) constraint.
+    // Captures: the comma prefix, the column list (with optional prefix lengths).
+    // Group 1 = column parenthesised list (may contain nested parens for prefix lengths).
+    static UNIQUE_KEY_RE: OnceLock<Regex> = OnceLock::new();
+    let re = UNIQUE_KEY_RE.get_or_init(|| {
+        init_regex(r"(?im),\s*UNIQUE\s+KEY\s+\w+\s*\(((?:[^()]*\([^)]*\))*[^)]*)\)")
     });
 
-    let mut s = re.replace_all(sql, "").to_string();
+    let mut s = re.replace_all(sql, |caps: &regex::Captures<'_>| {
+        let col_list = &caps[1];
+        // Strip prefix lengths: col_name(191) → col_name
+        let clean_cols = strip_prefix_lengths(col_list);
+        format!(", UNIQUE({})", clean_cols)
+    }).to_string();
+
+    // Step 2: Remove plain (non-unique) KEY definitions.
+    static KEY_LINE_RE: OnceLock<Regex> = OnceLock::new();
+    let re = KEY_LINE_RE.get_or_init(|| {
+        init_regex(r"(?im),\s*KEY\s+\w+\s*\((?:[^()]*\([^)]*\))*[^)]*\)")
+    });
+
+    s = re.replace_all(&s, "").to_string();
 
     // Clean up trailing commas before closing paren: `, )` → `)`
     static TRAILING_COMMA_RE: OnceLock<Regex> = OnceLock::new();
@@ -673,6 +717,16 @@ fn translate_key_indexes(sql: &str) -> String {
     s = re.replace_all(&s, ")").to_string();
 
     s
+}
+
+/// Strip MySQL prefix-index lengths from a column list.
+///
+/// `option_name(191)` → `option_name`
+/// `col1(100), col2` → `col1, col2`
+fn strip_prefix_lengths(col_list: &str) -> String {
+    static PREFIX_LEN_RE: OnceLock<Regex> = OnceLock::new();
+    let re = PREFIX_LEN_RE.get_or_init(|| init_regex(r"\(\d+\)"));
+    re.replace_all(col_list, "").to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -1017,6 +1071,11 @@ mod tests {
         assert!(!result.contains("ENGINE"), "ENGINE stripped");
         assert!(!result.contains("CHARSET"), "CHARSET stripped");
         assert!(!result.contains("COLLATE"), "COLLATE stripped");
+        // UNIQUE KEY should be converted to UNIQUE constraint
+        assert!(
+            result.contains("UNIQUE(option_name)"),
+            "UNIQUE KEY should become UNIQUE(option_name): {result}"
+        );
     }
 
     #[test]
@@ -1089,17 +1148,24 @@ mod tests {
     fn test_multi_table_delete() {
         let sql = "DELETE t, tt FROM wp_terms AS t INNER JOIN wp_term_taxonomy AS tt ON t.term_id = tt.term_id WHERE tt.taxonomy = 'nav_menu'";
         let result = translate(sql);
+        // Should produce two semicolon-separated DELETE statements with IN subqueries
+        let parts: Vec<&str> = result.split(';').collect();
         assert!(
-            result.contains("DELETE FROM wp_terms USING wp_term_taxonomy"),
-            "Should convert to DELETE ... USING: {result}"
+            parts.len() >= 2,
+            "Should produce two DELETE statements: {result}"
         );
         assert!(
-            result.contains("wp_terms.term_id = wp_term_taxonomy.term_id"),
-            "Should replace aliases with real table names: {result}"
+            parts[0].contains("DELETE FROM wp_terms WHERE term_id IN"),
+            "First DELETE should target wp_terms with IN subquery: {result}"
         );
         assert!(
-            !result.contains("INNER JOIN"),
-            "JOIN syntax should be removed: {result}"
+            parts[1].contains("DELETE FROM wp_term_taxonomy WHERE term_id IN"),
+            "Second DELETE should target wp_term_taxonomy with IN subquery: {result}"
+        );
+        // Subqueries should use original aliases, not resolved table names
+        assert!(
+            result.contains("INNER JOIN"),
+            "Subquery should contain JOIN: {result}"
         );
     }
 
@@ -1107,9 +1173,14 @@ mod tests {
     fn test_multi_table_delete_no_alias_keyword() {
         let sql = "DELETE a, b FROM wp_terms a JOIN wp_term_taxonomy b ON a.term_id = b.term_id WHERE b.count = 0";
         let result = translate(sql);
+        let parts: Vec<&str> = result.split(';').collect();
         assert!(
-            result.contains("DELETE FROM wp_terms USING wp_term_taxonomy"),
+            parts.len() >= 2,
             "Should handle JOIN without AS keyword: {result}"
+        );
+        assert!(
+            parts[0].contains("DELETE FROM wp_terms"),
+            "First DELETE should target wp_terms: {result}"
         );
     }
 
@@ -1133,7 +1204,7 @@ mod tests {
     }
 
     #[test]
-    fn test_unique_key_stripped() {
+    fn test_unique_key_converted() {
         let sql = "CREATE TABLE wp_users (
   ID BIGSERIAL NOT NULL,
   user_email varchar(100),
@@ -1144,11 +1215,15 @@ mod tests {
         let result = translate(sql);
         assert!(
             !result.contains("UNIQUE KEY"),
-            "UNIQUE KEY should be stripped: {result}"
+            "UNIQUE KEY syntax should be removed: {result}"
+        );
+        assert!(
+            result.contains("UNIQUE(user_email)"),
+            "UNIQUE KEY should be converted to UNIQUE constraint: {result}"
         );
         assert!(
             !result.contains("KEY user_login"),
-            "KEY should be stripped: {result}"
+            "Plain KEY should be stripped: {result}"
         );
         assert!(
             result.contains("PRIMARY KEY"),

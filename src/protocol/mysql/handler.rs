@@ -1031,37 +1031,50 @@ impl MySqlHandler {
     // ------------------------------------------------------------------
 
     async fn execute_dml(&mut self, sql: &str) -> Result<()> {
-        // Track whether this is an INSERT to capture last_insert_id
-        let is_insert = starts_with_icase(sql.trim(), "INSERT");
-        let table_name = if is_insert {
-            Self::extract_insert_table(sql)
-        } else {
-            None
-        };
+        // Split semicolon-separated statements (e.g. multi-table DELETE translation)
+        // and execute each sequentially, accumulating affected-row counts.
+        let statements: Vec<&str> = sql.split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
 
-        match self.database.execute(sql) {
-            Ok(affected) => {
-                // After INSERT, try to capture the auto-generated ID
-                let insert_id = if is_insert && affected > 0 {
-                    if let Some(ref tbl) = table_name {
-                        self.query_last_serial_id(tbl)
-                    } else {
-                        0
+        let mut total_affected: u64 = 0;
+        let mut last_insert_id: u64 = 0;
+
+        for stmt in &statements {
+            // Track whether this is an INSERT to capture last_insert_id
+            let is_insert = starts_with_icase(stmt.trim(), "INSERT");
+            let table_name = if is_insert {
+                Self::extract_insert_table(stmt)
+            } else {
+                None
+            };
+
+            match self.database.execute(stmt) {
+                Ok(affected) => {
+                    total_affected += affected;
+                    // After INSERT, try to capture the auto-generated ID
+                    if is_insert && affected > 0 {
+                        if let Some(ref tbl) = table_name {
+                            let id = self.query_last_serial_id(tbl);
+                            if id > 0 {
+                                last_insert_id = id;
+                            }
+                        }
                     }
-                } else {
-                    0
-                };
-                if insert_id > 0 {
-                    self.last_insert_id = insert_id;
                 }
-                self.send_ok(affected, insert_id).await
-            }
-            Err(e) => {
-                let msg = e.to_string();
-                let (code, state) = map_error_code(&msg);
-                self.send_error(code, state, &msg).await
+                Err(e) => {
+                    let msg = e.to_string();
+                    let (code, state) = map_error_code(&msg);
+                    return self.send_error(code, state, &msg).await;
+                }
             }
         }
+
+        if last_insert_id > 0 {
+            self.last_insert_id = last_insert_id;
+        }
+        self.send_ok(total_affected, last_insert_id).await
     }
 
     /// Handle INSERT ... ON DUPLICATE KEY UPDATE (MySQL upsert).
@@ -1689,10 +1702,13 @@ impl MySqlHandler {
                 }
             }
 
-            // Also add UNIQUE indexes
+            // Also add UNIQUE indexes from column-level unique flags
             let mut unique_seq = 1i64;
+            // Collect column-level unique names so we can de-dup below
+            let mut seen_unique_cols: std::collections::HashSet<String> = std::collections::HashSet::new();
             for col in &schema.columns {
                 if col.unique && !col.primary_key {
+                    seen_unique_cols.insert(col.name.to_uppercase());
                     rows.push(Tuple::new(vec![
                         Value::String(table_name.clone()),
                         Value::String("0".to_string()),
@@ -1709,6 +1725,45 @@ impl MySqlHandler {
                         Value::String(String::new()),
                     ]));
                     unique_seq += 1;
+                }
+            }
+
+            // Add UNIQUE indexes from table-level constraints (multi-column or
+            // any not already covered by column-level flags above).
+            if let Ok(constraints) = self.database.storage.catalog().load_table_constraints(&table_name) {
+                for uc in &constraints.unique_constraints {
+                    if uc.is_primary_key {
+                        continue; // already emitted in the PK section
+                    }
+                    // Skip single-column constraints already covered above
+                    if uc.columns.len() == 1 {
+                        if let Some(first) = uc.columns.first() {
+                            if seen_unique_cols.contains(&first.to_uppercase()) {
+                                continue;
+                            }
+                        }
+                    }
+                    let key_name = uc.name.clone();
+                    for (idx, col_name) in uc.columns.iter().enumerate() {
+                        let nullable = schema.columns.iter()
+                            .find(|c| c.name.eq_ignore_ascii_case(col_name))
+                            .map_or(false, |c| c.nullable);
+                        rows.push(Tuple::new(vec![
+                            Value::String(table_name.clone()),
+                            Value::String("0".to_string()),
+                            Value::String(key_name.clone()),
+                            Value::String((idx as i64 + 1).to_string()),
+                            Value::String(col_name.clone()),
+                            Value::String("A".to_string()),
+                            Value::String("0".to_string()),
+                            Value::Null,
+                            Value::Null,
+                            if nullable { Value::String("YES".to_string()) } else { Value::String(String::new()) },
+                            Value::String("BTREE".to_string()),
+                            Value::String(String::new()),
+                            Value::String(String::new()),
+                        ]));
+                    }
                 }
             }
         }
