@@ -363,21 +363,21 @@ fn translate_on_duplicate_key(sql: &str) -> String {
         init_regex(r"(?i)\s+ON\s+DUPLICATE\s+KEY\s+UPDATE\s+(.+)$")
     });
 
-    // Strip the ON DUPLICATE KEY UPDATE clause entirely.
-    // The MySQL handler implements upsert semantics by catching duplicate-key
-    // errors and falling back to UPDATE (see handle_upsert_dml).
+    // Translate ON DUPLICATE KEY UPDATE to ON CONFLICT DO UPDATE SET.
+    // The planner now supports ON CONFLICT natively, so we convert
+    // MySQL syntax to PostgreSQL syntax and let the engine handle it.
     if let Some(caps) = re.captures(sql) {
         let prefix = &sql[..caps.get(0).map_or(0, |m| m.start())];
-        prefix.to_string()
+        let set_clause = caps.get(1).map_or("", |m| m.as_str());
+        // Translate VALUES(col) references to EXCLUDED.col
+        let pg_set = translate_values_refs(set_clause);
+        format!("{prefix} ON CONFLICT DO UPDATE SET {pg_set}")
     } else {
         sql.to_string()
     }
 }
 
 /// Replace `VALUES(column_name)` references with `EXCLUDED.column_name`.
-///
-/// Kept for potential future use when planner gains ON CONFLICT support.
-#[allow(dead_code)]
 fn translate_values_refs(clause: &str) -> String {
     static VALUES_REF_RE: OnceLock<Regex> = OnceLock::new();
     let re = VALUES_REF_RE.get_or_init(|| init_regex(r"(?i)\bVALUES\s*\(\s*(\w+)\s*\)"));
@@ -792,15 +792,19 @@ mod tests {
     fn test_on_duplicate_key() {
         let sql = "INSERT INTO wp_options (option_name, option_value) VALUES ('siteurl', 'http://example.com') ON DUPLICATE KEY UPDATE option_value = VALUES(option_value)";
         let result = translate(sql);
-        // The translator now strips ON DUPLICATE KEY UPDATE entirely;
-        // upsert semantics are handled by the MySQL handler via try-insert/fallback-update.
+        // The translator converts ON DUPLICATE KEY UPDATE to ON CONFLICT DO UPDATE SET
+        // with VALUES(col) references replaced by EXCLUDED.col
         assert!(
             !result.contains("ON DUPLICATE KEY"),
             "Should strip ON DUPLICATE KEY UPDATE: {result}"
         );
         assert!(
-            result.contains("VALUES"),
-            "Should keep INSERT VALUES: {result}"
+            result.contains("ON CONFLICT DO UPDATE SET"),
+            "Should produce ON CONFLICT DO UPDATE SET: {result}"
+        );
+        assert!(
+            result.contains("EXCLUDED.option_value"),
+            "Should translate VALUES(col) to EXCLUDED.col: {result}"
         );
     }
 

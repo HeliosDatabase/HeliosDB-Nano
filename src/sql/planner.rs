@@ -265,7 +265,9 @@ impl<'a> Planner<'a> {
                 let returning = insert.returning.as_ref()
                     .map(|ret_items| self.convert_returning(ret_items))
                     .transpose()?;
-                self.insert_to_plan(table_name, columns, source, returning)
+                // Extract ON CONFLICT clause if present
+                let on_conflict = self.convert_on_conflict(&insert.on)?;
+                self.insert_to_plan(table_name, columns, source, returning, on_conflict)
             }
             Statement::CreateTable(create_table) => {
                 // Extract fields from CreateTable struct for v0.53 API
@@ -2595,6 +2597,7 @@ impl<'a> Planner<'a> {
         columns: Vec<sqlparser::ast::Ident>,
         source: Box<Query>,
         returning: Option<Vec<ReturningItem>>,
+        on_conflict: Option<OnConflictAction>,
     ) -> Result<LogicalPlan> {
         // Extract VALUES from query
         if let SetExpr::Values(values) = *source.body {
@@ -2617,6 +2620,7 @@ impl<'a> Planner<'a> {
                 columns: column_names,
                 values: rows?,
                 returning,
+                on_conflict,
             })
         } else {
             // INSERT ... SELECT: plan the source query
@@ -3211,6 +3215,51 @@ impl<'a> Planner<'a> {
                 }
             })
             .collect()
+    }
+
+    /// Convert ON CONFLICT clause from sqlparser AST to our internal representation
+    fn convert_on_conflict(
+        &self,
+        on_insert: &Option<sqlparser::ast::OnInsert>,
+    ) -> Result<Option<OnConflictAction>> {
+        let on = match on_insert {
+            Some(on) => on,
+            None => return Ok(None),
+        };
+        match on {
+            sqlparser::ast::OnInsert::OnConflict(conflict) => {
+                match &conflict.action {
+                    sqlparser::ast::OnConflictAction::DoNothing => {
+                        Ok(Some(OnConflictAction::DoNothing))
+                    }
+                    sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
+                        let assignments = do_update.assignments.iter()
+                            .map(|a| {
+                                let col_name = a.target.to_string();
+                                let expr = self.expr_to_logical(&a.value)?;
+                                Ok((col_name, expr))
+                            })
+                            .collect::<Result<Vec<_>>>()?;
+                        Ok(Some(OnConflictAction::DoUpdate { assignments }))
+                    }
+                }
+            }
+            sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments) => {
+                // MySQL ON DUPLICATE KEY UPDATE — convert to DoUpdate
+                let assign_pairs = assignments.iter()
+                    .map(|a| {
+                        let col_name = a.target.to_string();
+                        let expr = self.expr_to_logical(&a.value)?;
+                        Ok((col_name, expr))
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                Ok(Some(OnConflictAction::DoUpdate { assignments: assign_pairs }))
+            }
+            _ => {
+                // Future OnInsert variants — unsupported for now
+                Err(Error::query_execution("Unsupported ON INSERT clause"))
+            }
+        }
     }
 
     /// Convert DELETE statement to logical plan

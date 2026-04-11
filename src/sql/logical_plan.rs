@@ -94,6 +94,19 @@ pub enum ReturningItem {
     },
 }
 
+/// ON CONFLICT action for INSERT ... ON CONFLICT DO NOTHING / DO UPDATE
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum OnConflictAction {
+    /// ON CONFLICT DO NOTHING — silently skip conflicting rows
+    DoNothing,
+    /// ON CONFLICT DO UPDATE SET col = expr — upsert semantics
+    DoUpdate {
+        /// Column assignments (col_name, expression).
+        /// Expressions may reference `EXCLUDED.col` for the proposed insert values.
+        assignments: Vec<(String, LogicalExpr)>,
+    },
+}
+
 /// Trigger type: Regular or Constraint
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum TriggerType {
@@ -282,6 +295,8 @@ pub enum LogicalPlan {
         values: Vec<Vec<LogicalExpr>>,
         /// RETURNING clause (expressions to return from affected rows)
         returning: Option<Vec<ReturningItem>>,
+        /// ON CONFLICT action (DO NOTHING or DO UPDATE)
+        on_conflict: Option<OnConflictAction>,
     },
 
     /// Insert from a SELECT query (INSERT INTO ... SELECT ...)

@@ -865,7 +865,7 @@ impl EmbeddedDatabase {
 
                 Ok(1)
             }
-            sql::LogicalPlan::Insert { table_name, columns, values, returning } => {
+            sql::LogicalPlan::Insert { table_name, columns, values, returning, on_conflict } => {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
                 let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema {
@@ -1064,7 +1064,8 @@ impl EmbeddedDatabase {
                     }
 
                     // Validate UNIQUE constraints via ART index (O(1) lookup instead of O(N) table scan)
-                    if !table_constraints.unique_constraints.is_empty() {
+                    // When ON CONFLICT is specified, intercept constraint violations for upsert/skip
+                    {
                         let mut col_values_map = std::collections::HashMap::new();
                         for (i, col) in schema.columns.iter().enumerate() {
                             if let Some(v) = final_values_vec.get(i) {
@@ -1072,7 +1073,118 @@ impl EmbeddedDatabase {
                             }
                         }
                         if let Err(e) = self.storage.art_indexes().check_unique_constraints(table_name, &col_values_map) {
-                            return Err(Error::constraint_violation(e.to_string()));
+                            match on_conflict {
+                                Some(sql::logical_plan::OnConflictAction::DoNothing) => {
+                                    // Skip this row silently
+                                    continue;
+                                }
+                                Some(sql::logical_plan::OnConflictAction::DoUpdate { assignments }) => {
+                                    // Upsert: find existing row by PK and update it
+                                    // Build a map of insert column name -> proposed value for EXCLUDED resolution
+                                    let mut excluded_map = std::collections::HashMap::new();
+                                    for (i, col) in schema.columns.iter().enumerate() {
+                                        if let Some(v) = final_values_vec.get(i) {
+                                            excluded_map.insert(col.name.to_lowercase(), v.clone());
+                                        }
+                                    }
+
+                                    // Find the PK column(s) and their values
+                                    let pk_cols: Vec<(usize, &crate::Column)> = schema.columns.iter().enumerate()
+                                        .filter(|(_, c)| c.primary_key)
+                                        .collect();
+
+                                    if pk_cols.is_empty() {
+                                        return Err(Error::query_execution(
+                                            "ON CONFLICT DO UPDATE requires a PRIMARY KEY"
+                                        ));
+                                    }
+
+                                    // Look up existing row via ART PK index
+                                    let pk_values: Vec<Value> = pk_cols.iter()
+                                        .filter_map(|(idx, _)| final_values_vec.get(*idx).cloned())
+                                        .collect();
+                                    let pk_key = crate::storage::ArtIndexManager::encode_key(&pk_values);
+                                    let existing_row_id = self.storage.art_indexes()
+                                        .pk_index_lookup(table_name, &pk_key)
+                                        .ok_or_else(|| Error::query_execution(
+                                            "ON CONFLICT DO UPDATE: could not find existing row by PK"
+                                        ))?;
+
+                                    // Read existing row from storage
+                                    let existing_key = self.storage.branch_aware_data_key(table_name, existing_row_id);
+                                    let existing_raw = self.storage.get(&existing_key)?
+                                        .ok_or_else(|| Error::query_execution(
+                                            "ON CONFLICT DO UPDATE: existing row not found in storage"
+                                        ))?;
+                                    let mut existing_tuple: Tuple = bincode::deserialize(&existing_raw)
+                                        .map_err(|err| Error::storage(format!("Failed to deserialize tuple: {}", err)))?;
+                                    existing_tuple.row_id = Some(existing_row_id);
+
+                                    // Apply assignments, resolving EXCLUDED references
+                                    let update_evaluator = sql::Evaluator::new(std::sync::Arc::new(schema.clone()));
+                                    for (col_name, expr) in assignments {
+                                        let target_idx = schema.columns.iter()
+                                            .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                                            .ok_or_else(|| Error::query_execution(format!(
+                                                "ON CONFLICT DO UPDATE: column '{}' not found", col_name
+                                            )))?;
+
+                                        // Resolve EXCLUDED references in the expression
+                                        let resolved_expr = Self::resolve_excluded_refs(expr, &excluded_map);
+                                        let mut new_val = update_evaluator.evaluate(&resolved_expr, &existing_tuple)?;
+                                        // Cast if needed
+                                        let target_type = &schema.columns.get(target_idx)
+                                            .ok_or_else(|| Error::internal("column index out of bounds"))?
+                                            .data_type;
+                                        if new_val.data_type() != *target_type && !matches!(new_val, Value::Null) {
+                                            new_val = update_evaluator.cast_value(new_val, target_type)?;
+                                        }
+                                        if target_idx < existing_tuple.values.len() {
+                                            #[allow(clippy::indexing_slicing)]
+                                            { existing_tuple.values[target_idx] = new_val; }
+                                        }
+                                    }
+
+                                    // Write updated tuple back
+                                    let updated_val = bincode::serialize(&existing_tuple)
+                                        .map_err(|err| Error::storage(err.to_string()))?;
+                                    txn.put(existing_key.clone(), updated_val.clone())?;
+
+                                    // Update ART index
+                                    {
+                                        let mut updated_col_values = std::collections::HashMap::new();
+                                        for (i, col) in schema.columns.iter().enumerate() {
+                                            if let Some(v) = existing_tuple.values.get(i) {
+                                                updated_col_values.insert(col.name.clone(), v.clone());
+                                            }
+                                        }
+                                        // Remove old entry and insert new one
+                                        let _ = self.storage.art_indexes().on_delete(table_name, existing_row_id, &col_values_map);
+                                        let _ = self.storage.art_indexes().on_insert(table_name, existing_row_id, &updated_col_values);
+                                    }
+
+                                    // Log to WAL for replication
+                                    if !skip_fast_paths && self.storage.is_wal_enabled() {
+                                        self.storage.log_data_insert(table_name, &existing_key, &updated_val)?;
+                                    }
+
+                                    // Invalidate result cache on update
+                                    self.invalidate_result_cache();
+
+                                    count += 1;
+
+                                    // Collect for RETURNING if needed
+                                    if has_returning {
+                                        if let Some(projected) = Self::project_returning_columns(&existing_tuple, &schema, returning) {
+                                            returned_tuples.push(projected);
+                                        }
+                                    }
+                                    continue;
+                                }
+                                None => {
+                                    return Err(Error::constraint_violation(e.to_string()));
+                                }
+                            }
                         }
                     }
 
@@ -3751,7 +3863,7 @@ impl EmbeddedDatabase {
                 catalog.create_table(name, schema)?;
                 Ok(1) // 1 table created
             }
-            sql::LogicalPlan::Insert { table_name, columns, values, returning } => {
+            sql::LogicalPlan::Insert { table_name, columns, values, returning, on_conflict: _ } => {
                 // Check for RLS enforcement (with_check_expr)
                 let rls_enforced = self.tenant_manager.should_apply_rls(table_name, "INSERT");
                 let rls_check = if rls_enforced {
@@ -4667,6 +4779,56 @@ impl EmbeddedDatabase {
         Some(Tuple::new(projected_values))
     }
 
+    /// Resolve `EXCLUDED.col` references in an expression for ON CONFLICT DO UPDATE.
+    ///
+    /// Replaces `LogicalExpr::Column { table: Some("EXCLUDED"|"excluded"), name }` with
+    /// the literal value from the proposed INSERT row.  All other expressions are
+    /// recursively traversed and returned as-is.
+    fn resolve_excluded_refs(
+        expr: &sql::logical_plan::LogicalExpr,
+        excluded_map: &std::collections::HashMap<String, Value>,
+    ) -> sql::logical_plan::LogicalExpr {
+        match expr {
+            sql::logical_plan::LogicalExpr::Column { table: Some(tbl), name }
+                if tbl.eq_ignore_ascii_case("excluded") =>
+            {
+                // Replace with the literal value from the INSERT row
+                if let Some(val) = excluded_map.get(&name.to_lowercase()) {
+                    sql::logical_plan::LogicalExpr::Literal(val.clone())
+                } else {
+                    expr.clone()
+                }
+            }
+            sql::logical_plan::LogicalExpr::BinaryExpr { left, op, right } => {
+                sql::logical_plan::LogicalExpr::BinaryExpr {
+                    left: Box::new(Self::resolve_excluded_refs(left, excluded_map)),
+                    op: op.clone(),
+                    right: Box::new(Self::resolve_excluded_refs(right, excluded_map)),
+                }
+            }
+            sql::logical_plan::LogicalExpr::UnaryExpr { op, expr: inner } => {
+                sql::logical_plan::LogicalExpr::UnaryExpr {
+                    op: op.clone(),
+                    expr: Box::new(Self::resolve_excluded_refs(inner, excluded_map)),
+                }
+            }
+            sql::logical_plan::LogicalExpr::Cast { expr: inner, data_type } => {
+                sql::logical_plan::LogicalExpr::Cast {
+                    expr: Box::new(Self::resolve_excluded_refs(inner, excluded_map)),
+                    data_type: data_type.clone(),
+                }
+            }
+            sql::logical_plan::LogicalExpr::ScalarFunction { fun, args } => {
+                sql::logical_plan::LogicalExpr::ScalarFunction {
+                    fun: fun.clone(),
+                    args: args.iter().map(|a| Self::resolve_excluded_refs(a, excluded_map)).collect(),
+                }
+            }
+            // For other expression types (literals, plain columns, etc.), return as-is
+            other => other.clone(),
+        }
+    }
+
     /// Build a schema for RETURNING clause results
     pub(crate) fn returning_schema(
         table_schema: &Schema,
@@ -4720,7 +4882,7 @@ impl EmbeddedDatabase {
     /// only when RETURNING clause is present in INSERT/UPDATE/DELETE statements.
     fn execute_plan_with_params(&self, plan: &sql::LogicalPlan, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
         match plan {
-            sql::LogicalPlan::Insert { table_name, columns, values, returning } => {
+            sql::LogicalPlan::Insert { table_name, columns, values, returning, on_conflict: _ } => {
                 // Get table schema for column types
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
@@ -16543,5 +16705,126 @@ mod tests {
         db.execute("INSERT INTO t_uq VALUES (1, 'a@b.com')").unwrap();
         let result = db.execute("INSERT INTO t_uq VALUES (2, 'a@b.com')");
         assert!(result.is_err(), "Duplicate UNIQUE insert must fail");
+    }
+
+    // ========================================================================
+    // ON CONFLICT tests
+    // ========================================================================
+
+    #[test]
+    fn test_on_conflict_do_nothing() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_oc1 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t_oc1 VALUES (1, 'a')").unwrap();
+        // Should silently skip the conflicting row
+        db.execute("INSERT INTO t_oc1 VALUES (1, 'b') ON CONFLICT DO NOTHING").unwrap();
+        let rows = db.query("SELECT name FROM t_oc1 WHERE id = 1", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::String("a".to_string()));
+    }
+
+    #[test]
+    fn test_on_conflict_do_update() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_oc2 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t_oc2 VALUES (1, 'a')").unwrap();
+        // Should update the existing row with the proposed insert value
+        db.execute("INSERT INTO t_oc2 VALUES (1, 'b') ON CONFLICT DO UPDATE SET name = EXCLUDED.name").unwrap();
+        let rows = db.query("SELECT name FROM t_oc2 WHERE id = 1", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::String("b".to_string()));
+    }
+
+    #[test]
+    fn test_on_conflict_do_update_multiple_columns() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_oc3 (id INT PRIMARY KEY, name TEXT, score INT)").unwrap();
+        db.execute("INSERT INTO t_oc3 VALUES (1, 'alice', 10)").unwrap();
+        db.execute("INSERT INTO t_oc3 VALUES (1, 'bob', 20) ON CONFLICT DO UPDATE SET name = EXCLUDED.name, score = EXCLUDED.score").unwrap();
+        let rows = db.query("SELECT name, score FROM t_oc3 WHERE id = 1", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::String("bob".to_string()));
+        assert_eq!(rows[0].values[1], Value::Int4(20));
+    }
+
+    #[test]
+    fn test_on_conflict_do_nothing_no_conflict() {
+        // When there is no conflict, the insert should proceed normally
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_oc4 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t_oc4 VALUES (1, 'a') ON CONFLICT DO NOTHING").unwrap();
+        let rows = db.query("SELECT name FROM t_oc4 WHERE id = 1", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::String("a".to_string()));
+    }
+
+    #[test]
+    fn test_on_conflict_do_update_no_conflict() {
+        // When there is no conflict, the insert should proceed normally
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_oc5 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t_oc5 VALUES (1, 'a') ON CONFLICT DO UPDATE SET name = EXCLUDED.name").unwrap();
+        let rows = db.query("SELECT name FROM t_oc5 WHERE id = 1", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::String("a".to_string()));
+    }
+
+    #[test]
+    fn test_on_conflict_do_nothing_returns_zero() {
+        // When a row is skipped, it should not count as affected
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_oc6 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t_oc6 VALUES (1, 'a')").unwrap();
+        let affected = db.execute("INSERT INTO t_oc6 VALUES (1, 'b') ON CONFLICT DO NOTHING").unwrap();
+        assert_eq!(affected, 0, "DO NOTHING should report 0 affected rows");
+    }
+
+    #[test]
+    fn test_on_conflict_do_update_returns_one() {
+        // When a row is updated via upsert, it should count as 1 affected
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_oc7 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t_oc7 VALUES (1, 'a')").unwrap();
+        let affected = db.execute("INSERT INTO t_oc7 VALUES (1, 'b') ON CONFLICT DO UPDATE SET name = EXCLUDED.name").unwrap();
+        assert_eq!(affected, 1, "DO UPDATE should report 1 affected row");
+    }
+
+    #[test]
+    fn test_on_conflict_with_column_list() {
+        // INSERT with explicit column list + ON CONFLICT
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_oc8 (id INT PRIMARY KEY, name TEXT, val INT)").unwrap();
+        db.execute("INSERT INTO t_oc8 (id, name, val) VALUES (1, 'a', 10)").unwrap();
+        db.execute("INSERT INTO t_oc8 (id, name, val) VALUES (1, 'b', 20) ON CONFLICT DO UPDATE SET name = EXCLUDED.name, val = EXCLUDED.val").unwrap();
+        let rows = db.query("SELECT name, val FROM t_oc8 WHERE id = 1", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::String("b".to_string()));
+        assert_eq!(rows[0].values[1], Value::Int4(20));
+    }
+
+    #[test]
+    fn test_on_conflict_do_update_partial() {
+        // Only update some columns, leave others unchanged
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_oc9 (id INT PRIMARY KEY, name TEXT, val INT)").unwrap();
+        db.execute("INSERT INTO t_oc9 VALUES (1, 'alice', 10)").unwrap();
+        // Only update 'val', leave 'name' unchanged
+        db.execute("INSERT INTO t_oc9 VALUES (1, 'bob', 99) ON CONFLICT DO UPDATE SET val = EXCLUDED.val").unwrap();
+        let rows = db.query("SELECT name, val FROM t_oc9 WHERE id = 1", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::String("alice".to_string()), "name should be unchanged");
+        assert_eq!(rows[0].values[1], Value::Int4(99), "val should be updated");
+    }
+
+    #[test]
+    fn test_on_conflict_do_update_with_literal() {
+        // SET col = literal_value (not EXCLUDED reference)
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE t_oc10 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t_oc10 VALUES (1, 'a')").unwrap();
+        db.execute("INSERT INTO t_oc10 VALUES (1, 'b') ON CONFLICT DO UPDATE SET name = 'replaced'").unwrap();
+        let rows = db.query("SELECT name FROM t_oc10 WHERE id = 1", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::String("replaced".to_string()));
     }
 }

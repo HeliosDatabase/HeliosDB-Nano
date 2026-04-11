@@ -5,6 +5,19 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.9.5] - 2026-04-10
+
+### Added
+- **Native ON CONFLICT DO UPDATE / DO NOTHING** in planner and executor.
+  No more handler-level INSERT-catch-UPDATE workaround. Supports both
+  PostgreSQL `ON CONFLICT` and MySQL `ON DUPLICATE KEY UPDATE` syntax
+  natively through the planner with EXCLUDED.col reference resolution.
+- `OnConflictAction` enum in LogicalPlan::Insert (DoNothing, DoUpdate)
+- MySQL translator now produces proper `ON CONFLICT DO UPDATE SET col = EXCLUDED.col`
+  instead of stripping the clause
+- 10 new upsert tests covering DO NOTHING, DO UPDATE, EXCLUDED refs,
+  multi-column, partial update, and no-conflict paths
+
 ## [3.9.4] - 2026-04-10
 
 ### Fixed

@@ -970,9 +970,9 @@ impl MySqlHandler {
 
         if is_select {
             self.execute_query(trimmed).await
-        } else if raw_sql.to_uppercase().contains("ON DUPLICATE KEY UPDATE") {
-            self.handle_upsert_dml(trimmed, &raw_sql).await
         } else {
+            // ON DUPLICATE KEY UPDATE is now translated to ON CONFLICT DO UPDATE
+            // by the MySQL translator and handled natively by the planner/executor.
             self.execute_dml(trimmed).await
         }
     }
