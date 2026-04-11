@@ -533,6 +533,55 @@ struct PreparedStatement {
 // Case-insensitive prefix check (same helper as PG handler)
 // ============================================================================
 
+/// Split SQL on semicolons, but only OUTSIDE single-quoted string literals.
+/// This prevents splitting serialized PHP data like 'a:1:{s:13:"admin";b:1;}'.
+fn split_sql_respecting_quotes(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut in_single_quote = false;
+    let mut chars = sql.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\'' if !in_single_quote => {
+                in_single_quote = true;
+                current.push(ch);
+            }
+            '\'' if in_single_quote => {
+                current.push(ch);
+                // Check for escaped quote ''
+                if chars.peek() == Some(&'\'') {
+                    current.push(chars.next().unwrap_or('\''));
+                } else {
+                    in_single_quote = false;
+                }
+            }
+            '\\' if in_single_quote => {
+                // Backslash escape inside string — push both chars
+                current.push(ch);
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            ';' if !in_single_quote => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    statements.push(trimmed);
+                }
+                current.clear();
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        statements.push(trimmed);
+    }
+
+    statements
+}
+
 #[inline]
 fn starts_with_icase(s: &str, prefix: &str) -> bool {
     s.len() >= prefix.len()
@@ -1032,11 +1081,9 @@ impl MySqlHandler {
 
     async fn execute_dml(&mut self, sql: &str) -> Result<()> {
         // Split semicolon-separated statements (e.g. multi-table DELETE translation)
-        // and execute each sequentially, accumulating affected-row counts.
-        let statements: Vec<&str> = sql.split(';')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
+        // but respect single-quoted strings — semicolons inside serialized PHP data
+        // like 'a:1:{s:13:"administrator";b:1;}' must NOT split.
+        let statements = split_sql_respecting_quotes(sql);
 
         let mut total_affected: u64 = 0;
         let mut last_insert_id: u64 = 0;
