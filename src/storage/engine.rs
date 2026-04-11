@@ -1850,7 +1850,17 @@ impl StorageEngine {
             (Value::Int8(v), DataType::Int4) => Value::Int4(*v as i32),
             (Value::Int8(v), DataType::Int2) => Value::Int2(*v as i16),
             (Value::Int4(v), DataType::Int2) => Value::Int2(*v as i16),
-            // Already correct type or not an integer — return as-is
+            // String→Int coercion: MySQL sends WHERE ID = '1' via $wpdb->prepare(%s)
+            (Value::String(s), DataType::Int8) => {
+                s.parse::<i64>().map(Value::Int8).unwrap_or_else(|_| value.clone())
+            }
+            (Value::String(s), DataType::Int4) => {
+                s.parse::<i32>().map(Value::Int4).unwrap_or_else(|_| value.clone())
+            }
+            (Value::String(s), DataType::Int2) => {
+                s.parse::<i16>().map(Value::Int2).unwrap_or_else(|_| value.clone())
+            }
+            // Already correct type — return as-is
             _ => value.clone(),
         }
     }

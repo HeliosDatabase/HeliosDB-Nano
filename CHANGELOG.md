@@ -5,6 +5,17 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.9.9] - 2026-04-11
+
+### Fixed
+- **WHERE ID = '1' returns 0 rows** (root cause of wp_capabilities not written):
+  `coerce_pk_value()` handled Int→Int widening but NOT String→Int coercion.
+  WordPress `$wpdb->prepare("WHERE ID = %s", 1)` produces `WHERE ID = '1'`.
+  The ART index lookup received `String("1")` which didn't match stored
+  `Int8(1)`. Added String→Int8/Int4/Int2 parsing in coerce_pk_value().
+  This was the last piece: get_userdata(1) now finds the user, wp_insert_user()
+  writes capabilities, and the full install chain completes.
+
 ## [3.9.8] - 2026-04-10
 
 ### Fixed
