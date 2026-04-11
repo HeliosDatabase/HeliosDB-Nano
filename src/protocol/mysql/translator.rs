@@ -67,70 +67,110 @@ fn translate_backslash_escapes(sql: &str) -> String {
         if ch == '\'' {
             // Enter single-quoted string literal
             out.push('\'');
-            loop {
-                match chars.next() {
-                    Some('\\') => {
-                        // Backslash inside a single-quoted string
-                        match chars.peek() {
-                            Some('"') => {
-                                // \" → "  (strip the backslash)
-                                out.push('"');
-                                chars.next();
-                            }
-                            Some('\\') => {
-                                // \\ → \  (one backslash)
-                                out.push('\\');
-                                chars.next();
-                            }
-                            Some('n') => {
-                                out.push('\n');
-                                chars.next();
-                            }
-                            Some('r') => {
-                                out.push('\r');
-                                chars.next();
-                            }
-                            Some('t') => {
-                                out.push('\t');
-                                chars.next();
-                            }
-                            Some('0') => {
-                                // \0 → strip (NUL not storable in PG text)
-                                chars.next();
-                            }
-                            Some('\'') => {
-                                // \' → '' (PostgreSQL-style escaped quote)
-                                out.push('\'');
-                                out.push('\'');
-                                chars.next();
-                            }
-                            _ => {
-                                // Unknown escape — keep backslash
-                                out.push('\\');
-                            }
-                        }
-                    }
-                    Some('\'') => {
-                        // Check for escaped quote ('')
-                        if chars.peek() == Some(&'\'') {
-                            out.push('\'');
-                            out.push('\'');
-                            chars.next();
-                        } else {
-                            out.push('\'');
-                            break;
-                        }
-                    }
-                    Some(c) => out.push(c),
-                    None => break,
-                }
-            }
+            process_string_interior(&mut out, &mut chars, '\'');
+        } else if ch == '"' && looks_like_mysql_string_context(&out) {
+            // MySQL double-quoted string literal (not an identifier).
+            // Convert to single-quoted for PostgreSQL compatibility.
+            // Context check: after VALUES(, SET =, etc. — not after FROM/TABLE/INTO
+            out.push('\'');
+            process_string_interior(&mut out, &mut chars, '"');
         } else {
             out.push(ch);
         }
     }
 
     out
+}
+
+/// Process the interior of a string literal (single or double-quoted).
+/// Handles backslash escapes and outputs content between the open/close quotes.
+fn process_string_interior(
+    out: &mut String,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    quote_char: char,
+) {
+    loop {
+        match chars.next() {
+            Some('\\') => {
+                match chars.peek() {
+                    Some('"') => {
+                        out.push('"');
+                        chars.next();
+                    }
+                    Some('\\') => {
+                        out.push('\\');
+                        chars.next();
+                    }
+                    Some('n') => {
+                        out.push('\n');
+                        chars.next();
+                    }
+                    Some('r') => {
+                        out.push('\r');
+                        chars.next();
+                    }
+                    Some('t') => {
+                        out.push('\t');
+                        chars.next();
+                    }
+                    Some('0') => {
+                        chars.next(); // strip NUL
+                    }
+                    Some('\'') => {
+                        // \' → '' for PG
+                        out.push('\'');
+                        out.push('\'');
+                        chars.next();
+                    }
+                    _ => {
+                        out.push('\\');
+                    }
+                }
+            }
+            Some(c) if c == quote_char => {
+                // Check for doubled escape ('' or "")
+                if chars.peek() == Some(&quote_char) {
+                    if quote_char == '\'' {
+                        out.push('\'');
+                        out.push('\'');
+                    } else {
+                        // "" inside double-quoted string → single " in output
+                        out.push('"');
+                    }
+                    chars.next();
+                } else {
+                    // End of string — always close with single quote (PG style)
+                    out.push('\'');
+                    break;
+                }
+            }
+            Some('\'') if quote_char == '"' => {
+                // Single quote inside a double-quoted string → escape for PG
+                out.push('\'');
+                out.push('\'');
+            }
+            Some(c) => out.push(c),
+            None => break,
+        }
+    }
+}
+
+/// Heuristic: does the current output context suggest a string value (not an identifier)?
+/// Returns true after: VALUES (, SET x =, DEFAULT ', etc.
+/// Returns false after: FROM, TABLE, INTO, JOIN (where " would be an identifier quote).
+fn looks_like_mysql_string_context(out: &str) -> bool {
+    let trimmed = out.trim_end();
+    // After these, double-quoted value is a string literal
+    trimmed.ends_with('(')
+        || trimmed.ends_with(',')
+        || trimmed.ends_with('=')
+        || trimmed.to_uppercase().ends_with("VALUES")
+        || trimmed.to_uppercase().ends_with("SET")
+        || trimmed.to_uppercase().ends_with("DEFAULT")
+        || trimmed.to_uppercase().ends_with("LIKE")
+        || trimmed.to_uppercase().ends_with("WHERE")
+        || trimmed.to_uppercase().ends_with("AND")
+        || trimmed.to_uppercase().ends_with("OR")
 }
 
 // ---------------------------------------------------------------------------

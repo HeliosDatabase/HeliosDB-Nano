@@ -5,6 +5,16 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.9.8] - 2026-04-10
+
+### Fixed
+- MySQL double-quoted string literals: WordPress $wpdb->prepare() can produce
+  VALUES with double-quoted strings ("a:1:{s:13:\"admin\";b:1;}"). These were
+  passed through as identifier quotes, causing silent data loss. Translator
+  now detects double-quoted values in string context (after VALUES(, SET =,
+  etc.) and converts them to single-quoted PG string literals with proper
+  backslash escape handling. Fixes wp_capabilities not written during install.
+
 ## [3.9.7] - 2026-04-10
 
 ### Fixed
