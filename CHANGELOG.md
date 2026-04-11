@@ -5,6 +5,16 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.9.7] - 2026-04-10
+
+### Fixed
+- ON CONFLICT DO UPDATE now handles UNIQUE key conflicts (not just PK).
+  WordPress wp_options has option_id as PK and option_name as UNIQUE.
+  The conflict is on option_name but the old code only looked up by PK
+  (which was NULL/auto-generated). Now scans UNIQUE columns for the
+  conflicting value, falls back to PK lookup.
+  Fixes update_option(), transients, rewrite rules, cron.
+
 ## [3.9.6] - 2026-04-10
 
 ### Fixed

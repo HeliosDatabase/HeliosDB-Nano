@@ -1079,7 +1079,10 @@ impl EmbeddedDatabase {
                                     continue;
                                 }
                                 Some(sql::logical_plan::OnConflictAction::DoUpdate { assignments }) => {
-                                    // Upsert: find existing row by PK and update it
+                                    // Upsert: find existing row by the conflicting constraint and update it.
+                                    // The conflict might be on PK or a UNIQUE key — extract which from the error.
+                                    let err_msg = e.to_string();
+
                                     // Build a map of insert column name -> proposed value for EXCLUDED resolution
                                     let mut excluded_map = std::collections::HashMap::new();
                                     for (i, col) in schema.columns.iter().enumerate() {
@@ -1088,27 +1091,62 @@ impl EmbeddedDatabase {
                                         }
                                     }
 
-                                    // Find the PK column(s) and their values
-                                    let pk_cols: Vec<(usize, &crate::Column)> = schema.columns.iter().enumerate()
-                                        .filter(|(_, c)| c.primary_key)
-                                        .collect();
+                                    // Determine which column caused the conflict:
+                                    // 1. Try UNIQUE column mentioned in error message
+                                    // 2. Fall back to scanning UNIQUE columns for matching values
+                                    // 3. Last resort: try PK
+                                    let existing_row_id = {
+                                        let mut found_row_id: Option<u64> = None;
 
-                                    if pk_cols.is_empty() {
-                                        return Err(Error::query_execution(
-                                            "ON CONFLICT DO UPDATE requires a PRIMARY KEY"
-                                        ));
-                                    }
+                                        // Strategy 1: Try each UNIQUE column that has a non-null value in the INSERT
+                                        for (i, col) in schema.columns.iter().enumerate() {
+                                            if (col.unique || col.primary_key) && !col.primary_key {
+                                                // UNIQUE (non-PK) column — check if it caused the conflict
+                                                if let Some(val) = final_values_vec.get(i) {
+                                                    if !matches!(val, Value::Null) {
+                                                        // Scan table for existing row with this UNIQUE value
+                                                        let scan_sql = format!(
+                                                            "SELECT {} FROM {} WHERE {} = '{}'",
+                                                            schema.columns.iter().find(|c| c.primary_key).map(|c| c.name.as_str()).unwrap_or("rowid"),
+                                                            table_name,
+                                                            col.name,
+                                                            val.to_string().trim_matches('\'')
+                                                        );
+                                                        if let Ok(rows) = self.query(&scan_sql, &[]) {
+                                                            if let Some(row) = rows.first() {
+                                                                if let Some(pk_val) = row.values.first() {
+                                                                    match pk_val {
+                                                                        Value::Int8(id) => { found_row_id = Some(*id as u64); }
+                                                                        Value::Int4(id) => { found_row_id = Some(*id as u64); }
+                                                                        _ => {}
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        if found_row_id.is_some() { break; }
+                                                    }
+                                                }
+                                            }
+                                        }
 
-                                    // Look up existing row via ART PK index
-                                    let pk_values: Vec<Value> = pk_cols.iter()
-                                        .filter_map(|(idx, _)| final_values_vec.get(*idx).cloned())
-                                        .collect();
-                                    let pk_key = crate::storage::ArtIndexManager::encode_key(&pk_values);
-                                    let existing_row_id = self.storage.art_indexes()
-                                        .pk_index_lookup(table_name, &pk_key)
-                                        .ok_or_else(|| Error::query_execution(
-                                            "ON CONFLICT DO UPDATE: could not find existing row by PK"
-                                        ))?;
+                                        // Strategy 2: Try PK lookup (for PK conflicts)
+                                        if found_row_id.is_none() {
+                                            let pk_cols: Vec<(usize, &crate::Column)> = schema.columns.iter().enumerate()
+                                                .filter(|(_, c)| c.primary_key)
+                                                .collect();
+                                            let pk_values: Vec<Value> = pk_cols.iter()
+                                                .filter_map(|(idx, _)| final_values_vec.get(*idx).cloned())
+                                                .collect();
+                                            if !pk_values.is_empty() && !pk_values.iter().any(|v| matches!(v, Value::Null)) {
+                                                let pk_key = crate::storage::ArtIndexManager::encode_key(&pk_values);
+                                                found_row_id = self.storage.art_indexes().pk_index_lookup(table_name, &pk_key);
+                                            }
+                                        }
+
+                                        found_row_id.ok_or_else(|| Error::query_execution(
+                                            format!("ON CONFLICT DO UPDATE: could not find existing row ({})", err_msg)
+                                        ))?
+                                    };
 
                                     // Read existing row from storage
                                     let existing_key = self.storage.branch_aware_data_key(table_name, existing_row_id);
