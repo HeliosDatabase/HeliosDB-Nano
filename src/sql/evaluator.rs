@@ -263,7 +263,8 @@ impl Evaluator {
                 if matches!(value, Value::Null) {
                     return Ok(Value::Null);
                 }
-                let found = values.contains(&value);
+                // Use values_equal for cross-type coercion (String("9") matches Int8(9))
+                let found = values.iter().any(|v| self.values_equal(&value, v));
                 Ok(Value::Boolean(if *negated { !found } else { found }))
             }
 
@@ -4026,6 +4027,28 @@ impl Evaluator {
             }
             (Value::Int8(a), Value::Numeric(b)) => {
                 b.parse::<Decimal>().is_ok_and(|b| Decimal::from(*a) == b)
+            }
+
+            // String↔Int coercion (MySQL sends WHERE id IN ('9') via $wpdb->prepare)
+            (Value::String(s), Value::Int8(n)) | (Value::Int8(n), Value::String(s)) => {
+                s.parse::<i64>().is_ok_and(|parsed| parsed == *n)
+            }
+            (Value::String(s), Value::Int4(n)) | (Value::Int4(n), Value::String(s)) => {
+                s.parse::<i32>().is_ok_and(|parsed| parsed == *n)
+            }
+            (Value::String(s), Value::Int2(n)) | (Value::Int2(n), Value::String(s)) => {
+                s.parse::<i16>().is_ok_and(|parsed| parsed == *n)
+            }
+            // String↔Float coercion
+            (Value::String(s), Value::Float8(n)) | (Value::Float8(n), Value::String(s)) => {
+                s.parse::<f64>().is_ok_and(|parsed| (parsed - *n).abs() < f64::EPSILON)
+            }
+            (Value::String(s), Value::Float4(n)) | (Value::Float4(n), Value::String(s)) => {
+                s.parse::<f32>().is_ok_and(|parsed| (parsed - *n).abs() < f32::EPSILON)
+            }
+            // String↔Bool coercion
+            (Value::String(s), Value::Boolean(b)) | (Value::Boolean(b), Value::String(s)) => {
+                matches!((s.as_str(), b), ("1" | "true" | "TRUE" | "t", true) | ("0" | "false" | "FALSE" | "f", false))
             }
 
             // Null comparisons (SQL: NULL = anything is false, not NULL)
