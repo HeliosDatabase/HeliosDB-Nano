@@ -810,9 +810,9 @@ fn translate_misc(sql: &str) -> String {
     let re = STRAIGHT_JOIN_RE.get_or_init(|| init_regex(r"(?i)\bSTRAIGHT_JOIN\b"));
     s = re.replace_all(&s, "JOIN").to_string();
 
-    // Strip SQL_CALC_FOUND_ROWS
+    // Strip SQL_CALC_FOUND_ROWS (and trailing whitespace to avoid double-space)
     static CALC_FOUND_RE: OnceLock<Regex> = OnceLock::new();
-    let re = CALC_FOUND_RE.get_or_init(|| init_regex(r"(?i)\bSQL_CALC_FOUND_ROWS\b"));
+    let re = CALC_FOUND_RE.get_or_init(|| init_regex(r"(?i)\bSQL_CALC_FOUND_ROWS\s*"));
     s = re.replace_all(&s, "").to_string();
 
     // Strip HIGH_PRIORITY / LOW_PRIORITY / DELAYED
@@ -825,6 +825,16 @@ fn translate_misc(sql: &str) -> String {
     static BINARY_RE: OnceLock<Regex> = OnceLock::new();
     let re = BINARY_RE.get_or_init(|| init_regex(r"(?i)\bBINARY\s+(')"));
     s = re.replace_all(&s, "$1").to_string();
+
+    // Strip WHERE 1=1 tautology (WordPress adds to every query for chaining AND clauses)
+    // "WHERE 1=1 AND ..." → "WHERE ..."
+    static WHERE_1_1_AND_RE: OnceLock<Regex> = OnceLock::new();
+    let re = WHERE_1_1_AND_RE.get_or_init(|| init_regex(r"(?i)\bWHERE\s+1\s*=\s*1\s+AND\b"));
+    s = re.replace_all(&s, "WHERE").to_string();
+    // Standalone "WHERE 1=1" at end of query → strip entirely
+    static WHERE_1_1_RE: OnceLock<Regex> = OnceLock::new();
+    let re = WHERE_1_1_RE.get_or_init(|| init_regex(r"(?i)\bWHERE\s+1\s*=\s*1\s*$"));
+    s = re.replace_all(&s, "").to_string();
 
     s
 }
