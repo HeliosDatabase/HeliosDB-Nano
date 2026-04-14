@@ -675,6 +675,43 @@ fn translate_multi_table_delete(sql: &str) -> String {
         return format!("{del1};{del2}");
     }
 
+    // Also handle comma-join DELETE: DELETE a, b FROM table1 a, table2 b WHERE ...
+    // WordPress uses: DELETE a, b FROM wp_options a, wp_options b WHERE a.option_name LIKE ...
+    static COMMA_DEL_RE: OnceLock<Regex> = OnceLock::new();
+    let comma_re = COMMA_DEL_RE.get_or_init(|| {
+        init_regex(
+            r"(?is)^\s*DELETE\s+(\w+)\s*,\s*(\w+)\s+FROM\s+(\w+)\s+(?:AS\s+)?(\w+)\s*,\s*(\w+)\s+(?:AS\s+)?(\w+)\s+(WHERE\s+.+)$"
+        )
+    });
+
+    if let Some(caps) = comma_re.captures(sql) {
+        let del_alias1 = &caps[1]; // alias to delete from
+        let del_alias2 = &caps[2];
+        let table1 = &caps[3];
+        let alias1 = &caps[4];
+        let table2 = &caps[5];
+        let alias2 = &caps[6];
+        let where_clause = caps[7].trim();
+        let where_body = where_clause.strip_prefix("WHERE ").or_else(|| where_clause.strip_prefix("where ")).unwrap_or(where_clause);
+
+        // Find PK column from schema (default to "option_id" for wp_options pattern)
+        let pk_col = "option_id"; // WordPress transient cleanup always uses wp_options
+
+        // For same-table self-join DELETE, use a subquery with the WHERE condition
+        let subquery_from = format!("{table1} AS {alias1}, {table2} AS {alias2}");
+        let del1 = format!(
+            "DELETE FROM {table1} WHERE {pk_col} IN (SELECT {del_alias1}.{pk_col} FROM {subquery_from} WHERE {where_body})"
+        );
+        // Only generate second DELETE if tables differ
+        if table1 != table2 {
+            let del2 = format!(
+                "DELETE FROM {table2} WHERE {pk_col} IN (SELECT {del_alias2}.{pk_col} FROM {subquery_from} WHERE {where_body})"
+            );
+            return format!("{del1};{del2}");
+        }
+        return del1;
+    }
+
     sql.to_string()
 }
 
@@ -825,6 +862,15 @@ fn translate_misc(sql: &str) -> String {
     static BINARY_RE: OnceLock<Regex> = OnceLock::new();
     let re = BINARY_RE.get_or_init(|| init_regex(r"(?i)\bBINARY\s+(')"));
     s = re.replace_all(&s, "$1").to_string();
+
+    // Convert DATE_SUB(NOW(), INTERVAL N UNIT) → DATE_SUB(NOW(), 'N UNIT')
+    // and DATE_ADD(NOW(), INTERVAL N UNIT) → DATE_ADD(NOW(), 'N UNIT')
+    // sqlparser chokes on INTERVAL keyword inside function args; wrap as string
+    static DATE_INTERVAL_RE: OnceLock<Regex> = OnceLock::new();
+    let re = DATE_INTERVAL_RE.get_or_init(|| {
+        init_regex(r"(?i)\b(DATE_(?:ADD|SUB))\s*\(\s*([^,]+)\s*,\s*INTERVAL\s+(\d+)\s+(\w+)\s*\)")
+    });
+    s = re.replace_all(&s, "$1($2, '$3 $4')").to_string();
 
     // Strip WHERE 1=1 tautology (WordPress adds to every query for chaining AND clauses)
     // "WHERE 1=1 AND ..." → "WHERE ..."
