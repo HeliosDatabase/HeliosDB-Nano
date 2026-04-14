@@ -888,13 +888,28 @@ impl<'a> Planner<'a> {
             // SELECT without FROM (like SELECT 1+1)
             // Use DualScan as the input - it produces a single row with no columns
             LogicalPlan::DualScan
-        } else if select.from.len() > 1 {
-            return Err(Error::query_execution("Multiple FROM tables require explicit JOIN"));
-        } else {
+        } else if select.from.len() == 1 {
             self.table_with_joins_to_plan(
                 select.from.first()
                     .ok_or_else(|| Error::query_execution("FROM clause is empty"))?
             )?
+        } else {
+            // Multiple FROM tables: implicit cross-join (comma-join).
+            // FROM t1, t2 WHERE t1.id = t2.id  ≡  FROM t1 CROSS JOIN t2 WHERE ...
+            // WordPress uses this for _update_post_term_count.
+            let mut cross = self.table_with_joins_to_plan(&select.from[0])?;
+            #[allow(clippy::indexing_slicing)]
+            for from_item in &select.from[1..] {
+                let right = self.table_with_joins_to_plan(from_item)?;
+                cross = LogicalPlan::Join {
+                    left: Box::new(cross),
+                    right: Box::new(right),
+                    join_type: crate::sql::JoinType::Cross,
+                    on: None,
+                    lateral: false,
+                };
+            }
+            cross
         };
 
         // Add WHERE clause as Filter

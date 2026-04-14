@@ -35,6 +35,7 @@ pub fn translate(sql: &str) -> String {
     result = translate_functions(&result);
     result = translate_multi_table_delete(&result);
     result = translate_key_indexes(&result);
+    result = translate_alter_table_keys(&result);
     result = translate_misc(&result);
 
     result
@@ -770,7 +771,30 @@ fn strip_prefix_lengths(col_list: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// 12. Miscellaneous MySQL syntax
+// 12. ALTER TABLE ADD KEY/INDEX → strip (HeliosDB uses ART indexes)
+// ---------------------------------------------------------------------------
+
+/// Strip MySQL `ALTER TABLE t ADD KEY name (col(191))` and `ADD INDEX` statements.
+/// WordPress `dbDelta()` sends these during schema checks.
+fn translate_alter_table_keys(sql: &str) -> String {
+    let upper = sql.trim().to_uppercase();
+    if !upper.starts_with("ALTER TABLE") {
+        return sql.to_string();
+    }
+    // Match: ALTER TABLE t ADD [UNIQUE] KEY|INDEX name (cols)
+    static ALTER_KEY_RE: OnceLock<Regex> = OnceLock::new();
+    let re = ALTER_KEY_RE.get_or_init(|| {
+        init_regex(r"(?i)\bADD\s+(?:UNIQUE\s+)?(?:KEY|INDEX)\s+\w+\s*\((?:[^()]*\([^)]*\))*[^)]*\)")
+    });
+    if re.is_match(sql) {
+        // Convert to no-op (silently succeed)
+        return String::new();
+    }
+    sql.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// 13. Miscellaneous MySQL syntax
 // ---------------------------------------------------------------------------
 
 fn translate_misc(sql: &str) -> String {
