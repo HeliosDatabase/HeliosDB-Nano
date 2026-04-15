@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: heliosdb-nano
+    runtime: docker
+    dockerfilePath: ../docker/Dockerfile
+    plan: starter
+    envVars:
+      - key: DATA_DIR
+        value: /data
+    disk:
+      name: heliosdb-data
+      mountPath: /data
+      sizeGB: 10
+    healthCheckPath: /health

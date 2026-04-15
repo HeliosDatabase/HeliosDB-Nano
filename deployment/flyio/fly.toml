@@ -16,6 +16,9 @@ HELIOSDB_DATA_DIR = "/data"
 HELIOSDB_REST_PORT = "8080"
 HELIOSDB_PG_PORT = "5432"
 
+[processes]
+app = "heliosdb-nano start --data-dir /data --listen 0.0.0.0 --port 8080 --mysql --mysql-listen 0.0.0.0:3306"
+
 [mounts]
 source = "heliosdb_data"
 destination = "/data"
@@ -34,6 +37,14 @@ internal_port = 5432
 
 [[services.ports]]
 port = 5432
+handlers = ["tls"]
+
+[[services]]
+protocol = "tcp"
+internal_port = 3306
+
+[[services.ports]]
+port = 3306
 handlers = ["tls"]
 
 [http_service.concurrency]

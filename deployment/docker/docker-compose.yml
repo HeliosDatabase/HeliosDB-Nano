@@ -2,13 +2,14 @@ version: '3.8'
 
 services:
   heliosdb:
-    image: heliosdb/lite:3.0.0
+    image: heliosdb/nano:3.10
     build:
       context: ../..
       dockerfile: deployment/docker/Dockerfile
     ports:
       - "5432:5432"  # PostgreSQL protocol
       - "8080:8080"  # REST API
+      - "3306:3306"  # MySQL protocol
     volumes:
       - heliosdb_data:/data
     environment:
@@ -24,6 +25,13 @@ services:
       # Performance tuning
       - HELIOSDB_CACHE_SIZE_MB=512
       - HELIOSDB_MAX_CONNECTIONS=100
+    command: >
+      heliosdb-nano start
+      --data-dir /data
+      --listen 0.0.0.0
+      --port 8080
+      --mysql
+      --mysql-listen 0.0.0.0:3306
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
       interval: 30s

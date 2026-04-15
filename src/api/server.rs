@@ -10,6 +10,7 @@ use axum::{
         header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
         Method, StatusCode,
     },
+    response::Html,
 };
 use tower::ServiceBuilder;
 use tower_http::{
@@ -274,6 +275,8 @@ impl ApiServer {
             .route("/realtime/v1/websocket", axum::routing::get(super::handlers::ws_handler::ws_upgrade))
             .route("/health", axum::routing::get(health_check))
             .route("/version", axum::routing::get(version_info))
+            .route("/docs", axum::routing::get(swagger_ui))
+            .route("/openapi.json", axum::routing::get(openapi_json))
             .layer(base_middleware)
             .with_state(self.state.clone())
     }
@@ -382,6 +385,30 @@ async fn version_info() -> axum::Json<serde_json::Value> {
         "version": env!("CARGO_PKG_VERSION"),
         "api_version": "v1",
     }))
+}
+
+/// Swagger UI HTML page
+async fn swagger_ui() -> Html<&'static str> {
+    Html(r#"<!DOCTYPE html>
+<html>
+<head>
+  <title>HeliosDB Nano API</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/swagger-ui-dist/swagger-ui.css">
+</head>
+<body>
+  <div id="swagger-ui"></div>
+  <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist/swagger-ui-bundle.js"></script>
+  <script>SwaggerUIBundle({ url: '/openapi.json', dom_id: '#swagger-ui' })</script>
+</body>
+</html>"#)
+}
+
+/// Serve the OpenAPI spec as JSON (converted from the bundled YAML)
+async fn openapi_json() -> std::result::Result<axum::Json<serde_json::Value>, StatusCode> {
+    let yaml_bytes = include_str!("openapi/openapi.yaml");
+    let value: serde_json::Value =
+        serde_yaml::from_str(yaml_bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(axum::Json(value))
 }
 
 #[cfg(test)]

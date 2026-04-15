@@ -1,19 +1,22 @@
 # Railway deployment configuration for HeliosDB Nano
 # Deploy with: railway up
+#
+# NOTE: Railway only supports HTTP traffic. The PostgreSQL wire protocol
+# (port 5432) is NOT accessible on Railway. Use Fly.io if you need PG
+# wire protocol or MySQL wire protocol access.
 
 [build]
 builder = "dockerfile"
 dockerfilePath = "deployment/docker/Dockerfile"
 
 [deploy]
-startCommand = "heliosdb-nano start --mode server --port $PORT"
+startCommand = "heliosdb-nano start --data-dir /data --listen 0.0.0.0 --port $PORT --mysql --mysql-listen 0.0.0.0:3306"
 healthcheckPath = "/health"
 healthcheckTimeout = 30
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
 
 [variables]
-HELIOSDB_MODE = "server"
 HELIOSDB_LOG_LEVEL = "info"
 HELIOSDB_CACHE_SIZE_MB = "256"
 # Set these in Railway dashboard:
