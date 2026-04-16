@@ -4,233 +4,233 @@
 [![Documentation](https://docs.rs/heliosdb-nano/badge.svg)](https://docs.rs/heliosdb-nano)
 [![License](https://img.shields.io/crates/l/heliosdb-nano.svg)](LICENSE)
 
-**PostgreSQL & MySQL compatible embedded database for Rust** with HNSW vector search, AES-256-GCM encryption, git-like branching, time-travel queries, and 50+ enterprise features. Single binary, zero external dependencies.
+**The first embedded database with native PostgreSQL, MySQL, and SQLite compatibility.** Single 47 MB binary. HNSW vector search, git-like branching, time-travel queries, AES-256-GCM encryption, built-in BaaS layer (Auth, REST API, Realtime).
 
-HeliosDB Nano combines the simplicity of SQLite (embed it in your app) with PostgreSQL and MySQL compatibility (connect with `psql`, `mysql`, any PG/MySQL driver, or any ORM). Built on RocksDB + Apache Arrow.
+Use your existing clients (`psql`, `mysql`, `curl`) and ORMs — zero migration required.
 
-## Installation
+## Install
 
-```toml
-[dependencies]
-heliosdb-nano = "3.8"
+```bash
+# npm (cross-platform, auto-downloads binary)
+npx heliosdb start
+
+# Homebrew (macOS / Linux)
+brew install dimensigon/tap/heliosdb-nano
+
+# Docker
+docker run -p 5432:5432 -p 3306:3306 -p 8080:8080 heliosdb/nano:latest
+
+# Binary release
+curl -L https://github.com/Dimensigon/HDB-HeliosDB-Nano/releases/latest/download/heliosdb-nano-$(uname -m)-$(uname -s | tr A-Z a-z).tar.gz | tar xz
 ```
 
-## Quick Start
+## Start the Server
 
-```rust
-use heliosdb_nano::EmbeddedDatabase;
+```bash
+# Persistent, all three protocols
+heliosdb-nano start --data-dir ./mydata --mysql
 
-fn main() -> heliosdb_nano::Result<()> {
-    // Persistent on disk
-    let db = EmbeddedDatabase::new("./mydb.helio")?;
-    // Or fully in-memory: EmbeddedDatabase::new_in_memory()?
+# In-memory (great for dev/test)
+heliosdb-nano start --memory --mysql
 
-    db.execute("CREATE TABLE items (id INT PRIMARY KEY, name TEXT, price DECIMAL(10,2))")?;
-    db.execute("INSERT INTO items VALUES (1, 'Widget', 9.99)")?;
-
-    let rows = db.query("SELECT * FROM items WHERE price < 20", &[])?;
-    for row in &rows {
-        println!("{:?}", row);
-    }
-
-    // Parameterized queries (bind actual values)
-    use heliosdb_nano::Value;
-    let rows = db.query_params("SELECT * FROM items WHERE id = $1", &[Value::Int4(1)])?;
-
-    Ok(())
-}
+# With auth and TLS
+heliosdb-nano start --data-dir ./mydata --mysql \
+  --auth scram-sha-256 --password s3cret \
+  --tls-cert cert.pem --tls-key key.pem
 ```
 
-> **Note:** `query()` executes SQL directly. For user-supplied values, use `query_params()` with `$1`, `$2`, ... placeholders to prevent SQL injection.
+Three servers start on one process:
 
-> HeliosDB Nano is the first embedded database with native PostgreSQL, MySQL, and SQLite API compatibility. Use your existing tools, drivers, and ORMs — zero migration required.
+| Protocol | Port | Connect |
+|----------|-----:|---------|
+| PostgreSQL wire | 5432 | `psql`, psycopg2, pgx, JDBC, Npgsql, node-postgres |
+| MySQL wire | 3306 | `mysql`, PyMySQL, SQLAlchemy, JDBC, mysql2 |
+| REST / HTTP | 8080 | `curl`, fetch, any HTTP client |
 
-## Feature Highlights
+## Triple Compatibility — Same Data, Any Client
 
-### Vector Search (HNSW + Product Quantization)
+Start the server once, then connect from any of the three interfaces. They all read and write the same tables.
 
-Native HNSW indexes with cosine, L2, and inner product distance. Optional Product Quantization for 8-16x memory reduction.
+### Interactive REPL (zero setup)
 
-```rust
-db.execute("CREATE TABLE docs (id INT PRIMARY KEY, title TEXT, embedding VECTOR(1536))")?;
-db.execute("INSERT INTO docs VALUES (1, 'Hello', '[0.1, 0.2, ...]')")?;
-
-// K-nearest-neighbor search
-let results = db.query(
-    "SELECT title, embedding <-> '[0.15, 0.25, ...]' AS distance
-     FROM docs ORDER BY embedding <-> '[0.15, 0.25, ...]' LIMIT 10",
-    &[],
-)?;
+```bash
+$ heliosdb-nano repl --data-dir ./mydata
+heliosdb> CREATE TABLE products (id SERIAL PRIMARY KEY, name TEXT, price DECIMAL(10,2));
+OK
+heliosdb> INSERT INTO products (name, price) VALUES ('Widget', 9.99), ('Gadget', 19.99);
+INSERT 2
+heliosdb> SELECT * FROM products WHERE price < 15;
+ id |  name  | price
+----+--------+-------
+  1 | Widget |  9.99
+(1 row)
 ```
 
-Distance operators: `<->` (cosine), `<~>` (L2/Euclidean), `<#>` (inner product).
+### PostgreSQL Client (`psql`)
 
-### Git-Like Branching
-
-Create isolated database branches for dev/test/A/B experiments. Copy-on-write keeps branches lightweight.
-
-```rust
-db.execute("CREATE BRANCH staging")?;
-db.execute("USE BRANCH staging")?;
-db.execute("INSERT INTO items VALUES (99, 'Test', 0.01)")?;  // isolated to staging
-db.execute("MERGE BRANCH staging INTO main")?;
-db.execute("DROP BRANCH staging")?;
+```bash
+$ psql -h 127.0.0.1 -p 5432 -U postgres
+psql (16.0, server HeliosDB Nano 3.10.0)
+postgres=# INSERT INTO products (name, price) VALUES ('Gizmo', 29.99);
+INSERT 0 1
+postgres=# SELECT COUNT(*) FROM products;
+ count
+-------
+     3
 ```
 
-### Time-Travel Queries
+### MySQL Client (`mysql`)
 
-Query any table at a previous point in time:
-
-```rust
-let history = db.query(
-    "SELECT * FROM items AS OF TIMESTAMP '2024-06-01 00:00:00'", &[],
-)?;
-// Also: AS OF TRANSACTION 12345, AS OF SCN 999999
+```bash
+$ mysql -h 127.0.0.1 -P 3306 -u root
+Server version: 8.0.35-HeliosDB-Nano
+mysql> SELECT * FROM products WHERE name LIKE 'G%';
++----+--------+-------+
+| id | name   | price |
++----+--------+-------+
+|  2 | Gadget | 19.99 |
+|  3 | Gizmo  | 29.99 |
++----+--------+-------+
+mysql> INSERT INTO products (name, price) VALUES ('Gear', 39.99);
+Query OK, 1 row affected
 ```
 
-### Encryption
+### REST API (`curl`)
 
-- **TDE**: AES-256-GCM at-rest encryption with automatic key rotation
-- **ZKE**: Zero-Knowledge Encryption (client-side, server never sees plaintext)
-- **FIPS 140-3**: Build with `--features fips` for AWS-LC certified cryptography
+```bash
+# Query
+$ curl "http://localhost:8080/rest/v1/products?price=lt.50&select=id,name,price"
+[{"id":1,"name":"Widget","price":"9.99"},{"id":2,"name":"Gadget","price":"19.99"}, ...]
 
-### Materialized Views
+# Insert
+$ curl -X POST http://localhost:8080/rest/v1/products \
+    -H 'Content-Type: application/json' \
+    -d '{"name":"Gear 2","price":49.99}'
 
-```rust
-db.execute(
-    "CREATE MATERIALIZED VIEW sales_summary AS
-     SELECT product_id, SUM(amount) AS total FROM orders GROUP BY product_id"
-)?;
-db.execute("REFRESH MATERIALIZED VIEW sales_summary")?;
+# Interactive API explorer (Swagger UI)
+$ open http://localhost:8080/docs
 ```
 
-### Additional Features
+## Vector Search
 
-- **Full SQL**: JOINs, CTEs, window functions, subqueries, set operations, aggregates, CASE, DISTINCT
-- **PL/pgSQL**: Stored procedures and functions with multi-dialect support
-- **JSONB**: Field access (`->`/`->>`), containment (`@>`), key existence (`?`)
-- **Foreign keys**: CASCADE, SET NULL, RESTRICT
-- **Triggers**: BEFORE/AFTER INSERT/UPDATE/DELETE
-- **Row-Level Security**: Column masking and row filtering per tenant
-- **EXPLAIN**: Cost-based optimizer with ANALYZE, BUFFERS, JSON/XML/YAML output
-- **Backup/Restore**: Compressed dumps (zstd/gzip/brotli), incremental backups
-- **Import/Export**: CSV, JSON, JSONL, Parquet, Arrow, SQL formats
-- **Audit logging**: Tamper-proof trail with SHA-256 checksums
+Native HNSW indexes — no extensions, no separate vector database.
+
+```sql
+-- From any client (psql / mysql / REPL):
+CREATE TABLE docs (
+    id SERIAL PRIMARY KEY,
+    title TEXT,
+    embedding VECTOR(1536)
+);
+
+CREATE INDEX ON docs USING hnsw (embedding vector_cosine_ops);
+
+INSERT INTO docs (title, embedding)
+VALUES ('Intro', '[0.1, 0.2, 0.3, ...]');
+
+-- k-NN search
+SELECT title, embedding <-> '[0.15, 0.25, ...]' AS distance
+FROM docs
+ORDER BY distance
+LIMIT 10;
+```
+
+Distance operators: `<->` (cosine), `<~>` (L2), `<#>` (inner product).
+
+Via REST:
+
+```bash
+curl -X POST http://localhost:8080/api/vectors/search \
+    -H 'Content-Type: application/json' \
+    -d '{"collection":"docs","query":[0.15,0.25],"k":5,"metric":"cosine"}'
+```
+
+## Git-Like Branching
+
+Isolated copy-on-write branches for dev, test, and A/B experiments.
+
+```sql
+CREATE BRANCH staging FROM main;
+USE BRANCH staging;
+
+-- Changes here are invisible to main
+INSERT INTO products (name, price) VALUES ('Test', 0.01);
+
+MERGE BRANCH staging INTO main;
+DROP BRANCH staging;
+```
+
+## Time-Travel Queries
+
+```sql
+-- As of a timestamp
+SELECT * FROM products AS OF TIMESTAMP '2026-04-01 12:00:00';
+
+-- As of a transaction
+SELECT * FROM products AS OF TRANSACTION 12345;
+```
+
+## Built-in Backend-as-a-Service
+
+Self-hosted Supabase/Firebase alternative — Auth, REST, Realtime, RLS in the same binary:
+
+```bash
+# Sign up
+curl -X POST http://localhost:8080/auth/v1/signup \
+    -H 'Content-Type: application/json' \
+    -d '{"email":"alice@example.com","password":"s3cret"}'
+
+# Google OAuth redirect
+open http://localhost:8080/auth/v1/authorize?provider=google
+
+# Realtime subscriptions (WebSocket)
+wscat -c ws://localhost:8080/realtime/v1/websocket
+```
+
+RLS is automatic on REST endpoints via JWT claims. See [vs-supabase](https://heliosdb.com/vs-supabase.html).
+
+## ORM & Driver Compatibility
+
+| Language | PostgreSQL driver | MySQL driver | Tested ORMs |
+|----------|------------------|--------------|-------------|
+| Python | `psycopg2`, `asyncpg` | `PyMySQL`, `mysql-connector-python` | SQLAlchemy, Django ORM |
+| Node.js | `pg`, `node-postgres` | `mysql2` | Prisma, Drizzle, TypeORM, Sequelize |
+| Java | JDBC (postgresql) | JDBC (mysql-connector-j) | Hibernate, JPA |
+| Go | `lib/pq`, `pgx` | `go-sql-driver/mysql` | GORM, ent |
+| Rust | `tokio-postgres`, `sqlx` | `mysql_async`, `sqlx` | SeaORM, Diesel |
+| PHP | PDO pgsql | `mysqli`, PDO mysql | Laravel Eloquent, WordPress |
+
+**WordPress runs natively** with standard `wpdb` — no drop-in required.
 
 ## Data Types
 
-| Type | Aliases |
-|------|---------|
-| `BOOLEAN` | `BOOL` |
-| `SMALLINT` / `INTEGER` / `BIGINT` | `INT2` / `INT4` / `INT8` |
-| `REAL` / `DOUBLE PRECISION` | `FLOAT4` / `FLOAT8` |
-| `NUMERIC` | `DECIMAL(p,s)` |
-| `TEXT` / `VARCHAR(n)` | `CHARACTER VARYING` |
-| `BYTEA` | `BLOB` |
-| `DATE` / `TIME` / `TIMESTAMP` | `TIMESTAMPTZ` |
-| `UUID` | |
-| `JSON` / `JSONB` | |
-| `VECTOR(n)` | |
-| `ARRAY` | `INT[]`, `TEXT[]` |
+All PostgreSQL types plus MySQL type aliases (automatically translated):
 
-## Server Mode
+| Canonical | Aliases |
+|-----------|---------|
+| `BOOLEAN` | `BOOL`, `TINYINT(1)` |
+| `SMALLINT` / `INTEGER` / `BIGINT` | `INT2`/`INT4`/`INT8`, `TINYINT`, `MEDIUMINT` |
+| `REAL` / `DOUBLE PRECISION` | `FLOAT4`/`FLOAT8`, `FLOAT(N)` |
+| `NUMERIC(p,s)` | `DECIMAL(p,s)` |
+| `TEXT` | `VARCHAR(n)`, `LONGTEXT`, `MEDIUMTEXT`, `TINYTEXT` |
+| `BYTEA` | `BLOB`, `LONGBLOB`, `MEDIUMBLOB` |
+| `TIMESTAMP` | `DATETIME` |
+| `SERIAL` / `BIGSERIAL` | `INT AUTO_INCREMENT`, `BIGINT AUTO_INCREMENT` |
+| `UUID`, `JSON`, `JSONB`, `VECTOR(n)`, `ARRAY` | — |
 
-HeliosDB Nano also runs as a standalone PostgreSQL-compatible server:
+## Features at a Glance
 
-```bash
-# Start server (persistent)
-heliosdb-nano start --data-dir ./mydata
-
-# Start server (in-memory)
-heliosdb-nano start --memory
-
-# With SCRAM-SHA-256 authentication
-heliosdb-nano start --data-dir ./mydata --auth scram-sha-256 --password s3cret
-
-# With TLS
-heliosdb-nano start --data-dir ./mydata --tls-cert cert.pem --tls-key key.pem
-```
-
-Connect with any PostgreSQL client:
-
-```bash
-psql -h 127.0.0.1 -p 5432
-```
-
-Works with every PostgreSQL driver and ORM: libpq, psycopg2, JDBC, Npgsql, node-postgres, etc.
-
-### MySQL Protocol
-
-Enable the MySQL wire protocol for MySQL client/ORM compatibility:
-
-```bash
-# Enable MySQL alongside PostgreSQL
-heliosdb-nano start --data-dir ./mydata --mysql
-
-# MySQL on custom address
-heliosdb-nano start --data-dir ./mydata --mysql --mysql-listen 0.0.0.0:3306
-```
-
-Connect with any MySQL client:
-
-```bash
-mysql -h 127.0.0.1 -P 3306
-```
-
-Works with MySQL drivers and ORMs: PyMySQL, mysql-connector-python, JDBC (MySQL), Sequelize, SQLAlchemy, etc.
-
-## REST API
-
-When running in server mode, an HTTP API is available on port 8080:
-
-```bash
-# Execute SQL
-curl -X POST http://localhost:8080/api/query \
-  -H 'Content-Type: application/json' \
-  -d '{"sql": "SELECT * FROM users LIMIT 10"}'
-
-# Vector search
-curl -X POST http://localhost:8080/api/vectors/search \
-  -H 'Content-Type: application/json' \
-  -d '{"collection": "docs", "query": [0.1, 0.2], "k": 5, "metric": "cosine"}'
-```
-
-Endpoints: `/api/query`, `/api/data/:table`, `/api/vectors/search`, `/api/branches`, `/api/schema`, `/health`, and more.
-
-## High Availability (Feature Flags)
-
-All HA features are optional and compiled via Cargo feature flags:
-
-```bash
-cargo build --release --features ha-standard   # tier1 + tier2 + proxy + transaction replay
-cargo build --release --features ha-full        # all HA features
-```
-
-| Flag | Description |
-|------|-------------|
-| `ha-tier1` | Warm standby: WAL streaming, automatic failover, read replicas |
-| `ha-tier2` | Multi-primary: active-active with branch-based conflict resolution |
-| `ha-tier3` | Sharding: consistent hash ring, cross-shard queries |
-| `ha-proxy` | Connection router with load balancing |
-| `ha-tr` | Transaction Replay: journaling, cursor restore, session migration |
-| `ha-standard` | Bundle: tier1 + tier2 + proxy + tr |
-| `ha-full` | All HA features |
-
-## Building from Source
-
-**Prerequisites:** Rust 1.85+, C/C++ compiler (for RocksDB). Add clang + LLVM for FIPS builds.
-
-```bash
-# Default (ring crypto + encryption + vector search)
-cargo build --release
-
-# FIPS 140-3 compliant
-cargo build --release --no-default-features --features fips,encryption,vector-search
-
-# Run tests
-cargo test --lib               # ~1400 unit tests
-cargo test --test '*'           # ~800 integration tests
-```
+- **Full SQL**: JOINs, CTEs, window functions, subqueries, set operations, aggregates, CASE
+- **PL/pgSQL**: Stored procedures and functions
+- **JSONB**: `->`, `->>`, `@>`, `?` operators
+- **Foreign keys**: CASCADE, SET NULL, RESTRICT
+- **Triggers**: BEFORE/AFTER INSERT/UPDATE/DELETE
+- **Row-Level Security**: Per-tenant data isolation via policies
+- **EXPLAIN**: Cost-based optimizer, ANALYZE, JSON/XML/YAML output
+- **Backup/Restore**: Compressed dumps (zstd/gzip/brotli)
+- **Import/Export**: CSV, JSON, JSONL, Parquet, Arrow, SQL
+- **Audit logging**: Tamper-proof trail (SHA-256 checksums)
+- **Encryption**: AES-256-GCM TDE, FIPS 140-3 mode
 
 ## Architecture
 
@@ -239,17 +239,73 @@ cargo test --test '*'           # ~800 integration tests
 | Storage engine | RocksDB (LSM-tree) |
 | Columnar format | Apache Arrow |
 | SQL parser | sqlparser-rs |
-| Vector index | HNSW (Hierarchical Navigable Small World) |
-| Encryption | AES-256-GCM / AWS-LC (FIPS) |
-| Wire protocol | PostgreSQL v3 + MySQL v10 |
+| Vector index | HNSW + Product Quantization |
+| Wire protocols | PostgreSQL v3, MySQL v10 |
 | HTTP server | Axum |
+| Encryption | AES-256-GCM, AWS-LC FIPS |
+
+## High Availability (optional features)
+
+```bash
+cargo build --release --features ha-standard   # tier1 + tier2 + proxy + TR
+cargo build --release --features ha-full       # all HA features
+```
+
+| Flag | Description |
+|------|-------------|
+| `ha-tier1` | Warm standby: WAL streaming, failover, read replicas |
+| `ha-tier2` | Multi-primary: branch-based active-active |
+| `ha-tier3` | Sharding: consistent hash ring |
+| `ha-proxy` | Connection router + load balancing |
+| `ha-tr` | Transaction Replay: journaling, cursor restore |
+
+## Deploy
+
+| Platform | Template |
+|----------|----------|
+| **Fly.io** | [deployment/flyio/](deployment/flyio/) |
+| **Railway** | [deployment/railway/](deployment/railway/) |
+| **Render** | [deployment/render/](deployment/render/) |
+| **Docker** | [deployment/docker/](deployment/docker/) |
+
+## Embedded Library (Rust)
+
+For in-process use (no network, no daemon), add the crate as a dependency:
+
+```toml
+[dependencies]
+heliosdb-nano = "3.10"
+```
+
+See **[the Rust API guide](https://docs.rs/heliosdb-nano)** for embedded usage and the [examples/](examples/) directory for working code.
 
 ## SDKs & Integrations
 
-Official client SDKs (Go, Python, TypeScript, Rust) and platform integrations (VS Code, Zapier, n8n, Retool, Make, AutoGen) are maintained in the shared repository:
+Official client SDKs (Go, Python, TypeScript, Rust) and platform integrations (VS Code, Zapier, n8n, Retool, Make, AutoGen) live in a shared repository:
 
 **[heliosdb-sdks](https://github.com/dimensigon/heliosdb-sdks)** — works with all HeliosDB editions.
 
+```bash
+# JavaScript / TypeScript (Supabase-compatible fluent API)
+npm install @heliosdb/client
+```
+
+```javascript
+import { createClient } from '@heliosdb/client'
+const db = createClient('http://localhost:8080', 'anon-key')
+const { data } = await db.from('products').select('*').lt('price', 50)
+```
+
+## Documentation
+
+- [Getting Started](https://heliosdb.com/nano.html)
+- [API Explorer (Swagger UI)](http://localhost:8080/docs) — when running locally
+- [vs Supabase](https://heliosdb.com/vs-supabase.html)
+- [vs Firebase](https://heliosdb.com/vs-firebase.html)
+- [vs PostgreSQL](https://heliosdb.com/vs-postgresql.html)
+- [vs SQLite](https://heliosdb.com/vs-sqlite.html)
+- [Migrate from MySQL](https://heliosdb.com/migrate-mysql.html)
+
 ## License
 
-[AGPL-3.0-only](LICENSE) (GNU Affero General Public License v3)
+[AGPL-3.0-only](LICENSE) — GNU Affero General Public License v3
