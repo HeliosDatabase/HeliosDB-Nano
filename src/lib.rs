@@ -276,6 +276,7 @@ pub mod multi_tenant; // Multi-tenant support
 pub mod git_integration; // Git workflow integration
 pub mod runtime; // Per-request runtime helpers (bump arena, ...)
 pub mod graph;   // Native graph adjacency lists & traversal (HelixDB-inspired)
+pub mod search;  // BM25 + hybrid search + RRF/MMR rerankers (HelixDB-inspired)
 
 // Experimental modules (require feature flags)
 // DISABLED: Sync module has compilation issues and is 85% complete
