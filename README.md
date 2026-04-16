@@ -3,7 +3,6 @@
 [![Crates.io](https://img.shields.io/crates/v/heliosdb-nano.svg)](https://crates.io/crates/heliosdb-nano)
 [![Documentation](https://docs.rs/heliosdb-nano/badge.svg)](https://docs.rs/heliosdb-nano)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
-[![CI](https://github.com/Dimensigon/HDB-HeliosDB-Nano/actions/workflows/ci.yml/badge.svg)](https://github.com/Dimensigon/HDB-HeliosDB-Nano/actions/workflows/ci.yml)
 
 **The first embedded database with native PostgreSQL, MySQL, and SQLite compatibility.** Single 47 MB binary. HNSW vector search, git-like branching, time-travel queries, AES-256-GCM encryption, built-in BaaS layer (Auth, REST API, Realtime).
 
