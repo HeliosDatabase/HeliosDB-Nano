@@ -1,8 +1,5 @@
 [workspace]
-members = [
-    ".",
-    "crates/heliosdb-proxy",
-]
+members = ["."]
 
 [package]
 name = "heliosdb-nano"
@@ -166,7 +163,7 @@ unimplemented = "warn"
 todo = "warn"
 
 [features]
-default = ["encryption", "vector-search", "ring-crypto"]
+default = ["encryption", "vector-search", "ring-crypto", "ha-tier1"]
 encryption = []
 vector-search = []
 simd = []
@@ -192,55 +189,42 @@ fips = ["dep:aws-lc-rs"]
 # =============================================================================
 # HIGH AVAILABILITY FEATURE FLAGS
 # =============================================================================
-# See docs/guides/HIGH_AVAILABILITY_OVERVIEW.md for full documentation
+# Note: For connection routing / load balancing / failover proxy, use the
+# standalone HeliosProxy binary: https://github.com/dimensigon/heliosdb-proxy
+# See docs/guides/HIGH_AVAILABILITY_OVERVIEW.md for full documentation.
 
-# HA Tier 1: Warm Standby (Active-Passive)
+# HA Tier 1: Warm Standby (Active-Passive) — ENABLED BY DEFAULT
 # - WAL streaming replication
 # - Automatic failover detection
 # - Read replica support
 ha-tier1 = []
 
-# HA Tier 2: Multi-Primary (Active-Active)
+# HA Tier 2: Multi-Primary (Active-Active) — OPTIONAL
 # - Branch-based replication (unique to HeliosDB)
 # - Vector clock conflict resolution
 # - Multi-region support
-# Requires: ha-tier1 (for fallback)
 ha-tier2 = ["ha-tier1"]
 
-# HA Tier 3: Sharding (Horizontal Scaling)
+# HA Tier 3: Sharding (Horizontal Scaling) — OPTIONAL
 # - Consistent hash ring
 # - Cross-shard query routing
 # - Dynamic resharding
 ha-tier3 = []
 
-# Innovation Features
-ha-innovations = []  # Base innovation module
+# HA-Dedup: Content-addressed deduplication across nodes — OPTIONAL
+ha-dedup = []
 
-# HeliosProxy: Connection router with load balancing
-ha-proxy = ["ha-innovations"]
+# A/B Testing: Branch-based experiment routing — OPTIONAL
+ha-ab-testing = []
 
-# TR: Transaction Replay (Oracle TAF+TAC merged)
-# - Transaction journaling and replay
-# - Cursor restoration
-# - Session migration
-ha-tr = ["ha-proxy", "ha-tier1"]
-
-# HA-Dedup: Content-addressed deduplication across nodes
-ha-dedup = ["ha-innovations"]
-
-# A/B Testing: Branch-based experiment routing
-ha-ab-testing = ["ha-innovations"]
-
-# Branch-to-Server Replication: Selective branch sync to remote servers
+# Branch-to-Server Replication: Selective branch sync to remote servers — OPTIONAL
 ha-branch-replication = ["ha-tier2"]
 
-# Convenience bundles
+# Convenience bundle: all optional HA features
 ha-full = [
     "ha-tier1", "ha-tier2", "ha-tier3",
-    "ha-innovations", "ha-proxy", "ha-tr",
     "ha-dedup", "ha-ab-testing", "ha-branch-replication"
 ]
-ha-standard = ["ha-tier1", "ha-tier2", "ha-proxy", "ha-tr"]
 
 [profile.release]
 lto = true

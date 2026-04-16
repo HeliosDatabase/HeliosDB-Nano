@@ -244,20 +244,61 @@ All PostgreSQL types plus MySQL type aliases (automatically translated):
 | HTTP server | Axum |
 | Encryption | AES-256-GCM, AWS-LC FIPS |
 
-## High Availability (optional features)
+## High Availability
+
+**Warm standby is enabled by default** — no feature flag needed. Just pass the replication flags at startup:
 
 ```bash
-cargo build --release --features ha-standard   # tier1 + tier2 + proxy + TR
-cargo build --release --features ha-full       # all HA features
+# Primary
+heliosdb-nano start --data-dir ./data --replication-role primary \
+  --standby-hosts 10.0.0.2:5433,10.0.0.3:5433
+
+# Standby
+heliosdb-nano start --data-dir ./data --replication-role standby \
+  --primary-host 10.0.0.1:5433
 ```
+
+Optional HA features (opt-in at compile time):
 
 | Flag | Description |
 |------|-------------|
-| `ha-tier1` | Warm standby: WAL streaming, failover, read replicas |
+| `ha-tier1` | Warm standby — **enabled by default** |
 | `ha-tier2` | Multi-primary: branch-based active-active |
 | `ha-tier3` | Sharding: consistent hash ring |
-| `ha-proxy` | Connection router + load balancing |
-| `ha-tr` | Transaction Replay: journaling, cursor restore |
+| `ha-dedup` | Content-addressed deduplication across nodes |
+| `ha-ab-testing` | Branch-based experiment routing |
+| `ha-branch-replication` | Selective branch sync to remote servers |
+| `ha-full` | All optional HA features bundled |
+
+```bash
+cargo build --release --features ha-full    # everything
+```
+
+### Connection Routing & Load Balancing
+
+For production deployments with multiple HeliosDB Nano instances, put **[HeliosProxy](https://github.com/dimensigon/heliosdb-proxy)** in front — a standalone binary providing:
+
+- Read/write splitting across primary + standbys
+- Automatic failover with transaction replay (Oracle TAF-style)
+- Connection pooling
+- Health checks + circuit breakers
+- TLS termination
+
+### Recommended Production Setup
+
+```
+           ┌────────────────┐
+    psql ─▶│                │──▶ HeliosDB Nano (primary, read+write)
+   mysql ─▶│  HeliosProxy   │──▶ HeliosDB Nano (standby, read-only)
+    curl ─▶│                │──▶ HeliosDB Nano (standby, read-only)
+           └────────────────┘
+              port 5432/3306/8080
+```
+
+1. Deploy 1 primary + 2 standbys (Fly.io / Render / Docker Swarm)
+2. HeliosProxy in front for routing + failover
+3. Automatic failover on primary death (< 5 s typical)
+4. Readonly queries load-balanced across standbys
 
 ## Deploy
 

@@ -293,9 +293,8 @@ pub mod git_integration; // Git workflow integration
 ))]
 pub mod replication;
 
-// HeliosProxy - Connection router and failover manager
-#[cfg(feature = "ha-proxy")]
-pub mod proxy;
+// Connection routing, load balancing, and failover proxy live in the
+// standalone HeliosProxy binary: https://github.com/dimensigon/heliosdb-proxy
 
 // Branch-Based A/B Testing
 #[cfg(feature = "ha-ab-testing")]
