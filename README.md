@@ -6,7 +6,7 @@
 
 **The first embedded database with native PostgreSQL, MySQL, and SQLite compatibility.** Single 47 MB binary. HNSW vector search, git-like branching, time-travel queries, AES-256-GCM encryption, built-in BaaS layer (Auth, REST API, Realtime).
 
-Use your existing clients (`psql`, `mysql`, `curl`) and ORMs — zero migration required.
+Use your existing clients (`psql`, `mysql`, `sqlite3`), RESTful HTTP, drivers (`psycopg2`, `mysql-connector`, `node-postgres`, JDBC), and ORMs (SQLAlchemy, Prisma, Drizzle, Hibernate, GORM) — zero migration required.
 
 ## Install
 
