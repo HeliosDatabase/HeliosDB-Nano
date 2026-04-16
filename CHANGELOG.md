@@ -5,6 +5,46 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.11.0] - 2026-04-15
+
+### Added (HelixDB-inspired integration -- 5 features)
+
+- **Per-request bump arena** (`runtime::RequestArena`, idea 3): wraps
+  `bumpalo::Bump` so transient buffers (HNSW candidate lists, scratch
+  rows, BM25 term lists) are dropped wholesale when a request finishes
+  -- amortising deallocation cost to a single `free`. New crate dep:
+  `bumpalo` (with `collections` feature).
+- **Native graph adjacency lists** (`graph::*`, idea 1): in-memory
+  `GraphStore` backed by `dashmap` with O(1) edge insert / O(1)
+  per-node neighbor lookup, plus `traverse` module implementing BFS,
+  Dijkstra (non-negative weights), and bidirectional BFS, all gated
+  by `TraversalLimits` to bound runaway queries.
+- **BM25 + hybrid search + RRF/MMR** (`search::*`, idea 2):
+  Unicode-aware tokenizer, in-memory inverted-index BM25 with
+  configurable `(k1, b)`, Reciprocal Rank Fusion + Maximal Marginal
+  Relevance rerankers, and `hybrid_search` orchestrator that fuses
+  BM25 + vector hits via RRF / MMR / weighted-linear. Deterministic
+  tie-breaks on doc_id throughout. New crate dep:
+  `unicode-segmentation`.
+- **Compiled query plans** (`sql::compiled::CompiledPlanCache`, idea
+  4): LRU-bounded cache of parser output keyed by plan name.
+  `PREPARE COMPILED <name> AS <sql>` + `EXECUTE <name>` surface
+  recognised by `parse_prepare_compiled` / `parse_execute` /
+  `try_handle_compiled`.
+- **MCP idea-5 tools + resources** (`mcp_extensions::*`, idea 5):
+  six new tools (`heliosdb_bm25_index`, `heliosdb_hybrid_search`,
+  `heliosdb_graph_add_edge`, `heliosdb_graph_traverse`,
+  `heliosdb_graph_path`, `heliosdb_embed_and_store`) plus two
+  resource resolvers (`heliosdb://schema/{table}`,
+  `heliosdb://stats/{table}`). Lives in a standalone module pending
+  the legacy `src/mcp/` server's reconciliation with current
+  EmbeddedDatabase API -- see `BLOCKER_idea_5.md`.
+
+### Tests
+
+- 43 new integration tests across 9 new test files; 56 new unit tests
+  inside the new modules. Existing 1730 lib tests continue to pass.
+
 ## [3.10.0] - 2026-04-14
 
 ### Added
