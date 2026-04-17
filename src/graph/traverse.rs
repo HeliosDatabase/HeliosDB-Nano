@@ -1,6 +1,6 @@
 //! Graph traversal algorithms.
 //!
-//! HelixDB-inspired (idea 1).
+//! RAG-native (idea 1).
 //!
 //! Implements:
 //! - BFS (k-hop neighbor enumeration)

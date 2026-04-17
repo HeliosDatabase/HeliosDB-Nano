@@ -1,6 +1,6 @@
 //! Unicode-aware tokenizer for full-text indexing.
 //!
-//! HelixDB-inspired (idea 2).
+//! RAG-native (idea 2).
 //!
 //! Splits input on Unicode word boundaries, drops anything that isn't
 //! an alphanumeric word, and lowercases the survivors. Suitable as a

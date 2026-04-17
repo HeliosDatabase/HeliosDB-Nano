@@ -7,7 +7,7 @@
 //! candidate lists, scratch row vectors, BM25 term lists, ...) be allocated
 //! without touching the global allocator on every step.
 //!
-//! HelixDB-inspired (see HELIXDB_INTEGRATION_PLAN idea 3).
+//! RAG-native (see external-project_INTEGRATION_PLAN idea 3).
 
 pub mod arena;
 

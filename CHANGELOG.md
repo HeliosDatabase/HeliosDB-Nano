@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [3.11.0] - 2026-04-15
 
-### Added (HelixDB-inspired integration -- 5 features)
+### Added (RAG-native integration -- 5 features)
 
 - **Per-request bump arena** (`runtime::RequestArena`, idea 3): wraps
   `bumpalo::Bump` so transient buffers (HNSW candidate lists, scratch

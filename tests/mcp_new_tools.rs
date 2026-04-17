@@ -1,4 +1,4 @@
-//! Integration tests for the HelixDB-inspired MCP idea-5 tools.
+//! Integration tests for the RAG-native MCP idea-5 tools.
 //!
 //! See `BLOCKER_idea_5.md` for the rationale behind testing against
 //! `mcp_extensions` rather than the legacy `mcp` module.

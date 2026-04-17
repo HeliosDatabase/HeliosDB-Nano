@@ -1,6 +1,6 @@
 //! SQL adapter for graph traversal.
 //!
-//! HelixDB-inspired (idea 1).
+//! RAG-native (idea 1).
 //!
 //! Wires the in-memory `GraphStore` up to typed SQL values so it can be
 //! called from callers that speak `crate::Value`. Full integration with

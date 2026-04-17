@@ -1,6 +1,6 @@
 //! Basic graph store tests -- create / lookup / iterate.
 //!
-//! HelixDB-inspired (idea 1).
+//! RAG-native (idea 1).
 
 use heliosdb_nano::graph::{
     storage::{Direction, Edge, GraphStore},

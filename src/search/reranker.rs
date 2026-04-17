@@ -1,6 +1,6 @@
 //! Reranking algorithms: Reciprocal Rank Fusion + Maximal Marginal Relevance.
 //!
-//! HelixDB-inspired (idea 2).
+//! RAG-native (idea 2).
 
 use std::collections::HashMap;
 

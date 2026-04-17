@@ -1,6 +1,6 @@
 //! BM25 correctness against a known small corpus.
 //!
-//! HelixDB-inspired (idea 2).
+//! RAG-native (idea 2).
 
 use heliosdb_nano::search::Bm25Index;
 

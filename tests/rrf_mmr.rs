@@ -1,6 +1,6 @@
 //! Known fusion outputs for RRF and MMR.
 //!
-//! HelixDB-inspired (idea 2).
+//! RAG-native (idea 2).
 
 use heliosdb_nano::search::{mmr_rerank, rrf_fuse, RrfParams};
 

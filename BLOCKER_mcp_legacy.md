@@ -29,7 +29,7 @@ The plan asks for the new tools/resources to be wired directly into
 
 Re-enabling `mcp` requires reconciling ~15 call sites against the
 current `EmbeddedDatabase` API. That refactor is out of scope for
-this drop -- it isn't a HelixDB integration concern, it's pre-existing
+this drop -- it isn't a external project integration concern, it's pre-existing
 API drift in the legacy MCP wrapper.
 
 ## Migration path

@@ -1,6 +1,6 @@
 //! Compiled query plan cache integration tests.
 //!
-//! HelixDB-inspired (idea 4).
+//! RAG-native (idea 4).
 
 use heliosdb_nano::sql::compiled::{parse_execute, parse_prepare_compiled, try_handle_compiled, CompiledPlanCache};
 

@@ -1,4 +1,4 @@
-//! Tool handler implementations for the HelixDB-inspired MCP extensions.
+//! Tool handler implementations for the RAG-native MCP extensions.
 
 use std::sync::Arc;
 

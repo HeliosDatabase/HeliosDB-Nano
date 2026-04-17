@@ -1,6 +1,6 @@
 //! In-memory BM25 inverted index.
 //!
-//! HelixDB-inspired (idea 2).
+//! RAG-native (idea 2).
 //!
 //! Implements Okapi BM25 with the canonical `(k1, b)` parameters. The
 //! index is in-memory and reusable: callers `add_document` once and

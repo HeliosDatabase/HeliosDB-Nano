@@ -1,6 +1,6 @@
 //! SQL adapter integration tests for the graph module.
 //!
-//! HelixDB-inspired (idea 1).
+//! RAG-native (idea 1).
 
 use heliosdb_nano::graph::{
     sql,

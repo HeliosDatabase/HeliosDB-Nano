@@ -1,6 +1,6 @@
 //! Native graph adjacency-list storage and traversal.
 //!
-//! HelixDB-inspired (idea 1 of the integration plan).
+//! RAG-native (idea 1 of the integration plan).
 //!
 //! ## Design
 //!
@@ -15,7 +15,7 @@
 //! the graph CFs into the single-DB layout would require an engine-wide
 //! migration. The graph store is therefore an in-process manager that
 //! callers can warm from an external source (e.g. a SQL table) on
-//! startup. See the plan note in HELIXDB_INTEGRATION_PLAN.md.
+//! startup. See the plan note in external-project_INTEGRATION_PLAN.md.
 //!
 //! ## Public surface
 //!

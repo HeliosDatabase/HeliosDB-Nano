@@ -275,16 +275,16 @@ pub mod ai; // AI/NL query module
 pub mod multi_tenant; // Multi-tenant support
 pub mod git_integration; // Git workflow integration
 pub mod runtime; // Per-request runtime helpers (bump arena, ...)
-pub mod graph;   // Native graph adjacency lists & traversal (HelixDB-inspired)
-pub mod search;  // BM25 + hybrid search + RRF/MMR rerankers (HelixDB-inspired)
+pub mod graph;   // Native graph adjacency lists & traversal (RAG-native)
+pub mod search;  // BM25 + hybrid search + RRF/MMR rerankers (RAG-native)
 // NOTE: `mcp` module exists on disk but its server.rs / tools.rs reference
 // EmbeddedDatabase methods (query_branch, execute_branch, merge_branches,
 // query_at_timestamp, ...) that no longer exist on the current API. Enabling
-// it would require an mcp-wide refactor that's out of scope. The HelixDB
+// it would require an mcp-wide refactor that's out of scope. The external project
 // idea-5 tool *handlers* live in `mcp_extensions` instead and can be
 // folded back into the legacy mcp module once the upstream API drift is
 // reconciled. See BLOCKER_idea_5.md for details.
-pub mod mcp_extensions; // Standalone MCP idea-5 tool handlers (HelixDB-inspired)
+pub mod mcp_extensions; // Standalone MCP idea-5 tool handlers (RAG-native)
 
 // Experimental modules (require feature flags)
 // DISABLED: Sync module has compilation issues and is 85% complete

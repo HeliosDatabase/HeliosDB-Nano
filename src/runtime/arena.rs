@@ -25,10 +25,10 @@
 //! - Centralises configuration knobs (initial capacity, reset policy).
 //! - Provides telemetry hooks (`bytes_allocated`, `chunk_count`).
 //! - Lets callers reset and reuse a single arena across requests, which
-//!   keeps already-warmed memory chunks live (a common HelixDB pattern).
+//!   keeps already-warmed memory chunks live (a common external project pattern).
 //! - Future-proof: swap the underlying allocator without touching callers.
 //!
-//! HelixDB-inspired (see HELIXDB_INTEGRATION_PLAN idea 3).
+//! RAG-native (see external-project_INTEGRATION_PLAN idea 3).
 
 use bumpalo::Bump;
 

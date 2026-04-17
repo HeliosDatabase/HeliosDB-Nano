@@ -1,6 +1,6 @@
 //! End-to-end hybrid search assertions.
 //!
-//! HelixDB-inspired (idea 2).
+//! RAG-native (idea 2).
 
 use heliosdb_nano::search::hybrid::bm25_hits;
 use heliosdb_nano::search::{hybrid_search, Bm25Index, FusionMethod, ScoredHit};

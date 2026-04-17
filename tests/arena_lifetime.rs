@@ -1,6 +1,6 @@
 //! Lifetime / drop semantics tests for `runtime::RequestArena`.
 //!
-//! HelixDB-inspired (idea 3 of the integration plan).
+//! RAG-native (idea 3 of the integration plan).
 
 use heliosdb_nano::runtime::{
     arena::{string_with_capacity_in, vec_with_capacity_in, ArenaVec},

@@ -1,6 +1,6 @@
 //! Adjacency-list graph store.
 //!
-//! HelixDB-inspired (idea 1).
+//! RAG-native (idea 1).
 
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};

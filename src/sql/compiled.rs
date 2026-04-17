@@ -1,6 +1,6 @@
 //! Compiled query-plan cache.
 //!
-//! HelixDB-inspired (idea 4 of the integration plan).
+//! RAG-native (idea 4 of the integration plan).
 //!
 //! Caches the *output of parsing* (a `sqlparser::ast::Statement`) so
 //! subsequent executions of the same SQL skip the lexer+parser pass.

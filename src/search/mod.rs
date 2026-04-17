@@ -1,6 +1,6 @@
 //! Full-text + hybrid search.
 //!
-//! HelixDB-inspired (idea 2 of the integration plan).
+//! RAG-native (idea 2 of the integration plan).
 //!
 //! ## Modules
 //!

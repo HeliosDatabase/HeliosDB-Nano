@@ -1,4 +1,4 @@
-//! HelixDB-inspired MCP tool handlers (idea 5).
+//! RAG-native MCP tool handlers (idea 5).
 //!
 //! These handlers are designed to be folded into the existing
 //! `crate::mcp` server once that module's API drift against

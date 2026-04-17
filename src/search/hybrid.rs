@@ -1,6 +1,6 @@
 //! Hybrid (BM25 + vector) search orchestration.
 //!
-//! HelixDB-inspired (idea 2).
+//! RAG-native (idea 2).
 
 use super::bm25::{Bm25Index, Bm25Score};
 use super::reranker::{mmr_rerank, rrf_fuse, RrfParams};
