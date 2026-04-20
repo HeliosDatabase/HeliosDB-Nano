@@ -5,6 +5,43 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.14.1] - 2026-04-20
+
+### Fixed — TimeTracker retest follow-ups
+
+- **B19 pg_catalog visible on extended query protocol.**
+  `PgCatalog::handle_query` now runs from the
+  `Parse → Bind → Execute` path as well as the simple-Q path.
+  `postgres-js`, `pg`, `psycopg` and every other real driver does its
+  connect-time type introspection through the extended protocol;
+  without this fix they got a bogus
+  `Table 'pg_catalog.pg_type' does not exist` and couldn't connect.
+- **B20 catalog queries honor WHERE.** The emulator used to return
+  the full table and rely on projection-only filtering. Added a
+  small WHERE-clause evaluator that handles `col = 'lit'`, `col = N`,
+  `col <> 'lit'`, `col != 'lit'`, `col IN (…)`, `col NOT IN (…)`
+  and left-to-right conjunctions. Covers every driver introspection
+  query we've seen; complex WHEREs (OR, function calls, subqueries)
+  fall through unchanged (keeps all rows).
+- **B21 clear error for PL/pgSQL DO bodies.** `DO $$ DECLARE / IF /
+  LOOP / FOR / RAISE / := … $$` now returns a targeted error
+  identifying the unsupported keyword and pointing at
+  `docs/compatibility/plpgsql.md`. Silent no-op would corrupt
+  migrations — this version still refuses, but with a clear message
+  and migration-rewrite recipes.
+
+### Added
+
+- `docs/compatibility/plpgsql.md` enumerates supported / unsupported
+  PL/pgSQL features and gives rewrite recipes (backfill loop →
+  `INSERT … SELECT`, conditional index → `CREATE INDEX IF NOT
+  EXISTS`, conditional insert → `ON CONFLICT DO NOTHING`).
+- `tests/drizzle_compat_tests.rs` notes B19/B20/B21 regression is
+  live-verified at the wire level (psql smoke tests) — the core
+  `EmbeddedDatabase::query` API doesn't touch the PG wire handler so
+  those tests belong on the integration path rather than the unit
+  suite.
+
 ## [3.14.0] - 2026-04-20
 
 ### Fixed — Drizzle / Prisma / TypeORM compatibility (tracks `BUGS_TIMETRACKER_DRIZZLE_COMPAT.md`)

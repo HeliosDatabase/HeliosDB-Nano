@@ -49,30 +49,34 @@ Stock PostgreSQL 16 is the reference behaviour in every example below.
 
 ## Status overview
 
-Three columns:
+Four columns:
 - **3.13.x** — state before any of this work
-- **3.14.0 @ ba6f16d** — version bumped, fixes not yet on the built commit (the reporter's first retest)
-- **3.14.0 WT** — current working tree (after Sprint-1..4), verified via psql on a fresh `cargo build --release` 2026-04-20 afternoon
+- **3.14.0 @ ba6f16d** — version bumped, fixes not yet on the built commit (reporter's first retest)
+- **3.14.0 @ 88165aa** — Sprint-1..4 commit (reporter's second retest)
+- **3.14.1** — third round (B19 / B20 / B21)
 
-| ID  | Feature                               | Severity | 3.13.x   | 3.14.0 @ ba6f16d | 3.14.0 WT |
-|-----|---------------------------------------|----------|----------|------------------|-----------|
-| B1  | `SERIAL` auto-increment               | blocker  | failing  | **fixed**        | **fixed** |
-| B2  | `GENERATED ALWAYS AS IDENTITY`        | blocker  | failing  | **fixed**        | **fixed** |
-| B3  | `DEFAULT` keyword in `INSERT VALUES`  | blocker  | failing  | unchanged        | **fixed** |
-| B4  | `RETURNING` clause                    | blocker  | failing  | **worse**        | **fixed** |
-| B5  | `EXTRACT(EPOCH FROM <timestamp>)`     | blocker  | failing  | unchanged        | **fixed** |
-| B7  | `CREATE SEQUENCE`                     | major    | failing  | unchanged        | **fixed** |
-| B8  | `nextval()` / `currval()` / `setval()`| major    | failing  | unchanged        | **fixed** |
-| B9  | `DO $$ … END $$` / plain-SQL bodies   | major    | failing  | unchanged        | **fixed** (no PL/pgSQL control flow) |
-| B10 | Dollar-quoted string literals         | major    | failing  | unchanged        | **fixed** |
-| B11 | Multi-statement simple queries        | major    | failing  | unchanged        | **fixed** |
-| B12 | `pg_catalog.pg_type` missing          | major    | failing  | unchanged        | **fixed** |
-| B13 | `pg_tables` / `information_schema`    | major    | failing  | unchanged        | **fixed** |
-| B14 | Identifier case-folding               | major    | failing  | unchanged        | **fixed** (with SQL-standard caveat — see below) |
-| B15 | `gen_random_uuid()`                   | minor    | failing  | unchanged        | **fixed** |
-| B16 | `version()`                           | minor    | failing  | fixed (stale)    | **fixed** (reports 3.14.0) |
-| B17 | Startup banner capability advertising | minor    | open     | unchanged        | **fixed** (banner + `SELECT heliosdb_capability_report()`) |
-| B18 | Failed `RETURNING` corrupts rows      | blocker  | —        | **new**          | **fixed** (resolved by B4 fix) |
+| ID  | Feature                               | Severity | 3.13.x   | 3.14.0 @ ba6f16d | 3.14.0 @ 88165aa          | 3.14.1    |
+|-----|---------------------------------------|----------|----------|------------------|---------------------------|-----------|
+| B1  | `SERIAL` auto-increment               | blocker  | failing  | **fixed**        | **fixed**                 | **fixed** |
+| B2  | `GENERATED ALWAYS AS IDENTITY`        | blocker  | failing  | **fixed**        | **fixed**                 | **fixed** |
+| B3  | `DEFAULT` keyword in `INSERT VALUES`  | blocker  | failing  | unchanged        | **fixed**                 | **fixed** |
+| B4  | `RETURNING` clause                    | blocker  | failing  | **worse**        | **fixed**                 | **fixed** |
+| B5  | `EXTRACT(EPOCH FROM <timestamp>)`     | blocker  | failing  | unchanged        | **fixed**                 | **fixed** |
+| B7  | `CREATE SEQUENCE`                     | major    | failing  | unchanged        | **fixed**                 | **fixed** |
+| B8  | `nextval()` / `currval()` / `setval()`| major    | failing  | unchanged        | **fixed**                 | **fixed** |
+| B9  | `DO $$ … END $$` / plain-SQL bodies   | major    | failing  | unchanged        | **fixed** (plain-SQL only)| **fixed** |
+| B10 | Dollar-quoted string literals         | major    | failing  | unchanged        | **fixed**                 | **fixed** |
+| B11 | Multi-statement simple queries        | major    | failing  | unchanged        | **fixed**                 | **fixed** |
+| B12 | `pg_catalog.pg_type` missing          | major    | failing  | unchanged        | **fixed** (simple-Q only) | **fixed** (ext Q too) |
+| B13 | `pg_tables` / `information_schema`    | major    | failing  | unchanged        | **fixed**                 | **fixed** |
+| B14 | Identifier case-folding               | major    | failing  | unchanged        | **fixed** (PG-standard caveat) | **fixed** |
+| B15 | `gen_random_uuid()`                   | minor    | failing  | unchanged        | **fixed**                 | **fixed** |
+| B16 | `version()`                           | minor    | failing  | fixed (stale)    | **fixed** (3.14.0)        | **fixed** (3.14.1) |
+| B17 | Startup banner capability advertising | minor    | open     | unchanged        | **fixed**                 | **fixed** |
+| B18 | Failed `RETURNING` corrupts rows      | blocker  | —        | **new**          | **fixed** (via B4)        | **fixed** |
+| B19 | pg_catalog via extended Q protocol    | blocker  | —        | —                | **new**                   | **fixed** |
+| B20 | Catalog WHERE filter ignored          | blocker  | —        | —                | **new**                   | **fixed** (=, <>, !=, IN, NOT IN, AND) |
+| B21 | DO block DECLARE / FOR / IF (PL/pgSQL)| major    | —        | —                | **new**                   | **fixed** (clear error + migration recipes in docs/compatibility/plpgsql.md) |
 
 ---
 
@@ -494,8 +498,194 @@ working tree. This section is kept for historical reference.
 
 ---
 
+## Third retest (2026-04-20 evening) — rebuilt from commit `88165aa`
+
+Binary rebuilt from the freshly-committed `feat/v3.11.0-integration` tip
+(`88165aa feat(nano): v3.14.0 — Drizzle/Prisma/TypeORM compat + FTS + …`),
+image retagged `heliosdb-nano:3.14.0`, ttm-db recreated on a fresh
+`ttm_db_data` volume. `SELECT version()` now correctly reports
+`HeliosDB Nano 3.14.0`.
+
+Findings from running the actual TimeTracker app against this build:
+
+### psql-level smoke tests all pass
+
+```sql
+-- B4 / B18 (RETURNING + no corruption)
+INSERT INTO "users" ("email","password") VALUES ('a@b.c','pw') RETURNING *;
+--  id | email | password | created_at
+-- ----+-------+----------+------------
+--   1 | a@b.c | pw       |
+SELECT * FROM "users";  -- works, no "Column index out of bounds"
+
+-- B12 (pg_catalog.pg_type)
+SELECT typname FROM pg_catalog.pg_type LIMIT 5;  -- returns 12 rows ✓
+-- B13 (pg_tables)
+SELECT tablename FROM pg_tables;  -- returns all user tables ✓
+-- B16 (version)
+SELECT version();  -- PostgreSQL 16.0 (HeliosDB Nano 3.14.0) ✓
+```
+
+### B19 (NEW) — `pg_catalog.pg_type` is unreachable on the extended query protocol
+
+**Severity:** blocker — every `postgres-js` connect still fails, and
+every ORM that uses prepared statements (Drizzle, Prisma, TypeORM,
+`pg` with `pool.query(text, params)`) hits the same path.
+
+**Symptom.** `psql -c` (simple query protocol, one `Q` message) can
+read `pg_catalog.pg_type`. The exact same SQL via the extended query
+protocol (`Parse` → `Bind` → `Execute`, which is what every real driver
+uses by default) returns:
+
+```
+PostgresError: Query execution error: Table 'pg_catalog.pg_type' does not exist
+  code: 'XX000', severity_local: 'ERROR'
+```
+
+**Minimal reproducer** (run from inside the ttm container image —
+`postgres` 3.4.5 with default options):
+
+```js
+import postgres from "postgres";
+const sql = postgres("postgres://postgres@ttm-db:5432/heliosdb", { ssl: false });
+
+// simple query (works)
+//   n/a — postgres-js always goes through extended protocol for tagged templates
+
+// extended query (fails)
+await sql`select typname from pg_catalog.pg_type limit 3`;
+// PostgresError: Query execution error: Table 'pg_catalog.pg_type' does not exist
+```
+
+Same SQL via `psql -c` against the same server succeeds:
+```
+$ psql … -c "select typname from pg_catalog.pg_type limit 3"
+ typname
+---------
+ bool
+ int8
+ int2
+```
+
+So `pg_catalog.pg_type` exists, but only for the simple query path.
+The Parse/Bind path resolves catalog names from a different place and
+still reports the table missing.
+
+**Why `postgres-js` hits this.** On first connect, the driver runs:
+
+```sql
+select b.oid, b.typarray
+from pg_catalog.pg_type a
+left join pg_catalog.pg_type b on b.oid = a.typelem
+where a.typcategory = 'A'
+group by b.oid, b.typarray
+order by b.oid
+```
+
+to build its array-type map. That query is issued via the extended
+protocol and errors out with the "table does not exist" message above.
+The app crashes before it can serve a single request. The connection
+never completes, so the stderr is an *unhandled* `PostgresError` —
+TimeTracker's Express process exits.
+
+### B20 (NEW, probably the same root cause) — extended-protocol result shape ignores SELECT list
+
+When the query above *does* make it through (psql / simple protocol),
+the server returns **more columns than the SELECT list asks for**:
+
+Requested (postgres-js query):
+```sql
+select b.oid, b.typarray from pg_catalog.pg_type a
+left join pg_catalog.pg_type b on b.oid = a.typelem
+where a.typcategory = 'A' group by b.oid, b.typarray order by b.oid
+```
+
+Actual psql output:
+```
+ oid  |  typname  | typnamespace | typlen | typtype
+------+-----------+--------------+--------+---------
+   16 | bool      |           11 |      1 | b
+ …
+```
+(5 columns: `oid, typname, typnamespace, typlen, typtype` — not the
+2 columns — `b.oid, b.typarray` — requested; the `LEFT JOIN`,
+`WHERE a.typcategory = 'A'`, `GROUP BY`, and `ORDER BY` are all
+ignored too; the full `pg_catalog.pg_type` contents are dumped as-is.)
+
+A driver that trusts `RowDescription` vs `DataRow` field counts will
+raise "unexpected field count in D message" (this is how B4 used to
+manifest).
+
+**What this likely shares with B19.** Both point at a `pg_catalog`
+code path that:
+- doesn't register the catalog relation with the extended-protocol
+  Parse/Bind resolver, and
+- returns a canned "all columns, all rows" result from a pre-built
+  table rather than honouring the SELECT list, projection, joins,
+  or predicates.
+
+### B21 (NEW) — `DO $$ … DECLARE x RECORD; BEGIN … END $$` still unsupported
+
+The fix for B9 accepts `DO $$ <plain SQL> $$` but not the
+full-PL/pgSQL cases TimeTracker's migration `0003_add_workspaces.sql`
+actually uses (a `DECLARE u RECORD;` + `FOR u IN SELECT … LOOP` body
+for per-user workspace backfill).
+
+**Reproducer (2026-04-20 evening):**
+```sql
+DO $$
+DECLARE
+  u RECORD;
+  ws_id integer;
+BEGIN
+  FOR u IN SELECT id, email FROM users LOOP
+    INSERT INTO workspaces (name, owner_id)
+      VALUES (split_part(u.email, '@', 1), u.id);
+  END LOOP;
+END $$;
+```
+
+Actual:
+```
+psql:/tmp/m.sql:65: ERROR:  SQL parse error: Failed to parse SQL:
+  sql parser error: Expected: CURSOR, found: RECORD at Line: 2, Column: 5
+```
+
+The status table at the top of this doc calls B9 "fixed (no PL/pgSQL
+control flow)". That's accurate as far as it goes — but TimeTracker's
+real migration needs `DECLARE … RECORD` + `FOR … LOOP`, which hits the
+above parse error. On a fresh DB this is a no-op (no users to
+backfill), so TimeTracker continues to work — but tracking it here so
+a real data-migration scenario isn't blocked later.
+
+---
+
+## Status of the TimeTracker deployment after 3.14.0 @ 88165aa
+
+- `heliosdb-nano:3.14.0` rebuilt from `88165aa` (tree), `version()`
+  reports `HeliosDB Nano 3.14.0`, `pg_type` / `pg_tables` accessible
+  via `psql` (simple query protocol).
+- Migrations 0000–0002 apply cleanly. 0003 applies everything except
+  the `DO $$` PL/pgSQL backfill (B21) — no-op on a fresh DB.
+- **TimeTracker still cannot connect** because `postgres-js`'s
+  mandatory startup introspection goes through the extended query
+  protocol and hits **B19**.
+
+Until B19/B20 are resolved, the only way to run a standard
+`postgres-js` / Drizzle / Prisma / TypeORM stack is to disable type
+introspection client-side (e.g. `fetch_types: false`), which is a
+workaround we were explicitly asked not to apply.
+
+---
+
 ## Closing
 
 Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.0` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
 
 B18 in particular is worth a hardening test: any attempt to verify a B4 fix should also assert that `SELECT *` against the table after the failing INSERT still works.
+
+B19 and B20 are worth a paired test: any `pg_catalog` relation that
+answers simple-protocol `psql -c "…"` must also answer the same SQL
+via `Parse/Bind/Execute` and must honour the SELECT list + predicates.
+A minimal test harness using `node-postgres` with
+`client.query({ text, values: [] })` (extended protocol) catches both.

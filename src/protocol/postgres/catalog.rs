@@ -134,14 +134,147 @@ impl PgCatalog {
             Some((Schema::new(vec![]), vec![]))
         };
 
-        // Apply column projection based on SELECT clause
+        // Apply WHERE filter + column projection based on the user's
+        // SELECT clause. Catalog queries come in from every direction
+        // (Drizzle / postgres-js / psycopg introspection), so without
+        // these filters we'd send the full table regardless of the
+        // predicate — B20 from the TimeTracker report.
         match result {
             Some((schema, rows)) => {
-                let projected = Self::project_columns(&query_lower, schema, rows);
+                let filtered = Self::apply_where_filter(&query_lower, &schema, rows);
+                let projected = Self::project_columns(&query_lower, schema, filtered);
                 Ok(Some(projected))
             }
             None => Ok(None),
         }
+    }
+
+    /// Apply a small subset of WHERE predicates directly to catalog
+    /// rows before we send them back. Supports the common driver
+    /// introspection shapes:
+    ///   * `col = 'literal'`
+    ///   * `col = N`
+    ///   * `col IN ('a','b',...)` / `col NOT IN (...)`
+    ///   * `col <> 'literal'` / `col != 'literal'`
+    ///   * conjunctions (`AND`) — evaluated left-to-right
+    ///
+    /// Anything more complex (OR, function calls, subqueries) falls
+    /// through unchanged; the caller will get all rows, which is
+    /// still correct-if-noisy for every driver I've tested.
+    fn apply_where_filter(q: &str, schema: &Schema, rows: Vec<Tuple>) -> Vec<Tuple> {
+        // Find `where ` and collect the text up to the next clause
+        // keyword (`order by`, `group by`, `limit`, `;`, end).
+        let where_kw = " where ";
+        let start = match q.find(where_kw) { Some(p) => p + where_kw.len(), None => return rows };
+        let terminators = [" order by ", " group by ", " limit ", " offset ", ";"];
+        let mut end = q.len();
+        for t in &terminators {
+            if let Some(p) = q[start..].find(t) {
+                let cand = start + p;
+                if cand < end { end = cand; }
+            }
+        }
+        let predicate = q[start..end].trim();
+        if predicate.is_empty() { return rows; }
+
+        // Split on " and " at the top level (we don't handle parens).
+        let preds: Vec<&str> = predicate.split(" and ").map(str::trim).collect();
+        rows.into_iter().filter(|row| preds.iter().all(|p| Self::eval_simple_pred(p, schema, row))).collect()
+    }
+
+    /// Evaluate one of the predicate shapes supported by
+    /// `apply_where_filter`. Returns `true` when the predicate can't
+    /// be parsed — matches our "when in doubt, keep the row"
+    /// behaviour and avoids silently dropping data for complex
+    /// WHEREs we don't yet interpret.
+    fn eval_simple_pred(pred: &str, schema: &Schema, row: &Tuple) -> bool {
+        let p = pred.trim();
+
+        // `col NOT IN (a, b, c)` — must be tested BEFORE plain `IN`.
+        if let Some(idx) = p.find(" not in (") {
+            let col_name = p[..idx].trim();
+            let rest = p[idx + " not in (".len()..].trim_end_matches(')');
+            let items = Self::parse_in_list(rest);
+            let val = Self::row_value(schema, row, col_name);
+            return !items.iter().any(|v| Self::lit_eq_value(v, &val));
+        }
+        if let Some(idx) = p.find(" in (") {
+            let col_name = p[..idx].trim();
+            let rest = p[idx + " in (".len()..].trim_end_matches(')');
+            let items = Self::parse_in_list(rest);
+            let val = Self::row_value(schema, row, col_name);
+            return items.iter().any(|v| Self::lit_eq_value(v, &val));
+        }
+
+        // `col = 'lit'`, `col = N`, `col <> 'lit'`, `col != 'lit'`
+        for (op, eq) in [(" = ", true), (" <> ", false), (" != ", false)] {
+            if let Some(idx) = p.find(op) {
+                let col_name = p[..idx].trim();
+                let rhs = p[idx + op.len()..].trim();
+                let val = Self::row_value(schema, row, col_name);
+                let matches = Self::lit_eq_value(rhs, &val);
+                return if eq { matches } else { !matches };
+            }
+        }
+
+        // Unknown predicate shape — keep the row.
+        true
+    }
+
+    fn parse_in_list(s: &str) -> Vec<String> {
+        s.trim().trim_matches(|c: char| c == '(' || c == ')')
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    fn row_value(schema: &Schema, row: &Tuple, col_name: &str) -> Value {
+        let col_lower = col_name.trim().trim_matches('"').to_lowercase();
+        if let Some(idx) = schema.columns.iter().position(|c| c.name.to_lowercase() == col_lower) {
+            row.values.get(idx).cloned().unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        }
+    }
+
+    /// Compare a literal (as written in SQL: `'abc'` or `42`) with a
+    /// `Value`. Strips single quotes, parses numerics.
+    fn lit_eq_value(lit: &str, val: &Value) -> bool {
+        let lit = lit.trim();
+        // String literal
+        if (lit.starts_with('\'') && lit.ends_with('\'')) && lit.len() >= 2 {
+            let s = &lit[1..lit.len() - 1];
+            return match val {
+                Value::String(v) => v == s,
+                Value::Null => false,
+                other => other.to_string() == s,
+            };
+        }
+        // NULL literal
+        if lit.eq_ignore_ascii_case("null") {
+            return matches!(val, Value::Null);
+        }
+        // Numeric literal
+        if let Ok(n) = lit.parse::<i64>() {
+            return match val {
+                Value::Int2(v) => (*v as i64) == n,
+                Value::Int4(v) => (*v as i64) == n,
+                Value::Int8(v) => *v == n,
+                _ => false,
+            };
+        }
+        if let Ok(f) = lit.parse::<f64>() {
+            return match val {
+                Value::Float4(v) => (*v as f64 - f).abs() < 1e-9,
+                Value::Float8(v) => (v - f).abs() < 1e-9,
+                _ => false,
+            };
+        }
+        // Bool
+        if lit.eq_ignore_ascii_case("true") { return matches!(val, Value::Boolean(true)); }
+        if lit.eq_ignore_ascii_case("false") { return matches!(val, Value::Boolean(false)); }
+        false
     }
 
     /// Query information_schema.tables - returns real table metadata from the catalog

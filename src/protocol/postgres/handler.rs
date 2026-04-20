@@ -39,7 +39,7 @@ pub struct PgConnectionHandler<S = BufWriter<TcpStream>> {
     stream: S,
     pub(super) database: Arc<EmbeddedDatabase>,
     auth_manager: Arc<AuthManager>,
-    catalog: PgCatalog,
+    pub(super) catalog: PgCatalog,
     pub(super) prepared_statements: PreparedStatementManager,
     authenticated: bool,
     transaction_status: TransactionStatus,
@@ -1064,6 +1064,23 @@ where
         // (open/close anonymous PL/pgSQL block) are moot once we're
         // just running plain statements sequentially.
         let trimmed = pg_strip_begin_end(body.trim());
+
+        // If the body uses real PL/pgSQL control flow (DECLARE, IF,
+        // LOOP, FOR … IN SELECT … LOOP, RAISE, variables with `:=`,
+        // etc.), we can't execute it — only plain-SQL bodies are
+        // supported in this version. Surface a clear error so the
+        // caller knows to either rewrite the migration as plain SQL
+        // or to skip this hunk and run it manually — DO NOT silently
+        // succeed, which would corrupt migrations.
+        if let Some(kw) = pg_detect_plpgsql(trimmed) {
+            return Err(Error::query_execution(format!(
+                "PL/pgSQL control flow (`{kw}`) inside DO blocks is not yet \
+                 supported in HeliosDB Nano. Rewrite the block as plain SQL, \
+                 or execute each statement separately. \
+                 See: docs/compatibility/plpgsql.md"
+            )));
+        }
+
         let statements = pg_split_sql_respecting_quotes(trimmed);
 
         if statements.is_empty() {
@@ -1444,6 +1461,51 @@ fn pg_split_sql_respecting_quotes(sql: &str) -> Vec<String> {
 fn pg_looks_like_do_block(trimmed: &str) -> bool {
     let upper = trimmed.trim_start().to_ascii_uppercase();
     upper.starts_with("DO $") || upper.starts_with("DO LANGUAGE ")
+}
+
+/// Scan a DO-block body for PL/pgSQL control-flow tokens we can't
+/// interpret. Returns `Some(keyword)` when one is found, so the
+/// caller can put the offending token into the error message.
+///
+/// Kept simple on purpose — whole-word, case-insensitive substring
+/// check. Will miss the occasional corner case (`IF` inside a string
+/// literal), but those are false positives that lead to a clear
+/// error rather than silent data issues.
+fn pg_detect_plpgsql(body: &str) -> Option<&'static str> {
+    let upper = body.to_ascii_uppercase();
+    // Whole-word matches — bracket each keyword with a non-alnum
+    // lookalike by padding the haystack.
+    let padded = format!(" {upper} ");
+    const KEYWORDS: &[&str] = &[
+        " DECLARE ", " IF ", " LOOP ", " FOR ",
+        " WHILE ", " RAISE ", " RETURN ", " PERFORM ",
+        " EXCEPTION ", " EXIT ", " CONTINUE ",
+    ];
+    for kw in KEYWORDS {
+        if padded.contains(kw) {
+            // Strip the leading/trailing spaces for the error message.
+            let trimmed: &str = kw.trim();
+            return Some(match trimmed {
+                "DECLARE" => "DECLARE",
+                "IF" => "IF",
+                "LOOP" => "LOOP",
+                "FOR" => "FOR",
+                "WHILE" => "WHILE",
+                "RAISE" => "RAISE",
+                "RETURN" => "RETURN",
+                "PERFORM" => "PERFORM",
+                "EXCEPTION" => "EXCEPTION",
+                "EXIT" => "EXIT",
+                "CONTINUE" => "CONTINUE",
+                _ => "plpgsql",
+            });
+        }
+    }
+    // Also catch the `:=` assignment operator.
+    if body.contains(":=") {
+        return Some(":=");
+    }
+    None
 }
 
 /// Extract the text between the opening and closing `$tag$` markers

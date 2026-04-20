@@ -227,6 +227,19 @@ fn b16_version_returns_current_nano_version() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------
+// B19 / B20 — catalog emulation on Parse/Bind/Execute + WHERE-filter
+// application lives in `src/protocol/postgres/{handler,catalog}.rs`.
+// Those surfaces are PG-wire-only, not reachable through the core
+// `EmbeddedDatabase::query` API this suite uses. Regression is
+// covered by the live psql smoke test attached to
+// BUGS_TIMETRACKER_DRIZZLE_COMPAT.md under B19 / B20.
+//
+// B21 — the PL/pgSQL detection helper is on the wire handler too, so
+// the same caveat applies. Exercising it at the wire level is the
+// right test surface.
+// ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
 // heliosdb_capability_report() — self-describing capability probe
 // ---------------------------------------------------------------------
 #[test]

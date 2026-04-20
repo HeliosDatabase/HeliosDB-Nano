@@ -45,11 +45,25 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // actually returns rows — SQLAlchemy's psycopg dialect calls
         // `_row_as_tuple_getter` on that metadata and raises
         // NotImplementedError if it's missing.
-        let result_schema = match self.derive_result_schema(&statement) {
-            Ok(schema) => schema,
-            Err(e) => {
-                tracing::debug!("Schema derivation failed (falling back to AST): {}", e);
-                Self::synthesise_schema_from_ast(&statement)
+        // Catalog-first derivation: if this is a SELECT against
+        // pg_catalog / information_schema, get the schema from our
+        // catalog emulator so Describe returns the right
+        // RowDescription. Otherwise fall through to plan-based
+        // derivation + the AST-based fallback.
+        let catalog_schema = self.catalog
+            .handle_query(&query)
+            .ok()
+            .flatten()
+            .map(|(schema, _)| schema);
+        let result_schema = if let Some(s) = catalog_schema {
+            Some(s)
+        } else {
+            match self.derive_result_schema(&statement) {
+                Ok(schema) => schema,
+                Err(e) => {
+                    tracing::debug!("Schema derivation failed (falling back to AST): {}", e);
+                    Self::synthesise_schema_from_ast(&statement)
+                }
             }
         };
 
@@ -194,6 +208,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         };
 
         if is_select {
+            // Catalog fast path — `pg_catalog.pg_type` and friends must
+            // resolve on the extended query protocol too, not just on
+            // simple-Q. `postgres-js`, `pg`, `psycopg` all do their
+            // connect-time type introspection through Parse / Bind /
+            // Execute; without this route, every driver gets a
+            // spurious `Table 'pg_catalog.pg_type' does not exist`.
+            if let Some(catalog_result) = self.catalog.handle_query(&executed_query)? {
+                // Mark the portal complete and emit DataRows + CommandComplete
+                // directly against the catalog-emulated result.
+                self.prepared_statements.update_portal_state(
+                    &portal_name,
+                    PortalState::Complete,
+                )?;
+                for row in &catalog_result.1 {
+                    let values = super::handler::tuple_to_pg_values(row);
+                    self.send_message(BackendMessage::DataRow { values }).await?;
+                }
+                let tag = format!("SELECT {}", catalog_result.1.len());
+                self.send_command_complete(&tag).await?;
+                return Ok(());
+            }
+
             // SELECT query - return result set
             let results = self.database.query(&executed_query, &[])?;
 
