@@ -307,6 +307,7 @@ impl Planner {
             LogicalPlan::CreateTable { .. } |
             LogicalPlan::DropTable { .. } |
             LogicalPlan::CreateIndex { .. } |
+            LogicalPlan::CreateSequence { .. } |
             LogicalPlan::AlterColumnStorage { .. } |
             LogicalPlan::AlterTableAddColumn { .. } |
             LogicalPlan::AlterTableDropColumn { .. } |

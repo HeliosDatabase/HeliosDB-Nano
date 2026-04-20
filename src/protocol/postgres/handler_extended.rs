@@ -37,14 +37,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             param_types.clone()
         };
 
-        // Derive result schema from query plan (gracefully handle failures)
-        // If schema derivation fails (e.g., table doesn't exist), we still
-        // create the prepared statement. The actual error will surface during Execute.
+        // Derive result schema from query plan (gracefully handle failures).
+        // If planning fails (e.g., table doesn't exist, unknown function), we
+        // still create the prepared statement. For `SELECT` specifically,
+        // fall back to a best-effort schema derived straight from the
+        // projection list so Describe never sends `NoData` for a query that
+        // actually returns rows — SQLAlchemy's psycopg dialect calls
+        // `_row_as_tuple_getter` on that metadata and raises
+        // NotImplementedError if it's missing.
         let result_schema = match self.derive_result_schema(&statement) {
             Ok(schema) => schema,
             Err(e) => {
-                tracing::debug!("Schema derivation failed (will fail at execute): {}", e);
-                None
+                tracing::debug!("Schema derivation failed (falling back to AST): {}", e);
+                Self::synthesise_schema_from_ast(&statement)
             }
         };
 
@@ -447,6 +452,47 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             }
             // For any other statement types, assume no result schema
             _ => Ok(None),
+        }
+    }
+
+    /// Best-effort schema extraction straight from the `Statement::Query`
+    /// projection list, used as a fallback when full planner-based schema
+    /// derivation fails. Returns `None` for non-queries or when no
+    /// projection names can be extracted.
+    ///
+    /// All columns are typed as `Text` because we don't know the real
+    /// types without planning; psycopg accepts that and will coerce on
+    /// the client side. The goal is purely to keep `Describe` from
+    /// degrading to `NoData` for a SELECT, which breaks SQLAlchemy's
+    /// `_row_as_tuple_getter`.
+    fn synthesise_schema_from_ast(statement: &sqlparser::ast::Statement) -> Option<crate::Schema> {
+        use sqlparser::ast::{Statement, SetExpr, SelectItem};
+
+        let query = if let Statement::Query(q) = statement { q } else { return None; };
+        let select = if let SetExpr::Select(s) = &*query.body { s } else { return None; };
+
+        let columns: Vec<crate::Column> = select.projection.iter().enumerate().map(|(i, item)| {
+            let name = match item {
+                SelectItem::UnnamedExpr(expr) => Self::expr_column_label(expr).unwrap_or_else(|| format!("column{}", i + 1)),
+                SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => format!("column{}", i + 1),
+            };
+            crate::Column::new(name, crate::DataType::Text)
+        }).collect();
+
+        if columns.is_empty() { None } else { Some(crate::Schema::new(columns)) }
+    }
+
+    /// Pick a reasonable label for an unaliased SELECT expression — column
+    /// name for `Expr::Identifier`, rightmost part of a compound
+    /// identifier, function name for a call, or None otherwise.
+    fn expr_column_label(expr: &sqlparser::ast::Expr) -> Option<String> {
+        use sqlparser::ast::Expr;
+        match expr {
+            Expr::Identifier(ident) => Some(ident.value.clone()),
+            Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
+            Expr::Function(f) => f.name.to_string().split('.').last().map(|s| s.to_string()),
+            _ => None,
         }
     }
 

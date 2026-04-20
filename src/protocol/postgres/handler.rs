@@ -26,6 +26,8 @@ use super::ssl::SecureConnection;
 use bytes::{BytesMut, BufMut};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use std::sync::Arc;
 
 /// PostgreSQL connection handler
@@ -45,6 +47,10 @@ pub struct PgConnectionHandler<S = BufWriter<TcpStream>> {
     username: Option<String>,
     scram_state: Option<ScramAuthState>,
     write_buf: BytesMut,
+    /// When `true`, `send_ready_for_query()` is a no-op. Used by
+    /// multi-statement simple query dispatch to emit a single trailing
+    /// ReadyForQuery after the whole `;`-separated batch.
+    suppress_ready_for_query: bool,
 }
 
 impl PgConnectionHandler<BufWriter<TcpStream>> {
@@ -72,8 +78,51 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
             username: None,
             scram_state: None,
             write_buf: BytesMut::with_capacity(4096),
+            suppress_ready_for_query: false,
         }
     }
+}
+
+#[cfg(unix)]
+impl PgConnectionHandler<BufWriter<UnixStream>> {
+    /// Create a new connection handler bound to a Unix domain socket stream.
+    pub fn new_unix(
+        stream: UnixStream,
+        database: Arc<EmbeddedDatabase>,
+        auth_manager: Arc<AuthManager>,
+    ) -> Self {
+        Self {
+            stream: BufWriter::new(stream),
+            database: database.clone(),
+            auth_manager,
+            catalog: PgCatalog::with_database(database),
+            prepared_statements: PreparedStatementManager::new(),
+            authenticated: false,
+            transaction_status: TransactionStatus::Idle,
+            buffer: BytesMut::with_capacity(8192),
+            username: None,
+            scram_state: None,
+            write_buf: BytesMut::with_capacity(4096),
+            suppress_ready_for_query: false,
+        }
+    }
+}
+
+/// Accept a PostgreSQL client connection over a Unix domain socket.
+///
+/// Used for local / embedded deployments where clients expect libpq's
+/// default `/tmp/.s.PGSQL.<port>` socket path.
+#[cfg(unix)]
+pub async fn handle_connection_unix(
+    database: Arc<EmbeddedDatabase>,
+    stream: UnixStream,
+    _connection_id: u32,
+) -> Result<()> {
+    // Trust auth over a local socket — the kernel already enforces access
+    // via filesystem permissions on the socket file.
+    let auth_manager = Arc::new(AuthManager::new(AuthMethod::Trust));
+    let mut handler = PgConnectionHandler::new_unix(stream, database, auth_manager);
+    handler.handle().await
 }
 
 impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
@@ -101,6 +150,7 @@ impl PgConnectionHandler<BufWriter<SecureConnection<TcpStream>>> {
             username: None,
             scram_state: None,
             write_buf: BytesMut::with_capacity(4096),
+            suppress_ready_for_query: false,
         }
     }
 }
@@ -227,7 +277,10 @@ where
             }
 
             // Send parameter status messages
-            self.send_parameter_status("server_version", "17.0 (HeliosDB-Lite 2.0)").await?;
+            self.send_parameter_status(
+                "server_version",
+                &format!("16.0 (HeliosDB Nano {})", env!("CARGO_PKG_VERSION")),
+            ).await?;
             self.send_parameter_status("server_encoding", "UTF8").await?;
             self.send_parameter_status("client_encoding", "UTF8").await?;
             self.send_parameter_status("DateStyle", "ISO, MDY").await?;
@@ -329,11 +382,49 @@ where
         Ok(())
     }
 
-    /// Handle simple query protocol
+    /// Handle simple query protocol — dispatches one or more `;`-separated
+    /// statements within a single `Q` message, per the PostgreSQL wire
+    /// spec. Each statement produces its own response messages
+    /// (CommandComplete / RowDescription+DataRow / etc.); a **single**
+    /// ReadyForQuery terminates the whole batch.
+    async fn handle_query(&mut self, query: &str) -> Result<()> {
+        let statements = pg_split_sql_respecting_quotes(query);
+        if statements.len() <= 1 {
+            return self.handle_single_query(query).await;
+        }
+
+        // Multi-statement simple query. Each inner statement calls the
+        // per-statement handler, which sends its own ReadyForQuery. We
+        // swallow all but the last RFQ via the per-connection flag so the
+        // client sees the PostgreSQL-correct single trailing RFQ.
+        self.suppress_ready_for_query = true;
+        let last_idx = statements.len() - 1;
+        for (i, stmt) in statements.iter().enumerate() {
+            if i == last_idx {
+                self.suppress_ready_for_query = false;
+            }
+            self.handle_single_query(stmt).await?;
+        }
+        self.suppress_ready_for_query = false;
+        Ok(())
+    }
+
+    /// Handle exactly one statement. All pre-existing `handle_query`
+    /// logic lives here so the per-statement response sequence stays
+    /// unchanged from v3.12's behaviour.
     // SAFETY: results[0] is guarded by !results.is_empty() check.
     #[allow(clippy::indexing_slicing)]
-    async fn handle_query(&mut self, query: &str) -> Result<()> {
+    async fn handle_single_query(&mut self, query: &str) -> Result<()> {
         tracing::debug!("Executing query: {}", query);
+
+        // `DO $$ … $$` / `DO LANGUAGE … $$ … $$` blocks. sqlparser
+        // doesn't support DO, so we unwrap the body and recurse over
+        // the plain-SQL statements inside. No PL/pgSQL control flow
+        // is expanded — this covers the common Drizzle / Prisma
+        // migration backfill pattern only.
+        if pg_looks_like_do_block(query.trim()) {
+            return self.handle_do_block(query).await;
+        }
 
         // Check for empty query
         if query.trim().is_empty() {
@@ -960,7 +1051,52 @@ where
     }
 
     /// Send ready for query (flushes all buffered writes)
+    /// Handle `DO $$ … END $$ ;` blocks by executing the inner
+    /// plain-SQL body statement-by-statement. We do **not** implement
+    /// PL/pgSQL control flow (IF / LOOP / RAISE / variables) — only
+    /// sequences of plain SQL statements are supported. This covers
+    /// the common Drizzle / Prisma migration backfill pattern, not
+    /// procedural logic.
+    async fn handle_do_block(&mut self, query: &str) -> Result<()> {
+        // Extract the body between the first and last `$tag$` delimiters.
+        let body = pg_extract_do_block_body(query).unwrap_or("");
+        // Strip optional `BEGIN`/`END` wrapper tokens — their semantics
+        // (open/close anonymous PL/pgSQL block) are moot once we're
+        // just running plain statements sequentially.
+        let trimmed = pg_strip_begin_end(body.trim());
+        let statements = pg_split_sql_respecting_quotes(trimmed);
+
+        if statements.is_empty() {
+            self.send_command_complete("DO").await?;
+            self.send_ready_for_query().await?;
+            return Ok(());
+        }
+        // Execute each inner statement but suppress its ReadyForQuery;
+        // we emit a single `DO` CommandComplete + RFQ at the end. We
+        // call `execute()` directly rather than recursing into
+        // `handle_single_query` — avoids async recursion and skips the
+        // per-statement protocol response chatter, which is what
+        // callers of a DO block actually expect.
+        let prev = self.suppress_ready_for_query;
+        self.suppress_ready_for_query = true;
+        for stmt in &statements {
+            if let Err(e) = self.database.execute(stmt) {
+                self.suppress_ready_for_query = prev;
+                return Err(e);
+            }
+        }
+        self.suppress_ready_for_query = prev;
+        self.send_command_complete("DO").await?;
+        self.send_ready_for_query().await?;
+        Ok(())
+    }
+
     async fn send_ready_for_query(&mut self) -> Result<()> {
+        // Multi-statement simple query mode: suppress intra-batch
+        // ReadyForQuery so the client sees exactly one at the end.
+        if self.suppress_ready_for_query {
+            return Ok(());
+        }
         self.send_message(BackendMessage::ReadyForQuery {
             status: self.transaction_status,
         }).await?;
@@ -1053,7 +1189,7 @@ where
         let param_lower = param.to_lowercase();
         let col = param_lower.clone();
         let val = match param_lower.as_str() {
-            "server_version" => "16.0".to_string(),
+            "server_version" => format!("16.0 (HeliosDB Nano {})", env!("CARGO_PKG_VERSION")),
             "server_encoding" => "UTF8".to_string(),
             "client_encoding" => "UTF8".to_string(),
             "standard_conforming_strings" => "on".to_string(),
@@ -1211,4 +1347,149 @@ pub(super) fn tuple_to_pg_values(tuple: &Tuple) -> Vec<Option<Vec<u8>>> {
             Value::ColumnarRef => Some(b"<columnar>".to_vec()),
         }
     }).collect()
+}
+
+/// Split a SQL string on `;` while respecting single-quoted strings
+/// and dollar-quoted strings. Mirrors the MySQL handler's splitter
+/// (`protocol::mysql::handler::split_sql_respecting_quotes`) with
+/// added support for `$$…$$` / `$tag$…$tag$` blocks, which PG uses
+/// for procedure bodies and dollar-quoted literals.
+fn pg_split_sql_respecting_quotes(sql: &str) -> Vec<String> {
+    let mut statements = Vec::new();
+    let mut current = String::new();
+    let mut in_single_quote = false;
+    let mut in_dollar: Option<String> = None; // tag between `$` delimiters
+    let bytes = sql.as_bytes();
+    let mut i = 0usize;
+
+    while i < bytes.len() {
+        let b = bytes[i];
+        // Inside a `$tag$ … $tag$` block, we scan for the closing tag.
+        if let Some(tag) = &in_dollar {
+            current.push(b as char);
+            if b == b'$' {
+                // Try to match `$tag$`
+                let close = format!("${tag}$");
+                if sql.get(i..i + close.len()) == Some(close.as_str()) {
+                    for c in close.chars().skip(1) {
+                        current.push(c);
+                    }
+                    i += close.len();
+                    in_dollar = None;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        // Inside a single-quoted string: handle escaped quotes and
+        // backslash escapes identically to the MySQL splitter.
+        if in_single_quote {
+            current.push(b as char);
+            if b == b'\'' {
+                if bytes.get(i + 1) == Some(&b'\'') {
+                    current.push('\'');
+                    i += 2;
+                    continue;
+                }
+                in_single_quote = false;
+            } else if b == b'\\' {
+                if let Some(&next) = bytes.get(i + 1) {
+                    current.push(next as char);
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        // Start of a dollar-quoted string? `$tag$` where tag is empty or [A-Za-z0-9_]+.
+        if b == b'$' {
+            let rest = &sql[i + 1..];
+            if let Some(end) = rest.find('$') {
+                let tag = &rest[..end];
+                if tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                    current.push('$');
+                    for c in tag.chars() { current.push(c); }
+                    current.push('$');
+                    i += 1 + end + 1;
+                    in_dollar = Some(tag.to_string());
+                    continue;
+                }
+            }
+        }
+        match b {
+            b'\'' => { in_single_quote = true; current.push('\''); }
+            b';' => {
+                let trimmed = current.trim().to_string();
+                if !trimmed.is_empty() {
+                    statements.push(trimmed);
+                }
+                current.clear();
+            }
+            _ => current.push(b as char),
+        }
+        i += 1;
+    }
+    let trimmed = current.trim().to_string();
+    if !trimmed.is_empty() {
+        statements.push(trimmed);
+    }
+    statements
+}
+
+/// Detect `DO $$ … $$` / `DO [LANGUAGE plpgsql] $tag$ … $tag$;` blocks
+/// at statement level so we can strip the wrapper and execute the
+/// plain-SQL body statement-by-statement.
+fn pg_looks_like_do_block(trimmed: &str) -> bool {
+    let upper = trimmed.trim_start().to_ascii_uppercase();
+    upper.starts_with("DO $") || upper.starts_with("DO LANGUAGE ")
+}
+
+/// Extract the text between the opening and closing `$tag$` markers
+/// of a `DO` block. Returns `None` if the delimiters can't be matched.
+fn pg_extract_do_block_body(sql: &str) -> Option<&str> {
+    // Skip past `DO` and optional `LANGUAGE plpgsql` preamble.
+    let trimmed = sql.trim();
+    let after_do = trimmed.get(2..)?.trim_start();
+    let after_lang = if after_do.to_ascii_uppercase().starts_with("LANGUAGE") {
+        let after = after_do.get("LANGUAGE".len()..)?.trim_start();
+        // Eat the language identifier
+        let ident_end = after.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))?;
+        after.get(ident_end..)?.trim_start()
+    } else {
+        after_do
+    };
+
+    // Expect `$tag$` opener — tag may be empty.
+    if !after_lang.starts_with('$') {
+        return None;
+    }
+    let rest = after_lang.get(1..)?;
+    let tag_end = rest.find('$')?;
+    let tag = rest.get(..tag_end)?;
+    let closer = format!("${tag}$");
+    let body_start_abs = sql.len() - rest.len() + tag_end + 1;
+    let body_search = sql.get(body_start_abs..)?;
+    let close_rel = body_search.find(&closer)?;
+    sql.get(body_start_abs..body_start_abs + close_rel)
+}
+
+/// Strip optional `BEGIN` / `END` tokens that wrap a PL/pgSQL-style
+/// DO body. Keeps the inner statements intact so the splitter can
+/// run each one independently.
+fn pg_strip_begin_end(body: &str) -> &str {
+    let mut s = body.trim();
+    if s.to_ascii_uppercase().starts_with("BEGIN") {
+        s = s.get(5..).map(str::trim_start).unwrap_or(s);
+    }
+    // Strip a trailing `END;` or `END`.
+    let u = s.to_ascii_uppercase();
+    for suffix in ["END;", "END"] {
+        if u.ends_with(suffix) {
+            s = s.get(..s.len() - suffix.len()).map(str::trim_end).unwrap_or(s);
+            break;
+        }
+    }
+    s
 }

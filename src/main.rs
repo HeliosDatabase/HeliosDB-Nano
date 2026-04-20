@@ -133,6 +133,16 @@ enum Commands {
         /// MySQL listen address (default: 127.0.0.1:3306, localhost-only for security)
         #[arg(long, default_value = "127.0.0.1:3306")]
         mysql_listen: String,
+
+        /// MySQL Unix domain socket path (e.g. /tmp/heliosdb-mysql.sock).
+        /// Enables local-only connections for PHP mysqli / WordPress embedded mode.
+        #[arg(long)]
+        mysql_socket: Option<PathBuf>,
+
+        /// PostgreSQL Unix domain socket directory. If set, listens at
+        /// `<dir>/.s.PGSQL.<port>` — the libpq default. Use with psql `-h /tmp`.
+        #[arg(long)]
+        pg_socket_dir: Option<PathBuf>,
     },
 
     /// Stop a running server
@@ -236,7 +246,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { data_dir, memory, port, listen, config, daemon, pid_file, dump_on_shutdown, dump_schedule, tls_cert, tls_key, auth, password, replication_role, replication_port, primary_host, standby_hosts, observer_hosts, sync_mode, http_port, node_id, mysql, mysql_listen } => {
+        Commands::Start { data_dir, memory, port, listen, config, daemon, pid_file, dump_on_shutdown, dump_schedule, tls_cert, tls_key, auth, password, replication_role, replication_port, primary_host, standby_hosts, observer_hosts, sync_mode, http_port, node_id, mysql, mysql_listen, mysql_socket, pg_socket_dir } => {
             // Validate that either --data-dir or --memory is specified
             if !memory && data_dir.is_none() {
                 return Err(Error::config(
@@ -281,7 +291,7 @@ async fn main() -> Result<()> {
             if daemon {
                 start_server_daemon(resolved_data_dir, port, listen, config, pid_file, tls_cert, tls_key, auth, password, ha_config).await
             } else {
-                start_server(resolved_data_dir, port, listen, config, memory, dump_on_shutdown, tls_cert, tls_key, auth, password, ha_config, mysql, mysql_listen).await
+                start_server(resolved_data_dir, port, listen, config, memory, dump_on_shutdown, tls_cert, tls_key, auth, password, ha_config, mysql, mysql_listen, mysql_socket, pg_socket_dir).await
             }
         }
         Commands::Stop { ref pid_file } => {
@@ -338,6 +348,8 @@ async fn start_server(
     ha_config: HAConfig,
     mysql_enabled: bool,
     mysql_listen: String,
+    mysql_socket: Option<PathBuf>,
+    pg_socket_dir: Option<PathBuf>,
 ) -> Result<()> {
     use heliosdb_nano::protocol::postgres::server::{PgServer, PgServerConfig};
     use heliosdb_nano::protocol::postgres::auth::{AuthMethod, AuthManager};
@@ -467,6 +479,11 @@ async fn start_server(
     println!("    Python:     psycopg2.connect(host='{listen}', port={port})");
     println!("    Node.js:    pg.connect({{ host: '{listen}', port: {port} }})");
     println!("    JDBC:       jdbc:postgresql://{listen}:{port}/heliosdb");
+    println!();
+    println!("    Compatibility notes:");
+    println!("      FTS:         docs/compatibility/fts.md");
+    println!("      ORM matrix:  https://github.com/Dimensigon/HDB-HeliosDB-Nano/blob/main/docs/compatibility/orm.md");
+    println!("      Known gaps:  SELECT heliosdb_capability_report();");
     if mysql_enabled {
         println!();
         println!("    mysql:      mysql -h {} -P {}", mysql_listen.split(':').next().unwrap_or("127.0.0.1"),
@@ -538,6 +555,106 @@ async fn start_server(
         None
     };
 
+    // Start MySQL Unix domain socket listener if requested (local-only, no TCP)
+    // Useful for PHP mysqli / WordPress embedded-mode pointing at
+    // /var/run/mysqld/mysqld.sock or equivalent.
+    #[cfg(unix)]
+    let mysql_unix_handle = if let Some(ref socket_path) = mysql_socket {
+        let path = socket_path.clone();
+        // Remove stale socket file if it exists (best-effort)
+        let _ = std::fs::remove_file(&path);
+        let mysql_db = Arc::clone(&db);
+        let conn_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(1_000_000));
+        info!("MySQL Unix socket listening on {}", path.display());
+        println!("    mysql (UDS): mysql --socket={}", path.display());
+        Some(tokio::spawn(async move {
+            let listener = match tokio::net::UnixListener::bind(&path) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("Failed to bind MySQL Unix socket {}: {}", path.display(), e);
+                    return;
+                }
+            };
+            // Permissive mode so non-root clients can connect
+            let _ = std::fs::set_permissions(
+                &path,
+                std::os::unix::fs::PermissionsExt::from_mode(0o777),
+            );
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let db_clone = Arc::clone(&mysql_db);
+                        let conn_id = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tokio::spawn(async move {
+                            if let Err(e) = heliosdb_nano::protocol::mysql::handler::handle_mysql_connection_unix(
+                                db_clone, stream, conn_id,
+                            ).await {
+                                tracing::debug!("MySQL UDS connection error: {}", e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("MySQL UDS accept error: {}", e);
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let mysql_unix_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let _ = &mysql_socket; // silence unused on non-unix
+
+    // Start PostgreSQL Unix domain socket listener if requested.
+    // libpq uses `<dir>/.s.PGSQL.<port>` when host starts with `/`.
+    #[cfg(unix)]
+    let pg_unix_handle = if let Some(ref sock_dir) = pg_socket_dir {
+        let sock_path = sock_dir.join(format!(".s.PGSQL.{}", port));
+        let _ = std::fs::create_dir_all(sock_dir);
+        let _ = std::fs::remove_file(&sock_path);
+        let pg_db = Arc::clone(&db);
+        info!("PostgreSQL Unix socket listening on {}", sock_path.display());
+        println!("    psql (UDS):  psql -h {} -p {}", sock_dir.display(), port);
+        Some(tokio::spawn(async move {
+            let listener = match tokio::net::UnixListener::bind(&sock_path) {
+                Ok(l) => l,
+                Err(e) => {
+                    tracing::error!("Failed to bind PG Unix socket {}: {}", sock_path.display(), e);
+                    return;
+                }
+            };
+            let _ = std::fs::set_permissions(
+                &sock_path,
+                std::os::unix::fs::PermissionsExt::from_mode(0o777),
+            );
+            let conn_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2_000_000));
+            loop {
+                match listener.accept().await {
+                    Ok((stream, _)) => {
+                        let db_clone = Arc::clone(&pg_db);
+                        let conn_id = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        tokio::spawn(async move {
+                            if let Err(e) = heliosdb_nano::protocol::postgres::handler::handle_connection_unix(
+                                db_clone, stream, conn_id,
+                            ).await {
+                                tracing::debug!("PG UDS connection error: {}", e);
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        tracing::error!("PG UDS accept error: {}", e);
+                    }
+                }
+            }
+        }))
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let pg_unix_handle: Option<tokio::task::JoinHandle<()>> = None;
+    let _ = &pg_socket_dir;
+
     // Start server with graceful shutdown handling
     tokio::select! {
         result = pg_server.serve() => {
@@ -555,6 +672,21 @@ async fn start_server(
             println!("{}", "Received shutdown signal...".yellow());
             if let Some(h) = mysql_handle {
                 h.abort();
+            }
+            if let Some(h) = mysql_unix_handle {
+                h.abort();
+            }
+            if let Some(h) = pg_unix_handle {
+                h.abort();
+            }
+            // Best-effort unlink of Unix socket files on shutdown.
+            #[cfg(unix)]
+            {
+                if let Some(ref p) = mysql_socket { let _ = std::fs::remove_file(p); }
+                if let Some(ref d) = pg_socket_dir {
+                    let p = d.join(format!(".s.PGSQL.{}", port));
+                    let _ = std::fs::remove_file(p);
+                }
             }
         }
     }

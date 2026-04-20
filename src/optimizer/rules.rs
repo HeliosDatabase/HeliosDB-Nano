@@ -563,6 +563,11 @@ impl ProjectionPruningRule {
                     Self::collect_used_columns(expr, columns);
                 }
             }
+            LogicalExpr::Tuple { items } => {
+                for item in items {
+                    Self::collect_used_columns(item, columns);
+                }
+            }
             LogicalExpr::Literal(_) |
             LogicalExpr::Wildcard |
             LogicalExpr::Parameter { .. } => {}

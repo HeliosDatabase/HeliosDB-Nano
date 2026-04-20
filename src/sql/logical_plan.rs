@@ -376,6 +376,20 @@ pub enum LogicalPlan {
         if_not_exists: bool,
     },
 
+    /// Create a named sequence (for nextval / currval / setval).
+    ///
+    /// HeliosDB's sequences are currently process-scoped in-memory
+    /// counters (see `evaluator::sequences`). This is enough to unblock
+    /// Prisma / Drizzle / Django migrations that emit
+    /// `CREATE SEQUENCE` DDL but don't rely on cross-connection
+    /// monotonicity. Persistent sequences are a follow-up.
+    CreateSequence {
+        /// Sequence name (already normalised)
+        name: String,
+        /// Silently succeed if the sequence already exists
+        if_not_exists: bool,
+    },
+
     /// Alter column storage mode
     /// Changes per-column storage mode (Dictionary, Content-Addressed, Columnar)
     AlterColumnStorage {
@@ -967,6 +981,16 @@ pub enum LogicalExpr {
         index: Box<LogicalExpr>,
     },
 
+    /// Row/tuple constructor: `(expr1, expr2, ...)`.
+    ///
+    /// Enables keyset-style comparisons like
+    /// `WHERE (created_at, id) < ($1, $2)` which are compared
+    /// lexicographically element-by-element by the evaluator.
+    Tuple {
+        /// Elements of the tuple
+        items: Vec<LogicalExpr>,
+    },
+
     /// Window function: func(args) OVER (PARTITION BY ... ORDER BY ...)
     WindowFunction {
         /// Window function type
@@ -1121,6 +1145,10 @@ pub enum BinaryOperator {
     // String operators
     /// String concatenation: ||
     StringConcat,
+
+    // Full-text search operators
+    /// Text-search match: tsvector @@ tsquery → boolean
+    TsMatch,
 }
 
 /// Unary operator
@@ -1388,6 +1416,7 @@ impl LogicalPlan {
             Self::CreateTable { .. } => "CreateTable",
             Self::DropTable { .. } => "DropTable",
             Self::CreateIndex { .. } => "CreateIndex",
+            Self::CreateSequence { .. } => "CreateSequence",
             Self::Explain { .. } => "Explain",
             Self::Union { .. } => "Union",
             Self::Intersect { .. } => "Intersect",
@@ -1492,6 +1521,10 @@ impl LogicalPlan {
             }
             LogicalPlan::CreateIndex { .. } => {
                 // CreateIndex doesn't have output schema
+                Arc::new(Schema { columns: vec![] })
+            }
+            LogicalPlan::CreateSequence { .. } => {
+                // CREATE SEQUENCE is DDL — no output schema.
                 Arc::new(Schema { columns: vec![] })
             }
             LogicalPlan::AlterColumnStorage { .. } => {

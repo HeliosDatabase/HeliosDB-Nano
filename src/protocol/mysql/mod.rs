@@ -21,3 +21,5 @@ pub mod features;
 pub mod translator;
 
 pub use handler::{handle_mysql_connection, MySqlHandler, MySqlError};
+#[cfg(unix)]
+pub use handler::handle_mysql_connection_unix;

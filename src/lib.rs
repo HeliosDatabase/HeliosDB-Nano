@@ -4946,7 +4946,14 @@ impl EmbeddedDatabase {
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
                 let mut count = 0;
                 for value_row in values {
-                    let mut tuple_values: Vec<Value> = Vec::new();
+                    // Always allocate a schema-sized tuple so omitted
+                    // columns stay aligned with the schema. Previously
+                    // this loop pushed values positionally, producing
+                    // short tuples whenever the user omitted any
+                    // column — which made `INSERT (n) VALUES ('x')
+                    // RETURNING *` return a one-field DataRow against
+                    // a two-field RowDescription.
+                    let mut tuple_values: Vec<Value> = vec![Value::Null; schema.columns.len()];
 
                     for (col_idx, expr) in value_row.iter().enumerate() {
                         let target_col_idx = if let Some(ref cols) = columns {
@@ -4987,17 +4994,50 @@ impl EmbeddedDatabase {
                             value = evaluator.cast_value(value, target_type)?;
                         }
 
-                        tuple_values.push(value);
+                        if let Some(slot) = tuple_values.get_mut(target_col_idx) {
+                            *slot = value;
+                        }
                     }
 
+                    // Column defaults: the column-level `default_expr`
+                    // is stored as SQL text in the catalog; re-parsing
+                    // it here would add cost to the INSERT hot path.
+                    // Downstream `insert_tuple_*` handles SERIAL / PK
+                    // auto-fill for NULL values; non-SERIAL defaults
+                    // are applied by the legacy INSERT path (line 878+).
+
                     let tuple = Tuple::new(tuple_values);
-                    // Collect tuple for RETURNING clause before inserting
+                    // Insert first so the storage layer applies SERIAL /
+                    // IDENTITY auto-fill on NULL PK columns. Then read
+                    // the filled tuple back for RETURNING. This is the
+                    // only ordering that satisfies both:
+                    //   1. RETURNING must see the auto-generated PK.
+                    //   2. The storage engine owns the row_id counter.
+                    let row_id = self.storage.insert_tuple_branch_aware_with_schema(
+                        table_name, tuple.clone(), &schema,
+                    )?;
                     if has_returning {
-                        if let Some(projected) = Self::project_returning_columns(&tuple, &schema, returning) {
+                        let mut filled = tuple;
+                        for (i, col) in schema.columns.iter().enumerate() {
+                            if col.primary_key {
+                                if let Some(v) = filled.values.get(i) {
+                                    if matches!(v, Value::Null) {
+                                        if let Some(slot) = filled.values.get_mut(i) {
+                                            *slot = match col.data_type {
+                                                DataType::Int2 => Value::Int2(row_id as i16),
+                                                DataType::Int4 => Value::Int4(row_id as i32),
+                                                _ => Value::Int8(row_id as i64),
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        filled.row_id = Some(row_id);
+                        if let Some(projected) = Self::project_returning_columns(&filled, &schema, returning) {
                             returned_tuples.push(projected);
                         }
                     }
-                    self.storage.insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)?;
                     count += 1;
                 }
                 Ok((count, returned_tuples))
@@ -5369,13 +5409,27 @@ impl EmbeddedDatabase {
             }
         }
 
-        // Check result cache first (returns cached query results for identical SQL)
-        if let Some(cached_results) = self.result_cache.lock().ok()
-            .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone))
-        {
-            tracing::debug!(phase = "result_cache", "Result cache hit");
-            self.log_slow_query(sql, start.elapsed(), cached_results.len() as u64);
-            return Ok((*cached_results).clone());
+        // Check result cache first (returns cached query results for identical SQL).
+        // Skip queries that contain non-deterministic side-effecting
+        // scalar functions — nextval/currval/setval mutate server-side
+        // state, and gen_random_uuid / random / now / clock_timestamp
+        // must return a fresh value every time. Caching any of these
+        // would serve stale rows to the caller.
+        let is_non_deterministic = {
+            let up = sql.to_ascii_uppercase();
+            ["NEXTVAL", "SETVAL", "CURRVAL", "GEN_RANDOM_UUID",
+             "UUID_GENERATE_V4", "RANDOM(", "NOW(", "CLOCK_TIMESTAMP"]
+                .iter()
+                .any(|m| up.contains(m))
+        };
+        if !is_non_deterministic {
+            if let Some(cached_results) = self.result_cache.lock().ok()
+                .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone))
+            {
+                tracing::debug!(phase = "result_cache", "Result cache hit");
+                self.log_slow_query(sql, start.elapsed(), cached_results.len() as u64);
+                return Ok((*cached_results).clone());
+            }
         }
 
         // Fast path: SELECT * FROM table WHERE pk = literal (skips full SQL parsing)

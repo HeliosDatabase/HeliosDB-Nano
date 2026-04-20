@@ -18,6 +18,7 @@ pub mod procedural;
 pub mod functions;
 pub mod query_cache;
 pub mod compiled; // RAG-native compiled query plan cache (idea 4)
+pub mod sequences; // Named-counter store for CREATE SEQUENCE / nextval / currval / setval
 
 // EXPLAIN modules (Week 7-8)
 pub mod explain;

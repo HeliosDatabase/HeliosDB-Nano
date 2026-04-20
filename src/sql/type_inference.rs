@@ -245,6 +245,12 @@ impl TypeInference for LogicalExpr {
                 }
             }
 
+            // Row constructor: only appears inside comparisons, where the
+            // overall expression type is Boolean. If someone asks for the
+            // type of a bare tuple, fall back to Boolean (caller will error
+            // at evaluation time anyway).
+            LogicalExpr::Tuple { .. } => Ok(DataType::Boolean),
+
             // Window function: infer based on function type
             LogicalExpr::WindowFunction { fun, args, .. } => {
                 use super::logical_plan::WindowFunctionType;
@@ -413,6 +419,10 @@ impl TypeInference for LogicalExpr {
             // Array subscript: arr[n] is nullable (could be out of bounds or null input)
             LogicalExpr::ArraySubscript { .. } => true,
 
+            // Row constructor: boolean comparison, nullable only if any
+            // inner element is nullable.
+            LogicalExpr::Tuple { items } => items.iter().any(|e| e.infer_nullable(schema)),
+
             // Window function: most are nullable
             LogicalExpr::WindowFunction { fun, .. } => {
                 use super::logical_plan::WindowFunctionType;
@@ -483,7 +493,9 @@ fn coerce_binary_types(left: DataType, right: DataType, op: &BinaryOperator) -> 
         BinaryOperator::ILike | BinaryOperator::NotILike |
         BinaryOperator::RegexMatch | BinaryOperator::RegexIMatch |
         BinaryOperator::NotRegexMatch | BinaryOperator::NotRegexIMatch |
-        BinaryOperator::SimilarTo | BinaryOperator::NotSimilarTo => {
+        BinaryOperator::SimilarTo | BinaryOperator::NotSimilarTo |
+        // FTS match
+        BinaryOperator::TsMatch => {
             Ok(DataType::Boolean)
         }
 

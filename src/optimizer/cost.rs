@@ -540,6 +540,9 @@ impl CostEstimator {
                     .sum();
                 50.0 + arg_cost + partition_cost + order_cost
             }
+            LogicalExpr::Tuple { items } => {
+                1.0 + items.iter().map(Self::estimate_expr_complexity).sum::<f64>()
+            }
             LogicalExpr::Wildcard | LogicalExpr::Parameter { .. } => 1.0,
         }
     }

@@ -15,8 +15,10 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::sync::{Arc, OnceLock};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
+#[cfg(unix)]
+use tokio::net::UnixStream;
 use tracing::{debug, error, info, warn};
 
 use regex::Regex;
@@ -297,7 +299,7 @@ pub type Result<T> = std::result::Result<T, MySqlError>;
 // ============================================================================
 
 /// Read one MySQL packet (3-byte length + 1-byte seq + payload).
-async fn read_packet(stream: &mut TcpStream) -> Result<(u8, Bytes)> {
+async fn read_packet<S: AsyncRead + Unpin>(stream: &mut S) -> Result<(u8, Bytes)> {
     let mut hdr = [0u8; 4];
     stream.read_exact(&mut hdr).await.map_err(|e| {
         if e.kind() == ErrorKind::UnexpectedEof {
@@ -314,7 +316,7 @@ async fn read_packet(stream: &mut TcpStream) -> Result<(u8, Bytes)> {
 }
 
 /// Write one MySQL packet.
-async fn write_packet(stream: &mut TcpStream, seq: u8, payload: &[u8]) -> Result<()> {
+async fn write_packet<S: AsyncWrite + Unpin>(stream: &mut S, seq: u8, payload: &[u8]) -> Result<()> {
     let len = payload.len() as u32;
     let mut buf = BytesMut::with_capacity(4 + payload.len());
     buf.put_u8((len & 0xFF) as u8);
@@ -597,10 +599,14 @@ fn starts_with_icase(s: &str, prefix: &str) -> bool {
 /// Per-connection MySQL protocol handler.
 ///
 /// All SQL is delegated to `EmbeddedDatabase`, mirroring how the PG handler
-/// works.  The handler owns the TCP stream and sequence counter.
-pub struct MySqlHandler {
+/// works.  The handler owns the stream and sequence counter.
+///
+/// The stream is generic so the same handler works over both TCP and Unix
+/// domain sockets (required for embedded / localhost deployments such as
+/// WordPress talking to `/var/run/mysqld/mysqld.sock`).
+pub struct MySqlHandler<S: AsyncRead + AsyncWrite + Unpin + Send> {
     database: Arc<EmbeddedDatabase>,
-    stream: TcpStream,
+    stream: S,
     seq: u8,
     connection_id: u32,
     capabilities: CapabilityFlags,
@@ -618,12 +624,12 @@ pub struct MySqlHandler {
     last_insert_id: u64,
 }
 
-impl MySqlHandler {
+impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     // ------------------------------------------------------------------
     // Construction
     // ------------------------------------------------------------------
 
-    fn new(database: Arc<EmbeddedDatabase>, stream: TcpStream, connection_id: u32) -> Self {
+    fn new(database: Arc<EmbeddedDatabase>, stream: S, connection_id: u32) -> Self {
         let mut auth_seed = [0u8; 20];
         use rand::Rng;
         rand::thread_rng().fill(&mut auth_seed);
@@ -680,7 +686,7 @@ impl MySqlHandler {
     /// command loop.
     pub async fn handle_connection(
         database: Arc<EmbeddedDatabase>,
-        stream: TcpStream,
+        stream: S,
         connection_id: u32,
     ) -> Result<()> {
         let mut handler = Self::new(database, stream, connection_id);
@@ -1460,20 +1466,188 @@ impl MySqlHandler {
                 .await;
         }
 
-        if upper.contains("COLLATION") {
+        if upper.contains("ERRORS") {
             return self
-                .show_single_column("Collation", &["utf8mb4_general_ci"])
+                .show_three_columns("Level", "Code", "Message", &[])
                 .await;
         }
 
+        if upper.contains("COLLATION") {
+            return self.handle_show_collation().await;
+        }
+
+        if upper.contains("CHARACTER SET") || upper.contains("CHARSET") {
+            return self.handle_show_character_set().await;
+        }
+
         if upper.contains("ENGINES") {
-            return self
-                .show_single_column("Engine", &["HeliosDB"])
-                .await;
+            return self.handle_show_engines().await;
+        }
+
+        if upper.contains("PROCESSLIST") {
+            return self.handle_show_processlist().await;
+        }
+
+        if upper.contains("PLUGINS") {
+            return self.handle_show_plugins().await;
+        }
+
+        if upper.contains("PRIVILEGES") {
+            return self.handle_show_privileges().await;
+        }
+
+        if upper.contains("GRANTS") {
+            // SHOW GRANTS — return minimal ALL PRIVILEGES grant.
+            let user = self.username.clone().unwrap_or_else(|| "root".to_string());
+            let line = format!("GRANT ALL PRIVILEGES ON *.* TO '{}'@'%' WITH GRANT OPTION", user);
+            return self.show_single_column(
+                &format!("Grants for {}@%", user),
+                &[&line],
+            ).await;
+        }
+
+        if upper.contains("MASTER STATUS") || upper.contains("BINARY LOGS")
+            || upper.contains("REPLICA STATUS") || upper.contains("SLAVE STATUS")
+        {
+            // Empty result set — replication introspection not supported in embedded mode.
+            return self.send_ok(0, 0).await;
         }
 
         // Fallback: empty OK
         self.send_ok(0, 0).await
+    }
+
+    /// SHOW ENGINES — 6 columns (Engine, Support, Comment, Transactions, XA, Savepoints).
+    async fn handle_show_engines(&mut self) -> Result<()> {
+        let cols = vec![
+            "Engine".to_string(), "Support".to_string(), "Comment".to_string(),
+            "Transactions".to_string(), "XA".to_string(), "Savepoints".to_string(),
+        ];
+        let row = |e: &str, s: &str, c: &str, t: &str, x: &str, sv: &str| {
+            Tuple::new(vec![
+                Value::String(e.into()), Value::String(s.into()), Value::String(c.into()),
+                Value::String(t.into()), Value::String(x.into()), Value::String(sv.into()),
+            ])
+        };
+        let rows = vec![
+            row("HeliosDB", "DEFAULT", "HeliosDB Nano RocksDB-backed LSM engine",
+                "YES", "NO", "YES"),
+            row("InnoDB", "YES", "Alias of HeliosDB (for client compatibility)",
+                "YES", "NO", "YES"),
+            row("MEMORY", "YES", "In-memory tables (via CREATE TABLE ... ENGINE=MEMORY)",
+                "NO", "NO", "NO"),
+            row("MyISAM", "YES", "Alias of HeliosDB (for client compatibility)",
+                "NO", "NO", "NO"),
+        ];
+        self.send_result_set(&cols, &rows).await
+    }
+
+    /// SHOW CHARACTER SET — 4 columns.
+    async fn handle_show_character_set(&mut self) -> Result<()> {
+        let cols = vec![
+            "Charset".to_string(), "Description".to_string(),
+            "Default collation".to_string(), "Maxlen".to_string(),
+        ];
+        let row = |c: &str, d: &str, dc: &str, m: i64| {
+            Tuple::new(vec![
+                Value::String(c.into()), Value::String(d.into()),
+                Value::String(dc.into()), Value::Int8(m),
+            ])
+        };
+        let rows = vec![
+            row("utf8mb4", "UTF-8 Unicode", "utf8mb4_general_ci", 4),
+            row("utf8mb3", "UTF-8 Unicode (legacy)", "utf8mb3_general_ci", 3),
+            row("utf8", "UTF-8 Unicode", "utf8_general_ci", 3),
+            row("latin1", "cp1252 West European", "latin1_swedish_ci", 1),
+            row("ascii", "US ASCII", "ascii_general_ci", 1),
+            row("binary", "Binary pseudo charset", "binary", 1),
+        ];
+        self.send_result_set(&cols, &rows).await
+    }
+
+    /// SHOW COLLATION — 6 columns.
+    async fn handle_show_collation(&mut self) -> Result<()> {
+        let cols = vec![
+            "Collation".to_string(), "Charset".to_string(), "Id".to_string(),
+            "Default".to_string(), "Compiled".to_string(), "Sortlen".to_string(),
+        ];
+        let row = |coll: &str, cs: &str, id: i64, d: &str| {
+            Tuple::new(vec![
+                Value::String(coll.into()), Value::String(cs.into()),
+                Value::Int8(id), Value::String(d.into()),
+                Value::String("Yes".into()), Value::Int8(1),
+            ])
+        };
+        let rows = vec![
+            row("utf8mb4_general_ci", "utf8mb4", 45, "Yes"),
+            row("utf8mb4_unicode_ci", "utf8mb4", 224, ""),
+            row("utf8mb4_bin", "utf8mb4", 46, ""),
+            row("utf8_general_ci", "utf8", 33, "Yes"),
+            row("latin1_swedish_ci", "latin1", 8, "Yes"),
+            row("ascii_general_ci", "ascii", 11, "Yes"),
+            row("binary", "binary", 63, "Yes"),
+        ];
+        self.send_result_set(&cols, &rows).await
+    }
+
+    /// SHOW PROCESSLIST — 8 columns. Reports this connection only.
+    async fn handle_show_processlist(&mut self) -> Result<()> {
+        let cols = vec![
+            "Id".to_string(), "User".to_string(), "Host".to_string(),
+            "db".to_string(), "Command".to_string(), "Time".to_string(),
+            "State".to_string(), "Info".to_string(),
+        ];
+        let user = self.username.clone().unwrap_or_else(|| "root".to_string());
+        let db = self.current_database.clone().unwrap_or_else(|| "heliosdb".to_string());
+        let rows = vec![Tuple::new(vec![
+            Value::Int8(self.connection_id as i64),
+            Value::String(user),
+            Value::String("localhost".to_string()),
+            Value::String(db),
+            Value::String("Query".to_string()),
+            Value::Int8(0),
+            Value::String("executing".to_string()),
+            Value::String("SHOW PROCESSLIST".to_string()),
+        ])];
+        self.send_result_set(&cols, &rows).await
+    }
+
+    /// SHOW PLUGINS — minimal empty-ish set (Name, Status, Type, Library, License).
+    async fn handle_show_plugins(&mut self) -> Result<()> {
+        let cols = vec![
+            "Name".to_string(), "Status".to_string(), "Type".to_string(),
+            "Library".to_string(), "License".to_string(),
+        ];
+        let rows = vec![Tuple::new(vec![
+            Value::String("mysql_native_password".into()),
+            Value::String("ACTIVE".into()),
+            Value::String("AUTHENTICATION".into()),
+            Value::Null,
+            Value::String("AGPL-3.0".into()),
+        ])];
+        self.send_result_set(&cols, &rows).await
+    }
+
+    /// SHOW PRIVILEGES — minimal set.
+    async fn handle_show_privileges(&mut self) -> Result<()> {
+        let cols = vec![
+            "Privilege".to_string(), "Context".to_string(), "Comment".to_string(),
+        ];
+        let row = |p: &str, c: &str, d: &str| {
+            Tuple::new(vec![
+                Value::String(p.into()), Value::String(c.into()), Value::String(d.into()),
+            ])
+        };
+        let rows = vec![
+            row("ALL", "Server Admin", "All privileges (trust auth on local socket)"),
+            row("SELECT", "Tables", "Read data"),
+            row("INSERT", "Tables", "Insert rows"),
+            row("UPDATE", "Tables", "Update rows"),
+            row("DELETE", "Tables", "Delete rows"),
+            row("CREATE", "Databases,Tables", "Create schemas and tables"),
+            row("DROP", "Databases,Tables", "Drop schemas and tables"),
+        ];
+        self.send_result_set(&cols, &rows).await
     }
 
     async fn handle_show_columns(&mut self, sql: &str) -> Result<()> {
@@ -2523,6 +2697,18 @@ pub fn compute_native_auth(password: &str, nonce: &[u8]) -> Vec<u8> {
 pub async fn handle_mysql_connection(
     database: Arc<EmbeddedDatabase>,
     stream: TcpStream,
+    connection_id: u32,
+) -> Result<()> {
+    MySqlHandler::handle_connection(database, stream, connection_id).await
+}
+
+/// Accept and fully handle one MySQL client connection over a Unix domain
+/// socket — used for local / embedded deployments such as WordPress + PHP
+/// mysqli talking to `/var/run/mysqld/mysqld.sock`.
+#[cfg(unix)]
+pub async fn handle_mysql_connection_unix(
+    database: Arc<EmbeddedDatabase>,
+    stream: UnixStream,
     connection_id: u32,
 ) -> Result<()> {
     MySqlHandler::handle_connection(database, stream, connection_id).await

@@ -5,6 +5,178 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.14.0] - 2026-04-20
+
+### Fixed — Drizzle / Prisma / TypeORM compatibility (tracks `BUGS_TIMETRACKER_DRIZZLE_COMPAT.md`)
+
+- **B2 `GENERATED ALWAYS AS IDENTITY`**: planner now recognises the
+  SQL-standard identity syntax and routes it through the same
+  auto-fill path as `SERIAL`.
+- **B3 `DEFAULT` keyword in `INSERT ... VALUES`**: sqlparser classifies
+  `DEFAULT` as `Expr::Identifier`; the planner now rewrites it to
+  `NULL` inside VALUES lists so the existing SERIAL / default-value
+  path fires.
+- **B4 RETURNING field-count**: fixed a long-standing bug in
+  `execute_plan_with_params` where INSERT rows with omitted columns
+  produced short tuples, causing the PG wire protocol to emit a
+  `DataRow` with a different field count than the `RowDescription`.
+  Every `.returning()` call through Drizzle / psycopg is affected.
+- **B5 `EXTRACT(EPOCH|YEAR|MONTH|... FROM ...)`**: full coverage in the
+  evaluator — Epoch returns Float8 (Unix seconds); calendar fields
+  return Int4. `TIMESTAMP '2026-01-01'` and friends now parse (new
+  `TypedString` planner arm that lowers to a CAST).
+- **B7 `CREATE SEQUENCE`**: DDL is accepted and registers a named
+  counter in the new process-scoped sequence store
+  (`sql::sequences`). Persistent sequences are a follow-up.
+- **B8 `nextval` / `currval` / `setval`**: scalar functions backed by
+  the sequence store; always return Int8.
+- **B9 `DO $$ … END $$` blocks**: the PG handler unwraps the
+  dollar-quoted body and executes plain-SQL statements inside via a
+  single `DO` CommandComplete. PL/pgSQL control flow (IF / LOOP /
+  RAISE) is NOT interpreted — documented as out of scope.
+- **B10 dollar-quoted string literals**: `$$text$$` and `$tag$text$tag$`
+  values map to `Value::String` in the planner.
+- **B11 multi-statement simple queries**: the `Q` message now accepts
+  `;`-separated statements and emits one response per statement with a
+  single trailing `ReadyForQuery`, matching PG protocol.
+- **B14 identifier case-folding**: new `Planner::normalize_ident` and
+  `normalize_object_name` helpers strip surrounding quotes
+  (preserving case) and lower-case unquoted identifiers. Applied at
+  every DDL and reference call site — `CREATE TABLE Foo` matches
+  `SELECT FROM foo` matches `SELECT FROM FOO`, while quoted
+  `"Foo"` stays case-sensitive (PG-compliant).
+- **B15 `gen_random_uuid()` / `uuid_generate_v4()`**: new scalar
+  functions returning `Value::Uuid`.
+- **B17 startup banner**: now points to `docs/compatibility/`, the
+  FTS doc, and the new `heliosdb_capability_report()` probe so
+  drivers / migration tools can discover supported features before
+  bisecting failures.
+
+### Added
+
+- **`heliosdb_capability_report()`** scalar function — returns a
+  human-readable summary of what this server version supports vs.
+  stock Postgres.
+- **`src/sql/sequences.rs`** — process-scoped, thread-safe counter
+  store shared by `CREATE SEQUENCE` / `nextval` / `currval` /
+  `setval`.
+- **`tests/drizzle_compat_tests.rs`** — 15 regression cases, one per
+  bug in the `BUGS_TIMETRACKER_DRIZZLE_COMPAT.md` report.
+
+### Query-engine changes
+
+- Result cache now skips SQL that contains non-deterministic
+  functions (`nextval`, `setval`, `currval`, `gen_random_uuid`,
+  `random(`, `now(`, `clock_timestamp`). Previously, a second call
+  returned the first result verbatim.
+
+## [3.13.0] - 2026-04-19
+
+### Added — PostgreSQL-compatible full-text search
+
+- **Scalar FTS functions**: `to_tsvector(text)`,
+  `to_tsvector(config, text)`, `to_tsquery(text)`,
+  `plainto_tsquery(text)`, `phraseto_tsquery(text)`, `ts_rank(doc,
+  query)`, `ts_rank_cd(doc, query)` — all implemented in
+  `src/sql/evaluator.rs`. Values round-trip as `Value::Json` (array of
+  normalised tokens) so they flow through the PostgreSQL wire
+  protocol unchanged and render as JSON arrays for introspection.
+- **`@@` operator** (`tsvector @@ tsquery → boolean`): new
+  `BinaryOperator::TsMatch` in the logical plan, wired in the planner
+  from `SqlBinaryOp::AtAt` and evaluated via the shared
+  `search::tokenizer` + in-memory match.
+- **`TSVECTOR` / `TSQUERY` column types**: accepted in `CREATE TABLE`
+  (`src/sql/planner.rs:3044`). Stored as `DataType::Json` internally.
+- **`CREATE INDEX ... USING gin | gist (col)`**: accepted as DDL for
+  ORM/migration compatibility (`src/sql/executor/ddl.rs:79`). The
+  index is currently a no-op — `@@` still walks rows in the evaluator
+  — but the syntax round-trips cleanly so Django, SQLAlchemy, and
+  hand-written migrations load without errors.
+- Backed by `search::Bm25Index` (landed in v3.11.0), which had been
+  unreachable from SQL until now.
+
+### Fixed
+
+- **Stale version strings**. `pg_catalog.version()`, the
+  `server_version` parameter-status message, and the `SHOW
+  server_version` response all now use `env!("CARGO_PKG_VERSION")`
+  instead of the hardcoded `3.7.0` / `3.10.0` / `17.0 (HeliosDB-Lite
+  2.0)` strings that had drifted across releases.
+
+### Documentation
+
+- New `docs/compatibility/fts.md` — honest scope of our FTS support:
+  what works (token match, BM25 rank, JSON-encoded tsvector),
+  what doesn't (stemming, phrase queries, `setweight()`, persistent
+  GIN index), and the migration hook for when it does.
+- `tests/fts_tests.rs` (8 regression cases): tsvector construction,
+  `@@` match/miss, rank scoring, `GIN` DDL acceptance, null
+  propagation, version-string drift.
+
+### Tracks
+
+- Request from the EasyRAG team (`foor.network/easyrag`) — their
+  adapter (`backend/app/services/vectordb/adapters/heliosdb_nano_adapter.py`)
+  was client-side reranking with `rank_bm25.BM25Okapi` to work
+  around the missing FTS functions. Simplification guide published
+  at `easyrag/docs/heliosdb_nano_adapter_simplification.md`.
+
+## [3.12.0] - 2026-04-17
+
+### Fixed
+
+- **`LIMIT $1 OFFSET $2` via psycopg extended query protocol** (root
+  cause of SQLAlchemy's `NotImplementedError: _row_as_tuple_getter`).
+  The planner's `expr_to_usize` rejected `Expr::Value(Placeholder(_))`,
+  which made Parse-time schema derivation fail and caused `Describe` to
+  send `NoData` instead of `RowDescription`. Now accepts placeholders
+  (the real values are substituted at Execute time before planning).
+- **Fallback `RowDescription` for `SELECT`**: if schema derivation
+  still fails for an exotic query, we now synthesise a best-effort
+  schema from the sqlparser projection list rather than returning
+  `NoData` — matching PostgreSQL's behaviour and keeping SQLAlchemy
+  row decoders happy.
+
+### Added — Pagination
+
+- **Top-K operator** (`sql::executor::topk::TopKOperator`): streams the
+  input through a bounded max-heap of size `k = limit + offset` when
+  the plan is `Limit(Sort(…))` or `Limit(Project(Sort(…)))`.
+  Complexity drops from O(N log N) to O(N log k) and memory from O(N)
+  to O(k). Kicks in automatically whenever the `LIMIT` has a concrete
+  bound.
+- **Row-constructor comparison** for keyset pagination:
+  `WHERE (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT N`
+  is now planned and evaluated lexicographically. New
+  `LogicalExpr::Tuple` variant and `evaluate_tuple_compare` in the
+  evaluator. Supports `=`, `<>`, `<`, `<=`, `>`, `>=`.
+- **Storage-level OFFSET pushdown** (`storage::EmbeddedStorage::scan_table_with_offset_limit`):
+  skips `offset` rows at the RocksDB iterator level *without*
+  deserialising them (no bincode, no decrypt, no dict/CAS resolve) and
+  then fetches `limit` rows fully. Markon's `LIMIT 5 OFFSET 990` on
+  1000 rows now returns in ~1 ms (previously required materialising
+  all 995+ rows before the `LimitOperator` skipped).
+- **Primary-key range scan API**
+  (`storage::EmbeddedStorage::scan_table_pk_range`): low-level building
+  block for future planner-driven keyset pushdown; currently exposed
+  for callers that know the PK range up front.
+
+### Changed
+
+- `LogicalExpr` gains a `Tuple { items }` variant — every consumer
+  (`optimizer::rules`, `optimizer::cost`, `sql::type_inference`,
+  `sql::evaluator`) handles it.
+- Pagination integration test suite (`tests/pagination_tests.rs`, 7
+  tests) lands with the feature, covering empty tables, ORDER BY,
+  LEFT OUTER JOIN, keyset, row-constructor equality, and large-offset
+  correctness.
+
+### Tracks
+
+- `FEATURE_REQUEST_pagination.md` — acceptance criteria 1–5 met;
+  cross-engine benchmark (vs Postgres / Oracle / MSSQL) and a website
+  marketing page tracked as follow-up (see task #122).
+
 ## [3.11.0] - 2026-04-15
 
 ### Added (RAG-native integration -- 5 features)
