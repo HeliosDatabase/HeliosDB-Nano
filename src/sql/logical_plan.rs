@@ -962,6 +962,14 @@ pub enum LogicalExpr {
         negated: bool,
     },
 
+    /// `DEFAULT` keyword in an INSERT VALUES list. Signals to the
+    /// INSERT executor that this slot should fall through to the
+    /// column's declared DEFAULT expression (or NULL if none) —
+    /// same path as a fully-omitted column. Stock PostgreSQL: any
+    /// `DEFAULT` inside a VALUES row means "use the column's
+    /// default", NOT "substitute NULL".
+    DefaultValue,
+
     /// Wildcard (SELECT *)
     Wildcard,
 

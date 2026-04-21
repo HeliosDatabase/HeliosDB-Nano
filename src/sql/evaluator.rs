@@ -292,6 +292,14 @@ impl Evaluator {
                 ))
             }
 
+            LogicalExpr::DefaultValue => {
+                // `DEFAULT` keyword appearing outside an INSERT VALUES
+                // list — there's no target column to resolve against.
+                Err(Error::query_execution(
+                    "DEFAULT keyword is only valid inside INSERT … VALUES (…)"
+                ))
+            }
+
             LogicalExpr::ScalarSubquery { .. } => {
                 // Scalar subquery must be materialised before evaluation.
                 // Uncorrelated ones are materialised by

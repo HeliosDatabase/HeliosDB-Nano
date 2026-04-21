@@ -939,6 +939,15 @@ impl EmbeddedDatabase {
                             val_idx
                         };
 
+                        // `DEFAULT` marker: leave the slot as None so
+                        // the default-fill pass below runs the column's
+                        // declared DEFAULT expression. Skips the NOT
+                        // NULL check for explicit NULL too — that's
+                        // only for literal NULL, not for DEFAULT.
+                        if matches!(expr, sql::LogicalExpr::DefaultValue) {
+                            continue;
+                        }
+
                         let target_col = schema.get_column_at(target_col_idx)
                             .ok_or_else(|| Error::query_execution(format!(
                                 "Too many values for INSERT: table has {} columns",
@@ -5008,6 +5017,14 @@ impl EmbeddedDatabase {
                         } else {
                             col_idx
                         };
+
+                        // `DEFAULT` inside VALUES — leave the slot
+                        // untouched so the default-fill pass treats
+                        // it as "omitted" and applies the column's
+                        // declared DEFAULT (or NULL if none).
+                        if matches!(expr, sql::LogicalExpr::DefaultValue) {
+                            continue;
+                        }
 
                         let target_col = schema.get_column_at(target_col_idx)
                             .ok_or_else(|| Error::query_execution(format!(

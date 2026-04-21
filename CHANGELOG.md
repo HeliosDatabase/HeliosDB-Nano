@@ -5,6 +5,54 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.14.4] - 2026-04-21
+
+### Fixed — Drizzle `.insert().returning()` blockers (B27 / B28)
+
+- **B27 `DEFAULT` keyword inside `VALUES` resolves the column's declared
+  default.** v3.14.0 (B3) rewrote every `DEFAULT` token to NULL, which
+  worked for SERIAL/IDENTITY columns (auto-filled later in storage) but
+  broke any column with a real `DEFAULT <expr>` — v3.14.3's NOT NULL
+  enforcement then rejected the NULL.  New `LogicalExpr::DefaultValue`
+  marker flows from the planner to the INSERT executor; the executor
+  treats it as "column omitted", so the B24 default-fill pass runs the
+  declared DEFAULT expression.  Drizzle emits `VALUES (default, …,
+  default)` on every `.insert()` — every write in TimeTracker hit this.
+- **B28 `INSERT … RETURNING *` over the extended query protocol.**
+  `handle_execute_extended` used to dispatch non-SELECT writes through
+  `database.execute()` which drops the returning tuples. Now detects
+  `INSERT/UPDATE/DELETE … RETURNING …`, routes through
+  `execute_returning`, and emits the tuples as `DataRow` messages
+  (RowDescription was already sent during Describe).  Matches the
+  simple-query behaviour.
+- **Timestamp wire format** now microsecond-precision with a space
+  separator (`YYYY-MM-DD HH:MM:SS.ffffff`) — the PostgreSQL
+  on-the-wire format. Previously `rfc3339` nanosecond-precision output
+  crashed psycopg's timestamp parser ("timestamp too large (after year
+  10K)"). `postgres-js` accepted both but produced slightly different
+  `Date` values.
+
+### Added
+
+- `LogicalExpr::DefaultValue` — dedicated marker for the `DEFAULT`
+  keyword in INSERT VALUES. Threaded through planner, optimizer,
+  type_inference, and the three INSERT executor paths.
+- `tests/drizzle_compat_tests.rs` — two B27 regression cases (DEFAULT
+  for DEFAULT-expr column, DEFAULT for SERIAL column). B28 is a
+  wire-level regression verified via postgres-js end-to-end.
+
+### Verified end-to-end via `postgres-js 3.4.5` + Drizzle's exact INSERT shape
+
+```js
+const [user] = await sql`
+  INSERT INTO "users" ("id","email","pw","created_at")
+  VALUES (default, ${'alice@x.com'}, ${'pw'}, default)
+  RETURNING "id","email","pw","created_at"
+`
+//  { id: 1, email: 'alice@x.com', pw: 'pw',
+//    created_at: '2026-04-21T20:49:20.925Z' }
+```
+
 ## [3.14.3] - 2026-04-21
 
 ### Fixed — first-user-registration blockers (B24 / B25 / B26)

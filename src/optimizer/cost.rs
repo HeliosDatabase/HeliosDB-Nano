@@ -523,6 +523,7 @@ impl CostEstimator {
                 // Scalar subqueries — full plan execution
                 100.0
             }
+            LogicalExpr::DefaultValue => 0.0,
             LogicalExpr::Exists { .. } => {
                 // EXISTS subqueries are expensive
                 100.0

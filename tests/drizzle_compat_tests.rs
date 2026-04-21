@@ -398,6 +398,53 @@ fn b26_not_null_with_default_is_satisfied() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------
+// B27 — DEFAULT keyword in VALUES resolves the column's declared default
+// ---------------------------------------------------------------------
+#[test]
+fn b27_default_in_values_resolves_column_default() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT, created_at TIMESTAMP DEFAULT now() NOT NULL)")?;
+    // Drizzle's exact shape: DEFAULT for SERIAL id + for DEFAULT now() column
+    db.execute("INSERT INTO t (id, name, created_at) VALUES (DEFAULT, 'alice', DEFAULT)")?;
+    let rows = db.query("SELECT id, name, created_at FROM t", &[])?;
+    assert_eq!(rows.len(), 1);
+    // created_at must be a real Timestamp, not Null.
+    assert!(!matches!(rows[0].values[2], Value::Null),
+        "DEFAULT in VALUES should resolve to the column's default expression, got {:?}",
+        rows[0].values[2]);
+    Ok(())
+}
+
+#[test]
+fn b27_default_for_serial_still_auto_fills() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE t (id SERIAL PRIMARY KEY, v TEXT)")?;
+    // DEFAULT on a SERIAL column must still produce 1, 2, 3, ….
+    db.execute("INSERT INTO t (id, v) VALUES (DEFAULT, 'a')")?;
+    db.execute("INSERT INTO t (id, v) VALUES (DEFAULT, 'b')")?;
+    let rows = db.query("SELECT id, v FROM t ORDER BY id", &[])?;
+    assert_eq!(rows.len(), 2);
+    let id1 = match rows[0].values[0] {
+        Value::Int4(n) => n as i64,
+        Value::Int8(n) => n,
+        _ => panic!(),
+    };
+    let id2 = match rows[1].values[0] {
+        Value::Int4(n) => n as i64,
+        Value::Int8(n) => n,
+        _ => panic!(),
+    };
+    assert_eq!(id1, 1);
+    assert_eq!(id2, 2);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// B28 — wire-only regression (tested via postgres-js smoke rather than
+// core API, same as B19/B20).
+// ---------------------------------------------------------------------
+
+// ---------------------------------------------------------------------
 // heliosdb_capability_report() — self-describing capability probe
 // ---------------------------------------------------------------------
 #[test]

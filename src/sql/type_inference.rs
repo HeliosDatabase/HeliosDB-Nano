@@ -214,6 +214,10 @@ impl TypeInference for LogicalExpr {
                     ))
             }
 
+            // DEFAULT marker — the real type is the target column's,
+            // resolved by the INSERT executor at execute time.
+            LogicalExpr::DefaultValue => Ok(DataType::Text),
+
             // EXISTS subquery: always returns boolean
             LogicalExpr::Exists { .. } => {
                 Ok(DataType::Boolean)
@@ -404,6 +408,9 @@ impl TypeInference for LogicalExpr {
 
             // Scalar subquery: may return zero rows → NULL.
             LogicalExpr::ScalarSubquery { .. } => true,
+
+            // DEFAULT marker — nullable iff the column is.
+            LogicalExpr::DefaultValue => true,
 
             // EXISTS subquery: never nullable (always returns boolean)
             LogicalExpr::Exists { .. } => false,

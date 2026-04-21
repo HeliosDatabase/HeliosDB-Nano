@@ -2745,14 +2745,18 @@ impl<'a> Planner<'a> {
                     row.iter()
                         .map(|expr| {
                             // SQL `DEFAULT` keyword in a VALUES list:
-                            // sqlparser classifies it as `Expr::Identifier`
-                            // because `DEFAULT` isn't a keyword in the
-                            // expression grammar. Treat it as NULL so
-                            // the existing SERIAL auto-fill + column
-                            // default application kicks in downstream.
+                            // sqlparser classifies it as
+                            // `Expr::Identifier` because `DEFAULT` isn't
+                            // a keyword in the expression grammar.
+                            // Emit a dedicated `DefaultValue` marker so
+                            // the INSERT executor can fall through to
+                            // the column's declared DEFAULT expression
+                            // (or NULL if none) — matching stock
+                            // PostgreSQL semantics. Drizzle emits
+                            // `VALUES (default, ...)` for every INSERT.
                             if let Expr::Identifier(ident) = expr {
                                 if ident.value.eq_ignore_ascii_case("DEFAULT") {
-                                    return Ok(LogicalExpr::Literal(Value::Null));
+                                    return Ok(LogicalExpr::DefaultValue);
                                 }
                             }
                             self.expr_to_logical(expr)

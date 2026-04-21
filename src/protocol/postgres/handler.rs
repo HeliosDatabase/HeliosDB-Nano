@@ -7,7 +7,7 @@ use crate::{Result, Error, EmbeddedDatabase, Tuple, Value, Schema};
 
 /// Case-insensitive prefix check without allocating a new String.
 #[inline]
-fn starts_with_icase(s: &str, prefix: &str) -> bool {
+pub(super) fn starts_with_icase(s: &str, prefix: &str) -> bool {
     // Safety: length is checked on the left side of &&
     #[allow(clippy::indexing_slicing)]
     {
@@ -1328,9 +1328,20 @@ pub(super) fn tuple_to_pg_values(tuple: &Tuple) -> Vec<Option<Vec<u8>>> {
             Value::Json(j) => Some(j.to_string().into_bytes()),
             Value::Numeric(n) => Some(n.as_bytes().to_vec()),
             Value::Uuid(u) => Some(u.to_string().into_bytes()),
-            Value::Timestamp(ts) => Some(ts.to_rfc3339().into_bytes()),
+            // PostgreSQL timestamp wire format: microsecond precision,
+            // space separator, no trailing timezone on `timestamp without
+            // time zone` columns. psycopg's native parser rejects
+            // `rfc3339` nanosecond output ("timestamp too large (after
+            // year 10K)") — PG itself truncates to 6 fractional digits.
+            Value::Timestamp(ts) => Some(
+                ts.naive_utc()
+                    .format("%Y-%m-%d %H:%M:%S%.6f")
+                    .to_string()
+                    .into_bytes()
+            ),
             Value::Date(d) => Some(d.format("%Y-%m-%d").to_string().into_bytes()),
-            Value::Time(t) => Some(t.format("%H:%M:%S%.f").to_string().into_bytes()),
+            // Same story for TIME — truncate to microseconds.
+            Value::Time(t) => Some(t.format("%H:%M:%S%.6f").to_string().into_bytes()),
             Value::Interval(micros) => {
                 let total_secs = micros / 1_000_000;
                 let days = total_secs / 86400;

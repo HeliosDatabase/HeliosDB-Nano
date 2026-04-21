@@ -275,6 +275,36 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             let tag = format!("SELECT {}", results_to_send.len());
             self.send_command_complete(&tag).await?;
         } else {
+            // INSERT / UPDATE / DELETE with RETURNING must route through
+            // `execute_returning` — otherwise the tuples are dropped and
+            // Drizzle's `.returning()` / psycopg's fetchone() see no rows
+            // even though the write succeeded. Detection mirrors
+            // `handle_query`'s `is_dml_returning` check.
+            let upper = executed_query.to_uppercase();
+            let is_dml_returning = upper.contains("RETURNING")
+                && (super::handler::starts_with_icase(executed_query.trim(), "INSERT")
+                    || super::handler::starts_with_icase(executed_query.trim(), "UPDATE")
+                    || super::handler::starts_with_icase(executed_query.trim(), "DELETE"));
+            if is_dml_returning {
+                let (affected, tuples) = self.database.execute_returning(&executed_query)?;
+                self.prepared_statements.update_portal_state(&portal_name, PortalState::Complete)?;
+                // RowDescription was already sent during Describe; Execute
+                // only emits DataRows + CommandComplete.
+                for row in &tuples {
+                    let values = super::handler::tuple_to_pg_values(row);
+                    self.send_message(BackendMessage::DataRow { values }).await?;
+                }
+                let tag = if super::handler::starts_with_icase(executed_query.trim(), "INSERT") {
+                    format!("INSERT 0 {}", affected)
+                } else if super::handler::starts_with_icase(executed_query.trim(), "UPDATE") {
+                    format!("UPDATE {}", affected)
+                } else {
+                    format!("DELETE {}", affected)
+                };
+                self.send_command_complete(&tag).await?;
+                return Ok(());
+            }
+
             // Non-SELECT query
             let affected = self.database.execute(&executed_query)?;
             let tag = self.get_command_tag(&executed_query, affected);

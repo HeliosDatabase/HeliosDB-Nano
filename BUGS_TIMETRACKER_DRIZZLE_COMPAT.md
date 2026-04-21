@@ -49,13 +49,14 @@ Stock PostgreSQL 16 is the reference behaviour in every example below.
 
 ## Status overview
 
-Six columns:
+Seven columns:
 - **3.13.x** — state before any of this work
 - **3.14.0 @ ba6f16d** — version bumped, fixes not yet on the built commit (reporter's first retest)
 - **3.14.0 @ 88165aa** — Sprint-1..4 commit (reporter's second retest)
 - **3.14.1** — third round (B19 / B20 / B21)
 - **3.14.2** — fourth round (B22 / B23)
 - **3.14.3** — fifth round (B24 / B25 / B26)
+- **3.14.4** — sixth round (B27 / B28)
 
 | ID  | Feature                               | Severity | 3.13.x   | 3.14.0 @ ba6f16d | 3.14.0 @ 88165aa          | 3.14.1    |
 |-----|---------------------------------------|----------|----------|------------------|---------------------------|-----------|
@@ -84,6 +85,8 @@ Six columns:
 | B24 | DEFAULT `<expr>` on omitted column    | blocker  | —        | —                | —                         | **fixed** in 3.14.3 (now evaluated for omitted slots) |
 | B25 | `INSERT … DEFAULT VALUES` syntax      | major    | —        | —                | —                         | **fixed** in 3.14.3 (maps to empty VALUES row) |
 | B26 | NOT NULL not enforced                 | blocker  | —        | —                | —                         | **fixed** in 3.14.3 (all three INSERT paths) |
+| B27 | `DEFAULT` in VALUES → column's expr   | blocker  | —        | —                | —                         | **fixed** in 3.14.4 (LogicalExpr::DefaultValue) |
+| B28 | `RETURNING *` via extended protocol   | blocker  | —        | —                | —                         | **fixed** in 3.14.4 (routes through execute_returning) |
 
 ---
 
@@ -952,9 +955,156 @@ B24 is the remaining blocker between v3.14.2 and a running TimeTracker deploymen
 
 ---
 
+## Sixth retest (2026-04-21 evening) — rebuilt from commit `fb5599a` (v3.14.3)
+
+Binary rebuilt from `feat/v3.11.0-integration` tip
+`fb5599a fix(nano): v3.14.3 — DEFAULT expr + DEFAULT VALUES + NOT NULL (B24 / B25 / B26)`,
+repackaged as `heliosdb-nano:3.14.3`, fresh `ttm_db_data` volume.
+`SELECT version()` reports `HeliosDB Nano 3.14.3`.
+
+### Confirmed end-to-end fixed in 3.14.3
+
+Verified by running Drizzle-style INSERTs from both `psql` and a real
+postgres-js client:
+
+- **B24 (omitted-column DEFAULT)** — fixed. `INSERT INTO "users" ("email","password") VALUES ('simple@x.com','pw') RETURNING *` from psql returns `created_at = 2026-04-21T…` ✓
+- **B26 (NOT NULL enforcement)** — enforced consistently on the simple-query path now. `INSERT INTO t_nn (id, must_be_set) VALUES (1, NULL)` fails with `ERROR: NOT NULL constraint violated`.
+- **B25 (`INSERT … DEFAULT VALUES`)** — presumed fixed per release notes; not exercised in TimeTracker.
+
+### New blockers surfaced by Drizzle's actual INSERT SQL
+
+With B24/B25/B26 fixed, I captured the real SQL that `drizzle-orm`
+emits for a `db.insert(users).values({ email, password }).returning()`
+call, using the postgres-js `debug` hook:
+
+```
+SQL: insert into "users" ("id", "email", "password", "created_at")
+     values (default, $1, $2, default)
+     returning "id", "email", "password", "created_at"
+PARAMS: [ 'drz@x.com', 'pwhashed' ]
+```
+
+This is Drizzle's **default** insert shape — it *includes every column*
+in the column list, and uses the `DEFAULT` keyword as the value for
+columns it wants the DB to auto-fill. Two distinct bugs surface here:
+
+### B27 (NEW, blocker) — `DEFAULT` keyword inside VALUES is rewritten to NULL, not resolved to the column's declared default
+
+**Severity:** blocker — this is Drizzle's standard INSERT pattern;
+every write path in TimeTracker hits it.
+
+**Reproducer (2026-04-21):**
+```sql
+CREATE TABLE "users" ("id" SERIAL PRIMARY KEY,
+                      "email" varchar(255) NOT NULL,
+                      "password" varchar(255) NOT NULL,
+                      "created_at" timestamp DEFAULT now() NOT NULL);
+
+-- Drizzle-style: column listed, value is the DEFAULT keyword
+INSERT INTO "users" ("id","email","password","created_at")
+  VALUES (DEFAULT, 'psql@x.com', 'pw', DEFAULT)
+  RETURNING *;
+-- ERROR: Constraint violation: NOT NULL constraint violated:
+--        cannot insert NULL into column 'created_at'
+```
+
+**Root cause (inferred from B3's release note).** The B3 fix "rewrites
+`DEFAULT` appearing in an INSERT VALUES list to NULL so the SERIAL
+auto-fill / column default path applies". That's only half-right — it
+works when the column has an auto-fill (SERIAL/IDENTITY), but when the
+column has a declared `DEFAULT <expr>` (e.g. `DEFAULT now()`), the
+rewrite to NULL ends up:
+1. Storing NULL in that slot, and
+2. Triggering the now-enforced NOT NULL check (B26) because the
+   DEFAULT expression is never evaluated.
+
+The B24 fix evaluates `DEFAULT now()` only when the column is *omitted*
+from the column list. But Drizzle puts the column in the list and asks
+for DEFAULT via the keyword.
+
+**Fix shape.** In the B3 path, when the `DEFAULT` keyword is rewritten,
+check whether the target column has:
+- a `SERIAL`/`IDENTITY` → pass NULL (existing behaviour), or
+- a declared `DEFAULT <expr>` → evaluate that expression (same helper
+  already used by B24's omitted-column path), or
+- neither → pass NULL and let B26's NOT NULL check fire.
+
+**Verified identical failure from both protocols:**
+- psql simple-Q: `ERROR: Constraint violation: NOT NULL …`
+- postgres-js extended-Q: `Constraint violation: NOT NULL …`
+
+**Impact on TimeTracker.** 100% of writes via `drizzle-orm/postgres-js`
+fail here. This includes every `insert(…).values({…}).returning()`
+across `routes.ts`, `bulk-operations.ts`, `templates.ts`, `workspaces.ts`,
+and `auth.ts`. User registration — the first API call any app makes —
+errors out on this path.
+
+### B28 (NEW, blocker) — `INSERT … RETURNING *` via extended protocol returns 0 rows even when the INSERT succeeds
+
+**Severity:** blocker — Drizzle uses `.returning()` to retrieve
+generated IDs, timestamps, and other server-defaulted values; returning
+nothing breaks every `const [row] = await db.insert(…).returning()`.
+
+**Reproducer (2026-04-21 — extended-protocol, from postgres-js):**
+```js
+import postgres from 'postgres';
+const sql = postgres('postgres://postgres@ttm-db:5432/heliosdb', { ssl: false });
+
+// extended-Q INSERT with RETURNING — row persists, result is empty
+const r1 = await sql`insert into "users" ("email","password")
+                     values (${'r1@x.com'}, ${'pw'}) returning *`;
+console.log(r1);  // []   ← should be [{ id: …, email: 'r1@x.com', … }]
+
+const r2 = await sql`insert into "users" ("email","password")
+                     values (${'r2@x.com'}, ${'pw'})`;
+console.log(r2);  // []   ← expected, no RETURNING
+
+// Rows actually exist:
+const check = await sql`select id, email from "users"
+                        where email in (${'r1@x.com'}, ${'r2@x.com'})`;
+console.log(check);
+// [ { id: 3, email: 'r1@x.com' }, { id: 4, email: 'r2@x.com' } ]
+```
+
+**Observations.** The row is committed (`SELECT` finds it), but the
+`DataRow` stream for the RETURNING result is missing on the extended
+protocol path. On the simple-query path the same INSERT … RETURNING
+does emit the row (see B24 verification above), so the regression is
+specific to `Parse`/`Bind`/`Execute`.
+
+**Likely root cause.** After the B4 (RETURNING wire-format) and B22
+(Flush) fixes, the extended-protocol INSERT path still needs to emit
+its RETURNING rows before the final `CommandComplete`/`ReadyForQuery`.
+My guess is that `handle_execute_extended` calls the insert executor's
+"no-RETURNING" fast path even when the `Parse`-time query declared a
+RETURNING clause, so the rows are discarded.
+
+**Impact on TimeTracker.** Even if B27 is fixed, `auth.ts` does:
+```ts
+const [user] = await db.insert(users).values({…}).returning();
+const token = jwt.sign({ id: user.id }, JWT_SECRET, …);  // throws: user is undefined
+```
+Same pattern in every other `routes.ts` / `bulk-operations.ts` write.
+Registration, customer creation, time-entry start/stop, invoice
+generation, workspace creation — all depend on the returned row.
+
+---
+
+## Status of the TimeTracker deployment after 3.14.3 @ fb5599a
+
+- `heliosdb-nano:3.14.3` built from `fb5599a`, `version()` correctly reports `3.14.3`.
+- Migrations 0000–0003 apply with zero errors; backfill UPDATEs behave as no-ops on fresh DB.
+- `SELECT`s, `pg_catalog` lookups, `pg_tables` queries, parameterised reads all work end-to-end over the extended query protocol.
+- **TimeTracker still cannot register a user.** First INSERT from Drizzle is the quoted `"id","email","password","created_at" VALUES (DEFAULT, $1, $2, DEFAULT)` form, which hits B27. Even if B27 is worked around by changing the insert shape, B28 makes `.returning()` return `[]`, so the app crashes on `const [user] = …`.
+- No NPM proxy host created.
+
+B27 and B28 are the remaining blockers between v3.14.3 and a running TimeTracker deployment. Both are Drizzle-specific — they're on the hot path for every write operation — and both show up on the *extended* query protocol that every real driver uses.
+
+---
+
 ## Closing
 
-Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.2` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
+Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.3` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
 
 B18 in particular is worth a hardening test: any attempt to verify a B4 fix should also assert that `SELECT *` against the table after the failing INSERT still works.
 

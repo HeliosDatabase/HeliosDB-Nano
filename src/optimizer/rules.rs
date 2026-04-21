@@ -541,6 +541,9 @@ impl ProjectionPruningRule {
             LogicalExpr::ScalarSubquery { .. } => {
                 // Subquery columns are independent of the outer plan.
             }
+            LogicalExpr::DefaultValue => {
+                // DEFAULT marker has no outer-column dependencies.
+            }
             LogicalExpr::Exists { .. } => {
                 // EXISTS subquery has no direct column references from outer query
                 // (correlated subqueries would need different handling)
