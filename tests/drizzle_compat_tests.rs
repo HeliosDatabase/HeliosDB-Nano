@@ -302,6 +302,102 @@ fn b23_scalar_subquery_returning_null() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------
+// B24 — DEFAULT <expr> applied when the column is omitted from INSERT
+// ---------------------------------------------------------------------
+#[test]
+fn b24_default_expr_applied_when_column_omitted() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(
+        "CREATE TABLE t (id SERIAL PRIMARY KEY, name TEXT, \
+                         created_at TIMESTAMP DEFAULT now() NOT NULL)",
+    )?;
+    db.execute("INSERT INTO t (name) VALUES ('alice')")?;
+    let rows = db.query("SELECT name, created_at FROM t", &[])?;
+    assert_eq!(rows.len(), 1);
+    assert!(!matches!(rows[0].values[1], Value::Null),
+        "created_at must be populated from DEFAULT now(), got {:?}", rows[0].values[1]);
+    Ok(())
+}
+
+#[test]
+fn b24_default_literal_applied() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE t (id SERIAL PRIMARY KEY, n INT DEFAULT 42)")?;
+    db.execute("INSERT INTO t (id) VALUES (1)")?;
+    let rows = db.query("SELECT n FROM t", &[])?;
+    if let Value::Int4(v) = rows[0].values[0] {
+        assert_eq!(v, 42);
+    } else if let Value::Int8(v) = rows[0].values[0] {
+        assert_eq!(v, 42);
+    } else {
+        panic!("expected int 42, got {:?}", rows[0].values[0]);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// B25 — INSERT ... DEFAULT VALUES
+// ---------------------------------------------------------------------
+#[test]
+fn b25_default_values_syntax() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE t (id SERIAL PRIMARY KEY, n INT DEFAULT 99)")?;
+    db.execute("INSERT INTO t DEFAULT VALUES")?;
+    let rows = db.query("SELECT n FROM t", &[])?;
+    assert_eq!(rows.len(), 1);
+    if let Value::Int4(v) = rows[0].values[0] {
+        assert_eq!(v, 99);
+    } else if let Value::Int8(v) = rows[0].values[0] {
+        assert_eq!(v, 99);
+    } else {
+        panic!("expected 99, got {:?}", rows[0].values[0]);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// B26 — NOT NULL enforced (explicit NULL + omitted) on every INSERT path
+// ---------------------------------------------------------------------
+#[test]
+fn b26_not_null_explicit_null_rejected() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE t (id INT, must_be_set TEXT NOT NULL)")?;
+    let result = db.execute("INSERT INTO t (id, must_be_set) VALUES (1, NULL)");
+    assert!(result.is_err(), "explicit NULL into NOT NULL column should error");
+    let msg = format!("{}", result.unwrap_err());
+    assert!(msg.contains("NOT NULL") || msg.contains("not null"),
+        "error should mention NOT NULL, got: {msg}");
+    Ok(())
+}
+
+#[test]
+fn b26_not_null_omitted_rejected() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE t (id INT, must_be_set TEXT NOT NULL)")?;
+    // Omitting the NOT NULL column without a default should error,
+    // not silently insert NULL.
+    let result = db.execute("INSERT INTO t (id) VALUES (2)");
+    assert!(result.is_err(), "omitted NOT NULL column should error");
+    Ok(())
+}
+
+#[test]
+fn b26_not_null_with_default_is_satisfied() -> Result<()> {
+    // NOT NULL + DEFAULT: omitting the column should apply the default,
+    // not error. Per PG.
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE t (id INT, status TEXT DEFAULT 'pending' NOT NULL)")?;
+    db.execute("INSERT INTO t (id) VALUES (1)")?;
+    let rows = db.query("SELECT status FROM t", &[])?;
+    if let Value::String(s) = &rows[0].values[0] {
+        assert_eq!(s, "pending");
+    } else {
+        panic!("expected 'pending', got {:?}", rows[0].values);
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
 // heliosdb_capability_report() — self-describing capability probe
 // ---------------------------------------------------------------------
 #[test]

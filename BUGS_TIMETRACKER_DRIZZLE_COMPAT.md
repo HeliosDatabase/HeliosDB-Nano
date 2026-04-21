@@ -49,12 +49,13 @@ Stock PostgreSQL 16 is the reference behaviour in every example below.
 
 ## Status overview
 
-Five columns:
+Six columns:
 - **3.13.x** — state before any of this work
 - **3.14.0 @ ba6f16d** — version bumped, fixes not yet on the built commit (reporter's first retest)
 - **3.14.0 @ 88165aa** — Sprint-1..4 commit (reporter's second retest)
 - **3.14.1** — third round (B19 / B20 / B21)
 - **3.14.2** — fourth round (B22 / B23)
+- **3.14.3** — fifth round (B24 / B25 / B26)
 
 | ID  | Feature                               | Severity | 3.13.x   | 3.14.0 @ ba6f16d | 3.14.0 @ 88165aa          | 3.14.1    |
 |-----|---------------------------------------|----------|----------|------------------|---------------------------|-----------|
@@ -80,6 +81,9 @@ Five columns:
 | B21 | DO block DECLARE / FOR / IF (PL/pgSQL)| major    | —        | —                | **new**                   | **fixed** (clear error + migration recipes in docs/compatibility/plpgsql.md) |
 | B22 | Flush (`H`) message unknown           | blocker  | —        | —                | —                         | **fixed** in 3.14.2 (added FrontendMessage::Flush) |
 | B23 | Scalar subquery in UPDATE SET         | major    | —        | —                | —                         | **fixed** in 3.14.2 (correlated + uncorrelated) |
+| B24 | DEFAULT `<expr>` on omitted column    | blocker  | —        | —                | —                         | **fixed** in 3.14.3 (now evaluated for omitted slots) |
+| B25 | `INSERT … DEFAULT VALUES` syntax      | major    | —        | —                | —                         | **fixed** in 3.14.3 (maps to empty VALUES row) |
+| B26 | NOT NULL not enforced                 | blocker  | —        | —                | —                         | **fixed** in 3.14.3 (all three INSERT paths) |
 
 ---
 
@@ -773,9 +777,184 @@ B22 (Flush message) is the remaining blocker between v3.14.1 and a running TimeT
 
 ---
 
+## Fifth retest (2026-04-21 evening) — rebuilt from commit `9071d97` (v3.14.2)
+
+Binary rebuilt from `feat/v3.11.0-integration` tip
+`9071d97 fix(nano): v3.14.2 — Flush message + scalar subquery in UPDATE (B22 / B23)`,
+repackaged as `heliosdb-nano:3.14.2`, fresh `ttm_db_data` volume.
+`SELECT version()` reports `HeliosDB Nano 3.14.2`.
+
+### Confirmed end-to-end fixed in 3.14.2
+
+- **B22 (Flush)** — `postgres-js` connects, completes the startup handshake, and issues parameterised queries over the extended query protocol. Verified:
+  ```js
+  await sql`select 1 as one`
+    // => Result(1) [ { one: 1 } ]
+  await sql`select oid, typname from pg_catalog.pg_type where typname = ${'int4'}`
+    // => Result(1) [ { oid: 23, typname: 'int4' } ]
+  ```
+- **B19 + B20** — now exercisable end-to-end (previously only testable from psql). The parameterised `pg_catalog.pg_type` lookup above is exactly the form every ORM uses on connect; returns the correct row.
+- **B23** — scalar subqueries in `UPDATE … SET col = (SELECT … WHERE outer.fk = inner.id)` parse and execute. `drizzle/0003_add_workspaces.sql` applies cleanly (including the four backfill UPDATEs, which return `UPDATE 0` on a fresh DB).
+
+### Migration suite result
+
+```
+=== 0000_initial.sql ===          CREATE TABLE × 3  ✓
+=== 0001_add_customer_goals.sql === OK 0 (ADD COLUMN)  / CREATE TABLE ✓
+=== 0002_add_entry_templates.sql === CREATE TABLE / CREATE INDEX  ✓
+=== 0003_add_workspaces.sql ===   CREATE TABLE × 3, CREATE INDEX × 6,
+                                  INSERT 0 0 × 2, UPDATE 0 × 4  ✓
+```
+
+All four migrations apply without errors for the first time across this
+retest series.
+
+### New blockers surfaced by the app's first real INSERT
+
+With Flush + catalog + subqueries working, `postgres-js` now gets all
+the way to TimeTracker's registration path. It fails at the first user
+INSERT:
+
+```
+[ERROR] heliosdb_nano::protocol::postgres::handler:
+  Error handling message: Constraint violation:
+  NOT NULL constraint violated: cannot insert NULL into column 'created_at'
+```
+
+The Drizzle-generated SQL is the textbook form:
+
+```sql
+INSERT INTO "users" ("email","password") VALUES ($1, $2)
+```
+
+against a table declared as
+
+```sql
+CREATE TABLE "users" (
+  "id" SERIAL PRIMARY KEY,
+  "email" varchar(255) NOT NULL UNIQUE,
+  "password" varchar(255) NOT NULL,
+  "created_at" timestamp DEFAULT now() NOT NULL
+);
+```
+
+Drizzle (and every other ORM) omits `created_at` from the column list
+because the DEFAULT is expected to fill it in. Three distinct bugs
+surface here:
+
+### B24 (NEW, blocker) — `DEFAULT <expr>` not evaluated on INSERT when column is omitted
+
+**Severity:** blocker for every Drizzle / Prisma / TypeORM schema that
+uses the standard `created_at timestamp DEFAULT now() NOT NULL`
+pattern.
+
+**Reproducer (extended protocol, 2026-04-21):**
+```sql
+CREATE TABLE t_dn ("id" SERIAL PRIMARY KEY,
+                   "created_at" timestamp DEFAULT now() NOT NULL);
+
+-- Drizzle-style INSERT (omits the defaulted column):
+INSERT INTO t_dn DEFAULT VALUES;
+-- (see B25 — syntax not supported; real driver uses the next form)
+
+INSERT INTO t_dn ("id") VALUES (1);
+-- Simple-Q: INSERT 0 1, but SELECT shows created_at IS NULL (B26)
+-- Extended-Q from postgres-js: ERROR — NOT NULL constraint violated on created_at
+```
+
+The DEFAULT expression is parsed (stored in the CREATE TABLE metadata)
+but **never evaluated** when the column is absent from the INSERT
+column list. Extended protocol correctly raises NOT NULL because the
+value really is NULL; simple protocol silently inserts a NULL row
+despite the NOT NULL declaration (B26).
+
+**Expected (stock PG 16).** Omitted columns take their declared
+DEFAULT. `INSERT INTO … ("id") VALUES (1)` succeeds with
+`created_at = now()` and the NOT NULL holds trivially.
+
+**Impact on TimeTracker.** Every table has a `created_at timestamp
+DEFAULT now() NOT NULL`; additionally `users`, `customers`,
+`time_entries`, `invoices`, `workspaces`, `memberships`, and
+`entry_templates` rely on `DEFAULT` for `updated_at`, `status`,
+`is_break`, and role columns. Every single INSERT from the app hits
+B24 before B25 / B26.
+
+---
+
+### B25 (NEW, major) — `INSERT … DEFAULT VALUES` syntax not supported
+
+**Reproducer (2026-04-21):**
+```sql
+INSERT INTO t_dn DEFAULT VALUES;
+-- ERROR:  Query execution error: INSERT statement missing source query
+```
+
+**Expected (stock PG):** a single row inserted with every column set
+to its declared DEFAULT.
+
+Not currently emitted by Drizzle but used by Prisma and by hand-written
+migrations to create "seed" rows. Low-priority follow-on to B24.
+
+---
+
+### B26 (NEW, blocker) — `NOT NULL` constraint not enforced on the simple-query path
+
+**Severity:** blocker for schema integrity; allows permanently-broken
+rows into tables that claim `NOT NULL`.
+
+**Reproducer (psql, simple query protocol, 2026-04-21):**
+```sql
+CREATE TABLE t_nn (id INT PRIMARY KEY,
+                   must_be_set timestamp NOT NULL);
+
+INSERT INTO t_nn (id, must_be_set) VALUES (1, NULL);
+-- INSERT 0 1   ← should be ERROR: null value in column "must_be_set" …
+
+INSERT INTO t_nn (id) VALUES (2);
+-- INSERT 0 1   ← omitted column, no DEFAULT; should be ERROR too
+```
+
+Verification:
+```sql
+SELECT id, must_be_set, must_be_set IS NULL AS is_null FROM t_nn;
+--  id | must_be_set | is_null
+-- ----+-------------+---------
+--   1 |             |   t
+--   2 |             |   t
+```
+
+**Inconsistency with extended protocol.** The same `INSERT INTO t_nn
+(id) VALUES (2)` issued through postgres-js (extended protocol)
+correctly errors with `NOT NULL constraint violated`. So the constraint
+is declared, just not evaluated on the simple-query path.
+
+**Expected (stock PG):** identical behaviour on both protocols — both
+should reject NULL.
+
+**Impact on TimeTracker.** `psql -f migrations/*.sql` runs under the
+simple-query protocol and can therefore seed tables with NULL values
+into columns declared NOT NULL. When the app later reads those rows
+via Drizzle (extended protocol), Drizzle's generated TypeScript types
+promise non-null fields, so client code accessing `row.created_at` may
+`.toISOString()` on `undefined` and crash.
+
+---
+
+## Status of the TimeTracker deployment after 3.14.2 @ 9071d97
+
+- `heliosdb-nano:3.14.2` built from `9071d97`, `version()` correctly reports `3.14.2`.
+- Migrations 0000–0003 applied with **no errors** — first clean run across this retest series.
+- Driver-level compatibility over the extended query protocol is **live**: `postgres-js` connects, queries `pg_catalog.pg_type` with params, reads user tables. B19 / B20 / B22 verified end-to-end.
+- **TimeTracker still cannot register a user.** First `INSERT INTO "users" ("email","password") …` over the extended protocol fails with B24 (`NOT NULL constraint violated: created_at`), because the column's `DEFAULT now()` is never evaluated when Drizzle omits it.
+- No NPM proxy host created.
+
+B24 is the remaining blocker between v3.14.2 and a running TimeTracker deployment. B26 is a data-integrity concern that should be fixed alongside B24 since the two share the same "DEFAULT / NULL handling on INSERT" code path. B25 is a low-priority ergonomic follow-on.
+
+---
+
 ## Closing
 
-Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.1` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
+Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.2` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
 
 B18 in particular is worth a hardening test: any attempt to verify a B4 fix should also assert that `SELECT *` against the table after the failing INSERT still works.
 

@@ -286,16 +286,35 @@ impl<'a> Planner<'a> {
                 // Extract fields from Insert struct for v0.53 API
                 let table_name = Self::normalize_object_name(&insert.table_name);
                 let columns = insert.columns;
-                let source = insert.source.ok_or_else(||
-                    Error::query_execution("INSERT statement missing source query")
-                )?;
+                // `INSERT INTO t DEFAULT VALUES` — sqlparser leaves
+                // `source = None`. Emit an Insert with an empty
+                // VALUES row; the executor's default-fill pass
+                // provides every column's default (or NULL, or
+                // NOT NULL error). No columns are provided, so every
+                // slot goes through the "omitted" path.
+                let source_opt = insert.source;
                 // Extract RETURNING clause if present
                 let returning = insert.returning.as_ref()
                     .map(|ret_items| self.convert_returning(ret_items))
                     .transpose()?;
                 // Extract ON CONFLICT clause if present
                 let on_conflict = self.convert_on_conflict(&insert.on)?;
-                self.insert_to_plan(table_name, columns, source, returning, on_conflict)
+                match source_opt {
+                    Some(source) => self.insert_to_plan(table_name, columns, source, returning, on_conflict),
+                    None => Ok(LogicalPlan::Insert {
+                        table_name,
+                        columns: if columns.is_empty() {
+                            None
+                        } else {
+                            Some(columns.iter().map(Self::normalize_ident).collect())
+                        },
+                        // One row with zero user-provided values — the
+                        // INSERT executor's default-fill covers the rest.
+                        values: vec![vec![]],
+                        returning,
+                        on_conflict,
+                    }),
+                }
             }
             Statement::CreateTable(create_table) => {
                 // Extract fields from CreateTable struct for v0.53 API

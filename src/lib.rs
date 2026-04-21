@@ -1018,6 +1018,23 @@ impl EmbeddedDatabase {
                         .collect();
 
                     let final_values_vec = final_values?;
+
+                    // Enforce NOT NULL on columns the user passed
+                    // `NULL` for explicitly. Omitted columns were
+                    // already handled above (default-expr or error).
+                    // PK columns are left for SERIAL/IDENTITY auto-fill
+                    // to populate in the storage layer.
+                    for (idx, col) in schema.columns.iter().enumerate() {
+                        if !col.nullable && !col.primary_key {
+                            if matches!(final_values_vec.get(idx), Some(Value::Null)) {
+                                return Err(Error::constraint_violation(format!(
+                                    "NOT NULL constraint violated: cannot insert NULL into column '{}'",
+                                    col.name
+                                )));
+                            }
+                        }
+                    }
+
                     let mut tuple = Tuple::new(final_values_vec.clone());
 
                     // Validate foreign key constraints via ART index (O(1) lookup)
@@ -3296,12 +3313,23 @@ impl EmbeddedDatabase {
 
         // Build ordered tuple (columns may be in non-schema order)
         let mut tuple_values = vec![Value::Null; schema.columns.len()];
+        let mut user_provided = vec![false; schema.columns.len()];
         for (i, &col_idx) in col_indices.iter().enumerate() {
             if let Some(val) = values.get(i) {
                 if col_idx < tuple_values.len() {
                     tuple_values[col_idx] = val.clone();
+                    user_provided[col_idx] = true;
                 }
             }
+        }
+
+        // Apply DEFAULT expressions for omitted columns and enforce
+        // NOT NULL (B24 / B26). Evaluator errors here bubble up as the
+        // Result from this fast path — caller handles accordingly.
+        if let Err(e) = Self::apply_defaults_and_check_not_null(
+            &mut tuple_values, &schema, &user_provided,
+        ) {
+            return Some(Err(e));
         }
 
         let tuple = Tuple::new(tuple_values);
@@ -4969,6 +4997,7 @@ impl EmbeddedDatabase {
                     // RETURNING *` return a one-field DataRow against
                     // a two-field RowDescription.
                     let mut tuple_values: Vec<Value> = vec![Value::Null; schema.columns.len()];
+                    let mut user_provided: Vec<bool> = vec![false; schema.columns.len()];
 
                     for (col_idx, expr) in value_row.iter().enumerate() {
                         let target_col_idx = if let Some(ref cols) = columns {
@@ -5012,14 +5041,19 @@ impl EmbeddedDatabase {
                         if let Some(slot) = tuple_values.get_mut(target_col_idx) {
                             *slot = value;
                         }
+                        if let Some(flag) = user_provided.get_mut(target_col_idx) {
+                            *flag = true;
+                        }
                     }
 
-                    // Column defaults: the column-level `default_expr`
-                    // is stored as SQL text in the catalog; re-parsing
-                    // it here would add cost to the INSERT hot path.
-                    // Downstream `insert_tuple_*` handles SERIAL / PK
-                    // auto-fill for NULL values; non-SERIAL defaults
-                    // are applied by the legacy INSERT path (line 878+).
+                    // Apply DEFAULT expressions for omitted columns and
+                    // enforce NOT NULL. SERIAL / IDENTITY auto-fill still
+                    // runs inside the storage layer — we leave primary
+                    // keys NULL here on purpose so the counter picks the
+                    // row_id.
+                    Self::apply_defaults_and_check_not_null(
+                        &mut tuple_values, &schema, &user_provided,
+                    )?;
 
                     let tuple = Tuple::new(tuple_values);
                     // Insert first so the storage layer applies SERIAL /
@@ -7213,6 +7247,68 @@ impl EmbeddedDatabase {
         // Execute plan and extract just the row count (ignore returned tuples)
         let (count, _tuples) = self.execute_plan_with_params(plan, &[])?;
         Ok(count)
+    }
+
+    /// Apply DEFAULT expressions to NULL-valued columns and enforce
+    /// NOT NULL constraints on a tuple before storage insert.
+    ///
+    /// * Skips the primary-key column — SERIAL / IDENTITY auto-fill
+    ///   runs inside the storage layer after this method returns.
+    /// * Skips columns already marked `primary_key`; the storage
+    ///   layer fills them with `row_id`.
+    /// * Defaults are applied only when the column slot is NULL
+    ///   *and* was omitted from the user's VALUES list. Explicitly
+    ///   providing `NULL` bypasses the default and surfaces as a
+    ///   NOT NULL violation — this matches stock PostgreSQL.
+    ///
+    /// `user_provided[i] = true` for every column index that appeared
+    /// in the INSERT's column list (or for positional inserts with
+    /// the column's index inside the provided VALUES row).
+    pub(crate) fn apply_defaults_and_check_not_null(
+        tuple_values: &mut [Value],
+        schema: &Schema,
+        user_provided: &[bool],
+    ) -> Result<()> {
+        let evaluator = sql::Evaluator::new(std::sync::Arc::new(schema.clone()));
+        let empty_tuple = Tuple::new(vec![]);
+
+        for (idx, col) in schema.columns.iter().enumerate() {
+            let slot = match tuple_values.get_mut(idx) {
+                Some(s) => s,
+                None => continue,
+            };
+            let is_null = matches!(slot, Value::Null);
+            let was_omitted = user_provided.get(idx).copied().unwrap_or(false) == false;
+
+            if is_null && was_omitted {
+                // Try the column's DEFAULT expression.
+                if let Some(json) = &col.default_expr {
+                    if let Ok(default_expr) = serde_json::from_str::<sql::LogicalExpr>(json) {
+                        if let Ok(v) = evaluator.evaluate(&default_expr, &empty_tuple) {
+                            let casted = if v.data_type() != col.data_type {
+                                evaluator.cast_value(v, &col.data_type).unwrap_or(Value::Null)
+                            } else {
+                                v
+                            };
+                            *slot = casted;
+                        }
+                    }
+                }
+            }
+
+            // After potential default application, enforce NOT NULL.
+            // Primary-key columns skip this check because SERIAL /
+            // IDENTITY auto-fill runs in the storage layer later.
+            if !col.nullable && !col.primary_key {
+                if matches!(slot, Value::Null) {
+                    return Err(Error::constraint_violation(format!(
+                        "NOT NULL constraint violated: cannot insert NULL into column '{}'",
+                        col.name
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Pre-evaluate any `ScalarSubquery` nodes inside `expr` against

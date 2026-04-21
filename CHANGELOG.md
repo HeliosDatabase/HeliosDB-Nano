@@ -5,6 +5,42 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.14.3] - 2026-04-21
+
+### Fixed — first-user-registration blockers (B24 / B25 / B26)
+
+- **B24 `DEFAULT <expr>` applied on omitted columns.** Every Drizzle
+  table with `created_at TIMESTAMP DEFAULT now() NOT NULL` was
+  inserting NULL instead of evaluating `now()`, then either erroring
+  on the NOT NULL constraint or (worse) storing NULL silently. New
+  helper `apply_defaults_and_check_not_null` parses the stored
+  default expression JSON, evaluates it via the shared SQL evaluator,
+  and fills in the omitted slot. Only omitted slots get defaults —
+  explicit `NULL` bypasses the default and surfaces as a NOT NULL
+  violation, matching stock PostgreSQL.
+- **B25 `INSERT INTO t DEFAULT VALUES`.** sqlparser leaves
+  `insert.source = None` for this syntax; the planner used to error
+  with "INSERT statement missing source query". Now maps to an Insert
+  with a single empty VALUES row — every schema column goes through
+  the default-fill pass.
+- **B26 `NOT NULL` enforcement on every INSERT path.** Three INSERT
+  paths (fast-path `try_fast_insert`, per-params
+  `execute_plan_with_params`, main transactional
+  `execute_in_transaction`) all call the new NOT NULL check. Covers
+  both omitted columns and explicit `NULL` in user VALUES. Consistent
+  with the extended-protocol path.
+
+### Added
+
+- `EmbeddedDatabase::apply_defaults_and_check_not_null` — single
+  source of truth for default application + NOT NULL enforcement
+  across all three INSERT paths.
+- `tests/drizzle_compat_tests.rs` — six B24 / B25 / B26 regression
+  cases (DEFAULT with function call, DEFAULT with literal, DEFAULT
+  VALUES, explicit NULL rejected, omitted NOT NULL rejected, NOT NULL
+  satisfied by default). All 24 compat tests passing; 1730 lib tests
+  unchanged.
+
 ## [3.14.2] - 2026-04-21
 
 ### Fixed — real-driver blockers found during v3.14.1 retest
