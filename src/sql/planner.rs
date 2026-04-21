@@ -2498,6 +2498,17 @@ impl<'a> Planner<'a> {
                 })
             }
 
+            // Scalar subquery: `(SELECT col FROM t WHERE ...)` used as
+            // an expression. We don't materialise here because the
+            // caller (e.g. UPDATE SET) needs to supply the outer-row
+            // context for correlation. At simple-evaluation sites the
+            // evaluator materialises uncorrelated cases via
+            // `materialize_subqueries`.
+            Expr::Subquery(subquery) => {
+                let plan = self.query_to_plan((**subquery).clone())?;
+                Ok(LogicalExpr::ScalarSubquery { subquery: Box::new(plan) })
+            }
+
             // IN subquery: expr IN (SELECT ...)
             Expr::InSubquery { expr, subquery, negated } => {
                 // Convert subquery to a logical plan (dereference Box and clone Query)

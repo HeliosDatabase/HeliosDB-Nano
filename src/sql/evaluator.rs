@@ -292,6 +292,18 @@ impl Evaluator {
                 ))
             }
 
+            LogicalExpr::ScalarSubquery { .. } => {
+                // Scalar subquery must be materialised before evaluation.
+                // Uncorrelated ones are materialised by
+                // `Executor::materialize_subqueries`; correlated ones
+                // by the caller (see the UPDATE path).
+                Err(Error::query_execution(
+                    "Scalar subquery reached the evaluator without materialisation. \
+                     Correlated subqueries are only supported in UPDATE SET at the moment; \
+                     rewrite other uses as UPDATE … FROM joins or plain SELECT expressions."
+                ))
+            }
+
             LogicalExpr::Exists { .. } => {
                 // EXISTS evaluation requires executor context
                 // This should be handled at the executor level, not evaluator

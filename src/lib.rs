@@ -1734,7 +1734,16 @@ impl EmbeddedDatabase {
                         // Create new tuple with updated values
                         let mut new_tuple = old_tuple.clone();
                         for (col_name, value_expr) in assignments {
-                            let new_value = evaluator.evaluate(value_expr, &old_tuple)?;
+                            // Resolve any scalar subqueries (including
+                            // correlated ones) against the outer row
+                            // first — substitutes `outer_table.col`
+                            // refs with literals and executes the
+                            // plan once per row. No-op for expressions
+                            // without subqueries.
+                            let bound = self.materialize_scalar_subqueries_for_row(
+                                value_expr, &old_tuple, &schema, table_name,
+                            )?;
+                            let new_value = evaluator.evaluate(&bound, &old_tuple)?;
                             let col_index = evaluator.schema().get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
                             *new_tuple.values.get_mut(col_index)
@@ -4194,9 +4203,15 @@ impl EmbeddedDatabase {
                     };
 
                     if where_matches && rls_matches {
-                        // Apply updates
+                        // Apply updates — materialise any scalar
+                        // subqueries (including correlated ones) per
+                        // row before handing the expression to the
+                        // row-scoped evaluator.
                         for (col_name, value_expr) in assignments {
-                            let new_value = evaluator.evaluate(value_expr, &tuple)?;
+                            let bound = self.materialize_scalar_subqueries_for_row(
+                                value_expr, &tuple, &schema, table_name,
+                            )?;
+                            let new_value = evaluator.evaluate(&bound, &tuple)?;
                             // Find column index
                             let col_index = evaluator.schema().get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
@@ -5139,7 +5154,10 @@ impl EmbeddedDatabase {
 
                     if matches {
                         for (col_name, value_expr) in assignments {
-                            let new_value = evaluator.evaluate(value_expr, &tuple)?;
+                            let bound = self.materialize_scalar_subqueries_for_row(
+                                value_expr, &tuple, &schema, table_name,
+                            )?;
+                            let new_value = evaluator.evaluate(&bound, &tuple)?;
                             let col_index = evaluator.schema().get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
                             if let Some(slot) = tuple.values.get_mut(col_index) {
@@ -7195,6 +7213,148 @@ impl EmbeddedDatabase {
         // Execute plan and extract just the row count (ignore returned tuples)
         let (count, _tuples) = self.execute_plan_with_params(plan, &[])?;
         Ok(count)
+    }
+
+    /// Pre-evaluate any `ScalarSubquery` nodes inside `expr` against
+    /// the current outer row so that the regular evaluator (which
+    /// only sees the row) can run as normal.
+    ///
+    /// For correlated subqueries (refs to `outer_table`), we clone
+    /// the subquery plan and substitute every
+    /// `Column { table: Some(outer_table), name }` with the literal
+    /// value from `outer_row`. For uncorrelated cases the
+    /// substitution is a no-op. The substituted plan is executed
+    /// once per row; we take the first column of the first returned
+    /// row (or `Value::Null` for zero rows) — standard scalar
+    /// subquery semantics.
+    ///
+    /// Used by the UPDATE executor to support
+    /// `UPDATE t SET col = (SELECT … FROM other WHERE other.fk = t.id)`.
+    fn materialize_scalar_subqueries_for_row(
+        &self,
+        expr: &sql::LogicalExpr,
+        outer_row: &Tuple,
+        outer_schema: &Schema,
+        outer_table: &str,
+    ) -> Result<sql::LogicalExpr> {
+        use sql::LogicalExpr;
+        match expr {
+            LogicalExpr::ScalarSubquery { subquery } => {
+                // Substitute any outer-table column refs with literals.
+                let bound_plan = Self::bind_outer_refs_in_plan(
+                    subquery.as_ref(),
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                );
+                // Execute the (now-uncorrelated) plan.
+                let mut executor = sql::Executor::with_storage(&self.storage)
+                    .with_timeout(self.config.storage.query_timeout_ms);
+                let rows = executor.execute(&bound_plan)?;
+                let value = rows.first()
+                    .and_then(|t| t.values.first().cloned())
+                    .unwrap_or(Value::Null);
+                Ok(LogicalExpr::Literal(value))
+            }
+            LogicalExpr::BinaryExpr { left, op, right } => Ok(LogicalExpr::BinaryExpr {
+                left: Box::new(self.materialize_scalar_subqueries_for_row(left, outer_row, outer_schema, outer_table)?),
+                op: *op,
+                right: Box::new(self.materialize_scalar_subqueries_for_row(right, outer_row, outer_schema, outer_table)?),
+            }),
+            LogicalExpr::UnaryExpr { op, expr: inner } => Ok(LogicalExpr::UnaryExpr {
+                op: *op,
+                expr: Box::new(self.materialize_scalar_subqueries_for_row(inner, outer_row, outer_schema, outer_table)?),
+            }),
+            LogicalExpr::Cast { expr: inner, data_type } => Ok(LogicalExpr::Cast {
+                expr: Box::new(self.materialize_scalar_subqueries_for_row(inner, outer_row, outer_schema, outer_table)?),
+                data_type: data_type.clone(),
+            }),
+            // Everything else passes through unchanged.
+            other => Ok(other.clone()),
+        }
+    }
+
+    /// Walk a logical plan and replace any `Column { table: Some(t), name }`
+    /// where `t` matches `outer_table` with the literal value from
+    /// `outer_row[name]`. Used to turn a correlated scalar subquery
+    /// into an uncorrelated one per outer row.
+    fn bind_outer_refs_in_plan(
+        plan: &sql::LogicalPlan,
+        outer_row: &Tuple,
+        outer_schema: &Schema,
+        outer_table: &str,
+    ) -> sql::LogicalPlan {
+        use sql::LogicalPlan;
+        match plan {
+            LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
+                input: Box::new(Self::bind_outer_refs_in_plan(input, outer_row, outer_schema, outer_table)),
+                predicate: Self::bind_outer_refs_in_expr(predicate, outer_row, outer_schema, outer_table),
+            },
+            LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => LogicalPlan::Project {
+                input: Box::new(Self::bind_outer_refs_in_plan(input, outer_row, outer_schema, outer_table)),
+                exprs: exprs.iter()
+                    .map(|e| Self::bind_outer_refs_in_expr(e, outer_row, outer_schema, outer_table))
+                    .collect(),
+                aliases: aliases.clone(),
+                distinct: *distinct,
+                distinct_on: distinct_on.clone(),
+            },
+            LogicalPlan::Limit { input, limit, offset } => LogicalPlan::Limit {
+                input: Box::new(Self::bind_outer_refs_in_plan(input, outer_row, outer_schema, outer_table)),
+                limit: *limit,
+                offset: *offset,
+            },
+            LogicalPlan::Sort { input, exprs, asc } => LogicalPlan::Sort {
+                input: Box::new(Self::bind_outer_refs_in_plan(input, outer_row, outer_schema, outer_table)),
+                exprs: exprs.iter()
+                    .map(|e| Self::bind_outer_refs_in_expr(e, outer_row, outer_schema, outer_table))
+                    .collect(),
+                asc: asc.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
+    fn bind_outer_refs_in_expr(
+        expr: &sql::LogicalExpr,
+        outer_row: &Tuple,
+        outer_schema: &Schema,
+        outer_table: &str,
+    ) -> sql::LogicalExpr {
+        use sql::LogicalExpr;
+        match expr {
+            LogicalExpr::Column { table: Some(tbl), name } if tbl.eq_ignore_ascii_case(outer_table) => {
+                if let Some(idx) = outer_schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name)) {
+                    if let Some(v) = outer_row.values.get(idx) {
+                        return LogicalExpr::Literal(v.clone());
+                    }
+                }
+                expr.clone()
+            }
+            LogicalExpr::BinaryExpr { left, op, right } => LogicalExpr::BinaryExpr {
+                left: Box::new(Self::bind_outer_refs_in_expr(left, outer_row, outer_schema, outer_table)),
+                op: *op,
+                right: Box::new(Self::bind_outer_refs_in_expr(right, outer_row, outer_schema, outer_table)),
+            },
+            LogicalExpr::UnaryExpr { op, expr: inner } => LogicalExpr::UnaryExpr {
+                op: *op,
+                expr: Box::new(Self::bind_outer_refs_in_expr(inner, outer_row, outer_schema, outer_table)),
+            },
+            LogicalExpr::IsNull { expr: inner, is_null } => LogicalExpr::IsNull {
+                expr: Box::new(Self::bind_outer_refs_in_expr(inner, outer_row, outer_schema, outer_table)),
+                is_null: *is_null,
+            },
+            LogicalExpr::Between { expr: inner, low, high, negated } => LogicalExpr::Between {
+                expr: Box::new(Self::bind_outer_refs_in_expr(inner, outer_row, outer_schema, outer_table)),
+                low: Box::new(Self::bind_outer_refs_in_expr(low, outer_row, outer_schema, outer_table)),
+                high: Box::new(Self::bind_outer_refs_in_expr(high, outer_row, outer_schema, outer_table)),
+                negated: *negated,
+            },
+            LogicalExpr::ScalarSubquery { subquery } => LogicalExpr::ScalarSubquery {
+                subquery: Box::new(Self::bind_outer_refs_in_plan(subquery, outer_row, outer_schema, outer_table)),
+            },
+            other => other.clone(),
+        }
     }
 
     /// Extract PK value from a simple WHERE clause like `pk_col = literal` or `literal = pk_col`.

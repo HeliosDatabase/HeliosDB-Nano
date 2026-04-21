@@ -49,11 +49,12 @@ Stock PostgreSQL 16 is the reference behaviour in every example below.
 
 ## Status overview
 
-Four columns:
+Five columns:
 - **3.13.x** — state before any of this work
 - **3.14.0 @ ba6f16d** — version bumped, fixes not yet on the built commit (reporter's first retest)
 - **3.14.0 @ 88165aa** — Sprint-1..4 commit (reporter's second retest)
 - **3.14.1** — third round (B19 / B20 / B21)
+- **3.14.2** — fourth round (B22 / B23)
 
 | ID  | Feature                               | Severity | 3.13.x   | 3.14.0 @ ba6f16d | 3.14.0 @ 88165aa          | 3.14.1    |
 |-----|---------------------------------------|----------|----------|------------------|---------------------------|-----------|
@@ -77,6 +78,8 @@ Four columns:
 | B19 | pg_catalog via extended Q protocol    | blocker  | —        | —                | **new**                   | **fixed** |
 | B20 | Catalog WHERE filter ignored          | blocker  | —        | —                | **new**                   | **fixed** (=, <>, !=, IN, NOT IN, AND) |
 | B21 | DO block DECLARE / FOR / IF (PL/pgSQL)| major    | —        | —                | **new**                   | **fixed** (clear error + migration recipes in docs/compatibility/plpgsql.md) |
+| B22 | Flush (`H`) message unknown           | blocker  | —        | —                | —                         | **fixed** in 3.14.2 (added FrontendMessage::Flush) |
+| B23 | Scalar subquery in UPDATE SET         | major    | —        | —                | —                         | **fixed** in 3.14.2 (correlated + uncorrelated) |
 
 ---
 
@@ -678,9 +681,101 @@ workaround we were explicitly asked not to apply.
 
 ---
 
+## Fourth retest (2026-04-21) — rebuilt from commit `f26a5e6` (v3.14.1)
+
+Binary rebuilt from `feat/v3.11.0-integration` tip
+`f26a5e6 fix(nano): v3.14.1 — extended-Q catalog + WHERE filters + PL/pgSQL error (B19-B21)`,
+repackaged as `heliosdb-nano:3.14.1`, fresh `ttm_db_data` volume.
+`SELECT version()` reports `HeliosDB Nano 3.14.1`.
+
+### psql-level smoke tests
+
+- `version()` → `HeliosDB Nano 3.14.1` ✓
+- `SELECT typname FROM pg_catalog.pg_type LIMIT 5` → 12 rows ✓ (B12 remains fixed at simple-Q)
+- `SELECT tablename FROM pg_tables` → every user table ✓ (B13 remains fixed)
+- Migrations 0000, 0001, 0002, 0003 apply cleanly **except** the rewritten backfill UPDATEs in 0003, which now hit a new issue: see B23 below. On a fresh DB the UPDATEs are no-ops so TimeTracker continues.
+
+### Status of claimed fixes I couldn't actually exercise
+
+The v3.14.1 release notes claim B19 (`pg_catalog` on extended protocol) and B20 (catalog `WHERE` filters) are fixed. I could **not verify either end-to-end** because the extended-protocol path fails earlier due to **B22** (next entry). Every attempt to issue the standard postgres-js introspection query — with or without parameters — causes the server to close the connection before a `DataRow` comes back.
+
+### B22 (NEW) — Extended-protocol `Flush` message (`H` / 0x48) not implemented
+
+**Severity:** blocker — closes the connection before any driver can issue its first real query.
+
+**Symptom (server log, 2026-04-21):**
+```
+[…] ERROR heliosdb_nano::protocol::postgres::handler:
+  Error reading message: Protocol error: Unknown message type: H (0x48)
+```
+
+**Client symptom.** `postgres-js` and `pg` pipeline `Parse`/`Bind`/`Describe`/`Execute` messages followed by a `Flush` (`H`, 0x48) to force the server to emit results before the batch closes. HeliosDB-Nano rejects the `H` message and drops the TCP connection. The driver surfaces this as:
+```
+ERR: write CONNECTION_CLOSED ttm-db:5432
+```
+
+**Minimal reproducer** (inside the ttm app image, so the exact client versions that were used during deployment):
+```js
+import postgres from "/app/node_modules/postgres/src/index.js";
+const sql = postgres("postgres://postgres@ttm-db:5432/heliosdb", { ssl: false });
+await sql`select 1`;
+// ERR: write CONNECTION_CLOSED ttm-db:5432
+```
+
+**Expected.** Per the PostgreSQL frontend/backend protocol spec, `Flush` (`H`) is a mandatory extended-query message — it instructs the server to emit any buffered results for the current pipeline without ending the command cycle. Every driver that uses prepared statements emits it routinely. Without `Flush` support, **no real Postgres driver can complete a query over the extended protocol**, which reduces B19/B20 fixes to theoretical until this is resolved.
+
+**Net effect on TimeTracker.** v3.14.1 reports the right version, psql works, and DDL migrations apply; but the app's Drizzle / postgres-js connect sequence terminates the socket on the very first query. The Express process crashes on the unhandled rejection before serving any request.
+
+---
+
+### B23 (NEW) — Correlated scalar subquery in `UPDATE … SET` not supported
+
+**Severity:** major — blocks the standard Postgres data-backfill idiom (`UPDATE t SET fk = (SELECT id FROM parent WHERE parent.key = t.key)`).
+
+**Reproducer (from `drizzle/0003_add_workspaces.sql`, 2026-04-21):**
+```sql
+UPDATE "customers" SET "workspace_id" = (
+  SELECT "id" FROM "workspaces" WHERE "owner_id" = "customers"."user_id" LIMIT 1
+) WHERE "workspace_id" IS NULL AND "user_id" IS NOT NULL;
+```
+
+**Actual.** Server returns (excerpt — full AST dump included):
+```
+ERROR:  Query execution error: Expression not yet supported:
+  Subquery(Query { … body: Select(Select {
+    projection: [UnnamedExpr(Identifier(Ident { value: "id", … }))],
+    from: [TableWithJoins { relation: Table { name: ObjectName([Ident { value: "workspaces", … }]), … } }],
+    selection: Some(BinaryOp {
+      left: Identifier(Ident { value: "owner_id", … }),
+      op: Eq,
+      right: CompoundIdentifier([Ident { value: "customers", … }, Ident { value: "user_id", … }])
+    }),
+    …
+  }), limit: Some(Value(Number("1", false))) })
+```
+
+**Why this form.** The B9/B21 docs explicitly recommend rewriting PL/pgSQL `FOR … LOOP` backfills as `UPDATE … SET col = (SELECT …)` — which is what `drizzle/0003_add_workspaces.sql` now does. That rewrite hits B23 instead.
+
+**Impact on TimeTracker.** Zero on a fresh DB (no rows to backfill). Critical for anyone migrating an existing multi-user deployment to the workspaces schema.
+
+**Expected.** Stock PostgreSQL 16 executes the statement in all tested configurations; the subquery is evaluated once per outer row and returns a scalar for the `SET` expression. This is a core SQL-92 feature.
+
+---
+
+## Status of the TimeTracker deployment after 3.14.1 @ f26a5e6
+
+- `heliosdb-nano:3.14.1` built from `f26a5e6`, `version()` correctly reports `3.14.1`.
+- Migrations 0000–0003 applied; the backfill UPDATEs in 0003 error under B23 but on a fresh DB the affected rowcount is zero, so the schema state is correct.
+- **TimeTracker still cannot connect.** `postgres-js` opens a TCP socket, completes the startup handshake, issues its first pipelined `Parse` + `Flush`, and the server drops the connection with `Unknown message type: H (0x48)` (B22). The Express process exits.
+- No NPM proxy host created.
+
+B22 (Flush message) is the remaining blocker between v3.14.1 and a running TimeTracker deployment. Once the extended-protocol Flush path is wired through, B19 and B20 can finally be exercised end-to-end; B23 only matters for existing-data migration (no-op on fresh installs).
+
+---
+
 ## Closing
 
-Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.0` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
+Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.1` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
 
 B18 in particular is worth a hardening test: any attempt to verify a B4 fix should also assert that `SELECT *` against the table after the failing INSERT still works.
 
@@ -688,4 +783,8 @@ B19 and B20 are worth a paired test: any `pg_catalog` relation that
 answers simple-protocol `psql -c "…"` must also answer the same SQL
 via `Parse/Bind/Execute` and must honour the SELECT list + predicates.
 A minimal test harness using `node-postgres` with
-`client.query({ text, values: [] })` (extended protocol) catches both.
+`client.query({ text, values: [] })` (extended protocol) catches both — but requires **B22** fixed first.
+
+B22 is worth pairing with a driver-level integration test that actually calls `postgres-js`/`pg` with default options; the current simple-query-only validation path doesn't exercise the `Parse`+`Flush` pipeline that every production driver uses.
+
+B23 is worth a test that exercises `UPDATE tgt SET fk = (SELECT id FROM src WHERE src.k = tgt.k)` and the related `WHERE col IN (SELECT …)` / `DELETE … WHERE id IN (…)` / `INSERT … SELECT FROM (…)` forms — these are the core migration primitives that remain after B9/B21 shut the door on PL/pgSQL.

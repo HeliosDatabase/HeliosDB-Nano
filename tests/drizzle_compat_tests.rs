@@ -240,6 +240,68 @@ fn b16_version_returns_current_nano_version() -> Result<()> {
 // ---------------------------------------------------------------------
 
 // ---------------------------------------------------------------------
+// B23 — Scalar subquery in UPDATE SET (correlated + uncorrelated)
+// ---------------------------------------------------------------------
+#[test]
+fn b23_update_set_correlated_scalar_subquery() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT)")?;
+    db.execute("CREATE TABLE user_profile (user_id INT PRIMARY KEY, display_name TEXT)")?;
+    db.execute("INSERT INTO users (email) VALUES ('a@b.c'), ('c@d.e')")?;
+    db.execute("INSERT INTO user_profile (user_id) VALUES (1), (2)")?;
+
+    // Correlated — outer `user_profile.user_id` referenced inside the subquery.
+    db.execute(
+        "UPDATE user_profile \
+         SET display_name = (SELECT email FROM users WHERE users.id = user_profile.user_id)",
+    )?;
+    let rows = db.query("SELECT user_id, display_name FROM user_profile ORDER BY user_id", &[])?;
+    assert_eq!(rows.len(), 2);
+    if let Value::String(s) = &rows[0].values[1] {
+        assert_eq!(s, "a@b.c");
+    } else { panic!("expected String, got {:?}", rows[0].values); }
+    if let Value::String(s) = &rows[1].values[1] {
+        assert_eq!(s, "c@d.e");
+    } else { panic!("expected String"); }
+    Ok(())
+}
+
+#[test]
+fn b23_update_set_uncorrelated_scalar_subquery() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE u2 (id INT, v INT)")?;
+    db.execute("INSERT INTO u2 VALUES (1, 100), (2, 200)")?;
+    // Uncorrelated — (SELECT MAX(v) FROM u2) resolves once.
+    db.execute("UPDATE u2 SET v = (SELECT MAX(v) FROM u2)")?;
+    let rows = db.query("SELECT v FROM u2 ORDER BY id", &[])?;
+    assert_eq!(rows.len(), 2);
+    for r in &rows {
+        if let Value::Int4(n) = r.values[0] {
+            assert_eq!(n, 200);
+        } else if let Value::Int8(n) = r.values[0] {
+            assert_eq!(n, 200);
+        } else {
+            panic!("expected int, got {:?}", r.values);
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn b23_scalar_subquery_returning_null() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE t1 (id INT, n TEXT)")?;
+    db.execute("CREATE TABLE t2 (id INT, n TEXT)")?;
+    db.execute("INSERT INTO t1 VALUES (1, 'x')")?;
+    // t2 is empty — subquery returns 0 rows → NULL.
+    db.execute("UPDATE t1 SET n = (SELECT n FROM t2 WHERE t2.id = t1.id)")?;
+    let rows = db.query("SELECT n FROM t1", &[])?;
+    assert!(matches!(rows[0].values[0], Value::Null),
+        "expected NULL from empty scalar subquery, got {:?}", rows[0].values);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
 // heliosdb_capability_report() — self-describing capability probe
 // ---------------------------------------------------------------------
 #[test]

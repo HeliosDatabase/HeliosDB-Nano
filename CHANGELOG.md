@@ -5,6 +5,42 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.14.2] - 2026-04-21
+
+### Fixed — real-driver blockers found during v3.14.1 retest
+
+- **B22 `Flush` (`H` / 0x48) message** is now a first-class
+  `FrontendMessage` variant. Every pipelined Postgres driver
+  (postgres-js, `pg`, psycopg internally, Npgsql, JDBC) emits
+  `Parse → Bind → [Describe →] Execute → Flush` on every query and
+  then waits for the server to push the ParseComplete / DataRows /
+  CommandComplete before sending `Sync`. Without `Flush`, the driver
+  is killed mid-query and the TCP connection goes down.
+  The dispatch just flushes the socket buffer — no ReadyForQuery
+  (that's `Sync`'s job). Verified end-to-end via `postgres-js 3.4.5`
+  over TCP — connect + `SELECT version()` + parameterised
+  `pg_catalog.pg_type` lookup + `pg_tables` with `NOT IN` filter all
+  complete cleanly.
+- **B23 scalar subquery in `UPDATE … SET`** (correlated + uncorrelated).
+  `Expr::Subquery` is now a `LogicalExpr::ScalarSubquery` variant and
+  the UPDATE executor materialises it per row:
+  1. Walk the subquery plan, replace every
+     `Column { table: Some(<outer_table>), name }` with the literal
+     value from the current outer row.
+  2. Execute the (now uncorrelated) plan and take the first column
+     of the first row; return `NULL` if zero rows.
+  Handles the canonical Drizzle-migration rewrite pattern from
+  `docs/compatibility/plpgsql.md`:
+  `UPDATE user_profile SET display_name =
+   (SELECT email FROM users WHERE users.id = user_profile.user_id);`
+
+### Added
+
+- `tests/drizzle_compat_tests.rs` — three B23 regression cases
+  (correlated with outer ref, uncorrelated aggregate, empty
+  subquery → NULL). All 18 compat tests passing; 1730 lib tests
+  unchanged.
+
 ## [3.14.1] - 2026-04-20
 
 ### Fixed — TimeTracker retest follow-ups

@@ -205,6 +205,15 @@ impl TypeInference for LogicalExpr {
                 Ok(DataType::Boolean)
             }
 
+            // Scalar subquery: type is the first column of the subplan
+            LogicalExpr::ScalarSubquery { subquery } => {
+                subquery.schema().columns.first()
+                    .map(|c| c.data_type.clone())
+                    .ok_or_else(|| Error::type_conversion(
+                        "Scalar subquery returned no columns".to_string()
+                    ))
+            }
+
             // EXISTS subquery: always returns boolean
             LogicalExpr::Exists { .. } => {
                 Ok(DataType::Boolean)
@@ -392,6 +401,9 @@ impl TypeInference for LogicalExpr {
 
             // IN subquery: never nullable (always returns boolean)
             LogicalExpr::InSubquery { .. } => false,
+
+            // Scalar subquery: may return zero rows → NULL.
+            LogicalExpr::ScalarSubquery { .. } => true,
 
             // EXISTS subquery: never nullable (always returns boolean)
             LogicalExpr::Exists { .. } => false,

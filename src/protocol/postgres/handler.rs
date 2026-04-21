@@ -371,6 +371,17 @@ where
             FrontendMessage::Sync => {
                 self.send_ready_for_query().await?;
             }
+            FrontendMessage::Flush => {
+                // Flush tells the server to push any buffered response
+                // bytes to the network now — without ending the
+                // implicit extended-protocol transaction (that's what
+                // Sync does) and without sending ReadyForQuery. Every
+                // pipelined driver (postgres-js, pg, npgsql, etc.)
+                // emits Parse+Bind+[Describe+]Execute+Flush and waits
+                // for the ParseComplete / BindComplete / DataRows /
+                // CommandComplete to arrive before sending Sync.
+                self.flush().await?;
+            }
             FrontendMessage::Terminate => {
                 return Ok(());
             }

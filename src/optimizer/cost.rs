@@ -519,6 +519,10 @@ impl CostEstimator {
                 // Subqueries are expensive - estimate high cost
                 100.0 + Self::estimate_expr_complexity(expr)
             }
+            LogicalExpr::ScalarSubquery { .. } => {
+                // Scalar subqueries — full plan execution
+                100.0
+            }
             LogicalExpr::Exists { .. } => {
                 // EXISTS subqueries are expensive
                 100.0

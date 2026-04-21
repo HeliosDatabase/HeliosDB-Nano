@@ -538,6 +538,9 @@ impl ProjectionPruningRule {
                 // Collect from the main expression; subquery columns are independent
                 Self::collect_used_columns(expr, columns);
             }
+            LogicalExpr::ScalarSubquery { .. } => {
+                // Subquery columns are independent of the outer plan.
+            }
             LogicalExpr::Exists { .. } => {
                 // EXISTS subquery has no direct column references from outer query
                 // (correlated subqueries would need different handling)

@@ -930,6 +930,20 @@ pub enum LogicalExpr {
         negated: bool,
     },
 
+    /// Scalar subquery: `(SELECT col FROM t WHERE ...)` appearing as
+    /// a single expression. Yields the first column of the first row
+    /// returned by the plan, or `NULL` if the plan returns no rows.
+    /// Used in `UPDATE ... SET col = (SELECT ...)` and projection
+    /// lists.
+    ///
+    /// Correlation (references to the outer row) is resolved at
+    /// execute time by the caller (UPDATE executor substitutes outer
+    /// columns with literals before running the plan).
+    ScalarSubquery {
+        /// The subquery plan
+        subquery: Box<LogicalPlan>,
+    },
+
     /// IN subquery: expr IN (SELECT ...)
     InSubquery {
         /// Expression to test

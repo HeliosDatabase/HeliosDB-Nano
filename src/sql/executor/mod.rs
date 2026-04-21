@@ -411,6 +411,26 @@ impl<'a> Executor<'a> {
                     })
                 }
             }
+            LogicalExpr::ScalarSubquery { subquery } => {
+                // Execute the subquery once. A scalar subquery returns
+                // the first column of the first row (or NULL if the
+                // query returns zero rows). This branch runs at plan
+                // build time, so it only handles UNCORRELATED scalar
+                // subqueries — the UPDATE executor calls
+                // `materialize_scalar_subquery_with_outer` before
+                // per-row evaluation when correlation is involved.
+                let mut subquery_executor = if let Some(storage) = self.storage {
+                    Executor::with_storage(storage)
+                } else {
+                    Executor::new()
+                }.with_parameters(self.parameters.clone());
+
+                let results = subquery_executor.execute(subquery)?;
+                let value = results.first()
+                    .and_then(|tuple| tuple.values.first().cloned())
+                    .unwrap_or(crate::Value::Null);
+                Ok(LogicalExpr::Literal(value))
+            }
             LogicalExpr::Exists { subquery, negated } => {
                 // Execute the subquery to check if any rows exist
                 let mut subquery_executor = if let Some(storage) = self.storage {
