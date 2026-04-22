@@ -90,6 +90,8 @@ Eight columns:
 | B28 | `RETURNING *` via extended protocol   | blocker  | —        | —                | —                         | **fixed** in 3.14.4 (routes through execute_returning) |
 | B29 | Drizzle `select.where(eq)` returns [] | blocker  | —        | —                | —                         | **reopened** in 3.14.5 → **fixed in 3.14.6** (stale `result_cache` after `INSERT ... RETURNING` via `execute_plan_with_params`) |
 | B30 | Timestamp column parsed as null       | major    | —        | —                | —                         | **fixed** in 3.14.5 (microsecond precision, space separator) |
+| B31 | UPDATE/DELETE with qualified WHERE col| blocker  | —        | —                | —                         | **fixed in 3.14.7** (`Schema::with_source_table_name` applied to every DML evaluator) |
+| B32 | Timestamp/Date ↔ ISO-string compare    | blocker  | —        | —                | —                         | **fixed in 3.14.7** (implicit coercion in `compare_values`) |
 
 ---
 
@@ -1439,9 +1441,141 @@ Regression coverage in `tests/drizzle_compat_tests.rs`:
 
 ---
 
+## Ninth retest (2026-04-22 afternoon) — rebuilt from commit `be07da7` (v3.14.6)
+
+Binary rebuilt from `feat/v3.11.0-integration` tip
+`be07da7 fix(nano): v3.14.6 — stale result_cache after INSERT RETURNING (B29 real root cause)`,
+repackaged as `heliosdb-nano:3.14.6`. Fresh `ttm_db_data` volume.
+`SELECT version()` reports `HeliosDB Nano 3.14.6`.
+
+### Confirmed fixed in 3.14.6
+
+- **B29 (stale result_cache after INSERT RETURNING)** — fixed. The
+  register → login sequence now works end-to-end:
+  ```
+  POST /api/auth/register → 201  { user: { id:1, …, createdAt: '…' }, token: '…' }
+  POST /api/auth/login    → 200  { user: { id:1, …, createdAt: '…' }, token: '…' }
+  ```
+- Authenticated paths that read after resolving a workspace now return
+  the real row: `GET /api/workspaces` returns the auto-created Personal
+  workspace, `GET /api/customers` returns the created customer,
+  `GET /api/time-entries` returns the active timer, `POST /api/customers`
+  and `POST /api/time-entries` succeed.
+
+**This is the first time a full register + login + workspace resolve +
+insert-customer + start-time-entry flow completes cleanly against
+HeliosDB-Nano.** Every bug from B1 through B30 is now either fixed
+end-to-end or shown to be out of scope (B14) across the retest series.
+
+### Two new blockers found by exercising UPDATE / DELETE / analytics
+
+With read-by-unique-key working, I swept the remaining TimeTracker
+endpoints (stop timer, edit entry, delete entry, dashboard, patterns,
+insights, custom report, compare report, statistics). Two distinct
+bugs surface immediately:
+
+### B31 (NEW, blocker) — UPDATE / DELETE with a table-qualified column in WHERE fails
+
+**Severity:** blocker — every Drizzle `.update(t).set(…).where(eq(t.id, x))` and `.delete(t).where(eq(t.id, x))` emits `"t"."col" = $1`.
+
+**Reproducer (2026-04-22, `heliosdb-nano:3.14.6`):**
+```sql
+UPDATE "time_entries"
+  SET "notes" = $1
+  WHERE "time_entries"."id" = $2
+  RETURNING *;
+```
+```
+ERROR:  Query execution error: Column 'time_entries.id' not found in schema
+```
+
+```sql
+DELETE FROM "time_entries" WHERE "time_entries"."id" = $1 RETURNING *;
+```
+```
+ERROR:  Query execution error: Column 'time_entries.id' not found in schema
+```
+
+**Unqualified forms work:**
+```sql
+UPDATE "time_entries" SET "notes" = $1 WHERE "id" = $2 RETURNING *;  -- OK
+DELETE FROM "time_entries"               WHERE "id" = $1 RETURNING *;  -- OK
+```
+
+Note: **SELECT** accepts `"t"."col"` qualification (see B29 verification) — the name-resolver for UPDATE / DELETE doesn't strip the table prefix the same way. Drizzle emits the qualified form for all three statement kinds, so UPDATE and DELETE fail while SELECT succeeds.
+
+**Impact on TimeTracker.** Every write-update API fails:
+- `PATCH /api/time-entries/:id` — stop timer, edit entry
+- `PATCH /api/customers/:id` — update goal, billing
+- `DELETE /api/time-entries/:id` — remove an entry
+- `DELETE /api/customers/:id` — remove a customer
+- `PATCH /api/workspaces/:id/members/:userId` — role changes
+- `DELETE /api/workspaces/:id/members/:userId` — remove member
+- `PATCH /api/entry-templates/:id` + `DELETE` — template edits
+- Every bulk-update path (`/api/time-entries/bulk` PATCH + DELETE)
+
+### B32 (NEW, blocker) — timestamp-vs-string comparison rejected
+
+**Severity:** blocker — any date-range query that passes an ISO 8601 string as `$n` fails.
+
+**Reproducer (from the ttm app logs, 2026-04-22):**
+```
+Dashboard error: PostgresError: Query execution error:
+  Cannot compare Timestamp(2026-04-22T15:02:34.399Z) and String("2026-04-23T00:00:00.000Z")
+Compare error:   Cannot compare Timestamp(…) and String("2026-04-22T23:59:59.000Z")
+Patterns error:  Cannot compare Timestamp(…) and String("2026-04-15T15:04:22.429Z")
+Insights error:  Cannot compare Timestamp(…) and String("2026-03-23T15:04:22.879Z")
+Custom report:   Cannot compare Timestamp(…) and String("2026-04-22T23:59:59.000Z")
+```
+
+In Postgres, `WHERE ts_col >= $1` with `$1` bound as `text` (ISO 8601) is accepted and the string is implicitly cast to `timestamp`. HeliosDB rejects the comparison outright.
+
+**Minimal SQL reproducer:**
+```sql
+SELECT * FROM "time_entries"
+  WHERE "check_in" >= $1
+  AND   "check_in" <= $2;
+-- Params: $1 = '2026-04-15T00:00:00Z', $2 = '2026-04-22T23:59:59Z'
+-- ERROR: Cannot compare Timestamp(…) and String("2026-04-15T00:00:00Z")
+```
+
+**Impact on TimeTracker.** Every analytics endpoint fails:
+- `GET /api/dashboard`
+- `GET /api/patterns?days=N`
+- `GET /api/insights`
+- `POST /api/reports/custom`
+- `POST /api/reports/compare`
+- `GET /api/productivity-analysis`
+
+(The one exception on my smoke run, `GET /api/statistics`, succeeded
+because the active timer has `check_out IS NULL` and the `SUM(CASE
+WHEN check_out IS NOT NULL …)` short-circuits before the comparison
+fires.)
+
+**Workaround the client can't reasonably apply.** Drizzle passes
+`new Date(...)` or `.toISOString()` strings into `gte()` / `lte()`
+helpers; they become bind parameters with text-type OID. The
+server-side fix is to either (a) accept `text` → `timestamp` cast
+implicitly, or (b) let Bind coerce parameter OIDs according to the
+column type of the comparison target.
+
+---
+
+## Status of the TimeTracker deployment after 3.14.6 @ be07da7
+
+- `heliosdb-nano:3.14.6` built from `be07da7`, `version()` reports `3.14.6`.
+- Migrations 0000–0003 apply cleanly; all 29 drizzle_compat tests pass in-tree per the release note.
+- **Read + write-insert flows now work end-to-end.** Register → login → list workspaces → create customer → start time entry all succeed via the real HTTP API through Drizzle + postgres-js.
+- **Write-update and analytics still broken.** Stop-timer and delete-entry hit B31 (qualified WHERE in UPDATE/DELETE). Dashboard / reports / patterns / insights hit B32 (timestamp ↔ text comparison).
+- No NPM proxy host created.
+
+B31 and B32 are the last two TimeTracker blockers. Both are narrow server-side issues — B31 is a name-resolution asymmetry between SELECT and UPDATE/DELETE; B32 is the missing `text → timestamp` implicit cast on parameter comparisons.
+
+---
+
 ## Closing
 
-Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.5` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
+Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.6` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
 
 B18 in particular is worth a hardening test: any attempt to verify a B4 fix should also assert that `SELECT *` against the table after the failing INSERT still works.
 

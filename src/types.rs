@@ -658,6 +658,29 @@ impl Schema {
         Self { columns }
     }
 
+    /// Stamp every column in the schema with a source table (both the
+    /// alias slot and the actual table-name slot), so that qualified
+    /// column references like `"t"."col"` resolve against this schema
+    /// via [`Schema::get_qualified_column_index`].
+    ///
+    /// Use this when constructing an evaluator for a single-table DML
+    /// operation (UPDATE, DELETE, INSERT...RETURNING) — without the
+    /// stamp, the evaluator can only resolve unqualified columns, and
+    /// any `WHERE "t"."col" = …` predicate fails with
+    /// `Column 't.col' not found in schema` (B31).
+    #[must_use]
+    pub fn with_source_table_name(mut self, table: &str) -> Self {
+        for col in &mut self.columns {
+            if col.source_table.is_none() {
+                col.source_table = Some(table.to_string());
+            }
+            if col.source_table_name.is_none() {
+                col.source_table_name = Some(table.to_string());
+            }
+        }
+        self
+    }
+
     /// Project schema to subset of columns
     ///
     /// Returns a new schema containing only the columns at the specified indices.

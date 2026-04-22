@@ -560,6 +560,83 @@ fn b29_qualified_predicate_matches_scan_row() -> Result<()> {
 
 
 // ---------------------------------------------------------------------
+// B31 — UPDATE / DELETE with table-qualified WHERE column
+//
+// Reporter: `UPDATE "time_entries" SET "notes"=$1 WHERE
+// "time_entries"."id"=$2 RETURNING *` fails with
+// `Column 'time_entries.id' not found in schema`. Unqualified form
+// works. SELECT with the same qualified predicate works (B29 retest
+// confirmed). Asymmetry: Update/Delete built their evaluator from the
+// bare catalog schema without stamping `source_table_name` on each
+// column, so `Schema::get_qualified_column_index` couldn't match.
+// ---------------------------------------------------------------------
+#[test]
+fn b31_update_with_qualified_where_column() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(r#"CREATE TABLE "time_entries" ("id" SERIAL PRIMARY KEY, "notes" TEXT)"#)?;
+    db.execute(r#"INSERT INTO "time_entries" ("notes") VALUES ('old')"#)?;
+    let (n, rows) = db.execute_returning(
+        r#"UPDATE "time_entries" SET "notes"='new' WHERE "time_entries"."id"=1 RETURNING *"#,
+    )?;
+    assert_eq!(n, 1);
+    assert_eq!(rows.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn b31_delete_with_qualified_where_column() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(r#"CREATE TABLE "t" ("id" INT, "v" TEXT)"#)?;
+    db.execute(r#"INSERT INTO "t" ("id","v") VALUES (1,'a'), (2,'b')"#)?;
+    let n = db.execute(r#"DELETE FROM "t" WHERE "t"."id"=1"#)?;
+    assert_eq!(n, 1);
+    let left = db.query(r#"SELECT "id" FROM "t""#, &[])?;
+    assert_eq!(left.len(), 1);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// B32 — Timestamp/Date ↔ ISO-string implicit coercion
+//
+// Reporter: Drizzle's `gte(column, date)` helpers bind JavaScript
+// Date instances as ISO 8601 strings (`"2026-04-23T00:00:00.000Z"`)
+// against OID 1114 / OID 1082 columns. Stock Postgres implicitly
+// casts the literal to TIMESTAMP / DATE; HeliosDB refused with
+// `Cannot compare Timestamp(…) and String(…)`, blocking every
+// analytics endpoint. Fix: coerce in the comparator using the same
+// parser as the TIMESTAMP cast path.
+// ---------------------------------------------------------------------
+#[test]
+fn b32_timestamp_vs_iso_string_comparison() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(r#"CREATE TABLE "t" ("id" INT, "ts" TIMESTAMP)"#)?;
+    db.execute(r#"INSERT INTO "t" VALUES (1, '2026-04-22 15:02:34')"#)?;
+    db.execute(r#"INSERT INTO "t" VALUES (2, '2026-04-24 10:00:00')"#)?;
+    let gte = db.query(
+        r#"SELECT "id" FROM "t" WHERE "ts" >= '2026-04-23T00:00:00.000Z'"#,
+        &[],
+    )?;
+    assert_eq!(gte.len(), 1);
+    let lt = db.query(
+        r#"SELECT "id" FROM "t" WHERE "ts" < '2026-04-23T00:00:00.000Z'"#,
+        &[],
+    )?;
+    assert_eq!(lt.len(), 1);
+    Ok(())
+}
+
+#[test]
+fn b32_date_vs_iso_string_comparison() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(r#"CREATE TABLE "t" ("id" INT, "d" DATE)"#)?;
+    db.execute(r#"INSERT INTO "t" VALUES (1, '2026-04-22')"#)?;
+    db.execute(r#"INSERT INTO "t" VALUES (2, '2026-04-24')"#)?;
+    let rows = db.query(r#"SELECT "id" FROM "t" WHERE "d" >= '2026-04-23'"#, &[])?;
+    assert_eq!(rows.len(), 1);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
 // heliosdb_capability_report() — self-describing capability probe
 // ---------------------------------------------------------------------
 #[test]

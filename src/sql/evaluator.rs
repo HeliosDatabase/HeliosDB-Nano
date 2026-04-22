@@ -2430,6 +2430,40 @@ impl Evaluator {
         }
     }
 
+    /// Parse an ISO-8601 / PG-timestamp string into a UTC DateTime.
+    /// Accepts the same formats the TIMESTAMP cast path accepts —
+    /// RFC 3339 (`2026-04-23T00:00:00Z`, `…+00:00`), space-separated
+    /// (`2026-04-23 00:00:00[.ffffff]`), and date-only
+    /// (`2026-04-23`, treated as midnight UTC).
+    fn parse_timestamp_string(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        use chrono::Utc;
+        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(s) {
+            return Some(ts.with_timezone(&Utc));
+        }
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+            return Some(chrono::DateTime::from_naive_utc_and_offset(ndt, Utc));
+        }
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+            return Some(chrono::DateTime::from_naive_utc_and_offset(ndt, Utc));
+        }
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+            if let Some(ndt) = d.and_hms_opt(0, 0, 0) {
+                return Some(chrono::DateTime::from_naive_utc_and_offset(ndt, Utc));
+            }
+        }
+        None
+    }
+
+    /// Parse a date string into a NaiveDate. Accepts `YYYY-MM-DD` and
+    /// the leading date portion of an ISO 8601 timestamp.
+    fn parse_date_string(s: &str) -> Option<chrono::NaiveDate> {
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+            return Some(d);
+        }
+        // Fall back to parsing a timestamp and extracting the date.
+        Self::parse_timestamp_string(s).map(|ts| ts.date_naive())
+    }
+
     /// Compare two values using a comparison function
     fn compare_values<F>(&self, left: &Value, right: &Value, cmp: F) -> Result<Value>
     where
@@ -2604,6 +2638,38 @@ impl Evaluator {
             // Timestamp to Date comparisons (compare dates only)
             (Value::Timestamp(a), Value::Date(b)) => a.date_naive().cmp(b),
             (Value::Date(a), Value::Timestamp(b)) => a.cmp(&b.date_naive()),
+
+            // Timestamp ↔ String: implicit coercion mirrors stock
+            // PostgreSQL, which accepts `timestamp = 'YYYY-MM-DD…'`
+            // by casting the literal to TIMESTAMP. Drizzle binds
+            // JavaScript `Date`s as ISO 8601 strings into gte/lte
+            // helpers over OID 1114 columns — without this the
+            // analytics endpoints fail with "Cannot compare" (B32).
+            (Value::Timestamp(a), Value::String(b)) => {
+                match Self::parse_timestamp_string(b) {
+                    Some(b_ts) => a.cmp(&b_ts),
+                    None => a.to_rfc3339().as_str().cmp(b.as_str()),
+                }
+            }
+            (Value::String(a), Value::Timestamp(b)) => {
+                match Self::parse_timestamp_string(a) {
+                    Some(a_ts) => a_ts.cmp(b),
+                    None => a.as_str().cmp(b.to_rfc3339().as_str()),
+                }
+            }
+            // Date ↔ String: same rationale for `date` columns.
+            (Value::Date(a), Value::String(b)) => {
+                match Self::parse_date_string(b) {
+                    Some(b_d) => a.cmp(&b_d),
+                    None => a.to_string().as_str().cmp(b.as_str()),
+                }
+            }
+            (Value::String(a), Value::Date(b)) => {
+                match Self::parse_date_string(a) {
+                    Some(a_d) => a_d.cmp(b),
+                    None => a.as_str().cmp(b.to_string().as_str()),
+                }
+            }
 
             // String-to-Integer coercion (MySQL compatibility: WHERE int_col = '0')
             (Value::String(a), Value::Int2(b)) => {

@@ -1715,8 +1715,11 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::Update { table_name, assignments, selection, returning } => {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
+                // Stamp source_table_name so qualified predicates
+                // `WHERE "t"."col" = …` resolve (B31).
+                let eval_schema = schema.clone().with_source_table_name(table_name);
                 let evaluator = sql::Evaluator::with_parameters(
-                    std::sync::Arc::new(schema.clone()),
+                    std::sync::Arc::new(eval_schema),
                     vec![],
                 );
 
@@ -1914,8 +1917,13 @@ impl EmbeddedDatabase {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
                 let schema_arc = std::sync::Arc::new(schema);
+                // Stamp source_table_name so qualified predicates
+                // `WHERE "t"."col" = …` resolve (B31).
+                let eval_schema = std::sync::Arc::new(
+                    (*schema_arc).clone().with_source_table_name(table_name),
+                );
                 let evaluator = sql::Evaluator::with_parameters(
-                    schema_arc.clone(),
+                    eval_schema,
                     vec![],
                 );
 
@@ -4207,7 +4215,9 @@ impl EmbeddedDatabase {
                 // Scan table to get all tuples with their row IDs
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
-                let evaluator = sql::Evaluator::new(std::sync::Arc::new(schema.clone()));
+                // Stamp source_table_name so qualified predicates resolve (B31).
+                let eval_schema = schema.clone().with_source_table_name(table_name);
+                let evaluator = sql::Evaluator::new(std::sync::Arc::new(eval_schema));
 
                 // Use branch-aware scan to get tuples (includes main + branch overrides - deleted)
                 let tuples = self.storage.scan_table_branch_aware(table_name)?;
@@ -4280,7 +4290,9 @@ impl EmbeddedDatabase {
                 // Scan table to get all tuples
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
-                let evaluator = sql::Evaluator::new(std::sync::Arc::new(schema.clone()));
+                // Stamp source_table_name so qualified predicates resolve (B31).
+                let eval_schema = schema.clone().with_source_table_name(table_name);
+                let evaluator = sql::Evaluator::new(std::sync::Arc::new(eval_schema));
 
                 // Use branch-aware scan to get tuples (includes main + branch overrides - deleted)
                 let tuples = self.storage.scan_table_branch_aware(table_name)?;
@@ -5205,8 +5217,12 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::Update { table_name, assignments, selection, returning } => {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
+                // Stamp source_table_name on every column so
+                // qualified predicates like `WHERE "t"."col" = $1`
+                // resolve against this evaluator schema (B31).
+                let eval_schema = schema.clone().with_source_table_name(table_name);
                 let evaluator = sql::Evaluator::with_parameters(
-                    std::sync::Arc::new(schema.clone()),
+                    std::sync::Arc::new(eval_schema),
                     params.to_vec(),
                 );
 
@@ -5259,8 +5275,9 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::Delete { table_name, selection, returning } => {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
+                let eval_schema = schema.clone().with_source_table_name(table_name);
                 let evaluator = sql::Evaluator::with_parameters(
-                    std::sync::Arc::new(schema.clone()),
+                    std::sync::Arc::new(eval_schema),
                     params.to_vec(),
                 );
 

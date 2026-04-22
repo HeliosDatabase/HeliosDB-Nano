@@ -5,6 +5,46 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.14.7] - 2026-04-22
+
+### Fixed — Drizzle UPDATE/DELETE and analytics date ranges (B31 / B32)
+
+**B31** — `UPDATE "t" SET … WHERE "t"."col" = $1` and the equivalent
+DELETE fail with `Column 't.col' not found in schema`. Root cause:
+the Update and Delete arms of `execute_plan_with_params` (and the
+in-transaction variants) build their evaluator directly from the
+catalog schema, which does not carry `source_table_name` on its
+columns. The SELECT path works because the Scan operator stamps
+`source_table_name` on every yielded column; DML didn't.
+
+Fix: new helper `Schema::with_source_table_name(&str)` that stamps
+`source_table` and `source_table_name` on every column.
+Every single-table DML evaluator now builds its schema through this
+helper, so qualified WHERE columns resolve the same way they do for
+SELECT. Blocks the stop-timer, edit/delete entry, edit/delete
+customer, bulk ops, and role/member management paths.
+
+**B32** — `timestamp >= '2026-04-23T00:00:00.000Z'` (and the `date`
+analogue) fail with `Cannot compare Timestamp(…) and String(…)`.
+Stock PostgreSQL implicitly casts the literal to the column type;
+Drizzle's `gte()` / `lte()` helpers bind JavaScript `Date` instances
+as ISO 8601 strings, so every analytics / reporting endpoint hit
+this.
+
+Fix: `Evaluator::compare_values` gains four new arms —
+`Timestamp ↔ String` and `Date ↔ String` — using the same ISO 8601
+/ space-separated / date-only parser as the TIMESTAMP cast path
+(`Self::parse_timestamp_string`, `Self::parse_date_string`). Falls
+back to string-wise comparison if the literal isn't a valid date /
+timestamp, matching the behaviour of the other coercion arms (e.g.
+`Int ↔ String`).
+
+Regression tests (tests/drizzle_compat_tests.rs):
+- `b31_update_with_qualified_where_column`
+- `b31_delete_with_qualified_where_column`
+- `b32_timestamp_vs_iso_string_comparison`
+- `b32_date_vs_iso_string_comparison`
+
 ## [3.14.6] - 2026-04-22
 
 ### Fixed — Drizzle login read-by-unique-key (B29, real root cause)
