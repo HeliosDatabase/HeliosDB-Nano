@@ -752,6 +752,135 @@ fn b34_update_set_literal_iso_string() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------
+// B35 — GROUP BY / projection matching across qualifier styles + DATE/TIME
+// comparison.
+//
+// Reporter: Drizzle's embedded-SQL idiom emits queries that mix
+// unqualified column refs in SELECT / CASE bodies with table-qualified
+// refs in GROUP BY / WHERE, e.g.:
+//
+//   select date("check_in"), sum(...)
+//   from "time_entries"
+//   where "time_entries"."workspace_id" = $1
+//   group by date("time_entries"."check_in")
+//
+// Stock PG treats `"check_in"` and `"time_entries"."check_in"` as the
+// same column when unambiguous; Nano matched SELECT items against
+// GROUP BY with `PartialEq`, so the two `Column` variants didn't
+// match and the projection emitted an un-rewritten
+// `date(col "check_in")` that later tried to resolve against the
+// aggregate's output schema → `Column 'check_in' not found in schema`.
+//
+// Second root cause found while reproducing: `compare_values` in the
+// aggregate's GroupKey sort had no Date / Time / Interval / Numeric
+// arms, so any two values of those types compared equal. GROUP BY on
+// a DATE column always collapsed to a single group. ORDER BY on a
+// DATE column was similarly broken.
+//
+// Fix: (1) qualifier-insensitive structural equivalence
+// (`Planner::exprs_equivalent`) used in the projection-rewrite step;
+// (2) add Date / Time / Interval / Numeric arms to `compare_values`.
+// ---------------------------------------------------------------------
+#[test]
+fn b35_mixed_qualifier_group_by() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(
+        r#"CREATE TABLE "time_entries" ("id" INT, "check_in" TIMESTAMP, "workspace_id" INT)"#,
+    )?;
+    db.execute(
+        r#"INSERT INTO "time_entries" VALUES
+            (1, '2026-04-22 10:00:00', 1),
+            (2, '2026-04-22 15:00:00', 1),
+            (3, '2026-04-23 09:00:00', 1)"#,
+    )?;
+    let rows = db.query(
+        r#"select date("check_in"), count(*) from "time_entries"
+           group by date("time_entries"."check_in")"#,
+        &[],
+    )?;
+    assert_eq!(rows.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn b35_both_qualified_group_by() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(r#"CREATE TABLE "time_entries" ("id" INT, "check_in" TIMESTAMP)"#)?;
+    db.execute(
+        r#"INSERT INTO "time_entries" VALUES
+            (1, '2026-04-22 10:00:00'), (2, '2026-04-23 09:00:00')"#,
+    )?;
+    let rows = db.query(
+        r#"select date("time_entries"."check_in"), count(*) from "time_entries"
+           group by date("time_entries"."check_in")"#,
+        &[],
+    )?;
+    assert_eq!(rows.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn b35_both_unqualified_group_by() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(r#"CREATE TABLE "time_entries" ("id" INT, "check_in" TIMESTAMP)"#)?;
+    db.execute(
+        r#"INSERT INTO "time_entries" VALUES
+            (1, '2026-04-22 10:00:00'), (2, '2026-04-23 09:00:00')"#,
+    )?;
+    let rows = db.query(
+        r#"select date("check_in"), count(*) from "time_entries"
+           group by date("check_in")"#,
+        &[],
+    )?;
+    assert_eq!(rows.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn b35_reporter_full_shape() -> Result<()> {
+    // Reporter's exact Drizzle-emitted query, verbatim.
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(
+        r#"CREATE TABLE "time_entries" (
+             "id" INT,
+             "check_in" TIMESTAMP,
+             "check_out" TIMESTAMP,
+             "is_break" BOOLEAN,
+             "workspace_id" INT
+           )"#,
+    )?;
+    db.execute(
+        r#"INSERT INTO "time_entries" VALUES
+            (1, '2026-04-22 09:00:00', '2026-04-22 11:00:00', false, 1),
+            (2, '2026-04-22 13:00:00', '2026-04-22 14:30:00', true,  1),
+            (3, '2026-04-23 08:30:00', '2026-04-23 12:00:00', false, 1)"#,
+    )?;
+    let rows = db.query_params(
+        r#"select date("check_in"),
+                 sum(case when "check_out" is not null and "is_break" = false
+                          then extract(epoch from ("check_out" - "check_in"))/60 else 0 end)
+           from "time_entries"
+           where ("time_entries"."workspace_id" = $1 and "time_entries"."check_in" >= $2)
+           group by date("time_entries"."check_in")"#,
+        &[Value::Int4(1), Value::String("2026-04-01 00:00:00".to_string())],
+    )?;
+    assert_eq!(rows.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn b35_date_column_group_by_correctness() -> Result<()> {
+    // Root-cause guard: grouping by a DATE column used to collapse to
+    // a single group (compare_values lacked a Date/Date arm).
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(r#"CREATE TABLE "t" ("d" DATE)"#)?;
+    db.execute(r#"INSERT INTO "t" VALUES ('2026-04-22'), ('2026-04-23'), ('2026-04-22')"#)?;
+    let rows = db.query(r#"SELECT "d", count(*) FROM "t" GROUP BY "d""#, &[])?;
+    assert_eq!(rows.len(), 2);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
 // heliosdb_capability_report() — self-describing capability probe
 // ---------------------------------------------------------------------
 #[test]

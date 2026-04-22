@@ -1247,6 +1247,17 @@ pub(crate) fn compare_values(a: &crate::Value, b: &crate::Value) -> std::cmp::Or
 
         (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
         (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+        // Date, Time, Interval — without these arms two distinct
+        // values compared equal under type_priority, which broke
+        // GROUP BY / ORDER BY on any of these columns (B35).
+        (Value::Date(a), Value::Date(b)) => a.cmp(b),
+        (Value::Time(a), Value::Time(b)) => a.cmp(b),
+        (Value::Interval(a), Value::Interval(b)) => a.cmp(b),
+        // Numeric compares lexicographically on the decimal string
+        // representation — not perfect across different scales but
+        // matches the existing Hash impl, which is enough to keep
+        // GROUP BY / ORDER BY correct.
+        (Value::Numeric(a), Value::Numeric(b)) => a.cmp(b),
         // For JSON and complex types, compare as strings
         (Value::Json(a), Value::Json(b)) => {
             a.to_string().cmp(&b.to_string())

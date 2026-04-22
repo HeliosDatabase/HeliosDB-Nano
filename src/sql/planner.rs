@@ -1838,6 +1838,69 @@ impl<'a> Planner<'a> {
     /// Rewrite a LogicalExpr tree, replacing AggregateFunction nodes with
     /// Column references to the pre-computed aggregate output columns (agg_0, agg_1, ...).
     /// Also replaces column references that match GROUP BY expressions with group_N references.
+    /// Qualifier-insensitive structural equivalence between two
+    /// `LogicalExpr`s. Two `Column { table, name }` references are
+    /// equivalent when their names match and either side has no
+    /// qualifier (or both carry the same qualifier). Everything else
+    /// recurses into the matching constructor.
+    ///
+    /// Needed because a single statement may freely mix qualified
+    /// (`"t"."col"`) and unqualified (`"col"`) references across
+    /// SELECT / WHERE / GROUP BY — stock PostgreSQL treats them as
+    /// the same column when unambiguous (B35).
+    fn exprs_equivalent(a: &LogicalExpr, b: &LogicalExpr) -> bool {
+        match (a, b) {
+            (
+                LogicalExpr::Column { table: t1, name: n1 },
+                LogicalExpr::Column { table: t2, name: n2 },
+            ) => {
+                if n1 != n2 {
+                    return false;
+                }
+                match (t1, t2) {
+                    (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+                    _ => true,
+                }
+            }
+            (
+                LogicalExpr::ScalarFunction { fun: f1, args: a1 },
+                LogicalExpr::ScalarFunction { fun: f2, args: a2 },
+            ) => {
+                f1.eq_ignore_ascii_case(f2)
+                    && a1.len() == a2.len()
+                    && a1.iter().zip(a2.iter()).all(|(x, y)| Self::exprs_equivalent(x, y))
+            }
+            (
+                LogicalExpr::AggregateFunction { fun: f1, args: a1, distinct: d1 },
+                LogicalExpr::AggregateFunction { fun: f2, args: a2, distinct: d2 },
+            ) => {
+                f1 == f2
+                    && d1 == d2
+                    && a1.len() == a2.len()
+                    && a1.iter().zip(a2.iter()).all(|(x, y)| Self::exprs_equivalent(x, y))
+            }
+            (
+                LogicalExpr::BinaryExpr { left: l1, op: op1, right: r1 },
+                LogicalExpr::BinaryExpr { left: l2, op: op2, right: r2 },
+            ) => {
+                op1 == op2
+                    && Self::exprs_equivalent(l1, l2)
+                    && Self::exprs_equivalent(r1, r2)
+            }
+            (
+                LogicalExpr::UnaryExpr { op: op1, expr: e1 },
+                LogicalExpr::UnaryExpr { op: op2, expr: e2 },
+            ) => op1 == op2 && Self::exprs_equivalent(e1, e2),
+            (
+                LogicalExpr::Cast { expr: e1, data_type: d1 },
+                LogicalExpr::Cast { expr: e2, data_type: d2 },
+            ) => d1 == d2 && Self::exprs_equivalent(e1, e2),
+            // For everything else fall back on strict PartialEq — this
+            // covers Literal, Parameter, IN, BETWEEN, Like, etc.
+            _ => a == b,
+        }
+    }
+
     fn rewrite_expr_replace_aggregates(
         expr: &LogicalExpr,
         aggr_exprs: &[LogicalExpr],
@@ -1846,8 +1909,10 @@ impl<'a> Planner<'a> {
         // First check if the entire expression matches a GROUP BY expression.
         // This handles cases like `id % 2` in both SELECT and GROUP BY, where
         // the whole expression should map to `group_N` rather than recursing into parts.
+        // Qualifier-insensitive equivalence (B35): `date("check_in")` and
+        // `date("t"."check_in")` are the same expression when unambiguous.
         for (i, gb_expr) in group_by.iter().enumerate() {
-            if gb_expr == expr {
+            if Self::exprs_equivalent(gb_expr, expr) {
                 return LogicalExpr::Column {
                     table: None,
                     name: format!("group_{}", i),
@@ -1858,7 +1923,7 @@ impl<'a> Planner<'a> {
         match expr {
             LogicalExpr::AggregateFunction { .. } => {
                 for (i, aggr) in aggr_exprs.iter().enumerate() {
-                    if aggr == expr {
+                    if Self::exprs_equivalent(aggr, expr) {
                         return LogicalExpr::Column {
                             table: None,
                             name: format!("agg_{}", i),
@@ -1869,7 +1934,7 @@ impl<'a> Planner<'a> {
             }
             LogicalExpr::Column { name, .. } => {
                 for (i, gb_expr) in group_by.iter().enumerate() {
-                    if gb_expr == expr {
+                    if Self::exprs_equivalent(gb_expr, expr) {
                         return LogicalExpr::Column {
                             table: None,
                             name: format!("group_{}", i),

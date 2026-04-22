@@ -5,6 +5,58 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.14.9] - 2026-04-22
+
+### Fixed — GROUP BY correctness with mixed qualifier styles and DATE keys (B35)
+
+**Reporter's symptom.** A Drizzle-emitted analytics query mixing
+unqualified column refs in SELECT / CASE bodies with table-qualified
+refs in GROUP BY / WHERE:
+
+```sql
+select date("check_in"), sum(case when "check_out" is not null ...)
+from "time_entries"
+where "time_entries"."workspace_id" = $1
+group by date("time_entries"."check_in")
+```
+
+failed with `Column 'check_in' not found in schema`. Stock PostgreSQL
+treats `"check_in"` and `"time_entries"."check_in"` as the same
+column when unambiguous.
+
+**Root cause #1 — projection-rewrite matching too strict.**
+After planning `Aggregate`, the planner rewrites each SELECT item so
+column refs that match a GROUP BY expression become references to the
+aggregate operator's output column (`group_N`). The matching step
+used `PartialEq`, so `date(Column{table:None,name:"check_in"})` did
+not match `date(Column{table:Some("time_entries"),name:"check_in"})`
+— the SELECT item's `"check_in"` reference was left as-is and then
+failed to resolve against the aggregate's output schema.
+
+Fix: new `Planner::exprs_equivalent` that recursively compares
+expressions with qualifier-insensitive `Column` matching. Used at
+both sites inside `rewrite_expr_replace_aggregates`.
+
+**Root cause #2 — `compare_values` missing DATE / TIME / INTERVAL /
+NUMERIC arms (found while reproducing).**
+`GroupKey` in the aggregate operator is ordered via
+`compare_values` (src/sql/executor/mod.rs). Any two values without a
+dedicated arm fall through to `type_priority`, which returns `Equal`
+for any two values of the same type. So `GROUP BY <date-col>` put
+every row into a single group (count grew, distinct dates vanished);
+`ORDER BY <date-col>` produced non-deterministic output.
+
+Fix: add arms for `Date`, `Time`, `Interval`, `Numeric` in
+`compare_values`.
+
+Regression tests (`tests/drizzle_compat_tests.rs`):
+- `b35_mixed_qualifier_group_by`
+- `b35_both_qualified_group_by`
+- `b35_both_unqualified_group_by`
+- `b35_reporter_full_shape` (verbatim Drizzle query with SUM + CASE +
+  EXTRACT + parameterised WHERE)
+- `b35_date_column_group_by_correctness` (guards the second root cause)
+
 ## [3.14.8] - 2026-04-22
 
 ### Fixed — parameterized LIMIT/OFFSET and UPDATE SET type coercion (B33 / B34)

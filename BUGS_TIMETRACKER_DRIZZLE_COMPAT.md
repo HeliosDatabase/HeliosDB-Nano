@@ -94,6 +94,7 @@ Eight columns:
 | B32 | Timestamp/Date ↔ ISO-string compare    | blocker  | —        | —                | —                         | **fixed in 3.14.7** (implicit coercion in `compare_values`) |
 | B33 | parameterized LIMIT $1 / OFFSET $2    | blocker  | —        | —                | —                         | **fixed in 3.14.8** (`LogicalPlan::Limit.{limit,offset}_param` + executor resolves bound params; planner accepts quoted-integer literal) |
 | B34 | UPDATE SET … = $1 silently nulls TS   | blocker (data loss) | — | — | — | **fixed in 3.14.8** (auto-cast in every UPDATE SET path, matching INSERT) |
+| B35 | GROUP BY with mixed qualifier styles  | blocker  | —        | —                | —                         | **fixed in 3.14.9** (`Planner::exprs_equivalent` + Date/Time/Interval/Numeric arms in `compare_values`) |
 
 ---
 
@@ -1666,9 +1667,107 @@ B33 and B34 are the last two blockers. Both are narrow: B33 needs to accept a bi
 
 ---
 
+## Eleventh retest (2026-04-22 night) — rebuilt from commit `3b04450` (v3.14.8)
+
+Binary rebuilt from `feat/v3.11.0-integration` tip
+`3b04450 fix(nano): v3.14.8 — parameterized LIMIT/OFFSET + UPDATE SET coercion (B33 / B34)`,
+repackaged as `heliosdb-nano:3.14.8`. Fresh `ttm_db_data` volume.
+`SELECT version()` reports `HeliosDB Nano 3.14.8`.
+
+### Confirmed fixed in 3.14.8
+
+- **B33 (parameterized `LIMIT` / `OFFSET`)** — fixed. `select … limit ${5}` via postgres-js no longer errors, and `/api/reports/compare` returns a real delta payload:
+  ```
+  { "current": { "workMinutes": 5.09…, "sessions": 1, "activeDays": 1 }, "previous": {…}, "deltaPct": {…} }
+  ```
+- **B34 (UPDATE SET silently nulls TIMESTAMP)** — fixed. `PATCH /api/time-entries/:id` now persists `checkOut` correctly:
+  ```
+  { "id": 1, "checkIn": "2026-04-22T20:24:54.131Z", "checkOut": "2026-04-22T20:30:00.000Z",
+    "updatedAt": "2026-04-22T20:24:54.753Z" }
+  ```
+  `SELECT` back confirms the value is stored, not just echoed.
+
+End-to-end smoke on v3.14.8: register ✓ · login ✓ · create customer ✓ · start timer ✓ · stop timer ✓ · delete entry ✓ · list workspaces/customers/time-entries ✓ · `/api/statistics` ✓ · `/api/search` ✓ · `/api/reports/compare` ✓.
+
+### New blocker on the remaining analytics endpoints
+
+Four analytics endpoints still return 500, all with the same underlying server error:
+
+- `GET /api/dashboard` → 500
+- `GET /api/patterns?days=7` → 500
+- `GET /api/insights` → 500
+- `POST /api/reports/custom` → 500
+
+All four log the same server-side error:
+```
+Dashboard error: PostgresError: Query execution error: Column 'check_in' not found in schema
+```
+
+### B35 (NEW, blocker) — name resolution fails when SELECT uses unqualified column and GROUP BY uses the qualified form (or vice-versa)
+
+**Severity:** blocker — Drizzle embeds column references through its
+template SQL helper and emits one style in the SELECT expression body
+(via `sql\`… ${col} …\``) and another style in `.groupBy(...)`,
+depending on the context. Mixed forms are a normal part of Drizzle SQL.
+
+**Minimal reproducer** (raw postgres-js, `heliosdb-nano:3.14.8`, 2026-04-22):
+```sql
+select date("check_in"), count(*)
+  from "time_entries"
+  group by date("time_entries"."check_in");
+-- ERROR: Column 'check_in' not found in schema
+```
+
+All three "normalized" variants work:
+```sql
+-- both unqualified
+select date("check_in"), count(*)            from "time_entries" group by date("check_in");              -- ✓
+-- both qualified
+select date("time_entries"."check_in"), count(*) from "time_entries" group by date("time_entries"."check_in"); -- ✓
+-- no GROUP BY
+select "check_in" from "time_entries" where "time_entries"."workspace_id" = $1;  -- ✓
+```
+
+So the bug is specifically the **mix** of qualifier styles across clauses of the same statement. Stock PostgreSQL treats `"check_in"` and `"time_entries"."check_in"` as the same column when there's only one table in the FROM; HeliosDB's resolver currently doesn't.
+
+**The exact failing SQL emitted by Drizzle for `/api/dashboard` (captured via postgres-js `debug` hook, 2026-04-22):**
+```sql
+select date("check_in"),
+       sum(case when "check_out" is not null and "is_break" = false
+               then extract(epoch from ("check_out" - "check_in"))/60 else 0 end)
+from "time_entries"
+where ("time_entries"."workspace_id" = $1 and "time_entries"."check_in" >= $2)
+group by date("time_entries"."check_in")
+```
+
+SELECT list and the CASE body use unqualified names (`"check_in"`, `"check_out"`, `"is_break"`); WHERE and GROUP BY use qualified names. Drizzle's template SQL helper renders the embedded column reference with whatever qualifier the surrounding call site produced — since TimeTracker mixes raw `sql\`…\`` templates with `.groupBy(timeEntries.checkIn)` style calls, both forms end up in the same statement.
+
+**Impact on TimeTracker.** Remaining analytics endpoints:
+- `/api/dashboard` — weekStats (`group by date(…)`)
+- `/api/patterns` — hourly and weekday grouping
+- `/api/insights` — productivity-insights engine aggregations
+- `/api/reports/custom` — `date_trunc` groupings
+
+Every one emits the same kind of mixed-qualifier aggregation and hits B35.
+
+**Fix shape.** The name resolver should treat `"<col>"` and `"<table>"."<col>"` as the same reference when `<col>` unambiguously identifies a column across the current FROM scope (stock PG behaviour). This mirrors the fix used for B31 (UPDATE/DELETE qualified WHERE) — where the resolver was taught the prefixed form; the remaining gap is letting the two forms intermix within a single statement.
+
+---
+
+## Status of the TimeTracker deployment after 3.14.8 @ 3b04450
+
+- `heliosdb-nano:3.14.8` built from `3b04450`, `version()` reports `3.14.8`.
+- **Core Drizzle surface now fully working end-to-end**: register, login, create customer, start/stop/delete time entry, list customers/entries/workspaces, `/api/statistics`, `/api/search`, `/api/reports/compare`. That's 10+ endpoints across INSERT / UPDATE / DELETE / SELECT all passing against real HTTP traffic.
+- **B35 is the last remaining TimeTracker blocker.** Analytics endpoints that do `GROUP BY date(qualified_col)` with unqualified references in the SELECT projection fail with `Column 'check_in' not found in schema`.
+- No NPM proxy host created.
+
+Once B35 ships, every TimeTracker endpoint should be green and the NPM proxy host for `ttm.danielmoya.cv` can be created.
+
+---
+
 ## Closing
 
-Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.7` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
+Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.8` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
 
 B18 in particular is worth a hardening test: any attempt to verify a B4 fix should also assert that `SELECT *` against the table after the failing INSERT still works.
 
