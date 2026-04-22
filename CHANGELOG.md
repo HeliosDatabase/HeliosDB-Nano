@@ -5,6 +5,54 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.14.6] - 2026-04-22
+
+### Fixed — Drizzle login read-by-unique-key (B29, real root cause)
+
+The 3.14.5 fix addressed timestamp formatting (B30) but assumed B29
+was a downstream symptom. TimeTracker's retest proved otherwise: even
+with timestamps round-tripping cleanly, the canonical Drizzle shape
+`select <all cols> from t where t.col = $1` still returned `[]`.
+
+Actual root cause: `execute_plan_with_params` (src/lib.rs:4983), the
+plan-executor behind `EmbeddedDatabase::execute_returning` and
+`execute_params_returning`, mutated data but never invalidated
+`result_cache`. The `Database::query` entry point DOES invalidate on
+DML, but the extended-Q handler for `INSERT ... RETURNING` calls
+`execute_returning` **directly**, bypassing that invalidation.
+
+Trigger sequence (TimeTracker's login/register flow):
+
+1. User attempts login against an empty `users` table.
+   `SELECT ... WHERE "users"."email" = $1` → `[]`. After parameter
+   substitution the key is the fully-rendered SQL;
+   `result_cache` stores `[]` under it.
+2. User registers. `INSERT ... RETURNING ...` via extended-Q lands in
+   `execute_plan_with_params`, which inserts the row but does NOT
+   clear `result_cache`.
+3. User logs in. Same canonical SQL → substitutes to the same key →
+   cache hit → stale `[]` is served forever, even though the row now
+   exists.
+
+Swapping any trigger (unqualified WHERE, different projection, string
+literal instead of `$1`) produces a different substituted SQL and
+therefore a different cache key that misses, which is why every
+variation returned the row while the canonical shape didn't — and why
+the bug looked like a "planner/prepared-statement" issue to the
+reporter.
+
+Fix: invalidate `result_cache` at the single choke point in
+`execute_plan_with_params` whenever the plan is `Insert` /
+`InsertSelect` / `Update` / `Delete` and the execution succeeded.
+
+Regression tests:
+- `tests/drizzle_compat_tests.rs::b29_login_probe_then_register_then_login`
+  — in-process reproduction of the trigger sequence.
+- `tests/drizzle_compat_tests.rs::b29_canonical_drizzle_select_returns_row`
+  — pins the canonical substituted shape.
+- `tests/drizzle_compat_tests.rs::b29_qualified_predicate_matches_scan_row`
+  — shrinks the qualified-predicate invariant.
+
 ## [3.14.5] - 2026-04-22
 
 ### Fixed — Drizzle login + timestamp reads (B29 / B30)

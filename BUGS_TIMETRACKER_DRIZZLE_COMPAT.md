@@ -88,7 +88,7 @@ Eight columns:
 | B26 | NOT NULL not enforced                 | blocker  | —        | —                | —                         | **fixed** in 3.14.3 (all three INSERT paths) |
 | B27 | `DEFAULT` in VALUES → column's expr   | blocker  | —        | —                | —                         | **fixed** in 3.14.4 (LogicalExpr::DefaultValue) |
 | B28 | `RETURNING *` via extended protocol   | blocker  | —        | —                | —                         | **fixed** in 3.14.4 (routes through execute_returning) |
-| B29 | Drizzle `select.where(eq)` returns [] | blocker  | —        | —                | —                         | **fixed** in 3.14.5 (timestamp format on direct-encoding path) |
+| B29 | Drizzle `select.where(eq)` returns [] | blocker  | —        | —                | —                         | **reopened** in 3.14.5 → **fixed in 3.14.6** (stale `result_cache` after `INSERT ... RETURNING` via `execute_plan_with_params`) |
 | B30 | Timestamp column parsed as null       | major    | —        | —                | —                         | **fixed** in 3.14.5 (microsecond precision, space separator) |
 
 ---
@@ -1232,9 +1232,216 @@ B29 + B30 are the remaining blockers. Both manifest only through the standard Dr
 
 ---
 
+## Eighth retest (2026-04-22) — rebuilt from commit `0bb5ecb` (v3.14.5)
+
+Binary rebuilt from `feat/v3.11.0-integration` tip
+`0bb5ecb fix(nano): v3.14.5 — Drizzle SELECT + timestamp (B29 / B30)`,
+repackaged as `heliosdb-nano:3.14.5`. Fresh `ttm_db_data` volume.
+`SELECT version()` reports `HeliosDB Nano 3.14.5`.
+
+### Confirmed fixed in 3.14.5
+
+- **B30 (timestamp column read as `null` in Drizzle)** — fixed. `db.select().from(users)` now returns `createdAt: "2026-04-22T11:01:44.316Z"` for the timestamp column (raw postgres-js sees the same value; the two match). The direct-encoding `DataRow` path now emits `YYYY-MM-DD HH:MM:SS.ffffff` as advertised in the commit note.
+- **B27 / B28** remain fixed — `POST /api/auth/register` still succeeds end-to-end on v3.14.5:
+  ```
+  POST /api/auth/register → 201
+  { "user": { "id": 1, "email": "alice@example.com", "createdAt": "2026-04-22T11:01:44.316Z" }, "token": "…" }
+  ```
+
+### B29 — still reproduces **independently of B30**
+
+The v3.14.5 hypothesis was that B29 and B30 shared a root cause
+(postgres-js crashing while parsing the malformed timestamp and
+producing `[]` for the row). **That hypothesis is incorrect**: with
+B30 fixed and timestamps round-tripping cleanly, B29 still fires at
+exactly the same trigger pattern. Every other query shape returns
+the row, and only the canonical Drizzle shape still returns `[]`.
+
+**Reproducer (2026-04-22, `heliosdb-nano:3.14.5`, `postgres-js` 3.4.5):**
+```js
+const sql = postgres('postgres://postgres@ttm-db:5432/heliosdb', { ssl: false });
+
+await sql`select "id", "email", "password", "created_at"
+          from "users"
+          where "users"."email" = ${'alice@example.com'}`;
+// []          ← still empty
+
+await sql`select "id", "email", "password", "created_at"
+          from "users"
+          where "email" = ${'alice@example.com'}`;   // WHERE unqualified
+// [ { id: 1, email: 'alice@example.com', password: '$2a$10$…',
+//     created_at: '2026-04-22T11:01:44.316Z' } ]
+
+await sql.unsafe(
+  `select "id", "email", "password", "created_at"
+   from "users"
+   where "users"."email" = 'alice@example.com'`);    // literal instead of $1
+// [ { id: 1, email: 'alice@example.com', … } ]
+
+await sql`select "id", "email", "password"
+          from "users"
+          where "users"."email" = ${'alice@example.com'}`;   // 3 cols instead of 4
+// [ { id: 1, email: 'alice@example.com', password: '…' } ]
+```
+
+Same three conditions are required in combination:
+
+1. SELECT list = every column of the table, in schema-declaration order, **unqualified**;
+2. WHERE predicate = **table-qualified** `"t"."col" = $1`;
+3. `$1` is a **string parameter** supplied via extended-Q Bind.
+
+Any one of the three swapped out → one row. All three together → `[]`.
+
+### Why it's not a timestamp-format issue
+
+1. The raw wire value for the timestamp column is now correct (verified via both Drizzle `db.select().from(users)` and `sql\`select …\``).
+2. The 4-column SELECT **without** the table qualifier in WHERE returns the row, timestamp and all.
+3. The 3-column SELECT **with** the table qualifier returns the row (timestamp not in the list).
+4. `sql.unsafe` with a literal in place of `$1` returns the row.
+
+So the timestamp column's encoding is not the trigger — the combination
+of **projection shape + qualified predicate + bind parameter** is.
+
+**Net effect on TimeTracker.** Register succeeds (INSERT path).
+Login fails because `db.select().from(users).where(eq(users.email, email))`
+emits the canonical Drizzle shape that B29 zeroes out. Every other
+read-by-unique-key path in the app has the same shape and the same
+failure mode (`getCustomers`, `getTimeEntries`, workspace resolution,
+membership lookup, invitation accept, etc.).
+
+---
+
+## Status of the TimeTracker deployment after 3.14.5 @ 0bb5ecb
+
+- `heliosdb-nano:3.14.5` built from `0bb5ecb`, `version()` reports `3.14.5`.
+- Migrations 0000–0003 apply with zero errors.
+- **Write side fully working.** `POST /api/auth/register` returns a valid JWT, `createdAt` populated, timestamp round-trips through Drizzle as a real Date (B30 verified fixed).
+- **Read-by-unique-key still broken.** `POST /api/auth/login` still returns 401 in ~2 ms because Drizzle's `select().from(users).where(eq(users.email, email))` hits B29.
+- No NPM proxy host created.
+
+B29 is the last remaining blocker on the TimeTracker deployment path.
+It is a planner / extended-protocol issue independent of B30 — please
+re-open the B29 investigation separately. The v3.14.5 fix addressed
+a symptom (timestamp format) but the underlying SELECT-shape bug is
+still present.
+
+---
+
+## B29 — reopened investigation (2026-04-22, Nano side)
+
+**Outcome:** could not reproduce on the binary built from the same
+commit (`0bb5ecb`, v3.14.5). Every canonical-shape reproduction
+attempted against a local `heliosdb-nano` server returns the row, on
+three independent client stacks:
+
+- **`postgres-js` 3.4.5, tagged template, `prepare: true`** (default):
+  ```
+  select "id", "email", "password", "created_at"
+    from "users"
+   where "users"."email" = $1   params: ['alice@example.com']
+  → [{ id, email: 'alice@example.com', password, created_at: '…' }]
+  ```
+- **`postgres-js` 3.4.5, `sql.unsafe(query, values)`** — the exact form
+  shown in the original reproducer at `BUGS_TIMETRACKER_DRIZZLE_COMPAT.md:1176-1183`:
+  also returns the row.
+- **`node-postgres` 8.x (`pg.Client`) with named prepared statement**
+  (`client.query({ name: 'login_by_email', text, values })`) — twice in a
+  row to exercise the server-side cached plan — both calls return the
+  row.
+
+Additional variations tried (all return the row):
+- `UNIQUE(email)` + `FK workspaces.owner_id -> users.id`
+- persistent data volume + server restart between INSERT and SELECT
+- multiple sequential clients (`sql.end()` + fresh `postgres(opts)`)
+- register + login from the same pool vs. register + login from
+  different pools
+- `alice@example.com` (reporter's value) vs. shorter / longer payloads
+
+Binary: `target/release/heliosdb-nano` built from `0bb5ecb` locally
+(`md5sum ee5ff3cbfeac1dcd4875d862ae32bab4`); `SELECT version()` reports
+`PostgreSQL 16.0 (HeliosDB Nano 3.14.5)`.
+
+Server trace (`RUST_LOG=heliosdb_nano::protocol=trace`) shows the
+Parse → Bind → Execute sequence with `params: ['alice@example.com']`
+reaching the executor and emitting one `DataRow` plus
+`CommandComplete "SELECT 1"`. No short-circuit plan, no empty result,
+no error. The plan shape (captured via a separate `PREPARE` test) is:
+
+```
+Project exprs=[id,email,password,created_at]
+  Filter predicate=(users.email = $1)
+    Scan table=users  (source_table_name='users' on every column)
+```
+
+`Schema::get_qualified_column_index(Some("users"), "email")` resolves
+correctly (matches `source_table_name`), so the filter is evaluated
+against the row's `email` value.
+
+**Regression locks** added in this branch so a future regression is
+caught immediately:
+
+- `tests/drizzle_compat_tests.rs::b29_canonical_drizzle_select_returns_row`
+  — exercises the post-substitution SQL (exactly what
+  `database.query()` sees after `substitute_parameters()`): all four
+  columns unqualified, table-qualified WHERE, string literal in the
+  predicate slot. Pins the planner/executor output to one row.
+- `tests/drizzle_compat_tests.rs::b29_qualified_predicate_matches_scan_row`
+  — shrinks the invariant: a scan yields rows whose
+  `source_table_name == Some("t")` and the filter predicate carries
+  `Column { table: Some("t"), .. }`; the match must succeed.
+- `tests/server_mode_integration_test.rs::test_b29_canonical_drizzle_shape`
+  — wire-level regression via `tokio-postgres`, extended-Q Parse/Bind/
+  Execute. Currently `#[ignore]` for the same pre-existing reason as
+  every other `setup_test_server()` test (the in-process `PgServer`
+  stack-overflows under `#[tokio::test]`). Runs cleanly against a
+  subprocess binary.
+
+**Root cause (found in v3.14.6):** stale `result_cache`, not a planner
+or prepared-statement bug.
+
+The `Database::query` entry point (src/lib.rs:5443) invalidates
+`result_cache` on DML-with-RETURNING. The extended-Q handler for
+`INSERT ... RETURNING`, however, short-circuits and calls
+`execute_returning` directly (handler_extended.rs:289), which lands
+in `execute_plan_with_params` (lib.rs:4983). That function mutated
+data but never invalidated `result_cache`.
+
+TimeTracker's login/register flow hits exactly the pattern that
+exercises this hole:
+
+1. Login attempt against empty table → `SELECT ... WHERE
+   "users"."email" = $1` → `[]`. After `substitute_parameters`, the
+   SQL is `SELECT … WHERE "users"."email" = 'alice@example.com'`, and
+   `result_cache` stores `[]` under that exact string.
+2. Register → `INSERT ... RETURNING ...` via extended-Q → lands in
+   `execute_plan_with_params` → row inserted, cache untouched.
+3. Login again → same canonical SQL → same substituted key → cache
+   hit → stale `[]` returned in ~2 ms.
+
+Why the reporter's other shapes worked: any variation (unqualified
+WHERE, 3 cols, string literal in place of `$1`, fully-qualified
+projection) produces a DIFFERENT substituted SQL string, therefore a
+different cache key, therefore a cache miss. Only the exact shape
+TimeTracker kept hitting had a matching stale entry.
+
+**Fix in v3.14.6:** `execute_plan_with_params` now calls
+`invalidate_result_cache()` on success for any plan that is `Insert`,
+`InsertSelect`, `Update`, or `Delete`. This is the single choke point
+for every DML code path that was routing around the cache
+invalidation at the `Database::query` level.
+
+Regression coverage in `tests/drizzle_compat_tests.rs`:
+- `b29_login_probe_then_register_then_login` — end-to-end repro.
+- `b29_canonical_drizzle_select_returns_row` — pins the shape.
+- `b29_qualified_predicate_matches_scan_row` — pins the predicate
+  resolution invariant (originally suspected, now verified sound).
+
+
+---
+
 ## Closing
 
-Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.4` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
+Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.5` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
 
 B18 in particular is worth a hardening test: any attempt to verify a B4 fix should also assert that `SELECT *` against the table after the failing INSERT still works.
 

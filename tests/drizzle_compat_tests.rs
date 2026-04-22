@@ -445,6 +445,121 @@ fn b27_default_for_serial_still_auto_fills() -> Result<()> {
 // ---------------------------------------------------------------------
 
 // ---------------------------------------------------------------------
+// B29 — canonical Drizzle SELECT shape returns the row
+//
+// Reporter claims the combination of:
+//   (1) SELECT list = every column in schema order (unqualified)
+//   (2) WHERE "t"."col" = $1     (table-qualified predicate)
+//   (3) $1 = string bind parameter via extended-Q
+// returns `[]`. This test pins the *post-substitution* SQL (exactly what
+// `database.query()` sees after `substitute_parameters()` rewrites the
+// placeholder) and asserts one row comes back. The wire-level side of
+// B29 (extended-Q Parse/Bind/Execute) is covered by
+// `server_mode_integration_test::test_b29_canonical_drizzle_shape`.
+// ---------------------------------------------------------------------
+#[test]
+fn b29_canonical_drizzle_select_returns_row() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(
+        r#"CREATE TABLE "users" (
+             "id" SERIAL PRIMARY KEY,
+             "email" TEXT NOT NULL UNIQUE,
+             "password" TEXT NOT NULL,
+             "created_at" TIMESTAMP DEFAULT now() NOT NULL
+           )"#,
+    )?;
+    db.execute(
+        r#"INSERT INTO "users" ("email","password")
+           VALUES ('alice@example.com', '$2a$10$pw')"#,
+    )?;
+    // All three triggers: all cols in schema order (unqualified),
+    // table-qualified WHERE, string literal in the predicate position
+    // (mirrors substituted $1).
+    let rows = db.query(
+        r#"SELECT "id", "email", "password", "created_at"
+             FROM "users"
+            WHERE "users"."email" = 'alice@example.com'"#,
+        &[],
+    )?;
+    assert_eq!(rows.len(), 1, "canonical Drizzle shape returned 0 rows");
+    match &rows[0].values[1] {
+        Value::String(s) => assert_eq!(s, "alice@example.com"),
+        v => panic!("email column: expected String, got {:?}", v),
+    }
+    Ok(())
+}
+
+/// B29 root cause: a SELECT that returned `[]` before an
+/// `INSERT ... RETURNING` must NOT continue to return `[]` from the
+/// result cache after the insert. The extended-Q handler routes
+/// `INSERT RETURNING` through `execute_returning` →
+/// `execute_params_returning` → `execute_plan_with_params`, which
+/// previously forgot to invalidate the cache — so a login probe
+/// before register would poison every subsequent login with a stale
+/// empty result (TimeTracker symptom: 401 in ~2 ms).
+#[test]
+fn b29_login_probe_then_register_then_login() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(
+        r#"CREATE TABLE "users" (
+             "id" SERIAL PRIMARY KEY,
+             "email" TEXT NOT NULL UNIQUE,
+             "password" TEXT NOT NULL,
+             "created_at" TIMESTAMP DEFAULT now() NOT NULL
+           )"#,
+    )?;
+    // 1) login probe against empty table — caches `[]` under the
+    //    substituted SQL key.
+    let probe = db.query(
+        r#"SELECT "id", "email", "password", "created_at"
+             FROM "users"
+            WHERE "users"."email" = 'alice@example.com'"#,
+        &[],
+    )?;
+    assert_eq!(probe.len(), 0);
+    // 2) register via execute_returning — same code path the
+    //    extended-Q handler takes for INSERT...RETURNING.
+    let (count, returned) = db.execute_returning(
+        r#"INSERT INTO "users" ("email","password")
+             VALUES ('alice@example.com', 'pw')
+           RETURNING "id", "email", "password", "created_at""#,
+    )?;
+    assert_eq!(count, 1);
+    assert_eq!(returned.len(), 1);
+    // 3) login with the exact same SQL — must NOT return the stale [].
+    let login = db.query(
+        r#"SELECT "id", "email", "password", "created_at"
+             FROM "users"
+            WHERE "users"."email" = 'alice@example.com'"#,
+        &[],
+    )?;
+    assert_eq!(login.len(), 1, "B29: stale result_cache after INSERT RETURNING");
+    Ok(())
+}
+
+#[test]
+fn b29_qualified_predicate_matches_scan_row() -> Result<()> {
+    // Minimal reproduction of the predicate-matching invariant:
+    // a scan yields rows whose `source_table_name == Some("t")`; the
+    // filter predicate references `Column { table: Some("t"), name }`.
+    // `Schema::get_qualified_column_index` must resolve it.
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute("CREATE TABLE t (id INT, name TEXT)")?;
+    db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")?;
+    let rows = db.query(
+        "SELECT id, name FROM t WHERE t.name = 'b'",
+        &[],
+    )?;
+    assert_eq!(rows.len(), 1);
+    match &rows[0].values[0] {
+        Value::Int4(1 | 2 | 3) => {}
+        v => panic!("unexpected id value: {:?}", v),
+    }
+    Ok(())
+}
+
+
+// ---------------------------------------------------------------------
 // heliosdb_capability_report() — self-describing capability probe
 // ---------------------------------------------------------------------
 #[test]

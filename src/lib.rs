@@ -4981,6 +4981,28 @@ impl EmbeddedDatabase {
     /// Returns (rows_affected, returned_tuples) where returned_tuples is populated
     /// only when RETURNING clause is present in INSERT/UPDATE/DELETE statements.
     fn execute_plan_with_params(&self, plan: &sql::LogicalPlan, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
+        let result = self.execute_plan_with_params_inner(plan, params);
+        // Invalidate the result cache on any successful mutating plan.
+        // Without this, an earlier `SELECT ... WHERE col = 'v'` that
+        // returned `[]` (e.g. a login probe before register) is served
+        // from the cache forever — the `INSERT ... RETURNING` path
+        // routes through here and otherwise leaves the stale entry in
+        // place. See the B29 regression in `tests/drizzle_compat_tests.rs`.
+        if result.is_ok()
+            && matches!(
+                plan,
+                sql::LogicalPlan::Insert { .. }
+                    | sql::LogicalPlan::InsertSelect { .. }
+                    | sql::LogicalPlan::Update { .. }
+                    | sql::LogicalPlan::Delete { .. }
+            )
+        {
+            self.invalidate_result_cache();
+        }
+        result
+    }
+
+    fn execute_plan_with_params_inner(&self, plan: &sql::LogicalPlan, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
         match plan {
             sql::LogicalPlan::Insert { table_name, columns, values, returning, on_conflict: _ } => {
                 // Get table schema for column types

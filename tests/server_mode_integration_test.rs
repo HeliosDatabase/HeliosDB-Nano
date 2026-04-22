@@ -170,3 +170,96 @@ async fn test_server_concurrent_clients() {
     let count: i64 = rows[0].get(0);
     assert_eq!(count, 10);
 }
+
+/// B29 regression: the canonical Drizzle SELECT shape must return the row.
+///
+/// Trigger pattern (per the TimeTracker reporter):
+///   1. SELECT list = all columns of the table in schema-declaration
+///      order, **unqualified**.
+///   2. WHERE predicate = **table-qualified** `"t"."col" = $1`.
+///   3. `$1` = **string parameter** bound via extended-Q.
+///
+/// Swapping any one trigger → returns the row. Reporter claims the
+/// combination returns `[]` against `heliosdb-nano:3.14.5` built from
+/// commit `0bb5ecb`. This test pins the wire-level behaviour.
+///
+/// NOTE: Marked `#[ignore]` for the same reason as the other
+/// `setup_test_server()`-based tests in this file — the in-process
+/// `PgServer` currently stack-overflows under the test harness. The
+/// planner/executor side of B29 is covered in
+/// `tests/drizzle_compat_tests.rs::b29_canonical_drizzle_select_returns_row`.
+#[tokio::test]
+#[ignore = "Server mode integration test - stack overflow issue"]
+async fn test_b29_canonical_drizzle_shape() {
+    let (conn_string, _handle) =
+        setup_test_server().await.expect("Failed to setup server");
+
+    let (client, connection) = tokio_postgres::connect(&conn_string, NoTls)
+        .await
+        .expect("Failed to connect");
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {e}");
+        }
+    });
+
+    client
+        .execute(
+            r#"CREATE TABLE "users" (
+                 "id" SERIAL PRIMARY KEY,
+                 "email" TEXT NOT NULL UNIQUE,
+                 "password" TEXT NOT NULL,
+                 "created_at" TIMESTAMP DEFAULT now() NOT NULL
+               )"#,
+            &[],
+        )
+        .await
+        .expect("create table");
+
+    let _ = client
+        .execute(
+            r#"INSERT INTO "users" ("email","password") VALUES ($1, $2)"#,
+            &[&"alice@example.com", &"$2a$10$pw"],
+        )
+        .await
+        .expect("register");
+
+    let rows = client
+        .query(
+            r#"SELECT "id", "email", "password", "created_at"
+                 FROM "users"
+                WHERE "users"."email" = $1"#,
+            &[&"alice@example.com"],
+        )
+        .await
+        .expect("login query");
+
+    assert_eq!(rows.len(), 1, "B29: canonical Drizzle shape returned 0 rows");
+    let email: &str = rows[0].get(1);
+    assert_eq!(email, "alice@example.com");
+
+    // Second run: server-side prepared-statement cache in postgres-js
+    // reuses the named statement; pin this too.
+    let rows2 = client
+        .query(
+            r#"SELECT "id", "email", "password", "created_at"
+                 FROM "users"
+                WHERE "users"."email" = $1"#,
+            &[&"alice@example.com"],
+        )
+        .await
+        .expect("login query (cached plan)");
+    assert_eq!(rows2.len(), 1, "B29: second run returned 0 rows");
+
+    // Also exercise the Drizzle variant F (fully-qualified projection).
+    let rows3 = client
+        .query(
+            r#"SELECT "users"."id", "users"."email", "users"."password", "users"."created_at"
+                 FROM "users"
+                WHERE "users"."email" = $1"#,
+            &[&"alice@example.com"],
+        )
+        .await
+        .expect("qualified projection");
+    assert_eq!(rows3.len(), 1, "B29: qualified-projection variant returned 0 rows");
+}
