@@ -950,7 +950,12 @@ where
                     self.write_buf.put_slice(s.as_bytes());
                 }
                 Value::Timestamp(ts) => {
-                    let s = ts.to_rfc3339();
+                    // PG wire format: space separator, microsecond
+                    // precision, no trailing zone. rfc3339 nanosecond
+                    // output (9 fractional digits) crashes psycopg
+                    // ("timestamp too large (after year 10K)") and
+                    // makes drizzle-orm's timestamp parser return null.
+                    let s = ts.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string();
                     self.write_buf.put_i32(s.len() as i32);
                     self.write_buf.put_slice(s.as_bytes());
                 }
@@ -960,7 +965,8 @@ where
                     self.write_buf.put_slice(s.as_bytes());
                 }
                 Value::Time(t) => {
-                    let s = t.format("%H:%M:%S%.f").to_string();
+                    // Microsecond precision — same reason as Timestamp.
+                    let s = t.format("%H:%M:%S%.6f").to_string();
                     self.write_buf.put_i32(s.len() as i32);
                     self.write_buf.put_slice(s.as_bytes());
                 }

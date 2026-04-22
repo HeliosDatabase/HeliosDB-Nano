@@ -5,6 +5,52 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.14.5] - 2026-04-22
+
+### Fixed — Drizzle login + timestamp reads (B29 / B30)
+
+Both bugs had the same root cause: the direct-encoding path at
+`send_data_row_direct` (src/protocol/postgres/handler.rs:952) was
+still emitting `Timestamp` values as RFC-3339 with nanosecond
+precision (`2026-04-21T20:43:55.674347541+00:00`). v3.14.4 fixed the
+fallback `tuple_to_pg_values` path but missed this one. Consequences:
+
+- **B29 Drizzle SELECT shape returns empty.** When Drizzle's
+  `postgres-js` integration parsed the malformed timestamp it
+  crashed the result binding silently, and Drizzle's type-coerced
+  filter comparison (`eq(users.email, v)`) resolved against a
+  null-valued row that the app-side filter then rejected as
+  non-matching — the symptom being "empty result set". The
+  underlying pg query *did* return the row; the client just failed
+  to interpret it.
+- **B30 timestamp columns parsed as null.** `drizzle-orm/postgres-js`
+  registers a custom parser for OID 1114 (`timestamp`) that expects
+  PG wire format `YYYY-MM-DD HH:MM:SS.ffffff` (microsecond precision,
+  space separator, no zone). Our nanosecond-precision RFC-3339
+  output silently produced `null`.
+
+Fix: emit PostgreSQL-standard `YYYY-MM-DD HH:MM:SS.ffffff` on the
+direct-encoding path (matching v3.14.4's `tuple_to_pg_values` fix).
+Applied to `Timestamp` and `Time` — `Date` was already correct.
+
+### Verified end-to-end with `drizzle-orm/postgres-js`
+
+```js
+const users = pgTable('users', {
+  id: serial('id').primaryKey(),
+  email: text('email').notNull(),
+  password: text('password').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+})
+
+const [u] = await db.insert(users).values({ email, password }).returning()
+// { id: 1, email: 'alice@x.com', password: 'pw',
+//   createdAt: 2026-04-22T06:05:01.619Z }  ← real Date, not null
+
+const rows = await db.select().from(users).where(eq(users.email, 'alice@x.com'))
+// [{ id: 1, email: 'alice@x.com', password: 'pw', createdAt: Date(…) }]
+```
+
 ## [3.14.4] - 2026-04-21
 
 ### Fixed — Drizzle `.insert().returning()` blockers (B27 / B28)
