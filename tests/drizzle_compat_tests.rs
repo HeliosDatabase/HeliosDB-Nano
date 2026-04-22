@@ -637,6 +637,121 @@ fn b32_date_vs_iso_string_comparison() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------
+// B33 — parameterized LIMIT / OFFSET
+//
+// Reporter: `LIMIT $1 OFFSET $2` fails with
+// `LIMIT/OFFSET must be a number`, blocking every Drizzle `.limit(N)`
+// analytics endpoint. Wire trigger: postgres-js binds the literal as
+// TEXT (OID 25 / unknown OID 0), so `substitute_parameters` renders it
+// as `LIMIT '3'`, which the planner's old `expr_to_usize` rejected.
+// In-process: the planner mapped the placeholder to `usize::MAX` but
+// the Limit plan held a fixed usize, so the bound integer never made
+// it to the operator.
+//
+// Fix: (1) planner accepts `SingleQuotedString` parseable as usize;
+// (2) `LogicalPlan::Limit` gained `limit_param` / `offset_param`
+// fields; the executor resolves them from bound parameters at
+// execution time.
+// ---------------------------------------------------------------------
+#[test]
+fn b33_parameterized_limit() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(r#"CREATE TABLE "t" ("id" INT)"#)?;
+    db.execute(r#"INSERT INTO "t" VALUES (1),(2),(3),(4),(5)"#)?;
+    let rows = db.query_params(
+        r#"SELECT "id" FROM "t" ORDER BY "id" LIMIT $1"#,
+        &[Value::Int4(3)],
+    )?;
+    assert_eq!(rows.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn b33_parameterized_limit_offset() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(r#"CREATE TABLE "t" ("id" INT)"#)?;
+    db.execute(r#"INSERT INTO "t" VALUES (1),(2),(3),(4),(5)"#)?;
+    let rows = db.query_params(
+        r#"SELECT "id" FROM "t" ORDER BY "id" LIMIT $1 OFFSET $2"#,
+        &[Value::Int4(2), Value::Int4(2)],
+    )?;
+    assert_eq!(rows.len(), 2);
+    Ok(())
+}
+
+#[test]
+fn b33_quoted_string_limit_wire_substitution() -> Result<()> {
+    // Simulates the wire path: `substitute_parameters` renders a
+    // TEXT-bound parameter with surrounding single quotes, so the
+    // planner must accept `LIMIT '3'`.
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(r#"CREATE TABLE "t" ("id" INT)"#)?;
+    db.execute(r#"INSERT INTO "t" VALUES (1),(2),(3),(4),(5)"#)?;
+    let rows = db.query(r#"SELECT "id" FROM "t" ORDER BY "id" LIMIT '3'"#, &[])?;
+    assert_eq!(rows.len(), 3);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
+// B34 — UPDATE SET … = $1 silently stored NULL for TIMESTAMP columns
+//
+// Reporter: `UPDATE t SET ts_col = $1` via extended-Q with an ISO 8601
+// string parameter returned 200 / row count 1, but the column ended
+// up NULL. `sql.unsafe(same-sql + params)` worked. INSERT worked. Root
+// cause: INSERT's value path auto-casts the evaluated value to the
+// target column type; UPDATE's SET path didn't — the String was
+// pushed straight into a Timestamp slot and serialized away.
+//
+// Fix: mirror INSERT's auto-cast in all three UPDATE SET paths
+// (`execute_plan_with_params`, `execute_in_transaction_inner`, and the
+// non-params RLS path).
+// ---------------------------------------------------------------------
+#[test]
+fn b34_update_set_param_timestamp() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(r#"CREATE TABLE "t" ("id" INT PRIMARY KEY, "ts" TIMESTAMP, "updated_at" TIMESTAMP)"#)?;
+    db.execute(r#"INSERT INTO "t" VALUES (1, NULL, NULL)"#)?;
+    let (count, _rows) = db.execute_params_returning(
+        r#"UPDATE "t" SET "ts" = $1, "updated_at" = $2 WHERE "id" = $3"#,
+        &[
+            Value::String("2026-04-23T10:00:00.000Z".to_string()),
+            Value::String("2026-04-23T10:00:00.000Z".to_string()),
+            Value::Int4(1),
+        ],
+    )?;
+    assert_eq!(count, 1);
+    let rows = db.query(r#"SELECT "ts", "updated_at" FROM "t""#, &[])?;
+    assert_eq!(rows.len(), 1);
+    assert!(
+        matches!(rows[0].values[0], Value::Timestamp(_)),
+        "ts after UPDATE SET $1 should be Timestamp, got {:?}",
+        rows[0].values[0],
+    );
+    assert!(
+        matches!(rows[0].values[1], Value::Timestamp(_)),
+        "updated_at after UPDATE SET $2 should be Timestamp, got {:?}",
+        rows[0].values[1],
+    );
+    Ok(())
+}
+
+#[test]
+fn b34_update_set_literal_iso_string() -> Result<()> {
+    // Wire path after substitute_parameters renders the TEXT-typed
+    // bind as a single-quoted literal in the SET expression.
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(r#"CREATE TABLE "t" ("id" INT PRIMARY KEY, "ts" TIMESTAMP)"#)?;
+    db.execute(r#"INSERT INTO "t" VALUES (1, NULL)"#)?;
+    db.execute(r#"UPDATE "t" SET "ts" = '2026-04-23T10:00:00.000Z' WHERE "id" = 1"#)?;
+    let rows = db.query(r#"SELECT "ts" FROM "t""#, &[])?;
+    assert!(
+        matches!(rows[0].values[0], Value::Timestamp(_)),
+        "expected Timestamp, got {:?}", rows[0].values[0],
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------
 // heliosdb_capability_report() — self-describing capability probe
 // ---------------------------------------------------------------------
 #[test]

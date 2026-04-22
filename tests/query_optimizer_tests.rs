@@ -610,6 +610,8 @@ fn test_complex_query_all_optimizations() {
         input: Box::new(sort),
         limit: 10,
         offset: 0,
+        limit_param: None,
+        offset_param: None,
     };
 
     let optimized = optimizer.optimize(limit).expect("Optimization failed");

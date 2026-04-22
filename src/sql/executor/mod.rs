@@ -713,7 +713,43 @@ impl<'a> Executor<'a> {
                     ).with_timeout(self.timeout_ctx.clone())))
                 }
             }
-            LogicalPlan::Limit { input, limit, offset } => {
+            LogicalPlan::Limit { input, limit, offset, limit_param, offset_param } => {
+                // Resolve `LIMIT $N` / `OFFSET $N` from the bound
+                // parameter list if the planner left a placeholder
+                // sentinel in place. Accepts integer, integer-castable
+                // string, and NULL (treated as no bound / zero).
+                let resolve = |sentinel: usize, param_idx: &Option<usize>| -> Result<usize> {
+                    match param_idx {
+                        None => Ok(sentinel),
+                        Some(idx) => {
+                            let value = self.parameters.get(idx.saturating_sub(1))
+                                .ok_or_else(|| Error::query_execution(format!(
+                                    "LIMIT/OFFSET parameter ${} not provided (have {} parameters)",
+                                    idx, self.parameters.len(),
+                                )))?;
+                            match value {
+                                crate::Value::Int2(n) => Ok((*n).max(0) as usize),
+                                crate::Value::Int4(n) => Ok((*n).max(0) as usize),
+                                crate::Value::Int8(n) => Ok((*n).max(0) as usize),
+                                crate::Value::String(s) => s.parse::<usize>().map_err(|_| {
+                                    Error::query_execution(format!(
+                                        "LIMIT/OFFSET parameter ${} is not an integer: {:?}",
+                                        idx, s,
+                                    ))
+                                }),
+                                crate::Value::Null => Ok(sentinel),
+                                other => Err(Error::query_execution(format!(
+                                    "LIMIT/OFFSET parameter ${} must be integer or integer-string, got {:?}",
+                                    idx, other,
+                                ))),
+                            }
+                        }
+                    }
+                };
+                let limit = resolve(*limit, limit_param)?;
+                let offset = resolve(*offset, offset_param)?;
+                let limit = &limit;
+                let offset = &offset;
                 // LIMIT pushdown: detect Scan or Project(Scan) with no filter/sort
                 let scan_info = match input.as_ref() {
                     LogicalPlan::Scan { table_name, schema, projection, .. } => {

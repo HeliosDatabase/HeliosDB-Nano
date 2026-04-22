@@ -875,19 +875,21 @@ impl<'a> Planner<'a> {
 
         // Handle LIMIT and OFFSET
         if query.limit.is_some() || query.offset.is_some() {
-            let limit = match query.limit {
-                Some(expr) => self.expr_to_usize(&expr)?,
-                None => usize::MAX,
+            let (limit, limit_param) = match query.limit {
+                Some(expr) => self.expr_to_limit_bound(&expr)?,
+                None => (usize::MAX, None),
             };
-            let offset = match &query.offset {
-                Some(offset) => self.expr_to_usize(&offset.value)?,
-                None => 0,
+            let (offset, offset_param) = match &query.offset {
+                Some(offset) => self.expr_to_limit_bound(&offset.value)?,
+                None => (0, None),
             };
 
             plan = LogicalPlan::Limit {
                 input: Box::new(plan),
                 limit,
                 offset,
+                limit_param,
+                offset_param,
             };
         }
 
@@ -3196,12 +3198,56 @@ impl<'a> Planner<'a> {
     /// Execute-time planner runs, so `usize::MAX` here is a safe
     /// schema-preserving placeholder.
     fn expr_to_usize(&self, expr: &Expr) -> Result<usize> {
+        Ok(self.expr_to_limit_bound(expr)?.0)
+    }
+
+    /// Resolve a LIMIT / OFFSET expression to `(literal_value,
+    /// parameter_index)`.
+    ///
+    /// - `Number` → `(n, None)`.
+    /// - `Placeholder("$N")` → `(usize::MAX, Some(N))`; the real value
+    ///   is bound at execute time by the executor using its parameter
+    ///   list. `usize::MAX` is a schema-preserving sentinel so Parse /
+    ///   Describe still see a sensible plan and the optimiser doesn't
+    ///   accidentally short-circuit.
+    /// - `SingleQuotedString(n)` where `n` parses as `usize` →
+    ///   `(n, None)`. This is what substituted wire-level queries look
+    ///   like when the bind parameter is typed TEXT (OID 25) or UNKNOWN
+    ///   (OID 0): `substitute_parameters` renders string values with
+    ///   surrounding single quotes. Matches stock PG's implicit
+    ///   `text → integer` cast for LIMIT / OFFSET (B33).
+    fn expr_to_limit_bound(&self, expr: &Expr) -> Result<(usize, Option<usize>)> {
         match expr {
             Expr::Value(sqlparser::ast::Value::Number(n, _)) => {
-                n.parse::<usize>()
-                    .map_err(|e| Error::query_execution(format!("Invalid number: {}", e)))
+                let v = n.parse::<usize>()
+                    .map_err(|e| Error::query_execution(format!("Invalid number: {}", e)))?;
+                Ok((v, None))
             }
-            Expr::Value(sqlparser::ast::Value::Placeholder(_)) => Ok(usize::MAX),
+            Expr::Value(sqlparser::ast::Value::Placeholder(placeholder)) => {
+                if let Some(idx_str) = placeholder.strip_prefix('$') {
+                    let idx = idx_str.parse::<usize>().map_err(|_| {
+                        Error::query_execution(format!(
+                            "Invalid parameter placeholder: {placeholder}. Expected $1, $2, ..."
+                        ))
+                    })?;
+                    if idx == 0 {
+                        return Err(Error::query_execution(
+                            "Parameter indices must be 1-based (e.g. $1, $2)",
+                        ));
+                    }
+                    Ok((usize::MAX, Some(idx)))
+                } else {
+                    Ok((usize::MAX, None))
+                }
+            }
+            Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
+                let v = s.parse::<usize>().map_err(|_| {
+                    Error::query_execution(format!(
+                        "LIMIT/OFFSET must be a number (got quoted value '{s}')"
+                    ))
+                })?;
+                Ok((v, None))
+            }
             _ => Err(Error::query_execution("LIMIT/OFFSET must be a number")),
         }
     }

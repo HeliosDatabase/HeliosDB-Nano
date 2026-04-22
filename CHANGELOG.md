@@ -5,6 +5,57 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.14.8] - 2026-04-22
+
+### Fixed — parameterized LIMIT/OFFSET and UPDATE SET type coercion (B33 / B34)
+
+**B33** — `LIMIT $1 OFFSET $2` was rejected with `LIMIT/OFFSET must
+be a number`. Two independent issues surfaced together:
+
+- Wire path: postgres-js binds numeric parameters as TEXT (OID 0 or
+  25) by default. `substitute_parameters` renders a string value with
+  surrounding single quotes, so the planner saw `LIMIT '3'`, which
+  the old `expr_to_usize` rejected.
+- In-process path: the planner mapped `$N` to `usize::MAX` as a
+  sentinel, but `LogicalPlan::Limit` only carried the sentinel — the
+  bound integer never reached the executor. Queries silently returned
+  all rows (or all-rows-minus-offset).
+
+Fix:
+1. `expr_to_limit_bound` (new) returns `(usize, Option<usize>)`.
+   Accepts `Number`, `Placeholder($N)` → `(MAX, Some(N))`, and
+   `SingleQuotedString(n)` → `(n, None)`. The quoted-string arm
+   matches stock PG's implicit `text → integer` cast for LIMIT /
+   OFFSET.
+2. `LogicalPlan::Limit` gained `limit_param: Option<usize>` and
+   `offset_param: Option<usize>` fields, propagated through the
+   optimizer, RLS plan rewrite, and outer-ref binding paths.
+3. The executor's Limit branch resolves these from the bound
+   parameter list before running any of the Top-K, storage-offset, or
+   generic Limit paths.
+
+**B34** — `UPDATE t SET ts_col = $1` via extended-Q silently stored
+NULL in TIMESTAMP columns. `sql.unsafe` with the same SQL + string
+params worked. INSERT with the same pattern worked.
+
+Root cause: INSERT's value path auto-casts each evaluated value to
+its target column type before persistence; UPDATE's SET path did not
+— a `Value::String("2026-04-23T10:00:00.000Z")` was pushed straight
+into a TIMESTAMP slot, which the storage serializer dropped as an
+implicit NULL.
+
+Fix: mirror INSERT's auto-cast in every UPDATE SET path — the
+`execute_plan_with_params::Update` arm, the trigger-aware
+`execute_in_transaction_inner::Update` arm, and the RLS-aware
+non-params Update arm. All three now call `evaluator.cast_value(new,
+target_type)` when the new value and column type disagree.
+
+Regression tests (`tests/drizzle_compat_tests.rs`):
+- `b33_parameterized_limit`, `b33_parameterized_limit_offset`,
+  `b33_quoted_string_limit_wire_substitution`
+- `b34_update_set_param_timestamp`,
+  `b34_update_set_literal_iso_string`
+
 ## [3.14.7] - 2026-04-22
 
 ### Fixed — Drizzle UPDATE/DELETE and analytics date ranges (B31 / B32)

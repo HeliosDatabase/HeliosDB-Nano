@@ -1772,9 +1772,31 @@ impl EmbeddedDatabase {
                             let bound = self.materialize_scalar_subqueries_for_row(
                                 value_expr, &old_tuple, &schema, table_name,
                             )?;
-                            let new_value = evaluator.evaluate(&bound, &old_tuple)?;
+                            let mut new_value = evaluator.evaluate(&bound, &old_tuple)?;
                             let col_index = evaluator.schema().get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
+                            // Auto-cast SET values to target column type (B34).
+                            let target_col = schema.get_column_at(col_index)
+                                .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
+                            let target_type = &target_col.data_type;
+                            let needs_cast = !matches!(&new_value, Value::Null)
+                                && !matches!(
+                                    (&new_value, target_type),
+                                    (Value::Vector(_), DataType::Vector(_))
+                                    | (Value::Int2(_), DataType::Int2)
+                                    | (Value::Int4(_), DataType::Int4)
+                                    | (Value::Int8(_), DataType::Int8)
+                                    | (Value::Float4(_), DataType::Float4)
+                                    | (Value::Float8(_), DataType::Float8)
+                                    | (Value::String(_), DataType::Text | DataType::Varchar(_))
+                                    | (Value::Boolean(_), DataType::Boolean)
+                                    | (Value::Json(_), DataType::Json | DataType::Jsonb)
+                                    | (Value::Timestamp(_), DataType::Timestamp | DataType::Timestamptz)
+                                    | (Value::Date(_), DataType::Date)
+                                );
+                            if needs_cast {
+                                new_value = evaluator.cast_value(new_value, target_type)?;
+                            }
                             *new_tuple.values.get_mut(col_index)
                                 .ok_or_else(|| Error::internal("column index out of bounds"))? = new_value;
                         }
@@ -4258,10 +4280,32 @@ impl EmbeddedDatabase {
                             let bound = self.materialize_scalar_subqueries_for_row(
                                 value_expr, &tuple, &schema, table_name,
                             )?;
-                            let new_value = evaluator.evaluate(&bound, &tuple)?;
+                            let mut new_value = evaluator.evaluate(&bound, &tuple)?;
                             // Find column index
                             let col_index = evaluator.schema().get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
+                            // Auto-cast to target column type (B34).
+                            let target_col = schema.get_column_at(col_index)
+                                .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
+                            let target_type = &target_col.data_type;
+                            let needs_cast = !matches!(&new_value, Value::Null)
+                                && !matches!(
+                                    (&new_value, target_type),
+                                    (Value::Vector(_), DataType::Vector(_))
+                                    | (Value::Int2(_), DataType::Int2)
+                                    | (Value::Int4(_), DataType::Int4)
+                                    | (Value::Int8(_), DataType::Int8)
+                                    | (Value::Float4(_), DataType::Float4)
+                                    | (Value::Float8(_), DataType::Float8)
+                                    | (Value::String(_), DataType::Text | DataType::Varchar(_))
+                                    | (Value::Boolean(_), DataType::Boolean)
+                                    | (Value::Json(_), DataType::Json | DataType::Jsonb)
+                                    | (Value::Timestamp(_), DataType::Timestamp | DataType::Timestamptz)
+                                    | (Value::Date(_), DataType::Date)
+                                );
+                            if needs_cast {
+                                new_value = evaluator.cast_value(new_value, target_type)?;
+                            }
                             if let Some(slot) = tuple.values.get_mut(col_index) {
                                 *slot = new_value;
                             }
@@ -5246,9 +5290,39 @@ impl EmbeddedDatabase {
                             let bound = self.materialize_scalar_subqueries_for_row(
                                 value_expr, &tuple, &schema, table_name,
                             )?;
-                            let new_value = evaluator.evaluate(&bound, &tuple)?;
+                            let mut new_value = evaluator.evaluate(&bound, &tuple)?;
                             let col_index = evaluator.schema().get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
+                            // Auto-cast SET values to the target
+                            // column type (B34). Drizzle binds
+                            // JavaScript `Date`s as ISO 8601 strings
+                            // against TIMESTAMP columns — without an
+                            // explicit cast the storage layer ended
+                            // up persisting NULL. INSERT already does
+                            // this; UPDATE must match.
+                            let target_col = schema.get_column_at(col_index)
+                                .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
+                            let target_type = &target_col.data_type;
+                            let needs_cast = match (&new_value, target_type) {
+                                (Value::Null, _) => false,
+                                (Value::Vector(_), DataType::Vector(_)) => false,
+                                (Value::String(_), DataType::Vector(_)) => true,
+                                (Value::String(_), DataType::Json | DataType::Jsonb) => true,
+                                (Value::Int2(_), DataType::Int2) => false,
+                                (Value::Int4(_), DataType::Int4) => false,
+                                (Value::Int8(_), DataType::Int8) => false,
+                                (Value::Float4(_), DataType::Float4) => false,
+                                (Value::Float8(_), DataType::Float8) => false,
+                                (Value::String(_), DataType::Text | DataType::Varchar(_)) => false,
+                                (Value::Boolean(_), DataType::Boolean) => false,
+                                (Value::Json(_), DataType::Json | DataType::Jsonb) => false,
+                                (Value::Timestamp(_), DataType::Timestamp | DataType::Timestamptz) => false,
+                                (Value::Date(_), DataType::Date) => false,
+                                _ => true,
+                            };
+                            if needs_cast {
+                                new_value = evaluator.cast_value(new_value, target_type)?;
+                            }
                             if let Some(slot) = tuple.values.get_mut(col_index) {
                                 *slot = new_value;
                             }
@@ -7451,10 +7525,12 @@ impl EmbeddedDatabase {
                 distinct: *distinct,
                 distinct_on: distinct_on.clone(),
             },
-            LogicalPlan::Limit { input, limit, offset } => LogicalPlan::Limit {
+            LogicalPlan::Limit { input, limit, offset, limit_param, offset_param } => LogicalPlan::Limit {
                 input: Box::new(Self::bind_outer_refs_in_plan(input, outer_row, outer_schema, outer_table)),
                 limit: *limit,
                 offset: *offset,
+                limit_param: *limit_param,
+                offset_param: *offset_param,
             },
             LogicalPlan::Sort { input, exprs, asc } => LogicalPlan::Sort {
                 input: Box::new(Self::bind_outer_refs_in_plan(input, outer_row, outer_schema, outer_table)),
@@ -7616,11 +7692,13 @@ impl EmbeddedDatabase {
                 })
             }
 
-            sql::LogicalPlan::Limit { input, limit, offset } => {
+            sql::LogicalPlan::Limit { input, limit, offset, limit_param, offset_param } => {
                 Ok(sql::LogicalPlan::Limit {
                     input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
                     limit,
                     offset,
+                    limit_param,
+                    offset_param,
                 })
             }
 

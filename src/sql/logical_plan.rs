@@ -249,10 +249,21 @@ pub enum LogicalPlan {
     Limit {
         /// Input plan
         input: Box<LogicalPlan>,
-        /// Number of rows to return
+        /// Number of rows to return (resolved at plan time when the
+        /// SQL used a literal; set to `usize::MAX` as a sentinel when
+        /// `LIMIT $N` was used — the executor resolves the real value
+        /// from `limit_param` at execution time).
         limit: usize,
-        /// Number of rows to skip
+        /// Number of rows to skip (same semantics as `limit`).
         offset: usize,
+        /// When `Some(n)`, the real LIMIT was `$n` — executor must
+        /// resolve from parameters before running.
+        #[serde(default)]
+        limit_param: Option<usize>,
+        /// When `Some(n)`, the real OFFSET was `$n` — executor must
+        /// resolve from parameters before running.
+        #[serde(default)]
+        offset_param: Option<usize>,
     },
 
     /// UNION - combine results from two queries

@@ -434,7 +434,7 @@ fn format_plan(lines: &mut Vec<String>, plan: &LogicalPlan, depth: usize, verbos
             lines.push(format!("{}{}Sort: [{}]", indent, arrow, sort_info.join(", ")));
             format_plan(lines, input, depth + 1, verbose);
         }
-        LogicalPlan::Limit { input, limit, offset } => {
+        LogicalPlan::Limit { input, limit, offset, .. } => {
             let offset_str = if *offset > 0 {
                 format!(" OFFSET {}", offset)
             } else {

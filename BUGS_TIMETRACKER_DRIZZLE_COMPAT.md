@@ -92,6 +92,8 @@ Eight columns:
 | B30 | Timestamp column parsed as null       | major    | —        | —                | —                         | **fixed** in 3.14.5 (microsecond precision, space separator) |
 | B31 | UPDATE/DELETE with qualified WHERE col| blocker  | —        | —                | —                         | **fixed in 3.14.7** (`Schema::with_source_table_name` applied to every DML evaluator) |
 | B32 | Timestamp/Date ↔ ISO-string compare    | blocker  | —        | —                | —                         | **fixed in 3.14.7** (implicit coercion in `compare_values`) |
+| B33 | parameterized LIMIT $1 / OFFSET $2    | blocker  | —        | —                | —                         | **fixed in 3.14.8** (`LogicalPlan::Limit.{limit,offset}_param` + executor resolves bound params; planner accepts quoted-integer literal) |
+| B34 | UPDATE SET … = $1 silently nulls TS   | blocker (data loss) | — | — | — | **fixed in 3.14.8** (auto-cast in every UPDATE SET path, matching INSERT) |
 
 ---
 
@@ -1573,9 +1575,100 @@ B31 and B32 are the last two TimeTracker blockers. Both are narrow server-side i
 
 ---
 
+## Tenth retest (2026-04-22 evening) — rebuilt from commit `b757d41` (v3.14.7)
+
+Binary rebuilt from `feat/v3.11.0-integration` tip
+`b757d41 fix(nano): v3.14.7 — UPDATE/DELETE qualified WHERE + date-range coercion (B31 / B32)`,
+repackaged as `heliosdb-nano:3.14.7`. Fresh `ttm_db_data` volume.
+`SELECT version()` reports `HeliosDB Nano 3.14.7`.
+
+### Confirmed fixed in 3.14.7
+
+- **B31 (UPDATE / DELETE qualified WHERE)** — fixed. `PATCH /api/time-entries/:id` and `DELETE /api/time-entries/:id` no longer error with `Column 'time_entries.id' not found in schema`. Both return 200 from the app.
+- **B32 (timestamp ↔ ISO string coercion)** — fixed. The earlier `Cannot compare Timestamp(…) and String("…Z")` error is gone from `/api/dashboard`, `/api/patterns`, `/api/reports/custom`, and `/api/reports/compare`.
+
+### New blockers exposed by the next slice of the app surface
+
+With the write-update path unblocked, the app's `PATCH /api/time-entries/:id` no longer 500s — but the row comes back with **`check_out: null` and `updated_at: null`**, meaning the UPDATE ran but dropped its `SET` values. And once the analytics endpoints move past the string/timestamp comparison, they now fail on **parameter-bound `LIMIT`/`OFFSET`**.
+
+### B33 (NEW, blocker) — parameterized `LIMIT` / `OFFSET` rejected
+
+**Severity:** blocker — Drizzle always binds LIMIT/OFFSET (pagination, `.limit(N)`, `.offset(N)`). Every analytics endpoint uses it.
+
+**Reproducer (2026-04-22, `heliosdb-nano:3.14.7`):**
+```js
+await sql`select * from "time_entries" limit 5`;            // OK
+await sql`select * from "time_entries" limit ${5}`;         // ERROR
+```
+
+Server:
+```
+ERROR:  Query execution error: LIMIT/OFFSET must be a number
+```
+
+**Impact on TimeTracker.** `/api/dashboard` calls `db.select(...).limit(1)` (active timer lookup) → 500. Same pattern in `/api/patterns`, `/api/insights`, `/api/reports/custom`, `/api/reports/compare`, `/api/productivity-analysis`, and every `/api/search` / bulk-export request.
+
+**Expected (stock PG 16).** `LIMIT $1` with `$1 = 5 :: int4` is accepted; the server evaluates the bind value to the integer 5 before the limit check.
+
+### B34 (NEW, blocker) — Drizzle `UPDATE … SET ts_col = $n` through the extended protocol stores NULL
+
+**Severity:** blocker — every Drizzle `.update(t).set({ <timestamp>: Date })` write silently writes NULL into the timestamp column.
+
+**Reproducer (2026-04-22, Drizzle 0.36.4 + postgres-js 3.4.5):**
+```ts
+const ins = await db.insert(timeEntries).values({
+  userId: 1, workspaceId: 1, checkIn: new Date('2026-01-01T00:00:00Z')
+}).returning();
+// ins[0].checkIn === '2026-01-01T00:00:00.000Z'  ✓ INSERT accepts timestamp param
+
+const [u] = await db.update(timeEntries)
+  .set({ checkOut: new Date('2026-01-01T01:00:00Z') })
+  .where(eq(timeEntries.id, ins[0].id))
+  .returning();
+// u.checkOut === null   ✗ UPDATE silently stored NULL
+
+await db.select().from(timeEntries).where(eq(timeEntries.id, ins[0].id));
+// [{ …, checkOut: null }]   ✗ confirmed: the DB really holds NULL
+```
+
+**Same SQL + same params via `sql.unsafe` (simple query protocol) works.** The regression is specific to the extended-protocol Bind:
+```js
+await sql.unsafe(
+  `update "time_entries" set "check_out" = $1, "updated_at" = $2 where "time_entries"."id" = $3 returning "id", "check_out", "updated_at"`,
+  ['2026-04-22T18:17:04.618Z', '2026-04-22T18:17:04.618Z', id]
+);
+// [{ id, check_out: '2026-04-22T18:17:04.618Z', updated_at: '2026-04-22T18:17:04.618Z' }]   ✓
+```
+
+**Likely cause.** Drizzle + postgres-js sends the UPDATE via Parse/Bind/Execute, declaring parameter OIDs for the timestamp columns (most likely `1114` / `timestamp`). Postgres-js encodes `Date` to text form `YYYY-MM-DDTHH:MM:SS.sssZ` before binding. The server stores NULL for that SET value — so either the OID isn't recognised on the SET path, or the text-format decoder silently produces NULL when it can't parse the ISO form. The INSERT path handles the same string-as-timestamp correctly (verified), so the mismatch is UPDATE-specific.
+
+**Impact on TimeTracker.**
+- `PATCH /api/time-entries/:id` (stop timer) — stores `check_out = NULL, updated_at = NULL`; timer never "ends"
+- `PATCH /api/customers/:id` — any customer field that's a timestamp
+- `PATCH /api/entry-templates/:id`
+- `/api/time-entries/bulk` PATCH — every bulk update
+- `PATCH /api/workspaces/:id/members/:userId` — role change (no timestamp cols, so may actually work; not separately verified)
+
+Any UPDATE path that carries a timestamp in `SET` silently corrupts data.
+
+---
+
+## Status of the TimeTracker deployment after 3.14.7 @ b757d41
+
+- `heliosdb-nano:3.14.7` built from `b757d41`, `version()` reports `3.14.7`.
+- Migrations 0000–0003 apply cleanly.
+- **Full-trip Drizzle read + insert + delete flow working end-to-end** — register, login, create customer, start timer, list, delete all succeed via the real HTTP API.
+- **UPDATE silently nulls timestamp columns** (B34) — stop-timer `PATCH /api/time-entries/:id` 200s but the DB row ends up with `check_out = NULL`.
+- **Analytics endpoints still fail** on parameter-bound `LIMIT` (B33). The B32 error is gone; the replacement error is `LIMIT/OFFSET must be a number`.
+- No NPM proxy host created.
+
+B33 and B34 are the last two blockers. Both are narrow: B33 needs to accept a bind parameter in the LIMIT/OFFSET slot; B34 needs the extended-Bind → UPDATE SET path to treat the supplied text value the same way the INSERT path already does.
+
+---
+
 ## Closing
 
-Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.6` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
+Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.7` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
 
 B18 in particular is worth a hardening test: any attempt to verify a B4 fix should also assert that `SELECT *` against the table after the failing INSERT still works.
 
