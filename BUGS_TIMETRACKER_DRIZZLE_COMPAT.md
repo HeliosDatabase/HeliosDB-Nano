@@ -1765,9 +1765,75 @@ Once B35 ships, every TimeTracker endpoint should be green and the NPM proxy hos
 
 ---
 
+## Twelfth retest (2026-04-22 late) — rebuilt from commit `9a130ad` (v3.14.9)
+
+Binary rebuilt from `feat/v3.11.0-integration` tip
+`9a130ad fix(nano): v3.14.9 — GROUP BY mixed qualifiers + DATE key comparison (B35)`,
+repackaged as `heliosdb-nano:3.14.9`. Fresh `ttm_db_data` volume.
+`SELECT version()` reports `HeliosDB Nano 3.14.9`.
+
+### Confirmed fixed in 3.14.9
+
+- **B35 (mixed-qualifier name resolution in SELECT vs GROUP BY)** — fixed. The minimal reproducer now returns rows:
+  ```sql
+  select date("check_in"), count(*)
+    from "time_entries"
+    group by date("time_entries"."check_in");
+  -- OK, 1 row
+  ```
+- **Bonus fix** (root cause #2 in the commit note): `compare_values` now has arms for Date / Time / Interval / Numeric, so `GROUP BY <date_col>` produces one group per distinct date instead of collapsing everything into a single group. Verified through the ttm app — `/api/reports/custom` and `/api/dashboard`'s `weekStats` both return a row per day with correct per-day totals.
+
+### End-to-end TimeTracker smoke — all green
+
+Full authenticated flow via the HTTP API on `heliosdb-nano:3.14.9`:
+
+| Endpoint | Status |
+|----------|--------|
+| `POST /api/auth/register` | 201 ✓ |
+| `POST /api/auth/login`    | 200 ✓ |
+| `POST /api/customers`     | 200 ✓ |
+| `GET  /api/customers`     | 200 ✓ |
+| `POST /api/time-entries`  | 200 ✓ |
+| `PATCH /api/time-entries/:id` (stop timer) | 200 ✓ — `checkOut` persists |
+| `DELETE /api/time-entries/:id` | 200 ✓ |
+| `GET  /api/workspaces`    | 200 ✓ |
+| `GET  /api/statistics`    | 200 ✓ — sums + customer breakdown |
+| `POST /api/search`        | 200 ✓ — pagination + filters |
+| `GET  /api/dashboard`     | 200 ✓ — todayStats, weekStats, recentActivity, topCustomers |
+| `GET  /api/patterns?days=7` | 200 ✓ — hourly + weekday + break patterns |
+| `GET  /api/insights`      | 200 ✓ — summary, trends, hourlyPattern, recommendations |
+| `POST /api/reports/custom` | 200 ✓ — per-day rollup + customer breakdown |
+| `POST /api/reports/compare` | 200 ✓ — current / previous / delta |
+
+Every endpoint that ran anywhere in this retest series is now green.
+The `/api/dashboard` output includes real numeric values computed from
+`extract(epoch from check_out - check_in)/60` (9.94 min from a 10-minute
+timer run), confirming the full analytics stack end-to-end.
+
+### Status tracker: all reported bugs resolved
+
+B1 through B35 — every blocker, major, and minor bug in this doc is
+either **fixed** in an `heliosdb-nano:3.14.x` release or documented as
+out-of-scope (B14's specific reproducer is standard SQL-92 behaviour).
+
+| Phase | Release | Bugs closed |
+|-------|---------|-------------|
+| Foundation | 3.14.0 (88165aa) | B1, B2, B3, B4, B5, B7, B8, B9, B10, B11, B12, B13, B14, B15, B16, B17, B18 |
+| Driver-level compat | 3.14.1 (f26a5e6) | B19, B20, B21 |
+| Protocol + executor | 3.14.2 (9071d97) | B22, B23 |
+| INSERT path | 3.14.3 (fb5599a) | B24, B25, B26 |
+| Drizzle write path | 3.14.4 (d92d370) | B27, B28 |
+| Timestamp wire format | 3.14.5 (0bb5ecb) | B30 |
+| Cache invalidation | 3.14.6 (be07da7) | B29 |
+| UPDATE/DELETE + coercion | 3.14.7 (b757d41) | B31, B32 |
+| LIMIT/OFFSET + UPDATE SET | 3.14.8 (3b04450) | B33, B34 |
+| Name resolution + DATE keys | 3.14.9 (9a130ad) | B35 |
+
+---
+
 ## Closing
 
-Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.8` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
+Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.9` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
 
 B18 in particular is worth a hardening test: any attempt to verify a B4 fix should also assert that `SELECT *` against the table after the failing INSERT still works.
 
