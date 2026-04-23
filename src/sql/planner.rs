@@ -2922,11 +2922,14 @@ impl<'a> Planner<'a> {
                         on_update,
                         ..
                     } => {
+                        // Normalize the referenced table / columns (B36).
+                        // See the matching comment on the table-level FK
+                        // branch in `convert_table_constraint`.
                         let fk_constraint = TableConstraint::ForeignKey {
                             name: None,
-                            columns: vec![col.name.value.clone()],
-                            references_table: foreign_table.to_string(),
-                            references_columns: referred_columns.iter().map(|i| i.value.clone()).collect(),
+                            columns: vec![Self::normalize_ident(&col.name)],
+                            references_table: Self::normalize_object_name(foreign_table),
+                            references_columns: referred_columns.iter().map(Self::normalize_ident).collect(),
                             on_delete: on_delete.as_ref().map(|a| convert_referential_action(a)),
                             on_update: on_update.as_ref().map(|a| convert_referential_action(a)),
                             deferrable: false,
@@ -3026,9 +3029,16 @@ impl<'a> Planner<'a> {
 
                 Some(TableConstraint::ForeignKey {
                     name: name.as_ref().map(|n| n.to_string()),
-                    columns: columns.iter().map(|c| c.to_string()).collect(),
-                    references_table: foreign_table.to_string(),
-                    references_columns: referred_columns.iter().map(|c| c.to_string()).collect(),
+                    // Normalize identifiers so FK metadata matches the
+                    // form tables/columns are stored under in the
+                    // catalog. Previously `ObjectName::to_string()`
+                    // preserved the original quote characters, so
+                    // `REFERENCES "users"(id)` produced a
+                    // `references_table = "\"users\""` that later
+                    // FK-check lookups could not resolve (B36).
+                    columns: columns.iter().map(Self::normalize_ident).collect(),
+                    references_table: Self::normalize_object_name(foreign_table),
+                    references_columns: referred_columns.iter().map(Self::normalize_ident).collect(),
                     on_delete: on_delete.as_ref().map(|a| convert_referential_action(a)),
                     on_update: on_update.as_ref().map(|a| convert_referential_action(a)),
                     deferrable,

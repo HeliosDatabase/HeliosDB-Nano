@@ -881,6 +881,115 @@ fn b35_date_column_group_by_correctness() -> Result<()> {
 }
 
 // ---------------------------------------------------------------------
+// B36 — FK references with quoted identifiers + fast-path bypass
+//
+// Reporter: `INSERT INTO "workspaces" (name, owner_id) VALUES (…)`
+// over the extended protocol failed with
+// `ERROR: Table '"users"' does not exist`, while the unquoted form
+// silently succeeded even when no parent row matched. Two bugs
+// acting together:
+//
+// Root cause #1 — planner stored `ObjectName::to_string()` for the
+// referenced table, which preserves the original quote characters.
+// `REFERENCES "users"(id)` (Drizzle's default) produced an FK whose
+// `references_table` was literally `"users"` (with the quotes), and
+// the FK-check catalog lookup couldn't find any table by that name.
+// Fixed by normalising the table name (and column names) at
+// constraint-construction time.
+//
+// Root cause #2 — `try_fast_insert` skipped FK validation entirely
+// and extracted the table name from the SQL text verbatim (so
+// quoted identifiers fell out of the fast path). Fixed by
+// (a) stripping surrounding quotes from the extracted table name,
+// and (b) bailing to the normal path for any table with FK
+// constraints so the validated Insert arm handles it.
+// ---------------------------------------------------------------------
+#[test]
+fn b36_fk_insert_with_quoted_references() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(r#"CREATE TABLE "users" ("id" SERIAL PRIMARY KEY, "email" TEXT)"#)?;
+    db.execute(
+        r#"CREATE TABLE "workspaces" (
+             "id" SERIAL PRIMARY KEY,
+             "name" TEXT,
+             "owner_id" INTEGER REFERENCES "users"("id")
+           )"#,
+    )?;
+    let (_, rows) = db.execute_returning(
+        r#"INSERT INTO "users" ("email") VALUES ('a') RETURNING "id""#,
+    )?;
+    let parent_id = match rows[0].values[0] {
+        Value::Int4(n) => n as i64,
+        Value::Int8(n) => n,
+        _ => panic!("unexpected id type"),
+    };
+    db.execute_params_returning(
+        r#"INSERT INTO "workspaces" ("name", "owner_id") VALUES ($1, $2)"#,
+        &[Value::String("w".into()), Value::Int4(parent_id as i32)],
+    )?;
+    Ok(())
+}
+
+#[test]
+fn b36_fk_violation_fires_on_unquoted_insert() -> Result<()> {
+    // Fast-path regression guard: unquoted INSERT used to bypass FK
+    // validation entirely, silently writing orphan rows.
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(r#"CREATE TABLE users (id SERIAL PRIMARY KEY, email TEXT)"#)?;
+    db.execute(
+        r#"CREATE TABLE workspaces (
+             id SERIAL PRIMARY KEY,
+             name TEXT,
+             owner_id INTEGER REFERENCES users(id)
+           )"#,
+    )?;
+    let err = db.execute(
+        r#"INSERT INTO workspaces (name, owner_id) VALUES ('w', 999)"#,
+    );
+    assert!(err.is_err(), "FK violation expected, got Ok");
+    Ok(())
+}
+
+#[test]
+fn b36_fk_violation_fires_on_quoted_insert() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(r#"CREATE TABLE "users" ("id" SERIAL PRIMARY KEY, "email" TEXT)"#)?;
+    db.execute(
+        r#"CREATE TABLE "workspaces" (
+             "id" SERIAL PRIMARY KEY,
+             "name" TEXT,
+             "owner_id" INTEGER REFERENCES "users"("id")
+           )"#,
+    )?;
+    let err = db.execute(
+        r#"INSERT INTO "workspaces" ("name", "owner_id") VALUES ('w', 999)"#,
+    );
+    assert!(err.is_err(), "FK violation expected, got Ok");
+    Ok(())
+}
+
+#[test]
+fn b36_fk_succeeds_both_shapes() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    db.execute(r#"CREATE TABLE "users" ("id" SERIAL PRIMARY KEY, "email" TEXT)"#)?;
+    db.execute(
+        r#"CREATE TABLE "workspaces" (
+             "id" SERIAL PRIMARY KEY,
+             "name" TEXT,
+             "owner_id" INTEGER REFERENCES "users"("id")
+           )"#,
+    )?;
+    db.execute(r#"INSERT INTO "users" ("email") VALUES ('a')"#)?;
+    db.execute(r#"INSERT INTO workspaces (name, owner_id) VALUES ('u', 1)"#)?;
+    db.execute(r#"INSERT INTO "workspaces" ("name", "owner_id") VALUES ('q', 1)"#)?;
+    let count = db.query(r#"SELECT count(*) FROM "workspaces""#, &[])?;
+    match count[0].values[0] {
+        Value::Int8(2) => Ok(()),
+        ref v => panic!("expected 2 rows, got {:?}", v),
+    }
+}
+
+// ---------------------------------------------------------------------
 // heliosdb_capability_report() — self-describing capability probe
 // ---------------------------------------------------------------------
 #[test]

@@ -5,6 +5,60 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.14.10] - 2026-04-23
+
+### Fixed — Foreign key validation with quoted identifiers, fast-path bypass (B36)
+
+**Reporter's symptom.** `INSERT INTO "workspaces" (name, owner_id)
+VALUES (…)` over the extended protocol failed with
+`ERROR: Table '"users"' does not exist`, while the unquoted
+`INSERT INTO workspaces (…)` silently succeeded even with a
+nonexistent parent row. Drizzle emits every identifier quoted, so
+every Drizzle-shaped INSERT on an FK-bearing table tripped this.
+
+Two interlocking bugs:
+
+**Root cause #1 — FK references stored with literal quote
+characters.** `src/sql/planner.rs` built
+`TableConstraint::ForeignKey` via `ObjectName::to_string()` at both
+the inline `ColumnOption::ForeignKey` site and the table-level
+`SqlTC::ForeignKey` site. `ObjectName::to_string()` preserves the
+original quoting, so `REFERENCES "users"("id")` stored the
+referenced table as the four-character string `"users"` (with the
+quotes). FK validation later called `get_table_schema(&fk.references_table)`
+and emitted the verbatim `Table '"users"' does not exist`.
+
+Fix: normalise every identifier at FK construction time with the
+same `Planner::normalize_ident` / `Planner::normalize_object_name`
+helpers every other DDL path uses. `REFERENCES "users"("id")` and
+`REFERENCES users(id)` both now store `references_table = "users"`
+and `references_columns = ["id"]`.
+
+**Root cause #2 — `try_fast_insert` skipped FK validation.**
+`src/lib.rs::try_fast_insert` wrote rows directly to storage with no
+call to `check_fk_constraints` / `check_foreign_key_exists`. Unquoted
+INSERTs into FK-bearing tables silently succeeded regardless of
+parent-row existence — a data-integrity hole. It also extracted the
+target table name with its surrounding quotes intact, so quoted
+INSERTs fell out of the fast path entirely and triggered root cause
+#1 on the normal path.
+
+Fix: (a) strip surrounding double quotes from the fast-path table
+name so quoted and unquoted shapes route identically; (b) bail to the
+normal path for any table with registered FK constraints so the
+already-validated Insert arm handles the write.
+
+Regression tests (`tests/drizzle_compat_tests.rs`):
+- `b36_fk_insert_with_quoted_references` — verbatim Drizzle shape
+  (CREATE TABLE with `REFERENCES "users"("id")`, INSERT via extended
+  protocol with a valid FK). Must succeed.
+- `b36_fk_violation_fires_on_unquoted_insert` — guards the fast-path
+  bypass; unquoted INSERT without a matching parent row must fail.
+- `b36_fk_violation_fires_on_quoted_insert` — same for the quoted
+  shape.
+- `b36_fk_succeeds_both_shapes` — both quoted and unquoted INSERTs
+  succeed when the FK is satisfied (symmetry guard).
+
 ## [3.14.9] - 2026-04-22
 
 ### Fixed — GROUP BY correctness with mixed qualifier styles and DATE keys (B35)

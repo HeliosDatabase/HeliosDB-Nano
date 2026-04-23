@@ -95,6 +95,7 @@ Eight columns:
 | B33 | parameterized LIMIT $1 / OFFSET $2    | blocker  | —        | —                | —                         | **fixed in 3.14.8** (`LogicalPlan::Limit.{limit,offset}_param` + executor resolves bound params; planner accepts quoted-integer literal) |
 | B34 | UPDATE SET … = $1 silently nulls TS   | blocker (data loss) | — | — | — | **fixed in 3.14.8** (auto-cast in every UPDATE SET path, matching INSERT) |
 | B35 | GROUP BY with mixed qualifier styles  | blocker  | —        | —                | —                         | **fixed in 3.14.9** (`Planner::exprs_equivalent` + Date/Time/Interval/Numeric arms in `compare_values`) |
+| B36 | Extended-protocol INSERT on quoted target fails FK validation with "Table '\"X\"' does not exist" | blocker (+ partial commit) | — | — | — | **fixed in 3.14.10** (planner normalises `REFERENCES` identifiers; `try_fast_insert` strips quotes from the target name and bails to the validated Insert arm for any FK-bearing table — also closes a data-integrity hole where unquoted INSERTs silently bypassed FK validation). |
 
 ---
 
@@ -1828,6 +1829,153 @@ out-of-scope (B14's specific reproducer is standard SQL-92 behaviour).
 | UPDATE/DELETE + coercion | 3.14.7 (b757d41) | B31, B32 |
 | LIMIT/OFFSET + UPDATE SET | 3.14.8 (3b04450) | B33, B34 |
 | Name resolution + DATE keys | 3.14.9 (9a130ad) | B35 |
+| FK identifier normalisation + fast-path bypass | 3.14.10 | B36 |
+
+---
+
+## Thirteenth retest (2026-04-23) — new bug surfaced on 3.14.9 @ 9a130ad
+
+While wiring TimeTracker's "create one workspace at register time"
+flow, a new HeliosDB regression appeared. It only fires when the
+INSERT is issued via the **extended query protocol with identifiers
+quoted** — exactly how `drizzle-orm/postgres-js` emits everything.
+
+### B36 (NEW, blocker) — Extended-protocol INSERT into a quoted-identifier target fails FK validation with a misleading "Table does not exist" error
+
+**Severity:** blocker — every INSERT Drizzle emits against a table
+that has a `REFERENCES` declaration errors out, despite the
+constraint not appearing in `pg_constraint` and the referenced row
+being present and visible to `SELECT`.
+
+**Shapes affected**
+
+- `INSERT INTO "workspaces" (…)` — `workspaces.owner_id → users.id` FK check fails with `Table '"users"' does not exist`.
+- `INSERT INTO "memberships" (…)` — `memberships.workspace_id → workspaces.id` FK check fails with `Table '"workspaces"' does not exist`.
+- Both failure messages wrap the referenced table's name in literal double quotes inside the error text (`'"users"'`), which suggests the lookup is happening against a string-keyed catalog that wasn't normalised before comparison.
+
+**Reproducer via `psql` (simple protocol):**
+```sql
+-- Works:
+INSERT INTO users (email, password) VALUES ('foo@bar', 'x');
+-- INSERT 0 1
+
+-- Works (unquoted target):
+INSERT INTO workspaces (name, owner_id) VALUES ('noquot', 1);
+-- INSERT 0 1
+
+-- Fails (quoted target):
+INSERT INTO "workspaces" (name, owner_id) VALUES ('quoted', 1);
+-- ERROR:  Query execution error: Table '"users"' does not exist
+```
+
+Note: the **same table, same data, same session** — only the
+quoted-vs-unquoted INSERT target differs.
+
+**Reproducer via `postgres-js` (extended protocol, parameterised):**
+```js
+import postgres from "postgres";
+const sql = postgres("postgres://postgres@ttm-db:5432/heliosdb", { ssl: false });
+
+// Works — user insert (no FK to traverse)
+const [u] = await sql`INSERT INTO users (email, password) VALUES (${'drz@x'}, ${'x'}) RETURNING id`;
+
+// Fails — has FK to users
+const [ws] = await sql`INSERT INTO workspaces (name, owner_id) VALUES (${'ws'}, ${u.id}) RETURNING id`;
+// PostgresError: Query execution error: Table '"workspaces"' does not exist
+// (Note: error names workspaces — not users — when the FK path is traversed
+//  through a hop; the quoted-name misformat is the common symptom.)
+```
+
+postgres-js binds every identifier as quoted and always uses the
+extended protocol with prepared statements, so every
+Drizzle-generated INSERT trips this path.
+
+**State at time of failure.** Both participating rows are present
+and are visible to an independent `SELECT`:
+
+```sql
+SELECT COUNT(*) FROM users;       -- 1 (the just-inserted row)
+SELECT COUNT(*) FROM workspaces;  -- grows on every failed attempt,
+                                  --  because the workspace INSERT
+                                  --  does write its row before the
+                                  --  FK check fires on a subsequent
+                                  --  statement.
+```
+
+**Observations**
+
+1. The error text hex-encodes the referenced table's name with extra
+   quotes in it (`'"users"'`), suggesting the lookup key is formed by
+   concatenating the surrounding quote characters rather than parsing
+   the identifier.
+2. `pg_constraint` returns **zero rows** for the affected tables
+   (`memberships`, `workspaces`) — so the FK check is happening
+   through an internal metadata path, not the standard catalog.
+3. `DROP CONSTRAINT …` and `DROP FOREIGN KEY …` variants are rejected
+   (`unknown statement`), so clients can't remove the constraint even
+   as a workaround.
+4. `INSERT … RETURNING *` on a table without a FK works fine — users,
+   customers (no FK to users at this point), time_entries, projects,
+   entry_templates, invoices. Only the workspace / membership FK hops
+   fail.
+
+**Workaround TimeTracker is using in production today.** The register
+handler uses `sql.unsafe()` with client-side escaped literals (no
+Bind parameters) for the three inserts:
+
+```ts
+const esc = (v: string) => v.replace(/'/g, "''");
+const raw = createPool();
+const [user] = await raw.unsafe(
+  `INSERT INTO users (email, password) VALUES ('${esc(email)}', '${esc(hash)}')
+    RETURNING id, email, password, created_at AS "createdAt"`
+);
+const [ws] = await raw.unsafe(
+  `INSERT INTO workspaces (name, owner_id) VALUES ('${esc(name)}', ${user.id}) RETURNING id`
+);
+await raw.unsafe(
+  `INSERT INTO memberships (workspace_id, user_id, role) VALUES (${ws.id}, ${user.id}, 'owner')`
+);
+```
+
+That routes through the simple-query protocol and bypasses whatever
+the extended-protocol path is doing wrong. It's not pretty — every
+subsequent new-workspace / new-membership insert in the app has to
+use the same trick — but it unblocks the register flow end-to-end.
+
+### Why this is "B36" and not a B-X-minor
+
+The bug silently corrupts the user experience:
+
+- `POST /api/auth/register` returns `400 "Registration failed"` while
+  the user row **and** the workspace row have already been committed
+  to the database.
+- The user thinks registration failed (no token) and tries again —
+  which hits `email already registered` and leaves an orphan
+  workspace forever.
+- On a fresh database, within 5 failed attempts you can rack up a
+  handful of orphan workspaces that are invisible to users (no
+  membership, so they never appear in the UI) but bloat the
+  workspace ID sequence.
+
+In other words: not only does every Drizzle-style INSERT on a
+FK-bearing table fail, but the failure mode is **"succeed in part,
+error with a misleading message"** — the worst possible
+combination from a data-integrity perspective.
+
+### Minimum test harness
+
+A good regression test should exercise all three of these:
+
+1. `INSERT INTO "t" (…) RETURNING *` via the extended protocol with a
+   bound parameter, where `t` has a `REFERENCES` to another table.
+2. Same insert via the **simple** protocol with a literal.
+3. `SELECT COUNT(*) FROM t` after each attempt, to confirm the row
+   count matches the number of times the statement "succeeded"
+   (currently, failed attempts still increment the count).
+
+A pass requires (1) and (2) to both succeed, and (3) to match the
+expected count. Currently only (2) passes cleanly.
 
 ---
 

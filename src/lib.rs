@@ -3269,9 +3269,13 @@ impl EmbeddedDatabase {
         }
         let after_into = after_insert.get(4..)?.trim_start();
 
-        // Extract table name (until '(' or whitespace)
+        // Extract table name (until '(' or whitespace). Strip
+        // surrounding double quotes so `INSERT INTO "workspaces" …`
+        // and `INSERT INTO workspaces …` both match the same schema
+        // entry — without this, quoted identifiers fell out of the
+        // fast path and routed to the normal path (part of B36).
         let table_end = after_into.find(|c: char| c == '(' || c.is_whitespace())?;
-        let table_name = after_into.get(..table_end)?.trim();
+        let table_name = after_into.get(..table_end)?.trim().trim_matches('"');
         if table_name.is_empty() {
             return None;
         }
@@ -3326,6 +3330,18 @@ impl EmbeddedDatabase {
             Ok(s) => s,
             Err(_) => return None, // Table doesn't exist — let normal path handle error
         };
+
+        // Bail if the target table has any foreign key constraints.
+        // The fast path skips FK validation entirely and used to let
+        // orphan rows slip in silently (B36 data-integrity half). The
+        // normal path's Insert arm does the full FK check, so it's
+        // both simpler and safer to route FK-bearing tables through
+        // it than to re-implement validation here.
+        if let Ok(tc) = catalog.load_table_constraints(table_name) {
+            if !tc.foreign_keys.is_empty() {
+                return None;
+            }
+        }
 
         // Resolve column indices and target types
         if columns.len() != Self::fast_parse_value_count(values_str) {
