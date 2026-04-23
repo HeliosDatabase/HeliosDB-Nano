@@ -76,6 +76,30 @@ pub(super) fn handle_create_index(
                     ) {
                         tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
                     }
+                } else if idx_type == "gin" || idx_type == "gist" {
+                    // Postgres FTS/GIN/GiST index.
+                    //
+                    // Accepted for syntactic compatibility (Django, Rails,
+                    // and hand-written migrations emit CREATE INDEX ...
+                    // USING gin) but does NOT yet build a real inverted
+                    // index — the @@ operator walks the table row by row
+                    // using the in-evaluator BM25 scorer. On realistic
+                    // text volumes this is fine; at scale, consider the
+                    // native search::bm25 API until a persistent GIN
+                    // backend lands.
+                    //
+                    // See docs/compatibility/fts.md for the full list of
+                    // behaviours we do and do not implement.
+                    tracing::info!(
+                        "Accepted CREATE INDEX {} USING {} ON {} ({}) — \
+                         DDL-only (no backing index yet)",
+                        name, idx_type, table_name, column_name
+                    );
+                    if let Err(e) = storage.log_create_index(
+                        name, table_name, column_name, Some(idx_type.as_str()), &[],
+                    ) {
+                        tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
+                    }
                 } else if idx_type == "hnsw" {
                     // Check if index already exists
                     let vector_indexes = storage.vector_indexes();

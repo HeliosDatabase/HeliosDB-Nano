@@ -484,7 +484,7 @@ impl ExplainPlanner {
                 })
             }
 
-            LogicalPlan::Limit { input, limit, offset } => {
+            LogicalPlan::Limit { input, limit, offset, .. } => {
                 let input_node = self.plan_to_node(input)?;
 
                 let mut details = HashMap::new();

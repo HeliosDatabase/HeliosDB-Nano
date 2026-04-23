@@ -519,6 +519,11 @@ impl CostEstimator {
                 // Subqueries are expensive - estimate high cost
                 100.0 + Self::estimate_expr_complexity(expr)
             }
+            LogicalExpr::ScalarSubquery { .. } => {
+                // Scalar subqueries — full plan execution
+                100.0
+            }
+            LogicalExpr::DefaultValue => 0.0,
             LogicalExpr::Exists { .. } => {
                 // EXISTS subqueries are expensive
                 100.0
@@ -539,6 +544,9 @@ impl CostEstimator {
                     .map(|(e, _)| Self::estimate_expr_complexity(e))
                     .sum();
                 50.0 + arg_cost + partition_cost + order_cost
+            }
+            LogicalExpr::Tuple { items } => {
+                1.0 + items.iter().map(Self::estimate_expr_complexity).sum::<f64>()
             }
             LogicalExpr::Wildcard | LogicalExpr::Parameter { .. } => 1.0,
         }

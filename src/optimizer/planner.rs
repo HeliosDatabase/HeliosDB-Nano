@@ -285,8 +285,11 @@ impl Planner {
                 }
             }
 
-            // Limit - direct conversion
-            LogicalPlan::Limit { input, limit, offset } => {
+            // Limit - direct conversion. Parameter indices are
+            // discarded here; this physical planner is only wired up
+            // for test/demo paths (the main executor reads parameters
+            // directly from the LogicalPlan in `executor::mod`).
+            LogicalPlan::Limit { input, limit, offset, .. } => {
                 if self.verbose {
                     debug!("Planning: Limit({}, offset={})", limit, offset);
                 }
@@ -307,6 +310,7 @@ impl Planner {
             LogicalPlan::CreateTable { .. } |
             LogicalPlan::DropTable { .. } |
             LogicalPlan::CreateIndex { .. } |
+            LogicalPlan::CreateSequence { .. } |
             LogicalPlan::AlterColumnStorage { .. } |
             LogicalPlan::AlterTableAddColumn { .. } |
             LogicalPlan::AlterTableDropColumn { .. } |

@@ -249,10 +249,21 @@ pub enum LogicalPlan {
     Limit {
         /// Input plan
         input: Box<LogicalPlan>,
-        /// Number of rows to return
+        /// Number of rows to return (resolved at plan time when the
+        /// SQL used a literal; set to `usize::MAX` as a sentinel when
+        /// `LIMIT $N` was used — the executor resolves the real value
+        /// from `limit_param` at execution time).
         limit: usize,
-        /// Number of rows to skip
+        /// Number of rows to skip (same semantics as `limit`).
         offset: usize,
+        /// When `Some(n)`, the real LIMIT was `$n` — executor must
+        /// resolve from parameters before running.
+        #[serde(default)]
+        limit_param: Option<usize>,
+        /// When `Some(n)`, the real OFFSET was `$n` — executor must
+        /// resolve from parameters before running.
+        #[serde(default)]
+        offset_param: Option<usize>,
     },
 
     /// UNION - combine results from two queries
@@ -373,6 +384,20 @@ pub enum LogicalPlan {
         /// Index options (e.g., quantization, pq_subquantizers, etc.)
         options: Vec<IndexOption>,
         /// If index already exists, do nothing
+        if_not_exists: bool,
+    },
+
+    /// Create a named sequence (for nextval / currval / setval).
+    ///
+    /// HeliosDB's sequences are currently process-scoped in-memory
+    /// counters (see `evaluator::sequences`). This is enough to unblock
+    /// Prisma / Drizzle / Django migrations that emit
+    /// `CREATE SEQUENCE` DDL but don't rely on cross-connection
+    /// monotonicity. Persistent sequences are a follow-up.
+    CreateSequence {
+        /// Sequence name (already normalised)
+        name: String,
+        /// Silently succeed if the sequence already exists
         if_not_exists: bool,
     },
 
@@ -916,6 +941,20 @@ pub enum LogicalExpr {
         negated: bool,
     },
 
+    /// Scalar subquery: `(SELECT col FROM t WHERE ...)` appearing as
+    /// a single expression. Yields the first column of the first row
+    /// returned by the plan, or `NULL` if the plan returns no rows.
+    /// Used in `UPDATE ... SET col = (SELECT ...)` and projection
+    /// lists.
+    ///
+    /// Correlation (references to the outer row) is resolved at
+    /// execute time by the caller (UPDATE executor substitutes outer
+    /// columns with literals before running the plan).
+    ScalarSubquery {
+        /// The subquery plan
+        subquery: Box<LogicalPlan>,
+    },
+
     /// IN subquery: expr IN (SELECT ...)
     InSubquery {
         /// Expression to test
@@ -933,6 +972,14 @@ pub enum LogicalExpr {
         /// True for NOT EXISTS, false for EXISTS
         negated: bool,
     },
+
+    /// `DEFAULT` keyword in an INSERT VALUES list. Signals to the
+    /// INSERT executor that this slot should fall through to the
+    /// column's declared DEFAULT expression (or NULL if none) —
+    /// same path as a fully-omitted column. Stock PostgreSQL: any
+    /// `DEFAULT` inside a VALUES row means "use the column's
+    /// default", NOT "substitute NULL".
+    DefaultValue,
 
     /// Wildcard (SELECT *)
     Wildcard,
@@ -965,6 +1012,16 @@ pub enum LogicalExpr {
         array: Box<LogicalExpr>,
         /// Index expression (1-based for PostgreSQL compatibility)
         index: Box<LogicalExpr>,
+    },
+
+    /// Row/tuple constructor: `(expr1, expr2, ...)`.
+    ///
+    /// Enables keyset-style comparisons like
+    /// `WHERE (created_at, id) < ($1, $2)` which are compared
+    /// lexicographically element-by-element by the evaluator.
+    Tuple {
+        /// Elements of the tuple
+        items: Vec<LogicalExpr>,
     },
 
     /// Window function: func(args) OVER (PARTITION BY ... ORDER BY ...)
@@ -1121,6 +1178,10 @@ pub enum BinaryOperator {
     // String operators
     /// String concatenation: ||
     StringConcat,
+
+    // Full-text search operators
+    /// Text-search match: tsvector @@ tsquery → boolean
+    TsMatch,
 }
 
 /// Unary operator
@@ -1388,6 +1449,7 @@ impl LogicalPlan {
             Self::CreateTable { .. } => "CreateTable",
             Self::DropTable { .. } => "DropTable",
             Self::CreateIndex { .. } => "CreateIndex",
+            Self::CreateSequence { .. } => "CreateSequence",
             Self::Explain { .. } => "Explain",
             Self::Union { .. } => "Union",
             Self::Intersect { .. } => "Intersect",
@@ -1492,6 +1554,10 @@ impl LogicalPlan {
             }
             LogicalPlan::CreateIndex { .. } => {
                 // CreateIndex doesn't have output schema
+                Arc::new(Schema { columns: vec![] })
+            }
+            LogicalPlan::CreateSequence { .. } => {
+                // CREATE SEQUENCE is DDL — no output schema.
                 Arc::new(Schema { columns: vec![] })
             }
             LogicalPlan::AlterColumnStorage { .. } => {

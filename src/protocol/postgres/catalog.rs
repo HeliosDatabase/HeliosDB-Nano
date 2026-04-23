@@ -32,6 +32,14 @@ impl PgCatalog {
     pub fn handle_query(&self, query: &str) -> Result<Option<(Schema, Vec<Tuple>)>> {
         let query_lower = query.trim().to_lowercase();
 
+        // --- psql meta-command query detection ---------------------------
+        // psql sends complex JOINs across pg_class / pg_namespace /
+        // pg_attribute that our simple substring matcher can't resolve, so
+        // recognise them by signature and synthesise a shaped response.
+        if let Some(result) = self.try_psql_metacommand(&query_lower)? {
+            return Ok(Some(result));
+        }
+
         // Handle SELECT version() - required by SQLAlchemy, psql, pgAdmin, DBeaver
         if query_lower.contains("version()") {
             return Ok(Some(self.query_version()?));
@@ -55,22 +63,62 @@ impl PgCatalog {
             return Ok(Some(Self::query_current_user()?));
         }
 
-        // Check for information_schema queries (table and column listing)
-        let result = if query_lower.contains("information_schema") {
+        // Check for information_schema queries (table / column listing).
+        // We must match the TABLE reference (`information_schema.<name>`
+        // or `from information_schema.`) and NOT the string literal
+        // `'information_schema'` that Drizzle / postgres-js / Prisma
+        // pass in WHERE clauses like
+        //   SELECT … FROM pg_tables WHERE schemaname NOT IN
+        //   ('pg_catalog','information_schema');
+        let has_information_schema_ref =
+            query_lower.contains("information_schema.")
+            || query_lower.contains(" information_schema ");
+        let result = if has_information_schema_ref {
             if query_lower.contains("information_schema.columns") {
                 Some(self.query_information_schema_columns(&query_lower)?)
             } else if query_lower.contains("information_schema.tables") {
                 Some(self.query_information_schema_tables(&query_lower)?)
+            } else if query_lower.contains("information_schema.key_column_usage") {
+                Some(self.query_information_schema_key_column_usage()?)
+            } else if query_lower.contains("information_schema.table_constraints") {
+                Some(self.query_information_schema_table_constraints()?)
+            } else if query_lower.contains("information_schema.schemata") {
+                Some(self.query_information_schema_schemata()?)
             } else {
                 // Return empty for other information_schema queries
                 Some((Schema::new(vec![]), vec![]))
             }
-        } else if !query_lower.contains("pg_catalog") && !query_lower.contains("pg_type") &&
-           !query_lower.contains("pg_class") && !query_lower.contains("pg_namespace") &&
-           !query_lower.contains("pg_attribute") && !query_lower.contains("pg_database") {
+        } else if !Self::is_catalog_query(&query_lower) {
             return Ok(None);
         } else if query_lower.contains("pg_type") {
             Some(self.query_pg_type()?)
+        } else if query_lower.contains("pg_index") && !query_lower.contains("pg_indexes") {
+            Some(self.query_pg_index()?)
+        } else if query_lower.contains("pg_indexes") {
+            Some(self.query_pg_indexes()?)
+        } else if query_lower.contains("pg_tables") {
+            Some(self.query_pg_tables()?)
+        } else if query_lower.contains("pg_views") {
+            Some(self.query_pg_views()?)
+        } else if query_lower.contains("pg_constraint") {
+            Some(self.query_pg_constraint()?)
+        } else if query_lower.contains("pg_description") {
+            // No table/column comments stored.
+            Some((Schema::new(vec![
+                Column::new("objoid", DataType::Int4),
+                Column::new("classoid", DataType::Int4),
+                Column::new("objsubid", DataType::Int4),
+                Column::new("description", DataType::Text),
+            ]), vec![]))
+        } else if query_lower.contains("pg_roles") || query_lower.contains("pg_user") {
+            Some(self.query_pg_roles()?)
+        } else if query_lower.contains("pg_proc") {
+            // Procedures — empty set is fine (we don't expose pg_catalog-registered functions).
+            Some((Schema::new(vec![
+                Column::new("oid", DataType::Int4),
+                Column::new("proname", DataType::Text),
+                Column::new("pronamespace", DataType::Int4),
+            ]), vec![]))
         } else if query_lower.contains("pg_class") {
             Some(self.query_pg_class()?)
         } else if query_lower.contains("pg_namespace") {
@@ -86,14 +134,147 @@ impl PgCatalog {
             Some((Schema::new(vec![]), vec![]))
         };
 
-        // Apply column projection based on SELECT clause
+        // Apply WHERE filter + column projection based on the user's
+        // SELECT clause. Catalog queries come in from every direction
+        // (Drizzle / postgres-js / psycopg introspection), so without
+        // these filters we'd send the full table regardless of the
+        // predicate — B20 from the TimeTracker report.
         match result {
             Some((schema, rows)) => {
-                let projected = Self::project_columns(&query_lower, schema, rows);
+                let filtered = Self::apply_where_filter(&query_lower, &schema, rows);
+                let projected = Self::project_columns(&query_lower, schema, filtered);
                 Ok(Some(projected))
             }
             None => Ok(None),
         }
+    }
+
+    /// Apply a small subset of WHERE predicates directly to catalog
+    /// rows before we send them back. Supports the common driver
+    /// introspection shapes:
+    ///   * `col = 'literal'`
+    ///   * `col = N`
+    ///   * `col IN ('a','b',...)` / `col NOT IN (...)`
+    ///   * `col <> 'literal'` / `col != 'literal'`
+    ///   * conjunctions (`AND`) — evaluated left-to-right
+    ///
+    /// Anything more complex (OR, function calls, subqueries) falls
+    /// through unchanged; the caller will get all rows, which is
+    /// still correct-if-noisy for every driver I've tested.
+    fn apply_where_filter(q: &str, schema: &Schema, rows: Vec<Tuple>) -> Vec<Tuple> {
+        // Find `where ` and collect the text up to the next clause
+        // keyword (`order by`, `group by`, `limit`, `;`, end).
+        let where_kw = " where ";
+        let start = match q.find(where_kw) { Some(p) => p + where_kw.len(), None => return rows };
+        let terminators = [" order by ", " group by ", " limit ", " offset ", ";"];
+        let mut end = q.len();
+        for t in &terminators {
+            if let Some(p) = q[start..].find(t) {
+                let cand = start + p;
+                if cand < end { end = cand; }
+            }
+        }
+        let predicate = q[start..end].trim();
+        if predicate.is_empty() { return rows; }
+
+        // Split on " and " at the top level (we don't handle parens).
+        let preds: Vec<&str> = predicate.split(" and ").map(str::trim).collect();
+        rows.into_iter().filter(|row| preds.iter().all(|p| Self::eval_simple_pred(p, schema, row))).collect()
+    }
+
+    /// Evaluate one of the predicate shapes supported by
+    /// `apply_where_filter`. Returns `true` when the predicate can't
+    /// be parsed — matches our "when in doubt, keep the row"
+    /// behaviour and avoids silently dropping data for complex
+    /// WHEREs we don't yet interpret.
+    fn eval_simple_pred(pred: &str, schema: &Schema, row: &Tuple) -> bool {
+        let p = pred.trim();
+
+        // `col NOT IN (a, b, c)` — must be tested BEFORE plain `IN`.
+        if let Some(idx) = p.find(" not in (") {
+            let col_name = p[..idx].trim();
+            let rest = p[idx + " not in (".len()..].trim_end_matches(')');
+            let items = Self::parse_in_list(rest);
+            let val = Self::row_value(schema, row, col_name);
+            return !items.iter().any(|v| Self::lit_eq_value(v, &val));
+        }
+        if let Some(idx) = p.find(" in (") {
+            let col_name = p[..idx].trim();
+            let rest = p[idx + " in (".len()..].trim_end_matches(')');
+            let items = Self::parse_in_list(rest);
+            let val = Self::row_value(schema, row, col_name);
+            return items.iter().any(|v| Self::lit_eq_value(v, &val));
+        }
+
+        // `col = 'lit'`, `col = N`, `col <> 'lit'`, `col != 'lit'`
+        for (op, eq) in [(" = ", true), (" <> ", false), (" != ", false)] {
+            if let Some(idx) = p.find(op) {
+                let col_name = p[..idx].trim();
+                let rhs = p[idx + op.len()..].trim();
+                let val = Self::row_value(schema, row, col_name);
+                let matches = Self::lit_eq_value(rhs, &val);
+                return if eq { matches } else { !matches };
+            }
+        }
+
+        // Unknown predicate shape — keep the row.
+        true
+    }
+
+    fn parse_in_list(s: &str) -> Vec<String> {
+        s.trim().trim_matches(|c: char| c == '(' || c == ')')
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    }
+
+    fn row_value(schema: &Schema, row: &Tuple, col_name: &str) -> Value {
+        let col_lower = col_name.trim().trim_matches('"').to_lowercase();
+        if let Some(idx) = schema.columns.iter().position(|c| c.name.to_lowercase() == col_lower) {
+            row.values.get(idx).cloned().unwrap_or(Value::Null)
+        } else {
+            Value::Null
+        }
+    }
+
+    /// Compare a literal (as written in SQL: `'abc'` or `42`) with a
+    /// `Value`. Strips single quotes, parses numerics.
+    fn lit_eq_value(lit: &str, val: &Value) -> bool {
+        let lit = lit.trim();
+        // String literal
+        if (lit.starts_with('\'') && lit.ends_with('\'')) && lit.len() >= 2 {
+            let s = &lit[1..lit.len() - 1];
+            return match val {
+                Value::String(v) => v == s,
+                Value::Null => false,
+                other => other.to_string() == s,
+            };
+        }
+        // NULL literal
+        if lit.eq_ignore_ascii_case("null") {
+            return matches!(val, Value::Null);
+        }
+        // Numeric literal
+        if let Ok(n) = lit.parse::<i64>() {
+            return match val {
+                Value::Int2(v) => (*v as i64) == n,
+                Value::Int4(v) => (*v as i64) == n,
+                Value::Int8(v) => *v == n,
+                _ => false,
+            };
+        }
+        if let Ok(f) = lit.parse::<f64>() {
+            return match val {
+                Value::Float4(v) => (*v as f64 - f).abs() < 1e-9,
+                Value::Float8(v) => (v - f).abs() < 1e-9,
+                _ => false,
+            };
+        }
+        // Bool
+        if lit.eq_ignore_ascii_case("true") { return matches!(val, Value::Boolean(true)); }
+        if lit.eq_ignore_ascii_case("false") { return matches!(val, Value::Boolean(false)); }
+        false
     }
 
     /// Query information_schema.tables - returns real table metadata from the catalog
@@ -343,9 +524,10 @@ impl PgCatalog {
         let schema = Schema::new(vec![
             Column::new("version", DataType::Text),
         ]);
-        let row = Tuple::new(vec![Value::String(
-            "PostgreSQL 16.0 (HeliosDB Nano 3.10.0)".to_string(),
-        )]);
+        let row = Tuple::new(vec![Value::String(format!(
+            "PostgreSQL 16.0 (HeliosDB Nano {})",
+            env!("CARGO_PKG_VERSION")
+        ))]);
         Ok((schema, vec![row]))
     }
 
@@ -621,6 +803,539 @@ impl PgCatalog {
             DataType::Array(_) => 2277,
             DataType::Vector(_) => 25, // stored as text
         }
+    }
+
+    /// Detect the canonical queries that `psql` sends for its meta-commands
+    /// (`\dt`, `\d table`, `\di`, `\dn`, `\du`, `\l`) and synthesise a shaped
+    /// response. Returns `Ok(None)` if the query doesn't match any known
+    /// psql signature — the caller should then fall through to the generic
+    /// catalog handler.
+    fn try_psql_metacommand(&self, q: &str) -> Result<Option<(Schema, Vec<Tuple>)>> {
+        let db = match &self.database {
+            Some(db) => db,
+            None => return Ok(None),
+        };
+        let catalog = db.storage.catalog();
+
+        // ---- \l (list databases) ------------------------------------------------
+        // psql sends SELECT d.datname ... FROM pg_catalog.pg_database d LEFT JOIN ...
+        if q.contains("pg_database") && q.contains("pg_catalog.pg_database") && q.contains("d.datname") {
+            let schema = Schema::new(vec![
+                Column::new("Name", DataType::Text),
+                Column::new("Owner", DataType::Text),
+                Column::new("Encoding", DataType::Text),
+                Column::new("Collate", DataType::Text),
+                Column::new("Ctype", DataType::Text),
+                Column::new("Access privileges", DataType::Text),
+            ]);
+            let rows = vec![Tuple::new(vec![
+                Value::String("heliosdb".into()),
+                Value::String("heliosdb".into()),
+                Value::String("UTF8".into()),
+                Value::String("C.UTF-8".into()),
+                Value::String("C.UTF-8".into()),
+                Value::Null,
+            ])];
+            return Ok(Some((schema, rows)));
+        }
+
+        // ---- \du / \dg (list roles) --------------------------------------------
+        // psql sends a SELECT of 11 columns from pg_catalog.pg_roles.
+        // Mirror its exact shape so psql's client-side formatter accepts it.
+        if q.contains("pg_catalog.pg_roles") && q.contains("rolname")
+            && q.contains("rolsuper")
+        {
+            let schema = Schema::new(vec![
+                Column::new("rolname", DataType::Text),
+                Column::new("rolsuper", DataType::Boolean),
+                Column::new("rolinherit", DataType::Boolean),
+                Column::new("rolcreaterole", DataType::Boolean),
+                Column::new("rolcreatedb", DataType::Boolean),
+                Column::new("rolcanlogin", DataType::Boolean),
+                Column::new("rolconnlimit", DataType::Int4),
+                Column::new("rolvaliduntil", DataType::Text),
+                Column::new("memberof", DataType::Text),
+                Column::new("rolreplication", DataType::Boolean),
+                Column::new("rolbypassrls", DataType::Boolean),
+            ]);
+            let role = |name: &str| Tuple::new(vec![
+                Value::String(name.into()),
+                Value::Boolean(true),  // rolsuper
+                Value::Boolean(true),  // rolinherit
+                Value::Boolean(true),  // rolcreaterole
+                Value::Boolean(true),  // rolcreatedb
+                Value::Boolean(true),  // rolcanlogin
+                Value::Int4(-1),       // rolconnlimit (unlimited)
+                Value::Null,           // rolvaliduntil
+                Value::String("{}".into()), // memberof
+                Value::Boolean(true),  // rolreplication
+                Value::Boolean(true),  // rolbypassrls
+            ]);
+            let rows = vec![role("postgres"), role("helios")];
+            return Ok(Some((schema, rows)));
+        }
+
+        // ---- \dn (list schemas) -------------------------------------------------
+        // Must NOT match \dt / \di / \d — those also JOIN pg_namespace.
+        if q.contains("pg_catalog.pg_namespace")
+            && q.contains("nspname")
+            && q.contains("pg_get_userbyid")
+            && !q.contains("pg_catalog.pg_class")
+            && !q.contains("pg_class c")
+        {
+            let schema = Schema::new(vec![
+                Column::new("Name", DataType::Text),
+                Column::new("Owner", DataType::Text),
+            ]);
+            let rows = vec![Tuple::new(vec![
+                Value::String("public".into()),
+                Value::String("heliosdb".into()),
+            ])];
+            return Ok(Some((schema, rows)));
+        }
+
+        // ---- \dt / \d (list tables) --------------------------------------------
+        // Signature: SELECT n.nspname, c.relname, ..., pg_get_userbyid(c.relowner)
+        // FROM pg_catalog.pg_class c LEFT JOIN pg_catalog.pg_namespace n ...
+        // WHERE c.relkind IN ('r', ...)
+        let is_dt = q.contains("pg_catalog.pg_class")
+            && q.contains("pg_catalog.pg_namespace")
+            && q.contains("pg_get_userbyid")
+            && (q.contains("'r'") || q.contains("relkind in ('r"))
+            && !q.contains("pg_index ");
+        if is_dt {
+            let schema = Schema::new(vec![
+                Column::new("Schema", DataType::Text),
+                Column::new("Name", DataType::Text),
+                Column::new("Type", DataType::Text),
+                Column::new("Owner", DataType::Text),
+            ]);
+            let mut rows = Vec::new();
+            let name_filter = Self::extract_psql_relname_filter(q);
+            for name in catalog.list_tables()? {
+                if let Some(ref pat) = name_filter {
+                    if !Self::sql_like_match(&name, pat) { continue; }
+                }
+                rows.push(Tuple::new(vec![
+                    Value::String("public".into()),
+                    Value::String(name),
+                    Value::String("table".into()),
+                    Value::String("heliosdb".into()),
+                ]));
+            }
+            return Ok(Some((schema, rows)));
+        }
+
+        // Note: psql's `\d table_name` sends a sequence of 4+ catalog queries
+        // (OID lookup, relation metadata, attributes, indexes) each with
+        // precise expected column shapes.  We deliberately do NOT intercept
+        // these — they fall through to the generic pg_class/pg_attribute
+        // handlers.  Attempting to synthesise the exact shapes was crashing
+        // psql on column-count mismatches, so we leave `\d table_name` as
+        // a known limitation; `\dt`, `\l`, `\dn`, `\du`, `\di` all work.
+
+        // ---- \di (list indexes) ------------------------------------------------
+        let is_di = q.contains("pg_catalog.pg_class")
+            && q.contains("pg_catalog.pg_namespace")
+            && q.contains("pg_get_userbyid")
+            && (q.contains("'i'") || q.contains("relkind in ('i"));
+        if is_di {
+            let schema = Schema::new(vec![
+                Column::new("Schema", DataType::Text),
+                Column::new("Name", DataType::Text),
+                Column::new("Type", DataType::Text),
+                Column::new("Owner", DataType::Text),
+                Column::new("Table", DataType::Text),
+            ]);
+            let mut rows = Vec::new();
+            for name in catalog.list_tables()? {
+                if let Ok(ts) = catalog.get_table_schema(&name) {
+                    if ts.columns.iter().any(|c| c.primary_key) {
+                        rows.push(Tuple::new(vec![
+                            Value::String("public".into()),
+                            Value::String(format!("{}_pkey", name)),
+                            Value::String("index".into()),
+                            Value::String("heliosdb".into()),
+                            Value::String(name.clone()),
+                        ]));
+                    }
+                    for col in &ts.columns {
+                        if col.unique && !col.primary_key {
+                            rows.push(Tuple::new(vec![
+                                Value::String("public".into()),
+                                Value::String(format!("{}_{}_key", name, col.name)),
+                                Value::String("index".into()),
+                                Value::String("heliosdb".into()),
+                                Value::String(name.clone()),
+                            ]));
+                        }
+                    }
+                }
+            }
+            return Ok(Some((schema, rows)));
+        }
+
+        Ok(None)
+    }
+
+    /// Extract a `relname ~ '^(pattern)$'` filter from a psql \d query.
+    fn extract_psql_relname_filter(q: &str) -> Option<String> {
+        let marker = "relname ~ '^(";
+        if let Some(start) = q.find(marker) {
+            let after = q.get(start + marker.len()..)?;
+            if let Some(end) = after.find(")$") {
+                let pat = after.get(..end)?;
+                // Convert regex anchor to LIKE-style pattern (approx): leave as-is for exact match.
+                return Some(pat.to_string());
+            }
+        }
+        None
+    }
+
+    /// Check whether a query touches any pg_catalog table we emulate.
+    fn is_catalog_query(q: &str) -> bool {
+        const MARKERS: &[&str] = &[
+            "pg_catalog", "pg_type", "pg_class", "pg_namespace", "pg_attribute",
+            "pg_database", "pg_index", "pg_indexes", "pg_tables", "pg_views",
+            "pg_constraint", "pg_description", "pg_roles", "pg_user", "pg_proc",
+            "pg_settings",
+        ];
+        MARKERS.iter().any(|m| q.contains(m))
+    }
+
+    /// Query pg_index — per-table primary key and unique indexes.
+    /// Columns: indexrelid, indrelid, indisunique, indisprimary, indkey.
+    fn query_pg_index(&self) -> Result<(Schema, Vec<Tuple>)> {
+        let schema = Schema::new(vec![
+            Column::new("indexrelid", DataType::Int4),
+            Column::new("indrelid", DataType::Int4),
+            Column::new("indisunique", DataType::Boolean),
+            Column::new("indisprimary", DataType::Boolean),
+            Column::new("indkey", DataType::Text),
+        ]);
+        let db = match &self.database {
+            Some(db) => db,
+            None => return Ok((schema, vec![])),
+        };
+        let catalog = db.storage.catalog();
+        let tables = catalog.list_tables()?;
+        let mut rows = Vec::new();
+        for (ti, name) in tables.iter().enumerate() {
+            let table_oid = (16384 + ti) as i32;
+            if let Ok(tschema) = catalog.get_table_schema(name) {
+                // Primary key: any column flagged primary_key
+                let pk_cols: Vec<String> = tschema.columns.iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.primary_key)
+                    .map(|(i, _)| (i + 1).to_string())
+                    .collect();
+                if !pk_cols.is_empty() {
+                    rows.push(Tuple::new(vec![
+                        Value::Int4(table_oid + 100_000), // synthetic index oid
+                        Value::Int4(table_oid),
+                        Value::Boolean(true),  // indisunique
+                        Value::Boolean(true),  // indisprimary
+                        Value::String(pk_cols.join(" ")),
+                    ]));
+                }
+                // Unique indexes: any column flagged unique (non-PK)
+                for (ci, col) in tschema.columns.iter().enumerate() {
+                    if col.unique && !col.primary_key {
+                        rows.push(Tuple::new(vec![
+                            Value::Int4(table_oid + 100_000 + ci as i32 + 1),
+                            Value::Int4(table_oid),
+                            Value::Boolean(true),
+                            Value::Boolean(false),
+                            Value::String((ci + 1).to_string()),
+                        ]));
+                    }
+                }
+            }
+        }
+        Ok((schema, rows))
+    }
+
+    /// Query pg_indexes (view) — 5 columns (schemaname, tablename, indexname, tablespace, indexdef).
+    fn query_pg_indexes(&self) -> Result<(Schema, Vec<Tuple>)> {
+        let schema = Schema::new(vec![
+            Column::new("schemaname", DataType::Text),
+            Column::new("tablename", DataType::Text),
+            Column::new("indexname", DataType::Text),
+            Column::new("tablespace", DataType::Text),
+            Column::new("indexdef", DataType::Text),
+        ]);
+        let db = match &self.database {
+            Some(db) => db,
+            None => return Ok((schema, vec![])),
+        };
+        let catalog = db.storage.catalog();
+        let tables = catalog.list_tables()?;
+        let mut rows = Vec::new();
+        for name in &tables {
+            if let Ok(tschema) = catalog.get_table_schema(name) {
+                let pk_cols: Vec<String> = tschema.columns.iter()
+                    .filter(|c| c.primary_key)
+                    .map(|c| c.name.clone())
+                    .collect();
+                if !pk_cols.is_empty() {
+                    let idx_name = format!("{}_pkey", name);
+                    let def = format!(
+                        "CREATE UNIQUE INDEX {} ON public.{} USING btree ({})",
+                        idx_name, name, pk_cols.join(", ")
+                    );
+                    rows.push(Tuple::new(vec![
+                        Value::String("public".into()),
+                        Value::String(name.clone()),
+                        Value::String(idx_name),
+                        Value::Null,
+                        Value::String(def),
+                    ]));
+                }
+                for col in &tschema.columns {
+                    if col.unique && !col.primary_key {
+                        let idx_name = format!("{}_{}_key", name, col.name);
+                        let def = format!(
+                            "CREATE UNIQUE INDEX {} ON public.{} USING btree ({})",
+                            idx_name, name, col.name
+                        );
+                        rows.push(Tuple::new(vec![
+                            Value::String("public".into()),
+                            Value::String(name.clone()),
+                            Value::String(idx_name),
+                            Value::Null,
+                            Value::String(def),
+                        ]));
+                    }
+                }
+            }
+        }
+        Ok((schema, rows))
+    }
+
+    /// Query pg_tables (view) — 5 cols (schemaname, tablename, tableowner, tablespace, hasindexes).
+    fn query_pg_tables(&self) -> Result<(Schema, Vec<Tuple>)> {
+        let schema = Schema::new(vec![
+            Column::new("schemaname", DataType::Text),
+            Column::new("tablename", DataType::Text),
+            Column::new("tableowner", DataType::Text),
+            Column::new("tablespace", DataType::Text),
+            Column::new("hasindexes", DataType::Boolean),
+        ]);
+        let db = match &self.database {
+            Some(db) => db,
+            None => return Ok((schema, vec![])),
+        };
+        let tables = db.storage.catalog().list_tables()?;
+        let rows = tables.into_iter().map(|t| {
+            Tuple::new(vec![
+                Value::String("public".into()),
+                Value::String(t),
+                Value::String("heliosdb".into()),
+                Value::Null,
+                Value::Boolean(true),
+            ])
+        }).collect();
+        Ok((schema, rows))
+    }
+
+    /// Query pg_views (view) — always empty; Nano does not persist view definitions.
+    fn query_pg_views(&self) -> Result<(Schema, Vec<Tuple>)> {
+        let schema = Schema::new(vec![
+            Column::new("schemaname", DataType::Text),
+            Column::new("viewname", DataType::Text),
+            Column::new("viewowner", DataType::Text),
+            Column::new("definition", DataType::Text),
+        ]);
+        Ok((schema, vec![]))
+    }
+
+    /// Query pg_constraint — primary key + unique constraints per table.
+    fn query_pg_constraint(&self) -> Result<(Schema, Vec<Tuple>)> {
+        let schema = Schema::new(vec![
+            Column::new("oid", DataType::Int4),
+            Column::new("conname", DataType::Text),
+            Column::new("contype", DataType::Text), // 'p' PK, 'u' unique
+            Column::new("conrelid", DataType::Int4),
+            Column::new("conkey", DataType::Text),
+        ]);
+        let db = match &self.database {
+            Some(db) => db,
+            None => return Ok((schema, vec![])),
+        };
+        let catalog = db.storage.catalog();
+        let tables = catalog.list_tables()?;
+        let mut rows = Vec::new();
+        for (ti, name) in tables.iter().enumerate() {
+            let table_oid = (16384 + ti) as i32;
+            if let Ok(tschema) = catalog.get_table_schema(name) {
+                let pk_cols: Vec<String> = tschema.columns.iter()
+                    .enumerate()
+                    .filter(|(_, c)| c.primary_key)
+                    .map(|(i, _)| (i + 1).to_string())
+                    .collect();
+                if !pk_cols.is_empty() {
+                    rows.push(Tuple::new(vec![
+                        Value::Int4(table_oid + 200_000),
+                        Value::String(format!("{}_pkey", name)),
+                        Value::String("p".into()),
+                        Value::Int4(table_oid),
+                        Value::String(format!("{{{}}}", pk_cols.join(","))),
+                    ]));
+                }
+                for (ci, col) in tschema.columns.iter().enumerate() {
+                    if col.unique && !col.primary_key {
+                        rows.push(Tuple::new(vec![
+                            Value::Int4(table_oid + 200_000 + ci as i32 + 1),
+                            Value::String(format!("{}_{}_key", name, col.name)),
+                            Value::String("u".into()),
+                            Value::Int4(table_oid),
+                            Value::String(format!("{{{}}}", ci + 1)),
+                        ]));
+                    }
+                }
+            }
+        }
+        Ok((schema, rows))
+    }
+
+    /// Query pg_roles / pg_user — single admin role.
+    fn query_pg_roles(&self) -> Result<(Schema, Vec<Tuple>)> {
+        let schema = Schema::new(vec![
+            Column::new("oid", DataType::Int4),
+            Column::new("rolname", DataType::Text),
+            Column::new("rolsuper", DataType::Boolean),
+            Column::new("rolcanlogin", DataType::Boolean),
+        ]);
+        let rows = vec![
+            Tuple::new(vec![
+                Value::Int4(10),
+                Value::String("postgres".into()),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ]),
+            Tuple::new(vec![
+                Value::Int4(11),
+                Value::String("helios".into()),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ]),
+        ];
+        Ok((schema, rows))
+    }
+
+    /// information_schema.schemata
+    fn query_information_schema_schemata(&self) -> Result<(Schema, Vec<Tuple>)> {
+        let schema = Schema::new(vec![
+            Column::new("catalog_name", DataType::Text),
+            Column::new("schema_name", DataType::Text),
+            Column::new("schema_owner", DataType::Text),
+        ]);
+        let rows = vec![
+            Tuple::new(vec![
+                Value::String("heliosdb".into()),
+                Value::String("public".into()),
+                Value::String("heliosdb".into()),
+            ]),
+            Tuple::new(vec![
+                Value::String("heliosdb".into()),
+                Value::String("information_schema".into()),
+                Value::String("heliosdb".into()),
+            ]),
+            Tuple::new(vec![
+                Value::String("heliosdb".into()),
+                Value::String("pg_catalog".into()),
+                Value::String("heliosdb".into()),
+            ]),
+        ];
+        Ok((schema, rows))
+    }
+
+    /// information_schema.key_column_usage — PK / unique columns.
+    fn query_information_schema_key_column_usage(&self) -> Result<(Schema, Vec<Tuple>)> {
+        let schema = Schema::new(vec![
+            Column::new("constraint_catalog", DataType::Text),
+            Column::new("constraint_schema", DataType::Text),
+            Column::new("constraint_name", DataType::Text),
+            Column::new("table_name", DataType::Text),
+            Column::new("column_name", DataType::Text),
+            Column::new("ordinal_position", DataType::Int4),
+        ]);
+        let db = match &self.database {
+            Some(db) => db,
+            None => return Ok((schema, vec![])),
+        };
+        let catalog = db.storage.catalog();
+        let mut rows = Vec::new();
+        for name in catalog.list_tables()? {
+            if let Ok(tschema) = catalog.get_table_schema(&name) {
+                let mut pos = 1;
+                for col in &tschema.columns {
+                    if col.primary_key {
+                        rows.push(Tuple::new(vec![
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(format!("{}_pkey", name)),
+                            Value::String(name.clone()),
+                            Value::String(col.name.clone()),
+                            Value::Int4(pos),
+                        ]));
+                        pos += 1;
+                    } else if col.unique {
+                        rows.push(Tuple::new(vec![
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(format!("{}_{}_key", name, col.name)),
+                            Value::String(name.clone()),
+                            Value::String(col.name.clone()),
+                            Value::Int4(1),
+                        ]));
+                    }
+                }
+            }
+        }
+        Ok((schema, rows))
+    }
+
+    /// information_schema.table_constraints — PK and UNIQUE per table.
+    fn query_information_schema_table_constraints(&self) -> Result<(Schema, Vec<Tuple>)> {
+        let schema = Schema::new(vec![
+            Column::new("constraint_catalog", DataType::Text),
+            Column::new("constraint_schema", DataType::Text),
+            Column::new("constraint_name", DataType::Text),
+            Column::new("table_name", DataType::Text),
+            Column::new("constraint_type", DataType::Text),
+        ]);
+        let db = match &self.database {
+            Some(db) => db,
+            None => return Ok((schema, vec![])),
+        };
+        let catalog = db.storage.catalog();
+        let mut rows = Vec::new();
+        for name in catalog.list_tables()? {
+            if let Ok(tschema) = catalog.get_table_schema(&name) {
+                if tschema.columns.iter().any(|c| c.primary_key) {
+                    rows.push(Tuple::new(vec![
+                        Value::String("heliosdb".into()),
+                        Value::String("public".into()),
+                        Value::String(format!("{}_pkey", name)),
+                        Value::String(name.clone()),
+                        Value::String("PRIMARY KEY".into()),
+                    ]));
+                }
+                for col in &tschema.columns {
+                    if col.unique && !col.primary_key {
+                        rows.push(Tuple::new(vec![
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(format!("{}_{}_key", name, col.name)),
+                            Value::String(name.clone()),
+                            Value::String("UNIQUE".into()),
+                        ]));
+                    }
+                }
+            }
+        }
+        Ok((schema, rows))
     }
 
     /// Map DataType to PostgreSQL type length

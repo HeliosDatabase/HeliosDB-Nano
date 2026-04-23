@@ -4,9 +4,9 @@
 [![Documentation](https://docs.rs/heliosdb-nano/badge.svg)](https://docs.rs/heliosdb-nano)
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL--3.0-blue.svg)](LICENSE)
 
-**The first embedded database with native PostgreSQL, MySQL, and SQLite compatibility.** Single 47 MB binary. HNSW vector search, git-like branching, time-travel queries, AES-256-GCM encryption, built-in BaaS layer (Auth, REST API, Realtime).
+**An embedded database with native PostgreSQL and MySQL wire-protocol compatibility, plus one-shot SQLite file import.** Single 47 MB binary. HNSW vector search, git-like branching, time-travel queries, AES-256-GCM encryption, built-in BaaS layer (Auth, REST API, Realtime).
 
-Use your existing clients (`psql`, `mysql`, `sqlite3`), RESTful HTTP, drivers (`psycopg2`, `mysql-connector`, `node-postgres`, JDBC), and ORMs (SQLAlchemy, Prisma, Drizzle, Hibernate, GORM) — zero migration required.
+Use your existing clients (`psql`, `mysql`), RESTful HTTP, drivers (`psycopg2`, `mysql-connector`, `node-postgres`, JDBC), and ORMs (SQLAlchemy, Prisma, Drizzle, Hibernate, GORM) — zero migration required. Existing `.sqlite` files import via a bundled converter.
 
 ## Install
 
@@ -37,6 +37,12 @@ heliosdb-nano start --memory --mysql
 heliosdb-nano start --data-dir ./mydata --mysql \
   --auth scram-sha-256 --password s3cret \
   --tls-cert cert.pem --tls-key key.pem
+
+# Same-host / embedded mode — Unix sockets (no TCP)
+heliosdb-nano start --memory \
+  --pg-socket-dir /tmp \
+  --mysql --mysql-socket /tmp/heliosdb-mysql.sock
+# then: psql -h /tmp  or  mysql --socket=/tmp/heliosdb-mysql.sock
 ```
 
 Three servers start on one process:
@@ -44,7 +50,9 @@ Three servers start on one process:
 | Protocol | Port | Connect |
 |----------|-----:|---------|
 | PostgreSQL wire | 5432 | `psql`, psycopg2, pgx, JDBC, Npgsql, node-postgres |
+| PostgreSQL Unix socket | `/tmp/.s.PGSQL.5432` | `psql -h /tmp`, libpq-default apps |
 | MySQL wire | 3306 | `mysql`, PyMySQL, SQLAlchemy, JDBC, mysql2 |
+| MySQL Unix socket | `/tmp/heliosdb-mysql.sock` (configurable) | `mysql --socket=…`, PHP `mysqli`, WordPress |
 | REST / HTTP | 8080 | `curl`, fetch, any HTTP client |
 
 ## Triple Compatibility — Same Data, Any Client
@@ -70,7 +78,7 @@ heliosdb> SELECT * FROM products WHERE price < 15;
 
 ```bash
 $ psql -h 127.0.0.1 -p 5432 -U postgres
-psql (16.0, server HeliosDB Nano 3.10.0)
+psql (16.0, server HeliosDB Nano 3.13.0)
 postgres=# INSERT INTO products (name, price) VALUES ('Gizmo', 29.99);
 INSERT 0 1
 postgres=# SELECT COUNT(*) FROM products;
@@ -145,6 +153,41 @@ curl -X POST http://localhost:8080/api/vectors/search \
     -d '{"collection":"docs","query":[0.15,0.25],"k":5,"metric":"cosine"}'
 ```
 
+## Full-Text Search
+
+PostgreSQL-compatible FTS surface — no extensions, backed by built-in BM25:
+
+```sql
+-- Native tsvector / tsquery / @@ / ts_rank_cd:
+SELECT title, ts_rank_cd(to_tsvector(body), to_tsquery('heliosdb')) AS rank
+FROM articles
+WHERE to_tsvector(body) @@ to_tsquery('heliosdb')
+ORDER BY rank DESC
+LIMIT 10;
+
+-- Persistent tsvector column + GIN-style DDL:
+CREATE TABLE articles (id SERIAL PRIMARY KEY, body TEXT, body_tsv TSVECTOR);
+CREATE INDEX articles_body_fts ON articles USING gin (body_tsv);
+
+-- Hybrid search (FTS + vector) in one query:
+SELECT id, text,
+       0.7 * (1.0 - (embedding <=> $1::vector))
+     + 0.3 * ts_rank_cd(to_tsvector(text), plainto_tsquery($2)) AS score
+FROM chunks
+ORDER BY score DESC LIMIT 10;
+```
+
+Scope and honest limitations: see [docs/compatibility/fts.md](docs/compatibility/fts.md).
+
+## Pagination — Constant-Time at Depth
+
+Deep `LIMIT … OFFSET` runs in ~30 µs regardless of offset, up to **334× faster
+than PostgreSQL 13** for 100k-row tables. Top-K over Sort, storage-level
+`OFFSET` skip, and keyset (`WHERE (col, id) < ($1, $2)`) are all native.
+
+See [pagination-performance.html](https://heliosdb.com/pagination-performance.html)
+for measured numbers and reproduction recipe.
+
 ## Git-Like Branching
 
 Isolated copy-on-write branches for dev, test, and A/B experiments.
@@ -217,12 +260,15 @@ All PostgreSQL types plus MySQL type aliases (automatically translated):
 | `TIMESTAMP` | `DATETIME` |
 | `SERIAL` / `BIGSERIAL` | `INT AUTO_INCREMENT`, `BIGINT AUTO_INCREMENT` |
 | `UUID`, `JSON`, `JSONB`, `VECTOR(n)`, `ARRAY` | — |
+| `TSVECTOR`, `TSQUERY` | stored as JSON arrays of normalised tokens |
 
 ## Features at a Glance
 
 - **Full SQL**: JOINs, CTEs, window functions, subqueries, set operations, aggregates, CASE
 - **PL/pgSQL**: Stored procedures and functions
 - **JSONB**: `->`, `->>`, `@>`, `?` operators
+- **Full-text search**: `tsvector`, `tsquery`, `@@`, `ts_rank_cd`, `CREATE INDEX ... USING gin` (see [FTS scope](docs/compatibility/fts.md))
+- **Keyset pagination**: row-constructor comparison `WHERE (col, id) < ($1, $2)`; top-K sort; constant-time deep OFFSET
 - **Foreign keys**: CASCADE, SET NULL, RESTRICT
 - **Triggers**: BEFORE/AFTER INSERT/UPDATE/DELETE
 - **Row-Level Security**: Per-tenant data isolation via policies
@@ -231,6 +277,7 @@ All PostgreSQL types plus MySQL type aliases (automatically translated):
 - **Import/Export**: CSV, JSON, JSONL, Parquet, Arrow, SQL
 - **Audit logging**: Tamper-proof trail (SHA-256 checksums)
 - **Encryption**: AES-256-GCM TDE, FIPS 140-3 mode
+- **Unix domain socket listeners** for both PostgreSQL (`--pg-socket-dir /tmp`) and MySQL (`--mysql-socket /tmp/heliosdb.sock`) — PHP `mysqli` / WordPress embedded-mode and libpq defaults work out of the box
 
 ## Architecture
 
@@ -315,7 +362,7 @@ For in-process use (no network, no daemon), add the crate as a dependency:
 
 ```toml
 [dependencies]
-heliosdb-nano = "3.10"
+heliosdb-nano = "3.13"
 ```
 
 See **[the Rust API guide](https://docs.rs/heliosdb-nano)** for embedded usage and the [examples/](examples/) directory for working code.

@@ -104,6 +104,13 @@ pub enum FrontendMessage {
     /// Sync (complete extended protocol sequence)
     Sync,
 
+    /// Flush — force the server to push any buffered response
+    /// immediately, without ending the extended-protocol transaction
+    /// (that's Sync's job). `postgres-js`, `pg` and every other
+    /// pipelined driver emit `Parse, Bind, [Describe,] Execute, Flush`
+    /// to get the results back without committing the implicit txn.
+    Flush,
+
     /// Terminate connection
     Terminate,
 
@@ -291,6 +298,11 @@ impl FrontendMessage {
             b'S' => {
                 buf.advance(len);
                 FrontendMessage::Sync
+            },
+            b'H' => {
+                // Flush has no payload beyond the length header.
+                buf.advance(len);
+                FrontendMessage::Flush
             },
             b'X' => {
                 buf.advance(len);

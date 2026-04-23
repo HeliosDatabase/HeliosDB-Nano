@@ -25,6 +25,7 @@ pub mod phase3;
 pub mod explain;
 pub mod window;
 pub mod set_ops;
+pub mod topk;
 
 // Re-export operators for public API
 pub use scan::{ScanOperator, VectorScanOperator, MaterializedOperator, GenerateSeriesOperator, UnnestOperator};
@@ -34,6 +35,7 @@ pub use join::{NestedLoopJoinOperator, HashJoinOperator};
 pub use aggregate::{AggregateOperator, SortOperator};
 pub use window::WindowOperator;
 pub use set_ops::{UnionOperator, IntersectOperator, ExceptOperator};
+pub use topk::TopKOperator;
 
 /// Create a schema for COUNT(*) fast path results (single Int8 column).
 fn count_star_schema() -> Arc<Schema> {
@@ -332,6 +334,39 @@ impl<'a> Executor<'a> {
         Ok((results, columns))
     }
 
+    /// Pattern-match the input to a `Limit` for the Top-K optimisation:
+    /// `Sort(inner)` or `Project(Sort(inner))`. Returns the sort exprs,
+    /// ASC flags, the sort's inner plan, and optionally the Project
+    /// parameters that need to be re-wrapped around the TopK output.
+    #[allow(clippy::type_complexity)]
+    fn extract_sort_for_topk(
+        input: &LogicalPlan,
+    ) -> Option<(
+        Vec<crate::sql::LogicalExpr>,
+        Vec<bool>,
+        &LogicalPlan,
+        Option<(Vec<crate::sql::LogicalExpr>, Vec<String>, bool, Option<Vec<crate::sql::LogicalExpr>>)>,
+    )> {
+        match input {
+            LogicalPlan::Sort { input: inner, exprs, asc } => {
+                Some((exprs.clone(), asc.clone(), inner.as_ref(), None))
+            }
+            LogicalPlan::Project { input: inner, exprs: p_exprs, aliases, distinct, distinct_on, .. } => {
+                if let LogicalPlan::Sort { input: inner2, exprs, asc } = inner.as_ref() {
+                    Some((
+                        exprs.clone(),
+                        asc.clone(),
+                        inner2.as_ref(),
+                        Some((p_exprs.clone(), aliases.clone(), *distinct, distinct_on.clone())),
+                    ))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Materialize IN subqueries by executing them and converting to InList
     ///
     /// This allows the evaluator to handle IN expressions without needing
@@ -375,6 +410,26 @@ impl<'a> Executor<'a> {
                         negated: *negated,
                     })
                 }
+            }
+            LogicalExpr::ScalarSubquery { subquery } => {
+                // Execute the subquery once. A scalar subquery returns
+                // the first column of the first row (or NULL if the
+                // query returns zero rows). This branch runs at plan
+                // build time, so it only handles UNCORRELATED scalar
+                // subqueries — the UPDATE executor calls
+                // `materialize_scalar_subquery_with_outer` before
+                // per-row evaluation when correlation is involved.
+                let mut subquery_executor = if let Some(storage) = self.storage {
+                    Executor::with_storage(storage)
+                } else {
+                    Executor::new()
+                }.with_parameters(self.parameters.clone());
+
+                let results = subquery_executor.execute(subquery)?;
+                let value = results.first()
+                    .and_then(|tuple| tuple.values.first().cloned())
+                    .unwrap_or(crate::Value::Null);
+                Ok(LogicalExpr::Literal(value))
             }
             LogicalExpr::Exists { subquery, negated } => {
                 // Execute the subquery to check if any rows exist
@@ -658,7 +713,43 @@ impl<'a> Executor<'a> {
                     ).with_timeout(self.timeout_ctx.clone())))
                 }
             }
-            LogicalPlan::Limit { input, limit, offset } => {
+            LogicalPlan::Limit { input, limit, offset, limit_param, offset_param } => {
+                // Resolve `LIMIT $N` / `OFFSET $N` from the bound
+                // parameter list if the planner left a placeholder
+                // sentinel in place. Accepts integer, integer-castable
+                // string, and NULL (treated as no bound / zero).
+                let resolve = |sentinel: usize, param_idx: &Option<usize>| -> Result<usize> {
+                    match param_idx {
+                        None => Ok(sentinel),
+                        Some(idx) => {
+                            let value = self.parameters.get(idx.saturating_sub(1))
+                                .ok_or_else(|| Error::query_execution(format!(
+                                    "LIMIT/OFFSET parameter ${} not provided (have {} parameters)",
+                                    idx, self.parameters.len(),
+                                )))?;
+                            match value {
+                                crate::Value::Int2(n) => Ok((*n).max(0) as usize),
+                                crate::Value::Int4(n) => Ok((*n).max(0) as usize),
+                                crate::Value::Int8(n) => Ok((*n).max(0) as usize),
+                                crate::Value::String(s) => s.parse::<usize>().map_err(|_| {
+                                    Error::query_execution(format!(
+                                        "LIMIT/OFFSET parameter ${} is not an integer: {:?}",
+                                        idx, s,
+                                    ))
+                                }),
+                                crate::Value::Null => Ok(sentinel),
+                                other => Err(Error::query_execution(format!(
+                                    "LIMIT/OFFSET parameter ${} must be integer or integer-string, got {:?}",
+                                    idx, other,
+                                ))),
+                            }
+                        }
+                    }
+                };
+                let limit = resolve(*limit, limit_param)?;
+                let offset = resolve(*offset, offset_param)?;
+                let limit = &limit;
+                let offset = &offset;
                 // LIMIT pushdown: detect Scan or Project(Scan) with no filter/sort
                 let scan_info = match input.as_ref() {
                     LogicalPlan::Scan { table_name, schema, projection, .. } => {
@@ -676,8 +767,13 @@ impl<'a> Executor<'a> {
                 if let Some((table_name, schema, projection)) = scan_info {
                     if let Some(storage) = self.storage {
                     if self.get_cte(table_name).is_none() {
-                        let fetch_count = limit.saturating_add(*offset);
-                        let tuples = storage.scan_table_with_limit(table_name, fetch_count)?;
+                        // Storage-level OFFSET pushdown: skip the first
+                        // `offset` rows without deserialising them, then
+                        // fetch the next `limit` fully. Cheaper than the
+                        // old "fetch limit+offset, discard offset" path.
+                        let tuples = storage.scan_table_with_offset_limit(
+                            table_name, *offset, *limit,
+                        )?;
                         let scan_op = Box::new(ScanOperator::new(
                             table_name.clone(), schema.clone(), projection.clone(), tuples, self.parameters.clone(),
                         ).with_timeout(self.timeout_ctx.clone()));
@@ -698,12 +794,62 @@ impl<'a> Executor<'a> {
                         } else {
                             scan_op
                         };
+                        // Storage already applied the offset, so the outer
+                        // LimitOperator gets offset=0 and just caps at `limit`.
                         return Ok(Box::new(LimitOperator::new(
                             final_input,
                             *limit,
-                            *offset,
+                            0,
                         ).with_timeout(self.timeout_ctx.clone())));
                     }
+                    }
+                }
+                // Top-K fast path: Limit over Sort (optionally under Project)
+                // uses a bounded heap (O(N log k)) instead of a full sort.
+                // `k = limit + offset`; the outer LimitOperator still applies
+                // the offset skip on the already-sorted k-row window.
+                //
+                // Only engages when limit is a real bound (not usize::MAX),
+                // otherwise there's no benefit over the generic Sort path.
+                let k = limit.saturating_add(*offset);
+                let real_bound = *limit != usize::MAX;
+                if real_bound {
+                    if let Some((sort_exprs, sort_asc, sort_input, project_wrap)) =
+                        Self::extract_sort_for_topk(input)
+                    {
+                        let sort_input_op = self.plan_to_operator(sort_input)?;
+                        let topk: Box<dyn PhysicalOperator> = Box::new(
+                            TopKOperator::new(
+                                sort_input_op,
+                                sort_exprs,
+                                sort_asc,
+                                k,
+                                self.timeout_ctx.clone(),
+                            )?,
+                        );
+                        // Re-wrap with the Project on top, if we stripped one.
+                        let after_project: Box<dyn PhysicalOperator> = match project_wrap {
+                            Some((exprs, aliases, distinct, distinct_on)) => {
+                                let materialised: Vec<crate::sql::LogicalExpr> = exprs
+                                    .iter()
+                                    .map(|e| self.materialize_subqueries(e))
+                                    .collect::<Result<Vec<_>>>()?;
+                                Box::new(ProjectOperator::new_with_distinct_on(
+                                    topk,
+                                    materialised,
+                                    aliases,
+                                    distinct,
+                                    distinct_on,
+                                    self.parameters.clone(),
+                                ).with_timeout(self.timeout_ctx.clone()))
+                            }
+                            None => topk,
+                        };
+                        return Ok(Box::new(LimitOperator::new(
+                            after_project,
+                            *limit,
+                            *offset,
+                        ).with_timeout(self.timeout_ctx.clone())));
                     }
                 }
                 let input_op = self.plan_to_operator(input)?;
@@ -833,6 +979,18 @@ impl<'a> Executor<'a> {
             }
             LogicalPlan::CreateIndex { .. } => {
                 ddl::handle_create_index(self, plan)
+            }
+            LogicalPlan::CreateSequence { name, if_not_exists } => {
+                // In-memory sequence registration. Returns empty result
+                // set (DDL semantics).
+                crate::sql::sequences::create_sequence(name, *if_not_exists);
+                Ok(Box::new(ScanOperator::new(
+                    String::new(),
+                    Arc::new(crate::Schema { columns: vec![] }),
+                    None,
+                    vec![],
+                    vec![],
+                ).with_timeout(self.timeout_ctx())))
             }
             LogicalPlan::DropTable { name, if_exists } => {
                 ddl::handle_drop_table(self, name, *if_exists)
@@ -1089,6 +1247,17 @@ pub(crate) fn compare_values(a: &crate::Value, b: &crate::Value) -> std::cmp::Or
 
         (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
         (Value::Timestamp(a), Value::Timestamp(b)) => a.cmp(b),
+        // Date, Time, Interval — without these arms two distinct
+        // values compared equal under type_priority, which broke
+        // GROUP BY / ORDER BY on any of these columns (B35).
+        (Value::Date(a), Value::Date(b)) => a.cmp(b),
+        (Value::Time(a), Value::Time(b)) => a.cmp(b),
+        (Value::Interval(a), Value::Interval(b)) => a.cmp(b),
+        // Numeric compares lexicographically on the decimal string
+        // representation — not perfect across different scales but
+        // matches the existing Hash impl, which is enough to keep
+        // GROUP BY / ORDER BY correct.
+        (Value::Numeric(a), Value::Numeric(b)) => a.cmp(b),
         // For JSON and complex types, compare as strings
         (Value::Json(a), Value::Json(b)) => {
             a.to_string().cmp(&b.to_string())

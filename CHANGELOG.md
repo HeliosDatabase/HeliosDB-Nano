@@ -5,6 +5,612 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.14.9] - 2026-04-22
+
+### Fixed — GROUP BY correctness with mixed qualifier styles and DATE keys (B35)
+
+**Reporter's symptom.** A Drizzle-emitted analytics query mixing
+unqualified column refs in SELECT / CASE bodies with table-qualified
+refs in GROUP BY / WHERE:
+
+```sql
+select date("check_in"), sum(case when "check_out" is not null ...)
+from "time_entries"
+where "time_entries"."workspace_id" = $1
+group by date("time_entries"."check_in")
+```
+
+failed with `Column 'check_in' not found in schema`. Stock PostgreSQL
+treats `"check_in"` and `"time_entries"."check_in"` as the same
+column when unambiguous.
+
+**Root cause #1 — projection-rewrite matching too strict.**
+After planning `Aggregate`, the planner rewrites each SELECT item so
+column refs that match a GROUP BY expression become references to the
+aggregate operator's output column (`group_N`). The matching step
+used `PartialEq`, so `date(Column{table:None,name:"check_in"})` did
+not match `date(Column{table:Some("time_entries"),name:"check_in"})`
+— the SELECT item's `"check_in"` reference was left as-is and then
+failed to resolve against the aggregate's output schema.
+
+Fix: new `Planner::exprs_equivalent` that recursively compares
+expressions with qualifier-insensitive `Column` matching. Used at
+both sites inside `rewrite_expr_replace_aggregates`.
+
+**Root cause #2 — `compare_values` missing DATE / TIME / INTERVAL /
+NUMERIC arms (found while reproducing).**
+`GroupKey` in the aggregate operator is ordered via
+`compare_values` (src/sql/executor/mod.rs). Any two values without a
+dedicated arm fall through to `type_priority`, which returns `Equal`
+for any two values of the same type. So `GROUP BY <date-col>` put
+every row into a single group (count grew, distinct dates vanished);
+`ORDER BY <date-col>` produced non-deterministic output.
+
+Fix: add arms for `Date`, `Time`, `Interval`, `Numeric` in
+`compare_values`.
+
+Regression tests (`tests/drizzle_compat_tests.rs`):
+- `b35_mixed_qualifier_group_by`
+- `b35_both_qualified_group_by`
+- `b35_both_unqualified_group_by`
+- `b35_reporter_full_shape` (verbatim Drizzle query with SUM + CASE +
+  EXTRACT + parameterised WHERE)
+- `b35_date_column_group_by_correctness` (guards the second root cause)
+
+## [3.14.8] - 2026-04-22
+
+### Fixed — parameterized LIMIT/OFFSET and UPDATE SET type coercion (B33 / B34)
+
+**B33** — `LIMIT $1 OFFSET $2` was rejected with `LIMIT/OFFSET must
+be a number`. Two independent issues surfaced together:
+
+- Wire path: postgres-js binds numeric parameters as TEXT (OID 0 or
+  25) by default. `substitute_parameters` renders a string value with
+  surrounding single quotes, so the planner saw `LIMIT '3'`, which
+  the old `expr_to_usize` rejected.
+- In-process path: the planner mapped `$N` to `usize::MAX` as a
+  sentinel, but `LogicalPlan::Limit` only carried the sentinel — the
+  bound integer never reached the executor. Queries silently returned
+  all rows (or all-rows-minus-offset).
+
+Fix:
+1. `expr_to_limit_bound` (new) returns `(usize, Option<usize>)`.
+   Accepts `Number`, `Placeholder($N)` → `(MAX, Some(N))`, and
+   `SingleQuotedString(n)` → `(n, None)`. The quoted-string arm
+   matches stock PG's implicit `text → integer` cast for LIMIT /
+   OFFSET.
+2. `LogicalPlan::Limit` gained `limit_param: Option<usize>` and
+   `offset_param: Option<usize>` fields, propagated through the
+   optimizer, RLS plan rewrite, and outer-ref binding paths.
+3. The executor's Limit branch resolves these from the bound
+   parameter list before running any of the Top-K, storage-offset, or
+   generic Limit paths.
+
+**B34** — `UPDATE t SET ts_col = $1` via extended-Q silently stored
+NULL in TIMESTAMP columns. `sql.unsafe` with the same SQL + string
+params worked. INSERT with the same pattern worked.
+
+Root cause: INSERT's value path auto-casts each evaluated value to
+its target column type before persistence; UPDATE's SET path did not
+— a `Value::String("2026-04-23T10:00:00.000Z")` was pushed straight
+into a TIMESTAMP slot, which the storage serializer dropped as an
+implicit NULL.
+
+Fix: mirror INSERT's auto-cast in every UPDATE SET path — the
+`execute_plan_with_params::Update` arm, the trigger-aware
+`execute_in_transaction_inner::Update` arm, and the RLS-aware
+non-params Update arm. All three now call `evaluator.cast_value(new,
+target_type)` when the new value and column type disagree.
+
+Regression tests (`tests/drizzle_compat_tests.rs`):
+- `b33_parameterized_limit`, `b33_parameterized_limit_offset`,
+  `b33_quoted_string_limit_wire_substitution`
+- `b34_update_set_param_timestamp`,
+  `b34_update_set_literal_iso_string`
+
+## [3.14.7] - 2026-04-22
+
+### Fixed — Drizzle UPDATE/DELETE and analytics date ranges (B31 / B32)
+
+**B31** — `UPDATE "t" SET … WHERE "t"."col" = $1` and the equivalent
+DELETE fail with `Column 't.col' not found in schema`. Root cause:
+the Update and Delete arms of `execute_plan_with_params` (and the
+in-transaction variants) build their evaluator directly from the
+catalog schema, which does not carry `source_table_name` on its
+columns. The SELECT path works because the Scan operator stamps
+`source_table_name` on every yielded column; DML didn't.
+
+Fix: new helper `Schema::with_source_table_name(&str)` that stamps
+`source_table` and `source_table_name` on every column.
+Every single-table DML evaluator now builds its schema through this
+helper, so qualified WHERE columns resolve the same way they do for
+SELECT. Blocks the stop-timer, edit/delete entry, edit/delete
+customer, bulk ops, and role/member management paths.
+
+**B32** — `timestamp >= '2026-04-23T00:00:00.000Z'` (and the `date`
+analogue) fail with `Cannot compare Timestamp(…) and String(…)`.
+Stock PostgreSQL implicitly casts the literal to the column type;
+Drizzle's `gte()` / `lte()` helpers bind JavaScript `Date` instances
+as ISO 8601 strings, so every analytics / reporting endpoint hit
+this.
+
+Fix: `Evaluator::compare_values` gains four new arms —
+`Timestamp ↔ String` and `Date ↔ String` — using the same ISO 8601
+/ space-separated / date-only parser as the TIMESTAMP cast path
+(`Self::parse_timestamp_string`, `Self::parse_date_string`). Falls
+back to string-wise comparison if the literal isn't a valid date /
+timestamp, matching the behaviour of the other coercion arms (e.g.
+`Int ↔ String`).
+
+Regression tests (tests/drizzle_compat_tests.rs):
+- `b31_update_with_qualified_where_column`
+- `b31_delete_with_qualified_where_column`
+- `b32_timestamp_vs_iso_string_comparison`
+- `b32_date_vs_iso_string_comparison`
+
+## [3.14.6] - 2026-04-22
+
+### Fixed — Drizzle login read-by-unique-key (B29, real root cause)
+
+The 3.14.5 fix addressed timestamp formatting (B30) but assumed B29
+was a downstream symptom. TimeTracker's retest proved otherwise: even
+with timestamps round-tripping cleanly, the canonical Drizzle shape
+`select <all cols> from t where t.col = $1` still returned `[]`.
+
+Actual root cause: `execute_plan_with_params` (src/lib.rs:4983), the
+plan-executor behind `EmbeddedDatabase::execute_returning` and
+`execute_params_returning`, mutated data but never invalidated
+`result_cache`. The `Database::query` entry point DOES invalidate on
+DML, but the extended-Q handler for `INSERT ... RETURNING` calls
+`execute_returning` **directly**, bypassing that invalidation.
+
+Trigger sequence (TimeTracker's login/register flow):
+
+1. User attempts login against an empty `users` table.
+   `SELECT ... WHERE "users"."email" = $1` → `[]`. After parameter
+   substitution the key is the fully-rendered SQL;
+   `result_cache` stores `[]` under it.
+2. User registers. `INSERT ... RETURNING ...` via extended-Q lands in
+   `execute_plan_with_params`, which inserts the row but does NOT
+   clear `result_cache`.
+3. User logs in. Same canonical SQL → substitutes to the same key →
+   cache hit → stale `[]` is served forever, even though the row now
+   exists.
+
+Swapping any trigger (unqualified WHERE, different projection, string
+literal instead of `$1`) produces a different substituted SQL and
+therefore a different cache key that misses, which is why every
+variation returned the row while the canonical shape didn't — and why
+the bug looked like a "planner/prepared-statement" issue to the
+reporter.
+
+Fix: invalidate `result_cache` at the single choke point in
+`execute_plan_with_params` whenever the plan is `Insert` /
+`InsertSelect` / `Update` / `Delete` and the execution succeeded.
+
+Regression tests:
+- `tests/drizzle_compat_tests.rs::b29_login_probe_then_register_then_login`
+  — in-process reproduction of the trigger sequence.
+- `tests/drizzle_compat_tests.rs::b29_canonical_drizzle_select_returns_row`
+  — pins the canonical substituted shape.
+- `tests/drizzle_compat_tests.rs::b29_qualified_predicate_matches_scan_row`
+  — shrinks the qualified-predicate invariant.
+
+## [3.14.5] - 2026-04-22
+
+### Fixed — Drizzle login + timestamp reads (B29 / B30)
+
+Both bugs had the same root cause: the direct-encoding path at
+`send_data_row_direct` (src/protocol/postgres/handler.rs:952) was
+still emitting `Timestamp` values as RFC-3339 with nanosecond
+precision (`2026-04-21T20:43:55.674347541+00:00`). v3.14.4 fixed the
+fallback `tuple_to_pg_values` path but missed this one. Consequences:
+
+- **B29 Drizzle SELECT shape returns empty.** When Drizzle's
+  `postgres-js` integration parsed the malformed timestamp it
+  crashed the result binding silently, and Drizzle's type-coerced
+  filter comparison (`eq(users.email, v)`) resolved against a
+  null-valued row that the app-side filter then rejected as
+  non-matching — the symptom being "empty result set". The
+  underlying pg query *did* return the row; the client just failed
+  to interpret it.
+- **B30 timestamp columns parsed as null.** `drizzle-orm/postgres-js`
+  registers a custom parser for OID 1114 (`timestamp`) that expects
+  PG wire format `YYYY-MM-DD HH:MM:SS.ffffff` (microsecond precision,
+  space separator, no zone). Our nanosecond-precision RFC-3339
+  output silently produced `null`.
+
+Fix: emit PostgreSQL-standard `YYYY-MM-DD HH:MM:SS.ffffff` on the
+direct-encoding path (matching v3.14.4's `tuple_to_pg_values` fix).
+Applied to `Timestamp` and `Time` — `Date` was already correct.
+
+### Verified end-to-end with `drizzle-orm/postgres-js`
+
+```js
+const users = pgTable('users', {
+  id: serial('id').primaryKey(),
+  email: text('email').notNull(),
+  password: text('password').notNull(),
+  createdAt: timestamp('created_at').defaultNow().notNull(),
+})
+
+const [u] = await db.insert(users).values({ email, password }).returning()
+// { id: 1, email: 'alice@x.com', password: 'pw',
+//   createdAt: 2026-04-22T06:05:01.619Z }  ← real Date, not null
+
+const rows = await db.select().from(users).where(eq(users.email, 'alice@x.com'))
+// [{ id: 1, email: 'alice@x.com', password: 'pw', createdAt: Date(…) }]
+```
+
+## [3.14.4] - 2026-04-21
+
+### Fixed — Drizzle `.insert().returning()` blockers (B27 / B28)
+
+- **B27 `DEFAULT` keyword inside `VALUES` resolves the column's declared
+  default.** v3.14.0 (B3) rewrote every `DEFAULT` token to NULL, which
+  worked for SERIAL/IDENTITY columns (auto-filled later in storage) but
+  broke any column with a real `DEFAULT <expr>` — v3.14.3's NOT NULL
+  enforcement then rejected the NULL.  New `LogicalExpr::DefaultValue`
+  marker flows from the planner to the INSERT executor; the executor
+  treats it as "column omitted", so the B24 default-fill pass runs the
+  declared DEFAULT expression.  Drizzle emits `VALUES (default, …,
+  default)` on every `.insert()` — every write in TimeTracker hit this.
+- **B28 `INSERT … RETURNING *` over the extended query protocol.**
+  `handle_execute_extended` used to dispatch non-SELECT writes through
+  `database.execute()` which drops the returning tuples. Now detects
+  `INSERT/UPDATE/DELETE … RETURNING …`, routes through
+  `execute_returning`, and emits the tuples as `DataRow` messages
+  (RowDescription was already sent during Describe).  Matches the
+  simple-query behaviour.
+- **Timestamp wire format** now microsecond-precision with a space
+  separator (`YYYY-MM-DD HH:MM:SS.ffffff`) — the PostgreSQL
+  on-the-wire format. Previously `rfc3339` nanosecond-precision output
+  crashed psycopg's timestamp parser ("timestamp too large (after year
+  10K)"). `postgres-js` accepted both but produced slightly different
+  `Date` values.
+
+### Added
+
+- `LogicalExpr::DefaultValue` — dedicated marker for the `DEFAULT`
+  keyword in INSERT VALUES. Threaded through planner, optimizer,
+  type_inference, and the three INSERT executor paths.
+- `tests/drizzle_compat_tests.rs` — two B27 regression cases (DEFAULT
+  for DEFAULT-expr column, DEFAULT for SERIAL column). B28 is a
+  wire-level regression verified via postgres-js end-to-end.
+
+### Verified end-to-end via `postgres-js 3.4.5` + Drizzle's exact INSERT shape
+
+```js
+const [user] = await sql`
+  INSERT INTO "users" ("id","email","pw","created_at")
+  VALUES (default, ${'alice@x.com'}, ${'pw'}, default)
+  RETURNING "id","email","pw","created_at"
+`
+//  { id: 1, email: 'alice@x.com', pw: 'pw',
+//    created_at: '2026-04-21T20:49:20.925Z' }
+```
+
+## [3.14.3] - 2026-04-21
+
+### Fixed — first-user-registration blockers (B24 / B25 / B26)
+
+- **B24 `DEFAULT <expr>` applied on omitted columns.** Every Drizzle
+  table with `created_at TIMESTAMP DEFAULT now() NOT NULL` was
+  inserting NULL instead of evaluating `now()`, then either erroring
+  on the NOT NULL constraint or (worse) storing NULL silently. New
+  helper `apply_defaults_and_check_not_null` parses the stored
+  default expression JSON, evaluates it via the shared SQL evaluator,
+  and fills in the omitted slot. Only omitted slots get defaults —
+  explicit `NULL` bypasses the default and surfaces as a NOT NULL
+  violation, matching stock PostgreSQL.
+- **B25 `INSERT INTO t DEFAULT VALUES`.** sqlparser leaves
+  `insert.source = None` for this syntax; the planner used to error
+  with "INSERT statement missing source query". Now maps to an Insert
+  with a single empty VALUES row — every schema column goes through
+  the default-fill pass.
+- **B26 `NOT NULL` enforcement on every INSERT path.** Three INSERT
+  paths (fast-path `try_fast_insert`, per-params
+  `execute_plan_with_params`, main transactional
+  `execute_in_transaction`) all call the new NOT NULL check. Covers
+  both omitted columns and explicit `NULL` in user VALUES. Consistent
+  with the extended-protocol path.
+
+### Added
+
+- `EmbeddedDatabase::apply_defaults_and_check_not_null` — single
+  source of truth for default application + NOT NULL enforcement
+  across all three INSERT paths.
+- `tests/drizzle_compat_tests.rs` — six B24 / B25 / B26 regression
+  cases (DEFAULT with function call, DEFAULT with literal, DEFAULT
+  VALUES, explicit NULL rejected, omitted NOT NULL rejected, NOT NULL
+  satisfied by default). All 24 compat tests passing; 1730 lib tests
+  unchanged.
+
+## [3.14.2] - 2026-04-21
+
+### Fixed — real-driver blockers found during v3.14.1 retest
+
+- **B22 `Flush` (`H` / 0x48) message** is now a first-class
+  `FrontendMessage` variant. Every pipelined Postgres driver
+  (postgres-js, `pg`, psycopg internally, Npgsql, JDBC) emits
+  `Parse → Bind → [Describe →] Execute → Flush` on every query and
+  then waits for the server to push the ParseComplete / DataRows /
+  CommandComplete before sending `Sync`. Without `Flush`, the driver
+  is killed mid-query and the TCP connection goes down.
+  The dispatch just flushes the socket buffer — no ReadyForQuery
+  (that's `Sync`'s job). Verified end-to-end via `postgres-js 3.4.5`
+  over TCP — connect + `SELECT version()` + parameterised
+  `pg_catalog.pg_type` lookup + `pg_tables` with `NOT IN` filter all
+  complete cleanly.
+- **B23 scalar subquery in `UPDATE … SET`** (correlated + uncorrelated).
+  `Expr::Subquery` is now a `LogicalExpr::ScalarSubquery` variant and
+  the UPDATE executor materialises it per row:
+  1. Walk the subquery plan, replace every
+     `Column { table: Some(<outer_table>), name }` with the literal
+     value from the current outer row.
+  2. Execute the (now uncorrelated) plan and take the first column
+     of the first row; return `NULL` if zero rows.
+  Handles the canonical Drizzle-migration rewrite pattern from
+  `docs/compatibility/plpgsql.md`:
+  `UPDATE user_profile SET display_name =
+   (SELECT email FROM users WHERE users.id = user_profile.user_id);`
+
+### Added
+
+- `tests/drizzle_compat_tests.rs` — three B23 regression cases
+  (correlated with outer ref, uncorrelated aggregate, empty
+  subquery → NULL). All 18 compat tests passing; 1730 lib tests
+  unchanged.
+
+## [3.14.1] - 2026-04-20
+
+### Fixed — TimeTracker retest follow-ups
+
+- **B19 pg_catalog visible on extended query protocol.**
+  `PgCatalog::handle_query` now runs from the
+  `Parse → Bind → Execute` path as well as the simple-Q path.
+  `postgres-js`, `pg`, `psycopg` and every other real driver does its
+  connect-time type introspection through the extended protocol;
+  without this fix they got a bogus
+  `Table 'pg_catalog.pg_type' does not exist` and couldn't connect.
+- **B20 catalog queries honor WHERE.** The emulator used to return
+  the full table and rely on projection-only filtering. Added a
+  small WHERE-clause evaluator that handles `col = 'lit'`, `col = N`,
+  `col <> 'lit'`, `col != 'lit'`, `col IN (…)`, `col NOT IN (…)`
+  and left-to-right conjunctions. Covers every driver introspection
+  query we've seen; complex WHEREs (OR, function calls, subqueries)
+  fall through unchanged (keeps all rows).
+- **B21 clear error for PL/pgSQL DO bodies.** `DO $$ DECLARE / IF /
+  LOOP / FOR / RAISE / := … $$` now returns a targeted error
+  identifying the unsupported keyword and pointing at
+  `docs/compatibility/plpgsql.md`. Silent no-op would corrupt
+  migrations — this version still refuses, but with a clear message
+  and migration-rewrite recipes.
+
+### Added
+
+- `docs/compatibility/plpgsql.md` enumerates supported / unsupported
+  PL/pgSQL features and gives rewrite recipes (backfill loop →
+  `INSERT … SELECT`, conditional index → `CREATE INDEX IF NOT
+  EXISTS`, conditional insert → `ON CONFLICT DO NOTHING`).
+- `tests/drizzle_compat_tests.rs` notes B19/B20/B21 regression is
+  live-verified at the wire level (psql smoke tests) — the core
+  `EmbeddedDatabase::query` API doesn't touch the PG wire handler so
+  those tests belong on the integration path rather than the unit
+  suite.
+
+## [3.14.0] - 2026-04-20
+
+### Fixed — Drizzle / Prisma / TypeORM compatibility (tracks `BUGS_TIMETRACKER_DRIZZLE_COMPAT.md`)
+
+- **B2 `GENERATED ALWAYS AS IDENTITY`**: planner now recognises the
+  SQL-standard identity syntax and routes it through the same
+  auto-fill path as `SERIAL`.
+- **B3 `DEFAULT` keyword in `INSERT ... VALUES`**: sqlparser classifies
+  `DEFAULT` as `Expr::Identifier`; the planner now rewrites it to
+  `NULL` inside VALUES lists so the existing SERIAL / default-value
+  path fires.
+- **B4 RETURNING field-count**: fixed a long-standing bug in
+  `execute_plan_with_params` where INSERT rows with omitted columns
+  produced short tuples, causing the PG wire protocol to emit a
+  `DataRow` with a different field count than the `RowDescription`.
+  Every `.returning()` call through Drizzle / psycopg is affected.
+- **B5 `EXTRACT(EPOCH|YEAR|MONTH|... FROM ...)`**: full coverage in the
+  evaluator — Epoch returns Float8 (Unix seconds); calendar fields
+  return Int4. `TIMESTAMP '2026-01-01'` and friends now parse (new
+  `TypedString` planner arm that lowers to a CAST).
+- **B7 `CREATE SEQUENCE`**: DDL is accepted and registers a named
+  counter in the new process-scoped sequence store
+  (`sql::sequences`). Persistent sequences are a follow-up.
+- **B8 `nextval` / `currval` / `setval`**: scalar functions backed by
+  the sequence store; always return Int8.
+- **B9 `DO $$ … END $$` blocks**: the PG handler unwraps the
+  dollar-quoted body and executes plain-SQL statements inside via a
+  single `DO` CommandComplete. PL/pgSQL control flow (IF / LOOP /
+  RAISE) is NOT interpreted — documented as out of scope.
+- **B10 dollar-quoted string literals**: `$$text$$` and `$tag$text$tag$`
+  values map to `Value::String` in the planner.
+- **B11 multi-statement simple queries**: the `Q` message now accepts
+  `;`-separated statements and emits one response per statement with a
+  single trailing `ReadyForQuery`, matching PG protocol.
+- **B14 identifier case-folding**: new `Planner::normalize_ident` and
+  `normalize_object_name` helpers strip surrounding quotes
+  (preserving case) and lower-case unquoted identifiers. Applied at
+  every DDL and reference call site — `CREATE TABLE Foo` matches
+  `SELECT FROM foo` matches `SELECT FROM FOO`, while quoted
+  `"Foo"` stays case-sensitive (PG-compliant).
+- **B15 `gen_random_uuid()` / `uuid_generate_v4()`**: new scalar
+  functions returning `Value::Uuid`.
+- **B17 startup banner**: now points to `docs/compatibility/`, the
+  FTS doc, and the new `heliosdb_capability_report()` probe so
+  drivers / migration tools can discover supported features before
+  bisecting failures.
+
+### Added
+
+- **`heliosdb_capability_report()`** scalar function — returns a
+  human-readable summary of what this server version supports vs.
+  stock Postgres.
+- **`src/sql/sequences.rs`** — process-scoped, thread-safe counter
+  store shared by `CREATE SEQUENCE` / `nextval` / `currval` /
+  `setval`.
+- **`tests/drizzle_compat_tests.rs`** — 15 regression cases, one per
+  bug in the `BUGS_TIMETRACKER_DRIZZLE_COMPAT.md` report.
+
+### Query-engine changes
+
+- Result cache now skips SQL that contains non-deterministic
+  functions (`nextval`, `setval`, `currval`, `gen_random_uuid`,
+  `random(`, `now(`, `clock_timestamp`). Previously, a second call
+  returned the first result verbatim.
+
+## [3.13.0] - 2026-04-19
+
+### Added — PostgreSQL-compatible full-text search
+
+- **Scalar FTS functions**: `to_tsvector(text)`,
+  `to_tsvector(config, text)`, `to_tsquery(text)`,
+  `plainto_tsquery(text)`, `phraseto_tsquery(text)`, `ts_rank(doc,
+  query)`, `ts_rank_cd(doc, query)` — all implemented in
+  `src/sql/evaluator.rs`. Values round-trip as `Value::Json` (array of
+  normalised tokens) so they flow through the PostgreSQL wire
+  protocol unchanged and render as JSON arrays for introspection.
+- **`@@` operator** (`tsvector @@ tsquery → boolean`): new
+  `BinaryOperator::TsMatch` in the logical plan, wired in the planner
+  from `SqlBinaryOp::AtAt` and evaluated via the shared
+  `search::tokenizer` + in-memory match.
+- **`TSVECTOR` / `TSQUERY` column types**: accepted in `CREATE TABLE`
+  (`src/sql/planner.rs:3044`). Stored as `DataType::Json` internally.
+- **`CREATE INDEX ... USING gin | gist (col)`**: accepted as DDL for
+  ORM/migration compatibility (`src/sql/executor/ddl.rs:79`). The
+  index is currently a no-op — `@@` still walks rows in the evaluator
+  — but the syntax round-trips cleanly so Django, SQLAlchemy, and
+  hand-written migrations load without errors.
+- Backed by `search::Bm25Index` (landed in v3.11.0), which had been
+  unreachable from SQL until now.
+
+### Fixed
+
+- **Stale version strings**. `pg_catalog.version()`, the
+  `server_version` parameter-status message, and the `SHOW
+  server_version` response all now use `env!("CARGO_PKG_VERSION")`
+  instead of the hardcoded `3.7.0` / `3.10.0` / `17.0 (HeliosDB-Lite
+  2.0)` strings that had drifted across releases.
+
+### Documentation
+
+- New `docs/compatibility/fts.md` — honest scope of our FTS support:
+  what works (token match, BM25 rank, JSON-encoded tsvector),
+  what doesn't (stemming, phrase queries, `setweight()`, persistent
+  GIN index), and the migration hook for when it does.
+- `tests/fts_tests.rs` (8 regression cases): tsvector construction,
+  `@@` match/miss, rank scoring, `GIN` DDL acceptance, null
+  propagation, version-string drift.
+
+### Tracks
+
+- Request from the EasyRAG team (`foor.network/easyrag`) — their
+  adapter (`backend/app/services/vectordb/adapters/heliosdb_nano_adapter.py`)
+  was client-side reranking with `rank_bm25.BM25Okapi` to work
+  around the missing FTS functions. Simplification guide published
+  at `easyrag/docs/heliosdb_nano_adapter_simplification.md`.
+
+## [3.12.0] - 2026-04-17
+
+### Fixed
+
+- **`LIMIT $1 OFFSET $2` via psycopg extended query protocol** (root
+  cause of SQLAlchemy's `NotImplementedError: _row_as_tuple_getter`).
+  The planner's `expr_to_usize` rejected `Expr::Value(Placeholder(_))`,
+  which made Parse-time schema derivation fail and caused `Describe` to
+  send `NoData` instead of `RowDescription`. Now accepts placeholders
+  (the real values are substituted at Execute time before planning).
+- **Fallback `RowDescription` for `SELECT`**: if schema derivation
+  still fails for an exotic query, we now synthesise a best-effort
+  schema from the sqlparser projection list rather than returning
+  `NoData` — matching PostgreSQL's behaviour and keeping SQLAlchemy
+  row decoders happy.
+
+### Added — Pagination
+
+- **Top-K operator** (`sql::executor::topk::TopKOperator`): streams the
+  input through a bounded max-heap of size `k = limit + offset` when
+  the plan is `Limit(Sort(…))` or `Limit(Project(Sort(…)))`.
+  Complexity drops from O(N log N) to O(N log k) and memory from O(N)
+  to O(k). Kicks in automatically whenever the `LIMIT` has a concrete
+  bound.
+- **Row-constructor comparison** for keyset pagination:
+  `WHERE (created_at, id) < ($1, $2) ORDER BY created_at DESC, id DESC LIMIT N`
+  is now planned and evaluated lexicographically. New
+  `LogicalExpr::Tuple` variant and `evaluate_tuple_compare` in the
+  evaluator. Supports `=`, `<>`, `<`, `<=`, `>`, `>=`.
+- **Storage-level OFFSET pushdown** (`storage::EmbeddedStorage::scan_table_with_offset_limit`):
+  skips `offset` rows at the RocksDB iterator level *without*
+  deserialising them (no bincode, no decrypt, no dict/CAS resolve) and
+  then fetches `limit` rows fully. Markon's `LIMIT 5 OFFSET 990` on
+  1000 rows now returns in ~1 ms (previously required materialising
+  all 995+ rows before the `LimitOperator` skipped).
+- **Primary-key range scan API**
+  (`storage::EmbeddedStorage::scan_table_pk_range`): low-level building
+  block for future planner-driven keyset pushdown; currently exposed
+  for callers that know the PK range up front.
+
+### Changed
+
+- `LogicalExpr` gains a `Tuple { items }` variant — every consumer
+  (`optimizer::rules`, `optimizer::cost`, `sql::type_inference`,
+  `sql::evaluator`) handles it.
+- Pagination integration test suite (`tests/pagination_tests.rs`, 7
+  tests) lands with the feature, covering empty tables, ORDER BY,
+  LEFT OUTER JOIN, keyset, row-constructor equality, and large-offset
+  correctness.
+
+### Tracks
+
+- `FEATURE_REQUEST_pagination.md` — acceptance criteria 1–5 met;
+  cross-engine benchmark (vs Postgres / Oracle / MSSQL) and a website
+  marketing page tracked as follow-up (see task #122).
+
+## [3.11.0] - 2026-04-15
+
+### Added (RAG-native integration -- 5 features)
+
+- **Per-request bump arena** (`runtime::RequestArena`, idea 3): wraps
+  `bumpalo::Bump` so transient buffers (HNSW candidate lists, scratch
+  rows, BM25 term lists) are dropped wholesale when a request finishes
+  -- amortising deallocation cost to a single `free`. New crate dep:
+  `bumpalo` (with `collections` feature).
+- **Native graph adjacency lists** (`graph::*`, idea 1): in-memory
+  `GraphStore` backed by `dashmap` with O(1) edge insert / O(1)
+  per-node neighbor lookup, plus `traverse` module implementing BFS,
+  Dijkstra (non-negative weights), and bidirectional BFS, all gated
+  by `TraversalLimits` to bound runaway queries.
+- **BM25 + hybrid search + RRF/MMR** (`search::*`, idea 2):
+  Unicode-aware tokenizer, in-memory inverted-index BM25 with
+  configurable `(k1, b)`, Reciprocal Rank Fusion + Maximal Marginal
+  Relevance rerankers, and `hybrid_search` orchestrator that fuses
+  BM25 + vector hits via RRF / MMR / weighted-linear. Deterministic
+  tie-breaks on doc_id throughout. New crate dep:
+  `unicode-segmentation`.
+- **Compiled query plans** (`sql::compiled::CompiledPlanCache`, idea
+  4): LRU-bounded cache of parser output keyed by plan name.
+  `PREPARE COMPILED <name> AS <sql>` + `EXECUTE <name>` surface
+  recognised by `parse_prepare_compiled` / `parse_execute` /
+  `try_handle_compiled`.
+- **MCP idea-5 tools + resources** (`mcp_extensions::*`, idea 5):
+  six new tools (`heliosdb_bm25_index`, `heliosdb_hybrid_search`,
+  `heliosdb_graph_add_edge`, `heliosdb_graph_traverse`,
+  `heliosdb_graph_path`, `heliosdb_embed_and_store`) plus two
+  resource resolvers (`heliosdb://schema/{table}`,
+  `heliosdb://stats/{table}`). Lives in a standalone module pending
+  the legacy `src/mcp/` server's reconciliation with current
+  EmbeddedDatabase API -- see `BLOCKER_idea_5.md`.
+
+### Tests
+
+- 43 new integration tests across 9 new test files; 56 new unit tests
+  inside the new modules. Existing 1730 lib tests continue to pass.
+
 ## [3.10.0] - 2026-04-14
 
 ### Added

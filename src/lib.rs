@@ -274,6 +274,17 @@ pub mod session; // Multi-user session management
 pub mod ai; // AI/NL query module
 pub mod multi_tenant; // Multi-tenant support
 pub mod git_integration; // Git workflow integration
+pub mod runtime; // Per-request runtime helpers (bump arena, ...)
+pub mod graph;   // Native graph adjacency lists & traversal (RAG-native)
+pub mod search;  // BM25 + hybrid search + RRF/MMR rerankers (RAG-native)
+// NOTE: `mcp` module exists on disk but its server.rs / tools.rs reference
+// EmbeddedDatabase methods (query_branch, execute_branch, merge_branches,
+// query_at_timestamp, ...) that no longer exist on the current API. Enabling
+// it would require an mcp-wide refactor that's out of scope. The external project
+// idea-5 tool *handlers* live in `mcp_extensions` instead and can be
+// folded back into the legacy mcp module once the upstream API drift is
+// reconciled. See BLOCKER_idea_5.md for details.
+pub mod mcp_extensions; // Standalone MCP idea-5 tool handlers (RAG-native)
 
 // Experimental modules (require feature flags)
 // DISABLED: Sync module has compilation issues and is 85% complete
@@ -928,6 +939,15 @@ impl EmbeddedDatabase {
                             val_idx
                         };
 
+                        // `DEFAULT` marker: leave the slot as None so
+                        // the default-fill pass below runs the column's
+                        // declared DEFAULT expression. Skips the NOT
+                        // NULL check for explicit NULL too — that's
+                        // only for literal NULL, not for DEFAULT.
+                        if matches!(expr, sql::LogicalExpr::DefaultValue) {
+                            continue;
+                        }
+
                         let target_col = schema.get_column_at(target_col_idx)
                             .ok_or_else(|| Error::query_execution(format!(
                                 "Too many values for INSERT: table has {} columns",
@@ -1007,6 +1027,23 @@ impl EmbeddedDatabase {
                         .collect();
 
                     let final_values_vec = final_values?;
+
+                    // Enforce NOT NULL on columns the user passed
+                    // `NULL` for explicitly. Omitted columns were
+                    // already handled above (default-expr or error).
+                    // PK columns are left for SERIAL/IDENTITY auto-fill
+                    // to populate in the storage layer.
+                    for (idx, col) in schema.columns.iter().enumerate() {
+                        if !col.nullable && !col.primary_key {
+                            if matches!(final_values_vec.get(idx), Some(Value::Null)) {
+                                return Err(Error::constraint_violation(format!(
+                                    "NOT NULL constraint violated: cannot insert NULL into column '{}'",
+                                    col.name
+                                )));
+                            }
+                        }
+                    }
+
                     let mut tuple = Tuple::new(final_values_vec.clone());
 
                     // Validate foreign key constraints via ART index (O(1) lookup)
@@ -1678,8 +1715,11 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::Update { table_name, assignments, selection, returning } => {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
+                // Stamp source_table_name so qualified predicates
+                // `WHERE "t"."col" = …` resolve (B31).
+                let eval_schema = schema.clone().with_source_table_name(table_name);
                 let evaluator = sql::Evaluator::with_parameters(
-                    std::sync::Arc::new(schema.clone()),
+                    std::sync::Arc::new(eval_schema),
                     vec![],
                 );
 
@@ -1723,9 +1763,40 @@ impl EmbeddedDatabase {
                         // Create new tuple with updated values
                         let mut new_tuple = old_tuple.clone();
                         for (col_name, value_expr) in assignments {
-                            let new_value = evaluator.evaluate(value_expr, &old_tuple)?;
+                            // Resolve any scalar subqueries (including
+                            // correlated ones) against the outer row
+                            // first — substitutes `outer_table.col`
+                            // refs with literals and executes the
+                            // plan once per row. No-op for expressions
+                            // without subqueries.
+                            let bound = self.materialize_scalar_subqueries_for_row(
+                                value_expr, &old_tuple, &schema, table_name,
+                            )?;
+                            let mut new_value = evaluator.evaluate(&bound, &old_tuple)?;
                             let col_index = evaluator.schema().get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
+                            // Auto-cast SET values to target column type (B34).
+                            let target_col = schema.get_column_at(col_index)
+                                .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
+                            let target_type = &target_col.data_type;
+                            let needs_cast = !matches!(&new_value, Value::Null)
+                                && !matches!(
+                                    (&new_value, target_type),
+                                    (Value::Vector(_), DataType::Vector(_))
+                                    | (Value::Int2(_), DataType::Int2)
+                                    | (Value::Int4(_), DataType::Int4)
+                                    | (Value::Int8(_), DataType::Int8)
+                                    | (Value::Float4(_), DataType::Float4)
+                                    | (Value::Float8(_), DataType::Float8)
+                                    | (Value::String(_), DataType::Text | DataType::Varchar(_))
+                                    | (Value::Boolean(_), DataType::Boolean)
+                                    | (Value::Json(_), DataType::Json | DataType::Jsonb)
+                                    | (Value::Timestamp(_), DataType::Timestamp | DataType::Timestamptz)
+                                    | (Value::Date(_), DataType::Date)
+                                );
+                            if needs_cast {
+                                new_value = evaluator.cast_value(new_value, target_type)?;
+                            }
                             *new_tuple.values.get_mut(col_index)
                                 .ok_or_else(|| Error::internal("column index out of bounds"))? = new_value;
                         }
@@ -1868,8 +1939,13 @@ impl EmbeddedDatabase {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
                 let schema_arc = std::sync::Arc::new(schema);
+                // Stamp source_table_name so qualified predicates
+                // `WHERE "t"."col" = …` resolve (B31).
+                let eval_schema = std::sync::Arc::new(
+                    (*schema_arc).clone().with_source_table_name(table_name),
+                );
                 let evaluator = sql::Evaluator::with_parameters(
-                    schema_arc.clone(),
+                    eval_schema,
                     vec![],
                 );
 
@@ -3276,12 +3352,23 @@ impl EmbeddedDatabase {
 
         // Build ordered tuple (columns may be in non-schema order)
         let mut tuple_values = vec![Value::Null; schema.columns.len()];
+        let mut user_provided = vec![false; schema.columns.len()];
         for (i, &col_idx) in col_indices.iter().enumerate() {
             if let Some(val) = values.get(i) {
                 if col_idx < tuple_values.len() {
                     tuple_values[col_idx] = val.clone();
+                    user_provided[col_idx] = true;
                 }
             }
+        }
+
+        // Apply DEFAULT expressions for omitted columns and enforce
+        // NOT NULL (B24 / B26). Evaluator errors here bubble up as the
+        // Result from this fast path — caller handles accordingly.
+        if let Err(e) = Self::apply_defaults_and_check_not_null(
+            &mut tuple_values, &schema, &user_provided,
+        ) {
+            return Some(Err(e));
         }
 
         let tuple = Tuple::new(tuple_values);
@@ -4150,7 +4237,9 @@ impl EmbeddedDatabase {
                 // Scan table to get all tuples with their row IDs
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
-                let evaluator = sql::Evaluator::new(std::sync::Arc::new(schema.clone()));
+                // Stamp source_table_name so qualified predicates resolve (B31).
+                let eval_schema = schema.clone().with_source_table_name(table_name);
+                let evaluator = sql::Evaluator::new(std::sync::Arc::new(eval_schema));
 
                 // Use branch-aware scan to get tuples (includes main + branch overrides - deleted)
                 let tuples = self.storage.scan_table_branch_aware(table_name)?;
@@ -4183,12 +4272,40 @@ impl EmbeddedDatabase {
                     };
 
                     if where_matches && rls_matches {
-                        // Apply updates
+                        // Apply updates — materialise any scalar
+                        // subqueries (including correlated ones) per
+                        // row before handing the expression to the
+                        // row-scoped evaluator.
                         for (col_name, value_expr) in assignments {
-                            let new_value = evaluator.evaluate(value_expr, &tuple)?;
+                            let bound = self.materialize_scalar_subqueries_for_row(
+                                value_expr, &tuple, &schema, table_name,
+                            )?;
+                            let mut new_value = evaluator.evaluate(&bound, &tuple)?;
                             // Find column index
                             let col_index = evaluator.schema().get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
+                            // Auto-cast to target column type (B34).
+                            let target_col = schema.get_column_at(col_index)
+                                .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
+                            let target_type = &target_col.data_type;
+                            let needs_cast = !matches!(&new_value, Value::Null)
+                                && !matches!(
+                                    (&new_value, target_type),
+                                    (Value::Vector(_), DataType::Vector(_))
+                                    | (Value::Int2(_), DataType::Int2)
+                                    | (Value::Int4(_), DataType::Int4)
+                                    | (Value::Int8(_), DataType::Int8)
+                                    | (Value::Float4(_), DataType::Float4)
+                                    | (Value::Float8(_), DataType::Float8)
+                                    | (Value::String(_), DataType::Text | DataType::Varchar(_))
+                                    | (Value::Boolean(_), DataType::Boolean)
+                                    | (Value::Json(_), DataType::Json | DataType::Jsonb)
+                                    | (Value::Timestamp(_), DataType::Timestamp | DataType::Timestamptz)
+                                    | (Value::Date(_), DataType::Date)
+                                );
+                            if needs_cast {
+                                new_value = evaluator.cast_value(new_value, target_type)?;
+                            }
                             if let Some(slot) = tuple.values.get_mut(col_index) {
                                 *slot = new_value;
                             }
@@ -4217,7 +4334,9 @@ impl EmbeddedDatabase {
                 // Scan table to get all tuples
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
-                let evaluator = sql::Evaluator::new(std::sync::Arc::new(schema.clone()));
+                // Stamp source_table_name so qualified predicates resolve (B31).
+                let eval_schema = schema.clone().with_source_table_name(table_name);
+                let evaluator = sql::Evaluator::new(std::sync::Arc::new(eval_schema));
 
                 // Use branch-aware scan to get tuples (includes main + branch overrides - deleted)
                 let tuples = self.storage.scan_table_branch_aware(table_name)?;
@@ -4918,6 +5037,28 @@ impl EmbeddedDatabase {
     /// Returns (rows_affected, returned_tuples) where returned_tuples is populated
     /// only when RETURNING clause is present in INSERT/UPDATE/DELETE statements.
     fn execute_plan_with_params(&self, plan: &sql::LogicalPlan, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
+        let result = self.execute_plan_with_params_inner(plan, params);
+        // Invalidate the result cache on any successful mutating plan.
+        // Without this, an earlier `SELECT ... WHERE col = 'v'` that
+        // returned `[]` (e.g. a login probe before register) is served
+        // from the cache forever — the `INSERT ... RETURNING` path
+        // routes through here and otherwise leaves the stale entry in
+        // place. See the B29 regression in `tests/drizzle_compat_tests.rs`.
+        if result.is_ok()
+            && matches!(
+                plan,
+                sql::LogicalPlan::Insert { .. }
+                    | sql::LogicalPlan::InsertSelect { .. }
+                    | sql::LogicalPlan::Update { .. }
+                    | sql::LogicalPlan::Delete { .. }
+            )
+        {
+            self.invalidate_result_cache();
+        }
+        result
+    }
+
+    fn execute_plan_with_params_inner(&self, plan: &sql::LogicalPlan, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
         match plan {
             sql::LogicalPlan::Insert { table_name, columns, values, returning, on_conflict: _ } => {
                 // Get table schema for column types
@@ -4935,7 +5076,15 @@ impl EmbeddedDatabase {
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
                 let mut count = 0;
                 for value_row in values {
-                    let mut tuple_values: Vec<Value> = Vec::new();
+                    // Always allocate a schema-sized tuple so omitted
+                    // columns stay aligned with the schema. Previously
+                    // this loop pushed values positionally, producing
+                    // short tuples whenever the user omitted any
+                    // column — which made `INSERT (n) VALUES ('x')
+                    // RETURNING *` return a one-field DataRow against
+                    // a two-field RowDescription.
+                    let mut tuple_values: Vec<Value> = vec![Value::Null; schema.columns.len()];
+                    let mut user_provided: Vec<bool> = vec![false; schema.columns.len()];
 
                     for (col_idx, expr) in value_row.iter().enumerate() {
                         let target_col_idx = if let Some(ref cols) = columns {
@@ -4946,6 +5095,14 @@ impl EmbeddedDatabase {
                         } else {
                             col_idx
                         };
+
+                        // `DEFAULT` inside VALUES — leave the slot
+                        // untouched so the default-fill pass treats
+                        // it as "omitted" and applies the column's
+                        // declared DEFAULT (or NULL if none).
+                        if matches!(expr, sql::LogicalExpr::DefaultValue) {
+                            continue;
+                        }
 
                         let target_col = schema.get_column_at(target_col_idx)
                             .ok_or_else(|| Error::query_execution(format!(
@@ -4976,17 +5133,55 @@ impl EmbeddedDatabase {
                             value = evaluator.cast_value(value, target_type)?;
                         }
 
-                        tuple_values.push(value);
+                        if let Some(slot) = tuple_values.get_mut(target_col_idx) {
+                            *slot = value;
+                        }
+                        if let Some(flag) = user_provided.get_mut(target_col_idx) {
+                            *flag = true;
+                        }
                     }
 
+                    // Apply DEFAULT expressions for omitted columns and
+                    // enforce NOT NULL. SERIAL / IDENTITY auto-fill still
+                    // runs inside the storage layer — we leave primary
+                    // keys NULL here on purpose so the counter picks the
+                    // row_id.
+                    Self::apply_defaults_and_check_not_null(
+                        &mut tuple_values, &schema, &user_provided,
+                    )?;
+
                     let tuple = Tuple::new(tuple_values);
-                    // Collect tuple for RETURNING clause before inserting
+                    // Insert first so the storage layer applies SERIAL /
+                    // IDENTITY auto-fill on NULL PK columns. Then read
+                    // the filled tuple back for RETURNING. This is the
+                    // only ordering that satisfies both:
+                    //   1. RETURNING must see the auto-generated PK.
+                    //   2. The storage engine owns the row_id counter.
+                    let row_id = self.storage.insert_tuple_branch_aware_with_schema(
+                        table_name, tuple.clone(), &schema,
+                    )?;
                     if has_returning {
-                        if let Some(projected) = Self::project_returning_columns(&tuple, &schema, returning) {
+                        let mut filled = tuple;
+                        for (i, col) in schema.columns.iter().enumerate() {
+                            if col.primary_key {
+                                if let Some(v) = filled.values.get(i) {
+                                    if matches!(v, Value::Null) {
+                                        if let Some(slot) = filled.values.get_mut(i) {
+                                            *slot = match col.data_type {
+                                                DataType::Int2 => Value::Int2(row_id as i16),
+                                                DataType::Int4 => Value::Int4(row_id as i32),
+                                                _ => Value::Int8(row_id as i64),
+                                            };
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        filled.row_id = Some(row_id);
+                        if let Some(projected) = Self::project_returning_columns(&filled, &schema, returning) {
                             returned_tuples.push(projected);
                         }
                     }
-                    self.storage.insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)?;
                     count += 1;
                 }
                 Ok((count, returned_tuples))
@@ -5066,8 +5261,12 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::Update { table_name, assignments, selection, returning } => {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
+                // Stamp source_table_name on every column so
+                // qualified predicates like `WHERE "t"."col" = $1`
+                // resolve against this evaluator schema (B31).
+                let eval_schema = schema.clone().with_source_table_name(table_name);
                 let evaluator = sql::Evaluator::with_parameters(
-                    std::sync::Arc::new(schema.clone()),
+                    std::sync::Arc::new(eval_schema),
                     params.to_vec(),
                 );
 
@@ -5088,9 +5287,42 @@ impl EmbeddedDatabase {
 
                     if matches {
                         for (col_name, value_expr) in assignments {
-                            let new_value = evaluator.evaluate(value_expr, &tuple)?;
+                            let bound = self.materialize_scalar_subqueries_for_row(
+                                value_expr, &tuple, &schema, table_name,
+                            )?;
+                            let mut new_value = evaluator.evaluate(&bound, &tuple)?;
                             let col_index = evaluator.schema().get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
+                            // Auto-cast SET values to the target
+                            // column type (B34). Drizzle binds
+                            // JavaScript `Date`s as ISO 8601 strings
+                            // against TIMESTAMP columns — without an
+                            // explicit cast the storage layer ended
+                            // up persisting NULL. INSERT already does
+                            // this; UPDATE must match.
+                            let target_col = schema.get_column_at(col_index)
+                                .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
+                            let target_type = &target_col.data_type;
+                            let needs_cast = match (&new_value, target_type) {
+                                (Value::Null, _) => false,
+                                (Value::Vector(_), DataType::Vector(_)) => false,
+                                (Value::String(_), DataType::Vector(_)) => true,
+                                (Value::String(_), DataType::Json | DataType::Jsonb) => true,
+                                (Value::Int2(_), DataType::Int2) => false,
+                                (Value::Int4(_), DataType::Int4) => false,
+                                (Value::Int8(_), DataType::Int8) => false,
+                                (Value::Float4(_), DataType::Float4) => false,
+                                (Value::Float8(_), DataType::Float8) => false,
+                                (Value::String(_), DataType::Text | DataType::Varchar(_)) => false,
+                                (Value::Boolean(_), DataType::Boolean) => false,
+                                (Value::Json(_), DataType::Json | DataType::Jsonb) => false,
+                                (Value::Timestamp(_), DataType::Timestamp | DataType::Timestamptz) => false,
+                                (Value::Date(_), DataType::Date) => false,
+                                _ => true,
+                            };
+                            if needs_cast {
+                                new_value = evaluator.cast_value(new_value, target_type)?;
+                            }
                             if let Some(slot) = tuple.values.get_mut(col_index) {
                                 *slot = new_value;
                             }
@@ -5117,8 +5349,9 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::Delete { table_name, selection, returning } => {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
+                let eval_schema = schema.clone().with_source_table_name(table_name);
                 let evaluator = sql::Evaluator::with_parameters(
-                    std::sync::Arc::new(schema.clone()),
+                    std::sync::Arc::new(eval_schema),
                     params.to_vec(),
                 );
 
@@ -5358,13 +5591,27 @@ impl EmbeddedDatabase {
             }
         }
 
-        // Check result cache first (returns cached query results for identical SQL)
-        if let Some(cached_results) = self.result_cache.lock().ok()
-            .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone))
-        {
-            tracing::debug!(phase = "result_cache", "Result cache hit");
-            self.log_slow_query(sql, start.elapsed(), cached_results.len() as u64);
-            return Ok((*cached_results).clone());
+        // Check result cache first (returns cached query results for identical SQL).
+        // Skip queries that contain non-deterministic side-effecting
+        // scalar functions — nextval/currval/setval mutate server-side
+        // state, and gen_random_uuid / random / now / clock_timestamp
+        // must return a fresh value every time. Caching any of these
+        // would serve stale rows to the caller.
+        let is_non_deterministic = {
+            let up = sql.to_ascii_uppercase();
+            ["NEXTVAL", "SETVAL", "CURRVAL", "GEN_RANDOM_UUID",
+             "UUID_GENERATE_V4", "RANDOM(", "NOW(", "CLOCK_TIMESTAMP"]
+                .iter()
+                .any(|m| up.contains(m))
+        };
+        if !is_non_deterministic {
+            if let Some(cached_results) = self.result_cache.lock().ok()
+                .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone))
+            {
+                tracing::debug!(phase = "result_cache", "Result cache hit");
+                self.log_slow_query(sql, start.elapsed(), cached_results.len() as u64);
+                return Ok((*cached_results).clone());
+            }
         }
 
         // Fast path: SELECT * FROM table WHERE pk = literal (skips full SQL parsing)
@@ -7132,6 +7379,212 @@ impl EmbeddedDatabase {
         Ok(count)
     }
 
+    /// Apply DEFAULT expressions to NULL-valued columns and enforce
+    /// NOT NULL constraints on a tuple before storage insert.
+    ///
+    /// * Skips the primary-key column — SERIAL / IDENTITY auto-fill
+    ///   runs inside the storage layer after this method returns.
+    /// * Skips columns already marked `primary_key`; the storage
+    ///   layer fills them with `row_id`.
+    /// * Defaults are applied only when the column slot is NULL
+    ///   *and* was omitted from the user's VALUES list. Explicitly
+    ///   providing `NULL` bypasses the default and surfaces as a
+    ///   NOT NULL violation — this matches stock PostgreSQL.
+    ///
+    /// `user_provided[i] = true` for every column index that appeared
+    /// in the INSERT's column list (or for positional inserts with
+    /// the column's index inside the provided VALUES row).
+    pub(crate) fn apply_defaults_and_check_not_null(
+        tuple_values: &mut [Value],
+        schema: &Schema,
+        user_provided: &[bool],
+    ) -> Result<()> {
+        let evaluator = sql::Evaluator::new(std::sync::Arc::new(schema.clone()));
+        let empty_tuple = Tuple::new(vec![]);
+
+        for (idx, col) in schema.columns.iter().enumerate() {
+            let slot = match tuple_values.get_mut(idx) {
+                Some(s) => s,
+                None => continue,
+            };
+            let is_null = matches!(slot, Value::Null);
+            let was_omitted = user_provided.get(idx).copied().unwrap_or(false) == false;
+
+            if is_null && was_omitted {
+                // Try the column's DEFAULT expression.
+                if let Some(json) = &col.default_expr {
+                    if let Ok(default_expr) = serde_json::from_str::<sql::LogicalExpr>(json) {
+                        if let Ok(v) = evaluator.evaluate(&default_expr, &empty_tuple) {
+                            let casted = if v.data_type() != col.data_type {
+                                evaluator.cast_value(v, &col.data_type).unwrap_or(Value::Null)
+                            } else {
+                                v
+                            };
+                            *slot = casted;
+                        }
+                    }
+                }
+            }
+
+            // After potential default application, enforce NOT NULL.
+            // Primary-key columns skip this check because SERIAL /
+            // IDENTITY auto-fill runs in the storage layer later.
+            if !col.nullable && !col.primary_key {
+                if matches!(slot, Value::Null) {
+                    return Err(Error::constraint_violation(format!(
+                        "NOT NULL constraint violated: cannot insert NULL into column '{}'",
+                        col.name
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Pre-evaluate any `ScalarSubquery` nodes inside `expr` against
+    /// the current outer row so that the regular evaluator (which
+    /// only sees the row) can run as normal.
+    ///
+    /// For correlated subqueries (refs to `outer_table`), we clone
+    /// the subquery plan and substitute every
+    /// `Column { table: Some(outer_table), name }` with the literal
+    /// value from `outer_row`. For uncorrelated cases the
+    /// substitution is a no-op. The substituted plan is executed
+    /// once per row; we take the first column of the first returned
+    /// row (or `Value::Null` for zero rows) — standard scalar
+    /// subquery semantics.
+    ///
+    /// Used by the UPDATE executor to support
+    /// `UPDATE t SET col = (SELECT … FROM other WHERE other.fk = t.id)`.
+    fn materialize_scalar_subqueries_for_row(
+        &self,
+        expr: &sql::LogicalExpr,
+        outer_row: &Tuple,
+        outer_schema: &Schema,
+        outer_table: &str,
+    ) -> Result<sql::LogicalExpr> {
+        use sql::LogicalExpr;
+        match expr {
+            LogicalExpr::ScalarSubquery { subquery } => {
+                // Substitute any outer-table column refs with literals.
+                let bound_plan = Self::bind_outer_refs_in_plan(
+                    subquery.as_ref(),
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                );
+                // Execute the (now-uncorrelated) plan.
+                let mut executor = sql::Executor::with_storage(&self.storage)
+                    .with_timeout(self.config.storage.query_timeout_ms);
+                let rows = executor.execute(&bound_plan)?;
+                let value = rows.first()
+                    .and_then(|t| t.values.first().cloned())
+                    .unwrap_or(Value::Null);
+                Ok(LogicalExpr::Literal(value))
+            }
+            LogicalExpr::BinaryExpr { left, op, right } => Ok(LogicalExpr::BinaryExpr {
+                left: Box::new(self.materialize_scalar_subqueries_for_row(left, outer_row, outer_schema, outer_table)?),
+                op: *op,
+                right: Box::new(self.materialize_scalar_subqueries_for_row(right, outer_row, outer_schema, outer_table)?),
+            }),
+            LogicalExpr::UnaryExpr { op, expr: inner } => Ok(LogicalExpr::UnaryExpr {
+                op: *op,
+                expr: Box::new(self.materialize_scalar_subqueries_for_row(inner, outer_row, outer_schema, outer_table)?),
+            }),
+            LogicalExpr::Cast { expr: inner, data_type } => Ok(LogicalExpr::Cast {
+                expr: Box::new(self.materialize_scalar_subqueries_for_row(inner, outer_row, outer_schema, outer_table)?),
+                data_type: data_type.clone(),
+            }),
+            // Everything else passes through unchanged.
+            other => Ok(other.clone()),
+        }
+    }
+
+    /// Walk a logical plan and replace any `Column { table: Some(t), name }`
+    /// where `t` matches `outer_table` with the literal value from
+    /// `outer_row[name]`. Used to turn a correlated scalar subquery
+    /// into an uncorrelated one per outer row.
+    fn bind_outer_refs_in_plan(
+        plan: &sql::LogicalPlan,
+        outer_row: &Tuple,
+        outer_schema: &Schema,
+        outer_table: &str,
+    ) -> sql::LogicalPlan {
+        use sql::LogicalPlan;
+        match plan {
+            LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
+                input: Box::new(Self::bind_outer_refs_in_plan(input, outer_row, outer_schema, outer_table)),
+                predicate: Self::bind_outer_refs_in_expr(predicate, outer_row, outer_schema, outer_table),
+            },
+            LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => LogicalPlan::Project {
+                input: Box::new(Self::bind_outer_refs_in_plan(input, outer_row, outer_schema, outer_table)),
+                exprs: exprs.iter()
+                    .map(|e| Self::bind_outer_refs_in_expr(e, outer_row, outer_schema, outer_table))
+                    .collect(),
+                aliases: aliases.clone(),
+                distinct: *distinct,
+                distinct_on: distinct_on.clone(),
+            },
+            LogicalPlan::Limit { input, limit, offset, limit_param, offset_param } => LogicalPlan::Limit {
+                input: Box::new(Self::bind_outer_refs_in_plan(input, outer_row, outer_schema, outer_table)),
+                limit: *limit,
+                offset: *offset,
+                limit_param: *limit_param,
+                offset_param: *offset_param,
+            },
+            LogicalPlan::Sort { input, exprs, asc } => LogicalPlan::Sort {
+                input: Box::new(Self::bind_outer_refs_in_plan(input, outer_row, outer_schema, outer_table)),
+                exprs: exprs.iter()
+                    .map(|e| Self::bind_outer_refs_in_expr(e, outer_row, outer_schema, outer_table))
+                    .collect(),
+                asc: asc.clone(),
+            },
+            other => other.clone(),
+        }
+    }
+
+    fn bind_outer_refs_in_expr(
+        expr: &sql::LogicalExpr,
+        outer_row: &Tuple,
+        outer_schema: &Schema,
+        outer_table: &str,
+    ) -> sql::LogicalExpr {
+        use sql::LogicalExpr;
+        match expr {
+            LogicalExpr::Column { table: Some(tbl), name } if tbl.eq_ignore_ascii_case(outer_table) => {
+                if let Some(idx) = outer_schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name)) {
+                    if let Some(v) = outer_row.values.get(idx) {
+                        return LogicalExpr::Literal(v.clone());
+                    }
+                }
+                expr.clone()
+            }
+            LogicalExpr::BinaryExpr { left, op, right } => LogicalExpr::BinaryExpr {
+                left: Box::new(Self::bind_outer_refs_in_expr(left, outer_row, outer_schema, outer_table)),
+                op: *op,
+                right: Box::new(Self::bind_outer_refs_in_expr(right, outer_row, outer_schema, outer_table)),
+            },
+            LogicalExpr::UnaryExpr { op, expr: inner } => LogicalExpr::UnaryExpr {
+                op: *op,
+                expr: Box::new(Self::bind_outer_refs_in_expr(inner, outer_row, outer_schema, outer_table)),
+            },
+            LogicalExpr::IsNull { expr: inner, is_null } => LogicalExpr::IsNull {
+                expr: Box::new(Self::bind_outer_refs_in_expr(inner, outer_row, outer_schema, outer_table)),
+                is_null: *is_null,
+            },
+            LogicalExpr::Between { expr: inner, low, high, negated } => LogicalExpr::Between {
+                expr: Box::new(Self::bind_outer_refs_in_expr(inner, outer_row, outer_schema, outer_table)),
+                low: Box::new(Self::bind_outer_refs_in_expr(low, outer_row, outer_schema, outer_table)),
+                high: Box::new(Self::bind_outer_refs_in_expr(high, outer_row, outer_schema, outer_table)),
+                negated: *negated,
+            },
+            LogicalExpr::ScalarSubquery { subquery } => LogicalExpr::ScalarSubquery {
+                subquery: Box::new(Self::bind_outer_refs_in_plan(subquery, outer_row, outer_schema, outer_table)),
+            },
+            other => other.clone(),
+        }
+    }
+
     /// Extract PK value from a simple WHERE clause like `pk_col = literal` or `literal = pk_col`.
     /// Returns None if the predicate is not a simple PK equality or no PK column exists.
     fn try_extract_pk_value(selection: Option<&sql::LogicalExpr>, schema: &Schema) -> Option<Value> {
@@ -7239,11 +7692,13 @@ impl EmbeddedDatabase {
                 })
             }
 
-            sql::LogicalPlan::Limit { input, limit, offset } => {
+            sql::LogicalPlan::Limit { input, limit, offset, limit_param, offset_param } => {
                 Ok(sql::LogicalPlan::Limit {
                     input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
                     limit,
                     offset,
+                    limit_param,
+                    offset_param,
                 })
             }
 

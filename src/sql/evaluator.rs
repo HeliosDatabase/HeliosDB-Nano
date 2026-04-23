@@ -124,9 +124,25 @@ impl Evaluator {
                     }
                     _ => {}
                 }
+                // Row-constructor comparison: `(a, b) <op> (c, d)` evaluates
+                // each side element-wise and compares lexicographically.
+                // Used for keyset pagination `WHERE (col, id) < ($1, $2)`.
+                if let (LogicalExpr::Tuple { items: l_items }, LogicalExpr::Tuple { items: r_items }) =
+                    (left.as_ref(), right.as_ref())
+                {
+                    return self.evaluate_tuple_compare(l_items, op, r_items, tuple);
+                }
                 let left_val = self.evaluate(left, tuple)?;
                 let right_val = self.evaluate(right, tuple)?;
                 self.evaluate_binary_op(&left_val, op, &right_val)
+            }
+
+            LogicalExpr::Tuple { .. } => {
+                // Bare tuples only make sense inside row-constructor
+                // comparisons, which we intercept in `BinaryExpr` above.
+                Err(Error::query_execution(
+                    "Row constructor used outside a comparison — expected (a, b) <op> (c, d)",
+                ))
             }
 
             LogicalExpr::UnaryExpr { op, expr } => {
@@ -273,6 +289,26 @@ impl Evaluator {
                 // This should be handled at the executor level, not evaluator
                 Err(Error::query_execution(
                     "IN subquery evaluation requires executor context. Use executor for subquery evaluation."
+                ))
+            }
+
+            LogicalExpr::DefaultValue => {
+                // `DEFAULT` keyword appearing outside an INSERT VALUES
+                // list — there's no target column to resolve against.
+                Err(Error::query_execution(
+                    "DEFAULT keyword is only valid inside INSERT … VALUES (…)"
+                ))
+            }
+
+            LogicalExpr::ScalarSubquery { .. } => {
+                // Scalar subquery must be materialised before evaluation.
+                // Uncorrelated ones are materialised by
+                // `Executor::materialize_subqueries`; correlated ones
+                // by the caller (see the UPDATE path).
+                Err(Error::query_execution(
+                    "Scalar subquery reached the evaluator without materialisation. \
+                     Correlated subqueries are only supported in UPDATE SET at the moment; \
+                     rewrite other uses as UPDATE … FROM joins or plain SELECT expressions."
                 ))
             }
 
@@ -581,7 +617,10 @@ impl Evaluator {
 
             // PostgreSQL compatibility functions (SQLAlchemy, psql, pgAdmin, DBeaver)
             "version" | "pg_catalog.version" => {
-                Ok(Value::String("PostgreSQL 16.0 (HeliosDB Nano 3.7.0)".to_string()))
+                Ok(Value::String(format!(
+                    "PostgreSQL 16.0 (HeliosDB Nano {})",
+                    env!("CARGO_PKG_VERSION")
+                )))
             }
             "current_schema" => {
                 Ok(Value::String("public".to_string()))
@@ -592,12 +631,229 @@ impl Evaluator {
             "current_user" | "session_user" => {
                 Ok(Value::String("heliosdb".to_string()))
             }
+            // Random UUID v4 — the default for Postgres 13+ PK columns.
+            "gen_random_uuid" | "pg_catalog.gen_random_uuid" | "uuid_generate_v4" => {
+                Ok(Value::Uuid(uuid::Uuid::new_v4()))
+            }
+
+            // `nextval('seq')` / `currval('seq')` / `setval('seq', n)`.
+            // Backed by the process-scoped sequence store in
+            // `crate::sql::sequences`. Returns Int8 to match Postgres.
+            "nextval" | "pg_catalog.nextval" => {
+                let name = match arg_values.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Null) => return Ok(Value::Null),
+                    _ => return Err(Error::query_execution(
+                        "nextval() requires a text argument (sequence name)",
+                    )),
+                };
+                Ok(Value::Int8(crate::sql::sequences::nextval(&name)))
+            }
+            "currval" | "pg_catalog.currval" => {
+                let name = match arg_values.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Null) => return Ok(Value::Null),
+                    _ => return Err(Error::query_execution(
+                        "currval() requires a text argument (sequence name)",
+                    )),
+                };
+                Ok(Value::Int8(crate::sql::sequences::currval(&name)))
+            }
+            "setval" | "pg_catalog.setval" => {
+                let name = match arg_values.first() {
+                    Some(Value::String(s)) => s.clone(),
+                    Some(Value::Null) => return Ok(Value::Null),
+                    _ => return Err(Error::query_execution(
+                        "setval() requires (text, integer) arguments",
+                    )),
+                };
+                let value = match arg_values.get(1) {
+                    Some(Value::Int8(n)) => *n,
+                    Some(Value::Int4(n)) => *n as i64,
+                    Some(Value::Int2(n)) => *n as i64,
+                    _ => return Err(Error::query_execution(
+                        "setval() second argument must be an integer",
+                    )),
+                };
+                Ok(Value::Int8(crate::sql::sequences::setval(&name, value)))
+            }
+            // Self-introspection: summarise what HeliosDB Nano supports
+            // vs. stock PostgreSQL. Useful for drivers / migration tools
+            // to probe at connect-time without guessing.
+            "heliosdb_capability_report" => {
+                Ok(Value::String(concat!(
+                    "HeliosDB Nano ", env!("CARGO_PKG_VERSION"), "\n",
+                    "  SERIAL / BIGSERIAL / GENERATED AS IDENTITY  : yes\n",
+                    "  ON CONFLICT DO NOTHING / DO UPDATE         : yes\n",
+                    "  RETURNING *                                : yes\n",
+                    "  EXTRACT(EPOCH|YEAR|MONTH|... FROM ...)     : yes\n",
+                    "  gen_random_uuid() / uuid_generate_v4()     : yes\n",
+                    "  Full-text search (tsvector/@@/ts_rank_cd)  : yes (unstemmed, no phrase)\n",
+                    "  pg_catalog.pg_type / pg_tables / pg_indexes: yes\n",
+                    "  Keyset pagination (row constructor <,<=,=) : yes\n",
+                    "  Dollar-quoted strings $$text$$             : yes\n",
+                    "  DO $$ plain-SQL body $$                    : yes (no PL/pgSQL control flow)\n",
+                    "  Multi-statement simple query (Q message)   : yes\n",
+                    "  Case-folding of unquoted identifiers       : yes (lowercase, PG-compatible)\n",
+                    "  CREATE SEQUENCE / nextval / currval / setval: yes\n",
+                    "  GIN / GiST indexes                         : DDL accepted, no backing store yet\n",
+                    "  PL/pgSQL control flow (IF/LOOP/RAISE)      : no — use procedures\n",
+                    "  Language-specific FTS stemmers             : no — tokenize + lowercase only\n",
+                ).to_string()))
+            }
+
+            // EXTRACT(<field> FROM <expr>) — the planner lowers these
+            // to `__extract_<field>(expr)` so we don't need a separate
+            // match arm for Expr::Extract.
+            f if f.starts_with("__extract_") => {
+                let field = &f["__extract_".len()..];
+                Self::extract_field(field, &arg_values)
+            }
+
+            // ---- Postgres full-text search (FTS) ----
+            // `to_tsvector(text)` and `to_tsvector(config, text)`:
+            // tokenise with the shared search::tokenizer and return a
+            // JSON-encoded array of normalised tokens. The optional
+            // `config` argument (e.g. 'english') is accepted for
+            // compatibility but ignored — we use a single Unicode-word
+            // tokenizer regardless.
+            "to_tsvector" | "pg_catalog.to_tsvector" => {
+                Self::fts_build_from_text(&arg_values, "to_tsvector")
+            }
+            // `to_tsquery(text)` / `plainto_tsquery(text)`: same encoding
+            // as tsvector. `to_tsquery` normally understands `&`, `|`,
+            // `!`, `<->`; we treat those as term separators (no boolean
+            // logic, no phrase queries — documented limitation).
+            "to_tsquery" | "plainto_tsquery" | "phraseto_tsquery"
+            | "pg_catalog.to_tsquery" | "pg_catalog.plainto_tsquery" => {
+                Self::fts_build_from_text(&arg_values, fun)
+            }
+            // `ts_rank_cd(doc, query)` / `ts_rank(doc, query)`: run BM25
+            // against a 1-document index built on the fly. Returns
+            // Float8 in the 0..~10 range, higher = more relevant.
+            // Optional `weights` and `normalization` args are accepted
+            // for signature compatibility but ignored.
+            "ts_rank" | "ts_rank_cd" => {
+                Self::fts_score(&arg_values)
+            }
 
             _ => Err(Error::query_execution(format!(
                 "Unknown scalar function: {}",
                 fun
             ))),
         }
+    }
+
+    // ---- Postgres FTS helpers ----
+    //
+    // Internal representation of `tsvector` / `tsquery`:
+    //   `Value::Json(serde_json::to_string(&["tok1","tok2",...]))`.
+    // This lets the value flow through the whole pipeline (wire
+    // protocol, storage, bincode) unchanged while still being
+    // introspectable by psql and clients as a JSON array. Full Postgres
+    // fidelity (positions, weights, phrase queries) is intentionally
+    // out of scope — see docs/compatibility/fts.md.
+
+    fn fts_build_from_text(args: &[Value], fn_name: &str) -> Result<Value> {
+        // Accept (text) or (config, text); first arg is treated as
+        // config iff there are exactly two args.
+        let text_val = match args.len() {
+            1 => &args[0],
+            2 => &args[1],
+            n => return Err(Error::query_execution(format!(
+                "{fn_name} expects 1 or 2 arguments, got {n}"
+            ))),
+        };
+        let text = match text_val {
+            Value::Null => return Ok(Value::Null),
+            Value::String(s) => s.as_str(),
+            Value::Json(s) => s.as_str(),
+            _ => return Err(Error::query_execution(format!(
+                "{fn_name} expects text argument"
+            ))),
+        };
+        let tokens = crate::search::tokenizer::tokenize(text);
+        let json = serde_json::to_string(&tokens)
+            .map_err(|e| Error::query_execution(format!("tsvector encode: {e}")))?;
+        Ok(Value::Json(json))
+    }
+
+    /// Decode a tsvector/tsquery value back into a `Vec<String>`.
+    /// Accepts:
+    ///   • `Value::Json("[\"a\",\"b\"]")` — our canonical encoding.
+    ///   • `Value::String("'a' 'b' 'c'")` — a Postgres-style tsvector
+    ///     printout (tokens quoted, separated by spaces). We fall back
+    ///     to plain tokenisation if parsing the quoted form fails.
+    ///   • `Value::Array([String, ...])` — if someone hand-builds one.
+    fn fts_decode_tokens(v: &Value) -> Vec<String> {
+        match v {
+            Value::Json(s) => serde_json::from_str::<Vec<String>>(s).unwrap_or_else(|_| {
+                // Fall back: treat as raw text if JSON parse fails.
+                crate::search::tokenizer::tokenize(s)
+            }),
+            Value::String(s) => crate::search::tokenizer::tokenize(s),
+            Value::Array(items) => items.iter().filter_map(|v| match v {
+                Value::String(s) => Some(s.clone()),
+                _ => None,
+            }).collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    fn fts_score(args: &[Value]) -> Result<Value> {
+        // Signature: ts_rank[_cd]([weights,] doc, query [, normalization])
+        // We only use `doc` and `query` — the rest are accepted for
+        // compatibility and ignored.
+        let (doc, query) = match args.len() {
+            2 => (&args[0], &args[1]),
+            3 => (&args[0], &args[1]),      // weights, doc, query  — ignore weights[0]? no, skip
+            4 => (&args[1], &args[2]),      // weights, doc, query, norm
+            n => return Err(Error::query_execution(format!(
+                "ts_rank expects 2..4 arguments, got {n}"
+            ))),
+        };
+        // Handle the 3-arg form: PG's 3-arg signature is
+        // `ts_rank(doc, query, normalization)`, so check if args[0] is
+        // a tsvector-like value (Json/String with tokens).
+        let (doc, query) = if args.len() == 3 {
+            // Heuristic: if the first arg is a numeric array / weights,
+            // skip it; otherwise args[0]=doc, args[1]=query, args[2]=norm.
+            (doc, query)
+        } else {
+            (doc, query)
+        };
+
+        if matches!(doc, Value::Null) || matches!(query, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let doc_tokens = Self::fts_decode_tokens(doc);
+        let q_tokens = Self::fts_decode_tokens(query);
+        if doc_tokens.is_empty() || q_tokens.is_empty() {
+            return Ok(Value::Float8(0.0));
+        }
+        // Build an ephemeral 1-doc BM25 index and score.
+        let idx = crate::search::Bm25Index::new();
+        idx.add_document(1, &doc_tokens.join(" "));
+        let query_str = q_tokens.join(" ");
+        let hits = idx.score(&query_str, Some(1));
+        let score = hits.first().map(|h| h.score).unwrap_or(0.0);
+        Ok(Value::Float8(score))
+    }
+
+    /// tsvector @@ tsquery: true iff any query term appears in the document.
+    pub(crate) fn evaluate_ts_match(left: &Value, right: &Value) -> Result<Value> {
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let doc_tokens = Self::fts_decode_tokens(left);
+        let q_tokens = Self::fts_decode_tokens(right);
+        if q_tokens.is_empty() {
+            return Ok(Value::Boolean(false));
+        }
+        let doc_set: std::collections::HashSet<&str> =
+            doc_tokens.iter().map(String::as_str).collect();
+        let matched = q_tokens.iter().any(|t| doc_set.contains(t.as_str()));
+        Ok(Value::Boolean(matched))
     }
 
     // ---- MySQL date/time helper functions (WordPress compatibility) ----
@@ -733,6 +989,104 @@ impl Evaluator {
         }
         let d = Self::value_to_naive_date(arg)?;
         Ok(Value::Date(d))
+    }
+
+    /// `EXTRACT(<field> FROM <timestamp|date|interval>)` — the planner
+    /// lowers this into a call to `__extract_<field>(expr)` so we can
+    /// dispatch here with all the normal function-evaluation
+    /// machinery (null propagation, type inference).
+    ///
+    /// Returns `Float8` for `Epoch` / sub-second fields (matching
+    /// Postgres' `double precision` output) and `Int4` for calendar
+    /// fields (year, month, day, hour, minute, dow, doy, week, quarter).
+    fn extract_field(field: &str, args: &[Value]) -> Result<Value> {
+        use chrono::{Datelike, Timelike};
+        let [arg] = args else {
+            return Err(Error::query_execution(format!(
+                "EXTRACT({field}) requires exactly one argument"
+            )));
+        };
+        if matches!(arg, Value::Null) {
+            return Ok(Value::Null);
+        }
+
+        // EPOCH is the one field that works on any temporal type
+        // (timestamp, date, interval) and returns Float8 (seconds).
+        if field == "epoch" {
+            let secs = match arg {
+                Value::Timestamp(ts) => {
+                    ts.timestamp() as f64 + ts.timestamp_subsec_nanos() as f64 / 1e9
+                }
+                Value::Date(d) => d
+                    .and_hms_opt(0, 0, 0)
+                    .map(|dt| dt.and_utc().timestamp() as f64)
+                    .unwrap_or(0.0),
+                Value::Time(t) => {
+                    (t.num_seconds_from_midnight() as f64)
+                        + (t.nanosecond() as f64) / 1e9
+                }
+                Value::Interval(us) => *us as f64 / 1e6,
+                Value::Int8(n) => *n as f64, // treat as unix seconds
+                Value::Int4(n) => *n as f64,
+                Value::String(s) => Self::value_to_naive_datetime(&Value::String(s.clone()))?
+                    .and_utc()
+                    .timestamp() as f64,
+                _ => return Err(Error::query_execution(format!(
+                    "EXTRACT(EPOCH) does not accept {:?}",
+                    arg
+                ))),
+            };
+            return Ok(Value::Float8(secs));
+        }
+
+        // Interval extraction: components measured as ints.
+        if let Value::Interval(us) = arg {
+            let total_secs = (*us as i64) / 1_000_000;
+            return Ok(Value::Int4(match field {
+                "year" | "years" => (total_secs / (365 * 24 * 3600)) as i32,
+                "month" | "months" => ((total_secs / (30 * 24 * 3600)) % 12) as i32,
+                "day" | "days" => (total_secs / (24 * 3600)) as i32,
+                "hour" | "hours" => ((total_secs / 3600) % 24) as i32,
+                "minute" | "minutes" => ((total_secs / 60) % 60) as i32,
+                "second" | "seconds" => (total_secs % 60) as i32,
+                _ => return Err(Error::query_execution(format!(
+                    "EXTRACT({field}) from interval not supported"
+                ))),
+            }));
+        }
+
+        // Date / timestamp / string: dispatch on field.
+        let ndt = Self::value_to_naive_datetime(arg)?;
+        let out = match field {
+            "year" | "years" => ndt.year(),
+            "month" | "months" => ndt.month() as i32,
+            "day" | "days" => ndt.day() as i32,
+            "hour" | "hours" => ndt.hour() as i32,
+            "minute" | "minutes" => ndt.minute() as i32,
+            "second" | "seconds" => ndt.second() as i32,
+            "dow" => ndt.weekday().num_days_from_sunday() as i32,
+            "isodow" => ndt.weekday().number_from_monday() as i32,
+            "doy" => ndt.ordinal() as i32,
+            "week" => ndt.iso_week().week() as i32,
+            "quarter" => ((ndt.month() - 1) / 3 + 1) as i32,
+            "decade" => ndt.year() / 10,
+            "century" => (ndt.year() - 1) / 100 + 1,
+            "millennium" => (ndt.year() - 1) / 1000 + 1,
+            "millisecond" | "milliseconds" => {
+                return Ok(Value::Float8(
+                    ndt.second() as f64 + ndt.nanosecond() as f64 / 1e6,
+                ))
+            }
+            "microsecond" | "microseconds" => {
+                return Ok(Value::Float8(
+                    ndt.second() as f64 * 1e6 + ndt.nanosecond() as f64 / 1e3,
+                ))
+            }
+            _ => return Err(Error::query_execution(format!(
+                "EXTRACT({field}) is not supported"
+            ))),
+        };
+        Ok(Value::Int4(out))
     }
 
     /// YEAR(date) — extract the year from a date/timestamp. Returns Int4.
@@ -1936,6 +2290,9 @@ impl Evaluator {
             // String concatenation: ||
             BinaryOperator::StringConcat => self.string_concat_op(left, right),
 
+            // Full-text search match: tsvector @@ tsquery
+            BinaryOperator::TsMatch => Self::evaluate_ts_match(left, right),
+
             // String pattern matching (LIKE)
             BinaryOperator::Like => self.like_op(left, right, false),
             BinaryOperator::NotLike => self.like_op(left, right, true),
@@ -2003,6 +2360,108 @@ impl Evaluator {
                 op
             ))),
         }
+    }
+
+    /// Lexicographic row-constructor comparison:
+    /// `(a1, a2, …) <op> (b1, b2, …)` compares element-by-element with
+    /// three-valued logic. Supports Eq/NotEq/Lt/LtEq/Gt/GtEq.
+    fn evaluate_tuple_compare(
+        &self,
+        left: &[LogicalExpr],
+        op: &super::BinaryOperator,
+        right: &[LogicalExpr],
+        tuple: &Tuple,
+    ) -> Result<Value> {
+        use super::BinaryOperator as Op;
+        if left.len() != right.len() {
+            return Err(Error::query_execution(format!(
+                "Row constructor size mismatch: {} vs {}",
+                left.len(),
+                right.len()
+            )));
+        }
+
+        // Evaluate pairs from left to right; for Eq/NotEq we can
+        // short-circuit on the first inequality, for ordering ops we
+        // walk until we find the first non-equal pair.
+        let mut saw_null = false;
+        for (l_expr, r_expr) in left.iter().zip(right.iter()) {
+            let l_val = self.evaluate(l_expr, tuple)?;
+            let r_val = self.evaluate(r_expr, tuple)?;
+
+            if matches!(l_val, Value::Null) || matches!(r_val, Value::Null) {
+                // NULL makes the pair comparison unknown — propagate.
+                saw_null = true;
+                continue;
+            }
+
+            let eq = self.compare_values(&l_val, &r_val, |c| c.is_eq())?;
+            let is_eq = matches!(eq, Value::Boolean(true));
+            if is_eq {
+                continue;
+            }
+
+            // First unequal pair decides the comparison.
+            return match op {
+                Op::Eq => Ok(Value::Boolean(false)),
+                Op::NotEq => Ok(Value::Boolean(true)),
+                Op::Lt => self.compare_values(&l_val, &r_val, |c| c.is_lt()),
+                Op::LtEq => self.compare_values(&l_val, &r_val, |c| c.is_lt()),
+                Op::Gt => self.compare_values(&l_val, &r_val, |c| c.is_gt()),
+                Op::GtEq => self.compare_values(&l_val, &r_val, |c| c.is_gt()),
+                _ => Err(Error::query_execution(format!(
+                    "Operator {:?} not supported on row constructors",
+                    op
+                ))),
+            };
+        }
+
+        // All pairs equal (or NULL).
+        if saw_null {
+            return Ok(Value::Null);
+        }
+        match op {
+            Op::Eq | Op::LtEq | Op::GtEq => Ok(Value::Boolean(true)),
+            Op::NotEq | Op::Lt | Op::Gt => Ok(Value::Boolean(false)),
+            _ => Err(Error::query_execution(format!(
+                "Operator {:?} not supported on row constructors",
+                op
+            ))),
+        }
+    }
+
+    /// Parse an ISO-8601 / PG-timestamp string into a UTC DateTime.
+    /// Accepts the same formats the TIMESTAMP cast path accepts —
+    /// RFC 3339 (`2026-04-23T00:00:00Z`, `…+00:00`), space-separated
+    /// (`2026-04-23 00:00:00[.ffffff]`), and date-only
+    /// (`2026-04-23`, treated as midnight UTC).
+    fn parse_timestamp_string(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+        use chrono::Utc;
+        if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(s) {
+            return Some(ts.with_timezone(&Utc));
+        }
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+            return Some(chrono::DateTime::from_naive_utc_and_offset(ndt, Utc));
+        }
+        if let Ok(ndt) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
+            return Some(chrono::DateTime::from_naive_utc_and_offset(ndt, Utc));
+        }
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+            if let Some(ndt) = d.and_hms_opt(0, 0, 0) {
+                return Some(chrono::DateTime::from_naive_utc_and_offset(ndt, Utc));
+            }
+        }
+        None
+    }
+
+    /// Parse a date string into a NaiveDate. Accepts `YYYY-MM-DD` and
+    /// the leading date portion of an ISO 8601 timestamp.
+    fn parse_date_string(s: &str) -> Option<chrono::NaiveDate> {
+        if let Ok(d) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+            return Some(d);
+        }
+        // Fall back to parsing a timestamp and extracting the date.
+        Self::parse_timestamp_string(s).map(|ts| ts.date_naive())
     }
 
     /// Compare two values using a comparison function
@@ -2179,6 +2638,38 @@ impl Evaluator {
             // Timestamp to Date comparisons (compare dates only)
             (Value::Timestamp(a), Value::Date(b)) => a.date_naive().cmp(b),
             (Value::Date(a), Value::Timestamp(b)) => a.cmp(&b.date_naive()),
+
+            // Timestamp ↔ String: implicit coercion mirrors stock
+            // PostgreSQL, which accepts `timestamp = 'YYYY-MM-DD…'`
+            // by casting the literal to TIMESTAMP. Drizzle binds
+            // JavaScript `Date`s as ISO 8601 strings into gte/lte
+            // helpers over OID 1114 columns — without this the
+            // analytics endpoints fail with "Cannot compare" (B32).
+            (Value::Timestamp(a), Value::String(b)) => {
+                match Self::parse_timestamp_string(b) {
+                    Some(b_ts) => a.cmp(&b_ts),
+                    None => a.to_rfc3339().as_str().cmp(b.as_str()),
+                }
+            }
+            (Value::String(a), Value::Timestamp(b)) => {
+                match Self::parse_timestamp_string(a) {
+                    Some(a_ts) => a_ts.cmp(b),
+                    None => a.as_str().cmp(b.to_rfc3339().as_str()),
+                }
+            }
+            // Date ↔ String: same rationale for `date` columns.
+            (Value::Date(a), Value::String(b)) => {
+                match Self::parse_date_string(b) {
+                    Some(b_d) => a.cmp(&b_d),
+                    None => a.to_string().as_str().cmp(b.as_str()),
+                }
+            }
+            (Value::String(a), Value::Date(b)) => {
+                match Self::parse_date_string(a) {
+                    Some(a_d) => a_d.cmp(b),
+                    None => a.as_str().cmp(b.to_string().as_str()),
+                }
+            }
 
             // String-to-Integer coercion (MySQL compatibility: WHERE int_col = '0')
             (Value::String(a), Value::Int2(b)) => {

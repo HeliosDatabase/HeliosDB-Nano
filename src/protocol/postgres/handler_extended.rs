@@ -37,14 +37,33 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             param_types.clone()
         };
 
-        // Derive result schema from query plan (gracefully handle failures)
-        // If schema derivation fails (e.g., table doesn't exist), we still
-        // create the prepared statement. The actual error will surface during Execute.
-        let result_schema = match self.derive_result_schema(&statement) {
-            Ok(schema) => schema,
-            Err(e) => {
-                tracing::debug!("Schema derivation failed (will fail at execute): {}", e);
-                None
+        // Derive result schema from query plan (gracefully handle failures).
+        // If planning fails (e.g., table doesn't exist, unknown function), we
+        // still create the prepared statement. For `SELECT` specifically,
+        // fall back to a best-effort schema derived straight from the
+        // projection list so Describe never sends `NoData` for a query that
+        // actually returns rows — SQLAlchemy's psycopg dialect calls
+        // `_row_as_tuple_getter` on that metadata and raises
+        // NotImplementedError if it's missing.
+        // Catalog-first derivation: if this is a SELECT against
+        // pg_catalog / information_schema, get the schema from our
+        // catalog emulator so Describe returns the right
+        // RowDescription. Otherwise fall through to plan-based
+        // derivation + the AST-based fallback.
+        let catalog_schema = self.catalog
+            .handle_query(&query)
+            .ok()
+            .flatten()
+            .map(|(schema, _)| schema);
+        let result_schema = if let Some(s) = catalog_schema {
+            Some(s)
+        } else {
+            match self.derive_result_schema(&statement) {
+                Ok(schema) => schema,
+                Err(e) => {
+                    tracing::debug!("Schema derivation failed (falling back to AST): {}", e);
+                    Self::synthesise_schema_from_ast(&statement)
+                }
             }
         };
 
@@ -189,6 +208,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         };
 
         if is_select {
+            // Catalog fast path — `pg_catalog.pg_type` and friends must
+            // resolve on the extended query protocol too, not just on
+            // simple-Q. `postgres-js`, `pg`, `psycopg` all do their
+            // connect-time type introspection through Parse / Bind /
+            // Execute; without this route, every driver gets a
+            // spurious `Table 'pg_catalog.pg_type' does not exist`.
+            if let Some(catalog_result) = self.catalog.handle_query(&executed_query)? {
+                // Mark the portal complete and emit DataRows + CommandComplete
+                // directly against the catalog-emulated result.
+                self.prepared_statements.update_portal_state(
+                    &portal_name,
+                    PortalState::Complete,
+                )?;
+                for row in &catalog_result.1 {
+                    let values = super::handler::tuple_to_pg_values(row);
+                    self.send_message(BackendMessage::DataRow { values }).await?;
+                }
+                let tag = format!("SELECT {}", catalog_result.1.len());
+                self.send_command_complete(&tag).await?;
+                return Ok(());
+            }
+
             // SELECT query - return result set
             let results = self.database.query(&executed_query, &[])?;
 
@@ -234,6 +275,36 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             let tag = format!("SELECT {}", results_to_send.len());
             self.send_command_complete(&tag).await?;
         } else {
+            // INSERT / UPDATE / DELETE with RETURNING must route through
+            // `execute_returning` — otherwise the tuples are dropped and
+            // Drizzle's `.returning()` / psycopg's fetchone() see no rows
+            // even though the write succeeded. Detection mirrors
+            // `handle_query`'s `is_dml_returning` check.
+            let upper = executed_query.to_uppercase();
+            let is_dml_returning = upper.contains("RETURNING")
+                && (super::handler::starts_with_icase(executed_query.trim(), "INSERT")
+                    || super::handler::starts_with_icase(executed_query.trim(), "UPDATE")
+                    || super::handler::starts_with_icase(executed_query.trim(), "DELETE"));
+            if is_dml_returning {
+                let (affected, tuples) = self.database.execute_returning(&executed_query)?;
+                self.prepared_statements.update_portal_state(&portal_name, PortalState::Complete)?;
+                // RowDescription was already sent during Describe; Execute
+                // only emits DataRows + CommandComplete.
+                for row in &tuples {
+                    let values = super::handler::tuple_to_pg_values(row);
+                    self.send_message(BackendMessage::DataRow { values }).await?;
+                }
+                let tag = if super::handler::starts_with_icase(executed_query.trim(), "INSERT") {
+                    format!("INSERT 0 {}", affected)
+                } else if super::handler::starts_with_icase(executed_query.trim(), "UPDATE") {
+                    format!("UPDATE {}", affected)
+                } else {
+                    format!("DELETE {}", affected)
+                };
+                self.send_command_complete(&tag).await?;
+                return Ok(());
+            }
+
             // Non-SELECT query
             let affected = self.database.execute(&executed_query)?;
             let tag = self.get_command_tag(&executed_query, affected);
@@ -447,6 +518,47 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             }
             // For any other statement types, assume no result schema
             _ => Ok(None),
+        }
+    }
+
+    /// Best-effort schema extraction straight from the `Statement::Query`
+    /// projection list, used as a fallback when full planner-based schema
+    /// derivation fails. Returns `None` for non-queries or when no
+    /// projection names can be extracted.
+    ///
+    /// All columns are typed as `Text` because we don't know the real
+    /// types without planning; psycopg accepts that and will coerce on
+    /// the client side. The goal is purely to keep `Describe` from
+    /// degrading to `NoData` for a SELECT, which breaks SQLAlchemy's
+    /// `_row_as_tuple_getter`.
+    fn synthesise_schema_from_ast(statement: &sqlparser::ast::Statement) -> Option<crate::Schema> {
+        use sqlparser::ast::{Statement, SetExpr, SelectItem};
+
+        let query = if let Statement::Query(q) = statement { q } else { return None; };
+        let select = if let SetExpr::Select(s) = &*query.body { s } else { return None; };
+
+        let columns: Vec<crate::Column> = select.projection.iter().enumerate().map(|(i, item)| {
+            let name = match item {
+                SelectItem::UnnamedExpr(expr) => Self::expr_column_label(expr).unwrap_or_else(|| format!("column{}", i + 1)),
+                SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => format!("column{}", i + 1),
+            };
+            crate::Column::new(name, crate::DataType::Text)
+        }).collect();
+
+        if columns.is_empty() { None } else { Some(crate::Schema::new(columns)) }
+    }
+
+    /// Pick a reasonable label for an unaliased SELECT expression — column
+    /// name for `Expr::Identifier`, rightmost part of a compound
+    /// identifier, function name for a call, or None otherwise.
+    fn expr_column_label(expr: &sqlparser::ast::Expr) -> Option<String> {
+        use sqlparser::ast::Expr;
+        match expr {
+            Expr::Identifier(ident) => Some(ident.value.clone()),
+            Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.value.clone()),
+            Expr::Function(f) => f.name.to_string().split('.').last().map(|s| s.to_string()),
+            _ => None,
         }
     }
 

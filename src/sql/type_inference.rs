@@ -205,6 +205,19 @@ impl TypeInference for LogicalExpr {
                 Ok(DataType::Boolean)
             }
 
+            // Scalar subquery: type is the first column of the subplan
+            LogicalExpr::ScalarSubquery { subquery } => {
+                subquery.schema().columns.first()
+                    .map(|c| c.data_type.clone())
+                    .ok_or_else(|| Error::type_conversion(
+                        "Scalar subquery returned no columns".to_string()
+                    ))
+            }
+
+            // DEFAULT marker — the real type is the target column's,
+            // resolved by the INSERT executor at execute time.
+            LogicalExpr::DefaultValue => Ok(DataType::Text),
+
             // EXISTS subquery: always returns boolean
             LogicalExpr::Exists { .. } => {
                 Ok(DataType::Boolean)
@@ -244,6 +257,12 @@ impl TypeInference for LogicalExpr {
                     )),
                 }
             }
+
+            // Row constructor: only appears inside comparisons, where the
+            // overall expression type is Boolean. If someone asks for the
+            // type of a bare tuple, fall back to Boolean (caller will error
+            // at evaluation time anyway).
+            LogicalExpr::Tuple { .. } => Ok(DataType::Boolean),
 
             // Window function: infer based on function type
             LogicalExpr::WindowFunction { fun, args, .. } => {
@@ -387,6 +406,12 @@ impl TypeInference for LogicalExpr {
             // IN subquery: never nullable (always returns boolean)
             LogicalExpr::InSubquery { .. } => false,
 
+            // Scalar subquery: may return zero rows → NULL.
+            LogicalExpr::ScalarSubquery { .. } => true,
+
+            // DEFAULT marker — nullable iff the column is.
+            LogicalExpr::DefaultValue => true,
+
             // EXISTS subquery: never nullable (always returns boolean)
             LogicalExpr::Exists { .. } => false,
 
@@ -412,6 +437,10 @@ impl TypeInference for LogicalExpr {
 
             // Array subscript: arr[n] is nullable (could be out of bounds or null input)
             LogicalExpr::ArraySubscript { .. } => true,
+
+            // Row constructor: boolean comparison, nullable only if any
+            // inner element is nullable.
+            LogicalExpr::Tuple { items } => items.iter().any(|e| e.infer_nullable(schema)),
 
             // Window function: most are nullable
             LogicalExpr::WindowFunction { fun, .. } => {
@@ -483,7 +512,9 @@ fn coerce_binary_types(left: DataType, right: DataType, op: &BinaryOperator) -> 
         BinaryOperator::ILike | BinaryOperator::NotILike |
         BinaryOperator::RegexMatch | BinaryOperator::RegexIMatch |
         BinaryOperator::NotRegexMatch | BinaryOperator::NotRegexIMatch |
-        BinaryOperator::SimilarTo | BinaryOperator::NotSimilarTo => {
+        BinaryOperator::SimilarTo | BinaryOperator::NotSimilarTo |
+        // FTS match
+        BinaryOperator::TsMatch => {
             Ok(DataType::Boolean)
         }
 

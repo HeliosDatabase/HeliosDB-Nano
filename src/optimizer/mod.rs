@@ -287,12 +287,14 @@ impl Optimizer {
                     asc,
                 }
             }
-            LogicalPlan::Limit { input, limit, offset } => {
+            LogicalPlan::Limit { input, limit, offset, limit_param, offset_param } => {
                 let optimized_input = self.optimize_recursive(*input)?;
                 LogicalPlan::Limit {
                     input: Box::new(optimized_input),
                     limit,
                     offset,
+                    limit_param,
+                    offset_param,
                 }
             }
             // InsertSelect - optimize the source sub-plan

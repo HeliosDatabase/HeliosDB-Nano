@@ -538,6 +538,12 @@ impl ProjectionPruningRule {
                 // Collect from the main expression; subquery columns are independent
                 Self::collect_used_columns(expr, columns);
             }
+            LogicalExpr::ScalarSubquery { .. } => {
+                // Subquery columns are independent of the outer plan.
+            }
+            LogicalExpr::DefaultValue => {
+                // DEFAULT marker has no outer-column dependencies.
+            }
             LogicalExpr::Exists { .. } => {
                 // EXISTS subquery has no direct column references from outer query
                 // (correlated subqueries would need different handling)
@@ -561,6 +567,11 @@ impl ProjectionPruningRule {
                 }
                 for (expr, _) in order_by {
                     Self::collect_used_columns(expr, columns);
+                }
+            }
+            LogicalExpr::Tuple { items } => {
+                for item in items {
+                    Self::collect_used_columns(item, columns);
                 }
             }
             LogicalExpr::Literal(_) |
