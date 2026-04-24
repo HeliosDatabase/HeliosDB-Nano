@@ -288,20 +288,13 @@ pub mod code_graph;
 #[cfg(feature = "graph-rag")]
 pub mod graph_rag;
 
-// Native MCP endpoint (FR 5) — JSON-RPC over HTTP on top of the
-// `mcp_extensions` tool catalogue. Additive — not required for
-// embedded-mode callers. Mount `mcp_http::handle_rpc` on the
-// Axum route of your choice.
+// Native MCP endpoint (FR 5) — JSON-RPC 2.0 surface over a unified
+// tool + resource catalogue. Reusable from stdio, HTTP, WebSocket,
+// SSE. See `src/mcp/rpc.rs` for the pure dispatcher and
+// `src/mcp/server.rs` for the stdio transport used by
+// `heliosdb-nano mcp-server`.
 #[cfg(feature = "mcp-endpoint")]
-pub mod mcp_http;
-// NOTE: `mcp` module exists on disk but its server.rs / tools.rs reference
-// EmbeddedDatabase methods (query_branch, execute_branch, merge_branches,
-// query_at_timestamp, ...) that no longer exist on the current API. Enabling
-// it would require an mcp-wide refactor that's out of scope. The external project
-// idea-5 tool *handlers* live in `mcp_extensions` instead and can be
-// folded back into the legacy mcp module once the upstream API drift is
-// reconciled. See BLOCKER_idea_5.md for details.
-pub mod mcp_extensions; // Standalone MCP idea-5 tool handlers (RAG-native)
+pub mod mcp;
 
 // Experimental modules (require feature flags)
 // DISABLED: Sync module has compilation issues and is 85% complete

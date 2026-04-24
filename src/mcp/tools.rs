@@ -1,233 +1,214 @@
-//! MCP Tool definitions for HeliosDB
+//! Unified MCP tool catalogue for HeliosDB-Nano.
 //!
-//! Provides the tool implementations that Claude can use to interact with the database.
+//! Combines two families of tools under a single dispatcher:
+//!
+//! * **DB-backed** (`heliosdb_query`, `heliosdb_schema`, `heliosdb_list_tables`,
+//!   `heliosdb_create_table`, `heliosdb_insert`, `heliosdb_branch_create`,
+//!   `heliosdb_branch_list`, `heliosdb_branch_merge`, `heliosdb_search`,
+//!   `heliosdb_time_travel`) — require an `EmbeddedDatabase` reference.
+//! * **In-process** (`heliosdb_bm25_index`, `heliosdb_hybrid_search`,
+//!   `heliosdb_graph_add_edge`, `heliosdb_graph_traverse`, `heliosdb_graph_path`,
+//!   `heliosdb_embed_and_store`) — use process-static BM25 / graph state
+//!   so they work from transports that don't thread a DB through.
+//!
+//! The dispatcher takes `Option<&EmbeddedDatabase>` so the same entry
+//! point is reusable from the stdio server (has DB) and from HTTP
+//! handlers that may choose to expose only the in-process subset.
 
-use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::sync::Arc;
 
-use crate::EmbeddedDatabase;
-use super::protocol::{Tool, ToolResult};
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
+use serde::Deserialize;
+use serde_json::{json, Value as JsonValue};
 
-/// Get all available tools
-pub fn get_tools() -> Vec<Tool> {
-    vec![
+use crate::graph::{
+    sql as graph_sql,
+    storage::{Edge, GraphStore},
+};
+use crate::search::{hybrid::bm25_hits, hybrid_search, Bm25Index, FusionMethod, ScoredHit};
+use crate::{EmbeddedDatabase, Tuple, Value};
+
+use super::protocol::Tool;
+
+/// Process-wide BM25 indexes keyed by user-supplied name.
+pub static BM25_INDEXES: Lazy<DashMap<String, Arc<Bm25Index>>> = Lazy::new(DashMap::new);
+
+/// Process-wide graph store used by `graph_traverse` / `graph_path`.
+pub static GRAPH_STORE: Lazy<Arc<GraphStore>> = Lazy::new(|| Arc::new(GraphStore::new()));
+
+/// MCP-style tool descriptor: name, human description, JSON-schema input.
+#[derive(Debug, Clone)]
+pub struct ToolDescriptor {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub input_schema: JsonValue,
+}
+
+impl ToolDescriptor {
+    pub fn to_tool(&self) -> Tool {
         Tool {
-            name: "heliosdb_query".to_string(),
-            description: "Execute a SQL query on the database. Returns query results as JSON.".to_string(),
+            name: self.name.to_string(),
+            description: self.description.to_string(),
+            input_schema: self.input_schema.clone(),
+        }
+    }
+}
+
+/// Result of a tool invocation.
+#[derive(Debug, Clone)]
+pub struct ToolOutcome {
+    pub is_error: bool,
+    pub payload: JsonValue,
+}
+
+impl ToolOutcome {
+    pub fn ok(v: JsonValue) -> Self {
+        Self { is_error: false, payload: v }
+    }
+    pub fn err<E: ToString>(e: E) -> Self {
+        Self { is_error: true, payload: json!({ "error": e.to_string() }) }
+    }
+}
+
+/// Full catalogue of tools — DB-backed and in-process alike. The stdio
+/// server advertises all of them; an HTTP handler without a DB can still
+/// list them but will error out on DB-backed `tools/call` requests.
+#[must_use]
+pub fn list_tools() -> Vec<ToolDescriptor> {
+    let mut out = db_tools();
+    out.extend(in_process_tools());
+    out
+}
+
+fn db_tools() -> Vec<ToolDescriptor> {
+    vec![
+        ToolDescriptor {
+            name: "heliosdb_query",
+            description: "Execute a SQL query against the database. Returns rows as JSON arrays.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "sql": {
-                        "type": "string",
-                        "description": "The SQL query to execute"
-                    },
-                    "params": {
-                        "type": "array",
-                        "items": {},
-                        "description": "Query parameters for parameterized queries",
-                        "default": []
-                    },
-                    "branch": {
-                        "type": "string",
-                        "description": "Branch to query (default: main)",
-                        "default": "main"
-                    }
+                    "sql": { "type": "string" },
+                    "params": { "type": "array", "items": {}, "default": [] },
+                    "branch": { "type": "string", "default": "main" }
                 },
                 "required": ["sql"]
             }),
         },
-        Tool {
-            name: "heliosdb_schema".to_string(),
-            description: "Get the schema of a table including columns, types, and indexes.".to_string(),
+        ToolDescriptor {
+            name: "heliosdb_schema",
+            description: "Return the column list of a given table from the catalog.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "table": {
-                        "type": "string",
-                        "description": "Name of the table to get schema for"
-                    },
-                    "branch": {
-                        "type": "string",
-                        "description": "Branch to query (default: main)",
-                        "default": "main"
-                    }
+                    "table":  { "type": "string" },
+                    "branch": { "type": "string", "default": "main" }
                 },
                 "required": ["table"]
             }),
         },
-        Tool {
-            name: "heliosdb_list_tables".to_string(),
-            description: "List all tables in the database.".to_string(),
+        ToolDescriptor {
+            name: "heliosdb_list_tables",
+            description: "List all user tables (filters out helios_* / mv_* internals).",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "branch": {
-                        "type": "string",
-                        "description": "Branch to list tables from (default: main)",
-                        "default": "main"
-                    }
+                    "branch": { "type": "string", "default": "main" }
                 }
             }),
         },
-        Tool {
-            name: "heliosdb_create_table".to_string(),
-            description: "Create a new table in the database.".to_string(),
+        ToolDescriptor {
+            name: "heliosdb_create_table",
+            description: "Create a new table with the given columns.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Name of the table to create"
-                    },
+                    "name": { "type": "string" },
                     "columns": {
                         "type": "array",
                         "items": {
                             "type": "object",
                             "properties": {
-                                "name": { "type": "string" },
-                                "type": { "type": "string" },
-                                "nullable": { "type": "boolean", "default": true },
+                                "name":        { "type": "string" },
+                                "type":        { "type": "string" },
+                                "nullable":    { "type": "boolean", "default": true },
                                 "primary_key": { "type": "boolean", "default": false }
                             },
                             "required": ["name", "type"]
-                        },
-                        "description": "Column definitions"
+                        }
                     },
-                    "branch": {
-                        "type": "string",
-                        "description": "Branch to create table on (default: main)",
-                        "default": "main"
-                    }
+                    "branch": { "type": "string", "default": "main" }
                 },
                 "required": ["name", "columns"]
             }),
         },
-        Tool {
-            name: "heliosdb_insert".to_string(),
-            description: "Insert rows into a table.".to_string(),
+        ToolDescriptor {
+            name: "heliosdb_insert",
+            description: "Insert one or more rows into a table.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "table": {
-                        "type": "string",
-                        "description": "Name of the table to insert into"
-                    },
-                    "rows": {
-                        "type": "array",
-                        "items": {
-                            "type": "object"
-                        },
-                        "description": "Array of row objects to insert"
-                    },
-                    "branch": {
-                        "type": "string",
-                        "description": "Branch to insert into (default: main)",
-                        "default": "main"
-                    }
+                    "table":  { "type": "string" },
+                    "rows":   { "type": "array", "items": { "type": "object" } },
+                    "branch": { "type": "string", "default": "main" }
                 },
                 "required": ["table", "rows"]
             }),
         },
-        Tool {
-            name: "heliosdb_branch_create".to_string(),
-            description: "Create a new branch from an existing branch.".to_string(),
+        ToolDescriptor {
+            name: "heliosdb_branch_create",
+            description: "Create a new branch (copy-on-write) starting from an existing one.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "name": {
-                        "type": "string",
-                        "description": "Name for the new branch"
-                    },
-                    "from_branch": {
-                        "type": "string",
-                        "description": "Branch to create from (default: main)",
-                        "default": "main"
-                    }
+                    "name":        { "type": "string" },
+                    "from_branch": { "type": "string", "default": "main" }
                 },
                 "required": ["name"]
             }),
         },
-        Tool {
-            name: "heliosdb_branch_list".to_string(),
-            description: "List all branches in the database.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {}
-            }),
+        ToolDescriptor {
+            name: "heliosdb_branch_list",
+            description: "List every branch known to the database.",
+            input_schema: json!({ "type": "object", "properties": {} }),
         },
-        Tool {
-            name: "heliosdb_branch_merge".to_string(),
-            description: "Merge a branch into another branch.".to_string(),
+        ToolDescriptor {
+            name: "heliosdb_branch_merge",
+            description: "Merge a source branch into a target branch.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "source": {
-                        "type": "string",
-                        "description": "Source branch to merge from"
-                    },
-                    "target": {
-                        "type": "string",
-                        "description": "Target branch to merge into (default: main)",
-                        "default": "main"
-                    }
+                    "source": { "type": "string" },
+                    "target": { "type": "string", "default": "main" }
                 },
                 "required": ["source"]
             }),
         },
-        Tool {
-            name: "heliosdb_search".to_string(),
-            description: "Perform semantic vector search on a table with vector embeddings.".to_string(),
+        ToolDescriptor {
+            name: "heliosdb_search",
+            description: "Vector-similarity search over a table with an embedding column.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "table": {
-                        "type": "string",
-                        "description": "Table to search in"
-                    },
-                    "vector": {
-                        "type": "array",
-                        "items": { "type": "number" },
-                        "description": "Query vector for similarity search"
-                    },
-                    "vector_column": {
-                        "type": "string",
-                        "description": "Column containing vectors",
-                        "default": "embedding"
-                    },
-                    "top_k": {
-                        "type": "integer",
-                        "description": "Number of results to return",
-                        "default": 10
-                    },
-                    "branch": {
-                        "type": "string",
-                        "description": "Branch to search in (default: main)",
-                        "default": "main"
-                    }
+                    "table":         { "type": "string" },
+                    "vector":        { "type": "array", "items": { "type": "number" } },
+                    "vector_column": { "type": "string", "default": "embedding" },
+                    "top_k":         { "type": "integer", "default": 10 },
+                    "branch":        { "type": "string", "default": "main" }
                 },
                 "required": ["table", "vector"]
             }),
         },
-        Tool {
-            name: "heliosdb_time_travel".to_string(),
-            description: "Query the database at a specific point in time.".to_string(),
+        ToolDescriptor {
+            name: "heliosdb_time_travel",
+            description: "Run a read-only query against a historical snapshot via AS OF TIMESTAMP.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "sql": {
-                        "type": "string",
-                        "description": "SQL query to execute"
-                    },
-                    "timestamp": {
-                        "type": "string",
-                        "description": "ISO 8601 timestamp to query at"
-                    },
-                    "branch": {
-                        "type": "string",
-                        "description": "Branch to query (default: main)",
-                        "default": "main"
-                    }
+                    "sql":       { "type": "string" },
+                    "timestamp": { "type": "string", "description": "ISO-8601 timestamp" },
+                    "branch":    { "type": "string", "default": "main" }
                 },
                 "required": ["sql", "timestamp"]
             }),
@@ -235,367 +216,907 @@ pub fn get_tools() -> Vec<Tool> {
     ]
 }
 
-/// Tool input types
-#[derive(Debug, Deserialize)]
-pub struct QueryInput {
-    pub sql: String,
-    #[serde(default)]
-    pub params: Vec<serde_json::Value>,
-    #[serde(default = "default_branch")]
-    pub branch: String,
+fn in_process_tools() -> Vec<ToolDescriptor> {
+    vec![
+        ToolDescriptor {
+            name: "heliosdb_bm25_index",
+            description: "Create or replace an in-memory BM25 index from a list of (doc_id, text) documents.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string" },
+                    "documents": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "doc_id": { "type": "integer" },
+                                "text":   { "type": "string"  }
+                            },
+                            "required": ["doc_id", "text"]
+                        }
+                    }
+                },
+                "required": ["name", "documents"]
+            }),
+        },
+        ToolDescriptor {
+            name: "heliosdb_hybrid_search",
+            description: "Hybrid BM25 + vector search with RRF / MMR / weighted-linear fusion.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "index_name":  { "type": "string" },
+                    "query_text":  { "type": "string" },
+                    "vector_hits": { "type": "array", "default": [] },
+                    "fusion":      { "type": "string", "enum": ["rrf", "mmr", "linear"], "default": "rrf" },
+                    "lambda":      { "type": "number",  "default": 0.5 },
+                    "limit":       { "type": "integer", "default": 10 }
+                },
+                "required": ["index_name", "query_text"]
+            }),
+        },
+        ToolDescriptor {
+            name: "heliosdb_graph_add_edge",
+            description: "Add a directed edge to the in-process graph store.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "from":   { "type": "string" },
+                    "to":     { "type": "string" },
+                    "label":  { "type": "string", "default": "edge" },
+                    "weight": { "type": "number", "default": 1.0 }
+                },
+                "required": ["from", "to"]
+            }),
+        },
+        ToolDescriptor {
+            name: "heliosdb_graph_traverse",
+            description: "BFS traversal from a starting node, with optional label filter and depth bound.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "start":      { "type": "string" },
+                    "edge_label": { "type": "string" },
+                    "direction":  { "type": "string", "default": "out" },
+                    "depth":      { "type": "integer", "default": 3 }
+                },
+                "required": ["start"]
+            }),
+        },
+        ToolDescriptor {
+            name: "heliosdb_graph_path",
+            description: "Shortest-path query using BFS, Dijkstra, or bidirectional BFS.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "from":       { "type": "string" },
+                    "to":         { "type": "string" },
+                    "algorithm":  { "type": "string", "default": "bfs" },
+                    "direction":  { "type": "string", "default": "out" },
+                    "edge_label": { "type": "string" }
+                },
+                "required": ["from", "to"]
+            }),
+        },
+        ToolDescriptor {
+            name: "heliosdb_embed_and_store",
+            description: "Stash a (doc_id, text) tuple into a BM25 index (auto-created on first call).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "index_name": { "type": "string" },
+                    "doc_id":     { "type": "integer" },
+                    "text":       { "type": "string" }
+                },
+                "required": ["index_name", "doc_id", "text"]
+            }),
+        },
+    ]
 }
 
-#[derive(Debug, Deserialize)]
-pub struct SchemaInput {
-    pub table: String,
-    #[serde(default = "default_branch")]
-    pub branch: String,
-}
+/// Unified dispatch. In-process tools ignore `db`; DB-backed tools error
+/// with a clear message when `db` is `None`.
+pub fn call_tool(db: Option<&EmbeddedDatabase>, name: &str, args: JsonValue) -> ToolOutcome {
+    match name {
+        "heliosdb_query" => require_db(db, "heliosdb_query", |d| do_query(d, args)),
+        "heliosdb_schema" => require_db(db, "heliosdb_schema", |d| do_schema(d, args)),
+        "heliosdb_list_tables" => require_db(db, "heliosdb_list_tables", |d| do_list_tables(d, args)),
+        "heliosdb_create_table" => require_db(db, "heliosdb_create_table", |d| do_create_table(d, args)),
+        "heliosdb_insert" => require_db(db, "heliosdb_insert", |d| do_insert(d, args)),
+        "heliosdb_branch_create" => require_db(db, "heliosdb_branch_create", |d| do_branch_create(d, args)),
+        "heliosdb_branch_list" => require_db(db, "heliosdb_branch_list", |d| do_branch_list(d)),
+        "heliosdb_branch_merge" => require_db(db, "heliosdb_branch_merge", |d| do_branch_merge(d, args)),
+        "heliosdb_search" => require_db(db, "heliosdb_search", |d| do_search(d, args)),
+        "heliosdb_time_travel" => require_db(db, "heliosdb_time_travel", |d| do_time_travel(d, args)),
 
-#[derive(Debug, Deserialize)]
-pub struct ListTablesInput {
-    #[serde(default = "default_branch")]
-    pub branch: String,
-}
+        "heliosdb_bm25_index" => do_bm25_index(args),
+        "heliosdb_hybrid_search" => do_hybrid_search(args),
+        "heliosdb_graph_add_edge" => do_graph_add_edge(args),
+        "heliosdb_graph_traverse" => do_graph_traverse(args),
+        "heliosdb_graph_path" => do_graph_path(args),
+        "heliosdb_embed_and_store" => do_embed_and_store(args),
 
-#[derive(Debug, Deserialize)]
-pub struct CreateTableInput {
-    pub name: String,
-    pub columns: Vec<ColumnDef>,
-    #[serde(default = "default_branch")]
-    pub branch: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ColumnDef {
-    pub name: String,
-    #[serde(rename = "type")]
-    pub col_type: String,
-    #[serde(default)]
-    pub nullable: bool,
-    #[serde(default)]
-    pub primary_key: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct InsertInput {
-    pub table: String,
-    pub rows: Vec<serde_json::Map<String, serde_json::Value>>,
-    #[serde(default = "default_branch")]
-    pub branch: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BranchCreateInput {
-    pub name: String,
-    #[serde(default = "default_branch")]
-    pub from_branch: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct BranchMergeInput {
-    pub source: String,
-    #[serde(default = "default_branch")]
-    pub target: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct SearchInput {
-    pub table: String,
-    pub vector: Vec<f32>,
-    #[serde(default = "default_vector_column")]
-    pub vector_column: String,
-    #[serde(default = "default_top_k")]
-    pub top_k: usize,
-    #[serde(default = "default_branch")]
-    pub branch: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct TimeTravelInput {
-    pub sql: String,
-    pub timestamp: String,
-    #[serde(default = "default_branch")]
-    pub branch: String,
-}
-
-fn default_branch() -> String {
-    "main".to_string()
-}
-
-fn default_vector_column() -> String {
-    "embedding".to_string()
-}
-
-fn default_top_k() -> usize {
-    10
-}
-
-/// Execute a tool with the given name and arguments
-pub async fn execute_tool(
-    db: Arc<EmbeddedDatabase>,
-    tool_name: &str,
-    args: serde_json::Value,
-) -> ToolResult {
-    match tool_name {
-        "heliosdb_query" => execute_query(db, args).await,
-        "heliosdb_schema" => execute_schema(db, args).await,
-        "heliosdb_list_tables" => execute_list_tables(db, args).await,
-        "heliosdb_create_table" => execute_create_table(db, args).await,
-        "heliosdb_insert" => execute_insert(db, args).await,
-        "heliosdb_branch_create" => execute_branch_create(db, args).await,
-        "heliosdb_branch_list" => execute_branch_list(db, args).await,
-        "heliosdb_branch_merge" => execute_branch_merge(db, args).await,
-        "heliosdb_search" => execute_search(db, args).await,
-        "heliosdb_time_travel" => execute_time_travel(db, args).await,
-        _ => ToolResult::error(format!("Unknown tool: {}", tool_name)),
+        other => ToolOutcome::err(format!("unknown tool '{other}'")),
     }
 }
 
-async fn execute_query(db: Arc<EmbeddedDatabase>, args: serde_json::Value) -> ToolResult {
+fn require_db<F>(db: Option<&EmbeddedDatabase>, tool: &str, f: F) -> ToolOutcome
+where
+    F: FnOnce(&EmbeddedDatabase) -> ToolOutcome,
+{
+    match db {
+        Some(d) => f(d),
+        None => ToolOutcome::err(format!(
+            "tool '{tool}' requires a database connection; this transport is in-process-only"
+        )),
+    }
+}
+
+// ---- Branch scoping helper --------------------------------------------
+
+/// Run `f` with the active branch set to `branch`, restoring the previous
+/// branch afterwards. `branch == "main"` and `branch == current` both
+/// skip the switch.
+fn with_branch<F, R>(db: &EmbeddedDatabase, branch: &str, f: F) -> crate::Result<R>
+where
+    F: FnOnce(&EmbeddedDatabase) -> crate::Result<R>,
+{
+    let previous = db.storage.get_current_branch();
+    let current = previous.as_deref().unwrap_or("main");
+    if branch == current {
+        return f(db);
+    }
+    if branch != "main" {
+        db.switch_branch(branch)?;
+    } else {
+        // "main" requested while on a non-main branch: switch off.
+        db.switch_branch("main")?;
+    }
+    let result = f(db);
+    // Restore — best-effort.
+    if let Some(prev) = previous {
+        if prev != branch {
+            let _ = db.switch_branch(&prev);
+        }
+    } else if branch != "main" {
+        let _ = db.switch_branch("main");
+    }
+    result
+}
+
+// ---- DB tool input structs --------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct QueryInput {
+    sql: String,
+    #[serde(default)]
+    params: Vec<JsonValue>,
+    #[serde(default = "default_branch")]
+    branch: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SchemaInput {
+    table: String,
+    #[serde(default = "default_branch")]
+    branch: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListTablesInput {
+    #[serde(default = "default_branch")]
+    branch: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateTableInput {
+    name: String,
+    columns: Vec<ColumnDef>,
+    #[serde(default = "default_branch")]
+    branch: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ColumnDef {
+    name: String,
+    #[serde(rename = "type")]
+    col_type: String,
+    #[serde(default = "default_true")]
+    nullable: bool,
+    #[serde(default)]
+    primary_key: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct InsertInput {
+    table: String,
+    rows: Vec<serde_json::Map<String, JsonValue>>,
+    #[serde(default = "default_branch")]
+    branch: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BranchCreateInput {
+    name: String,
+    #[serde(default = "default_branch")]
+    from_branch: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct BranchMergeInput {
+    source: String,
+    #[serde(default = "default_branch")]
+    target: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SearchInput {
+    table: String,
+    vector: Vec<f32>,
+    #[serde(default = "default_vector_column")]
+    vector_column: String,
+    #[serde(default = "default_top_k")]
+    top_k: usize,
+    #[serde(default = "default_branch")]
+    branch: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TimeTravelInput {
+    sql: String,
+    timestamp: String,
+    #[serde(default = "default_branch")]
+    branch: String,
+}
+
+fn default_branch() -> String { "main".to_string() }
+fn default_vector_column() -> String { "embedding".to_string() }
+fn default_top_k() -> usize { 10 }
+fn default_true() -> bool { true }
+
+// ---- DB-backed handlers ------------------------------------------------
+
+fn do_query(db: &EmbeddedDatabase, args: JsonValue) -> ToolOutcome {
     let input: QueryInput = match serde_json::from_value(args) {
         Ok(v) => v,
-        Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
     };
-
-    // Convert JSON params to internal format
-    let params: Vec<crate::Value> = input.params.iter().map(json_to_value).collect();
-
-    match db.query_branch(&input.branch, &input.sql, params) {
-        Ok(result) => {
-            let output = json!({
-                "columns": result.columns.iter().map(|(name, _)| name).collect::<Vec<_>>(),
-                "rows": result.rows,
-                "row_count": result.rows.len()
-            });
-            ToolResult::json(&output)
-        }
-        Err(e) => ToolResult::error(format!("Query failed: {}", e)),
-    }
+    let params: Vec<Value> = input.params.iter().map(json_to_value).collect();
+    let run = |d: &EmbeddedDatabase| d.query_params(&input.sql, &params);
+    let rows = match with_branch(db, &input.branch, run) {
+        Ok(r) => r,
+        Err(e) => return ToolOutcome::err(format!("query failed: {e}")),
+    };
+    ToolOutcome::ok(json!({
+        "branch": input.branch,
+        "row_count": rows.len(),
+        "rows": rows.iter().map(tuple_to_json).collect::<Vec<_>>(),
+    }))
 }
 
-async fn execute_schema(db: Arc<EmbeddedDatabase>, args: serde_json::Value) -> ToolResult {
+fn do_schema(db: &EmbeddedDatabase, args: JsonValue) -> ToolOutcome {
     let input: SchemaInput = match serde_json::from_value(args) {
         Ok(v) => v,
-        Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
     };
-
-    // Get table info via query
-    let sql = format!(
-        "SELECT column_name, data_type, is_nullable FROM information_schema.columns WHERE table_name = '{}'",
-        input.table.replace('\'', "''")
-    );
-
-    match db.query_branch(&input.branch, &sql, vec![]) {
-        Ok(result) => {
-            let output = json!({
-                "table": input.table,
-                "columns": result.rows
-            });
-            ToolResult::json(&output)
-        }
-        Err(e) => ToolResult::error(format!("Failed to get schema: {}", e)),
-    }
+    let lookup = |d: &EmbeddedDatabase| d.storage.catalog().get_table_schema(&input.table);
+    let schema = match with_branch(db, &input.branch, lookup) {
+        Ok(s) => s,
+        Err(e) => return ToolOutcome::err(format!("schema lookup failed: {e}")),
+    };
+    let cols: Vec<JsonValue> = schema
+        .columns
+        .iter()
+        .map(|c| {
+            json!({
+                "name": c.name,
+                "data_type": format!("{:?}", c.data_type),
+                "nullable": c.nullable,
+                "primary_key": c.primary_key,
+            })
+        })
+        .collect();
+    ToolOutcome::ok(json!({
+        "table": input.table,
+        "branch": input.branch,
+        "columns": cols,
+    }))
 }
 
-async fn execute_list_tables(db: Arc<EmbeddedDatabase>, args: serde_json::Value) -> ToolResult {
+fn do_list_tables(db: &EmbeddedDatabase, args: JsonValue) -> ToolOutcome {
     let input: ListTablesInput = match serde_json::from_value(args) {
         Ok(v) => v,
-        Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
     };
-
-    let sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'";
-
-    match db.query_branch(&input.branch, sql, vec![]) {
-        Ok(result) => {
-            let tables: Vec<String> = result.rows.iter()
-                .filter_map(|row| row.first())
-                .filter_map(|v| {
-                    if let crate::Value::String(s) = v {
-                        Some(s.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect();
-            ToolResult::json(&json!({ "tables": tables }))
-        }
-        Err(e) => ToolResult::error(format!("Failed to list tables: {}", e)),
-    }
+    let run = |d: &EmbeddedDatabase| d.storage.catalog().list_tables();
+    let names = match with_branch(db, &input.branch, run) {
+        Ok(r) => r,
+        Err(e) => return ToolOutcome::err(format!("list tables failed: {e}")),
+    };
+    let user_tables: Vec<String> = names
+        .into_iter()
+        .filter(|n| !n.starts_with("helios_") && !n.starts_with("mv_"))
+        .collect();
+    ToolOutcome::ok(json!({ "branch": input.branch, "tables": user_tables }))
 }
 
-async fn execute_create_table(db: Arc<EmbeddedDatabase>, args: serde_json::Value) -> ToolResult {
+fn do_create_table(db: &EmbeddedDatabase, args: JsonValue) -> ToolOutcome {
     let input: CreateTableInput = match serde_json::from_value(args) {
         Ok(v) => v,
-        Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
     };
-
-    let columns: Vec<String> = input.columns.iter().map(|col| {
-        let mut def = format!("{} {}", col.name, col.col_type);
-        if !col.nullable {
-            def.push_str(" NOT NULL");
-        }
-        if col.primary_key {
-            def.push_str(" PRIMARY KEY");
-        }
-        def
-    }).collect();
-
+    let columns: Vec<String> = input
+        .columns
+        .iter()
+        .map(|c| {
+            let mut s = format!("{} {}", c.name, c.col_type);
+            if !c.nullable {
+                s.push_str(" NOT NULL");
+            }
+            if c.primary_key {
+                s.push_str(" PRIMARY KEY");
+            }
+            s
+        })
+        .collect();
     let sql = format!("CREATE TABLE {} ({})", input.name, columns.join(", "));
-
-    match db.execute_branch(&input.branch, &sql, vec![]) {
-        Ok(_) => ToolResult::text(format!("Table '{}' created successfully", input.name)),
-        Err(e) => ToolResult::error(format!("Failed to create table: {}", e)),
+    let run = |d: &EmbeddedDatabase| d.execute(&sql);
+    match with_branch(db, &input.branch, run) {
+        Ok(_) => ToolOutcome::ok(json!({
+            "table": input.name,
+            "branch": input.branch,
+            "created": true,
+        })),
+        Err(e) => ToolOutcome::err(format!("create table failed: {e}")),
     }
 }
 
-async fn execute_insert(db: Arc<EmbeddedDatabase>, args: serde_json::Value) -> ToolResult {
+fn do_insert(db: &EmbeddedDatabase, args: JsonValue) -> ToolOutcome {
     let input: InsertInput = match serde_json::from_value(args) {
         Ok(v) => v,
-        Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
     };
-
     if input.rows.is_empty() {
-        return ToolResult::error("No rows to insert".to_string());
+        return ToolOutcome::err("no rows to insert");
     }
-
-    let mut total_inserted = 0;
-
-    for row in &input.rows {
-        let columns: Vec<&str> = row.keys().map(|s| s.as_str()).collect();
-        let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("${}", i)).collect();
-        let values: Vec<crate::Value> = row.values().map(json_to_value).collect();
-
-        let sql = format!(
-            "INSERT INTO {} ({}) VALUES ({})",
-            input.table,
-            columns.join(", "),
-            placeholders.join(", ")
-        );
-
-        match db.execute_branch(&input.branch, &sql, values) {
-            Ok(_) => total_inserted += 1,
-            Err(e) => return ToolResult::error(format!("Insert failed: {}", e)),
+    let run = |d: &EmbeddedDatabase| -> crate::Result<usize> {
+        let mut inserted = 0usize;
+        for row in &input.rows {
+            let columns: Vec<&str> = row.keys().map(String::as_str).collect();
+            let placeholders: Vec<String> =
+                (1..=columns.len()).map(|i| format!("${i}")).collect();
+            let values: Vec<Value> = row.values().map(json_to_value).collect();
+            let sql = format!(
+                "INSERT INTO {} ({}) VALUES ({})",
+                input.table,
+                columns.join(", "),
+                placeholders.join(", ")
+            );
+            d.execute_params(&sql, &values)?;
+            inserted += 1;
         }
+        Ok(inserted)
+    };
+    match with_branch(db, &input.branch, run) {
+        Ok(n) => ToolOutcome::ok(json!({
+            "table": input.table,
+            "branch": input.branch,
+            "inserted": n,
+        })),
+        Err(e) => ToolOutcome::err(format!("insert failed: {e}")),
     }
-
-    ToolResult::text(format!("Inserted {} row(s) into '{}'", total_inserted, input.table))
 }
 
-async fn execute_branch_create(db: Arc<EmbeddedDatabase>, args: serde_json::Value) -> ToolResult {
+fn do_branch_create(db: &EmbeddedDatabase, args: JsonValue) -> ToolOutcome {
     let input: BranchCreateInput = match serde_json::from_value(args) {
         Ok(v) => v,
-        Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
     };
-
-    match db.create_branch(&input.name, &input.from_branch) {
-        Ok(_) => ToolResult::text(format!(
-            "Branch '{}' created from '{}'",
-            input.name, input.from_branch
-        )),
-        Err(e) => ToolResult::error(format!("Failed to create branch: {}", e)),
+    // Create from the requested parent branch: switch to it first, then
+    // create. Restore afterwards.
+    let parent_scope = |d: &EmbeddedDatabase| d.create_branch(&input.name);
+    match with_branch(db, &input.from_branch, parent_scope) {
+        Ok(_) => ToolOutcome::ok(json!({
+            "branch": input.name,
+            "from": input.from_branch,
+            "created": true,
+        })),
+        Err(e) => ToolOutcome::err(format!("branch create failed: {e}")),
     }
 }
 
-async fn execute_branch_list(db: Arc<EmbeddedDatabase>, _args: serde_json::Value) -> ToolResult {
-    match db.list_branches() {
-        Ok(branches) => ToolResult::json(&json!({ "branches": branches })),
-        Err(e) => ToolResult::error(format!("Failed to list branches: {}", e)),
+fn do_branch_list(db: &EmbeddedDatabase) -> ToolOutcome {
+    match db.storage.list_branches() {
+        Ok(rows) => {
+            let names: Vec<String> = rows.into_iter().map(|b| b.name).collect();
+            ToolOutcome::ok(json!({ "branches": names }))
+        }
+        Err(e) => ToolOutcome::err(format!("list branches failed: {e}")),
     }
 }
 
-async fn execute_branch_merge(db: Arc<EmbeddedDatabase>, args: serde_json::Value) -> ToolResult {
+fn do_branch_merge(db: &EmbeddedDatabase, args: JsonValue) -> ToolOutcome {
     let input: BranchMergeInput = match serde_json::from_value(args) {
         Ok(v) => v,
-        Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
     };
-
-    match db.merge_branches(&input.source, &input.target) {
-        Ok(_) => ToolResult::text(format!(
-            "Branch '{}' merged into '{}'",
-            input.source, input.target
-        )),
-        Err(e) => ToolResult::error(format!("Merge failed: {}", e)),
+    // merge_branch merges `source` into the *current* branch; switch to
+    // `target` first, then merge.
+    let scope = |d: &EmbeddedDatabase| d.merge_branch(&input.source);
+    match with_branch(db, &input.target, scope) {
+        Ok(_) => ToolOutcome::ok(json!({
+            "source": input.source,
+            "target": input.target,
+            "merged": true,
+        })),
+        Err(e) => ToolOutcome::err(format!("merge failed: {e}")),
     }
 }
 
-async fn execute_search(db: Arc<EmbeddedDatabase>, args: serde_json::Value) -> ToolResult {
+fn do_search(db: &EmbeddedDatabase, args: JsonValue) -> ToolOutcome {
     let input: SearchInput = match serde_json::from_value(args) {
         Ok(v) => v,
-        Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
     };
-
-    // Vector search using SQL extension
     let sql = format!(
-        "SELECT *, vector_distance({}, $1) as distance FROM {} ORDER BY distance LIMIT {}",
-        input.vector_column, input.table, input.top_k
+        "SELECT *, vector_distance({col}, $1) AS distance \
+         FROM {tbl} ORDER BY distance LIMIT {k}",
+        col = input.vector_column,
+        tbl = input.table,
+        k = input.top_k,
     );
-
-    let vector_value = crate::Value::Vector(input.vector);
-
-    match db.query_branch(&input.branch, &sql, vec![vector_value]) {
-        Ok(result) => ToolResult::json(&json!({
-            "results": result.rows,
-            "count": result.rows.len()
+    let params = vec![Value::Vector(input.vector)];
+    let run = |d: &EmbeddedDatabase| d.query_params(&sql, &params);
+    match with_branch(db, &input.branch, run) {
+        Ok(rows) => ToolOutcome::ok(json!({
+            "table": input.table,
+            "branch": input.branch,
+            "count": rows.len(),
+            "results": rows.iter().map(tuple_to_json).collect::<Vec<_>>(),
         })),
-        Err(e) => ToolResult::error(format!("Search failed: {}", e)),
+        Err(e) => ToolOutcome::err(format!("search failed: {e}")),
     }
 }
 
-async fn execute_time_travel(db: Arc<EmbeddedDatabase>, args: serde_json::Value) -> ToolResult {
+fn do_time_travel(db: &EmbeddedDatabase, args: JsonValue) -> ToolOutcome {
     let input: TimeTravelInput = match serde_json::from_value(args) {
         Ok(v) => v,
-        Err(e) => return ToolResult::error(format!("Invalid arguments: {}", e)),
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
     };
-
-    // Parse timestamp
-    let timestamp = match chrono::DateTime::parse_from_rfc3339(&input.timestamp) {
-        Ok(t) => t.timestamp() as u64,
-        Err(e) => return ToolResult::error(format!("Invalid timestamp: {}", e)),
-    };
-
-    match db.query_at_timestamp(&input.branch, &input.sql, vec![], timestamp) {
-        Ok(result) => {
-            let output = json!({
-                "columns": result.columns.iter().map(|(name, _)| name).collect::<Vec<_>>(),
-                "rows": result.rows,
-                "row_count": result.rows.len(),
-                "timestamp": input.timestamp
-            });
-            ToolResult::json(&output)
-        }
-        Err(e) => ToolResult::error(format!("Time travel query failed: {}", e)),
+    // Nano rewrites `AS OF TIMESTAMP 'iso'` natively; splice it onto the
+    // user's SQL so the query runs against the historical snapshot.
+    let escaped = input.timestamp.replace('\'', "''");
+    let rewritten = format!("{} AS OF TIMESTAMP '{}'", input.sql.trim_end_matches(';'), escaped);
+    let run = |d: &EmbeddedDatabase| d.query(&rewritten, &[]);
+    match with_branch(db, &input.branch, run) {
+        Ok(rows) => ToolOutcome::ok(json!({
+            "branch": input.branch,
+            "timestamp": input.timestamp,
+            "count": rows.len(),
+            "rows": rows.iter().map(tuple_to_json).collect::<Vec<_>>(),
+        })),
+        Err(e) => ToolOutcome::err(format!("time-travel query failed: {e}")),
     }
 }
 
-/// Convert JSON value to internal Value type
-fn json_to_value(v: &serde_json::Value) -> crate::Value {
+// ---- In-process tool input structs ------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct Bm25IndexInput {
+    name: String,
+    documents: Vec<Bm25Doc>,
+}
+#[derive(Debug, Deserialize)]
+struct Bm25Doc {
+    doc_id: u64,
+    text: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HybridInput {
+    index_name: String,
+    query_text: String,
+    #[serde(default)]
+    vector_hits: Vec<HybridVecHit>,
+    #[serde(default = "default_fusion")]
+    fusion: String,
+    #[serde(default = "default_lambda")]
+    lambda: f64,
+    #[serde(default = "default_limit")]
+    limit: usize,
+}
+#[derive(Debug, Deserialize)]
+struct HybridVecHit {
+    doc_id: u64,
+    score: f64,
+    #[serde(default)]
+    vector: Option<Vec<f32>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphAddEdgeInput {
+    from: String,
+    to: String,
+    #[serde(default = "default_edge_label")]
+    label: String,
+    #[serde(default = "default_edge_weight")]
+    weight: f64,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphTraverseInput {
+    start: String,
+    #[serde(default)]
+    edge_label: Option<String>,
+    #[serde(default = "default_direction")]
+    direction: String,
+    #[serde(default = "default_depth")]
+    depth: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct GraphPathInput {
+    from: String,
+    to: String,
+    #[serde(default = "default_algorithm")]
+    algorithm: String,
+    #[serde(default = "default_direction")]
+    direction: String,
+    #[serde(default)]
+    edge_label: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbedAndStoreInput {
+    index_name: String,
+    doc_id: u64,
+    text: String,
+}
+
+fn default_fusion() -> String { "rrf".to_string() }
+fn default_lambda() -> f64 { 0.5 }
+fn default_limit() -> usize { 10 }
+fn default_edge_label() -> String { "edge".to_string() }
+fn default_edge_weight() -> f64 { 1.0 }
+fn default_direction() -> String { "out".to_string() }
+fn default_depth() -> usize { 3 }
+fn default_algorithm() -> String { "bfs".to_string() }
+
+// ---- In-process handlers ----------------------------------------------
+
+fn do_bm25_index(args: JsonValue) -> ToolOutcome {
+    let input: Bm25IndexInput = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
+    };
+    let idx = Arc::new(Bm25Index::new());
+    for d in &input.documents {
+        idx.add_document(d.doc_id, &d.text);
+    }
+    let count = input.documents.len();
+    BM25_INDEXES.insert(input.name.clone(), idx);
+    ToolOutcome::ok(json!({
+        "index": input.name,
+        "indexed_documents": count,
+    }))
+}
+
+fn do_hybrid_search(args: JsonValue) -> ToolOutcome {
+    let input: HybridInput = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
+    };
+    let Some(idx) = BM25_INDEXES.get(&input.index_name) else {
+        return ToolOutcome::err(format!(
+            "BM25 index '{}' not found -- create one via heliosdb_bm25_index first",
+            input.index_name
+        ));
+    };
+    let bm25 = bm25_hits(idx.value(), &input.query_text, Some(input.limit * 4));
+    let vec_hits: Vec<ScoredHit> = input
+        .vector_hits
+        .into_iter()
+        .map(|h| ScoredHit { doc_id: h.doc_id, score: h.score, vector: h.vector })
+        .collect();
+    let fusion = match input.fusion.to_ascii_lowercase().as_str() {
+        "rrf" => FusionMethod::Rrf,
+        "mmr" => FusionMethod::Mmr,
+        "linear" => FusionMethod::Linear,
+        other => return ToolOutcome::err(format!("unknown fusion method '{other}'")),
+    };
+    let res = hybrid_search(&bm25, &vec_hits, fusion, input.lambda, input.limit);
+    ToolOutcome::ok(json!({
+        "index": input.index_name,
+        "fusion": input.fusion,
+        "results": res
+            .iter()
+            .map(|h| json!({ "doc_id": h.doc_id, "score": h.score }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+fn do_graph_add_edge(args: JsonValue) -> ToolOutcome {
+    let input: GraphAddEdgeInput = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
+    };
+    let from = match uuid::Uuid::parse_str(&input.from) {
+        Ok(u) => u,
+        Err(e) => return ToolOutcome::err(format!("invalid 'from' uuid: {e}")),
+    };
+    let to = match uuid::Uuid::parse_str(&input.to) {
+        Ok(u) => u,
+        Err(e) => return ToolOutcome::err(format!("invalid 'to' uuid: {e}")),
+    };
+    let id = GRAPH_STORE.add_edge(Edge::new(from, to, input.label).with_weight(input.weight));
+    ToolOutcome::ok(json!({
+        "edge_id": id.to_string(),
+        "from": from.to_string(),
+        "to": to.to_string(),
+        "edge_count": GRAPH_STORE.edge_count(),
+    }))
+}
+
+fn do_graph_traverse(args: JsonValue) -> ToolOutcome {
+    let input: GraphTraverseInput = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
+    };
+    let start = match uuid::Uuid::parse_str(&input.start) {
+        Ok(u) => u,
+        Err(e) => return ToolOutcome::err(format!("invalid 'start' uuid: {e}")),
+    };
+    let direction = match graph_sql::parse_direction(&input.direction) {
+        Ok(d) => d,
+        Err(e) => return ToolOutcome::err(e.to_string()),
+    };
+    let rows = graph_sql::graph_traverse(
+        &GRAPH_STORE,
+        start,
+        input.edge_label.as_deref(),
+        direction,
+        input.depth,
+    );
+    ToolOutcome::ok(json!({
+        "start": start.to_string(),
+        "direction": format!("{direction:?}"),
+        "rows": rows
+            .iter()
+            .map(|r| json!({ "node": r.node.to_string(), "depth": r.depth }))
+            .collect::<Vec<_>>(),
+    }))
+}
+
+fn do_graph_path(args: JsonValue) -> ToolOutcome {
+    let input: GraphPathInput = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
+    };
+    let from = match uuid::Uuid::parse_str(&input.from) {
+        Ok(u) => u,
+        Err(e) => return ToolOutcome::err(format!("invalid 'from' uuid: {e}")),
+    };
+    let to = match uuid::Uuid::parse_str(&input.to) {
+        Ok(u) => u,
+        Err(e) => return ToolOutcome::err(format!("invalid 'to' uuid: {e}")),
+    };
+    let direction = match graph_sql::parse_direction(&input.direction) {
+        Ok(d) => d,
+        Err(e) => return ToolOutcome::err(e.to_string()),
+    };
+    let algorithm = match graph_sql::parse_algorithm(&input.algorithm) {
+        Ok(a) => a,
+        Err(e) => return ToolOutcome::err(e.to_string()),
+    };
+    let path = graph_sql::graph_shortest_path(
+        &GRAPH_STORE,
+        from,
+        to,
+        algorithm,
+        direction,
+        input.edge_label.as_deref(),
+    );
+    match path {
+        Some(p) => ToolOutcome::ok(json!({
+            "from": from.to_string(),
+            "to": to.to_string(),
+            "algorithm": input.algorithm,
+            "hops": p.hops(),
+            "total_weight": p.total_weight,
+            "nodes": p.nodes.iter().map(uuid::Uuid::to_string).collect::<Vec<_>>(),
+            "edges": p.edges.iter().map(uuid::Uuid::to_string).collect::<Vec<_>>(),
+        })),
+        None => ToolOutcome::ok(json!({
+            "from": from.to_string(),
+            "to": to.to_string(),
+            "path_found": false,
+        })),
+    }
+}
+
+fn do_embed_and_store(args: JsonValue) -> ToolOutcome {
+    let input: EmbedAndStoreInput = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
+    };
+    let idx = BM25_INDEXES
+        .entry(input.index_name.clone())
+        .or_insert_with(|| Arc::new(Bm25Index::new()))
+        .value()
+        .clone();
+    idx.add_document(input.doc_id, &input.text);
+    ToolOutcome::ok(json!({
+        "index": input.index_name,
+        "doc_id": input.doc_id,
+        "bm25": "indexed",
+    }))
+}
+
+// ---- JSON <-> Value conversions ---------------------------------------
+
+pub(crate) fn tuple_to_json(t: &Tuple) -> JsonValue {
+    JsonValue::Array(t.values.iter().map(value_to_json).collect())
+}
+
+pub(crate) fn value_to_json(v: &Value) -> JsonValue {
     match v {
-        serde_json::Value::Null => crate::Value::Null,
-        serde_json::Value::Bool(b) => crate::Value::Boolean(*b),
-        serde_json::Value::Number(n) => {
+        Value::Null => JsonValue::Null,
+        Value::Boolean(b) => JsonValue::Bool(*b),
+        Value::Int2(n) => JsonValue::from(*n),
+        Value::Int4(n) => JsonValue::from(*n),
+        Value::Int8(n) => JsonValue::from(*n),
+        Value::Float4(n) => {
+            serde_json::Number::from_f64(f64::from(*n))
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null)
+        }
+        Value::Float8(n) => {
+            serde_json::Number::from_f64(*n)
+                .map(JsonValue::Number)
+                .unwrap_or(JsonValue::Null)
+        }
+        Value::Numeric(s) | Value::String(s) => JsonValue::String(s.clone()),
+        Value::Bytes(b) => {
+            use base64::{engine::general_purpose::STANDARD as B64, Engine};
+            JsonValue::String(B64.encode(b))
+        }
+        Value::Uuid(u) => JsonValue::String(u.to_string()),
+        Value::Timestamp(t) => JsonValue::String(t.to_rfc3339()),
+        Value::Date(d) => JsonValue::String(d.to_string()),
+        Value::Time(t) => JsonValue::String(t.to_string()),
+        Value::Interval(i) => JsonValue::from(*i),
+        Value::Json(s) => serde_json::from_str(s).unwrap_or_else(|_| JsonValue::String(s.clone())),
+        Value::Array(a) => JsonValue::Array(a.iter().map(value_to_json).collect()),
+        Value::Vector(v) => JsonValue::Array(
+            v.iter()
+                .map(|f| {
+                    serde_json::Number::from_f64(f64::from(*f))
+                        .map(JsonValue::Number)
+                        .unwrap_or(JsonValue::Null)
+                })
+                .collect(),
+        ),
+        Value::DictRef { dict_id } => json!({ "dict_id": dict_id }),
+        Value::CasRef { hash } => json!({ "cas_ref": hex::encode(hash) }),
+        Value::ColumnarRef => JsonValue::String("<columnar_ref>".to_string()),
+    }
+}
+
+pub(crate) fn json_to_value(v: &JsonValue) -> Value {
+    match v {
+        JsonValue::Null => Value::Null,
+        JsonValue::Bool(b) => Value::Boolean(*b),
+        JsonValue::Number(n) => {
             if let Some(i) = n.as_i64() {
-                crate::Value::Int8(i)
+                Value::Int8(i)
             } else if let Some(f) = n.as_f64() {
-                crate::Value::Float8(f)
+                Value::Float8(f)
             } else {
-                crate::Value::Null
+                Value::Null
             }
         }
-        serde_json::Value::String(s) => crate::Value::String(s.clone()),
-        serde_json::Value::Array(arr) => {
-            // Try to parse as vector
-            let floats: Result<Vec<f32>, _> = arr.iter()
+        JsonValue::String(s) => Value::String(s.clone()),
+        JsonValue::Array(arr) => {
+            let floats: Result<Vec<f32>, ()> = arr
+                .iter()
                 .map(|v| v.as_f64().map(|f| f as f32).ok_or(()))
                 .collect();
             if let Ok(vec) = floats {
-                crate::Value::Vector(vec)
+                Value::Vector(vec)
             } else {
-                crate::Value::String(serde_json::to_string(arr).unwrap_or_default())
+                Value::String(serde_json::to_string(arr).unwrap_or_default())
             }
         }
-        serde_json::Value::Object(_) => {
-            crate::Value::String(serde_json::to_string(v).unwrap_or_default())
+        JsonValue::Object(_) => Value::String(serde_json::to_string(v).unwrap_or_default()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unique(prefix: &str) -> String {
+        format!("{prefix}-{}", uuid::Uuid::new_v4())
+    }
+
+    #[test]
+    fn list_tools_covers_db_and_in_process() {
+        let names: Vec<_> = list_tools().into_iter().map(|t| t.name).collect();
+        for n in [
+            "heliosdb_query",
+            "heliosdb_schema",
+            "heliosdb_list_tables",
+            "heliosdb_create_table",
+            "heliosdb_insert",
+            "heliosdb_branch_create",
+            "heliosdb_branch_list",
+            "heliosdb_branch_merge",
+            "heliosdb_search",
+            "heliosdb_time_travel",
+            "heliosdb_bm25_index",
+            "heliosdb_hybrid_search",
+            "heliosdb_graph_add_edge",
+            "heliosdb_graph_traverse",
+            "heliosdb_graph_path",
+            "heliosdb_embed_and_store",
+        ] {
+            assert!(names.contains(&n), "missing {n} in {names:?}");
         }
+    }
+
+    #[test]
+    fn db_tool_without_db_errors_cleanly() {
+        let r = call_tool(None, "heliosdb_query", json!({ "sql": "SELECT 1" }));
+        assert!(r.is_error);
+        assert!(r.payload["error"].as_str().unwrap().contains("requires a database"));
+    }
+
+    #[test]
+    fn in_process_tool_works_without_db() {
+        let name = unique("tools-unit");
+        let r = call_tool(
+            None,
+            "heliosdb_bm25_index",
+            json!({
+                "name": name,
+                "documents": [
+                    { "doc_id": 1, "text": "alpha beta" },
+                    { "doc_id": 2, "text": "gamma delta" }
+                ]
+            }),
+        );
+        assert!(!r.is_error);
+        assert_eq!(r.payload["indexed_documents"].as_u64(), Some(2));
+    }
+
+    #[test]
+    fn unknown_tool_errors() {
+        let r = call_tool(None, "heliosdb_missing", json!({}));
+        assert!(r.is_error);
+    }
+
+    #[test]
+    fn hybrid_search_without_index_errors() {
+        let r = call_tool(
+            None,
+            "heliosdb_hybrid_search",
+            json!({ "index_name": "nope", "query_text": "x" }),
+        );
+        assert!(r.is_error);
+    }
+
+    #[test]
+    fn db_tool_with_db_works() {
+        let db = EmbeddedDatabase::new_in_memory().expect("db");
+        db.execute("CREATE TABLE t (id INT4 PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("INSERT INTO t VALUES (1, 'alpha')").unwrap();
+        let r = call_tool(
+            Some(&db),
+            "heliosdb_query",
+            json!({ "sql": "SELECT id, name FROM t" }),
+        );
+        assert!(!r.is_error, "{:?}", r.payload);
+        assert_eq!(r.payload["row_count"].as_u64(), Some(1));
     }
 }
