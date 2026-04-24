@@ -3093,6 +3093,16 @@ impl EmbeddedDatabase {
         code_graph::diff::ast_diff(self, file_path, at_a, at_b)
     }
 
+    /// (Re)build the per-file semantic Merkle roll-up table
+    /// `_hdb_code_merkle`.  Idempotent.  Files whose member symbols
+    /// haven't changed keep the same roll-up hash.
+    #[cfg(feature = "code-graph")]
+    pub fn code_graph_merkle_refresh(
+        &self,
+    ) -> Result<code_graph::MerkleStats> {
+        code_graph::merkle_refresh(self)
+    }
+
     /// `WITH CONTEXT (...)` entry point — runs the seed query, then
     /// expands the graph subgraph per the clause options.  Result
     /// tuples: `(node_id, node_kind, title, text, source_ref, hop_distance)`.

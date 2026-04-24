@@ -10,12 +10,14 @@
 //! projection from `_hdb_code_symbols` to `_hdb_graph_nodes` is
 //! meaningless without a code-graph source).
 
+pub mod centrality;
 pub mod ingest;
 pub mod linker;
 pub mod schema;
 pub mod search;
 pub mod with_context;
 
+pub use centrality::{centrality_rerank, Centrality};
 pub use ingest::{
     ingest_docs, ingest_email, ingest_issues, ingest_qa, ChunkStrategy,
     IngestDocsOptions, IngestEmailOptions, IngestIssuesOptions, IngestQaOptions,

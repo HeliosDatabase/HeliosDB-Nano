@@ -107,16 +107,21 @@ pub struct VectorScanOperator {
     tuples: Vec<Tuple>,
     /// Current iteration index
     current_index: usize,
+    /// Optional pre-filter predicate.  When set, tuples are tested
+    /// BEFORE being emitted — callers that want "semantic pre-filter
+    /// before the vector search" semantics over-fetch candidates and
+    /// let this rejection step drop the ones that don't qualify.
+    ///
+    /// `None` = no pre-filter (equivalent to the pre-3.17.1 behaviour).
+    prefilter: Option<crate::sql::LogicalExpr>,
+    /// Cached evaluator used to apply `prefilter` to each tuple.
+    /// Built lazily on first `next()` so operator construction stays
+    /// cheap.
+    evaluator: Option<crate::sql::Evaluator>,
 }
 
 impl VectorScanOperator {
-    /// Create a new vector scan operator
-    ///
-    /// # Arguments
-    /// * `table_name` - Name of the table to scan
-    /// * `schema` - Schema of the table
-    /// * `results` - Pre-computed k-NN search results (row_id, distance)
-    /// * `tuples` - Full tuples from storage (ordered by k-NN results)
+    /// Create a new vector scan operator.  No pre-filter.
     pub fn new(
         table_name: String,
         schema: Arc<Schema>,
@@ -129,10 +134,23 @@ impl VectorScanOperator {
             results,
             tuples,
             current_index: 0,
+            prefilter: None,
+            evaluator: None,
         }
     }
 
-    /// Get the distance for the current tuple (if available)
+    /// Construct with an optional pre-filter predicate.  The expected
+    /// usage pattern is: the caller asks the upstream HNSW search
+    /// for `over_fetch_multiplier × k` candidates, hands them to
+    /// this operator, and lets `prefilter` drop the ones that fail
+    /// the scalar predicate.  Composes cleanly with `LIMIT k`
+    /// downstream to guarantee the correct final count.
+    pub fn with_prefilter(mut self, predicate: crate::sql::LogicalExpr) -> Self {
+        self.prefilter = Some(predicate);
+        self
+    }
+
+    /// Get the distance for the current tuple (if available).
     #[allow(dead_code)]
     pub fn current_distance(&self) -> Option<f32> {
         if self.current_index > 0 && self.current_index <= self.results.len() {
@@ -145,15 +163,39 @@ impl VectorScanOperator {
 
 impl PhysicalOperator for VectorScanOperator {
     fn next(&mut self) -> Result<Option<Tuple>> {
-        if self.current_index >= self.tuples.len() {
-            return Ok(None);
+        loop {
+            if self.current_index >= self.tuples.len() {
+                return Ok(None);
+            }
+            let tuple = self
+                .tuples
+                .get(self.current_index)
+                .cloned()
+                .ok_or_else(|| {
+                    Error::query_execution("Vector scan index out of bounds")
+                })?;
+            self.current_index += 1;
+            // Fast path: no pre-filter.
+            let Some(pred) = &self.prefilter else {
+                return Ok(Some(tuple));
+            };
+            if self.evaluator.is_none() {
+                self.evaluator =
+                    Some(crate::sql::Evaluator::new(self.schema.clone()));
+            }
+            let pass = match self.evaluator.as_ref() {
+                Some(ev) => match ev.evaluate(pred, &tuple) {
+                    Ok(crate::Value::Boolean(b)) => b,
+                    Ok(_) => false,
+                    Err(_) => false,
+                },
+                None => true,
+            };
+            if pass {
+                return Ok(Some(tuple));
+            }
+            // Otherwise loop — drop the tuple and try the next one.
         }
-
-        let tuple = self.tuples.get(self.current_index).cloned()
-            .ok_or_else(|| Error::query_execution("Vector scan index out of bounds"))?;
-        self.current_index += 1;
-
-        Ok(Some(tuple))
     }
 
     fn schema(&self) -> Arc<Schema> {
