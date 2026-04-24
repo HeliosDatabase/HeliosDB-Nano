@@ -3084,6 +3084,32 @@ impl EmbeddedDatabase {
         code_graph::diff::ast_diff(self, file_path, at_a, at_b)
     }
 
+    /// `WITH CONTEXT (...)` entry point — runs the seed query, then
+    /// expands the graph subgraph per the clause options.  Result
+    /// tuples: `(node_id, node_kind, title, text, source_ref, hop_distance)`.
+    #[cfg(feature = "graph-rag")]
+    fn run_with_context(
+        &self,
+        inner_sql: &str,
+        opts: &graph_rag::WithContextOptions,
+    ) -> Result<Vec<Tuple>> {
+        let hits =
+            graph_rag::graph_rag_expand_with_context(self, inner_sql, opts)?;
+        Ok(hits
+            .into_iter()
+            .map(|h| {
+                Tuple::new(vec![
+                    Value::Int8(h.node_id),
+                    Value::String(h.node_kind),
+                    h.title.map(Value::String).unwrap_or(Value::Null),
+                    h.text.map(Value::String).unwrap_or(Value::Null),
+                    h.source_ref.map(Value::String).unwrap_or(Value::Null),
+                    Value::Int4(h.hop_distance as i32),
+                ])
+            })
+            .collect())
+    }
+
     /// Pre-parser rewrite for code-graph table-function references.
     /// When the `code-graph` feature is on, every entry point pipes
     /// user SQL through this first so `SELECT * FROM lsp_definition('X')`
@@ -5877,6 +5903,14 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
+        // Graph-RAG WITH CONTEXT clause: strip, run the inner query
+        // as a seed, expand. Runs before the code-graph rewriter so
+        // both features compose (the inner SELECT can still reference
+        // `lsp_*`).
+        #[cfg(feature = "graph-rag")]
+        if let Some((inner, opts)) = graph_rag::detect_with_context(sql) {
+            return self.run_with_context(&inner, &opts);
+        }
         // Code-graph pre-parser: expands `lsp_*(…)` table-function
         // calls to the underlying `_hdb_code_*` SELECTs.  No-op when
         // the feature is off or the query has no matching calls.

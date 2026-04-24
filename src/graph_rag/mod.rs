@@ -12,6 +12,10 @@
 
 pub mod schema;
 pub mod search;
+pub mod with_context;
 
 pub use schema::{ensure_tables, project_code_symbols, GraphRagStats};
 pub use search::{graph_rag_search, Direction, GraphRagHit, GraphRagOptions};
+pub use with_context::{
+    detect_with_context, graph_rag_expand_with_context, WithContextOptions,
+};
