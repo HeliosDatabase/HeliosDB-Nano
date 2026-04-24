@@ -149,6 +149,9 @@ fn walk(
             match lang {
                 Language::Rust => visit_rust(node, source, scope, parent_idx, symbols, refs),
                 Language::Python => visit_python(node, source, scope, parent_idx, symbols, refs),
+                Language::TypeScript | Language::Tsx | Language::JavaScript => {
+                    visit_typescript(node, source, scope, parent_idx, symbols, refs)
+                }
             };
 
         // Descend into children with the possibly-updated scope / parent.
@@ -316,6 +319,79 @@ fn emit_named_block(
         parent_idx,
     });
     (true, Some(qualified), Some(idx))
+}
+
+fn visit_typescript(
+    node: Node<'_>,
+    source: &str,
+    scope: &[String],
+    parent_idx: Option<usize>,
+    symbols: &mut Vec<Symbol>,
+    refs: &mut Vec<SymbolRef>,
+) -> (bool, Option<String>, Option<usize>) {
+    match node.kind() {
+        "function_declaration" | "generator_function_declaration" => {
+            let (emitted, scope_c, idx) = emit_named_block(
+                node,
+                source,
+                SymbolKind::Function,
+                scope,
+                parent_idx,
+                symbols,
+            );
+            if let Some(i) = idx {
+                collect_call_refs(source, node, i, refs);
+            }
+            (emitted, scope_c, idx)
+        }
+        "method_definition" => {
+            let (emitted, scope_c, idx) = emit_named_block(
+                node,
+                source,
+                SymbolKind::Method,
+                scope,
+                parent_idx,
+                symbols,
+            );
+            if let Some(i) = idx {
+                collect_call_refs(source, node, i, refs);
+            }
+            (emitted, scope_c, idx)
+        }
+        "class_declaration" | "abstract_class_declaration" => emit_named_block(
+            node,
+            source,
+            SymbolKind::Class,
+            scope,
+            parent_idx,
+            symbols,
+        ),
+        "interface_declaration" => emit_named_block(
+            node,
+            source,
+            SymbolKind::Trait,
+            scope,
+            parent_idx,
+            symbols,
+        ),
+        "type_alias_declaration" => emit_named_block(
+            node,
+            source,
+            SymbolKind::Type,
+            scope,
+            parent_idx,
+            symbols,
+        ),
+        "enum_declaration" => emit_named_block(
+            node,
+            source,
+            SymbolKind::Enum,
+            scope,
+            parent_idx,
+            symbols,
+        ),
+        _ => (false, None, None),
+    }
 }
 
 fn visit_python(

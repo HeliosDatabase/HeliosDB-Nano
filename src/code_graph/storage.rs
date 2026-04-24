@@ -12,6 +12,7 @@
 //! about schema management.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{EmbeddedDatabase, Error, Result, Value};
 
@@ -91,11 +92,30 @@ pub struct CodeIndexStats {
     pub languages_seen: Vec<String>,
 }
 
+/// Tracks whether `CREATE EXTENSION hdb_code` has been executed in the
+/// current process. Purely advisory today — `code_index` also
+/// bootstraps on first call, so callers can use either entry point.
+static EXTENSION_INSTALLED: AtomicBool = AtomicBool::new(false);
+
+/// Record that the extension has been installed. Called from the
+/// SQL-side `CREATE EXTENSION hdb_code` handler. Safe to call
+/// repeatedly.
+pub fn mark_extension_installed() {
+    EXTENSION_INSTALLED.store(true, Ordering::Relaxed);
+}
+
+/// True when the extension has been installed (via DDL or, implicitly,
+/// via a prior `code_index` call that ran the bootstrap).
+pub fn is_extension_installed() -> bool {
+    EXTENSION_INSTALLED.load(Ordering::Relaxed)
+}
+
 /// Run the indexer over `opts.source_table`. Creates the `_hdb_code_*`
 /// tables on first call. Returns statistics; never mutates the source
 /// table.
 pub fn code_index(db: &EmbeddedDatabase, opts: CodeIndexOptions) -> Result<CodeIndexStats> {
     bootstrap_tables(db)?;
+    mark_extension_installed();
 
     let embedder: Box<dyn Embedder> = match opts.embed_endpoint.as_deref() {
         Some(url) if opts.embed_bodies => {
@@ -147,7 +167,78 @@ pub fn code_index(db: &EmbeddedDatabase, opts: CodeIndexOptions) -> Result<CodeI
     }
 
     stats.languages_seen = lang_set.into_iter().collect();
+
+    // Cross-file resolution pass: for every unresolved ref, look up
+    // the `to_name` in `_hdb_code_symbols` (full corpus) and rebind.
+    // Single-candidate hits are marked `exact`; multi-candidate hits
+    // bind to the first match with `heuristic`.
+    cross_file_resolve(db, &mut stats)?;
+
     Ok(stats)
+}
+
+fn cross_file_resolve(db: &EmbeddedDatabase, stats: &mut CodeIndexStats) -> Result<()> {
+    // Build a corpus map name→(node_id, count) in one scan.
+    let rows = db.query(
+        "SELECT name, node_id FROM _hdb_code_symbols ORDER BY name, node_id",
+        &[],
+    )?;
+    let mut first: std::collections::HashMap<String, (i64, u32)> = std::collections::HashMap::new();
+    for row in rows {
+        let name = match row.values.first() {
+            Some(Value::String(s)) => s.clone(),
+            _ => continue,
+        };
+        let id = match row.values.get(1) {
+            Some(Value::Int4(n)) => *n as i64,
+            Some(Value::Int8(n)) => *n,
+            _ => continue,
+        };
+        let entry = first.entry(name).or_insert((id, 0));
+        entry.1 += 1;
+    }
+
+    let unresolved = db.query(
+        "SELECT edge_id, to_name FROM _hdb_code_symbol_refs WHERE resolution = 'unresolved'",
+        &[],
+    )?;
+    let mut rebound = 0u64;
+    for row in unresolved {
+        let edge_id = match row.values.first() {
+            Some(Value::Int4(n)) => *n as i64,
+            Some(Value::Int8(n)) => *n,
+            _ => continue,
+        };
+        let to_name = match row.values.get(1) {
+            Some(Value::String(s)) => s.clone(),
+            _ => continue,
+        };
+        let bare = last_segment(&to_name);
+        if let Some((id, count)) = first.get(bare) {
+            let res = if *count == 1 { "exact" } else { "heuristic" };
+            db.execute(&format!(
+                "UPDATE _hdb_code_symbol_refs \
+                   SET to_symbol = {id}, resolution = '{res}' \
+                 WHERE edge_id = {edge_id}"
+            ))?;
+            rebound += 1;
+        }
+    }
+    let _ = rebound;
+    let _ = stats;
+    Ok(())
+}
+
+fn last_segment(name: &str) -> &str {
+    let bare = name.trim_end_matches(')');
+    let bare = bare.split('(').next().unwrap_or(bare);
+    if let Some(idx) = bare.rfind("::") {
+        return &bare[idx + 2..];
+    }
+    if let Some(idx) = bare.rfind('.') {
+        return &bare[idx + 1..];
+    }
+    bare
 }
 
 // ---------------------------------------------------------------------------

@@ -85,6 +85,42 @@ fn last_segment(name: &str) -> &str {
     bare
 }
 
+/// Phase-2 cross-file rebinder. For each symbol ref, if the local
+/// in-file resolver came up empty, try to match by last-segment name
+/// against every other file's symbol table. Returns the corpus-wide
+/// symbol_id (not the in-file index).
+///
+/// Caller supplies a `corpus` map `name → Vec<symbol_id>`. Multiple
+/// matches → first wins, `resolution = 'heuristic'`.
+pub fn rebind_cross_file(
+    resolved: &mut [ResolvedRef],
+    in_file_symbol_ids: &[i64],
+    corpus: &std::collections::HashMap<String, Vec<i64>>,
+    out_xfile: &mut Vec<(usize, i64)>,
+) {
+    for (idx, r) in resolved.iter_mut().enumerate() {
+        if r.to_idx.is_some() {
+            continue;
+        }
+        let bare = last_segment(&r.to_name);
+        if let Some(candidates) = corpus.get(bare) {
+            if let Some(first) = candidates.first().copied() {
+                // Don't let a ref bind to a symbol that's actually
+                // in the same file under a different local index —
+                // that case was already handled above.
+                if !in_file_symbol_ids.contains(&first) {
+                    out_xfile.push((idx, first));
+                    r.resolution = if candidates.len() == 1 {
+                        Resolution::Exact
+                    } else {
+                        Resolution::Heuristic
+                    };
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::parse::Language;

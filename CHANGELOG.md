@@ -5,6 +5,36 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.16.0] - 2026-04-24
+
+### Added — Code-graph phase 2 (opt-in, feature = "code-graph")
+
+- `CREATE EXTENSION hdb_code` DDL. Parses through the standard
+  planner, runs the code-graph bootstrap, and marks the extension
+  installed in the process. `IF NOT EXISTS` with an unknown extension
+  is a silent no-op (matches PG's permissive migration behaviour).
+- TypeScript / JavaScript / TSX grammar support via
+  `tree-sitter-typescript`. `Language` enum extended; symbol
+  extractor handles `function_declaration`, `method_definition`,
+  `class_declaration`, `abstract_class_declaration`,
+  `interface_declaration`, `type_alias_declaration`,
+  `enum_declaration`.
+- Cross-file symbol resolver. After the per-file pass,
+  `code_index` rebinds every `resolution='unresolved'` edge against
+  a corpus-wide name index. Single match → `exact`, multiple → the
+  first with `heuristic`.
+- New `LogicalPlan::{CreateExtension, DropExtension}` variants;
+  `DropExtension` is reserved for forward compatibility (sqlparser
+  0.53 doesn't expose `DROP EXTENSION`).
+
+Regression coverage:
+- `tests/code_graph_phase2.rs`: 5 new integration tests —
+  `typescript_extracts_class_and_method`,
+  `create_extension_hdb_code_bootstraps_tables`,
+  `create_extension_unknown_errors`,
+  `create_extension_unknown_if_not_exists_is_noop`,
+  `cross_file_ref_resolves`.
+
 ## [3.15.0] - 2026-04-24
 
 ### Added — Code-graph track, phase 1 (FR 2 MVP, opt-in)

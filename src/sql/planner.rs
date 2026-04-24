@@ -610,6 +610,16 @@ impl<'a> Planner<'a> {
                 };
                 Ok(LogicalPlan::Deallocate { name: stmt_name })
             }
+            // CREATE EXTENSION <name> — phase 2 of the code-graph
+            // track. Dispatches to extension-specific installers at
+            // execution time; unknown names error cleanly unless
+            // IF NOT EXISTS is set.
+            Statement::CreateExtension { name, if_not_exists, .. } => {
+                Ok(LogicalPlan::CreateExtension {
+                    name: name.value.to_ascii_lowercase(),
+                    if_not_exists,
+                })
+            }
             // Procedural statements
             Statement::CreateFunction(cf) => self.create_function_to_plan(cf),
             Statement::CreateProcedure { or_alter, name, params, body } => {

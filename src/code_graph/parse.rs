@@ -11,6 +11,9 @@ use crate::{Error, Result};
 pub enum Language {
     Rust,
     Python,
+    TypeScript,
+    Tsx,
+    JavaScript,
 }
 
 impl Language {
@@ -21,6 +24,9 @@ impl Language {
         match s.trim().to_ascii_lowercase().as_str() {
             "rust" | "rs" => Some(Language::Rust),
             "python" | "py" => Some(Language::Python),
+            "typescript" | "ts" => Some(Language::TypeScript),
+            "tsx" => Some(Language::Tsx),
+            "javascript" | "js" | "mjs" | "cjs" => Some(Language::JavaScript),
             _ => None,
         }
     }
@@ -31,6 +37,9 @@ impl Language {
         match self {
             Language::Rust => "rust",
             Language::Python => "python",
+            Language::TypeScript => "typescript",
+            Language::Tsx => "tsx",
+            Language::JavaScript => "javascript",
         }
     }
 }
@@ -52,6 +61,10 @@ fn grammar_for(lang: Language) -> tree_sitter::Language {
     match lang {
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::Python => tree_sitter_python::LANGUAGE.into(),
+        Language::TypeScript | Language::JavaScript => {
+            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
+        }
+        Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
     }
 }
 

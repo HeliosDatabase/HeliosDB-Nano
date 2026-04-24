@@ -3,7 +3,7 @@ members = ["."]
 
 [package]
 name = "heliosdb-nano"
-version = "3.15.0"
+version = "3.16.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Daniel Moya <daniel.moya@dimensigon.com>"]
@@ -142,9 +142,10 @@ sysinfo = "0.30"  # CPU monitoring for MV scheduler
 # Code-graph track (feature = "code-graph") — tree-sitter AST parsing
 # for LSP-shaped queries over source code. All crates optional; the
 # default build pulls none of them.
-tree-sitter        = { version = "0.23", optional = true }
-tree-sitter-rust   = { version = "0.23", optional = true }
-tree-sitter-python = { version = "0.23", optional = true }
+tree-sitter             = { version = "0.23", optional = true }
+tree-sitter-rust        = { version = "0.23", optional = true }
+tree-sitter-python      = { version = "0.23", optional = true }
+tree-sitter-typescript  = { version = "0.23", optional = true }
 
 # Config
 toml = "0.8"
@@ -199,6 +200,7 @@ code-graph = [
     "dep:tree-sitter",
     "dep:tree-sitter-rust",
     "dep:tree-sitter-python",
+    "dep:tree-sitter-typescript",
     "reqwest/blocking",
 ]
 
