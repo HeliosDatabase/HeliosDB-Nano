@@ -3,7 +3,7 @@ members = ["."]
 
 [package]
 name = "heliosdb-nano"
-version = "3.17.0"
+version = "3.18.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Daniel Moya <daniel.moya@dimensigon.com>"]
@@ -211,6 +211,15 @@ code-graph = [
 # Rust API. Requires `code-graph` because the code-symbol projection
 # is the primary node population.
 graph-rag = ["code-graph"]
+
+# =============================================================================
+# MCP ENDPOINT (FR 5)
+# =============================================================================
+# Exposes an MCP-compatible JSON-RPC endpoint backed by the existing
+# `src/mcp_extensions/` tool handlers. Additive — embedded-only callers
+# compile without this flag. Ship alongside the existing Axum server
+# by mounting the handler on a route of your choice.
+mcp-endpoint = []
 
 # =============================================================================
 # CRYPTOGRAPHIC PROVIDER FEATURE FLAGS

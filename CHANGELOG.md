@@ -5,6 +5,48 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.18.0] - 2026-04-24
+
+### Added — MCP endpoint phase 4 MVP (FR 5, opt-in, feature = "mcp-endpoint")
+
+First landing for the native MCP endpoint. Ships a JSON-RPC 2.0
+dispatcher on top of the existing `src/mcp_extensions/` tool
+catalogue so an MCP-capable agent (Claude Code, Cursor, Continue,
+Codex, Aider) can drive HeliosDB-Nano with no wrapper process.
+
+- New Cargo feature `mcp-endpoint`. Additive — embedded-only
+  callers compile without it.
+- New module `src/mcp_http/` with two files:
+  - `rpc.rs` — `handle_rpc(req) → resp`, pure function over JSON-RPC
+    `initialize`, `tools/list`, `tools/call`, `ping`. Unknown methods
+    return the canonical `-32601 Method not found`.
+  - `mod.rs` — re-exports.
+- Tool catalogue: every tool already registered in
+  `mcp_extensions::tools::list_tools()` is surfaced automatically.
+  `heliosdb_bm25_index`, `heliosdb_hybrid_search`,
+  `heliosdb_graph_add_edge`, `heliosdb_graph_traverse`,
+  `heliosdb_graph_path`, `heliosdb_embed_and_store`.
+- Server-info handshake reports `{"name":"heliosdb-nano","version":<pkg>}`.
+
+Explicit non-goals for the MVP (tracked for follow-ups):
+- WebSocket / SSE framing — HTTP JSON-RPC only.
+- Repair of legacy `src/mcp/` module — `BLOCKER_mcp_legacy.md`
+  stays accurate. Phase 4 deliberately does not touch it; the
+  MVP handler backs onto the already-working `mcp_extensions/`
+  crate directly.
+- Axum route wiring — we ship `handle_rpc` as a pure function so
+  embedders mount it on whatever route / auth surface they want.
+- Macro-driven auto-registration of `lsp_*` / `graph_rag_*` as MCP
+  tools (the tool catalogue remains the six-tool `mcp_extensions`
+  set for now).
+
+Regression coverage:
+- 4 new unit tests (`src/mcp_http/rpc.rs`): `initialize`,
+  `tools/list`, unknown method, `tools/call` without name.
+- 4 new integration tests (`tests/mcp_endpoint_phase4.rs`):
+  canonical handshake, real tool call, unknown tool as
+  `isError=true`, ping.
+
 ## [3.17.0] - 2026-04-24
 
 ### Added — Graph-RAG phase 3 MVP (opt-in, feature = "graph-rag")

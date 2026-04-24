@@ -287,6 +287,13 @@ pub mod code_graph;
 // schema + seed/expand/rerank API. Opt-in; implies `code-graph`.
 #[cfg(feature = "graph-rag")]
 pub mod graph_rag;
+
+// Native MCP endpoint (FR 5) — JSON-RPC over HTTP on top of the
+// `mcp_extensions` tool catalogue. Additive — not required for
+// embedded-mode callers. Mount `mcp_http::handle_rpc` on the
+// Axum route of your choice.
+#[cfg(feature = "mcp-endpoint")]
+pub mod mcp_http;
 // NOTE: `mcp` module exists on disk but its server.rs / tools.rs reference
 // EmbeddedDatabase methods (query_branch, execute_branch, merge_branches,
 // query_at_timestamp, ...) that no longer exist on the current API. Enabling
