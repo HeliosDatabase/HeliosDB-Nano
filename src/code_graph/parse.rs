@@ -14,6 +14,9 @@ pub enum Language {
     TypeScript,
     Tsx,
     JavaScript,
+    Go,
+    Markdown,
+    Sql,
 }
 
 impl Language {
@@ -27,6 +30,9 @@ impl Language {
             "typescript" | "ts" => Some(Language::TypeScript),
             "tsx" => Some(Language::Tsx),
             "javascript" | "js" | "mjs" | "cjs" => Some(Language::JavaScript),
+            "go" => Some(Language::Go),
+            "markdown" | "md" => Some(Language::Markdown),
+            "sql" => Some(Language::Sql),
             _ => None,
         }
     }
@@ -40,6 +46,9 @@ impl Language {
             Language::TypeScript => "typescript",
             Language::Tsx => "tsx",
             Language::JavaScript => "javascript",
+            Language::Go => "go",
+            Language::Markdown => "markdown",
+            Language::Sql => "sql",
         }
     }
 }
@@ -65,6 +74,9 @@ fn grammar_for(lang: Language) -> tree_sitter::Language {
             tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
         }
         Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+        Language::Go => tree_sitter_go::LANGUAGE.into(),
+        Language::Markdown => tree_sitter_md::LANGUAGE.into(),
+        Language::Sql => tree_sitter_sequel::LANGUAGE.into(),
     }
 }
 

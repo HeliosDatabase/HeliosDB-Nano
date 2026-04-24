@@ -77,6 +77,150 @@ fn create_extension_unknown_if_not_exists_is_noop() -> Result<()> {
 }
 
 #[test]
+fn go_extracts_function_and_struct() -> Result<()> {
+    let db = setup()?;
+    insert(
+        &db,
+        "x.go",
+        "go",
+        "package p\n\ntype Account struct { ID int }\n\nfunc (a *Account) Name() string { return \"\" }\n\nfunc Hello() string { return \"hi\" }\n",
+    )?;
+    let stats = db.code_index(CodeIndexOptions::for_table("src"))?;
+    assert!(stats.files_parsed >= 1);
+    let defs = db.lsp_definition("Hello", &DefinitionHint::default())?;
+    assert!(!defs.is_empty());
+    let types = db.lsp_definition("Account", &DefinitionHint::default())?;
+    assert!(!types.is_empty());
+    let methods = db.lsp_definition("Name", &DefinitionHint::default())?;
+    assert!(!methods.is_empty());
+    Ok(())
+}
+
+#[test]
+fn markdown_extracts_headings() -> Result<()> {
+    let db = setup()?;
+    insert(
+        &db,
+        "README.md",
+        "markdown",
+        "# Overview\n\nSome text.\n\n## Install\n\nMore.\n\n### Docker\n\nEven more.\n",
+    )?;
+    let _ = db.code_index(CodeIndexOptions::for_table("src"))?;
+    let overview = db.lsp_definition("Overview", &DefinitionHint::default())?;
+    assert!(!overview.is_empty(), "markdown heading not extracted");
+    let install = db.lsp_definition("Install", &DefinitionHint::default())?;
+    assert!(!install.is_empty());
+    Ok(())
+}
+
+#[test]
+fn sql_extracts_tables_and_functions() -> Result<()> {
+    let db = setup()?;
+    insert(
+        &db,
+        "schema.sql",
+        "sql",
+        "CREATE TABLE users (id INT);\n\
+         CREATE VIEW recent_users AS SELECT * FROM users;\n",
+    )?;
+    let _ = db.code_index(CodeIndexOptions::for_table("src"))?;
+    // Tree-sitter-sequel may produce different node names across
+    // versions; verify at least one symbol was written from the SQL file.
+    let rows = db.query(
+        "SELECT COUNT(*) FROM _hdb_code_symbols s JOIN _hdb_code_files f \
+         ON f.node_id = s.file_id WHERE f.lang = 'sql'",
+        &[],
+    )?;
+    match &rows[0].values[0] {
+        heliosdb_nano::Value::Int4(n) => {
+            assert!(*n >= 1, "sql symbol count was {n}")
+        }
+        heliosdb_nano::Value::Int8(n) => {
+            assert!(*n >= 1, "sql symbol count was {n}")
+        }
+        v => panic!("expected integer count, got {v:?}"),
+    }
+    Ok(())
+}
+
+#[test]
+fn rust_imports_extracted() -> Result<()> {
+    let db = setup()?;
+    insert(
+        &db,
+        "m.rs",
+        "rust",
+        "use std::collections::HashMap;\nuse crate::foo::Bar;\n\npub fn entry() {}\n",
+    )?;
+    db.code_index(CodeIndexOptions::for_table("src"))?;
+    let rows = db.query(
+        "SELECT to_name FROM _hdb_code_symbol_refs WHERE kind = 'IMPORTS'",
+        &[],
+    )?;
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| match r.values.first() {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(names.iter().any(|n| n.contains("HashMap")), "got {names:?}");
+    assert!(names.iter().any(|n| n.contains("crate::foo::Bar")), "got {names:?}");
+    Ok(())
+}
+
+#[test]
+fn python_imports_extracted() -> Result<()> {
+    let db = setup()?;
+    insert(
+        &db,
+        "x.py",
+        "python",
+        "import os\nfrom collections import defaultdict\n\ndef run():\n    return 1\n",
+    )?;
+    db.code_index(CodeIndexOptions::for_table("src"))?;
+    let rows = db.query(
+        "SELECT to_name FROM _hdb_code_symbol_refs WHERE kind = 'IMPORTS'",
+        &[],
+    )?;
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| match r.values.first() {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(names.iter().any(|n| n.contains("import os")), "got {names:?}");
+    assert!(names.iter().any(|n| n.contains("defaultdict")), "got {names:?}");
+    Ok(())
+}
+
+#[test]
+fn go_imports_extracted() -> Result<()> {
+    let db = setup()?;
+    insert(
+        &db,
+        "m.go",
+        "go",
+        "package p\n\nimport \"fmt\"\n\nfunc Go() { fmt.Println(\"hi\") }\n",
+    )?;
+    db.code_index(CodeIndexOptions::for_table("src"))?;
+    let rows = db.query(
+        "SELECT to_name FROM _hdb_code_symbol_refs WHERE kind = 'IMPORTS'",
+        &[],
+    )?;
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| match r.values.first() {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(names.iter().any(|n| n.contains("\"fmt\"")), "got {names:?}");
+    Ok(())
+}
+
+#[test]
 fn cross_file_ref_resolves() -> Result<()> {
     let db = setup()?;
     // `caller.py` calls `helper()` from `helper.py`; the in-file

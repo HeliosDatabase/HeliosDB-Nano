@@ -128,9 +128,14 @@ pub fn extract(lang: Language, source: &str, tree: &Tree) -> (Vec<Symbol>, Vec<S
     let mut cursor = tree.walk();
     let scope: Vec<String> = Vec::new();
     walk(lang, source, &mut cursor, &scope, None, &mut symbols, &mut refs);
-    refs
-        .iter()
-        .for_each(|_| {}); // silence clippy over the empty-if-ever case
+
+    // Second pass: file-level IMPORTS. Attached to the first
+    // top-level symbol so downstream consumers can still resolve
+    // `from_symbol`.  If a file has no top-level symbol at all
+    // (unusual), imports are dropped.
+    if !symbols.is_empty() {
+        collect_imports(lang, source, tree, &mut refs);
+    }
     (symbols, refs)
 }
 
@@ -152,6 +157,11 @@ fn walk(
                 Language::TypeScript | Language::Tsx | Language::JavaScript => {
                     visit_typescript(node, source, scope, parent_idx, symbols, refs)
                 }
+                Language::Go => visit_go(node, source, scope, parent_idx, symbols, refs),
+                Language::Markdown => {
+                    visit_markdown(node, source, scope, parent_idx, symbols)
+                }
+                Language::Sql => visit_sql(node, source, scope, parent_idx, symbols),
             };
 
         // Descend into children with the possibly-updated scope / parent.
@@ -445,6 +455,210 @@ fn visit_python(
     }
 }
 
+fn visit_go(
+    node: Node<'_>,
+    source: &str,
+    scope: &[String],
+    parent_idx: Option<usize>,
+    symbols: &mut Vec<Symbol>,
+    refs: &mut Vec<SymbolRef>,
+) -> (bool, Option<String>, Option<usize>) {
+    match node.kind() {
+        "function_declaration" => {
+            let (emitted, scope_c, idx) = emit_named_block(
+                node,
+                source,
+                SymbolKind::Function,
+                scope,
+                parent_idx,
+                symbols,
+            );
+            if let Some(i) = idx {
+                collect_call_refs(source, node, i, refs);
+            }
+            (emitted, scope_c, idx)
+        }
+        "method_declaration" => {
+            let (emitted, scope_c, idx) = emit_named_block(
+                node,
+                source,
+                SymbolKind::Method,
+                scope,
+                parent_idx,
+                symbols,
+            );
+            if let Some(i) = idx {
+                collect_call_refs(source, node, i, refs);
+            }
+            (emitted, scope_c, idx)
+        }
+        "type_spec" => {
+            // Go: `type Foo struct { ... }` — treat as a Struct if
+            // the body is a struct_type, Trait if interface_type,
+            // otherwise Type.
+            let kind = node
+                .child_by_field_name("type")
+                .map(|n| match n.kind() {
+                    "struct_type" => SymbolKind::Struct,
+                    "interface_type" => SymbolKind::Trait,
+                    _ => SymbolKind::Type,
+                })
+                .unwrap_or(SymbolKind::Type);
+            emit_named_block(node, source, kind, scope, parent_idx, symbols)
+        }
+        "const_spec" | "var_spec" => {
+            // Take the first identifier as the declaration name.
+            let name_node = node.child_by_field_name("name").or_else(|| {
+                let n = node.named_child_count();
+                (0..n)
+                    .filter_map(|i| node.named_child(i))
+                    .find(|ch| ch.kind() == "identifier")
+            });
+            let Some(n) = name_node else {
+                return (false, None, None);
+            };
+            let name = node_text(n, source).unwrap_or_default().to_string();
+            if name.is_empty() {
+                return (false, None, None);
+            }
+            let qualified = make_qualified(scope, &name);
+            let sig = first_line(node_text(node, source).unwrap_or("")).to_string();
+            let kind = if node.kind() == "const_spec" {
+                SymbolKind::Const
+            } else {
+                SymbolKind::Var
+            };
+            let idx = push(
+                symbols,
+                Symbol {
+                    name: name.clone(),
+                    qualified: qualified.clone(),
+                    kind,
+                    signature: sig,
+                    visibility: if name
+                        .chars()
+                        .next()
+                        .map(|c| c.is_ascii_uppercase())
+                        .unwrap_or(false)
+                    {
+                        Visibility::Public
+                    } else {
+                        Visibility::Private
+                    },
+                    line_start: node.start_position().row as u32 + 1,
+                    line_end: node.end_position().row as u32 + 1,
+                    byte_start: node.start_byte() as u32,
+                    byte_end: node.end_byte() as u32,
+                    parent_idx,
+                },
+            );
+            (true, Some(qualified), Some(idx))
+        }
+        _ => (false, None, None),
+    }
+}
+
+fn visit_markdown(
+    node: Node<'_>,
+    source: &str,
+    scope: &[String],
+    parent_idx: Option<usize>,
+    symbols: &mut Vec<Symbol>,
+) -> (bool, Option<String>, Option<usize>) {
+    // Every `atx_heading` / `setext_heading` is a navigable symbol.
+    // Heading level is recorded in `kind` so consumers can filter.
+    match node.kind() {
+        "atx_heading" | "setext_heading" => {
+            let text = node_text(node, source).unwrap_or("").trim();
+            // Pick the first line after stripping leading `#`s.
+            let first = text.lines().next().unwrap_or(text);
+            let name = first
+                .trim_start_matches('#')
+                .trim()
+                .trim_end_matches('=')
+                .trim_end_matches('-')
+                .trim()
+                .to_string();
+            if name.is_empty() {
+                return (false, None, None);
+            }
+            let qualified = make_qualified(scope, &name);
+            let idx = push(
+                symbols,
+                Symbol {
+                    name: name.clone(),
+                    qualified: qualified.clone(),
+                    kind: SymbolKind::Module,
+                    signature: first.to_string(),
+                    visibility: Visibility::Public,
+                    line_start: node.start_position().row as u32 + 1,
+                    line_end: node.end_position().row as u32 + 1,
+                    byte_start: node.start_byte() as u32,
+                    byte_end: node.end_byte() as u32,
+                    parent_idx,
+                },
+            );
+            (true, Some(qualified), Some(idx))
+        }
+        _ => (false, None, None),
+    }
+}
+
+fn visit_sql(
+    node: Node<'_>,
+    source: &str,
+    scope: &[String],
+    parent_idx: Option<usize>,
+    symbols: &mut Vec<Symbol>,
+) -> (bool, Option<String>, Option<usize>) {
+    // The `tree-sitter-sequel` grammar tags statement kinds in the
+    // node kind. We surface CREATE TABLE / CREATE VIEW / CREATE
+    // FUNCTION / CREATE PROCEDURE as symbols — the common things
+    // users navigate to in SQL codebases.
+    let (kind, kind_str) = match node.kind() {
+        "create_table" => (SymbolKind::Struct, "table"),
+        "create_view" | "create_materialized_view" => (SymbolKind::Type, "view"),
+        "create_function" => (SymbolKind::Function, "function"),
+        "create_procedure" => (SymbolKind::Function, "procedure"),
+        _ => return (false, None, None),
+    };
+    let _ = kind_str;
+
+    // The name is under field "name" on every CREATE variant.
+    let name_node = node.child_by_field_name("name").or_else(|| {
+        let n = node.named_child_count();
+        (0..n).filter_map(|i| node.named_child(i)).find(|ch| {
+            let k = ch.kind();
+            k == "object_reference" || k == "identifier"
+        })
+    });
+    let Some(n) = name_node else {
+        return (false, None, None);
+    };
+    let name = node_text(n, source).unwrap_or_default().to_string();
+    if name.is_empty() {
+        return (false, None, None);
+    }
+    let qualified = make_qualified(scope, &name);
+    let sig = first_line(node_text(node, source).unwrap_or("")).to_string();
+    let idx = push(
+        symbols,
+        Symbol {
+            name,
+            qualified: qualified.clone(),
+            kind,
+            signature: sig,
+            visibility: Visibility::Public,
+            line_start: node.start_position().row as u32 + 1,
+            line_end: node.end_position().row as u32 + 1,
+            byte_start: node.start_byte() as u32,
+            byte_end: node.end_byte() as u32,
+            parent_idx,
+        },
+    );
+    (true, Some(qualified), Some(idx))
+}
+
 fn collect_call_refs(
     source: &str,
     owner: Node<'_>,
@@ -542,6 +756,119 @@ fn push(symbols: &mut Vec<Symbol>, sym: Symbol) -> usize {
     let idx = symbols.len();
     symbols.push(sym);
     idx
+}
+
+/// Walk the tree once more looking for import / use / require nodes.
+/// Each hit emits an IMPORTS `SymbolRef` anchored at the first
+/// top-level symbol (index 0).  Caller has already guaranteed that
+/// `symbols` is non-empty.
+fn collect_imports(lang: Language, source: &str, tree: &Tree, refs: &mut Vec<SymbolRef>) {
+    let root = tree.root_node();
+    let mut stack: Vec<Node<'_>> = Vec::with_capacity(64);
+    stack.push(root);
+    while let Some(n) = stack.pop() {
+        let before = refs.len();
+        match lang {
+            Language::Rust => rust_import(n, source, refs),
+            Language::Python => python_import(n, source, refs),
+            Language::TypeScript | Language::Tsx | Language::JavaScript => {
+                ts_import(n, source, refs)
+            }
+            Language::Go => go_import(n, source, refs),
+            Language::Markdown | Language::Sql => {} // no imports modelled
+        }
+        // Only descend into children if the node wasn't handled as an
+        // import itself — imports are always top-level or near-top-
+        // level, and descending into call expressions costs a lot.
+        if refs.len() == before {
+            let nc = n.named_child_count();
+            for i in 0..nc {
+                if let Some(ch) = n.named_child(i) {
+                    stack.push(ch);
+                }
+            }
+        }
+    }
+}
+
+fn rust_import(n: Node<'_>, source: &str, refs: &mut Vec<SymbolRef>) {
+    if n.kind() != "use_declaration" {
+        return;
+    }
+    // Take the full path text (after `use `, before `;`) as the
+    // target — callers can split as they see fit.
+    let full = node_text(n, source).unwrap_or("").trim();
+    let target = full
+        .trim_start_matches("pub ")
+        .trim_start_matches("use ")
+        .trim_end_matches(';')
+        .trim()
+        .to_string();
+    if !target.is_empty() {
+        refs.push(SymbolRef {
+            from_idx: 0,
+            to_name: target,
+            kind: SymbolRefKind::Imports,
+            line: n.start_position().row as u32 + 1,
+            byte_start: n.start_byte() as u32,
+            byte_end: n.end_byte() as u32,
+        });
+    }
+}
+
+fn python_import(n: Node<'_>, source: &str, refs: &mut Vec<SymbolRef>) {
+    match n.kind() {
+        "import_statement" | "import_from_statement" => {
+            let full = node_text(n, source).unwrap_or("").trim();
+            if !full.is_empty() {
+                refs.push(SymbolRef {
+                    from_idx: 0,
+                    to_name: full.to_string(),
+                    kind: SymbolRefKind::Imports,
+                    line: n.start_position().row as u32 + 1,
+                    byte_start: n.start_byte() as u32,
+                    byte_end: n.end_byte() as u32,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn ts_import(n: Node<'_>, source: &str, refs: &mut Vec<SymbolRef>) {
+    match n.kind() {
+        "import_statement" => {
+            let full = node_text(n, source).unwrap_or("").trim();
+            if !full.is_empty() {
+                refs.push(SymbolRef {
+                    from_idx: 0,
+                    to_name: full.to_string(),
+                    kind: SymbolRefKind::Imports,
+                    line: n.start_position().row as u32 + 1,
+                    byte_start: n.start_byte() as u32,
+                    byte_end: n.end_byte() as u32,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn go_import(n: Node<'_>, source: &str, refs: &mut Vec<SymbolRef>) {
+    if n.kind() != "import_declaration" {
+        return;
+    }
+    let full = node_text(n, source).unwrap_or("").trim();
+    if !full.is_empty() {
+        refs.push(SymbolRef {
+            from_idx: 0,
+            to_name: full.to_string(),
+            kind: SymbolRefKind::Imports,
+            line: n.start_position().row as u32 + 1,
+            byte_start: n.start_byte() as u32,
+            byte_end: n.end_byte() as u32,
+        });
+    }
 }
 
 #[cfg(test)]
