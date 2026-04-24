@@ -3049,6 +3049,41 @@ impl EmbeddedDatabase {
         code_graph::lsp::lsp_hover(self, symbol_id)
     }
 
+    /// Temporal diff of references — added / removed / moved between
+    /// two temporal points. See FR 3 §3.3.
+    #[cfg(feature = "code-graph")]
+    pub fn lsp_references_diff(
+        &self,
+        symbol_id: i64,
+        at_a: &code_graph::AsOfRef,
+        at_b: &code_graph::AsOfRef,
+    ) -> Result<Vec<code_graph::RefDiffRow>> {
+        code_graph::diff::lsp_references_diff(self, symbol_id, at_a, at_b)
+    }
+
+    /// Line-by-line body diff of a single symbol between two points.
+    #[cfg(feature = "code-graph")]
+    pub fn lsp_body_diff(
+        &self,
+        symbol_id: i64,
+        at_a: &code_graph::AsOfRef,
+        at_b: &code_graph::AsOfRef,
+    ) -> Result<Vec<code_graph::BodyDiffLine>> {
+        code_graph::diff::lsp_body_diff(self, symbol_id, at_a, at_b)
+    }
+
+    /// File-level structural diff (which symbols exist, moved, or
+    /// disappeared) between two points.
+    #[cfg(feature = "code-graph")]
+    pub fn ast_diff(
+        &self,
+        file_path: &str,
+        at_a: &code_graph::AsOfRef,
+        at_b: &code_graph::AsOfRef,
+    ) -> Result<Vec<code_graph::AstDiffRow>> {
+        code_graph::diff::ast_diff(self, file_path, at_a, at_b)
+    }
+
     /// Pre-parser rewrite for code-graph table-function references.
     /// When the `code-graph` feature is on, every entry point pipes
     /// user SQL through this first so `SELECT * FROM lsp_definition('X')`

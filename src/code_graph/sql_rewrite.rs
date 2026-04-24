@@ -40,10 +40,12 @@ pub fn rewrite_lsp_calls(sql: &str) -> String {
     while let Some(hit) = find_lsp_call(rest) {
         out.push_str(&rest[..hit.start]);
         let expansion = match hit.func {
-            Func::Definition => expand_definition(&hit.args),
-            Func::References => expand_references(&hit.args),
-            Func::CallHierarchy => expand_call_hierarchy(&hit.args),
-            Func::Hover => expand_hover(&hit.args),
+            Func::Definition => expand_definition(&hit.args, hit.as_of.as_deref()),
+            Func::References => expand_references(&hit.args, hit.as_of.as_deref()),
+            Func::CallHierarchy => {
+                expand_call_hierarchy(&hit.args, hit.as_of.as_deref())
+            }
+            Func::Hover => expand_hover(&hit.args, hit.as_of.as_deref()),
         };
         out.push('(');
         out.push_str(&expansion);
@@ -78,6 +80,91 @@ struct Hit {
     end: usize,
     func: Func,
     args: Vec<String>,
+    /// Optional `AS OF …` clause attached to the lsp_* reference.
+    as_of: Option<String>,
+}
+
+/// Trailing temporal / branch clause that can follow an `lsp_*(...)`
+/// table-function call.  Example: `lsp_definition('X') AS OF COMMIT 'abc'`.
+#[derive(Debug, Clone, Default)]
+struct TrailingClause {
+    /// Raw SQL fragment of the AS OF clause (`AS OF COMMIT 'abc'`,
+    /// `AS OF TIMESTAMP '2025-01-02'`, etc.). Propagated verbatim
+    /// into every scan target in the rewritten subquery so Nano's
+    /// executor handles resolution uniformly.
+    as_of: Option<String>,
+    /// Length in bytes consumed from the outer SQL for this clause
+    /// (so the rewriter knows where to resume).
+    consumed: usize,
+}
+
+fn scan_trailing_clause(s: &str) -> TrailingClause {
+    // Skip leading whitespace.
+    let mut i = 0usize;
+    let bytes = s.as_bytes();
+    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    let rest = &s[i..];
+    let lower = rest.to_ascii_lowercase();
+    // AS OF COMMIT 'sha' | AS OF TIMESTAMP 'ts' | AS OF NOW
+    if lower.starts_with("as of ") {
+        // Find next keyword token.
+        let after_as_of = &rest[6..];
+        let after_trim = after_as_of.trim_start();
+        let kw_start = rest.len() - after_trim.len();
+        let low_after = after_trim.to_ascii_lowercase();
+        let (kw_len, expects_literal) = if low_after.starts_with("commit") {
+            (6, true)
+        } else if low_after.starts_with("timestamp") {
+            (9, true)
+        } else if low_after.starts_with("now") {
+            (3, false)
+        } else if low_after.starts_with("transaction") {
+            (11, true)
+        } else if low_after.starts_with("scn") {
+            (3, true)
+        } else {
+            return TrailingClause::default();
+        };
+        let after_kw = &after_trim[kw_len..];
+        let mut consumed_inner = kw_start + kw_len;
+        let mut literal: Option<String> = None;
+        if expects_literal {
+            // Skip whitespace, take a single-quoted string.
+            let tail = after_kw.trim_start();
+            let ws_skip = after_kw.len() - tail.len();
+            if !tail.starts_with('\'') {
+                return TrailingClause::default();
+            }
+            if let Some(close) = tail[1..].find('\'') {
+                let lit = &tail[..close + 2]; // include both quotes
+                literal = Some(lit.to_string());
+                consumed_inner += ws_skip + lit.len();
+            } else {
+                return TrailingClause::default();
+            }
+        }
+        let clause = format!(
+            "AS OF {}{}",
+            match kw_len {
+                6 => "COMMIT",
+                9 => "TIMESTAMP",
+                3 => "NOW",
+                11 => "TRANSACTION",
+                _ => "SCN",
+            },
+            literal
+                .as_deref()
+                .map(|s| format!(" {s}"))
+                .unwrap_or_default(),
+        );
+        return TrailingClause {
+            as_of: Some(clause),
+            consumed: i + consumed_inner,
+        };
+    }
+    TrailingClause::default()
 }
 
 fn find_lsp_call(s: &str) -> Option<Hit> {
@@ -153,11 +240,14 @@ fn find_lsp_call(s: &str) -> Option<Hit> {
                             Func::CallHierarchy => Func::CallHierarchy,
                             Func::Hover => Func::Hover,
                         };
+                        // Peek at what follows for an AS OF clause.
+                        let trailing = scan_trailing_clause(&s[i + 1..]);
                         return Some(Hit {
                             start: idx,
-                            end: i + 1,
+                            end: i + 1 + trailing.consumed,
                             func: func_owned,
                             args,
+                            as_of: trailing.as_of,
                         });
                     }
                 }
@@ -219,17 +309,18 @@ fn split_args(s: &str) -> Vec<String> {
 
 // ---------- expansions -------------------------------------------------
 
-fn expand_definition(args: &[String]) -> String {
+fn expand_definition(args: &[String], as_of: Option<&str>) -> String {
     // lsp_definition(name, hint_path?)
     let name = args.first().cloned().unwrap_or_else(|| "NULL".into());
     let path = args.get(1).cloned();
+    let ao = as_of.map(|a| format!(" {a}")).unwrap_or_default();
     let mut s = String::new();
     write!(
         s,
         "SELECT s.node_id AS symbol_id, f.path, s.line_start AS line, \
                 s.signature, s.qualified, s.kind \
-         FROM _hdb_code_symbols s \
-         JOIN _hdb_code_files f ON f.node_id = s.file_id \
+         FROM _hdb_code_symbols s{ao} \
+         JOIN _hdb_code_files f{ao} ON f.node_id = s.file_id \
          WHERE s.name = {name}"
     )
     .expect("fmt");
@@ -240,21 +331,19 @@ fn expand_definition(args: &[String]) -> String {
     s
 }
 
-fn expand_references(args: &[String]) -> String {
-    let id = args
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "NULL".into());
+fn expand_references(args: &[String], as_of: Option<&str>) -> String {
+    let id = args.first().cloned().unwrap_or_else(|| "NULL".into());
+    let ao = as_of.map(|a| format!(" {a}")).unwrap_or_default();
     format!(
         "SELECT r.file_id, f.path, r.line, r.kind, r.from_symbol AS caller_symbol_id \
-         FROM _hdb_code_symbol_refs r \
-         JOIN _hdb_code_files f ON f.node_id = r.file_id \
+         FROM _hdb_code_symbol_refs r{ao} \
+         JOIN _hdb_code_files f{ao} ON f.node_id = r.file_id \
          WHERE r.to_symbol = {id} \
          ORDER BY r.line"
     )
 }
 
-fn expand_call_hierarchy(args: &[String]) -> String {
+fn expand_call_hierarchy(args: &[String], as_of: Option<&str>) -> String {
     // Arity is (symbol_id, direction?, depth?). Depth is a hop cap we
     // apply by UNIONing one level. Deep walks fall back to the Rust
     // API. This surface is enough for `depth <= 2` which is the
@@ -267,15 +356,16 @@ fn expand_call_hierarchy(args: &[String]) -> String {
 
     // Build a union of up to `depth` levels; each pulls the peers at
     // that hop. For `depth = 1` the subquery is a single SELECT.
+    let ao = as_of.map(|a| format!(" {a}")).unwrap_or_default();
     let mut levels = Vec::with_capacity(depth as usize);
     for d in 1..=depth {
         let inner = if d == 1 {
             format!(
                 "SELECT {d} AS depth, \
                         {peer_col} AS symbol_id, s.qualified, f.path, s.line_start AS line \
-                 FROM _hdb_code_symbol_refs r \
-                 JOIN _hdb_code_symbols s ON s.node_id = r.{peer_col} \
-                 JOIN _hdb_code_files f ON f.node_id = s.file_id \
+                 FROM _hdb_code_symbol_refs r{ao} \
+                 JOIN _hdb_code_symbols s{ao} ON s.node_id = r.{peer_col} \
+                 JOIN _hdb_code_files f{ao} ON f.node_id = s.file_id \
                  WHERE r.{anchor_col} = {id} AND r.kind = 'CALLS'",
                 peer_col = if dir == "outgoing" { "to_symbol" } else { "from_symbol" },
                 anchor_col = if dir == "outgoing" { "from_symbol" } else { "to_symbol" },
@@ -291,11 +381,12 @@ fn expand_call_hierarchy(args: &[String]) -> String {
     levels.join(" UNION ")
 }
 
-fn expand_hover(args: &[String]) -> String {
+fn expand_hover(args: &[String], as_of: Option<&str>) -> String {
     let id = args.first().cloned().unwrap_or_else(|| "NULL".into());
+    let ao = as_of.map(|a| format!(" {a}")).unwrap_or_default();
     format!(
         "SELECT s.signature, NULL AS doc, NULL AS ai_summary \
-         FROM _hdb_code_symbols s \
+         FROM _hdb_code_symbols s{ao} \
          WHERE s.node_id = {id}"
     )
 }

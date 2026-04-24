@@ -30,7 +30,12 @@ pub mod lsp;
 pub mod embed;
 pub mod sql_rewrite;
 pub mod git_hook;
+pub mod diff;
 
+pub use diff::{
+    ast_diff, lsp_body_diff, lsp_references_diff, AsOfRef, AstDiffRow, BodyDiffLine,
+    BodyOp, DiffChange, RefDiffRow,
+};
 pub use embed::{Embedder, NoopEmbedder, HttpEmbedder};
 pub use lsp::{DefinitionHint, DefinitionRow, ReferenceRow, CallHierarchyRow, HoverRow};
 pub use sql_rewrite::{
