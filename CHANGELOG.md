@@ -5,6 +5,40 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.17.0] - 2026-04-24
+
+### Added — Graph-RAG phase 3 MVP (opt-in, feature = "graph-rag")
+
+First landing for the universal cross-modal graph. Still embedded
+Rust API; SQL-level `WITH CONTEXT` clause, graph-weighted HNSW
+tie-breaking, and semantic-Merkle invalidation are follow-ups.
+
+- New Cargo feature `graph-rag` (implies `code-graph`).
+- New module `src/graph_rag/` (`mod.rs`, `schema.rs`, `search.rs`).
+- `_hdb_graph_nodes` and `_hdb_graph_edges` tables bootstrapped on
+  first call. Plain user tables; queryable and joinable.
+- `EmbeddedDatabase::graph_rag_project_symbols()` — project every
+  row of `_hdb_code_symbols` into `_hdb_graph_nodes` + every
+  resolved row of `_hdb_code_symbol_refs` into `_hdb_graph_edges`.
+  Idempotent. Tolerates the code-graph tables being absent (no-op
+  when nothing to project).
+- `EmbeddedDatabase::graph_rag_search(opts)` — seed → BFS expand →
+  return subgraph with hop distances. `seed_text` matches title/
+  text case-insensitively; `seed_kinds` + `edge_kinds` push down
+  through `FilteredScan` so bloom / zone-map / SIMD selection
+  applies automatically.
+
+Regression coverage:
+- `tests/graph_rag_phase3.rs`: 3 tests —
+  `project_and_search_finds_symbol`, `empty_seed_text_errors`,
+  `bfs_respects_hops`.
+
+Explicitly out of scope for phase 3 (tracked for phase 3.1):
+hybrid-search + vector rerank on seeds, graph-weighted HNSW
+tie-breaking, semantic-Merkle index, `WITH CONTEXT` SQL clause,
+corpus ingestion adapters (`ingest_docs` etc.), entity linker for
+cross-modal MENTIONS.
+
 ## [3.16.0] - 2026-04-24
 
 ### Added — Code-graph phase 2 (opt-in, feature = "code-graph")

@@ -282,6 +282,11 @@ pub mod search;  // BM25 + hybrid search + RRF/MMR rerankers (RAG-native)
 // `_hdb_code_*` tables, LSP-shaped queries. Opt-in.
 #[cfg(feature = "code-graph")]
 pub mod code_graph;
+
+// Graph-RAG track (FR 4) — universal cross-modal `_hdb_graph_*`
+// schema + seed/expand/rerank API. Opt-in; implies `code-graph`.
+#[cfg(feature = "graph-rag")]
+pub mod graph_rag;
 // NOTE: `mcp` module exists on disk but its server.rs / tools.rs reference
 // EmbeddedDatabase methods (query_branch, execute_branch, merge_branches,
 // query_at_timestamp, ...) that no longer exist on the current API. Enabling
@@ -3035,6 +3040,33 @@ impl EmbeddedDatabase {
     #[cfg(feature = "code-graph")]
     pub fn lsp_hover(&self, symbol_id: i64) -> Result<Option<code_graph::HoverRow>> {
         code_graph::lsp::lsp_hover(self, symbol_id)
+    }
+
+    // ------------------------------------------------------------------
+    // Graph-RAG API (feature = "graph-rag", implies `code-graph`)
+    // ------------------------------------------------------------------
+
+    /// Project every `_hdb_code_symbols` row into `_hdb_graph_nodes`
+    /// so the universal-graph layer sees every code symbol as a node.
+    /// Idempotent. Creates the graph tables on first call.
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_project_symbols(&self) -> Result<graph_rag::GraphRagStats> {
+        let mut stats = graph_rag::GraphRagStats::default();
+        graph_rag::project_code_symbols(self, &mut stats)?;
+        Ok(stats)
+    }
+
+    /// Seed → BFS expand → return subgraph. See
+    /// `graph_rag::GraphRagOptions` for knobs. Nano pushes every
+    /// seed/edge WHERE predicate through `FilteredScan`, so the
+    /// storage-level bloom / zone-map / SIMD pipeline carries the
+    /// weight at corpus scale.
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_search(
+        &self,
+        opts: &graph_rag::GraphRagOptions,
+    ) -> Result<Vec<graph_rag::GraphRagHit>> {
+        graph_rag::graph_rag_search(self, opts)
     }
 
     pub fn execute(&self, sql: &str) -> Result<u64> {
