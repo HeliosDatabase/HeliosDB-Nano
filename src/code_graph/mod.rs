@@ -28,8 +28,11 @@ pub mod resolver;
 pub mod storage;
 pub mod lsp;
 pub mod embed;
+pub mod sql_rewrite;
+pub mod git_hook;
 
 pub use embed::{Embedder, NoopEmbedder, HttpEmbedder};
 pub use lsp::{DefinitionHint, DefinitionRow, ReferenceRow, CallHierarchyRow, HoverRow};
+pub use sql_rewrite::rewrite_lsp_calls;
 pub use storage::{CodeIndexOptions, CodeIndexStats, SupportedLanguage};
 pub use symbols::{Symbol, SymbolKind, SymbolRef, SymbolRefKind};

@@ -3049,6 +3049,22 @@ impl EmbeddedDatabase {
         code_graph::lsp::lsp_hover(self, symbol_id)
     }
 
+    /// Pre-parser rewrite for code-graph table-function references.
+    /// When the `code-graph` feature is on, every entry point pipes
+    /// user SQL through this first so `SELECT * FROM lsp_definition('X')`
+    /// expands to an ordinary `SELECT ... FROM _hdb_code_*` subquery.
+    #[inline]
+    fn maybe_rewrite_code_graph<'a>(&self, sql: &'a str) -> std::borrow::Cow<'a, str> {
+        #[cfg(feature = "code-graph")]
+        {
+            let rewritten = code_graph::rewrite_lsp_calls(sql);
+            if rewritten != sql {
+                return std::borrow::Cow::Owned(rewritten);
+            }
+        }
+        std::borrow::Cow::Borrowed(sql)
+    }
+
     // ------------------------------------------------------------------
     // Graph-RAG API (feature = "graph-rag", implies `code-graph`)
     // ------------------------------------------------------------------
@@ -5667,6 +5683,11 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
+        // Code-graph pre-parser: expands `lsp_*(…)` table-function
+        // calls to the underlying `_hdb_code_*` SELECTs.  No-op when
+        // the feature is off or the query has no matching calls.
+        let rewritten = self.maybe_rewrite_code_graph(sql);
+        let sql = rewritten.as_ref();
         let start = std::time::Instant::now();
 
         // DML with RETURNING clause: route through execute_returning path
@@ -6389,6 +6410,9 @@ impl EmbeddedDatabase {
     /// This method prevents SQL injection by treating parameters as data, not code.
     /// Even malicious input is safely handled as a literal value.
     pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<Vec<Tuple>> {
+        // Code-graph pre-parser: see `maybe_rewrite_code_graph`.
+        let rewritten = self.maybe_rewrite_code_graph(sql);
+        let sql = rewritten.as_ref();
         let start = std::time::Instant::now();
 
         // 1. Parse SQL (will recognize $N placeholders)

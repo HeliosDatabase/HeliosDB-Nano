@@ -273,6 +273,7 @@ All PostgreSQL types plus MySQL type aliases (automatically translated):
 - **Triggers**: BEFORE/AFTER INSERT/UPDATE/DELETE
 - **Row-Level Security**: Per-tenant data isolation via policies
 - **EXPLAIN**: Cost-based optimizer, ANALYZE, JSON/XML/YAML output
+- **Code-graph** *(opt-in, `--features code-graph`)*: tree-sitter-backed AST index + `lsp_definition` / `lsp_references` / `lsp_call_hierarchy` / `lsp_hover` as Rust API & SQL table functions — see [code-graph overview](docs/code_graph/overview.md)
 - **Backup/Restore**: Compressed dumps (zstd/gzip/brotli)
 - **Import/Export**: CSV, JSON, JSONL, Parquet, Arrow, SQL
 - **Audit logging**: Tamper-proof trail (SHA-256 checksums)
