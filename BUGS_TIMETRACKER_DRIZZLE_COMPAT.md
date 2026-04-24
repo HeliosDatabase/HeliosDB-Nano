@@ -1979,6 +1979,69 @@ expected count. Currently only (2) passes cleanly.
 
 ---
 
+## Fourteenth retest (2026-04-24) — rebuilt from commit `fb4cc2f` (v3.14.10)
+
+Binary rebuilt from `main` tip
+`fb4cc2f fix(nano): v3.14.10 — FK validation with quoted identifiers + fast-path bypass (B36)`,
+repackaged as `heliosdb-nano:3.14.10`. Fresh `ttm_db_data` volume.
+`SELECT version()` reports `HeliosDB Nano 3.14.10`.
+
+### Confirmed fixed in 3.14.10
+
+- **B36 (FK validation with quoted identifiers)** — fixed at both root causes cited in the release note: planner `REFERENCES` normalisation + `try_fast_insert` stripping surrounding quotes and bailing to the validated Insert arm for any FK-bearing table. TimeTracker's register handler now uses the plain Drizzle-ORM path (no `sql.unsafe()` escape hatch) and succeeds:
+  ```
+  POST /api/auth/register { email, password }
+    → 201 { user: { id, email, createdAt }, token: "…" }
+  ```
+  The handler issues three Drizzle-emitted INSERTs on quoted identifiers (`"users"`, `"workspaces"`, `"memberships"`); all three land, FK checks pass, no orphan rows.
+
+### Full TimeTracker regression sweep — 17/17 green
+
+Every prior bug covered by the ttm HTTP surface was exercised end-to-end through Drizzle + postgres-js against `heliosdb-nano:3.14.10`:
+
+| Area | Endpoints | Bugs exercised | Result |
+|------|-----------|----------------|--------|
+| Auth | `POST /api/auth/register` · `POST /api/auth/login` | B1–B4, B12, B24, B26–B28, B30, **B36** | ✓ |
+| Workspace fan-out | 6× parallel `GET /api/customers` on a brand-new session | B29 (result-cache invalidation) | ✓ · no dupes, 1 workspace per user |
+| Write path | `POST /api/customers` · `POST /api/projects` (FK to customers) · `POST /api/time-entries` (FK to projects, customers) · `PATCH /api/time-entries/:id` | B4, B18, B27, B31, B34 | ✓ |
+| Analytics | `GET /api/dashboard` · `GET /api/patterns?days=7` · `GET /api/insights` · `GET /api/statistics` · `POST /api/reports/custom` · `POST /api/reports/compare` | B5, B19, B20, B22, B32, B33, B35 | ✓ |
+| Delete | `DELETE /api/time-entries/:id` | B31 (qualified WHERE) | ✓ |
+| Invoice | `POST /api/generate-invoice` | end-to-end PDF generation | ✓ 200 · `application/pdf` · 2377 B · PDF 1.3 |
+
+**pass: 17 · fail: 0 · regressions: none.** Every bug B1 through B36
+is now either **fixed and shipping** or explicitly out-of-scope
+(B14's quoted-case-sensitive identifier reproducer matches stock
+PostgreSQL behaviour).
+
+### Status overview — all green
+
+| ID  | Status on 3.14.10 |
+|-----|-------------------|
+| B1 – B17 | fixed since 3.14.0 |
+| B18 | fixed since 3.14.0 (via B4) |
+| B19, B20, B21 | fixed since 3.14.1 |
+| B22, B23 | fixed since 3.14.2 |
+| B24, B25, B26 | fixed since 3.14.3 |
+| B27, B28 | fixed since 3.14.4 |
+| B30 | fixed since 3.14.5 |
+| B29 | fixed since 3.14.6 |
+| B31, B32 | fixed since 3.14.7 |
+| B33, B34 | fixed since 3.14.8 |
+| B35 | fixed since 3.14.9 |
+| **B36** | **fixed since 3.14.10** |
+
+### TimeTracker client-side change landed alongside
+
+- Dropped the `sql.unsafe()` + client-side escape workaround from `server/auth.ts`; the register handler is back to idiomatic Drizzle:
+  ```ts
+  const [user] = await db.insert(users).values({ email, password: hashedPassword }).returning();
+  const [ws] = await db.insert(workspaces).values({ name: workspaceName, ownerId: user.id }).returning();
+  await db.insert(memberships).values({ workspaceId: ws.id, userId: user.id, role: "owner" });
+  ```
+- Removed the `createPool` import that existed only for the workaround.
+
+---
+
 ## Closing
 
 Happy to contribute failing integration tests in Rust or pytest if useful — the reproducers above can be lifted straight into `tests/compat/` and run against the `heliosdb-nano:3.14.9` binary. The symptom quotes in each "Actual" block are verbatim from the server over the PG wire (message code, text, and structured error payload where present).
