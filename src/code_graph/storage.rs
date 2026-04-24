@@ -86,6 +86,9 @@ pub struct CodeIndexStats {
     pub files_seen: u64,
     pub files_parsed: u64,
     pub files_skipped: u64,
+    /// Files whose content-hash matched the stored sha256 and that
+    /// therefore skipped the parse + re-insert cycle entirely.
+    pub files_unchanged: u64,
     pub symbols_written: u64,
     pub refs_written: u64,
     pub embed_calls: u64,
@@ -113,6 +116,11 @@ pub fn is_extension_installed() -> bool {
 /// Run the indexer over `opts.source_table`. Creates the `_hdb_code_*`
 /// tables on first call. Returns statistics; never mutates the source
 /// table.
+///
+/// Inserts are batched via multi-row `VALUES` (up to
+/// [`INSERT_BATCH`] rows / call) and unchanged files are skipped by
+/// comparing the row's SHA-256 against the stored hash. `force_reparse`
+/// bypasses the sha gate.
 pub fn code_index(db: &EmbeddedDatabase, opts: CodeIndexOptions) -> Result<CodeIndexStats> {
     bootstrap_tables(db)?;
     mark_extension_installed();
@@ -129,8 +137,10 @@ pub fn code_index(db: &EmbeddedDatabase, opts: CodeIndexOptions) -> Result<CodeI
     };
 
     let files = fetch_source_files(db, &opts.source_table)?;
+    let existing_sha = fetch_file_sha_map(db)?;
     let mut stats = CodeIndexStats::default();
     let mut lang_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut touched = false;
 
     for file in &files {
         stats.files_seen += 1;
@@ -140,26 +150,33 @@ pub fn code_index(db: &EmbeddedDatabase, opts: CodeIndexOptions) -> Result<CodeI
         };
         lang_set.insert(lang.as_str().to_string());
 
-        // Phase 1: always rewrite. Phase 2 gates on content hash.
-        let _ = opts.force_reparse;
+        // Content-hash gate: if the content hash matches the stored
+        // sha and the caller did not set `force_reparse`, skip this
+        // file entirely. Keeps warm re-indexes close to O(changed).
+        let sha = sha256_hex(&file.content);
+        let unchanged = existing_sha
+            .get(&file.path)
+            .map(|s| s == &sha)
+            .unwrap_or(false);
+        if unchanged && !opts.force_reparse {
+            stats.files_unchanged += 1;
+            continue;
+        }
+        touched = true;
 
         let tree = parse::parse(lang, &file.content)?;
         let (symbols, refs) = extract(lang, &file.content, &tree);
 
-        // Upsert the file row, get back the file_id.
-        let file_id = upsert_file(db, file)?;
+        // Upsert the file row, get back the file_id. This also writes
+        // the new sha256 so the next run can short-circuit.
+        let file_id = upsert_file(db, file, &sha)?;
 
-        // Delete previous symbols/refs for this file so we re-populate
-        // cleanly. Cross-file refs can point AT symbols in this file
-        // from other files, so null those out first — the cross-file
-        // resolver at the end of `code_index` rebinds them.
-        //
-        // Two-step rather than `UPDATE … WHERE to_symbol IN (SELECT …)`
-        // — the SQL subquery-in-DML path isn't wired in this engine yet.
+        // Null inbound cross-file refs pointing at this file's old
+        // symbols — the cross-file resolver at the end of the run
+        // rebinds them. Uses a literal IN list (SELECT-then-UPDATE)
+        // since `UPDATE … IN (SELECT …)` isn't wired in the DML path.
         let sym_rows = db.query(
-            &format!(
-                "SELECT node_id FROM _hdb_code_symbols WHERE file_id = {file_id}"
-            ),
+            &format!("SELECT node_id FROM _hdb_code_symbols WHERE file_id = {file_id}"),
             &[],
         )?;
         let stale_ids: Vec<i64> = sym_rows
@@ -200,13 +217,48 @@ pub fn code_index(db: &EmbeddedDatabase, opts: CodeIndexOptions) -> Result<CodeI
 
     stats.languages_seen = lang_set.into_iter().collect();
 
-    // Cross-file resolution pass: for every unresolved ref, look up
-    // the `to_name` in `_hdb_code_symbols` (full corpus) and rebind.
-    // Single-candidate hits are marked `exact`; multi-candidate hits
-    // bind to the first match with `heuristic`.
-    cross_file_resolve(db, &mut stats)?;
+    // Cross-file resolution only pays off if the corpus actually
+    // changed this run.
+    if touched {
+        cross_file_resolve(db, &mut stats)?;
+    }
 
     Ok(stats)
+}
+
+/// Max rows per multi-row `INSERT … VALUES (...), (...), …`. Each row
+/// binds ~10 parameters, so 100 rows = ~1000 parameters per call —
+/// well under any sane engine limit, while collapsing 77 K individual
+/// writes on Nano's own `src/` into under 800 batched calls.
+const INSERT_BATCH: usize = 100;
+
+fn sha256_hex(s: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(s.as_bytes());
+    hex::encode(h.finalize())
+}
+
+fn fetch_file_sha_map(db: &EmbeddedDatabase) -> Result<HashMap<String, String>> {
+    // Probe first — _hdb_code_files may not exist on the very first call.
+    let probe = db.query("SELECT 1 FROM _hdb_code_files LIMIT 1", &[]);
+    if probe.is_err() {
+        return Ok(HashMap::new());
+    }
+    let rows = db.query("SELECT path, sha256 FROM _hdb_code_files", &[])?;
+    let mut out = HashMap::with_capacity(rows.len());
+    for row in rows {
+        let path = match row.values.first() {
+            Some(Value::String(s)) => s.clone(),
+            _ => continue,
+        };
+        let sha = match row.values.get(1) {
+            Some(Value::String(s)) => s.clone(),
+            _ => continue,
+        };
+        out.insert(path, sha);
+    }
+    Ok(out)
 }
 
 fn cross_file_resolve(db: &EmbeddedDatabase, stats: &mut CodeIndexStats) -> Result<()> {
@@ -370,16 +422,12 @@ fn fetch_source_files(db: &EmbeddedDatabase, source_table: &str) -> Result<Vec<S
 // Write helpers
 // ---------------------------------------------------------------------------
 
-fn upsert_file(db: &EmbeddedDatabase, file: &SourceFile) -> Result<i64> {
+fn upsert_file(db: &EmbeddedDatabase, file: &SourceFile, sha: &str) -> Result<i64> {
     // Parameterised path — source strings (paths, languages, sha256s)
     // may contain arbitrary characters we refuse to hand-escape.
     let path_val = Value::String(file.path.clone());
     let lang_val = Value::String(file.lang.clone());
-    let sha_val = file
-        .sha256
-        .as_ref()
-        .map(|s| Value::String(s.clone()))
-        .unwrap_or(Value::Null);
+    let sha_val = Value::String(sha.to_string());
 
     let existing = db.query_params(
         "SELECT node_id FROM _hdb_code_files \
@@ -431,7 +479,8 @@ fn insert_symbols(
     embedder: &dyn Embedder,
     stats: &mut CodeIndexStats,
 ) -> Result<Vec<i64>> {
-    let mut ids = Vec::with_capacity(symbols.len());
+    // Embedding is optional + per-symbol; keep it outside the batch
+    // loop so we don't conflate it with DB throughput.
     for sym in symbols {
         if !sym.signature.is_empty() {
             let v = embedder.embed(&sym.signature)?;
@@ -439,35 +488,69 @@ fn insert_symbols(
                 stats.embed_calls += 1;
             }
         }
-        let (_, rows) = db.execute_params_returning(
+    }
+
+    let mut ids = Vec::with_capacity(symbols.len());
+    // Batch N rows per INSERT. Multi-row VALUES collapses
+    // parse+plan+WAL overhead; RETURNING gives us the ids back in
+    // insert order so we can bind refs afterward.
+    const COLS: usize = 10;
+    for chunk in symbols.chunks(INSERT_BATCH) {
+        let mut sql = String::with_capacity(COLS * 8 * chunk.len() + 128);
+        sql.push_str(
             "INSERT INTO _hdb_code_symbols \
                (file_id, name, qualified, kind, signature, \
                 visibility, line_start, line_end, byte_start, byte_end) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
-             RETURNING node_id",
-            &[
-                Value::Int8(file_id),
-                Value::String(sym.name.clone()),
-                Value::String(sym.qualified.clone()),
-                Value::String(sym.kind.as_str().to_string()),
-                Value::String(sym.signature.clone()),
-                Value::String(sym.visibility.as_str().to_string()),
-                Value::Int4(sym.line_start as i32),
-                Value::Int4(sym.line_end as i32),
-                Value::Int4(sym.byte_start as i32),
-                Value::Int4(sym.byte_end as i32),
-            ],
-        )?;
-        let id = rows
-            .first()
-            .and_then(|r| r.values.first())
-            .and_then(|v| match v {
-                Value::Int4(n) => Some(*n as i64),
-                Value::Int8(n) => Some(*n),
-                _ => None,
-            })
-            .ok_or_else(|| Error::query_execution("symbol RETURNING yielded no id"))?;
-        ids.push(id);
+             VALUES ",
+        );
+        let mut params: Vec<Value> = Vec::with_capacity(COLS * chunk.len());
+        for (row_idx, sym) in chunk.iter().enumerate() {
+            if row_idx > 0 {
+                sql.push(',');
+            }
+            sql.push('(');
+            for col in 0..COLS {
+                if col > 0 {
+                    sql.push(',');
+                }
+                sql.push('$');
+                sql.push_str(&(row_idx * COLS + col + 1).to_string());
+            }
+            sql.push(')');
+            params.push(Value::Int8(file_id));
+            params.push(Value::String(sym.name.clone()));
+            params.push(Value::String(sym.qualified.clone()));
+            params.push(Value::String(sym.kind.as_str().to_string()));
+            params.push(Value::String(sym.signature.clone()));
+            params.push(Value::String(sym.visibility.as_str().to_string()));
+            params.push(Value::Int4(sym.line_start as i32));
+            params.push(Value::Int4(sym.line_end as i32));
+            params.push(Value::Int4(sym.byte_start as i32));
+            params.push(Value::Int4(sym.byte_end as i32));
+        }
+        sql.push_str(" RETURNING node_id");
+        let (_, rows) = db.execute_params_returning(&sql, &params)?;
+        if rows.len() != chunk.len() {
+            return Err(Error::query_execution(format!(
+                "batched INSERT returned {} rows, expected {}",
+                rows.len(),
+                chunk.len()
+            )));
+        }
+        for row in &rows {
+            let id = row
+                .values
+                .first()
+                .and_then(|v| match v {
+                    Value::Int4(n) => Some(*n as i64),
+                    Value::Int8(n) => Some(*n),
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    Error::query_execution("symbol RETURNING yielded no id")
+                })?;
+            ids.push(id);
+        }
     }
     Ok(ids)
 }
@@ -478,41 +561,60 @@ fn insert_refs(
     symbol_ids: &[i64],
     resolved: &[super::resolver::ResolvedRef],
 ) -> Result<u64> {
-    // Build a name→id map for same-file lookups; reassign from the
-    // resolved `to_idx` back to the actual `node_id` written above.
-    let _ = symbol_ids;
+    if resolved.is_empty() {
+        return Ok(0);
+    }
+    const COLS: usize = 7;
     let mut written = 0u64;
-    for r in resolved {
-        let from_id = symbol_ids.get(r.from_idx).copied().ok_or_else(|| {
-            Error::query_execution(format!("resolver produced invalid from_idx {}", r.from_idx))
-        })?;
-        let to_val = match r.to_idx {
-            Some(idx) => symbol_ids
-                .get(idx)
-                .map(|id| Value::Int8(*id))
-                .unwrap_or(Value::Null),
-            None => Value::Null,
-        };
-        let res = match r.resolution {
-            Resolution::Exact => "exact",
-            Resolution::Heuristic => "heuristic",
-            Resolution::Unresolved => "unresolved",
-        };
-        db.execute_params_returning(
+    for chunk in resolved.chunks(INSERT_BATCH) {
+        let mut sql = String::with_capacity(COLS * 8 * chunk.len() + 128);
+        sql.push_str(
             "INSERT INTO _hdb_code_symbol_refs \
                (file_id, from_symbol, to_symbol, to_name, kind, line, resolution) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            &[
-                Value::Int8(file_id),
-                Value::Int8(from_id),
-                to_val,
-                Value::String(r.to_name.clone()),
-                Value::String(r.kind_str.to_string()),
-                Value::Int4(r.line as i32),
-                Value::String(res.to_string()),
-            ],
-        )?;
-        written += 1;
+             VALUES ",
+        );
+        let mut params: Vec<Value> = Vec::with_capacity(COLS * chunk.len());
+        for (row_idx, r) in chunk.iter().enumerate() {
+            let from_id = symbol_ids.get(r.from_idx).copied().ok_or_else(|| {
+                Error::query_execution(format!(
+                    "resolver produced invalid from_idx {}",
+                    r.from_idx
+                ))
+            })?;
+            let to_val = match r.to_idx {
+                Some(idx) => symbol_ids
+                    .get(idx)
+                    .map(|id| Value::Int8(*id))
+                    .unwrap_or(Value::Null),
+                None => Value::Null,
+            };
+            let res = match r.resolution {
+                Resolution::Exact => "exact",
+                Resolution::Heuristic => "heuristic",
+                Resolution::Unresolved => "unresolved",
+            };
+            if row_idx > 0 {
+                sql.push(',');
+            }
+            sql.push('(');
+            for col in 0..COLS {
+                if col > 0 {
+                    sql.push(',');
+                }
+                sql.push('$');
+                sql.push_str(&(row_idx * COLS + col + 1).to_string());
+            }
+            sql.push(')');
+            params.push(Value::Int8(file_id));
+            params.push(Value::Int8(from_id));
+            params.push(to_val);
+            params.push(Value::String(r.to_name.clone()));
+            params.push(Value::String(r.kind_str.to_string()));
+            params.push(Value::Int4(r.line as i32));
+            params.push(Value::String(res.to_string()));
+        }
+        db.execute_params_returning(&sql, &params)?;
+        written += chunk.len() as u64;
     }
     Ok(written)
 }

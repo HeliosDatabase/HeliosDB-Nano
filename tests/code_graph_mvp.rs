@@ -131,8 +131,11 @@ fn code_index_is_idempotent() -> Result<()> {
     insert_file(&db, "x.rs", "rust", "pub fn f() {}\n")?;
     let s1 = db.code_index(CodeIndexOptions::for_table("src"))?;
     let s2 = db.code_index(CodeIndexOptions::for_table("src"))?;
-    assert_eq!(s1.symbols_written, s2.symbols_written);
-    // The second run should leave a single `f` row, not two.
+    // Content-hash gate short-circuits the second run: it writes 0
+    // new symbols (file is unchanged) but the lookup still resolves.
+    assert_eq!(s1.symbols_written, 1);
+    assert_eq!(s2.symbols_written, 0);
+    assert_eq!(s2.files_unchanged, 1);
     let defs = db.lsp_definition("f", &DefinitionHint::default())?;
     assert_eq!(defs.len(), 1, "re-index duplicated rows: {defs:?}");
     Ok(())
