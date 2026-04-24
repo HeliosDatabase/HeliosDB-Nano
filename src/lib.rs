@@ -3004,7 +3004,16 @@ impl EmbeddedDatabase {
         &self,
         opts: code_graph::CodeIndexOptions,
     ) -> Result<code_graph::CodeIndexStats> {
-        code_graph::storage::code_index(self, opts)
+        let stats = code_graph::storage::code_index(self, opts)?;
+        // Incremental projection: when graph-rag is enabled, mirror
+        // new code symbols + refs into the universal `_hdb_graph_*`
+        // schema.  Keeps the projection in sync without callers
+        // having to remember to call `graph_rag_project_symbols`.
+        #[cfg(feature = "graph-rag")]
+        {
+            let _ = self.graph_rag_project_symbols();
+        }
+        Ok(stats)
     }
 
     /// "Where is `name` defined?" — returns zero or more candidate
@@ -3280,6 +3289,19 @@ impl EmbeddedDatabase {
         opts: &graph_rag::GraphRagOptions,
     ) -> Result<Vec<graph_rag::GraphRagHit>> {
         graph_rag::graph_rag_search(self, opts)
+    }
+
+    /// Entity-linker pass: emits `MENTIONS` edges from text-bearing
+    /// nodes (DocChunk / Email / Issue / InvestorQuestion …) to code
+    /// symbols whose qualified name appears as a whole word in the
+    /// node's title/text.  Idempotent.  `extra_kinds` adds more
+    /// text-bearing `node_kind`s to the match set beyond the default.
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_link_exact(
+        &self,
+        extra_kinds: &[&str],
+    ) -> Result<graph_rag::LinkerStats> {
+        graph_rag::link_exact_qualified(self, extra_kinds)
     }
 
     pub fn execute(&self, sql: &str) -> Result<u64> {

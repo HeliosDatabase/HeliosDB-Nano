@@ -47,6 +47,64 @@ impl Default for TraversalLimits {
     }
 }
 
+/// Scan-time predicate applied to every edge during BFS / Dijkstra /
+/// shortest-path traversal.  Equivalent to `FilteredScan` at the
+/// graph layer: edges not matching the predicate are skipped before
+/// the visited set even sees their target.
+///
+/// Empty `labels` + `None` weight bounds = match everything.  Label
+/// filtering on the existing `label: Option<&str>` param combines
+/// with this — the string match narrows first, then weight bounds
+/// filter the remainder.
+#[derive(Debug, Clone, Default)]
+pub struct EdgePredicate {
+    /// When non-empty, only edges whose `label` is in this set pass.
+    pub labels: Vec<String>,
+    /// Minimum weight (inclusive) an edge must carry.
+    pub min_weight: Option<f64>,
+    /// Maximum weight (inclusive) an edge must carry.
+    pub max_weight: Option<f64>,
+}
+
+impl EdgePredicate {
+    pub fn with_labels<I, S>(labels: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        Self {
+            labels: labels.into_iter().map(Into::into).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[must_use]
+    pub fn with_weight_range(mut self, min: Option<f64>, max: Option<f64>) -> Self {
+        self.min_weight = min;
+        self.max_weight = max;
+        self
+    }
+
+    /// Test an edge against this predicate. O(labels) per edge.
+    #[inline]
+    pub fn matches(&self, edge: &super::storage::Edge) -> bool {
+        if !self.labels.is_empty() && !self.labels.iter().any(|l| l == &edge.label) {
+            return false;
+        }
+        if let Some(min) = self.min_weight {
+            if edge.weight < min {
+                return false;
+            }
+        }
+        if let Some(max) = self.max_weight {
+            if edge.weight > max {
+                return false;
+            }
+        }
+        true
+    }
+}
+
 /// A discovered path through the graph.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Path {
@@ -76,6 +134,20 @@ pub fn bfs(
     label: Option<&str>,
     limits: TraversalLimits,
 ) -> Vec<(NodeId, usize)> {
+    bfs_filtered(graph, start, direction, label, limits, None)
+}
+
+/// `bfs` with an additional scan-time predicate.  Edges failing
+/// `predicate.matches` are skipped before the visited set records
+/// their target.  Passing `None` is equivalent to calling [`bfs`].
+pub fn bfs_filtered(
+    graph: &GraphStore,
+    start: NodeId,
+    direction: Direction,
+    label: Option<&str>,
+    limits: TraversalLimits,
+    predicate: Option<&EdgePredicate>,
+) -> Vec<(NodeId, usize)> {
     let mut visited = HashSet::with_capacity(64);
     let mut queue = VecDeque::with_capacity(64);
     let mut out = Vec::with_capacity(64);
@@ -89,6 +161,11 @@ pub fn bfs(
             continue;
         }
         for edge in graph.neighbors(node, direction, label) {
+            if let Some(p) = predicate {
+                if !p.matches(&edge) {
+                    continue;
+                }
+            }
             let next = other_end(&edge, node, direction);
             if visited.insert(next) {
                 queue.push_back((next, depth + 1));
