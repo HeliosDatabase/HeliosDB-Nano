@@ -1,5 +1,7 @@
-//! Pre-parser SQL rewriter: turns `lsp_xxx(...)` table-function
-//! references into ordinary `SELECT ... FROM _hdb_code_*` subqueries.
+//! Pre-parser SQL rewriter + `CREATE AST INDEX` detector.
+//!
+//! First role: turns `lsp_xxx(...)` table-function references into
+//! ordinary `SELECT ... FROM _hdb_code_*` subqueries.
 //!
 //! The engine has no first-class UDTF (user-defined table function)
 //! support, and adding one would ripple through every executor
@@ -359,5 +361,363 @@ mod tests {
         // `O'Brien` escaped as O''Brien — must survive the rewriter.
         let got = rewrite_lsp_calls("SELECT * FROM lsp_definition('O''Brien')");
         assert!(got.contains("s.name = 'O''Brien'"));
+    }
+}
+
+// ============================================================================
+// CREATE AST INDEX / hdb_code.pause|resume detection
+// ============================================================================
+
+/// Everything an `CREATE AST INDEX` statement binds on the engine
+/// side after we've pulled it out of the SQL text. The executor takes
+/// this and routes it to `code_graph::storage::code_index`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AstIndexDdl {
+    pub index_name: String,
+    pub table: String,
+    /// Column that holds source text (currently informational — the
+    /// indexer reads `content` from the source table by convention).
+    pub content_col: String,
+    /// `lang_col` may be the name of a column that holds the per-row
+    /// language tag, OR `None` when the user wrote `USING tree_sitter`
+    /// without arguments (then all rows are treated as the default
+    /// language — error at index time).
+    pub lang_col: Option<String>,
+    pub if_not_exists: bool,
+    pub auto_reparse: bool,
+    pub embed_bodies: bool,
+    pub embed_endpoint: Option<String>,
+    pub embed_bearer: Option<String>,
+    pub resolve_cross_file: bool,
+}
+
+/// Return `Some(AstIndexDdl)` if `sql` is a `CREATE AST INDEX`
+/// statement, else `None`.  Syntax accepted:
+///
+/// ```text
+/// CREATE AST INDEX [IF NOT EXISTS] <name>
+///     ON <table> (<content_col>)
+///     [ USING tree_sitter[(<lang_col>)] ]
+///     [ WITH (opt = value, ...) ]
+///     [;]
+/// ```
+pub fn detect_create_ast_index(sql: &str) -> Option<AstIndexDdl> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let lower = s.to_ascii_lowercase();
+    // Must start with `create ast index` (whitespace between words OK).
+    let mut it = lower.split_ascii_whitespace();
+    if it.next()? != "create" {
+        return None;
+    }
+    if it.next()? != "ast" {
+        return None;
+    }
+    if it.next()? != "index" {
+        return None;
+    }
+
+    // Work on the original-case string from here on, using a simple
+    // tokenizer that treats whitespace, parens, and commas as
+    // separators.
+    let mut t = Tokenizer::new(s);
+    // advance past CREATE AST INDEX
+    t.expect_word("create")?;
+    t.expect_word("ast")?;
+    t.expect_word("index")?;
+
+    let mut if_not_exists = false;
+    if t.peek_word_eq("if") {
+        t.expect_word("if")?;
+        t.expect_word("not")?;
+        t.expect_word("exists")?;
+        if_not_exists = true;
+    }
+
+    let index_name = t.take_ident()?;
+    t.expect_word("on")?;
+    let table = t.take_ident()?;
+    t.expect_char('(')?;
+    let content_col = t.take_ident()?;
+    t.expect_char(')')?;
+
+    // Optional USING tree_sitter[(col)]
+    let mut lang_col: Option<String> = None;
+    if t.peek_word_eq("using") {
+        t.expect_word("using")?;
+        let meth = t.take_ident()?.to_ascii_lowercase();
+        if meth != "tree_sitter" {
+            return None;
+        }
+        if t.peek_char() == Some('(') {
+            t.expect_char('(')?;
+            lang_col = Some(t.take_ident()?);
+            t.expect_char(')')?;
+        }
+    }
+
+    // Optional WITH (k = v, k = v, ...)
+    let mut auto_reparse = false;
+    let mut embed_bodies = false;
+    let mut embed_endpoint: Option<String> = None;
+    let mut embed_bearer: Option<String> = None;
+    let mut resolve_cross_file = true;
+    if t.peek_word_eq("with") {
+        t.expect_word("with")?;
+        t.expect_char('(')?;
+        loop {
+            let key = t.take_ident()?.to_ascii_lowercase();
+            t.expect_char('=')?;
+            let val = t.take_value()?;
+            match key.as_str() {
+                "auto_reparse" => auto_reparse = parse_bool(&val),
+                "embed_bodies" => embed_bodies = parse_bool(&val),
+                "embed_endpoint" => embed_endpoint = Some(val),
+                "embed_bearer" => embed_bearer = Some(val),
+                "resolve_cross_file" => resolve_cross_file = parse_bool(&val),
+                _ => { /* ignore unknown keys for forward compat */ }
+            }
+            match t.peek_char() {
+                Some(',') => {
+                    t.expect_char(',')?;
+                }
+                Some(')') => break,
+                _ => return None,
+            }
+        }
+        t.expect_char(')')?;
+    }
+
+    Some(AstIndexDdl {
+        index_name,
+        table,
+        content_col,
+        lang_col,
+        if_not_exists,
+        auto_reparse,
+        embed_bodies,
+        embed_endpoint,
+        embed_bearer,
+        resolve_cross_file,
+    })
+}
+
+/// Detect `SELECT hdb_code.pause('index_name')` and
+/// `SELECT hdb_code.resume('index_name')` — both are admin calls
+/// that toggle the index's auto_reparse flag in process-local state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PauseResume {
+    Pause(String),
+    Resume(String),
+}
+
+pub fn detect_pause_resume(sql: &str) -> Option<PauseResume> {
+    let s = sql.trim().trim_end_matches(';');
+    let low = s.to_ascii_lowercase();
+    for (needle, ctor) in &[
+        ("hdb_code.pause", true),
+        ("hdb_code.resume", false),
+    ] {
+        if let Some(i) = low.find(needle) {
+            let after = &s[i + needle.len()..];
+            let after = after.trim_start();
+            if !after.starts_with('(') {
+                continue;
+            }
+            let inner = &after[1..];
+            let close = inner.find(')')?;
+            let arg = inner[..close].trim().trim_matches('\'').to_string();
+            if arg.is_empty() {
+                return None;
+            }
+            return Some(if *ctor {
+                PauseResume::Pause(arg)
+            } else {
+                PauseResume::Resume(arg)
+            });
+        }
+    }
+    None
+}
+
+fn parse_bool(v: &str) -> bool {
+    matches!(
+        v.trim().trim_matches('\'').to_ascii_lowercase().as_str(),
+        "true" | "t" | "1" | "yes"
+    )
+}
+
+// ---------- tiny tokenizer -------------------------------------------------
+
+struct Tokenizer<'a> {
+    src: &'a str,
+    pos: usize,
+}
+
+impl<'a> Tokenizer<'a> {
+    fn new(s: &'a str) -> Self { Self { src: s, pos: 0 } }
+
+    fn skip_ws(&mut self) {
+        while self.pos < self.src.len() {
+            let c = self.src.as_bytes()[self.pos];
+            if c.is_ascii_whitespace() {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn peek_char(&mut self) -> Option<char> {
+        self.skip_ws();
+        self.src.as_bytes().get(self.pos).map(|b| *b as char)
+    }
+
+    fn expect_char(&mut self, c: char) -> Option<()> {
+        self.skip_ws();
+        let b = self.src.as_bytes().get(self.pos).copied()?;
+        if b as char != c {
+            return None;
+        }
+        self.pos += 1;
+        Some(())
+    }
+
+    fn expect_word(&mut self, word: &str) -> Option<()> {
+        self.skip_ws();
+        let end = self.pos + word.len();
+        let slice = self.src.get(self.pos..end)?;
+        if !slice.eq_ignore_ascii_case(word) {
+            return None;
+        }
+        // Must not be followed by an identifier char.
+        let next = self.src.as_bytes().get(end).copied();
+        if matches!(next, Some(c) if (c as char).is_ascii_alphanumeric() || c == b'_') {
+            return None;
+        }
+        self.pos = end;
+        Some(())
+    }
+
+    fn peek_word_eq(&mut self, word: &str) -> bool {
+        self.skip_ws();
+        self.src
+            .get(self.pos..self.pos + word.len())
+            .map(|s| s.eq_ignore_ascii_case(word))
+            .unwrap_or(false)
+            && self
+                .src
+                .as_bytes()
+                .get(self.pos + word.len())
+                .map(|c| !((*c as char).is_ascii_alphanumeric() || *c == b'_'))
+                .unwrap_or(true)
+    }
+
+    fn take_ident(&mut self) -> Option<String> {
+        self.skip_ws();
+        let bytes = self.src.as_bytes();
+        // Support double-quoted identifiers: "foo"
+        if bytes.get(self.pos).copied() == Some(b'"') {
+            self.pos += 1;
+            let start = self.pos;
+            while self.pos < bytes.len() && bytes[self.pos] != b'"' {
+                self.pos += 1;
+            }
+            let name = self.src.get(start..self.pos)?.to_string();
+            if self.pos < bytes.len() && bytes[self.pos] == b'"' {
+                self.pos += 1;
+            }
+            return Some(name);
+        }
+        let start = self.pos;
+        while self.pos < bytes.len() {
+            let b = bytes[self.pos];
+            if b.is_ascii_alphanumeric() || b == b'_' {
+                self.pos += 1;
+            } else {
+                break;
+            }
+        }
+        if self.pos == start {
+            return None;
+        }
+        Some(self.src.get(start..self.pos)?.to_string())
+    }
+
+    fn take_value(&mut self) -> Option<String> {
+        self.skip_ws();
+        let bytes = self.src.as_bytes();
+        if bytes.get(self.pos).copied() == Some(b'\'') {
+            self.pos += 1;
+            let start = self.pos;
+            while self.pos < bytes.len() && bytes[self.pos] != b'\'' {
+                self.pos += 1;
+            }
+            let v = self.src.get(start..self.pos)?.to_string();
+            if self.pos < bytes.len() && bytes[self.pos] == b'\'' {
+                self.pos += 1;
+            }
+            return Some(v);
+        }
+        // Unquoted: take until whitespace, comma, or paren.
+        let start = self.pos;
+        while self.pos < bytes.len() {
+            let b = bytes[self.pos];
+            if b.is_ascii_whitespace() || b == b',' || b == b')' {
+                break;
+            }
+            self.pos += 1;
+        }
+        Some(self.src.get(start..self.pos)?.to_string())
+    }
+}
+
+#[cfg(test)]
+mod ast_index_tests {
+    use super::*;
+
+    #[test]
+    fn simple_create_ast_index() {
+        let d = detect_create_ast_index(
+            "CREATE AST INDEX src_ast ON src (content) USING tree_sitter(lang)",
+        )
+        .unwrap();
+        assert_eq!(d.index_name, "src_ast");
+        assert_eq!(d.table, "src");
+        assert_eq!(d.content_col, "content");
+        assert_eq!(d.lang_col.as_deref(), Some("lang"));
+        assert!(!d.auto_reparse);
+    }
+
+    #[test]
+    fn with_options() {
+        let d = detect_create_ast_index(
+            "CREATE AST INDEX IF NOT EXISTS a ON t (content) \
+             USING tree_sitter(lang) \
+             WITH (auto_reparse = true, embed_endpoint = 'http://x', resolve_cross_file = false);",
+        )
+        .unwrap();
+        assert!(d.if_not_exists);
+        assert!(d.auto_reparse);
+        assert_eq!(d.embed_endpoint.as_deref(), Some("http://x"));
+        assert!(!d.resolve_cross_file);
+    }
+
+    #[test]
+    fn not_an_ast_index() {
+        assert!(detect_create_ast_index("CREATE INDEX x ON t (a)").is_none());
+        assert!(detect_create_ast_index("SELECT 1").is_none());
+    }
+
+    #[test]
+    fn pause_resume() {
+        assert_eq!(
+            detect_pause_resume("SELECT hdb_code.pause('src_ast')"),
+            Some(PauseResume::Pause("src_ast".into()))
+        );
+        assert_eq!(
+            detect_pause_resume("select  hdb_code.resume('a') ;"),
+            Some(PauseResume::Resume("a".into()))
+        );
+        assert!(detect_pause_resume("SELECT 1").is_none());
     }
 }

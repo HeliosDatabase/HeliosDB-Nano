@@ -3065,6 +3065,135 @@ impl EmbeddedDatabase {
         std::borrow::Cow::Borrowed(sql)
     }
 
+    /// Run a `CREATE AST INDEX …` declaration. Registers the index
+    /// in the process-local AST-index registry, then does an initial
+    /// `code_index` pass so every existing source row is indexed.
+    #[cfg(feature = "code-graph")]
+    fn handle_create_ast_index(
+        &self,
+        ddl: code_graph::AstIndexDdl,
+    ) -> Result<u64> {
+        let existing = code_graph::storage::get_ast_index(&ddl.index_name);
+        if existing.is_some() && !ddl.if_not_exists {
+            return Err(Error::query_execution(format!(
+                "AST index '{}' already exists",
+                ddl.index_name
+            )));
+        }
+        let meta = code_graph::AstIndexMeta {
+            index_name: ddl.index_name.clone(),
+            table: ddl.table.clone(),
+            content_col: ddl.content_col,
+            lang_col: ddl.lang_col,
+            embed_endpoint: ddl.embed_endpoint.clone(),
+            embed_bearer: ddl.embed_bearer.clone(),
+            embed_bodies: ddl.embed_bodies,
+            auto_reparse: ddl.auto_reparse,
+            resolve_cross_file: ddl.resolve_cross_file,
+            paused: false,
+        };
+        code_graph::register_ast_index(meta.clone());
+        // Initial full parse of the current table contents.
+        let opts = code_graph::CodeIndexOptions {
+            source_table: ddl.table,
+            embed_bodies: meta.embed_bodies,
+            embed_endpoint: meta.embed_endpoint,
+            embed_bearer: meta.embed_bearer,
+            force_reparse: false,
+        };
+        self.code_index(opts)?;
+        Ok(0)
+    }
+
+    /// Flip the `paused` flag on a registered AST index. Returns 0
+    /// rows affected either way; surfaces an error only when the
+    /// named index is not registered.
+    #[cfg(feature = "code-graph")]
+    fn handle_pause_resume(
+        &self,
+        pr: code_graph::PauseResume,
+    ) -> Result<u64> {
+        let (name, paused) = match pr {
+            code_graph::PauseResume::Pause(n) => (n, true),
+            code_graph::PauseResume::Resume(n) => (n, false),
+        };
+        if !code_graph::storage::set_ast_index_paused(&name, paused) {
+            return Err(Error::query_execution(format!(
+                "AST index '{name}' is not registered"
+            )));
+        }
+        Ok(0)
+    }
+
+    /// Code-graph auto_reparse hook. Called after a successful
+    /// `INSERT` / `UPDATE` / `DELETE` on any user table — if any
+    /// registered AST index is bound to that table and its paused
+    /// flag is clear, run `code_index`. The content-hash gate makes
+    /// unchanged files cheap, so this is safe to fire often.
+    #[cfg(feature = "code-graph")]
+    fn maybe_auto_reparse(&self, touched_table: Option<&str>) {
+        let Some(tbl) = touched_table else { return };
+        for idx in code_graph::storage::ast_indexes_for_table(tbl) {
+            if !idx.auto_reparse {
+                continue;
+            }
+            let opts = code_graph::CodeIndexOptions {
+                source_table: idx.table.clone(),
+                embed_bodies: idx.embed_bodies,
+                embed_endpoint: idx.embed_endpoint.clone(),
+                embed_bearer: idx.embed_bearer.clone(),
+                force_reparse: false,
+            };
+            let _ = self.code_index(opts);
+        }
+    }
+
+    /// Best-effort table extraction from a user SQL statement for the
+    /// auto_reparse hook. Recognises `INSERT INTO "?tbl"?`,
+    /// `UPDATE "?tbl"?`, `DELETE FROM "?tbl"?`. Returns `None` for
+    /// anything else.
+    #[cfg(feature = "code-graph")]
+    fn touched_table_from_sql(sql: &str) -> Option<String> {
+        let s = sql.trim_start();
+        let low = s.to_ascii_lowercase();
+        if low.starts_with("insert into") {
+            let rest = s.get("insert into".len()..)?.trim_start();
+            Some(Self::take_ident(rest))
+        } else if low.starts_with("update") {
+            let rest = s.get("update".len()..)?.trim_start();
+            Some(Self::take_ident(rest))
+        } else if low.starts_with("delete from") {
+            let rest = s.get("delete from".len()..)?.trim_start();
+            Some(Self::take_ident(rest))
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "code-graph")]
+    fn take_ident(s: &str) -> String {
+        let mut out = String::new();
+        let mut it = s.chars().peekable();
+        if matches!(it.peek(), Some('"')) {
+            it.next();
+            for c in it {
+                if c == '"' {
+                    break;
+                }
+                out.push(c);
+            }
+            return out;
+        }
+        for c in it {
+            if c.is_alphanumeric() || c == '_' {
+                out.push(c);
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
     // ------------------------------------------------------------------
     // Graph-RAG API (feature = "graph-rag", implies `code-graph`)
     // ------------------------------------------------------------------
@@ -3095,6 +3224,20 @@ impl EmbeddedDatabase {
     pub fn execute(&self, sql: &str) -> Result<u64> {
         use crate::error::LockResultExt;
 
+        // Code-graph: intercept `CREATE AST INDEX …`, `hdb_code.pause`,
+        // `hdb_code.resume` before the regular parser sees them.
+        #[cfg(feature = "code-graph")]
+        if let Some(ddl) = code_graph::detect_create_ast_index(sql) {
+            return self.handle_create_ast_index(ddl);
+        }
+        #[cfg(feature = "code-graph")]
+        if let Some(pr) = code_graph::detect_pause_resume(sql) {
+            return self.handle_pause_resume(pr);
+        }
+        // And rewrite any `lsp_*(…)` table-function references.
+        let rewritten = self.maybe_rewrite_code_graph(sql);
+        let sql = rewritten.as_ref();
+
         let start = std::time::Instant::now();
 
         // Check if this is a transaction control statement
@@ -3124,6 +3267,11 @@ impl EmbeddedDatabase {
         // Invalidate result cache on successful DML (any data modification)
         if result.is_ok() {
             self.invalidate_result_cache();
+            #[cfg(feature = "code-graph")]
+            {
+                let touched = Self::touched_table_from_sql(sql);
+                self.maybe_auto_reparse(touched.as_deref());
+            }
         }
 
         let rows = result.as_ref().copied().unwrap_or(0);
@@ -5020,7 +5168,18 @@ impl EmbeddedDatabase {
         let plan = planner.statement_to_plan(statement)?;
 
         // 3. Execute plan with parameters
-        self.execute_plan_with_params(&plan, params)
+        let out = self.execute_plan_with_params(&plan, params);
+
+        // 4. Code-graph auto_reparse hook — same logic as `execute()`
+        //    so parameterised DML updates stay in sync with declared
+        //    AST indexes.
+        #[cfg(feature = "code-graph")]
+        if out.is_ok() {
+            let touched = Self::touched_table_from_sql(sql);
+            self.maybe_auto_reparse(touched.as_deref());
+        }
+
+        out
     }
 
     /// Project columns from a tuple according to RETURNING clause

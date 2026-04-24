@@ -33,6 +33,11 @@ pub mod git_hook;
 
 pub use embed::{Embedder, NoopEmbedder, HttpEmbedder};
 pub use lsp::{DefinitionHint, DefinitionRow, ReferenceRow, CallHierarchyRow, HoverRow};
-pub use sql_rewrite::rewrite_lsp_calls;
-pub use storage::{CodeIndexOptions, CodeIndexStats, SupportedLanguage};
+pub use sql_rewrite::{
+    detect_create_ast_index, detect_pause_resume, rewrite_lsp_calls, AstIndexDdl,
+    PauseResume,
+};
+pub use storage::{
+    register_ast_index, AstIndexMeta, CodeIndexOptions, CodeIndexStats, SupportedLanguage,
+};
 pub use symbols::{Symbol, SymbolKind, SymbolRef, SymbolRefKind};

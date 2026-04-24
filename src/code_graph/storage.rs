@@ -113,6 +113,74 @@ pub fn is_extension_installed() -> bool {
     EXTENSION_INSTALLED.load(Ordering::Relaxed)
 }
 
+/// Metadata for a declared AST index. Held in process-local state;
+/// `auto_reparse` is checked whenever user code inserts/updates the
+/// source table.  `paused` temporarily suppresses auto-reparse (see
+/// `hdb_code.pause` / `hdb_code.resume`).
+#[derive(Debug, Clone)]
+pub struct AstIndexMeta {
+    pub index_name: String,
+    pub table: String,
+    pub content_col: String,
+    pub lang_col: Option<String>,
+    pub embed_endpoint: Option<String>,
+    pub embed_bearer: Option<String>,
+    pub embed_bodies: bool,
+    pub auto_reparse: bool,
+    pub resolve_cross_file: bool,
+    pub paused: bool,
+}
+
+static AST_INDEXES: std::sync::OnceLock<
+    std::sync::RwLock<HashMap<String, AstIndexMeta>>,
+> = std::sync::OnceLock::new();
+
+fn ast_registry() -> &'static std::sync::RwLock<HashMap<String, AstIndexMeta>> {
+    AST_INDEXES.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
+}
+
+/// Register (or replace) an AST index declaration.  Called by the
+/// CREATE AST INDEX dispatcher.
+pub fn register_ast_index(meta: AstIndexMeta) {
+    let mut reg = ast_registry().write().unwrap_or_else(|p| p.into_inner());
+    reg.insert(meta.index_name.clone(), meta);
+}
+
+/// Look up an AST index by name.
+pub fn get_ast_index(name: &str) -> Option<AstIndexMeta> {
+    ast_registry()
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(name)
+        .cloned()
+}
+
+/// Return all indexes whose `table == table_name`.  Used by the
+/// auto_reparse hook to know which indexes to refresh when a
+/// source table is mutated.
+pub fn ast_indexes_for_table(table_name: &str) -> Vec<AstIndexMeta> {
+    ast_registry()
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .values()
+        .filter(|m| m.table == table_name && !m.paused)
+        .cloned()
+        .collect()
+}
+
+/// Flip the `paused` flag on the named index.  Returns `false` if
+/// there is no index by that name.
+pub fn set_ast_index_paused(name: &str, paused: bool) -> bool {
+    let mut reg = ast_registry().write().unwrap_or_else(|p| p.into_inner());
+    match reg.get_mut(name) {
+        Some(m) => {
+            m.paused = paused;
+            true
+        }
+        None => false,
+    }
+}
+
 /// Run the indexer over `opts.source_table`. Creates the `_hdb_code_*`
 /// tables on first call. Returns statistics; never mutates the source
 /// table.
