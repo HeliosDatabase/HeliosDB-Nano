@@ -3304,6 +3304,43 @@ impl EmbeddedDatabase {
         graph_rag::link_exact_qualified(self, extra_kinds)
     }
 
+    /// Ingest markdown / plain text rows as DocChunk / DocSection
+    /// nodes.  See `graph_rag::IngestDocsOptions`.
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_ingest_docs(
+        &self,
+        opts: &graph_rag::IngestDocsOptions,
+    ) -> Result<graph_rag::IngestStats> {
+        graph_rag::ingest_docs(self, opts)
+    }
+
+    /// Ingest structured email rows into Email + Person nodes.
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_ingest_email(
+        &self,
+        opts: &graph_rag::IngestEmailOptions,
+    ) -> Result<graph_rag::IngestStats> {
+        graph_rag::ingest_email(self, opts)
+    }
+
+    /// Ingest structured issue rows into Issue + Comment + Person nodes.
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_ingest_issues(
+        &self,
+        opts: &graph_rag::IngestIssuesOptions,
+    ) -> Result<graph_rag::IngestStats> {
+        graph_rag::ingest_issues(self, opts)
+    }
+
+    /// Ingest structured Q&A rows into InvestorQuestion + Answer + Person.
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_ingest_qa(
+        &self,
+        opts: &graph_rag::IngestQaOptions,
+    ) -> Result<graph_rag::IngestStats> {
+        graph_rag::ingest_qa(self, opts)
+    }
+
     pub fn execute(&self, sql: &str) -> Result<u64> {
         use crate::error::LockResultExt;
 

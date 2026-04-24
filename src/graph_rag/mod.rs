@@ -10,11 +10,17 @@
 //! projection from `_hdb_code_symbols` to `_hdb_graph_nodes` is
 //! meaningless without a code-graph source).
 
+pub mod ingest;
 pub mod linker;
 pub mod schema;
 pub mod search;
 pub mod with_context;
 
+pub use ingest::{
+    ingest_docs, ingest_email, ingest_issues, ingest_qa, ChunkStrategy,
+    IngestDocsOptions, IngestEmailOptions, IngestIssuesOptions, IngestQaOptions,
+    IngestStats,
+};
 pub use linker::{link_exact_qualified, LinkerStats};
 pub use schema::{ensure_tables, project_code_symbols, GraphRagStats};
 pub use search::{graph_rag_search, Direction, GraphRagHit, GraphRagOptions};
