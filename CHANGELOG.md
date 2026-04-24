@@ -5,6 +5,60 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.15.0] - 2026-04-24
+
+### Added — Code-graph track, phase 1 (FR 2 MVP, opt-in)
+
+New opt-in feature `code-graph` that turns HeliosDB-Nano into an
+embedded code-graph for AI coding agents. Phase 1 ships the
+foundational Rust API — wire-level DDL (`CREATE EXTENSION hdb_code`,
+`CREATE AST INDEX`) and temporal queries land in phase 2.
+
+- New Cargo feature `code-graph` pulling
+  `tree-sitter = "0.23"`, `tree-sitter-rust`, and `tree-sitter-python`
+  as optional deps. Default builds pull none of them; the default
+  release binary stays the same size.
+- New module `src/code_graph/` with a minimal in-file AST + symbol
+  extractor for Rust and Python. Adds:
+  - `EmbeddedDatabase::code_index(opts)` — parse every row of a user
+    table `(path TEXT PK, lang TEXT, content TEXT)` and populate the
+    `_hdb_code_*` tables idempotently.
+  - `EmbeddedDatabase::lsp_definition(name, hint)` — "where is X defined?"
+  - `EmbeddedDatabase::lsp_references(symbol_id)` — "who uses X?"
+  - `EmbeddedDatabase::lsp_call_hierarchy(symbol_id, direction, depth)` —
+    BFS over the `CALLS` edges.
+  - `EmbeddedDatabase::lsp_hover(symbol_id)` — signature lookup.
+- New tables created automatically on first `code_index` call:
+  `_hdb_code_files`, `_hdb_code_symbols`, `_hdb_code_symbol_refs`.
+  Plain user tables — queryable, joinable, branch-aware.
+- Pluggable embedding surface (`src/code_graph/embed.rs`):
+  `NoopEmbedder` (default) and `HttpEmbedder` for external endpoints
+  matching `POST {"input": "..."} → {"embedding": [...]}`. Nano ships
+  no inference runtime; by design, all inference is external.
+- Storage-level filtering is the competitive lever: every `lsp_*`
+  query pushes its WHERE through the existing `FilteredScan` path in
+  `src/storage/predicate_pushdown.rs`, so bloom-filter / zone-map /
+  SIMD selection applies without new code.
+
+Out of scope for phase 1 (tracked for phase 2+ in the track docs):
+`CREATE EXTENSION` DDL, `CREATE AST INDEX` DDL, real schema
+namespacing, temporal / branch variants, incremental reparse,
+semantic-Merkle subtree hashes, `WITH CONTEXT` clause, native MCP
+endpoint.
+
+Regression coverage:
+- 12 new module-level unit tests (parser, symbol extraction,
+  in-file resolver, embedder).
+- 6 new integration tests at `tests/code_graph_mvp.rs`:
+  `rust_lsp_definition_finds_function`,
+  `lsp_references_returns_call_sites`,
+  `lsp_call_hierarchy_incoming_terminates`,
+  `lsp_hover_returns_signature`,
+  `code_index_is_idempotent`,
+  `unknown_lang_is_skipped_cleanly`.
+
+Docs: `docs/code_graph/overview.md`.
+
 ## [3.14.10] - 2026-04-23
 
 ### Fixed — Foreign key validation with quoted identifiers, fast-path bypass (B36)

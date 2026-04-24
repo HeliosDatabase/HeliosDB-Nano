@@ -3,7 +3,7 @@ members = ["."]
 
 [package]
 name = "heliosdb-nano"
-version = "3.14.10"
+version = "3.15.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Daniel Moya <daniel.moya@dimensigon.com>"]
@@ -139,6 +139,13 @@ unicode-segmentation = "1"
 
 sysinfo = "0.30"  # CPU monitoring for MV scheduler
 
+# Code-graph track (feature = "code-graph") — tree-sitter AST parsing
+# for LSP-shaped queries over source code. All crates optional; the
+# default build pulls none of them.
+tree-sitter        = { version = "0.23", optional = true }
+tree-sitter-rust   = { version = "0.23", optional = true }
+tree-sitter-python = { version = "0.23", optional = true }
+
 # Config
 toml = "0.8"
 
@@ -177,6 +184,23 @@ sync-experimental = []  # Sync/replication module - Core features implemented (c
 test-utils = []  # Test utilities for integration tests and benchmarks
 server = []  # Server-mode features requiring async runtime
 internal-tests = []  # Internal API tests (disabled for public builds)
+
+# =============================================================================
+# CODE-GRAPH TRACK (FR 2 / FR 3)
+# =============================================================================
+# Enables the `src/code_graph/` module: tree-sitter-backed AST index,
+# LSP-shaped queries (`lsp_definition`, `lsp_references`, …), and the
+# `_hdb_code_*` system tables.  Off by default.  Requires at least
+# one grammar dep; Rust + Python ship in phase 1.
+#
+# Embedding generation is external-only (a pluggable HTTP endpoint).
+# Nano ships no inference runtime of its own.
+code-graph = [
+    "dep:tree-sitter",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-python",
+    "reqwest/blocking",
+]
 
 # =============================================================================
 # CRYPTOGRAPHIC PROVIDER FEATURE FLAGS

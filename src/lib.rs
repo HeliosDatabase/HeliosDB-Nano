@@ -277,6 +277,11 @@ pub mod git_integration; // Git workflow integration
 pub mod runtime; // Per-request runtime helpers (bump arena, ...)
 pub mod graph;   // Native graph adjacency lists & traversal (RAG-native)
 pub mod search;  // BM25 + hybrid search + RRF/MMR rerankers (RAG-native)
+
+// Code-graph track (FR 2 / FR 3) — tree-sitter-backed AST index,
+// `_hdb_code_*` tables, LSP-shaped queries. Opt-in.
+#[cfg(feature = "code-graph")]
+pub mod code_graph;
 // NOTE: `mcp` module exists on disk but its server.rs / tools.rs reference
 // EmbeddedDatabase methods (query_branch, execute_branch, merge_branches,
 // query_at_timestamp, ...) that no longer exist on the current API. Enabling
@@ -2969,6 +2974,69 @@ impl EmbeddedDatabase {
     /// # Ok(())
     /// # }
     /// ```
+
+    // ------------------------------------------------------------------
+    // Code-graph API (feature = "code-graph")
+    // ------------------------------------------------------------------
+
+    /// Parse every row of `source_table` (which must have at least
+    /// `path TEXT PRIMARY KEY`, `lang TEXT`, `content TEXT`) and
+    /// populate the `_hdb_code_*` tables. Idempotent.
+    ///
+    /// The embedding endpoint from `opts.embed_endpoint` is called
+    /// per-symbol only when `opts.embed_bodies` is set. Without an
+    /// endpoint, `body_vec` stays `NULL` and BM25-based retrieval
+    /// still works.
+    #[cfg(feature = "code-graph")]
+    pub fn code_index(
+        &self,
+        opts: code_graph::CodeIndexOptions,
+    ) -> Result<code_graph::CodeIndexStats> {
+        code_graph::storage::code_index(self, opts)
+    }
+
+    /// "Where is `name` defined?" — returns zero or more candidate
+    /// definition rows ordered by score. Score is a heuristic: 1.1
+    /// when `hint_kind` matches, 1.0 for unqualified single match,
+    /// 0.8 for name-only fallback.
+    #[cfg(feature = "code-graph")]
+    pub fn lsp_definition(
+        &self,
+        name: &str,
+        hint: &code_graph::DefinitionHint,
+    ) -> Result<Vec<code_graph::DefinitionRow>> {
+        code_graph::lsp::lsp_definition(self, name, hint)
+    }
+
+    /// "Who uses `symbol_id`?" — enumerates every row in
+    /// `_hdb_code_symbol_refs` where `to_symbol = symbol_id`.
+    #[cfg(feature = "code-graph")]
+    pub fn lsp_references(
+        &self,
+        symbol_id: i64,
+    ) -> Result<Vec<code_graph::ReferenceRow>> {
+        code_graph::lsp::lsp_references(self, symbol_id)
+    }
+
+    /// "What calls `symbol_id`, up to `depth` hops?" — BFS over the
+    /// `CALLS` edges in either direction.
+    #[cfg(feature = "code-graph")]
+    pub fn lsp_call_hierarchy(
+        &self,
+        symbol_id: i64,
+        direction: code_graph::lsp::CallDirection,
+        depth: u32,
+    ) -> Result<Vec<code_graph::lsp::CallHierarchyRow>> {
+        code_graph::lsp::lsp_call_hierarchy(self, symbol_id, direction, depth)
+    }
+
+    /// Signature + (phase 2) doc-comment for a symbol. Returns `None`
+    /// when the id does not exist.
+    #[cfg(feature = "code-graph")]
+    pub fn lsp_hover(&self, symbol_id: i64) -> Result<Option<code_graph::HoverRow>> {
+        code_graph::lsp::lsp_hover(self, symbol_id)
+    }
+
     pub fn execute(&self, sql: &str) -> Result<u64> {
         use crate::error::LockResultExt;
 
