@@ -149,7 +149,39 @@ pub fn code_index(db: &EmbeddedDatabase, opts: CodeIndexOptions) -> Result<CodeI
         // Upsert the file row, get back the file_id.
         let file_id = upsert_file(db, file)?;
 
-        // Delete previous symbols/refs for this file so we re-populate cleanly.
+        // Delete previous symbols/refs for this file so we re-populate
+        // cleanly. Cross-file refs can point AT symbols in this file
+        // from other files, so null those out first — the cross-file
+        // resolver at the end of `code_index` rebinds them.
+        //
+        // Two-step rather than `UPDATE … WHERE to_symbol IN (SELECT …)`
+        // — the SQL subquery-in-DML path isn't wired in this engine yet.
+        let sym_rows = db.query(
+            &format!(
+                "SELECT node_id FROM _hdb_code_symbols WHERE file_id = {file_id}"
+            ),
+            &[],
+        )?;
+        let stale_ids: Vec<i64> = sym_rows
+            .iter()
+            .filter_map(|r| match r.values.first() {
+                Some(Value::Int4(n)) => Some(*n as i64),
+                Some(Value::Int8(n)) => Some(*n),
+                _ => None,
+            })
+            .collect();
+        if !stale_ids.is_empty() {
+            let csv = stale_ids
+                .iter()
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            db.execute(&format!(
+                "UPDATE _hdb_code_symbol_refs \
+                    SET to_symbol = NULL, resolution = 'unresolved' \
+                  WHERE to_symbol IN ({csv})"
+            ))?;
+        }
         db.execute(&format!(
             "DELETE FROM _hdb_code_symbol_refs WHERE file_id = {file_id}"
         ))?;
@@ -339,21 +371,20 @@ fn fetch_source_files(db: &EmbeddedDatabase, source_table: &str) -> Result<Vec<S
 // ---------------------------------------------------------------------------
 
 fn upsert_file(db: &EmbeddedDatabase, file: &SourceFile) -> Result<i64> {
-    // Look up existing row first. This keeps us agnostic to whether
-    // the engine's composite-UNIQUE + ON CONFLICT path is wired — the
-    // explicit SELECT-then-INSERT-or-UPDATE pattern is simpler and
-    // matches how the rest of Nano's code paths handle idempotent
-    // upserts today.
-    let lang_sql = sql_text(&file.lang);
-    let path_sql = sql_text(&file.path);
-    let sha_sql = file.sha256.as_deref().map(sql_text).unwrap_or("NULL".into());
+    // Parameterised path — source strings (paths, languages, sha256s)
+    // may contain arbitrary characters we refuse to hand-escape.
+    let path_val = Value::String(file.path.clone());
+    let lang_val = Value::String(file.lang.clone());
+    let sha_val = file
+        .sha256
+        .as_ref()
+        .map(|s| Value::String(s.clone()))
+        .unwrap_or(Value::Null);
 
-    let existing = db.query(
-        &format!(
-            "SELECT node_id FROM _hdb_code_files \
-             WHERE source_table = 'indexed' AND path = {path_sql}"
-        ),
-        &[],
+    let existing = db.query_params(
+        "SELECT node_id FROM _hdb_code_files \
+         WHERE source_table = 'indexed' AND path = $1",
+        &[path_val.clone()],
     )?;
     if let Some(row) = existing.first() {
         if let Some(v) = row.values.first() {
@@ -366,20 +397,19 @@ fn upsert_file(db: &EmbeddedDatabase, file: &SourceFile) -> Result<i64> {
                     )))
                 }
             };
-            db.execute(&format!(
-                "UPDATE _hdb_code_files \
-                   SET lang = {lang_sql}, sha256 = {sha_sql} \
-                 WHERE node_id = {id}"
-            ))?;
+            db.execute_params_returning(
+                "UPDATE _hdb_code_files SET lang = $1, sha256 = $2 WHERE node_id = $3",
+                &[lang_val, sha_val, Value::Int8(id)],
+            )?;
             return Ok(id);
         }
     }
 
-    let (_, rows) = db.execute_returning(&format!(
-        r#"INSERT INTO _hdb_code_files (source_table, path, lang, sha256)
-             VALUES ('indexed', {path_sql}, {lang_sql}, {sha_sql})
-           RETURNING node_id"#
-    ))?;
+    let (_, rows) = db.execute_params_returning(
+        "INSERT INTO _hdb_code_files (source_table, path, lang, sha256) \
+         VALUES ('indexed', $1, $2, $3) RETURNING node_id",
+        &[path_val, lang_val, sha_val],
+    )?;
     if let Some(row) = rows.first() {
         if let Some(v) = row.values.first() {
             return match v {
@@ -403,35 +433,31 @@ fn insert_symbols(
 ) -> Result<Vec<i64>> {
     let mut ids = Vec::with_capacity(symbols.len());
     for sym in symbols {
-        // Phase 1: call the embedder only if it would produce a value
-        // we could store. Since the schema has no vector column yet,
-        // this is a no-op until phase 2. Keep the plumbing so swapping
-        // embedder flavours is self-contained.
         if !sym.signature.is_empty() {
             let v = embedder.embed(&sym.signature)?;
             if v.is_some() {
                 stats.embed_calls += 1;
             }
         }
-        let sql = format!(
-            r#"INSERT INTO _hdb_code_symbols
-                 (file_id, name, qualified, kind, signature,
-                  visibility, line_start, line_end, byte_start, byte_end)
-               VALUES
-                 ({file_id}, {name}, {qualified}, {kind}, {signature},
-                  {visibility}, {lstart}, {lend}, {bstart}, {bend})
-               RETURNING node_id"#,
-            name = sql_text(&sym.name),
-            qualified = sql_text(&sym.qualified),
-            kind = sql_text(sym.kind.as_str()),
-            signature = sql_text(&sym.signature),
-            visibility = sql_text(sym.visibility.as_str()),
-            lstart = sym.line_start,
-            lend = sym.line_end,
-            bstart = sym.byte_start,
-            bend = sym.byte_end,
-        );
-        let (_, rows) = db.execute_returning(&sql)?;
+        let (_, rows) = db.execute_params_returning(
+            "INSERT INTO _hdb_code_symbols \
+               (file_id, name, qualified, kind, signature, \
+                visibility, line_start, line_end, byte_start, byte_end) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+             RETURNING node_id",
+            &[
+                Value::Int8(file_id),
+                Value::String(sym.name.clone()),
+                Value::String(sym.qualified.clone()),
+                Value::String(sym.kind.as_str().to_string()),
+                Value::String(sym.signature.clone()),
+                Value::String(sym.visibility.as_str().to_string()),
+                Value::Int4(sym.line_start as i32),
+                Value::Int4(sym.line_end as i32),
+                Value::Int4(sym.byte_start as i32),
+                Value::Int4(sym.byte_end as i32),
+            ],
+        )?;
         let id = rows
             .first()
             .and_then(|r| r.values.first())
@@ -460,28 +486,32 @@ fn insert_refs(
         let from_id = symbol_ids.get(r.from_idx).copied().ok_or_else(|| {
             Error::query_execution(format!("resolver produced invalid from_idx {}", r.from_idx))
         })?;
-        let to_sql = match r.to_idx {
+        let to_val = match r.to_idx {
             Some(idx) => symbol_ids
                 .get(idx)
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "NULL".into()),
-            None => "NULL".into(),
+                .map(|id| Value::Int8(*id))
+                .unwrap_or(Value::Null),
+            None => Value::Null,
         };
-        let sql = format!(
-            r#"INSERT INTO _hdb_code_symbol_refs
-                 (file_id, from_symbol, to_symbol, to_name, kind, line, resolution)
-               VALUES
-                 ({file_id}, {from_id}, {to_sql}, {to_name}, {kind}, {line}, {res})"#,
-            to_name = sql_text(&r.to_name),
-            kind = sql_text(r.kind_str),
-            line = r.line,
-            res = sql_text(match r.resolution {
-                Resolution::Exact => "exact",
-                Resolution::Heuristic => "heuristic",
-                Resolution::Unresolved => "unresolved",
-            }),
-        );
-        db.execute(&sql)?;
+        let res = match r.resolution {
+            Resolution::Exact => "exact",
+            Resolution::Heuristic => "heuristic",
+            Resolution::Unresolved => "unresolved",
+        };
+        db.execute_params_returning(
+            "INSERT INTO _hdb_code_symbol_refs \
+               (file_id, from_symbol, to_symbol, to_name, kind, line, resolution) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[
+                Value::Int8(file_id),
+                Value::Int8(from_id),
+                to_val,
+                Value::String(r.to_name.clone()),
+                Value::String(r.kind_str.to_string()),
+                Value::Int4(r.line as i32),
+                Value::String(res.to_string()),
+            ],
+        )?;
         written += 1;
     }
     Ok(written)
