@@ -70,6 +70,7 @@ pub fn mcp_router(state: McpState) -> Router {
         .route("/", post(handle_post))
         .route("/ws", get(handle_ws_upgrade))
         .route("/sse", get(handle_sse))
+        .route("/info", get(handle_info))
         .with_state(state)
 }
 
@@ -85,6 +86,7 @@ pub fn attach<S: Clone + Send + Sync + 'static>(
         .route("/mcp", post(handle_post))
         .route("/mcp/ws", get(handle_ws_upgrade))
         .route("/mcp/sse", get(handle_sse))
+        .route("/mcp/info", get(handle_info))
         .with_state(state);
     router.merge(mcp)
 }
@@ -214,6 +216,26 @@ pub async fn handle_sse(
                 .text("keep-alive"),
         )
         .into_response()
+}
+
+// ── GET /mcp/info ───────────────────────────────────────────────────────
+
+/// Discovery endpoint: serverInfo + capabilities + verbose tool
+/// catalogue + resource list, all in one shot. Useful for clients
+/// that want a single packet of self-description without doing the
+/// `initialize` → `tools/list?verbose=true` → `resources/list`
+/// dance over JSON-RPC.
+pub async fn handle_info(
+    State(state): State<McpState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if let Err(e) = state.auth.check(auth_header, Scope::Read) {
+        return (e.status(), e.message()).into_response();
+    }
+    Json(super::rpc::info_result()).into_response()
 }
 
 #[cfg(test)]

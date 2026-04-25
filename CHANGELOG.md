@@ -5,6 +5,91 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added — code-graph / graph-rag / MCP follow-ups
+
+Closes nine of the gaps a downstream client raised against the v3.18
+merge (`feat/code-graph-phase1` → `main`).  All additive; no public
+API breakage.
+
+- **#1 `helios_lsp_document_symbols`** — file outline ordered by
+  line, optional kind filter.
+- **#2 `helios_lsp_rename_preview`** — preview-only edit list
+  (definition + every reference site); never writes back.
+- **#3 `helios_graphrag_search`** — wraps the embedded
+  `graph_rag::graph_rag_search` Rust API as an MCP tool. The
+  flagship cross-modal query is now reachable over JSON-RPC, not
+  just over SQL.
+- **#4 `helios_lsp_references_diff` / `helios_lsp_body_diff` /
+  `helios_ast_diff`** — wraps the existing `diff::*` Rust API.
+  Accepts AS OF refs as `{"now": true}`, `{"commit": "sha"}`,
+  `{"timestamp": "iso"}`.
+- **#5 FR-3 `ON BRANCH '<name>'` per-call override** on
+  `lsp_*(...)` table functions. RAII branch guard restores the
+  prior branch on every early-return path. Combines with `AS OF`
+  in either order.
+- **#6 `CREATE SEMANTIC HASH INDEX [IF NOT EXISTS] <name>`** DDL
+  surfaces the existing `code_graph::merkle_refresh` Rust
+  primitive at the SQL layer (FR 4 §4.6).
+- **#7 `graph_rag_link_vector`** — vector-similar entity-linker
+  stage (FR 4 §4.3 strategy 3). Takes caller-supplied
+  `(node_id, vector)` pairs on both sides; runs cosine top-k with
+  threshold gating; emits MENTIONS edges with
+  `weight = similarity`.
+- **#8 `tools/list?verbose=true`** + **`helios/info` JSON-RPC
+  method** + **`GET /mcp/info` HTTP route** — single-shot
+  discovery payload (serverInfo + capabilities + verbose tool
+  catalogue + resource list).
+- **`SupportedLanguage`** alignment: enum now mirrors `Language`
+  (Rust / Python / TypeScript / Tsx / JavaScript / Go / Markdown /
+  Sql) so the planned `hdb_code.list_languages` system view
+  doesn't lie about the static set. `SupportedLanguage::all()`
+  + `From<Language>` conversion added.
+
+### Tests
+
+- 9 follow-up integration tests in `tests/mcp_followups.rs`.
+- 4 introspection tests in `tests/mcp_introspection.rs`.
+- 2 ON BRANCH integration tests in `tests/code_graph_on_branch.rs`.
+- 2 semantic-hash DDL tests in
+  `tests/code_graph_semantic_hash_ddl.rs`.
+- 4 vector-similar linker tests in
+  `tests/graph_rag_linker_vector.rs`.
+- 6 new `sql_rewrite` unit tests for `ON BRANCH` parsing
+  (combinations, escape, tie-break) + 3 unit tests for
+  `detect_create_semantic_hash_index`.
+
+### Ratified deviations from FR text
+
+These design choices in v3.15–v3.18 were reviewed by a downstream
+client; we ratify them here as the intended end-state rather than
+TODOs:
+
+- **Flat-prefix tables (`_hdb_code_*` / `_hdb_graph_*`) instead of
+  dotted schemas (`_hdb_code.*`).** Simpler bootstrap; no catalog
+  refactor required. Promotion to real schema namespacing is a
+  separate engine-wide refactor that benefits `pg_catalog` too,
+  not part of the code-graph track.
+- **Cargo features (`code-graph` / `graph-rag` / `mcp-endpoint`)
+  instead of runtime `CREATE EXTENSION`.** Build-time opt-in; no
+  per-process activation step; the static grammar set is fixed at
+  build but the runtime grammar registry
+  (`src/code_graph/parse.rs::register_grammar`) covers the dynamic
+  plug-in case (caller supplies the loader — wasm runtime,
+  dynamically-linked grammar, etc.).
+- **Centrality is a post-rerank weighting, not an HNSW navigation
+  bias** (`src/graph_rag/centrality.rs:10`). Ships the smaller
+  relevance lift but avoids forking `hnsw_rs`. Descent-bias is a
+  separate phase-3.1 follow-up if the relevance gap turns out to
+  matter in the pilot.
+
+### Known follow-ups
+
+- **#9 Streaming `notifications/progress` events from long-running
+  tools** — not yet shipped; the JSON-RPC framing supports it but
+  no tool emits progress today. Tracked separately.
+
 ## [3.18.0] - 2026-04-24
 
 ### Added — MCP endpoint phase 4 MVP (FR 5, opt-in, feature = "mcp-endpoint")

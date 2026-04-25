@@ -21,20 +21,46 @@ use super::parse::{self, Language};
 use super::resolver::{resolve_in_file, Resolution};
 use super::symbols::{extract, Symbol, SymbolRef};
 
-/// Languages phase 1 accepts. Extracted into an enum so SQL-surface
-/// callers (phase 2) can advertise the set via a system view.
+/// Statically-supported languages. Mirrors the variants in
+/// [`Language`] so the system view planned for phase 2
+/// (`hdb_code.list_languages`) and the per-row
+/// `_hdb_code_files.lang` column stay in sync.
+///
+/// Dynamically-registered grammars (via
+/// [`crate::code_graph::parse::register_grammar`]) live alongside
+/// these but aren't enumerated here — pull
+/// [`crate::code_graph::parse::registered_grammars`] for the live
+/// dynamic list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SupportedLanguage {
     Rust,
     Python,
+    TypeScript,
+    Tsx,
+    JavaScript,
+    Go,
+    Markdown,
+    Sql,
 }
 
 impl SupportedLanguage {
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Rust => "rust",
-            Self::Python => "python",
-        }
+        Language::from(self).as_str()
+    }
+
+    /// Every statically-supported language. Stable order — callers
+    /// rendering a system view can render these as-is.
+    pub fn all() -> &'static [SupportedLanguage] {
+        &[
+            SupportedLanguage::Rust,
+            SupportedLanguage::Python,
+            SupportedLanguage::TypeScript,
+            SupportedLanguage::Tsx,
+            SupportedLanguage::JavaScript,
+            SupportedLanguage::Go,
+            SupportedLanguage::Markdown,
+            SupportedLanguage::Sql,
+        ]
     }
 }
 
@@ -43,6 +69,27 @@ impl From<SupportedLanguage> for Language {
         match s {
             SupportedLanguage::Rust => Language::Rust,
             SupportedLanguage::Python => Language::Python,
+            SupportedLanguage::TypeScript => Language::TypeScript,
+            SupportedLanguage::Tsx => Language::Tsx,
+            SupportedLanguage::JavaScript => Language::JavaScript,
+            SupportedLanguage::Go => Language::Go,
+            SupportedLanguage::Markdown => Language::Markdown,
+            SupportedLanguage::Sql => Language::Sql,
+        }
+    }
+}
+
+impl From<Language> for SupportedLanguage {
+    fn from(l: Language) -> Self {
+        match l {
+            Language::Rust => SupportedLanguage::Rust,
+            Language::Python => SupportedLanguage::Python,
+            Language::TypeScript => SupportedLanguage::TypeScript,
+            Language::Tsx => SupportedLanguage::Tsx,
+            Language::JavaScript => SupportedLanguage::JavaScript,
+            Language::Go => SupportedLanguage::Go,
+            Language::Markdown => SupportedLanguage::Markdown,
+            Language::Sql => SupportedLanguage::Sql,
         }
     }
 }

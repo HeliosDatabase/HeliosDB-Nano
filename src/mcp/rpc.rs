@@ -74,7 +74,14 @@ fn handle_rpc_opt(db: Option<&EmbeddedDatabase>, req: RpcRequest) -> RpcResponse
     let id = req.id.clone().unwrap_or(JsonValue::Null);
     match req.method.as_str() {
         "initialize" => RpcResponse::success(id, initialize_result()),
-        "tools/list" => RpcResponse::success(id, tools_list_result()),
+        "tools/list" => {
+            let verbose = req
+                .params
+                .get("verbose")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            RpcResponse::success(id, tools_list_result(verbose))
+        }
         "tools/call" => match tools_call(db, &req.params) {
             Ok(v) => RpcResponse::success(id, v),
             Err(e) => RpcResponse::error(id, -32000, e),
@@ -92,8 +99,48 @@ fn handle_rpc_opt(db: Option<&EmbeddedDatabase>, req: RpcRequest) -> RpcResponse
             ),
         },
         "ping" => RpcResponse::success(id, json!({})),
+        // Nano-specific introspection RPC mirroring `GET /mcp/info`.
+        // Returns the same payload the HTTP info endpoint emits so
+        // stdio / WebSocket clients can pull a single discovery
+        // packet without juggling resources/list + tools/list +
+        // initialize.
+        "helios/info" => RpcResponse::success(id, info_result()),
         other => RpcResponse::error(id, -32601, format!("Method not found: {other}")),
     }
+}
+
+/// Single-shot discovery payload — server info, advertised
+/// capabilities, full tool catalogue (verbose), and resource list.
+pub(crate) fn info_result() -> JsonValue {
+    let tools: Vec<JsonValue> = list_tools()
+        .into_iter()
+        .map(|t| tool_to_json(t, true))
+        .collect();
+    let resources: Vec<JsonValue> = super::resources::list_resources()
+        .into_iter()
+        .map(|(uri, name, desc)| {
+            json!({
+                "uri": uri,
+                "name": name,
+                "description": desc,
+                "mimeType": "application/json",
+            })
+        })
+        .collect();
+    json!({
+        "serverInfo": {
+            "name": "heliosdb-nano",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "protocolVersion": "2024-11-05",
+        "capabilities": {
+            "tools":     { "listChanged": false },
+            "resources": { "subscribe": false, "listChanged": false },
+        },
+        "tools": tools,
+        "resources": resources,
+        "tool_count": tools.len(),
+    })
 }
 
 fn initialize_result() -> JsonValue {
@@ -110,17 +157,45 @@ fn initialize_result() -> JsonValue {
     })
 }
 
-fn tools_list_result() -> JsonValue {
-    let tools: Vec<JsonValue> = list_tools().into_iter().map(tool_to_json).collect();
+fn tools_list_result(verbose: bool) -> JsonValue {
+    let tools: Vec<JsonValue> = list_tools()
+        .into_iter()
+        .map(|t| tool_to_json(t, verbose))
+        .collect();
     json!({ "tools": tools })
 }
 
-fn tool_to_json(t: ToolDescriptor) -> JsonValue {
-    json!({
+fn tool_to_json(t: ToolDescriptor, verbose: bool) -> JsonValue {
+    let mut out = json!({
         "name": t.name,
         "description": t.description,
         "inputSchema": t.input_schema,
-    })
+    });
+    if verbose {
+        // `category` distinguishes the unified DB-backed catalogue
+        // (heliosdb_*) from the auto-registered helios_* extensions
+        // declared via mcp_tool!.  Useful for clients wanting to
+        // gate which tools they expose to a model.
+        let category = if t.name.starts_with("helios_") {
+            "extension"
+        } else {
+            "core"
+        };
+        let needs_db = match t.name {
+            "heliosdb_bm25_index"
+            | "heliosdb_hybrid_search"
+            | "heliosdb_graph_add_edge"
+            | "heliosdb_graph_traverse"
+            | "heliosdb_graph_path"
+            | "heliosdb_embed_and_store" => false,
+            _ => true,
+        };
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("category".into(), json!(category));
+            obj.insert("requiresDatabase".into(), json!(needs_db));
+        }
+    }
+    out
 }
 
 fn tools_call(db: Option<&EmbeddedDatabase>, params: &JsonValue) -> Result<JsonValue, String> {

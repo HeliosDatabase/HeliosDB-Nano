@@ -289,6 +289,7 @@ impl ApiServer {
                 .route("/mcp", axum::routing::post(crate::mcp::axum_routes::handle_post))
                 .route("/mcp/ws", axum::routing::get(crate::mcp::axum_routes::handle_ws_upgrade))
                 .route("/mcp/sse", axum::routing::get(crate::mcp::axum_routes::handle_sse))
+                .route("/mcp/info", axum::routing::get(crate::mcp::axum_routes::handle_info))
                 .with_state(mcp_state);
             router.merge(mcp_only)
         };
