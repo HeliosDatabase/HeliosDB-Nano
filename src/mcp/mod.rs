@@ -24,6 +24,9 @@ pub mod resources;
 pub mod rpc;
 pub mod server;
 pub mod axum_routes;
+pub mod auto_register;
+#[cfg(feature = "code-graph")]
+pub mod lsp_tools;
 
 pub use protocol::{
     Capabilities, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse,

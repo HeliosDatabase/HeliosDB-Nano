@@ -40,7 +40,10 @@ pub use diff::{
     BodyOp, DiffChange, RefDiffRow,
 };
 pub use embed::{Embedder, NoopEmbedder, HttpEmbedder};
-pub use lsp::{DefinitionHint, DefinitionRow, ReferenceRow, CallHierarchyRow, HoverRow};
+pub use lsp::{
+    lsp_call_hierarchy, lsp_definition, lsp_hover, lsp_references, CallDirection,
+    CallHierarchyRow, DefinitionHint, DefinitionRow, HoverRow, ReferenceRow,
+};
 pub use sql_rewrite::{
     detect_create_ast_index, detect_pause_resume, rewrite_lsp_calls, AstIndexDdl,
     PauseResume,

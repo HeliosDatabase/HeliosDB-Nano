@@ -131,6 +131,7 @@ regex = "1.10"
 once_cell = "1.19"
 lru = "0.12"
 dashmap = "5.5"
+inventory = { version = "0.3", optional = true }
 
 # Arena allocation (RAG-native -- reduces per-request alloc churn)
 bumpalo = { version = "3", features = ["collections"] }
@@ -227,7 +228,7 @@ graph-rag = ["code-graph"]
 # and 4 resource URIs. Transport-agnostic — reusable from stdio,
 # HTTP (Axum), WebSocket, and SSE mounts. Additive — embedded-only
 # callers compile without this flag.
-mcp-endpoint = []
+mcp-endpoint = ["dep:inventory"]
 
 # =============================================================================
 # CRYPTOGRAPHIC PROVIDER FEATURE FLAGS

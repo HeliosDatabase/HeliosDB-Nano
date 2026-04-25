@@ -74,10 +74,21 @@ impl ToolOutcome {
 /// Full catalogue of tools — DB-backed and in-process alike. The stdio
 /// server advertises all of them; an HTTP handler without a DB can still
 /// list them but will error out on DB-backed `tools/call` requests.
+///
+/// Inventory-registered tools (declared via `mcp_tool!` from any module
+/// gated on `mcp-endpoint`) are merged in here, so adding a new tool
+/// from outside `tools.rs` doesn't require editing this file.
 #[must_use]
 pub fn list_tools() -> Vec<ToolDescriptor> {
     let mut out = db_tools();
     out.extend(in_process_tools());
+    for entry in super::auto_register::registered() {
+        out.push(ToolDescriptor {
+            name: entry.name,
+            description: entry.description,
+            input_schema: (entry.schema)(),
+        });
+    }
     out
 }
 
@@ -337,7 +348,8 @@ pub fn call_tool(db: Option<&EmbeddedDatabase>, name: &str, args: JsonValue) -> 
         "heliosdb_graph_path" => do_graph_path(args),
         "heliosdb_embed_and_store" => do_embed_and_store(args),
 
-        other => ToolOutcome::err(format!("unknown tool '{other}'")),
+        other => super::auto_register::try_call(db, other, args)
+            .unwrap_or_else(|| ToolOutcome::err(format!("unknown tool '{other}'"))),
     }
 }
 
