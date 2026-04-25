@@ -27,6 +27,7 @@ pub mod axum_routes;
 pub mod auto_register;
 pub mod auth;
 pub mod progress;
+pub mod session;
 pub mod streaming;
 pub mod unix_socket;
 #[cfg(feature = "code-graph")]

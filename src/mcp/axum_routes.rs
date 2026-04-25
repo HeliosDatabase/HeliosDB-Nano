@@ -114,8 +114,98 @@ pub async fn handle_post(
         )
             .into_response();
     }
+
+    // Streaming progress over the paired SSE channel: opt in by
+    // sending both `Mcp-Session-Id` (matching an open SSE
+    // connection) AND `_meta.progressToken`. Any tools/call meeting
+    // both gets its progress events forwarded to the SSE stream
+    // while the POST itself returns the final response.
+    if req.method == "tools/call" {
+        let session_id = headers
+            .get("mcp-session-id")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+        let token = extract_progress_token(&req.params);
+        if let (Some(sid), Some(tok)) = (session_id, token) {
+            if let Some(sse_tx) = super::session::sender_for(&sid) {
+                let resp = dispatch_streaming_post(state.db.clone(), req, tok, sse_tx).await;
+                return Json(resp).into_response();
+            }
+        }
+    }
+
     let resp = handle_rpc_with_db(state.db.as_ref(), req);
     Json(resp).into_response()
+}
+
+/// Streaming-progress dispatch over the SSE-paired POST: forward
+/// every `notifications/progress` event to the SSE channel keyed
+/// by the `Mcp-Session-Id` header, while the POST waits for the
+/// final tools/call response.
+async fn dispatch_streaming_post(
+    db: std::sync::Arc<crate::EmbeddedDatabase>,
+    req: RpcRequest,
+    progress_token: serde_json::Value,
+    sse_tx: tokio::sync::mpsc::UnboundedSender<axum::response::sse::Event>,
+) -> RpcResponse {
+    use super::streaming::call_tool_streaming;
+    let id = req.id.clone().unwrap_or(serde_json::Value::Null);
+    let name = req
+        .params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let args = req
+        .params
+        .get("arguments")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    let Some(name) = name else {
+        return RpcResponse::error(id, -32000, "tools/call requires 'name'");
+    };
+
+    let (mut rx, handle) = call_tool_streaming(Some(db), name, args);
+    while let Some(ev) = rx.recv().await {
+        let mut params = serde_json::json!({
+            "progressToken": progress_token,
+            "progress": ev.progress,
+        });
+        if let Some(total) = ev.total {
+            if let Some(o) = params.as_object_mut() {
+                o.insert("total".into(), serde_json::Value::from(total));
+            }
+        }
+        if let Some(msg) = ev.message {
+            if let Some(o) = params.as_object_mut() {
+                o.insert("message".into(), serde_json::Value::String(msg));
+            }
+        }
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": params,
+        });
+        let event = axum::response::sse::Event::default()
+            .event("notifications/progress")
+            .data(payload.to_string());
+        if sse_tx.send(event).is_err() {
+            // SSE channel dropped — keep the tool running but stop
+            // forwarding events.
+            break;
+        }
+    }
+    let outcome = handle
+        .await
+        .unwrap_or_else(|e| super::tools::ToolOutcome::err(format!("tool task panicked: {e}")));
+    RpcResponse::success(
+        id,
+        serde_json::json!({
+            "isError": outcome.is_error,
+            "content": [
+                { "type": "text", "text": outcome.payload.to_string() }
+            ]
+        }),
+    )
 }
 
 // ── GET /mcp/ws ─────────────────────────────────────────────────────────
@@ -296,6 +386,7 @@ async fn dispatch_streaming_tools_call(
 pub async fn handle_sse(
     State(state): State<McpState>,
     headers: axum::http::HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> axum::response::Response {
     // SSE handshake itself is read-only, but the handshake announces
     // the POST endpoint that the client will use for any request,
@@ -308,9 +399,41 @@ pub async fn handle_sse(
     if let Err(e) = state.auth.check(auth_header, Scope::Read) {
         return (e.status(), e.message()).into_response();
     }
-    let endpoint_event = Event::default().event("endpoint").data("/mcp");
+
+    // Resolve the session id: prefer the client's `?session=<id>`
+    // query param, otherwise mint a fresh UUID. We announce the
+    // session id via the spec-defined `endpoint` event so the
+    // client knows what `Mcp-Session-Id` header to set on the
+    // paired POST /mcp.
+    let session_id = params
+        .get("session")
+        .cloned()
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let rx = super::session::register(session_id.clone());
+
+    // The endpoint event payload mirrors the MCP HTTP+SSE handshake
+    // shape: a URL the client should POST to.  We include the
+    // session id as a query suffix so naive clients parse the URL
+    // and copy it back.  Spec-aware clients use the
+    // `Mcp-Session-Id` header explicitly.
+    let endpoint_data = format!("/mcp?session={session_id}");
+    let endpoint_event = Event::default().event("endpoint").data(endpoint_data);
+
+    // Forward every event the session sender emits as an SSE
+    // chunk, then end-of-stream when the channel is closed (the
+    // session is dropped from the table on TTL expiry).  Built via
+    // `futures::stream::unfold` to avoid pulling in tokio-stream.
+    let progress_stream = stream::unfold(rx, |mut rx| async move {
+        match rx.recv().await {
+            Some(ev) => Some((Ok::<_, Infallible>(ev), rx)),
+            None => None,
+        }
+    });
     let initial = stream::iter(vec![Ok::<_, Infallible>(endpoint_event)]);
-    Sse::new(initial)
+    use futures::StreamExt;
+    let combined = initial.chain(progress_stream);
+
+    Sse::new(combined)
         .keep_alive(
             KeepAlive::new()
                 .interval(Duration::from_secs(15))
