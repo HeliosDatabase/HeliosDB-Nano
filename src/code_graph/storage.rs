@@ -350,7 +350,11 @@ pub fn code_index_with_embedder(
         ))?;
 
         let symbol_ids = insert_symbols(db, file_id, &symbols, embedder.as_ref(), &mut stats)?;
-        let resolved = resolve_in_file(&symbols, &refs);
+        let mut resolved = resolve_in_file(&symbols, &refs);
+        // Scope-chain pass: upgrade unresolved CALLS/REFERENCES to
+        // their imported qualified path when there's an unambiguous
+        // matching IMPORTS edge.
+        super::resolver::rebind_via_imports(&mut resolved);
         let refs_written = insert_refs(db, file_id, &symbol_ids, &resolved)?;
 
         stats.files_parsed += 1;

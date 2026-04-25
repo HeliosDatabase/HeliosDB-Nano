@@ -85,6 +85,169 @@ fn last_segment(name: &str) -> &str {
     bare
 }
 
+/// Scope-chain rebinder (FR-7 §189): for every unresolved CALLS /
+/// REFERENCES ref, consult the file's IMPORTS edges. If exactly one
+/// import path ends in the unresolved bare name (after the right
+/// language-specific separator), promote the ref's `to_name` to the
+/// fully-qualified import path so the cross-file rebinder can hit
+/// it.  Resolution is upgraded from `Unresolved` / `Heuristic` to
+/// `Exact` only when the import match is unambiguous.
+///
+/// Recognised separators:
+/// * Rust  — `::`  (`use foo::bar;`)
+/// * Python / TS / Go — `.` (`from foo import bar` becomes
+///   `foo.bar` once the extractor canonicalises imports; for
+///   pre-canonicalised imports we also accept the bare name as a
+///   trailing match.)
+pub fn rebind_via_imports(refs: &mut [ResolvedRef]) {
+    // Snapshot every IMPORTS to_name (skip already-resolved /
+    // already-imports rows).  Treat IMPORTS as scope members of
+    // the file: a single matching import wins.
+    let imports: Vec<String> = refs
+        .iter()
+        .filter(|r| r.kind_str == "IMPORTS")
+        .map(|r| r.to_name.clone())
+        .collect();
+    if imports.is_empty() {
+        return;
+    }
+    for r in refs.iter_mut() {
+        if r.kind_str == "IMPORTS" {
+            continue;
+        }
+        if matches!(r.resolution, Resolution::Exact) {
+            continue;
+        }
+        let bare = last_segment(&r.to_name).to_string();
+        if bare.is_empty() {
+            continue;
+        }
+        let mut candidates: Vec<&str> = Vec::new();
+        for imp in &imports {
+            if matches_import(imp, &bare) {
+                candidates.push(imp.as_str());
+            }
+        }
+        match candidates.len() {
+            0 => {}
+            1 => {
+                r.to_name = candidates[0].to_string();
+                r.resolution = Resolution::Exact;
+            }
+            _ => {
+                // Ambiguous: keep heuristic but still rewrite to the
+                // first candidate so the cross-file pass has a
+                // qualified name to chase.
+                r.to_name = candidates[0].to_string();
+                if matches!(r.resolution, Resolution::Unresolved) {
+                    r.resolution = Resolution::Heuristic;
+                }
+            }
+        }
+    }
+}
+
+fn matches_import(import_path: &str, bare: &str) -> bool {
+    if import_path == bare {
+        return true;
+    }
+    if let Some(stripped) = import_path.strip_suffix(bare) {
+        let prev = stripped.as_bytes().last().copied();
+        // Boundary must be a separator: `::`, `.`, or `/` (Go style).
+        if matches!(prev, Some(b':') | Some(b'.') | Some(b'/')) {
+            // For `::`, also reject single-colon false positives.
+            if prev == Some(b':') {
+                let len = stripped.len();
+                if len < 2 || stripped.as_bytes().get(len - 2) != Some(&b':') {
+                    return false;
+                }
+            }
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod imports_tests {
+    use super::*;
+
+    #[test]
+    fn matches_rust_use_path() {
+        assert!(matches_import("foo::bar", "bar"));
+        assert!(matches_import("std::collections::HashMap", "HashMap"));
+        assert!(!matches_import("foobar", "bar"));
+        assert!(!matches_import("foo:bar", "bar")); // single colon ≠ `::`
+    }
+
+    #[test]
+    fn matches_python_dot_path() {
+        assert!(matches_import("foo.bar", "bar"));
+        assert!(matches_import("a.b.c.bar", "bar"));
+        assert!(!matches_import("foo_bar", "bar"));
+    }
+
+    #[test]
+    fn rebinds_unambiguous_import() {
+        let mut refs = vec![
+            ResolvedRef {
+                from_idx: 0,
+                to_idx: None,
+                to_name: "bar".into(),
+                kind_str: "CALLS",
+                line: 5,
+                resolution: Resolution::Unresolved,
+            },
+            ResolvedRef {
+                from_idx: 0,
+                to_idx: None,
+                to_name: "foo::bar".into(),
+                kind_str: "IMPORTS",
+                line: 1,
+                resolution: Resolution::Unresolved,
+            },
+        ];
+        rebind_via_imports(&mut refs);
+        assert_eq!(refs[0].to_name, "foo::bar");
+        assert_eq!(refs[0].resolution, Resolution::Exact);
+    }
+
+    #[test]
+    fn ambiguous_import_falls_back_to_heuristic() {
+        let mut refs = vec![
+            ResolvedRef {
+                from_idx: 0,
+                to_idx: None,
+                to_name: "bar".into(),
+                kind_str: "CALLS",
+                line: 5,
+                resolution: Resolution::Unresolved,
+            },
+            ResolvedRef {
+                from_idx: 0,
+                to_idx: None,
+                to_name: "foo::bar".into(),
+                kind_str: "IMPORTS",
+                line: 1,
+                resolution: Resolution::Unresolved,
+            },
+            ResolvedRef {
+                from_idx: 0,
+                to_idx: None,
+                to_name: "qux::bar".into(),
+                kind_str: "IMPORTS",
+                line: 2,
+                resolution: Resolution::Unresolved,
+            },
+        ];
+        rebind_via_imports(&mut refs);
+        // First candidate wins (deterministic), but resolution
+        // stays heuristic to flag the ambiguity.
+        assert_eq!(refs[0].to_name, "foo::bar");
+        assert_eq!(refs[0].resolution, Resolution::Heuristic);
+    }
+}
+
 /// Phase-2 cross-file rebinder. For each symbol ref, if the local
 /// in-file resolver came up empty, try to match by last-segment name
 /// against every other file's symbol table. Returns the corpus-wide
