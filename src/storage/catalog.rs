@@ -232,6 +232,43 @@ impl<'a> Catalog<'a> {
         self.storage.next_row_id(table_name)
     }
 
+    /// List every catalogued table as `(schema, name)`.
+    /// Default schema is `"public"`; `_hdb_code_*` and `_hdb_graph_*`
+    /// flat-prefix tables are reported under their dotted-form
+    /// schemas (`_hdb_code` / `_hdb_graph`).  Stable order, sorted
+    /// lexicographically.
+    pub fn list_tables_qualified(&self) -> Result<Vec<(String, String)>> {
+        let names = self.list_tables()?;
+        let mut out: Vec<(String, String)> = names
+            .into_iter()
+            .map(|n| {
+                if let Some(rest) = n.strip_prefix("_hdb_code_") {
+                    ("_hdb_code".to_string(), rest.to_string())
+                } else if let Some(rest) = n.strip_prefix("_hdb_graph_") {
+                    ("_hdb_graph".to_string(), rest.to_string())
+                } else if let Some(idx) = n.find('.') {
+                    let (s, t) = n.split_at(idx);
+                    (s.to_string(), t[1..].to_string())
+                } else {
+                    ("public".to_string(), n)
+                }
+            })
+            .collect();
+        out.sort();
+        Ok(out)
+    }
+
+    /// List the distinct schemas seen across every catalogued
+    /// table.  Useful for `pg_namespace` materialisation.
+    pub fn list_schemas(&self) -> Result<Vec<String>> {
+        use std::collections::BTreeSet;
+        let mut s: BTreeSet<String> = BTreeSet::new();
+        for (sch, _) in self.list_tables_qualified()? {
+            s.insert(sch);
+        }
+        Ok(s.into_iter().collect())
+    }
+
     /// List all tables in the database
     pub fn list_tables(&self) -> Result<Vec<String>> {
         let prefix = b"meta:table:";

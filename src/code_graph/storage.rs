@@ -351,6 +351,26 @@ pub fn code_index_with_embedder(
 
         let symbol_ids = insert_symbols(db, file_id, &symbols, embedder.as_ref(), &mut stats)?;
         let mut resolved = resolve_in_file(&symbols, &refs);
+        // Local-type pass: bind `x.method` to `Type::method` when
+        // `let x: Type = …` is in scope, then let the imports +
+        // cross-file rebinders pick the resulting qualified name
+        // up.  Only fires for non-empty bodies.
+        let bodies: Vec<super::resolver::FunctionBody<'_>> = symbols
+            .iter()
+            .filter_map(|s| {
+                let lo = (s.byte_start as usize).min(file.content.len());
+                let hi = (s.byte_end as usize).min(file.content.len());
+                if hi <= lo {
+                    return None;
+                }
+                Some(super::resolver::FunctionBody {
+                    line_start: s.line_start,
+                    line_end: s.line_end,
+                    body_text: &file.content[lo..hi],
+                })
+            })
+            .collect();
+        super::resolver::rebind_via_local_types(&mut resolved, &bodies);
         // Scope-chain pass: upgrade unresolved CALLS/REFERENCES to
         // their imported qualified path when there's an unambiguous
         // matching IMPORTS edge.

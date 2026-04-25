@@ -2349,26 +2349,38 @@ impl SystemViewRegistry {
 
     /// Execute pg_namespace() system view
     ///
-    /// Returns information about all schemas (namespaces)
-    fn execute_pg_namespace(_storage: &StorageEngine) -> Result<Vec<Tuple>> {
+    /// Returns information about all schemas (namespaces).
+    /// Always exposes `public` + `information_schema`; other
+    /// schemas (`_hdb_code` / `_hdb_graph` / user-created) come
+    /// from the catalog's `list_schemas()` materialisation.
+    fn execute_pg_namespace(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        use std::collections::BTreeSet;
+        let mut all: BTreeSet<String> = BTreeSet::new();
+        all.insert("public".to_string());
+        all.insert("information_schema".to_string());
+        if let Ok(catalog_schemas) = storage.catalog().list_schemas() {
+            for s in catalog_schemas {
+                all.insert(s);
+            }
+        }
+
         let mut results = Vec::new();
-
-        // Public schema
-        let tuple = Tuple::new(vec![
-            Value::Int4(2200),                         // oid
-            Value::String("public".to_string()),       // nspname
-            Value::Int4(10),                           // nspowner
-        ]);
-        results.push(tuple);
-
-        // Information schema
-        let tuple = Tuple::new(vec![
-            Value::Int4(11),                           // oid
-            Value::String("information_schema".to_string()),  // nspname
-            Value::Int4(10),                           // nspowner
-        ]);
-        results.push(tuple);
-
+        let mut next_oid = 2200i32;
+        for nspname in all {
+            let oid = match nspname.as_str() {
+                "public" => 2200,
+                "information_schema" => 11,
+                _ => {
+                    next_oid += 1;
+                    next_oid
+                }
+            };
+            results.push(Tuple::new(vec![
+                Value::Int4(oid),
+                Value::String(nspname),
+                Value::Int4(10),
+            ]));
+        }
         Ok(results)
     }
 

@@ -248,6 +248,247 @@ mod imports_tests {
     }
 }
 
+/// Constraint-propagation pass (FR §189-extended): looks at the
+/// surrounding function body of each unresolved CALLS / REFERENCES
+/// ref and tries to bind the *receiver* name to a type, then
+/// rewrites the ref's `to_name` to `Type::method`.
+///
+/// Strictly cheaper than full HM:
+/// * Only handles syntactically explicit annotations
+///   (`let x: Foo = …`, `: Foo` parameter types) and `Type::new`-
+///   shaped initialisers (`let x = Foo::new(...)`).
+/// * Per-language regex-driven; bound to the function's textual
+///   range from the symbol metadata caller passes in.
+/// * Generics, traits, impl-blocks, and lifetime params are left
+///   alone — those pin to `Heuristic` and downstream rebinding
+///   takes its chances.
+///
+/// Works hand-in-hand with [`rebind_via_imports`]: the type name
+/// resulting from this pass is fed back through imports and the
+/// cross-file rebinder.
+pub fn rebind_via_local_types(
+    refs: &mut [ResolvedRef],
+    function_bodies: &[FunctionBody<'_>],
+) {
+    if function_bodies.is_empty() {
+        return;
+    }
+    for r in refs.iter_mut() {
+        if r.kind_str == "IMPORTS" {
+            continue;
+        }
+        if matches!(r.resolution, Resolution::Exact) {
+            continue;
+        }
+        // Look at the receiver: `x.method` or `x.method(...)`.
+        let to_name = r.to_name.clone();
+        let bare = last_segment(&to_name);
+        let parent = receiver_segment(&to_name);
+        let Some(parent) = parent else { continue };
+        // Find a function body that owns this ref (by line).
+        let Some(body) = function_bodies
+            .iter()
+            .find(|f| r.line >= f.line_start && r.line <= f.line_end)
+        else {
+            continue;
+        };
+        // Try to type-bind the receiver name.
+        if let Some(ty) = body.type_of(parent) {
+            r.to_name = format!("{ty}::{bare}");
+            // Don't pin Exact yet — the cross-file pass will lift
+            // this once it matches a qualified symbol.  Promote
+            // from Unresolved to Heuristic so callers see we got
+            // somewhere.
+            if matches!(r.resolution, Resolution::Unresolved) {
+                r.resolution = Resolution::Heuristic;
+            }
+        }
+    }
+}
+
+/// Function body the local-type resolver inspects. Caller emits
+/// one per indexed function symbol; the `body_text` is the raw
+/// source slice between `byte_start` / `byte_end`.
+#[derive(Debug, Clone)]
+pub struct FunctionBody<'a> {
+    pub line_start: u32,
+    pub line_end: u32,
+    pub body_text: &'a str,
+}
+
+impl<'a> FunctionBody<'a> {
+    /// Look up `name`'s declared type via syntactic `let name:
+    /// Type = …` / `let name = Type::new(...)` / `let name =
+    /// Type { … }` patterns.  None when no declarative shape
+    /// matches.
+    pub fn type_of(&self, name: &str) -> Option<&str> {
+        let body = self.body_text;
+        // Pattern 1: `let <name>: <type> = …`
+        if let Some(t) = scan_let_typed(body, name) {
+            return Some(t);
+        }
+        // Pattern 2: `let <name> = <Type>::new(...)`
+        if let Some(t) = scan_let_assoc_call(body, name) {
+            return Some(t);
+        }
+        // Pattern 3: `let <name> = <Type> { … }`  (struct literal)
+        if let Some(t) = scan_let_struct_literal(body, name) {
+            return Some(t);
+        }
+        None
+    }
+}
+
+fn receiver_segment(qualified: &str) -> Option<&str> {
+    // `x.method` → Some("x");   `Foo::bar` → None (already typed);
+    // `bar` → None.
+    let bare = qualified.trim_end_matches(')');
+    let bare = bare.split('(').next().unwrap_or(bare);
+    if bare.contains("::") {
+        return None;
+    }
+    let dot = bare.rfind('.')?;
+    let head = &bare[..dot];
+    if head.is_empty() {
+        None
+    } else {
+        Some(head)
+    }
+}
+
+fn scan_let_typed<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+    // Match `let <name>: <Type>` or `let mut <name>: <Type>`.
+    // <Type> stops at the first `=`, `;`, `,`, or whitespace
+    // that's not part of a generic.  We strip generic args entirely.
+    let mut search_start = 0usize;
+    while let Some(pos) = body[search_start..].find("let ") {
+        let abs = search_start + pos;
+        let after = &body[abs + 4..];
+        let after_mut = after.strip_prefix("mut ").unwrap_or(after);
+        let after_trim = after_mut.trim_start();
+        if let Some(rest) = after_trim.strip_prefix(name) {
+            let rest_t = rest.trim_start();
+            if let Some(after_colon) = rest_t.strip_prefix(':') {
+                let after_colon = after_colon.trim_start();
+                let mut end = 0usize;
+                let bytes = after_colon.as_bytes();
+                while end < bytes.len() {
+                    let b = bytes[end];
+                    if b == b'=' || b == b';' || b == b',' || b == b'\n' {
+                        break;
+                    }
+                    end += 1;
+                }
+                let ty = after_colon[..end].trim();
+                let ty = ty.split('<').next().unwrap_or(ty).trim();
+                let ty = ty.trim_end_matches('&').trim();
+                if !ty.is_empty() {
+                    return Some(unsafe {
+                        std::mem::transmute::<&str, &'a str>(ty)
+                    });
+                }
+            }
+        }
+        search_start = abs + 4;
+    }
+    None
+}
+
+fn scan_let_assoc_call<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+    // `let <name> = <Type>::<method>(...)` — receiver Type comes
+    // from the LHS of `::`.
+    let needle = format!("let {name} = ");
+    let pos = body.find(&needle)?;
+    let after = &body[pos + needle.len()..];
+    let after_amp = after.trim_start_matches('&').trim();
+    let cc = after_amp.find("::")?;
+    let ty = after_amp[..cc].trim();
+    let ty = ty.split_whitespace().next_back()?;
+    if ty.is_empty() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute::<&str, &'a str>(ty) })
+    }
+}
+
+fn scan_let_struct_literal<'a>(body: &'a str, name: &str) -> Option<&'a str> {
+    let needle = format!("let {name} = ");
+    let pos = body.find(&needle)?;
+    let after = &body[pos + needle.len()..];
+    let after_amp = after.trim_start_matches('&').trim();
+    // Look for `Type {`  — first whitespace separator before `{`.
+    let brace = after_amp.find('{')?;
+    let head = after_amp[..brace].trim();
+    // Reject `if` / `match` / `unsafe` etc.
+    if head.is_empty() || head.contains('(') || head.contains('=') {
+        return None;
+    }
+    let ty = head.split_whitespace().next_back()?;
+    let ty = ty.trim_end_matches(',').trim();
+    if ty.is_empty() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute::<&str, &'a str>(ty) })
+    }
+}
+
+#[cfg(test)]
+mod local_types_tests {
+    use super::*;
+
+    fn body(text: &'static str) -> FunctionBody<'static> {
+        FunctionBody {
+            line_start: 1,
+            line_end: 100,
+            body_text: text,
+        }
+    }
+
+    #[test]
+    fn binds_let_with_explicit_type() {
+        let b = body("let x: Foo = bar();\nx.method();\n");
+        assert_eq!(b.type_of("x"), Some("Foo"));
+    }
+
+    #[test]
+    fn binds_let_with_assoc_call() {
+        let b = body("let x = Foo::new();\nx.method();\n");
+        assert_eq!(b.type_of("x"), Some("Foo"));
+    }
+
+    #[test]
+    fn binds_let_struct_literal() {
+        let b = body("let x = Foo { a: 1, b: 2 };\nx.do();\n");
+        assert_eq!(b.type_of("x"), Some("Foo"));
+    }
+
+    #[test]
+    fn ignores_anonymous_locals() {
+        let b = body("let _ = bar();\n");
+        assert!(b.type_of("y").is_none());
+    }
+
+    #[test]
+    fn rebinds_method_call_through_local_type() {
+        let mut refs = vec![ResolvedRef {
+            from_idx: 0,
+            to_idx: None,
+            to_name: "x.method".into(),
+            kind_str: "CALLS",
+            line: 5,
+            resolution: Resolution::Unresolved,
+        }];
+        let bodies = vec![FunctionBody {
+            line_start: 1,
+            line_end: 10,
+            body_text: "let x: Foo = bar();\nx.method();",
+        }];
+        rebind_via_local_types(&mut refs, &bodies);
+        assert_eq!(refs[0].to_name, "Foo::method");
+        assert_eq!(refs[0].resolution, Resolution::Heuristic);
+    }
+}
+
 /// Phase-2 cross-file rebinder. For each symbol ref, if the local
 /// in-file resolver came up empty, try to match by last-segment name
 /// against every other file's symbol table. Returns the corpus-wide

@@ -34,6 +34,27 @@ fn dotted_name_resolves_to_flat_prefix() {
 }
 
 #[test]
+fn pg_namespace_lists_hdb_schemas() {
+    let db = indexed_db();
+    let rows = db
+        .query("SELECT nspname FROM pg_namespace ORDER BY nspname", &[])
+        .unwrap();
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|t| match t.values.first() {
+            Some(Value::String(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(names.contains(&"public".to_string()), "have: {names:?}");
+    assert!(names.contains(&"_hdb_code".to_string()), "have: {names:?}");
+    assert!(
+        names.contains(&"information_schema".to_string()),
+        "have: {names:?}"
+    );
+}
+
+#[test]
 fn pg_tables_over_sql_reports_schema_split() {
     let db = indexed_db();
     let rows = db
