@@ -346,5 +346,15 @@ harness = false
 name = "phase3_benchmarks"
 harness = false
 
+[[bench]]
+name = "with_context_bench"
+harness = false
+required-features = ["graph-rag", "code-graph"]
+
+[[bench]]
+name = "linker_precision"
+harness = false
+required-features = ["graph-rag", "code-graph"]
+
 [profile.bench]
 inherits = "release"
