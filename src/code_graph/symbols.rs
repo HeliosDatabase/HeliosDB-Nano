@@ -121,6 +121,67 @@ impl SymbolRefKind {
     }
 }
 
+/// Trait that turns a parsed tree-sitter tree into `(symbols, refs)`.
+/// Implemented by each statically-supported language plus by any
+/// downstream extractor registered against a runtime grammar via
+/// [`register_extractor`].
+pub trait SymbolExtractor: Send + Sync {
+    fn extract(&self, source: &str, tree: &Tree) -> (Vec<Symbol>, Vec<SymbolRef>);
+}
+
+/// Default extractor implementation that delegates to the static
+/// language dispatcher in [`extract`].  Useful for callers that
+/// want to register a static-language wrapper under a custom name.
+pub struct StaticLanguageExtractor {
+    pub language: Language,
+}
+
+impl SymbolExtractor for StaticLanguageExtractor {
+    fn extract(&self, source: &str, tree: &Tree) -> (Vec<Symbol>, Vec<SymbolRef>) {
+        extract(self.language, source, tree)
+    }
+}
+
+/// Process-static registry: language tag → extractor.
+fn extractor_registry()
+    -> &'static parking_lot::RwLock<std::collections::HashMap<String, std::sync::Arc<dyn SymbolExtractor>>>
+{
+    static R: std::sync::OnceLock<
+        parking_lot::RwLock<std::collections::HashMap<String, std::sync::Arc<dyn SymbolExtractor>>>,
+    > = std::sync::OnceLock::new();
+    R.get_or_init(|| parking_lot::RwLock::new(std::collections::HashMap::new()))
+}
+
+/// Register a custom extractor under a language tag.  Returns the
+/// previous registration if any.  Pair with
+/// [`crate::code_graph::parse::register_grammar`] under the same tag
+/// so the parser and the extractor share resolution.
+pub fn register_extractor(
+    name: impl Into<String>,
+    extractor: std::sync::Arc<dyn SymbolExtractor>,
+) -> Option<std::sync::Arc<dyn SymbolExtractor>> {
+    extractor_registry().write().insert(name.into(), extractor)
+}
+
+/// Drop a registered extractor.
+pub fn unregister_extractor(name: &str) -> Option<std::sync::Arc<dyn SymbolExtractor>> {
+    extractor_registry().write().remove(name)
+}
+
+/// Snapshot of every registered extractor's tag.
+pub fn registered_extractors() -> Vec<String> {
+    let mut v: Vec<String> = extractor_registry().read().keys().cloned().collect();
+    v.sort();
+    v
+}
+
+/// Look up an extractor by language tag.  Used by the indexer when
+/// `Language::from_lang_str` doesn't recognise the row's `lang`
+/// column.
+pub fn registered_extractor(name: &str) -> Option<std::sync::Arc<dyn SymbolExtractor>> {
+    extractor_registry().read().get(name).cloned()
+}
+
 /// Extract symbols and in-file references from a parsed tree.
 pub fn extract(lang: Language, source: &str, tree: &Tree) -> (Vec<Symbol>, Vec<SymbolRef>) {
     let mut symbols: Vec<Symbol> = Vec::new();

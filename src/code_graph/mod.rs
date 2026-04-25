@@ -55,4 +55,7 @@ pub use storage::{
     code_index_with_embedder, register_ast_index, AstIndexMeta, CodeIndexOptions,
     CodeIndexStats, SupportedLanguage,
 };
-pub use symbols::{Symbol, SymbolKind, SymbolRef, SymbolRefKind};
+pub use symbols::{
+    register_extractor, registered_extractor, registered_extractors, unregister_extractor,
+    StaticLanguageExtractor, Symbol, SymbolExtractor, SymbolKind, SymbolRef, SymbolRefKind,
+};

@@ -3072,6 +3072,34 @@ impl EmbeddedDatabase {
         code_graph::parse::registered_grammars()
     }
 
+    /// Register a SymbolExtractor under a language tag. Pair with
+    /// [`Self::register_grammar`] under the same tag — without a
+    /// matching extractor the indexer skips files for the language
+    /// (parser alone yields zero symbols, which is silently wrong).
+    #[cfg(feature = "code-graph")]
+    pub fn register_extractor(
+        &self,
+        name: impl Into<String>,
+        extractor: std::sync::Arc<dyn code_graph::SymbolExtractor>,
+    ) -> Option<std::sync::Arc<dyn code_graph::SymbolExtractor>> {
+        code_graph::register_extractor(name, extractor)
+    }
+
+    /// Drop a registered extractor.
+    #[cfg(feature = "code-graph")]
+    pub fn unregister_extractor(
+        &self,
+        name: &str,
+    ) -> Option<std::sync::Arc<dyn code_graph::SymbolExtractor>> {
+        code_graph::unregister_extractor(name)
+    }
+
+    /// Snapshot of every registered extractor's tag.
+    #[cfg(feature = "code-graph")]
+    pub fn registered_extractors(&self) -> Vec<String> {
+        code_graph::registered_extractors()
+    }
+
     #[cfg(feature = "code-graph")]
     pub fn code_index(
         &self,

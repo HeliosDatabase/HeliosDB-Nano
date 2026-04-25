@@ -270,11 +270,18 @@ pub fn code_index_with_embedder(
 
     for file in &files {
         stats.files_seen += 1;
-        let Some(lang) = Language::from_lang_str(&file.lang) else {
-            stats.files_skipped += 1;
-            continue;
+        // Resolve a parser + extractor pair: prefer the static
+        // dispatch, fall back to the dynamic registry for runtime
+        // grammars + extractors.
+        let resolution = resolve_parser_and_extractor(&file.lang);
+        let resolution = match resolution {
+            Some(r) => r,
+            None => {
+                stats.files_skipped += 1;
+                continue;
+            }
         };
-        lang_set.insert(lang.as_str().to_string());
+        lang_set.insert(file.lang.to_ascii_lowercase());
 
         // Content-hash gate: if the content hash matches the stored
         // sha and the caller did not set `force_reparse`, skip this
@@ -290,8 +297,18 @@ pub fn code_index_with_embedder(
         }
         touched = true;
 
-        let tree = parse::parse(lang, &file.content)?;
-        let (symbols, refs) = extract(lang, &file.content, &tree);
+        let tree = match &resolution {
+            ParseExtractPair::Static(lang) => parse::parse(*lang, &file.content)?,
+            ParseExtractPair::Dynamic { .. } => {
+                parse::parse_by_name(&file.lang, &file.content)?
+            }
+        };
+        let (symbols, refs) = match &resolution {
+            ParseExtractPair::Static(lang) => extract(*lang, &file.content, &tree),
+            ParseExtractPair::Dynamic { extractor } => {
+                extractor.extract(&file.content, &tree)
+            }
+        };
 
         // Upsert the file row, get back the file_id. This also writes
         // the new sha256 so the next run can short-circuit.
@@ -363,6 +380,35 @@ fn sha256_hex(s: &str) -> String {
     let mut h = Sha256::new();
     h.update(s.as_bytes());
     hex::encode(h.finalize())
+}
+
+/// Parser + extractor pair used by the indexer to handle both
+/// static and dynamically-registered languages uniformly.
+enum ParseExtractPair {
+    Static(Language),
+    Dynamic {
+        extractor: std::sync::Arc<dyn super::symbols::SymbolExtractor>,
+    },
+}
+
+fn resolve_parser_and_extractor(lang: &str) -> Option<ParseExtractPair> {
+    if let Some(builtin) = Language::from_lang_str(lang) {
+        return Some(ParseExtractPair::Static(builtin));
+    }
+    // Dynamic path: require BOTH a registered grammar AND a
+    // registered extractor.  A grammar without an extractor would
+    // parse to an empty symbol set silently — that's worse than
+    // skipping the file outright.
+    let canonical = lang.trim().to_ascii_lowercase();
+    if super::parse::registered_grammars()
+        .iter()
+        .any(|g| g == &canonical)
+    {
+        if let Some(extractor) = super::symbols::registered_extractor(&canonical) {
+            return Some(ParseExtractPair::Dynamic { extractor });
+        }
+    }
+    None
 }
 
 /// Lazy install of `_hdb_code_symbols.body_vec VECTOR(<dim>)`.
