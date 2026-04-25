@@ -454,6 +454,56 @@ fn starts_with_icase(s: &str, prefix: &str) -> bool {
         && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()) }
 }
 
+/// RAII guard that swaps the active branch for the duration of a
+/// query when the FR-3 `ON BRANCH '<name>'` directive is present in
+/// an `lsp_*` call. Restores the previous branch on Drop so every
+/// early-return path through the entry point is covered without
+/// closure plumbing.
+#[cfg(feature = "code-graph")]
+struct CodeGraphBranchGuard<'a> {
+    db: Option<&'a EmbeddedDatabase>,
+    previous: Option<String>,
+    target: Option<String>,
+}
+
+#[cfg(feature = "code-graph")]
+impl<'a> CodeGraphBranchGuard<'a> {
+    fn noop() -> Self {
+        Self { db: None, previous: None, target: None }
+    }
+
+    fn switch_to(db: &'a EmbeddedDatabase, target: String) -> Self {
+        let previous = db.storage.get_current_branch();
+        let current = previous.as_deref().unwrap_or("main");
+        if current == target {
+            // Already on the requested branch; nothing to do.
+            return Self::noop();
+        }
+        // Best-effort switch — if the branch doesn't exist the user
+        // gets the underlying error on the first read/write rather
+        // than a guard-construction failure.
+        let _ = db.switch_branch(&target);
+        Self { db: Some(db), previous, target: Some(target) }
+    }
+}
+
+#[cfg(feature = "code-graph")]
+impl<'a> Drop for CodeGraphBranchGuard<'a> {
+    fn drop(&mut self) {
+        let Some(db) = self.db else { return };
+        let Some(target) = self.target.as_deref() else { return };
+        match self.previous.as_deref() {
+            Some(prev) if prev != target => {
+                let _ = db.switch_branch(prev);
+            }
+            None if target != "main" => {
+                let _ = db.switch_branch("main");
+            }
+            _ => {}
+        }
+    }
+}
+
 impl EmbeddedDatabase {
     /// Check if a SQL statement is a transaction control statement (zero-allocation)
     fn is_transaction_control(sql: &str) -> bool {
@@ -3168,6 +3218,25 @@ impl EmbeddedDatabase {
         std::borrow::Cow::Borrowed(sql)
     }
 
+    /// Pre-parser rewrite that also returns an RAII branch guard for
+    /// the FR-3 `ON BRANCH '<name>'` directive. The guard switches
+    /// branch on construction and restores it on Drop, so every
+    /// early-return path through the entry point honors the override
+    /// without needing a wrapping closure.
+    ///
+    /// Always returns an owned `String` for the rewritten SQL
+    /// (whether or not the rewriter changed anything) so the entry
+    /// point can keep the borrow stable across early returns.
+    #[cfg(feature = "code-graph")]
+    fn rewrite_and_scope(&self, sql: &str) -> (String, CodeGraphBranchGuard<'_>) {
+        let rewrite = code_graph::rewrite_lsp_calls_full(sql);
+        let guard = match rewrite.branch_override {
+            Some(target) => CodeGraphBranchGuard::switch_to(self, target),
+            None => CodeGraphBranchGuard::noop(),
+        };
+        (rewrite.sql, guard)
+    }
+
     /// Run a `CREATE AST INDEX …` declaration. Registers the index
     /// in the process-local AST-index registry, then does an initial
     /// `code_index` pass so every existing source row is indexed.
@@ -3388,8 +3457,15 @@ impl EmbeddedDatabase {
             return self.handle_pause_resume(pr);
         }
         // And rewrite any `lsp_*(…)` table-function references.
-        let rewritten = self.maybe_rewrite_code_graph(sql);
-        let sql = rewritten.as_ref();
+        // `ON BRANCH '…'` directives, if any, are scoped by a
+        // CodeGraphBranchGuard that switches on construction and
+        // restores on Drop — covers every early-return path below.
+        #[cfg(feature = "code-graph")]
+        let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql);
+        #[cfg(feature = "code-graph")]
+        let sql: &str = &rewritten_owned;
+        #[cfg(not(feature = "code-graph"))]
+        let sql: &str = sql;
 
         let start = std::time::Instant::now();
 
@@ -6006,8 +6082,14 @@ impl EmbeddedDatabase {
         // Code-graph pre-parser: expands `lsp_*(…)` table-function
         // calls to the underlying `_hdb_code_*` SELECTs.  No-op when
         // the feature is off or the query has no matching calls.
-        let rewritten = self.maybe_rewrite_code_graph(sql);
-        let sql = rewritten.as_ref();
+        // `ON BRANCH '…'` directives are scoped via a Drop guard so
+        // every early-return path below honors the override.
+        #[cfg(feature = "code-graph")]
+        let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql);
+        #[cfg(feature = "code-graph")]
+        let sql: &str = &rewritten_owned;
+        #[cfg(not(feature = "code-graph"))]
+        let sql: &str = sql;
         let start = std::time::Instant::now();
 
         // DML with RETURNING clause: route through execute_returning path
@@ -6731,8 +6813,14 @@ impl EmbeddedDatabase {
     /// Even malicious input is safely handled as a literal value.
     pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<Vec<Tuple>> {
         // Code-graph pre-parser: see `maybe_rewrite_code_graph`.
-        let rewritten = self.maybe_rewrite_code_graph(sql);
-        let sql = rewritten.as_ref();
+        // `ON BRANCH '…'` directives swap the active branch via a
+        // Drop guard for the duration of this query.
+        #[cfg(feature = "code-graph")]
+        let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql);
+        #[cfg(feature = "code-graph")]
+        let sql: &str = &rewritten_owned;
+        #[cfg(not(feature = "code-graph"))]
+        let sql: &str = sql;
         let start = std::time::Instant::now();
 
         // 1. Parse SQL (will recognize $N placeholders)

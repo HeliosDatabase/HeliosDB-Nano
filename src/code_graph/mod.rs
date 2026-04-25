@@ -45,8 +45,8 @@ pub use lsp::{
     CallHierarchyRow, DefinitionHint, DefinitionRow, HoverRow, ReferenceRow,
 };
 pub use sql_rewrite::{
-    detect_create_ast_index, detect_pause_resume, rewrite_lsp_calls, AstIndexDdl,
-    PauseResume,
+    detect_create_ast_index, detect_pause_resume, rewrite_lsp_calls, rewrite_lsp_calls_full,
+    AstIndexDdl, LspRewrite, PauseResume,
 };
 pub use storage::{
     register_ast_index, AstIndexMeta, CodeIndexOptions, CodeIndexStats, SupportedLanguage,

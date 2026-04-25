@@ -27,16 +27,27 @@
 
 use std::fmt::Write;
 
-/// Rewrite every `lsp_*` table-function call in `sql` in place and
-/// return the transformed SQL. Idempotent — calling on a query with
-/// no `lsp_*` refs is a no-op pass-through.
-pub fn rewrite_lsp_calls(sql: &str) -> String {
+/// Structured result of a `lsp_*` rewrite — the rewritten SQL plus any
+/// session-scoped directives (currently just an `ON BRANCH '…'`
+/// override) the rewriter peeled off the input.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LspRewrite {
+    pub sql: String,
+    pub branch_override: Option<String>,
+}
+
+/// Rewrite every `lsp_*` table-function call in `sql` and return the
+/// transformed SQL plus any session directives. Idempotent — input
+/// with no `lsp_*` refs comes back as-is with `branch_override =
+/// None`.
+pub fn rewrite_lsp_calls_full(sql: &str) -> LspRewrite {
     // Fast path: most queries never mention lsp_.
     if !contains_lsp_ignore_case(sql) {
-        return sql.to_string();
+        return LspRewrite { sql: sql.to_string(), branch_override: None };
     }
     let mut out = String::with_capacity(sql.len() + 64);
     let mut rest = sql;
+    let mut branch_override: Option<String> = None;
     while let Some(hit) = find_lsp_call(rest) {
         out.push_str(&rest[..hit.start]);
         let expansion = match hit.func {
@@ -50,10 +61,25 @@ pub fn rewrite_lsp_calls(sql: &str) -> String {
         out.push('(');
         out.push_str(&expansion);
         out.push(')');
+        // First branch override wins; later occurrences are ignored
+        // rather than letting the second clobber the session scope.
+        if branch_override.is_none() {
+            if let Some(b) = &hit.branch {
+                branch_override = Some(b.clone());
+            }
+        }
         rest = &rest[hit.end..];
     }
     out.push_str(rest);
-    out
+    LspRewrite { sql: out, branch_override }
+}
+
+/// Backwards-compatible string-only API. Returns just the rewritten
+/// SQL — any `ON BRANCH '…'` directive is lost. Internal entry points
+/// (`maybe_rewrite_code_graph`) call `rewrite_lsp_calls_full` so the
+/// branch directive survives.
+pub fn rewrite_lsp_calls(sql: &str) -> String {
+    rewrite_lsp_calls_full(sql).sql
 }
 
 fn contains_lsp_ignore_case(s: &str) -> bool {
@@ -82,10 +108,18 @@ struct Hit {
     args: Vec<String>,
     /// Optional `AS OF …` clause attached to the lsp_* reference.
     as_of: Option<String>,
+    /// Optional `ON BRANCH '…'` directive attached to the lsp_*
+    /// reference. Stripped from the rewrite output and surfaced via
+    /// `LspRewrite::branch_override` so the call site can scope the
+    /// branch switch around execution.
+    branch: Option<String>,
 }
 
 /// Trailing temporal / branch clause that can follow an `lsp_*(...)`
-/// table-function call.  Example: `lsp_definition('X') AS OF COMMIT 'abc'`.
+/// table-function call.  Examples:
+///   `lsp_definition('X') AS OF COMMIT 'abc'`
+///   `lsp_references(42) ON BRANCH 'preview'`
+///   `lsp_call_hierarchy(7, 'incoming', 2) AS OF NOW ON BRANCH 'main'`
 #[derive(Debug, Clone, Default)]
 struct TrailingClause {
     /// Raw SQL fragment of the AS OF clause (`AS OF COMMIT 'abc'`,
@@ -93,78 +127,128 @@ struct TrailingClause {
     /// into every scan target in the rewritten subquery so Nano's
     /// executor handles resolution uniformly.
     as_of: Option<String>,
-    /// Length in bytes consumed from the outer SQL for this clause
-    /// (so the rewriter knows where to resume).
+    /// `ON BRANCH '<name>'` override. Stripped from the rewritten
+    /// SQL (Nano's parser doesn't recognise the clause); surfaced via
+    /// `LspRewrite::branch_override` so the entry point can scope
+    /// the branch switch around the actual query execution.
+    branch: Option<String>,
+    /// Length in bytes consumed from the outer SQL (so the rewriter
+    /// knows where to resume).
     consumed: usize,
 }
 
 fn scan_trailing_clause(s: &str) -> TrailingClause {
-    // Skip leading whitespace.
-    let mut i = 0usize;
-    let bytes = s.as_bytes();
-    while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+    // The two clauses can appear in any order. Loop, peeling off
+    // whichever matches next, until neither does.
+    let mut clause = TrailingClause::default();
+    let mut cursor = 0usize;
+    loop {
+        let mut i = cursor;
+        let bytes = s.as_bytes();
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let rest = &s[i..];
+        let lower = rest.to_ascii_lowercase();
+
+        if clause.as_of.is_none() && lower.starts_with("as of ") {
+            if let Some((as_of, consumed_inner)) = parse_as_of(rest) {
+                clause.as_of = Some(as_of);
+                cursor = i + consumed_inner;
+                clause.consumed = cursor;
+                continue;
+            }
+            break;
+        }
+
+        if clause.branch.is_none() && lower.starts_with("on branch") {
+            if let Some((branch, consumed_inner)) = parse_on_branch(rest) {
+                clause.branch = Some(branch);
+                cursor = i + consumed_inner;
+                clause.consumed = cursor;
+                continue;
+            }
+            break;
+        }
+
+        break;
+    }
+    clause
+}
+
+fn parse_as_of(rest: &str) -> Option<(String, usize)> {
+    let after_as_of = &rest[6..];
+    let after_trim = after_as_of.trim_start();
+    let kw_start = rest.len() - after_trim.len();
+    let low_after = after_trim.to_ascii_lowercase();
+    let (kw_len, expects_literal) = if low_after.starts_with("commit") {
+        (6, true)
+    } else if low_after.starts_with("timestamp") {
+        (9, true)
+    } else if low_after.starts_with("now") {
+        (3, false)
+    } else if low_after.starts_with("transaction") {
+        (11, true)
+    } else if low_after.starts_with("scn") {
+        (3, true)
+    } else {
+        return None;
+    };
+    let after_kw = &after_trim[kw_len..];
+    let mut consumed_inner = kw_start + kw_len;
+    let mut literal: Option<String> = None;
+    if expects_literal {
+        let tail = after_kw.trim_start();
+        let ws_skip = after_kw.len() - tail.len();
+        if !tail.starts_with('\'') {
+            return None;
+        }
+        let close = tail[1..].find('\'')?;
+        let lit = &tail[..close + 2];
+        literal = Some(lit.to_string());
+        consumed_inner += ws_skip + lit.len();
+    }
+    let kw = match kw_len {
+        6 => "COMMIT",
+        9 => "TIMESTAMP",
+        3 => "NOW",
+        11 => "TRANSACTION",
+        _ => "SCN",
+    };
+    let clause = match literal.as_deref() {
+        Some(lit) => format!("AS OF {kw} {lit}"),
+        None => format!("AS OF {kw}"),
+    };
+    Some((clause, consumed_inner))
+}
+
+fn parse_on_branch(rest: &str) -> Option<(String, usize)> {
+    // "on branch" is 9 bytes; expect whitespace then a single-quoted
+    // identifier. Doubled `''` inside the literal is an escaped
+    // single-quote per ANSI SQL.
+    let after = &rest[9..];
+    let trimmed = after.trim_start();
+    let ws_skip = after.len() - trimmed.len();
+    let bytes = trimmed.as_bytes();
+    if bytes.first() != Some(&b'\'') {
+        return None;
+    }
+    let mut i = 1usize;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                i += 2;
+                continue;
+            }
+            // Closing quote.
+            let raw = &trimmed[1..i];
+            let unescaped = raw.replace("''", "'");
+            let total = 9 + ws_skip + i + 1;
+            return Some((unescaped, total));
+        }
         i += 1;
     }
-    let rest = &s[i..];
-    let lower = rest.to_ascii_lowercase();
-    // AS OF COMMIT 'sha' | AS OF TIMESTAMP 'ts' | AS OF NOW
-    if lower.starts_with("as of ") {
-        // Find next keyword token.
-        let after_as_of = &rest[6..];
-        let after_trim = after_as_of.trim_start();
-        let kw_start = rest.len() - after_trim.len();
-        let low_after = after_trim.to_ascii_lowercase();
-        let (kw_len, expects_literal) = if low_after.starts_with("commit") {
-            (6, true)
-        } else if low_after.starts_with("timestamp") {
-            (9, true)
-        } else if low_after.starts_with("now") {
-            (3, false)
-        } else if low_after.starts_with("transaction") {
-            (11, true)
-        } else if low_after.starts_with("scn") {
-            (3, true)
-        } else {
-            return TrailingClause::default();
-        };
-        let after_kw = &after_trim[kw_len..];
-        let mut consumed_inner = kw_start + kw_len;
-        let mut literal: Option<String> = None;
-        if expects_literal {
-            // Skip whitespace, take a single-quoted string.
-            let tail = after_kw.trim_start();
-            let ws_skip = after_kw.len() - tail.len();
-            if !tail.starts_with('\'') {
-                return TrailingClause::default();
-            }
-            if let Some(close) = tail[1..].find('\'') {
-                let lit = &tail[..close + 2]; // include both quotes
-                literal = Some(lit.to_string());
-                consumed_inner += ws_skip + lit.len();
-            } else {
-                return TrailingClause::default();
-            }
-        }
-        let clause = format!(
-            "AS OF {}{}",
-            match kw_len {
-                6 => "COMMIT",
-                9 => "TIMESTAMP",
-                3 => "NOW",
-                11 => "TRANSACTION",
-                _ => "SCN",
-            },
-            literal
-                .as_deref()
-                .map(|s| format!(" {s}"))
-                .unwrap_or_default(),
-        );
-        return TrailingClause {
-            as_of: Some(clause),
-            consumed: i + consumed_inner,
-        };
-    }
-    TrailingClause::default()
+    None
 }
 
 fn find_lsp_call(s: &str) -> Option<Hit> {
@@ -240,7 +324,7 @@ fn find_lsp_call(s: &str) -> Option<Hit> {
                             Func::CallHierarchy => Func::CallHierarchy,
                             Func::Hover => Func::Hover,
                         };
-                        // Peek at what follows for an AS OF clause.
+                        // Peek at what follows for AS OF / ON BRANCH.
                         let trailing = scan_trailing_clause(&s[i + 1..]);
                         return Some(Hit {
                             start: idx,
@@ -248,6 +332,7 @@ fn find_lsp_call(s: &str) -> Option<Hit> {
                             func: func_owned,
                             args,
                             as_of: trailing.as_of,
+                            branch: trailing.branch,
                         });
                     }
                 }
@@ -452,6 +537,64 @@ mod tests {
         // `O'Brien` escaped as O''Brien — must survive the rewriter.
         let got = rewrite_lsp_calls("SELECT * FROM lsp_definition('O''Brien')");
         assert!(got.contains("s.name = 'O''Brien'"));
+    }
+
+    #[test]
+    fn on_branch_directive_extracted_and_stripped() {
+        let r = rewrite_lsp_calls_full(
+            "SELECT * FROM lsp_definition('Foo') ON BRANCH 'preview'",
+        );
+        assert_eq!(r.branch_override.as_deref(), Some("preview"));
+        assert!(!r.sql.to_ascii_lowercase().contains("on branch"));
+        assert!(r.sql.contains("_hdb_code_symbols"));
+    }
+
+    #[test]
+    fn on_branch_combines_with_as_of() {
+        // Both clauses, AS OF first.
+        let r = rewrite_lsp_calls_full(
+            "SELECT * FROM lsp_references(42) AS OF COMMIT 'sha' ON BRANCH 'feat/x'",
+        );
+        assert_eq!(r.branch_override.as_deref(), Some("feat/x"));
+        assert!(r.sql.contains("AS OF COMMIT 'sha'"));
+        // ON BRANCH stripped from the rewritten output.
+        assert!(!r.sql.to_ascii_lowercase().contains("on branch"));
+    }
+
+    #[test]
+    fn on_branch_combines_reverse_order() {
+        // ON BRANCH before AS OF is also accepted.
+        let r = rewrite_lsp_calls_full(
+            "SELECT * FROM lsp_hover(7) ON BRANCH 'b1' AS OF NOW",
+        );
+        assert_eq!(r.branch_override.as_deref(), Some("b1"));
+        assert!(r.sql.contains("AS OF NOW"));
+    }
+
+    #[test]
+    fn on_branch_quote_escaping() {
+        // 'O''Brien' style branch name (unlikely, but the parser
+        // should tolerate it).
+        let r = rewrite_lsp_calls_full(
+            "SELECT * FROM lsp_hover(1) ON BRANCH 'feat-O''Brien'",
+        );
+        assert_eq!(r.branch_override.as_deref(), Some("feat-O'Brien"));
+    }
+
+    #[test]
+    fn no_on_branch_means_no_override() {
+        let r = rewrite_lsp_calls_full("SELECT * FROM lsp_hover(1)");
+        assert!(r.branch_override.is_none());
+    }
+
+    #[test]
+    fn first_on_branch_wins() {
+        // Two lsp_* calls, only the first override is honored.
+        let r = rewrite_lsp_calls_full(
+            "SELECT * FROM lsp_hover(1) ON BRANCH 'a', \
+             lsp_hover(2) ON BRANCH 'b'",
+        );
+        assert_eq!(r.branch_override.as_deref(), Some("a"));
     }
 }
 
