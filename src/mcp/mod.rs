@@ -26,6 +26,8 @@ pub mod server;
 pub mod axum_routes;
 pub mod auto_register;
 pub mod auth;
+pub mod progress;
+pub mod streaming;
 pub mod unix_socket;
 #[cfg(feature = "code-graph")]
 pub mod lsp_tools;
@@ -45,4 +47,8 @@ pub use server::McpServer;
 pub use tools::{call_tool, list_tools, ToolDescriptor, ToolOutcome, BM25_INDEXES, GRAPH_STORE};
 pub use axum_routes::{attach as attach_mcp_routes, mcp_router, McpState};
 pub use auth::{bind_safety_check, AuthError, McpAuth, Scope};
+pub use progress::{
+    emit as emit_progress, ChannelProgressSink, NoopProgressSink, ProgressEvent, ProgressSink,
+};
+pub use streaming::call_tool_streaming;
 pub use unix_socket::UnixSocketServer;

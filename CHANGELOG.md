@@ -41,6 +41,17 @@ API breakage.
   method** + **`GET /mcp/info` HTTP route** — single-shot
   discovery payload (serverInfo + capabilities + verbose tool
   catalogue + resource list).
+- **#9 Streaming `notifications/progress` events.** Tools that
+  call `mcp::progress::emit` from anywhere on the call stack
+  produce JSON-RPC `notifications/progress` messages when the
+  client opted in via `_meta.progressToken`. Wired into the
+  WebSocket and stdio transports; HTTP POST stays single-shot
+  (use the SSE channel for streaming there). The streaming
+  dispatcher (`mcp::call_tool_streaming`) runs the sync handler
+  on `spawn_blocking` and forwards events through an unbounded
+  channel. `helios_graphrag_search` is the first tool wired —
+  emits a "seeding" event on entry and a "<n> hits" event on
+  exit so agents can render a progress indicator.
 - **`SupportedLanguage`** alignment: enum now mirrors `Language`
   (Rust / Python / TypeScript / Tsx / JavaScript / Go / Markdown /
   Sql) so the planned `hdb_code.list_languages` system view
@@ -56,6 +67,10 @@ API breakage.
   `tests/code_graph_semantic_hash_ddl.rs`.
 - 4 vector-similar linker tests in
   `tests/graph_rag_linker_vector.rs`.
+- 4 progress-streaming integration tests in
+  `tests/mcp_progress.rs` (WS round-trip with token, no token,
+  numeric token, scalar-token contract) + 3 lib unit tests
+  covering the channel sink + thread-local routing.
 - 6 new `sql_rewrite` unit tests for `ON BRANCH` parsing
   (combinations, escape, tie-break) + 3 unit tests for
   `detect_create_semantic_hash_index`.
@@ -86,9 +101,9 @@ TODOs:
 
 ### Known follow-ups
 
-- **#9 Streaming `notifications/progress` events from long-running
-  tools** — not yet shipped; the JSON-RPC framing supports it but
-  no tool emits progress today. Tracked separately.
+- **HTTP POST progress** — `POST /mcp` is request/response so
+  streaming requires the paired SSE channel; not yet wired.
+  WebSocket and stdio cover the streaming case today.
 
 ## [3.18.0] - 2026-04-24
 

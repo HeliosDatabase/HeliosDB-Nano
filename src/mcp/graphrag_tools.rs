@@ -16,6 +16,7 @@ use crate::graph_rag::{self, Direction, GraphRagOptions};
 use crate::EmbeddedDatabase;
 
 use super::auto_register::McpExtensionTool;
+use super::progress::{self, ProgressEvent};
 use super::tools::ToolOutcome;
 
 #[derive(Debug, Deserialize)]
@@ -69,24 +70,45 @@ fn graphrag_search_handler(
         direction,
         limit: input.limit,
     };
+
+    // Bookend the search with two progress events. We can't emit
+    // mid-flight events without changing graph_rag_search's signature
+    // — but seeds-found / final-count is enough signal for an agent
+    // to render a "thinking" indicator vs a stuck call.
+    progress::emit(
+        ProgressEvent::new(0.0)
+            .with_total(opts.limit as f64)
+            .with_message(format!(
+                "graph_rag_search: seeding for '{}', hops={}",
+                opts.seed_text, opts.hops
+            )),
+    );
+
     match graph_rag::graph_rag_search(db, &opts) {
-        Ok(rows) => ToolOutcome::ok(json!({
-            "seed_text": opts.seed_text,
-            "hops": opts.hops,
-            "direction": format!("{:?}", opts.direction),
-            "count": rows.len(),
-            "rows": rows
-                .iter()
-                .map(|r| json!({
-                    "node_id": r.node_id,
-                    "node_kind": r.node_kind,
-                    "title": r.title,
-                    "text": r.text,
-                    "source_ref": r.source_ref,
-                    "hop_distance": r.hop_distance,
-                }))
-                .collect::<Vec<_>>(),
-        })),
+        Ok(rows) => {
+            progress::emit(
+                ProgressEvent::new(rows.len() as f64)
+                    .with_total(opts.limit as f64)
+                    .with_message(format!("graph_rag_search: {} hits", rows.len())),
+            );
+            ToolOutcome::ok(json!({
+                "seed_text": opts.seed_text,
+                "hops": opts.hops,
+                "direction": format!("{:?}", opts.direction),
+                "count": rows.len(),
+                "rows": rows
+                    .iter()
+                    .map(|r| json!({
+                        "node_id": r.node_id,
+                        "node_kind": r.node_kind,
+                        "title": r.title,
+                        "text": r.text,
+                        "source_ref": r.source_ref,
+                        "hop_distance": r.hop_distance,
+                    }))
+                    .collect::<Vec<_>>(),
+            }))
+        }
         Err(e) => ToolOutcome::err(format!("graph_rag_search failed: {e}")),
     }
 }

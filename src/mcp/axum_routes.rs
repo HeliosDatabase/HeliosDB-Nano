@@ -141,12 +141,6 @@ pub async fn handle_ws_upgrade(
 
 async fn handle_ws(mut socket: WebSocket, state: McpState) {
     info!("mcp ws client connected");
-    // Snapshot whether the upgrade-time token also carried Write
-    // scope. The header is gone after upgrade, so we can't re-check
-    // — instead we make the test once and remember the answer.
-    // (`Disabled` always returns Ok(_) so this works in test.)
-    // For Disabled mode this is a no-op; for Jwt it's a single
-    // signature verification.
     while let Some(msg) = socket.recv().await {
         let frame = match msg {
             Ok(m) => m,
@@ -157,21 +151,7 @@ async fn handle_ws(mut socket: WebSocket, state: McpState) {
         };
         match frame {
             Message::Text(text) => {
-                let resp_text = match serde_json::from_str::<RpcRequest>(&text) {
-                    Ok(req) => {
-                        let resp = handle_rpc_with_db(state.db.as_ref(), req);
-                        serde_json::to_string(&resp).unwrap_or_else(|e| {
-                            format!(
-                                r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"serialize: {e}"}}}}"#
-                            )
-                        })
-                    }
-                    Err(e) => format!(
-                        r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32700,"message":"parse error: {e}"}}}}"#
-                    ),
-                };
-                if let Err(e) = socket.send(Message::Text(resp_text)).await {
-                    warn!("mcp ws send failed: {e}");
+                if !dispatch_ws_text(&mut socket, &state, &text).await {
                     break;
                 }
             }
@@ -188,6 +168,127 @@ async fn handle_ws(mut socket: WebSocket, state: McpState) {
         }
     }
     info!("mcp ws client disconnected");
+}
+
+/// Returns `true` if the connection should stay open, `false` if
+/// downstream sends failed and we should disconnect.
+async fn dispatch_ws_text(socket: &mut WebSocket, state: &McpState, text: &str) -> bool {
+    let parsed: serde_json::Result<RpcRequest> = serde_json::from_str(text);
+    let req = match parsed {
+        Ok(r) => r,
+        Err(e) => {
+            let err = format!(
+                r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32700,"message":"parse error: {e}"}}}}"#
+            );
+            return socket.send(Message::Text(err)).await.is_ok();
+        }
+    };
+
+    // tools/call with a progressToken takes the streaming path —
+    // the handler runs on a blocking thread, progress events are
+    // forwarded as `notifications/progress`, then the final
+    // tools/call response is sent.
+    if req.method == "tools/call" {
+        if let Some(token) = extract_progress_token(&req.params) {
+            return dispatch_streaming_tools_call(socket, state, req, token).await;
+        }
+    }
+
+    let resp = super::rpc::handle_rpc_with_db(state.db.as_ref(), req);
+    let json = serde_json::to_string(&resp).unwrap_or_else(|e| {
+        format!(
+            r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"serialize: {e}"}}}}"#
+        )
+    });
+    socket.send(Message::Text(json)).await.is_ok()
+}
+
+/// Per the MCP spec: `params._meta.progressToken` (string or number)
+/// signals the client wants progress notifications. Anything else
+/// means no streaming.
+fn extract_progress_token(params: &serde_json::Value) -> Option<serde_json::Value> {
+    let token = params.get("_meta")?.get("progressToken")?;
+    if token.is_string() || token.is_number() {
+        Some(token.clone())
+    } else {
+        None
+    }
+}
+
+async fn dispatch_streaming_tools_call(
+    socket: &mut WebSocket,
+    state: &McpState,
+    req: RpcRequest,
+    progress_token: serde_json::Value,
+) -> bool {
+    use super::streaming::call_tool_streaming;
+
+    // Pull tool name + arguments from the JSON-RPC params shape.
+    let name = req
+        .params
+        .get("name")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+    let args = req.params.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
+
+    let id = req.id.clone().unwrap_or(serde_json::Value::Null);
+    let Some(name) = name else {
+        let err = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "error": { "code": -32000, "message": "tools/call requires 'name'" }
+        });
+        return socket
+            .send(Message::Text(err.to_string()))
+            .await
+            .is_ok();
+    };
+
+    let (mut rx, handle) = call_tool_streaming(Some(state.db.clone()), name, args);
+
+    // Forward progress events as JSON-RPC notifications until the
+    // handler completes.
+    while let Some(ev) = rx.recv().await {
+        let mut params = serde_json::json!({
+            "progressToken": progress_token,
+            "progress": ev.progress,
+        });
+        if let Some(total) = ev.total {
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert("total".into(), serde_json::Value::from(total));
+            }
+        }
+        if let Some(msg) = ev.message {
+            if let Some(obj) = params.as_object_mut() {
+                obj.insert("message".into(), serde_json::Value::String(msg));
+            }
+        }
+        let notif = serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/progress",
+            "params": params,
+        });
+        if socket
+            .send(Message::Text(notif.to_string()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+
+    let outcome = handle.await.unwrap_or_else(|e| super::tools::ToolOutcome::err(format!("tool task panicked: {e}")));
+    let resp = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "isError": outcome.is_error,
+            "content": [
+                { "type": "text", "text": outcome.payload.to_string() }
+            ]
+        }
+    });
+    socket.send(Message::Text(resp.to_string())).await.is_ok()
 }
 
 // ── GET /mcp/sse ────────────────────────────────────────────────────────
