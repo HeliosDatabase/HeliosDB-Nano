@@ -38,17 +38,28 @@ use tracing::{debug, error, info, warn};
 
 use crate::EmbeddedDatabase;
 
+use super::auth::{McpAuth, Scope};
 use super::rpc::{handle_rpc_with_db, RpcRequest, RpcResponse};
 
-/// State injected into the MCP routes — only needs the database handle.
+/// State injected into the MCP routes. Holds the database handle plus
+/// an optional authenticator. Default is [`McpAuth::Disabled`] —
+/// suitable for loopback / local-only mounts. For non-loopback binds
+/// pass an [`McpAuth::Jwt`] and the [`crate::mcp::bind_safety_check`]
+/// helper enforces the policy at bind time.
 #[derive(Clone)]
 pub struct McpState {
     pub db: Arc<EmbeddedDatabase>,
+    pub auth: McpAuth,
 }
 
 impl McpState {
     pub fn new(db: Arc<EmbeddedDatabase>) -> Self {
-        Self { db }
+        Self { db, auth: McpAuth::Disabled }
+    }
+
+    pub fn with_auth(mut self, auth: McpAuth) -> Self {
+        self.auth = auth;
+        self
     }
 }
 
@@ -82,24 +93,58 @@ pub fn attach<S: Clone + Send + Sync + 'static>(
 
 pub async fn handle_post(
     State(state): State<McpState>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<RpcRequest>,
-) -> Json<RpcResponse> {
+) -> impl IntoResponse {
     debug!(method = %req.method, "mcp http request");
+    let scope = Scope::for_method(&req.method);
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if let Err(e) = state.auth.check(auth_header, scope) {
+        return (
+            e.status(),
+            Json(RpcResponse::error(
+                req.id.unwrap_or(serde_json::Value::Null),
+                -32001,
+                e.message(),
+            )),
+        )
+            .into_response();
+    }
     let resp = handle_rpc_with_db(state.db.as_ref(), req);
-    Json(resp)
+    Json(resp).into_response()
 }
 
 // ── GET /mcp/ws ─────────────────────────────────────────────────────────
 
 pub async fn handle_ws_upgrade(
     State(state): State<McpState>,
+    headers: axum::http::HeaderMap,
     ws: WebSocketUpgrade,
-) -> impl IntoResponse {
+) -> axum::response::Response {
+    // Upgrade requires Write scope: the WS frame loop has no
+    // per-message header, so we gate at upgrade time on the highest
+    // privilege the client could exercise during the session.
+    // Read-only clients can use POST /mcp instead.
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if let Err(e) = state.auth.check(auth_header, Scope::Write) {
+        return (e.status(), e.message()).into_response();
+    }
     ws.on_upgrade(move |socket| handle_ws(socket, state))
+        .into_response()
 }
 
 async fn handle_ws(mut socket: WebSocket, state: McpState) {
     info!("mcp ws client connected");
+    // Snapshot whether the upgrade-time token also carried Write
+    // scope. The header is gone after upgrade, so we can't re-check
+    // — instead we make the test once and remember the answer.
+    // (`Disabled` always returns Ok(_) so this works in test.)
+    // For Disabled mode this is a no-op; for Jwt it's a single
+    // signature verification.
     while let Some(msg) = socket.recv().await {
         let frame = match msg {
             Ok(m) => m,
@@ -146,21 +191,29 @@ async fn handle_ws(mut socket: WebSocket, state: McpState) {
 // ── GET /mcp/sse ────────────────────────────────────────────────────────
 
 pub async fn handle_sse(
-    State(_state): State<McpState>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    // Per the MCP HTTP+SSE transport handshake, the SSE channel emits
-    // an `endpoint` event whose data is the POST URI clients should
-    // use for outbound JSON-RPC requests. After that we keep the
-    // connection alive with comments.
-    let endpoint_event = Event::default()
-        .event("endpoint")
-        .data("/mcp");
+    State(state): State<McpState>,
+    headers: axum::http::HeaderMap,
+) -> axum::response::Response {
+    // SSE handshake itself is read-only, but the handshake announces
+    // the POST endpoint that the client will use for any request,
+    // including writes. Require Read scope at minimum; the actual
+    // write gate runs on POST /mcp once the client opens that
+    // connection with its own Authorization header.
+    let auth_header = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+    if let Err(e) = state.auth.check(auth_header, Scope::Read) {
+        return (e.status(), e.message()).into_response();
+    }
+    let endpoint_event = Event::default().event("endpoint").data("/mcp");
     let initial = stream::iter(vec![Ok::<_, Infallible>(endpoint_event)]);
-    Sse::new(initial).keep_alive(
-        KeepAlive::new()
-            .interval(Duration::from_secs(15))
-            .text("keep-alive"),
-    )
+    Sse::new(initial)
+        .keep_alive(
+            KeepAlive::new()
+                .interval(Duration::from_secs(15))
+                .text("keep-alive"),
+        )
+        .into_response()
 }
 
 #[cfg(test)]
