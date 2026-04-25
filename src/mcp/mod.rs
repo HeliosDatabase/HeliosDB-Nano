@@ -29,6 +29,8 @@ pub mod auth;
 pub mod unix_socket;
 #[cfg(feature = "code-graph")]
 pub mod lsp_tools;
+#[cfg(feature = "graph-rag")]
+pub mod graphrag_tools;
 
 pub use protocol::{
     Capabilities, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
