@@ -92,6 +92,39 @@ impl PhysicalOperator for DualScanOperator {
     }
 }
 
+/// Coerce a SQL literal Value to a column's declared type when
+/// the obvious cross-type case calls for it.  Currently handles
+/// String→UUID/Date/Timestamp; everything else passes through.
+///
+/// Necessary because the planner emits `Value::String(...)` for
+/// any quoted literal regardless of the comparison column's type,
+/// and the ART index lookup encodes types byte-exactly.  Without
+/// this coercion `WHERE id = '<uuid>'` against a UUID PK misses
+/// every row.
+pub(crate) fn coerce_literal_to_column_type(
+    v: crate::Value,
+    col_type: &crate::DataType,
+) -> crate::Value {
+    use crate::{DataType, Value};
+    match (&v, col_type) {
+        (Value::String(s), DataType::Uuid) => match uuid::Uuid::parse_str(s) {
+            Ok(u) => Value::Uuid(u),
+            Err(_) => v,
+        },
+        (Value::String(s), DataType::Date) => match s.parse::<chrono::NaiveDate>() {
+            Ok(d) => Value::Date(d),
+            Err(_) => v,
+        },
+        (Value::String(s), DataType::Timestamp) => {
+            match chrono::DateTime::parse_from_rfc3339(s) {
+                Ok(t) => Value::Timestamp(t.to_utc()),
+                Err(_) => v,
+            }
+        }
+        _ => v,
+    }
+}
+
 /// StatusMessage operator for DDL operations
 ///
 /// Returns a single row with a status message, used for DDL operations
@@ -574,6 +607,15 @@ impl<'a> Executor<'a> {
             Some(v) => v,
             None => return Ok(None),
         };
+
+        // Coerce the literal to the PK column's declared type when
+        // a string literal targets a non-textual PK (UUID / DATE /
+        // TIMESTAMP).  Without this the ART index lookup encodes
+        // `Value::String("<uuid>")` while the stored PK is
+        // `Value::Uuid(...)`, the keys differ, the lookup misses,
+        // and the row appears invisible — the root cause of the
+        // CloudV2 admin_db persistence bug (#205).
+        let pk_value = self::coerce_literal_to_column_type(pk_value, &pk_col.data_type);
 
         // Try the ART index lookup (pass pre-fetched schema to avoid redundant catalog lookup)
         let tuple = storage.get_row_by_pk_with_schema(table_name, &pk_value, schema)?;

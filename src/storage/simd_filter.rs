@@ -225,6 +225,17 @@ impl FilterPredicate {
             (Value::String(a), Value::String(b)) => a == b,
             (Value::Bytes(a), Value::Bytes(b)) => a == b,
             (Value::Uuid(a), Value::Uuid(b)) => a == b,
+            // Cross-type UUID/String coercion — `WHERE id = '<uuid>'`
+            // when `id` is UUID-typed.  Without this, the SIMD
+            // pushdown rejects the row even though the evaluator's
+            // generic compare_values would accept it (root cause
+            // of the CloudV2 admin_db persistence bug, #205).
+            (Value::Uuid(a), Value::String(b)) => uuid::Uuid::parse_str(b)
+                .map(|u| *a == u)
+                .unwrap_or(false),
+            (Value::String(a), Value::Uuid(b)) => uuid::Uuid::parse_str(a)
+                .map(|u| u == *b)
+                .unwrap_or(false),
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
             (Value::Numeric(a), Value::Numeric(b)) => a == b,
             (Value::Json(a), Value::Json(b)) => a == b,

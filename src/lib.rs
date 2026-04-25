@@ -4454,7 +4454,27 @@ impl EmbeddedDatabase {
                     }
                     // End of string
                     let rest = inner.get(end + 1..)?;
-                    return Some((Value::String(result), rest));
+                    // Coerce string literal to target type when the
+                    // column is non-textual.  Without this the
+                    // fast-select PK lookup compares
+                    // Value::String("<uuid>") against the stored
+                    // Value::Uuid(...) and misses every time —
+                    // root cause of the CloudV2 admin_db
+                    // persistence bug (#205).
+                    let typed = match target_type {
+                        DataType::Uuid => uuid::Uuid::parse_str(&result)
+                            .map(Value::Uuid)
+                            .unwrap_or(Value::String(result)),
+                        DataType::Date => result
+                            .parse::<chrono::NaiveDate>()
+                            .map(Value::Date)
+                            .unwrap_or(Value::String(result)),
+                        DataType::Timestamp => chrono::DateTime::parse_from_rfc3339(&result)
+                            .map(|t| Value::Timestamp(t.to_utc()))
+                            .unwrap_or(Value::String(result)),
+                        _ => Value::String(result),
+                    };
+                    return Some((typed, rest));
                 }
                 end += 1;
             }

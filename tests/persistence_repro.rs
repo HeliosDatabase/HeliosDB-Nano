@@ -43,7 +43,6 @@ async fn setup() -> Result<(String, tokio::task::JoinHandle<()>), Box<dyn std::e
 }
 
 #[tokio::test]
-#[ignore = "PostgreSQL wire-protocol server requires CloudV2-specific patches; tracked in #205"]
 async fn insert_then_select_visible_on_same_connection() {
     let (cs, server_handle) = setup().await.expect("server up");
     let (client, connection) = tokio_postgres::connect(&cs, NoTls)
