@@ -271,11 +271,32 @@ impl<'a> Planner<'a> {
     /// `CREATE TABLE Users` and `SELECT FROM users` resolve to the
     /// same name.
     pub(crate) fn normalize_object_name(name: &sqlparser::ast::ObjectName) -> String {
-        name.0
+        let joined = name
+            .0
             .iter()
             .map(Self::normalize_ident)
             .collect::<Vec<_>>()
-            .join(".")
+            .join(".");
+        // Schema-namespacing alias: `_hdb_code.<table>` → `_hdb_code_<table>`,
+        // `_hdb_graph.<table>` → `_hdb_graph_<table>`.  Lets users
+        // address the code-graph / graph-rag tables in dotted form
+        // without forcing a catalog refactor.  The flat-prefix names
+        // remain the canonical storage keys.
+        Self::dealias_schema(&joined).unwrap_or(joined)
+    }
+
+    /// Map dotted names of the form `_hdb_code.<table>` or
+    /// `_hdb_graph.<table>` onto their canonical flat-prefix
+    /// counterparts.  Returns `None` for everything else, so plain
+    /// `public` table names go through unchanged.
+    pub(crate) fn dealias_schema(name: &str) -> Option<String> {
+        if let Some(rest) = name.strip_prefix("_hdb_code.") {
+            return Some(format!("_hdb_code_{rest}"));
+        }
+        if let Some(rest) = name.strip_prefix("_hdb_graph.") {
+            return Some(format!("_hdb_graph_{rest}"));
+        }
+        None
     }
 
     /// Convert a SQL statement to a logical plan

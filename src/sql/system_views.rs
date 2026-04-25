@@ -1070,9 +1070,21 @@ impl SystemViewRegistry {
                 continue;
             }
 
+            // Schema-namespacing surface (#188): the flat-prefix
+            // `_hdb_code_*` / `_hdb_graph_*` tables are reported
+            // under the `_hdb_code` / `_hdb_graph` schemas in
+            // pg_catalog, even though the canonical storage key
+            // stays flat.  Everything else lives in `public`.
+            let (schema, bare) = if let Some(rest) = table_name.strip_prefix("_hdb_code_") {
+                ("_hdb_code".to_string(), rest.to_string())
+            } else if let Some(rest) = table_name.strip_prefix("_hdb_graph_") {
+                ("_hdb_graph".to_string(), rest.to_string())
+            } else {
+                ("public".to_string(), table_name.clone())
+            };
             let tuple = Tuple::new(vec![
-                Value::String("public".to_string()),
-                Value::String(table_name.clone()),
+                Value::String(schema),
+                Value::String(bare),
                 Value::String("heliosdb".to_string()),
                 Value::Null, // tablespace
                 Value::Boolean(false), // hasindexes (simplified)
