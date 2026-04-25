@@ -3277,6 +3277,34 @@ impl EmbeddedDatabase {
         Ok(0)
     }
 
+    /// Run a `CREATE SEMANTIC HASH INDEX …` declaration. Materialises
+    /// the BLAKE3 roll-up over `_hdb_code_symbols` into the
+    /// `_hdb_code_merkle` table; subsequent calls refresh only files
+    /// whose member symbols changed (idempotent).
+    ///
+    /// `IF NOT EXISTS` gates rebuilding when the merkle table is
+    /// already populated — a re-run is otherwise free to call.
+    #[cfg(feature = "code-graph")]
+    fn handle_create_semantic_hash_index(
+        &self,
+        ddl: code_graph::SemanticHashIndexDdl,
+    ) -> Result<u64> {
+        // The roll-up table is created on demand inside merkle_refresh,
+        // so the DDL itself is little more than a wrapper around
+        // build_or_refresh that records the index name in process-
+        // local state for diagnostics.
+        let stats = code_graph::merkle_refresh(self)?;
+        tracing::info!(
+            index = %ddl.index_name,
+            files_hashed = stats.files_hashed,
+            files_unchanged = stats.files_unchanged,
+            symbols_hashed = stats.symbols_hashed,
+            "CREATE SEMANTIC HASH INDEX completed"
+        );
+        let _ = ddl.if_not_exists; // accepted for forward compat
+        Ok(stats.files_hashed)
+    }
+
     /// Flip the `paused` flag on a registered AST index. Returns 0
     /// rows affected either way; surfaces an error only when the
     /// named index is not registered.
@@ -3406,6 +3434,24 @@ impl EmbeddedDatabase {
         graph_rag::link_exact_qualified(self, extra_kinds)
     }
 
+    /// Vector-similar entity-linker stage (FR 4 §4.3 strategy 3).
+    /// For each text-bearing graph node embedding, finds the top-k
+    /// closest code-symbol embeddings by cosine and emits a
+    /// `MENTIONS` edge with `weight = similarity` for any pair above
+    /// `threshold`.  Embeddings are caller-supplied so the linker
+    /// works with any external embedder without requiring a schema
+    /// extension.
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_link_vector(
+        &self,
+        text_queries: &[graph_rag::TextEmbedding],
+        symbol_targets: &[graph_rag::SymbolEmbedding],
+        top_k: usize,
+        threshold: f32,
+    ) -> Result<graph_rag::LinkerStats> {
+        graph_rag::link_vector_similar(self, text_queries, symbol_targets, top_k, threshold)
+    }
+
     /// Ingest markdown / plain text rows as DocChunk / DocSection
     /// nodes.  See `graph_rag::IngestDocsOptions`.
     #[cfg(feature = "graph-rag")]
@@ -3455,6 +3501,10 @@ impl EmbeddedDatabase {
         #[cfg(feature = "code-graph")]
         if let Some(pr) = code_graph::detect_pause_resume(sql) {
             return self.handle_pause_resume(pr);
+        }
+        #[cfg(feature = "code-graph")]
+        if let Some(ddl) = code_graph::detect_create_semantic_hash_index(sql) {
+            return self.handle_create_semantic_hash_index(ddl);
         }
         // And rewrite any `lsp_*(…)` table-function references.
         // `ON BRANCH '…'` directives, if any, are scoped by a

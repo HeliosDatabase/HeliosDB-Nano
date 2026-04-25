@@ -735,6 +735,68 @@ pub fn detect_create_ast_index(sql: &str) -> Option<AstIndexDdl> {
     })
 }
 
+/// Parsed `CREATE SEMANTIC HASH INDEX [IF NOT EXISTS] <name>` DDL.
+/// The index materialises a BLAKE3 roll-up over the existing
+/// `_hdb_code_symbols` rows into the `_hdb_code_merkle` table —
+/// exactly what `code_graph::semantic_merkle::build_or_refresh`
+/// produces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SemanticHashIndexDdl {
+    pub index_name: String,
+    pub if_not_exists: bool,
+}
+
+/// Detect `CREATE SEMANTIC HASH INDEX [IF NOT EXISTS] <name>` and
+/// return the parsed DDL. The trailing `ON <table>` is intentionally
+/// optional — there's a single semantic-Merkle target today
+/// (`_hdb_code_symbols`) so naming the table is informational.
+///
+/// Grammar:
+/// ```text
+/// CREATE SEMANTIC HASH INDEX [IF NOT EXISTS] <name>
+///     [ ON <table> ]
+///     [;]
+/// ```
+pub fn detect_create_semantic_hash_index(sql: &str) -> Option<SemanticHashIndexDdl> {
+    let s = sql.trim().trim_end_matches(';').trim();
+    let lower = s.to_ascii_lowercase();
+    let mut it = lower.split_ascii_whitespace();
+    if it.next()? != "create" {
+        return None;
+    }
+    if it.next()? != "semantic" {
+        return None;
+    }
+    if it.next()? != "hash" {
+        return None;
+    }
+    if it.next()? != "index" {
+        return None;
+    }
+
+    let mut t = Tokenizer::new(s);
+    t.expect_word("create")?;
+    t.expect_word("semantic")?;
+    t.expect_word("hash")?;
+    t.expect_word("index")?;
+
+    let mut if_not_exists = false;
+    if t.peek_word_eq("if") {
+        t.expect_word("if")?;
+        t.expect_word("not")?;
+        t.expect_word("exists")?;
+        if_not_exists = true;
+    }
+    let index_name = t.take_ident()?;
+    // Optional ON <table> — phase 3 has only one merkle target so we
+    // accept and ignore the table name for forward compatibility.
+    if t.peek_word_eq("on") {
+        t.expect_word("on")?;
+        let _table = t.take_ident()?;
+    }
+    Some(SemanticHashIndexDdl { index_name, if_not_exists })
+}
+
 /// Detect `SELECT hdb_code.pause('index_name')` and
 /// `SELECT hdb_code.resume('index_name')` — both are admin calls
 /// that toggle the index's auto_reparse flag in process-local state.
@@ -953,5 +1015,32 @@ mod ast_index_tests {
             Some(PauseResume::Resume("a".into()))
         );
         assert!(detect_pause_resume("SELECT 1").is_none());
+    }
+
+    #[test]
+    fn detects_create_semantic_hash_index_basic() {
+        let d = detect_create_semantic_hash_index(
+            "CREATE SEMANTIC HASH INDEX code_merkle",
+        )
+        .expect("parsed");
+        assert_eq!(d.index_name, "code_merkle");
+        assert!(!d.if_not_exists);
+    }
+
+    #[test]
+    fn detects_create_semantic_hash_index_if_not_exists() {
+        let d = detect_create_semantic_hash_index(
+            "CREATE SEMANTIC HASH INDEX IF NOT EXISTS m ON _hdb_code_symbols;",
+        )
+        .expect("parsed");
+        assert_eq!(d.index_name, "m");
+        assert!(d.if_not_exists);
+    }
+
+    #[test]
+    fn ignores_create_index_without_semantic_keyword() {
+        assert!(detect_create_semantic_hash_index("CREATE INDEX x ON t (a)").is_none());
+        assert!(detect_create_semantic_hash_index("CREATE AST INDEX x ON t (c)").is_none());
+        assert!(detect_create_semantic_hash_index("SELECT 1").is_none());
     }
 }

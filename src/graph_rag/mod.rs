@@ -23,7 +23,9 @@ pub use ingest::{
     IngestDocsOptions, IngestEmailOptions, IngestIssuesOptions, IngestQaOptions,
     IngestStats,
 };
-pub use linker::{link_exact_qualified, LinkerStats};
+pub use linker::{
+    link_exact_qualified, link_vector_similar, LinkerStats, SymbolEmbedding, TextEmbedding,
+};
 pub use schema::{ensure_tables, project_code_symbols, GraphRagStats};
 pub use search::{graph_rag_search, Direction, GraphRagHit, GraphRagOptions};
 pub use with_context::{
