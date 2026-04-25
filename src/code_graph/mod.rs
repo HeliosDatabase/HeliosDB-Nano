@@ -52,6 +52,7 @@ pub use sql_rewrite::{
     SemanticHashIndexDdl,
 };
 pub use storage::{
-    register_ast_index, AstIndexMeta, CodeIndexOptions, CodeIndexStats, SupportedLanguage,
+    code_index_with_embedder, register_ast_index, AstIndexMeta, CodeIndexOptions,
+    CodeIndexStats, SupportedLanguage,
 };
 pub use symbols::{Symbol, SymbolKind, SymbolRef, SymbolRefKind};

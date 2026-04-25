@@ -237,9 +237,6 @@ pub fn set_ast_index_paused(name: &str, paused: bool) -> bool {
 /// comparing the row's SHA-256 against the stored hash. `force_reparse`
 /// bypasses the sha gate.
 pub fn code_index(db: &EmbeddedDatabase, opts: CodeIndexOptions) -> Result<CodeIndexStats> {
-    bootstrap_tables(db)?;
-    mark_extension_installed();
-
     let embedder: Box<dyn Embedder> = match opts.embed_endpoint.as_deref() {
         Some(url) if opts.embed_bodies => {
             let mut h = super::embed::HttpEmbedder::new(url);
@@ -250,6 +247,20 @@ pub fn code_index(db: &EmbeddedDatabase, opts: CodeIndexOptions) -> Result<CodeI
         }
         _ => Box::new(NoopEmbedder),
     };
+    code_index_with_embedder(db, opts, embedder)
+}
+
+/// Indexer entry-point that takes a pre-constructed embedder.
+/// Used by tests + by `code-embed`-feature callers that want to
+/// supply their own (e.g. fastembed) implementation without going
+/// through the URL-based `HttpEmbedder` path.
+pub fn code_index_with_embedder(
+    db: &EmbeddedDatabase,
+    opts: CodeIndexOptions,
+    embedder: Box<dyn Embedder>,
+) -> Result<CodeIndexStats> {
+    bootstrap_tables(db)?;
+    mark_extension_installed();
 
     let files = fetch_source_files(db, &opts.source_table)?;
     let existing_sha = fetch_file_sha_map(db)?;
@@ -352,6 +363,23 @@ fn sha256_hex(s: &str) -> String {
     let mut h = Sha256::new();
     h.update(s.as_bytes());
     hex::encode(h.finalize())
+}
+
+/// Lazy install of `_hdb_code_symbols.body_vec VECTOR(<dim>)`.
+///
+/// Uses Nano's `ADD COLUMN IF NOT EXISTS` support — a no-op when
+/// the column is already present, and the planner accepts it even
+/// when LIMIT 0 SELECT probing would short-circuit before column
+/// resolution and falsely report "exists".
+///
+/// When the column already exists at a different dimension, the
+/// engine surfaces a column-conflict error from the underlying
+/// schema check.
+fn ensure_body_vec_column(db: &EmbeddedDatabase, dim: usize) -> Result<()> {
+    db.execute(&format!(
+        "ALTER TABLE _hdb_code_symbols ADD COLUMN IF NOT EXISTS body_vec VECTOR({dim})"
+    ))?;
+    Ok(())
 }
 
 fn fetch_file_sha_map(db: &EmbeddedDatabase) -> Result<HashMap<String, String>> {
@@ -594,13 +622,47 @@ fn insert_symbols(
     embedder: &dyn Embedder,
     stats: &mut CodeIndexStats,
 ) -> Result<Vec<i64>> {
-    // Embedding is optional + per-symbol; keep it outside the batch
-    // loop so we don't conflate it with DB throughput.
+    // Compute embeddings up-front so we can: (a) negotiate the
+    // VECTOR column dimension once, (b) include body_vec in the
+    // batched INSERT path. NoopEmbedder returns None for everything
+    // → vectors stays empty → no schema change.
+    let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(symbols.len());
     for sym in symbols {
-        if !sym.signature.is_empty() {
-            let v = embedder.embed(&sym.signature)?;
-            if v.is_some() {
-                stats.embed_calls += 1;
+        let v = if !sym.signature.is_empty() {
+            embedder.embed(&sym.signature)?
+        } else {
+            None
+        };
+        if v.is_some() {
+            stats.embed_calls += 1;
+        }
+        vectors.push(v);
+    }
+
+    let any_vec = vectors.iter().any(Option::is_some);
+    if any_vec {
+        // Pick a dimension from the first non-null vector and stick
+        // with it. ensure_body_vec_column installs the column on
+        // the first non-null run; subsequent runs require dim
+        // match.
+        let dim = vectors
+            .iter()
+            .find_map(|v| v.as_ref().map(|v| v.len()))
+            .unwrap_or(0);
+        if dim == 0 {
+            return Err(Error::query_execution(
+                "embedder returned a zero-length vector",
+            ));
+        }
+        ensure_body_vec_column(db, dim)?;
+        for v in &vectors {
+            if let Some(vec) = v {
+                if vec.len() != dim {
+                    return Err(Error::query_execution(format!(
+                        "embedder dimension mismatch: expected {dim}, got {}",
+                        vec.len()
+                    )));
+                }
             }
         }
     }
@@ -608,28 +670,46 @@ fn insert_symbols(
     let mut ids = Vec::with_capacity(symbols.len());
     // Batch N rows per INSERT. Multi-row VALUES collapses
     // parse+plan+WAL overhead; RETURNING gives us the ids back in
-    // insert order so we can bind refs afterward.
-    const COLS: usize = 10;
-    for chunk in symbols.chunks(INSERT_BATCH) {
-        let mut sql = String::with_capacity(COLS * 8 * chunk.len() + 128);
-        sql.push_str(
-            "INSERT INTO _hdb_code_symbols \
-               (file_id, name, qualified, kind, signature, \
-                visibility, line_start, line_end, byte_start, byte_end) \
-             VALUES ",
-        );
-        let mut params: Vec<Value> = Vec::with_capacity(COLS * chunk.len());
+    // insert order so we can bind refs afterward.  When any
+    // vector is present, we INSERT the body_vec column too;
+    // otherwise we keep the legacy 10-column shape so the
+    // embedder-less path stays unchanged.
+    let with_vec = any_vec;
+    let cols: usize = if with_vec { 11 } else { 10 };
+    for (chunk_start, chunk) in symbols
+        .chunks(INSERT_BATCH)
+        .enumerate()
+        .map(|(i, c)| (i * INSERT_BATCH, c))
+    {
+        let mut sql = String::with_capacity(cols * 8 * chunk.len() + 128);
+        if with_vec {
+            sql.push_str(
+                "INSERT INTO _hdb_code_symbols \
+                   (file_id, name, qualified, kind, signature, \
+                    visibility, line_start, line_end, byte_start, byte_end, \
+                    body_vec) \
+                 VALUES ",
+            );
+        } else {
+            sql.push_str(
+                "INSERT INTO _hdb_code_symbols \
+                   (file_id, name, qualified, kind, signature, \
+                    visibility, line_start, line_end, byte_start, byte_end) \
+                 VALUES ",
+            );
+        }
+        let mut params: Vec<Value> = Vec::with_capacity(cols * chunk.len());
         for (row_idx, sym) in chunk.iter().enumerate() {
             if row_idx > 0 {
                 sql.push(',');
             }
             sql.push('(');
-            for col in 0..COLS {
+            for col in 0..cols {
                 if col > 0 {
                     sql.push(',');
                 }
                 sql.push('$');
-                sql.push_str(&(row_idx * COLS + col + 1).to_string());
+                sql.push_str(&(row_idx * cols + col + 1).to_string());
             }
             sql.push(')');
             params.push(Value::Int8(file_id));
@@ -642,6 +722,15 @@ fn insert_symbols(
             params.push(Value::Int4(sym.line_end as i32));
             params.push(Value::Int4(sym.byte_start as i32));
             params.push(Value::Int4(sym.byte_end as i32));
+            if with_vec {
+                let abs_idx = chunk_start + row_idx;
+                let v = vectors
+                    .get(abs_idx)
+                    .and_then(|v| v.clone())
+                    .map(Value::Vector)
+                    .unwrap_or(Value::Null);
+                params.push(v);
+            }
         }
         sql.push_str(" RETURNING node_id");
         let (_, rows) = db.execute_params_returning(&sql, &params)?;
