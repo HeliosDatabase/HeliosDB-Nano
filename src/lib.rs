@@ -277,14 +277,24 @@ pub mod git_integration; // Git workflow integration
 pub mod runtime; // Per-request runtime helpers (bump arena, ...)
 pub mod graph;   // Native graph adjacency lists & traversal (RAG-native)
 pub mod search;  // BM25 + hybrid search + RRF/MMR rerankers (RAG-native)
-// NOTE: `mcp` module exists on disk but its server.rs / tools.rs reference
-// EmbeddedDatabase methods (query_branch, execute_branch, merge_branches,
-// query_at_timestamp, ...) that no longer exist on the current API. Enabling
-// it would require an mcp-wide refactor that's out of scope. The external project
-// idea-5 tool *handlers* live in `mcp_extensions` instead and can be
-// folded back into the legacy mcp module once the upstream API drift is
-// reconciled. See BLOCKER_idea_5.md for details.
-pub mod mcp_extensions; // Standalone MCP idea-5 tool handlers (RAG-native)
+
+// Code-graph track (FR 2 / FR 3) — tree-sitter-backed AST index,
+// `_hdb_code_*` tables, LSP-shaped queries. Opt-in.
+#[cfg(feature = "code-graph")]
+pub mod code_graph;
+
+// Graph-RAG track (FR 4) — universal cross-modal `_hdb_graph_*`
+// schema + seed/expand/rerank API. Opt-in; implies `code-graph`.
+#[cfg(feature = "graph-rag")]
+pub mod graph_rag;
+
+// Native MCP endpoint (FR 5) — JSON-RPC 2.0 surface over a unified
+// tool + resource catalogue. Reusable from stdio, HTTP, WebSocket,
+// SSE. See `src/mcp/rpc.rs` for the pure dispatcher and
+// `src/mcp/server.rs` for the stdio transport used by
+// `heliosdb-nano mcp-server`.
+#[cfg(feature = "mcp-endpoint")]
+pub mod mcp;
 
 // Experimental modules (require feature flags)
 // DISABLED: Sync module has compilation issues and is 85% complete
@@ -2969,8 +2979,417 @@ impl EmbeddedDatabase {
     /// # Ok(())
     /// # }
     /// ```
+
+    // ------------------------------------------------------------------
+    // Code-graph API (feature = "code-graph")
+    // ------------------------------------------------------------------
+
+    /// Parse every row of `source_table` (which must have at least
+    /// `path TEXT PRIMARY KEY`, `lang TEXT`, `content TEXT`) and
+    /// populate the `_hdb_code_*` tables. Idempotent.
+    ///
+    /// The embedding endpoint from `opts.embed_endpoint` is called
+    /// per-symbol only when `opts.embed_bodies` is set. Without an
+    /// endpoint, `body_vec` stays `NULL` and BM25-based retrieval
+    /// still works.
+    /// Register a tree-sitter grammar at runtime under a language tag.
+    ///
+    /// Lets callers extend the indexer with grammars Nano doesn't ship
+    /// statically — load WASM via a wasm runtime, dynamically-linked
+    /// shared libraries, or anything else that yields a
+    /// [`tree_sitter::Language`]. Idempotent: re-registering replaces.
+    ///
+    /// See [`code_graph::parse::register_grammar`] for loader patterns.
+    #[cfg(feature = "code-graph")]
+    pub fn register_grammar(
+        &self,
+        name: impl Into<String>,
+        grammar: tree_sitter::Language,
+    ) -> Option<tree_sitter::Language> {
+        code_graph::parse::register_grammar(name, grammar)
+    }
+
+    /// Drop a previously-registered grammar. Returns the entry if
+    /// any; falls through silently otherwise.
+    #[cfg(feature = "code-graph")]
+    pub fn unregister_grammar(&self, name: &str) -> Option<tree_sitter::Language> {
+        code_graph::parse::unregister_grammar(name)
+    }
+
+    /// Snapshot the names of every dynamically-registered grammar.
+    #[cfg(feature = "code-graph")]
+    pub fn registered_grammars(&self) -> Vec<String> {
+        code_graph::parse::registered_grammars()
+    }
+
+    #[cfg(feature = "code-graph")]
+    pub fn code_index(
+        &self,
+        opts: code_graph::CodeIndexOptions,
+    ) -> Result<code_graph::CodeIndexStats> {
+        let stats = code_graph::storage::code_index(self, opts)?;
+        // Incremental projection: when graph-rag is enabled, mirror
+        // new code symbols + refs into the universal `_hdb_graph_*`
+        // schema.  Keeps the projection in sync without callers
+        // having to remember to call `graph_rag_project_symbols`.
+        #[cfg(feature = "graph-rag")]
+        {
+            let _ = self.graph_rag_project_symbols();
+        }
+        Ok(stats)
+    }
+
+    /// "Where is `name` defined?" — returns zero or more candidate
+    /// definition rows ordered by score. Score is a heuristic: 1.1
+    /// when `hint_kind` matches, 1.0 for unqualified single match,
+    /// 0.8 for name-only fallback.
+    #[cfg(feature = "code-graph")]
+    pub fn lsp_definition(
+        &self,
+        name: &str,
+        hint: &code_graph::DefinitionHint,
+    ) -> Result<Vec<code_graph::DefinitionRow>> {
+        code_graph::lsp::lsp_definition(self, name, hint)
+    }
+
+    /// "Who uses `symbol_id`?" — enumerates every row in
+    /// `_hdb_code_symbol_refs` where `to_symbol = symbol_id`.
+    #[cfg(feature = "code-graph")]
+    pub fn lsp_references(
+        &self,
+        symbol_id: i64,
+    ) -> Result<Vec<code_graph::ReferenceRow>> {
+        code_graph::lsp::lsp_references(self, symbol_id)
+    }
+
+    /// "What calls `symbol_id`, up to `depth` hops?" — BFS over the
+    /// `CALLS` edges in either direction.
+    #[cfg(feature = "code-graph")]
+    pub fn lsp_call_hierarchy(
+        &self,
+        symbol_id: i64,
+        direction: code_graph::lsp::CallDirection,
+        depth: u32,
+    ) -> Result<Vec<code_graph::lsp::CallHierarchyRow>> {
+        code_graph::lsp::lsp_call_hierarchy(self, symbol_id, direction, depth)
+    }
+
+    /// Signature + (phase 2) doc-comment for a symbol. Returns `None`
+    /// when the id does not exist.
+    #[cfg(feature = "code-graph")]
+    pub fn lsp_hover(&self, symbol_id: i64) -> Result<Option<code_graph::HoverRow>> {
+        code_graph::lsp::lsp_hover(self, symbol_id)
+    }
+
+    /// Temporal diff of references — added / removed / moved between
+    /// two temporal points. See FR 3 §3.3.
+    #[cfg(feature = "code-graph")]
+    pub fn lsp_references_diff(
+        &self,
+        symbol_id: i64,
+        at_a: &code_graph::AsOfRef,
+        at_b: &code_graph::AsOfRef,
+    ) -> Result<Vec<code_graph::RefDiffRow>> {
+        code_graph::diff::lsp_references_diff(self, symbol_id, at_a, at_b)
+    }
+
+    /// Line-by-line body diff of a single symbol between two points.
+    #[cfg(feature = "code-graph")]
+    pub fn lsp_body_diff(
+        &self,
+        symbol_id: i64,
+        at_a: &code_graph::AsOfRef,
+        at_b: &code_graph::AsOfRef,
+    ) -> Result<Vec<code_graph::BodyDiffLine>> {
+        code_graph::diff::lsp_body_diff(self, symbol_id, at_a, at_b)
+    }
+
+    /// File-level structural diff (which symbols exist, moved, or
+    /// disappeared) between two points.
+    #[cfg(feature = "code-graph")]
+    pub fn ast_diff(
+        &self,
+        file_path: &str,
+        at_a: &code_graph::AsOfRef,
+        at_b: &code_graph::AsOfRef,
+    ) -> Result<Vec<code_graph::AstDiffRow>> {
+        code_graph::diff::ast_diff(self, file_path, at_a, at_b)
+    }
+
+    /// (Re)build the per-file semantic Merkle roll-up table
+    /// `_hdb_code_merkle`.  Idempotent.  Files whose member symbols
+    /// haven't changed keep the same roll-up hash.
+    #[cfg(feature = "code-graph")]
+    pub fn code_graph_merkle_refresh(
+        &self,
+    ) -> Result<code_graph::MerkleStats> {
+        code_graph::merkle_refresh(self)
+    }
+
+    /// `WITH CONTEXT (...)` entry point — runs the seed query, then
+    /// expands the graph subgraph per the clause options.  Result
+    /// tuples: `(node_id, node_kind, title, text, source_ref, hop_distance)`.
+    #[cfg(feature = "graph-rag")]
+    fn run_with_context(
+        &self,
+        inner_sql: &str,
+        opts: &graph_rag::WithContextOptions,
+    ) -> Result<Vec<Tuple>> {
+        let hits =
+            graph_rag::graph_rag_expand_with_context(self, inner_sql, opts)?;
+        Ok(hits
+            .into_iter()
+            .map(|h| {
+                Tuple::new(vec![
+                    Value::Int8(h.node_id),
+                    Value::String(h.node_kind),
+                    h.title.map(Value::String).unwrap_or(Value::Null),
+                    h.text.map(Value::String).unwrap_or(Value::Null),
+                    h.source_ref.map(Value::String).unwrap_or(Value::Null),
+                    Value::Int4(h.hop_distance as i32),
+                ])
+            })
+            .collect())
+    }
+
+    /// Pre-parser rewrite for code-graph table-function references.
+    /// When the `code-graph` feature is on, every entry point pipes
+    /// user SQL through this first so `SELECT * FROM lsp_definition('X')`
+    /// expands to an ordinary `SELECT ... FROM _hdb_code_*` subquery.
+    #[inline]
+    fn maybe_rewrite_code_graph<'a>(&self, sql: &'a str) -> std::borrow::Cow<'a, str> {
+        #[cfg(feature = "code-graph")]
+        {
+            let rewritten = code_graph::rewrite_lsp_calls(sql);
+            if rewritten != sql {
+                return std::borrow::Cow::Owned(rewritten);
+            }
+        }
+        std::borrow::Cow::Borrowed(sql)
+    }
+
+    /// Run a `CREATE AST INDEX …` declaration. Registers the index
+    /// in the process-local AST-index registry, then does an initial
+    /// `code_index` pass so every existing source row is indexed.
+    #[cfg(feature = "code-graph")]
+    fn handle_create_ast_index(
+        &self,
+        ddl: code_graph::AstIndexDdl,
+    ) -> Result<u64> {
+        let existing = code_graph::storage::get_ast_index(&ddl.index_name);
+        if existing.is_some() && !ddl.if_not_exists {
+            return Err(Error::query_execution(format!(
+                "AST index '{}' already exists",
+                ddl.index_name
+            )));
+        }
+        let meta = code_graph::AstIndexMeta {
+            index_name: ddl.index_name.clone(),
+            table: ddl.table.clone(),
+            content_col: ddl.content_col,
+            lang_col: ddl.lang_col,
+            embed_endpoint: ddl.embed_endpoint.clone(),
+            embed_bearer: ddl.embed_bearer.clone(),
+            embed_bodies: ddl.embed_bodies,
+            auto_reparse: ddl.auto_reparse,
+            resolve_cross_file: ddl.resolve_cross_file,
+            paused: false,
+        };
+        code_graph::register_ast_index(meta.clone());
+        // Initial full parse of the current table contents.
+        let opts = code_graph::CodeIndexOptions {
+            source_table: ddl.table,
+            embed_bodies: meta.embed_bodies,
+            embed_endpoint: meta.embed_endpoint,
+            embed_bearer: meta.embed_bearer,
+            force_reparse: false,
+        };
+        self.code_index(opts)?;
+        Ok(0)
+    }
+
+    /// Flip the `paused` flag on a registered AST index. Returns 0
+    /// rows affected either way; surfaces an error only when the
+    /// named index is not registered.
+    #[cfg(feature = "code-graph")]
+    fn handle_pause_resume(
+        &self,
+        pr: code_graph::PauseResume,
+    ) -> Result<u64> {
+        let (name, paused) = match pr {
+            code_graph::PauseResume::Pause(n) => (n, true),
+            code_graph::PauseResume::Resume(n) => (n, false),
+        };
+        if !code_graph::storage::set_ast_index_paused(&name, paused) {
+            return Err(Error::query_execution(format!(
+                "AST index '{name}' is not registered"
+            )));
+        }
+        Ok(0)
+    }
+
+    /// Code-graph auto_reparse hook. Called after a successful
+    /// `INSERT` / `UPDATE` / `DELETE` on any user table — if any
+    /// registered AST index is bound to that table and its paused
+    /// flag is clear, run `code_index`. The content-hash gate makes
+    /// unchanged files cheap, so this is safe to fire often.
+    #[cfg(feature = "code-graph")]
+    fn maybe_auto_reparse(&self, touched_table: Option<&str>) {
+        let Some(tbl) = touched_table else { return };
+        for idx in code_graph::storage::ast_indexes_for_table(tbl) {
+            if !idx.auto_reparse {
+                continue;
+            }
+            let opts = code_graph::CodeIndexOptions {
+                source_table: idx.table.clone(),
+                embed_bodies: idx.embed_bodies,
+                embed_endpoint: idx.embed_endpoint.clone(),
+                embed_bearer: idx.embed_bearer.clone(),
+                force_reparse: false,
+            };
+            let _ = self.code_index(opts);
+        }
+    }
+
+    /// Best-effort table extraction from a user SQL statement for the
+    /// auto_reparse hook. Recognises `INSERT INTO "?tbl"?`,
+    /// `UPDATE "?tbl"?`, `DELETE FROM "?tbl"?`. Returns `None` for
+    /// anything else.
+    #[cfg(feature = "code-graph")]
+    fn touched_table_from_sql(sql: &str) -> Option<String> {
+        let s = sql.trim_start();
+        let low = s.to_ascii_lowercase();
+        if low.starts_with("insert into") {
+            let rest = s.get("insert into".len()..)?.trim_start();
+            Some(Self::take_ident(rest))
+        } else if low.starts_with("update") {
+            let rest = s.get("update".len()..)?.trim_start();
+            Some(Self::take_ident(rest))
+        } else if low.starts_with("delete from") {
+            let rest = s.get("delete from".len()..)?.trim_start();
+            Some(Self::take_ident(rest))
+        } else {
+            None
+        }
+    }
+
+    #[cfg(feature = "code-graph")]
+    fn take_ident(s: &str) -> String {
+        let mut out = String::new();
+        let mut it = s.chars().peekable();
+        if matches!(it.peek(), Some('"')) {
+            it.next();
+            for c in it {
+                if c == '"' {
+                    break;
+                }
+                out.push(c);
+            }
+            return out;
+        }
+        for c in it {
+            if c.is_alphanumeric() || c == '_' {
+                out.push(c);
+            } else {
+                break;
+            }
+        }
+        out
+    }
+
+    // ------------------------------------------------------------------
+    // Graph-RAG API (feature = "graph-rag", implies `code-graph`)
+    // ------------------------------------------------------------------
+
+    /// Project every `_hdb_code_symbols` row into `_hdb_graph_nodes`
+    /// so the universal-graph layer sees every code symbol as a node.
+    /// Idempotent. Creates the graph tables on first call.
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_project_symbols(&self) -> Result<graph_rag::GraphRagStats> {
+        let mut stats = graph_rag::GraphRagStats::default();
+        graph_rag::project_code_symbols(self, &mut stats)?;
+        Ok(stats)
+    }
+
+    /// Seed → BFS expand → return subgraph. See
+    /// `graph_rag::GraphRagOptions` for knobs. Nano pushes every
+    /// seed/edge WHERE predicate through `FilteredScan`, so the
+    /// storage-level bloom / zone-map / SIMD pipeline carries the
+    /// weight at corpus scale.
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_search(
+        &self,
+        opts: &graph_rag::GraphRagOptions,
+    ) -> Result<Vec<graph_rag::GraphRagHit>> {
+        graph_rag::graph_rag_search(self, opts)
+    }
+
+    /// Entity-linker pass: emits `MENTIONS` edges from text-bearing
+    /// nodes (DocChunk / Email / Issue / InvestorQuestion …) to code
+    /// symbols whose qualified name appears as a whole word in the
+    /// node's title/text.  Idempotent.  `extra_kinds` adds more
+    /// text-bearing `node_kind`s to the match set beyond the default.
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_link_exact(
+        &self,
+        extra_kinds: &[&str],
+    ) -> Result<graph_rag::LinkerStats> {
+        graph_rag::link_exact_qualified(self, extra_kinds)
+    }
+
+    /// Ingest markdown / plain text rows as DocChunk / DocSection
+    /// nodes.  See `graph_rag::IngestDocsOptions`.
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_ingest_docs(
+        &self,
+        opts: &graph_rag::IngestDocsOptions,
+    ) -> Result<graph_rag::IngestStats> {
+        graph_rag::ingest_docs(self, opts)
+    }
+
+    /// Ingest structured email rows into Email + Person nodes.
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_ingest_email(
+        &self,
+        opts: &graph_rag::IngestEmailOptions,
+    ) -> Result<graph_rag::IngestStats> {
+        graph_rag::ingest_email(self, opts)
+    }
+
+    /// Ingest structured issue rows into Issue + Comment + Person nodes.
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_ingest_issues(
+        &self,
+        opts: &graph_rag::IngestIssuesOptions,
+    ) -> Result<graph_rag::IngestStats> {
+        graph_rag::ingest_issues(self, opts)
+    }
+
+    /// Ingest structured Q&A rows into InvestorQuestion + Answer + Person.
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_ingest_qa(
+        &self,
+        opts: &graph_rag::IngestQaOptions,
+    ) -> Result<graph_rag::IngestStats> {
+        graph_rag::ingest_qa(self, opts)
+    }
+
     pub fn execute(&self, sql: &str) -> Result<u64> {
         use crate::error::LockResultExt;
+
+        // Code-graph: intercept `CREATE AST INDEX …`, `hdb_code.pause`,
+        // `hdb_code.resume` before the regular parser sees them.
+        #[cfg(feature = "code-graph")]
+        if let Some(ddl) = code_graph::detect_create_ast_index(sql) {
+            return self.handle_create_ast_index(ddl);
+        }
+        #[cfg(feature = "code-graph")]
+        if let Some(pr) = code_graph::detect_pause_resume(sql) {
+            return self.handle_pause_resume(pr);
+        }
+        // And rewrite any `lsp_*(…)` table-function references.
+        let rewritten = self.maybe_rewrite_code_graph(sql);
+        let sql = rewritten.as_ref();
 
         let start = std::time::Instant::now();
 
@@ -3001,6 +3420,11 @@ impl EmbeddedDatabase {
         // Invalidate result cache on successful DML (any data modification)
         if result.is_ok() {
             self.invalidate_result_cache();
+            #[cfg(feature = "code-graph")]
+            {
+                let touched = Self::touched_table_from_sql(sql);
+                self.maybe_auto_reparse(touched.as_deref());
+            }
         }
 
         let rows = result.as_ref().copied().unwrap_or(0);
@@ -4897,7 +5321,18 @@ impl EmbeddedDatabase {
         let plan = planner.statement_to_plan(statement)?;
 
         // 3. Execute plan with parameters
-        self.execute_plan_with_params(&plan, params)
+        let out = self.execute_plan_with_params(&plan, params);
+
+        // 4. Code-graph auto_reparse hook — same logic as `execute()`
+        //    so parameterised DML updates stay in sync with declared
+        //    AST indexes.
+        #[cfg(feature = "code-graph")]
+        if out.is_ok() {
+            let touched = Self::touched_table_from_sql(sql);
+            self.maybe_auto_reparse(touched.as_deref());
+        }
+
+        out
     }
 
     /// Project columns from a tuple according to RETURNING clause
@@ -5560,6 +5995,19 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
+        // Graph-RAG WITH CONTEXT clause: strip, run the inner query
+        // as a seed, expand. Runs before the code-graph rewriter so
+        // both features compose (the inner SELECT can still reference
+        // `lsp_*`).
+        #[cfg(feature = "graph-rag")]
+        if let Some((inner, opts)) = graph_rag::detect_with_context(sql) {
+            return self.run_with_context(&inner, &opts);
+        }
+        // Code-graph pre-parser: expands `lsp_*(…)` table-function
+        // calls to the underlying `_hdb_code_*` SELECTs.  No-op when
+        // the feature is off or the query has no matching calls.
+        let rewritten = self.maybe_rewrite_code_graph(sql);
+        let sql = rewritten.as_ref();
         let start = std::time::Instant::now();
 
         // DML with RETURNING clause: route through execute_returning path
@@ -6282,6 +6730,9 @@ impl EmbeddedDatabase {
     /// This method prevents SQL injection by treating parameters as data, not code.
     /// Even malicious input is safely handled as a literal value.
     pub fn query_params(&self, sql: &str, params: &[Value]) -> Result<Vec<Tuple>> {
+        // Code-graph pre-parser: see `maybe_rewrite_code_graph`.
+        let rewritten = self.maybe_rewrite_code_graph(sql);
+        let sql = rewritten.as_ref();
         let start = std::time::Instant::now();
 
         // 1. Parse SQL (will recognize $N placeholders)

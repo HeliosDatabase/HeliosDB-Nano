@@ -401,6 +401,27 @@ pub enum LogicalPlan {
         if_not_exists: bool,
     },
 
+    /// `CREATE EXTENSION <name>` — install a named extension. For
+    /// `hdb_code` this runs the code-graph bootstrap (see
+    /// `src/code_graph/storage.rs::bootstrap_tables`). Unknown
+    /// extension names return a clear error unless `if_not_exists`
+    /// is set.
+    CreateExtension {
+        /// Extension name (already normalised, lower-case).
+        name: String,
+        /// Silently succeed if the extension is already installed or
+        /// unrecognised in a known-safe way.
+        if_not_exists: bool,
+    },
+
+    /// `DROP EXTENSION <name>` — uninstall. Phase 1 drops the
+    /// `_hdb_code_*` tables (cascade-style); future phases may keep
+    /// data and only unregister functions.
+    DropExtension {
+        name: String,
+        if_exists: bool,
+    },
+
     /// Alter column storage mode
     /// Changes per-column storage mode (Dictionary, Content-Addressed, Columnar)
     AlterColumnStorage {
@@ -1450,6 +1471,8 @@ impl LogicalPlan {
             Self::DropTable { .. } => "DropTable",
             Self::CreateIndex { .. } => "CreateIndex",
             Self::CreateSequence { .. } => "CreateSequence",
+            Self::CreateExtension { .. } => "CreateExtension",
+            Self::DropExtension { .. } => "DropExtension",
             Self::Explain { .. } => "Explain",
             Self::Union { .. } => "Union",
             Self::Intersect { .. } => "Intersect",
@@ -1558,6 +1581,10 @@ impl LogicalPlan {
             }
             LogicalPlan::CreateSequence { .. } => {
                 // CREATE SEQUENCE is DDL — no output schema.
+                Arc::new(Schema { columns: vec![] })
+            }
+            LogicalPlan::CreateExtension { .. }
+            | LogicalPlan::DropExtension { .. } => {
                 Arc::new(Schema { columns: vec![] })
             }
             LogicalPlan::AlterColumnStorage { .. } => {

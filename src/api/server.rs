@@ -268,7 +268,7 @@ impl ApiServer {
             .route("/auth/v1/callback", axum::routing::get(oauth_handler::callback));
 
         // Build router with public and protected routes
-        Router::new()
+        let router = Router::new()
             .nest("/v1", v1_router)
             .nest("/rest/v1", rest_router)
             .merge(auth_router)
@@ -276,7 +276,24 @@ impl ApiServer {
             .route("/health", axum::routing::get(health_check))
             .route("/version", axum::routing::get(version_info))
             .route("/docs", axum::routing::get(swagger_ui))
-            .route("/openapi.json", axum::routing::get(openapi_json))
+            .route("/openapi.json", axum::routing::get(openapi_json));
+
+        // MCP endpoint (`POST /mcp`, `GET /mcp/ws`, `GET /mcp/sse`) is
+        // mounted alongside the regular API routes when the
+        // `mcp-endpoint` feature is enabled. Same listener, no
+        // separate process required.
+        #[cfg(feature = "mcp-endpoint")]
+        let router = {
+            let mcp_state = crate::mcp::McpState::new(self.state.db.clone());
+            let mcp_only = Router::new()
+                .route("/mcp", axum::routing::post(crate::mcp::axum_routes::handle_post))
+                .route("/mcp/ws", axum::routing::get(crate::mcp::axum_routes::handle_ws_upgrade))
+                .route("/mcp/sse", axum::routing::get(crate::mcp::axum_routes::handle_sse))
+                .with_state(mcp_state);
+            router.merge(mcp_only)
+        };
+
+        router
             .layer(base_middleware)
             .with_state(self.state.clone())
     }

@@ -3,7 +3,7 @@ members = ["."]
 
 [package]
 name = "heliosdb-nano"
-version = "3.14.10"
+version = "3.18.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Daniel Moya <daniel.moya@dimensigon.com>"]
@@ -63,7 +63,7 @@ async-stream = "0.3"
 
 # HTTP Server (for sync protocol v2.3.0)
 axum = { version = "0.7", features = ["ws"] }
-tower = "0.4"
+tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "compression-gzip", "trace"] }
 
 # PostgreSQL Protocol
@@ -131,6 +131,7 @@ regex = "1.10"
 once_cell = "1.19"
 lru = "0.12"
 dashmap = "5.5"
+inventory = { version = "0.3", optional = true }
 
 # Arena allocation (RAG-native -- reduces per-request alloc churn)
 bumpalo = { version = "3", features = ["collections"] }
@@ -138,6 +139,17 @@ bumpalo = { version = "3", features = ["collections"] }
 unicode-segmentation = "1"
 
 sysinfo = "0.30"  # CPU monitoring for MV scheduler
+
+# Code-graph track (feature = "code-graph") — tree-sitter AST parsing
+# for LSP-shaped queries over source code. All crates optional; the
+# default build pulls none of them.
+tree-sitter             = { version = "0.23", optional = true }
+tree-sitter-rust        = { version = "0.23", optional = true }
+tree-sitter-python      = { version = "0.23", optional = true }
+tree-sitter-typescript  = { version = "0.23", optional = true }
+tree-sitter-go          = { version = "0.23", optional = true }
+tree-sitter-md          = { version = "0.3",  optional = true }
+tree-sitter-sequel      = { version = "0.3",  optional = true }
 
 # Config
 toml = "0.8"
@@ -154,6 +166,7 @@ indicatif = "0.17"
 criterion = "0.5"
 proptest = "1.5"
 tokio-postgres = "0.7"
+tokio-tungstenite = "0.21"
 
 [lints.clippy]
 # Deny unwrap in production code - forces proper error handling
@@ -177,6 +190,45 @@ sync-experimental = []  # Sync/replication module - Core features implemented (c
 test-utils = []  # Test utilities for integration tests and benchmarks
 server = []  # Server-mode features requiring async runtime
 internal-tests = []  # Internal API tests (disabled for public builds)
+
+# =============================================================================
+# CODE-GRAPH TRACK (FR 2 / FR 3)
+# =============================================================================
+# Enables the `src/code_graph/` module: tree-sitter-backed AST index,
+# LSP-shaped queries (`lsp_definition`, `lsp_references`, …), and the
+# `_hdb_code_*` system tables.  Off by default.  Requires at least
+# one grammar dep; Rust + Python ship in phase 1.
+#
+# Embedding generation is external-only (a pluggable HTTP endpoint).
+# Nano ships no inference runtime of its own.
+code-graph = [
+    "dep:tree-sitter",
+    "dep:tree-sitter-rust",
+    "dep:tree-sitter-python",
+    "dep:tree-sitter-typescript",
+    "dep:tree-sitter-go",
+    "dep:tree-sitter-md",
+    "dep:tree-sitter-sequel",
+    "reqwest/blocking",
+]
+
+# =============================================================================
+# GRAPH-RAG TRACK (FR 4)
+# =============================================================================
+# Adds the `_hdb_graph_*` universal schema and the seed/expand/rerank
+# Rust API. Requires `code-graph` because the code-symbol projection
+# is the primary node population.
+graph-rag = ["code-graph"]
+
+# =============================================================================
+# MCP ENDPOINT (FR 5)
+# =============================================================================
+# Exposes the unified `src/mcp/` module: JSON-RPC 2.0 dispatcher,
+# stdio server, 16-tool catalogue (10 DB-backed + 6 in-process RAG),
+# and 4 resource URIs. Transport-agnostic — reusable from stdio,
+# HTTP (Axum), WebSocket, and SSE mounts. Additive — embedded-only
+# callers compile without this flag.
+mcp-endpoint = ["dep:inventory"]
 
 # =============================================================================
 # CRYPTOGRAPHIC PROVIDER FEATURE FLAGS

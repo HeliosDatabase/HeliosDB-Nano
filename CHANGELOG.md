@@ -5,6 +5,166 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.18.0] - 2026-04-24
+
+### Added — MCP endpoint phase 4 MVP (FR 5, opt-in, feature = "mcp-endpoint")
+
+First landing for the native MCP endpoint. Ships a JSON-RPC 2.0
+dispatcher on top of the existing `src/mcp_extensions/` tool
+catalogue so an MCP-capable agent (Claude Code, Cursor, Continue,
+Codex, Aider) can drive HeliosDB-Nano with no wrapper process.
+
+- New Cargo feature `mcp-endpoint`. Additive — embedded-only
+  callers compile without it.
+- New module `src/mcp_http/` with two files:
+  - `rpc.rs` — `handle_rpc(req) → resp`, pure function over JSON-RPC
+    `initialize`, `tools/list`, `tools/call`, `ping`. Unknown methods
+    return the canonical `-32601 Method not found`.
+  - `mod.rs` — re-exports.
+- Tool catalogue: every tool already registered in
+  `mcp_extensions::tools::list_tools()` is surfaced automatically.
+  `heliosdb_bm25_index`, `heliosdb_hybrid_search`,
+  `heliosdb_graph_add_edge`, `heliosdb_graph_traverse`,
+  `heliosdb_graph_path`, `heliosdb_embed_and_store`.
+- Server-info handshake reports `{"name":"heliosdb-nano","version":<pkg>}`.
+
+Explicit non-goals for the MVP (tracked for follow-ups):
+- WebSocket / SSE framing — HTTP JSON-RPC only.
+- Repair of legacy `src/mcp/` module — `BLOCKER_mcp_legacy.md`
+  stays accurate. Phase 4 deliberately does not touch it; the
+  MVP handler backs onto the already-working `mcp_extensions/`
+  crate directly.
+- Axum route wiring — we ship `handle_rpc` as a pure function so
+  embedders mount it on whatever route / auth surface they want.
+- Macro-driven auto-registration of `lsp_*` / `graph_rag_*` as MCP
+  tools (the tool catalogue remains the six-tool `mcp_extensions`
+  set for now).
+
+Regression coverage:
+- 4 new unit tests (`src/mcp_http/rpc.rs`): `initialize`,
+  `tools/list`, unknown method, `tools/call` without name.
+- 4 new integration tests (`tests/mcp_endpoint_phase4.rs`):
+  canonical handshake, real tool call, unknown tool as
+  `isError=true`, ping.
+
+## [3.17.0] - 2026-04-24
+
+### Added — Graph-RAG phase 3 MVP (opt-in, feature = "graph-rag")
+
+First landing for the universal cross-modal graph. Still embedded
+Rust API; SQL-level `WITH CONTEXT` clause, graph-weighted HNSW
+tie-breaking, and semantic-Merkle invalidation are follow-ups.
+
+- New Cargo feature `graph-rag` (implies `code-graph`).
+- New module `src/graph_rag/` (`mod.rs`, `schema.rs`, `search.rs`).
+- `_hdb_graph_nodes` and `_hdb_graph_edges` tables bootstrapped on
+  first call. Plain user tables; queryable and joinable.
+- `EmbeddedDatabase::graph_rag_project_symbols()` — project every
+  row of `_hdb_code_symbols` into `_hdb_graph_nodes` + every
+  resolved row of `_hdb_code_symbol_refs` into `_hdb_graph_edges`.
+  Idempotent. Tolerates the code-graph tables being absent (no-op
+  when nothing to project).
+- `EmbeddedDatabase::graph_rag_search(opts)` — seed → BFS expand →
+  return subgraph with hop distances. `seed_text` matches title/
+  text case-insensitively; `seed_kinds` + `edge_kinds` push down
+  through `FilteredScan` so bloom / zone-map / SIMD selection
+  applies automatically.
+
+Regression coverage:
+- `tests/graph_rag_phase3.rs`: 3 tests —
+  `project_and_search_finds_symbol`, `empty_seed_text_errors`,
+  `bfs_respects_hops`.
+
+Explicitly out of scope for phase 3 (tracked for phase 3.1):
+hybrid-search + vector rerank on seeds, graph-weighted HNSW
+tie-breaking, semantic-Merkle index, `WITH CONTEXT` SQL clause,
+corpus ingestion adapters (`ingest_docs` etc.), entity linker for
+cross-modal MENTIONS.
+
+## [3.16.0] - 2026-04-24
+
+### Added — Code-graph phase 2 (opt-in, feature = "code-graph")
+
+- `CREATE EXTENSION hdb_code` DDL. Parses through the standard
+  planner, runs the code-graph bootstrap, and marks the extension
+  installed in the process. `IF NOT EXISTS` with an unknown extension
+  is a silent no-op (matches PG's permissive migration behaviour).
+- TypeScript / JavaScript / TSX grammar support via
+  `tree-sitter-typescript`. `Language` enum extended; symbol
+  extractor handles `function_declaration`, `method_definition`,
+  `class_declaration`, `abstract_class_declaration`,
+  `interface_declaration`, `type_alias_declaration`,
+  `enum_declaration`.
+- Cross-file symbol resolver. After the per-file pass,
+  `code_index` rebinds every `resolution='unresolved'` edge against
+  a corpus-wide name index. Single match → `exact`, multiple → the
+  first with `heuristic`.
+- New `LogicalPlan::{CreateExtension, DropExtension}` variants;
+  `DropExtension` is reserved for forward compatibility (sqlparser
+  0.53 doesn't expose `DROP EXTENSION`).
+
+Regression coverage:
+- `tests/code_graph_phase2.rs`: 5 new integration tests —
+  `typescript_extracts_class_and_method`,
+  `create_extension_hdb_code_bootstraps_tables`,
+  `create_extension_unknown_errors`,
+  `create_extension_unknown_if_not_exists_is_noop`,
+  `cross_file_ref_resolves`.
+
+## [3.15.0] - 2026-04-24
+
+### Added — Code-graph track, phase 1 (FR 2 MVP, opt-in)
+
+New opt-in feature `code-graph` that turns HeliosDB-Nano into an
+embedded code-graph for AI coding agents. Phase 1 ships the
+foundational Rust API — wire-level DDL (`CREATE EXTENSION hdb_code`,
+`CREATE AST INDEX`) and temporal queries land in phase 2.
+
+- New Cargo feature `code-graph` pulling
+  `tree-sitter = "0.23"`, `tree-sitter-rust`, and `tree-sitter-python`
+  as optional deps. Default builds pull none of them; the default
+  release binary stays the same size.
+- New module `src/code_graph/` with a minimal in-file AST + symbol
+  extractor for Rust and Python. Adds:
+  - `EmbeddedDatabase::code_index(opts)` — parse every row of a user
+    table `(path TEXT PK, lang TEXT, content TEXT)` and populate the
+    `_hdb_code_*` tables idempotently.
+  - `EmbeddedDatabase::lsp_definition(name, hint)` — "where is X defined?"
+  - `EmbeddedDatabase::lsp_references(symbol_id)` — "who uses X?"
+  - `EmbeddedDatabase::lsp_call_hierarchy(symbol_id, direction, depth)` —
+    BFS over the `CALLS` edges.
+  - `EmbeddedDatabase::lsp_hover(symbol_id)` — signature lookup.
+- New tables created automatically on first `code_index` call:
+  `_hdb_code_files`, `_hdb_code_symbols`, `_hdb_code_symbol_refs`.
+  Plain user tables — queryable, joinable, branch-aware.
+- Pluggable embedding surface (`src/code_graph/embed.rs`):
+  `NoopEmbedder` (default) and `HttpEmbedder` for external endpoints
+  matching `POST {"input": "..."} → {"embedding": [...]}`. Nano ships
+  no inference runtime; by design, all inference is external.
+- Storage-level filtering is the competitive lever: every `lsp_*`
+  query pushes its WHERE through the existing `FilteredScan` path in
+  `src/storage/predicate_pushdown.rs`, so bloom-filter / zone-map /
+  SIMD selection applies without new code.
+
+Out of scope for phase 1 (tracked for phase 2+ in the track docs):
+`CREATE EXTENSION` DDL, `CREATE AST INDEX` DDL, real schema
+namespacing, temporal / branch variants, incremental reparse,
+semantic-Merkle subtree hashes, `WITH CONTEXT` clause, native MCP
+endpoint.
+
+Regression coverage:
+- 12 new module-level unit tests (parser, symbol extraction,
+  in-file resolver, embedder).
+- 6 new integration tests at `tests/code_graph_mvp.rs`:
+  `rust_lsp_definition_finds_function`,
+  `lsp_references_returns_call_sites`,
+  `lsp_call_hierarchy_incoming_terminates`,
+  `lsp_hover_returns_signature`,
+  `code_index_is_idempotent`,
+  `unknown_lang_is_skipped_cleanly`.
+
+Docs: `docs/code_graph/overview.md`.
+
 ## [3.14.10] - 2026-04-23
 
 ### Fixed — Foreign key validation with quoted identifiers, fast-path bypass (B36)

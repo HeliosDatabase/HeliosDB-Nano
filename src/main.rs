@@ -234,6 +234,38 @@ enum Commands {
         #[arg(short, long)]
         verbose: bool,
     },
+
+    /// Code-graph (FR 2+) management. Opt-in on binaries built with
+    /// `--features code-graph`.
+    #[cfg(feature = "code-graph")]
+    #[command(name = "code-graph")]
+    CodeGraph {
+        #[command(subcommand)]
+        action: CodeGraphAction,
+    },
+}
+
+/// Sub-actions for `heliosdb-nano code-graph`.
+#[cfg(feature = "code-graph")]
+#[derive(Subcommand)]
+enum CodeGraphAction {
+    /// Git-hook helper. Reads changed paths from stdin (one per line,
+    /// as `git diff-tree --no-commit-id --name-only -r HEAD`
+    /// produces), upserts each file's content into the source table
+    /// and runs the code-graph indexer.
+    Hook {
+        /// `.helios-index/heliosdb-data` directory. Empty string ⇒
+        /// in-memory (useful for dry-run / smoke tests).
+        #[arg(short, long)]
+        data_dir: PathBuf,
+        /// Root of the repository the paths are relative to.
+        #[arg(short, long, default_value = ".")]
+        repo_root: PathBuf,
+        /// Source-table name (default `src`). The table is created if
+        /// it doesn't already exist.
+        #[arg(short, long, default_value = "src")]
+        source_table: String,
+    },
 }
 
 #[tokio::main]
@@ -330,6 +362,25 @@ async fn main() -> Result<()> {
             };
             cmd.execute()
         }
+
+        #[cfg(feature = "code-graph")]
+        Commands::CodeGraph { action } => match action {
+            CodeGraphAction::Hook { data_dir, repo_root, source_table } => {
+                let stats = heliosdb_nano::code_graph::git_hook::run_from_stdin(
+                    &data_dir, &repo_root, &source_table,
+                )?;
+                println!(
+                    "code-graph hook: files_seen={} parsed={} unchanged={} skipped={} symbols={} refs={}",
+                    stats.files_seen,
+                    stats.files_parsed,
+                    stats.files_unchanged,
+                    stats.files_skipped,
+                    stats.symbols_written,
+                    stats.refs_written
+                );
+                Ok(())
+            }
+        },
     }
 }
 

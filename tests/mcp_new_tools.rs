@@ -1,9 +1,12 @@
-//! Integration tests for the RAG-native MCP idea-5 tools.
+//! Integration tests for the unified MCP tool catalogue.
 //!
-//! See `BLOCKER_idea_5.md` for the rationale behind testing against
-//! `mcp_extensions` rather than the legacy `mcp` module.
+//! Covers the 6 in-process RAG tools and the two single-table
+//! resource URIs. DB-backed tools are exercised in
+//! `tests/mcp_endpoint_phase4.rs`.
 
-use heliosdb_nano::mcp_extensions::{call_tool, list_tools, read_resource};
+#![cfg(feature = "mcp-endpoint")]
+
+use heliosdb_nano::mcp::{call_tool, list_tools, read_resource};
 use heliosdb_nano::EmbeddedDatabase;
 use serde_json::json;
 use uuid::Uuid;
@@ -13,9 +16,19 @@ fn unique(prefix: &str) -> String {
 }
 
 #[test]
-fn six_new_tools_are_listed() {
+fn all_sixteen_tools_are_listed() {
     let names: Vec<_> = list_tools().into_iter().map(|t| t.name).collect();
     for n in [
+        "heliosdb_query",
+        "heliosdb_schema",
+        "heliosdb_list_tables",
+        "heliosdb_create_table",
+        "heliosdb_insert",
+        "heliosdb_branch_create",
+        "heliosdb_branch_list",
+        "heliosdb_branch_merge",
+        "heliosdb_search",
+        "heliosdb_time_travel",
         "heliosdb_bm25_index",
         "heliosdb_hybrid_search",
         "heliosdb_graph_add_edge",
@@ -31,6 +44,7 @@ fn six_new_tools_are_listed() {
 fn bm25_index_then_hybrid_search_promotes_co_occurring_doc() {
     let name = unique("integration-bm25");
     let r = call_tool(
+        None,
         "heliosdb_bm25_index",
         json!({
             "name": name,
@@ -44,6 +58,7 @@ fn bm25_index_then_hybrid_search_promotes_co_occurring_doc() {
     assert!(!r.is_error, "indexing failed: {:?}", r.payload);
 
     let r2 = call_tool(
+        None,
         "heliosdb_hybrid_search",
         json!({
             "index_name": name,
@@ -58,8 +73,6 @@ fn bm25_index_then_hybrid_search_promotes_co_occurring_doc() {
     );
     assert!(!r2.is_error, "search failed: {:?}", r2.payload);
     let arr = r2.payload["results"].as_array().expect("results");
-    // Doc 3 is the only doc that matches both query terms AND tops
-    // the vector list -> unambiguous winner.
     assert_eq!(arr.first().and_then(|v| v["doc_id"].as_u64()), Some(3));
 }
 
@@ -70,6 +83,7 @@ fn graph_add_traverse_path_roundtrip() {
     let c = Uuid::new_v4();
     for (from, to) in [(a, b), (b, c)] {
         let r = call_tool(
+            None,
             "heliosdb_graph_add_edge",
             json!({"from": from.to_string(), "to": to.to_string(), "label": "x", "weight": 1.0}),
         );
@@ -77,6 +91,7 @@ fn graph_add_traverse_path_roundtrip() {
     }
 
     let trav = call_tool(
+        None,
         "heliosdb_graph_traverse",
         json!({"start": a.to_string(), "edge_label": "x", "depth": 5}),
     );
@@ -85,6 +100,7 @@ fn graph_add_traverse_path_roundtrip() {
     assert!(rows.len() >= 3);
 
     let path = call_tool(
+        None,
         "heliosdb_graph_path",
         json!({
             "from": a.to_string(),
@@ -102,6 +118,7 @@ fn graph_path_returns_not_found_for_unconnected_nodes() {
     let a = Uuid::new_v4();
     let b = Uuid::new_v4();
     let r = call_tool(
+        None,
         "heliosdb_graph_path",
         json!({"from": a.to_string(), "to": b.to_string()}),
     );
@@ -113,12 +130,14 @@ fn graph_path_returns_not_found_for_unconnected_nodes() {
 fn embed_and_store_then_search_finds_doc() {
     let name = unique("integration-embed");
     let r = call_tool(
+        None,
         "heliosdb_embed_and_store",
         json!({"index_name": name, "doc_id": 42, "text": "the quick brown fox"}),
     );
     assert!(!r.is_error);
 
     let r2 = call_tool(
+        None,
         "heliosdb_hybrid_search",
         json!({"index_name": name, "query_text": "fox", "fusion": "rrf", "limit": 5}),
     );
@@ -129,6 +148,9 @@ fn embed_and_store_then_search_finds_doc() {
 #[test]
 fn schema_and_stats_resources_resolve() {
     let db = EmbeddedDatabase::new_in_memory().expect("db");
+    db.execute("CREATE TABLE users (id INT4, name TEXT)").unwrap();
+    db.execute("CREATE TABLE orders (id INT4)").unwrap();
+
     let s = read_resource(&db, "heliosdb://schema/users")
         .expect("matched")
         .expect("ok");
