@@ -4,11 +4,13 @@
 //! Based on "Efficient and robust approximate nearest neighbor search using
 //! Hierarchical Navigable Small World graphs" (<https://arxiv.org/abs/1603.09320>)
 
+pub mod biased_descent;
 pub mod hnsw_index;
 pub mod quantization;
 pub mod quantized_hnsw;
 pub mod simd;
 
+pub use biased_descent::{apply_bias, BiasOptions, CentralityMap};
 pub use hnsw_index::{HnswIndex, HnswConfig, MultiMetricHnswIndex};
 pub use quantization::{
     ProductQuantizer, ProductQuantizerConfig, Codebook, QuantizedVector,
