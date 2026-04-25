@@ -2992,6 +2992,36 @@ impl EmbeddedDatabase {
     /// per-symbol only when `opts.embed_bodies` is set. Without an
     /// endpoint, `body_vec` stays `NULL` and BM25-based retrieval
     /// still works.
+    /// Register a tree-sitter grammar at runtime under a language tag.
+    ///
+    /// Lets callers extend the indexer with grammars Nano doesn't ship
+    /// statically — load WASM via a wasm runtime, dynamically-linked
+    /// shared libraries, or anything else that yields a
+    /// [`tree_sitter::Language`]. Idempotent: re-registering replaces.
+    ///
+    /// See [`code_graph::parse::register_grammar`] for loader patterns.
+    #[cfg(feature = "code-graph")]
+    pub fn register_grammar(
+        &self,
+        name: impl Into<String>,
+        grammar: tree_sitter::Language,
+    ) -> Option<tree_sitter::Language> {
+        code_graph::parse::register_grammar(name, grammar)
+    }
+
+    /// Drop a previously-registered grammar. Returns the entry if
+    /// any; falls through silently otherwise.
+    #[cfg(feature = "code-graph")]
+    pub fn unregister_grammar(&self, name: &str) -> Option<tree_sitter::Language> {
+        code_graph::parse::unregister_grammar(name)
+    }
+
+    /// Snapshot the names of every dynamically-registered grammar.
+    #[cfg(feature = "code-graph")]
+    pub fn registered_grammars(&self) -> Vec<String> {
+        code_graph::parse::registered_grammars()
+    }
+
     #[cfg(feature = "code-graph")]
     pub fn code_index(
         &self,
