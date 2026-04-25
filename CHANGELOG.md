@@ -5,7 +5,41 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased — 3.19.0]
+## [3.19.1] - 2026-04-25
+
+### Fixed — UUID literal coercion at PK index lookup (#205)
+
+Resolves the CloudV2 admin_db "INSERT-then-SELECT-misses-the-row"
+bug.  Root cause was not the COMMIT path / deadpool recycling /
+3.14.9 regression the original investigation theorised — it was a
+planner literal-typing bug.
+
+`SELECT … WHERE id = '<uuid>'` against a UUID-typed PK emitted
+`Value::String("<uuid>")` regardless of the column's declared
+type.  The ART point-lookup encoded the search key by Value
+variant, so Value::String and Value::Uuid produced different
+encoded keys → the lookup missed every row.
+
+Three patches land the fix:
+- `src/sql/executor/mod.rs::try_index_point_lookup` — coerce the
+  literal to the PK column's type before the ART lookup. New
+  helper `coerce_literal_to_column_type` handles
+  String→UUID/Date/Timestamp.
+- `src/lib.rs::fast_parse_one_value` — same coercion at the
+  fast-select parse layer for `SELECT *` queries.
+- `src/storage/simd_filter.rs::compare_eq` — Uuid↔String
+  cross-type case so the SIMD post-walk filter also matches.
+
+Verified by `tests/uuid_where_repro.rs` (direct API) and
+`tests/persistence_repro.rs` (wire protocol, no longer
+`#[ignore]`d).  All 1842 lib tests + every prior integration
+suite remain green.
+
+CloudV2 follow-ups: revert admin_db SELECT-all workarounds,
+drop the daily restart cron, graduate `cloud-v2.heliosdb.com`
+to production.
+
+## [3.19.0] - 2026-04-25
 
 ### Added — backlog sweep #181-#193
 
