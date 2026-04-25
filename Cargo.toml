@@ -63,7 +63,7 @@ async-stream = "0.3"
 
 # HTTP Server (for sync protocol v2.3.0)
 axum = { version = "0.7", features = ["ws"] }
-tower = "0.4"
+tower = { version = "0.4", features = ["util"] }
 tower-http = { version = "0.5", features = ["cors", "compression-gzip", "trace"] }
 
 # PostgreSQL Protocol
@@ -165,6 +165,7 @@ indicatif = "0.17"
 criterion = "0.5"
 proptest = "1.5"
 tokio-postgres = "0.7"
+tokio-tungstenite = "0.21"
 
 [lints.clippy]
 # Deny unwrap in production code - forces proper error handling

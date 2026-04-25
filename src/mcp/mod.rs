@@ -23,6 +23,7 @@ pub mod tools;
 pub mod resources;
 pub mod rpc;
 pub mod server;
+pub mod axum_routes;
 
 pub use protocol::{
     Capabilities, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
@@ -35,3 +36,4 @@ pub use resources::{list_resources, read_resource, ResourcePayload};
 pub use rpc::{handle_rpc, handle_rpc_with_db, RpcError, RpcRequest, RpcResponse};
 pub use server::McpServer;
 pub use tools::{call_tool, list_tools, ToolDescriptor, ToolOutcome, BM25_INDEXES, GRAPH_STORE};
+pub use axum_routes::{attach as attach_mcp_routes, mcp_router, McpState};
