@@ -151,6 +151,11 @@ tree-sitter-go          = { version = "0.23", optional = true }
 tree-sitter-md          = { version = "0.3",  optional = true }
 tree-sitter-sequel      = { version = "0.3",  optional = true }
 
+# Local in-process text embedder (feature = "code-embed").  Adds a
+# CPU ONNX runtime + pre-quantised models; ~150 MB at first run for
+# the model cache, no on-disk impact on the binary itself.
+fastembed = { version = "4", optional = true }
+
 # Config
 toml = "0.8"
 
@@ -219,6 +224,14 @@ code-graph = [
 # Rust API. Requires `code-graph` because the code-symbol projection
 # is the primary node population.
 graph-rag = ["code-graph"]
+
+# =============================================================================
+# CODE-EMBED — local in-process embedder
+# =============================================================================
+# Pulls fastembed-rs (and its ORT dep) so the indexer can populate
+# `_hdb_code_symbols.body_vec` without an external HTTP service.
+# Implies `code-graph` (the body_vec column lives there).
+code-embed = ["dep:fastembed", "code-graph"]
 
 # =============================================================================
 # MCP ENDPOINT (FR 5)

@@ -99,6 +99,64 @@ struct EmbeddingResponse {
     embedding: Vec<f32>,
 }
 
+// ── In-process embedder via fastembed-rs ────────────────────────────────
+//
+// Gated on `code-embed`. Wraps `fastembed::TextEmbedding` so the
+// indexer can populate `body_vec` without leaving the process.  The
+// model cache (~150 MB on first run) lives under
+// `$XDG_CACHE_HOME/.fastembed_cache`.
+
+#[cfg(feature = "code-embed")]
+pub use fastembed_impl::FastEmbedder;
+
+#[cfg(feature = "code-embed")]
+mod fastembed_impl {
+    use super::{Embedder, Error, Result};
+    use std::sync::Mutex;
+
+    /// Default in-process embedder. Lazily initialises a single
+    /// `fastembed::TextEmbedding` instance behind a Mutex (the
+    /// underlying ORT session is not Sync).  Default model is
+    /// `BGESmallENV15` — 384-dim, English, ~30 MB.
+    pub struct FastEmbedder {
+        inner: Mutex<fastembed::TextEmbedding>,
+    }
+
+    impl FastEmbedder {
+        /// Construct with the default `BGESmallENV15` model.
+        pub fn try_default() -> Result<Self> {
+            Self::with_model(fastembed::EmbeddingModel::BGESmallENV15)
+        }
+
+        pub fn with_model(model: fastembed::EmbeddingModel) -> Result<Self> {
+            let opts = fastembed::InitOptions::new(model);
+            let inner = fastembed::TextEmbedding::try_new(opts)
+                .map_err(|e| Error::query_execution(format!("fastembed init: {e}")))?;
+            Ok(Self { inner: Mutex::new(inner) })
+        }
+    }
+
+    impl std::fmt::Debug for FastEmbedder {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("FastEmbedder").finish()
+        }
+    }
+
+    impl Embedder for FastEmbedder {
+        fn embed(&self, text: &str) -> Result<Option<Vec<f32>>> {
+            let mut guard = self
+                .inner
+                .lock()
+                .map_err(|e| Error::query_execution(format!("fastembed lock: {e}")))?;
+            // The model expects a batch; run with a one-element vec.
+            let mut out = guard
+                .embed(vec![text.to_string()], None)
+                .map_err(|e| Error::query_execution(format!("fastembed embed: {e}")))?;
+            Ok(out.pop())
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

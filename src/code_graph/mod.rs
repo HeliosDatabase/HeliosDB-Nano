@@ -42,6 +42,8 @@ pub use diff::{
     BodyOp, DiffChange, RefDiffRow,
 };
 pub use embed::{Embedder, NoopEmbedder, HttpEmbedder};
+#[cfg(feature = "code-embed")]
+pub use embed::FastEmbedder;
 pub use lsp::{
     lsp_call_hierarchy, lsp_definition, lsp_hover, lsp_references, CallDirection,
     CallHierarchyRow, DefinitionHint, DefinitionRow, HoverRow, ReferenceRow,
