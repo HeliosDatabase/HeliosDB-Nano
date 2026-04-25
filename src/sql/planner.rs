@@ -1621,7 +1621,11 @@ impl<'a> Planner<'a> {
                         }
                     }
                 }
-                _ => return Err(Error::query_execution("SELECT item not supported")),
+                // SelectItem is exhaustive across the four variants
+                // above — the explicit fallback was for a pre-0.53
+                // sqlparser shape and the compiler now flags it as
+                // unreachable.  Keep the match exhaustive without
+                // a wildcard.
             }
         }
 

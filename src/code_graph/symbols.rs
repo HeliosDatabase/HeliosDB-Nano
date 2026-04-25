@@ -203,7 +203,7 @@ pub fn extract(lang: Language, source: &str, tree: &Tree) -> (Vec<Symbol>, Vec<S
 fn walk(
     lang: Language,
     source: &str,
-    cursor: &mut TreeCursor,
+    cursor: &mut TreeCursor<'_>,
     scope: &[String],
     parent_idx: Option<usize>,
     symbols: &mut Vec<Symbol>,

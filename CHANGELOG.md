@@ -5,7 +5,67 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [Unreleased — 3.19.0]
+
+### Added — backlog sweep #181-#193
+
+Closes the residual FR backlog the v3.18 review left open.  Each
+task carries a context doc under `docs/followups/`.
+
+- **#181 `hdb_code_languages` system view** — exposes
+  `SupportedLanguage::all()` + `parse::registered_grammars()` as a
+  queryable SQL view.  Runtime grammars shadowing a static tag
+  report `source = 'runtime'`.
+- **#182 `body_vec VECTOR(n)` column** materialised on
+  `_hdb_code_symbols` lazily on first non-null embedding.
+  Dimension negotiated at insert time; `code_index_with_embedder`
+  is the new public entry point that takes a pre-constructed
+  `Box<dyn Embedder>`.
+- **#183 SymbolExtractor pluggability** — runtime-registered
+  grammars can ship with paired extractors via
+  `EmbeddedDatabase::register_extractor`, so dynamic languages
+  produce real symbols instead of empty parse trees.
+- **#184 HTTP POST + SSE progress pairing** — process-static
+  session table keyed by `Mcp-Session-Id`.  POSTs that pair with
+  an open SSE channel get their `notifications/progress` events
+  forwarded to the SSE stream while the POST returns the final
+  `tools/call` response.
+- **#185 `helios_lsp_rename_apply`** — write-back side of the
+  preview tool; identifier-boundary aware, sha256 conflict check,
+  optional dry_run.
+- **#186 Docling content-conversion ingestion** —
+  `graph_rag_ingest_pdf / _office / _audio / _image` POSTs to
+  docling-serve, parses the DoclingDocument JSON, and projects
+  sections + chunks + tables under `_hdb_graph_nodes` with
+  CONTAINS edges.  Idempotent via source_ref keys.
+- **#187 `code-embed` feature** — fastembed-rs as the in-process
+  embedder.  Default model BGESmallENV15 (384-dim, ~30 MB cache
+  on first run).  No on-disk impact on the binary itself.
+- **#188 `_hdb_code.*` / `_hdb_graph.*` dotted namespacing
+  aliases** — planner-level rewrite at
+  `normalize_object_name`; `pg_tables.schemaname` reports the
+  schema split.  Catalog keys remain flat (full refactor tracked
+  separately).
+- **#189 Scope-chain resolver via IMPORTS** — unresolved CALLS /
+  REFERENCES refs upgrade to `Exact` when an unambiguous IMPORTS
+  edge in the same file ends in the bare name.  Handles Rust
+  `use foo::bar`, Python `from foo import bar`, TypeScript
+  `import { bar } from './foo'`, Go imports.
+- **#190 Centrality-biased + prefilter-aware HNSW wrapper** —
+  over-fetches `k * over_fetch_multiplier` candidates, applies
+  the row-level prefilter, re-scores with
+  `(1 - α) × distance - α × centrality`.  Equivalent to the FR's
+  Option B (post-rerank) lift; in-descent navigation bias is a
+  separate phase-3.1 follow-up.
+- **#191 Acceptance benchmarks** — `with_context_bench` (10k-node
+  fixture, 100-query mean ≤ 500 ms) and `linker_precision`
+  (≥ 80 % on a hand-labelled fixture).  Current run: mean 62 ms,
+  precision 100 %.
+- **#192 FR-6 pilot deployment** — `scripts/install-nano-pilot.sh`
+  + `docs/code_graph/{pilot,troubleshooting}.md`.
+- **#193 Build report** — `docs/followups/build-report.md`
+  captures the all-features release binary metadata
+  (35.0 MiB, sha256 `41176528…`, rustc 1.92.0).
 
 ### Added — code-graph / graph-rag / MCP follow-ups
 

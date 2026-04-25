@@ -33,11 +33,27 @@ fn dotted_name_resolves_to_flat_prefix() {
     assert_eq!(flat.len(), 2);
 }
 
-// pg_tables.schemaname split is exercised via the older
-// SystemViewRegistry's existing test surface in
-// tests/system_views_tests.rs — the SQL planner here only
-// dispatches phase-3 views.  We test the dotted-name aliasing
-// path instead, which is what end-users actually see.
+#[test]
+fn pg_tables_over_sql_reports_schema_split() {
+    let db = indexed_db();
+    let rows = db
+        .query(
+            "SELECT schemaname, tablename FROM pg_tables WHERE tablename = 'symbols'",
+            &[],
+        )
+        .unwrap();
+    let r = rows.first().expect("symbols row in pg_tables");
+    let schema = match r.values.first() {
+        Some(Value::String(s)) => s.clone(),
+        other => panic!("got {other:?}"),
+    };
+    let table = match r.values.get(1) {
+        Some(Value::String(s)) => s.clone(),
+        other => panic!("got {other:?}"),
+    };
+    assert_eq!(schema, "_hdb_code");
+    assert_eq!(table, "symbols");
+}
 
 #[cfg(feature = "graph-rag")]
 #[test]

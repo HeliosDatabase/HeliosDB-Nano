@@ -3,7 +3,6 @@
 //! Implements the Model Context Protocol JSON-RPC format.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 /// JSON-RPC request
 #[derive(Debug, Clone, Serialize, Deserialize)]

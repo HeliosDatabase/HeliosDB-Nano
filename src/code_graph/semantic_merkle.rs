@@ -44,7 +44,7 @@ pub fn build_or_refresh(db: &EmbeddedDatabase) -> Result<MerkleStats> {
     let mut stats = MerkleStats::default();
     let mut per_file_syms = 0u64;
 
-    let mut emit = |db: &EmbeddedDatabase,
+    let emit = |db: &EmbeddedDatabase,
                     stats: &mut MerkleStats,
                     file_id: i64,
                     hash: blake3::Hash,

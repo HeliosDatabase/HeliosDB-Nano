@@ -30,6 +30,7 @@ fn benchmark_hnsw_insert(c: &mut Criterion) {
             max_connections: 16,
             ef_construction: 200,
             distance_metric: DistanceMetric::L2,
+            ..HnswConfig::default()
         };
 
         group.bench_with_input(BenchmarkId::from_parameter(size), size, |b, &size| {
@@ -55,6 +56,7 @@ fn benchmark_hnsw_search(c: &mut Criterion) {
             max_connections: 16,
             ef_construction: 200,
             distance_metric: DistanceMetric::L2,
+            ..HnswConfig::default()
         };
 
         // Build index once
@@ -140,6 +142,7 @@ fn benchmark_knn_accuracy(c: &mut Criterion) {
             max_connections: 16,
             ef_construction: 200,
             distance_metric: DistanceMetric::L2,
+            ..HnswConfig::default()
         };
 
         let index = HnswIndex::new(config).unwrap();

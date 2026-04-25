@@ -3,7 +3,7 @@ members = ["."]
 
 [package]
 name = "heliosdb-nano"
-version = "3.18.0"
+version = "3.19.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Daniel Moya <daniel.moya@dimensigon.com>"]
@@ -195,6 +195,7 @@ sync-experimental = []  # Sync/replication module - Core features implemented (c
 test-utils = []  # Test utilities for integration tests and benchmarks
 server = []  # Server-mode features requiring async runtime
 internal-tests = []  # Internal API tests (disabled for public builds)
+compression = []      # MySQL wire-protocol packet compression (zlib via flate2)
 
 # =============================================================================
 # CODE-GRAPH TRACK (FR 2 / FR 3)
@@ -321,10 +322,12 @@ harness = false
 [[bench]]
 name = "conflict_detection_bench"
 harness = false
+required-features = ["sync-experimental"]
 
 [[bench]]
 name = "sync_benchmark"
 harness = false
+required-features = ["sync-experimental"]
 
 [[bench]]
 name = "branch_performance"
@@ -341,6 +344,7 @@ harness = false
 [[bench]]
 name = "mv_incremental_bench"
 harness = false
+required-features = ["sync-experimental"]  # gated behind a feature whose lib code is also disabled; see #202 for un-gating
 
 [[bench]]
 name = "phase3_benchmarks"

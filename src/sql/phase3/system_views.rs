@@ -1842,6 +1842,106 @@ impl SystemViewRegistry {
             description: "Shows row cache statistics and hit rates".to_string(),
         });
 
+        // pg_tables — make the basic catalog query work over SQL.
+        // The legacy SystemViewRegistry in sql/system_views.rs has
+        // a richer implementation we delegate to at execute time.
+        self.register_view(SystemViewSchema {
+            name: "pg_tables".to_string(),
+            schema: Schema {
+                columns: vec![
+                    Column {
+                        name: "schemaname".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                    Column {
+                        name: "tablename".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                    Column {
+                        name: "tableowner".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                    Column {
+                        name: "tablespace".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                    Column {
+                        name: "hasindexes".to_string(),
+                        data_type: DataType::Boolean,
+                        nullable: false,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                    Column {
+                        name: "hasrules".to_string(),
+                        data_type: DataType::Boolean,
+                        nullable: false,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                    Column {
+                        name: "hastriggers".to_string(),
+                        data_type: DataType::Boolean,
+                        nullable: false,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                    Column {
+                        name: "rowsecurity".to_string(),
+                        data_type: DataType::Boolean,
+                        nullable: false,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                ],
+            },
+            description: "Lists all user tables (schemaname split honours #188 namespacing)".to_string(),
+        });
+
         // hdb_code_languages — code-graph track grammar inventory.
         // Always registered so the view is discoverable; the
         // executor returns an empty result when the code-graph
@@ -1947,11 +2047,22 @@ impl SystemViewRegistry {
             "heliosdb_row_cache_stats" => Self::execute_heliosdb_row_cache_stats(storage),
             // Code-graph track grammar inventory.
             "hdb_code_languages" => Self::execute_hdb_code_languages(),
+            // pg_tables — delegate to the legacy SystemViewRegistry
+            // which has the schema-namespacing split we want.
+            "pg_tables" => Self::execute_pg_tables_compat(storage),
             _ => {
                 // Other system views not yet implemented
                 Ok(vec![])
             }
         }
+    }
+
+    /// Bridge to the legacy SystemViewRegistry's pg_tables
+    /// implementation so SELECT * FROM pg_tables works over SQL
+    /// (the planner only consults the phase-3 registry).
+    fn execute_pg_tables_compat(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let legacy = crate::sql::SystemViewRegistry::new();
+        legacy.execute("pg_tables", storage)
     }
 
     /// Materialise `hdb_code_languages`: one row per static

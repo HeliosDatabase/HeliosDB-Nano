@@ -103,27 +103,34 @@ pub fn rename_apply(
         });
     }
 
-    // Definition site path + sha. We deliberately ignore
-    // _hdb_code_files.source_table — it's currently hardcoded to
-    // 'indexed' by the indexer (pre-existing bug, separate fix).
-    // Caller provides the user table name via opts.source_table.
+    // Definition site path + source_table + sha.  After #201 the
+    // indexer writes the actual user-table name into
+    // `_hdb_code_files.source_table` so we trust the column.  When
+    // it disagrees with the explicit `opts.source_table` (different
+    // index passes against different tables), the explicit value
+    // wins.
     let def_rows = db.query(
         &format!(
-            "SELECT f.path, f.sha256 \
+            "SELECT f.path, f.source_table, f.sha256 \
              FROM _hdb_code_symbols s \
              JOIN _hdb_code_files f ON f.node_id = s.file_id \
              WHERE s.node_id = {symbol_id}"
         ),
         &[],
     )?;
-    let (def_path, def_sha) = match def_rows.into_iter().next() {
+    let (def_path, src_from_index, def_sha) = match def_rows.into_iter().next() {
         Some(r) => (
             r.values.first().and_then(string_of).unwrap_or_default(),
             r.values.get(1).and_then(string_of),
+            r.values.get(2).and_then(string_of),
         ),
         None => return Ok(RenameApplyStats::default()),
     };
-    let source_table = opts.source_table.clone();
+    let source_table = if opts.source_table != "src" {
+        opts.source_table.clone()
+    } else {
+        src_from_index.unwrap_or_else(|| opts.source_table.clone())
+    };
 
     let ref_rows = db.query(
         &format!(

@@ -142,7 +142,7 @@ fn benchmark_rls_command_types(c: &mut Criterion) {
     let commands = ["SELECT", "INSERT", "UPDATE", "DELETE"];
 
     for cmd in commands.iter() {
-        group.bench_function(cmd, |b| {
+        group.bench_function(*cmd, |b| {
             let manager = create_tenant_manager_with_policies(1);
 
             b.iter(|| {

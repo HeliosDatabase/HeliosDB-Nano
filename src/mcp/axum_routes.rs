@@ -33,8 +33,8 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures::stream::{self, Stream};
-use tracing::{debug, error, info, warn};
+use futures::stream;
+use tracing::{debug, info, warn};
 
 use crate::EmbeddedDatabase;
 

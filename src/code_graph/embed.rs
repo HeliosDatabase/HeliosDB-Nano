@@ -144,7 +144,7 @@ mod fastembed_impl {
 
     impl Embedder for FastEmbedder {
         fn embed(&self, text: &str) -> Result<Option<Vec<f32>>> {
-            let mut guard = self
+            let guard = self
                 .inner
                 .lock()
                 .map_err(|e| Error::query_execution(format!("fastembed lock: {e}")))?;

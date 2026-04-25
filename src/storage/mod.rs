@@ -11,7 +11,7 @@ mod wal;
 mod catalog;
 mod vector_index;
 mod gin_index;
-mod time_travel;
+pub mod time_travel;
 mod branch;
 mod materialized_view;
 mod view_catalog;

@@ -1394,6 +1394,7 @@ fn handle_create_extension<'a>(
         ));
     }
 
+    #[cfg(feature = "code-graph")]
     Ok(Box::new(MaterializedOperator::new(
         vec![],
         Arc::new(Schema { columns: vec![] }),

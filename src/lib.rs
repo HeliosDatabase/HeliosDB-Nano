@@ -324,7 +324,11 @@ pub mod ab_testing;
 // Internal modules
 mod error;
 mod types;
-mod config;
+// `config` was originally private but the encryption / sync
+// benchmarks reference its `KeySource` enum directly.  Promoted
+// to `pub` so the benches compile.  External consumers should
+// still prefer the re-exports below.
+pub mod config;
 mod embedded_db_dump;
 
 // Re-exports

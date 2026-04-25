@@ -19,7 +19,7 @@ use crate::{EmbeddedDatabase, Error, Result, Value};
 use super::embed::{Embedder, NoopEmbedder};
 use super::parse::{self, Language};
 use super::resolver::{resolve_in_file, Resolution};
-use super::symbols::{extract, Symbol, SymbolRef};
+use super::symbols::{extract, Symbol};
 
 /// Statically-supported languages. Mirrors the variants in
 /// [`Language`] so the system view planned for phase 2
@@ -312,7 +312,7 @@ pub fn code_index_with_embedder(
 
         // Upsert the file row, get back the file_id. This also writes
         // the new sha256 so the next run can short-circuit.
-        let file_id = upsert_file(db, file, &sha)?;
+        let file_id = upsert_file(db, &opts.source_table, file, &sha)?;
 
         // Null inbound cross-file refs pointing at this file's old
         // symbols — the cross-file resolver at the end of the run
@@ -615,17 +615,23 @@ fn fetch_source_files(db: &EmbeddedDatabase, source_table: &str) -> Result<Vec<S
 // Write helpers
 // ---------------------------------------------------------------------------
 
-fn upsert_file(db: &EmbeddedDatabase, file: &SourceFile, sha: &str) -> Result<i64> {
+fn upsert_file(
+    db: &EmbeddedDatabase,
+    source_table: &str,
+    file: &SourceFile,
+    sha: &str,
+) -> Result<i64> {
     // Parameterised path — source strings (paths, languages, sha256s)
     // may contain arbitrary characters we refuse to hand-escape.
     let path_val = Value::String(file.path.clone());
     let lang_val = Value::String(file.lang.clone());
     let sha_val = Value::String(sha.to_string());
+    let st_val = Value::String(source_table.to_string());
 
     let existing = db.query_params(
         "SELECT node_id FROM _hdb_code_files \
-         WHERE source_table = 'indexed' AND path = $1",
-        &[path_val.clone()],
+         WHERE source_table = $1 AND path = $2",
+        &[st_val.clone(), path_val.clone()],
     )?;
     if let Some(row) = existing.first() {
         if let Some(v) = row.values.first() {
@@ -648,8 +654,8 @@ fn upsert_file(db: &EmbeddedDatabase, file: &SourceFile, sha: &str) -> Result<i6
 
     let (_, rows) = db.execute_params_returning(
         "INSERT INTO _hdb_code_files (source_table, path, lang, sha256) \
-         VALUES ('indexed', $1, $2, $3) RETURNING node_id",
-        &[path_val, lang_val, sha_val],
+         VALUES ($1, $2, $3, $4) RETURNING node_id",
+        &[st_val, path_val, lang_val, sha_val],
     )?;
     if let Some(row) = rows.first() {
         if let Some(v) = row.values.first() {

@@ -1,0 +1,12 @@
+{
+  "comment": "Baseline binary sizes for the +5% CI guard. Re-baseline with deliberate sign-off when the size honestly grew. See scripts/binary-size-check.sh.",
+  "version": "3.19.0",
+  "captured_at": "2026-04-25",
+  "default_size": 28870736,
+  "all_features_size": 36772160,
+  "default_features": ["encryption", "vector-search", "ring-crypto", "ha-tier1"],
+  "all_features": ["encryption", "vector-search", "ring-crypto", "ha-tier1", "code-graph", "graph-rag", "mcp-endpoint", "code-embed"],
+  "platform": "linux-x86_64",
+  "rustc": "1.92.0",
+  "max_growth_pct": 5.0
+}
