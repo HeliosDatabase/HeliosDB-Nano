@@ -3176,6 +3176,21 @@ impl EmbeddedDatabase {
         code_graph::merkle_refresh(self)
     }
 
+    /// Apply a symbol rename: read the rename plan
+    /// (`lsp_rename_preview`) and write replacements back to the
+    /// source rows. Identifier-boundary aware.
+    /// `RenameApplyOptions::dry_run()` returns counts without
+    /// writing.
+    #[cfg(feature = "code-graph")]
+    pub fn lsp_rename_apply(
+        &self,
+        symbol_id: i64,
+        new_name: &str,
+        opts: &code_graph::RenameApplyOptions,
+    ) -> Result<code_graph::RenameApplyStats> {
+        code_graph::rename_apply(self, symbol_id, new_name, opts)
+    }
+
     /// `WITH CONTEXT (...)` entry point — runs the seed query, then
     /// expands the graph subgraph per the clause options.  Result
     /// tuples: `(node_id, node_kind, title, text, source_ref, hop_distance)`.

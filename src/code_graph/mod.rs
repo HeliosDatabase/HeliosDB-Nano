@@ -32,8 +32,10 @@ pub mod sql_rewrite;
 pub mod git_hook;
 pub mod diff;
 pub mod semantic_merkle;
+pub mod refactor;
 
 pub use semantic_merkle::{build_or_refresh as merkle_refresh, MerkleStats};
+pub use refactor::{rename_apply, RenameApplyOptions, RenameApplyStats};
 
 pub use diff::{
     ast_diff, lsp_body_diff, lsp_references_diff, AsOfRef, AstDiffRow, BodyDiffLine,

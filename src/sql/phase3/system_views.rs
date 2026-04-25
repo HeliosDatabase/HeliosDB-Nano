@@ -1841,6 +1841,42 @@ impl SystemViewRegistry {
             },
             description: "Shows row cache statistics and hit rates".to_string(),
         });
+
+        // hdb_code_languages — code-graph track grammar inventory.
+        // Always registered so the view is discoverable; the
+        // executor returns an empty result when the code-graph
+        // feature isn't compiled in.
+        self.register_view(SystemViewSchema {
+            name: "hdb_code_languages".to_string(),
+            schema: Schema {
+                columns: vec![
+                    Column {
+                        name: "name".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                    Column {
+                        name: "source".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                ],
+            },
+            description: "Lists every tree-sitter grammar the indexer can parse"
+                .to_string(),
+        });
     }
 
     /// Register a system view
@@ -1909,10 +1945,49 @@ impl SystemViewRegistry {
             "heliosdb_simd_capabilities" => Self::execute_heliosdb_simd_capabilities(),
             // Row cache stats
             "heliosdb_row_cache_stats" => Self::execute_heliosdb_row_cache_stats(storage),
+            // Code-graph track grammar inventory.
+            "hdb_code_languages" => Self::execute_hdb_code_languages(),
             _ => {
                 // Other system views not yet implemented
                 Ok(vec![])
             }
+        }
+    }
+
+    /// Materialise `hdb_code_languages`: one row per static
+    /// `SupportedLanguage` variant + one row per
+    /// runtime-registered grammar.  Sorted by name for stable
+    /// output. Returns an empty set when the `code-graph` feature
+    /// isn't compiled in.
+    fn execute_hdb_code_languages() -> Result<Vec<Tuple>> {
+        #[cfg(feature = "code-graph")]
+        {
+            use crate::code_graph::{parse, SupportedLanguage};
+            let mut rows: Vec<(String, &'static str)> = SupportedLanguage::all()
+                .iter()
+                .map(|l| (l.as_str().to_string(), "static"))
+                .collect();
+            for name in parse::registered_grammars() {
+                if let Some(idx) = rows.iter().position(|(n, _)| n == &name) {
+                    rows[idx].1 = "runtime";
+                } else {
+                    rows.push((name, "runtime"));
+                }
+            }
+            rows.sort_by(|a, b| a.0.cmp(&b.0));
+            Ok(rows
+                .into_iter()
+                .map(|(n, s)| {
+                    Tuple::new(vec![
+                        Value::String(n),
+                        Value::String(s.to_string()),
+                    ])
+                })
+                .collect())
+        }
+        #[cfg(not(feature = "code-graph"))]
+        {
+            Ok(vec![])
         }
     }
 

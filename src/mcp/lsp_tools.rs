@@ -14,6 +14,7 @@ use serde_json::{json, Value as JsonValue};
 
 use crate::code_graph::{
     self, ast_diff, lsp_body_diff, lsp_references_diff, AsOfRef, CallDirection, DefinitionHint,
+    RenameApplyOptions,
 };
 use crate::{EmbeddedDatabase, Value};
 
@@ -466,6 +467,78 @@ fn lsp_rename_preview_schema() -> JsonValue {
     })
 }
 
+// ---- helios_lsp_rename_apply -----------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct RenameApplyArgs {
+    symbol_id: i64,
+    new_name: String,
+    #[serde(default = "default_source_table")]
+    source_table: String,
+    #[serde(default)]
+    dry_run: bool,
+    #[serde(default = "default_strict")]
+    strict_hash_check: bool,
+}
+
+fn default_strict() -> bool { true }
+fn default_source_table() -> String { "src".to_string() }
+
+fn lsp_rename_apply_handler(
+    db: Option<&EmbeddedDatabase>,
+    args: JsonValue,
+) -> ToolOutcome {
+    let Some(db) = db else {
+        return ToolOutcome::err("helios_lsp_rename_apply requires a database connection");
+    };
+    let input: RenameApplyArgs = match serde_json::from_value(args) {
+        Ok(v) => v,
+        Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
+    };
+    let opts = RenameApplyOptions {
+        source_table: input.source_table,
+        dry_run: input.dry_run,
+        strict_hash_check: input.strict_hash_check,
+    };
+    match code_graph::rename_apply(db, input.symbol_id, &input.new_name, &opts) {
+        Ok(stats) => ToolOutcome::ok(json!({
+            "symbol_id": input.symbol_id,
+            "new_name": input.new_name,
+            "files_modified": stats.files_modified,
+            "occurrences_replaced": stats.occurrences_replaced,
+            "applied": stats.applied,
+            "conflicted_paths": stats.conflicted_paths,
+        })),
+        Err(e) => ToolOutcome::err(format!("rename_apply failed: {e}")),
+    }
+}
+
+inventory::submit! {
+    McpExtensionTool {
+        name: "helios_lsp_rename_apply",
+        description: "Apply a symbol rename — write replacements back to the source \
+                      rows. Identifier-boundary aware; conflict-aware via sha256 hash \
+                      check. Pair with helios_lsp_rename_preview for review-then-commit.",
+        schema: lsp_rename_apply_schema,
+        handler: lsp_rename_apply_handler,
+    }
+}
+
+fn lsp_rename_apply_schema() -> JsonValue {
+    json!({
+        "type": "object",
+        "properties": {
+            "symbol_id":         { "type": "integer" },
+            "new_name":          { "type": "string"  },
+            "source_table":      { "type": "string", "default": "src",
+                                    "description": "User table holding (path, content) source rows" },
+            "dry_run":           { "type": "boolean", "default": false },
+            "strict_hash_check": { "type": "boolean", "default": true }
+        },
+        "required": ["symbol_id", "new_name"]
+    })
+}
+
 // ---- Diff tools (FR 3.3 wrappers) ------------------------------------
 
 fn parse_as_of(v: &JsonValue) -> Result<AsOfRef, String> {
@@ -716,6 +789,7 @@ mod tests {
             "helios_lsp_hover",
             "helios_lsp_document_symbols",
             "helios_lsp_rename_preview",
+            "helios_lsp_rename_apply",
             "helios_lsp_references_diff",
             "helios_lsp_body_diff",
             "helios_ast_diff",
