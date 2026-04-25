@@ -3505,6 +3505,40 @@ impl EmbeddedDatabase {
         graph_rag::ingest_docs(self, opts)
     }
 
+    /// Ingest a PDF / DOCX / image / audio file via docling-serve.
+    /// See `graph_rag::DoclingIngestOptions`.
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_ingest_pdf(
+        &self,
+        opts: &graph_rag::DoclingIngestOptions,
+    ) -> Result<graph_rag::IngestStats> {
+        graph_rag::docling_ingest_pdf(self, opts)
+    }
+
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_ingest_office(
+        &self,
+        opts: &graph_rag::DoclingIngestOptions,
+    ) -> Result<graph_rag::IngestStats> {
+        graph_rag::docling_ingest_office(self, opts)
+    }
+
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_ingest_audio(
+        &self,
+        opts: &graph_rag::DoclingIngestOptions,
+    ) -> Result<graph_rag::IngestStats> {
+        graph_rag::docling_ingest_audio(self, opts)
+    }
+
+    #[cfg(feature = "graph-rag")]
+    pub fn graph_rag_ingest_image(
+        &self,
+        opts: &graph_rag::DoclingIngestOptions,
+    ) -> Result<graph_rag::IngestStats> {
+        graph_rag::docling_ingest_image(self, opts)
+    }
+
     /// Ingest structured email rows into Email + Person nodes.
     #[cfg(feature = "graph-rag")]
     pub fn graph_rag_ingest_email(

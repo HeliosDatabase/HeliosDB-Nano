@@ -11,6 +11,7 @@
 //! meaningless without a code-graph source).
 
 pub mod centrality;
+pub mod docling;
 pub mod ingest;
 pub mod linker;
 pub mod schema;
@@ -18,6 +19,11 @@ pub mod search;
 pub mod with_context;
 
 pub use centrality::{centrality_rerank, Centrality};
+pub use docling::{
+    ingest_audio as docling_ingest_audio, ingest_image as docling_ingest_image,
+    ingest_office as docling_ingest_office, ingest_pdf as docling_ingest_pdf,
+    DoclingIngestOptions,
+};
 pub use ingest::{
     ingest_docs, ingest_email, ingest_issues, ingest_qa, ChunkStrategy,
     IngestDocsOptions, IngestEmailOptions, IngestIssuesOptions, IngestQaOptions,
