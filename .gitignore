@@ -43,3 +43,4 @@ heliosdb.pid
 
 # Per-repo code-graph index (code-graph track pilot convention)
 .helios-index/
+.helios-kb/
