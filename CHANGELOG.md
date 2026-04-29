@@ -5,6 +5,72 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.22.1] - 2026-04-29
+
+### Fixed — phantom FK violation on `DELETE child; DELETE parent` inside a transaction
+
+Closes the publish-blocker filed in `BUGS_CODE_INDEX_FK_VIOLATION_v3_21_1.md`
+(also `FEATURE_REQUEST_fk_in_txn.md`): every `code_index` call against a
+populated KB raised
+`fk__hdb_code_symbol_refs_from_symbol___hdb_code_symbols`
+on the second of a `DELETE child WHERE …; DELETE parent WHERE …;`
+sequence inside a single transaction — even though the first DELETE
+removed every offending child row in the same txn.
+
+**Root cause.** `EmbeddedDatabase::check_referencing_rows_exist`
+called `storage.scan_table` directly, which reads RocksDB committed
+state. The just-tombstoned child rows lived in the txn's write-set,
+not yet committed, so they were still visible to the FK validator.
+
+**Fix.** The DELETE plan executor passes the active
+`storage::Transaction` through to `check_referencing_rows_exist`,
+which now calls `txn.merge_with_write_set(table_name, base)` on the
+scan result so in-txn DELETEs / INSERTs are reflected in the FK
+check. Equivalent to PG's read-your-own-writes semantics for FK
+validation.
+
+**Hang during fix iteration.** The first cut re-acquired
+`current_transaction.lock()` from inside `check_referencing_rows_exist`,
+which deadlocked because the DELETE caller already held that mutex.
+Resolved by threading the txn ref through as an
+`active_txn: Option<&Transaction>` parameter — no extra lock
+acquisition.
+
+**Acceptance fixtures.** `tests/code_graph_phase2.rs` now has the
+three populated-KB workflow tests the field-bench bug report
+requested: `ingest_twice_against_populated_kb` (SHA gate
+short-circuits), `ingest_twice_with_one_changed_file_against_populated_kb`
+(per-file delete-stale runs for the changed file — was the failing
+case), and `force_reparse_against_populated_kb`. All pass.
+
+### What this means for the daily workflow
+
+The pilot's silent-fail matrix is closed:
+
+| Workflow                              | v3.22.0          | **v3.22.1**       |
+|---------------------------------------|------------------|-------------------|
+| First-time `init --ingest`            | ✓ works          | ✓ works           |
+| `/helios-code-graph:refresh` (daily)  | ❌ silent fail   | **✓ works**       |
+| Git post-commit hook                  | ❌ silent fail   | **✓ works**       |
+| `--force` re-parse                    | ❌ silent fail   | **✓ works**       |
+
+### Known interaction — cross-process ON CONFLICT bug × FK validator cost
+
+The FK validator's `merge_with_write_set` walks the txn's
+DashMap write-set on every check. When the cross-process
+`INSERT ... ON CONFLICT (path) DO UPDATE` bug
+(`FEATURE_REQUEST_cross_process_on_conflict.md`) doubles the
+client's `src` table across re-runs, the indexer's
+duplicate-path defense triggers per-file delete-stale on the
+second occurrence of every path, and each FK check pays an
+O(write_set_size) cost. On Nano's own corpus this turns a
+~3-minute force-reparse into 30+ minutes. The correctness
+issue this release fixes is **independent**: even on a
+single-process KB without the cross-process bug, the FK
+violation reproduced (see the new `ingest_twice_with_one_changed_file_against_populated_kb`
+fixture). Closing the cross-process bug will eliminate the
+duplicate-path defense path entirely.
+
 ## [3.22.0] - 2026-04-29
 
 ### Added — code_index write-phase optimisations (Tier 1 + indexes + Tier 2.4 v2)

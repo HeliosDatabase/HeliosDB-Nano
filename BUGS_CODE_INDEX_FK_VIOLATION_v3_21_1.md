@@ -2,10 +2,11 @@
 reported-by: heliosdb-codekb-mcp pilot — danimoya
 reported-against: HeliosDB-Nano v3.21.1
 priority: high
-status: open
+status: fixed-in-v3.22.1
 date-filed: 2026-04-29
+date-fixed: 2026-04-29
 kind: regression / data integrity
-related: FEATURE_REQUEST_parallel_code_index.md (v3.21.0), CHANGELOG `## [3.21.1]` (Tier 1.1 + 1.3)
+related: FEATURE_REQUEST_parallel_code_index.md (v3.21.0), CHANGELOG `## [3.21.1]` (Tier 1.1 + 1.3), FEATURE_REQUEST_fk_in_txn.md (root-cause FR)
 ---
 
 # `code_index` foreign-key violation on populated KB in v3.21.1
@@ -163,6 +164,143 @@ measurable scenarios:
 
 Recommendation: **either roll v3.21.1 back, or block crates.io
 publish on a v3.21.2 that fixes both issues.**
+
+## Update 2026-04-29 (afternoon) — v3.22.0 partially closes, FK bug still open
+
+Re-ran the same three-test sweep against v3.22.0 (commit `1fe2f30`,
+"Tier 2.4 v2 direct-write bulk path closes force-reparse regression")
+on a fresh isolated KB at `/tmp/codekb-pilot-v3220-1777461227`.
+
+### What v3.22.0 fixes — cold ingest
+
+| Run | Engine | Wall clock | Parse | Write |
+|---|---|---|---|---|
+| cold | v3.19.1 baseline | 13 m 39 s | (sequential) | (sequential) |
+| cold | v3.21.0 | 5 m 43 s | ~3 s | ~340 s |
+| cold | v3.21.1 | 11 m 21 s | 3.585 s | 621.772 s ❌ |
+| **cold** | **v3.22.0** | **3 m 41.7 s** ✓ | **3.087 s** | **168.626 s** ✓ |
+
+`168.626 s` write phase vs v3.21.1's `621.772 s` is **3.69× faster**;
+vs v3.21.0's ~340 s is **2.02× faster**. The Tier 2.4 v2 direct-write
+bulk path is genuinely working on the cold path — engine team's claim
+of 1.57× cold speedup matches my measurement (5:43 → 3:42 = 1.55×).
+
+### What v3.22.0 does NOT fix — populated-KB paths
+
+Both re-ingest paths against a populated KB still hit the same FK
+violation as v3.21.1.
+
+**TEST C — incremental re-ingest, `RUST_LOG=warn`:**
+
+```
+WARN heliosdb_nano: Slow query (12525ms, 243 rows): DELETE FROM
+  _hdb_code_symbol_refs WHERE file_id = 1267 duration_ms=12525 rows=243
+WARN heliosdb_codekb_mcp::ingest: code_index failed: Constraint
+  violation: Foreign key constraint
+  'fk__hdb_code_symbol_refs_from_symbol___hdb_code_symbols' violated:
+  cannot delete row from '_hdb_code_symbols' - referenced by
+  '_hdb_code_symbol_refs'
+```
+
+Identical to the v3.21.1 output, including the slow-DELETE warning
+(now 12.5 s for 243 rows — even worse than v3.21.1's 2.5 s for 14 rows).
+
+**TEST B — `--force` re-parse:** completes in **1 m 24 s** (matches
+the engine team's claimed `4:00 → 1:22 (2.93×)`), but the
+`ingest summary` block has **no `code_index` line** — meaning
+`db.code_index()` returned `Err` and was logged at `WARN`. The
+1:24 is fast because it fails fast; no symbol/ref work persists.
+
+The CHANGELOG's "Tier 2.4 v2 direct-write bulk path closes
+force-reparse regression" is correct as a **performance** statement
+(the failed path is much faster than v3.21.1's 4-minute failed
+path) but **not** as a **correctness** statement — `code_index`
+still errors. The "2.93× speedup" appears to measure a faster
+failure, not a faster success.
+
+### Suggested verification on the engine side
+
+Add this to `tests/code_graph_phase2.rs` (or equivalent) — it's the
+exact path the pilot exercises:
+
+```rust
+#[test]
+fn ingest_twice_against_populated_kb() {
+    let db = test_db_with_corpus(...);                  // first ingest, fresh
+    db.code_index(opts(force_reparse = false))?;         // OK
+    db.code_index(opts(force_reparse = false))?;         // ← currently fails
+}
+
+#[test]
+fn force_reparse_against_populated_kb() {
+    let db = test_db_with_corpus(...);
+    db.code_index(opts(force_reparse = false))?;         // OK
+    let stats = db.code_index(opts(force_reparse = true))?;
+    assert!(stats.symbols_written > 0);                  // ← currently fails:
+                                                          //   stats is Err()
+}
+```
+
+Today's existing fixture only ingests once; both new test names
+fail today on v3.22.0.
+
+### Net effect on the v3.22.0 publish decision
+
+- ✅ **Cold ingest workflow** (first-time `init --ingest`): publishable.
+- ❌ **Daily incremental workflow** (`/helios-code-graph:refresh` or
+     git post-commit hook): silently fails on every run after the first.
+- ❌ **`--force` re-parse**: silently fails; no work persisted.
+
+For a tool whose primary value-prop is "fast incremental code-graph
+for AI agents", shipping with the daily workflow broken is not viable.
+Publish blocker remains.
+
+## Update 2026-04-29 (evening) — fixed in v3.22.1
+
+Root cause: `EmbeddedDatabase::check_referencing_rows_exist` called
+`storage.scan_table` directly, which reads only RocksDB committed
+state. After `DELETE FROM _hdb_code_symbol_refs WHERE file_id = X`
+inside a txn, the engine tombstones those rows in the txn's
+write-set but does not commit yet. The FK validator on the next
+`DELETE FROM _hdb_code_symbols WHERE file_id = X` therefore still
+sees the tombstoned refs in RocksDB and rejects the delete.
+
+The fix wires the active `storage::Transaction` through to
+`check_referencing_rows_exist`, which now merges
+`txn.merge_with_write_set` into the base scan — read-your-own-writes
+semantics for FK validation, matching what the rest of the SQL
+pipeline expects.
+
+### Acceptance fixtures (now passing)
+
+`tests/code_graph_phase2.rs`:
+
+- `ingest_twice_against_populated_kb` — SHA gate short-circuits,
+  no DELETEs run.
+- `ingest_twice_with_one_changed_file_against_populated_kb` — the
+  exact pilot path; touches one file, per-file delete-stale runs,
+  must succeed end-to-end. **Was failing on v3.22.0; passes on v3.22.1.**
+- `force_reparse_against_populated_kb` — TRUNCATE fast path,
+  must persist non-zero symbols/refs.
+
+All three pass on v3.22.1 (commit pending), plus all 1746 existing
+lib tests. The pilot's "publish-blocker" matrix flips to all-green.
+
+### Known related slowness — cross-process ON CONFLICT bug
+
+The FK validator's write-set merge is O(write-set-size) per check.
+When the cross-process
+`INSERT ... ON CONFLICT (path) DO UPDATE` bug
+(`FEATURE_REQUEST_cross_process_on_conflict.md`) doubles the
+client's `src` table across re-runs, the indexer's duplicate-path
+defense triggers per-file delete-stale on the second occurrence
+of every path, and each FK check pays the merge cost. On the
+pilot's own corpus this turns a 3-minute force-reparse into
+30+ minutes. The correctness fix is independent (single-process
+KB without the cross-process bug also reproduces the FK
+violation — see the new fixture). Closing the cross-process bug
+removes the duplicate-path defense path entirely and brings
+force-reparse back to the v3.22.0 measured wall-clock.
 
 ## Related
 

@@ -255,3 +255,123 @@ fn cross_file_ref_resolves() -> Result<()> {
     );
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// BUGS_CODE_INDEX_FK_VIOLATION_v3_21_1.md acceptance fixtures
+// ---------------------------------------------------------------------------
+//
+// Pilot client (`heliosdb-codekb-mcp`) reports that any `code_index`
+// call against a populated KB raises:
+//
+//   Foreign key constraint
+//     'fk__hdb_code_symbol_refs_from_symbol___hdb_code_symbols' violated:
+//     cannot delete row from '_hdb_code_symbols' - referenced by
+//     '_hdb_code_symbol_refs'
+//
+// preceded by a slow `DELETE FROM _hdb_code_symbol_refs WHERE file_id = ?`.
+// Both `--force` and incremental-with-changed-file paths surface it.
+// Acceptance: these three fixtures must succeed end to end on every
+// release.
+
+const PHASE2_FIXTURE: &[(&str, &str, &str)] = &[
+    ("a.rs", "rust", "pub fn alpha() { beta(); }\npub fn beta() {}\npub struct S;\nimpl S { pub fn m(&self) -> i32 { 0 } }\n"),
+    ("b.rs", "rust", "use crate::a::S;\npub fn make() -> S { S }\npub fn caller() { let s = make(); s.m(); }\n"),
+    ("c.rs", "rust", "pub trait T { fn run(&self); }\npub struct U;\nimpl T for U { fn run(&self) {} }\n"),
+    ("d.py", "python", "def hello():\n    print('hi')\n\nclass Foo:\n    def bar(self):\n        return hello()\n"),
+    ("e.py", "python", "from d import Foo\n\ndef use_foo():\n    f = Foo()\n    return f.bar()\n"),
+];
+
+fn populate_phase2_corpus(db: &EmbeddedDatabase) -> Result<()> {
+    db.execute("CREATE TABLE src (path TEXT PRIMARY KEY, lang TEXT, content TEXT)")?;
+    for (path, lang, content) in PHASE2_FIXTURE {
+        db.execute_params_returning(
+            "INSERT INTO src VALUES ($1, $2, $3)",
+            &[
+                Value::String((*path).into()),
+                Value::String((*lang).into()),
+                Value::String((*content).into()),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+#[test]
+fn ingest_twice_against_populated_kb() -> Result<()> {
+    // Pilot path: first ingest succeeds (cold), second ingest with no
+    // content changes goes through the SHA gate and short-circuits.
+    let db = EmbeddedDatabase::new_in_memory()?;
+    populate_phase2_corpus(&db)?;
+
+    let stats1 = db.code_index(CodeIndexOptions::for_table("src"))?;
+    assert!(stats1.symbols_written > 0, "first ingest wrote no symbols");
+    assert!(stats1.refs_written > 0, "first ingest wrote no refs");
+
+    let stats2 = db.code_index(CodeIndexOptions::for_table("src"))?;
+    assert_eq!(
+        stats2.files_unchanged as usize,
+        PHASE2_FIXTURE.len(),
+        "expected all {} files to be SHA-gated unchanged on the second ingest, got {} unchanged + {} parsed",
+        PHASE2_FIXTURE.len(),
+        stats2.files_unchanged,
+        stats2.files_parsed,
+    );
+    assert_eq!(stats2.files_parsed, 0, "no files should be re-parsed when SHAs match");
+    Ok(())
+}
+
+#[test]
+fn ingest_twice_with_one_changed_file_against_populated_kb() -> Result<()> {
+    // Daily incremental workflow: a single file's content changed.
+    // The per-file `delete-stale → re-insert` path runs for that file
+    // only. Must NOT raise the FK violation.
+    let db = EmbeddedDatabase::new_in_memory()?;
+    populate_phase2_corpus(&db)?;
+
+    db.code_index(CodeIndexOptions::for_table("src"))?;
+
+    // Touch a file whose symbols are referenced by other files (b.rs
+    // imports from a.rs, so a.rs is a juicy target).
+    db.execute_params_returning(
+        "UPDATE src SET content = $1 WHERE path = $2",
+        &[
+            Value::String(
+                "pub fn alpha() { beta(); gamma(); }\npub fn beta() {}\npub fn gamma() {}\npub struct S;\nimpl S { pub fn m(&self) -> i32 { 0 } }\n".into(),
+            ),
+            Value::String("a.rs".into()),
+        ],
+    )?;
+
+    let stats = db.code_index(CodeIndexOptions::for_table("src"))?;
+    assert_eq!(stats.files_parsed, 1, "exactly one file should be re-parsed");
+    assert!(stats.files_unchanged >= (PHASE2_FIXTURE.len() - 1) as u64);
+    Ok(())
+}
+
+#[test]
+fn force_reparse_against_populated_kb() -> Result<()> {
+    // `--force` workflow: TRUNCATE + bulk re-insert. Must succeed end
+    // to end with non-zero `symbols_written` (the failure mode the
+    // pilot saw was Err(...) returned, plugin logging at WARN, no
+    // `code_index` summary line — so the wall-clock looked fast but
+    // no work persisted).
+    let db = EmbeddedDatabase::new_in_memory()?;
+    populate_phase2_corpus(&db)?;
+
+    db.code_index(CodeIndexOptions::for_table("src"))?;
+
+    let mut opts = CodeIndexOptions::for_table("src");
+    opts.force_reparse = true;
+    let stats = db.code_index(opts)?;
+    assert!(
+        stats.symbols_written > 0,
+        "force-reparse must persist non-zero symbols (was {})",
+        stats.symbols_written
+    );
+    assert!(
+        stats.refs_written > 0,
+        "force-reparse must persist non-zero refs (was {})",
+        stats.refs_written
+    );
+    Ok(())
+}

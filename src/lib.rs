@@ -2111,11 +2111,17 @@ impl EmbeddedDatabase {
                                         })
                                         .collect();
 
-                                    // Check if any row in the referencing table uses these values
+                                    // Check if any row in the referencing table uses these values.
+                                    // Pass the active txn so the FK validator merges its
+                                    // write-set into the base scan (covers the
+                                    // "DELETE child; DELETE parent" sequence — without this
+                                    // the just-tombstoned child rows are still visible to
+                                    // `scan_table` and raise a phantom violation).
                                     let has_refs = self.check_referencing_rows_exist(
                                         &fk.table_name,
                                         &fk.columns,
                                         &ref_values,
+                                        Some(txn),
                                     )?;
 
                                     if has_refs {
@@ -8174,12 +8180,29 @@ impl EmbeddedDatabase {
         table_name: &str,
         column_names: &[String],
         values: &[Value],
+        active_txn: Option<&storage::Transaction>,
     ) -> Result<bool> {
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
 
-        // Scan the table and check for referencing rows
-        let tuples = self.storage.scan_table(table_name)?;
+        // Scan the table and check for referencing rows. When the
+        // caller is inside an explicit transaction, merge its
+        // write-set into the base scan so in-txn DELETEs / INSERTs
+        // are reflected — without this,
+        // `BEGIN; DELETE FROM child WHERE …; DELETE FROM parent
+        // WHERE …;` raises a phantom FK violation on the second
+        // DELETE because the just-tombstoned child rows still live
+        // in RocksDB until commit. (Filed in
+        // FEATURE_REQUEST_fk_in_txn.md; this is the root-cause fix.)
+        // Caller passes `active_txn` directly to avoid re-acquiring
+        // `current_transaction.lock()` (which deadlocks under the
+        // DELETE path that already holds it).
+        let base = self.storage.scan_table(table_name)?;
+        let tuples = if let Some(txn) = active_txn {
+            txn.merge_with_write_set(table_name, base)?
+        } else {
+            base
+        };
 
         for tuple in tuples {
             let mut matches = true;
