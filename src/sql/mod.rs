@@ -6,6 +6,7 @@
 pub mod parser;
 pub mod logical_plan;
 pub mod planner;
+pub mod sqlite_compat;
 pub mod executor;
 pub mod evaluator;
 pub mod type_inference;

@@ -501,6 +501,45 @@ where
             self.send_query_result(schema, vec![row]).await?;
             self.send_ready_for_query().await?;
             return Ok(());
+        } else if starts_with_icase(trimmed, "PRAGMA ") || trimmed.eq_ignore_ascii_case("PRAGMA") {
+            // SQLite drop-in: accept and stub PRAGMA. `table_info(t)` returns
+            // SQLite-shaped column rows; everything else returns an empty
+            // ack so sqlite3-driven apps don't blow up on schema-introspection
+            // / connection-tuning calls that have no PG analogue.
+            if let Some((name, arg)) = crate::sql::sqlite_compat::parse_pragma(trimmed) {
+                match name.to_lowercase().as_str() {
+                    "table_info" => {
+                        let table = arg.unwrap_or_default();
+                        // strip surrounding quotes / brackets
+                        let table = table.trim().trim_matches(|c| c == '\'' || c == '"' || c == '`').to_string();
+                        let rows = self.pragma_table_info(&table)?;
+                        let schema = Schema::new(vec![
+                            crate::Column::new("cid", crate::DataType::Int4),
+                            crate::Column::new("name", crate::DataType::Text),
+                            crate::Column::new("type", crate::DataType::Text),
+                            crate::Column::new("notnull", crate::DataType::Int4),
+                            crate::Column::new("dflt_value", crate::DataType::Text),
+                            crate::Column::new("pk", crate::DataType::Int4),
+                        ]);
+                        self.send_query_result(schema, rows).await?;
+                        self.send_ready_for_query().await?;
+                        return Ok(());
+                    }
+                    _ => {
+                        // Acknowledge unknown / connection-tuning PRAGMAs as no-ops.
+                        // Includes: foreign_keys, journal_mode, synchronous, busy_timeout,
+                        // cache_size, temp_store, locking_mode, etc.
+                        tracing::debug!("PRAGMA stubbed (no-op): {} = {:?}", name, arg);
+                        self.send_command_complete("PRAGMA").await?;
+                        self.send_ready_for_query().await?;
+                        return Ok(());
+                    }
+                }
+            } else {
+                self.send_command_complete("PRAGMA").await?;
+                self.send_ready_for_query().await?;
+                return Ok(());
+            }
         } else if trimmed.eq_ignore_ascii_case("COMMIT") {
             // Handle commit even if no transaction active (PostgreSQL warns but succeeds)
             if self.transaction_status == TransactionStatus::InTransaction {
@@ -1155,6 +1194,31 @@ where
             position: None,
         }).await?;
         self.send_ready_for_query().await
+    }
+
+    /// SQLite-shaped `PRAGMA table_info(t)` rows.
+    ///
+    /// One row per column with `(cid, name, type, notnull, dflt_value, pk)` —
+    /// the shape sqlite3-driven Python apps (notably token-dashboard's schema
+    /// migrators) consume to detect "does this column already exist?".
+    fn pragma_table_info(&self, table: &str) -> Result<Vec<Tuple>> {
+        let catalog = self.database.storage.catalog();
+        let schema = catalog.get_table_schema(table)?;
+        let mut rows = Vec::with_capacity(schema.columns.len());
+        for (idx, col) in schema.columns.iter().enumerate() {
+            rows.push(Tuple::new(vec![
+                Value::Int4(idx as i32),
+                Value::String(col.name.clone()),
+                Value::String(format!("{:?}", col.data_type).to_uppercase()),
+                Value::Int4(if col.nullable { 0 } else { 1 }),
+                col.default_expr
+                    .as_ref()
+                    .map(|d| Value::String(d.clone()))
+                    .unwrap_or(Value::Null),
+                Value::Int4(if col.primary_key { 1 } else { 0 }),
+            ]));
+        }
+        Ok(rows)
     }
 
     /// Derive schema for a DML statement with RETURNING clause

@@ -611,6 +611,34 @@ impl Evaluator {
             "unix_timestamp" => self.func_unix_timestamp(&arg_values),
             "from_unixtime" => self.func_from_unixtime(&arg_values),
 
+            // PostgreSQL date/time surface — drop-in for any client expecting
+            // PG date semantics (psycopg, Drizzle, Prisma, sqlx, …) and the
+            // canonical home for date formatting now that we no longer carry
+            // SQLite-specific names like STRFTIME / JULIANDAY.
+            "to_char"        => self.func_to_char(&arg_values),
+            "to_date"        => self.func_to_date(&arg_values),
+            "to_timestamp"   => self.func_to_timestamp(&arg_values),
+            "date_trunc"     => self.func_date_trunc(&arg_values),
+            "make_date"      => self.func_make_date(&arg_values),
+            "make_timestamp" => self.func_make_timestamp(&arg_values),
+            "age"            => self.func_age(&arg_values),
+            "date_part"      => {
+                // PostgreSQL alias: date_part('field', expr) ≡ EXTRACT(field FROM expr).
+                let [field_arg, val_arg] = arg_values.as_slice() else {
+                    return Err(Error::query_execution(
+                        "DATE_PART requires exactly 2 arguments"
+                    ));
+                };
+                let field = match field_arg {
+                    Value::String(s) => s.to_lowercase(),
+                    Value::Null => return Ok(Value::Null),
+                    other => return Err(Error::query_execution(format!(
+                        "DATE_PART field must be a string, got {:?}", other
+                    ))),
+                };
+                Self::extract_field(&field, std::slice::from_ref(val_arg))
+            }
+
             // MySQL string functions (WordPress plugin compatibility)
             "locate" => self.func_locate(&arg_values),
             "instr" => self.func_instr(&arg_values),
@@ -977,6 +1005,426 @@ impl Evaluator {
         };
         let chrono_fmt = Self::mysql_format_to_chrono(format_str);
         Ok(Value::String(ndt.format(&chrono_fmt).to_string()))
+    }
+
+    /// Translate a PostgreSQL `TO_CHAR` template string into a chrono format
+    /// string. Covers the codes that show up in the wild: YYYY/YY, MM/MON/Mon,
+    /// DD/DDD/DY/Day, HH24/HH12/HH, MI, SS, MS/US, AM/PM, am/pm, Q, IW/IYYY,
+    /// W, D.
+    ///
+    /// Case-sensitive PG codes (MON vs Mon vs mon, DAY vs Day vs day) and
+    /// codes with no chrono equivalent (Q, W) are emitted as `\u{1}TAG\u{2}`
+    /// markers so the post-processing pass can substitute the correctly-
+    /// cased value while leaving everything chrono produces alone.
+    /// Unknown codes pass through verbatim — same fail-soft policy as
+    /// `mysql_format_to_chrono`.
+    fn pg_format_to_chrono(format: &str) -> String {
+        const PATTERNS: &[(&str, &str)] = &[
+            // 5+ char codes.
+            ("MONTH", "\u{1}MONTH\u{2}"),
+            ("Month", "\u{1}Month\u{2}"),
+            ("month", "\u{1}month\u{2}"),
+            ("YYYY",  "%Y"),
+            ("HH24",  "%H"),
+            ("HH12",  "%I"),
+            ("IYYY",  "%G"),
+            // 3-char codes.
+            ("DDD",  "%j"),
+            ("DAY",  "\u{1}DAY\u{2}"),
+            ("Day",  "\u{1}Day\u{2}"),
+            ("day",  "\u{1}day\u{2}"),
+            ("MON",  "\u{1}MON\u{2}"),
+            ("Mon",  "\u{1}Mon\u{2}"),
+            ("mon",  "\u{1}mon\u{2}"),
+            ("am" ,  "%P"),
+            ("pm" ,  "%P"),
+            ("AM" ,  "%p"),
+            ("PM" ,  "%p"),
+            // 2-char codes.
+            ("YY", "%y"),
+            ("MM", "%m"),
+            ("DD", "%d"),
+            ("DY", "%a"),
+            ("HH", "%I"),
+            ("MI", "%M"),
+            ("SS", "%S"),
+            ("MS", "%3f"),
+            ("US", "%6f"),
+            ("IW", "%V"),
+            // 1-char codes (matched last so they don't shadow longer codes).
+            ("Q",  "\u{1}Q\u{2}"),
+            ("W",  "\u{1}W\u{2}"),
+            ("D",  "%u"),
+        ];
+        let mut out = String::with_capacity(format.len());
+        let bytes = format.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let mut matched = false;
+            for (pat, repl) in PATTERNS {
+                let plen = pat.len();
+                if i + plen <= bytes.len() && &bytes[i..i + plen] == pat.as_bytes() {
+                    out.push_str(repl);
+                    i += plen;
+                    matched = true;
+                    break;
+                }
+            }
+            if !matched {
+                #[allow(clippy::indexing_slicing)]
+                out.push(bytes[i] as char);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Substitute the `\u{1}TAG\u{2}` markers left by `pg_format_to_chrono`
+    /// with the correctly-cased / computed values for `ndt`.
+    fn pg_format_post_substitute(input: String, ndt: chrono::NaiveDateTime) -> String {
+        use chrono::Datelike;
+        if !input.contains('\u{1}') {
+            return input;
+        }
+        let month_full = ndt.format("%B").to_string();
+        let month_abbr = ndt.format("%b").to_string();
+        let day_full   = ndt.format("%A").to_string();
+        let q = ((ndt.month() - 1) / 3 + 1).to_string();
+        let w = ((ndt.day() - 1) / 7 + 1).to_string();
+        let mut out = String::with_capacity(input.len());
+        let mut chars = input.chars().peekable();
+        while let Some(c) = chars.next() {
+            if c != '\u{1}' {
+                out.push(c);
+                continue;
+            }
+            // Read tag until \u{2}.
+            let mut tag = String::new();
+            for next in chars.by_ref() {
+                if next == '\u{2}' {
+                    break;
+                }
+                tag.push(next);
+            }
+            match tag.as_str() {
+                "MONTH" => out.push_str(&month_full.to_uppercase()),
+                "Month" => out.push_str(&month_full),
+                "month" => out.push_str(&month_full.to_lowercase()),
+                "MON"   => out.push_str(&month_abbr.to_uppercase()),
+                "Mon"   => out.push_str(&month_abbr),
+                "mon"   => out.push_str(&month_abbr.to_lowercase()),
+                "DAY"   => out.push_str(&day_full.to_uppercase()),
+                "Day"   => out.push_str(&day_full),
+                "day"   => out.push_str(&day_full.to_lowercase()),
+                "Q"     => out.push_str(&q),
+                "W"     => out.push_str(&w),
+                other   => { out.push('\u{1}'); out.push_str(other); out.push('\u{2}'); }
+            }
+        }
+        out
+    }
+
+    /// `TO_CHAR(value, format)` — Postgres-style date/number formatting.
+    /// Date/timestamp values use `pg_format_to_chrono` + post-substitution
+    /// to render case-significant tokens (Mon vs MON vs mon, etc.).
+    /// Numeric `TO_CHAR(123.45, '9,999.00')` formatting is not implemented
+    /// yet — token-dashboard and similar callers don't need it.
+    fn func_to_char(&self, args: &[Value]) -> Result<Value> {
+        let [val, fmt] = args else {
+            return Err(Error::query_execution("TO_CHAR requires exactly 2 arguments"));
+        };
+        if matches!(val, Value::Null) || matches!(fmt, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let format_str = match fmt {
+            Value::String(s) => s.clone(),
+            other => return Err(Error::query_execution(format!(
+                "TO_CHAR format must be a string, got {:?}", other
+            ))),
+        };
+        match val {
+            Value::Date(_) | Value::Timestamp(_) | Value::String(_) => {
+                let ndt = Self::value_to_naive_datetime(val)?;
+                let chrono_fmt = Self::pg_format_to_chrono(&format_str);
+                let formatted = ndt.format(&chrono_fmt).to_string();
+                Ok(Value::String(Self::pg_format_post_substitute(formatted, ndt)))
+            }
+            other => Err(Error::query_execution(format!(
+                "TO_CHAR({:?}) is not yet supported (date/timestamp only)", other
+            ))),
+        }
+    }
+
+    /// `TO_DATE(text, format)` — parse text into a Date using a Postgres
+    /// template translated to chrono.
+    fn func_to_date(&self, args: &[Value]) -> Result<Value> {
+        let [text, fmt] = args else {
+            return Err(Error::query_execution("TO_DATE requires exactly 2 arguments"));
+        };
+        if matches!(text, Value::Null) || matches!(fmt, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let s = match text {
+            Value::String(s) => s.clone(),
+            other => return Err(Error::query_execution(format!(
+                "TO_DATE input must be a string, got {:?}", other
+            ))),
+        };
+        let f = match fmt {
+            Value::String(s) => s.clone(),
+            _ => unreachable!(),
+        };
+        let chrono_fmt = Self::pg_format_to_chrono(&f);
+        let parsed = chrono::NaiveDate::parse_from_str(&s, &chrono_fmt)
+            .map_err(|e| Error::query_execution(format!(
+                "TO_DATE('{}','{}') failed: {}", s, f, e
+            )))?;
+        Ok(Value::Date(parsed))
+    }
+
+    /// `TO_TIMESTAMP(text, format)` — parse text into a Timestamp.
+    /// Single-arg form `TO_TIMESTAMP(epoch_seconds)` converts a numeric
+    /// unix epoch (matches Postgres / MySQL `from_unixtime`).
+    fn func_to_timestamp(&self, args: &[Value]) -> Result<Value> {
+        match args.len() {
+            1 => {
+                let arg = args.first()
+                    .ok_or_else(|| Error::query_execution("TO_TIMESTAMP requires an argument"))?;
+                if matches!(arg, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let secs: f64 = match arg {
+                    Value::Int4(n) => *n as f64,
+                    Value::Int8(n) => *n as f64,
+                    Value::Float4(f) => *f as f64,
+                    Value::Float8(f) => *f,
+                    other => return Err(Error::query_execution(format!(
+                        "TO_TIMESTAMP({:?}) requires a numeric epoch", other
+                    ))),
+                };
+                let s = secs as i64;
+                let nanos = ((secs - s as f64) * 1e9) as u32;
+                let ts = chrono::DateTime::from_timestamp(s, nanos)
+                    .ok_or_else(|| Error::query_execution(format!(
+                        "TO_TIMESTAMP: invalid epoch {}", secs
+                    )))?;
+                Ok(Value::Timestamp(ts))
+            }
+            2 => {
+                let text = args.first().expect("len 2");
+                let fmt = args.get(1).expect("len 2");
+                if matches!(text, Value::Null) || matches!(fmt, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let s = match text {
+                    Value::String(s) => s.clone(),
+                    other => return Err(Error::query_execution(format!(
+                        "TO_TIMESTAMP input must be a string, got {:?}", other
+                    ))),
+                };
+                let f = match fmt {
+                    Value::String(s) => s.clone(),
+                    _ => unreachable!(),
+                };
+                let chrono_fmt = Self::pg_format_to_chrono(&f);
+                let parsed = chrono::NaiveDateTime::parse_from_str(&s, &chrono_fmt)
+                    .map_err(|e| Error::query_execution(format!(
+                        "TO_TIMESTAMP('{}','{}') failed: {}", s, f, e
+                    )))?;
+                Ok(Value::Timestamp(parsed.and_utc()))
+            }
+            _ => Err(Error::query_execution("TO_TIMESTAMP requires 1 or 2 arguments")),
+        }
+    }
+
+    /// `DATE_TRUNC(field, value)` — round a timestamp/date down to the
+    /// boundary of the specified field. PostgreSQL standard: returns a
+    /// Timestamp (or Date if input was Date).
+    fn func_date_trunc(&self, args: &[Value]) -> Result<Value> {
+        use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+        let [field_arg, val_arg] = args else {
+            return Err(Error::query_execution("DATE_TRUNC requires exactly 2 arguments"));
+        };
+        if matches!(val_arg, Value::Null) || matches!(field_arg, Value::Null) {
+            return Ok(Value::Null);
+        }
+        let field = match field_arg {
+            Value::String(s) => s.to_lowercase(),
+            other => return Err(Error::query_execution(format!(
+                "DATE_TRUNC field must be a string, got {:?}", other
+            ))),
+        };
+        let was_date = matches!(val_arg, Value::Date(_));
+        let ndt = Self::value_to_naive_datetime(val_arg)?;
+        let truncated: NaiveDateTime = match field.as_str() {
+            "microseconds" => ndt,
+            "milliseconds" => {
+                let ns = ndt.nanosecond();
+                let trimmed = (ns / 1_000_000) * 1_000_000;
+                ndt.with_nanosecond(trimmed).unwrap_or(ndt)
+            }
+            "second" | "seconds" => ndt.with_nanosecond(0).unwrap_or(ndt),
+            "minute" | "minutes" => ndt
+                .with_second(0).unwrap_or(ndt)
+                .with_nanosecond(0).unwrap_or(ndt),
+            "hour" | "hours" => ndt
+                .with_minute(0).unwrap_or(ndt)
+                .with_second(0).unwrap_or(ndt)
+                .with_nanosecond(0).unwrap_or(ndt),
+            "day" | "days" => ndt.date()
+                .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default()),
+            "week" | "weeks" => {
+                // ISO week: truncate to Monday.
+                let date = ndt.date();
+                let weekday = date.weekday().num_days_from_monday();
+                let monday = date - chrono::Duration::days(weekday as i64);
+                monday.and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default())
+            }
+            "month" | "months" => NaiveDate::from_ymd_opt(ndt.year(), ndt.month(), 1)
+                .ok_or_else(|| Error::query_execution("DATE_TRUNC(month): invalid date"))?
+                .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default()),
+            "quarter" | "quarters" => {
+                let q_start_month = ((ndt.month() - 1) / 3) * 3 + 1;
+                NaiveDate::from_ymd_opt(ndt.year(), q_start_month, 1)
+                    .ok_or_else(|| Error::query_execution("DATE_TRUNC(quarter): invalid date"))?
+                    .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default())
+            }
+            "year" | "years" => NaiveDate::from_ymd_opt(ndt.year(), 1, 1)
+                .ok_or_else(|| Error::query_execution("DATE_TRUNC(year): invalid date"))?
+                .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default()),
+            "decade" | "decades" => NaiveDate::from_ymd_opt(ndt.year() / 10 * 10, 1, 1)
+                .ok_or_else(|| Error::query_execution("DATE_TRUNC(decade): invalid date"))?
+                .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default()),
+            "century" | "centuries" => {
+                let century_year = ((ndt.year() - 1) / 100) * 100 + 1;
+                NaiveDate::from_ymd_opt(century_year, 1, 1)
+                    .ok_or_else(|| Error::query_execution("DATE_TRUNC(century): invalid date"))?
+                    .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default())
+            }
+            "millennium" | "millennia" => {
+                let millennium_year = ((ndt.year() - 1) / 1000) * 1000 + 1;
+                NaiveDate::from_ymd_opt(millennium_year, 1, 1)
+                    .ok_or_else(|| Error::query_execution("DATE_TRUNC(millennium): invalid date"))?
+                    .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default())
+            }
+            other => return Err(Error::query_execution(format!(
+                "DATE_TRUNC: unsupported field '{}'", other
+            ))),
+        };
+        if was_date {
+            Ok(Value::Date(truncated.date()))
+        } else {
+            Ok(Value::Timestamp(truncated.and_utc()))
+        }
+    }
+
+    /// `MAKE_DATE(year, month, day)` — construct a Date from integer
+    /// components. Returns an error for invalid combinations (matches
+    /// PostgreSQL).
+    fn func_make_date(&self, args: &[Value]) -> Result<Value> {
+        let [y, m, d] = args else {
+            return Err(Error::query_execution("MAKE_DATE requires exactly 3 arguments"));
+        };
+        let to_i32 = |v: &Value, name: &str| -> Result<i32> {
+            match v {
+                Value::Int2(n) => Ok(*n as i32),
+                Value::Int4(n) => Ok(*n),
+                Value::Int8(n) => Ok(*n as i32),
+                Value::Null => Err(Error::query_execution(format!(
+                    "MAKE_DATE: NULL not allowed for {}", name
+                ))),
+                other => Err(Error::query_execution(format!(
+                    "MAKE_DATE: {} must be integer, got {:?}", name, other
+                ))),
+            }
+        };
+        let year = to_i32(y, "year")?;
+        let month = to_i32(m, "month")? as u32;
+        let day = to_i32(d, "day")? as u32;
+        let date = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .ok_or_else(|| Error::query_execution(format!(
+                "MAKE_DATE: invalid date ({}, {}, {})", year, month, day
+            )))?;
+        Ok(Value::Date(date))
+    }
+
+    /// `MAKE_TIMESTAMP(year, month, day, hour, minute, sec)` — construct a
+    /// timestamp from integer components plus a numeric seconds value
+    /// (sec may be a float for sub-second precision). Returns Timestamp.
+    fn func_make_timestamp(&self, args: &[Value]) -> Result<Value> {
+        let [y, mo, d, h, mi, s] = args else {
+            return Err(Error::query_execution(
+                "MAKE_TIMESTAMP requires exactly 6 arguments (year, month, day, hour, min, sec)"
+            ));
+        };
+        let to_i32 = |v: &Value, name: &str| -> Result<i32> {
+            match v {
+                Value::Int2(n) => Ok(*n as i32),
+                Value::Int4(n) => Ok(*n),
+                Value::Int8(n) => Ok(*n as i32),
+                Value::Null => Err(Error::query_execution(format!(
+                    "MAKE_TIMESTAMP: NULL not allowed for {}", name
+                ))),
+                other => Err(Error::query_execution(format!(
+                    "MAKE_TIMESTAMP: {} must be integer, got {:?}", name, other
+                ))),
+            }
+        };
+        let year = to_i32(y, "year")?;
+        let month = to_i32(mo, "month")? as u32;
+        let day = to_i32(d, "day")? as u32;
+        let hour = to_i32(h, "hour")? as u32;
+        let minute = to_i32(mi, "minute")? as u32;
+        let secs: f64 = match s {
+            Value::Int2(n) => *n as f64,
+            Value::Int4(n) => *n as f64,
+            Value::Int8(n) => *n as f64,
+            Value::Float4(f) => *f as f64,
+            Value::Float8(f) => *f,
+            Value::Null => return Err(Error::query_execution("MAKE_TIMESTAMP: NULL second")),
+            other => return Err(Error::query_execution(format!(
+                "MAKE_TIMESTAMP: sec must be numeric, got {:?}", other
+            ))),
+        };
+        let whole = secs.trunc() as u32;
+        let nanos = ((secs - secs.trunc()) * 1e9) as u32;
+        let date = chrono::NaiveDate::from_ymd_opt(year, month, day)
+            .ok_or_else(|| Error::query_execution(format!(
+                "MAKE_TIMESTAMP: invalid date ({}, {}, {})", year, month, day
+            )))?;
+        let time = chrono::NaiveTime::from_hms_nano_opt(hour, minute, whole, nanos)
+            .ok_or_else(|| Error::query_execution(format!(
+                "MAKE_TIMESTAMP: invalid time ({}:{}:{})", hour, minute, secs
+            )))?;
+        Ok(Value::Timestamp(date.and_time(time).and_utc()))
+    }
+
+    /// `AGE(timestamp1, timestamp2)` — interval between two timestamps
+    /// (`t1 - t2`). Single-argument form uses the current timestamp as
+    /// `t1`. Result is a microsecond-precision `Interval`.
+    fn func_age(&self, args: &[Value]) -> Result<Value> {
+        let (a, b) = match args.len() {
+            1 => {
+                let arg = args.first().expect("len 1");
+                if matches!(arg, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                (Value::Timestamp(chrono::Utc::now()), arg.clone())
+            }
+            2 => {
+                let lhs = args.first().expect("len 2");
+                let rhs = args.get(1).expect("len 2");
+                if matches!(lhs, Value::Null) || matches!(rhs, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                (lhs.clone(), rhs.clone())
+            }
+            _ => return Err(Error::query_execution("AGE requires 1 or 2 arguments")),
+        };
+        let lhs_ndt = Self::value_to_naive_datetime(&a)?;
+        let rhs_ndt = Self::value_to_naive_datetime(&b)?;
+        let delta = lhs_ndt.and_utc().timestamp_micros() - rhs_ndt.and_utc().timestamp_micros();
+        Ok(Value::Interval(delta))
     }
 
     /// DATE(timestamp) — extract the date part from a timestamp.

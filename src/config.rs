@@ -35,7 +35,7 @@
 //! # Example: Programmatic Configuration
 //!
 //! ```rust
-//! use heliosdb_lite::Config;
+//! use heliosdb_nano::Config;
 //!
 //! // In-memory database
 //! let config = Config::in_memory();
@@ -55,7 +55,7 @@ use std::path::PathBuf;
 /// # Loading Configuration
 ///
 /// ```rust,no_run
-/// use heliosdb_lite::Config;
+/// use heliosdb_nano::Config;
 ///
 /// // Default configuration with file-based storage
 /// let config = Config::default();

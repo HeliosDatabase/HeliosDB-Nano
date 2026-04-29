@@ -69,7 +69,7 @@ impl ApiServer {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::{EmbeddedDatabase, api::ApiServer};
+    /// use heliosdb_nano::{EmbeddedDatabase, api::ApiServer};
     /// use std::sync::Arc;
     ///
     /// # #[tokio::main]
@@ -119,7 +119,7 @@ impl ApiServer {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::{EmbeddedDatabase, api::{ApiServer, AuthMiddleware}};
+    /// use heliosdb_nano::{EmbeddedDatabase, api::{ApiServer, AuthMiddleware}};
     /// use std::sync::Arc;
     ///
     /// # #[tokio::main]
@@ -146,7 +146,7 @@ impl ApiServer {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::{EmbeddedDatabase, api::{ApiServer, RateLimitMiddleware, RateLimitConfig}};
+    /// use heliosdb_nano::{EmbeddedDatabase, api::{ApiServer, RateLimitMiddleware, RateLimitConfig}};
     /// use std::sync::Arc;
     ///
     /// # #[tokio::main]
@@ -307,7 +307,7 @@ impl ApiServer {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::{EmbeddedDatabase, api::ApiServer};
+    /// use heliosdb_nano::{EmbeddedDatabase, api::ApiServer};
     /// use std::sync::Arc;
     ///
     /// # #[tokio::main]
@@ -349,7 +349,7 @@ impl ApiServer {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::{EmbeddedDatabase, api::ApiServer};
+    /// use heliosdb_nano::{EmbeddedDatabase, api::ApiServer};
     /// use std::sync::Arc;
     ///
     /// # #[tokio::main]

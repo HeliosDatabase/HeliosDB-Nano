@@ -23,7 +23,7 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use heliosdb_lite::sync::protocol::{SyncProtocol, SyncMessage};
+//! use heliosdb_nano::sync::protocol::{SyncProtocol, SyncMessage};
 //!
 //! let protocol = SyncProtocol::new(change_log, conflict_detector);
 //!

@@ -5,7 +5,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use heliosdb_lite::{EmbeddedDatabase, network::PgServer};
+//! use heliosdb_nano::{EmbeddedDatabase, network::PgServer};
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {

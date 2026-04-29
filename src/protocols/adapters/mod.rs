@@ -17,14 +17,14 @@
 //! # Usage
 //!
 //! ```rust,no_run
-//! use heliosdb_lite::protocols::adapters::{
+//! use heliosdb_nano::protocols::adapters::{
 //!     LiteStorageAdapter,
 //!     LiteQueryExecutorAdapter,
 //!     PubSubManager,
 //!     ConnectionPool,
 //!     PoolConfig,
 //! };
-//! use heliosdb_lite::{StorageEngine, Config, Result};
+//! use heliosdb_nano::{StorageEngine, Config, Result};
 //! use std::sync::Arc;
 //!
 //! # fn main() -> Result<()> {

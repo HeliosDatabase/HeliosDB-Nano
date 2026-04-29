@@ -34,7 +34,7 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use heliosdb_lite::crypto::{ZeroKnowledgeSession, ZkeKeyDerivation};
+//! use heliosdb_nano::crypto::{ZeroKnowledgeSession, ZkeKeyDerivation};
 //!
 //! // Client-side: Derive separate keys for auth and encryption
 //! let keys = ZkeKeyDerivation::derive_keys("password", "user@example.com")?;
@@ -48,7 +48,7 @@
 //! // Server validates and processes, returns encrypted_response...
 //! // Client decrypts response
 //! let decrypted = session.decrypt(&encrypted)?;
-//! # Ok::<(), heliosdb_lite::Error>(())
+//! # Ok::<(), heliosdb_nano::Error>(())
 //! ```
 
 use crate::crypto::{derive_key_from_password, encrypt, decrypt, EncryptionKey};
@@ -154,12 +154,12 @@ impl ZkeKeyDerivation {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::crypto::ZkeKeyDerivation;
+    /// use heliosdb_nano::crypto::ZkeKeyDerivation;
     ///
     /// let keys = ZkeKeyDerivation::derive_keys("my_password", "user@example.com")?;
     /// // keys.auth_key - for authentication
     /// // keys.encryption_key - for encryption (never send to server!)
-    /// # Ok::<(), heliosdb_lite::Error>(())
+    /// # Ok::<(), heliosdb_nano::Error>(())
     /// ```
     pub fn derive_keys(password: &str, identifier: &str) -> Result<ZkeDerivedKeys> {
         // Create deterministic salt from identifier

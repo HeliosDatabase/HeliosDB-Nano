@@ -325,8 +325,9 @@ impl ReplShell {
         }
 
         // Try to determine if this is a query (SELECT) or a command (INSERT, UPDATE, etc.)
-        // Also treat UPDATE/DELETE/INSERT with RETURNING as queries
-        // EXPLAIN also returns results, so treat it as a query
+        // Also treat UPDATE/DELETE/INSERT with RETURNING as queries.
+        // EXPLAIN also returns results, so treat it as a query.
+        // PRAGMA table_info(...) returns rows; route it through the query path.
         let sql_upper = sql.trim().to_uppercase();
         let has_returning = sql_upper.contains(" RETURNING ");
         let is_query = sql_upper.starts_with("SELECT")
@@ -334,9 +335,42 @@ impl ReplShell {
             || sql_upper.starts_with("TABLE")
             || sql_upper.starts_with("VALUES")
             || sql_upper.starts_with("EXPLAIN")
+            || sql_upper.starts_with("PRAGMA")
             || has_returning;
 
         if is_query {
+            // PRAGMA short-circuit: sqlparser doesn't recognise PRAGMA, so
+            // we synthesise a fixed schema for `table_info(t)` and an empty
+            // result schema for connection-tunable PRAGMAs (foreign_keys,
+            // journal_mode, …) — everything still goes through `db.query`.
+            if sql_upper.starts_with("PRAGMA") {
+                if let Some((name, _arg)) = crate::sql::sqlite_compat::parse_pragma(sql) {
+                    let schema = if name.eq_ignore_ascii_case("table_info") {
+                        crate::Schema::new(vec![
+                            crate::Column::new("cid", crate::DataType::Int4),
+                            crate::Column::new("name", crate::DataType::Text),
+                            crate::Column::new("type", crate::DataType::Text),
+                            crate::Column::new("notnull", crate::DataType::Int4),
+                            crate::Column::new("dflt_value", crate::DataType::Text),
+                            crate::Column::new("pk", crate::DataType::Int4),
+                        ])
+                    } else {
+                        crate::Schema::new(vec![])
+                    };
+                    match self.db.query(sql, &[]) {
+                        Ok(results) => {
+                            let duration = start.elapsed();
+                            println!("\n{}", formatter::format_results(&results, &schema));
+                            if self.show_timing {
+                                println!("{}", formatter::format_timing(duration.as_secs_f64()));
+                            }
+                        }
+                        Err(e) => eprintln!("{}", formatter::format_error(&e.to_string())),
+                    }
+                    return;
+                }
+            }
+
             // Execute query
             match self.db.query(sql, &[]) {
                 Ok(results) => {

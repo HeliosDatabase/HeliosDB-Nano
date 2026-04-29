@@ -1248,12 +1248,19 @@ impl EmbeddedDatabase {
                                         ))?
                                     };
 
-                                    // Read existing row from storage
+                                    // Read existing row through the transaction so that rows
+                                    // inserted earlier in the SAME transaction (still in the
+                                    // write set, not yet flushed to storage) are visible.
+                                    // Falls back to direct storage read for rows committed
+                                    // before this transaction started.
                                     let existing_key = self.storage.branch_aware_data_key(table_name, existing_row_id);
-                                    let existing_raw = self.storage.get(&existing_key)?
-                                        .ok_or_else(|| Error::query_execution(
-                                            "ON CONFLICT DO UPDATE: existing row not found in storage"
-                                        ))?;
+                                    let existing_raw = match txn.get(&existing_key)? {
+                                        Some(raw) => raw,
+                                        None => self.storage.get(&existing_key)?
+                                            .ok_or_else(|| Error::query_execution(
+                                                "ON CONFLICT DO UPDATE: existing row not found in storage"
+                                            ))?,
+                                    };
                                     let mut existing_tuple: Tuple = bincode::deserialize(&existing_raw)
                                         .map_err(|err| Error::storage(format!("Failed to deserialize tuple: {}", err)))?;
                                     existing_tuple.row_id = Some(existing_row_id);
@@ -2747,6 +2754,17 @@ impl EmbeddedDatabase {
         let lock_manager = std::sync::Arc::new(storage::LockManager::with_default_timeout());
         let dirty_tracker = std::sync::Arc::new(storage::DirtyTracker::new());
 
+        // Re-register and re-populate ART indexes from on-disk state. Without
+        // this a fresh process attaching to an existing data dir would have
+        // empty indexes, so PK / UNIQUE constraint checks would silently fall
+        // back to scans and ON CONFLICT couldn't find rows committed by a
+        // prior process. v3.21 interim — persistent index pages tracked for
+        // v3.22+.
+        let catalog = storage::Catalog::new(&storage);
+        if let Err(e) = catalog.rebuild_all_indexes() {
+            tracing::warn!("ART rebuild on open failed: {} — falling back to scan paths", e);
+        }
+
         Ok(Self {
             storage,
             config,
@@ -2843,7 +2861,8 @@ impl EmbeddedDatabase {
     /// ```
     #[allow(clippy::expect_used)] // Safety: cache sizes are non-zero compile-time constants
     pub fn with_config(config: Config) -> Result<Self> {
-        let storage = std::sync::Arc::new(if config.storage.memory_only {
+        let memory_only = config.storage.memory_only;
+        let storage = std::sync::Arc::new(if memory_only {
             storage::StorageEngine::open_in_memory(&config)?
         } else {
             let path = config.storage.path.as_ref()
@@ -2869,6 +2888,16 @@ impl EmbeddedDatabase {
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
         let lock_manager = std::sync::Arc::new(storage::LockManager::with_default_timeout());
         let dirty_tracker = std::sync::Arc::new(storage::DirtyTracker::new());
+
+        // For persistent storage, replay existing rows through the ART so a
+        // fresh process attaching to an existing data dir has consistent
+        // PK/UNIQUE/FK indexes. In-memory mode never has prior state.
+        if !memory_only {
+            let catalog = storage::Catalog::new(&storage);
+            if let Err(e) = catalog.rebuild_all_indexes() {
+                tracing::warn!("ART rebuild on open failed: {} — falling back to scan paths", e);
+            }
+        }
 
         Ok(Self {
             storage,
@@ -2919,7 +2948,7 @@ impl EmbeddedDatabase {
     /// Safe for hardcoded SQL strings. For queries with user input, use `execute_params()`:
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::{EmbeddedDatabase, Value};
+    /// use heliosdb_nano::{EmbeddedDatabase, Value};
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new("./data")?;
@@ -3319,6 +3348,8 @@ impl EmbeddedDatabase {
             embed_endpoint: meta.embed_endpoint,
             embed_bearer: meta.embed_bearer,
             force_reparse: false,
+            parallelism: None,
+            chunk_size: None,
         };
         self.code_index(opts)?;
         Ok(0)
@@ -3390,6 +3421,8 @@ impl EmbeddedDatabase {
                 embed_endpoint: idx.embed_endpoint.clone(),
                 embed_bearer: idx.embed_bearer.clone(),
                 force_reparse: false,
+                parallelism: None,
+                chunk_size: None,
             };
             let _ = self.code_index(opts);
         }
@@ -3573,6 +3606,13 @@ impl EmbeddedDatabase {
     pub fn execute(&self, sql: &str) -> Result<u64> {
         use crate::error::LockResultExt;
 
+        // SQLite-compat: PRAGMA without a result-set (assignments / no-op
+        // tunables) — `execute()` callers don't expect rows back.
+        if let Some((_, _)) = crate::sql::sqlite_compat::parse_pragma(sql) {
+            tracing::debug!("PRAGMA stubbed via execute(): {}", sql.trim());
+            return Ok(0);
+        }
+
         // Code-graph: intercept `CREATE AST INDEX …`, `hdb_code.pause`,
         // `hdb_code.resume` before the regular parser sees them.
         #[cfg(feature = "code-graph")]
@@ -3722,6 +3762,46 @@ impl EmbeddedDatabase {
     fn invalidate_result_cache(&self) {
         if let Ok(mut cache) = self.result_cache.lock() {
             cache.clear();
+        }
+    }
+
+    /// Handle SQLite `PRAGMA` queries from the embedded path. Returns
+    /// SQLite-shaped rows for introspection PRAGMAs (`table_info(t)`)
+    /// and an empty result for connection-tuning PRAGMAs (`foreign_keys`,
+    /// `journal_mode`, `synchronous`, `busy_timeout`, …) so sqlite3-driven
+    /// apps boot cleanly.
+    fn handle_pragma_query(&self, name: &str, arg: Option<&str>) -> Result<Vec<Tuple>> {
+        match name.to_lowercase().as_str() {
+            "table_info" => {
+                let table = arg
+                    .unwrap_or("")
+                    .trim()
+                    .trim_matches(|c| c == '\'' || c == '"' || c == '`');
+                if table.is_empty() {
+                    return Ok(vec![]);
+                }
+                let catalog = self.storage.catalog();
+                let schema = catalog.get_table_schema(table)?;
+                let mut rows = Vec::with_capacity(schema.columns.len());
+                for (idx, col) in schema.columns.iter().enumerate() {
+                    rows.push(Tuple::new(vec![
+                        Value::Int4(idx as i32),
+                        Value::String(col.name.clone()),
+                        Value::String(format!("{:?}", col.data_type).to_uppercase()),
+                        Value::Int4(if col.nullable { 0 } else { 1 }),
+                        col.default_expr
+                            .as_ref()
+                            .map(|d| Value::String(d.clone()))
+                            .unwrap_or(Value::Null),
+                        Value::Int4(if col.primary_key { 1 } else { 0 }),
+                    ]));
+                }
+                Ok(rows)
+            }
+            _ => {
+                tracing::debug!("PRAGMA stubbed (no-op rows): {} = {:?}", name, arg);
+                Ok(vec![])
+            }
         }
     }
 
@@ -5448,7 +5528,7 @@ impl EmbeddedDatabase {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::{EmbeddedDatabase, Value};
+    /// use heliosdb_nano::{EmbeddedDatabase, Value};
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new("./data")?;
@@ -5522,7 +5602,7 @@ impl EmbeddedDatabase {
     /// # Example
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::{EmbeddedDatabase, Value};
+    /// use heliosdb_nano::{EmbeddedDatabase, Value};
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new("./data")?;
@@ -6222,6 +6302,13 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn query(&self, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
+        // SQLite-compat: PRAGMA short-circuit. `table_info(t)` returns
+        // SQLite-shaped rows; everything else returns an empty result so
+        // sqlite3-driven apps can issue PRAGMAs without parser errors.
+        if let Some((name, arg)) = crate::sql::sqlite_compat::parse_pragma(sql) {
+            return self.handle_pragma_query(&name, arg.as_deref());
+        }
+
         // Graph-RAG WITH CONTEXT clause: strip, run the inner query
         // as a seed, expand. Runs before the code-graph rewriter so
         // both features compose (the inner SELECT can still reference
@@ -6613,7 +6700,7 @@ impl EmbeddedDatabase {
     ///
     /// ```rust,no_run
     /// use heliosdb_nano::EmbeddedDatabase;
-    /// use heliosdb_lite::session::IsolationLevel;
+    /// use heliosdb_nano::session::IsolationLevel;
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new_in_memory()?;
@@ -6919,7 +7006,7 @@ impl EmbeddedDatabase {
     /// # Examples
     ///
     /// ```rust,no_run
-    /// use heliosdb_lite::{EmbeddedDatabase, Value};
+    /// use heliosdb_nano::{EmbeddedDatabase, Value};
     ///
     /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
     /// let db = EmbeddedDatabase::new("./data")?;
@@ -7122,6 +7209,121 @@ impl EmbeddedDatabase {
         self.current_transaction.lock()
             .map(|txn| txn.is_some())
             .unwrap_or(false)
+    }
+
+    /// Bulk-insert pre-built `Tuple` rows into a table, bypassing the
+    /// SQL parser/planner/executor. Writes go directly to RocksDB
+    /// (matching the convention of parameterised
+    /// `INSERT … RETURNING` via `execute_plan_with_params` →
+    /// `insert_tuple_versioned_with_schema`) so subsequent SQL
+    /// statements within the same outer transaction see the rows
+    /// without paying `merge_with_write_set` cost on a bloated DashMap.
+    ///
+    /// Engine-internal fast path for bulk-load callers (e.g. the
+    /// code-graph indexer's symbol/ref ingestion). Skips:
+    /// - SQL string allocation / sqlparser invocation / planning
+    /// - FK validation (caller is responsible for parent-child order)
+    /// - CHECK constraints
+    /// - BEFORE/AFTER triggers
+    /// - RLS enforcement
+    /// - Per-row WAL log entries (RocksDB's internal WAL handles
+    ///   crash recovery; we lose engine-WAL-level replication for
+    ///   these rows, which is acceptable for engine-owned tables)
+    ///
+    /// Still performs:
+    /// - PK auto-fill (NULL → row_id) for SERIAL/BIGSERIAL columns
+    /// - PK / UNIQUE constraint checks via ART
+    /// - ART index update
+    /// - Branch-aware key encoding
+    ///
+    /// **Transactional caveat**: rows committed via this path are
+    /// NOT rolled back if the active transaction aborts. Use only
+    /// for engine-owned tables (e.g. `_hdb_code_*`, `_hdb_graph_*`)
+    /// where the caller's failure recovery either TRUNCATEs and
+    /// rebuilds (code_index force_reparse) or otherwise tolerates
+    /// orphan rows. User-facing tables should keep going through
+    /// `execute()` so triggers / RLS / FKs / rollback are honoured.
+    ///
+    /// Returns the allocated `row_id`s in input order.
+    #[allow(dead_code)]
+    pub(crate) fn bulk_insert_tuples(
+        &self,
+        table_name: &str,
+        tuples: Vec<Tuple>,
+    ) -> Result<Vec<u64>> {
+        let catalog = self.storage.catalog();
+        let schema = catalog.get_table_schema(table_name)?;
+
+        let mut row_ids: Vec<u64> = Vec::with_capacity(tuples.len());
+        let mut art_updates: Vec<(u64, std::collections::HashMap<String, Value>)> =
+            Vec::with_capacity(tuples.len());
+
+        for mut tuple in tuples {
+            let row_id = catalog.next_row_id(table_name)?;
+
+            // Fill BIGSERIAL / SERIAL PK columns with the auto-allocated
+            // row_id when the caller left them NULL.
+            for (i, col) in schema.columns.iter().enumerate() {
+                if col.primary_key {
+                    if let Some(v) = tuple.values.get(i) {
+                        if matches!(v, Value::Null) && i < tuple.values.len() {
+                            #[allow(clippy::indexing_slicing)]
+                            match col.data_type {
+                                DataType::Int2 => { tuple.values[i] = Value::Int2(row_id as i16); }
+                                DataType::Int4 => { tuple.values[i] = Value::Int4(row_id as i32); }
+                                _ => { tuple.values[i] = Value::Int8(row_id as i64); }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Build column-value map once — reused for both ART check
+            // and on_insert.
+            let mut col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+            for (i, col) in schema.columns.iter().enumerate() {
+                if let Some(v) = tuple.values.get(i) {
+                    col_values.insert(col.name.clone(), v.clone());
+                }
+            }
+
+            // PK / UNIQUE check before committing the write.
+            if let Err(e) = self.storage.art_indexes()
+                .check_unique_constraints(table_name, &col_values)
+            {
+                return Err(Error::constraint_violation(e.to_string()));
+            }
+
+            // Direct RocksDB write — bypasses txn.write_set so
+            // subsequent SQL statements in the outer txn don't pay
+            // O(N) merge_with_write_set cost.
+            let val = bincode::serialize(&tuple)
+                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+            let key = self.storage.branch_aware_data_key(table_name, row_id);
+            self.storage.put(&key, &val)?;
+
+            art_updates.push((row_id, col_values));
+            row_ids.push(row_id);
+        }
+
+        for (row_id, col_values) in art_updates {
+            if let Err(e) = self.storage.art_indexes()
+                .on_insert(table_name, row_id, &col_values)
+            {
+                tracing::debug!("ART on_insert {}: {}", table_name, e);
+            }
+        }
+
+        // Bulk path bypasses the SQL execute pipeline, so the
+        // engine-managed result + plan caches don't see this DML.
+        // Subsequent SELECT/DELETE/UPDATE statements on this table
+        // would otherwise plan against stale state.
+        self.invalidate_result_cache();
+        if let Ok(mut cache) = self.plan_cache.lock() {
+            cache.clear();
+        }
+
+        Ok(row_ids)
     }
 
     /// Begin a transaction (DEPRECATED - use `begin()` instead)

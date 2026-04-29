@@ -16,8 +16,8 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use heliosdb_lite::audit::{AuditLogger, AuditConfig};
-//! use heliosdb_lite::storage::StorageEngine;
+//! use heliosdb_nano::audit::{AuditLogger, AuditConfig};
+//! use heliosdb_nano::storage::StorageEngine;
 //! use std::sync::Arc;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {

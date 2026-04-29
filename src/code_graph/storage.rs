@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use crate::{EmbeddedDatabase, Error, Result, Value};
+use crate::{EmbeddedDatabase, Error, Result, Tuple, Value};
 
 use super::embed::{Embedder, NoopEmbedder};
 use super::parse::{self, Language};
@@ -112,6 +112,21 @@ pub struct CodeIndexOptions {
     /// Re-extract even if the file row hash has not changed.
     /// Default `false` — set by incremental-reparse callers.
     pub force_reparse: bool,
+    /// Worker count for the parallel parse + extract phase. `None` =
+    /// auto (`min(num_cpus, 8)`); `Some(1)` forces serial execution
+    /// (used by the equivalence test). The phase runs on a *dedicated*
+    /// rayon `ThreadPool` so it never steals threads from the global
+    /// pool that handles live OLTP traffic in daemon mode.
+    pub parallelism: Option<usize>,
+    /// Bound the in-flight memory footprint of the parse phase by
+    /// processing the corpus in batches of `n` files: parse a chunk in
+    /// parallel, drain its writes serially, then move to the next
+    /// chunk. `None` (default) = single chunk = max parse throughput,
+    /// optimal for small/medium corpora where holding all parsed
+    /// trees + symbol buffers in RAM at once is fine. `Some(n)` caps
+    /// peak memory at `n × avg_parsed_file_bytes` instead of
+    /// `corpus_size × …`. Recommended for corpora ≥ 10 K files.
+    pub chunk_size: Option<usize>,
 }
 
 impl CodeIndexOptions {
@@ -122,7 +137,23 @@ impl CodeIndexOptions {
             embed_endpoint: None,
             embed_bearer: None,
             force_reparse: false,
+            parallelism: None,
+            chunk_size: None,
         }
+    }
+
+    /// Resolve the configured parallelism to a concrete worker count.
+    /// Respects `Some(n)` (clamped to `>= 1`) and otherwise picks
+    /// `min(num_cpus, 8)` so we don't fan out beyond the working set
+    /// the parse phase can keep hot in cache.
+    pub(crate) fn resolved_parallelism(&self) -> usize {
+        if let Some(n) = self.parallelism {
+            return n.max(1);
+        }
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        cores.min(8).max(1)
     }
 }
 
@@ -140,6 +171,21 @@ pub struct CodeIndexStats {
     pub refs_written: u64,
     pub embed_calls: u64,
     pub languages_seen: Vec<String>,
+    /// Wall-clock time spent in the parallel parse + extract phase,
+    /// in milliseconds. Excludes DB read/write time.
+    pub parse_elapsed_ms: u64,
+    /// Wall-clock time spent in the serial write phase (upserts +
+    /// symbol/ref inserts + cross-file resolve), in milliseconds.
+    pub write_elapsed_ms: u64,
+    /// Worker count used by the parse phase (resolved from
+    /// `CodeIndexOptions::parallelism`).
+    pub parse_workers: u32,
+    /// Number of parse → write batches the corpus was split into.
+    /// `1` = single chunk (default for all corpora < `chunk_size`,
+    /// or unbounded when `chunk_size = None`); `>1` only when the
+    /// caller opted into bounded-memory mode via
+    /// `CodeIndexOptions::chunk_size`.
+    pub chunks_processed: u32,
 }
 
 /// Tracks whether `CREATE EXTENSION hdb_code` has been executed in the
@@ -233,7 +279,7 @@ pub fn set_ast_index_paused(name: &str, paused: bool) -> bool {
 /// table.
 ///
 /// Inserts are batched via multi-row `VALUES` (up to
-/// [`INSERT_BATCH`] rows / call) and unchanged files are skipped by
+/// engine-bypass bulk-insert primitive) and unchanged files are skipped by
 /// comparing the row's SHA-256 against the stored hash. `force_reparse`
 /// bypasses the sha gate.
 pub fn code_index(db: &EmbeddedDatabase, opts: CodeIndexOptions) -> Result<CodeIndexStats> {
@@ -263,18 +309,61 @@ pub fn code_index_with_embedder(
     mark_extension_installed();
 
     let files = fetch_source_files(db, &opts.source_table)?;
-    let existing_sha = fetch_file_sha_map(db)?;
+    let mut existing_sha = fetch_file_sha_map(db)?;
     let mut stats = CodeIndexStats::default();
     let mut lang_set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut touched = false;
 
-    for file in &files {
+    // -------- Tier 1.3: TRUNCATE fast path for force_reparse --------
+    //
+    // `force_reparse` against a populated KB takes the per-file
+    // delete-then-insert path: DELETE refs, DELETE symbols, INSERT
+    // fresh — for *every* row. On large corpora that's tens of
+    // thousands of small DELETEs followed by tens of thousands of
+    // INSERTs, which triggers RocksDB compaction storm and balloons
+    // wall-clock by an order of magnitude (the pilot reported a
+    // 1 h 55 m kill on this path).
+    //
+    // When the caller opts into `force_reparse`, the *intent* is
+    // "rebuild everything from scratch." A single TRUNCATE per
+    // table is cheap (one delete-range per CF, no per-row work) and
+    // gets the in-flight write loop into the same shape it'd be on
+    // a cold KB — every INSERT is fresh, no DELETE-then-INSERT
+    // churn. Skipped when the tables are already empty (cold KB)
+    // and when force_reparse is false (incremental).
+    let truncated = opts.force_reparse && !existing_sha.is_empty();
+    if truncated {
+        // Order matters for FK semantics in case anyone added FKs
+        // later: refs → symbols → ast_nodes → files.
+        for tbl in [
+            "_hdb_code_symbol_refs",
+            "_hdb_code_symbols",
+            "_hdb_code_ast_nodes",
+            "_hdb_code_files",
+        ] {
+            // TRUNCATE returns zero rows-affected; we don't care
+            // about the count, only that it succeeded. If a table
+            // doesn't exist (legacy KB without ast_nodes), swallow
+            // the error and keep going.
+            let _ = db.execute(&format!("TRUNCATE {tbl}"));
+        }
+        existing_sha.clear();
+        tracing::debug!("force_reparse + populated KB: truncated _hdb_code_* tables");
+    }
+
+    // -------- Read / triage phase (serial) --------
+    //
+    // Walk the corpus once: classify every row into "skip" (no
+    // extractor), "unchanged" (sha matches, no force_reparse), or
+    // "to_parse" (needs work). Classification has no DB writes and
+    // no parser cost; doing it serially keeps the parallel phase's
+    // input set tight and lets us count files_seen / files_skipped /
+    // files_unchanged exactly the same way the serial implementation
+    // did. Languages_seen is also accumulated here so the stats
+    // remain identical even when no files reach the parse phase.
+    let mut to_parse: Vec<(SourceFile, String, ParseExtractPair)> = Vec::new();
+    for file in files.into_iter() {
         stats.files_seen += 1;
-        // Resolve a parser + extractor pair: prefer the static
-        // dispatch, fall back to the dynamic registry for runtime
-        // grammars + extractors.
-        let resolution = resolve_parser_and_extractor(&file.lang);
-        let resolution = match resolution {
+        let resolution = match resolve_parser_and_extractor(&file.lang) {
             Some(r) => r,
             None => {
                 stats.files_skipped += 1;
@@ -282,10 +371,6 @@ pub fn code_index_with_embedder(
             }
         };
         lang_set.insert(file.lang.to_ascii_lowercase());
-
-        // Content-hash gate: if the content hash matches the stored
-        // sha and the caller did not set `force_reparse`, skip this
-        // file entirely. Keeps warm re-indexes close to O(changed).
         let sha = sha256_hex(&file.content);
         let unchanged = existing_sha
             .get(&file.path)
@@ -295,25 +380,223 @@ pub fn code_index_with_embedder(
             stats.files_unchanged += 1;
             continue;
         }
-        touched = true;
+        to_parse.push((file, sha, resolution));
+    }
 
-        let tree = match &resolution {
-            ParseExtractPair::Static(lang) => parse::parse(*lang, &file.content)?,
-            ParseExtractPair::Dynamic { .. } => {
-                parse::parse_by_name(&file.lang, &file.content)?
+    let touched = !to_parse.is_empty();
+
+    // -------- Pipeline construction --------
+    //
+    // Parse + extract runs on a *dedicated* rayon ThreadPool sized
+    // by the caller's `parallelism` setting (default
+    // `min(num_cpus, 8)`). Pool is built fresh per call and dropped
+    // at the end so it never steals threads from the global pool
+    // that handles live OLTP traffic on daemon-mode servers.
+    //
+    // Optional chunking (`opts.chunk_size = Some(n)`) bounds peak
+    // memory by interleaving parse + drain — parse a chunk, write
+    // it, then move to the next chunk. Default `None` keeps the
+    // single-chunk all-in-one path that's fastest for small/medium
+    // corpora where memory isn't a concern.
+    let workers = opts.resolved_parallelism();
+    stats.parse_workers = workers as u32;
+
+    let chunks: Vec<Vec<(SourceFile, String, ParseExtractPair)>> = match opts.chunk_size {
+        None => {
+            if to_parse.is_empty() {
+                Vec::new()
+            } else {
+                vec![to_parse]
             }
-        };
-        let (symbols, refs) = match &resolution {
-            ParseExtractPair::Static(lang) => extract(*lang, &file.content, &tree),
-            ParseExtractPair::Dynamic { extractor } => {
-                extractor.extract(&file.content, &tree)
+        }
+        Some(n) => {
+            let n = n.max(1);
+            let mut out = Vec::with_capacity(to_parse.len().div_ceil(n));
+            let mut iter = to_parse.into_iter();
+            loop {
+                let chunk: Vec<_> = (&mut iter).take(n).collect();
+                if chunk.is_empty() {
+                    break;
+                }
+                out.push(chunk);
             }
+            out
+        }
+    };
+
+    let pool = if chunks.is_empty() {
+        None
+    } else {
+        Some(
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(workers)
+                .thread_name(|i| format!("hdb-code-index-{i}"))
+                .build()
+                .map_err(|e| Error::query_execution(format!(
+                    "failed to build code-index thread pool ({e})"
+                )))?,
+        )
+    };
+
+    // -------- Tier 1.1 prelude: detect outer-txn vs self-managed --------
+    //
+    // Per-chunk writes are wrapped in an explicit transaction so the
+    // engine pays one WAL fsync per chunk instead of per-statement —
+    // tens-of-thousands → tens. ACID-positive (each chunk lands
+    // atomically; with `chunk_size = None` the whole ingest is one
+    // atomic commit). If the caller already has an outer transaction
+    // open (rare — `code_index` is normally called outside one), we
+    // honour theirs and skip our own begin/commit so we don't
+    // accidentally commit the caller's pending work. The MCP plugin
+    // commits its file-upsert txn before calling code_index, so this
+    // path takes the self-managed branch.
+    let manage_txn = !db.in_transaction();
+
+    // Tier 1.3 correctness guard: `skip_delete_stale` (set when we
+    // truncated up front) tells `write_one_parsed` to skip the
+    // SELECT-existing-symbols / DELETE-prior-refs / DELETE-prior-symbols
+    // preamble — safe ONLY for the FIRST occurrence of a given path
+    // in this call. If `source_table` happens to hold duplicate
+    // `path` rows (e.g. a buggy upsert client), subsequent occurrences
+    // need the normal delete-stale loop or symbols/refs accumulate.
+    // We track which paths we've already drained per call.
+    let mut processed_paths: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
+    // -------- Per-chunk: parallel parse → transactional drain --------
+    for chunk in chunks {
+        let parse_started = std::time::Instant::now();
+        let parsed: Vec<Result<ParsedFile>> = if let Some(pool) = &pool {
+            use rayon::prelude::*;
+            pool.install(|| {
+                chunk
+                    .into_par_iter()
+                    .map(parse_extract_one)
+                    .collect::<Vec<_>>()
+            })
+        } else {
+            chunk.into_iter().map(parse_extract_one).collect::<Vec<_>>()
         };
+        stats.parse_elapsed_ms += parse_started.elapsed().as_millis() as u64;
+        stats.chunks_processed += 1;
 
-        // Upsert the file row, get back the file_id. This also writes
-        // the new sha256 so the next run can short-circuit.
-        let file_id = upsert_file(db, &opts.source_table, file, &sha)?;
+        // Serial write phase for this chunk, wrapped in a single
+        // transaction. The engine's catalog/ART/transaction state
+        // isn't Sync for multi-writer access today, and the FR
+        // explicitly keeps writes single-threaded. Walk results in
+        // input order so output is deterministic regardless of worker
+        // scheduling.
+        let write_started = std::time::Instant::now();
+        if manage_txn {
+            db.begin()?;
+        }
+        let chunk_result = drain_chunk(
+            db,
+            &opts,
+            embedder.as_ref(),
+            &mut stats,
+            parsed,
+            truncated,
+            &mut processed_paths,
+        );
+        if manage_txn {
+            match chunk_result {
+                Ok(()) => db.commit()?,
+                Err(e) => {
+                    let _ = db.rollback();
+                    return Err(e);
+                }
+            }
+        } else {
+            chunk_result?;
+        }
+        stats.write_elapsed_ms += write_started.elapsed().as_millis() as u64;
+    }
 
+    stats.languages_seen = lang_set.into_iter().collect();
+
+    // Cross-file resolution only pays off if the corpus actually
+    // changed this run. Wrapped in its own transaction so its
+    // batched UPDATE+SELECT chatter pays one fsync, not many.
+    // Counted into the write timer because it's a serial DB
+    // operation, not a parse one.
+    if touched {
+        let cross_started = std::time::Instant::now();
+        if manage_txn {
+            db.begin()?;
+        }
+        let cross_result = cross_file_resolve(db, &mut stats);
+        if manage_txn {
+            match cross_result {
+                Ok(()) => db.commit()?,
+                Err(e) => {
+                    let _ = db.rollback();
+                    return Err(e);
+                }
+            }
+        } else {
+            cross_result?;
+        }
+        stats.write_elapsed_ms += cross_started.elapsed().as_millis() as u64;
+    }
+
+    Ok(stats)
+}
+
+/// Drain one chunk's worth of parsed files into `_hdb_code_*`. Caller
+/// wraps this in a transaction so the chunk is atomic and pays a
+/// single fsync. Errors propagate so the caller can roll back.
+///
+/// `truncated_this_call` is the Tier 1.3 fast-path flag: when set, the
+/// first occurrence of each path in this call skips the delete-stale
+/// preamble (the tables were truncated upfront so there's nothing to
+/// delete). `processed_paths` carries state across chunks so the same
+/// path appearing twice in `source_table` (e.g. duplicate upserts)
+/// still gets the second occurrence's preamble run, preventing
+/// symbol/ref accumulation.
+fn drain_chunk(
+    db: &EmbeddedDatabase,
+    opts: &CodeIndexOptions,
+    embedder: &dyn Embedder,
+    stats: &mut CodeIndexStats,
+    parsed: Vec<Result<ParsedFile>>,
+    truncated_this_call: bool,
+    processed_paths: &mut std::collections::HashSet<String>,
+) -> Result<()> {
+    for parsed_result in parsed {
+        let parsed = parsed_result?;
+        let first_time = processed_paths.insert(parsed.file.path.clone());
+        let skip_delete_stale = truncated_this_call && first_time;
+        write_one_parsed(db, opts, embedder, stats, parsed, skip_delete_stale)?;
+    }
+    Ok(())
+}
+
+/// Drain one parsed file into the `_hdb_code_*` tables. Caller wraps
+/// in a transaction (Tier 1.1).
+///
+/// `skip_delete_stale` short-circuits the
+/// SELECT-existing-symbols / UPDATE-inbound-refs / DELETE-symbols /
+/// DELETE-refs preamble. Set when the indexer just truncated the
+/// `_hdb_code_*` tables (force_reparse fast path) — the SELECT would
+/// always return empty and the DELETEs would be no-ops, so skipping
+/// them saves O(files) wasted SQL parses + RocksDB round-trips on
+/// large corpora.
+fn write_one_parsed(
+    db: &EmbeddedDatabase,
+    opts: &CodeIndexOptions,
+    embedder: &dyn Embedder,
+    stats: &mut CodeIndexStats,
+    parsed: ParsedFile,
+    skip_delete_stale: bool,
+) -> Result<()> {
+    let ParsedFile { file, sha, symbols, resolved } = parsed;
+
+    // Upsert the file row, get back the file_id. This also writes
+    // the new sha256 so the next run can short-circuit.
+    let file_id = upsert_file(db, &opts.source_table, &file, &sha)?;
+
+    if !skip_delete_stale {
         // Null inbound cross-file refs pointing at this file's old
         // symbols — the cross-file resolver at the end of the run
         // rebinds them. Uses a literal IN list (SELECT-then-UPDATE)
@@ -348,56 +631,65 @@ pub fn code_index_with_embedder(
         db.execute(&format!(
             "DELETE FROM _hdb_code_symbols WHERE file_id = {file_id}"
         ))?;
-
-        let symbol_ids = insert_symbols(db, file_id, &symbols, embedder.as_ref(), &mut stats)?;
-        let mut resolved = resolve_in_file(&symbols, &refs);
-        // Local-type pass: bind `x.method` to `Type::method` when
-        // `let x: Type = …` is in scope, then let the imports +
-        // cross-file rebinders pick the resulting qualified name
-        // up.  Only fires for non-empty bodies.
-        let bodies: Vec<super::resolver::FunctionBody<'_>> = symbols
-            .iter()
-            .filter_map(|s| {
-                let lo = (s.byte_start as usize).min(file.content.len());
-                let hi = (s.byte_end as usize).min(file.content.len());
-                if hi <= lo {
-                    return None;
-                }
-                Some(super::resolver::FunctionBody {
-                    line_start: s.line_start,
-                    line_end: s.line_end,
-                    body_text: &file.content[lo..hi],
-                })
-            })
-            .collect();
-        super::resolver::rebind_via_local_types(&mut resolved, &bodies);
-        // Scope-chain pass: upgrade unresolved CALLS/REFERENCES to
-        // their imported qualified path when there's an unambiguous
-        // matching IMPORTS edge.
-        super::resolver::rebind_via_imports(&mut resolved);
-        let refs_written = insert_refs(db, file_id, &symbol_ids, &resolved)?;
-
-        stats.files_parsed += 1;
-        stats.symbols_written += symbols.len() as u64;
-        stats.refs_written += refs_written;
     }
 
-    stats.languages_seen = lang_set.into_iter().collect();
+    let symbol_ids = insert_symbols(db, file_id, &symbols, embedder, stats)?;
+    let refs_written = insert_refs(db, file_id, &symbol_ids, &resolved)?;
 
-    // Cross-file resolution only pays off if the corpus actually
-    // changed this run.
-    if touched {
-        cross_file_resolve(db, &mut stats)?;
-    }
-
-    Ok(stats)
+    stats.files_parsed += 1;
+    stats.symbols_written += symbols.len() as u64;
+    stats.refs_written += refs_written;
+    Ok(())
 }
 
-/// Max rows per multi-row `INSERT … VALUES (...), (...), …`. Each row
-/// binds ~10 parameters, so 100 rows = ~1000 parameters per call —
-/// well under any sane engine limit, while collapsing 77 K individual
-/// writes on Nano's own `src/` into under 800 batched calls.
-const INSERT_BATCH: usize = 100;
+/// Per-file output of the parallel parse + extract phase. Holds only
+/// owned data — no references back into the source corpus, so workers
+/// can hand it back to the main thread cheaply.
+struct ParsedFile {
+    file: SourceFile,
+    sha: String,
+    symbols: Vec<Symbol>,
+    resolved: Vec<super::resolver::ResolvedRef>,
+}
+
+/// Pure parse + extract + in-file resolve. Runs inside a rayon worker;
+/// touches no DB state. Errors propagate back to the main thread, which
+/// short-circuits the whole `code_index` call (matching the serial
+/// implementation's `?`-propagation behaviour).
+fn parse_extract_one(
+    item: (SourceFile, String, ParseExtractPair),
+) -> Result<ParsedFile> {
+    let (file, sha, resolution) = item;
+    let tree = match &resolution {
+        ParseExtractPair::Static(lang) => parse::parse(*lang, &file.content)?,
+        ParseExtractPair::Dynamic { .. } => {
+            parse::parse_by_name(&file.lang, &file.content)?
+        }
+    };
+    let (symbols, refs) = match &resolution {
+        ParseExtractPair::Static(lang) => extract(*lang, &file.content, &tree),
+        ParseExtractPair::Dynamic { extractor } => extractor.extract(&file.content, &tree),
+    };
+    let mut resolved = resolve_in_file(&symbols, &refs);
+    let bodies: Vec<super::resolver::FunctionBody<'_>> = symbols
+        .iter()
+        .filter_map(|s| {
+            let lo = (s.byte_start as usize).min(file.content.len());
+            let hi = (s.byte_end as usize).min(file.content.len());
+            if hi <= lo {
+                return None;
+            }
+            Some(super::resolver::FunctionBody {
+                line_start: s.line_start,
+                line_end: s.line_end,
+                body_text: &file.content[lo..hi],
+            })
+        })
+        .collect();
+    super::resolver::rebind_via_local_types(&mut resolved, &bodies);
+    super::resolver::rebind_via_imports(&mut resolved);
+    Ok(ParsedFile { file, sha, symbols, resolved })
+}
 
 fn sha256_hex(s: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -589,6 +881,26 @@ fn bootstrap_tables(db: &EmbeddedDatabase) -> Result<()> {
              resolution  TEXT
            )"#,
     )?;
+
+    // Tier 2 perf indexes (added v3.21.1+). Without these, the
+    // per-file delete-stale path (`DELETE FROM … WHERE file_id = X`)
+    // does a full table scan — a 35-second slow query for a 181-row
+    // delete on a ~115 K-row refs table was observed in the field.
+    // file_id-indexed deletes drop that to single-millisecond range
+    // and are also the load-bearing index for the cross-file
+    // resolver's UPDATE-by-file_id path. Idempotent.
+    let _ = db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_hdb_code_symbols_file_id ON _hdb_code_symbols(file_id)",
+    );
+    let _ = db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_hdb_code_symbol_refs_file_id ON _hdb_code_symbol_refs(file_id)",
+    );
+    let _ = db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_hdb_code_symbol_refs_to_symbol ON _hdb_code_symbol_refs(to_symbol)",
+    );
+    let _ = db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_hdb_code_symbol_refs_from_symbol ON _hdb_code_symbol_refs(from_symbol)",
+    );
     Ok(())
 }
 
@@ -698,10 +1010,12 @@ fn insert_symbols(
     embedder: &dyn Embedder,
     stats: &mut CodeIndexStats,
 ) -> Result<Vec<i64>> {
-    // Compute embeddings up-front so we can: (a) negotiate the
-    // VECTOR column dimension once, (b) include body_vec in the
-    // batched INSERT path. NoopEmbedder returns None for everything
-    // → vectors stays empty → no schema change.
+    if symbols.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Compute embeddings up-front. NoopEmbedder returns None for
+    // everything → vectors stays empty → no schema change.
     let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(symbols.len());
     for sym in symbols {
         let v = if !sym.signature.is_empty() {
@@ -717,10 +1031,6 @@ fn insert_symbols(
 
     let any_vec = vectors.iter().any(Option::is_some);
     if any_vec {
-        // Pick a dimension from the first non-null vector and stick
-        // with it. ensure_body_vec_column installs the column on
-        // the first non-null run; subsequent runs require dim
-        // match.
         let dim = vectors
             .iter()
             .find_map(|v| v.as_ref().map(|v| v.len()))
@@ -743,96 +1053,58 @@ fn insert_symbols(
         }
     }
 
-    let mut ids = Vec::with_capacity(symbols.len());
-    // Batch N rows per INSERT. Multi-row VALUES collapses
-    // parse+plan+WAL overhead; RETURNING gives us the ids back in
-    // insert order so we can bind refs afterward.  When any
-    // vector is present, we INSERT the body_vec column too;
-    // otherwise we keep the legacy 10-column shape so the
-    // embedder-less path stays unchanged.
-    let with_vec = any_vec;
-    let cols: usize = if with_vec { 11 } else { 10 };
-    for (chunk_start, chunk) in symbols
-        .chunks(INSERT_BATCH)
-        .enumerate()
-        .map(|(i, c)| (i * INSERT_BATCH, c))
-    {
-        let mut sql = String::with_capacity(cols * 8 * chunk.len() + 128);
-        if with_vec {
-            sql.push_str(
-                "INSERT INTO _hdb_code_symbols \
-                   (file_id, name, qualified, kind, signature, \
-                    visibility, line_start, line_end, byte_start, byte_end, \
-                    body_vec) \
-                 VALUES ",
-            );
-        } else {
-            sql.push_str(
-                "INSERT INTO _hdb_code_symbols \
-                   (file_id, name, qualified, kind, signature, \
-                    visibility, line_start, line_end, byte_start, byte_end) \
-                 VALUES ",
-            );
-        }
-        let mut params: Vec<Value> = Vec::with_capacity(cols * chunk.len());
-        for (row_idx, sym) in chunk.iter().enumerate() {
-            if row_idx > 0 {
-                sql.push(',');
-            }
-            sql.push('(');
-            for col in 0..cols {
-                if col > 0 {
-                    sql.push(',');
-                }
-                sql.push('$');
-                sql.push_str(&(row_idx * cols + col + 1).to_string());
-            }
-            sql.push(')');
-            params.push(Value::Int8(file_id));
-            params.push(Value::String(sym.name.clone()));
-            params.push(Value::String(sym.qualified.clone()));
-            params.push(Value::String(sym.kind.as_str().to_string()));
-            params.push(Value::String(sym.signature.clone()));
-            params.push(Value::String(sym.visibility.as_str().to_string()));
-            params.push(Value::Int4(sym.line_start as i32));
-            params.push(Value::Int4(sym.line_end as i32));
-            params.push(Value::Int4(sym.byte_start as i32));
-            params.push(Value::Int4(sym.byte_end as i32));
-            if with_vec {
-                let abs_idx = chunk_start + row_idx;
-                let v = vectors
-                    .get(abs_idx)
-                    .and_then(|v| v.clone())
-                    .map(Value::Vector)
-                    .unwrap_or(Value::Null);
-                params.push(v);
-            }
-        }
-        sql.push_str(" RETURNING node_id");
-        let (_, rows) = db.execute_params_returning(&sql, &params)?;
-        if rows.len() != chunk.len() {
-            return Err(Error::query_execution(format!(
-                "batched INSERT returned {} rows, expected {}",
-                rows.len(),
-                chunk.len()
-            )));
-        }
-        for row in &rows {
-            let id = row
-                .values
-                .first()
-                .and_then(|v| match v {
-                    Value::Int4(n) => Some(*n as i64),
-                    Value::Int8(n) => Some(*n),
-                    _ => None,
-                })
-                .ok_or_else(|| {
-                    Error::query_execution("symbol RETURNING yielded no id")
-                })?;
-            ids.push(id);
-        }
+    // Tier 2.4 fast path: build Tuple rows in column order and
+    // bulk-insert via the engine's bypass-SQL primitive. The bulk
+    // primitive writes directly to RocksDB (matching
+    // `execute_plan_with_params`'s convention for `INSERT … RETURNING`)
+    // so subsequent SQL DELETEs in the same outer txn don't pay the
+    // O(N) `merge_with_write_set` cost that killed the v1 attempt.
+    let schema = db.storage.catalog().get_table_schema("_hdb_code_symbols")?;
+    let n_cols = schema.columns.len();
+    let expected_min_cols = if any_vec { 13 } else { 12 };
+    if n_cols < expected_min_cols {
+        return Err(Error::query_execution(format!(
+            "_hdb_code_symbols schema has {} cols, fast path expects ≥ {}",
+            n_cols, expected_min_cols
+        )));
     }
-    Ok(ids)
+
+    let mut tuples: Vec<Tuple> = Vec::with_capacity(symbols.len());
+    for (idx, sym) in symbols.iter().enumerate() {
+        let mut values: Vec<Value> = Vec::with_capacity(n_cols);
+        // Column order matches the CREATE TABLE in bootstrap_tables:
+        //   node_id, file_id, name, qualified, kind, signature,
+        //   visibility, line_start, line_end, byte_start, byte_end,
+        //   parent_id, [body_vec]
+        values.push(Value::Null); // node_id — auto-fill via bulk_insert_tuples
+        values.push(Value::Int8(file_id));
+        values.push(Value::String(sym.name.clone()));
+        values.push(Value::String(sym.qualified.clone()));
+        values.push(Value::String(sym.kind.as_str().to_string()));
+        values.push(Value::String(sym.signature.clone()));
+        values.push(Value::String(sym.visibility.as_str().to_string()));
+        values.push(Value::Int4(sym.line_start as i32));
+        values.push(Value::Int4(sym.line_end as i32));
+        values.push(Value::Int4(sym.byte_start as i32));
+        values.push(Value::Int4(sym.byte_end as i32));
+        values.push(Value::Null); // parent_id — phase-1 leaves this null
+        if any_vec && n_cols >= 13 {
+            let v = vectors
+                .get(idx)
+                .and_then(|v| v.clone())
+                .map(Value::Vector)
+                .unwrap_or(Value::Null);
+            values.push(v);
+        }
+        // Pad with Value::Null if the schema has more columns than
+        // we know about (forward-compat).
+        while values.len() < n_cols {
+            values.push(Value::Null);
+        }
+        tuples.push(Tuple::new(values));
+    }
+    let row_ids = db.bulk_insert_tuples("_hdb_code_symbols", tuples)?;
+    Ok(row_ids.into_iter().map(|id| id as i64).collect())
 }
 
 fn insert_refs(
@@ -844,58 +1116,56 @@ fn insert_refs(
     if resolved.is_empty() {
         return Ok(0);
     }
-    const COLS: usize = 7;
-    let mut written = 0u64;
-    for chunk in resolved.chunks(INSERT_BATCH) {
-        let mut sql = String::with_capacity(COLS * 8 * chunk.len() + 128);
-        sql.push_str(
-            "INSERT INTO _hdb_code_symbol_refs \
-               (file_id, from_symbol, to_symbol, to_name, kind, line, resolution) \
-             VALUES ",
-        );
-        let mut params: Vec<Value> = Vec::with_capacity(COLS * chunk.len());
-        for (row_idx, r) in chunk.iter().enumerate() {
-            let from_id = symbol_ids.get(r.from_idx).copied().ok_or_else(|| {
-                Error::query_execution(format!(
-                    "resolver produced invalid from_idx {}",
-                    r.from_idx
-                ))
-            })?;
-            let to_val = match r.to_idx {
-                Some(idx) => symbol_ids
-                    .get(idx)
-                    .map(|id| Value::Int8(*id))
-                    .unwrap_or(Value::Null),
-                None => Value::Null,
-            };
-            let res = match r.resolution {
-                Resolution::Exact => "exact",
-                Resolution::Heuristic => "heuristic",
-                Resolution::Unresolved => "unresolved",
-            };
-            if row_idx > 0 {
-                sql.push(',');
-            }
-            sql.push('(');
-            for col in 0..COLS {
-                if col > 0 {
-                    sql.push(',');
-                }
-                sql.push('$');
-                sql.push_str(&(row_idx * COLS + col + 1).to_string());
-            }
-            sql.push(')');
-            params.push(Value::Int8(file_id));
-            params.push(Value::Int8(from_id));
-            params.push(to_val);
-            params.push(Value::String(r.to_name.clone()));
-            params.push(Value::String(r.kind_str.to_string()));
-            params.push(Value::Int4(r.line as i32));
-            params.push(Value::String(res.to_string()));
-        }
-        db.execute_params_returning(&sql, &params)?;
-        written += chunk.len() as u64;
+
+    // Tier 2.4 fast path — same as insert_symbols, see notes there.
+    let schema = db.storage.catalog().get_table_schema("_hdb_code_symbol_refs")?;
+    let n_cols = schema.columns.len();
+    if n_cols < 8 {
+        return Err(Error::query_execution(format!(
+            "_hdb_code_symbol_refs schema has {} cols, fast path expects ≥ 8",
+            n_cols
+        )));
     }
+
+    let mut tuples: Vec<Tuple> = Vec::with_capacity(resolved.len());
+    for r in resolved {
+        let from_id = symbol_ids.get(r.from_idx).copied().ok_or_else(|| {
+            Error::query_execution(format!(
+                "resolver produced invalid from_idx {}",
+                r.from_idx
+            ))
+        })?;
+        let to_val = match r.to_idx {
+            Some(idx) => symbol_ids
+                .get(idx)
+                .map(|id| Value::Int8(*id))
+                .unwrap_or(Value::Null),
+            None => Value::Null,
+        };
+        let res = match r.resolution {
+            Resolution::Exact => "exact",
+            Resolution::Heuristic => "heuristic",
+            Resolution::Unresolved => "unresolved",
+        };
+        // Column order from bootstrap_tables:
+        //   edge_id, file_id, from_symbol, to_symbol, to_name, kind,
+        //   line, resolution
+        let mut values: Vec<Value> = Vec::with_capacity(n_cols);
+        values.push(Value::Null); // edge_id — auto-fill
+        values.push(Value::Int8(file_id));
+        values.push(Value::Int8(from_id));
+        values.push(to_val);
+        values.push(Value::String(r.to_name.clone()));
+        values.push(Value::String(r.kind_str.to_string()));
+        values.push(Value::Int4(r.line as i32));
+        values.push(Value::String(res.to_string()));
+        while values.len() < n_cols {
+            values.push(Value::Null);
+        }
+        tuples.push(Tuple::new(values));
+    }
+    let written = tuples.len() as u64;
+    db.bulk_insert_tuples("_hdb_code_symbol_refs", tuples)?;
     Ok(written)
 }
 

@@ -22,7 +22,7 @@
 //! # Examples
 //!
 //! ```rust
-//! use heliosdb_lite::{DataType, Value, Column, Schema};
+//! use heliosdb_nano::{DataType, Value, Column, Schema};
 //!
 //! // Define a schema
 //! let schema = Schema::new(vec![
@@ -367,7 +367,7 @@ impl fmt::Display for Value {
 /// # Example
 ///
 /// ```rust
-/// use heliosdb_lite::{Tuple, Value};
+/// use heliosdb_nano::{Tuple, Value};
 ///
 /// // Create a simple tuple
 /// let row = Tuple::new(vec![
@@ -464,7 +464,7 @@ impl Tuple {
 /// Column supports a builder pattern for setting constraints:
 ///
 /// ```rust
-/// use heliosdb_lite::{Column, DataType};
+/// use heliosdb_nano::{Column, DataType};
 ///
 /// let id_col = Column::new("id", DataType::Int4)
 ///     .primary_key();  // Sets primary_key=true, nullable=false
@@ -571,7 +571,7 @@ impl Column {
 /// # Example
 ///
 /// ```rust
-/// use heliosdb_lite::{Schema, Column, DataType};
+/// use heliosdb_nano::{Schema, Column, DataType};
 ///
 /// let users_schema = Schema::new(vec![
 ///     Column::new("id", DataType::Int4).primary_key(),

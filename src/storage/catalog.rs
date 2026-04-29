@@ -294,6 +294,144 @@ impl<'a> Catalog<'a> {
         Ok(tables)
     }
 
+    /// Re-register and re-populate every ART index from on-disk state.
+    ///
+    /// Called once at engine startup so that a fresh process attaching to an
+    /// existing data directory has the same in-memory ART state any process
+    /// that created the rows would have. Without this, PK / UNIQUE constraint
+    /// checks fall back to scans, and INSERT … ON CONFLICT can't find rows
+    /// committed by a previous process.
+    ///
+    /// Behaviour:
+    /// - PK and UNIQUE indexes are registered from the persisted schema.
+    /// - FK indexes are registered from the persisted `table_constraints`.
+    /// - Every row in every user table is replayed through `on_insert` to
+    ///   populate the indexes.
+    /// - Errors are logged but do not abort startup; a missing or corrupt
+    ///   index will fall back to a scan path at query time.
+    ///
+    /// Cost is `O(rows + indexes)` at startup with no extra cost on the OLTP
+    /// hot path. This is the v3.21 interim; persistent index pages backed by
+    /// a RocksDB column family are tracked separately for v3.22+.
+    pub fn rebuild_all_indexes(&self) -> Result<()> {
+        let started = std::time::Instant::now();
+        let art_manager = self.storage.art_indexes();
+        let mut total_rows: u64 = 0;
+        let mut total_tables: u64 = 0;
+
+        for table_name in self.list_tables()? {
+            // Skip system / internal bookkeeping tables — they have no
+            // user-facing constraint indexes and rebuilding them just
+            // wastes time at startup.
+            if table_name.starts_with("helios_") {
+                continue;
+            }
+
+            let schema = match self.get_table_schema(&table_name) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        "Index rebuild: skipping table {} — schema load failed: {}",
+                        table_name, e
+                    );
+                    continue;
+                }
+            };
+
+            // (Re)register the PK index structure if the table has one.
+            let pk_columns: Vec<String> = schema.columns.iter()
+                .filter(|c| c.primary_key)
+                .map(|c| c.name.clone())
+                .collect();
+            if !pk_columns.is_empty() {
+                if let Err(e) = art_manager.create_pk_index(&table_name, &pk_columns) {
+                    // IndexAlreadyExists is expected if create_table ran in
+                    // the same process; log at debug, continue.
+                    tracing::debug!(
+                        "Index rebuild: PK index for {} already registered: {}",
+                        table_name, e
+                    );
+                }
+            }
+
+            // (Re)register UNIQUE indexes (one per UNIQUE non-PK column).
+            for col in &schema.columns {
+                if col.unique && !col.primary_key {
+                    let cols = vec![col.name.clone()];
+                    if let Err(e) = art_manager.create_unique_index(
+                        &table_name, &cols, Some(&col.name),
+                    ) {
+                        tracing::debug!(
+                            "Index rebuild: UNIQUE index for {}.{} already registered: {}",
+                            table_name, col.name, e
+                        );
+                    }
+                }
+            }
+
+            // (Re)register FK indexes from persisted constraints.
+            if let Ok(constraints) = self.load_table_constraints(&table_name) {
+                for fk in &constraints.foreign_keys {
+                    if let Err(e) = art_manager.create_fk_index(
+                        &fk.table_name,
+                        &fk.columns,
+                        &fk.references_table,
+                        &fk.references_columns,
+                        Some(&fk.name),
+                    ) {
+                        tracing::debug!(
+                            "Index rebuild: FK index {} already registered: {}",
+                            fk.name, e
+                        );
+                    }
+                }
+            }
+
+            // Replay every existing row through on_insert so the indexes
+            // know about pre-existing data.
+            let tuples = match self.storage.scan_table_with_schema(&table_name, &schema) {
+                Ok(t) => t,
+                Err(e) => {
+                    tracing::warn!(
+                        "Index rebuild: scan failed for table {}: {}",
+                        table_name, e
+                    );
+                    continue;
+                }
+            };
+
+            for tuple in &tuples {
+                let row_id = match tuple.row_id {
+                    Some(id) => id,
+                    None => continue,
+                };
+                let mut col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+                for (idx, col) in schema.columns.iter().enumerate() {
+                    if let Some(v) = tuple.values.get(idx) {
+                        col_values.insert(col.name.clone(), v.clone());
+                    }
+                }
+                if let Err(e) = art_manager.on_insert(&table_name, row_id, &col_values) {
+                    tracing::debug!(
+                        "Index rebuild: on_insert skipped for {} row {}: {}",
+                        table_name, row_id, e
+                    );
+                }
+                total_rows += 1;
+            }
+
+            total_tables += 1;
+        }
+
+        tracing::info!(
+            "Index rebuild complete: {} tables, {} rows, {:.1}ms",
+            total_tables,
+            total_rows,
+            started.elapsed().as_secs_f64() * 1000.0,
+        );
+        Ok(())
+    }
+
     /// Rename a table atomically
     ///
     /// This operation renames a table by updating its metadata and moving all data rows

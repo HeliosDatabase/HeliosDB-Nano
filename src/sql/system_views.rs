@@ -310,6 +310,23 @@ impl SystemViewRegistry {
                 ],
             },
         });
+
+        // sqlite_master - SQLite-shaped catalog for drop-in compatibility
+        // (only the columns sqlite3 apps actually read).
+        self.register(SystemView {
+            name: "sqlite_master".to_string(),
+            category: ViewCategory::Core,
+            description: "SQLite-compatible schema catalog".to_string(),
+            schema: Schema {
+                columns: vec![
+                    Column::new("type", DataType::Text),
+                    Column::new("name", DataType::Text),
+                    Column::new("tbl_name", DataType::Text),
+                    Column::new("rootpage", DataType::Int4),
+                    Column::new("sql", DataType::Text),
+                ],
+            },
+        });
     }
 
     /// Register session and activity views
@@ -1010,6 +1027,9 @@ impl SystemViewRegistry {
             "pg_class" => self.execute_pg_class(storage),
             "pg_type" => self.execute_pg_type(storage),
 
+            // SQLite-compatibility catalog
+            "sqlite_master" => self.execute_sqlite_master(storage),
+
             // Session/Activity
             "pg_stat_activity" => self.execute_pg_stat_activity(storage),
             "pg_stat_database" => self.execute_pg_stat_database(storage),
@@ -1203,6 +1223,34 @@ impl SystemViewRegistry {
             results.push(tuple);
         }
 
+        Ok(results)
+    }
+
+    /// SQLite-shaped catalog: one row per user table (type='table'), one per
+    /// materialized view (type='view'). The `sql` column is best-effort —
+    /// most sqlite3 apps only filter on `type` and `name`.
+    fn execute_sqlite_master(&self, storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let catalog = storage.catalog();
+        let tables = catalog.list_tables()?;
+        let mut results = Vec::new();
+        for table_name in tables {
+            // Skip internal helios_* bookkeeping tables — sqlite3 apps don't expect them.
+            if table_name.starts_with("helios_") {
+                continue;
+            }
+            let (kind, sql_decl) = if let Some(rest) = table_name.strip_prefix("mv_") {
+                ("view", format!("CREATE MATERIALIZED VIEW {rest} AS ..."))
+            } else {
+                ("table", format!("CREATE TABLE {table_name} (...)"))
+            };
+            results.push(Tuple::new(vec![
+                Value::String(kind.to_string()),
+                Value::String(table_name.clone()),
+                Value::String(table_name),
+                Value::Int4(0), // rootpage - irrelevant; SQLite returns physical page id
+                Value::String(sql_decl),
+            ]));
+        }
         Ok(results)
     }
 

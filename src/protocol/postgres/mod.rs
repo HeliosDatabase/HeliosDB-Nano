@@ -14,7 +14,7 @@
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use heliosdb_lite::{EmbeddedDatabase, protocol::postgres::{PgServerBuilder, AuthMethod}};
+//! use heliosdb_nano::{EmbeddedDatabase, protocol::postgres::{PgServerBuilder, AuthMethod}};
 //! use std::sync::Arc;
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {

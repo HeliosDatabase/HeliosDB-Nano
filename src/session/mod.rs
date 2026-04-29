@@ -23,8 +23,8 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use heliosdb_lite::EmbeddedDatabase;
-//! use heliosdb_lite::session::IsolationLevel;
+//! use heliosdb_nano::EmbeddedDatabase;
+//! use heliosdb_nano::session::IsolationLevel;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let db = EmbeddedDatabase::new_in_memory()?;

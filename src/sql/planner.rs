@@ -435,12 +435,37 @@ impl<'a> Planner<'a> {
                 // Extract table name
                 let table = Self::normalize_object_name(&create_index.table_name);
 
-                // Extract column name (we only support single-column indexes for now)
+                // Extract column name. We support single-column B-tree / HNSW
+                // indexes natively; multi-column B-tree indexes are accepted
+                // (sqlite3 apps rely on them for query planning) but we only
+                // index the leading column today — the others are recorded for
+                // catalog visibility but not used by the executor. Vector
+                // indexes (HNSW, IVF, …) are rejected when multi-column since
+                // the algorithm can't span columns.
                 if create_index.columns.is_empty() {
                     return Err(Error::query_execution("At least one column required for index"));
                 }
+
+                // Extract index type (USING clause) up-front so we can decide
+                // whether multi-column is acceptable.
+                let index_type = create_index.using.as_ref().map(|ident| ident.value.to_lowercase());
+                let is_vector_index = matches!(
+                    index_type.as_deref(),
+                    Some("hnsw") | Some("ivfflat") | Some("ivf") | Some("vector")
+                );
+
+                if create_index.columns.len() > 1 && is_vector_index {
+                    return Err(Error::query_execution(
+                        "Multi-column vector indexes are not supported (HNSW/IVF require a single VECTOR column)"
+                    ));
+                }
                 if create_index.columns.len() > 1 {
-                    return Err(Error::query_execution("Multi-column vector indexes not yet supported"));
+                    tracing::debug!(
+                        "Composite index {:?} on {:?}({} cols): only the leading column is indexed",
+                        index_name,
+                        table,
+                        create_index.columns.len()
+                    );
                 }
 
                 let first_col = create_index.columns.first()
@@ -449,9 +474,6 @@ impl<'a> Planner<'a> {
                     Expr::Identifier(ident) => Self::normalize_ident(ident),
                     _ => return Err(Error::query_execution("Column name expected in CREATE INDEX")),
                 };
-
-                // Extract index type (USING clause)
-                let index_type = create_index.using.as_ref().map(|ident| ident.value.to_lowercase());
 
                 // Parse WITH options from SQL
                 let options = self.parse_index_options(&create_index.with)?;

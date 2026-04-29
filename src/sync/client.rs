@@ -16,7 +16,7 @@
 //! # Example
 //!
 //! ```ignore
-//! use heliosdb_lite::sync::SyncClient;
+//! use heliosdb_nano::sync::SyncClient;
 //! use std::sync::Arc;
 //!
 //! let client = SyncClient::new(

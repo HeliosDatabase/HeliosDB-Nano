@@ -33,7 +33,7 @@
 //! # Example Usage
 //!
 //! ```ignore
-//! use heliosdb_lite::sync::change_log::{ChangeLog, ChangeType, ChangeEntry};
+//! use heliosdb_nano::sync::change_log::{ChangeLog, ChangeType, ChangeEntry};
 //! use std::sync::Arc;
 //! use rocksdb::DB;
 //!

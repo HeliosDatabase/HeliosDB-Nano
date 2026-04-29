@@ -667,6 +667,72 @@ impl SystemViewRegistry {
             description: "Catalog of data types".to_string(),
         });
 
+        // sqlite_master - SQLite-shaped catalog for sqlite3-driven Python apps.
+        // Only the columns sqlite3 callers actually inspect.
+        self.register_view(SystemViewSchema {
+            name: "sqlite_master".to_string(),
+            schema: Schema {
+                columns: vec![
+                    Column {
+                        name: "type".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                    Column {
+                        name: "name".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                    Column {
+                        name: "tbl_name".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                    Column {
+                        name: "rootpage".to_string(),
+                        data_type: DataType::Int4,
+                        nullable: false,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                    Column {
+                        name: "sql".to_string(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
+                    },
+                ],
+            },
+            description: "SQLite-compatible catalog (drop-in for sqlite3 apps)".to_string(),
+        });
+
         // pg_namespace - Schemas
         self.register_view(SystemViewSchema {
             name: "pg_namespace".to_string(),
@@ -2026,6 +2092,7 @@ impl SystemViewRegistry {
             "pg_attribute" => Self::execute_pg_attribute(storage),
             "pg_type" => Self::execute_pg_type(storage),
             "pg_namespace" => Self::execute_pg_namespace(storage),
+            "sqlite_master" => Self::execute_sqlite_master(storage),
             "pg_index" => Self::execute_pg_index(storage),
             "pg_constraint" => Self::execute_pg_constraint(storage),
             "information_schema.columns" => Self::execute_information_schema_columns(storage),
@@ -2276,6 +2343,34 @@ impl SystemViewRegistry {
             results.push(tuple);
         }
 
+        Ok(results)
+    }
+
+    /// Execute sqlite_master view — SQLite-shaped catalog rows for each
+    /// user table / materialised view. The `sql` column is best-effort:
+    /// most sqlite3 callers only filter on `type` and `name`.
+    fn execute_sqlite_master(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let catalog = storage.catalog();
+        let tables = catalog.list_tables()?;
+        let mut results = Vec::new();
+        for table_name in tables {
+            // Skip internal helios_* bookkeeping tables — sqlite3 apps don't expect them.
+            if table_name.starts_with("helios_") || table_name.starts_with("_hdb_") {
+                continue;
+            }
+            let (kind, sql_decl) = if let Some(rest) = table_name.strip_prefix("mv_") {
+                ("view", format!("CREATE MATERIALIZED VIEW {rest} AS ..."))
+            } else {
+                ("table", format!("CREATE TABLE {table_name} (...)"))
+            };
+            results.push(Tuple::new(vec![
+                Value::String(kind.to_string()),
+                Value::String(table_name.clone()),
+                Value::String(table_name),
+                Value::Int4(0),
+                Value::String(sql_decl),
+            ]));
+        }
         Ok(results)
     }
 

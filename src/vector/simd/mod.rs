@@ -26,7 +26,7 @@
 //! ## Example
 //!
 //! ```rust
-//! use heliosdb_lite::vector::simd;
+//! use heliosdb_nano::vector::simd;
 //!
 //! let a = vec![1.0, 2.0, 3.0, 4.0];
 //! let b = vec![5.0, 6.0, 7.0, 8.0];

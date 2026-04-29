@@ -15,7 +15,7 @@
 //! # Error Handling Example
 //!
 //! ```rust,no_run
-//! use heliosdb_lite::{EmbeddedDatabase, Error, Result};
+//! use heliosdb_nano::{EmbeddedDatabase, Error, Result};
 //!
 //! fn run_query(db: &EmbeddedDatabase, sql: &str) -> Result<()> {
 //!     match db.execute(sql) {
@@ -43,7 +43,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Use the constructor methods for creating errors:
 ///
 /// ```rust
-/// use heliosdb_lite::Error;
+/// use heliosdb_nano::Error;
 ///
 /// let err = Error::storage("Table not found: users");
 /// let err = Error::transaction("Deadlock detected");

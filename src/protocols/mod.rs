@@ -59,13 +59,13 @@
 //! # Usage Example
 //!
 //! ```rust,no_run
-//! use heliosdb_lite::protocols::adapters::{
+//! use heliosdb_nano::protocols::adapters::{
 //!     LiteStorageAdapter,
 //!     LiteQueryExecutorAdapter,
 //!     StorageAdapter,
 //!     QueryExecutorAdapter,
 //! };
-//! use heliosdb_lite::{StorageEngine, Config};
+//! use heliosdb_nano::{StorageEngine, Config};
 //! use std::sync::Arc;
 //!
 //! // Initialize storage engine

@@ -2672,8 +2672,8 @@ pub fn compute_native_auth(password: &str, nonce: &[u8]) -> Vec<u8> {
 /// This is the top-level entry point — spawn one task per accepted socket.
 ///
 /// ```rust,no_run
-/// use heliosdb_lite::protocol::mysql::handler;
-/// use heliosdb_lite::EmbeddedDatabase;
+/// use heliosdb_nano::protocol::mysql::handler;
+/// use heliosdb_nano::EmbeddedDatabase;
 /// use std::sync::Arc;
 /// use tokio::net::TcpListener;
 ///

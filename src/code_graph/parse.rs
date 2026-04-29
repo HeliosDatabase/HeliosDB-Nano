@@ -145,7 +145,7 @@ fn registered_grammar(name: &str) -> Option<tree_sitter::Language> {
 
 /// Parse `source` under `lang`. The static grammar dispatch.
 pub fn parse(lang: Language, source: &str) -> Result<tree_sitter::Tree> {
-    do_parse(grammar_for(lang), source)
+    parse_with_cached(lang.as_str(), &grammar_for(lang), source)
 }
 
 /// Parse `source` under a language tag. Consults the dynamic registry
@@ -153,7 +153,8 @@ pub fn parse(lang: Language, source: &str) -> Result<tree_sitter::Tree> {
 /// `Error::query_execution` if no grammar is found.
 pub fn parse_by_name(lang_name: &str, source: &str) -> Result<tree_sitter::Tree> {
     if let Some(g) = registered_grammar(lang_name) {
-        return do_parse(g, source);
+        let key = format!("dyn:{lang_name}");
+        return parse_with_cached(&key, &g, source);
     }
     if let Some(builtin) = Language::from_lang_str(lang_name) {
         return parse(builtin, source);
@@ -164,14 +165,38 @@ pub fn parse_by_name(lang_name: &str, source: &str) -> Result<tree_sitter::Tree>
     )))
 }
 
-fn do_parse(ts_lang: tree_sitter::Language, source: &str) -> Result<tree_sitter::Tree> {
-    let mut parser = tree_sitter::Parser::new();
-    parser
-        .set_language(&ts_lang)
-        .map_err(|e| Error::query_execution(format!("tree-sitter set_language failed: {e}")))?;
-    parser
-        .parse(source, None)
-        .ok_or_else(|| Error::query_execution("tree-sitter parse returned None"))
+// Per-OS-thread `tree_sitter::Parser` cache, keyed by language tag.
+// Reused across files inside a worker so the parallel indexer doesn't
+// pay parser-allocation + set_language cost on every row.  The cache
+// has no eviction — at most ~10 entries per thread (one per supported
+// language plus any registered runtime grammars).  Parser is not Send,
+// which is exactly why we hold it in a thread-local.
+fn parse_with_cached(
+    cache_key: &str,
+    ts_lang: &tree_sitter::Language,
+    source: &str,
+) -> Result<tree_sitter::Tree> {
+    use std::cell::RefCell;
+    use std::collections::HashMap;
+    thread_local! {
+        static PARSERS: RefCell<HashMap<String, tree_sitter::Parser>> = RefCell::new(HashMap::new());
+    }
+    PARSERS.with(|cell| {
+        let mut map = cell.borrow_mut();
+        if !map.contains_key(cache_key) {
+            let mut p = tree_sitter::Parser::new();
+            p.set_language(ts_lang).map_err(|e| {
+                Error::query_execution(format!("tree-sitter set_language failed: {e}"))
+            })?;
+            map.insert(cache_key.to_string(), p);
+        }
+        let parser = map
+            .get_mut(cache_key)
+            .ok_or_else(|| Error::internal("Parser cache entry vanished"))?;
+        parser
+            .parse(source, None)
+            .ok_or_else(|| Error::query_execution("tree-sitter parse returned None"))
+    })
 }
 
 fn grammar_for(lang: Language) -> tree_sitter::Language {

@@ -124,7 +124,7 @@ impl ConflictDetector {
     /// # Example
     ///
     /// ```no_run
-    /// use heliosdb_lite::sync::conflict::{ConflictDetector, ConflictResolution};
+    /// use heliosdb_nano::sync::conflict::{ConflictDetector, ConflictResolution};
     /// use uuid::Uuid;
     ///
     /// let detector = ConflictDetector::new(
@@ -206,7 +206,7 @@ impl ConflictDetector {
     /// # Example
     ///
     /// ```no_run
-    /// # use heliosdb_lite::sync::conflict::{ConflictDetector, ConflictResolution};
+    /// # use heliosdb_nano::sync::conflict::{ConflictDetector, ConflictResolution};
     /// # use uuid::Uuid;
     /// # let detector = ConflictDetector::new(ConflictResolution::LastWriteWins, Uuid::new_v4());
     /// # let conflict = todo!();

@@ -10,7 +10,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use heliosdb_lite::session::{User, Session, IsolationLevel};
+//! use heliosdb_nano::session::{User, Session, IsolationLevel};
 //!
 //! // Create a user with password
 //! let user = User::new("alice", "secure_password");

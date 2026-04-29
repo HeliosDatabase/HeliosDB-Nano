@@ -5,6 +5,308 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.22.0] - 2026-04-29
+
+### Added — code_index write-phase optimisations (Tier 1 + indexes + Tier 2.4 v2)
+
+Field-driven follow-up to the v3.21.0 parallel-parse work. The pilot
+showed write-phase wall time was 95% of total ingest cost; v3.21.1
+attacks that directly without compromising OLTP/ACID. ACID-positive
+across the board (ingests are now atomic per chunk; force-reparse is
+atomic against the populated KB).
+
+- **Tier 1.1 — single-transaction write phase.** Per-chunk
+  `BEGIN ... COMMIT` around `code_index`'s write loop +
+  `cross_file_resolve`. Engine pays one WAL fsync per chunk instead
+  of per-statement (tens-of-thousands → tens). With `chunk_size =
+  None` (default) the whole ingest is one atomic commit. The
+  indexer auto-detects an outer transaction via `db.in_transaction()`
+  and honours it (skips its own begin/commit) so callers in
+  long-running txns aren't blindsided.
+  (`src/code_graph/storage.rs::code_index_with_embedder`)
+
+- **Tier 1.3 — TRUNCATE fast path for `force_reparse`.** When the
+  caller sets `force_reparse = true` against a populated KB, the
+  indexer issues `TRUNCATE _hdb_code_*` once instead of per-file
+  DELETE-then-INSERT. Closes the pilot's 1 h 55 m anti-pattern
+  outright (the prior path triggered RocksDB compaction storms on
+  bulk-delete-followed-by-bulk-insert against 36 K symbols + 178 K
+  refs). After truncate the per-file write loop's
+  `SELECT-existing/UPDATE-inbound/DELETE-stale-refs/DELETE-stale-symbols`
+  preamble is skipped on the first occurrence of each path —
+  guarded with a `processed_paths: HashSet<String>` so duplicate
+  paths in `source_table` still get the second occurrence's
+  preamble (defensive correctness when upstream upserts misbehave).
+
+- **`_hdb_code_*` covering indexes.** `idx_..._symbols_file_id`,
+  `idx_..._symbol_refs_file_id`, `idx_..._symbol_refs_to_symbol`,
+  `idx_..._symbol_refs_from_symbol` added to `bootstrap_tables`.
+  Eliminates the full-table-scan slow query the pilot observed
+  (35 s for a 181-row `DELETE … WHERE file_id = X` against ~115 K
+  refs). Also accelerates the cross-file resolver's per-symbol
+  back-pointer rebinding. Idempotent — picked up automatically on
+  the next `code_index` against an existing KB.
+
+- **Tier 2.4 — bulk RocksDB bypass for `_hdb_code_*` writes
+  (direct-write variant).** New crate-internal
+  `EmbeddedDatabase::bulk_insert_tuples` primitive: builds `Tuple`
+  rows in column order, allocates row_ids in batch, writes
+  *directly* to RocksDB via `storage.put` (NOT through the active
+  transaction's `write_set`), then updates ART indexes. Mirrors
+  the convention `execute_plan_with_params` already uses for
+  parameterised `INSERT … RETURNING` so subsequent SQL statements
+  in the same outer txn don't pay the O(N) `merge_with_write_set`
+  cost — the gotcha that killed an earlier v1 attempt (see
+  "Earlier rejected variant" below). `insert_symbols` /
+  `insert_refs` in the code-graph indexer route through this
+  primitive instead of multi-row `INSERT … VALUES … RETURNING`.
+  Trade-off documented in the doc comment: rows are NOT rolled
+  back if the outer txn aborts, which is fine for engine-owned
+  `_hdb_code_*` tables (the next force-reparse TRUNCATEs them
+  anyway) but is why this primitive is `pub(crate)` and gated
+  behind a "engine-owned tables only" caveat. User-facing tables
+  keep going through `execute()` so triggers / RLS / FKs /
+  rollback are honoured.
+
+### Field-bench results — Nano's own `src/` (663 files, 18 425 symbols, 114 784 refs)
+
+| Run                                                       | Wall    | Write   | Notes                                   |
+|-----------------------------------------------------------|--------:|--------:|-----------------------------------------|
+| Tier 1 only, cold ingest                                  |  7:24   |  6:31   | parse 3.1 s = 0.7 % of total            |
+| Tier 1 + indexes, cold ingest                             |  5:39   |  4:46   | indexes save 27 % of cold time          |
+| Tier 1.3 + indexes, force-reparse on populated KB         |  4:00   |  2:57   | 1.83× faster than cold                  |
+| **Tier 1+2.4 v2, cold ingest**                            | **3:36** | **2:44** | direct-write bulk, **1.57× over Tier 1+ix** |
+| **Tier 1+2.4 v2, force-reparse on populated KB**          | **1:22** | **~1:00** | **2.93× over Tier 1.3 force**           |
+| **Tier 1+2.4 v2, force-reparse (warm KB, 2nd run)**       | **1:05** | **~0:50** | RocksDB block cache warm                |
+| Prior baseline: force-reparse on populated KB             | KILLED at 1:55:00 | — | the anti-pattern this FR closes  |
+
+(In-sandbox numbers; user's host clocked the v3.20 parallel-only
+baseline at 5:43 cold.)
+
+### Tests — `tests/code_graph_parallel_index.rs` (now 9, all green)
+
+- New: `force_reparse_against_populated_kb_truncates` — content
+  parity (file paths, symbol signatures, ref signatures) between
+  cold and force-reparse-after-cold runs. ID columns are
+  intentionally NOT compared because Nano's TRUNCATE preserves
+  row-id counters (matching Postgres' default).
+- New: `write_phase_under_explicit_outer_txn_succeeds` — proves the
+  outer-txn-honouring branch produces the same row counts as the
+  self-managed branch.
+
+### Honest bug findings (filed as separate follow-ups)
+
+Two pre-existing engine issues surfaced during field benchmarking
+that the v3.21.0 work didn't introduce but did expose. Filed for
+their own FRs; tracked here for visibility:
+
+1. **Cross-process ON CONFLICT on PK doesn't detect prior committed
+   rows.** Re-running a path through `INSERT … ON CONFLICT (path)
+   DO UPDATE SET …` from a fresh process duplicates rows instead of
+   updating. The v3.21.0 eager-ART-rebuild on `EmbeddedDatabase::open`
+   *does* re-register the PK index but the conflict-detection path
+   appears to bypass it for cross-process state.
+2. **FK constraint sees pre-DELETE state inside a transaction.**
+   `BEGIN; DELETE FROM _hdb_code_symbol_refs WHERE …; DELETE FROM
+   _hdb_code_symbols WHERE …; COMMIT;` raises a from_symbol FK
+   violation on the second DELETE despite the first DELETE removing
+   every offending ref *in the same txn*.
+
+### Earlier rejected variant — Tier 2.4 v1 (txn write_set buffered)
+
+The first cut at the bulk primitive routed writes through
+`txn.put` when an outer transaction was active. Cold ingest
+dropped 5:39 → 2:40 (write phase 3.4×) — but the same KB's
+`--force` re-ingest regressed 4:00 → 8:03 (~2× slower). Root
+cause: with `chunk_size = None` the entire ingest's writes
+accumulate in the txn's DashMap `write_set` (~133 K entries on
+this corpus). Each subsequent SQL `DELETE … WHERE file_id = X`
+inside the same outer txn falls through `scan_table_filtered` →
+`merge_with_write_set`, which iterates and bincode-deserialises
+*every* `write_set` entry on every scan call. With ~665 second-
+occurrence delete-stale calls (forced by the duplicate-path
+defense for the cross-process ON CONFLICT bug surfaced in this
+release), the cumulative cost was O(N²) in `write_set` size —
+~7 minutes of pure deserialisation work. The fix in v2 is to
+write directly to RocksDB the way `execute_plan_with_params`
+already does for `INSERT … RETURNING` (`storage.put`, bypassing
+`txn.write_set`); subsequent SQL DELETEs read committed rows
+from the RocksDB snapshot at no extra per-row cost. v2 fixes
+both axes — see field-bench table above.
+
+## [3.21.0] - 2026-04-28
+
+### Added — parallel `code_index` (FR `parallel_code_index`)
+
+`code_graph::storage::code_index` is now split into a single-threaded
+**triage** pass (classify rows into skipped / unchanged / to-parse +
+hash-gate), a parallel **parse + extract + in-file resolve** phase
+running on a *dedicated* `rayon::ThreadPool`, and a single-threaded
+**write** phase that walks results in input order. Closes
+`FEATURE_REQUEST_parallel_code_index.md`.
+
+- **Dedicated thread pool** — never the global one. Daemon-mode
+  servers handling live OLTP traffic see no thread starvation
+  during code indexing.
+- **`CodeIndexOptions::parallelism: Option<usize>`** caps the
+  worker count (default `min(num_cpus, 8)`, `Some(1)` forces
+  serial). Operators on shared hosts can cap the indexer's
+  footprint to protect query latency.
+- **Per-OS-thread `tree_sitter::Parser` cache**
+  (`src/code_graph/parse.rs`). `thread_local!` `RefCell<HashMap<…,
+  Parser>>` reused across files within a worker — no
+  `set_language` overhead per row.
+- **Optional bounded-memory chunking** via
+  `CodeIndexOptions::chunk_size: Option<usize>`. `None` =
+  single-chunk all-in-one (default; max throughput; fits the
+  ~1.8 K-file pilot scale). `Some(n)` = drain rows into batches
+  of `n`, parse each chunk in parallel, write before moving on —
+  bounds peak RAM at `n × avg_parsed_file_bytes` for ≥ 10 K-file
+  corpora. Equivalence with the unchunked path is asserted by
+  `chunked_output_matches_unchunked`.
+- **`CodeIndexStats` telemetry**: `parse_elapsed_ms`,
+  `write_elapsed_ms`, `parse_workers`, `chunks_processed`. Lets
+  operators see the speed-up + memory-mode in the binary's own
+  output.
+- **Byte-identical** to the serial path: equivalence locked down
+  by `tests/code_graph_parallel_index.rs` against an 8-file
+  multi-language fixture (parallelism=1 vs parallelism=8, and
+  chunked vs unchunked). 7 unit tests, all green.
+- **Field-benchmarked** in release on Nano's own `src/` tree
+  (352 Rust files, 12-core host, 8 workers): total wall-clock
+  **49.8 s** (under the 2-minute FR budget); parse-phase speedup
+  **1.97×**. Parse utilisation caps at ~2× because of allocator
+  + grammar-init contention — not the worker pool — and is
+  documented as out-of-scope for this FR. See
+  `tests/code_graph_parallel_index_bench.rs`
+  (`#[ignore]`-gated; run via `cargo test --release --features
+  code-graph --test code_graph_parallel_index_bench --
+  --ignored --nocapture`).
+
+### Added — engine-level fixes for the v3.20 honest gaps
+
+These are general-purpose engine improvements, not SQLite-shim work. Each
+benefits every protocol (PG wire, MySQL wire, embedded REPL, embedded API)
+and every mode (single-connection, daemon-server, HA standby).
+
+- **Eager ART index rebuild on open** (`Catalog::rebuild_all_indexes`,
+  wired into `EmbeddedDatabase::new` and `EmbeddedDatabase::with_config`
+  for non-memory storage). A fresh process attaching to an existing data
+  dir now re-registers PK / UNIQUE / FK index structures from the
+  persisted schemas and replays existing rows through `on_insert` so
+  in-memory ART matches on-disk state. Cost: O(rows + indexes) at
+  startup; zero impact on the OLTP hot path. Closes the cross-process
+  embedded consistency gap. Persistent index pages backed by a RocksDB
+  column family are tracked separately for v3.22+.
+
+- **PostgreSQL date/time function audit** (`src/sql/evaluator.rs`). Added
+  `TO_CHAR(date, fmt)`, `TO_DATE(text, fmt)`,
+  `TO_TIMESTAMP(epoch | text, fmt)`, `DATE_TRUNC(field, value)`,
+  `DATE_PART(field, value)` (alias for EXTRACT), `AGE(t1, t2)`,
+  `MAKE_DATE(y, m, d)`, `MAKE_TIMESTAMP(y, m, d, h, mi, s)`. PG format
+  codes `YYYY/YY/MM/MON/Mon/mon/DD/DDD/DAY/Day/day/DY/HH24/HH12/MI/SS/MS/US/IW/IYYY/Q/W/D/AM/PM/am/pm`
+  are translated to chrono format; case-significant tokens use a
+  post-processing pass so output matches Postgres exactly. SQLite-only
+  function names (`STRFTIME`, `JULIANDAY`) are not added — callers that
+  need them can rewrite at the SDK layer.
+
+- **Composite-PK on the conflict-detection scan path**
+  (`src/lib.rs`). When the ART couldn't locate the conflicting row,
+  the planner already retried via PK lookup; with rebuild on open this
+  retry now sees the same indexes a fresh process would see.
+
+### Added — SDK shim (`heliosdb_sqlite` 3.0.1+)
+
+- **`cursor.lastrowid`** is now populated automatically. The SDK
+  detects `INSERT INTO t (...) VALUES (...)` (incl. `INSERT OR REPLACE`
+  / `OR IGNORE`), looks up the table's int PK column once via
+  `PRAGMA table_info(t)` (cached on the `Connection`), appends
+  `RETURNING <pk>`, and stores the returned value as
+  `cursor.lastrowid`. No engine state, no protocol change — pure
+  client-side use of standard SQL `RETURNING`. Tables with TEXT PKs
+  return `None`, matching sqlite3 semantics. Existing
+  `INSERT … RETURNING …` calls are passed through untouched.
+
+- **DSN parsing for daemon mode.** `connect(..., mode='daemon')` now
+  honours `HELIOSDB_DSN` (or an explicit `dsn=` kwarg) for
+  `host/port/user/password/database`, instead of hard-coding `helios`/
+  port 5432.
+
+### Tests
+- `tests/cross_process_index_rebuild_tests.rs` — 6 tests proving PK
+  lookups, INSERT-OR-REPLACE upserts, and UNIQUE constraint enforcement
+  all work after closing and reopening a populated data directory.
+- `tests/datetime_functions_tests.rs` — 19 tests covering every PG
+  date/time function added in this release plus a realistic OLTP-shaped
+  GROUP BY DATE_TRUNC aggregation.
+- 1746 lib tests + 11 sqlite_compat hardening + 72 aggregate hardening
+  remain green.
+
+## [3.20.0] - 2026-04-28
+
+### Added — SQLite drop-in compatibility
+
+Lifts the dialect ceiling so existing `sqlite3`-driven Python applications
+(and other SQLite clients) can talk to Nano with no query rewrites. Combined
+with the production-ready `heliosdb_sqlite` Python shim, swapping
+`import sqlite3` for `import heliosdb_sqlite as sqlite3` is enough to
+retarget most apps.
+
+Engine changes:
+- **`?` positional placeholders** — parser-level rewrite to PG-style `$N`
+  with quote/comment/dollar-quote awareness; mixed `?`/`$N` in a single
+  statement is rejected.
+- **`INSERT OR REPLACE INTO t (cols) VALUES …`** → expanded to
+  `INSERT … ON CONFLICT DO UPDATE SET col = EXCLUDED.col, …` so the same
+  upsert semantics apply to PG-wire and embedded REPL clients.
+- **`INSERT OR IGNORE INTO …`** → expanded to
+  `INSERT … ON CONFLICT DO NOTHING`.
+- **`INTEGER PRIMARY KEY AUTOINCREMENT`** → mapped to `BIGSERIAL PRIMARY KEY`
+  in DDL.
+- **`DATETIME('now')`** → recognised as `CURRENT_TIMESTAMP`.
+- **`sqlite_master` system view** with the SQLite column shape
+  (`type, name, tbl_name, rootpage, sql`).
+- **`PRAGMA` shims** — `table_info(t)` returns SQLite-shaped rows
+  (`cid, name, type, notnull, dflt_value, pk`); connection-tunable PRAGMAs
+  (`foreign_keys`, `journal_mode`, `synchronous`, `busy_timeout`) are
+  accepted as no-ops, intercepted at the protocol layer and at
+  `EmbeddedDatabase::execute/query`.
+- **Composite-column `CREATE INDEX`** is now accepted instead of erroring
+  with the misleading "Multi-column vector indexes" message — only the
+  leading column is indexed today (B-tree), but the DDL no longer breaks
+  sqlite3 schema migrations. Vector-index variants (`USING hnsw|ivf|…`)
+  still reject multi-column.
+
+### Fixed
+- **ON CONFLICT DO UPDATE within an explicit transaction** could fail with
+  *"existing row not found in storage"* when the conflicting row was
+  inserted earlier in the same transaction. The conflict path now reads
+  through `txn.get(...)` so write-set rows are visible.
+
+### Tests
+- `tests/sqlite_compat_tests.rs` — 11 hardening tests covering each item
+  above end-to-end against `EmbeddedDatabase`.
+- `src/sql/sqlite_compat.rs` — 16 unit tests for the parser-level
+  rewrites (placeholder quote-awareness, multi-statement boundaries,
+  PRAGMA detection).
+
+### Honest status
+- **Cross-process embedded mode** (one `heliosdb-nano repl` per Connection,
+  data shared via `--data-dir`) does not rebuild the in-memory ART
+  indexes on startup, which means a fresh process can't see the unique /
+  PK constraints registered by a prior process and falls back to scan
+  paths. Single-connection embedded use is the recommended path; daemon
+  mode (one `heliosdb-nano start`, many `psycopg2` connections) is the
+  recommended scale-up.
+- The Python SDK shim absorbs the rest: SQL-string positional binding for
+  `?`, table-output parser for box-drawn results, PRAGMA-as-query
+  routing, and a non-blocking `__del__` so finalisation doesn't time out
+  on slow rollbacks.
+
+See `docs/compatibility/sqlite.md` and
+`docs/guides/sqlite_drop_in_tutorial.md` for the full feature matrix
+and a runnable port walkthrough.
+
 ## [3.19.1] - 2026-04-25
 
 ### Fixed — UUID literal coercion at PK index lookup (#205)

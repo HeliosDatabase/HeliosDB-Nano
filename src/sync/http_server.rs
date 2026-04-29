@@ -25,7 +25,7 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use heliosdb_lite::sync::http_server::HttpSyncServer;
+//! use heliosdb_nano::sync::http_server::HttpSyncServer;
 //! use std::net::SocketAddr;
 //!
 //! let server = HttpSyncServer::new(protocol, "0.0.0.0:8080".parse()?);

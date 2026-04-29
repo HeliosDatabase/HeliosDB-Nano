@@ -13,7 +13,7 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use heliosdb_lite::session::{SessionManager, IsolationLevel, User};
+//! use heliosdb_nano::session::{SessionManager, IsolationLevel, User};
 //!
 //! let manager = SessionManager::new();
 //! let user = User::new("alice", "password");

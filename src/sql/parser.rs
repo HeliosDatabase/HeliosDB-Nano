@@ -214,8 +214,13 @@ impl Parser {
             return Ok(Vec::new());
         }
 
+        // SQLite-compat preprocessing: ?-placeholders, INSERT OR REPLACE/IGNORE,
+        // INTEGER PRIMARY KEY AUTOINCREMENT, DATETIME('now'). Runs before any
+        // other rewrite so downstream stages see canonical PostgreSQL syntax.
+        let sql_compat = crate::sql::sqlite_compat::translate(&sql_no_comments)?;
+
         // Preprocess to remove time-travel syntax for parsing
-        let mut processed_sql = self.preprocess_time_travel_sql(&sql_no_comments);
+        let mut processed_sql = self.preprocess_time_travel_sql(&sql_compat);
 
         // Preprocess DECIMAL to NUMERIC for sqlparser compatibility
         processed_sql = Self::preprocess_decimal_to_numeric(&processed_sql);

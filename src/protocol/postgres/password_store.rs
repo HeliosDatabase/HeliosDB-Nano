@@ -15,7 +15,7 @@
 //! ## Usage
 //!
 //! ```rust,no_run
-//! use heliosdb_lite::protocol::postgres::password_store::{PasswordStore, InMemoryPasswordStore};
+//! use heliosdb_nano::protocol::postgres::password_store::{PasswordStore, InMemoryPasswordStore};
 //!
 //! let mut store = InMemoryPasswordStore::new();
 //! store.add_user("alice", "secret123");
