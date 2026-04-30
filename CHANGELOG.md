@@ -5,6 +5,76 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.22.2] - 2026-04-30
+
+### Fixed — cross-process `INSERT … ON CONFLICT` no longer duplicates rows
+
+Closes `FEATURE_REQUEST_cross_process_on_conflict.md`. A second
+process attaching to a KB written by a prior process and issuing
+`INSERT … ON CONFLICT(col) DO UPDATE` (or any parameterised
+`INSERT` via `db.execute_params`) silently inserted duplicate
+rows — `Catalog::rebuild_all_indexes()` had populated the ART, but
+the relevant write paths weren't consulting it.
+
+**Root cause** — two divergences:
+
+1. `EmbeddedDatabase::insert_tuple_versioned_with_schema`
+   (the storage primitive used by `insert_tuple_branch_aware_with_schema`
+   on the main branch and by `execute_plan_with_params_inner`'s INSERT
+   arm) **did not call `check_unique_constraints`**. Its SQL fast-path
+   sibling `insert_tuple_fast` already did.
+2. `execute_plan_with_params_inner`'s `LogicalPlan::Insert` arm
+   discarded `on_conflict` (`on_conflict: _`).
+
+**Fix** (commit `6ec74d3`). Added the constraint check to
+`insert_tuple_versioned_with_schema` (matching the fast-path twin)
+and wired `on_conflict` through `execute_plan_with_params_inner` —
+pre-check uniqueness, route `DoNothing` (silent skip) and
+`DoUpdate` (UNIQUE-column scan / PK lookup → read existing tuple
+→ resolve `EXCLUDED` refs and apply assignments via a
+parameter-aware `Evaluator` → write back via `update_tuple_fast`).
+
+New test `tests/cross_process_index_rebuild_tests::on_conflict_named_column_upserts_after_reopen`
+reproduces the original FR repro and now passes alongside 6
+existing cross-process tests + 10 in-lib `on_conflict` tests.
+
+### Added — MCP server LRU cache stats in `helios/info` + `GET /mcp/info`
+
+The discovery payload now includes a `cache` sub-object covering
+the engine's MCP `result_cache` (server-side LRU for read-only
+`tools/call` results, 256-entry, 5-minute TTL):
+
+```json
+{
+  "cache": {
+    "size": 42, "capacity": 256, "generation": 7,
+    "hits": 1284, "misses": 201, "evictions": 0, "hit_rate": 0.864
+  }
+}
+```
+
+`hit_rate` is `0.0` when no requests have been served yet (avoids
+div-by-zero). `generation` increments on every mutating tool call
+(invalidates the cache). Both transports — JSON-RPC `helios/info`
+and HTTP `GET /mcp/info` — surface the same field.  New test
+`tests/mcp_introspection::helios_info_rpc_includes_cache_stats`.
+
+Commit `26956ba`.
+
+### Fixed — stale `heliosdb-nano mcp-server` CLI doc references
+
+`docs/code_graph/{pilot,troubleshooting}.md` plus a handful of
+source comments still showed CLI examples like
+`./bin/heliosdb-nano mcp-server --db ...` that fail with
+"unrecognized subcommand". The engine deliberately has no
+`mcp-server` CLI subcommand — MCP is a library integration
+consumed by the out-of-tree
+[`heliosdb-codekb-mcp`](https://github.com/dimensigon/heliosdb-codekb-mcp)
+plugin, which exposes `serve --source X [--http <addr>]`. Doc
+content updated to redirect users at the plugin.
+
+Commit `60f0460`.
+
 ## [3.22.1] - 2026-04-29
 
 ### Fixed — phantom FK violation on `DELETE child; DELETE parent` inside a transaction
