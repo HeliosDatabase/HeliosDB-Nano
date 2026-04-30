@@ -2,9 +2,11 @@
 requested-by: Tier 1 field-bench follow-up — danimoya
 requested-against: HeliosDB-Nano v3.21.1
 priority: medium
-status: open
+status: fixed-in-v3.22.1
 date-filed: 2026-04-28
+date-fixed: 2026-04-29
 track: storage / constraints
+fix-commit: b9893b2
 ---
 
 # Bug: FK constraint reads pre-DELETE state from inside a transaction

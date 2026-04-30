@@ -44,3 +44,6 @@ heliosdb.pid
 # Per-repo code-graph index (code-graph track pilot convention)
 .helios-index/
 .helios-kb/
+
+# Local fastembed model cache (pulled by `--features code-embed` builds)
+.fastembed_cache/

@@ -368,6 +368,32 @@ heliosdb-nano = "3.13"
 
 See **[the Rust API guide](https://docs.rs/heliosdb-nano)** for embedded usage and the [examples/](examples/) directory for working code.
 
+## Building from Source
+
+The `heliosdb-nano` binary builds with `cargo build --release`. Default features are `encryption + vector-search + ring-crypto + ha-tier1` — covers most embedded and single-node-server cases. Run `cargo info heliosdb-nano` (or `cargo metadata --no-deps --format-version 1 | jq '.packages[0].features'`) for the live list. Recipes for the non-obvious combinations:
+
+```bash
+# Default build — embedded + Postgres/MySQL wire + warm-standby HA.
+cargo build --release
+
+# Code-graph + MCP server (matches what heliosdb-codekb-mcp links).
+# Adds tree-sitter parsers, _hdb_code_* tables, lsp_* APIs, and the
+# JSON-RPC dispatcher for stdio / HTTP / WebSocket / SSE clients.
+cargo build --release --features "code-graph,graph-rag,mcp-endpoint"
+
+# In-process embedder (no external HTTP service for embeddings).
+# Pulls fastembed-rs + ORT — adds ~30 MB to the binary.
+cargo build --release --features "code-graph,code-embed"
+
+# FIPS 140-3 compliant crypto (AWS-LC FIPS Cert #4816, SHA-256, PBKDF2).
+# `--no-default-features` is required to swap out ring-crypto.
+cargo build --release --no-default-features \
+  --features "fips,encryption,vector-search,ha-tier1"
+
+# Full HA bundle — multi-primary + sharding + dedup + branch replication.
+cargo build --release --features "ha-full"
+```
+
 ## SDKs & Integrations
 
 Official client SDKs (Go, Python, TypeScript, Rust) and platform integrations (VS Code, Zapier, n8n, Retool, Make, AutoGen) live in a shared repository:
