@@ -2,8 +2,9 @@
 requested-by: heliosdb-codekb-mcp pilot — danimoya
 requested-against: HeliosDB-Nano v3.22.1
 priority: low
-status: open
+status: fixed-in-v3.22.1 (commit 3c0ce3e); stats surfaced in v3.22.2 (commit 26956ba)
 date-filed: 2026-04-30
+date-fixed: 2026-04-30
 track: mcp / token-economy
 ---
 

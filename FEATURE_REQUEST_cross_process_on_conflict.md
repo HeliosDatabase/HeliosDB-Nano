@@ -2,7 +2,7 @@
 requested-by: Tier 1 field-bench follow-up — danimoya
 requested-against: HeliosDB-Nano v3.21.1
 priority: high
-status: fixed-on-branch (feat/cross-process-conflict-and-cache-stats @ 6ec74d3)
+status: fixed-in-v3.22.2 (commit 6ec74d3, merged via 367a2a2)
 date-filed: 2026-04-28
 date-fixed: 2026-04-30
 track: storage / correctness
