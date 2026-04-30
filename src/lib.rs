@@ -5824,7 +5824,7 @@ impl EmbeddedDatabase {
 
     fn execute_plan_with_params_inner(&self, plan: &sql::LogicalPlan, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
         match plan {
-            sql::LogicalPlan::Insert { table_name, columns, values, returning, on_conflict: _ } => {
+            sql::LogicalPlan::Insert { table_name, columns, values, returning, on_conflict } => {
                 // Get table schema for column types
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
@@ -5915,38 +5915,188 @@ impl EmbeddedDatabase {
                     )?;
 
                     let tuple = Tuple::new(tuple_values);
-                    // Insert first so the storage layer applies SERIAL /
-                    // IDENTITY auto-fill on NULL PK columns. Then read
-                    // the filled tuple back for RETURNING. This is the
-                    // only ordering that satisfies both:
-                    //   1. RETURNING must see the auto-generated PK.
-                    //   2. The storage engine owns the row_id counter.
-                    let row_id = self.storage.insert_tuple_branch_aware_with_schema(
-                        table_name, tuple.clone(), &schema,
-                    )?;
-                    if has_returning {
-                        let mut filled = tuple;
-                        for (i, col) in schema.columns.iter().enumerate() {
-                            if col.primary_key {
-                                if let Some(v) = filled.values.get(i) {
-                                    if matches!(v, Value::Null) {
-                                        if let Some(slot) = filled.values.get_mut(i) {
-                                            *slot = match col.data_type {
-                                                DataType::Int2 => Value::Int2(row_id as i16),
-                                                DataType::Int4 => Value::Int4(row_id as i32),
-                                                _ => Value::Int8(row_id as i64),
-                                            };
+
+                    // Pre-check PK / UNIQUE constraints so a parameterised
+                    // `INSERT ... ON CONFLICT(col) DO UPDATE` can route the
+                    // dup to the UPDATE branch *without* allocating a
+                    // row_id from `catalog.next_row_id` only to throw it
+                    // away.  Closes the cross-process leg of FR
+                    // `cross_process_on_conflict`: the rebuilt ART
+                    // detects rows committed by a previous process, and
+                    // ON CONFLICT honours the existing-row branch.
+                    let mut col_values_map = std::collections::HashMap::with_capacity(schema.columns.len());
+                    for (i, col) in schema.columns.iter().enumerate() {
+                        if let Some(v) = tuple.values.get(i) {
+                            col_values_map.insert(col.name.clone(), v.clone());
+                        }
+                    }
+
+                    let conflict = self.storage.art_indexes()
+                        .check_unique_constraints(table_name, &col_values_map);
+
+                    match (conflict, on_conflict) {
+                        (Ok(()), _) => {
+                            // No conflict — proceed with normal versioned
+                            // insert.  `insert_tuple_branch_aware_with_schema`
+                            // also runs `check_unique_constraints` (defence
+                            // in depth post-FR fix), which is cheap.
+                            let row_id = self.storage.insert_tuple_branch_aware_with_schema(
+                                table_name, tuple.clone(), &schema,
+                            )?;
+                            if has_returning {
+                                let mut filled = tuple;
+                                for (i, col) in schema.columns.iter().enumerate() {
+                                    if col.primary_key {
+                                        if let Some(v) = filled.values.get(i) {
+                                            if matches!(v, Value::Null) {
+                                                if let Some(slot) = filled.values.get_mut(i) {
+                                                    *slot = match col.data_type {
+                                                        DataType::Int2 => Value::Int2(row_id as i16),
+                                                        DataType::Int4 => Value::Int4(row_id as i32),
+                                                        _ => Value::Int8(row_id as i64),
+                                                    };
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                filled.row_id = Some(row_id);
+                                if let Some(projected) = Self::project_returning_columns(&filled, &schema, returning) {
+                                    returned_tuples.push(projected);
+                                }
+                            }
+                            count += 1;
+                        }
+                        (Err(_), Some(sql::logical_plan::OnConflictAction::DoNothing)) => {
+                            // Silent skip — no count increment.
+                        }
+                        (Err(e), Some(sql::logical_plan::OnConflictAction::DoUpdate { assignments })) => {
+                            // Locate the existing row.  Try UNIQUE-column
+                            // scan first, fall back to PK lookup.
+                            let mut found_row_id: Option<u64> = None;
+                            for (i, col) in schema.columns.iter().enumerate() {
+                                if (col.unique || col.primary_key) && !col.primary_key {
+                                    if let Some(val) = tuple.values.get(i) {
+                                        if !matches!(val, Value::Null) {
+                                            let scan_sql = format!(
+                                                "SELECT {} FROM {} WHERE {} = '{}'",
+                                                schema.columns.iter().find(|c| c.primary_key)
+                                                    .map(|c| c.name.as_str()).unwrap_or("rowid"),
+                                                table_name,
+                                                col.name,
+                                                val.to_string().trim_matches('\''),
+                                            );
+                                            if let Ok(rows) = self.query(&scan_sql, &[]) {
+                                                if let Some(row) = rows.first() {
+                                                    if let Some(pk_val) = row.values.first() {
+                                                        match pk_val {
+                                                            Value::Int8(id) => { found_row_id = Some(*id as u64); }
+                                                            Value::Int4(id) => { found_row_id = Some(*id as u64); }
+                                                            _ => {}
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if found_row_id.is_some() { break; }
                                         }
                                     }
                                 }
                             }
+                            if found_row_id.is_none() {
+                                let pk_values: Vec<Value> = schema.columns.iter().enumerate()
+                                    .filter(|(_, c)| c.primary_key)
+                                    .filter_map(|(i, _)| tuple.values.get(i).cloned())
+                                    .collect();
+                                if !pk_values.is_empty()
+                                    && !pk_values.iter().any(|v| matches!(v, Value::Null))
+                                {
+                                    let pk_key = crate::storage::ArtIndexManager::encode_key(&pk_values);
+                                    found_row_id = self.storage.art_indexes()
+                                        .pk_index_lookup(table_name, &pk_key);
+                                }
+                            }
+                            let existing_row_id = found_row_id.ok_or_else(|| Error::query_execution(
+                                format!("ON CONFLICT DO UPDATE: could not find existing row ({})", e)
+                            ))?;
+
+                            // Read the existing tuple from storage.
+                            let existing_key = self.storage.branch_aware_data_key(
+                                table_name, existing_row_id,
+                            );
+                            let existing_raw = self.storage.get(&existing_key)?
+                                .ok_or_else(|| Error::query_execution(
+                                    "ON CONFLICT DO UPDATE: existing row not found in storage"
+                                ))?;
+                            let mut updated_tuple: Tuple = bincode::deserialize(&existing_raw)
+                                .map_err(|err| Error::storage(format!("Failed to deserialize tuple: {}", err)))?;
+                            updated_tuple.row_id = Some(existing_row_id);
+
+                            // Snapshot the old tuple for the ART diff.
+                            let old_tuple_for_art: Tuple = bincode::deserialize(&existing_raw)
+                                .map_err(|err| Error::storage(format!("Failed to deserialize tuple: {}", err)))?;
+
+                            // Apply the ON CONFLICT DO UPDATE assignments.
+                            // Evaluator includes both the table schema (so
+                            // unqualified column refs resolve to the
+                            // existing row) and the bound parameters (so
+                            // `$N` references in the assignment RHS work).
+                            let mut excluded_map = std::collections::HashMap::new();
+                            for (i, col) in schema.columns.iter().enumerate() {
+                                if let Some(v) = tuple.values.get(i) {
+                                    excluded_map.insert(col.name.to_lowercase(), v.clone());
+                                }
+                            }
+                            let update_eval = sql::Evaluator::with_parameters(
+                                std::sync::Arc::new(schema.clone()),
+                                params.to_vec(),
+                            );
+                            for (col_name, expr) in assignments {
+                                let target_idx = schema.columns.iter()
+                                    .position(|c| c.name.eq_ignore_ascii_case(col_name))
+                                    .ok_or_else(|| Error::query_execution(format!(
+                                        "ON CONFLICT DO UPDATE: column '{}' not found", col_name
+                                    )))?;
+                                let resolved_expr = Self::resolve_excluded_refs(expr, &excluded_map);
+                                let mut new_val = update_eval.evaluate(&resolved_expr, &updated_tuple)?;
+                                let target_type = &schema.columns.get(target_idx)
+                                    .ok_or_else(|| Error::internal("column index out of bounds"))?
+                                    .data_type;
+                                if new_val.data_type() != *target_type
+                                    && !matches!(new_val, Value::Null)
+                                {
+                                    new_val = update_eval.cast_value(new_val, target_type)?;
+                                }
+                                if target_idx < updated_tuple.values.len() {
+                                    #[allow(clippy::indexing_slicing)]
+                                    { updated_tuple.values[target_idx] = new_val; }
+                                }
+                            }
+
+                            // Write the updated row.  `update_tuple_fast`
+                            // overwrites in place and updates ART
+                            // indexes; sufficient for the conflict path.
+                            self.storage.update_tuple_fast(
+                                table_name,
+                                existing_row_id,
+                                updated_tuple.clone(),
+                                &old_tuple_for_art,
+                                &schema,
+                            )?;
+
+                            if has_returning {
+                                if let Some(projected) = Self::project_returning_columns(
+                                    &updated_tuple, &schema, returning,
+                                ) {
+                                    returned_tuples.push(projected);
+                                }
+                            }
+                            count += 1;
                         }
-                        filled.row_id = Some(row_id);
-                        if let Some(projected) = Self::project_returning_columns(&filled, &schema, returning) {
-                            returned_tuples.push(projected);
+                        (Err(e), None) => {
+                            // No ON CONFLICT supplied — propagate.
+                            return Err(Error::constraint_violation(e.to_string()));
                         }
                     }
-                    count += 1;
                 }
                 Ok((count, returned_tuples))
             }

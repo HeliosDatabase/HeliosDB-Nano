@@ -75,6 +75,27 @@ fn helios_info_rpc_returns_single_discovery_packet() {
     assert!(tools[0]["category"].is_string());
 }
 
+#[test]
+fn helios_info_rpc_includes_cache_stats() {
+    let resp = rpc_call("helios/info", Value::Null);
+    let cache = &resp["result"]["cache"];
+    assert!(cache.is_object(), "expected `cache` field on helios/info");
+    for key in [
+        "size", "capacity", "generation", "hits", "misses",
+        "evictions", "hit_rate",
+    ] {
+        assert!(
+            cache.get(key).is_some(),
+            "helios/info.cache missing `{key}` (got {cache})",
+        );
+    }
+    // `capacity` is u64-backed in JSON; assert it's a positive number.
+    assert!(cache["capacity"].as_u64().unwrap_or(0) >= 1);
+    // `hit_rate` ∈ [0.0, 1.0].
+    let hr = cache["hit_rate"].as_f64().expect("hit_rate as f64");
+    assert!((0.0..=1.0).contains(&hr), "hit_rate out of range: {hr}");
+}
+
 #[tokio::test]
 async fn http_get_mcp_info_returns_discovery_payload() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());

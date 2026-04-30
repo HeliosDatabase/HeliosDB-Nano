@@ -171,6 +171,51 @@ mod cross_process_rebuild {
     }
 
     #[test]
+    fn on_conflict_named_column_upserts_after_reopen() {
+        // FEATURE_REQUEST_cross_process_on_conflict.md repro.
+        //
+        // `INSERT OR REPLACE` (translated to bare `ON CONFLICT DO UPDATE`)
+        // is already covered by `insert_or_replace_upserts_across_reopens`.
+        // The bug specific to a *named-column* ON CONFLICT
+        // (`ON CONFLICT(path) DO UPDATE …`) — the form a plugin emits
+        // directly — must also detect prior-process committed rows.
+        let dir = scratch_dir();
+
+        // Process 1.
+        {
+            let db = EmbeddedDatabase::new(&dir).unwrap();
+            db.execute(
+                "CREATE TABLE src (path TEXT PRIMARY KEY, content TEXT)",
+            ).unwrap();
+            db.execute_params(
+                "INSERT INTO src (path, content) VALUES ($1, $2) \
+                 ON CONFLICT(path) DO UPDATE SET content = excluded.content",
+                &[Value::String("a.rs".into()), Value::String("v1".into())],
+            ).unwrap();
+        }
+
+        // Process 2: re-attach, run the same upsert. Expected: 1 row,
+        // content='v2'. Without the FR fix: 2 rows.
+        {
+            let db = EmbeddedDatabase::new(&dir).unwrap();
+            db.execute_params(
+                "INSERT INTO src (path, content) VALUES ($1, $2) \
+                 ON CONFLICT(path) DO UPDATE SET content = excluded.content",
+                &[Value::String("a.rs".into()), Value::String("v2".into())],
+            ).unwrap();
+
+            let rows = db.query("SELECT path, content FROM src", &[]).unwrap();
+            assert_eq!(
+                rows.len(), 1,
+                "named-column ON CONFLICT failed to detect prior-process row — {} rows present",
+                rows.len()
+            );
+            assert_eq!(to_str(&rows[0].values[0]), "a.rs");
+            assert_eq!(to_str(&rows[0].values[1]), "v2");
+        }
+    }
+
+    #[test]
     fn rebuild_skips_helios_internal_tables() {
         // helios_* prefix tables are skipped by the rebuild loop. This test
         // simply confirms that opening a DB with a helios_* present (which

@@ -554,6 +554,16 @@ pub fn code_index_with_embedder(
 /// path appearing twice in `source_table` (e.g. duplicate upserts)
 /// still gets the second occurrence's preamble run, preventing
 /// symbol/ref accumulation.
+///
+/// **Phase-2 batching (FR `parallel_writes`).** The previous
+/// per-file path called `bulk_insert_tuples` once per file × two
+/// (symbols + refs) — for the pilot's 666-file corpus that was
+/// 1 332 batched calls per chunk. This implementation collapses to
+/// **two `bulk_insert_tuples` calls per chunk** (one for all symbols
+/// across all files, one for all refs across all files) by tracking
+/// per-file slice boundaries through the batch. Per-file
+/// `upsert_file` and the SELECT/DELETE preamble remain serial — they
+/// have UPSERT semantics that don't bulk-trivially.
 fn drain_chunk(
     db: &EmbeddedDatabase,
     opts: &CodeIndexOptions,
@@ -563,13 +573,268 @@ fn drain_chunk(
     truncated_this_call: bool,
     processed_paths: &mut std::collections::HashSet<String>,
 ) -> Result<()> {
-    for parsed_result in parsed {
-        let parsed = parsed_result?;
-        let first_time = processed_paths.insert(parsed.file.path.clone());
-        let skip_delete_stale = truncated_this_call && first_time;
-        write_one_parsed(db, opts, embedder, stats, parsed, skip_delete_stale)?;
+    // Step 1 — short-circuit any worker-side parse errors. (Same
+    // behaviour as the prior implementation; '?' propagation halts
+    // the whole call.)
+    let parsed: Vec<ParsedFile> = parsed.into_iter().collect::<Result<Vec<_>>>()?;
+    if parsed.is_empty() {
+        return Ok(());
     }
+
+    // Step 2 — serial per-file preamble: upsert the file row, run
+    // the SELECT/DELETE clean-up of stale symbols + refs (skipped on
+    // the Tier 1.3 fast path for the FIRST occurrence of each path).
+    // Output is a vector of (file_id, parsed_file) preserving input
+    // order so cross-file batching below can map back unambiguously.
+    let mut prepared: Vec<(i64, ParsedFile)> = Vec::with_capacity(parsed.len());
+    for p in parsed {
+        let first_time = processed_paths.insert(p.file.path.clone());
+        let skip_delete_stale = truncated_this_call && first_time;
+        let file_id = upsert_file(db, &opts.source_table, &p.file, &p.sha)?;
+        if !skip_delete_stale {
+            delete_stale_symbols_and_refs(db, file_id)?;
+        }
+        prepared.push((file_id, p));
+    }
+
+    // Step 3 — flatten ALL symbols across files. Track per-file
+    // (start, count) ranges into the flat array so refs can map
+    // back. Run the embedder once per symbol; the dimension check
+    // and `ensure_body_vec_column` lift to the batch level.
+    let total_syms: usize = prepared.iter().map(|(_, p)| p.symbols.len()).sum();
+    let mut all_symbols: Vec<&Symbol> = Vec::with_capacity(total_syms);
+    let mut sym_ranges: Vec<(usize, usize)> = Vec::with_capacity(prepared.len());
+    let mut sym_owner_file_ids: Vec<i64> = Vec::with_capacity(total_syms);
+    for (file_id, p) in &prepared {
+        let start = all_symbols.len();
+        all_symbols.extend(p.symbols.iter());
+        sym_ranges.push((start, p.symbols.len()));
+        sym_owner_file_ids.extend(std::iter::repeat(*file_id).take(p.symbols.len()));
+    }
+
+    let symbol_ids: Vec<i64> = if all_symbols.is_empty() {
+        Vec::new()
+    } else {
+        bulk_insert_symbols_batched(db, embedder, stats, &sym_owner_file_ids, &all_symbols)?
+    };
+
+    // Step 4 — flatten ALL refs across files. For each file slice
+    // its symbol_ids out of the flat result; convert per-file
+    // ResolvedRef.from_idx / to_idx into absolute symbol_ids;
+    // collect into one Tuple vec; one bulk_insert_tuples call.
+    let total_refs: usize = prepared.iter().map(|(_, p)| p.resolved.len()).sum();
+    if total_refs > 0 {
+        let written = bulk_insert_refs_batched(db, &prepared, &symbol_ids, &sym_ranges)?;
+        stats.refs_written += written;
+    }
+
+    // Per-file stat updates (matches the per-file write_one_parsed
+    // accounting that callers / tests rely on).
+    for (i, (_, p)) in prepared.iter().enumerate() {
+        let _ = i; // index reserved for future per-file telemetry
+        stats.files_parsed += 1;
+        stats.symbols_written += p.symbols.len() as u64;
+    }
+
     Ok(())
+}
+
+/// Step 2 helper: run the SELECT/UPDATE/DELETE preamble for a single
+/// file (clean up stale symbols+refs left over from the previous
+/// ingest of this file). Skipped by the caller when truncate_this_call
+/// + first_time gives a clean-table guarantee.
+fn delete_stale_symbols_and_refs(db: &EmbeddedDatabase, file_id: i64) -> Result<()> {
+    let sym_rows = db.query(
+        &format!("SELECT node_id FROM _hdb_code_symbols WHERE file_id = {file_id}"),
+        &[],
+    )?;
+    let stale_ids: Vec<i64> = sym_rows
+        .iter()
+        .filter_map(|r| match r.values.first() {
+            Some(Value::Int4(n)) => Some(*n as i64),
+            Some(Value::Int8(n)) => Some(*n),
+            _ => None,
+        })
+        .collect();
+    if !stale_ids.is_empty() {
+        let csv = stale_ids
+            .iter()
+            .map(|i| i.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        db.execute(&format!(
+            "UPDATE _hdb_code_symbol_refs \
+                SET to_symbol = NULL, resolution = 'unresolved' \
+              WHERE to_symbol IN ({csv})"
+        ))?;
+    }
+    db.execute(&format!(
+        "DELETE FROM _hdb_code_symbol_refs WHERE file_id = {file_id}"
+    ))?;
+    db.execute(&format!(
+        "DELETE FROM _hdb_code_symbols WHERE file_id = {file_id}"
+    ))?;
+    Ok(())
+}
+
+/// Step 3 helper: bulk-insert all symbols across all files in a
+/// chunk in a single `bulk_insert_tuples` call. Mirror of the
+/// per-file `insert_symbols`; the only structural difference is
+/// the `file_id_per_symbol` parallel vector that maps each symbol
+/// row back to its owning file (the per-file `insert_symbols`
+/// got `file_id` once and applied to every row).
+fn bulk_insert_symbols_batched(
+    db: &EmbeddedDatabase,
+    embedder: &dyn Embedder,
+    stats: &mut CodeIndexStats,
+    file_id_per_symbol: &[i64],
+    symbols: &[&Symbol],
+) -> Result<Vec<i64>> {
+    debug_assert_eq!(file_id_per_symbol.len(), symbols.len());
+
+    let mut vectors: Vec<Option<Vec<f32>>> = Vec::with_capacity(symbols.len());
+    for sym in symbols {
+        let v = if !sym.signature.is_empty() {
+            embedder.embed(&sym.signature)?
+        } else {
+            None
+        };
+        if v.is_some() {
+            stats.embed_calls += 1;
+        }
+        vectors.push(v);
+    }
+
+    let any_vec = vectors.iter().any(Option::is_some);
+    if any_vec {
+        let dim = vectors
+            .iter()
+            .find_map(|v| v.as_ref().map(|v| v.len()))
+            .unwrap_or(0);
+        if dim == 0 {
+            return Err(Error::query_execution(
+                "embedder returned a zero-length vector",
+            ));
+        }
+        ensure_body_vec_column(db, dim)?;
+        for v in &vectors {
+            if let Some(vec) = v {
+                if vec.len() != dim {
+                    return Err(Error::query_execution(format!(
+                        "embedder dimension mismatch: expected {dim}, got {}",
+                        vec.len()
+                    )));
+                }
+            }
+        }
+    }
+
+    let schema = db.storage.catalog().get_table_schema("_hdb_code_symbols")?;
+    let n_cols = schema.columns.len();
+    let expected_min_cols = if any_vec { 13 } else { 12 };
+    if n_cols < expected_min_cols {
+        return Err(Error::query_execution(format!(
+            "_hdb_code_symbols schema has {} cols, fast path expects ≥ {}",
+            n_cols, expected_min_cols
+        )));
+    }
+
+    let mut tuples: Vec<Tuple> = Vec::with_capacity(symbols.len());
+    for (idx, sym) in symbols.iter().enumerate() {
+        let file_id = file_id_per_symbol[idx];
+        let mut values: Vec<Value> = Vec::with_capacity(n_cols);
+        values.push(Value::Null); // node_id — auto-fill
+        values.push(Value::Int8(file_id));
+        values.push(Value::String(sym.name.clone()));
+        values.push(Value::String(sym.qualified.clone()));
+        values.push(Value::String(sym.kind.as_str().to_string()));
+        values.push(Value::String(sym.signature.clone()));
+        values.push(Value::String(sym.visibility.as_str().to_string()));
+        values.push(Value::Int4(sym.line_start as i32));
+        values.push(Value::Int4(sym.line_end as i32));
+        values.push(Value::Int4(sym.byte_start as i32));
+        values.push(Value::Int4(sym.byte_end as i32));
+        values.push(Value::Null); // parent_id
+        if any_vec && n_cols >= 13 {
+            let v = vectors
+                .get(idx)
+                .and_then(|v| v.clone())
+                .map(Value::Vector)
+                .unwrap_or(Value::Null);
+            values.push(v);
+        }
+        while values.len() < n_cols {
+            values.push(Value::Null);
+        }
+        tuples.push(Tuple::new(values));
+    }
+    let row_ids = db.bulk_insert_tuples("_hdb_code_symbols", tuples)?;
+    Ok(row_ids.into_iter().map(|id| id as i64).collect())
+}
+
+/// Step 4 helper: bulk-insert all refs across all files in a chunk
+/// in a single `bulk_insert_tuples` call. For each file's resolved
+/// refs, slice the per-file symbol_ids out of the flat batch result
+/// and translate ResolvedRef.from_idx / to_idx into absolute ids.
+fn bulk_insert_refs_batched(
+    db: &EmbeddedDatabase,
+    prepared: &[(i64, ParsedFile)],
+    symbol_ids: &[i64],
+    sym_ranges: &[(usize, usize)],
+) -> Result<u64> {
+    let schema = db.storage.catalog().get_table_schema("_hdb_code_symbol_refs")?;
+    let n_cols = schema.columns.len();
+    if n_cols < 8 {
+        return Err(Error::query_execution(format!(
+            "_hdb_code_symbol_refs schema has {} cols, fast path expects ≥ 8",
+            n_cols
+        )));
+    }
+
+    let total: usize = prepared.iter().map(|(_, p)| p.resolved.len()).sum();
+    let mut tuples: Vec<Tuple> = Vec::with_capacity(total);
+    for (i, (file_id, p)) in prepared.iter().enumerate() {
+        let (start, count) = sym_ranges[i];
+        let file_symbol_ids = &symbol_ids[start..start + count];
+        for r in &p.resolved {
+            let from_id = file_symbol_ids.get(r.from_idx).copied().ok_or_else(|| {
+                Error::query_execution(format!(
+                    "resolver produced invalid from_idx {} for file_id {}",
+                    r.from_idx, file_id
+                ))
+            })?;
+            let to_val = match r.to_idx {
+                Some(idx) => file_symbol_ids
+                    .get(idx)
+                    .map(|id| Value::Int8(*id))
+                    .unwrap_or(Value::Null),
+                None => Value::Null,
+            };
+            let res = match r.resolution {
+                Resolution::Exact => "exact",
+                Resolution::Heuristic => "heuristic",
+                Resolution::Unresolved => "unresolved",
+            };
+            let mut values: Vec<Value> = Vec::with_capacity(n_cols);
+            values.push(Value::Null); // edge_id — auto-fill
+            values.push(Value::Int8(*file_id));
+            values.push(Value::Int8(from_id));
+            values.push(to_val);
+            values.push(Value::String(r.to_name.clone()));
+            values.push(Value::String(r.kind_str.to_string()));
+            values.push(Value::Int4(r.line as i32));
+            values.push(Value::String(res.to_string()));
+            while values.len() < n_cols {
+                values.push(Value::Null);
+            }
+            tuples.push(Tuple::new(values));
+        }
+    }
+    let written = tuples.len() as u64;
+    if !tuples.is_empty() {
+        db.bulk_insert_tuples("_hdb_code_symbol_refs", tuples)?;
+    }
+    Ok(written)
 }
 
 /// Drain one parsed file into the `_hdb_code_*` tables. Caller wraps
