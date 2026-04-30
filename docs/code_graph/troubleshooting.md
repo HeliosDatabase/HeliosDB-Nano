@@ -7,14 +7,13 @@ Common pilot-deployment gotchas + fixes.
 The agent (Claude Code / Cursor / etc.) can't reach the MCP
 endpoint.
 
-* Check the binary path in your `claude.json`. The installer
-  emits an absolute path; copy it verbatim.
-* Re-build with the right features:
-  ```sh
-  cargo build --release --features code-graph,graph-rag,mcp-endpoint
-  ```
-  A binary built without `mcp-endpoint` has no `mcp-server`
-  subcommand.
+* Check the binary path in your `claude.json`. Use the
+  `heliosdb-codekb-mcp` plugin binary path (the engine doesn't
+  ship an `mcp-server` CLI subcommand — MCP is a library
+  integration consumed by the plugin). Re-build the plugin with
+  `cd heliosdb-codekb-mcp && cargo build --release`; the engine
+  is pulled in transitively as a library dep with the right
+  features (`code-graph,graph-rag,mcp-endpoint,code-embed`).
 * If you bound to a non-loopback address, you need
   `McpAuth::Jwt(...)` configured — `bind_safety_check` refuses
   the bind otherwise.
@@ -62,8 +61,11 @@ SELECT hdb_code.resume('src_ast_index');
 
 ## Logs
 
+The MCP server runs out of `heliosdb-codekb-mcp serve`; redirect
+its stderr to a log file and filter via `HELIOS_LOG`:
+
 ```sh
-HELIOS_LOG=debug ./bin/heliosdb-nano mcp-server --db .helios-nano/data 2>./helios.log
+HELIOS_LOG=debug heliosdb-codekb-mcp serve --source /abs/repo 2>./helios.log
 ```
 
 Useful filters:

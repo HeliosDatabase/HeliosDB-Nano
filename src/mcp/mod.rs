@@ -4,8 +4,9 @@
 //!
 //! * JSON-RPC 2.0 dispatcher (`rpc::handle_rpc`, `rpc::handle_rpc_with_db`)
 //!   — transport-agnostic, reusable from stdio, HTTP, WebSocket, SSE.
-//! * Stdio server (`server::McpServer`) — used by `heliosdb-nano mcp-server`
-//!   and by MCP clients that spawn HeliosDB as a subprocess.
+//! * Stdio server (`server::McpServer`) — consumed by the out-of-tree
+//!   `heliosdb-codekb-mcp` plugin's `serve` subcommand and by MCP
+//!   clients that spawn the plugin as a subprocess.
 //! * Unified tool catalogue (`tools::list_tools` / `tools::call_tool`) —
 //!   10 DB-backed tools (query / schema / branch / search / time-travel)
 //!   + 6 in-process RAG tools (BM25 index, hybrid search, graph

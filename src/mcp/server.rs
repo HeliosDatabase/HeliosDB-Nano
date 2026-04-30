@@ -2,9 +2,11 @@
 //!
 //! Reads JSON-RPC 2.0 requests line-by-line from stdin, dispatches via
 //! the shared `rpc::handle_rpc_with_db`, and writes responses to stdout.
-//! This is the transport used by `heliosdb-nano mcp-server` and by any
-//! MCP client configured via
-//! `{"mcpServers":{"heliosdb":{"command":"heliosdb-nano","args":["mcp-server"]}}}`.
+//! This is the transport used by the out-of-tree
+//! [`heliosdb-codekb-mcp`](https://github.com/dimensigon/heliosdb-codekb-mcp)
+//! plugin's `serve` subcommand and by any MCP client that spawns the
+//! plugin as a subprocess via:
+//! `{"mcpServers":{"helios":{"command":"heliosdb-codekb-mcp","args":["serve","--source","/abs/repo"]}}}`.
 //!
 //! Supports `notifications/progress`: when a `tools/call` request
 //! includes `_meta.progressToken`, the handler runs on a blocking

@@ -66,22 +66,36 @@ git diff --cached --name-only --diff-filter=ACMR | \
 
 ## Wire into your AI client
 
+`heliosdb-nano` itself is a database engine — it has no `mcp-server`
+CLI subcommand on purpose (the engine stays generic). The MCP
+server runs as a tiny stdio / HTTP shim that consumes the engine
+as a library: the
+[`heliosdb-codekb-mcp`](https://github.com/dimensigon/heliosdb-codekb-mcp)
+plugin binary.
+
 Drop this snippet into `~/.config/claude/claude.json` (or the
 equivalent for Cursor / Codex / Continue):
 
 ```json
 {
   "mcpServers": {
-    "helios-nano-myrepo": {
-      "command": "/abs/path/to/.helios-nano/bin/heliosdb-nano",
-      "args": ["mcp-server", "--db", "/abs/path/to/.helios-nano/data"]
+    "helios-codekb-myrepo": {
+      "command": "/abs/path/to/heliosdb-codekb-mcp",
+      "args": ["serve", "--source", "/abs/path/to/repo-root"]
     }
   }
 }
 ```
 
-The 16-tool catalogue plus the auto-registered LSP / GraphRAG
-extensions show up in the agent's tool list immediately.
+For Cursor / Continue / any non-stdio MCP client, add `--http
+<addr>` to bind an HTTP/WebSocket/SSE server instead of stdio
+and point the client at it.
+
+The plugin's `init --source X --mode <co-located|global|hybrid>
+--ingest` step is what populates the KB before `serve` opens it.
+The full 27-tool catalogue (16 unified DB-backed + 11 LSP /
+GraphRAG / code-graph extensions) shows up in the agent's tool
+list immediately.
 
 ## Run the flagship query
 

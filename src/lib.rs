@@ -291,8 +291,9 @@ pub mod graph_rag;
 // Native MCP endpoint (FR 5) — JSON-RPC 2.0 surface over a unified
 // tool + resource catalogue. Reusable from stdio, HTTP, WebSocket,
 // SSE. See `src/mcp/rpc.rs` for the pure dispatcher and
-// `src/mcp/server.rs` for the stdio transport used by
-// `heliosdb-nano mcp-server`.
+// `src/mcp/server.rs` for the stdio transport used by the
+// out-of-tree `heliosdb-codekb-mcp` plugin (the engine is a
+// library here; no MCP CLI subcommand on the engine binary).
 #[cfg(feature = "mcp-endpoint")]
 pub mod mcp;
 
