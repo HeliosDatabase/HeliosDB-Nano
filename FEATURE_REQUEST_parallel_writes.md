@@ -1,12 +1,32 @@
 ---
 requested-by: heliosdb-codekb-mcp pilot — danimoya
 requested-against: HeliosDB-Nano v3.22.1
-priority: high
-status: open
+priority: medium
+status: subset-implemented-in-7bb58c2
 date-filed: 2026-04-30
+date-partially-implemented: 2026-04-30
 track: code-graph / performance
-related: FEATURE_REQUEST_parallel_code_index.md (Phase 1, shipped in v3.21.0); v3.22.1 + Async wal_sync delivers 8× cold-ingest vs v3.19.1 baseline; Phase 2 unlocks 10k+ file repos under the 5-minute budget.
+related: FEATURE_REQUEST_parallel_code_index.md (Phase 1, shipped in v3.21.0); v3.22.1 + Async wal_sync delivers 8× cold-ingest vs v3.19.1 baseline; commit 7bb58c2 lands the realisable subset (cross-file bulk-insert batching) and pushes the win further.
 ---
+
+> **Status (2026-04-30, post-7bb58c2 branch).** The realisable
+> subset of this FR — collapsing per-file `bulk_insert_tuples`
+> calls into per-chunk batches — has shipped. Pilot impact:
+>
+> | metric | v3.22.1 | v3.22.1 + 7bb58c2 |
+> |---|---|---|
+> | code_index write phase | 84.1 s | **6.8 s** (12.4×) |
+> | cold-ingest total | 1 m 42 s | **26.4 s** (3.86×) |
+> | vs v3.19.1 baseline (819 s) | 8.0× | **31.0×** |
+>
+> What remains in this FR — true multi-threaded multi-writer
+> across `_hdb_code_*` — is gated on engine-internal `Sync`-ing
+> of the catalog / ART / transaction state. That's a much larger
+> refactor and the pilot's 5-minute cold-ingest target is now
+> comfortably met for repos up to ~10 k files. **Revisit only
+> when a concrete > 10 k file repo workload makes the gap show
+> up again.**
+
 
 # Feature Request: Parallel write phase in `code_index_with_embedder`
 

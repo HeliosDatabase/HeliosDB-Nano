@@ -1,12 +1,29 @@
 ---
 requested-by: heliosdb-codekb-mcp pilot — danimoya
 requested-against: HeliosDB-Nano v3.22.1
-priority: medium
-status: open
+priority: low
+status: deferred-marginal-after-7bb58c2
 date-filed: 2026-04-30
+date-deferred: 2026-04-30
 track: code-graph / performance
-related: FEATURE_REQUEST_parallel_writes.md (orthogonal — they compose)
+related: FEATURE_REQUEST_parallel_writes.md (subset implemented in 7bb58c2 as cross-file bulk-insert batching)
 ---
+
+> **Note (2026-04-30, post-7bb58c2 branch).** The cross-file
+> bulk-insert batching commit (`7bb58c2`) drove the write phase
+> on the pilot corpus from 84 s → 6.8 s (12.4×). Cold ingest
+> total fell from 1 m 42 s → 26.4 s. Parse phase is 3.3 s. The
+> max possible win from overlapping parse + write is therefore
+> capped at ~3.3 s out of 26.4 s — ~12 %, marginal compared to
+> the implementation complexity (bounded MPMC channel,
+> backpressure, chunk-ordering, memory accounting). The
+> cost/benefit no longer justifies this FR at the current pilot
+> scale. **Revisit when a concrete 10 k+ file repo target makes
+> the absolute savings material again** — by extrapolation
+> (linear in symbols+refs) those bigger corpora put parse at
+> ~50 s and write at ~100 s, where streaming would save closer
+> to 50 s end-to-end.
+
 
 # Feature Request: Streaming pipeline — overlap parse + write phases
 
