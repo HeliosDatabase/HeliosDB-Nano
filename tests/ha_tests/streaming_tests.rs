@@ -19,6 +19,7 @@ fn make_test_entry(lsn: u64, data: &str) -> WalEntry {
     let data_bytes = data.as_bytes().to_vec();
     WalEntry {
         lsn,
+        tx_id: None,
         entry_type: WalEntryType::Insert,
         data: data_bytes.clone(),
         checksum: crc32fast::hash(&data_bytes),
@@ -283,24 +284,28 @@ async fn test_wal_entry_types() {
     let entries = vec![
         WalEntry {
             lsn: 1,
+            tx_id: None,
             entry_type: WalEntryType::Insert,
             data: b"insert_data".to_vec(),
             checksum: crc32fast::hash(b"insert_data"),
         },
         WalEntry {
             lsn: 2,
+            tx_id: None,
             entry_type: WalEntryType::Update,
             data: b"update_data".to_vec(),
             checksum: crc32fast::hash(b"update_data"),
         },
         WalEntry {
             lsn: 3,
+            tx_id: None,
             entry_type: WalEntryType::Delete,
             data: b"delete_data".to_vec(),
             checksum: crc32fast::hash(b"delete_data"),
         },
         WalEntry {
             lsn: 4,
+            tx_id: None,
             entry_type: WalEntryType::Checkpoint,
             data: b"checkpoint_data".to_vec(),
             checksum: crc32fast::hash(b"checkpoint_data"),
@@ -368,6 +373,7 @@ async fn test_wal_checksum_verification() {
     // Valid entry
     let valid_entry = WalEntry {
         lsn: 1,
+        tx_id: None,
         entry_type: WalEntryType::Insert,
         data: data.to_vec(),
         checksum: correct_checksum,
@@ -382,6 +388,7 @@ async fn test_wal_checksum_verification() {
     // Invalid checksum entry (should still append but verification will fail)
     let invalid_entry = WalEntry {
         lsn: 2,
+        tx_id: None,
         entry_type: WalEntryType::Insert,
         data: data.to_vec(),
         checksum: incorrect_checksum,

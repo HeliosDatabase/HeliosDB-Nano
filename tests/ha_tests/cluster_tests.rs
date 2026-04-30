@@ -31,6 +31,7 @@ fn make_test_entry(lsn: u64, data: &str) -> WalEntry {
     let data_bytes = data.as_bytes().to_vec();
     WalEntry {
         lsn,
+        tx_id: None,
         entry_type: WalEntryType::Insert,
         data: data_bytes.clone(),
         checksum: crc32fast::hash(&data_bytes),
