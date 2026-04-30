@@ -328,7 +328,34 @@ fn in_process_tools() -> Vec<ToolDescriptor> {
 
 /// Unified dispatch. In-process tools ignore `db`; DB-backed tools error
 /// with a clear message when `db` is `None`.
+///
+/// Wrapped in a server-side LRU cache for read-only tools (see
+/// `super::result_cache`) — repeated identical calls inside an
+/// agentic-coding session return the cached `ToolOutcome` without
+/// re-running the handler. Cache invalidates on any mutating tool call
+/// (`super::result_cache::writes`) and on TTL expiry.
 pub fn call_tool(db: Option<&EmbeddedDatabase>, name: &str, args: JsonValue) -> ToolOutcome {
+    use super::result_cache;
+
+    // Cache-hit short-circuit. Read-only tools only.
+    if let Some(cached) = result_cache::try_get(name, &args) {
+        return cached;
+    }
+
+    let outcome = call_tool_inner(db, name, args.clone());
+
+    // Populate cache (no-op for non-read-only tools or error outcomes).
+    result_cache::insert(name, &args, &outcome);
+
+    // Bump generation on writes — invalidates everything cached so far.
+    if !outcome.is_error && result_cache::writes(name) {
+        result_cache::invalidate_for_writes();
+    }
+
+    outcome
+}
+
+fn call_tool_inner(db: Option<&EmbeddedDatabase>, name: &str, args: JsonValue) -> ToolOutcome {
     match name {
         "heliosdb_query" => require_db(db, "heliosdb_query", |d| do_query(d, args)),
         "heliosdb_schema" => require_db(db, "heliosdb_schema", |d| do_schema(d, args)),
