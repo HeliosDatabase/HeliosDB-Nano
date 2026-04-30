@@ -4066,6 +4066,26 @@ impl StorageEngine {
             }
         }
 
+        // PK / UNIQUE check before committing the write.  Mirror of the
+        // check in `insert_tuple_fast` (the SQL fast-path entry); without
+        // this, parameterised INSERTs (`db.execute_params`) and other
+        // callers routed here would silently insert duplicates that a
+        // cross-process `Catalog::rebuild_all_indexes()` had already
+        // registered in the ART. (FR `cross_process_on_conflict`.)
+        {
+            let mut col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+            for (i, col) in schema.columns.iter().enumerate() {
+                if let Some(v) = tuple.values.get(i) {
+                    col_values.insert(col.name.clone(), v.clone());
+                }
+            }
+            if let Err(e) = self.art_index_manager
+                .check_unique_constraints(table_name, &col_values)
+            {
+                return Err(Error::constraint_violation(e.to_string()));
+            }
+        }
+
         // Check bulk load mode early - skip some operations if enabled
         let bulk_mode = self.is_bulk_load_mode();
 
