@@ -28,7 +28,7 @@ ignore = [
 
 [licenses]
 version = 2
-# Allow permissive and AGPL-compatible licenses
+# Allow permissive licenses compatible with our Apache-2.0 license
 allow = [
     "MIT",
     "Apache-2.0",
@@ -40,16 +40,11 @@ allow = [
     "Unicode-DFS-2016",
     "CC0-1.0",
     "0BSD",
-    "AGPL-3.0-only",
-    "AGPL-3.0-or-later",
-    "GPL-3.0-only",
-    "GPL-3.0-or-later",
 ]
 
 # Deny incompatible copyleft licenses
 deny = [
-    # GPL-3.0 and AGPL-3.0 are compatible with our AGPL-3.0 license
-    # but we restrict GPL to avoid confusion; AGPL deps are allowed
+    # GPL/AGPL deps are not compatible with our Apache-2.0 license
 ]
 
 # Warn about weak copyleft

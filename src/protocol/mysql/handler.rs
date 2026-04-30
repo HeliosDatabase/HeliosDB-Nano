@@ -1623,7 +1623,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             Value::String("ACTIVE".into()),
             Value::String("AUTHENTICATION".into()),
             Value::Null,
-            Value::String("AGPL-3.0".into()),
+            Value::String("Apache-2.0".into()),
         ])];
         self.send_result_set(&cols, &rows).await
     }
