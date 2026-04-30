@@ -127,6 +127,11 @@ pub(crate) fn info_result() -> JsonValue {
             })
         })
         .collect();
+    let cache = super::result_cache::stats();
+    let cache_hit_rate = {
+        let total = cache.hits + cache.misses;
+        if total == 0 { 0.0 } else { cache.hits as f64 / total as f64 }
+    };
     json!({
         "serverInfo": {
             "name": "heliosdb-nano",
@@ -140,6 +145,18 @@ pub(crate) fn info_result() -> JsonValue {
         "tools": tools,
         "resources": resources,
         "tool_count": tools.len(),
+        // Server-side LRU cache stats (read-only `tools/call`
+        // results). Plugin / ops surface this in `status` for hit
+        // rate, generation drift after writes, and capacity vs len.
+        "cache": {
+            "size":       cache.size,
+            "capacity":   cache.capacity,
+            "generation": cache.generation,
+            "hits":       cache.hits,
+            "misses":     cache.misses,
+            "evictions":  cache.evictions,
+            "hit_rate":   cache_hit_rate,
+        },
     })
 }
 
