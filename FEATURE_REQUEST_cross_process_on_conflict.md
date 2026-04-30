@@ -2,10 +2,51 @@
 requested-by: Tier 1 field-bench follow-up — danimoya
 requested-against: HeliosDB-Nano v3.21.1
 priority: high
-status: open
+status: fixed-on-branch (feat/cross-process-conflict-and-cache-stats @ 6ec74d3)
 date-filed: 2026-04-28
+date-fixed: 2026-04-30
 track: storage / correctness
 ---
+
+## Resolution
+
+**Root cause** (different from the original hypothesis):
+
+1. `insert_tuple_versioned_with_schema` (the storage primitive
+   used by `insert_tuple_branch_aware_with_schema` for main
+   branch and by `execute_plan_with_params_inner`'s INSERT path)
+   **did not call `check_unique_constraints`** — its SQL fast-path
+   sibling `insert_tuple_fast` already did. Cross-process
+   duplicate detection works only when the rebuilt ART is
+   consulted; bypassing the check let dups through silently.
+
+2. `execute_plan_with_params_inner`'s `LogicalPlan::Insert` arm
+   **discarded `on_conflict`** (`on_conflict: _`). Even with #1
+   fixed, parameterised
+   `INSERT … ON CONFLICT(col) DO UPDATE` would now error instead
+   of upserting.
+
+The encoding hypothesis in this doc was a red herring — both
+paths use `ArtIndexManager::encode_key` correctly. The bug was
+that one path didn't enforce constraints at all.
+
+**Fix** (engine commit `6ec74d3`):
+
+- Add the `check_unique_constraints` call to
+  `insert_tuple_versioned_with_schema` so direct callers and
+  the parameterised executor both pay the cost. Defence in depth
+  vs the existing pre-check at lib.rs:1175 in the full executor.
+- Wire `on_conflict` through `execute_plan_with_params_inner`:
+  pre-check uniqueness, route the conflict to DoNothing
+  (silent skip) or DoUpdate (UNIQUE-column scan / PK lookup →
+  read existing tuple → resolve EXCLUDED refs and apply
+  assignments via a parameter-aware `Evaluator` → write back via
+  `update_tuple_fast`).
+
+**Verification**: new test
+`tests/cross_process_index_rebuild_tests::on_conflict_named_column_upserts_after_reopen`
+reproduces the exact field repro and now passes alongside the
+6 pre-existing tests + 10 in-lib `on_conflict` tests.
 
 # Bug: cross-process `INSERT … ON CONFLICT (pk) DO UPDATE` doesn't detect prior committed rows
 
