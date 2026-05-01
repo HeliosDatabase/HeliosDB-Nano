@@ -52,8 +52,11 @@ jobs:
       # runner. They pass locally and form a separate (non-release-gating)
       # signal — keeping them out of the release path keeps the gate
       # deterministic.
-      - name: Run tests (lib + doc)
-        run: cargo test --locked --lib --doc -- --test-threads=2
+      - name: Run lib unit tests
+        run: cargo test --locked --lib -- --test-threads=2
+
+      - name: Run doc tests
+        run: cargo test --locked --doc -- --test-threads=2
 
       # ── Sanity gate 3: dry-run publish to catch metadata / packaging issues
       # before the real publish (real publish is irreversible — versions can be
