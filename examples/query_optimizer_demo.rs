@@ -567,6 +567,8 @@ fn demo_complex_query(optimizer: &Optimizer, users_schema: Arc<Schema>, orders_s
         input: Box::new(aggregate),
         limit: 100,
         offset: 0,
+        limit_param: None,
+        offset_param: None,
     };
 
     let before_cost = optimizer.cost_estimator().estimate_cost(&limit).unwrap_or(0.0);
