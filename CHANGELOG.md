@@ -5,6 +5,37 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.22.3] - 2026-05-01
+
+### Added — Agentic-operations skill catalogue
+
+Project-scoped catalogue of 17 SKILL.md files under `.claude/skills/heliosdb-nano-*/`
+plus a vendor-neutral `AGENTS.md` aggregate at the repo root, designed so
+LLM-driven coding agents (Claude Code, OpenAI Codex CLI, MCP-aware tools)
+get a complete A→Z verb catalogue for operating the database the moment
+they enter the project — no README spelunking required.
+
+Skills (one per domain): `heliosdb-nano-overview`, `-install`, `-connect`,
+`-schema`, `-query`, `-transactions`, `-branches`, `-time-travel`,
+`-backup`, `-vector`, `-code-graph`, `-graph-rag`, `-mcp`, `-server`,
+`-deploy`, `-observability`, `-migrate`. Plus reference helpers
+`_index/verb-map.md` (every CLI flag, REPL meta-command, public Rust API,
+MCP tool) and `_index/feature-matrix.md` (cargo feature ↔ skill).
+
+Distribution:
+
+- **`git clone`** — Claude Code automatically picks up `.claude/skills/`.
+- **`cargo install heliosdb-nano`** + manual install — run
+  `bash scripts/install-agent-skills.sh [--symlink]` to publish skills
+  into `~/.claude/skills/`. Existing `heliosdb-nano-*` directories there are
+  backed up to `*.bak.<unix-ts>` first.
+- **Codex / generic agents** — read `AGENTS.md` at project root (the
+  de-facto convention).
+
+No code changes — docs/scaffolding only. A future minor release may add
+a `heliosdb-nano skills install` subcommand so post-`cargo install` users
+don't need a repo checkout to publish skills globally.
+
 ## [3.22.2] - 2026-04-30
 
 ### Fixed — cross-process `INSERT … ON CONFLICT` no longer duplicates rows

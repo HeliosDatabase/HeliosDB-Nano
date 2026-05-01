@@ -411,6 +411,42 @@ const db = createClient('http://localhost:8080', 'anon-key')
 const { data } = await db.from('products').select('*').lt('price', 50)
 ```
 
+## Agentic Operations (Claude Code, Codex CLI, MCP-aware tools)
+
+HeliosDB-Nano ships an **agentic-operations skill catalogue** — 17 SKILL.md files that give an LLM-driven coding agent a full A→Z catalogue of "verbs" for operating the database (install, connect, schema, DML, transactions, branches, time-travel, backup, vector, code-graph, graph-rag, MCP, server, deploy, observability, migrate). For Codex / generic agents the same content is aggregated at [`AGENTS.md`](AGENTS.md) at the project root.
+
+```bash
+# After git clone, Claude Code automatically picks up .claude/skills/ in this project.
+
+# To install globally (~/.claude/skills/) so they apply in any project:
+bash scripts/install-agent-skills.sh                # copy (default, frozen snapshot)
+bash scripts/install-agent-skills.sh --symlink      # symlink (live updates)
+```
+
+Existing `~/.claude/skills/heliosdb-nano-*` directories are backed up to `*.bak.<unix-ts>` before being overwritten in either mode.
+
+| Skill | What it covers |
+|-------|---------------|
+| `heliosdb-nano-overview` | Top-level navigation; routes to one of the 16 domain skills |
+| `heliosdb-nano-install` | crates.io, source, feature flags (code-graph, mcp-endpoint, fips, ha-full…) |
+| `heliosdb-nano-connect` | Embedded library, REPL, PG wire, MySQL wire, Python sqlite3 drop-in, TLS |
+| `heliosdb-nano-schema` | DDL: tables, indexes (B-tree + HNSW), views, triggers, PL/pgSQL |
+| `heliosdb-nano-query` | DML, parameter styles (`?` `$1` `:name` `@name`), `ON CONFLICT`, `RETURNING` |
+| `heliosdb-nano-transactions` | BEGIN/COMMIT/ROLLBACK, savepoints, bulk-load patterns |
+| `heliosdb-nano-branches` | `CREATE/USE/MERGE/DROP DATABASE BRANCH`, `AS OF` clones |
+| `heliosdb-nano-time-travel` | `SELECT … AS OF TIMESTAMP '…'`, `\snapshots` |
+| `heliosdb-nano-backup` | `dump`/`restore`, compression, append, partial restore, `--dump-schedule` |
+| `heliosdb-nano-vector` | HNSW indexes, `<-> <#> <=>` operators, hybrid search |
+| `heliosdb-nano-code-graph` | AST symbol index, LSP queries, git hook (`code-graph` feature) |
+| `heliosdb-nano-graph-rag` | Knowledge graph + RAG ingest pipeline (`graph-rag` feature) |
+| `heliosdb-nano-mcp` | MCP server, 16-tool catalog, stdio/HTTP/WS (`mcp-endpoint` feature) |
+| `heliosdb-nano-server` | Daemon, TLS, auth, HA tier 1/2/3, user management |
+| `heliosdb-nano-deploy` | Docker, Fly.io, Railway, Render, systemd template |
+| `heliosdb-nano-observability` | Tracing, slow-query log, `/health`, `\stats`, `\optimize`, `\indexes` |
+| `heliosdb-nano-migrate` | sqlite3 / Postgres / MySQL drop-in checklists |
+
+Lookups: [`.claude/skills/_index/verb-map.md`](.claude/skills/_index/verb-map.md) (every CLI flag / REPL meta-command / public Rust API method / MCP tool) · [`.claude/skills/_index/feature-matrix.md`](.claude/skills/_index/feature-matrix.md) (cargo feature ↔ skill).
+
 ## Documentation
 
 - [Getting Started](https://heliosdb.com/nano.html)
