@@ -360,5 +360,16 @@ name = "linker_precision"
 harness = false
 required-features = ["graph-rag", "code-graph"]
 
+# Examples that require non-default features. Cargo skips them
+# automatically on default-feature builds (e.g. release CI), so
+# `cargo test` doesn't fail trying to compile feature-gated bodies.
+[[example]]
+name = "code_graph_pilot"
+required-features = ["code-graph"]
+
+[[example]]
+name = "code_graph_inspect"
+required-features = ["code-graph"]
+
 [profile.bench]
 inherits = "release"
