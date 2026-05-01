@@ -46,8 +46,11 @@ jobs:
           fi
 
       # ── Sanity gate 2: tests pass on the tagged commit ─────────────────────
+      # `--test-threads=2` matches typical GH-runner core count and avoids
+      # port-binding contention in HA streaming tests (socket-binding races
+      # surface only under high parallelism; locally the suite passes serially).
       - name: Run tests (default features)
-        run: cargo test --locked
+        run: cargo test --locked -- --test-threads=2
 
       # ── Sanity gate 3: dry-run publish to catch metadata / packaging issues
       # before the real publish (real publish is irreversible — versions can be
