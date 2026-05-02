@@ -360,6 +360,10 @@ name = "linker_precision"
 harness = false
 required-features = ["graph-rag", "code-graph"]
 
+[[bench]]
+name = "predicate_pushdown_bench"
+harness = false
+
 # Examples that require non-default features. Cargo skips them
 # automatically on default-feature builds (e.g. release CI), so
 # `cargo test` doesn't fail trying to compile feature-gated bodies.

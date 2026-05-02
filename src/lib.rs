@@ -6616,6 +6616,7 @@ impl EmbeddedDatabase {
             let rules: Vec<Box<dyn optimizer::rules::OptimizationRule>> = vec![
                 Box::new(optimizer::rules::ConstantFoldingRule::new()),
                 Box::new(optimizer::rules::SelectionPushdownRule::new()),
+                Box::new(optimizer::rules::JoinPredicatePushdownRule::new()),
                 Box::new(optimizer::rules::ProjectionPruningRule::new()),
             ];
             let opt = optimizer::Optimizer::with_rules(
@@ -6670,6 +6671,7 @@ impl EmbeddedDatabase {
             let rules: Vec<Box<dyn optimizer::rules::OptimizationRule>> = vec![
                 Box::new(optimizer::rules::ConstantFoldingRule::new()),
                 Box::new(optimizer::rules::SelectionPushdownRule::new()),
+                Box::new(optimizer::rules::JoinPredicatePushdownRule::new()),
                 Box::new(optimizer::rules::ProjectionPruningRule::new()),
             ];
             let opt = optimizer::Optimizer::with_rules(

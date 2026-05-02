@@ -322,6 +322,19 @@ Optional HA features (opt-in at compile time):
 cargo build --release --features ha-full    # everything
 ```
 
+> **Tip — verify HA changes locally, not in CI**: the HA streaming and
+> lock-management integration tests rely on tight TCP-port spin-waits
+> that pass cleanly on a developer workstation (sub-second) but routinely
+> hang on the 2-CPU GitHub Actions runner. The release workflow gates on
+> `cargo test --lib` only; if you're modifying anything under
+> `src/storage/wal/`, `src/cluster/`, or `src/storage/locks/`, run the full
+> integration suite locally first:
+>
+> ```bash
+> cargo test --features ha-tier1 --test ha_integration   # warm-standby + streaming
+> cargo test --tests --skip ha_tests::streaming_tests --skip lock_management
+> ```
+
 ### Connection Routing & Load Balancing
 
 For production deployments with multiple HeliosDB Nano instances, put **[HeliosProxy](https://github.com/dimensigon/heliosdb-proxy)** in front — a standalone binary providing:

@@ -130,7 +130,6 @@ mod cte_hardening {
     }
 
     #[test]
-    #[ignore = "FEATURE_REQUEST_cte_in_join_constant_predicate.md — planner returns 9 rows instead of 3 when JOIN predicate has no join-key column (degenerates to cross product). Latent pre-3.22.3 bug."]
     fn test_basic_cte_used_in_join() {
         let db = setup_db();
         let sql = "WITH eng AS (SELECT id, name, salary FROM cte_employees WHERE dept = 'Engineering') SELECT eng.name, cte_departments.budget FROM eng JOIN cte_departments ON cte_departments.name = 'Engineering'";
@@ -142,6 +141,28 @@ mod cte_hardening {
                 }
             }
             Err(e) => eprintln!("CTE in JOIN not supported: {e}"),
+        }
+    }
+
+    /// FR acceptance variant: one-sided ON predicate that is **not** a literal.
+    /// `cte_departments.budget > 350000` keeps only Engineering (500_000),
+    /// cross-joined with `eng` (3 rows) → 3 result rows. The same
+    /// predicate-pushdown rule must apply to non-equi one-sided predicates.
+    #[test]
+    fn test_basic_cte_used_in_join_one_sided_non_constant() {
+        let db = setup_db();
+        let sql = "WITH eng AS (SELECT id, name, salary FROM cte_employees WHERE dept = 'Engineering') SELECT eng.name, cte_departments.budget FROM eng JOIN cte_departments ON cte_departments.budget > 350000";
+        match try_q(&db, sql) {
+            Ok(rows) => {
+                assert_eq!(rows.len(), 3);
+                for row in &rows {
+                    let v = &row.values[1];
+                    let ok = matches!(v, Value::Int4(b) if *b > 350_000)
+                        || matches!(v, Value::Int8(b) if *b > 350_000);
+                    assert!(ok, "expected budget > 350000, got {v:?}");
+                }
+            }
+            Err(e) => eprintln!("CTE in JOIN with non-constant one-sided ON not supported: {e}"),
         }
     }
 

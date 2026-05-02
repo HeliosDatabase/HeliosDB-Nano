@@ -47,3 +47,4 @@ heliosdb.pid
 
 # Local fastembed model cache (pulled by `--features code-embed` builds)
 .fastembed_cache/
+bench-data-predicate-pushdown/

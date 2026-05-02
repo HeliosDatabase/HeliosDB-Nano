@@ -312,7 +312,7 @@ impl SelectionPushdownRule {
     }
 
     /// Collect all table names and aliases reachable from a plan subtree
-    fn collect_table_refs(plan: &LogicalPlan) -> HashSet<String> {
+    pub(crate) fn collect_table_refs(plan: &LogicalPlan) -> HashSet<String> {
         let mut refs = HashSet::new();
         Self::collect_table_refs_inner(plan, &mut refs);
         refs
@@ -340,7 +340,7 @@ impl SelectionPushdownRule {
     }
 
     /// Extract all table references from column expressions in a predicate
-    fn extract_column_table_refs(expr: &LogicalExpr) -> HashSet<String> {
+    pub(crate) fn extract_column_table_refs(expr: &LogicalExpr) -> HashSet<String> {
         let mut refs = HashSet::new();
         Self::extract_column_table_refs_inner(expr, &mut refs);
         refs
@@ -394,7 +394,7 @@ impl SelectionPushdownRule {
     }
 
     /// Combine conjuncts with AND
-    fn combine_conjuncts(mut conjuncts: Vec<LogicalExpr>) -> LogicalExpr {
+    pub(crate) fn combine_conjuncts(mut conjuncts: Vec<LogicalExpr>) -> LogicalExpr {
         debug_assert!(!conjuncts.is_empty());
         if conjuncts.len() == 1 {
             return conjuncts.remove(0);
@@ -411,7 +411,7 @@ impl SelectionPushdownRule {
     }
 
     /// Extract AND conjuncts from a predicate
-    fn extract_conjuncts(expr: &LogicalExpr) -> Vec<LogicalExpr> {
+    pub(crate) fn extract_conjuncts(expr: &LogicalExpr) -> Vec<LogicalExpr> {
         match expr {
             LogicalExpr::BinaryExpr { left, op: BinaryOperator::And, right } => {
                 let mut result = Self::extract_conjuncts(left);
@@ -1302,15 +1302,283 @@ impl Default for StorageFilterPushdownRule {
     }
 }
 
+// =============================================================================
+// Rule N: Join Predicate Pushdown
+// =============================================================================
+
+/// Pushes one-sided ON predicates from `Join` nodes down into `Filter` wrappers
+/// above each input.
+///
+/// `SelectionPushdownRule` already handles `Filter(Join(...))` — predicates
+/// sitting *above* a join. This rule covers predicates **inside** a join's
+/// `ON` clause, which the executor's join builder
+/// (`src/sql/executor/join.rs::collect_and_terms`) misclassifies as equi-join
+/// keys whenever they're shaped like `<expr> = <expr>` — even if one side is
+/// a literal. That misclassification produced wrong results in queries like
+/// `JOIN t ON t.col = 'literal'`, where the hash join collapsed every left
+/// row onto every right row. See
+/// `FEATURE_REQUEST_cte_in_join_constant_predicate.md`.
+///
+/// By pushing left-only / right-only ON conjuncts into Filter wrappers above
+/// each input, only true cross-side predicates reach the join builder, which
+/// is then correct by construction.
+///
+/// Outer-join semantics are preserved:
+/// * `INNER`: push left-only and right-only.
+/// * `LEFT`:  push only right-only (left-only would change which left rows
+///   participate in NULL extension).
+/// * `RIGHT`: push only left-only (mirror of `LEFT`).
+/// * `FULL`:  push neither (both sides are preservation-side).
+///
+/// LATERAL joins are skipped — the right side may reference left columns;
+/// pushing predicates can be unsafe. (Constant predicates would be safe but
+/// the analysis to prove that is more than this rule wants to know.)
+pub struct JoinPredicatePushdownRule;
+
+impl JoinPredicatePushdownRule {
+    /// Create a new join predicate pushdown rule
+    pub fn new() -> Self {
+        Self
+    }
+
+    /// Recursively rewrite any `Join` node in the tree to push pushable
+    /// ON conjuncts into Filter wrappers above the inputs.
+    fn rewrite(plan: LogicalPlan) -> LogicalPlan {
+        match plan {
+            LogicalPlan::Join { left, right, join_type, on, lateral } => {
+                // Recurse into both sides first.
+                let left = Box::new(Self::rewrite(*left));
+                let right = Box::new(Self::rewrite(*right));
+
+                // LATERAL joins: don't try to push.
+                if lateral {
+                    return LogicalPlan::Join { left, right, join_type, on, lateral };
+                }
+
+                // Cross join (no ON): nothing to push.
+                let Some(on_expr) = on else {
+                    return LogicalPlan::Join { left, right, join_type, on: None, lateral };
+                };
+
+                let conjuncts = SelectionPushdownRule::extract_conjuncts(&on_expr);
+                let left_tables = SelectionPushdownRule::collect_table_refs(&left);
+                let right_tables = SelectionPushdownRule::collect_table_refs(&right);
+
+                let mut left_preds = Vec::new();
+                let mut right_preds = Vec::new();
+                let mut keep_on = Vec::new();
+
+                for conjunct in conjuncts {
+                    let refs = SelectionPushdownRule::extract_column_table_refs(&conjunct);
+
+                    // Constants or unqualified-only refs: can't classify safely; keep on join.
+                    if refs.is_empty() {
+                        keep_on.push(conjunct);
+                        continue;
+                    }
+
+                    let touches_left = refs.iter().any(|r| left_tables.contains(r));
+                    let touches_right = refs.iter().any(|r| right_tables.contains(r));
+
+                    match (touches_left, touches_right) {
+                        (true, false) => {
+                            // Left-only. Pushing under LEFT/FULL would
+                            // change preservation semantics.
+                            if matches!(join_type, crate::sql::JoinType::Inner | crate::sql::JoinType::Right) {
+                                left_preds.push(conjunct);
+                            } else {
+                                keep_on.push(conjunct);
+                            }
+                        }
+                        (false, true) => {
+                            // Right-only. Pushing under RIGHT/FULL would
+                            // change preservation semantics.
+                            if matches!(join_type, crate::sql::JoinType::Inner | crate::sql::JoinType::Left) {
+                                right_preds.push(conjunct);
+                            } else {
+                                keep_on.push(conjunct);
+                            }
+                        }
+                        _ => keep_on.push(conjunct),
+                    }
+                }
+
+                // Nothing to push — reassemble unchanged. (Note: rebuilding
+                // `on` from `keep_on` is a no-op when `keep_on` is exactly
+                // the original conjunct list.)
+                if left_preds.is_empty() && right_preds.is_empty() {
+                    let new_on = if keep_on.is_empty() {
+                        None
+                    } else {
+                        Some(SelectionPushdownRule::combine_conjuncts(keep_on))
+                    };
+                    return LogicalPlan::Join { left, right, join_type, on: new_on, lateral };
+                }
+
+                let new_left = if left_preds.is_empty() {
+                    left
+                } else {
+                    Box::new(LogicalPlan::Filter {
+                        input: left,
+                        predicate: SelectionPushdownRule::combine_conjuncts(left_preds),
+                    })
+                };
+                let new_right = if right_preds.is_empty() {
+                    right
+                } else {
+                    Box::new(LogicalPlan::Filter {
+                        input: right,
+                        predicate: SelectionPushdownRule::combine_conjuncts(right_preds),
+                    })
+                };
+                let new_on = if keep_on.is_empty() {
+                    None
+                } else {
+                    Some(SelectionPushdownRule::combine_conjuncts(keep_on))
+                };
+
+                LogicalPlan::Join { left: new_left, right: new_right, join_type, on: new_on, lateral }
+            }
+
+            // Pass-through recursion for plans that wrap a single child.
+            LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
+                input: Box::new(Self::rewrite(*input)),
+                predicate,
+            },
+            LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => {
+                LogicalPlan::Project {
+                    input: Box::new(Self::rewrite(*input)),
+                    exprs,
+                    aliases,
+                    distinct,
+                    distinct_on,
+                }
+            }
+            LogicalPlan::Sort { input, exprs, asc } => LogicalPlan::Sort {
+                input: Box::new(Self::rewrite(*input)),
+                exprs,
+                asc,
+            },
+            LogicalPlan::Limit { input, limit, offset, limit_param, offset_param } => {
+                LogicalPlan::Limit {
+                    input: Box::new(Self::rewrite(*input)),
+                    limit,
+                    offset,
+                    limit_param,
+                    offset_param,
+                }
+            }
+            LogicalPlan::Aggregate { input, group_by, aggr_exprs, having } => {
+                LogicalPlan::Aggregate {
+                    input: Box::new(Self::rewrite(*input)),
+                    group_by,
+                    aggr_exprs,
+                    having,
+                }
+            }
+            LogicalPlan::Union { left, right, all } => LogicalPlan::Union {
+                left: Box::new(Self::rewrite(*left)),
+                right: Box::new(Self::rewrite(*right)),
+                all,
+            },
+            LogicalPlan::Intersect { left, right, all } => LogicalPlan::Intersect {
+                left: Box::new(Self::rewrite(*left)),
+                right: Box::new(Self::rewrite(*right)),
+                all,
+            },
+            LogicalPlan::Except { left, right, all } => LogicalPlan::Except {
+                left: Box::new(Self::rewrite(*left)),
+                right: Box::new(Self::rewrite(*right)),
+                all,
+            },
+            LogicalPlan::With { ctes, query, recursive } => LogicalPlan::With {
+                ctes: ctes
+                    .into_iter()
+                    .map(|(name, plan, aliases)| (name, Box::new(Self::rewrite(*plan)), aliases))
+                    .collect(),
+                query: Box::new(Self::rewrite(*query)),
+                recursive,
+            },
+            LogicalPlan::InsertSelect { table_name, columns, source, returning } => {
+                LogicalPlan::InsertSelect {
+                    table_name,
+                    columns,
+                    source: Box::new(Self::rewrite(*source)),
+                    returning,
+                }
+            }
+
+            // Leaves and other variants (Scan / FilteredScan / DDL / DML /
+            // misc.): no nested Join to rewrite.
+            other => other,
+        }
+    }
+}
+
+impl OptimizationRule for JoinPredicatePushdownRule {
+    fn name(&self) -> &'static str {
+        "JoinPredicatePushdown"
+    }
+
+    /// Cheap pre-filter: only run if the tree contains a Join with a
+    /// non-empty ON. Avoids the recursive walk on plans with no joins.
+    fn is_applicable(&self, plan: &LogicalPlan) -> bool {
+        fn contains_join_with_on(plan: &LogicalPlan) -> bool {
+            match plan {
+                LogicalPlan::Join { on: Some(_), lateral: false, .. } => true,
+                LogicalPlan::Join { left, right, .. } => {
+                    contains_join_with_on(left) || contains_join_with_on(right)
+                }
+                LogicalPlan::Filter { input, .. }
+                | LogicalPlan::Project { input, .. }
+                | LogicalPlan::Sort { input, .. }
+                | LogicalPlan::Limit { input, .. }
+                | LogicalPlan::Aggregate { input, .. } => contains_join_with_on(input),
+                LogicalPlan::Union { left, right, .. }
+                | LogicalPlan::Intersect { left, right, .. }
+                | LogicalPlan::Except { left, right, .. } => {
+                    contains_join_with_on(left) || contains_join_with_on(right)
+                }
+                LogicalPlan::With { ctes, query, .. } => {
+                    contains_join_with_on(query)
+                        || ctes.iter().any(|(_, p, _)| contains_join_with_on(p))
+                }
+                LogicalPlan::InsertSelect { source, .. } => contains_join_with_on(source),
+                _ => false,
+            }
+        }
+        contains_join_with_on(plan)
+    }
+
+    /// Apply the rewrite. Returns `Some` only when the plan actually
+    /// changed — keeps the optimizer driver from spinning at fixed-point.
+    fn apply(&self, plan: LogicalPlan, _cost_estimator: &CostEstimator) -> Result<Option<LogicalPlan>> {
+        let original = plan.clone();
+        let rewritten = Self::rewrite(plan);
+        if rewritten == original {
+            Ok(None)
+        } else {
+            Ok(Some(rewritten))
+        }
+    }
+}
+
+impl Default for JoinPredicatePushdownRule {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Create all standard optimization rules
 pub fn create_default_rules() -> Vec<Box<dyn OptimizationRule>> {
     vec![
-        Box::new(ConstantFoldingRule::new()),       // Apply first - simplifies expressions
-        Box::new(SelectionPushdownRule::new()),     // Push filters early
-        Box::new(ProjectionPruningRule::new()),     // Reduce columns early
-        Box::new(IndexSelectionRule::new()),        // Choose indexes
-        Box::new(JoinReorderingRule::new()),        // Optimize join order
-        Box::new(StorageFilterPushdownRule::new()), // Storage-level filtering (last - converts Filter+Scan to FilteredScan)
+        Box::new(ConstantFoldingRule::new()),         // Apply first - simplifies expressions
+        Box::new(SelectionPushdownRule::new()),       // Push filters above joins/projections down
+        Box::new(JoinPredicatePushdownRule::new()),   // Push one-sided ON conjuncts into inputs
+        Box::new(ProjectionPruningRule::new()),       // Reduce columns early
+        Box::new(IndexSelectionRule::new()),          // Choose indexes
+        Box::new(JoinReorderingRule::new()),          // Optimize join order
+        Box::new(StorageFilterPushdownRule::new()),   // Storage-level filtering (last - converts Filter+Scan to FilteredScan)
     ]
 }
 
@@ -1495,5 +1763,256 @@ mod tests {
                 assert_eq!(table_name, "small");
             }
         }
+    }
+
+    // =============================================================================
+    // JoinPredicatePushdown rule tests
+    // =============================================================================
+
+    fn make_scan(name: &str) -> LogicalPlan {
+        LogicalPlan::Scan {
+            table_name: name.to_string(),
+            alias: None,
+            schema: create_test_schema(),
+            projection: None,
+            as_of: None,
+        }
+    }
+
+    fn col(table: &str, name: &str) -> LogicalExpr {
+        LogicalExpr::Column { table: Some(table.to_string()), name: name.to_string() }
+    }
+
+    fn lit_int(v: i32) -> LogicalExpr {
+        LogicalExpr::Literal(Value::Int4(v))
+    }
+
+    fn lit_str(s: &str) -> LogicalExpr {
+        LogicalExpr::Literal(Value::String(s.to_string()))
+    }
+
+    fn binary(left: LogicalExpr, op: BinaryOperator, right: LogicalExpr) -> LogicalExpr {
+        LogicalExpr::BinaryExpr { left: Box::new(left), op, right: Box::new(right) }
+    }
+
+    fn make_join(left: LogicalPlan, right: LogicalPlan, on: Option<LogicalExpr>, jt: JoinType) -> LogicalPlan {
+        LogicalPlan::Join {
+            left: Box::new(left),
+            right: Box::new(right),
+            join_type: jt,
+            on,
+            lateral: false,
+        }
+    }
+
+    /// Right-only literal predicate on INNER → push to right.
+    #[test]
+    fn jpp_pushes_right_only_literal_inner() {
+        let rule = JoinPredicatePushdownRule::new();
+        let estimator = CostEstimator::new(StatsCatalog::new());
+        let plan = make_join(
+            make_scan("l"),
+            make_scan("r"),
+            Some(binary(col("r", "name"), BinaryOperator::Eq, lit_str("alice"))),
+            JoinType::Inner,
+        );
+        let result = rule.apply(plan, &estimator).unwrap().expect("should rewrite");
+        if let LogicalPlan::Join { left, right, on, .. } = result {
+            assert!(matches!(*left, LogicalPlan::Scan { .. }), "left untouched");
+            assert!(matches!(*right, LogicalPlan::Filter { .. }), "right wrapped in Filter");
+            assert!(on.is_none(), "ON cleared after pushdown");
+        } else {
+            panic!("expected Join at top level");
+        }
+    }
+
+    /// Left-only non-constant predicate on INNER → push to left.
+    #[test]
+    fn jpp_pushes_left_only_non_constant_inner() {
+        let rule = JoinPredicatePushdownRule::new();
+        let estimator = CostEstimator::new(StatsCatalog::new());
+        let plan = make_join(
+            make_scan("l"),
+            make_scan("r"),
+            Some(binary(col("l", "id"), BinaryOperator::Gt, lit_int(10))),
+            JoinType::Inner,
+        );
+        let result = rule.apply(plan, &estimator).unwrap().expect("should rewrite");
+        if let LogicalPlan::Join { left, right, on, .. } = result {
+            assert!(matches!(*left, LogicalPlan::Filter { .. }));
+            assert!(matches!(*right, LogicalPlan::Scan { .. }));
+            assert!(on.is_none());
+        } else {
+            panic!("expected Join");
+        }
+    }
+
+    /// Cross-side equi-join predicate → no rewrite.
+    #[test]
+    fn jpp_keeps_cross_side_equi_predicate() {
+        let rule = JoinPredicatePushdownRule::new();
+        let estimator = CostEstimator::new(StatsCatalog::new());
+        let on = binary(col("l", "id"), BinaryOperator::Eq, col("r", "id"));
+        let plan = make_join(
+            make_scan("l"),
+            make_scan("r"),
+            Some(on),
+            JoinType::Inner,
+        );
+        let result = rule.apply(plan, &estimator).unwrap();
+        // No conjunct is pushable, so the rule should return None.
+        assert!(result.is_none(), "cross-side ON should NOT be rewritten, got {:?}", result);
+    }
+
+    /// Mixed: equi-join key AND right-only constant → split, push the constant.
+    #[test]
+    fn jpp_splits_mixed_predicate() {
+        let rule = JoinPredicatePushdownRule::new();
+        let estimator = CostEstimator::new(StatsCatalog::new());
+        let on = binary(
+            binary(col("l", "id"), BinaryOperator::Eq, col("r", "id")),
+            BinaryOperator::And,
+            binary(col("r", "name"), BinaryOperator::Eq, lit_str("alice")),
+        );
+        let plan = make_join(make_scan("l"), make_scan("r"), Some(on), JoinType::Inner);
+        let result = rule.apply(plan, &estimator).unwrap().expect("should rewrite");
+        if let LogicalPlan::Join { left, right, on, .. } = result {
+            assert!(matches!(*left, LogicalPlan::Scan { .. }), "left untouched");
+            assert!(matches!(*right, LogicalPlan::Filter { .. }), "right gets Filter");
+            assert!(on.is_some(), "equi-join key stays on the join");
+        } else {
+            panic!("expected Join");
+        }
+    }
+
+    /// LEFT JOIN with a left-only ON predicate must NOT be pushed (would
+    /// change which left rows participate in NULL extension).
+    #[test]
+    fn jpp_left_join_does_not_push_left_only() {
+        let rule = JoinPredicatePushdownRule::new();
+        let estimator = CostEstimator::new(StatsCatalog::new());
+        let on = binary(col("l", "id"), BinaryOperator::Gt, lit_int(10));
+        let plan = make_join(make_scan("l"), make_scan("r"), Some(on), JoinType::Left);
+        let result = rule.apply(plan, &estimator).unwrap();
+        assert!(result.is_none(), "LEFT JOIN must keep left-only ON predicate");
+    }
+
+    /// LEFT JOIN with a right-only ON predicate IS safe to push.
+    #[test]
+    fn jpp_left_join_pushes_right_only() {
+        let rule = JoinPredicatePushdownRule::new();
+        let estimator = CostEstimator::new(StatsCatalog::new());
+        let on = binary(col("r", "id"), BinaryOperator::Gt, lit_int(10));
+        let plan = make_join(make_scan("l"), make_scan("r"), Some(on), JoinType::Left);
+        let result = rule.apply(plan, &estimator).unwrap().expect("should rewrite");
+        if let LogicalPlan::Join { right, .. } = result {
+            assert!(matches!(*right, LogicalPlan::Filter { .. }));
+        } else {
+            panic!("expected Join");
+        }
+    }
+
+    /// FULL JOIN: never push either side.
+    #[test]
+    fn jpp_full_join_pushes_nothing() {
+        let rule = JoinPredicatePushdownRule::new();
+        let estimator = CostEstimator::new(StatsCatalog::new());
+        let on = binary(col("r", "id"), BinaryOperator::Gt, lit_int(10));
+        let plan = make_join(make_scan("l"), make_scan("r"), Some(on), JoinType::Full);
+        let result = rule.apply(plan, &estimator).unwrap();
+        assert!(result.is_none(), "FULL JOIN must preserve ON predicate");
+    }
+
+    /// LATERAL: skip — right may depend on left.
+    #[test]
+    fn jpp_skips_lateral_joins() {
+        let rule = JoinPredicatePushdownRule::new();
+        let estimator = CostEstimator::new(StatsCatalog::new());
+        let plan = LogicalPlan::Join {
+            left: Box::new(make_scan("l")),
+            right: Box::new(make_scan("r")),
+            join_type: JoinType::Inner,
+            on: Some(binary(col("r", "name"), BinaryOperator::Eq, lit_str("alice"))),
+            lateral: true,
+        };
+        let result = rule.apply(plan, &estimator).unwrap();
+        assert!(result.is_none(), "LATERAL joins must be left alone");
+    }
+
+    /// Cross join (no ON): rule is no-op.
+    #[test]
+    fn jpp_cross_join_no_op() {
+        let rule = JoinPredicatePushdownRule::new();
+        let estimator = CostEstimator::new(StatsCatalog::new());
+        let plan = make_join(make_scan("l"), make_scan("r"), None, JoinType::Inner);
+        let result = rule.apply(plan, &estimator).unwrap();
+        assert!(result.is_none());
+    }
+
+    /// Idempotency: applying the rule twice yields no further change.
+    #[test]
+    fn jpp_is_idempotent() {
+        let rule = JoinPredicatePushdownRule::new();
+        let estimator = CostEstimator::new(StatsCatalog::new());
+        let plan = make_join(
+            make_scan("l"),
+            make_scan("r"),
+            Some(binary(col("r", "name"), BinaryOperator::Eq, lit_str("alice"))),
+            JoinType::Inner,
+        );
+        let once = rule.apply(plan, &estimator).unwrap().unwrap();
+        let twice = rule.apply(once.clone(), &estimator).unwrap();
+        assert!(twice.is_none(), "second pass should be a no-op");
+    }
+
+    /// Recursion: rule descends through Project/Filter/With/Sort/Limit/Aggregate
+    /// and rewrites Joins nested anywhere in the tree.
+    #[test]
+    fn jpp_descends_through_wrappers() {
+        let rule = JoinPredicatePushdownRule::new();
+        let estimator = CostEstimator::new(StatsCatalog::new());
+
+        let join = make_join(
+            make_scan("l"),
+            make_scan("r"),
+            Some(binary(col("r", "name"), BinaryOperator::Eq, lit_str("alice"))),
+            JoinType::Inner,
+        );
+        let project = LogicalPlan::Project {
+            input: Box::new(join),
+            exprs: vec![col("l", "id")],
+            aliases: vec!["id".to_string()],
+            distinct: false,
+            distinct_on: None,
+        };
+
+        let result = rule.apply(project, &estimator).unwrap().expect("should rewrite");
+        if let LogicalPlan::Project { input, .. } = result {
+            if let LogicalPlan::Join { right, on, .. } = *input {
+                assert!(matches!(*right, LogicalPlan::Filter { .. }));
+                assert!(on.is_none());
+            } else {
+                panic!("expected Join under Project");
+            }
+        } else {
+            panic!("expected Project at top");
+        }
+    }
+
+    /// is_applicable cheap pre-filter: returns false for plans with no Joins.
+    #[test]
+    fn jpp_is_applicable_skips_join_free_plans() {
+        let rule = JoinPredicatePushdownRule::new();
+        let scan = make_scan("t");
+        assert!(!rule.is_applicable(&scan));
+
+        let project = LogicalPlan::Project {
+            input: Box::new(scan),
+            exprs: vec![col("t", "id")],
+            aliases: vec!["id".to_string()],
+            distinct: false,
+            distinct_on: None,
+        };
+        assert!(!rule.is_applicable(&project));
     }
 }
