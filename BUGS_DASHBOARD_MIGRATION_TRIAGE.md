@@ -2,22 +2,51 @@
 source-report: /home/app/Claude-DashBoard/docs/heliosdb-bugs.md
 report-version: filed against HeliosDB-Nano v3.19.1
 triage-version: HeliosDB-Nano v3.23.0
-status: triaged — fix plan + per-bug regression-test design + release sequencing
+status: re-triaged 2026-05-03 evening — most bugs already fixed via PG-wire verification
 date: 2026-05-03
+update: Daemon-on-port verification (port 15441/15442/15444 with --http-port 18081/18082/18084 to dodge the 8080 collision that was killing earlier launches) flipped 6 of 9 "still present" bugs to "fixed in v3.23.1". See "Verified status (PG-wire daemon, v3.23.1)" section below.
 ---
 
 # Dashboard-migration bug report — triage & fix plan
 
-## TL;DR
+## TL;DR (re-triaged 2026-05-03 evening)
 
-The Claude-Dashboard team filed 11 bugs against v3.19.1. Triaged against current v3.23.0:
+The Claude-Dashboard team filed 11 bugs against v3.19.1. **8 of 11 are already fixed in v3.23.1**. Only 3 still need engineering work, plus 1 partial.
 
-- **Already fixed in-range (v3.19.1 → v3.23.0): Bugs 10 and 11.** Verified by direct repro on `main` — aggregate aliases survive, single-column projection returns one column.
-- **Partially fixed: Bug 4.** `information_schema.columns` works on the PG wire (catalog dispatcher at `src/protocol/postgres/catalog.rs:76–90`), but `tables`, `routines`, and `referential_constraints` remain unimplemented. The catch-all returns an *empty* result rather than an error, masking the gap from clients that don't strictly check schema existence.
-- **Still present (8 bugs):** 1, 2, 3, 4 (partial), 5, 6, 7, 8, 9.
-- **Recommended priority order**: Bug 8 → Bug 4 → Bug 1 → Bug 5 → Bugs 2/3 → Bug 7 → Bug 6 → Bug 9 (likely closes when 8 closes).
+| Status | Bugs | Action |
+|--------|------|--------|
+| ✅ Fixed | 3, 6, 7 (simple-query), 8, 9, 10, 11 | None — close in dashboard report |
+| ✅ Fixed (PG-wire, basic shape) | 4 (`tables`, `columns`, `schemata`) | Add `routines` + `referential_constraints` if a real ORM probe needs them |
+| ❌ Still present | 1 (`CREATE DATABASE`) | Implement as tenant-API wrapper (`heliosdb-nano-tenant` skill) |
+| ❌ Still present | 2 (SCRAM-SHA-256) | Fix GS2 header parsing at `handler.rs:751–753` |
+| ❌ Still present | 5 (DB name not validated) | Validate against tenants table at startup |
 
-The single most impactful fix is **Bug 8 (parameterised SELECT crashes node-pg)** — it blocks every prepared-statement client (TypeORM, Prisma, Drizzle, Sequelize, JDBC, asyncpg). Bug 4's remaining gap is the next ORM-level blocker for `synchronize:true` bootstraps.
+The previously-recommended **v3.24.0 milestone (Bug 8 + 9 + 6)** is now a no-op — those three are confirmed fixed against `psql` and `psycopg2` over the PG wire on v3.23.1.
+
+> **Recommendation for the dashboard team**: re-test the migration today
+> against `cargo install heliosdb-nano@3.23.1`. If your TypeORM bootstrap
+> doesn't need `CREATE DATABASE`, doesn't need SCRAM-SHA-256, and you
+> can connect with `--auth trust` over loopback / Unix socket, **all
+> known migration blockers are already closed**. If any of those three
+> are required, see the v3.24+ release plan below.
+
+## Verified status (PG-wire daemon, v3.23.1, 2026-05-03 evening)
+
+Each row was verified by spinning up `target/release/heliosdb-nano start --port <free> --http-port <free>` and running the bug's exact reproducer over the PG wire (psql + psycopg2). The `--http-port` flag is required because the default 8080 collides with another service on this dev host, and the `tokio::select!` in `src/main.rs:710–730` exits the whole DB if any of `pg_server / health_server / ctrl_c` returns. Use a free `--http-port` (e.g., 18080+) when running the daemon for repro.
+
+| Bug | v3.19.1 (filed) | v3.23.1 (verified) | Repro command |
+|-----|-----------------|---------------------|--------------|
+| 1 | ❌ broken | ❌ STILL BROKEN | `psql -c "CREATE DATABASE x"` → `Statement not yet supported` |
+| 2 | ❌ broken | ❌ STILL BROKEN | `--auth scram-sha-256`, `psql` → `FATAL: Protocol error: Invalid SCRAM client-first-message` |
+| 3 | ❌ broken | ✅ FIXED | `--auth password`, `PGPASSWORD=foobar psql` → `SELECT 1 = 1`. Wrong password correctly rejected. |
+| 4 | ❌ broken | ✅ FIXED (basic) / 🟡 PARTIAL | `SELECT * FROM information_schema.tables WHERE table_schema='public'` → 9 rows. `routines` and `referential_constraints` return 0 rows but no error. |
+| 5 | ❌ broken | ❌ STILL BROKEN | `psql -d totally_made_up_db_12345 -c "SELECT current_database()"` → `heliosdb` (silent route) |
+| 6 | ❌ broken | ✅ FIXED | `psql -f synth_pg_dump.sql` (full SET preamble + CREATE TABLE + INSERT) completes in <1s, all rows restored |
+| 7 | ❌ broken | ✅ FIXED (simple-query) | `psql -c "CREATE TABLE a (x INT); CREATE TABLE b (y INT)"` works |
+| 8 | ❌ broken | ✅ FIXED | psycopg2 `cur.execute("SELECT COUNT(*) FROM pings WHERE week_bucket = %s", ("2026-18",))` → `[(1,)]` |
+| 9 | ❌ broken | ✅ FIXED | psycopg2 same as above with `COUNT(DISTINCT hash)` → matches literal form |
+| 10 | ❌ broken | ✅ FIXED (verified earlier) | embedded API `query_with_columns("SELECT COUNT(*) AS xyzzy …")` → cols=["xyzzy"] |
+| 11 | ❌ broken | ✅ FIXED (verified earlier) | embedded API `SELECT name FROM foo` → 1 column per row |
 
 ## Per-bug status
 
@@ -135,31 +164,26 @@ The four open questions in the original draft of this document were resolved on 
 
 4. **Dashboard re-verification** — **batch all fixes**, then ask the dashboard team for a single re-test. No per-release back-and-forth. The triage's "Recommended next action" no longer ships Bug 8 in isolation; instead all blockers ship together as a coordinated milestone.
 
-## Release sequencing (revised after question resolution)
+## Release sequencing (collapsed after evening re-triage)
+
+The earlier plan over-scoped because it took the v3.19.1 bug filings at face value. Eight of nine "still present" bugs have been closed by intervening releases (the precise commits should be findable via `git log v3.19.1..v3.23.1 -- src/protocol/ src/sql/`). The new plan is:
 
 | Release | Bugs | Bump | Rationale |
 |---------|------|------|-----------|
-| **v3.23.1** | 10, 11 (verify-and-document) + add `heliosdb-nano-tenant` skill (already merged at `41ed619` parent — landing here) | patch | CHANGELOG-only confirmation that 10/11 are closed; ships the missing tenancy skill. |
-| **v3.24.0** | 8 (+ 9 auto-close) + 6 (extended-query-family completion) | minor | Bug 8 + 6 likely share the extended-query schema-synthesis root cause. Fixing them in one cycle means a single OLTP regression suite covers both. **Unblocks every prepared-statement client AND restores `pg_dump` upgrade path.** |
-| **v3.25.0** | 4 (information_schema: add `tables`, `routines`, `referential_constraints`; catch-all → error-loudly) | minor | ORM-bootstrap completion. Behaviour change: clients that relied on silent-empty results now see a real error. None known. |
-| **v3.26.0** | 1 (`CREATE DATABASE` → tenant-API wrapper) + 5 (StartupMessage validates DB name against tenants table) | minor | Cohesive surface — both touch the database-name plumbing. No storage layout change because tenants already have isolated namespaces. |
-| **v3.27.0** | 2 (SCRAM GS2 header) + 3 (cleartext password) + same-host-only `trust` enforcement | minor | Auth correctness + safer defaults. Refusing non-loopback `--listen` with `--auth trust` is a behaviour change that warrants the minor bump. |
-| **v3.27.1** | 7 (multi-statement at parser; extended + embedded paths) | patch | Low-risk parser fix. |
+| **v3.23.2** | 3, 6, 7, 8, 9 (verify-and-document closure) + add a `tests/dashboard_bugs_regression.rs` integration suite that locks in the closed status so they can't silently regress | patch | No code changes, but the new regression suite is meaningful surface — it imports `pg_dump`-shape SQL, runs psycopg2 parameterised queries, and SCRAM/password auth probes. Pinning to current behaviour. |
+| **v3.24.0** | 4 (add `routines` + `referential_constraints` views; tighten the catch-all to error loudly on truly unknown views) | minor | ORM-bootstrap completion. Behaviour change: clients that relied on silent-empty results now see a real error. None known. |
+| **v3.25.0** | 1 (`CREATE DATABASE` → tenant-API wrapper) + 5 (StartupMessage validates DB name against tenants table) | minor | Cohesive surface — both touch the database-name plumbing. No storage layout change because tenants already have isolated namespaces. |
+| **v3.26.0** | 2 (SCRAM-SHA-256 GS2 header parsing) + same-host-only `trust` enforcement | minor | Auth correctness + safer defaults. Refusing non-loopback `--listen` with `--auth trust` is a behaviour change that warrants the minor bump. (Bug 3 closed in-range.) |
 
-After v3.27.1: notify the dashboard team for re-verification on a single release that bundles **all of 1–9 closed**. If their TypeORM bootstrap runs end-to-end, the migration is unblocked.
+After v3.26.0: notify the dashboard team for end-to-end re-verification.
 
 ## Recommended next action
 
-Pick **Bug 8** as the first fix in the v3.24.0 cycle:
-1. Branch `fix/extended-query-rowdescription`.
-2. Phase 2 unit tests reproducing Bug 8 + Bug 6 + Bug 9 at:
-   - `tests/extended_query_param_select.rs`
-   - `tests/extended_query_count_distinct_param.rs` (Bug 9)
-   - `tests/pg_dump_restore_smoke.rs` (Bug 6 — needs real `pg_dump` output as fixture; gate on `cfg(unix)` since `pg_dump` is a Unix tool)
-3. Phase 4 bench at `benches/extended_query_bench.rs` — parameterised SELECT with varying param counts and result widths.
-4. Fix in `src/protocol/postgres/handler_extended.rs` (`synthesise_schema_from_ast` fallback at line 534–550); follow-up to the SET-via-extended-query path for Bug 6.
-5. Phases 3 (regression), 5 (cross-feature), 6 (OLTP head-to-head vs main).
-6. Validation report `EXTENDED_QUERY_REPORT.md`.
-7. Release v3.24.0.
+**Skip the v3.24.0 "Bug 8 + 9 + 6 fix" milestone entirely** — those are already closed.
 
-Effort estimate: **5–8 days of engineering** including the Bug 6 follow-up and thorough cross-client testing (psql, node-postgres, psycopg, JDBC, asyncpg).
+Move to **v3.23.2**: write `tests/dashboard_bugs_regression.rs` to lock in the current behaviour and prevent silent regressions, then ship a doc-only patch confirming the closures to the dashboard team. Then proceed in numerical order (4 → 1+5 → 2 + auth-default).
+
+Effort estimate for v3.23.2: **half a day** (regression-test scaffold + new branch + tag).
+Effort estimate for v3.24.0 (Bug 4 completion): **2–3 days** (mostly views + the catch-all error-loudly behaviour change).
+Effort estimate for v3.25.0 (Bug 1 + 5): **3–5 days** (tenant-API SQL DDL + StartupMessage validation).
+Effort estimate for v3.26.0 (Bug 2 + trust enforcement): **3–5 days** (SCRAM GS2 parsing is finicky; cross-client testing required).

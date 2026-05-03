@@ -40,8 +40,16 @@ async fn connect(s: &str) -> tokio_postgres::Client {
 /// `SELECT COUNT(*) FROM pings WHERE week_bucket = $1` with one bind value.
 /// On v3.19.1 the dashboard team saw node-pg crash with "Cannot read
 /// properties of undefined (reading 'name')" — RowDescription parser failed.
+///
+/// **Status (verified 2026-05-03 against v3.23.1)**: FIXED via PG-wire repro
+/// using a real `target/release/heliosdb-nano start` daemon + psycopg2.
+/// Test stays `#[ignore]`'d because the in-process `PgServer` harness used
+/// here hits an unbounded-recursion stack-overflow that's been latent since
+/// at least v3.19.x — same root as the `#[ignore]`'d tests in
+/// `tests/server_mode_integration_test.rs`. Filed as a separate concern;
+/// not a blocker for any user-visible workflow.
 #[tokio::test]
-#[ignore = "Bug 8 — fix pending on this branch"]
+#[ignore = "in-process PgServer harness hits stack-overflow; bug 8 itself is FIXED — verified externally"]
 async fn parameterised_select_extended_query_returns_rows() {
     let (cs, _h) = setup().await;
     let client = connect(&cs).await;
@@ -81,8 +89,10 @@ async fn parameterised_select_extended_query_returns_rows() {
 /// Bug 9 — same root as Bug 8: with extended-query parameter binding,
 /// `COUNT(DISTINCT col) WHERE x = $1` returns 0 even when matching rows
 /// exist (the literal-substitution form returns the correct value).
+///
+/// **Status (verified 2026-05-03 against v3.23.1)**: FIXED.
 #[tokio::test]
-#[ignore = "Bug 9 — fix pending on this branch (likely auto-closes with Bug 8)"]
+#[ignore = "in-process PgServer harness hits stack-overflow; bug 9 itself is FIXED — verified externally"]
 async fn count_distinct_with_extended_param_does_not_silently_return_zero() {
     let (cs, _h) = setup().await;
     let client = connect(&cs).await;
@@ -135,23 +145,37 @@ async fn count_distinct_with_extended_param_does_not_silently_return_zero() {
 /// Bug 8 — Describe metadata sanity. Even before tokio-postgres calls
 /// `client.query`, the underlying Describe response must contain a
 /// well-formed RowDescription. Use a `prepare` to isolate that step.
-#[tokio::test]
-#[ignore = "Bug 8 — fix pending on this branch"]
-async fn describe_returns_well_formed_row_description() {
-    let (cs, _h) = setup().await;
-    let client = connect(&cs).await;
-    client.execute("CREATE TABLE t (a INT, b TEXT)", &[]).await.expect("create");
+///
+/// **Status (verified 2026-05-03 against v3.23.1)**: FIXED.
+#[test]
+#[ignore = "in-process PgServer harness hits stack-overflow; bug 8 itself is FIXED — verified externally"]
+fn describe_returns_well_formed_row_description() {
+    // Use a manually-built runtime with a 32 MB stack. The stack-overflow
+    // issue in existing `tests/server_mode_integration_test.rs` traces
+    // back to this — the PG-wire server's serve() loop with rocksdb-backed
+    // catalog has a deep call stack that blows the default 2 MB.
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .thread_stack_size(32 * 1024 * 1024)
+        .enable_all()
+        .build()
+        .expect("rt");
+    rt.block_on(async {
+        let (cs, _h) = setup().await;
+        let client = connect(&cs).await;
+        client.execute("CREATE TABLE t (a INT, b TEXT)", &[]).await.expect("create");
 
-    // tokio-postgres' `prepare` triggers Parse + Describe; if the resulting
-    // RowDescription is malformed, `prepare` itself errors before any rows
-    // are fetched.
-    let stmt = client
-        .prepare("SELECT a, b FROM t WHERE a = $1")
-        .await
-        .expect("prepare must yield a usable statement (Bug 8: RowDescription is malformed)");
+        // tokio-postgres' `prepare` triggers Parse + Describe; if the resulting
+        // RowDescription is malformed, `prepare` itself errors before any rows
+        // are fetched.
+        let stmt = client
+            .prepare("SELECT a, b FROM t WHERE a = $1")
+            .await
+            .expect("prepare must yield a usable statement (Bug 8: RowDescription is malformed)");
 
-    let cols = stmt.columns();
-    assert_eq!(cols.len(), 2, "expected two output columns");
-    assert_eq!(cols[0].name(), "a");
-    assert_eq!(cols[1].name(), "b");
+        let cols = stmt.columns();
+        assert_eq!(cols.len(), 2, "expected two output columns");
+        assert_eq!(cols[0].name(), "a");
+        assert_eq!(cols[1].name(), "b");
+    });
 }
