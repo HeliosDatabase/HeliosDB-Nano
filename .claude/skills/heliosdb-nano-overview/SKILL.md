@@ -32,6 +32,7 @@ Single-binary embedded database (Rust). PostgreSQL- and MySQL-wire compatible. O
 | Docker, Fly.io, Railway, Render, systemd | `heliosdb-nano-deploy` |
 | Tracing, slow-query log, /health, metrics | `heliosdb-nano-observability` |
 | Migrating from sqlite3 / Postgres / MySQL | `heliosdb-nano-migrate` |
+| Pre-merge validation methodology (required before any release) | `heliosdb-nano-merge-validation` |
 
 ## Sanity-check the install (one-liner)
 ```bash
