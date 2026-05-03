@@ -91,8 +91,27 @@ pub struct PgServer {
 }
 
 impl PgServer {
+    /// Refuse `AuthMethod::Trust` on a non-loopback listener. v3.26.0
+    /// safety gate: silently accepting any client on a public interface
+    /// is a footgun, so the server refuses to start in that
+    /// configuration. SCRAM-SHA-256 and CleartextPassword stay available
+    /// for non-loopback deployments.
+    fn enforce_trust_loopback_only(config: &PgServerConfig) -> Result<()> {
+        if matches!(config.auth_method, AuthMethod::Trust) && !config.address.ip().is_loopback() {
+            return Err(Error::authentication(format!(
+                "AuthMethod::Trust is only permitted on loopback (127.0.0.1, ::1) listeners; \
+                 binding to {} requires a non-trust auth method (password, scram-sha-256). \
+                 To start anyway on a non-loopback address, switch the auth method or bind to 127.0.0.1.",
+                config.address
+            )));
+        }
+        Ok(())
+    }
+
     /// Create a new PostgreSQL server
     pub fn new(config: PgServerConfig, database: Arc<EmbeddedDatabase>) -> Result<Self> {
+        Self::enforce_trust_loopback_only(&config)?;
+
         let auth_manager = Arc::new(
             AuthManager::new(config.auth_method)
                 .with_default_users()
@@ -122,6 +141,18 @@ impl PgServer {
         database: Arc<EmbeddedDatabase>,
         auth_manager: AuthManager,
     ) -> Result<Self> {
+        // Apply the trust-loopback gate using the AuthManager's method
+        // (the user may have constructed it with a different method
+        // than `config.auth_method`).
+        let effective_method = auth_manager.method();
+        if matches!(effective_method, AuthMethod::Trust) && !config.address.ip().is_loopback() {
+            return Err(Error::authentication(format!(
+                "AuthMethod::Trust is only permitted on loopback (127.0.0.1, ::1) listeners; \
+                 binding to {} requires a non-trust auth method (password, scram-sha-256).",
+                config.address
+            )));
+        }
+
         // Initialize SSL negotiator if SSL is configured
         let ssl_negotiator = if let Some(ref ssl_config) = config.ssl_config {
             Some(Arc::new(SslNegotiator::new(ssl_config.clone())?))

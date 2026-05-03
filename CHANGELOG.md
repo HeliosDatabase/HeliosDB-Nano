@@ -5,6 +5,62 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.26.0] - 2026-05-03
+
+### Fixed — SCRAM-SHA-256 GS2 header parsing (Bug 2)
+
+The SCRAM client-first-message parser at
+`src/protocol/postgres/handler.rs:768-777` was splitting on commas and
+indexing `parts[1]` as the username, which only worked when the GS2
+header was missing. Real clients (libpq, asyncpg, node-postgres, JDBC,
+sqlx, psycopg2) per RFC 5802 always send `n,,n=user,r=nonce` — the
+leading `n,,` is the GS2 channel-binding flag + (empty) authzid header.
+The old parser misaligned every offset and rejected every compliant
+client with `Invalid SCRAM client-first-message`.
+
+The new parser (`auth::parse_scram_client_first`) walks the GS2 header
+properly via `splitn(3, ',')` and scans the bare body for `n=` /
+`r=` tokens (order-independent). Channel-binding flag (`p=`),
+authzid (`a=`), and the `y` flag are all accepted.
+
+Closes Bug 2 from the dashboard-migration triage. With this fix and
+the v3.25.0 connection-name validation, the dashboard team's
+`--auth scram-sha-256` deployment path is fully unblocked.
+
+### Changed — same-host-only `trust` enforcement
+
+**Behaviour change**: `PgServer::new` and `PgServer::with_auth_manager`
+now refuse to construct when `auth_method = AuthMethod::Trust` and the
+listener is non-loopback. Per the dashboard-migration triage's
+auth-defaults resolution, silently accepting any client on a public
+interface is a footgun:
+
+- `127.0.0.1` and `::1`: trust is allowed.
+- `0.0.0.0`, `::`, `192.0.2.x`, etc.: trust is refused with a clear
+  error naming the safe alternatives (`password`, `scram-sha-256`).
+- `with_auth_manager` checks the AuthManager's method (the actual
+  runtime behaviour), not just `config.auth_method`.
+
+If you currently rely on `--listen 0.0.0.0 --auth trust`, switch to
+`--auth scram-sha-256` (recommended) or `--auth password`. Loopback
+deployments are unchanged.
+
+### Tests
+
+- New: `tests/scram_gs2_and_trust_loopback.rs` — 13 unit tests covering
+  the GS2 parser (libpq, authzid, `y`-flag, truncated, missing-username,
+  missing-nonce) and the trust-loopback gate (loopback-allowed,
+  IPv6-loopback-allowed, 0.0.0.0-refused, public-IP-refused,
+  password-on-public-allowed, scram-on-public-allowed,
+  with-auth-manager-also-enforced).
+
+### Validation
+
+Followed the 8-phase merge-validation methodology
+(`.claude/skills/heliosdb-nano-merge-validation/SKILL.md`). Full
+report at `VALIDATION_REPORT_v3.26.0.md`. Lib tests 1758/1758 pass,
+all targeted tests pass, no regression in v3.24.0 / v3.25.0 surfaces.
+
 ## [3.25.0] - 2026-05-03
 
 ### Added — `CREATE DATABASE` + `DROP DATABASE` (Bug 1)

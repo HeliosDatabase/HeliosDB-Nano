@@ -33,6 +33,77 @@ use std::num::NonZeroU32;
 
 use super::password_store::{InMemoryPasswordStore, SharedPasswordStore};
 
+/// Parse the SCRAM client-first-message per RFC 5802 §7. Returns
+/// `(username, client_nonce)` extracted from the bare body.
+///
+/// Format:
+/// ```text
+/// client-first-message  = gs2-header client-first-message-bare
+/// gs2-header            = gs2-cbind-flag "," [authzid] ","
+/// gs2-cbind-flag        = ("p=" cb-name) / "n" / "y"
+/// authzid               = "a=" saslname
+/// client-first-message-bare = [reserved-mext ","] username "," nonce ["," extensions]
+/// ```
+///
+/// The previous parser at `handler.rs:768-777` split the whole message
+/// on commas and indexed `parts[1]` as the username, which only worked
+/// when the GS2 header was *missing* — but libpq, asyncpg, and every
+/// other compliant client always sends the header, so the parser was
+/// broken for every real client.
+pub fn parse_scram_client_first(msg: &str) -> Result<(String, String)> {
+    // GS2 header: at least 2 commas before the bare body.
+    let mut iter = msg.splitn(3, ',');
+    let _gs2_cbind_flag = iter.next().ok_or_else(|| {
+        Error::protocol("Invalid SCRAM client-first-message: missing GS2 channel-binding flag")
+    })?;
+    let _authzid = iter.next().ok_or_else(|| {
+        Error::protocol("Invalid SCRAM client-first-message: missing GS2 authzid slot")
+    })?;
+    let bare = iter.next().ok_or_else(|| {
+        Error::protocol("Invalid SCRAM client-first-message: missing client-first-message-bare")
+    })?;
+    if bare.is_empty() {
+        return Err(Error::protocol(
+            "Invalid SCRAM client-first-message: empty bare body",
+        ));
+    }
+    // Bare body. Username and nonce are required; extensions and
+    // reserved-mext may appear in any order before/around them.
+    let mut username: Option<&str> = None;
+    let mut nonce: Option<&str> = None;
+    for part in bare.split(',') {
+        if let Some(rest) = part.strip_prefix("n=") {
+            username = Some(rest);
+        } else if let Some(rest) = part.strip_prefix("r=") {
+            nonce = Some(rest);
+        }
+    }
+    let username = username.ok_or_else(|| {
+        Error::protocol("Invalid SCRAM client-first-message: missing username (n=)")
+    })?;
+    let nonce = nonce.ok_or_else(|| {
+        Error::protocol("Invalid SCRAM client-first-message: missing nonce (r=)")
+    })?;
+    if username.is_empty() {
+        return Err(Error::protocol(
+            "Invalid SCRAM client-first-message: empty username",
+        ));
+    }
+    if nonce.is_empty() {
+        return Err(Error::protocol(
+            "Invalid SCRAM client-first-message: empty nonce",
+        ));
+    }
+    Ok((username.to_string(), nonce.to_string()))
+}
+
+/// Test-only re-export so integration tests in `tests/` can verify the
+/// SCRAM parser without going through the full PG-wire round-trip.
+#[doc(hidden)]
+pub fn parse_scram_client_first_for_test(msg: &str) -> Result<(String, String)> {
+    parse_scram_client_first(msg)
+}
+
 /// Authentication method
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthMethod {

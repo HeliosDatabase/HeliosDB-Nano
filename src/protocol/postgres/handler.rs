@@ -762,19 +762,14 @@ where
 
         tracing::debug!("Received client-first-message: {}", client_first);
 
-        // Parse client-first-message
-        // Format: [gs2-header,]client-first-message-bare
-        // client-first-message-bare: n=user,r=nonce
-        let parts: Vec<&str> = client_first.split(',').collect();
-        if parts.len() < 3 {
-            return Err(Error::protocol("Invalid SCRAM client-first-message"));
-        }
-
-        // Parse username and client nonce
-        let username = parts[1].strip_prefix("n=")
-            .ok_or_else(|| Error::protocol("Invalid username in SCRAM message"))?;
-        let client_nonce = parts[2].strip_prefix("r=")
-            .ok_or_else(|| Error::protocol("Invalid nonce in SCRAM message"))?;
+        // Parse client-first-message per RFC 5802. Bug 2: the previous
+        // parser ignored the GS2 header and misaligned every offset for
+        // real clients (libpq, asyncpg, node-postgres, JDBC). Now
+        // delegated to `auth::parse_scram_client_first`.
+        let (username_owned, client_nonce_owned) =
+            super::auth::parse_scram_client_first(&client_first)?;
+        let username: &str = &username_owned;
+        let client_nonce: &str = &client_nonce_owned;
 
         tracing::info!("SCRAM authentication for user: {}", username);
 
