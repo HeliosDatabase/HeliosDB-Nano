@@ -5,6 +5,65 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.23.0] - 2026-05-03
+
+### Fixed — JOIN with one-sided ON predicate no longer degenerates to cross product
+
+Closes the latent planner bug previously tracked in
+`FEATURE_REQUEST_cte_in_join_constant_predicate.md` (now removed).
+
+A `JOIN ... ON <one-sided predicate>` (e.g. `ON t.col = 'literal'` or
+`ON t.col > 100`) was being misclassified as an equi-join key by the
+executor's join builder (`split_join_condition` + `is_pure_equi_join`
+in `src/sql/executor/join.rs`). The hash-join build/probe phases then
+collapsed onto a degenerate single-bucket key and emitted full
+cross-products instead of correctly-filtered results — silently
+returning up to N×M rows where the user expected the filtered
+cardinality. Latent since the test that surfaced it landed in commit
+`eda2290`.
+
+**Fix.** A new optimizer pass — `JoinPredicatePushdownRule` — splits a
+Join's ON clause into conjuncts and pushes left-only / right-only
+conjuncts into Filter wrappers above each input, leaving only true
+cross-side predicates on the join. Outer-join semantics are preserved:
+LEFT/FULL never push left-only predicates; RIGHT/FULL never push
+right-only; LATERAL joins are skipped entirely.
+
+### Added — JoinPredicatePushdownRule (`src/optimizer/rules.rs`)
+
+The rule runs as part of the standard optimizer pipeline (registered
+between `SelectionPushdownRule` and `ProjectionPruningRule`). It
+recurses through `Join`, `Filter`, `Project`, `Sort`, `Limit`,
+`Aggregate`, `Union/Intersect/Except`, `With`, and `InsertSelect`,
+rewriting every Join it finds. A cheap O(plan-depth) `is_applicable`
+pre-filter short-circuits the walk on plans with no joins.
+
+### Added — Predicate-pushdown perf bench
+
+`benches/predicate_pushdown_bench.rs` runs four query shapes (control,
+right-only literal, left-only literal, mixed equi+one-sided) twice
+each — with and without the new rule — and sanity-checks that both
+runs return the same scalar `COUNT(*)` before timing. Validates both
+correctness and absence of perf regression.
+
+### Added — OLTP smoke bench
+
+`examples/oltp_smoke.rs` mirrors `pg_vs_helios.py`'s shapes via the
+embedded API. Run back-to-back on `main` and `feat/predicate-pushdown`
+to confirm no OLTP regression: every metric within run-to-run noise,
+INSERT and JOIN paths marginally faster.
+
+### Validation
+
+- 1758/1758 lib tests pass (1746 pre-existing + 12 new optimizer-rule tests).
+- 39/39 cte_hardening integration tests pass (the previously-`#[ignore]`d
+  `test_basic_cte_used_in_join` is back in the suite, plus a new
+  parametric variant `_one_sided_non_constant`).
+- `art_index_bench` runs at normal numbers — no regression on
+  non-JOIN workloads.
+
+See `PREDICATE_PUSHDOWN_REPORT.md` for the full validation matrix.
+
 ## [3.22.3] - 2026-05-01
 
 ### Added — Agentic-operations skill catalogue
