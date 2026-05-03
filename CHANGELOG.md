@@ -5,6 +5,33 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.23.1] - 2026-05-03
+
+### Added — Documentation & skill catalogue updates (no code changes)
+
+- **`heliosdb-nano-tenant` skill** — covers the existing multi-tenancy
+  surface (isolation modes, plans, RLS, `\tenant` REPL commands, library
+  API). Closes a gap in the skill catalogue.
+- **`heliosdb-nano-merge-validation` skill** — eight-phase pre-merge
+  validation methodology distilled from the v3.23.0 release work. Required
+  reading before any non-trivial change to engine code (planner, executor,
+  storage, parser, optimiser).
+- **`BUGS_DASHBOARD_MIGRATION_TRIAGE.md`** — full triage of the 11 bugs
+  filed by the Claude-Dashboard team against v3.19.1, verified against
+  v3.23.0. Two bugs (10, 11 — column-projection / aggregate-alias) are
+  confirmed already fixed in-range; the remaining nine are scheduled
+  across v3.24.0 → v3.27.1.
+
+### Confirmed fixed in-range (v3.19.1 → v3.23.0)
+
+- **Bug 10** — `SELECT COUNT(*) AS xyzzy FROM t` correctly returns the
+  column named `xyzzy` (alias preserved on aggregate output).
+- **Bug 11** — `SELECT col FROM t` returns only the requested column,
+  not the entire row.
+
+Dashboard team can re-test against v3.23.x to confirm — no re-engagement
+needed for these two specifically.
+
 ## [3.23.0] - 2026-05-03
 
 ### Fixed — JOIN with one-sided ON predicate no longer degenerates to cross product
