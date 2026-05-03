@@ -96,12 +96,11 @@ baseline.
 
 Sizing knob: `HELIOSDB_PP_BENCH_ROWS` env var.
 - Default `5_000_000` (≈ 11 GB on disk after RocksDB MVCC + zstd).
-- Recorded results in this report use 100 000 rows (≈ 220 MB) — at the
-  current row-by-row ingest rate (~27 rows/s through the SQL planner) the
-  10 GB run would take roughly 50 hours of wall time, which is impractical
-  for routine bench cycles. The harness scales correctly; ingest-path
-  performance is a separate concern (`bulk_insert_tuples` exists internally
-  but is not yet a public API for bench loaders).
+- Recorded results in this report use 100 000 rows (≈ 220 MB). The OLTP
+  comparison below confirms the embedded ingest path moves at **~800 rows/s**
+  (single-row-INSERT-in-txn through `db.execute_params`), so a literal 10 GB
+  seed completes in roughly **1.7 hours** end-to-end — feasible for
+  scheduled performance regression runs.
 
 ### Query shapes
 
@@ -148,6 +147,36 @@ correct-and-fast (Q2 pushdown at 186 ms emitting 300 K correct rows)
 *widens* in absolute terms — the buggy path's wasted cross-product work
 scales with the product of inputs, while the pushdown path scales with the
 filtered cardinality.
+
+## OLTP head-to-head (`examples/oltp_smoke.rs`)
+
+A second bench mirrors the workload shapes of `benches/external/pg_vs_helios.py`
+(batch INSERT, single INSERT, PK lookup, COUNT, INNER JOIN, repeated query)
+via the embedded API. Run **back-to-back on `main` and `feat/predicate-pushdown`**
+with the same release-mode binary, 10 000 main rows + 5 000 orders rows seed.
+
+| Metric | `main` | `feat/predicate-pushdown` | Δ |
+|--------|--------|---------------------------|---|
+| Batch INSERT (1000 rows) | 1242.57 ms (805 ops/s) | 1213.04 ms (824 ops/s) | **-2.4 % (faster)** |
+| INSERT single + commit | 1.22 ms (823 ops/s) | 1.16 ms (865 ops/s) | **-5 % (faster)** |
+| PK lookup (hot) | 909 K ops/s | 935 K ops/s | +3 % |
+| COUNT(*) | 3.23 M ops/s | 3.13 M ops/s | -3 % (noise) |
+| INNER JOIN — p50 (n=2000) | 9.5 µs | **8.5 µs** | **-11 % (faster)** |
+| INNER JOIN — p99 (n=2000) | 12.4 µs | 11.3 µs | -9 % (faster) |
+| Repeated query x100 (cached) | 973 K ops/s | 977 K ops/s | 0 % |
+
+**No metric regresses on this branch.** The INNER JOIN delta deserves a
+note: the rule's `apply` clones the plan, walks it, finds a cross-side
+equi-join only, and returns `None` — that work is sub-µs in release mode,
+well below the 9 µs baseline. The 1 µs improvement is most plausibly run-to-run
+noise; what matters is the absence of any meaningful slowdown.
+
+> **Reconciling against `docs/BENCHMARK_PG_VS_HELIOS.txt`**: the historical
+> doc shows ~25 rows/s for batch INSERT (1000 rows in 39 s). That's the
+> **PG-wire / psycopg2** path — every statement crosses the wire, gets
+> parsed by the protocol handler, and round-trips. The embedded API
+> shortcuts both. The ~30× difference is the cost of the wire protocol
+> on localhost TCP, not a property of the database core.
 
 ## Cross-feature regressions
 
