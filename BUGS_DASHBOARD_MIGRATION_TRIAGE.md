@@ -123,41 +123,43 @@ Each fix below ships with the eight-phase merge-validation methodology defined a
 | 7 | `tests/multi_statement_simple_query.rs` (already passes) + `tests/multi_statement_extended_query.rs` + `tests/multi_statement_embedded_api.rs` | n/a (no perf surface) | n/a |
 | 6 | `tests/pg_dump_restore_smoke.rs` — `pg_dump` from a real PG, `psql -f` against Nano, full restore + row-count parity | E2E timing of restore (~10K rows, ~100K rows) | **Major improvement once unstuck** — today restore hangs forever |
 
-## Release sequencing
+## Resolved questions (user-confirmed)
 
-Per the merge-validation methodology, each fix gets its own branch, validation report, and release. **Don't bundle.** That said, fixes within a root-cause group should land close in time so the regression test of one validates the other:
+The four open questions in the original draft of this document were resolved on **2026-05-03**:
+
+1. **Bug 1 scope** — `CREATE DATABASE` maps to the **existing tenant-management infrastructure** (`src/tenant/`, `\tenant create … db` REPL, `IsolationMode::DatabasePerTenant`). The fix is a thin SQL-DDL → tenant-API wrapper, not a new storage feature. Documented at `.claude/skills/heliosdb-nano-tenant/SKILL.md`. **No major bump needed.** A future minor release may add `CREATE DATABASE … WITH PLAN 'enterprise'` syntax to surface plan selection through SQL.
+
+2. **Auth defaults** — `--auth trust` is acceptable **only when the listener is loopback (`127.0.0.1` / `::1`) or a Unix domain socket**. Any non-loopback `--listen` MUST require a non-trust auth method. SCRAM-SHA-256 must work as a first-class option (Bug 2 fix is mandatory; cleartext Bug 3 stays as a fallback). Implementation: at startup, if `--listen` resolves outside loopback AND `--auth trust`, refuse to start with a clear error. **Promotes Bug 2 from "high" to "release-blocker for any non-loopback deployment".**
+
+3. **`pg_dump` round-trip** — already on the **documented upgrade path**: <https://www.heliosdb.com/docs/nano/guides/migration_guide_v220/#option-2-exportimport>. The Nano-to-Nano version-migration story relies on `pg_dump | psql` over the PG wire. **Promotes Bug 6 from "medium" to "high"** — a stalling restore breaks the documented upgrade for users coming from any earlier Nano version.
+
+4. **Dashboard re-verification** — **batch all fixes**, then ask the dashboard team for a single re-test. No per-release back-and-forth. The triage's "Recommended next action" no longer ships Bug 8 in isolation; instead all blockers ship together as a coordinated milestone.
+
+## Release sequencing (revised after question resolution)
 
 | Release | Bugs | Bump | Rationale |
 |---------|------|------|-----------|
-| **v3.23.1** | 10, 11 (verify-and-document) | patch | No code change; CHANGELOG-only entry confirming closure. Plus a heads-up to the dashboard team. |
-| **v3.24.0** | 8 (+ 9 auto-close) | minor | Behaviour change: queries that returned wrong rows now return correct rows. User-visible. **Highest-impact single fix.** |
-| **v3.25.0** | 4 (information_schema completion) | minor | Adds `tables`, `routines`, `referential_constraints`; flips catch-all to error-loudly. Behaviour change for clients that depended on silent-empty (none we know of). |
-| **v3.26.0** | 1 + 5 | minor | Multi-database support. Big surface. Possibly a major bump (v4.0.0) if storage key layout changes. **Decision needed before starting.** |
-| **v3.27.0** | 2 + 3 | minor | Auth protocol fixes. Independent of each other; bundle for one minor cycle. |
-| **v3.27.1** | 7 (extended + embedded paths) | patch | Multi-statement fix at parser level. Low risk. |
-| **v3.28.0** | 6 (pg_dump unstall) | minor | Likely a follow-up after v3.24 (Bug 8) since they share the extended-query path. |
+| **v3.23.1** | 10, 11 (verify-and-document) + add `heliosdb-nano-tenant` skill (already merged at `41ed619` parent — landing here) | patch | CHANGELOG-only confirmation that 10/11 are closed; ships the missing tenancy skill. |
+| **v3.24.0** | 8 (+ 9 auto-close) + 6 (extended-query-family completion) | minor | Bug 8 + 6 likely share the extended-query schema-synthesis root cause. Fixing them in one cycle means a single OLTP regression suite covers both. **Unblocks every prepared-statement client AND restores `pg_dump` upgrade path.** |
+| **v3.25.0** | 4 (information_schema: add `tables`, `routines`, `referential_constraints`; catch-all → error-loudly) | minor | ORM-bootstrap completion. Behaviour change: clients that relied on silent-empty results now see a real error. None known. |
+| **v3.26.0** | 1 (`CREATE DATABASE` → tenant-API wrapper) + 5 (StartupMessage validates DB name against tenants table) | minor | Cohesive surface — both touch the database-name plumbing. No storage layout change because tenants already have isolated namespaces. |
+| **v3.27.0** | 2 (SCRAM GS2 header) + 3 (cleartext password) + same-host-only `trust` enforcement | minor | Auth correctness + safer defaults. Refusing non-loopback `--listen` with `--auth trust` is a behaviour change that warrants the minor bump. |
+| **v3.27.1** | 7 (multi-statement at parser; extended + embedded paths) | patch | Low-risk parser fix. |
 
-If multi-database (Bug 1) requires a storage key-layout change, that's a **major bump (v4.0.0)** and should be sequenced last — design a migration story for existing v3.x data dirs.
+After v3.27.1: notify the dashboard team for re-verification on a single release that bundles **all of 1–9 closed**. If their TypeORM bootstrap runs end-to-end, the migration is unblocked.
 
 ## Recommended next action
 
-Pick **Bug 8** as the first fix:
+Pick **Bug 8** as the first fix in the v3.24.0 cycle:
 1. Branch `fix/extended-query-rowdescription`.
-2. Phase 2 unit tests reproducing the bug at `tests/extended_query_param_select.rs`.
+2. Phase 2 unit tests reproducing Bug 8 + Bug 6 + Bug 9 at:
+   - `tests/extended_query_param_select.rs`
+   - `tests/extended_query_count_distinct_param.rs` (Bug 9)
+   - `tests/pg_dump_restore_smoke.rs` (Bug 6 — needs real `pg_dump` output as fixture; gate on `cfg(unix)` since `pg_dump` is a Unix tool)
 3. Phase 4 bench at `benches/extended_query_bench.rs` — parameterised SELECT with varying param counts and result widths.
-4. Fix in `src/protocol/postgres/handler_extended.rs` (specifically the `synthesise_schema_from_ast` fallback at line 534–550).
+4. Fix in `src/protocol/postgres/handler_extended.rs` (`synthesise_schema_from_ast` fallback at line 534–550); follow-up to the SET-via-extended-query path for Bug 6.
 5. Phases 3 (regression), 5 (cross-feature), 6 (OLTP head-to-head vs main).
 6. Validation report `EXTENDED_QUERY_REPORT.md`.
 7. Release v3.24.0.
 
-Effort estimate: **3–5 days of engineering** including thorough tests against multiple PG-wire clients (psql, node-postgres, psycopg, JDBC, asyncpg).
-
-## Open questions for the user
-
-1. **Bug 1 scope**: implement multi-DB as a real storage-level isolation feature, or implement `CREATE DATABASE` as a no-op-with-success notice (everything still goes to the single namespace)? The latter unblocks pg_dump restores and most ORM bootstraps without a major version bump. Recommend the no-op-with-NOTICE first, then real multi-DB later.
-
-2. **Auth method default**: currently `--auth trust` is the documented default. Should v3.27.0 also flip the documented default to `scram-sha-256` once it works, or keep `trust` for dev convenience and require explicit production settings?
-
-3. **`pg_dump` source-of-truth**: should we add `pg_dump` round-trip parity to the OLTP bench harness so it's a permanent gate, or treat it as a one-shot validation when Bug 6 closes?
-
-4. **Dashboard re-verification**: when v3.24.0 ships (Bug 8 fix), can the dashboard team re-run their TypeORM bootstrap against it? That's the highest-confidence signal that the fix lands the migration unblocker, even if other bugs remain.
+Effort estimate: **5–8 days of engineering** including the Bug 6 follow-up and thorough cross-client testing (psql, node-postgres, psycopg, JDBC, asyncpg).
