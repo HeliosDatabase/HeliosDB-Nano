@@ -5,6 +5,60 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.24.0] - 2026-05-03
+
+### Added — `information_schema` completion (Bug 4)
+
+Closes the dashboard-migration triage's Bug 4. ORM bootstraps that probe
+the SQL-standard `information_schema.*` views (TypeORM's `hasTable`,
+sqlx's metadata reflection, Drizzle's introspection, etc.) now get
+well-formed responses instead of misleading silent-empties.
+
+- **`information_schema.routines`** — 16-column SQL-standard schema, zero
+  rows. Nano supports `CREATE FUNCTION` but does not yet surface the
+  runtime function catalog through this view; an empty result is
+  correct (signals "no user-defined routines visible").
+- **`information_schema.referential_constraints`** — populated from real
+  FK metadata. One row per `FOREIGN KEY` constraint with `update_rule`
+  and `delete_rule` mapped from `ReferentialAction` (`NO ACTION`,
+  `RESTRICT`, `CASCADE`, `SET NULL`, `SET DEFAULT`).
+- **`information_schema.check_constraints`** and
+  **`information_schema.views`** — SQL-standard schemas, zero rows.
+- **Whitelist of SQL-standard placeholder views** — `triggers`,
+  `parameters`, `sequences`, `domains`, `character_sets`, `collations`,
+  `*_privileges`, `role_*_grants`, `constraint_*_usage`,
+  `view_*_usage`, `applicable_roles`, `enabled_roles`,
+  `element_types`. All return zero rows with the right column shape
+  so ORM probes don't break.
+
+### Changed — `information_schema.<unknown>` now errors loudly
+
+**Behaviour change**: previously, any unrecognised `information_schema.*`
+query returned an empty schema with empty rows. ORMs that strict-check
+saw a misleading empty result rather than an actionable error. Now
+unknown view names return a `QueryExecution` error that names every
+supported view and points users to file an issue.
+
+If your client relies on the silent-empty behaviour for an
+SQL-standard view, that view is in the whitelist and behaviour is
+unchanged. If it relies on it for a non-standard / made-up name,
+file an issue and we'll add the placeholder.
+
+### Tests
+
+- New: `tests/information_schema_completion.rs` — 9 unit tests covering
+  every new view, the whitelist, the error-loudly behaviour, and a
+  regression check for the four pre-existing views (`tables`,
+  `columns`, `schemata`, `key_column_usage`, `table_constraints`).
+
+### Validation
+
+Followed the 8-phase merge-validation methodology
+(`.claude/skills/heliosdb-nano-merge-validation/SKILL.md`). Full
+report at `VALIDATION_REPORT_v3.24.0.md`. Lib tests 1758/1758 pass,
+doc tests 47/47 pass, info_schema completion 9/9 pass, system_views
+22/22 pass.
+
 ## [3.23.2] - 2026-05-03
 
 ### Confirmed fixed in-range — five more bugs from the dashboard-migration report

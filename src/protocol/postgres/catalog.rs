@@ -82,10 +82,34 @@ impl PgCatalog {
                 Some(self.query_information_schema_key_column_usage()?)
             } else if query_lower.contains("information_schema.table_constraints") {
                 Some(self.query_information_schema_table_constraints()?)
+            } else if query_lower.contains("information_schema.referential_constraints") {
+                Some(self.query_information_schema_referential_constraints()?)
+            } else if query_lower.contains("information_schema.routines") {
+                Some(Self::query_information_schema_routines())
+            } else if query_lower.contains("information_schema.check_constraints") {
+                Some(Self::query_information_schema_check_constraints())
+            } else if query_lower.contains("information_schema.views") {
+                Some(Self::query_information_schema_views())
             } else if query_lower.contains("information_schema.schemata") {
                 Some(self.query_information_schema_schemata()?)
+            } else if let Some(name) = Self::information_schema_view_name(&query_lower) {
+                if let Some(empty) = Self::known_empty_information_schema_view(&name) {
+                    Some(empty)
+                } else {
+                    return Err(crate::Error::QueryExecution(format!(
+                        "information_schema.{name} is not a recognised view; \
+                         HeliosDB Nano implements the SQL-standard subset \
+                         (tables, columns, schemata, key_column_usage, \
+                         table_constraints, referential_constraints, routines, \
+                         check_constraints, views) and a whitelist of empty \
+                         placeholder views (triggers, parameters, sequences, \
+                         domains, character_sets, collations, *_privileges, \
+                         role_*). Please file an issue if this view is needed."
+                    )));
+                }
             } else {
-                // Return empty for other information_schema queries
+                // Bare `from information_schema` reference without a view name
+                // (rare; psql `\dn`-style probes). Pass through.
                 Some((Schema::new(vec![]), vec![]))
             }
         } else if !Self::is_catalog_query(&query_lower) {
@@ -1333,6 +1357,226 @@ impl PgCatalog {
                         ]));
                     }
                 }
+            }
+        }
+        Ok((schema, rows))
+    }
+
+    /// Extract the view name from an `information_schema.<view>` reference.
+    /// Returns the lowercase name on the first match, or `None` if the
+    /// query references `information_schema` without naming a view.
+    fn information_schema_view_name(q: &str) -> Option<String> {
+        let marker = "information_schema.";
+        let idx = q.find(marker)?;
+        let tail = q.get(idx + marker.len()..)?;
+        // Stop at the first non-identifier character.
+        let end = tail
+            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .unwrap_or(tail.len());
+        let name = tail.get(..end)?.to_string();
+        if name.is_empty() { None } else { Some(name) }
+    }
+
+    /// Whitelist of SQL-standard `information_schema` view names that Nano
+    /// recognises but legitimately doesn't populate. Returns a stable
+    /// schema-only response (zero rows) so ORM probes get a well-formed
+    /// reply rather than an error.
+    fn known_empty_information_schema_view(name: &str) -> Option<(Schema, Vec<Tuple>)> {
+        let cols: &[(&str, DataType)] = match name {
+            "triggers" => &[
+                ("trigger_catalog", DataType::Text),
+                ("trigger_schema", DataType::Text),
+                ("trigger_name", DataType::Text),
+                ("event_manipulation", DataType::Text),
+                ("event_object_catalog", DataType::Text),
+                ("event_object_schema", DataType::Text),
+                ("event_object_table", DataType::Text),
+                ("action_statement", DataType::Text),
+                ("action_orientation", DataType::Text),
+                ("action_timing", DataType::Text),
+            ],
+            "parameters" => &[
+                ("specific_catalog", DataType::Text),
+                ("specific_schema", DataType::Text),
+                ("specific_name", DataType::Text),
+                ("ordinal_position", DataType::Int4),
+                ("parameter_mode", DataType::Text),
+                ("parameter_name", DataType::Text),
+                ("data_type", DataType::Text),
+            ],
+            "sequences" => &[
+                ("sequence_catalog", DataType::Text),
+                ("sequence_schema", DataType::Text),
+                ("sequence_name", DataType::Text),
+                ("data_type", DataType::Text),
+                ("start_value", DataType::Text),
+                ("minimum_value", DataType::Text),
+                ("maximum_value", DataType::Text),
+                ("increment", DataType::Text),
+            ],
+            "domains" => &[
+                ("domain_catalog", DataType::Text),
+                ("domain_schema", DataType::Text),
+                ("domain_name", DataType::Text),
+                ("data_type", DataType::Text),
+            ],
+            "character_sets" => &[
+                ("character_set_catalog", DataType::Text),
+                ("character_set_schema", DataType::Text),
+                ("character_set_name", DataType::Text),
+                ("default_collate_name", DataType::Text),
+            ],
+            "collations" => &[
+                ("collation_catalog", DataType::Text),
+                ("collation_schema", DataType::Text),
+                ("collation_name", DataType::Text),
+            ],
+            "table_privileges" | "column_privileges" | "usage_privileges" => &[
+                ("grantor", DataType::Text),
+                ("grantee", DataType::Text),
+                ("table_catalog", DataType::Text),
+                ("table_schema", DataType::Text),
+                ("table_name", DataType::Text),
+                ("privilege_type", DataType::Text),
+                ("is_grantable", DataType::Text),
+            ],
+            "role_table_grants" | "role_column_grants" | "role_usage_grants" | "role_routine_grants" => &[
+                ("grantor", DataType::Text),
+                ("grantee", DataType::Text),
+                ("table_catalog", DataType::Text),
+                ("table_schema", DataType::Text),
+                ("table_name", DataType::Text),
+                ("privilege_type", DataType::Text),
+                ("is_grantable", DataType::Text),
+            ],
+            "constraint_column_usage" | "constraint_table_usage" => &[
+                ("table_catalog", DataType::Text),
+                ("table_schema", DataType::Text),
+                ("table_name", DataType::Text),
+                ("column_name", DataType::Text),
+                ("constraint_catalog", DataType::Text),
+                ("constraint_schema", DataType::Text),
+                ("constraint_name", DataType::Text),
+            ],
+            "view_column_usage" | "view_table_usage" => &[
+                ("view_catalog", DataType::Text),
+                ("view_schema", DataType::Text),
+                ("view_name", DataType::Text),
+                ("table_catalog", DataType::Text),
+                ("table_schema", DataType::Text),
+                ("table_name", DataType::Text),
+            ],
+            "applicable_roles" | "enabled_roles" | "administrable_role_authorizations" => &[
+                ("grantee", DataType::Text),
+                ("role_name", DataType::Text),
+                ("is_grantable", DataType::Text),
+            ],
+            "element_types" => &[
+                ("object_catalog", DataType::Text),
+                ("object_schema", DataType::Text),
+                ("object_name", DataType::Text),
+                ("data_type", DataType::Text),
+            ],
+            _ => return None,
+        };
+        let columns = cols.iter().map(|(n, dt)| Column::new(*n, dt.clone())).collect();
+        Some((Schema::new(columns), vec![]))
+    }
+
+    /// information_schema.routines — SQL-standard schema, zero rows.
+    /// Nano supports CREATE FUNCTION but does not currently expose its
+    /// runtime function catalog through this view; ORM probes that look
+    /// up routine names will see an empty set, which is correct (it
+    /// signals "no user-defined routines visible").
+    fn query_information_schema_routines() -> (Schema, Vec<Tuple>) {
+        let schema = Schema::new(vec![
+            Column::new("specific_catalog", DataType::Text),
+            Column::new("specific_schema", DataType::Text),
+            Column::new("specific_name", DataType::Text),
+            Column::new("routine_catalog", DataType::Text),
+            Column::new("routine_schema", DataType::Text),
+            Column::new("routine_name", DataType::Text),
+            Column::new("routine_type", DataType::Text),
+            Column::new("data_type", DataType::Text),
+            Column::new("type_udt_catalog", DataType::Text),
+            Column::new("type_udt_schema", DataType::Text),
+            Column::new("type_udt_name", DataType::Text),
+            Column::new("routine_body", DataType::Text),
+            Column::new("routine_definition", DataType::Text),
+            Column::new("external_language", DataType::Text),
+            Column::new("is_deterministic", DataType::Text),
+            Column::new("security_type", DataType::Text),
+        ]);
+        (schema, vec![])
+    }
+
+    /// information_schema.check_constraints — SQL-standard schema, zero
+    /// rows. Nano stores CHECK constraints internally but does not yet
+    /// surface them through this view.
+    fn query_information_schema_check_constraints() -> (Schema, Vec<Tuple>) {
+        let schema = Schema::new(vec![
+            Column::new("constraint_catalog", DataType::Text),
+            Column::new("constraint_schema", DataType::Text),
+            Column::new("constraint_name", DataType::Text),
+            Column::new("check_clause", DataType::Text),
+        ]);
+        (schema, vec![])
+    }
+
+    /// information_schema.views — SQL-standard schema, zero rows. Nano
+    /// does not persist VIEW definitions, mirroring `pg_views`.
+    fn query_information_schema_views() -> (Schema, Vec<Tuple>) {
+        let schema = Schema::new(vec![
+            Column::new("table_catalog", DataType::Text),
+            Column::new("table_schema", DataType::Text),
+            Column::new("table_name", DataType::Text),
+            Column::new("view_definition", DataType::Text),
+            Column::new("check_option", DataType::Text),
+            Column::new("is_updatable", DataType::Text),
+            Column::new("is_insertable_into", DataType::Text),
+        ]);
+        (schema, vec![])
+    }
+
+    /// information_schema.referential_constraints — one row per FK
+    /// constraint. Reads from the per-table `TableConstraints` blob via
+    /// the storage catalog, so cross-schema and self-referential FKs
+    /// surface correctly.
+    fn query_information_schema_referential_constraints(&self) -> Result<(Schema, Vec<Tuple>)> {
+        let schema = Schema::new(vec![
+            Column::new("constraint_catalog", DataType::Text),
+            Column::new("constraint_schema", DataType::Text),
+            Column::new("constraint_name", DataType::Text),
+            Column::new("unique_constraint_catalog", DataType::Text),
+            Column::new("unique_constraint_schema", DataType::Text),
+            Column::new("unique_constraint_name", DataType::Text),
+            Column::new("match_option", DataType::Text),
+            Column::new("update_rule", DataType::Text),
+            Column::new("delete_rule", DataType::Text),
+        ]);
+        let db = match &self.database {
+            Some(db) => db,
+            None => return Ok((schema, vec![])),
+        };
+        let catalog = db.storage.catalog();
+        let mut rows = Vec::new();
+        for table in catalog.list_tables()? {
+            let constraints = match catalog.load_table_constraints(&table) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            for fk in &constraints.foreign_keys {
+                rows.push(Tuple::new(vec![
+                    Value::String("heliosdb".into()),
+                    Value::String("public".into()),
+                    Value::String(fk.name.clone()),
+                    Value::String("heliosdb".into()),
+                    Value::String("public".into()),
+                    Value::String(format!("{}_pkey", fk.references_table)),
+                    Value::String("NONE".into()),
+                    Value::String(fk.on_update.to_string()),
+                    Value::String(fk.on_delete.to_string()),
+                ]));
             }
         }
         Ok((schema, rows))
