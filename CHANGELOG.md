@@ -5,6 +5,64 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.25.0] - 2026-05-03
+
+### Added — `CREATE DATABASE` + `DROP DATABASE` (Bug 1)
+
+Closes the dashboard-migration triage's Bug 1. ORM bootstraps that emit
+`CREATE DATABASE testdb` (TypeORM, sqlx with `database_create=true`,
+node-pg admin connections) now succeed end-to-end. The new SQL surface
+is a thin metadata-only wrapper around the existing `TenantManager` API
+— there is no storage-layout change.
+
+- `Statement::CreateDatabase` and `Statement::Drop { object_type:
+  Database }` are routed through new `LogicalPlan::CreateDatabase` /
+  `LogicalPlan::DropDatabase` nodes.
+- `IF NOT EXISTS` succeeds silently on duplicate names. `IF EXISTS`
+  succeeds silently on missing names. Bare `CREATE DATABASE foo` errors
+  on duplicate; bare `DROP DATABASE foo` errors when `foo` doesn't
+  exist.
+- Reserved names (`heliosdb`, `postgres`) cannot be created or dropped.
+  `CREATE DATABASE IF NOT EXISTS heliosdb` succeeds silently
+  (idempotent shape).
+
+The new tenant is registered with `IsolationMode::DatabasePerTenant`
+on the `free` plan. Tenants are tracked in the in-memory
+`TenantManager`; cross-restart persistence is a follow-up.
+
+### Changed — PG-wire StartupMessage validates `database` parameter (Bug 5)
+
+**Behaviour change**: previously, the PG-wire startup handler at
+`src/protocol/postgres/handler.rs:236-239` accepted any `database`
+parameter without validation, silently routing every connection to the
+default `heliosdb` keyspace. v3.25.0 now validates the requested name:
+
+- `heliosdb` and `postgres` are accepted (reserved system databases).
+- Any registered tenant name is accepted.
+- An empty / missing `database` parameter falls back to the
+  `user` parameter (libpq default).
+- Anything else returns `database "x" does not exist` and the
+  connection is refused.
+
+This closes Bug 5 from the dashboard-migration triage. Clients
+configured to hit a deliberately-named database now get a clear error
+on a typo; clients using the libpq defaults are unaffected because
+`postgres` and `heliosdb` are both recognised.
+
+### Tests
+
+- New: `tests/create_database_and_dbname_validation.rs` — 8 unit tests
+  covering CREATE / DROP / IF [NOT] EXISTS / reserved-name protection /
+  StartupMessage validation.
+
+### Validation
+
+Followed the 8-phase merge-validation methodology
+(`.claude/skills/heliosdb-nano-merge-validation/SKILL.md`). Full
+report at `VALIDATION_REPORT_v3.25.0.md`. Lib tests 1758/1758 pass,
+doc tests 47/47 pass, all targeted CREATE-DATABASE tests pass,
+v3.24.0 information_schema tests still pass (no regression).
+
 ## [3.24.0] - 2026-05-03
 
 ### Added — `information_schema` completion (Bug 4)

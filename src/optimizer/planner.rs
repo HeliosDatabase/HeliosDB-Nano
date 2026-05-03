@@ -313,6 +313,8 @@ impl Planner {
             LogicalPlan::CreateSequence { .. } |
             LogicalPlan::CreateExtension { .. } |
             LogicalPlan::DropExtension { .. } |
+            LogicalPlan::CreateDatabase { .. } |
+            LogicalPlan::DropDatabase { .. } |
             LogicalPlan::AlterColumnStorage { .. } |
             LogicalPlan::AlterTableAddColumn { .. } |
             LogicalPlan::AlterTableDropColumn { .. } |

@@ -1582,6 +1582,13 @@ impl PgCatalog {
         Ok((schema, rows))
     }
 
+    /// Bug 5 — validate a StartupMessage `database` parameter. Thin
+    /// associated-function wrapper around `EmbeddedDatabase::database_name_is_valid`
+    /// so the PG-wire handler doesn't need to peek at internals.
+    pub fn is_valid_database_name(db: &EmbeddedDatabase, name: &str) -> bool {
+        db.database_name_is_valid(name)
+    }
+
     /// Map DataType to PostgreSQL type length
     fn datatype_to_len(dt: &DataType) -> i16 {
         match dt {

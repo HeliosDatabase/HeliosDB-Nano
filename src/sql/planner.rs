@@ -370,6 +370,14 @@ impl<'a> Planner<'a> {
                             if_exists,
                         })
                     }
+                    sqlparser::ast::ObjectType::Database => {
+                        // DROP DATABASE — Bug 1 mirror; wraps the
+                        // tenant-API.
+                        Ok(LogicalPlan::DropDatabase {
+                            name,
+                            if_exists,
+                        })
+                    }
                     _ => {
                         // Default to DROP TABLE for backwards compatibility
                         Ok(LogicalPlan::DropTable {
@@ -737,6 +745,15 @@ impl<'a> Planner<'a> {
             Statement::CreateSequence { name, if_not_exists, .. } => {
                 let seq_name = Self::normalize_object_name(&name);
                 Ok(LogicalPlan::CreateSequence { name: seq_name, if_not_exists })
+            }
+            // `CREATE DATABASE name [IF NOT EXISTS]` — Bug 1 from the
+            // dashboard-migration triage. Wraps the existing
+            // `TenantManager::register_tenant_with_plan` API as a
+            // metadata-only DDL. The reserved-name and duplicate
+            // semantics live in the executor.
+            Statement::CreateDatabase { db_name, if_not_exists, .. } => {
+                let name = Self::normalize_object_name(&db_name);
+                Ok(LogicalPlan::CreateDatabase { name, if_not_exists })
             }
             _ => Err(Error::query_execution(format!(
                 "Statement not yet supported: {:?}",

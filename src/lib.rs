@@ -2701,6 +2701,14 @@ impl EmbeddedDatabase {
                 self.storage.art_indexes().clear_table_indexes(table_name);
                 Ok(count)
             }
+            sql::LogicalPlan::CreateDatabase { name, if_not_exists } => {
+                let (count, _) = self.handle_create_database(name, *if_not_exists)?;
+                Ok(count)
+            }
+            sql::LogicalPlan::DropDatabase { name, if_exists } => {
+                let (count, _) = self.handle_drop_database(name, *if_exists)?;
+                Ok(count)
+            }
             _ => {
                 // For other operations (CREATE INDEX, SELECT, etc.), use executor
                 // with transaction context so reads see uncommitted writes
@@ -5512,6 +5520,14 @@ impl EmbeddedDatabase {
                     Err(Error::query_execution(format!("Savepoint '{}' does not exist", name)))
                 }
             }
+            sql::LogicalPlan::CreateDatabase { name, if_not_exists } => {
+                let (count, _) = self.handle_create_database(name, *if_not_exists)?;
+                Ok(count)
+            }
+            sql::LogicalPlan::DropDatabase { name, if_exists } => {
+                let (count, _) = self.handle_drop_database(name, *if_exists)?;
+                Ok(count)
+            }
             _ => {
                 // For query plans, use executor
                 let mut executor = sql::Executor::with_storage(&self.storage)
@@ -5824,6 +5840,17 @@ impl EmbeddedDatabase {
     }
 
     fn execute_plan_with_params_inner(&self, plan: &sql::LogicalPlan, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
+        // CREATE DATABASE / DROP DATABASE are handled here, above the
+        // executor, because they only touch the in-memory TenantManager
+        // (no storage). Reserved names (`heliosdb`, `postgres`) are
+        // protected: CREATE refuses unless IF NOT EXISTS, DROP always
+        // refuses.
+        if let sql::LogicalPlan::CreateDatabase { name, if_not_exists } = plan {
+            return self.handle_create_database(name, *if_not_exists);
+        }
+        if let sql::LogicalPlan::DropDatabase { name, if_exists } = plan {
+            return self.handle_drop_database(name, *if_exists);
+        }
         match plan {
             sql::LogicalPlan::Insert { table_name, columns, values, returning, on_conflict } => {
                 // Get table schema for column types
@@ -8461,6 +8488,103 @@ impl EmbeddedDatabase {
         // Execute plan and extract just the row count (ignore returned tuples)
         let (count, _tuples) = self.execute_plan_with_params(plan, &[])?;
         Ok(count)
+    }
+
+    /// Reserved database names that always exist and cannot be created
+    /// or dropped. `heliosdb` is the default keyspace; `postgres` is
+    /// kept for PG-client compatibility (psql, pgAdmin, etc. probe it
+    /// during connection bootstrap).
+    pub(crate) const RESERVED_DATABASE_NAMES: &'static [&'static str] = &["heliosdb", "postgres"];
+
+    fn database_name_is_reserved(name: &str) -> bool {
+        let lower = name.to_ascii_lowercase();
+        Self::RESERVED_DATABASE_NAMES.iter().any(|r| *r == lower)
+    }
+
+    /// CREATE DATABASE — Bug 1 from the dashboard-migration triage.
+    /// Wraps `TenantManager::register_tenant_with_plan` with the
+    /// reserved-name + duplicate semantics PostgreSQL clients expect.
+    fn handle_create_database(&self, name: &str, if_not_exists: bool) -> Result<(u64, Vec<Tuple>)> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(Error::query_execution("CREATE DATABASE requires a non-empty name"));
+        }
+        if Self::database_name_is_reserved(trimmed) {
+            if if_not_exists {
+                return Ok((0, vec![]));
+            }
+            return Err(Error::query_execution(format!(
+                "database \"{trimmed}\" is a reserved system database and cannot be created"
+            )));
+        }
+        // Duplicate check.
+        let already_exists = self
+            .tenant_manager
+            .list_tenants()
+            .iter()
+            .any(|t| t.name.eq_ignore_ascii_case(trimmed));
+        if already_exists {
+            if if_not_exists {
+                return Ok((0, vec![]));
+            }
+            return Err(Error::query_execution(format!(
+                "database \"{trimmed}\" already exists"
+            )));
+        }
+        self.tenant_manager.register_tenant_with_plan(
+            trimmed.to_string(),
+            crate::tenant::IsolationMode::DatabasePerTenant,
+            "free",
+        );
+        Ok((0, vec![]))
+    }
+
+    /// DROP DATABASE — Bug 1 mirror. Reserved names always refused.
+    fn handle_drop_database(&self, name: &str, if_exists: bool) -> Result<(u64, Vec<Tuple>)> {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return Err(Error::query_execution("DROP DATABASE requires a non-empty name"));
+        }
+        if Self::database_name_is_reserved(trimmed) {
+            return Err(Error::query_execution(format!(
+                "database \"{trimmed}\" is a reserved system database and cannot be dropped"
+            )));
+        }
+        let target = self
+            .tenant_manager
+            .list_tenants()
+            .into_iter()
+            .find(|t| t.name.eq_ignore_ascii_case(trimmed));
+        let Some(tenant) = target else {
+            if if_exists {
+                return Ok((0, vec![]));
+            }
+            return Err(Error::query_execution(format!(
+                "database \"{trimmed}\" does not exist"
+            )));
+        };
+        self.tenant_manager
+            .delete_tenant(tenant.id)
+            .map_err(Error::query_execution)?;
+        Ok((0, vec![]))
+    }
+
+    /// Bug 5 — validate a StartupMessage `database` parameter. Returns
+    /// `true` for `heliosdb` / `postgres` (reserved) or any registered
+    /// tenant; `false` for empty / unknown names. Used by the PG-wire
+    /// startup handler to refuse connections to non-existent databases.
+    pub fn database_name_is_valid(&self, name: &str) -> bool {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            return false;
+        }
+        if Self::database_name_is_reserved(trimmed) {
+            return true;
+        }
+        self.tenant_manager
+            .list_tenants()
+            .iter()
+            .any(|t| t.name.eq_ignore_ascii_case(trimmed))
     }
 
     /// Apply DEFAULT expressions to NULL-valued columns and enforce

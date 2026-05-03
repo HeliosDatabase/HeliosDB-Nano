@@ -414,6 +414,30 @@ pub enum LogicalPlan {
         if_not_exists: bool,
     },
 
+    /// `CREATE DATABASE <name>` — registers a new tenant in the
+    /// in-memory `TenantManager` with `IsolationMode::DatabasePerTenant`.
+    /// Reserved names (`heliosdb`, `postgres`) are refused unless
+    /// `IF NOT EXISTS` is set. This is the SQL surface for Bug 1 from
+    /// the dashboard-migration triage; it intentionally wraps the
+    /// existing tenant-management infrastructure rather than
+    /// introducing a new storage layer.
+    CreateDatabase {
+        /// Database / tenant name (case-preserving, normalised below).
+        name: String,
+        /// Silently succeed if the name is already registered or is
+        /// one of the reserved names.
+        if_not_exists: bool,
+    },
+
+    /// `DROP DATABASE <name>` — removes a tenant from the
+    /// `TenantManager`. Reserved names are always refused.
+    DropDatabase {
+        /// Database / tenant name.
+        name: String,
+        /// Silently succeed if the name doesn't exist.
+        if_exists: bool,
+    },
+
     /// `DROP EXTENSION <name>` — uninstall. Phase 1 drops the
     /// `_hdb_code_*` tables (cascade-style); future phases may keep
     /// data and only unregister functions.
@@ -1472,6 +1496,8 @@ impl LogicalPlan {
             Self::CreateIndex { .. } => "CreateIndex",
             Self::CreateSequence { .. } => "CreateSequence",
             Self::CreateExtension { .. } => "CreateExtension",
+            Self::CreateDatabase { .. } => "CreateDatabase",
+            Self::DropDatabase { .. } => "DropDatabase",
             Self::DropExtension { .. } => "DropExtension",
             Self::Explain { .. } => "Explain",
             Self::Union { .. } => "Union",
@@ -1584,7 +1610,9 @@ impl LogicalPlan {
                 Arc::new(Schema { columns: vec![] })
             }
             LogicalPlan::CreateExtension { .. }
-            | LogicalPlan::DropExtension { .. } => {
+            | LogicalPlan::DropExtension { .. }
+            | LogicalPlan::CreateDatabase { .. }
+            | LogicalPlan::DropDatabase { .. } => {
                 Arc::new(Schema { columns: vec![] })
             }
             LogicalPlan::AlterColumnStorage { .. } => {

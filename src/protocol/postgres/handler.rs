@@ -238,6 +238,23 @@ where
 
             self.username = params.get("user").cloned();
 
+            // Bug 5 — validate the requested database name. Reject
+            // unknown names rather than silently routing every
+            // connection to the default `heliosdb` keyspace. Reserved
+            // names (`heliosdb`, `postgres`) and any registered tenant
+            // are accepted. An empty / missing `database` parameter
+            // falls back to the username, matching libpq behaviour;
+            // we still validate that fallback.
+            if let Some(requested) = params.get("database").cloned()
+                .or_else(|| params.get("user").cloned())
+            {
+                if !self.database.database_name_is_valid(&requested) {
+                    return Err(Error::authentication(format!(
+                        "database \"{requested}\" does not exist"
+                    )));
+                }
+            }
+
             // Send authentication request
             match self.auth_manager.method() {
                 AuthMethod::Trust => {

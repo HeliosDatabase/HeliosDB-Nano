@@ -1049,6 +1049,20 @@ impl<'a> Executor<'a> {
                     vec![],
                 ).with_timeout(self.timeout_ctx())))
             }
+            LogicalPlan::CreateDatabase { .. } | LogicalPlan::DropDatabase { .. } => {
+                // Handled at the EmbeddedDatabase layer (which has the
+                // TenantManager). The Executor never sees these plans
+                // because `execute_plan_with_params_inner` intercepts
+                // them before invoking the executor; this arm exists
+                // only for exhaustiveness.
+                Ok(Box::new(ScanOperator::new(
+                    String::new(),
+                    Arc::new(crate::Schema { columns: vec![] }),
+                    None,
+                    vec![],
+                    vec![],
+                ).with_timeout(self.timeout_ctx())))
+            }
             LogicalPlan::DropTable { name, if_exists } => {
                 ddl::handle_drop_table(self, name, *if_exists)
             }
