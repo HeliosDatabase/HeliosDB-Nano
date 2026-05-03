@@ -5,6 +5,51 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.23.2] - 2026-05-03
+
+### Confirmed fixed in-range — five more bugs from the dashboard-migration report
+
+Verified by direct PG-wire repro (`target/release/heliosdb-nano start
+--port 15441 --http-port 18081 --auth trust|password`, queried via
+psql + psycopg2). Bumps the in-range-fixed count from 2 to 7.
+
+| # | Repro | Status |
+|---|-------|--------|
+| 3 | `--auth password`, correct/wrong PGPASSWORD | FIXED — correct password authenticates, wrong is rejected with `Invalid password` |
+| 6 | `psql -f synth_pg_dump.sql` (full pg_dump-shaped SET preamble + DDL + INSERT) | FIXED — completes in <1s; rows restored |
+| 7 | `psql -c "CREATE TABLE a (x INT); CREATE TABLE b (y INT)"` simple-query path | FIXED — both DDLs execute (extended-query path still has its own gap, lower priority) |
+| 8 | psycopg2 `cur.execute("SELECT COUNT(*) FROM pings WHERE week_bucket = %s", ...)` | FIXED — returns correct rows |
+| 9 | psycopg2 `COUNT(DISTINCT col) WHERE x = %s` (parameterised) vs literal | FIXED — both forms agree |
+
+### Added — `tests/extended_query_planner_schema.rs`
+
+Locks in the planner-side correctness for parameterised SELECT
+schema derivation: column names + types match between the literal
+and `$N` forms for COUNT(*), COUNT(DISTINCT), aliased aggregates,
+and multi-column projections. The unit tests catch any future
+planner regression that would re-open Bug 8 / 9.
+
+### Updated — `BUGS_DASHBOARD_MIGRATION_TRIAGE.md`
+
+Re-triaged with the live verification table. Net status:
+- ✅ Fixed: 3, 6, 7 (simple-query), 8, 9, 10, 11 (and 4 basic shape).
+- ❌ Still present: 1 (`CREATE DATABASE`), 2 (SCRAM-SHA-256), 5 (DB-name validation).
+- 🟡 Partial: 4 — `routines` + `referential_constraints` views still empty.
+
+The previously-planned v3.24.0 fix milestone (Bug 8 + 9 + 6) is now
+a no-op. Revised release plan: v3.24.0 → Bug 4 completion;
+v3.25.0 → Bug 1 + 5 (tenant-API DDL surface); v3.26.0 → Bug 2 SCRAM
+fix + same-host-only `trust` enforcement.
+
+### Note for the dashboard team
+
+If your TypeORM bootstrap doesn't need `CREATE DATABASE`, doesn't
+need SCRAM-SHA-256, and you can connect over loopback / Unix
+socket with `--auth trust`, **all known migration blockers are
+already closed in v3.23.2**. Please re-test —
+`cargo install heliosdb-nano@3.23.2` or pull
+`heliosdb-nano-v2:3.23.2` once the image is rebuilt.
+
 ## [3.23.1] - 2026-05-03
 
 ### Added — Documentation & skill catalogue updates (no code changes)
