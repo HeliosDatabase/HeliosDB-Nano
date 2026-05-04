@@ -282,7 +282,22 @@ impl<'a> Planner<'a> {
         // address the code-graph / graph-rag tables in dotted form
         // without forcing a catalog refactor.  The flat-prefix names
         // remain the canonical storage keys.
-        Self::dealias_schema(&joined).unwrap_or(joined)
+        if let Some(dealiased) = Self::dealias_schema(&joined) {
+            return dealiased;
+        }
+        // Schema-qualified `public.<table>` and `pg_catalog.<table>`
+        // collapse to bare `<table>` — Nano stores everything in the
+        // implicit `public` schema, and most ORM-emitted DDL prefixes
+        // table names with `"public"."tbl"` (KanttBan #13 against
+        // v3.28.0). pg_catalog references are also normalized so
+        // `pg_catalog.pg_type` and `pg_type` resolve identically.
+        if let Some(rest) = joined.strip_prefix("public.") {
+            return rest.to_string();
+        }
+        if let Some(rest) = joined.strip_prefix("pg_catalog.") {
+            return rest.to_string();
+        }
+        joined
     }
 
     /// Map dotted names of the form `_hdb_code.<table>` or

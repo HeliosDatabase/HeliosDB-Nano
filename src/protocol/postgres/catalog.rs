@@ -134,6 +134,36 @@ impl PgCatalog {
                 Column::new("cache_size", DataType::Int8),
                 Column::new("last_value", DataType::Int8),
             ]), vec![]))
+        } else if query_lower.contains("pg_policies") {
+            // RLS policies — drizzle-kit `pull` introspects this after
+            // pg_sequences (KanttBan #12 against v3.28.0). Nano's RLS
+            // is exposed via the per-tenant manager rather than
+            // pg_policies, so we return the standard 8-column shape
+            // with zero rows.
+            Some((Schema::new(vec![
+                Column::new("schemaname", DataType::Text),
+                Column::new("tablename", DataType::Text),
+                Column::new("policyname", DataType::Text),
+                Column::new("permissive", DataType::Text),
+                Column::new("roles", DataType::Text),
+                Column::new("cmd", DataType::Text),
+                Column::new("qual", DataType::Text),
+                Column::new("with_check", DataType::Text),
+            ]), vec![]))
+        } else if query_lower.contains("pg_matviews") {
+            // Materialized views — drizzle-kit also introspects this.
+            // Standard 6-column shape; we have first-class support
+            // for matviews via `pg_mv_staleness()` but the pg_matviews
+            // PG-shaped view is a separate surface most ORMs default to.
+            Some((Schema::new(vec![
+                Column::new("schemaname", DataType::Text),
+                Column::new("matviewname", DataType::Text),
+                Column::new("matviewowner", DataType::Text),
+                Column::new("tablespace", DataType::Text),
+                Column::new("hasindexes", DataType::Boolean),
+                Column::new("ispopulated", DataType::Boolean),
+                Column::new("definition", DataType::Text),
+            ]), vec![]))
         } else if query_lower.contains("pg_index") && !query_lower.contains("pg_indexes") {
             Some(self.query_pg_index()?)
         } else if query_lower.contains("pg_indexes") {
@@ -730,7 +760,13 @@ impl PgCatalog {
             Column::new("encoding", DataType::Int4),
         ]);
 
-        let rows = vec![
+        // Always include the implicit `heliosdb` system database. Then
+        // append every tenant registered via `CREATE DATABASE` (the
+        // v3.25 wrap of the multi-tenant API). Without this, `\l` and
+        // every ORM that calls `pg_database` see only the default DB
+        // even after `CREATE DATABASE foo` succeeded — KanttBan #16
+        // partial fix against v3.28.0.
+        let mut rows = vec![
             Tuple::new(vec![
                 Value::Int4(1),
                 Value::String("heliosdb".to_string()),
@@ -738,6 +774,20 @@ impl PgCatalog {
                 Value::Int4(6), // UTF8
             ]),
         ];
+        if let Some(db) = self.database.as_ref() {
+            for (i, t) in db.tenant_manager.list_tenants().iter().enumerate() {
+                // Skip the implicit system database — already in the list.
+                if t.name.eq_ignore_ascii_case("heliosdb") || t.name.eq_ignore_ascii_case("postgres") {
+                    continue;
+                }
+                rows.push(Tuple::new(vec![
+                    Value::Int4((100 + i) as i32),
+                    Value::String(t.name.clone()),
+                    Value::Int4(10),
+                    Value::Int4(6),
+                ]));
+            }
+        }
 
         Ok((schema, rows))
     }
@@ -968,13 +1018,70 @@ impl PgCatalog {
             return Ok(Some((schema, rows)));
         }
 
-        // Note: psql's `\d table_name` sends a sequence of 4+ catalog queries
-        // (OID lookup, relation metadata, attributes, indexes) each with
-        // precise expected column shapes.  We deliberately do NOT intercept
-        // these — they fall through to the generic pg_class/pg_attribute
-        // handlers.  Attempting to synthesise the exact shapes was crashing
-        // psql on column-count mismatches, so we leave `\d table_name` as
-        // a known limitation; `\dt`, `\l`, `\dn`, `\du`, `\di` all work.
+        // ---- \d table_name (KanttBan #7, deferred from v3.28) ----------
+        // psql's `\d <name>` sends several catalog queries; the one that
+        // libpq error-rejects with "column number 5 is out of range 0..4"
+        // is the per-column descriptor:
+        //
+        //   SELECT a.attname,
+        //          pg_catalog.format_type(a.atttypid, a.atttypmod),
+        //          (default-expr subquery),
+        //          a.attnotnull,
+        //          (collation subquery),
+        //          a.attidentity,
+        //          a.attgenerated
+        //   FROM pg_catalog.pg_attribute a
+        //   WHERE a.attrelid = '<oid>' AND a.attnum > 0 AND NOT a.attisdropped
+        //   ORDER BY a.attnum;
+        //
+        // Match on the telltale `attnum > 0` + `attisdropped` combination
+        // and emit the 7-column shape filled from our internal schema —
+        // identity / generated / collation default to empty since Nano
+        // doesn't expose them.
+        if q.contains("pg_catalog.pg_attribute")
+            && q.contains("attnum")
+            && q.contains("attisdropped")
+        {
+            let schema = Schema::new(vec![
+                Column::new("attname", DataType::Text),
+                Column::new("format_type", DataType::Text),
+                Column::new("default_expr", DataType::Text),
+                Column::new("attnotnull", DataType::Boolean),
+                Column::new("collation", DataType::Text),
+                Column::new("attidentity", DataType::Char(1)),
+                Column::new("attgenerated", DataType::Char(1)),
+            ]);
+            // Extract the OID literal so we can find the matching table.
+            // psql formats it as `a.attrelid = '<oid>'`. Any single OID
+            // literal in the query is the target.
+            let oid_literal = Self::extract_attrelid(q);
+            let table_names = catalog.list_tables()?;
+            let mut rows = Vec::new();
+            for (ti, table_name) in table_names.iter().enumerate() {
+                let table_oid = (16384 + ti) as i32;
+                if let Some(target_oid) = oid_literal {
+                    if target_oid != table_oid {
+                        continue;
+                    }
+                }
+                if let Ok(table_schema) = catalog.get_table_schema(table_name) {
+                    for col in &table_schema.columns {
+                        rows.push(Tuple::new(vec![
+                            Value::String(col.name.clone()),
+                            Value::String(Self::pg_format_type(&col.data_type)),
+                            col.default_expr.as_ref()
+                                .map(|d| Value::String(d.clone()))
+                                .unwrap_or(Value::Null),
+                            Value::Boolean(!col.nullable),
+                            Value::Null, // collation
+                            Value::String(if col.primary_key { "d".to_string() } else { "".to_string() }),
+                            Value::String(String::new()), // attgenerated — Nano has no GENERATED columns
+                        ]));
+                    }
+                }
+            }
+            return Ok(Some((schema, rows)));
+        }
 
         // ---- \di (list indexes) ------------------------------------------------
         let is_di = q.contains("pg_catalog.pg_class")
@@ -1020,6 +1127,49 @@ impl PgCatalog {
         Ok(None)
     }
 
+    /// Extract the table OID literal from psql's
+    /// `WHERE a.attrelid = '<oid>'` shape used by `\d <table>`.
+    fn extract_attrelid(q: &str) -> Option<i32> {
+        let marker = "attrelid = '";
+        let start = q.find(marker)?;
+        let after = q.get(start + marker.len()..)?;
+        let end = after.find('\'')?;
+        after.get(..end)?.parse::<i32>().ok()
+    }
+
+    /// Render a `DataType` in the long form `pg_catalog.format_type`
+    /// produces for psql `\d`. Lossy but human-readable enough for the
+    /// describe panel; `integer` / `text` / `timestamp without time zone`
+    /// match how stock PG renders the corresponding columns.
+    fn pg_format_type(dt: &DataType) -> String {
+        match dt {
+            DataType::Boolean => "boolean".into(),
+            DataType::Int2 => "smallint".into(),
+            DataType::Int4 => "integer".into(),
+            DataType::Int8 => "bigint".into(),
+            DataType::Float4 => "real".into(),
+            DataType::Float8 => "double precision".into(),
+            DataType::Numeric => "numeric".into(),
+            DataType::Varchar(n) => match n {
+                Some(len) => format!("character varying({len})"),
+                None => "character varying".into(),
+            },
+            DataType::Char(n) => format!("character({n})"),
+            DataType::Text => "text".into(),
+            DataType::Bytea => "bytea".into(),
+            DataType::Date => "date".into(),
+            DataType::Time => "time without time zone".into(),
+            DataType::Timestamp => "timestamp without time zone".into(),
+            DataType::Timestamptz => "timestamp with time zone".into(),
+            DataType::Interval => "interval".into(),
+            DataType::Uuid => "uuid".into(),
+            DataType::Json => "json".into(),
+            DataType::Jsonb => "jsonb".into(),
+            DataType::Array(inner) => format!("{}[]", Self::pg_format_type(inner)),
+            DataType::Vector(n) => format!("vector({n})"),
+        }
+    }
+
     /// Extract a `relname ~ '^(pattern)$'` filter from a psql \d query.
     fn extract_psql_relname_filter(q: &str) -> Option<String> {
         let marker = "relname ~ '^(";
@@ -1040,7 +1190,7 @@ impl PgCatalog {
             "pg_catalog", "pg_type", "pg_class", "pg_namespace", "pg_attribute",
             "pg_database", "pg_index", "pg_indexes", "pg_sequences", "pg_tables",
             "pg_views", "pg_constraint", "pg_description", "pg_roles", "pg_user",
-            "pg_proc", "pg_settings",
+            "pg_proc", "pg_settings", "pg_policies", "pg_matviews",
         ];
         MARKERS.iter().any(|m| q.contains(m))
     }

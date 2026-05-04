@@ -6362,6 +6362,21 @@ impl EmbeddedDatabase {
                             }
                         }
 
+                        // FK validation on UPDATE — KanttBan #15 fix.
+                        // The extended-query path (Drizzle's
+                        // db.update().set().where()) was the only
+                        // remaining write site that didn't run the
+                        // check_fk_constraints_on_write hook in
+                        // v3.28.0. Mirror what the simple-query
+                        // and execute_in_transaction Update arms do.
+                        let mut new_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+                        for (i, col) in schema.columns.iter().enumerate() {
+                            if let Some(v) = tuple.values.get(i) {
+                                new_col_values.insert(col.name.clone(), v.clone());
+                            }
+                        }
+                        self.check_fk_constraints_on_write(table_name, &new_col_values, None)?;
+
                         let row_id = tuple.row_id.unwrap_or(0);
                         updates.push((row_id, tuple));
                     }

@@ -1128,19 +1128,19 @@ where
     async fn handle_do_block(&mut self, query: &str) -> Result<()> {
         // Extract the body between the first and last `$tag$` delimiters.
         let body = pg_extract_do_block_body(query).unwrap_or("");
-        // Strip optional `BEGIN`/`END` wrapper tokens — their semantics
-        // (open/close anonymous PL/pgSQL block) are moot once we're
-        // just running plain statements sequentially.
-        let trimmed = pg_strip_begin_end(body.trim());
+        // Strip optional `BEGIN`/`END` wrapper tokens.
+        let stripped = pg_strip_begin_end(body.trim());
 
-        // If the body uses real PL/pgSQL control flow (DECLARE, IF,
-        // LOOP, FOR … IN SELECT … LOOP, RAISE, variables with `:=`,
-        // etc.), we can't execute it — only plain-SQL bodies are
-        // supported in this version. Surface a clear error so the
-        // caller knows to either rewrite the migration as plain SQL
-        // or to skip this hunk and run it manually — DO NOT silently
-        // succeed, which would corrupt migrations.
-        if let Some(kw) = pg_detect_plpgsql(trimmed) {
+        // KanttBan #14 (v3.29.0): idempotent EXCEPTION handler. Drizzle
+        // wraps every ALTER in
+        //   DO $$ BEGIN <stmt>; EXCEPTION WHEN duplicate_object THEN null; END $$;
+        // Parse the body into (main, exception_codes); swallow only
+        // errors whose message matches the named exception conditions.
+        // This is intentionally narrow — full PL/pgSQL control flow
+        // still errors via `pg_detect_plpgsql` below.
+        let (main_body, exception_codes) = pg_split_exception(stripped);
+
+        if let Some(kw) = pg_detect_plpgsql(main_body) {
             return Err(Error::query_execution(format!(
                 "PL/pgSQL control flow (`{kw}`) inside DO blocks is not yet \
                  supported in HeliosDB Nano. Rewrite the block as plain SQL, \
@@ -1149,23 +1149,24 @@ where
             )));
         }
 
-        let statements = pg_split_sql_respecting_quotes(trimmed);
+        let statements = pg_split_sql_respecting_quotes(main_body);
 
         if statements.is_empty() {
             self.send_command_complete("DO").await?;
             self.send_ready_for_query().await?;
             return Ok(());
         }
-        // Execute each inner statement but suppress its ReadyForQuery;
-        // we emit a single `DO` CommandComplete + RFQ at the end. We
-        // call `execute()` directly rather than recursing into
-        // `handle_single_query` — avoids async recursion and skips the
-        // per-statement protocol response chatter, which is what
-        // callers of a DO block actually expect.
         let prev = self.suppress_ready_for_query;
         self.suppress_ready_for_query = true;
         for stmt in &statements {
             if let Err(e) = self.database.execute(stmt) {
+                if pg_exception_matches(&exception_codes, &e.to_string()) {
+                    tracing::debug!(
+                        "DO block: caught {:?} via EXCEPTION clause; continuing",
+                        e.to_string()
+                    );
+                    continue;
+                }
                 self.suppress_ready_for_query = prev;
                 return Err(e);
             }
@@ -1567,6 +1568,86 @@ fn pg_looks_like_do_block(trimmed: &str) -> bool {
     upper.starts_with("DO $") || upper.starts_with("DO LANGUAGE ")
 }
 
+/// Split a DO-block body into its main BEGIN body and the list of
+/// exception names declared in the trailing `EXCEPTION` clause.
+///
+/// drizzle-kit emits this exact shape and nothing else for the
+/// EXCEPTION case — we don't try to parse the THEN action since
+/// it's always `null` (a no-op).
+fn pg_split_exception(body: &str) -> (&str, Vec<String>) {
+    let upper = body.to_ascii_uppercase();
+    let padded = format!(" {upper} ");
+    let needle = " EXCEPTION ";
+    let Some(off_in_padded) = padded.find(needle) else {
+        return (body, Vec::new());
+    };
+    // Map the position back to the original (un-padded, mixed-case) body.
+    // off_in_padded counts from the leading space we added; subtract 1.
+    let offset = off_in_padded.saturating_sub(1);
+    let main = &body[..offset];
+    let exception_block = &body[offset + "EXCEPTION".len()..];
+
+    // Collect every identifier following a `WHEN` keyword. Multiple
+    // exceptions can be OR'd: `WHEN a OR b THEN …`. We don't try to
+    // parse `THEN <stmt>` — the action is implied no-op for our use.
+    let mut codes = Vec::new();
+    let upper_eb = exception_block.to_ascii_uppercase();
+    let mut search_from = 0;
+    while let Some(rel) = upper_eb[search_from..].find("WHEN") {
+        let start = search_from + rel + "WHEN".len();
+        // Read identifiers until THEN.
+        let after = &upper_eb[start..];
+        let then_pos = after.find("THEN").unwrap_or(after.len());
+        let conditions = &after[..then_pos];
+        for name in conditions.split(|c: char| c == ',' || c == '|' || c == 'O' && false) {
+            // Split conservatively on commas, tabs, OR (matched as an identifier).
+            for token in name.split_whitespace() {
+                let cleaned: String = token.chars()
+                    .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("OR") {
+                    continue;
+                }
+                codes.push(cleaned.to_lowercase());
+            }
+        }
+        search_from = start + then_pos.min(after.len());
+        if search_from >= upper_eb.len() {
+            break;
+        }
+    }
+    (main, codes)
+}
+
+/// Return true if `error_message` matches any of the named PG exception
+/// conditions in `codes`. Only the codes drizzle-kit actually emits
+/// are mapped — others fall through (safer to surface unknown errors
+/// than to silently swallow them).
+fn pg_exception_matches(codes: &[String], error_message: &str) -> bool {
+    if codes.is_empty() {
+        return false;
+    }
+    let lower = error_message.to_ascii_lowercase();
+    for code in codes {
+        let matches = match code.as_str() {
+            // "already exists" family (drizzle's idempotent ADD)
+            "duplicate_object" | "duplicate_table" | "duplicate_column"
+            | "duplicate_database" | "duplicate_schema" | "duplicate_function"
+            | "duplicate_alias" => lower.contains("already exists"),
+            "unique_violation" => lower.contains("unique") || lower.contains("duplicate key"),
+            "undefined_table" | "undefined_object" | "undefined_column"
+            | "undefined_function" => lower.contains("does not exist") || lower.contains("not found"),
+            // OTHERS catches everything — drizzle uses this rarely.
+            "others" => true,
+            _ => false,
+        };
+        if matches {
+            return true;
+        }
+    }
+    false
+}
+
 /// Scan a DO-block body for PL/pgSQL control-flow tokens we can't
 /// interpret. Returns `Some(keyword)` when one is found, so the
 /// caller can put the offending token into the error message.
@@ -1580,10 +1661,14 @@ fn pg_detect_plpgsql(body: &str) -> Option<&'static str> {
     // Whole-word matches — bracket each keyword with a non-alnum
     // lookalike by padding the haystack.
     let padded = format!(" {upper} ");
+    // Note: `EXCEPTION` intentionally absent — handled via
+    // `pg_split_exception` upstream. drizzle-kit emits idempotent
+    // ALTERs as `DO $$ BEGIN <stmt>; EXCEPTION WHEN duplicate_object
+    // THEN null; END $$;` which we now run.
     const KEYWORDS: &[&str] = &[
         " DECLARE ", " IF ", " LOOP ", " FOR ",
         " WHILE ", " RAISE ", " RETURN ", " PERFORM ",
-        " EXCEPTION ", " EXIT ", " CONTINUE ",
+        " EXIT ", " CONTINUE ",
     ];
     for kw in KEYWORDS {
         if padded.contains(kw) {
@@ -1598,7 +1683,6 @@ fn pg_detect_plpgsql(body: &str) -> Option<&'static str> {
                 "RAISE" => "RAISE",
                 "RETURN" => "RETURN",
                 "PERFORM" => "PERFORM",
-                "EXCEPTION" => "EXCEPTION",
                 "EXIT" => "EXIT",
                 "CONTINUE" => "CONTINUE",
                 _ => "plpgsql",

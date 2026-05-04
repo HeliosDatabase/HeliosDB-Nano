@@ -5,6 +5,86 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.29.0] - 2026-05-04
+
+### Fixed — KanttBan / Drizzle ORM follow-up (BUGS_HELIOSDB.md re-test)
+
+The KanttBan team verified v3.28.0 end-to-end and reported 7 new
+issues plus 2 partial fixes. v3.29.0 closes the deferred #7 and
+all of the new #12–#16; #17 (PREPARE/EXECUTE) and #18 (intermittent
+ParseComplete corruption) carry forward.
+
+- **Bug #7 — `psql \d <table>` "column number 5 is out of range 0..4"**
+  (DEFERRED from v3.28). The PG-wire catalog dispatcher now intercepts
+  psql 13's per-column descriptor query and emits the 7-column shape
+  it expects (attname, format_type, default_expr, attnotnull,
+  collation, attidentity, attgenerated). Filtered by the `attrelid`
+  literal in the WHERE clause. `\d <table>` now lists columns
+  interactively.
+
+- **Bug #12 — `pg_policies` + `pg_matviews` missing.** drizzle-kit's
+  introspection sweep advanced past v3.28's `pg_sequences` fix and
+  tripped on these two views. Both now stub with the standard PG
+  column shape and zero rows. Added `pg_policies`, `pg_matviews`
+  to `is_catalog_query`'s marker list.
+
+- **Bug #13 — schema-qualified `"public"."tbl"` references.**
+  `Planner::normalize_object_name` now strips both `public.` and
+  `pg_catalog.` schema prefixes during ObjectName resolution.
+  `REFERENCES "public"."teams"("id")` resolves to `teams` the same
+  way the bare `REFERENCES "teams"("id")` did. `_hdb_code.<t>` /
+  `_hdb_graph.<t>` aliases are unchanged.
+
+- **Bug #14 — `DO $$ BEGIN … EXCEPTION WHEN duplicate_object THEN
+  null; END $$;`.** New `pg_split_exception` parser splits the body
+  into BEGIN-body + named exception list, then runs the body and
+  swallows only errors whose message matches one of the listed
+  conditions (mapped via `pg_exception_matches`: `duplicate_object`
+  / `duplicate_table` / `unique_violation` / `undefined_table` /
+  `OTHERS` etc.). drizzle-kit's idempotent ALTERs now apply.
+  Full PL/pgSQL control flow (DECLARE / IF / LOOP / RAISE / `:=`)
+  still errors loudly via `pg_detect_plpgsql`.
+
+- **Bug #15 — extended-query UPDATE silently bypassed FK** (HIGH,
+  correctness). v3.28 fixed FK enforcement on the simple-query
+  path; the parameterised path (Drizzle's
+  `db.update().set().where()`) silently accepted orphan rows. The
+  third Update arm in `execute_plan_with_params_inner` now runs
+  `check_fk_constraints_on_write` — same hook the simple-query
+  path and parameterised INSERT use. Drizzle's UPDATE FK violations
+  now error correctly.
+
+- **Bug #16 — `CREATE DATABASE` silent no-op (regression from v3.27).**
+  Partial fix. `CREATE DATABASE foo` already registered a tenant via
+  the v3.25 wrap, but `query_pg_database` returned hardcoded
+  "heliosdb" so `\l` and ORM probes never saw it. Now appends every
+  registered tenant to the `pg_database` catalog response. Full
+  per-DB isolation (separate storage namespaces, `current_database()`
+  resolution) is a larger architectural change deferred to v3.30.0;
+  the regression-from-v3.27 is the visibility issue, which is closed.
+
+### Tests
+
+- New: `tests/kanttban_quirks_v3_28.rs` (5 tests covering #7, #13,
+  #14, #15, #16 at the embedded API level). All pass.
+- Lib 1758/1758. All cross-feature suites green
+  (kanttban_v3_27 9/9, dashboard_quirks 10/10, repl_meta 4/4,
+  info_schema 9/9, create_database 8/8, scram_gs2 13/13).
+
+### Carry-forward to v3.30.0
+
+- **Bug #17** — SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE`. Wire
+  protocol extended-query works; only the SQL statement form errors.
+  LOW priority (most ORMs use the wire form directly).
+- **Bug #18** — intermittent extended-query INSERT FK-violation
+  ParseComplete corruption. Flaky single-occurrence; needs a
+  reliable repro before deeper investigation.
+- **#16 strict per-database isolation** — `current_database()`
+  resolution + per-tenant storage namespace.
+- **Token-Dashboard Quirks H + I** — DELETE/DROP hang on 11k-row
+  tables; ON CONFLICT DO UPDATE 400× slower than INSERT on
+  populated tables. Need targeted benches.
+
 ## [3.28.0] - 2026-05-04
 
 ### Fixed — KanttBan / Drizzle ORM migration quirks
