@@ -5,6 +5,41 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.26.1] - 2026-05-03
+
+### Fixed — REPL meta-commands now display real data instead of hint text
+
+`\branches`, `\snapshots`, `\dmv`, `\dmv <view>`, `\compression`, and
+`\indexes <table>` were returning a "use this SQL query instead" hint
+message rather than running the corresponding query themselves.
+`SHOW BRANCHES` was hitting the executor and computing rows correctly,
+but the REPL routed it through `db.execute()` which discards rows and
+only surfaces the count, producing `Query OK, 2 row(s) affected` with
+no table.
+
+- `\branches` now runs `SELECT * FROM pg_database_branches()` and
+  pretty-prints the table.
+- `\snapshots` now reads `db.storage.snapshot_manager().list_snapshots()`
+  directly (the `pg_snapshots` view is PG-wire-only, not embedded-path).
+- `\dmv` now runs `SELECT * FROM pg_mv_staleness()`.
+- `\dmv <view>` now runs the same with `WHERE view_name = '<view>'`
+  (single-quote-escaped per SQL-92).
+- `\compression` now runs `SELECT * FROM pg_vector_index_stats()`.
+- `\indexes <table>` now walks `db.storage.art_indexes().list_indexes()`
+  filtered to that table.
+- `SHOW BRANCHES` in the REPL is now classified as a query (not a
+  command) so its rows are pretty-printed; the same input via the
+  embedded API (`db.query_with_columns`) also now succeeds — previously
+  sqlparser parsed it as a generic `SHOW <variable>` and the planner
+  rejected it.
+
+### Tests
+
+- New: `tests/repl_meta_commands.rs` — 4 unit tests covering the
+  underlying queries (`pg_database_branches()`, `pg_mv_staleness()`,
+  `pg_vector_index_stats()`) and the `SHOW BRANCHES` query-path
+  routing.
+
 ## [3.26.0] - 2026-05-03
 
 ### Fixed — SCRAM-SHA-256 GS2 header parsing (Bug 2)

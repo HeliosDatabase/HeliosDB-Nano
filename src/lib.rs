@@ -6687,11 +6687,19 @@ impl EmbeddedDatabase {
     /// plan (e.g. table column names, aliases) instead of requiring the caller
     /// to generate generic names.
     pub fn query_with_columns(&self, sql: &str) -> Result<(Vec<Tuple>, Vec<String>)> {
-        let (statement, _) = self.parse_cached(sql)?;
-        let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog)
-            .with_sql(sql.to_string());
-        let plan = planner.statement_to_plan(statement)?;
+        // Phase 3 branching commands (`SHOW BRANCHES`, `USE BRANCH`)
+        // aren't recognised by sqlparser; mirror the pre-detect that
+        // `execute_in_transaction_inner` already does so the query path
+        // produces rows instead of "Statement not yet supported".
+        let plan = if sql::Parser::is_show_branches(sql) {
+            sql::LogicalPlan::ShowBranches
+        } else {
+            let (statement, _) = self.parse_cached(sql)?;
+            let catalog = self.storage.catalog();
+            let planner = sql::Planner::with_catalog(&catalog)
+                .with_sql(sql.to_string());
+            planner.statement_to_plan(statement)?
+        };
 
         let plan = {
             let stats = optimizer::cost::StatsCatalog::new();

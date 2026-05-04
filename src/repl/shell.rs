@@ -336,6 +336,11 @@ impl ReplShell {
             || sql_upper.starts_with("VALUES")
             || sql_upper.starts_with("EXPLAIN")
             || sql_upper.starts_with("PRAGMA")
+            // SHOW BRANCHES / SHOW DATABASE BRANCHES / SHOW <var> all
+            // produce result rows; without this the executor still
+            // returns the tuples but `db.execute()` discards them and
+            // only the row count surfaces ("Query OK, N row(s) affected").
+            || sql_upper.starts_with("SHOW")
             || has_returning;
 
         if is_query {

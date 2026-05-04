@@ -2,7 +2,7 @@
 //!
 //! PostgreSQL-style meta commands like \d, \dt, \q, etc.
 
-use crate::{EmbeddedDatabase, Result, Error};
+use crate::{EmbeddedDatabase, Result, Error, Schema, Column, DataType};
 use crate::sql::{Parser, Planner, explain::{ExplainPlanner, ExplainMode, ExplainFormat}};
 use crate::sql::explain_options::{ExplainOptions, ExplainFormatOption};
 use crate::sql::explain_storage::{StorageFeatureCollector, format_storage_features_text};
@@ -10,6 +10,33 @@ use colored::Colorize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use super::help_manager::HelpManager;
+use super::formatter;
+
+/// Run a SQL query and pretty-print the result table. Used by the
+/// data-listing meta-commands (`\branches`, `\snapshots`, `\dmv`,
+/// `\compression`) that previously stubbed out as hint text.
+fn print_query_table(
+    db: &EmbeddedDatabase,
+    title: &str,
+    sql: &str,
+    empty_msg: &str,
+) -> Result<()> {
+    let (rows, cols) = db.query_with_columns(sql)?;
+    println!("\n{}", title.bold());
+    if rows.is_empty() {
+        println!("{}", empty_msg.dimmed());
+        println!();
+        return Ok(());
+    }
+    let schema = Schema::new(
+        cols.into_iter()
+            .map(|name| Column::new(name, DataType::Text))
+            .collect(),
+    );
+    println!("{}", formatter::format_results(&rows, &schema));
+    println!();
+    Ok(())
+}
 
 /// Meta command types
 #[derive(Debug, Clone, PartialEq)]
@@ -1351,10 +1378,13 @@ impl MetaCommand {
 
             // v2.0 Feature commands
             MetaCommand::ListBranches => {
-                println!("\n{}", "Database Branches:".bold());
-                println!("{}", "─".repeat(70));
-                println!("{}", "Use: SELECT * FROM pg_database_branches();".dimmed());
-                println!("{}", "Use: \\use <branch_name> to switch branches".dimmed());
+                print_query_table(
+                    db,
+                    "Database Branches:",
+                    "SELECT * FROM pg_database_branches()",
+                    "(no branches)",
+                )?;
+                println!("{}", "Switch branches with: \\use <branch_name>".dimmed());
                 println!();
                 Ok(MetaCommandResult::Continue)
             }
@@ -1383,40 +1413,84 @@ impl MetaCommand {
             }
 
             MetaCommand::ListSnapshots => {
+                // The embedded planner doesn't expose `pg_snapshots` as
+                // a system view (that registry is PG-wire only); read
+                // directly from the storage time-travel API.
+                let snapshots = db.storage.snapshot_manager().list_snapshots().unwrap_or_default();
                 println!("\n{}", "Time-Travel Snapshots:".bold());
-                println!("{}", "─".repeat(70));
-                println!("{}", "Use time-travel queries:".dimmed());
-                println!("  {}", "SELECT * FROM table AS OF TIMESTAMP '2025-11-23 10:00:00';".cyan());
-                println!("  {}", "SELECT * FROM table AS OF TRANSACTION 12345;".cyan());
+                if snapshots.is_empty() {
+                    println!("{}", "(no snapshots)".dimmed());
+                } else {
+                    let schema = Schema::new(vec![
+                        Column::new("timestamp", DataType::Int8),
+                        Column::new("transaction_id", DataType::Int8),
+                        Column::new("scn", DataType::Int8),
+                        Column::new("wall_clock", DataType::Text),
+                        Column::new("active_txns", DataType::Int8),
+                        Column::new("gc_eligible", DataType::Boolean),
+                    ]);
+                    let rows: Vec<crate::Tuple> = snapshots
+                        .iter()
+                        .map(|s| crate::Tuple::new(vec![
+                            crate::Value::Int8(s.timestamp as i64),
+                            crate::Value::Int8(s.transaction_id as i64),
+                            crate::Value::Int8(s.scn as i64),
+                            crate::Value::String(s.wall_clock_time.clone()),
+                            crate::Value::Int8(s.active_transactions as i64),
+                            crate::Value::Boolean(s.gc_eligible),
+                        ]))
+                        .collect();
+                    println!("{}", formatter::format_results(&rows, &schema));
+                }
+                println!(
+                    "{}",
+                    "Time-travel: SELECT * FROM <t> AS OF TIMESTAMP '...' | AS OF TRANSACTION <tx>".dimmed()
+                );
                 println!();
                 Ok(MetaCommandResult::Continue)
             }
 
             MetaCommand::ListMaterializedViews => {
-                println!("\n{}", "Materialized Views:".bold());
-                println!("{}", "─".repeat(70));
-                println!("{}", "Use: SELECT * FROM pg_mv_staleness();".dimmed());
-                println!();
+                print_query_table(
+                    db,
+                    "Materialized Views:",
+                    "SELECT * FROM pg_mv_staleness()",
+                    "(no materialized views)",
+                )?;
                 Ok(MetaCommandResult::Continue)
             }
 
             MetaCommand::DescribeMaterializedView(view_name) => {
-                println!("\n{}: {}", "Materialized View".bold(), view_name.cyan());
-                println!("{}", "─".repeat(70));
-                println!("{}", "Check staleness:".dimmed());
-                println!("  {}", format!("SELECT * FROM pg_mv_staleness() WHERE view_name = '{}';", view_name).cyan());
-                println!();
-                println!("{}", "Refresh:".dimmed());
-                println!("  {}", format!("REFRESH MATERIALIZED VIEW {};", view_name).cyan());
+                // Quote the view name into a string literal for the SQL
+                // query. Single quotes inside the name are doubled per
+                // SQL-92 escaping rules; this keeps the meta-command
+                // safe against `\dmv x' OR '1'='1`-style input.
+                let escaped = view_name.replace('\'', "''");
+                let sql = format!("SELECT * FROM pg_mv_staleness() WHERE view_name = '{escaped}'");
+                print_query_table(
+                    db,
+                    &format!("Materialized View: {view_name}"),
+                    &sql,
+                    "(view not found or not refreshed)",
+                )?;
+                println!(
+                    "{}",
+                    format!("Refresh with: REFRESH MATERIALIZED VIEW {view_name};").dimmed()
+                );
                 println!();
                 Ok(MetaCommandResult::Continue)
             }
 
             MetaCommand::ShowCompression => {
-                println!("\n{}", "Compression Statistics:".bold());
-                println!("{}", "─".repeat(70));
-                println!("{}", "Use: SELECT * FROM pg_vector_index_stats();".dimmed());
-                println!();
+                // `pg_vector_index_stats()` is the phase3 system view
+                // exposed through the embedded planner; the PG-wire-only
+                // `pg_compression_stats` view isn't reachable here.
+                print_query_table(
+                    db,
+                    "Compression / Vector-Index Statistics:",
+                    "SELECT * FROM pg_vector_index_stats()",
+                    "(no vector indexes — table compression is set per-table via ALTER TABLE)",
+                )?;
                 Ok(MetaCommandResult::Continue)
             }
 
@@ -1610,10 +1684,37 @@ impl MetaCommand {
             }
 
             MetaCommand::ShowIndexes(table_name) => {
-                println!("\n{}: {}", "Index Recommendations".bold(), table_name.cyan());
-                println!("{}", "─".repeat(70));
-                println!("{}", "Use the index recommender:".dimmed());
-                println!("  {}", format!("SELECT * FROM recommend_indexes('{}');", table_name).cyan());
+                // Walk the in-memory ART manager filtered to this
+                // table — no embedded-path system view exposes per-table
+                // index metadata.
+                let art = db.storage.art_indexes();
+                let all = art.list_indexes();
+                let filtered: Vec<_> = all.into_iter()
+                    .filter(|(_, t, _, _)| t == table_name)
+                    .collect();
+                println!("\n{}: {}", "Indexes on".bold(), table_name.cyan());
+                if filtered.is_empty() {
+                    println!("{}", "(no user-defined indexes — the implicit PK index is not listed)".dimmed());
+                } else {
+                    let schema = Schema::new(vec![
+                        Column::new("index_name", DataType::Text),
+                        Column::new("type", DataType::Text),
+                        Column::new("columns", DataType::Text),
+                    ]);
+                    let rows: Vec<crate::Tuple> = filtered
+                        .into_iter()
+                        .map(|(name, _table, idx_type, cols)| crate::Tuple::new(vec![
+                            crate::Value::String(name),
+                            crate::Value::String(format!("{:?}", idx_type)),
+                            crate::Value::String(cols.join(", ")),
+                        ]))
+                        .collect();
+                    println!("{}", formatter::format_results(&rows, &schema));
+                }
+                println!(
+                    "{}",
+                    format!("Recommendations: SELECT * FROM recommend_indexes('{table_name}');").dimmed()
+                );
                 println!();
                 Ok(MetaCommandResult::Continue)
             }
