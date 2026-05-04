@@ -192,18 +192,32 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             }
         }
 
-        // Substitute parameters into query
-        let executed_query = if param_values.is_empty() {
+        // Quirks B and E from the dashboard cutover: the previous
+        // implementation textually substituted parameter values into
+        // the SQL before running it, which (a) re-fed values through
+        // sqlparser — strings with control chars or huge length blew
+        // up parsing — and (b) made parameterised CTEs subtly fragile
+        // because some shapes of `substitute_parameters` output didn't
+        // round-trip through the planner identically to the
+        // `query_params`-threaded form. Now: keep the substituted
+        // form ONLY for the catalog dispatcher (which is regex-based
+        // and predates parameters), and route everything else through
+        // `query_params` / `execute_params_returning` / `execute_params`.
+        let substituted_for_catalog = if param_values.is_empty() {
             statement.query.clone()
         } else {
             substitute_parameters(&statement.query, &param_values)?
         };
 
-        tracing::debug!("Executing query: {}", executed_query);
+        tracing::debug!(
+            "Executing query: {} (params: {})",
+            statement.query,
+            param_values.len()
+        );
 
         // Execute query
         let is_select = {
-            let t = executed_query.trim();
+            let t = statement.query.trim();
             t.len() >= 6 && t.as_bytes()[..6].eq_ignore_ascii_case(b"SELECT")
         };
 
@@ -214,7 +228,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             // connect-time type introspection through Parse / Bind /
             // Execute; without this route, every driver gets a
             // spurious `Table 'pg_catalog.pg_type' does not exist`.
-            if let Some(catalog_result) = self.catalog.handle_query(&executed_query)? {
+            // Catalog is regex-driven and doesn't speak parameters, so
+            // it sees the substituted form.
+            if let Some(catalog_result) = self.catalog.handle_query(&substituted_for_catalog)? {
                 // Mark the portal complete and emit DataRows + CommandComplete
                 // directly against the catalog-emulated result.
                 self.prepared_statements.update_portal_state(
@@ -230,8 +246,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 return Ok(());
             }
 
-            // SELECT query - return result set
-            let results = self.database.query(&executed_query, &[])?;
+            // SELECT query — pass parameters to the planner via
+            // `query_params` so values stay value-shaped instead of
+            // being spliced back into SQL.
+            let results = self.database.query_params(&statement.query, &param_values)?;
 
             // Handle max_rows limit
             let results_to_send = if max_rows > 0 {
@@ -276,17 +294,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             self.send_command_complete(&tag).await?;
         } else {
             // INSERT / UPDATE / DELETE with RETURNING must route through
-            // `execute_returning` — otherwise the tuples are dropped and
-            // Drizzle's `.returning()` / psycopg's fetchone() see no rows
-            // even though the write succeeded. Detection mirrors
-            // `handle_query`'s `is_dml_returning` check.
-            let upper = executed_query.to_uppercase();
-            let is_dml_returning = upper.contains("RETURNING")
-                && (super::handler::starts_with_icase(executed_query.trim(), "INSERT")
-                    || super::handler::starts_with_icase(executed_query.trim(), "UPDATE")
-                    || super::handler::starts_with_icase(executed_query.trim(), "DELETE"));
+            // the params-aware path so the executor evaluates `$N`
+            // against `param_values` rather than relying on textual
+            // substitution. Detection mirrors `handle_query`'s
+            // `is_dml_returning` check, but uses the original (not
+            // substituted) query.
+            let upper = statement.query.to_uppercase();
+            let trimmed = statement.query.trim();
+            let is_insert = super::handler::starts_with_icase(trimmed, "INSERT");
+            let is_update = super::handler::starts_with_icase(trimmed, "UPDATE");
+            let is_delete = super::handler::starts_with_icase(trimmed, "DELETE");
+            let is_dml_returning = upper.contains("RETURNING") && (is_insert || is_update || is_delete);
             if is_dml_returning {
-                let (affected, tuples) = self.database.execute_returning(&executed_query)?;
+                let (affected, tuples) = self.database.execute_params_returning(&statement.query, &param_values)?;
                 self.prepared_statements.update_portal_state(&portal_name, PortalState::Complete)?;
                 // RowDescription was already sent during Describe; Execute
                 // only emits DataRows + CommandComplete.
@@ -294,9 +314,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     let values = super::handler::tuple_to_pg_values(row);
                     self.send_message(BackendMessage::DataRow { values }).await?;
                 }
-                let tag = if super::handler::starts_with_icase(executed_query.trim(), "INSERT") {
+                let tag = if is_insert {
                     format!("INSERT 0 {}", affected)
-                } else if super::handler::starts_with_icase(executed_query.trim(), "UPDATE") {
+                } else if is_update {
                     format!("UPDATE {}", affected)
                 } else {
                     format!("DELETE {}", affected)
@@ -305,9 +325,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 return Ok(());
             }
 
-            // Non-SELECT query
-            let affected = self.database.execute(&executed_query)?;
-            let tag = self.get_command_tag(&executed_query, affected);
+            // Non-SELECT query — params-aware execution.
+            let affected = self.database.execute_params(&statement.query, &param_values)?;
+            let tag = self.get_command_tag(&statement.query, affected);
             self.send_command_complete(&tag).await?;
 
             // Mark portal complete

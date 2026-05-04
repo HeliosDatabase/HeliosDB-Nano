@@ -1161,9 +1161,31 @@ impl Parser {
         };
 
         let after_create = cleaned[name_start..].trim_start();
-        let name_end = after_create.find(|c: char| c.is_whitespace() || c == ';')
-            .unwrap_or(after_create.len());
-        let branch_name = after_create[..name_end].to_string();
+        // Branch names accept three forms:
+        //   - bare identifier:           CREATE BRANCH foo AS OF NOW
+        //   - single-quoted string:      CREATE BRANCH 'foo' AS OF NOW
+        //   - double-quoted identifier:  CREATE BRANCH "foo" AS OF NOW
+        // Strip the surrounding quotes when present so the branch is
+        // stored under its intended bare name (Quirk C from the
+        // dashboard cutover: 'verify-branch' was being stored verbatim
+        // including the quotes, making the branch unfindable).
+        let (branch_name, name_end) = if after_create.starts_with('\'') {
+            let rest = &after_create[1..];
+            let close = rest.find('\'').ok_or_else(|| {
+                Error::query_execution("CREATE BRANCH: unterminated quoted branch name")
+            })?;
+            (rest[..close].to_string(), 1 + close + 1)
+        } else if after_create.starts_with('"') {
+            let rest = &after_create[1..];
+            let close = rest.find('"').ok_or_else(|| {
+                Error::query_execution("CREATE BRANCH: unterminated double-quoted branch name")
+            })?;
+            (rest[..close].to_string(), 1 + close + 1)
+        } else {
+            let end = after_create.find(|c: char| c.is_whitespace() || c == ';')
+                .unwrap_or(after_create.len());
+            (after_create[..end].to_string(), end)
+        };
 
         if branch_name.is_empty() {
             return Err(Error::query_execution("CREATE BRANCH requires a branch name"));

@@ -2760,6 +2760,38 @@ impl<'a> Planner<'a> {
                 })
             }
 
+            // Quirk D from the dashboard cutover: SQL-standard
+            // `SUBSTRING (s FROM x [FOR y])` and the special bracket form
+            // are first-class AST nodes in sqlparser, distinct from the
+            // function form `SUBSTR(s, x, y)`. Desugar them into the same
+            // `substr` ScalarFunction the executor already handles.
+            //
+            // - `SUBSTRING(s FROM x FOR y)` → `substr(s, x, y)`
+            // - `SUBSTRING(s FROM x)`       → `substr(s, x)` (open-ended)
+            // - `SUBSTRING(s FOR y)`        → `substr(s, 1, y)` (start at 1)
+            Expr::Substring { expr: inner, substring_from, substring_for, .. } => {
+                let s = self.expr_to_logical(inner)?;
+                let mut args = vec![s];
+                match (substring_from, substring_for) {
+                    (Some(from), Some(for_)) => {
+                        args.push(self.expr_to_logical(from)?);
+                        args.push(self.expr_to_logical(for_)?);
+                    }
+                    (Some(from), None) => {
+                        args.push(self.expr_to_logical(from)?);
+                    }
+                    (None, Some(for_)) => {
+                        args.push(LogicalExpr::Literal(Value::Int8(1)));
+                        args.push(self.expr_to_logical(for_)?);
+                    }
+                    (None, None) => {} // SUBSTRING(s) with no slice — pass-through
+                }
+                Ok(LogicalExpr::ScalarFunction {
+                    fun: "substr".to_string(),
+                    args,
+                })
+            }
+
             _ => Err(Error::query_execution(format!(
                 "Expression not yet supported: {:?}",
                 expr

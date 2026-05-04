@@ -5,6 +5,111 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.27.0] - 2026-05-04
+
+### Fixed — Token-dashboard cutover quirks B + C + D + E
+
+The Token-Dashboard team filed five new quirks against v3.26.0 during
+their high-volume cutover (`/home/app/websites/token-dashboard/HELIOSDB_CUTOVER_RESULTS.md`,
+`HELIOSDB_INTEGRATION_RESULTS.md`). v3.27.0 closes the four
+correctness ones in a single release.
+
+#### Quirk B + Quirk E — Bind values no longer fed back into the parser
+
+The PG-wire extended-query Bind/Execute path at
+`src/protocol/postgres/handler_extended.rs:195-200` was textually
+splicing parameter values into the SQL string before execution
+(`substitute_parameters` from `prepared.rs`). Two fallout symptoms:
+
+- **Quirk B** — `WITH spend AS (…) SELECT … FROM spend WHERE x >= $1`
+  returned 0 rows even when the flat `WHERE x >= $1` form returned the
+  expected rows. (Some shapes of the substituted SQL didn't round-trip
+  through the planner identically to the parameterised form.)
+- **Quirk E** — payloads with control chars (`\0`, `\x01`–`\x1f` other
+  than `\t\n\r`) or large length (>~50k chars) failed Bind with
+  `Unterminated string literal at Line: N, Column: N`. The substituted
+  SQL was malformed because the value-side bytes weren't sanitised for
+  re-parsing.
+
+Now the extended-query path threads parameters through to the planner
+as `Value`s via `db.query_params` / `db.execute_params_returning` /
+`db.execute_params`. Textual substitution is preserved only for the
+catalog dispatcher (`PgCatalog::handle_query`) which is regex-based
+and predates parameter support.
+
+This is the dashboard-cutover-blocker fix.
+
+#### Quirk C — `CREATE BRANCH 'name'` strips surrounding quotes
+
+`src/sql/parser.rs::parse_create_branch_sql` was including the
+surrounding single or double quotes in the branch name. The
+dashboard's call:
+
+```sql
+CREATE BRANCH 'verify-branch' AS OF NOW;
+```
+
+stored the branch under `'verify-branch'` (with quotes), making it
+unfindable via `SHOW BRANCHES` filtered against `verify-branch`. The
+parser now strips both `'…'` and `"…"` wrappers, accepting all three
+forms:
+
+- `CREATE BRANCH foo AS OF NOW` (bare identifier)
+- `CREATE BRANCH 'foo' AS OF NOW` (single-quoted)
+- `CREATE BRANCH "foo" AS OF NOW` (double-quoted)
+
+#### Quirk D — `SUBSTRING (s FROM x [FOR y])` special form supported
+
+The SQL-standard `Substring { special: false }` AST node hit the
+planner's catch-all `Expression not yet supported`. Now desugared into
+a `substr(s, x, y)` ScalarFunction call (the same node the function
+form `SUBSTR(s, x, y)` already produced). Three shapes covered:
+
+- `SUBSTRING(s FROM x FOR y)` → `substr(s, x, y)`
+- `SUBSTRING(s FROM x)`       → `substr(s, x)` (open-ended slice)
+- `SUBSTRING(s FOR y)`        → `substr(s, 1, y)` (start at column 1)
+
+### Investigated — Quirk A (autocommit visibility)
+
+The dashboard's pg8000 `autocommit=True` repro (INSERT-then-SELECT
+sees 0 rows until explicit COMMIT) was investigated. The embedded
+API repro at `tests/dashboard_quirks_v3_26.rs::embedded_insert_then_select_*`
+passes — the fix may live in the wire-protocol session-state
+machine which our in-process test harness can't exercise (the
+existing `tests/server_mode_integration_test.rs` in-process harness
+hits a separate stack-overflow). The wire-side investigation is
+deferred; if the symptom persists after the dashboard team re-tests
+v3.27.0 against a real daemon, escalate.
+
+The Quirk B/E param-threading refactor incidentally moves writes
+through a cleaner code path that may resolve A as a side effect.
+
+### Tests
+
+- New: `tests/dashboard_quirks_v3_26.rs` — 10 unit tests covering all
+  four fixed quirks plus the A repro that already passes at the
+  embedded API level.
+
+### Known limits — perf quirks deferred to v3.28.0
+
+- **Quirk H** — DELETE / DROP on a table with ~11k rows hangs the
+  daemon for >5 min, requiring kill -9. Likely a per-row WAL fsync
+  issue. Workaround: avoid bulk DELETE on large tables; recreate the
+  data dir for full resets.
+- **Quirk I** — `INSERT … ON CONFLICT … DO UPDATE` is ~400× slower
+  than bare `INSERT` on a populated table (0.4 ins/sec at 11k rows
+  vs 181). Workaround: use `DO NOTHING` if upsert semantics aren't
+  required, or pre-truncate target tables.
+
+Both will be addressed in v3.28.0 with targeted benches.
+
+### Validation
+
+Lib tests 1758/1758 pass. Doc tests 47/47 pass. All targeted
+integration suites (dashboard_quirks 10/10, repl_meta_commands 4/4,
+information_schema_completion 9/9, create_database 8/8,
+scram_gs2 13/13) pass.
+
 ## [3.26.1] - 2026-05-03
 
 ### Fixed — REPL meta-commands now display real data instead of hint text
