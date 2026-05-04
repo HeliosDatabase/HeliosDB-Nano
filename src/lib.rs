@@ -1391,6 +1391,21 @@ impl EmbeddedDatabase {
                         }
                     }
 
+                    // Build column-name → Value map up front; reused for
+                    // FK validation and ART updates below.
+                    let mut col_values = std::collections::HashMap::new();
+                    for (i, col) in schema.columns.iter().enumerate() {
+                        if let Some(v) = tuple.values.get(i) {
+                            col_values.insert(col.name.clone(), v.clone());
+                        }
+                    }
+
+                    // FK validation on INSERT (Kanttban bug #6 fix).
+                    // Pass the active txn so the parent-existence check
+                    // sees in-flight inserts to the parent table within
+                    // the same transaction (read-your-own-writes).
+                    self.check_fk_constraints_on_write(table_name, &col_values, Some(txn))?;
+
                     // Serialize tuple directly (RocksDB LZ4 handles compression at block level)
                     let val = bincode::serialize(&tuple).map_err(|e| Error::storage(e.to_string()))?;
                     txn.put(key.clone(), val.clone())?;
@@ -1403,12 +1418,6 @@ impl EmbeddedDatabase {
 
                     // Update ART index for PK/unique constraint lookups
                     {
-                        let mut col_values = std::collections::HashMap::new();
-                        for (i, col) in schema.columns.iter().enumerate() {
-                            if let Some(v) = tuple.values.get(i) {
-                                col_values.insert(col.name.clone(), v.clone());
-                            }
-                        }
                         if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
                             tracing::debug!("ART index insert for '{}': {}", table_name, e);
                         }
@@ -1906,6 +1915,17 @@ impl EmbeddedDatabase {
                                 }
                             }
                         }
+
+                        // FK validation on UPDATE (Kanttban bug #6 fix).
+                        // Only validate if the assigned columns include
+                        // any FK column — otherwise skip the lookup.
+                        let mut new_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+                        for (i, col) in schema.columns.iter().enumerate() {
+                            if let Some(v) = new_tuple.values.get(i) {
+                                new_col_values.insert(col.name.clone(), v.clone());
+                            }
+                        }
+                        self.check_fk_constraints_on_write(table_name, &new_col_values, Some(txn))?;
 
                         let row_id = new_tuple.row_id.unwrap_or(0);
                         updates.push((row_id, new_tuple.clone()));
@@ -2638,6 +2658,46 @@ impl EmbeddedDatabase {
                     table_name, new_table_name
                 );
 
+                Ok(0)
+            }
+            sql::LogicalPlan::AlterTableAddForeignKey {
+                table_name,
+                constraint_name,
+                columns,
+                references_table,
+                references_columns,
+                on_delete,
+                on_update,
+                deferrable,
+                initially_deferred,
+            } => {
+                // Validate the parent table exists.
+                let catalog = self.storage.catalog();
+                catalog.get_table_schema(table_name)?;
+                catalog.get_table_schema(references_table)?;
+
+                let fk_name = constraint_name
+                    .clone()
+                    .unwrap_or_else(|| sql::ForeignKeyConstraint::generate_name(
+                        table_name, columns, references_table,
+                    ));
+                let mut fk = sql::ForeignKeyConstraint::new(
+                    fk_name,
+                    table_name.clone(),
+                    columns.clone(),
+                    references_table.clone(),
+                    references_columns.clone(),
+                );
+                if let Some(action) = on_delete {
+                    fk = fk.on_delete(convert_logical_referential_action(action));
+                }
+                if let Some(action) = on_update {
+                    fk = fk.on_update(convert_logical_referential_action(action));
+                }
+                if *deferrable {
+                    fk = fk.deferrable(*initially_deferred);
+                }
+                catalog.add_foreign_key(fk)?;
                 Ok(0)
             }
             sql::LogicalPlan::AlterTableMulti { operations } => {
@@ -4231,9 +4291,20 @@ impl EmbeddedDatabase {
         let set_col_idx = schema.get_column_index(set_col)?;
         let set_column = schema.get_column_at(set_col_idx)?;
 
-        // Check for FK constraints on the table (skip fast path if present)
+        // Check for FK constraints on the table (skip fast path if present).
+        // KanttBan bug #6: `has_fk` only sees FKs that have a registered
+        // ART index. Inline `REFERENCES` FKs in CREATE TABLE persist the
+        // metadata via `save_table_constraints` but don't create the FK
+        // ART index — so `has_fk` misses them and the fast path runs
+        // without FK validation. Bail out if the persisted constraint
+        // catalogue says this table has any outgoing FK.
         if self.storage.art_indexes().has_fk(table_name) {
-            return None; // FK validation needed — fall through
+            return None;
+        }
+        if let Ok(constraints) = self.storage.catalog().load_table_constraints(table_name) {
+            if !constraints.foreign_keys.is_empty() {
+                return None; // FK validation needed — fall through.
+            }
         }
 
         // Parse PK value
@@ -4706,6 +4777,7 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::AlterTableDropColumn { .. } |
             sql::LogicalPlan::AlterTableRename { .. } |
             sql::LogicalPlan::AlterTableRenameColumn { .. } |
+            sql::LogicalPlan::AlterTableAddForeignKey { .. } |
             sql::LogicalPlan::AlterTableMulti { .. } |
             sql::LogicalPlan::CreateIndex { .. } |
             sql::LogicalPlan::Truncate { .. } |
@@ -5072,6 +5144,17 @@ impl EmbeddedDatabase {
                                 *slot = new_value;
                             }
                         }
+
+                        // FK validation on UPDATE (Kanttban bug #6 fix)
+                        // — secondary path that bypassed the txn-bound
+                        // executor.
+                        let mut new_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+                        for (i, col) in schema.columns.iter().enumerate() {
+                            if let Some(v) = tuple.values.get(i) {
+                                new_col_values.insert(col.name.clone(), v.clone());
+                            }
+                        }
+                        self.check_fk_constraints_on_write(table_name, &new_col_values, None)?;
 
                         let row_id = tuple.row_id.unwrap_or(0);
                         updates.push((row_id, tuple));
@@ -5968,6 +6051,15 @@ impl EmbeddedDatabase {
                             // insert.  `insert_tuple_branch_aware_with_schema`
                             // also runs `check_unique_constraints` (defence
                             // in depth post-FR fix), which is cheap.
+                            //
+                            // FK validation on the parameterised INSERT
+                            // path (Kanttban bug #6 fix). Inside the SQL
+                            // pipeline we don't have direct access to the
+                            // outer txn here; pass None — the validator
+                            // falls back to a committed-snapshot scan,
+                            // which is correct for the autocommit /
+                            // implicit-tx surface this path serves.
+                            self.check_fk_constraints_on_write(table_name, &col_values_map, None)?;
                             let row_id = self.storage.insert_tuple_branch_aware_with_schema(
                                 table_name, tuple.clone(), &schema,
                             )?;
@@ -8363,6 +8455,79 @@ impl EmbeddedDatabase {
     /// Check if any rows in the referencing table reference the given values
     ///
     /// Used for FK constraint validation during DELETE/UPDATE operations.
+    /// Validate every outgoing FK on `table_name` against the new
+    /// child column values produced by an INSERT or UPDATE.
+    ///
+    /// Each FK row points at zero or more (parent_table, parent_columns)
+    /// pairs. For each FK, gather the local column values and check
+    /// that a row with matching values exists in the parent table.
+    /// NULLs in any of the FK columns short-circuit the check (PG
+    /// behaviour: an FK with NULLs is considered "trivially valid"
+    /// — used by optional FKs and MATCH SIMPLE semantics).
+    ///
+    /// (KanttBan bug #6 against v3.27.0: the asymmetric enforcement
+    /// where DELETE checked but INSERT/UPDATE silently accepted orphans
+    /// is the worst possible failure mode for ORMs — apps wrote
+    /// invalid rows that later blocked legitimate parent deletes.)
+    fn check_fk_constraints_on_write(
+        &self,
+        table_name: &str,
+        col_values: &std::collections::HashMap<String, Value>,
+        active_txn: Option<&storage::Transaction>,
+    ) -> Result<()> {
+        let catalog = self.storage.catalog();
+        let constraints = match catalog.load_table_constraints(table_name) {
+            Ok(c) => c,
+            Err(_) => return Ok(()), // No constraints metadata → nothing to validate.
+        };
+        if constraints.foreign_keys.is_empty() {
+            return Ok(());
+        }
+        for fk in &constraints.foreign_keys {
+            // Gather the FK column values from the new tuple.
+            let mut parent_values: Vec<Value> = Vec::with_capacity(fk.columns.len());
+            let mut any_null = false;
+            for col in &fk.columns {
+                match col_values.get(col) {
+                    Some(v) if matches!(v, Value::Null) => {
+                        any_null = true;
+                        break;
+                    }
+                    Some(v) => parent_values.push(v.clone()),
+                    None => {
+                        any_null = true;
+                        break;
+                    }
+                }
+            }
+            // PG MATCH SIMPLE: any NULL FK column → constraint trivially
+            // satisfied. (FK is "optional" for that row.)
+            if any_null {
+                continue;
+            }
+            let parent_exists = self.check_referencing_rows_exist(
+                &fk.references_table,
+                &fk.references_columns,
+                &parent_values,
+                active_txn,
+            )?;
+            if !parent_exists {
+                let parent_repr: Vec<String> = parent_values.iter()
+                    .map(|v| format!("{v}"))
+                    .collect();
+                return Err(Error::constraint_violation(format!(
+                    "Foreign key constraint '{}' violated: row references \
+                     non-existent {}({}) = ({})",
+                    fk.name,
+                    fk.references_table,
+                    fk.references_columns.join(", "),
+                    parent_repr.join(", "),
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn check_referencing_rows_exist(
         &self,
         table_name: &str,

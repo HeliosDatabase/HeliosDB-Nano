@@ -107,7 +107,7 @@ impl HookManager {
         };
 
         format!(r#"#!/bin/sh
-# HeliosDB-Lite Git Hook: post-checkout
+# HeliosDB-Nano Git Hook: post-checkout
 # Auto-switch database branch when Git branch changes
 #
 # Arguments:
@@ -171,7 +171,7 @@ fi
         }).unwrap_or_default();
 
         format!(r#"#!/bin/sh
-# HeliosDB-Lite Git Hook: pre-commit
+# HeliosDB-Nano Git Hook: pre-commit
 # Validate schema and migrations before commit
 
 {migration_check}
@@ -201,7 +201,7 @@ exit 0
         };
 
         format!(r#"#!/bin/sh
-# HeliosDB-Lite Git Hook: post-merge
+# HeliosDB-Nano Git Hook: post-merge
 # Sync database state after merge
 
 # Get current Git branch
@@ -257,7 +257,7 @@ exit 0
             let content = fs::read_to_string(&hook_path)
                 .map_err(|e| Error::io(format!("Failed to read existing hook: {}", e)))?;
 
-            if !content.contains("HeliosDB-Lite Git Hook") {
+            if !content.contains("HeliosDB-Nano Git Hook") {
                 // Backup existing hook
                 let backup_path = hook_path.with_extension("backup");
                 fs::rename(&hook_path, &backup_path)
@@ -303,7 +303,7 @@ exit 0
             let content = fs::read_to_string(&hook_path)
                 .map_err(|e| Error::io(format!("Failed to read hook: {}", e)))?;
 
-            if content.contains("HeliosDB-Lite Git Hook") {
+            if content.contains("HeliosDB-Nano Git Hook") {
                 fs::remove_file(&hook_path)
                     .map_err(|e| Error::io(format!("Failed to remove hook: {}", e)))?;
 
@@ -344,7 +344,7 @@ exit 0
                 let installed = path.exists();
                 let is_helios_hook = if installed {
                     fs::read_to_string(&path)
-                        .map(|c| c.contains("HeliosDB-Lite Git Hook"))
+                        .map(|c| c.contains("HeliosDB-Nano Git Hook"))
                         .unwrap_or(false)
                 } else {
                     false
@@ -384,7 +384,7 @@ mod tests {
         let manager = HookManager::new(PathBuf::from("/tmp"), config);
         let script = manager.generate(HookType::PostCheckout);
 
-        assert!(script.contains("HeliosDB-Lite Git Hook"));
+        assert!(script.contains("HeliosDB-Nano Git Hook"));
         assert!(script.contains("post-checkout"));
         assert!(script.contains("helios git sync"));
     }

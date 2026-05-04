@@ -3033,7 +3033,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         }
 
                         let mut dump_content = String::new();
-                        dump_content.push_str("-- HeliosDB Lite Database Dump\n");
+                        dump_content.push_str("-- HeliosDB Nano Database Dump\n");
                         dump_content.push_str(&format!("-- Generated: {}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")));
                         dump_content.push_str("-- Database: heliosdb-nano\n\n");
 
@@ -4281,7 +4281,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
             // v3.4 Information Commands
             MetaCommand::Version => {
-                println!("\n{}", "HeliosDB Lite Version Information".bold());
+                println!("\n{}", "HeliosDB Nano Version Information".bold());
                 println!("{}", "═".repeat(50));
                 println!("{}: {}", "Version".cyan(), env!("CARGO_PKG_VERSION"));
                 println!("{}: {}", "Edition".cyan(), "2021");
@@ -5157,7 +5157,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
     /// Print help text
     fn print_help() {
-        println!("\n{}", format!("HeliosDB Lite v{} REPL Commands", env!("CARGO_PKG_VERSION")).bold());
+        println!("\n{}", format!("HeliosDB Nano v{} REPL Commands", env!("CARGO_PKG_VERSION")).bold());
         println!("{}", "═".repeat(70));
 
         println!("\n{}", "Basic Meta Commands:".bold());

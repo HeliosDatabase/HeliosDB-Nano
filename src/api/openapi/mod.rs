@@ -84,7 +84,7 @@ async fn swagger_ui() -> Html<String> {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HeliosDB-Lite API Documentation</title>
+    <title>HeliosDB Nano API Documentation</title>
     <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.9.0/swagger-ui.css">
     <style>
         body {{
@@ -128,7 +128,7 @@ async fn swagger_ui() -> Html<String> {
 </head>
 <body>
     <div class="helios-header">
-        <h1>HeliosDB-Lite</h1>
+        <h1>HeliosDB Nano</h1>
         <span class="version">v3.3.0</span>
     </div>
     <div id="swagger-ui"></div>
@@ -171,7 +171,7 @@ async fn redoc_ui() -> Html<String> {
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>HeliosDB-Lite API Reference</title>
+    <title>HeliosDB Nano API Reference</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
     <style>
         body {{
@@ -219,7 +219,7 @@ async fn redoc_ui() -> Html<String> {
 </head>
 <body>
     <div class="helios-header">
-        <h1>HeliosDB-Lite</h1>
+        <h1>HeliosDB Nano</h1>
         <span class="version">v3.3.0</span>
         <div class="links">
             <a href="/v1/docs">Swagger UI</a>

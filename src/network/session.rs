@@ -257,7 +257,7 @@ impl Session {
         // Send parameter status messages
         responses.push(BackendMessage::ParameterStatus {
             name: "server_version".to_string(),
-            value: "17.0 (HeliosDB Lite 0.1.0)".to_string(),
+            value: "17.0 (HeliosDB Nano 3.27.0)".to_string(),
         });
         responses.push(BackendMessage::ParameterStatus {
             name: "server_encoding".to_string(),

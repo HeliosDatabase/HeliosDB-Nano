@@ -29,6 +29,7 @@ struct HAConfig {
 
 #[derive(Parser)]
 #[command(name = "heliosdb-nano")]
+#[command(version = env!("CARGO_PKG_VERSION"))]
 #[command(about = "PostgreSQL & MySQL compatible database with vector search and encryption", long_about = None)]
 struct Cli {
     #[command(subcommand)]
@@ -417,7 +418,7 @@ async fn start_server(
     // Print startup banner
     println!();
     println!("╔═══════════════════════════════════════════════════════════════╗");
-    println!("║           HeliosDB-Lite v{:<32} ║", env!("CARGO_PKG_VERSION"));
+    println!("║           HeliosDB Nano v{:<32} ║", env!("CARGO_PKG_VERSION"));
     println!("║   PostgreSQL-compatible database with enterprise features     ║");
     println!("╚═══════════════════════════════════════════════════════════════╝");
     println!();
@@ -551,7 +552,7 @@ async fn start_server(
     println!();
 
     // Log for tracing subscribers
-    info!("HeliosDB-Lite server listening on {}", pg_addr);
+    info!("HeliosDB Nano server listening on {}", pg_addr);
 
     // Start HA components if enabled
     #[cfg(feature = "ha-tier1")]
@@ -561,11 +562,42 @@ async fn start_server(
         HAHandles::default()
     };
 
-    // Start HTTP health endpoint (for Docker health checks)
-    let http_addr: SocketAddr = format!("{}:{}", listen, ha_config.http_port).parse()
-        .map_err(|e| Error::config(format!("Invalid HTTP address: {e}")))?;
-    let health_server = start_health_server(http_addr);
-    info!("Health endpoint at http://{}/health", http_addr);
+    // Start HTTP health endpoint (for Docker health checks).
+    //
+    // KanttBan bug #2 (v3.27.0): a `--http-port` collision used to take
+    // the entire server process down silently — `start_health_server`
+    // returned an `Err`, the future completed early, the `tokio::select!`
+    // health-server arm fired, and shutdown happened right after the
+    // "Server ready!" banner. Now: bind eagerly so we surface the
+    // failure at ERROR before the banner, and run the accept loop in a
+    // detached task that the main `select!` never observes — so a
+    // late-life health failure cannot tear down the database listener.
+    // `--http-port 0` opts out (no health endpoint, no listener).
+    let http_health_disabled = ha_config.http_port == 0;
+    if !http_health_disabled {
+        let http_addr: SocketAddr = format!("{}:{}", listen, ha_config.http_port).parse()
+            .map_err(|e| Error::config(format!("Invalid HTTP address: {e}")))?;
+        match tokio::net::TcpListener::bind(http_addr).await {
+            Ok(listener) => {
+                info!("Health endpoint at http://{}/health", http_addr);
+                tokio::spawn(async move {
+                    if let Err(e) = run_health_listener(listener).await {
+                        tracing::error!("Health server accept loop exited: {e}");
+                    }
+                });
+            }
+            Err(e) => {
+                tracing::error!(
+                    "Failed to bind HTTP health endpoint on {}: {} (os error {:?}). \
+                     The database listener stays up; pass --http-port <free> or \
+                     --http-port 0 to silence this.",
+                    http_addr, e, e.raw_os_error(),
+                );
+            }
+        }
+    } else {
+        info!("HTTP health endpoint disabled (--http-port 0)");
+    }
 
     // Start MySQL listener if enabled
     let mysql_handle = if mysql_enabled {
@@ -706,7 +738,9 @@ async fn start_server(
     let pg_unix_handle: Option<tokio::task::JoinHandle<()>> = None;
     let _ = &pg_socket_dir;
 
-    // Start server with graceful shutdown handling
+    // Start server with graceful shutdown handling. The health
+    // server runs in its own detached task (see above) so a failure
+    // there cannot tear the database listener down.
     tokio::select! {
         result = pg_server.serve() => {
             // Server stopped (error or normal shutdown)
@@ -714,9 +748,6 @@ async fn start_server(
                 tracing::error!("Server error: {e}");
             }
             result?;
-        }
-        _ = health_server => {
-            info!("Health server stopped");
         }
         _ = tokio::signal::ctrl_c() => {
             println!();
@@ -783,7 +814,7 @@ async fn start_server(
 
 fn init_database(data_dir: &PathBuf) -> Result<()> {
     println!();
-    println!("Initializing new HeliosDB-Lite database...");
+    println!("Initializing new HeliosDB Nano database...");
     println!("  Location: {}", data_dir.display());
 
     // Create directory
@@ -976,7 +1007,7 @@ async fn start_server_daemon(
         let exe = std::env::current_exe()
             .map_err(|e| Error::io(format!("Failed to get current executable: {e}")))?;
 
-        let child = Command::new(&exe)
+        let mut child = Command::new(&exe)
             .args(&args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -986,13 +1017,71 @@ async fn start_server_daemon(
 
         let pid = child.id();
 
-        // Write PID file
+        // KanttBan bug #1 (v3.27.0): the parent used to print the
+        // "Daemon Started" banner unconditionally and return 0 before
+        // the child had bound its port — even when the worker died at
+        // startup (e.g. http-port collision, see #2). Now: poll the
+        // child's PG port for up to 5 s waiting for it to be
+        // accepting connections, OR observe the child's exit status
+        // first. If neither happens within the deadline we fail with
+        // a non-zero exit so caller scripts (`scripts/heliosdb.sh`)
+        // can detect failure without polling `ss` themselves.
+        let target = format!("{}:{}", listen, port);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut child_dead = false;
+        loop {
+            // Did the child exit prematurely?
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    child_dead = true;
+                    let _ = std::fs::remove_file(&pid_file);
+                    return Err(Error::io(format!(
+                        "Daemon worker exited at startup (status: {status}). \
+                         Check the logs for the bind / config error and retry."
+                    )));
+                }
+                Ok(None) => {} // Still running.
+                Err(e) => {
+                    tracing::warn!("Failed to poll daemon child: {e}");
+                }
+            }
+            // Try connecting to the PG port.
+            if std::net::TcpStream::connect_timeout(
+                &target.parse::<std::net::SocketAddr>().unwrap_or_else(|_| {
+                    // listen may be 0.0.0.0; probe 127.0.0.1 instead.
+                    format!("127.0.0.1:{port}").parse().expect("valid loopback addr")
+                }),
+                std::time::Duration::from_millis(200),
+            ).is_ok() {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                // Don't leave a zombie if we time out — kill the child
+                // and fail loudly. Caller can retry.
+                let _ = child.kill();
+                let _ = std::fs::remove_file(&pid_file);
+                return Err(Error::io(format!(
+                    "Daemon did not become ready on {target} within 5s. \
+                     Most common cause: another listener already on this port \
+                     (or on the HTTP health port, see #2 in BUGS_HELIOSDB.md). \
+                     Pass --port and --http-port to non-conflicting values."
+                )));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = child_dead;
+
+        // Detach so the daemon outlives the launching shell.
+        // `child.id()` is preserved in the PID file even after we drop.
+        std::mem::forget(child);
+
+        // Write PID file (we already verified the worker is up).
         std::fs::write(&pid_file, pid.to_string())
             .map_err(|e| Error::io(format!("Failed to write PID file: {e}")))?;
 
         println!();
         println!("╔═══════════════════════════════════════════════════════════════╗");
-        println!("║              HeliosDB-Lite Daemon Started                      ║");
+        println!("║              HeliosDB Nano Daemon Started                      ║");
         println!("╚═══════════════════════════════════════════════════════════════╝");
         println!();
         println!("  Status:         RUNNING");
@@ -1359,20 +1448,16 @@ async fn start_ha_components(
 }
 
 /// Simple HTTP health server for Docker health checks
-async fn start_health_server(addr: std::net::SocketAddr) -> std::io::Result<()> {
-    use tokio::net::TcpListener;
+/// Drive the HTTP health-listener accept loop. Caller owns the
+/// already-bound `TcpListener` so bind failures are reported up front
+/// (see KanttBan bug #2 / v3.28.0 fix).
+async fn run_health_listener(listener: tokio::net::TcpListener) -> std::io::Result<()> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
-    let listener = TcpListener::bind(addr).await?;
-    info!("Health server listening on {}", addr);
-
     loop {
         let (mut socket, _) = listener.accept().await?;
-
         tokio::spawn(async move {
             let mut buf = [0u8; 1024];
             if socket.read(&mut buf).await.is_ok() {
-                // Proper HTTP response with correct formatting
                 let body = r#"{"status":"ok"}"#;
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",

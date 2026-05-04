@@ -3231,6 +3231,44 @@ impl<'a> Planner<'a> {
                     new_table_name: new_name.to_string(),
                 })
             }
+            // ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY (KanttBan #5
+            // against v3.27.0). drizzle-kit / Prisma / Flyway / Liquibase
+            // all emit FKs as a separate ALTER TABLE step at the end of
+            // their migrations so they can topologically order tables
+            // without worrying about cycle resolution. Wires the
+            // sqlparser ForeignKey shape through to the same
+            // `catalog.add_foreign_key` API the inline-`REFERENCES`
+            // path in CREATE TABLE already uses.
+            AlterTableOperation::AddConstraint(sqlparser::ast::TableConstraint::ForeignKey {
+                name,
+                columns,
+                foreign_table,
+                referred_columns,
+                on_delete,
+                on_update,
+                characteristics,
+            }) => {
+                let (deferrable, initially_deferred) = characteristics
+                    .as_ref()
+                    .map(|c| (
+                        c.deferrable.unwrap_or(false),
+                        c.initially.map(|i| matches!(
+                            i, sqlparser::ast::DeferrableInitial::Deferred
+                        )).unwrap_or(false),
+                    ))
+                    .unwrap_or((false, false));
+                Ok(LogicalPlan::AlterTableAddForeignKey {
+                    table_name,
+                    constraint_name: name.as_ref().map(|n| n.to_string()),
+                    columns: columns.iter().map(Self::normalize_ident).collect(),
+                    references_table: Self::normalize_object_name(&foreign_table),
+                    references_columns: referred_columns.iter().map(Self::normalize_ident).collect(),
+                    on_delete: on_delete.as_ref().map(convert_referential_action),
+                    on_update: on_update.as_ref().map(convert_referential_action),
+                    deferrable,
+                    initially_deferred,
+                })
+            }
             _ => Err(Error::query_execution(format!(
                 "Unsupported ALTER TABLE operation: {operation:?}",
             ))),

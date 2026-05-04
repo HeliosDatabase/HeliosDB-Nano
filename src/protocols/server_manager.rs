@@ -107,7 +107,7 @@ impl ServerManager {
 
     /// Start all enabled protocol servers
     pub async fn start(self) -> Result<()> {
-        info!("Starting HeliosDB-Lite Protocol Server Manager");
+        info!("Starting HeliosDB Nano Protocol Server Manager");
 
         let mut tasks = Vec::new();
 

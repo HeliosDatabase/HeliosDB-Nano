@@ -48,7 +48,7 @@ impl HelpManager {
     /// Print 2-column layout for narrow terminals (< 120 cols)
     fn print_help_2col() {
         println!("\n{}", "╔══════════════════════════════════════════════════════════════════════════════╗".cyan());
-        println!("{}", "║              HeliosDB Lite - Interactive SQL REPL Help                      ║".cyan().bold());
+        println!("{}", "║              HeliosDB Nano - Interactive SQL REPL Help                      ║".cyan().bold());
         println!("{}", "╚══════════════════════════════════════════════════════════════════════════════╝".cyan());
 
         println!("\n{}", "Quick Start:".yellow().bold());
@@ -79,7 +79,7 @@ impl HelpManager {
     /// Print 3-column layout for wide terminals (>= 120 cols)
     fn print_help_3col() {
         println!("\n{}", "╔══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╗".cyan());
-        println!("{}", "║                             HeliosDB Lite - Interactive SQL REPL Help                                           ║".cyan().bold());
+        println!("{}", "║                             HeliosDB Nano - Interactive SQL REPL Help                                           ║".cyan().bold());
         println!("{}", "╚══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝".cyan());
 
         println!("\n{}", "Quick Start:".yellow().bold());

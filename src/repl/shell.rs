@@ -451,7 +451,7 @@ impl ReplShell {
         println!();
         println!("╔═══════════════════════════════════════════════════════════════╗");
         println!("║  {} {}{}",
-            "HeliosDB Lite".bold().cyan(),
+            "HeliosDB Nano".bold().cyan(),
             format!("v{}", env!("CARGO_PKG_VERSION")).bold().green(),
             "                                    ║"
         );

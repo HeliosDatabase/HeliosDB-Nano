@@ -322,7 +322,7 @@ impl ApiServer {
     pub async fn serve(self) -> Result<()> {
         let app = self.build_router();
 
-        info!("Starting HeliosDB-Lite REST API server on {}", self.addr);
+        info!("Starting HeliosDB Nano REST API server on {}", self.addr);
 
         let listener = TcpListener::bind(self.addr)
             .await
@@ -372,7 +372,7 @@ impl ApiServer {
     {
         let app = self.build_router();
 
-        info!("Starting HeliosDB-Lite REST API server on {}", self.addr);
+        info!("Starting HeliosDB Nano REST API server on {}", self.addr);
 
         let listener = TcpListener::bind(self.addr)
             .await
@@ -399,7 +399,7 @@ async fn health_check() -> (StatusCode, &'static str) {
 /// Version information endpoint
 async fn version_info() -> axum::Json<serde_json::Value> {
     axum::Json(serde_json::json!({
-        "name": "HeliosDB-Lite",
+        "name": "HeliosDB-Nano",
         "version": env!("CARGO_PKG_VERSION"),
         "api_version": "v1",
     }))
@@ -453,7 +453,7 @@ mod tests {
     async fn test_version_info() {
         let response = version_info().await;
         let json = response.0;
-        assert_eq!(json["name"], "HeliosDB-Lite");
+        assert_eq!(json["name"], "HeliosDB-Nano");
         assert!(json["version"].is_string());
         assert_eq!(json["api_version"], "v1");
     }

@@ -765,6 +765,51 @@ impl Evaluator {
                 Self::fts_score(&arg_values)
             }
 
+            // `current_setting(name [, missing_ok])` — Postgres GUC
+            // accessor. Used by observability tooling (DataDog,
+            // pgwatch2, pgbouncer auth_query) and by Drizzle for some
+            // session probes. We expose a small fixed set of
+            // user-relevant settings; unknown names return empty
+            // string when `missing_ok = true` (the default for the
+            // single-arg form), or an error otherwise — matching PG
+            // semantics. (KanttBan bug #9 against v3.27.0.)
+            "current_setting" => {
+                let name = match arg_values.first() {
+                    Some(Value::String(s)) => s.to_lowercase(),
+                    _ => return Err(Error::query_execution(
+                        "current_setting() requires a setting name as its first argument".to_string(),
+                    )),
+                };
+                let missing_ok = matches!(arg_values.get(1), Some(Value::Boolean(true)));
+                let value = match name.as_str() {
+                    // Server identity
+                    "server_version" => Some("17.0".to_string()),
+                    "server_version_num" => Some("170000".to_string()),
+                    // Encoding / locale (default UTF-8 / C)
+                    "client_encoding" | "server_encoding" => Some("UTF8".to_string()),
+                    "lc_collate" | "lc_ctype" | "lc_messages" | "lc_monetary"
+                    | "lc_numeric" | "lc_time" => Some("C".to_string()),
+                    "datestyle" => Some("ISO, MDY".to_string()),
+                    "timezone" => Some("UTC".to_string()),
+                    "standard_conforming_strings" => Some("on".to_string()),
+                    "integer_datetimes" => Some("on".to_string()),
+                    // Trivia some clients probe
+                    "is_superuser" => Some("on".to_string()),
+                    "session_authorization" | "current_user" | "current_role" => {
+                        Some("postgres".to_string())
+                    }
+                    "search_path" => Some("\"$user\", public".to_string()),
+                    _ => None,
+                };
+                match value {
+                    Some(v) => Ok(Value::String(v)),
+                    None if missing_ok => Ok(Value::String(String::new())),
+                    None => Err(Error::query_execution(format!(
+                        "unrecognized configuration parameter '{name}'"
+                    ))),
+                }
+            }
+
             _ => Err(Error::query_execution(format!(
                 "Unknown scalar function: {}",
                 fun

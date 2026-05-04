@@ -116,6 +116,24 @@ impl PgCatalog {
             return Ok(None);
         } else if query_lower.contains("pg_type") {
             Some(self.query_pg_type()?)
+        } else if query_lower.contains("pg_sequences") {
+            // KanttBan / Drizzle-kit pull queries `pg_sequences` during
+            // introspection. Nano doesn't expose user-facing sequences
+            // (BIGSERIAL is a synthetic counter, not a sequence object),
+            // so return the standard 7-column shape with no rows.
+            Some((Schema::new(vec![
+                Column::new("schemaname", DataType::Text),
+                Column::new("sequencename", DataType::Text),
+                Column::new("sequenceowner", DataType::Text),
+                Column::new("data_type", DataType::Text),
+                Column::new("start_value", DataType::Int8),
+                Column::new("min_value", DataType::Int8),
+                Column::new("max_value", DataType::Int8),
+                Column::new("increment_by", DataType::Int8),
+                Column::new("cycle", DataType::Boolean),
+                Column::new("cache_size", DataType::Int8),
+                Column::new("last_value", DataType::Int8),
+            ]), vec![]))
         } else if query_lower.contains("pg_index") && !query_lower.contains("pg_indexes") {
             Some(self.query_pg_index()?)
         } else if query_lower.contains("pg_indexes") {
@@ -1020,9 +1038,9 @@ impl PgCatalog {
     fn is_catalog_query(q: &str) -> bool {
         const MARKERS: &[&str] = &[
             "pg_catalog", "pg_type", "pg_class", "pg_namespace", "pg_attribute",
-            "pg_database", "pg_index", "pg_indexes", "pg_tables", "pg_views",
-            "pg_constraint", "pg_description", "pg_roles", "pg_user", "pg_proc",
-            "pg_settings",
+            "pg_database", "pg_index", "pg_indexes", "pg_sequences", "pg_tables",
+            "pg_views", "pg_constraint", "pg_description", "pg_roles", "pg_user",
+            "pg_proc", "pg_settings",
         ];
         MARKERS.iter().any(|m| q.contains(m))
     }

@@ -499,6 +499,31 @@ pub enum LogicalPlan {
         new_table_name: String,
     },
 
+    /// Add a foreign-key constraint to an existing table.
+    /// Mirrors the inline `REFERENCES …` form already supported in
+    /// CREATE TABLE; persists FK metadata via
+    /// `catalog.add_foreign_key` and creates the FK ART index.
+    AlterTableAddForeignKey {
+        /// Table name (owning the FK)
+        table_name: String,
+        /// Optional constraint name (auto-generated if absent)
+        constraint_name: Option<String>,
+        /// Local columns
+        columns: Vec<String>,
+        /// Referenced (parent) table
+        references_table: String,
+        /// Referenced (parent) columns
+        references_columns: Vec<String>,
+        /// ON DELETE action (logical-plan form, converted at executor time)
+        on_delete: Option<ReferentialAction>,
+        /// ON UPDATE action (logical-plan form, converted at executor time)
+        on_update: Option<ReferentialAction>,
+        /// DEFERRABLE
+        deferrable: bool,
+        /// INITIALLY DEFERRED
+        initially_deferred: bool,
+    },
+
     /// Multiple ALTER TABLE operations in a single statement
     AlterTableMulti {
         /// The individual ALTER TABLE operations to execute sequentially
@@ -1633,6 +1658,9 @@ impl LogicalPlan {
             }
             LogicalPlan::AlterTableRename { .. } => {
                 // ALTER TABLE RENAME doesn't have output schema
+                Arc::new(Schema { columns: vec![] })
+            }
+            LogicalPlan::AlterTableAddForeignKey { .. } => {
                 Arc::new(Schema { columns: vec![] })
             }
             LogicalPlan::AlterTableMulti { .. } => {

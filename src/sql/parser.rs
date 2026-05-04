@@ -231,6 +231,15 @@ impl Parser {
         // Preprocess to remove STORAGE clauses from column definitions (not supported by sqlparser)
         processed_sql = Self::preprocess_remove_storage_clauses(&processed_sql);
 
+        // Preprocess: strip the parenthesized sequence-options block on
+        // `GENERATED ALWAYS AS IDENTITY (sequence name … INCREMENT BY …
+        // CACHE …)`. drizzle-kit / Prisma emit this form; sqlparser
+        // doesn't accept it. The bare `GENERATED ALWAYS AS IDENTITY`
+        // already auto-generates monotonically, and the parenthesized
+        // options are advisory (sequence name, start, increment, cache).
+        // (KanttBan bug #4 against v3.27.0.)
+        processed_sql = Self::preprocess_strip_identity_options(&processed_sql);
+
         // Preprocess CREATE INDEX USING clause for sqlparser compatibility
         let index_type_override = if Self::is_create_index_using(&processed_sql) {
             let (cleaned_sql, index_type) = Self::preprocess_create_index_using(&processed_sql);
@@ -687,6 +696,91 @@ impl Parser {
     ///
     /// sqlparser doesn't support PostgreSQL-style STORAGE clauses in column definitions,
     /// so we remove them before parsing and extract them separately.
+    /// Strip the parenthesized sequence-options block that follows
+    /// `GENERATED ALWAYS AS IDENTITY` (or `BY DEFAULT`) in DDL emitted
+    /// by drizzle-kit / Prisma:
+    ///
+    /// ```sql
+    ///   id integer PRIMARY KEY GENERATED ALWAYS AS IDENTITY (
+    ///     sequence name "tasks_id_seq" INCREMENT BY 1 MINVALUE 1
+    ///     MAXVALUE 2147483647 START WITH 1 CACHE 1
+    ///   ),
+    /// ```
+    ///
+    /// becomes
+    ///
+    /// ```sql
+    ///   id integer PRIMARY KEY GENERATED ALWAYS AS IDENTITY,
+    /// ```
+    ///
+    /// Quote-aware paren matching so identifiers like `"my(table)"`
+    /// don't fool the scan.
+    pub fn preprocess_strip_identity_options(sql: &str) -> String {
+        let upper = sql.to_uppercase();
+        let bytes = sql.as_bytes();
+        let mut result = String::with_capacity(sql.len());
+        let mut i = 0;
+        let n = sql.len();
+        while i < n {
+            // Look for "AS IDENTITY" word-bounded.
+            let remaining_upper = &upper[i..];
+            if let Some(p) = remaining_upper.find("AS IDENTITY") {
+                let abs = i + p;
+                // Confirm word-bounded on both sides (so `IDENTITYX` isn't a hit).
+                let before_ok = abs == 0
+                    || !sql.as_bytes().get(abs - 1).map(|b| b.is_ascii_alphanumeric() || *b == b'_').unwrap_or(false);
+                let end_kw = abs + "AS IDENTITY".len();
+                let after_ok = end_kw >= n
+                    || !sql.as_bytes().get(end_kw).map(|b| b.is_ascii_alphanumeric() || *b == b'_').unwrap_or(false);
+                if !(before_ok && after_ok) {
+                    // Copy through and continue past this occurrence.
+                    let advance = (abs - i) + "AS IDENTITY".len();
+                    #[allow(clippy::indexing_slicing)]
+                    result.push_str(&sql[i..i + advance]);
+                    i += advance;
+                    continue;
+                }
+                // Copy through "AS IDENTITY".
+                #[allow(clippy::indexing_slicing)]
+                result.push_str(&sql[i..end_kw]);
+                i = end_kw;
+                // Look ahead: optional whitespace then '('.
+                let mut j = i;
+                while j < n && (bytes[j] == b' ' || bytes[j] == b'\t' || bytes[j] == b'\n' || bytes[j] == b'\r') {
+                    j += 1;
+                }
+                if j < n && bytes[j] == b'(' {
+                    // Find matching close paren, respecting double-quoted identifiers.
+                    let mut depth: usize = 1;
+                    let mut k = j + 1;
+                    let mut in_dquote = false;
+                    while k < n && depth > 0 {
+                        match bytes[k] {
+                            b'"' => in_dquote = !in_dquote,
+                            b'(' if !in_dquote => depth += 1,
+                            b')' if !in_dquote => depth -= 1,
+                            _ => {}
+                        }
+                        k += 1;
+                    }
+                    if depth == 0 {
+                        // Drop the entire `(...)` block (k is one past ')').
+                        i = k;
+                        continue;
+                    }
+                    // Unbalanced; bail out — don't mutate sql we don't understand.
+                }
+                // No "(" follows; nothing to strip.
+                continue;
+            }
+            // No more "AS IDENTITY" — copy the rest.
+            #[allow(clippy::indexing_slicing)]
+            result.push_str(&sql[i..]);
+            break;
+        }
+        result
+    }
+
     pub fn preprocess_remove_storage_clauses(sql: &str) -> String {
         let upper = sql.to_uppercase();
 

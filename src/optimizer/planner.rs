@@ -320,6 +320,7 @@ impl Planner {
             LogicalPlan::AlterTableDropColumn { .. } |
             LogicalPlan::AlterTableRenameColumn { .. } |
             LogicalPlan::AlterTableRename { .. } |
+            LogicalPlan::AlterTableAddForeignKey { .. } |
             LogicalPlan::Truncate { .. } |
             LogicalPlan::CreateBranch { .. } |
             LogicalPlan::DropBranch { .. } |

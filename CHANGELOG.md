@@ -5,6 +5,91 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.28.0] - 2026-05-04
+
+### Fixed — KanttBan / Drizzle ORM migration quirks
+
+The KanttBan team migrated their full Drizzle-ORM auth + tasks API to
+HeliosDB-Nano v3.27.0 and filed nine bugs in
+`/home/app/Personal/KanttBan/Kanttban/BUGS_HELIOSDB.md`. v3.28.0 closes
+all of them (#7, #8 — psql `\d` col-count and CREATE SCHEMA — deferred
+to v3.29.0; both have working substitutes in `information_schema`).
+
+- **Bug #1 (CRITICAL) — `--daemon` reports success even when worker
+  never starts.** The parent now polls the child's PG port for up to
+  5 s and returns a non-zero exit + cleans up the pidfile if the
+  worker dies at startup or fails to bind. Removes the need for
+  caller scripts to poll `ss` themselves.
+- **Bug #2 (CRITICAL) — `--http-port` collision silently kills the
+  whole server.** The HTTP health endpoint now binds eagerly (so bind
+  failures surface at ERROR before the "Server ready!" banner), runs
+  in a detached task (so a late-life failure can't tear the database
+  listener down), and supports `--http-port 0` to opt out entirely.
+- **Bug #3 (CRITICAL) — `pg_sequences` missing.** The PG-wire catalog
+  dispatcher (`src/protocol/postgres/catalog.rs`) now responds to
+  `pg_sequences` with the standard 11-column shape (empty rows —
+  Nano's BIGSERIAL is a synthetic counter, not a sequence object).
+  Unblocks `drizzle-kit pull / push` introspection.
+- **Bug #4 (CRITICAL) — `GENERATED ALWAYS AS IDENTITY (sequence name
+  … INCREMENT BY …)` parse error.** New
+  `Parser::preprocess_strip_identity_options` quote-aware preprocessor
+  strips the parenthesized sequence-options block before sqlparser
+  sees it. The bare IDENTITY auto-generates monotonically as before.
+- **Bug #5 (CRITICAL) — `ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY`
+  not supported.** New `LogicalPlan::AlterTableAddForeignKey` variant
+  routes the sqlparser ForeignKey shape through to the same
+  `catalog.add_foreign_key` API the inline-`REFERENCES` path in CREATE
+  TABLE already uses. Drizzle / Prisma / Flyway / Liquibase now run
+  unmodified migrations.
+- **Bug #6 (HIGH) — FK enforcement asymmetric (DELETE checked,
+  INSERT/UPDATE skipped).** New
+  `EmbeddedDatabase::check_fk_constraints_on_write` runs before every
+  INSERT and UPDATE, walking each outgoing FK and verifying the
+  referenced parent row exists (PG MATCH SIMPLE — NULL FK columns
+  trivially satisfy the constraint). The fast UPDATE path (line 4187)
+  also bails to the normal path when persisted FK metadata exists,
+  even if no FK ART index is registered.
+- **Bug #9 (LOW) — `current_setting()` not implemented.** Now a
+  scalar function returning a curated set of GUCs (`server_version`,
+  `client_encoding`, `datestyle`, `timezone`, `search_path`, …).
+  Two-arg form with `missing_ok = true` returns empty string for
+  unknown settings; one-arg form errors. PG-correct semantics.
+- **Bug #10 (cosmetic) — banner / init / trace strings said
+  "HeliosDB-Lite".** Flipped to "HeliosDB Nano" across `src/main.rs`,
+  `src/api/server.rs`, `src/api/openapi/mod.rs`, `src/api/supabase`,
+  `src/protocols/server_manager.rs`, `src/repl/`, `src/storage/dump`,
+  `src/network/session.rs`, `src/git_integration/hooks/`. Module names
+  and crate name unchanged (still `heliosdb-nano`).
+- **Bug #11 (cosmetic) — `--version` flag rejected.** Added
+  `#[command(version = env!("CARGO_PKG_VERSION"))]` to the clap
+  derive. `heliosdb-nano --version` now prints
+  `heliosdb-nano 3.28.0`.
+
+### Tests
+
+- New: `tests/kanttban_quirks_v3_27.rs` — 9 unit tests covering
+  bugs #3–#6, #9 end to end. All pass.
+- Lib 1758/1758, dashboard_quirks 10/10, repl_meta_commands 4/4,
+  information_schema_completion 9/9, create_database 8/8, scram 13/13.
+
+### Deferred
+
+- **Bug #7** — `psql \d <table>` "column number 5 is out of range
+  0..4" — needs the catalog query to return the full 8-column
+  shape psql expects. Workaround: `SELECT column_name, data_type
+  FROM information_schema.columns WHERE table_name = '<t>'` works
+  today.
+- **Bug #8** — `CREATE DATABASE` / `CREATE SCHEMA` not supported.
+  v3.25.0 added per-tenant CREATE DATABASE through the tenant
+  manager, but plain `CREATE SCHEMA` for namespacing within a
+  database is a larger scope. v3.29.0.
+
+### Dashboard cutover quirks (v3.27.0) — perf items still open
+
+- **Quirk H** (DELETE/DROP hang on 11k-row table) and **Quirk I**
+  (DO UPDATE 400× slower than INSERT on populated table) carry
+  forward unchanged. v3.29.0 with targeted benches.
+
 ## [3.27.0] - 2026-05-04
 
 ### Fixed — Token-dashboard cutover quirks B + C + D + E

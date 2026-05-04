@@ -106,7 +106,7 @@ impl RouteResponse {
 fn default_headers() -> HashMap<String, String> {
     let mut headers = HashMap::new();
     headers.insert("Content-Type".to_string(), "application/json".to_string());
-    headers.insert("X-Powered-By".to_string(), "HeliosDB-Lite".to_string());
+    headers.insert("X-Powered-By".to_string(), "HeliosDB-Nano".to_string());
     headers
 }
 

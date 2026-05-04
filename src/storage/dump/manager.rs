@@ -266,7 +266,7 @@ impl DumpManager {
         let mut writer = BufWriter::new(file);
 
         // Write header
-        writeln!(writer, "-- HeliosDB Lite Database Dump")
+        writeln!(writer, "-- HeliosDB Nano Database Dump")
             .map_err(|e| Error::storage(format!("Failed to write header: {}", e)))?;
         writeln!(writer, "-- Generated: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
             .map_err(|e| Error::storage(format!("Failed to write header: {}", e)))?;
