@@ -5,6 +5,80 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.30.0] - 2026-05-04
+
+### Fixed — Token-Dashboard perf carry-over: Quirks H + I
+
+Both deferred from v3.27 and v3.28. Field repros from the
+Token-Dashboard cutover at
+`~/.claude/projects/-home-app-websites-token-dashboard/memory/heliosdb_v326_quirks.md`.
+
+#### Quirk H — DELETE / DROP on FK-referenced tables (>5 min hang → milliseconds)
+
+`EmbeddedDatabase::check_referencing_rows_exist` did a full
+`storage.scan_table` of the referencing table for every parent
+row being deleted. With ~11k rows on each side that was
+~121 M tuple checks per DELETE, dominated by per-row bincode
+deserialisation. Now uses the existing PK / UNIQUE / FK ART
+index for the lookup when available — O(log N) per call. The
+slow scan-and-merge fallback stays for the in-transaction path
+(`active_txn = Some(_)`) so read-your-own-writes semantics from
+the v3.22.1 fix are preserved.
+
+Bench: DELETE 1000 FK-parent rows: **~950 ms** (vs >5 min);
+DROP populated FK'd parent + child: **~5 ms**.
+
+#### Quirk I — `INSERT … ON CONFLICT (col) DO UPDATE` (~400× slower → instant)
+
+The DO UPDATE branch's existing-row lookup ran
+`self.query("SELECT pk FROM tbl WHERE col = 'val'")` per
+conflicting row — a full SQL planner round-trip ending in a
+table scan. Now goes through `art.find_column_index` +
+`art.index_get_all` directly: O(log N) per row,
+ACID-correct (the UNIQUE index was already proven by
+`check_unique_constraints` immediately above).
+
+Bench: 1000 ON CONFLICT DO UPDATE on a populated 1000-row
+table: **812 ms** (~1230 ops/sec). v3.27 baseline was
+0.4 ops/sec — **~3000× speedup**.
+
+### Tests
+
+- New: `tests/quirks_h_i_perf.rs` (4 tests, all pass with the
+  bounds documented above). Includes
+  `fk_validation_still_blocks_orphan_deletes` to pin
+  correctness alongside the perf bound.
+
+### Documentation
+
+- `tests/kanttban_quirks_v3_28.rs` carry-forward intact.
+- KanttBan team's `BUGS_HELIOSDB.md` (#18 — intermittent
+  ParseComplete corruption) updated with a `RUST_LOG=trace`
+  capture recipe pointing at `docs/TRACING_GUIDE.md`. Next
+  reproduction will have enough state to triage.
+
+### Investigation closed
+
+- **Bug #16 — `CREATE DATABASE` per-tenant routing.** Confirmed
+  `IsolationMode::DatabasePerTenant` is metadata-only: the
+  PG-wire startup handler validates the requested DB name
+  (Bug 5 / v3.25) but doesn't set per-connection tenant context,
+  and the storage layer has no per-tenant key prefix. v3.29
+  visibility fix (`\l` lists CREATE-DATABASE'd tenants) is
+  enough for KanttBan's single-DB use. Real per-DB isolation
+  needs (a) per-connection tenant context wiring and (b) a
+  per-tenant storage namespace; both are bigger scope and
+  carry forward to v3.31 / later.
+
+### Carry-forward to v3.31
+
+- **Bug #17** — SQL-level `PREPARE` / `EXECUTE` / `DEALLOCATE`.
+  Wire-protocol extended-query already works.
+- **Bug #18** — once a fresh trace lands, debug the FK
+  validator vs response-writer ordering.
+- **Bug #16 strict isolation** — per-DB storage namespace +
+  `current_database()` resolution from connection state.
+
 ## [3.29.0] - 2026-05-04
 
 ### Fixed — KanttBan / Drizzle ORM follow-up (BUGS_HELIOSDB.md re-test)

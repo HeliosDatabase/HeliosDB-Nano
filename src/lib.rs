@@ -6091,30 +6091,35 @@ impl EmbeddedDatabase {
                             // Silent skip — no count increment.
                         }
                         (Err(e), Some(sql::logical_plan::OnConflictAction::DoUpdate { assignments })) => {
-                            // Locate the existing row.  Try UNIQUE-column
-                            // scan first, fall back to PK lookup.
+                            // Locate the existing row.
+                            //
+                            // KanttBan / Token-Dashboard Quirk I (v3.27):
+                            // ON CONFLICT DO UPDATE was 400× slower than
+                            // bare INSERT on populated tables (0.4 ins/sec
+                            // at 11k rows vs 181). The previous code did
+                            // `self.query("SELECT pk FROM tbl WHERE col =
+                            // 'val'")` per conflicting row — a full SQL
+                            // round-trip ending in a table scan. Now the
+                            // UNIQUE-column lookup goes through the ART
+                            // unique index directly: O(log N) per row,
+                            // ACID-correct (the unique index was already
+                            // checked by `check_unique_constraints` above
+                            // — we're just reading the row_id we already
+                            // know exists).
                             let mut found_row_id: Option<u64> = None;
+                            let art = self.storage.art_indexes();
                             for (i, col) in schema.columns.iter().enumerate() {
                                 if (col.unique || col.primary_key) && !col.primary_key {
                                     if let Some(val) = tuple.values.get(i) {
                                         if !matches!(val, Value::Null) {
-                                            let scan_sql = format!(
-                                                "SELECT {} FROM {} WHERE {} = '{}'",
-                                                schema.columns.iter().find(|c| c.primary_key)
-                                                    .map(|c| c.name.as_str()).unwrap_or("rowid"),
-                                                table_name,
-                                                col.name,
-                                                val.to_string().trim_matches('\''),
-                                            );
-                                            if let Ok(rows) = self.query(&scan_sql, &[]) {
-                                                if let Some(row) = rows.first() {
-                                                    if let Some(pk_val) = row.values.first() {
-                                                        match pk_val {
-                                                            Value::Int8(id) => { found_row_id = Some(*id as u64); }
-                                                            Value::Int4(id) => { found_row_id = Some(*id as u64); }
-                                                            _ => {}
-                                                        }
-                                                    }
+                                            // Index fast-path: O(log N) lookup against the
+                                            // unique index that the conflict above already
+                                            // proved exists.
+                                            if let Some(name) = art.find_column_index(table_name, &col.name) {
+                                                let key = storage::ArtIndexManager::encode_key(&[val.clone()]);
+                                                let row_ids = art.index_get_all(&name, &key);
+                                                if let Some(rid) = row_ids.first() {
+                                                    found_row_id = Some(*rid);
                                                 }
                                             }
                                             if found_row_id.is_some() { break; }
@@ -8550,21 +8555,57 @@ impl EmbeddedDatabase {
         values: &[Value],
         active_txn: Option<&storage::Transaction>,
     ) -> Result<bool> {
-        let catalog = self.storage.catalog();
-        let schema = catalog.get_table_schema(table_name)?;
+        // Fast path: index lookup. KanttBan / Token-Dashboard Quirk H
+        // (DELETE / DROP on 11k-row table hangs >5min). The previous
+        // implementation walked the entire referencing table for every
+        // parent row being deleted — O(N×M) with N rows in the
+        // referenced table and M rows in the child. With both ~11k,
+        // that's 121M tuple checks per DELETE, dominated by per-row
+        // bincode deserialisation. Now: if a single-column index
+        // (PK / UNIQUE / FK) already exists on the relevant
+        // `(table_name, column_names)`, look up via ART —
+        // O(log N), and crucially skips the deserialisation.
+        //
+        // The index path is taken when `active_txn` is None (committed
+        // read) — uncommitted in-txn writes are merged below by the
+        // scan-and-filter fallback, so the index path stays
+        // ACID-correct for the autocommit / implicit-tx surface that
+        // dominates the DELETE / DROP workload.
+        if active_txn.is_none() && column_names.len() == values.len() && !column_names.is_empty() {
+            let art = self.storage.art_indexes();
+            // Try to find any index covering exactly these columns.
+            let index_name = if column_names.len() == 1 {
+                #[allow(clippy::indexing_slicing)]
+                art.find_column_index(table_name, &column_names[0])
+            } else {
+                None
+            };
+            if let Some(name) = index_name {
+                let key = storage::ArtIndexManager::encode_key(values);
+                let row_ids = art.index_get_all(&name, &key);
+                if !row_ids.is_empty() {
+                    return Ok(true);
+                }
+                // Index says no match — but the index could be stale
+                // if the caller registered the constraint without
+                // also rebuilding the index. Fall through to a scan
+                // only when we have *no* index for the table at all
+                // (defensive); otherwise trust the index.
+                return Ok(false);
+            }
+        }
 
-        // Scan the table and check for referencing rows. When the
-        // caller is inside an explicit transaction, merge its
+        // Slow path / in-transaction path: scan + merge with txn write-set.
+        // When the caller is inside an explicit transaction, merge its
         // write-set into the base scan so in-txn DELETEs / INSERTs
         // are reflected — without this,
         // `BEGIN; DELETE FROM child WHERE …; DELETE FROM parent
         // WHERE …;` raises a phantom FK violation on the second
         // DELETE because the just-tombstoned child rows still live
         // in RocksDB until commit. (Filed in
-        // FEATURE_REQUEST_fk_in_txn.md; this is the root-cause fix.)
-        // Caller passes `active_txn` directly to avoid re-acquiring
-        // `current_transaction.lock()` (which deadlocks under the
-        // DELETE path that already holds it).
+        // FEATURE_REQUEST_fk_in_txn.md; root-cause fix.)
+        let catalog = self.storage.catalog();
+        let schema = catalog.get_table_schema(table_name)?;
         let base = self.storage.scan_table(table_name)?;
         let tuples = if let Some(txn) = active_txn {
             txn.merge_with_write_set(table_name, base)?
