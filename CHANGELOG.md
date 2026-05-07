@@ -5,6 +5,60 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.30.1] - 2026-05-07
+
+### Fixed — KanttBan v3.30 re-test: 3 of 4 still-open quirks
+
+Repros and re-test report from
+`/home/app/Personal/KanttBan/HELIOSDB_v3_30_0_RETEST.md`. The
+remaining item, Bug #20 (`CREATE TYPE … AS ENUM`), needs a
+new planner arm and is deferred to v3.31.0.
+
+#### Bug #21A — Aggregates on `pg_catalog` / `information_schema`
+
+The PG-wire catalog handler short-circuits introspection
+queries to a substring-matched response *before* the planner
+runs (`src/protocol/postgres/handler.rs`), so `count(*)` and
+`GROUP BY` were never executed — drivers got the underlying
+catalog rows back instead of a scalar / bucketed shape, and
+`drizzle-kit push` rejected the malformed schema-set.
+
+`src/protocol/postgres/catalog.rs` now:
+- recognises `col IS NULL` / `col IS NOT NULL` in
+  `apply_where_filter` (the previous matcher only handled `=`,
+  `<>`, `IN`, `NOT IN`);
+- runs an `apply_aggregate` stage after WHERE filtering that
+  detects `count(*)` (with optional single-column `GROUP BY`)
+  and emits the `count`-shaped response. Anything more complex
+  (multiple GROUP BY columns, HAVING, custom aggregates) falls
+  through to ordinary projection, matching the existing
+  graceful-degradation path.
+
+Closes the only remaining tooling-blocker for `drizzle-kit push`.
+
+#### Bug #7 — `psql \d <table>` "column number 5 is out of range 0..4"
+
+`\d` issues two pg_class queries; the second is a 15-column
+header pull that the previous matcher served from the generic
+5-column `query_pg_class` fallback, so libpq errored when it
+tried to read column index 5. Added an explicit matcher in
+`try_psql_metacommand` keyed on
+`relchecks` + `relhasindex` + `c.oid = '<oid>'` that returns
+the full 15-column shape psql expects (`relkind`,
+`relhasindex`, `relhastriggers`, `relrowsecurity`, …,
+`am.amname`).
+
+#### Bug #14 — `DO $$ BEGIN CREATE TABLE IF NOT EXISTS … END $$`
+
+`pg_detect_plpgsql` did a substring scan for ` IF ` and
+flagged the SQL DDL idiom `IF NOT EXISTS` as PL/pgSQL control
+flow. Now strips ` IF NOT EXISTS ` / ` IF EXISTS ` from the
+body before the keyword scan; genuine PL/pgSQL `IF cond THEN`
+is still detected (regression-tested).
+
+drizzle-kit's idempotent `CREATE TABLE IF NOT EXISTS` wrapped
+in a DO block now executes.
+
 ## [3.30.0] - 2026-05-04
 
 ### Fixed — Token-Dashboard perf carry-over: Quirks H + I

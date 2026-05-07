@@ -1658,9 +1658,17 @@ fn pg_exception_matches(codes: &[String], error_message: &str) -> bool {
 /// error rather than silent data issues.
 fn pg_detect_plpgsql(body: &str) -> Option<&'static str> {
     let upper = body.to_ascii_uppercase();
+    // KanttBan #14 (v3.30.1): strip the SQL DDL idioms `IF NOT EXISTS`
+    // / `IF EXISTS` before scanning. drizzle-kit emits
+    //   DO $$ BEGIN CREATE TABLE IF NOT EXISTS … END $$;
+    // and the literal `IF` inside that DDL would otherwise trip the
+    // PL/pgSQL `IF` detector below — even though the body is plain SQL.
+    let scrubbed = upper
+        .replace(" IF NOT EXISTS ", " ")
+        .replace(" IF EXISTS ", " ");
     // Whole-word matches — bracket each keyword with a non-alnum
     // lookalike by padding the haystack.
-    let padded = format!(" {upper} ");
+    let padded = format!(" {scrubbed} ");
     // Note: `EXCEPTION` intentionally absent — handled via
     // `pg_split_exception` upstream. drizzle-kit emits idempotent
     // ALTERs as `DO $$ BEGIN <stmt>; EXCEPTION WHEN duplicate_object
@@ -1742,4 +1750,44 @@ fn pg_strip_begin_end(body: &str) -> &str {
         }
     }
     s
+}
+
+#[cfg(test)]
+mod plpgsql_detection_tests {
+    use super::pg_detect_plpgsql;
+
+    #[test]
+    fn create_table_if_not_exists_is_plain_sql() {
+        // KanttBan #14 (v3.30.1): drizzle-kit wraps DDL in
+        //   DO $$ BEGIN CREATE TABLE IF NOT EXISTS … END $$;
+        // The IF in IF NOT EXISTS must NOT be flagged as PL/pgSQL.
+        assert_eq!(
+            pg_detect_plpgsql("CREATE TABLE IF NOT EXISTS foo (id integer);"),
+            None,
+        );
+        assert_eq!(
+            pg_detect_plpgsql("DROP TABLE IF EXISTS foo;"),
+            None,
+        );
+        assert_eq!(
+            pg_detect_plpgsql("create index if not exists ix_foo on foo(id);"),
+            None,
+        );
+    }
+
+    #[test]
+    fn real_plpgsql_if_still_detected() {
+        // A genuine PL/pgSQL IF block must still be flagged.
+        assert_eq!(
+            pg_detect_plpgsql("IF x > 0 THEN PERFORM 1; END IF;"),
+            Some("IF"),
+        );
+    }
+
+    #[test]
+    fn other_plpgsql_keywords_still_detected() {
+        assert_eq!(pg_detect_plpgsql("LOOP exit; END LOOP;"), Some("LOOP"));
+        assert_eq!(pg_detect_plpgsql("RAISE NOTICE 'hi';"), Some("RAISE"));
+        assert_eq!(pg_detect_plpgsql("DECLARE v integer;"), Some("DECLARE"));
+    }
 }

@@ -211,13 +211,106 @@ impl PgCatalog {
         // (Drizzle / postgres-js / psycopg introspection), so without
         // these filters we'd send the full table regardless of the
         // predicate — B20 from the TimeTracker report.
+        //
+        // KanttBan #21A (v3.30.1): if the SELECT contains an aggregate
+        // (`count(*)` / `count(col)`) we collapse rows AFTER filtering
+        // and BEFORE projection — projection looks for column names in
+        // the schema and can't see synthetic aggregate output columns.
+        // drizzle-kit's introspection asks for things like
+        //   SELECT count(*) FROM pg_namespace WHERE nspname IS NULL;
+        //   SELECT table_schema, count(*) FROM information_schema.tables GROUP BY table_schema;
+        // Without this stage both queries return the underlying tuples
+        // and break tooling that expects scalar shapes.
         match result {
             Some((schema, rows)) => {
                 let filtered = Self::apply_where_filter(&query_lower, &schema, rows);
+                if let Some(agg) = Self::apply_aggregate(&query_lower, &schema, &filtered) {
+                    return Ok(Some(agg));
+                }
                 let projected = Self::project_columns(&query_lower, schema, filtered);
                 Ok(Some(projected))
             }
             None => Ok(None),
+        }
+    }
+
+    /// Detect `count(*)` (with optional `GROUP BY <col>`) in the SELECT
+    /// clause of a catalog query and collapse the rows accordingly.
+    /// Returns `None` when the query is not an aggregate, leaving the
+    /// caller to fall through to ordinary projection.
+    ///
+    /// Only handles the shapes drivers actually emit against catalog
+    /// tables — bare `count(*)` and single-column `GROUP BY`. Anything
+    /// more complex (multiple GROUP BY columns, HAVING, custom
+    /// aggregates) falls through and the caller returns the
+    /// underlying rows; that's the same "graceful degradation" path
+    /// `apply_where_filter` and `project_columns` use.
+    fn apply_aggregate(q: &str, schema: &Schema, rows: &[Tuple]) -> Option<(Schema, Vec<Tuple>)> {
+        if !q.contains("count(") {
+            return None;
+        }
+
+        let select_pos = q.find("select")? + "select".len();
+        let from_pos = q.find(" from ")?;
+        if select_pos >= from_pos {
+            return None;
+        }
+
+        // Pull the GROUP BY column (if any). Stop at the next clause
+        // keyword so trailing ORDER BY / LIMIT don't bleed in.
+        let group_by_col = q.find(" group by ").map(|g| {
+            let after = &q[g + " group by ".len()..];
+            let mut end = after.len();
+            for t in [" order by ", " having ", " limit ", " offset ", ";"] {
+                if let Some(p) = after.find(t) {
+                    if p < end { end = p; }
+                }
+            }
+            after[..end].trim().to_string()
+        });
+
+        if let Some(group_col_raw) = group_by_col {
+            // Strip alias prefix (`t.col` → `col`) and quotes.
+            let group_col = group_col_raw
+                .rsplit('.')
+                .next()
+                .unwrap_or(&group_col_raw)
+                .trim()
+                .trim_matches('"')
+                .to_lowercase();
+            let col_idx = schema
+                .columns
+                .iter()
+                .position(|c| c.name.to_lowercase() == group_col)?;
+
+            let mut buckets: Vec<(Value, i64)> = Vec::new();
+            for row in rows {
+                let v = row.values.get(col_idx).cloned().unwrap_or(Value::Null);
+                if let Some(b) = buckets.iter_mut().find(|(bv, _)| bv == &v) {
+                    b.1 += 1;
+                } else {
+                    buckets.push((v, 1));
+                }
+            }
+
+            // Safety: col_idx came from `position` above.
+            #[allow(clippy::indexing_slicing)]
+            let group_col_meta = schema.columns[col_idx].clone();
+            let out_schema = Schema::new(vec![
+                group_col_meta,
+                Column::new("count", DataType::Int8),
+            ]);
+            let out_rows: Vec<Tuple> = buckets
+                .into_iter()
+                .map(|(v, c)| Tuple::new(vec![v, Value::Int8(c)]))
+                .collect();
+            Some((out_schema, out_rows))
+        } else {
+            // Bare `count(*)` — collapse to a single scalar row.
+            let n = rows.len() as i64;
+            let out_schema = Schema::new(vec![Column::new("count", DataType::Int8)]);
+            let out_rows = vec![Tuple::new(vec![Value::Int8(n)])];
+            Some((out_schema, out_rows))
         }
     }
 
@@ -261,6 +354,20 @@ impl PgCatalog {
     /// WHEREs we don't yet interpret.
     fn eval_simple_pred(pred: &str, schema: &Schema, row: &Tuple) -> bool {
         let p = pred.trim();
+
+        // `col is null` / `col is not null` (KanttBan #21A, v3.30.1).
+        // Must be tested BEFORE the `=` / `<>` family because these
+        // predicates also contain spaces around the column name.
+        if let Some(idx) = p.find(" is not null") {
+            let col_name = p[..idx].trim();
+            let val = Self::row_value(schema, row, col_name);
+            return !matches!(val, Value::Null);
+        }
+        if let Some(idx) = p.find(" is null") {
+            let col_name = p[..idx].trim();
+            let val = Self::row_value(schema, row, col_name);
+            return matches!(val, Value::Null);
+        }
 
         // `col NOT IN (a, b, c)` — must be tested BEFORE plain `IN`.
         if let Some(idx) = p.find(" not in (") {
@@ -1018,6 +1125,81 @@ impl PgCatalog {
             return Ok(Some((schema, rows)));
         }
 
+        // ---- \d table_name (KanttBan #7, v3.30.1 follow-up) ------------
+        // The first query psql sends for `\d <name>` after resolving
+        // the relation OID is a 15-column pg_class header pull:
+        //
+        //   SELECT c.relchecks, c.relkind, c.relhasindex, c.relhasrules,
+        //          c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity,
+        //          false AS relhasoids, c.relispartition, '',
+        //          c.reltablespace,
+        //          CASE WHEN c.reloftype = 0 THEN '' ELSE … END,
+        //          c.relpersistence, c.relreplident, am.amname
+        //   FROM pg_catalog.pg_class c
+        //     LEFT JOIN pg_catalog.pg_class tc ON (c.reltoastrelid = tc.oid)
+        //     LEFT JOIN pg_catalog.pg_am am ON (c.relam = am.oid)
+        //   WHERE c.oid = '<oid>';
+        //
+        // The generic `pg_class` matcher returns only 5 columns, so
+        // psql's libpq errors with "column number 5 is out of range
+        // 0..4" — the exact message KanttBan reported in the v3.30
+        // re-test. We special-case the shape and emit the 15 columns
+        // psql's client formatter expects.
+        if q.contains("pg_catalog.pg_class")
+            && q.contains("relchecks")
+            && q.contains("relhasindex")
+            && q.contains("c.oid = '")
+        {
+            let schema = Schema::new(vec![
+                Column::new("relchecks", DataType::Int2),
+                Column::new("relkind", DataType::Char(1)),
+                Column::new("relhasindex", DataType::Boolean),
+                Column::new("relhasrules", DataType::Boolean),
+                Column::new("relhastriggers", DataType::Boolean),
+                Column::new("relrowsecurity", DataType::Boolean),
+                Column::new("relforcerowsecurity", DataType::Boolean),
+                Column::new("relhasoids", DataType::Boolean),
+                Column::new("relispartition", DataType::Boolean),
+                Column::new("reltoasttable", DataType::Text),
+                Column::new("reltablespace", DataType::Int4),
+                Column::new("reloftype", DataType::Text),
+                Column::new("relpersistence", DataType::Char(1)),
+                Column::new("relreplident", DataType::Char(1)),
+                Column::new("amname", DataType::Text),
+            ]);
+            let target_oid = Self::extract_relchecks_oid(q);
+            let table_names = catalog.list_tables()?;
+            let mut rows = Vec::new();
+            for (ti, name) in table_names.iter().enumerate() {
+                let table_oid = (16384 + ti) as i32;
+                if let Some(t) = target_oid {
+                    if t != table_oid { continue; }
+                }
+                let has_index = catalog
+                    .get_table_schema(name)
+                    .map(|s| s.columns.iter().any(|c| c.primary_key || c.unique))
+                    .unwrap_or(false);
+                rows.push(Tuple::new(vec![
+                    Value::Int2(0),                   // relchecks
+                    Value::String("r".into()),        // relkind = ordinary table
+                    Value::Boolean(has_index),        // relhasindex
+                    Value::Boolean(false),            // relhasrules
+                    Value::Boolean(false),            // relhastriggers
+                    Value::Boolean(false),            // relrowsecurity
+                    Value::Boolean(false),            // relforcerowsecurity
+                    Value::Boolean(false),            // relhasoids
+                    Value::Boolean(false),            // relispartition
+                    Value::String(String::new()),     // (literal '' from psql query)
+                    Value::Int4(0),                   // reltablespace = pg_default
+                    Value::String(String::new()),     // CASE reloftype → ''
+                    Value::String("p".into()),        // relpersistence = permanent
+                    Value::String("d".into()),        // relreplident = default
+                    Value::String("heap".into()),     // am.amname
+                ]));
+            }
+            return Ok(Some((schema, rows)));
+        }
+
         // ---- \d table_name (KanttBan #7, deferred from v3.28) ----------
         // psql's `\d <name>` sends several catalog queries; the one that
         // libpq error-rejects with "column number 5 is out of range 0..4"
@@ -1131,6 +1313,17 @@ impl PgCatalog {
     /// `WHERE a.attrelid = '<oid>'` shape used by `\d <table>`.
     fn extract_attrelid(q: &str) -> Option<i32> {
         let marker = "attrelid = '";
+        let start = q.find(marker)?;
+        let after = q.get(start + marker.len()..)?;
+        let end = after.find('\'')?;
+        after.get(..end)?.parse::<i32>().ok()
+    }
+
+    /// Extract the table OID literal from psql's
+    /// `WHERE c.oid = '<oid>'` shape used by `\d <table>`'s
+    /// 15-column pg_class header pull.
+    fn extract_relchecks_oid(q: &str) -> Option<i32> {
+        let marker = "c.oid = '";
         let start = q.find(marker)?;
         let after = q.get(start + marker.len()..)?;
         let end = after.find('\'')?;
@@ -1868,5 +2061,97 @@ mod tests {
     fn test_extract_eq_filter() {
         let query = "select column_name from information_schema.columns c where table_name = 'my_table'";
         assert_eq!(PgCatalog::extract_eq_filter(query, "table_name"), Some("my_table".to_string()));
+    }
+
+    // -------------------------------------------------------------------
+    // KanttBan #21A (v3.30.1) — aggregates / WHERE IS NULL on catalog
+    // tables. drizzle-kit's introspection emits these shapes; without
+    // the apply_aggregate stage they short-circuit catalog tuples back
+    // to the client and break `drizzle-kit push`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn count_star_pg_namespace_returns_scalar() {
+        let catalog = PgCatalog::new();
+        let result = catalog
+            .handle_query("select count(*) from pg_namespace")
+            .unwrap()
+            .unwrap();
+        let (schema, rows) = result;
+        assert_eq!(schema.columns.len(), 1);
+        assert_eq!(schema.columns[0].name, "count");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::Int8(2));
+    }
+
+    #[test]
+    fn count_star_with_is_null_filter_returns_zero() {
+        // Reproduces the exact KanttBan #21A repro:
+        // SELECT count(*) FROM pg_namespace WHERE nspname IS NULL;
+        let catalog = PgCatalog::new();
+        let (schema, rows) = catalog
+            .handle_query("select count(*) from pg_namespace where nspname is null")
+            .unwrap()
+            .unwrap();
+        assert_eq!(schema.columns.len(), 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].values[0], Value::Int8(0));
+    }
+
+    #[test]
+    fn count_star_with_is_not_null_filter_returns_all() {
+        let catalog = PgCatalog::new();
+        let (_schema, rows) = catalog
+            .handle_query("select count(*) from pg_namespace where nspname is not null")
+            .unwrap()
+            .unwrap();
+        assert_eq!(rows[0].values[0], Value::Int8(2));
+    }
+
+    #[test]
+    fn group_by_information_schema_tables_buckets_correctly() {
+        // Reproduces the `drizzle-kit push` blocker shape:
+        // SELECT table_schema, count(*) FROM information_schema.tables
+        // GROUP BY table_schema;
+        // Without a database attached the rows list is empty, but we
+        // still want the response shape to be (table_schema, count).
+        let catalog = PgCatalog::new();
+        let (schema, rows) = catalog
+            .handle_query(
+                "select table_schema, count(*) from information_schema.tables group by table_schema",
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(schema.columns.len(), 2);
+        assert_eq!(schema.columns[1].name, "count");
+        assert_eq!(rows.len(), 0);
+    }
+
+    #[test]
+    fn is_null_eval_simple_pred_drops_non_null_row() {
+        let schema = Schema::new(vec![Column::new("c", DataType::Text)]);
+        let row_text = Tuple::new(vec![Value::String("x".into())]);
+        let row_null = Tuple::new(vec![Value::Null]);
+        assert!(!PgCatalog::eval_simple_pred("c is null", &schema, &row_text));
+        assert!(PgCatalog::eval_simple_pred("c is null", &schema, &row_null));
+        assert!(PgCatalog::eval_simple_pred("c is not null", &schema, &row_text));
+        assert!(!PgCatalog::eval_simple_pred("c is not null", &schema, &row_null));
+    }
+
+    #[test]
+    fn extract_relchecks_oid_parses_psql_d_query() {
+        // KanttBan #7 (v3.30.1): the literal 15-column header that
+        // psql `\d <name>` sends after resolving the relation OID.
+        let q = "select c.relchecks, c.relkind, c.relhasindex, c.relhasrules, \
+                 c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, \
+                 false as relhasoids, c.relispartition, '', c.reltablespace, \
+                 case when c.reloftype = 0 then '' else \
+                 c.reloftype::pg_catalog.regtype::pg_catalog.text end, \
+                 c.relpersistence, c.relreplident, am.amname \
+                 from pg_catalog.pg_class c \
+                 left join pg_catalog.pg_class tc on (c.reltoastrelid = tc.oid) \
+                 left join pg_catalog.pg_am am on (c.relam = am.oid) \
+                 where c.oid = '16384';";
+        assert_eq!(PgCatalog::extract_relchecks_oid(q), Some(16384));
     }
 }
