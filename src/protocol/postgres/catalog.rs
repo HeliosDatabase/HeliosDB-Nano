@@ -196,6 +196,26 @@ impl PgCatalog {
                 Column::new("ispopulated", DataType::Boolean),
                 Column::new("definition", DataType::Text),
             ]), vec![]))
+        } else if query_lower.contains("pg_inherits") {
+            // Inheritance is not a Nano feature. psql `\d` sends two
+            // queries against pg_inherits (parent + child); without an
+            // explicit empty shape they fall through to pg_class and
+            // psql renders bogus "Inherits / Number of child tables"
+            // sections. Return empty 3-col shape that absorbs both
+            // forms (parent: 1 col, child: 3 cols — psql is tolerant
+            // when zero rows come back).
+            Some((Schema::new(vec![
+                Column::new("oid", DataType::Text),
+                Column::new("relkind", DataType::Char(1)),
+                Column::new("partbound", DataType::Text),
+            ]), vec![]))
+        } else if query_lower.contains("pg_publication") {
+            // Logical replication publications — not implemented.
+            // psql `\d` sends a UNION over pg_publication +
+            // pg_publication_rel selecting one column (`pubname`).
+            Some((Schema::new(vec![
+                Column::new("pubname", DataType::Text),
+            ]), vec![]))
         } else if query_lower.contains("pg_index") && !query_lower.contains("pg_indexes") {
             Some(self.query_pg_index()?)
         } else if query_lower.contains("pg_indexes") {
@@ -1048,6 +1068,45 @@ impl PgCatalog {
         };
         let catalog = db.storage.catalog();
 
+        // ---- \d <name> first sub-query: relation OID lookup ---------------------
+        // psql resolves the target with a regex match:
+        //
+        //   SELECT c.oid, n.nspname, c.relname
+        //   FROM pg_catalog.pg_class c
+        //     LEFT JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+        //   WHERE c.relname OPERATOR(pg_catalog.~) '^(<name>)$' COLLATE pg_catalog.default
+        //     AND pg_catalog.pg_table_is_visible(c.oid)
+        //   ORDER BY 2, 3;
+        //
+        // The 5-col query_pg_class fallback returned every table, so
+        // psql then iterated `\d` over each one in turn. Filter to
+        // exactly the matching relation here (KanttBan #7 follow-up,
+        // v3.30.1 smoke).
+        if q.contains("operator(pg_catalog.~)")
+            && q.contains("c.oid")
+            && q.contains("c.relname")
+            && q.contains("pg_table_is_visible")
+        {
+            let schema = Schema::new(vec![
+                Column::new("oid", DataType::Int4),
+                Column::new("nspname", DataType::Text),
+                Column::new("relname", DataType::Text),
+            ]);
+            let pat = Self::extract_psql_regex_relname(q);
+            let mut rows = Vec::new();
+            for (ti, name) in catalog.list_tables()?.iter().enumerate() {
+                if let Some(ref p) = pat {
+                    if name != p { continue; }
+                }
+                rows.push(Tuple::new(vec![
+                    Value::Int4((16384 + ti) as i32),
+                    Value::String("public".into()),
+                    Value::String(name.clone()),
+                ]));
+            }
+            return Ok(Some((schema, rows)));
+        }
+
         // ---- \l (list databases) ------------------------------------------------
         // psql sends SELECT d.datname ... FROM pg_catalog.pg_database d LEFT JOIN ...
         if q.contains("pg_database") && q.contains("pg_catalog.pg_database") && q.contains("d.datname") {
@@ -1368,6 +1427,24 @@ impl PgCatalog {
         let after = q.get(start + marker.len()..)?;
         let end = after.find('\'')?;
         after.get(..end)?.parse::<i32>().ok()
+    }
+
+    /// Extract the relation name from psql's `\d <name>` regex-match
+    /// shape `c.relname OPERATOR(pg_catalog.~) '^(<name>)$' COLLATE …`.
+    /// Returns None when the regex isn't a plain anchored name (e.g.
+    /// the user passed a pattern with metacharacters), in which case
+    /// the caller falls back to "return all tables".
+    fn extract_psql_regex_relname(q: &str) -> Option<String> {
+        let marker = "operator(pg_catalog.~) '^(";
+        let start = q.find(marker)?;
+        let after = q.get(start + marker.len()..)?;
+        let end = after.find(")$'")?;
+        let name = after.get(..end)?;
+        if name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+            Some(name.to_string())
+        } else {
+            None
+        }
     }
 
     /// Render a `DataType` in the long form `pg_catalog.format_type`
