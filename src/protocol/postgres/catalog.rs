@@ -1364,6 +1364,98 @@ impl PgCatalog {
             return Ok(Some((schema, rows)));
         }
 
+        // ---- \d <name> index list (12 columns) -----------------------------
+        // psql sends:
+        //
+        //   SELECT c2.relname, i.indisprimary, i.indisunique, i.indisclustered,
+        //          i.indisvalid, pg_catalog.pg_get_indexdef(...),
+        //          pg_catalog.pg_get_constraintdef(con.oid, true), contype,
+        //          condeferrable, condeferred, i.indisreplident, c2.reltablespace
+        //   FROM pg_catalog.pg_class c, pg_catalog.pg_class c2,
+        //        pg_catalog.pg_index i
+        //     LEFT JOIN pg_catalog.pg_constraint con ON …
+        //   WHERE c.oid = '<oid>' AND c.oid = i.indrelid AND i.indexrelid = c2.oid
+        //
+        // The generic pg_index handler returns 5 cols; psql expected 12,
+        // hence "column number 7 is out of range 0..4" on the v3.30.1
+        // smoke (KanttBan #7 follow-up). Emit one row per PRIMARY KEY
+        // and per UNIQUE column on the target relation.
+        if q.contains("pg_get_indexdef")
+            && q.contains("pg_get_constraintdef")
+            && q.contains("c2.relname")
+        {
+            let schema = Schema::new(vec![
+                Column::new("relname", DataType::Text),
+                Column::new("indisprimary", DataType::Boolean),
+                Column::new("indisunique", DataType::Boolean),
+                Column::new("indisclustered", DataType::Boolean),
+                Column::new("indisvalid", DataType::Boolean),
+                Column::new("indexdef", DataType::Text),
+                Column::new("constraintdef", DataType::Text),
+                Column::new("contype", DataType::Char(1)),
+                Column::new("condeferrable", DataType::Boolean),
+                Column::new("condeferred", DataType::Boolean),
+                Column::new("indisreplident", DataType::Boolean),
+                Column::new("reltablespace", DataType::Int4),
+            ]);
+            let target_oid = Self::extract_relchecks_oid(q);
+            let mut rows = Vec::new();
+            for (ti, name) in catalog.list_tables()?.iter().enumerate() {
+                let table_oid = (16384 + ti) as i32;
+                if let Some(t) = target_oid {
+                    if t != table_oid { continue; }
+                }
+                if let Ok(ts) = catalog.get_table_schema(name) {
+                    let pk_cols: Vec<&str> = ts.columns.iter()
+                        .filter(|c| c.primary_key)
+                        .map(|c| c.name.as_str())
+                        .collect();
+                    if !pk_cols.is_empty() {
+                        let cols = pk_cols.join(", ");
+                        rows.push(Tuple::new(vec![
+                            Value::String(format!("{}_pkey", name)),
+                            Value::Boolean(true),  // indisprimary
+                            Value::Boolean(true),  // indisunique
+                            Value::Boolean(false), // indisclustered
+                            Value::Boolean(true),  // indisvalid
+                            Value::String(format!(
+                                "CREATE UNIQUE INDEX {}_pkey ON public.{} USING btree ({})",
+                                name, name, cols,
+                            )),
+                            Value::String(format!("PRIMARY KEY ({})", cols)),
+                            Value::String("p".into()),
+                            Value::Boolean(false),
+                            Value::Boolean(false),
+                            Value::Boolean(false),
+                            Value::Int4(0),
+                        ]));
+                    }
+                    for col in &ts.columns {
+                        if col.unique && !col.primary_key {
+                            rows.push(Tuple::new(vec![
+                                Value::String(format!("{}_{}_key", name, col.name)),
+                                Value::Boolean(false),
+                                Value::Boolean(true),
+                                Value::Boolean(false),
+                                Value::Boolean(true),
+                                Value::String(format!(
+                                    "CREATE UNIQUE INDEX {0}_{1}_key ON public.{0} USING btree ({1})",
+                                    name, col.name,
+                                )),
+                                Value::String(format!("UNIQUE ({})", col.name)),
+                                Value::String("u".into()),
+                                Value::Boolean(false),
+                                Value::Boolean(false),
+                                Value::Boolean(false),
+                                Value::Int4(0),
+                            ]));
+                        }
+                    }
+                }
+            }
+            return Ok(Some((schema, rows)));
+        }
+
         // ---- \di (list indexes) ------------------------------------------------
         let is_di = q.contains("pg_catalog.pg_class")
             && q.contains("pg_catalog.pg_namespace")
