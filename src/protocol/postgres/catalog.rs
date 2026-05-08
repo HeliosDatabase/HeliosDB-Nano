@@ -150,6 +150,38 @@ impl PgCatalog {
                 Column::new("qual", DataType::Text),
                 Column::new("with_check", DataType::Text),
             ]), vec![]))
+        } else if query_lower.contains("pg_statistic_ext") {
+            // Extended-statistics catalog. psql's `\d <table>` sends a
+            // 9-column query joining pg_attribute in a subquery. Nano
+            // has no extended stats — return the empty 9-column shape
+            // so libpq's column-count check succeeds (KanttBan #7
+            // follow-up, v3.30.1 smoke).
+            Some((Schema::new(vec![
+                Column::new("oid", DataType::Int4),
+                Column::new("stxrelid", DataType::Text),
+                Column::new("nsp", DataType::Text),
+                Column::new("stxname", DataType::Text),
+                Column::new("columns", DataType::Text),
+                Column::new("ndist_enabled", DataType::Boolean),
+                Column::new("deps_enabled", DataType::Boolean),
+                Column::new("mcv_enabled", DataType::Boolean),
+                Column::new("stxstattarget", DataType::Int4),
+            ]), vec![]))
+        } else if query_lower.contains("pg_catalog.pg_policy ")
+            || query_lower.contains("from pg_policy ")
+            || query_lower.contains("pg_catalog.pg_policy\n")
+        {
+            // pg_policy (singular catalog table; pg_policies is the
+            // schemaname-prefixed view above). psql `\d <table>` sends
+            // a 6-column query against this. Empty shape.
+            Some((Schema::new(vec![
+                Column::new("polname", DataType::Text),
+                Column::new("polpermissive", DataType::Boolean),
+                Column::new("roles", DataType::Text),
+                Column::new("qual", DataType::Text),
+                Column::new("with_check", DataType::Text),
+                Column::new("cmd", DataType::Text),
+            ]), vec![]))
         } else if query_lower.contains("pg_matviews") {
             // Materialized views — drizzle-kit also introspects this.
             // Standard 6-column shape; we have first-class support
@@ -1220,8 +1252,16 @@ impl PgCatalog {
         // and emit the 7-column shape filled from our internal schema —
         // identity / generated / collation default to empty since Nano
         // doesn't expose them.
-        if q.contains("pg_catalog.pg_attribute")
-            && q.contains("attnum")
+        //
+        // KanttBan #7 follow-up (v3.30.1 smoke): the previous matcher
+        // false-fired on `pg_statistic_ext` queries which JOIN
+        // `pg_catalog.pg_attribute` in a subquery. Tightened to require
+        // the OUTER `FROM pg_catalog.pg_attribute a` plus the
+        // `a.attrelid = '<oid>'` WHERE predicate that only the
+        // descriptor query emits.
+        if q.contains("from pg_catalog.pg_attribute a")
+            && q.contains("a.attrelid = '")
+            && q.contains("a.attnum > 0")
             && q.contains("attisdropped")
         {
             let schema = Schema::new(vec![

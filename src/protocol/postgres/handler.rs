@@ -1576,14 +1576,31 @@ fn pg_looks_like_do_block(trimmed: &str) -> bool {
 /// it's always `null` (a no-op).
 fn pg_split_exception(body: &str) -> (&str, Vec<String>) {
     let upper = body.to_ascii_uppercase();
-    let padded = format!(" {upper} ");
-    let needle = " EXCEPTION ";
-    let Some(off_in_padded) = padded.find(needle) else {
+    // KanttBan #14 (v3.30.1 smoke): the previous needle `" EXCEPTION "`
+    // only matched space-bounded EXCEPTION. drizzle-kit emits a
+    // multi-line shape with a newline before `EXCEPTION`, which
+    // slipped past the split — `pg_detect_plpgsql` then ran on the
+    // un-stripped body and (after we taught it to ignore IF NOT EXISTS)
+    // the unstripped EXCEPTION clause leaked through to the SQL
+    // splitter, which fed `EXCEPTION WHEN duplicate_object …` to
+    // sqlparser as a top-level statement and parse-errored.
+    //
+    // Find the standalone `EXCEPTION` keyword by checking for any
+    // ASCII whitespace immediately before and after it.
+    let offset = upper
+        .match_indices("EXCEPTION")
+        .find(|(idx, _)| {
+            let before_ok = *idx == 0
+                || upper.as_bytes().get(*idx - 1).copied().is_some_and(|b| b.is_ascii_whitespace());
+            let after_pos = *idx + "EXCEPTION".len();
+            let after_ok = after_pos == upper.len()
+                || upper.as_bytes().get(after_pos).copied().is_some_and(|b| b.is_ascii_whitespace());
+            before_ok && after_ok
+        })
+        .map(|(idx, _)| idx);
+    let Some(offset) = offset else {
         return (body, Vec::new());
     };
-    // Map the position back to the original (un-padded, mixed-case) body.
-    // off_in_padded counts from the leading space we added; subtract 1.
-    let offset = off_in_padded.saturating_sub(1);
     let main = &body[..offset];
     let exception_block = &body[offset + "EXCEPTION".len()..];
 
@@ -1789,5 +1806,52 @@ mod plpgsql_detection_tests {
         assert_eq!(pg_detect_plpgsql("LOOP exit; END LOOP;"), Some("LOOP"));
         assert_eq!(pg_detect_plpgsql("RAISE NOTICE 'hi';"), Some("RAISE"));
         assert_eq!(pg_detect_plpgsql("DECLARE v integer;"), Some("DECLARE"));
+    }
+}
+
+#[cfg(test)]
+mod do_block_split_tests {
+    use super::pg_split_exception;
+
+    #[test]
+    fn split_handles_newline_before_exception() {
+        // KanttBan #14 (v3.30.1 smoke): drizzle-kit emits the
+        // EXCEPTION clause on its own line — `\n` before EXCEPTION,
+        // which the previous space-bounded needle missed.
+        let body = "CREATE TABLE IF NOT EXISTS hdb_test_do (id integer);\n\
+                    EXCEPTION WHEN duplicate_object THEN null;";
+        let (main, codes) = pg_split_exception(body);
+        assert!(main.starts_with("CREATE TABLE"));
+        assert!(!main.to_ascii_uppercase().contains("EXCEPTION"));
+        assert_eq!(codes, vec!["duplicate_object".to_string()]);
+    }
+
+    #[test]
+    fn split_still_handles_inline_exception() {
+        let body = "ALTER TABLE x ADD COLUMN y INT; EXCEPTION WHEN duplicate_column THEN null;";
+        let (main, codes) = pg_split_exception(body);
+        assert!(main.starts_with("ALTER TABLE"));
+        assert!(!main.to_ascii_uppercase().contains("EXCEPTION"));
+        assert_eq!(codes, vec!["duplicate_column".to_string()]);
+    }
+
+    #[test]
+    fn split_handles_no_exception() {
+        let body = "ALTER TABLE x ADD COLUMN y INT;";
+        let (main, codes) = pg_split_exception(body);
+        assert_eq!(main, body);
+        assert!(codes.is_empty());
+    }
+
+    #[test]
+    fn split_does_not_match_exception_inside_identifier() {
+        // `MY_EXCEPTION_TABLE` should not be confused with the EXCEPTION
+        // keyword. Standalone EXCEPTION later in the body still wins.
+        let body = "SELECT * FROM my_exception_table;\nEXCEPTION WHEN others THEN null;";
+        let (main, codes) = pg_split_exception(body);
+        assert!(main.starts_with("SELECT"));
+        assert!(main.to_ascii_uppercase().contains("MY_EXCEPTION_TABLE"));
+        assert!(!main.to_ascii_uppercase().ends_with("EXCEPTION"));
+        assert_eq!(codes, vec!["others".to_string()]);
     }
 }
