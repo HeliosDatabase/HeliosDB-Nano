@@ -5,7 +5,7 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [3.30.1] - 2026-05-07
+## [3.30.1] - 2026-05-09
 
 ### Fixed — KanttBan v3.30 re-test: 3 of 4 still-open quirks
 
@@ -36,28 +36,67 @@ catalog rows back instead of a scalar / bucketed shape, and
 
 Closes the only remaining tooling-blocker for `drizzle-kit push`.
 
-#### Bug #7 — `psql \d <table>` "column number 5 is out of range 0..4"
+#### Bug #7 — `psql \d <table>` end-to-end
 
-`\d` issues two pg_class queries; the second is a 15-column
-header pull that the previous matcher served from the generic
-5-column `query_pg_class` fallback, so libpq errored when it
-tried to read column index 5. Added an explicit matcher in
-`try_psql_metacommand` keyed on
-`relchecks` + `relhasindex` + `c.oid = '<oid>'` that returns
-the full 15-column shape psql expects (`relkind`,
-`relhasindex`, `relhastriggers`, `relrowsecurity`, …,
-`am.amname`).
+`\d <table>` sends ~9 catalog sub-queries in sequence, several
+of which our handler matched too loosely or not at all. The
+previous matcher only fixed the second (15-col pg_class
+header); end-to-end smoke against the freshly-built v3.30.1
+binary surfaced four more issues that all manifested as
+"column number N is out of range 0..M" libpq errors followed
+by a psql segfault. Now handled in `try_psql_metacommand`
+(`src/protocol/postgres/catalog.rs`):
+
+- **Q1 (relation OID lookup)** — `c.relname OPERATOR(pg_catalog.~)
+  '^(<name>)$'`. Was falling through to the generic 5-col
+  `query_pg_class`, which returned every table; psql then
+  iterated `\d` over each one in turn. Added a regex-aware
+  matcher that returns exactly the matching relation.
+- **Q3 (per-column descriptor)** — the previous 7-col matcher
+  was keyed on `pg_catalog.pg_attribute` + `attnum` +
+  `attisdropped`, which false-fired on the `pg_statistic_ext`
+  query that JOINs `pg_attribute` in a subquery. Tightened to
+  require the OUTER `from pg_catalog.pg_attribute a` plus
+  `a.attrelid = '<oid>'`.
+- **Q4 (index-list, 12 cols)** — `pg_get_indexdef` +
+  `pg_get_constraintdef` + `c2.relname`. The generic
+  `query_pg_index` returned 5 cols. New matcher emits one row
+  per PRIMARY KEY / UNIQUE column with the full 12-col shape.
+- **Q5 / Q6 / Q7 / Q8** — added empty-shape stubs for
+  `pg_statistic_ext` (9 cols), `pg_policy` singular catalog
+  table (6 cols), `pg_publication` (1 col), `pg_inherits`
+  (3 cols). Without these the queries fell through to
+  `query_pg_class` / `query_pg_attribute` / `query_pg_roles`
+  and rendered bogus inheritance / partition / RLS sections.
+
+Net result: `psql -c '\d users'` now renders the full
+`Table "public.users"` panel with column types, defaults,
+nullability, and indexes — no error, no segfault, no spurious
+inheritance info.
 
 #### Bug #14 — `DO $$ BEGIN CREATE TABLE IF NOT EXISTS … END $$`
 
-`pg_detect_plpgsql` did a substring scan for ` IF ` and
-flagged the SQL DDL idiom `IF NOT EXISTS` as PL/pgSQL control
-flow. Now strips ` IF NOT EXISTS ` / ` IF EXISTS ` from the
-body before the keyword scan; genuine PL/pgSQL `IF cond THEN`
-is still detected (regression-tested).
+Two layered issues, both in
+`src/protocol/postgres/handler.rs`:
+
+1. `pg_detect_plpgsql` did a substring scan for ` IF ` and
+   flagged the SQL DDL idiom `IF NOT EXISTS` as PL/pgSQL
+   control flow. Now strips ` IF NOT EXISTS ` / ` IF EXISTS `
+   from the body before the keyword scan; genuine PL/pgSQL
+   `IF cond THEN` is still detected (regression-tested).
+2. `pg_split_exception` used a needle ` EXCEPTION `
+   (space-bounded), so when drizzle-kit emitted the EXCEPTION
+   clause on its own line — `\n` before EXCEPTION — the split
+   missed it. The unstripped clause then leaked through to
+   `pg_split_sql_respecting_quotes` which handed
+   `EXCEPTION WHEN duplicate_object THEN null` to sqlparser as
+   a top-level statement. Replaced with a `match_indices` walk
+   that accepts any ASCII whitespace before/after the keyword.
 
 drizzle-kit's idempotent `CREATE TABLE IF NOT EXISTS` wrapped
-in a DO block now executes.
+in a DO block now executes; the rerun catches via the
+EXCEPTION handler (or is a no-op when IF NOT EXISTS suppresses
+the error first).
 
 ## [3.30.0] - 2026-05-04
 
