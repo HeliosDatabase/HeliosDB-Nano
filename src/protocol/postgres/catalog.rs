@@ -234,8 +234,6 @@ impl PgCatalog {
                 Column::new("objsubid", DataType::Int4),
                 Column::new("description", DataType::Text),
             ]), vec![]))
-        } else if query_lower.contains("pg_roles") || query_lower.contains("pg_user") {
-            Some(self.query_pg_roles()?)
         } else if query_lower.contains("pg_proc") {
             // Procedures — empty set is fine (we don't expose pg_catalog-registered functions).
             Some((Schema::new(vec![
@@ -243,19 +241,21 @@ impl PgCatalog {
                 Column::new("proname", DataType::Text),
                 Column::new("pronamespace", DataType::Int4),
             ]), vec![]))
-        } else if query_lower.contains("pg_class") {
-            Some(self.query_pg_class()?)
-        } else if query_lower.contains("pg_namespace") {
-            Some(self.query_pg_namespace()?)
         } else if query_lower.contains("pg_database") {
             Some(self.query_pg_database()?)
         } else if query_lower.contains("pg_settings") {
             Some(self.query_pg_settings()?)
-        } else if query_lower.contains("pg_attribute") {
-            Some(self.query_pg_attribute()?)
         } else {
-            // Return empty result for unknown catalog queries
-            Some((Schema::new(vec![]), vec![]))
+            // KanttBan #22 (v3.31.0): pg_namespace / pg_class / pg_attribute /
+            // pg_index / pg_constraint / pg_user / pg_roles previously had
+            // fixed-shape branches here. They now flow through the regular
+            // planner via the SystemViewRegistry (see src/sql/planner.rs
+            // dealias_schema + table_factor_to_plan; src/sql/executor/scan.rs
+            // handle_scan). Returning None signals the caller to fall through
+            // to the planner; the planner handles SELECT projection, column
+            // aliases, JOINs, complex WHERE, aggregates — all the things
+            // this substring router didn't.
+            return Ok(None);
         };
 
         // Apply WHERE filter + column projection based on the user's

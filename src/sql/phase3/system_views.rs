@@ -2012,6 +2012,33 @@ impl SystemViewRegistry {
         // Always registered so the view is discoverable; the
         // executor returns an empty result when the code-graph
         // feature isn't compiled in.
+        // ---- KanttBan #22 (v3.31.0) — pg_user for catalog JOINs ----
+        // drizzle-kit / Postgres ORMs JOIN pg_namespace ⨝ pg_user on
+        // `u.usesysid = n.nspowner` to attribute schemas to owners.
+        // Pre-v3.31.0 the substring-routed short-circuit in
+        // protocol/postgres/catalog.rs picked the first matching branch
+        // (pg_roles) and discarded the pg_namespace side of the JOIN,
+        // returning bogus rows. Now JOINs flow through the regular
+        // operator pipeline; pg_user just needs to exist as a scannable
+        // source with the standard shape.
+        self.register_view(SystemViewSchema {
+            name: "pg_user".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("usename", DataType::Text),
+                    sv_col("usesysid", DataType::Int4),
+                    sv_col("usecreatedb", DataType::Boolean),
+                    sv_col("usesuper", DataType::Boolean),
+                    sv_col("userepl", DataType::Boolean),
+                    sv_col("usebypassrls", DataType::Boolean),
+                    sv_col("passwd", DataType::Text),
+                    sv_col("valuntil", DataType::Text),
+                    sv_col("useconfig", DataType::Text),
+                ],
+            },
+            description: "Built-in PG-compat view over pg_authid (read-only stub)".to_string(),
+        });
+
         self.register_view(SystemViewSchema {
             name: "hdb_code_languages".to_string(),
             schema: Schema {
@@ -2049,6 +2076,27 @@ impl SystemViewRegistry {
     fn register_view(&mut self, view: SystemViewSchema) {
         self.views.insert(view.name.clone(), view);
     }
+}
+
+/// Build a non-PK, non-unique nullable column with default storage —
+/// the shape system-view columns take. Reduces the per-column boilerplate
+/// from 9 fields to 2.
+#[inline]
+fn sv_col(name: &str, data_type: DataType) -> Column {
+    Column {
+        name: name.to_string(),
+        data_type,
+        nullable: true,
+        primary_key: false,
+        source_table: None,
+        source_table_name: None,
+        default_expr: None,
+        unique: false,
+        storage_mode: ColumnStorageMode::Default,
+    }
+}
+
+impl SystemViewRegistry {
 
     /// Get system view schema
     pub fn get_schema(&self, view_name: &str) -> Option<&Schema> {
@@ -2092,6 +2140,7 @@ impl SystemViewRegistry {
             "pg_attribute" => Self::execute_pg_attribute(storage),
             "pg_type" => Self::execute_pg_type(storage),
             "pg_namespace" => Self::execute_pg_namespace(storage),
+            "pg_user" => Self::execute_pg_user(),
             "sqlite_master" => Self::execute_sqlite_master(storage),
             "pg_index" => Self::execute_pg_index(storage),
             "pg_constraint" => Self::execute_pg_constraint(storage),
@@ -2448,6 +2497,28 @@ impl SystemViewRegistry {
     /// Always exposes `public` + `information_schema`; other
     /// schemas (`_hdb_code` / `_hdb_graph` / user-created) come
     /// from the catalog's `list_schemas()` materialisation.
+    /// KanttBan #22 (v3.31.0): pg_user as a read-only stub. Mirrors
+    /// the two hard-coded roles the legacy substring router exposed
+    /// via query_pg_roles in `protocol/postgres/catalog.rs`.
+    /// usesysid is the value drivers JOIN to nspowner / relowner /
+    /// proowner; keep it stable at 10 (postgres) and 11 (helios) so
+    /// existing introspection sees the schemas / tables as owned by
+    /// the postgres super-user.
+    fn execute_pg_user() -> Result<Vec<Tuple>> {
+        let role = |name: &str, uid: i32| Tuple::new(vec![
+            Value::String(name.into()),     // usename
+            Value::Int4(uid),                // usesysid
+            Value::Boolean(true),            // usecreatedb
+            Value::Boolean(true),            // usesuper
+            Value::Boolean(true),            // userepl
+            Value::Boolean(true),            // usebypassrls
+            Value::Null,                     // passwd
+            Value::Null,                     // valuntil
+            Value::Null,                     // useconfig
+        ]);
+        Ok(vec![role("postgres", 10), role("helios", 11)])
+    }
+
     fn execute_pg_namespace(storage: &StorageEngine) -> Result<Vec<Tuple>> {
         use std::collections::BTreeSet;
         let mut all: BTreeSet<String> = BTreeSet::new();
