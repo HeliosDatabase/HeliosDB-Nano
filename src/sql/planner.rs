@@ -311,6 +311,14 @@ impl<'a> Planner<'a> {
         if let Some(rest) = name.strip_prefix("_hdb_graph.") {
             return Some(format!("_hdb_graph_{rest}"));
         }
+        // KanttBan #22 (v3.31.0): treat `pg_catalog.<view>` and bare
+        // `<view>` as equivalent for system-view lookup. The Phase 3
+        // SystemViewRegistry keys on bare names; psql / drizzle-kit /
+        // most ORMs schema-qualify catalog reads. Stripping the prefix
+        // here funnels both forms to the same registry entry.
+        if let Some(rest) = name.strip_prefix("pg_catalog.") {
+            return Some(rest.to_string());
+        }
         None
     }
 
@@ -1391,15 +1399,37 @@ impl<'a> Planner<'a> {
                     });
                 }
 
-                // Check if this is a system view (Phase 3 features)
+                // Check if this is a system view (Phase 3 features).
+                //
+                // KanttBan #22 (v3.31.0): previously this returned a
+                // `LogicalPlan::SystemView` terminal that didn't
+                // compose with Project / Filter / Join — so
+                // `SELECT n.nspname AS x FROM pg_namespace n` had no
+                // way to reach the projection / alias logic. Now we
+                // emit `LogicalPlan::Scan` with the registry's schema;
+                // `scan::handle_scan` recognises the table name and
+                // materialises rows from the registry. This makes
+                // catalog reads first-class in the operator pipeline
+                // — WHERE / JOIN / projection / aliases all "just
+                // work" because the same operators handle them as for
+                // user tables.
                 use crate::sql::phase3::SystemViewRegistry;
                 let registry = SystemViewRegistry::new();
 
                 if registry.is_system_view(&table_name) {
-                    // This is a system view, not a regular table
-                    return Ok(LogicalPlan::SystemView {
-                        name: table_name,
-                        args: vec![], // System views don't use arguments from table name
+                    let schema = Arc::new(
+                        registry
+                            .get_schema(&table_name)
+                            .cloned()
+                            .unwrap_or_else(|| Schema { columns: vec![] }),
+                    );
+                    let table_alias = alias.as_ref().map(|a| a.name.value.clone());
+                    return Ok(LogicalPlan::Scan {
+                        table_name,
+                        alias: table_alias,
+                        schema,
+                        projection: None,
+                        as_of: None,
                     });
                 }
 

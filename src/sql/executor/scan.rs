@@ -269,6 +269,37 @@ pub(super) fn handle_scan(
             ).with_timeout(executor.timeout_ctx())));
         }
 
+        // KanttBan #22 (v3.31.0): system-view source (pg_namespace,
+        // pg_class, pg_attribute, …). The planner rewrites
+        // `pg_catalog.<view>` → `<view>` and emits Scan; we materialise
+        // the rows from the Phase 3 registry here so Project / Filter /
+        // Join compose on top exactly like a user table.
+        use crate::sql::phase3::SystemViewRegistry;
+        let registry = SystemViewRegistry::new();
+        if registry.is_system_view(table_name) {
+            let storage = executor.storage().ok_or_else(|| {
+                Error::query_execution(
+                    "system view requires storage context".to_string(),
+                )
+            })?;
+            let mut schema = registry
+                .get_schema(table_name)
+                .cloned()
+                .unwrap_or_else(|| Schema { columns: vec![] });
+            for col in &mut schema.columns {
+                col.source_table = Some(source_name.clone());
+                col.source_table_name = Some(table_name.clone());
+            }
+            let tuples = registry.execute(table_name, storage)?;
+            return Ok(Box::new(ScanOperator::new(
+                table_name.clone(),
+                Arc::new(schema),
+                projection.clone(),
+                tuples,
+                executor.parameters().to_vec(),
+            ).with_timeout(executor.timeout_ctx())));
+        }
+
         // Fetch actual schema from storage and scan table
         let (actual_schema, tuples) = if let Some(storage) = executor.storage() {
             let catalog = storage.catalog();
