@@ -216,16 +216,15 @@ impl PgCatalog {
             Some((Schema::new(vec![
                 Column::new("pubname", DataType::Text),
             ]), vec![]))
-        } else if query_lower.contains("pg_index") && !query_lower.contains("pg_indexes") {
-            Some(self.query_pg_index()?)
         } else if query_lower.contains("pg_indexes") {
+            // pg_indexes (the user-facing view) — not in the registry
+            // yet. Leave as fixed-shape until migrated.
             Some(self.query_pg_indexes()?)
         } else if query_lower.contains("pg_tables") {
+            // Same — leave until migrated to registry.
             Some(self.query_pg_tables()?)
         } else if query_lower.contains("pg_views") {
             Some(self.query_pg_views()?)
-        } else if query_lower.contains("pg_constraint") {
-            Some(self.query_pg_constraint()?)
         } else if query_lower.contains("pg_description") {
             // No table/column comments stored.
             Some((Schema::new(vec![
@@ -2273,57 +2272,55 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // KanttBan #21A (v3.30.1) — aggregates / WHERE IS NULL on catalog
-    // tables. drizzle-kit's introspection emits these shapes; without
-    // the apply_aggregate stage they short-circuit catalog tuples back
-    // to the client and break `drizzle-kit push`.
+    // KanttBan #21A (v3.30.1) — aggregates / WHERE IS NULL on pg_catalog.
+    //
+    // v3.30.1 implemented these in a custom `apply_aggregate` post-filter
+    // stage inside the catalog handler. v3.31.0 (KanttBan #22) moved the
+    // catalog reads through the regular planner — these queries now
+    // return `Ok(None)` from `handle_query` and the planner's aggregate
+    // operator takes over. The contract these tests assert flipped:
+    //     v3.30.1: Some((schema=[count], rows=[Int8(n)]))
+    //     v3.31.0: None  (fall through to planner)
+    // End-to-end behaviour for the user is identical (smoked via psql);
+    // tested here at the handler boundary.
     // -------------------------------------------------------------------
 
     #[test]
-    fn count_star_pg_namespace_returns_scalar() {
+    fn count_star_pg_namespace_falls_through_to_planner() {
         let catalog = PgCatalog::new();
         let result = catalog
             .handle_query("select count(*) from pg_namespace")
-            .unwrap()
             .unwrap();
-        let (schema, rows) = result;
-        assert_eq!(schema.columns.len(), 1);
-        assert_eq!(schema.columns[0].name, "count");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values[0], Value::Int8(2));
+        assert!(result.is_none(), "pg_namespace should fall through to planner; got {result:?}");
     }
 
     #[test]
-    fn count_star_with_is_null_filter_returns_zero() {
-        // Reproduces the exact KanttBan #21A repro:
+    fn count_star_with_is_null_filter_falls_through_to_planner() {
+        // Original KanttBan #21A shape:
         // SELECT count(*) FROM pg_namespace WHERE nspname IS NULL;
         let catalog = PgCatalog::new();
-        let (schema, rows) = catalog
+        let result = catalog
             .handle_query("select count(*) from pg_namespace where nspname is null")
-            .unwrap()
             .unwrap();
-        assert_eq!(schema.columns.len(), 1);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values[0], Value::Int8(0));
+        assert!(result.is_none(), "pg_namespace WHERE IS NULL should fall through; got {result:?}");
     }
 
     #[test]
-    fn count_star_with_is_not_null_filter_returns_all() {
+    fn count_star_with_is_not_null_filter_falls_through_to_planner() {
         let catalog = PgCatalog::new();
-        let (_schema, rows) = catalog
+        let result = catalog
             .handle_query("select count(*) from pg_namespace where nspname is not null")
-            .unwrap()
             .unwrap();
-        assert_eq!(rows[0].values[0], Value::Int8(2));
+        assert!(result.is_none(), "pg_namespace WHERE IS NOT NULL should fall through; got {result:?}");
     }
 
     #[test]
-    fn group_by_information_schema_tables_buckets_correctly() {
-        // Reproduces the `drizzle-kit push` blocker shape:
-        // SELECT table_schema, count(*) FROM information_schema.tables
-        // GROUP BY table_schema;
-        // Without a database attached the rows list is empty, but we
-        // still want the response shape to be (table_schema, count).
+    fn group_by_information_schema_tables_still_handled_by_catalog_router() {
+        // information_schema.tables hasn't been migrated to the registry
+        // yet (slice 3+ work). It still hits the legacy
+        // apply_aggregate post-filter path, so the v3.30.1 contract
+        // (Some-with-count-shape) holds. Once migrated, flip this to
+        // expect None like the pg_namespace tests above.
         let catalog = PgCatalog::new();
         let (schema, rows) = catalog
             .handle_query(
