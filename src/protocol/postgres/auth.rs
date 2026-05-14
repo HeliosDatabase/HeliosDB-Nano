@@ -84,11 +84,12 @@ pub fn parse_scram_client_first(msg: &str) -> Result<(String, String)> {
     let nonce = nonce.ok_or_else(|| {
         Error::protocol("Invalid SCRAM client-first-message: missing nonce (r=)")
     })?;
-    if username.is_empty() {
-        return Err(Error::protocol(
-            "Invalid SCRAM client-first-message: empty username",
-        ));
-    }
+    // BUG-003 (Perf-73): per RFC 5802 and the Postgres SCRAM profile, the
+    // SCRAM `n=` field MUST be empty — the real username comes from the
+    // StartupMessage's `user` parameter. libpq, psycopg, pgx and every other
+    // standards-compliant driver sends `n,,n=,r=<nonce>`. Allow empty
+    // username at this layer; callers must source the actual user name from
+    // the connection's startup parameters, not from SCRAM.
     if nonce.is_empty() {
         return Err(Error::protocol(
             "Invalid SCRAM client-first-message: empty nonce",

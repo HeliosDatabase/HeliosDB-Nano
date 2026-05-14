@@ -755,7 +755,17 @@ where
         self.flush().await?; // Client must read challenge before responding
 
         // Wait for client-first-message (SASL initial response)
+        // BUG-003 (restored iter-72): accept the parser's SaslInitialResponse
+        // variant. Older handler only matched PasswordMessage, which read the
+        // SCRAM body as if it were null-terminated and lost everything after
+        // "SCRAM-SHA-256" — every libpq client then failed
+        // `parse_scram_client_first` with "missing GS2 authzid slot".
         let client_first = match self.read_message().await? {
+            Some(FrontendMessage::SaslInitialResponse { mechanism: _, data }) => {
+                String::from_utf8(data).map_err(|e| {
+                    Error::protocol(format!("SCRAM client-first-message not UTF-8: {}", e))
+                })?
+            }
             Some(FrontendMessage::PasswordMessage { password }) => password,
             _ => return Err(Error::protocol("Expected SASL initial response")),
         };
@@ -766,8 +776,17 @@ where
         // parser ignored the GS2 header and misaligned every offset for
         // real clients (libpq, asyncpg, node-postgres, JDBC). Now
         // delegated to `auth::parse_scram_client_first`.
-        let (username_owned, client_nonce_owned) =
+        // BUG-003 (Perf-73): per RFC 5802 + the Postgres SCRAM profile, the
+        // SCRAM `n=` field is empty. Source the real username from the
+        // StartupMessage that was stored on `self.username` during the
+        // startup phase.
+        let (_scram_user_unused, client_nonce_owned) =
             super::auth::parse_scram_client_first(&client_first)?;
+        let username_owned = self.username.clone().ok_or_else(|| {
+            Error::authentication(
+                "SCRAM authentication started without a startup-time user name",
+            )
+        })?;
         let username: &str = &username_owned;
         let client_nonce: &str = &client_nonce_owned;
 
@@ -784,8 +803,12 @@ where
         let mut scram_state = ScramAuthState::new(username.to_string());
         scram_state.set_client_nonce(client_nonce.to_string());
 
-        // Build client-first-message-bare for auth message
-        let client_first_bare = format!("n={},r={}", username, client_nonce);
+        // Build client-first-message-bare for auth message.
+        // BUG-003 (Perf-73): MUST match exactly what the client sent (empty
+        // `n=` per the Postgres SCRAM profile + RFC 5802) — the SCRAM proof
+        // verification hashes this string. Reconstructing with the startup
+        // user breaks the proof and yields "Invalid password".
+        let client_first_bare = format!("n=,r={}", client_nonce);
         scram_state.set_client_first_message_bare(client_first_bare);
 
         // Generate server-first-message
@@ -801,8 +824,14 @@ where
         )).await?;
         self.flush().await?; // Client must read continue before responding
 
-        // Wait for client-final-message
+        // Wait for client-final-message. BUG-003 (Perf-73): SCRAM client-final
+        // arrives as a SASLResponse (no mechanism prefix), not a PasswordMessage.
         let client_final = match self.read_message().await? {
+            Some(FrontendMessage::SaslResponse { data }) => {
+                String::from_utf8(data).map_err(|e| {
+                    Error::protocol(format!("SCRAM client-final-message not UTF-8: {}", e))
+                })?
+            }
             Some(FrontendMessage::PasswordMessage { password }) => password,
             _ => return Err(Error::protocol("Expected SASL response")),
         };

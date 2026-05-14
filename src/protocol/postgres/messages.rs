@@ -445,9 +445,55 @@ impl FrontendMessage {
     }
 
     fn parse_password(buf: &mut BytesMut, len: usize) -> Result<Self> {
-        buf.advance(4); // Skip length
-        let password = read_cstring(buf)?;
-        Ok(FrontendMessage::PasswordMessage { password })
+        // BUG-003 (Perf-73): the 'p' message tag covers THREE wire shapes:
+        //   - PasswordMessage:    `<password>\0`
+        //   - SaslInitialResponse: `<mechanism>\0<i32 data_len><data>`
+        //   - SaslResponse:       `<data>` (raw, length = msg body)
+        // Differentiate by the first body byte. SaslResponse's data is a
+        // SCRAM client-final like `c=biws,r=…,p=…` whose first byte is an
+        // ASCII letter (no leading null). PasswordMessage / SaslInitial both
+        // start with a printable name followed by `\0`. The unambiguous tell
+        // for SaslResponse is "no null byte in the body" — peek to decide.
+        buf.advance(4); // Skip length field
+        let body_len = len.saturating_sub(4);
+        if body_len == 0 {
+            return Ok(FrontendMessage::PasswordMessage { password: String::new() });
+        }
+        // Peek the body to see if it contains a null byte.
+        let has_null = buf.chunk().iter().take(body_len).any(|b| *b == 0);
+        if !has_null {
+            // SaslResponse: raw bytes only.
+            let mut data = vec![0u8; body_len];
+            buf.copy_to_slice(&mut data);
+            return Ok(FrontendMessage::SaslResponse { data });
+        }
+        // Has at least one null: parse first cstring.
+        let cstring_start_remaining = buf.remaining();
+        let first = read_cstring(buf)?;
+        let consumed_by_cstring = cstring_start_remaining - buf.remaining();
+        let body_left = body_len.saturating_sub(consumed_by_cstring);
+        if body_left == 0 {
+            return Ok(FrontendMessage::PasswordMessage { password: first });
+        }
+        // SaslInitialResponse: cstring + i32 data_len + data.
+        if body_left < 4 || buf.remaining() < 4 {
+            return Err(Error::protocol(
+                "SASL InitialResponse: truncated data length",
+            ));
+        }
+        let data_len_raw = buf.get_i32();
+        let data_len = if data_len_raw < 0 { 0 } else { data_len_raw as usize };
+        if buf.remaining() < data_len {
+            return Err(Error::protocol(
+                "SASL InitialResponse: truncated response data",
+            ));
+        }
+        let mut data = vec![0u8; data_len];
+        buf.copy_to_slice(&mut data);
+        Ok(FrontendMessage::SaslInitialResponse {
+            mechanism: first,
+            data,
+        })
     }
 
     fn parse_close(buf: &mut BytesMut, len: usize) -> Result<Self> {
