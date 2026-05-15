@@ -145,6 +145,23 @@ impl PgCatalog {
             Some((Schema::new(vec![
                 Column::new("pubname", DataType::Text),
             ]), vec![]))
+        } else if query_lower.contains("pg_statistic_ext") {
+            // Same carve-out: psql's `\d` query against pg_statistic_ext
+            // projects `stxrelid::pg_catalog.regclass` and
+            // `stxnamespace::pg_catalog.regnamespace`, both regclass-family
+            // type casts the planner doesn't handle. Empty 9-col shape
+            // matches the slice 5 registry registration.
+            Some((Schema::new(vec![
+                Column::new("oid", DataType::Int4),
+                Column::new("stxrelid", DataType::Text),
+                Column::new("nsp", DataType::Text),
+                Column::new("stxname", DataType::Text),
+                Column::new("columns", DataType::Text),
+                Column::new("ndist_enabled", DataType::Boolean),
+                Column::new("deps_enabled", DataType::Boolean),
+                Column::new("mcv_enabled", DataType::Boolean),
+                Column::new("stxstattarget", DataType::Int4),
+            ]), vec![]))
         } else if query_lower.contains("pg_indexes") {
             // pg_indexes (the user-facing view) — not in the registry
             // yet. Leave as fixed-shape until migrated.
