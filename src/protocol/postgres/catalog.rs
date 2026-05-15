@@ -77,7 +77,14 @@ impl PgCatalog {
             if query_lower.contains("information_schema.columns") {
                 Some(self.query_information_schema_columns(&query_lower)?)
             } else if query_lower.contains("information_schema.tables") {
-                Some(self.query_information_schema_tables(&query_lower)?)
+                // KanttBan #22 (v3.31.0 slice 4): migrated to the
+                // SystemViewRegistry. Returning None falls through to
+                // the planner; the registry's
+                // `execute_information_schema_tables` handles WHERE /
+                // alias / JOIN natively. The legacy
+                // `query_information_schema_tables` helper still
+                // exists for tests that hit it directly.
+                return Ok(None);
             } else if query_lower.contains("information_schema.key_column_usage") {
                 Some(self.query_information_schema_key_column_usage()?)
             } else if query_lower.contains("information_schema.table_constraints") {
@@ -240,8 +247,6 @@ impl PgCatalog {
                 Column::new("proname", DataType::Text),
                 Column::new("pronamespace", DataType::Int4),
             ]), vec![]))
-        } else if query_lower.contains("pg_database") {
-            Some(self.query_pg_database()?)
         } else if query_lower.contains("pg_settings") {
             Some(self.query_pg_settings()?)
         } else {
@@ -2225,14 +2230,15 @@ mod tests {
 
     #[test]
     fn test_handle_query_information_schema_tables() {
+        // v3.31.0 slice 4: information_schema.tables migrated to the
+        // SystemViewRegistry. The catalog handler now returns None
+        // (falls through to the planner) instead of doing its own
+        // limited projection / WHERE filtering.
         let catalog = PgCatalog::new();
-        let result = catalog.handle_query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'");
-        assert!(result.is_ok());
-        // Without database, returns empty but doesn't error
-        // project_columns reduces to only the requested column (table_name)
-        let (schema, rows) = result.unwrap().unwrap();
-        assert_eq!(schema.columns.len(), 1);
-        assert_eq!(rows.len(), 0);
+        let result = catalog
+            .handle_query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+            .unwrap();
+        assert!(result.is_none(), "information_schema.tables falls through; got {result:?}");
     }
 
     #[test]
@@ -2315,22 +2321,20 @@ mod tests {
     }
 
     #[test]
-    fn group_by_information_schema_tables_still_handled_by_catalog_router() {
-        // information_schema.tables hasn't been migrated to the registry
-        // yet (slice 3+ work). It still hits the legacy
-        // apply_aggregate post-filter path, so the v3.30.1 contract
-        // (Some-with-count-shape) holds. Once migrated, flip this to
-        // expect None like the pg_namespace tests above.
+    fn group_by_information_schema_tables_falls_through_to_planner() {
+        // v3.31.0 slice 4: information_schema.tables migrated to the
+        // SystemViewRegistry, so this query now falls through to the
+        // planner exactly like the pg_namespace variants above.
+        // End-to-end behaviour is preserved (smoked via psql); the
+        // aggregate is now applied by the planner's aggregate
+        // operator, not the catalog handler's apply_aggregate.
         let catalog = PgCatalog::new();
-        let (schema, rows) = catalog
+        let result = catalog
             .handle_query(
                 "select table_schema, count(*) from information_schema.tables group by table_schema",
             )
-            .unwrap()
             .unwrap();
-        assert_eq!(schema.columns.len(), 2);
-        assert_eq!(schema.columns[1].name, "count");
-        assert_eq!(rows.len(), 0);
+        assert!(result.is_none(), "information_schema.tables should fall through; got {result:?}");
     }
 
     #[test]

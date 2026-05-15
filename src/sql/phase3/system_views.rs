@@ -2039,6 +2039,46 @@ impl SystemViewRegistry {
             description: "Built-in PG-compat view over pg_authid (read-only stub)".to_string(),
         });
 
+        // information_schema.tables — drizzle-kit / Prisma / Knex /
+        // postgres-js all introspect through this. Same 4-column shape
+        // as the catalog handler's query_information_schema_tables.
+        self.register_view(SystemViewSchema {
+            name: "information_schema.tables".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("table_catalog", DataType::Text),
+                    sv_col("table_schema", DataType::Text),
+                    sv_col("table_name", DataType::Text),
+                    sv_col("table_type", DataType::Text),
+                ],
+            },
+            description: "SQL-standard table catalogue, sourced from storage::catalog::list_tables".to_string(),
+        });
+
+        // pg_database — \l, ORM connection introspection. Minimal
+        // implementation returns only the implicit 'heliosdb' row;
+        // tenant enumeration (the v3.25 CREATE DATABASE wrap) needs
+        // EmbeddedDatabase access which the registry execute()
+        // signature doesn't expose today — flag for v3.31.x follow-up.
+        self.register_view(SystemViewSchema {
+            name: "pg_database".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("oid", DataType::Int4),
+                    sv_col("datname", DataType::Text),
+                    sv_col("datdba", DataType::Int4),
+                    sv_col("encoding", DataType::Int4),
+                    sv_col("datcollate", DataType::Text),
+                    sv_col("datctype", DataType::Text),
+                    sv_col("datistemplate", DataType::Boolean),
+                    sv_col("datallowconn", DataType::Boolean),
+                    sv_col("datconnlimit", DataType::Int4),
+                    sv_col("dattablespace", DataType::Int4),
+                ],
+            },
+            description: "PG-compat database list (registry-stub; tenant enumeration deferred)".to_string(),
+        });
+
         self.register_view(SystemViewSchema {
             name: "hdb_code_languages".to_string(),
             schema: Schema {
@@ -2141,6 +2181,8 @@ impl SystemViewRegistry {
             "pg_type" => Self::execute_pg_type(storage),
             "pg_namespace" => Self::execute_pg_namespace(storage),
             "pg_user" => Self::execute_pg_user(),
+            "information_schema.tables" => Self::execute_information_schema_tables(storage),
+            "pg_database" => Self::execute_pg_database(),
             "sqlite_master" => Self::execute_sqlite_master(storage),
             "pg_index" => Self::execute_pg_index(storage),
             "pg_constraint" => Self::execute_pg_constraint(storage),
@@ -2497,6 +2539,48 @@ impl SystemViewRegistry {
     /// Always exposes `public` + `information_schema`; other
     /// schemas (`_hdb_code` / `_hdb_graph` / user-created) come
     /// from the catalog's `list_schemas()` materialisation.
+    /// KanttBan #22 (v3.31.0): information_schema.tables backed by
+    /// the storage catalogue. Mirrors the legacy
+    /// `protocol/postgres/catalog.rs::query_information_schema_tables`
+    /// (sans the substring LIKE filter — the planner handles WHERE
+    /// LIKE natively now).
+    fn execute_information_schema_tables(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let table_names = storage.catalog().list_tables()?;
+        let mut rows = Vec::with_capacity(table_names.len());
+        for name in &table_names {
+            rows.push(Tuple::new(vec![
+                Value::String("heliosdb".into()),
+                Value::String("public".into()),
+                Value::String(name.clone()),
+                Value::String("BASE TABLE".into()),
+            ]));
+        }
+        Ok(rows)
+    }
+
+    /// KanttBan #22 (v3.31.0): pg_database minimal stub. Only the
+    /// implicit `heliosdb` system database is enumerated — surfacing
+    /// tenant databases registered via `CREATE DATABASE` needs
+    /// `EmbeddedDatabase::tenant_manager` access, which the registry's
+    /// `execute(&StorageEngine)` signature doesn't carry. Deferred to
+    /// a follow-up that widens the executor context. `\l` already
+    /// renders only `heliosdb` (via try_psql_metacommand's own
+    /// matcher), so there's no current-behaviour regression.
+    fn execute_pg_database() -> Result<Vec<Tuple>> {
+        Ok(vec![Tuple::new(vec![
+            Value::Int4(1),                       // oid
+            Value::String("heliosdb".into()),     // datname
+            Value::Int4(10),                      // datdba
+            Value::Int4(6),                       // encoding = UTF8
+            Value::String("C.UTF-8".into()),      // datcollate
+            Value::String("C.UTF-8".into()),      // datctype
+            Value::Boolean(false),                // datistemplate
+            Value::Boolean(true),                 // datallowconn
+            Value::Int4(-1),                      // datconnlimit
+            Value::Int4(1663),                    // dattablespace = pg_default
+        ])])
+    }
+
     /// KanttBan #22 (v3.31.0): pg_user as a read-only stub. Mirrors
     /// the two hard-coded roles the legacy substring router exposed
     /// via query_pg_roles in `protocol/postgres/catalog.rs`.
