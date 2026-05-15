@@ -123,6 +123,28 @@ impl PgCatalog {
             return Ok(None);
         } else if query_lower.contains("pg_type") {
             Some(self.query_pg_type()?)
+        } else if query_lower.contains("pg_inherits") {
+            // KanttBan #22 slice 5 regression carve-out: pg_inherits
+            // is registered in the SystemViewRegistry but psql's `\d`
+            // sub-queries against it use `c.oid::pg_catalog.regclass`
+            // which the planner doesn't yet parse. Short-circuit with
+            // an empty 3-col shape so libpq doesn't error and psql's
+            // describe panel doesn't render bogus "Inherits" sections.
+            // Direct ORM queries against pg_inherits still get the
+            // empty rowset via this route — same behaviour as the
+            // registry would have produced.
+            Some((Schema::new(vec![
+                Column::new("oid", DataType::Text),
+                Column::new("relkind", DataType::Char(1)),
+                Column::new("partbound", DataType::Text),
+            ]), vec![]))
+        } else if query_lower.contains("pg_publication") {
+            // Same carve-out as pg_inherits: psql `\d` joins this with
+            // `pg_relation_is_publishable(<oid>)`, which the planner
+            // doesn't implement. Empty 1-col `pubname` response.
+            Some((Schema::new(vec![
+                Column::new("pubname", DataType::Text),
+            ]), vec![]))
         } else if query_lower.contains("pg_indexes") {
             // pg_indexes (the user-facing view) — not in the registry
             // yet. Leave as fixed-shape until migrated.
