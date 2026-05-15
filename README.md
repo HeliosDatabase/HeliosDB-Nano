@@ -90,7 +90,7 @@ heliosdb> SELECT * FROM products WHERE price < 15;
 
 ```bash
 $ psql -h 127.0.0.1 -p 5432 -U postgres
-psql (16.0, server HeliosDB Nano 3.13.0)
+psql (16.0, server HeliosDB Nano 3.30.1)
 postgres=# INSERT INTO products (name, price) VALUES ('Gizmo', 29.99);
 INSERT 0 1
 postgres=# SELECT COUNT(*) FROM products;
@@ -197,7 +197,33 @@ Deep `LIMIT … OFFSET` runs in ~30 µs regardless of offset, up to **334× fast
 than PostgreSQL 13** for 100k-row tables. Top-K over Sort, storage-level
 `OFFSET` skip, and keyset (`WHERE (col, id) < ($1, $2)`) are all native.
 
-See [pagination-performance.html](https://heliosdb.com/pagination-performance.html)
+```sql
+-- Traditional LIMIT / OFFSET — constant-time at any depth via storage-level skip
+SELECT id, created_at, subject
+  FROM leads
+ ORDER BY created_at DESC, id DESC
+ LIMIT 20 OFFSET 100000;
+
+-- Keyset (row-constructor tuple, v3.12.0+) — preferred for high-volume lists
+SELECT id, created_at, subject
+  FROM leads
+ WHERE (created_at, id) < ($1, $2)
+ ORDER BY created_at DESC, id DESC
+ LIMIT 20;
+
+-- JOIN + pagination composes cleanly (v3.23.0+: JoinPredicatePushdownRule)
+SELECT l.id, l.subject, c.name AS company
+  FROM leads l
+  LEFT OUTER JOIN companies c ON l.company_id = c.id
+ WHERE (l.created_at, l.id) < ($1, $2)
+ ORDER BY l.created_at DESC, l.id DESC
+ LIMIT 20;
+```
+
+Pitfalls: the sort key must be unique (always tail with `id` or another unique
+column); avoid floating-point sort keys; do not mix `ASC`/`DESC` directions
+inside the tuple. See
+[pagination-performance.html](https://heliosdb.com/pagination-performance.html)
 for measured numbers and reproduction recipe.
 
 ## Git-Like Branching
@@ -473,6 +499,22 @@ Existing `~/.claude/skills/heliosdb-nano-*` directories are backed up to `*.bak.
 Lookups: [`.claude/skills/_index/verb-map.md`](.claude/skills/_index/verb-map.md) (every CLI flag / REPL meta-command / public Rust API method / MCP tool) · [`.claude/skills/_index/feature-matrix.md`](.claude/skills/_index/feature-matrix.md) (cargo feature ↔ skill).
 
 ## Documentation
+
+In-repo guides (`docs/`):
+
+- [Upgrade between Nano versions](docs/guides/upgrade.md)
+- [Database management — `CREATE` / `DROP DATABASE`](docs/guides/database_management.md)
+- [Authentication — SCRAM-SHA-256, trust, password, TLS](docs/guides/authentication.md)
+- [`information_schema` compatibility](docs/compatibility/information_schema.md)
+- [SQLite drop-in tutorial](docs/guides/sqlite_drop_in_tutorial.md)
+- [REPL demo](docs/guides/repl_demo.md)
+- [HA cluster tutorial](docs/guides/ha_cluster_tutorial.md) · [HA testing](docs/guides/ha_testing.md)
+- [Audit logging](docs/guides/audit.md)
+- [Tracing guide](docs/TRACING_GUIDE.md)
+- [Full-text search](docs/compatibility/fts.md) · [PL/pgSQL compatibility](docs/compatibility/plpgsql.md) · [SQLite compatibility](docs/compatibility/sqlite.md)
+- [Code-graph overview](docs/code_graph/overview.md)
+
+Hosted docs:
 
 - [Getting Started](https://heliosdb.com/nano.html)
 - [API Explorer (Swagger UI)](http://localhost:8080/docs) — when running locally
