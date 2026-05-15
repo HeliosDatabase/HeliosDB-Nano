@@ -123,106 +123,6 @@ impl PgCatalog {
             return Ok(None);
         } else if query_lower.contains("pg_type") {
             Some(self.query_pg_type()?)
-        } else if query_lower.contains("pg_sequences") {
-            // KanttBan / Drizzle-kit pull queries `pg_sequences` during
-            // introspection. Nano doesn't expose user-facing sequences
-            // (BIGSERIAL is a synthetic counter, not a sequence object),
-            // so return the standard 7-column shape with no rows.
-            Some((Schema::new(vec![
-                Column::new("schemaname", DataType::Text),
-                Column::new("sequencename", DataType::Text),
-                Column::new("sequenceowner", DataType::Text),
-                Column::new("data_type", DataType::Text),
-                Column::new("start_value", DataType::Int8),
-                Column::new("min_value", DataType::Int8),
-                Column::new("max_value", DataType::Int8),
-                Column::new("increment_by", DataType::Int8),
-                Column::new("cycle", DataType::Boolean),
-                Column::new("cache_size", DataType::Int8),
-                Column::new("last_value", DataType::Int8),
-            ]), vec![]))
-        } else if query_lower.contains("pg_policies") {
-            // RLS policies — drizzle-kit `pull` introspects this after
-            // pg_sequences (KanttBan #12 against v3.28.0). Nano's RLS
-            // is exposed via the per-tenant manager rather than
-            // pg_policies, so we return the standard 8-column shape
-            // with zero rows.
-            Some((Schema::new(vec![
-                Column::new("schemaname", DataType::Text),
-                Column::new("tablename", DataType::Text),
-                Column::new("policyname", DataType::Text),
-                Column::new("permissive", DataType::Text),
-                Column::new("roles", DataType::Text),
-                Column::new("cmd", DataType::Text),
-                Column::new("qual", DataType::Text),
-                Column::new("with_check", DataType::Text),
-            ]), vec![]))
-        } else if query_lower.contains("pg_statistic_ext") {
-            // Extended-statistics catalog. psql's `\d <table>` sends a
-            // 9-column query joining pg_attribute in a subquery. Nano
-            // has no extended stats — return the empty 9-column shape
-            // so libpq's column-count check succeeds (KanttBan #7
-            // follow-up, v3.30.1 smoke).
-            Some((Schema::new(vec![
-                Column::new("oid", DataType::Int4),
-                Column::new("stxrelid", DataType::Text),
-                Column::new("nsp", DataType::Text),
-                Column::new("stxname", DataType::Text),
-                Column::new("columns", DataType::Text),
-                Column::new("ndist_enabled", DataType::Boolean),
-                Column::new("deps_enabled", DataType::Boolean),
-                Column::new("mcv_enabled", DataType::Boolean),
-                Column::new("stxstattarget", DataType::Int4),
-            ]), vec![]))
-        } else if query_lower.contains("pg_catalog.pg_policy ")
-            || query_lower.contains("from pg_policy ")
-            || query_lower.contains("pg_catalog.pg_policy\n")
-        {
-            // pg_policy (singular catalog table; pg_policies is the
-            // schemaname-prefixed view above). psql `\d <table>` sends
-            // a 6-column query against this. Empty shape.
-            Some((Schema::new(vec![
-                Column::new("polname", DataType::Text),
-                Column::new("polpermissive", DataType::Boolean),
-                Column::new("roles", DataType::Text),
-                Column::new("qual", DataType::Text),
-                Column::new("with_check", DataType::Text),
-                Column::new("cmd", DataType::Text),
-            ]), vec![]))
-        } else if query_lower.contains("pg_matviews") {
-            // Materialized views — drizzle-kit also introspects this.
-            // Standard 6-column shape; we have first-class support
-            // for matviews via `pg_mv_staleness()` but the pg_matviews
-            // PG-shaped view is a separate surface most ORMs default to.
-            Some((Schema::new(vec![
-                Column::new("schemaname", DataType::Text),
-                Column::new("matviewname", DataType::Text),
-                Column::new("matviewowner", DataType::Text),
-                Column::new("tablespace", DataType::Text),
-                Column::new("hasindexes", DataType::Boolean),
-                Column::new("ispopulated", DataType::Boolean),
-                Column::new("definition", DataType::Text),
-            ]), vec![]))
-        } else if query_lower.contains("pg_inherits") {
-            // Inheritance is not a Nano feature. psql `\d` sends two
-            // queries against pg_inherits (parent + child); without an
-            // explicit empty shape they fall through to pg_class and
-            // psql renders bogus "Inherits / Number of child tables"
-            // sections. Return empty 3-col shape that absorbs both
-            // forms (parent: 1 col, child: 3 cols — psql is tolerant
-            // when zero rows come back).
-            Some((Schema::new(vec![
-                Column::new("oid", DataType::Text),
-                Column::new("relkind", DataType::Char(1)),
-                Column::new("partbound", DataType::Text),
-            ]), vec![]))
-        } else if query_lower.contains("pg_publication") {
-            // Logical replication publications — not implemented.
-            // psql `\d` sends a UNION over pg_publication +
-            // pg_publication_rel selecting one column (`pubname`).
-            Some((Schema::new(vec![
-                Column::new("pubname", DataType::Text),
-            ]), vec![]))
         } else if query_lower.contains("pg_indexes") {
             // pg_indexes (the user-facing view) — not in the registry
             // yet. Leave as fixed-shape until migrated.
@@ -232,21 +132,6 @@ impl PgCatalog {
             Some(self.query_pg_tables()?)
         } else if query_lower.contains("pg_views") {
             Some(self.query_pg_views()?)
-        } else if query_lower.contains("pg_description") {
-            // No table/column comments stored.
-            Some((Schema::new(vec![
-                Column::new("objoid", DataType::Int4),
-                Column::new("classoid", DataType::Int4),
-                Column::new("objsubid", DataType::Int4),
-                Column::new("description", DataType::Text),
-            ]), vec![]))
-        } else if query_lower.contains("pg_proc") {
-            // Procedures — empty set is fine (we don't expose pg_catalog-registered functions).
-            Some((Schema::new(vec![
-                Column::new("oid", DataType::Int4),
-                Column::new("proname", DataType::Text),
-                Column::new("pronamespace", DataType::Int4),
-            ]), vec![]))
         } else if query_lower.contains("pg_settings") {
             Some(self.query_pg_settings()?)
         } else {

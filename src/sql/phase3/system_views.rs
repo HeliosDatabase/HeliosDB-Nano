@@ -2055,6 +2055,141 @@ impl SystemViewRegistry {
             description: "SQL-standard table catalogue, sourced from storage::catalog::list_tables".to_string(),
         });
 
+        // ---- Empty-stub catalogue/view tables (KanttBan #22 v3.31.0 slice 5)
+        // Nano doesn't implement these features (sequences as objects,
+        // logical replication, RLS policies, extended stats, mat-view
+        // catalogue, inheritance, server functions/procedures). Every
+        // entry registers the standard PG-shape so introspection tools
+        // see the expected column names through the planner pipeline.
+        // execute returns vec![] — empty rowset.
+
+        self.register_view(SystemViewSchema {
+            name: "pg_sequences".to_string(),
+            schema: Schema { columns: vec![
+                sv_col("schemaname", DataType::Text),
+                sv_col("sequencename", DataType::Text),
+                sv_col("sequenceowner", DataType::Text),
+                sv_col("data_type", DataType::Text),
+                sv_col("start_value", DataType::Int8),
+                sv_col("min_value", DataType::Int8),
+                sv_col("max_value", DataType::Int8),
+                sv_col("increment_by", DataType::Int8),
+                sv_col("cycle", DataType::Boolean),
+                sv_col("cache_size", DataType::Int8),
+                sv_col("last_value", DataType::Int8),
+            ] },
+            description: "PG-compat sequences view (empty — Nano uses synthetic counters)".to_string(),
+        });
+
+        self.register_view(SystemViewSchema {
+            name: "pg_proc".to_string(),
+            schema: Schema { columns: vec![
+                sv_col("oid", DataType::Int4),
+                sv_col("proname", DataType::Text),
+                sv_col("pronamespace", DataType::Int4),
+                sv_col("proowner", DataType::Int4),
+                sv_col("prolang", DataType::Int4),
+                sv_col("prorettype", DataType::Int4),
+                sv_col("proargtypes", DataType::Text),
+                sv_col("prosrc", DataType::Text),
+            ] },
+            description: "PG-compat procedures catalogue (empty stub)".to_string(),
+        });
+
+        self.register_view(SystemViewSchema {
+            name: "pg_description".to_string(),
+            schema: Schema { columns: vec![
+                sv_col("objoid", DataType::Int4),
+                sv_col("classoid", DataType::Int4),
+                sv_col("objsubid", DataType::Int4),
+                sv_col("description", DataType::Text),
+            ] },
+            description: "PG-compat object descriptions (empty — Nano doesn't store COMMENT ON)".to_string(),
+        });
+
+        self.register_view(SystemViewSchema {
+            name: "pg_policies".to_string(),
+            schema: Schema { columns: vec![
+                sv_col("schemaname", DataType::Text),
+                sv_col("tablename", DataType::Text),
+                sv_col("policyname", DataType::Text),
+                sv_col("permissive", DataType::Text),
+                sv_col("roles", DataType::Text),
+                sv_col("cmd", DataType::Text),
+                sv_col("qual", DataType::Text),
+                sv_col("with_check", DataType::Text),
+            ] },
+            description: "PG-compat RLS policies view (empty — Nano RLS via TenantManager)".to_string(),
+        });
+
+        self.register_view(SystemViewSchema {
+            name: "pg_policy".to_string(),
+            schema: Schema { columns: vec![
+                sv_col("oid", DataType::Int4),
+                sv_col("polname", DataType::Text),
+                sv_col("polrelid", DataType::Int4),
+                sv_col("polcmd", DataType::Char(1)),
+                sv_col("polpermissive", DataType::Boolean),
+                sv_col("polroles", DataType::Text),
+                sv_col("polqual", DataType::Text),
+                sv_col("polwithcheck", DataType::Text),
+            ] },
+            description: "PG-compat RLS policy catalogue (empty stub)".to_string(),
+        });
+
+        self.register_view(SystemViewSchema {
+            name: "pg_matviews".to_string(),
+            schema: Schema { columns: vec![
+                sv_col("schemaname", DataType::Text),
+                sv_col("matviewname", DataType::Text),
+                sv_col("matviewowner", DataType::Text),
+                sv_col("tablespace", DataType::Text),
+                sv_col("hasindexes", DataType::Boolean),
+                sv_col("ispopulated", DataType::Boolean),
+                sv_col("definition", DataType::Text),
+            ] },
+            description: "PG-compat matview view (empty — use pg_mv_staleness instead)".to_string(),
+        });
+
+        self.register_view(SystemViewSchema {
+            name: "pg_inherits".to_string(),
+            schema: Schema { columns: vec![
+                sv_col("inhrelid", DataType::Int4),
+                sv_col("inhparent", DataType::Int4),
+                sv_col("inhseqno", DataType::Int4),
+            ] },
+            description: "PG-compat inheritance catalogue (empty — Nano has no inheritance)".to_string(),
+        });
+
+        self.register_view(SystemViewSchema {
+            name: "pg_publication".to_string(),
+            schema: Schema { columns: vec![
+                sv_col("oid", DataType::Int4),
+                sv_col("pubname", DataType::Text),
+                sv_col("pubowner", DataType::Int4),
+                sv_col("puballtables", DataType::Boolean),
+                sv_col("pubinsert", DataType::Boolean),
+                sv_col("pubupdate", DataType::Boolean),
+                sv_col("pubdelete", DataType::Boolean),
+                sv_col("pubtruncate", DataType::Boolean),
+            ] },
+            description: "PG-compat logical replication publications (empty stub)".to_string(),
+        });
+
+        self.register_view(SystemViewSchema {
+            name: "pg_statistic_ext".to_string(),
+            schema: Schema { columns: vec![
+                sv_col("oid", DataType::Int4),
+                sv_col("stxrelid", DataType::Int4),
+                sv_col("stxnamespace", DataType::Int4),
+                sv_col("stxname", DataType::Text),
+                sv_col("stxkeys", DataType::Text),
+                sv_col("stxkind", DataType::Text),
+                sv_col("stxstattarget", DataType::Int4),
+            ] },
+            description: "PG-compat extended stats catalogue (empty stub)".to_string(),
+        });
+
         // pg_database — \l, ORM connection introspection. Minimal
         // implementation returns only the implicit 'heliosdb' row;
         // tenant enumeration (the v3.25 CREATE DATABASE wrap) needs
@@ -2183,6 +2318,18 @@ impl SystemViewRegistry {
             "pg_user" => Self::execute_pg_user(),
             "information_schema.tables" => Self::execute_information_schema_tables(storage),
             "pg_database" => Self::execute_pg_database(),
+            // Empty-stub catalogue tables (v3.31.0 slice 5). Schema
+            // already registered; rows are always empty because Nano
+            // doesn't model these concepts.
+            "pg_sequences"
+            | "pg_proc"
+            | "pg_description"
+            | "pg_policies"
+            | "pg_policy"
+            | "pg_matviews"
+            | "pg_inherits"
+            | "pg_publication"
+            | "pg_statistic_ext" => Ok(vec![]),
             "sqlite_master" => Self::execute_sqlite_master(storage),
             "pg_index" => Self::execute_pg_index(storage),
             "pg_constraint" => Self::execute_pg_constraint(storage),
