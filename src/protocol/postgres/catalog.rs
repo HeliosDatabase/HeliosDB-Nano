@@ -1112,8 +1112,19 @@ impl PgCatalog {
         }
 
         // ---- \l (list databases) ------------------------------------------------
-        // psql sends SELECT d.datname ... FROM pg_catalog.pg_database d LEFT JOIN ...
-        if q.contains("pg_database") && q.contains("pg_catalog.pg_database") && q.contains("d.datname") {
+        // psql sends a multi-column SELECT joining pg_database to
+        // pg_authid + pg_tablespace + pg_shdescription. v3.31.0 slice 4
+        // wrinkle: the previous signature (`pg_database` + `d.datname`)
+        // false-fired on drizzle-kit-style queries like
+        // `SELECT d.datname AS db_name FROM pg_database d WHERE …`.
+        // Tightened to require the multi-column shape psql actually
+        // sends — `pg_get_userbyid(d.datdba)` (the owner column) is a
+        // good discriminator since no ORM emits it.
+        if q.contains("pg_database")
+            && q.contains("pg_catalog.pg_database")
+            && q.contains("d.datname")
+            && q.contains("pg_get_userbyid(d.datdba)")
+        {
             let schema = Schema::new(vec![
                 Column::new("Name", DataType::Text),
                 Column::new("Owner", DataType::Text),
