@@ -499,6 +499,15 @@ impl SystemViewRegistry {
                     unique: false,
                     storage_mode: ColumnStorageMode::Default,
                     },
+                    // KanttBan v3.31.0 release-gate: drizzle-kit's
+                    // tables-list query (bin.cjs:19810) reads
+                    // `c.relrowsecurity AS rls_enabled`. Nano doesn't
+                    // expose pg_catalog-level RLS — RLS lives in the
+                    // TenantManager — so report `false` for every
+                    // row. Pre-v3.31.0 the catalog short-circuit
+                    // hid this; now that pg_class flows through the
+                    // planner, the column needs to actually exist.
+                    sv_col("relrowsecurity", DataType::Boolean),
                 ],
             },
             description: "Catalog of tables, indexes, sequences, and views".to_string(),
@@ -2603,6 +2612,7 @@ impl SystemViewRegistry {
                 Value::Int4(oid + 1000),               // reltype
                 Value::String("r".to_string()),        // relkind (r = relation/table)
                 Value::Int4(oid),                      // relfilenode
+                Value::Boolean(false),                 // relrowsecurity (Nano RLS is via TenantManager, not pg_catalog)
             ]);
             results.push(tuple);
         }

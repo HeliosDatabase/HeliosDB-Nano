@@ -110,6 +110,21 @@ legacy `apply_aggregate` `Some` shape). 5 KanttBan v3.28 integration
 tests still green. End-to-end `drizzle-kit push` against KanttBan's
 schema returns `[✓] Changes applied`.
 
+### Known gaps (deferred to v3.31.1)
+
+- `pg_sequences` still returns 0 rows for IDENTITY columns. Nano
+  uses synthetic row-counters rather than catalog sequences, and
+  the table schema doesn't currently retain the IDENTITY marker on
+  individual columns — surfacing one synthetic sequence row per
+  IDENTITY column needs a small schema-side change. drizzle-kit's
+  sequence-diff path will show every IDENTITY column as a missing
+  sequence (cosmetic — `drizzle-kit push` itself still applies the
+  table successfully).
+- `SELECT * FROM pg_class` (without the `pg_catalog.` prefix)
+  errors with `Table 'pg_class' does not exist`. Drizzle / Prisma
+  always qualify; non-blocking. Fix is to register schemaless
+  aliases for the catalog views.
+
 ### Known nits (not introduced by v3.31.0, deferred to a polish pass)
 
 - `psql \d <table>` renders Default values as JSON-encoded
