@@ -5,6 +5,120 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.31.0] - 2026-05-16
+
+### Fixed — KanttBan #22 + #20: catalog architecture + CREATE TYPE AS ENUM
+
+KanttBan filed two bugs against v3.30.1 that v3.30.1's surgical
+patches couldn't address structurally. v3.31.0 closes both. End-to-end
+acceptance test (the actual goal KanttBan wanted): **`drizzle-kit
+push` against KanttBan's full schema now succeeds** — all 7 tables
+(teams / users / api_tokens / password_reset_tokens / tasks /
+task_assignments / task_events) introspect, diff, and apply cleanly.
+
+#### Bug #22 — pg_catalog reads now flow through the regular planner
+
+The v3.30.x catalog handler (`src/protocol/postgres/handler.rs:674`)
+short-circuited every pg_catalog query to a substring-routed,
+fixed-shape response **before** the planner ran. It couldn't handle
+SELECT aliases (`SELECT nspname AS table_schema`), column-alias
+prefixes (`SELECT n.nspname FROM pg_namespace n`), JOINs across
+catalog tables (the dispatcher picked one table and discarded the
+rest), or complex WHERE clauses (limited to `=`, `<>`, `IN`,
+`NOT IN`, plus `IS NULL` added in v3.30.1).
+
+Fix is architectural — register pg_catalog tables in the Phase 3
+`SystemViewRegistry`, route them through the planner via
+`LogicalPlan::Scan`, materialise rows at scan time. Now WHERE / JOIN
+/ projection / alias / aggregate all "just work" because the same
+operators handle them as for user tables.
+
+Touched files (~250 line net):
+
+- `src/sql/planner.rs`: `pg_catalog.X` → `X` rewrite in
+  `dealias_schema`. `table_factor_to_plan` SystemView arm now emits
+  `LogicalPlan::Scan` with the registry's schema + the SQL alias,
+  not a terminal `LogicalPlan::SystemView` that didn't compose.
+
+- `src/sql/executor/scan.rs`: `handle_scan` checks the registry
+  before the storage lookup; on hit, materialises rows via
+  `registry.execute()` and wraps in a `ScanOperator`. Mirrors the
+  existing CTE branch.
+
+- `src/sql/phase3/system_views.rs`: registered 11 new catalog
+  views — `pg_user` / `pg_roles` (paired with the existing
+  pg_namespace JOIN target), `information_schema.tables`,
+  `pg_database`, plus 9 empty-stub tables drizzle-kit introspects
+  (pg_sequences, pg_proc, pg_description, pg_policies, pg_policy,
+  pg_matviews, pg_inherits, pg_publication, pg_statistic_ext).
+
+- `src/protocol/postgres/catalog.rs`: stripped the substring
+  branches for the migrated tables. Tightened the `\l` matcher
+  signature (was eating drizzle-kit's
+  `SELECT d.datname AS x FROM pg_database d`). Carved out three
+  exceptions (pg_inherits, pg_publication, pg_statistic_ext) for
+  psql `\d` sub-queries that use `::pg_catalog.regclass` casts the
+  planner doesn't parse yet — direct ORM queries against those
+  tables still hit the registry path.
+
+Closes the only remaining tooling-blocker for `drizzle-kit push`,
+which v3.30.1 closed at the leaf-symptom level but kept the
+architectural problem.
+
+#### Bug #20 — `CREATE TYPE … AS ENUM`
+
+drizzle wraps enum creation in an idempotent DO+EXCEPTION block. The
+v3.30.1 SQL parser accepted the syntax but `Statement::CreateType`
+fell to the planner's catch-all "Statement not yet supported".
+
+Design: enum labels persist in the catalog at
+`meta:enum_type:<name>` → bincode `Vec<String>`. At `CREATE TABLE`
+plan time, columns whose declared type is a Custom-name matching a
+registered enum get rewritten to TEXT and an implicit
+`CHECK (col IN ('a','b','c'))` constraint is appended to the
+TableConstraint list. The CHECK persists in storage, so labels are
+enforced even if the enum is later dropped.
+
+Touched files:
+
+- `src/storage/catalog.rs`: `register_enum_type` /
+  `get_enum_labels` / `enum_type_exists` / `drop_enum_type` +
+  `enum_type_key(name) → meta:enum_type:<lower(name)>`.
+
+- `src/sql/logical_plan.rs`: new `CreateEnumType { name, labels }`
+  and `DropEnumType { name, if_exists }` variants.
+
+- `src/sql/planner.rs`: `Statement::CreateType { Enum }` arm,
+  `Statement::Drop { object_type: Type }` arm,
+  `sql_data_type_to_data_type` enum-lookup fallback,
+  `create_table_to_plan` synthesises the `InList` CHECK.
+
+- `src/sql/executor/mod.rs`: dispatch arms call the catalog
+  methods. `DropEnumType` honours `IF EXISTS`; non-IF-EXISTS drop
+  of a missing type errors with `type "<name>" does not exist`.
+
+Composite / range / domain `CREATE TYPE` representations are
+intentionally out of scope; they emit a clear "only AS ENUM is
+supported" error. `ALTER TYPE ADD VALUE` and `pg_type` / `pg_enum`
+catalog rows are future work.
+
+### Tests
+
+1771 lib tests pass (4 v3.30.1 catalog aggregate tests refreshed to
+assert the new `Ok(None)` fall-through contract instead of the
+legacy `apply_aggregate` `Some` shape). 5 KanttBan v3.28 integration
+tests still green. End-to-end `drizzle-kit push` against KanttBan's
+schema returns `[✓] Changes applied`.
+
+### Known nits (not introduced by v3.31.0, deferred to a polish pass)
+
+- `psql \d <table>` renders Default values as JSON-encoded
+  LogicalExpr blobs (e.g. `{"Literal":{"String":"backlog"}}`) rather
+  than the human-readable SQL (`'backlog'`).
+- Identity-column rows in `\d` show "generated by default as
+  identity" but the `Nullable` column is blank when it should be
+  "not null".
+
 ## [3.30.1] - 2026-05-09
 
 ### Fixed — KanttBan v3.30 re-test: 3 of 4 still-open quirks
