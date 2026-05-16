@@ -2039,6 +2039,31 @@ impl SystemViewRegistry {
             description: "Built-in PG-compat view over pg_authid (read-only stub)".to_string(),
         });
 
+        // pg_roles — PG's authoritative role list (different shape from
+        // pg_user, includes rolinherit / rolreplication / rolconnlimit /
+        // rolvaliduntil etc.). drizzle-kit queries this directly during
+        // introspection. Same two hard-coded roles.
+        self.register_view(SystemViewSchema {
+            name: "pg_roles".to_string(),
+            schema: Schema {
+                columns: vec![
+                    sv_col("oid", DataType::Int4),
+                    sv_col("rolname", DataType::Text),
+                    sv_col("rolsuper", DataType::Boolean),
+                    sv_col("rolinherit", DataType::Boolean),
+                    sv_col("rolcreaterole", DataType::Boolean),
+                    sv_col("rolcreatedb", DataType::Boolean),
+                    sv_col("rolcanlogin", DataType::Boolean),
+                    sv_col("rolreplication", DataType::Boolean),
+                    sv_col("rolconnlimit", DataType::Int4),
+                    sv_col("rolpassword", DataType::Text),
+                    sv_col("rolvaliduntil", DataType::Text),
+                    sv_col("rolbypassrls", DataType::Boolean),
+                ],
+            },
+            description: "Built-in PG-compat view over pg_authid (read-only stub)".to_string(),
+        });
+
         // information_schema.tables — drizzle-kit / Prisma / Knex /
         // postgres-js all introspect through this. Same 4-column shape
         // as the catalog handler's query_information_schema_tables.
@@ -2316,6 +2341,7 @@ impl SystemViewRegistry {
             "pg_type" => Self::execute_pg_type(storage),
             "pg_namespace" => Self::execute_pg_namespace(storage),
             "pg_user" => Self::execute_pg_user(),
+            "pg_roles" => Self::execute_pg_roles(),
             "information_schema.tables" => Self::execute_information_schema_tables(storage),
             "pg_database" => Self::execute_pg_database(),
             // Empty-stub catalogue tables (v3.31.0 slice 5). Schema
@@ -2686,6 +2712,27 @@ impl SystemViewRegistry {
     /// Always exposes `public` + `information_schema`; other
     /// schemas (`_hdb_code` / `_hdb_graph` / user-created) come
     /// from the catalog's `list_schemas()` materialisation.
+    /// pg_roles companion to pg_user — different shape (12 cols vs 9)
+    /// but same two synthetic roles. drizzle-kit's introspection
+    /// queries pg_roles directly during pull.
+    fn execute_pg_roles() -> Result<Vec<Tuple>> {
+        let role = |oid: i32, name: &str| Tuple::new(vec![
+            Value::Int4(oid),                  // oid
+            Value::String(name.into()),        // rolname
+            Value::Boolean(true),              // rolsuper
+            Value::Boolean(true),              // rolinherit
+            Value::Boolean(true),              // rolcreaterole
+            Value::Boolean(true),              // rolcreatedb
+            Value::Boolean(true),              // rolcanlogin
+            Value::Boolean(true),              // rolreplication
+            Value::Int4(-1),                   // rolconnlimit
+            Value::Null,                       // rolpassword
+            Value::Null,                       // rolvaliduntil
+            Value::Boolean(true),              // rolbypassrls
+        ]);
+        Ok(vec![role(10, "postgres"), role(11, "helios")])
+    }
+
     /// KanttBan #22 (v3.31.0): information_schema.tables backed by
     /// the storage catalogue. Mirrors the legacy
     /// `protocol/postgres/catalog.rs::query_information_schema_tables`
