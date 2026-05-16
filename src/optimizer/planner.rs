@@ -311,6 +311,8 @@ impl Planner {
             LogicalPlan::DropTable { .. } |
             LogicalPlan::CreateIndex { .. } |
             LogicalPlan::CreateSequence { .. } |
+            LogicalPlan::CreateEnumType { .. } |
+            LogicalPlan::DropEnumType { .. } |
             LogicalPlan::CreateExtension { .. } |
             LogicalPlan::DropExtension { .. } |
             LogicalPlan::CreateDatabase { .. } |

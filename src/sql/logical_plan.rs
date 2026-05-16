@@ -1953,6 +1953,10 @@ impl LogicalPlan {
                     ],
                 })
             }
+            LogicalPlan::CreateEnumType { .. } | LogicalPlan::DropEnumType { .. } => {
+                // KanttBan #20 (v3.31.0): DDL — no output rows.
+                Arc::new(Schema { columns: vec![] })
+            }
         }
     }
 }
