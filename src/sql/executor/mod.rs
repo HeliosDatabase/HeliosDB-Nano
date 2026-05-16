@@ -1034,6 +1034,47 @@ impl<'a> Executor<'a> {
                     vec![],
                 ).with_timeout(self.timeout_ctx())))
             }
+            LogicalPlan::CreateEnumType { name, labels } => {
+                // KanttBan #20 (v3.31.0). Persist the enum labels in
+                // the catalog. CREATE TABLE statements that reference
+                // this type will resolve through
+                // `Catalog::get_enum_labels` and synthesize a CHECK
+                // constraint at plan time. No IF NOT EXISTS at the
+                // syntax level (drizzle wraps in DO+EXCEPTION);
+                // duplicate names silently overwrite for now —
+                // matches PG behaviour close enough for the
+                // idempotent migration pattern.
+                let storage = self.storage.ok_or_else(|| {
+                    Error::query_execution("CREATE TYPE requires storage context".to_string())
+                })?;
+                storage.catalog().register_enum_type(name, labels)?;
+                Ok(Box::new(ScanOperator::new(
+                    String::new(),
+                    Arc::new(crate::Schema { columns: vec![] }),
+                    None,
+                    vec![],
+                    vec![],
+                ).with_timeout(self.timeout_ctx())))
+            }
+            LogicalPlan::DropEnumType { name, if_exists } => {
+                let storage = self.storage.ok_or_else(|| {
+                    Error::query_execution("DROP TYPE requires storage context".to_string())
+                })?;
+                let catalog = storage.catalog();
+                if !*if_exists && !catalog.enum_type_exists(name)? {
+                    return Err(Error::query_execution(format!(
+                        "type \"{name}\" does not exist"
+                    )));
+                }
+                catalog.drop_enum_type(name)?;
+                Ok(Box::new(ScanOperator::new(
+                    String::new(),
+                    Arc::new(crate::Schema { columns: vec![] }),
+                    None,
+                    vec![],
+                    vec![],
+                ).with_timeout(self.timeout_ctx())))
+            }
             LogicalPlan::CreateExtension { name, if_not_exists } => {
                 handle_create_extension(self, name, *if_not_exists)
             }

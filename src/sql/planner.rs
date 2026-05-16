@@ -401,6 +401,22 @@ impl<'a> Planner<'a> {
                             if_exists,
                         })
                     }
+                    sqlparser::ast::ObjectType::Type => {
+                        // KanttBan #20 (v3.31.0): DROP TYPE removes
+                        // the enum registration from the catalog. Any
+                        // tables that referenced the type retain
+                        // their CHECK constraint — we don't track
+                        // back-pointers. Behaviour mirrors stock PG
+                        // semantically (PG would refuse with
+                        // "depends on…" without CASCADE; for an
+                        // embedded DB the laxer behaviour is more
+                        // useful and the CHECK still enforces the
+                        // allowed labels).
+                        Ok(LogicalPlan::DropEnumType {
+                            name,
+                            if_exists,
+                        })
+                    }
                     _ => {
                         // Default to DROP TABLE for backwards compatibility
                         Ok(LogicalPlan::DropTable {
@@ -777,6 +793,32 @@ impl<'a> Planner<'a> {
             Statement::CreateDatabase { db_name, if_not_exists, .. } => {
                 let name = Self::normalize_object_name(&db_name);
                 Ok(LogicalPlan::CreateDatabase { name, if_not_exists })
+            }
+            // KanttBan #20 (v3.31.0): `CREATE TYPE <name> AS ENUM (…)`.
+            // drizzle wraps this in an idempotent DO block — `DO $$
+            // BEGIN CREATE TYPE foo AS ENUM ('a','b'); EXCEPTION WHEN
+            // duplicate_object THEN null; END $$;` — so we don't need
+            // IF NOT EXISTS at the syntax level. Composite / range /
+            // domain representations error here; only enums are
+            // implemented in this slice.
+            Statement::CreateType { name, representation } => {
+                let normalised = Self::normalize_object_name(&name);
+                use sqlparser::ast::UserDefinedTypeRepresentation;
+                match representation {
+                    UserDefinedTypeRepresentation::Enum { labels } => {
+                        let labels: Vec<String> =
+                            labels.into_iter().map(|ident| ident.value).collect();
+                        Ok(LogicalPlan::CreateEnumType {
+                            name: normalised,
+                            labels,
+                        })
+                    }
+                    other => Err(Error::query_execution(format!(
+                        "CREATE TYPE {normalised} — only AS ENUM is supported \
+                         (got representation: {other:?}). Composite, range, \
+                         and domain types are not yet implemented."
+                    ))),
+                }
             }
             _ => Err(Error::query_execution(format!(
                 "Statement not yet supported: {:?}",
@@ -3103,6 +3145,42 @@ impl<'a> Planner<'a> {
             }
         }
 
+        // KanttBan #20 (v3.31.0): generate the implicit
+        // `CHECK (col IN ('a','b',…))` constraint for columns whose
+        // declared type was a registered enum. The column's resolved
+        // DataType is already TEXT (rewritten in
+        // sql_data_type_to_data_type); the labels list lives in the
+        // catalog. We scan the original parsed columns to identify
+        // which ones were enum-typed, then append one Check
+        // TableConstraint per enum column.
+        if let Some(catalog) = self.catalog {
+            for col in &columns {
+                if let SqlDataType::Custom(object_name, _) = &col.data_type {
+                    let raw_name = object_name.to_string();
+                    let lookup_name = Self::dealias_schema(&raw_name)
+                        .unwrap_or(raw_name);
+                    if let Some(labels) = catalog.get_enum_labels(&lookup_name)? {
+                        let col_name = Self::normalize_ident(&col.name);
+                        let expression = LogicalExpr::InList {
+                            expr: Box::new(LogicalExpr::Column {
+                                table: None,
+                                name: col_name,
+                            }),
+                            list: labels
+                                .into_iter()
+                                .map(|l| LogicalExpr::Literal(Value::String(l)))
+                                .collect(),
+                            negated: false,
+                        };
+                        constraints.push(TableConstraint::Check {
+                            name: None,
+                            expression,
+                        });
+                    }
+                }
+            }
+        }
+
         // Propagate table-level PRIMARY KEY constraint to column defs.
         // WordPress uses `PRIMARY KEY (col)` at the table level, not inline.
         // Without this, col.primary_key stays false and SERIAL auto-fill never fires.
@@ -3440,10 +3518,28 @@ impl<'a> Planner<'a> {
                     // weights, phrase queries) is intentionally out of
                     // scope — see docs/compatibility/fts.md.
                     "TSVECTOR" | "TSQUERY" => Ok(DataType::Json),
-                    _ => Err(Error::query_execution(format!(
-                        "Custom data type not yet supported: {}",
-                        type_name
-                    ))),
+                    _ => {
+                        // KanttBan #20 (v3.31.0): unknown custom type
+                        // might be a user-defined enum. Check the
+                        // catalog; on hit, store as TEXT and rely on
+                        // the CHECK constraint appended by
+                        // `create_table_to_plan` to enforce labels.
+                        // `object_name.to_string()` here preserves
+                        // dotted-prefix form (e.g. `public.foo`); the
+                        // catalog lookup normalises before keying.
+                        if let Some(catalog) = self.catalog {
+                            let raw_name = object_name.to_string();
+                            let lookup_name = Self::dealias_schema(&raw_name)
+                                .unwrap_or(raw_name);
+                            if catalog.enum_type_exists(&lookup_name)? {
+                                return Ok(DataType::Text);
+                            }
+                        }
+                        Err(Error::query_execution(format!(
+                            "Custom data type not yet supported: {}",
+                            type_name
+                        )))
+                    }
                 }
             }
             _ => Err(Error::query_execution(format!(

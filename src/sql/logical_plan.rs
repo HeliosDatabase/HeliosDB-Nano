@@ -401,6 +401,32 @@ pub enum LogicalPlan {
         if_not_exists: bool,
     },
 
+    /// `CREATE TYPE <name> AS ENUM (label1, label2, …)` — KanttBan
+    /// #20 (v3.31.0). Registers the labels in the catalog at
+    /// `meta:enum_type:<name>`. Subsequent `CREATE TABLE` references
+    /// to this type get rewritten to `TEXT` + an implicit `CHECK (col
+    /// IN (labels…))` constraint at plan time, so the labels are
+    /// enforced at the storage layer without runtime registry
+    /// lookups. Composite / range / domain types are not supported
+    /// and emit a clear error at parse time.
+    CreateEnumType {
+        /// Type name (already normalised).
+        name: String,
+        /// The enum's allowed labels, in declaration order.
+        labels: Vec<String>,
+    },
+
+    /// `DROP TYPE <name>` — removes a registered enum type. Note that
+    /// tables created against this type retain their CHECK constraint
+    /// (we don't track usages back-pointers). `IF EXISTS` makes the
+    /// drop a no-op when the type isn't registered.
+    DropEnumType {
+        /// Type name (already normalised).
+        name: String,
+        /// Silently succeed if the type isn't registered.
+        if_exists: bool,
+    },
+
     /// `CREATE EXTENSION <name>` — install a named extension. For
     /// `hdb_code` this runs the code-graph bootstrap (see
     /// `src/code_graph/storage.rs::bootstrap_tables`). Unknown

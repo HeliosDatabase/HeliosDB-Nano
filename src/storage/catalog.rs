@@ -563,6 +563,57 @@ impl<'a> Catalog<'a> {
         format!("meta:table:{}", table_name).into_bytes()
     }
 
+    // -------------------------------------------------------------------
+    // KanttBan #20 (v3.31.0) — CREATE TYPE … AS ENUM
+    //
+    // Storage: each registered enum type lives at
+    // `meta:enum_type:<name>` → bincode-encoded `Vec<String>` of labels.
+    // Persistence + lookup happens here at the catalog layer so that
+    // plan-time `CREATE TABLE foo (col my_enum)` can resolve labels
+    // and synthesize an implicit CHECK (col IN (labels…)) constraint.
+    // The column itself is stored as TEXT.
+    // -------------------------------------------------------------------
+
+    fn enum_type_key(name: &str) -> Vec<u8> {
+        format!("meta:enum_type:{}", name.to_lowercase()).into_bytes()
+    }
+
+    /// Register an enum type with its labels. Overwrites any existing
+    /// entry — callers that need IF NOT EXISTS semantics should check
+    /// `enum_type_exists` first.
+    pub fn register_enum_type(&self, name: &str, labels: &[String]) -> Result<()> {
+        let key = Self::enum_type_key(name);
+        let value = bincode::serialize(labels)
+            .map_err(|e| Error::query_execution(format!("enum serialize: {e}")))?;
+        self.storage.put(&key, &value)
+    }
+
+    /// Look up the labels for a registered enum type. Returns None if
+    /// the name isn't registered.
+    pub fn get_enum_labels(&self, name: &str) -> Result<Option<Vec<String>>> {
+        let key = Self::enum_type_key(name);
+        match self.storage.get(&key)? {
+            Some(bytes) => {
+                let labels: Vec<String> = bincode::deserialize(&bytes)
+                    .map_err(|e| Error::query_execution(format!("enum deserialize: {e}")))?;
+                Ok(Some(labels))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// True if an enum with this name exists.
+    pub fn enum_type_exists(&self, name: &str) -> Result<bool> {
+        Ok(self.get_enum_labels(name)?.is_some())
+    }
+
+    /// Drop a registered enum type. No-op if it doesn't exist
+    /// (callers wanting strict semantics should pre-check).
+    pub fn drop_enum_type(&self, name: &str) -> Result<()> {
+        let key = Self::enum_type_key(name);
+        self.storage.delete(&key)
+    }
+
     /// Build counter key for table row IDs
     fn table_counter_key(table_name: &str) -> Vec<u8> {
         format!("counter:{}", table_name).into_bytes()
