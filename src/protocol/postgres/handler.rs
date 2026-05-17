@@ -1585,7 +1585,7 @@ fn pg_split_sql_respecting_quotes(sql: &str) -> Vec<String> {
             b'\'' => { in_single_quote = true; current.push('\''); }
             b';' => {
                 let trimmed = current.trim().to_string();
-                if !trimmed.is_empty() {
+                if !trimmed.is_empty() && !pg_stmt_is_only_comment(&trimmed) {
                     statements.push(trimmed);
                 }
                 current.clear();
@@ -1595,10 +1595,27 @@ fn pg_split_sql_respecting_quotes(sql: &str) -> Vec<String> {
         i += 1;
     }
     let trimmed = current.trim().to_string();
-    if !trimmed.is_empty() {
+    if !trimmed.is_empty() && !pg_stmt_is_only_comment(&trimmed) {
         statements.push(trimmed);
     }
     statements
+}
+
+/// KanttBan #23 phase 2.7: return true if `stmt` (already trimmed)
+/// contains nothing but SQL line comments (`-- …`) and whitespace.
+/// drizzle-kit's getColumnsInfoQuery ends with
+/// `ORDER BY a.attnum;  -- Order by column number` — splitting on
+/// `;` left the trailing `-- …` as a "statement" which sqlparser
+/// rejected with "No SQL statement found". Skipping comment-only
+/// segments at the splitter level mirrors PG's tolerance for
+/// trailing comments after a terminating semicolon.
+fn pg_stmt_is_only_comment(stmt: &str) -> bool {
+    for line in stmt.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        if !trimmed.starts_with("--") { return false; }
+    }
+    true
 }
 
 /// Detect `DO $$ … $$` / `DO [LANGUAGE plpgsql] $tag$ … $tag$;` blocks
