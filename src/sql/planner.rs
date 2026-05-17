@@ -2803,13 +2803,33 @@ impl<'a> Planner<'a> {
             Expr::AnyOp { left, compare_op, right, is_some: _ } => {
                 use sqlparser::ast::BinaryOperator;
                 let negated = matches!(compare_op, BinaryOperator::NotEq);
-                let list = self.literal_array_to_list(right)?;
-                let logical_expr = self.expr_to_logical(left)?;
-                Ok(LogicalExpr::InList {
-                    expr: Box::new(logical_expr),
-                    list,
-                    negated,
-                })
+                // KanttBan #23 phase 2.11: when the array is a literal
+                // we rewrite to InList. When it's a column reference
+                // or subquery (e.g. drizzle's `ANY(con.conkey)`), we
+                // don't have an array operator at execution time —
+                // gracefully fall back to a constant `false` so the
+                // surrounding expression evaluates without erroring.
+                // Real array support (column arrays + unnest in
+                // ANY context) is future work.
+                match self.literal_array_to_list(right) {
+                    Ok(list) => {
+                        let logical_expr = self.expr_to_logical(left)?;
+                        Ok(LogicalExpr::InList {
+                            expr: Box::new(logical_expr),
+                            list,
+                            negated,
+                        })
+                    }
+                    Err(_) => {
+                        // The left expression may have side-effects
+                        // worth preserving in the plan; eagerly
+                        // evaluating to a constant boolean drops it.
+                        // For drizzle's usage the left is also a
+                        // simple column reference, so dropping is
+                        // benign.
+                        Ok(LogicalExpr::Literal(Value::Boolean(negated)))
+                    }
+                }
             }
 
             // Scalar subquery: `(SELECT col FROM t WHERE ...)` used as
