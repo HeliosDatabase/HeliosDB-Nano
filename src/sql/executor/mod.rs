@@ -458,7 +458,25 @@ impl<'a> Executor<'a> {
                     Executor::new()
                 }.with_parameters(self.parameters.clone());
 
-                let results = subquery_executor.execute(subquery)?;
+                // KanttBan #23 phase 2.10: same fallback as
+                // correlated EXISTS (phase 2.5b) — when the inner
+                // SELECT references an outer column we can't resolve
+                // (e.g. `(SELECT oid FROM pg_class WHERE relname =
+                // tc.table_name)` in drizzle's info_schema query),
+                // swallow the error and return NULL. Genuine
+                // correlated-subquery support needs nested-loop or
+                // dependent rewrite; this lets drizzle keep going
+                // (the JOIN evaluates with the NULL on one side →
+                // ON-clause is false → no match).
+                let results = match subquery_executor.execute(subquery) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!(
+                            "Correlated scalar subquery failed ({e}); falling back to NULL"
+                        );
+                        Vec::new()
+                    }
+                };
                 let value = results.first()
                     .and_then(|tuple| tuple.values.first().cloned())
                     .unwrap_or(crate::Value::Null);
