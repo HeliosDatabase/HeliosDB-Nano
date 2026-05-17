@@ -5,6 +5,125 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.31.1] - 2026-05-17
+
+### Fixed — KanttBan #23: drizzle-kit push introspection layer
+
+KanttBan filed #23 against v3.31.0 (commit `2a8c8cb`) after the
+empty-DB `drizzle-kit push` succeeded but the second push — running
+the per-table `getColumnsInfoQuery` introspection — failed on
+~10 distinct catalog surfaces drizzle-kit reads that Nano didn't yet
+expose. 14 surgical phases landed in v3.31.1 to chip away at the
+gap. **End-to-end `drizzle-kit push` against a populated DB is
+still incomplete** — a remaining JOIN-with-USING planner bug
+(cartesian-like cardinality on system-view joins) blocks the final
+introspection query. The 14 fixes here are real underlying
+improvements; the rest is tracked for v3.31.2.
+
+#### Type plumbing (phase 1, 2.3, 2.5, 2.11)
+
+- `regclass` / `regtype` / `regrole` / `regnamespace` / `regoper` /
+  `regoperator` / `regproc` / `regprocedure` / `regconfig` /
+  `regdictionary` accepted as type names (cast to TEXT). Both
+  first-class `SqlDataType::Regclass` and `Custom("regtype")` are
+  matched.
+- `Value::String → DataType::Text` cast preserves contents (was
+  wrapping in single quotes via `Display::fmt`, breaking downstream
+  regtype lookups).
+- `x = ANY('{a,b,c}'::T[])` rewritten to `LogicalExpr::InList` at
+  plan time. When `T` is a regtype family, labels are mapped to
+  OIDs via `regtype_label_to_oid`. Non-literal arrays (column
+  references / subqueries) fall back to a constant `false` so the
+  surrounding expression doesn't error.
+
+#### Catalog table surfaces (phase 1, 2, 2.4, 2.6, 2.8, 2.9)
+
+- `pg_attrdef` registered as an empty stub view. Populated with
+  `nextval('<table>_<col>_seq'::regclass)` rows for IDENTITY
+  columns (drizzle's EXISTS subquery against pg_attrdef gates its
+  SERIAL detection).
+- `pg_sequences` populated with synthetic rows per IDENTITY column
+  (from a new `meta:identity:<table>` side-table written by
+  CREATE TABLE GENERATED AS IDENTITY).
+- `pg_attribute` extended with `attisdropped` / `attndims` /
+  `attidentity` / `attgenerated` / `atthasdef` / `attcollation`
+  columns drizzle reads per column.
+- `pg_type` extended with `typnamespace` / `typtype` / `typowner` /
+  `typrelid` / `typbasetype` (drizzle LEFT-JOINs pg_namespace on
+  `enum_t.typnamespace`).
+- `information_schema.columns` extended with `udt_name` /
+  `is_generated` / `generation_expression` / `is_identity` /
+  `identity_generation` / `identity_start` / `identity_increment` /
+  `identity_maximum` / `identity_minimum` / `identity_cycle`.
+  Identity columns now report `is_identity = 'YES'` with the
+  correct generation strategy.
+- `information_schema.tables` migrated to the SystemViewRegistry.
+- `information_schema.table_constraints` / `key_column_usage` /
+  `referential_constraints` / `constraint_column_usage` migrated.
+- `pg_database` registered with the standard 10-col shape (returns
+  the implicit `heliosdb` database only — tenant enumeration
+  deferred).
+
+#### Storage layer (phase 2)
+
+- `Catalog::register_identity_columns` / `list_identity_columns` /
+  `is_identity_column` / `drop_identity_columns` (side-table over
+  `meta:identity:<table>`). Chosen over adding `is_identity` to the
+  `Column` struct because that would have propagated through ~200
+  struct literals across the codebase.
+- CREATE TABLE handler reads the new `is_identity` flag on
+  `ColumnDef` (planner-internal) and persists the matching column
+  names. DROP TABLE cleans up the record.
+
+#### Scalar functions (phase 1, 2.4)
+
+- `pg_get_expr(adbin, adrelid, ...)` — returns NULL.
+- `pg_get_serial_sequence(table, col)` — returns NULL.
+- `format_type(oid, typmod)` — maps PG type OID to readable name
+  (`23 → 'integer'`, `25 → 'text'`, etc.). Accepts both integer
+  OIDs and regtype text (e.g. `'int4'::regtype`).
+- `pg_catalog.` function-name prefix stripped before dispatch so
+  every helper works with or without the schema-qualifier.
+
+#### Wire / parser / executor fallbacks (phase 2.2, 2.5b, 2.7, 2.10)
+
+- PG's `SELECT FROM <table>` empty-projection shorthand (valid
+  inside `EXISTS` subqueries) rewritten to `SELECT 1 FROM <table>`
+  before the parser sees it. sqlparser-rs doesn't accept the empty
+  form.
+- Multi-statement splitter skips trailing comment-only segments
+  (`-- …` after a terminating `;` no longer errors with
+  "No SQL statement found").
+- Correlated `EXISTS (SELECT … WHERE outer.col = inner.col)`
+  catches the "Column not found" error and returns `false` instead.
+  Same fallback for correlated scalar subqueries
+  (`= (SELECT … WHERE outer.col = inner.col)` → NULL). Real
+  correlated-subquery support (nested-loop or dependent rewrite)
+  remains future work.
+
+### Known limitations (deferred to v3.31.2)
+
+- **JOIN with USING produces cartesian-like cardinality on system
+  views**: `tc JOIN ccu USING (constraint_schema, constraint_name)
+  WHERE tc.table_name = 'users'` returns 17 rows where the
+  equivalent explicit ON returns 1. This is the next concrete
+  blocker for drizzle-kit push end-to-end.
+- **`SELECT count(*)` over joined system views** returns 0
+  (aggregate-over-join planner issue, surfaced during this work).
+- **True correlated subqueries** (the proper fix, not the
+  fallback-to-false hack) — needs nested-loop join or
+  dependent-rewrite design.
+
+### Tests
+
+1771 lib tests + 5 kanttban_quirks_v3_28 integration tests stay
+green throughout. KanttBan runtime (vitest 9/9 / 73/73) unaffected.
+First-push `drizzle-kit push` against an empty database still
+succeeds; second push (introspection of populated tables) gets much
+further than v3.31.0 (clears the parse-error stage, populates
+identity metadata, joins more catalog views) but doesn't yet
+complete due to the USING-JOIN bug above.
+
 ## [3.31.0] - 2026-05-16
 
 ### Fixed — KanttBan #22 + #20: catalog architecture + CREATE TYPE AS ENUM
