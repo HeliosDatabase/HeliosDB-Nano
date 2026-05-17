@@ -4777,8 +4777,18 @@ impl Evaluator {
             },
 
             DataType::Text | DataType::Varchar(_) => {
-                // Most types can be converted to text
-                Ok(Value::String(value.to_string()))
+                // KanttBan #23 phase 2.5: identity-preserve strings.
+                // Value::String's Display impl wraps in single quotes
+                // (`'foo'`) for SQL-literal rendering — using
+                // `value.to_string()` here corrupted text-to-text
+                // casts (e.g. `'int4'::regtype` came out as
+                // `Value::String("'int4'")`, which broke
+                // format_type's downstream OID lookup). Bytes use
+                // raw_string_repr; other types fall back to Display.
+                match value {
+                    Value::String(s) => Ok(Value::String(s)),
+                    other => Ok(Value::String(other.to_string())),
+                }
             },
 
             DataType::Vector(dimension) => match value {
