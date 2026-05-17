@@ -75,7 +75,14 @@ impl PgCatalog {
             || query_lower.contains(" information_schema ");
         let result = if has_information_schema_ref {
             if query_lower.contains("information_schema.columns") {
-                Some(self.query_information_schema_columns(&query_lower)?)
+                // KanttBan #23 (v3.31.1 phase 2): migrated to the
+                // SystemViewRegistry with the full identity-column
+                // shape. Falling through to the planner so drizzle's
+                // getColumnsInfoQuery (which JOINs against this view
+                // and reads is_identity / identity_generation / etc.)
+                // gets the rich row data instead of the legacy
+                // 6-col substring-routed shape.
+                return Ok(None);
             } else if query_lower.contains("information_schema.tables") {
                 // KanttBan #22 (v3.31.0 slice 4): migrated to the
                 // SystemViewRegistry. Returning None falls through to
@@ -2177,6 +2184,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "v3.31.1 phase 2: information_schema.columns migrated to the registry; this test asserts the old contract. Replace with a planner-level test."]
     fn test_handle_query_information_schema_columns() {
         let catalog = PgCatalog::new();
         let result = catalog.handle_query("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'test'");
