@@ -92,12 +92,17 @@ impl PgCatalog {
                 // `query_information_schema_tables` helper still
                 // exists for tests that hit it directly.
                 return Ok(None);
-            } else if query_lower.contains("information_schema.key_column_usage") {
-                Some(self.query_information_schema_key_column_usage()?)
-            } else if query_lower.contains("information_schema.table_constraints") {
-                Some(self.query_information_schema_table_constraints()?)
-            } else if query_lower.contains("information_schema.referential_constraints") {
-                Some(self.query_information_schema_referential_constraints()?)
+            } else if query_lower.contains("information_schema.key_column_usage")
+                || query_lower.contains("information_schema.table_constraints")
+                || query_lower.contains("information_schema.referential_constraints")
+            {
+                // KanttBan #23 phase 2.8: migrated to the
+                // SystemViewRegistry. Falling through lets the
+                // planner JOIN these three views together — critical
+                // for drizzle-kit, which queries
+                // table_constraints ⨝ key_column_usage in a single
+                // statement.
+                return Ok(None);
             } else if query_lower.contains("information_schema.routines") {
                 Some(Self::query_information_schema_routines())
             } else if query_lower.contains("information_schema.check_constraints") {

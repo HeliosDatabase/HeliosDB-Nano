@@ -2111,6 +2111,54 @@ impl SystemViewRegistry {
             description: "Built-in PG-compat view over pg_authid (read-only stub)".to_string(),
         });
 
+        // information_schema.table_constraints — drizzle reads this for
+        // PK/UNIQUE/FK constraint info. 5-col PG-standard shape.
+        self.register_view(SystemViewSchema {
+            name: "information_schema.table_constraints".to_string(),
+            schema: Schema { columns: vec![
+                sv_col("constraint_catalog", DataType::Text),
+                sv_col("constraint_schema", DataType::Text),
+                sv_col("constraint_name", DataType::Text),
+                sv_col("table_name", DataType::Text),
+                sv_col("constraint_type", DataType::Text),
+            ] },
+            description: "Standard SQL info_schema.table_constraints (PK/UNIQUE/FK)".to_string(),
+        });
+
+        // information_schema.key_column_usage — column-to-constraint
+        // mapping. drizzle joins this with table_constraints to map
+        // FK columns to their referenced table/column.
+        self.register_view(SystemViewSchema {
+            name: "information_schema.key_column_usage".to_string(),
+            schema: Schema { columns: vec![
+                sv_col("constraint_catalog", DataType::Text),
+                sv_col("constraint_schema", DataType::Text),
+                sv_col("constraint_name", DataType::Text),
+                sv_col("table_name", DataType::Text),
+                sv_col("column_name", DataType::Text),
+                sv_col("ordinal_position", DataType::Int4),
+            ] },
+            description: "Standard SQL info_schema.key_column_usage".to_string(),
+        });
+
+        // information_schema.referential_constraints — FK referential
+        // actions (ON UPDATE / ON DELETE) per constraint.
+        self.register_view(SystemViewSchema {
+            name: "information_schema.referential_constraints".to_string(),
+            schema: Schema { columns: vec![
+                sv_col("constraint_catalog", DataType::Text),
+                sv_col("constraint_schema", DataType::Text),
+                sv_col("constraint_name", DataType::Text),
+                sv_col("unique_constraint_catalog", DataType::Text),
+                sv_col("unique_constraint_schema", DataType::Text),
+                sv_col("unique_constraint_name", DataType::Text),
+                sv_col("match_option", DataType::Text),
+                sv_col("update_rule", DataType::Text),
+                sv_col("delete_rule", DataType::Text),
+            ] },
+            description: "Standard SQL info_schema.referential_constraints (FK actions)".to_string(),
+        });
+
         // information_schema.tables — drizzle-kit / Prisma / Knex /
         // postgres-js all introspect through this. Same 4-column shape
         // as the catalog handler's query_information_schema_tables.
@@ -2439,6 +2487,9 @@ impl SystemViewRegistry {
             "pg_user" => Self::execute_pg_user(),
             "pg_roles" => Self::execute_pg_roles(),
             "information_schema.tables" => Self::execute_information_schema_tables(storage),
+            "information_schema.table_constraints" => Self::execute_information_schema_table_constraints(storage),
+            "information_schema.key_column_usage" => Self::execute_information_schema_key_column_usage(storage),
+            "information_schema.referential_constraints" => Self::execute_information_schema_referential_constraints(storage),
             "pg_database" => Self::execute_pg_database(),
             // Empty-stub catalogue tables (v3.31.0 slice 5). Schema
             // already registered; rows are always empty because Nano
@@ -2921,6 +2972,101 @@ impl SystemViewRegistry {
             Value::Boolean(true),              // rolbypassrls
         ]);
         Ok(vec![role(10, "postgres"), role(11, "helios")])
+    }
+
+    /// KanttBan #23 phase 2.8: information_schema.table_constraints —
+    /// PK + UNIQUE per table. Mirrors the legacy
+    /// `query_information_schema_table_constraints` in
+    /// protocol/postgres/catalog.rs.
+    fn execute_information_schema_table_constraints(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let catalog = storage.catalog();
+        let mut rows = Vec::new();
+        for name in catalog.list_tables()? {
+            if let Ok(tschema) = catalog.get_table_schema(&name) {
+                if tschema.columns.iter().any(|c| c.primary_key) {
+                    rows.push(Tuple::new(vec![
+                        Value::String("heliosdb".into()),
+                        Value::String("public".into()),
+                        Value::String(format!("{}_pkey", name)),
+                        Value::String(name.clone()),
+                        Value::String("PRIMARY KEY".into()),
+                    ]));
+                }
+                for col in &tschema.columns {
+                    if col.unique && !col.primary_key {
+                        rows.push(Tuple::new(vec![
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(format!("{}_{}_key", name, col.name)),
+                            Value::String(name.clone()),
+                            Value::String("UNIQUE".into()),
+                        ]));
+                    }
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// KanttBan #23 phase 2.8: information_schema.key_column_usage.
+    fn execute_information_schema_key_column_usage(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let catalog = storage.catalog();
+        let mut rows = Vec::new();
+        for name in catalog.list_tables()? {
+            if let Ok(tschema) = catalog.get_table_schema(&name) {
+                let mut pos: i32 = 1;
+                for col in &tschema.columns {
+                    if col.primary_key {
+                        rows.push(Tuple::new(vec![
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(format!("{}_pkey", name)),
+                            Value::String(name.clone()),
+                            Value::String(col.name.clone()),
+                            Value::Int4(pos),
+                        ]));
+                        pos += 1;
+                    } else if col.unique {
+                        rows.push(Tuple::new(vec![
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(format!("{}_{}_key", name, col.name)),
+                            Value::String(name.clone()),
+                            Value::String(col.name.clone()),
+                            Value::Int4(1),
+                        ]));
+                    }
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// KanttBan #23 phase 2.8: information_schema.referential_constraints
+    /// — FK ON UPDATE / ON DELETE rules per constraint.
+    fn execute_information_schema_referential_constraints(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let catalog = storage.catalog();
+        let mut rows = Vec::new();
+        for table in catalog.list_tables()? {
+            let constraints = match catalog.load_table_constraints(&table) {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+            for fk in &constraints.foreign_keys {
+                rows.push(Tuple::new(vec![
+                    Value::String("heliosdb".into()),
+                    Value::String("public".into()),
+                    Value::String(fk.name.clone()),
+                    Value::String("heliosdb".into()),
+                    Value::String("public".into()),
+                    Value::String(format!("{}_pkey", fk.references_table)),
+                    Value::String("NONE".into()),
+                    Value::String(fk.on_update.to_string()),
+                    Value::String(fk.on_delete.to_string()),
+                ]));
+            }
+        }
+        Ok(rows)
     }
 
     /// KanttBan #22 (v3.31.0): information_schema.tables backed by
