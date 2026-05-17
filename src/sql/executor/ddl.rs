@@ -274,6 +274,10 @@ pub(super) fn handle_drop_table(
             Ok(_) => {
                 // Table exists - drop it
                 catalog.drop_table(table_name)?;
+                // KanttBan #23 (v3.31.1 phase 2): clean up the
+                // identity side-table record. Best-effort; missing
+                // record is fine.
+                let _ = catalog.drop_identity_columns(table_name);
             }
             Err(_) => {
                 // Table doesn't exist

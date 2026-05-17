@@ -1019,6 +1019,19 @@ impl SystemViewRegistry {
                     unique: false,
                     storage_mode: ColumnStorageMode::Default,
                     },
+                    // KanttBan #23 (v3.31.1 phase 2): identity /
+                    // generated-column fields that drizzle-kit's
+                    // getColumnsInfoQuery reads.
+                    sv_col("udt_name", DataType::Text),
+                    sv_col("is_generated", DataType::Text),       // 'NEVER' or 'ALWAYS'
+                    sv_col("generation_expression", DataType::Text),
+                    sv_col("is_identity", DataType::Text),        // 'YES' or 'NO'
+                    sv_col("identity_generation", DataType::Text), // 'ALWAYS' or 'BY DEFAULT' or NULL
+                    sv_col("identity_start", DataType::Text),
+                    sv_col("identity_increment", DataType::Text),
+                    sv_col("identity_maximum", DataType::Text),
+                    sv_col("identity_minimum", DataType::Text),
+                    sv_col("identity_cycle", DataType::Text),     // 'YES' or 'NO'
                 ],
             },
             description: "Information schema view of all table columns (ANSI SQL standard)".to_string(),
@@ -2306,6 +2319,36 @@ impl SystemViewRegistry {
     }
 }
 
+/// KanttBan #23 (v3.31.1 phase 2): map a Nano DataType to the
+/// canonical PG udt_name string. Matches `format_pg_type_oid` in
+/// `src/sql/evaluator.rs` (different surface, same OID-to-name
+/// table) — kept in sync by convention.
+fn format_pg_type_name(dt: &DataType) -> String {
+    match dt {
+        DataType::Boolean => "bool".into(),
+        DataType::Int2 => "int2".into(),
+        DataType::Int4 => "int4".into(),
+        DataType::Int8 => "int8".into(),
+        DataType::Float4 => "float4".into(),
+        DataType::Float8 => "float8".into(),
+        DataType::Numeric => "numeric".into(),
+        DataType::Varchar(_) => "varchar".into(),
+        DataType::Text => "text".into(),
+        DataType::Char(_) => "bpchar".into(),
+        DataType::Bytea => "bytea".into(),
+        DataType::Date => "date".into(),
+        DataType::Time => "time".into(),
+        DataType::Timestamp => "timestamp".into(),
+        DataType::Timestamptz => "timestamptz".into(),
+        DataType::Interval => "interval".into(),
+        DataType::Uuid => "uuid".into(),
+        DataType::Json => "json".into(),
+        DataType::Jsonb => "jsonb".into(),
+        DataType::Array(inner) => format!("_{}", format_pg_type_name(inner)),
+        DataType::Vector(_) => "vector".into(),
+    }
+}
+
 /// Build a non-PK, non-unique nullable column with default storage —
 /// the shape system-view columns take. Reduces the per-column boilerplate
 /// from 9 fields to 2.
@@ -2375,16 +2418,16 @@ impl SystemViewRegistry {
             // Empty-stub catalogue tables (v3.31.0 slice 5). Schema
             // already registered; rows are always empty because Nano
             // doesn't model these concepts.
-            "pg_sequences"
-            | "pg_proc"
+            "pg_sequences" => Self::execute_pg_sequences(storage),
+            "pg_attrdef" => Self::execute_pg_attrdef(storage),
+            "pg_proc"
             | "pg_description"
             | "pg_policies"
             | "pg_policy"
             | "pg_matviews"
             | "pg_inherits"
             | "pg_publication"
-            | "pg_statistic_ext"
-            | "pg_attrdef" => Ok(vec![]),
+            | "pg_statistic_ext" => Ok(vec![]),
             "sqlite_master" => Self::execute_sqlite_master(storage),
             "pg_index" => Self::execute_pg_index(storage),
             "pg_constraint" => Self::execute_pg_constraint(storage),
@@ -2742,6 +2785,70 @@ impl SystemViewRegistry {
     /// Always exposes `public` + `information_schema`; other
     /// schemas (`_hdb_code` / `_hdb_graph` / user-created) come
     /// from the catalog's `list_schemas()` materialisation.
+    /// KanttBan #23 (v3.31.1 phase 2): synthesise pg_sequences rows
+    /// for every IDENTITY / SERIAL column registered in the catalog.
+    /// Nano doesn't model sequences as separate objects (synthetic
+    /// row counters on the column), so we project one synthetic
+    /// sequence per identity column with name `<table>_<col>_seq`.
+    /// drizzle-kit's sequence-diff path treats these as existing
+    /// objects → no spurious "missing sequence" diffs.
+    fn execute_pg_sequences(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let catalog = storage.catalog();
+        let mut rows = Vec::new();
+        for table_name in catalog.list_tables()? {
+            for col_name in catalog.list_identity_columns(&table_name)? {
+                rows.push(Tuple::new(vec![
+                    Value::String("public".into()),                       // schemaname
+                    Value::String(format!("{table_name}_{col_name}_seq")),// sequencename
+                    Value::String("postgres".into()),                     // sequenceowner
+                    Value::String("bigint".into()),                       // data_type
+                    Value::Int8(1),                                       // start_value
+                    Value::Int8(1),                                       // min_value
+                    Value::Int8(i64::MAX),                                // max_value
+                    Value::Int8(1),                                       // increment_by
+                    Value::Boolean(false),                                // cycle
+                    Value::Int8(1),                                       // cache_size
+                    Value::Null,                                          // last_value (unknown — synthetic counter)
+                ]));
+            }
+        }
+        Ok(rows)
+    }
+
+    /// KanttBan #23 (v3.31.1 phase 2): synthesise pg_attrdef rows for
+    /// every IDENTITY / SERIAL column so drizzle's EXISTS subquery
+    /// (joins pg_attrdef ON ad.adrelid + ad.adnum, filters where
+    /// pg_get_expr(ad.adbin, ad.adrelid) = 'nextval(''<seq>''::regclass)')
+    /// resolves to TRUE for those columns. The literal `adsrc` string
+    /// matches the format drizzle's CASE arm looks for.
+    fn execute_pg_attrdef(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let catalog = storage.catalog();
+        let mut rows = Vec::new();
+        let mut oid_counter: i32 = 7000;
+        for (table_idx, table_name) in catalog.list_tables()?.iter().enumerate() {
+            let adrelid = 1000_i32 + table_idx as i32;
+            if let Ok(schema) = catalog.get_table_schema(table_name) {
+                let identity_cols = catalog.list_identity_columns(table_name)?;
+                for (col_idx, col) in schema.columns.iter().enumerate() {
+                    if !identity_cols.iter().any(|c| c.eq_ignore_ascii_case(&col.name)) {
+                        continue;
+                    }
+                    let seq_name = format!("{table_name}_{}_seq", col.name);
+                    let adsrc = format!("nextval('{seq_name}'::regclass)");
+                    rows.push(Tuple::new(vec![
+                        Value::Int4(oid_counter),                  // oid
+                        Value::Int4(adrelid),                      // adrelid
+                        Value::Int2((col_idx + 1) as i16),         // adnum (1-indexed)
+                        Value::String(adsrc.clone()),              // adbin (node-tree text; same as adsrc for our purposes)
+                        Value::String(adsrc),                      // adsrc
+                    ]));
+                    oid_counter += 1;
+                }
+            }
+        }
+        Ok(rows)
+    }
+
     /// pg_roles companion to pg_user — different shape (12 cols vs 9)
     /// but same two synthetic roles. drizzle-kit's introspection
     /// queries pg_roles directly during pull.
@@ -2923,20 +3030,67 @@ impl SystemViewRegistry {
         let mut results = Vec::new();
 
         for table_name in tables.iter() {
+            let identity_cols = catalog.list_identity_columns(table_name).unwrap_or_default();
             match catalog.get_table_schema(table_name) {
                 Ok(schema) => {
                     for (col_idx, column) in schema.columns.iter().enumerate() {
                         let is_nullable = if column.nullable { "YES" } else { "NO" };
                         let data_type = format!("{:?}", column.data_type);
+                        let pg_type_name = format_pg_type_name(&column.data_type);
+                        let is_identity_col = identity_cols.iter()
+                            .any(|c| c.eq_ignore_ascii_case(&column.name));
+                        // KanttBan #23 (v3.31.1 phase 2): identity
+                        // metadata. We always report BY DEFAULT — we
+                        // don't track GENERATED ALWAYS separately
+                        // (SERIAL maps to BY DEFAULT, IDENTITY can be
+                        // either; defaulting to the user-friendly
+                        // form). identity_start / identity_increment
+                        // / identity_maximum / identity_minimum
+                        // match the bigint defaults (1 / 1 / max /
+                        // 1). identity_cycle = NO.
+                        let (is_identity_str, id_gen, id_start, id_incr, id_max, id_min, id_cycle) =
+                            if is_identity_col {
+                                (
+                                    Value::String("YES".into()),
+                                    Value::String("BY DEFAULT".into()),
+                                    Value::String("1".into()),
+                                    Value::String("1".into()),
+                                    Value::String(i64::MAX.to_string()),
+                                    Value::String("1".into()),
+                                    Value::String("NO".into()),
+                                )
+                            } else {
+                                (Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null)
+                            };
+                        let column_default = if is_identity_col {
+                            Value::String(format!(
+                                "nextval('{table_name}_{}_seq'::regclass)",
+                                column.name,
+                            ))
+                        } else {
+                            column.default_expr.as_ref()
+                                .map(|s| Value::String(s.clone()))
+                                .unwrap_or(Value::Null)
+                        };
 
                         let tuple = Tuple::new(vec![
                             Value::String("public".to_string()),           // table_schema
                             Value::String(table_name.clone()),             // table_name
                             Value::String(column.name.clone()),            // column_name
                             Value::Int4((col_idx + 1) as i32),             // ordinal_position
-                            Value::Null,                                   // column_default
+                            column_default,                                // column_default
                             Value::String(is_nullable.to_string()),        // is_nullable
                             Value::String(data_type),                      // data_type
+                            Value::String(pg_type_name),                   // udt_name
+                            Value::String("NEVER".into()),                 // is_generated
+                            Value::Null,                                   // generation_expression
+                            is_identity_str,                               // is_identity
+                            id_gen,                                        // identity_generation
+                            id_start,                                      // identity_start
+                            id_incr,                                       // identity_increment
+                            id_max,                                        // identity_maximum
+                            id_min,                                        // identity_minimum
+                            id_cycle,                                      // identity_cycle
                         ]);
                         results.push(tuple);
                     }

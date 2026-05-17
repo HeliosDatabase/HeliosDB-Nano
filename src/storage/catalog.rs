@@ -614,6 +614,61 @@ impl<'a> Catalog<'a> {
         self.storage.delete(&key)
     }
 
+    // -------------------------------------------------------------------
+    // KanttBan #23 (v3.31.1 phase 2) — IDENTITY column tracking.
+    //
+    // Stored as `meta:identity:<table>` → bincode `Vec<String>` of
+    // column names. Could've added the bool to the Column struct
+    // itself, but that propagates through 200+ struct literals
+    // across the codebase. A side table keeps the change additive.
+    // Callers: pg_sequences / pg_attrdef / information_schema.columns
+    // executors enumerate identity columns to populate their rows.
+    // -------------------------------------------------------------------
+
+    fn identity_key(table_name: &str) -> Vec<u8> {
+        format!("meta:identity:{}", table_name.to_lowercase()).into_bytes()
+    }
+
+    /// Record that the given column on the given table was declared
+    /// with `GENERATED [ALWAYS | BY DEFAULT] AS IDENTITY`. Overwrites
+    /// any previous list for that table — callers passing the full
+    /// post-CREATE-TABLE column set is the expected shape.
+    pub fn register_identity_columns(&self, table_name: &str, columns: &[String]) -> Result<()> {
+        let key = Self::identity_key(table_name);
+        if columns.is_empty() {
+            // Avoid storing empty entries — keeps the prefix scan
+            // narrow when many tables have no identity columns.
+            self.storage.delete(&key)?;
+            return Ok(());
+        }
+        let value = bincode::serialize(columns)
+            .map_err(|e| Error::query_execution(format!("identity serialize: {e}")))?;
+        self.storage.put(&key, &value)
+    }
+
+    /// List the identity columns recorded for a table. Returns an
+    /// empty Vec when the table has none (or when no record exists).
+    pub fn list_identity_columns(&self, table_name: &str) -> Result<Vec<String>> {
+        let key = Self::identity_key(table_name);
+        match self.storage.get(&key)? {
+            Some(bytes) => bincode::deserialize(&bytes)
+                .map_err(|e| Error::query_execution(format!("identity deserialize: {e}"))),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// True if the given (table, column) pair was marked IDENTITY.
+    pub fn is_identity_column(&self, table_name: &str, column_name: &str) -> Result<bool> {
+        let cols = self.list_identity_columns(table_name)?;
+        Ok(cols.iter().any(|c| c.eq_ignore_ascii_case(column_name)))
+    }
+
+    /// Drop the identity record for a table (called from DROP TABLE).
+    pub fn drop_identity_columns(&self, table_name: &str) -> Result<()> {
+        let key = Self::identity_key(table_name);
+        self.storage.delete(&key)
+    }
+
     /// Build counter key for table row IDs
     fn table_counter_key(table_name: &str) -> Vec<u8> {
         format!("counter:{}", table_name).into_bytes()

@@ -1331,6 +1331,15 @@ pub struct ColumnDef {
     /// Storage mode for per-column optimization
     #[serde(default)]
     pub storage_mode: crate::ColumnStorageMode,
+    /// KanttBan #23 (v3.31.1 phase 2): set when the column was
+    /// declared `GENERATED [ALWAYS | BY DEFAULT] AS IDENTITY` or
+    /// SERIAL / BIGSERIAL / SMALLSERIAL. The executor uses this to
+    /// register the column with `Catalog::register_identity_columns`,
+    /// which pg_sequences / pg_attrdef / information_schema.columns
+    /// then surface to ORM introspection. Defaults to false so
+    /// ColumnDefs deserialised from pre-v3.31.1 plans still work.
+    #[serde(default)]
+    pub is_identity: bool,
 }
 
 /// Table-level constraint for CREATE TABLE

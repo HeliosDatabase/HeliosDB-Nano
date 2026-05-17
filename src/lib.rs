@@ -827,6 +827,18 @@ impl EmbeddedDatabase {
 
                 catalog.create_table(name, schema)?;
 
+                // KanttBan #23 (v3.31.1 phase 2): persist the list of
+                // IDENTITY / SERIAL columns to a side-table so
+                // pg_sequences / pg_attrdef / information_schema.columns
+                // can surface them to drizzle-kit's introspection.
+                let identity_cols: Vec<String> = columns.iter()
+                    .filter(|c| c.is_identity)
+                    .map(|c| c.name.clone())
+                    .collect();
+                if !identity_cols.is_empty() {
+                    catalog.register_identity_columns(name, &identity_cols)?;
+                }
+
                 // Save table constraints if any
                 if !constraints.is_empty() {
                     let mut table_constraints = sql::TableConstraints::new();

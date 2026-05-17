@@ -3458,6 +3458,7 @@ impl<'a> Planner<'a> {
             unique,
             default,
             storage_mode: crate::ColumnStorageMode::Default, // Set via ALTER TABLE ALTER COLUMN SET STORAGE
+            is_identity: is_identity || is_serial,
         })
     }
 
