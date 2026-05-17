@@ -2141,6 +2141,23 @@ impl SystemViewRegistry {
             description: "Standard SQL info_schema.key_column_usage".to_string(),
         });
 
+        // information_schema.constraint_column_usage — columns used
+        // BY a constraint (the target side for FKs; same as KCU for
+        // PK/UNIQUE). drizzle reads this for FK target resolution.
+        self.register_view(SystemViewSchema {
+            name: "information_schema.constraint_column_usage".to_string(),
+            schema: Schema { columns: vec![
+                sv_col("table_catalog", DataType::Text),
+                sv_col("table_schema", DataType::Text),
+                sv_col("table_name", DataType::Text),
+                sv_col("column_name", DataType::Text),
+                sv_col("constraint_catalog", DataType::Text),
+                sv_col("constraint_schema", DataType::Text),
+                sv_col("constraint_name", DataType::Text),
+            ] },
+            description: "Standard SQL info_schema.constraint_column_usage".to_string(),
+        });
+
         // information_schema.referential_constraints — FK referential
         // actions (ON UPDATE / ON DELETE) per constraint.
         self.register_view(SystemViewSchema {
@@ -2489,6 +2506,7 @@ impl SystemViewRegistry {
             "information_schema.tables" => Self::execute_information_schema_tables(storage),
             "information_schema.table_constraints" => Self::execute_information_schema_table_constraints(storage),
             "information_schema.key_column_usage" => Self::execute_information_schema_key_column_usage(storage),
+            "information_schema.constraint_column_usage" => Self::execute_information_schema_constraint_column_usage(storage),
             "information_schema.referential_constraints" => Self::execute_information_schema_referential_constraints(storage),
             "pg_database" => Self::execute_pg_database(),
             // Empty-stub catalogue tables (v3.31.0 slice 5). Schema
@@ -3000,6 +3018,61 @@ impl SystemViewRegistry {
                             Value::String(format!("{}_{}_key", name, col.name)),
                             Value::String(name.clone()),
                             Value::String("UNIQUE".into()),
+                        ]));
+                    }
+                }
+            }
+        }
+        Ok(rows)
+    }
+
+    /// KanttBan #23 phase 2.9: information_schema.constraint_column_usage.
+    /// For PK/UNIQUE constraints, lists the same columns that form the
+    /// constraint (same as KCU). For FK constraints, lists the
+    /// REFERENCED (target) columns on the parent table. drizzle reads
+    /// this to map FK definitions to their target table+column.
+    fn execute_information_schema_constraint_column_usage(storage: &StorageEngine) -> Result<Vec<Tuple>> {
+        let catalog = storage.catalog();
+        let mut rows = Vec::new();
+        for name in catalog.list_tables()? {
+            // PK + UNIQUE columns (same shape as KCU)
+            if let Ok(tschema) = catalog.get_table_schema(&name) {
+                for col in &tschema.columns {
+                    if col.primary_key {
+                        rows.push(Tuple::new(vec![
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(name.clone()),
+                            Value::String(col.name.clone()),
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(format!("{}_pkey", name)),
+                        ]));
+                    } else if col.unique {
+                        rows.push(Tuple::new(vec![
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(name.clone()),
+                            Value::String(col.name.clone()),
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(format!("{}_{}_key", name, col.name)),
+                        ]));
+                    }
+                }
+            }
+            // FK target columns (references_table + references_columns)
+            if let Ok(constraints) = catalog.load_table_constraints(&name) {
+                for fk in &constraints.foreign_keys {
+                    for refcol in &fk.references_columns {
+                        rows.push(Tuple::new(vec![
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(fk.references_table.clone()),
+                            Value::String(refcol.clone()),
+                            Value::String("heliosdb".into()),
+                            Value::String("public".into()),
+                            Value::String(fk.name.clone()),
                         ]));
                     }
                 }

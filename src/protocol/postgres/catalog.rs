@@ -95,13 +95,14 @@ impl PgCatalog {
             } else if query_lower.contains("information_schema.key_column_usage")
                 || query_lower.contains("information_schema.table_constraints")
                 || query_lower.contains("information_schema.referential_constraints")
+                || query_lower.contains("information_schema.constraint_column_usage")
             {
-                // KanttBan #23 phase 2.8: migrated to the
+                // KanttBan #23 phase 2.8+2.9: migrated to the
                 // SystemViewRegistry. Falling through lets the
-                // planner JOIN these three views together — critical
+                // planner JOIN these views together — critical
                 // for drizzle-kit, which queries
-                // table_constraints ⨝ key_column_usage in a single
-                // statement.
+                // table_constraints ⨝ key_column_usage ⨝
+                // constraint_column_usage in a single statement.
                 return Ok(None);
             } else if query_lower.contains("information_schema.routines") {
                 Some(Self::query_information_schema_routines())
