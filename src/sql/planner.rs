@@ -2448,6 +2448,49 @@ impl<'a> Planner<'a> {
     }
 
     /// Convert sqlparser Expr to LogicalExpr
+    /// KanttBan #23 (v3.31.1 phase 2.3): unpack a PG literal-array
+    /// expression like `'{int,int8,int2}'::regtype[]` into a list of
+    /// LogicalExpr items suitable for the existing `InList` operator.
+    /// Errors when the input isn't a recognised literal-array shape;
+    /// callers (currently AnyOp) fall through to the original error
+    /// path in that case.
+    fn literal_array_to_list(&self, expr: &Expr) -> Result<Vec<LogicalExpr>> {
+        use sqlparser::ast::{Expr as SqlExpr, Value as SqlValue, ValueWithSpan};
+        let (inner_str, elem_type) = match expr {
+            SqlExpr::Cast { expr: inner, data_type, .. } => {
+                let s = match inner.as_ref() {
+                    SqlExpr::Value(ValueWithSpan { value: SqlValue::SingleQuotedString(s), .. }) => s.clone(),
+                    _ => return Err(Error::query_execution(format!(
+                        "ANY(array): only literal-array cast supported, got {:?}", inner
+                    ))),
+                };
+                (s, data_type.clone())
+            }
+            _ => return Err(Error::query_execution(format!(
+                "ANY(array): only literal-array cast supported, got {:?}", expr
+            ))),
+        };
+        // PG array literal syntax: `{a,b,c}` (curly-brace separated).
+        let stripped = inner_str.trim_matches(|c: char| c == '{' || c == '}');
+        let labels: Vec<&str> = stripped.split(',').map(str::trim).filter(|s| !s.is_empty()).collect();
+        // If the element type is a regtype (or its array form), map
+        // each label to the PG OID. Otherwise keep as text — InList's
+        // string-equality semantics will at least cover identical
+        // textual comparisons.
+        let is_regtype = format!("{:?}", elem_type).to_uppercase().contains("REGTYPE");
+        let items: Vec<LogicalExpr> = labels.into_iter()
+            .map(|s| {
+                if is_regtype {
+                    let oid = regtype_label_to_oid(s);
+                    LogicalExpr::Literal(Value::Int4(oid))
+                } else {
+                    LogicalExpr::Literal(Value::String(s.to_string()))
+                }
+            })
+            .collect();
+        Ok(items)
+    }
+
     fn expr_to_logical(&self, expr: &Expr) -> Result<LogicalExpr> {
         match expr {
             Expr::Identifier(ident) => Ok(LogicalExpr::Column {
@@ -2742,6 +2785,30 @@ impl<'a> Planner<'a> {
                     expr: Box::new(logical_expr),
                     list: logical_list,
                     negated: *negated,
+                })
+            }
+
+            // KanttBan #23 (v3.31.1 phase 2.3): `x = ANY(arr)` and
+            // `x <> ANY(arr)` — equivalent to `x IN (a, b, …)`
+            // when the array is a literal. drizzle-kit's
+            // getColumnsInfoQuery uses
+            // `a.atttypid = ANY ('{int,int8,int2}'::regtype[])` for
+            // SERIAL detection. Convert at plan time so the existing
+            // InList operator handles evaluation.
+            //
+            // Only the literal-array shape is rewritten; AnyOp over
+            // a column or subquery still errors via the catch-all
+            // (the executor would need true array support to handle
+            // those, which is a bigger lift).
+            Expr::AnyOp { left, compare_op, right, is_some: _ } => {
+                use sqlparser::ast::BinaryOperator;
+                let negated = matches!(compare_op, BinaryOperator::NotEq);
+                let list = self.literal_array_to_list(right)?;
+                let logical_expr = self.expr_to_logical(left)?;
+                Ok(LogicalExpr::InList {
+                    expr: Box::new(logical_expr),
+                    list,
+                    negated,
                 })
             }
 
@@ -4202,6 +4269,37 @@ impl<'a> Planner<'a> {
 impl Default for Planner<'_> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// KanttBan #23 (v3.31.1 phase 2.3): map a PG regtype text label
+/// to the corresponding type OID. Mirrors `PgCatalog::datatype_to_oid`
+/// from the opposite direction. Unknown labels yield OID 0 (invalid),
+/// which makes the InList comparison harmlessly false against any
+/// real atttypid — preferable to erroring at plan time on names we
+/// don't recognise yet.
+fn regtype_label_to_oid(label: &str) -> i32 {
+    match label.to_lowercase().as_str() {
+        "bool" | "boolean" => 16,
+        "bytea" => 17,
+        "int2" | "smallint" => 21,
+        "int" | "int4" | "integer" => 23,
+        "int8" | "bigint" => 20,
+        "text" => 25,
+        "json" => 114,
+        "float4" | "real" => 700,
+        "float8" | "double precision" => 701,
+        "bpchar" | "character" => 1042,
+        "varchar" | "character varying" => 1043,
+        "date" => 1082,
+        "time" | "time without time zone" => 1083,
+        "timestamp" | "timestamp without time zone" => 1114,
+        "timestamptz" | "timestamp with time zone" => 1184,
+        "interval" => 1186,
+        "numeric" | "decimal" => 1700,
+        "uuid" => 2950,
+        "jsonb" => 3802,
+        _ => 0,
     }
 }
 
