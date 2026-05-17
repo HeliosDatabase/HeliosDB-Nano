@@ -2224,6 +2224,25 @@ impl SystemViewRegistry {
             description: "PG-compat extended stats catalogue (empty stub)".to_string(),
         });
 
+        // pg_attrdef — column-default catalogue. KanttBan #23
+        // (v3.31.1 phase 1): drizzle-kit's getColumnsInfoQuery joins
+        // here in an EXISTS subquery to detect SERIAL columns. Empty
+        // stub means the EXISTS is false → drizzle's SERIAL-detection
+        // CASE falls through to format_type, which is what we want.
+        // Phase 2 populates from real column defaults to make the
+        // SERIAL/IDENTITY detection accurate.
+        self.register_view(SystemViewSchema {
+            name: "pg_attrdef".to_string(),
+            schema: Schema { columns: vec![
+                sv_col("oid", DataType::Int4),
+                sv_col("adrelid", DataType::Int4),
+                sv_col("adnum", DataType::Int2),
+                sv_col("adbin", DataType::Text),
+                sv_col("adsrc", DataType::Text),
+            ] },
+            description: "PG-compat column-default catalogue (empty stub; phase-2 will populate)".to_string(),
+        });
+
         // pg_database — \l, ORM connection introspection. Minimal
         // implementation returns only the implicit 'heliosdb' row;
         // tenant enumeration (the v3.25 CREATE DATABASE wrap) needs
@@ -2364,7 +2383,8 @@ impl SystemViewRegistry {
             | "pg_matviews"
             | "pg_inherits"
             | "pg_publication"
-            | "pg_statistic_ext" => Ok(vec![]),
+            | "pg_statistic_ext"
+            | "pg_attrdef" => Ok(vec![]),
             "sqlite_master" => Self::execute_sqlite_master(storage),
             "pg_index" => Self::execute_pg_index(storage),
             "pg_constraint" => Self::execute_pg_constraint(storage),

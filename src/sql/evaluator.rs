@@ -400,7 +400,15 @@ impl Evaluator {
             .collect();
         let arg_values = arg_values?;
 
-        match fun.to_lowercase().as_str() {
+        // KanttBan #23 (v3.31.1 phase 1): drizzle-kit / psql /
+        // pgAdmin call several pg_catalog helpers both with and
+        // without the `pg_catalog.` prefix. Strip it so the dispatch
+        // arms only need to list the bare name.
+        let fun_lower = fun.to_lowercase();
+        let fun_dispatch = fun_lower
+            .strip_prefix("pg_catalog.")
+            .unwrap_or(&fun_lower);
+        match fun_dispatch {
             // JSONB extraction functions
             "jsonb_extract_path" | "json_extract_path" => {
                 self.jsonb_extract_path(&arg_values)
@@ -808,6 +816,40 @@ impl Evaluator {
                         "unrecognized configuration parameter '{name}'"
                     ))),
                 }
+            }
+
+            // KanttBan #23 (v3.31.1 phase 1): pg_catalog helpers
+            // drizzle-kit's getColumnsInfoQuery calls into.
+            //
+            // pg_get_expr(pg_node_tree, oid[, prettify]) — pretty-prints
+            //   a serialized node tree (default expression / constraint).
+            //   Returns NULL when pg_attrdef is empty (Nano phase 1),
+            //   so drizzle's EXISTS subquery against pg_attrdef
+            //   never reaches this call. Stubbed as NULL so explicit
+            //   calls don't error.
+            //
+            // pg_get_serial_sequence(table, column) — returns the
+            //   regclass name of the sequence backing a SERIAL column,
+            //   or NULL if there is none. Nano doesn't model
+            //   sequences as separate objects (synthetic counters
+            //   on the row), so NULL is the truthful answer. drizzle
+            //   uses this to detect SERIAL columns; NULL falls
+            //   through to format_type.
+            //
+            // format_type(oid, typmod) — render a type OID as the
+            //   textual form (e.g. 23 → "integer"). Mirrors
+            //   `PgCatalog::pg_format_type` but at the SQL layer so
+            //   `SELECT format_type(a.atttypid, a.atttypmod)` works.
+            "pg_get_expr" => Ok(Value::Null),
+            "pg_get_serial_sequence" => Ok(Value::Null),
+            "format_type" => {
+                let oid = arg_values.first().and_then(|v| match v {
+                    Value::Int2(n) => Some(*n as i32),
+                    Value::Int4(n) => Some(*n),
+                    Value::Int8(n) => Some(*n as i32),
+                    _ => None,
+                });
+                Ok(Value::String(format_pg_type_oid(oid)))
             }
 
             _ => Err(Error::query_execution(format!(
@@ -6359,6 +6401,38 @@ impl Evaluator {
         }
         let x = self.value_to_f64(arg)?;
         Ok(Value::Float8(x.to_radians()))
+    }
+}
+
+/// Map a PG type OID to the textual form `pg_catalog.format_type`
+/// produces. Mirrors `PgCatalog::pg_format_type` (via `datatype_to_oid`)
+/// in reverse — the same OID assignments live in
+/// `src/protocol/postgres/catalog.rs`. Unknown OIDs return "???" so
+/// the calling SQL doesn't error.
+fn format_pg_type_oid(oid: Option<i32>) -> String {
+    match oid {
+        Some(16) => "boolean".into(),
+        Some(17) => "bytea".into(),
+        Some(20) => "bigint".into(),
+        Some(21) => "smallint".into(),
+        Some(23) => "integer".into(),
+        Some(25) => "text".into(),
+        Some(114) => "json".into(),
+        Some(700) => "real".into(),
+        Some(701) => "double precision".into(),
+        Some(1042) => "character".into(),
+        Some(1043) => "character varying".into(),
+        Some(1082) => "date".into(),
+        Some(1083) => "time without time zone".into(),
+        Some(1114) => "timestamp without time zone".into(),
+        Some(1184) => "timestamp with time zone".into(),
+        Some(1186) => "interval".into(),
+        Some(1700) => "numeric".into(),
+        Some(2277) => "anyarray".into(),
+        Some(2950) => "uuid".into(),
+        Some(3802) => "jsonb".into(),
+        Some(other) => format!("oid#{other}"),
+        None => "???".into(),
     }
 }
 

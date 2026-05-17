@@ -3518,6 +3518,18 @@ impl<'a> Planner<'a> {
                     // weights, phrase queries) is intentionally out of
                     // scope — see docs/compatibility/fts.md.
                     "TSVECTOR" | "TSQUERY" => Ok(DataType::Json),
+                    // KanttBan #23 (v3.31.1 phase 1): regtype / regrole /
+                    // regnamespace etc. — OID-alias types. drizzle-kit's
+                    // getColumnsInfoQuery uses `'int'::regtype` to
+                    // resolve type-name → OID. Treat as TEXT for now;
+                    // a fuller implementation would do the name→OID
+                    // lookup at cast time so `int = ANY('{int}'::regtype[])`
+                    // works against the int OID. The current behaviour
+                    // makes the CASE branch in drizzle's query fall
+                    // through to format_type, which is what we want.
+                    "REGTYPE" | "REGCLASS" | "REGROLE" | "REGNAMESPACE"
+                    | "REGOPER" | "REGOPERATOR" | "REGPROC" | "REGPROCEDURE"
+                    | "REGCONFIG" | "REGDICTIONARY" => Ok(DataType::Text),
                     _ => {
                         // KanttBan #20 (v3.31.0): unknown custom type
                         // might be a user-defined enum. Check the
@@ -3542,6 +3554,16 @@ impl<'a> Planner<'a> {
                     }
                 }
             }
+            // KanttBan #23 (v3.31.1 phase 1): sqlparser exposes
+            // these PG OID-alias types as first-class variants (not
+            // Custom). drizzle-kit's getColumnsInfoQuery uses
+            // `a.attrelid::regclass::text AS table_name`. Treat as
+            // TEXT — the cast is essentially a no-op for our purposes
+            // since downstream code reads `cls.relname` for the real
+            // name, and the `attrelid::regclass::text` output is just
+            // shown in the result (where any string suffices for
+            // drizzle's diff path).
+            SqlDataType::Regclass => Ok(DataType::Text),
             _ => Err(Error::query_execution(format!(
                 "Data type not yet supported: {:?}",
                 data_type
