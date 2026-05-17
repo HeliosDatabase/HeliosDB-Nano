@@ -686,6 +686,16 @@ impl SystemViewRegistry {
                     unique: false,
                     storage_mode: ColumnStorageMode::Default,
                     },
+                    // KanttBan #23 phase 2.6: drizzle's
+                    // getColumnsInfoQuery LEFT-JOINs pg_type and then
+                    // pg_namespace on `enum_t.typnamespace`. Add the
+                    // column (every built-in lives in pg_catalog OID
+                    // 11) so the join resolves.
+                    sv_col("typnamespace", DataType::Int4),
+                    sv_col("typtype", DataType::Text),
+                    sv_col("typowner", DataType::Int4),
+                    sv_col("typrelid", DataType::Int4),
+                    sv_col("typbasetype", DataType::Int4),
                 ],
             },
             description: "Catalog of data types".to_string(),
@@ -2805,6 +2815,16 @@ impl SystemViewRegistry {
                 Value::Boolean(byval),                     // typbyval
                 Value::String(category.to_string()),       // typcategory
                 Value::Boolean(notnull),                   // typnotnull
+                // KanttBan #23 phase 2.6: typnamespace + 4 more
+                // columns drizzle joins / reads. Every built-in
+                // type lives in pg_catalog (OID 11). typtype 'b' =
+                // base type. typowner = postgres (10). typrelid /
+                // typbasetype = 0 for non-composite/non-domain.
+                Value::Int4(11),                           // typnamespace
+                Value::String("b".into()),                 // typtype
+                Value::Int4(10),                           // typowner
+                Value::Int4(0),                            // typrelid
+                Value::Int4(0),                            // typbasetype
             ]);
             results.push(tuple);
         }
