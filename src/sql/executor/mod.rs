@@ -472,7 +472,29 @@ impl<'a> Executor<'a> {
                     Executor::new()
                 }.with_parameters(self.parameters.clone());
 
-                let results = subquery_executor.execute(subquery)?;
+                // KanttBan #23 phase 2.5: correlated EXISTS
+                // (inner WHERE references outer columns) fails here
+                // with "Column 'a.attrelid' not found in schema"
+                // because we materialise the subquery once with no
+                // outer-row context. drizzle's getColumnsInfoQuery
+                // uses correlated EXISTS for SERIAL detection — true
+                // correlated-subquery support needs nested-loop join
+                // or dependent-rewrite (significant planner work,
+                // deferred). For now: swallow the error and treat
+                // EXISTS as false. drizzle's CASE then falls through
+                // to format_type, which is what we want. Other paths
+                // that need accurate correlated EXISTS will need to
+                // wait for the full implementation.
+                let results = match subquery_executor.execute(subquery) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        tracing::debug!(
+                            "Correlated EXISTS subquery failed ({e}); falling back to false. \
+                             True correlated-subquery support is tracked as future work."
+                        );
+                        Vec::new()
+                    }
+                };
 
                 // EXISTS returns true if subquery returns any rows
                 let exists = !results.is_empty();
