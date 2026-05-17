@@ -843,10 +843,18 @@ impl Evaluator {
             "pg_get_expr" => Ok(Value::Null),
             "pg_get_serial_sequence" => Ok(Value::Null),
             "format_type" => {
+                // KanttBan #23 phase 2.4: accept both OID and text
+                // input. drizzle calls `format_type('int4'::regtype, NULL)`
+                // where the first arg is the regtype cast result —
+                // currently text (regtype is registered as DataType::Text
+                // in phase 1, the cast is identity for text input). Map
+                // text type-names back to OIDs via the same table
+                // regtype_label_to_oid uses in the planner.
                 let oid = arg_values.first().and_then(|v| match v {
                     Value::Int2(n) => Some(*n as i32),
                     Value::Int4(n) => Some(*n),
                     Value::Int8(n) => Some(*n as i32),
+                    Value::String(s) => Some(regtype_label_to_oid_str(s)),
                     _ => None,
                 });
                 Ok(Value::String(format_pg_type_oid(oid)))
@@ -6401,6 +6409,35 @@ impl Evaluator {
         }
         let x = self.value_to_f64(arg)?;
         Ok(Value::Float8(x.to_radians()))
+    }
+}
+
+/// KanttBan #23 phase 2.4: PG type-name → OID lookup. Mirrors the
+/// `regtype_label_to_oid` in src/sql/planner.rs (different surface,
+/// same table) — kept in sync by convention. Unknown names produce
+/// OID 0 which `format_pg_type_oid` then renders as "???".
+pub(crate) fn regtype_label_to_oid_str(label: &str) -> i32 {
+    match label.to_lowercase().as_str() {
+        "bool" | "boolean" => 16,
+        "bytea" => 17,
+        "int2" | "smallint" => 21,
+        "int" | "int4" | "integer" => 23,
+        "int8" | "bigint" => 20,
+        "text" => 25,
+        "json" => 114,
+        "float4" | "real" => 700,
+        "float8" | "double precision" => 701,
+        "bpchar" | "character" => 1042,
+        "varchar" | "character varying" => 1043,
+        "date" => 1082,
+        "time" | "time without time zone" => 1083,
+        "timestamp" | "timestamp without time zone" => 1114,
+        "timestamptz" | "timestamp with time zone" => 1184,
+        "interval" => 1186,
+        "numeric" | "decimal" => 1700,
+        "uuid" => 2950,
+        "jsonb" => 3802,
+        _ => 0,
     }
 }
 

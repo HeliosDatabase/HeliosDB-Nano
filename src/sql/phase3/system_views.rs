@@ -595,6 +595,21 @@ impl SystemViewRegistry {
                     unique: false,
                     storage_mode: ColumnStorageMode::Default,
                     },
+                    // KanttBan #23 phase 2.4: drizzle-kit reads these
+                    // four per-column attributes. attisdropped is the
+                    // most critical — drizzle filters on
+                    // `NOT a.attisdropped` and would error out
+                    // without it. attndims tracks array nesting (0
+                    // for scalars). attidentity / attgenerated are
+                    // CHAR(1) PG codes — '' (empty) when neither, 'd'
+                    // for IDENTITY BY DEFAULT, 'a' for ALWAYS, 's' /
+                    // 'v' for STORED / VIRTUAL generated columns.
+                    sv_col("attisdropped", DataType::Boolean),
+                    sv_col("attndims", DataType::Int4),
+                    sv_col("attidentity", DataType::Text),
+                    sv_col("attgenerated", DataType::Text),
+                    sv_col("atthasdef", DataType::Boolean),
+                    sv_col("attcollation", DataType::Int4),
                 ],
             },
             description: "Catalog of table columns and their attributes".to_string(),
@@ -2722,11 +2737,23 @@ impl SystemViewRegistry {
 
         for (table_idx, table_name) in tables.iter().enumerate() {
             let table_oid = oid_counter + (table_idx as i32);
+            // KanttBan #23 phase 2.4: cache the IDENTITY column list
+            // for this table so we can set attidentity = 'd' on the
+            // right rows. Empty / missing record → no identity cols
+            // → every column gets attidentity = ''.
+            let identity_cols = catalog.list_identity_columns(table_name).unwrap_or_default();
 
             match catalog.get_table_schema(table_name) {
                 Ok(schema) => {
                     for (col_idx, column) in schema.columns.iter().enumerate() {
                         let type_oid = Self::get_type_oid(&column.data_type);
+                        let is_identity_col = identity_cols.iter()
+                            .any(|c| c.eq_ignore_ascii_case(&column.name));
+                        let ndims: i32 = match &column.data_type {
+                            DataType::Array(_) => 1,
+                            _ => 0,
+                        };
+                        let has_default = column.default_expr.is_some() || is_identity_col;
                         let tuple = Tuple::new(vec![
                             Value::Int4(table_oid),                        // attrelid
                             Value::String(column.name.clone()),            // attname
@@ -2735,6 +2762,12 @@ impl SystemViewRegistry {
                             Value::Boolean(!column.nullable),              // attnotnull
                             Value::Int4((col_idx + 1) as i32),             // attnum
                             Value::Int4(-1),                               // atttypmod
+                            Value::Boolean(false),                         // attisdropped
+                            Value::Int4(ndims),                            // attndims
+                            Value::String(if is_identity_col { "d".into() } else { String::new() }), // attidentity
+                            Value::String(String::new()),                  // attgenerated
+                            Value::Boolean(has_default),                   // atthasdef
+                            Value::Int4(0),                                // attcollation (default)
                         ]);
                         results.push(tuple);
                     }
