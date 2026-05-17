@@ -2455,11 +2455,11 @@ impl<'a> Planner<'a> {
     /// callers (currently AnyOp) fall through to the original error
     /// path in that case.
     fn literal_array_to_list(&self, expr: &Expr) -> Result<Vec<LogicalExpr>> {
-        use sqlparser::ast::{Expr as SqlExpr, Value as SqlValue, ValueWithSpan};
+        use sqlparser::ast::{Expr as SqlExpr, Value as SqlValue};
         let (inner_str, elem_type) = match expr {
             SqlExpr::Cast { expr: inner, data_type, .. } => {
                 let s = match inner.as_ref() {
-                    SqlExpr::Value(ValueWithSpan { value: SqlValue::SingleQuotedString(s), .. }) => s.clone(),
+                    SqlExpr::Value(SqlValue::SingleQuotedString(s)) => s.clone(),
                     _ => return Err(Error::query_execution(format!(
                         "ANY(array): only literal-array cast supported, got {:?}", inner
                     ))),
