@@ -19,6 +19,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
     ) -> Result<()> {
         tracing::debug!("Parse statement '{}': {}", statement_name, query);
 
+        // KanttBan #23 (v3.31.1 phase 2.2): rewrite PG's empty
+        // `SELECT FROM …` projection shorthand before parsing.
+        // See the matching note in `handle_single_query`.
+        let query = super::handler::pg_rewrite_empty_projection(&query);
+
         // Parse and validate query syntax
         let parser = crate::sql::Parser::new();
         let statement = parser.parse_one(&query)?;

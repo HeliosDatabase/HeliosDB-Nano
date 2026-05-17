@@ -454,6 +454,18 @@ where
             return self.handle_do_block(query).await;
         }
 
+        // KanttBan #23 (v3.31.1 phase 2.2): rewrite PG's
+        // `SELECT FROM …` shorthand (empty projection, valid in
+        // PG inside EXISTS subqueries) to `SELECT 1 FROM …`.
+        // sqlparser-rs doesn't accept the empty-projection form,
+        // and drizzle-kit's getColumnsInfoQuery uses it heavily in
+        // an EXISTS subquery for SERIAL detection. Hoisting the
+        // rewrite into a single helper so every wire-protocol path
+        // (simple-query here, extended-query in handler_extended.rs)
+        // benefits.
+        let rewritten = pg_rewrite_empty_projection(query);
+        let query = rewritten.as_str();
+
         // Check for empty query
         if query.trim().is_empty() {
             self.send_message(BackendMessage::EmptyQueryResponse).await?;
@@ -1603,6 +1615,44 @@ fn pg_looks_like_do_block(trimmed: &str) -> bool {
 /// drizzle-kit emits this exact shape and nothing else for the
 /// EXCEPTION case — we don't try to parse the THEN action since
 /// it's always `null` (a no-op).
+/// KanttBan #23 (v3.31.1 phase 2.2): rewrite PG's `SELECT FROM …`
+/// empty-projection shorthand to `SELECT 1 FROM …` so sqlparser-rs
+/// can parse it. drizzle-kit's getColumnsInfoQuery uses the empty
+/// form inside `EXISTS (SELECT FROM pg_attrdef ad WHERE …)` — valid
+/// in PG, rejected by our parser.
+///
+/// Scope: only matches `SELECT` followed by whitespace then `FROM`.
+/// `SELECT *` / `SELECT col` / `SELECT 1` are untouched. Comments and
+/// string literals containing `SELECT FROM` would be falsely rewritten
+/// — that's a known sharp edge but no real driver query has that
+/// shape inside a string. The substitution is idempotent and case-
+/// preserving on the matched tokens.
+pub(crate) fn pg_rewrite_empty_projection(query: &str) -> String {
+    let needle_lower = "select from ";
+    let mut out = String::with_capacity(query.len() + 16);
+    let mut remaining = query;
+    loop {
+        let lower = remaining.to_ascii_lowercase();
+        match lower.find(needle_lower) {
+            None => {
+                out.push_str(remaining);
+                break;
+            }
+            Some(idx) => {
+                let after = idx + needle_lower.len();
+                // Preserve the original case of "SELECT" / "select" / "FROM"
+                // by slicing remaining (the actual text) rather than `lower`.
+                out.push_str(&remaining[..idx]);
+                out.push_str(&remaining[idx..idx + 6]); // "SELECT" / "select"
+                out.push_str(" 1 ");
+                out.push_str(&remaining[idx + 7..after]); // "FROM " / "from "
+                remaining = &remaining[after..];
+            }
+        }
+    }
+    out
+}
+
 fn pg_split_exception(body: &str) -> (&str, Vec<String>) {
     let upper = body.to_ascii_uppercase();
     // KanttBan #14 (v3.30.1 smoke): the previous needle `" EXCEPTION "`
