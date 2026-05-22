@@ -8567,23 +8567,31 @@ impl EmbeddedDatabase {
         values: &[Value],
         active_txn: Option<&storage::Transaction>,
     ) -> Result<bool> {
-        // Fast path: index lookup. KanttBan / Token-Dashboard Quirk H
-        // (DELETE / DROP on 11k-row table hangs >5min). The previous
-        // implementation walked the entire referencing table for every
-        // parent row being deleted — O(N×M) with N rows in the
-        // referenced table and M rows in the child. With both ~11k,
-        // that's 121M tuple checks per DELETE, dominated by per-row
-        // bincode deserialisation. Now: if a single-column index
-        // (PK / UNIQUE / FK) already exists on the relevant
-        // `(table_name, column_names)`, look up via ART —
-        // O(log N), and crucially skips the deserialisation.
+        // Fast path: ART index lookup. KanttBan / Token-Dashboard Quirk H
+        // (DELETE / DROP on 11k-row table hangs >5min) introduced the
+        // O(log N) ART path for autocommit/implicit-tx callers. The
+        // original v3.30.0 gate `active_txn.is_none()` carved out
+        // explicit transactions to preserve read-your-own-writes
+        // semantics — but that left the v3.28.0 per-write FK validator
+        // (`check_fk_constraints_on_write`) on the O(parent_size) scan
+        // path inside every explicit txn, which made the codekb-mcp
+        // plugin's bulk-ingest workload O(N×M) and ~338× slower than
+        // pre-v3.28 (117k refs × 18k symbol-table scans = 1.15B tuple
+        // comparisons, ~3.3 ks observed; see
+        // `ENGINE_REGRESSION_BISECT_v3.28.0.md`).
         //
-        // The index path is taken when `active_txn` is None (committed
-        // read) — uncommitted in-txn writes are merged below by the
-        // scan-and-filter fallback, so the index path stays
-        // ACID-correct for the autocommit / implicit-tx surface that
-        // dominates the DELETE / DROP workload.
-        if active_txn.is_none() && column_names.len() == values.len() && !column_names.is_empty() {
+        // v3.31.2: the ART path is now taken for the explicit-txn case
+        // too. This is safe because the INSERT/UPDATE/DELETE write paths
+        // already update the ART index eagerly inside the txn
+        // (`art_indexes().on_insert` at `lib.rs:1433`, on_delete at
+        // `lib.rs:2303`), so the ART view is consistent with the txn's
+        // own writes. `art_undo_log` reverts the on_insert side on
+        // rollback (`lib.rs:578-583`). The remaining concern —
+        // concurrent txns seeing each other's in-flight ART updates —
+        // is pre-existing (it's already the case for the autocommit
+        // path) and is tracked separately for the planned `helios.
+        // fk_validation_source = proxy` work in v3.33+.
+        if column_names.len() == values.len() && !column_names.is_empty() {
             let art = self.storage.art_indexes();
             // Try to find any index covering exactly these columns.
             let index_name = if column_names.len() == 1 {
@@ -8607,15 +8615,12 @@ impl EmbeddedDatabase {
             }
         }
 
-        // Slow path / in-transaction path: scan + merge with txn write-set.
-        // When the caller is inside an explicit transaction, merge its
-        // write-set into the base scan so in-txn DELETEs / INSERTs
-        // are reflected — without this,
-        // `BEGIN; DELETE FROM child WHERE …; DELETE FROM parent
-        // WHERE …;` raises a phantom FK violation on the second
-        // DELETE because the just-tombstoned child rows still live
-        // in RocksDB until commit. (Filed in
-        // FEATURE_REQUEST_fk_in_txn.md; root-cause fix.)
+        // Slow path: scan + (optional) merge with txn write-set.
+        // Reached when no single-column ART index covers the FK target
+        // (multi-column PKs, schemas without indexes registered). The
+        // write-set merge preserves read-your-own-writes for the
+        // BEGIN; DELETE child; DELETE parent; pattern (filed in
+        // FEATURE_REQUEST_fk_in_txn.md, fixed in v3.22.1).
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
         let base = self.storage.scan_table(table_name)?;
