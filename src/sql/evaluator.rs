@@ -4785,8 +4785,16 @@ impl Evaluator {
                 // `Value::String("'int4'")`, which broke
                 // format_type's downstream OID lookup). Bytes use
                 // raw_string_repr; other types fall back to Display.
+                //
+                // ada-core compat: Value::Uuid's Display also wraps in
+                // single quotes (types.rs:306 — `'<hex>'`), which broke
+                // `CAST(uuid AS text)` for the python clients (got
+                // literal `'<uuid>'` instead of the bare hex form).
+                // Match psycopg / pgvector behaviour: emit the canonical
+                // hyphenated 36-char hex form, no quotes.
                 match value {
                     Value::String(s) => Ok(Value::String(s)),
+                    Value::Uuid(u) => Ok(Value::String(u.to_string())),
                     other => Ok(Value::String(other.to_string())),
                 }
             },

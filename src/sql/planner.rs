@@ -2767,7 +2767,46 @@ impl<'a> Planner<'a> {
             // CAST expressions: CAST(expr AS type) or expr::type
             Expr::Cast { expr, data_type, .. } => {
                 let logical_expr = self.expr_to_logical(expr)?;
-                let target_type = self.sql_data_type_to_data_type(data_type)?;
+                // ada-core compat: pgvector accepts the bare `'[1,2,3]'::vector`
+                // form (no dimension) and infers the dimension from the literal.
+                // Match that behavior at the CAST site so every pgvector tutorial
+                // / drizzle / asyncpg snippet works out of the box. DDL still
+                // requires explicit `VECTOR(n)` (sql_data_type_to_data_type at
+                // planner.rs:3591 enforces it for column types).
+                let target_type = match (data_type, expr.as_ref()) {
+                    (sqlparser::ast::DataType::Custom(name, modifiers), inner)
+                        if modifiers.is_empty()
+                            && name.to_string().eq_ignore_ascii_case("vector") =>
+                    {
+                        if let sqlparser::ast::Expr::Value(
+                            sqlparser::ast::Value::SingleQuotedString(s)
+                        ) = inner
+                        {
+                            // Infer dimension by counting elements of the literal.
+                            let trimmed = s.trim();
+                            let inner_str = trimmed
+                                .trim_start_matches('[').trim_end_matches(']');
+                            let count = inner_str.split(',')
+                                .map(str::trim)
+                                .filter(|t| !t.is_empty())
+                                .count();
+                            if count > 0 {
+                                DataType::Vector(count)
+                            } else {
+                                return Err(Error::query_execution(
+                                    "bare ::vector cast requires a non-empty literal to infer dimension; \
+                                     use ::vector(N) for parameter or column-typed sources".to_string()
+                                ));
+                            }
+                        } else {
+                            return Err(Error::query_execution(
+                                "bare ::vector cast can only infer dimension from a literal string; \
+                                 use ::vector(N) explicitly otherwise".to_string()
+                            ));
+                        }
+                    }
+                    _ => self.sql_data_type_to_data_type(data_type)?,
+                };
                 Ok(LogicalExpr::Cast {
                     expr: Box::new(logical_expr),
                     data_type: target_type,
