@@ -5,6 +5,107 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.31.2] - 2026-05-22
+
+### Fixed — in-txn FK validation ~338× regression (codekb-mcp / KanttBan bulk ingest)
+
+`EmbeddedDatabase::check_referencing_rows_exist` carried an
+`active_txn.is_none()` guard on its ART-index fast path, added with the
+Quirk H fix in v3.30.0 to preserve read-your-own-writes on a
+hypothetical "ART only reflects committed state" model. But the engine
+has been updating ART eagerly inside transactions all along
+(`on_insert` at `lib.rs:1433`, `on_delete` at `lib.rs:2303`,
+`art_undo_log` reversal at `lib.rs:578`), so the guard added no
+correctness while pinning the v3.28.0 per-write FK validator
+(`check_fk_constraints_on_write`) to the O(parent_size) scan-and-merge
+path inside every explicit transaction.
+
+For the heliosdb-codekb-mcp plugin's bulk-ingest workload (117k
+FK-bearing INSERTs in one txn × ~10k mean parent scan = ~1.15B tuple
+deserialisations), the observed runtime was 3,279 s vs 9.7 s
+pre-v3.28.0 — a ~338× regression. Bisect localised the originating
+commit to `20169f4` (KanttBan Bug #6 fix on v3.28.0, which added the
+FK-on-write check).
+
+End-to-end validation on the same corpus and harness:
+
+| Engine             | `code_index ms write=` | Total ingest |
+|--------------------|------------------------|--------------|
+| v3.22.2 (baseline) | 9,709 ms               | 35.1 s       |
+| v3.30.0 (regressed)| 3,279,362 ms           | ~55 min      |
+| **v3.31.2**        | **10,226 ms**          | **59.1 s**   |
+
+~321× speedup on the write phase; within 6% of the pre-v3.28.0
+baseline. The four-tier follow-up roadmap (session GUC
+`helios.fk_validation`, per-FK `NOT ENFORCED`, HeliosProxy `fk-cache`
+WASM plugin) is tracked in `PROPOSAL_FK_VALIDATION_OPTIMIZATION.md`.
+
+### Fixed — pgvector bare `::vector` cast accepts inferred dimension (ada-core)
+
+ada-core's `HELIOSDB-NANO-COMPATIBILITY.md` flagged that
+`'[1,2,3]'::vector` (no dimension) was rejected with
+`VECTOR type requires dimension: VECTOR(n)` — but pgvector accepts it
+and infers the dimension from the literal's element count. Every
+pgvector tutorial / asyncpg snippet / drizzle example uses the bare
+form, so this was a high-visibility friction.
+
+The CAST site in `sql/planner.rs` now matches pgvector: bare
+`::vector` on a single-quoted string literal counts the elements and
+produces `DataType::Vector(N)`. Errors for bare `::vector` on
+non-literal sources (parameters / column refs) recommending the
+explicit `::vector(N)` form. DDL still requires explicit dimension
+(`CREATE TABLE t (v vector)` still errors at
+`sql_data_type_to_data_type` — column types must be fixed-dim).
+
+### Fixed — `CAST(uuid AS text)` returns bare canonical form (ada-core)
+
+ada-core observed that `CAST(some_uuid AS text)` wrapped the result
+in single quotes (`'<uuid>'`), breaking client-side string comparisons
+in psycopg / asyncpg flows. Root cause: `Value::Uuid`'s `Display` impl
+at `types.rs:306` emits the SQL-literal form `'<uuid>'`, and the text
+cast handler at `evaluator.rs` used the unmodified `to_string()`
+output.
+
+Now matches Postgres semantics: `CAST(uuid AS text)` returns the bare
+36-char canonical hex form (`550e8400-e29b-41d4-a716-446655440000`)
+with no quote characters. Other paths that need the SQL-literal form
+(e.g. logging, error messages) are unchanged — the fix is scoped to
+the cast handler only.
+
+### Tests
+
+- `tests/fk_in_txn_perf_regression.rs` — 5 in-txn FK correctness cases +
+  one perf guard (3k FK INSERTs/txn under 5s).
+- `tests/compat_ada_core.rs` — 7 cases covering vector bare cast
+  (with literal, mismatched explicit dim, explicit dim guard, DDL
+  rejection, empty literal rejection) and UUID-cast-to-text (canonical
+  form, unaffected non-cast paths).
+- Lib test suite: 1770/1770 pass (109s on the release-host class).
+
+### Known limitations (carried forward to v3.32+)
+
+From ada-core's compatibility doc, the following remain deferred —
+each requires multi-week feature work:
+
+- `TEXT[]` array column types (workaround: `JSONB` with JSON array body)
+- `ALTER COLUMN DROP NOT NULL` (workaround: table recreate)
+- `interval` type (workaround: compute timestamps in app code with
+  `timedelta`, bind as `::timestamptz`)
+- `LISTEN` / `NOTIFY` pub-sub (workaround: short-interval polling)
+- asyncpg binary `int4` protocol mismatch (workaround:
+  `postgresql+psycopg://` with `prepare_threshold=None`)
+- SQLAlchemy txn-frame "Explicit rollback() forbidden" (workaround:
+  ada-core ships a custom migration runner; alembic's online runner is
+  non-functional today)
+- "Transaction already active" stuck-connection state (workaround:
+  `psycopg_pool` with short `max_lifetime` + error-aware retry)
+- `ON CONFLICT DO UPDATE` patchiness (workaround:
+  `SELECT … FOR UPDATE` + branch)
+- Bare `::vector` cast → column-dim safety check at INSERT/UPDATE
+  storage time (pgvector does this; Nano's INSERT path doesn't yet
+  validate value-vector-dim against column-vector-dim — surfaced by
+  the new compat fix, tracked as a follow-up)
+
 ## [3.31.1] - 2026-05-17
 
 ### Fixed — KanttBan #23: drizzle-kit push introspection layer
