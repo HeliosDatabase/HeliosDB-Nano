@@ -41,17 +41,15 @@ pub type ElementId = u64;
 /// On-disk format version for the persistent index keyspace.
 pub const PERSIST_SCHEMA_VERSION: u32 = 1;
 
-/// Rerank-vector storage precision.
-///
-/// Only [`VectorPrecision::F32`] is wired; `F16` / `I8` are accepted on the config
-/// surface but rejected with a clear error until the multi-precision phase lands.
+/// Rerank-vector storage precision — a memory/accuracy dial for the persisted full
+/// vectors that stacks on top of PQ.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VectorPrecision {
-    /// 32-bit float — exact rerank, no compression.
+    /// 32-bit float — exact, no compression (4 bytes/dim).
     F32,
-    /// 16-bit float — reserved for a later phase.
+    /// IEEE-754 half — ~2× smaller (2 bytes/dim), ~3 significant digits.
     F16,
-    /// 8-bit integer — reserved for a later phase.
+    /// Per-vector symmetric int8 scalar quantization — ~4× smaller (1 byte/dim + scale).
     I8,
 }
 
@@ -172,6 +170,16 @@ impl IndexState {
             return pq.decode(code).ok();
         }
         None
+    }
+
+    /// The vector to keep resident in RAM (PQ-inactive mode): exact for `F32`, otherwise
+    /// round-tripped through the configured precision so in-session results match
+    /// post-reopen (which loads the lossily-stored vector).
+    fn resident_vector(&self, v: &Vector) -> Result<Vector> {
+        match self.config.rerank_precision {
+            VectorPrecision::F32 => Ok(v.clone()),
+            _ => decode_vector(&self.config, &encode_vector(&self.config, v)?),
+        }
     }
 
     /// Build a query probe: an ADC distance table when PQ is active, otherwise an
@@ -339,23 +347,104 @@ fn parse_id(s: Option<&str>) -> Result<u64> {
         .ok_or_else(|| Error::storage("vector-persist: malformed key id"))
 }
 
-/// Encode a rerank vector for storage at the configured precision.
+/// Encode a rerank vector for storage at the configured precision. `F16` halves the
+/// footprint (IEEE half), `I8` quarters it (per-vector symmetric scalar quantization).
 fn encode_vector(cfg: &PqHnswConfig, v: &Vector) -> Result<Vec<u8>> {
     match cfg.rerank_precision {
         VectorPrecision::F32 => ser(v),
-        other => Err(Error::storage(format!(
-            "vector-persist: rerank precision {other:?} is implemented in a later phase"
-        ))),
+        VectorPrecision::F16 => {
+            let half: Vec<u16> = v.iter().map(|&x| f32_to_f16(x)).collect();
+            ser(&half)
+        }
+        VectorPrecision::I8 => {
+            let max_abs = v.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+            let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
+            let codes: Vec<i8> = v
+                .iter()
+                .map(|&x| (x / scale).round().clamp(-127.0, 127.0) as i8)
+                .collect();
+            ser(&(scale, codes))
+        }
     }
 }
 /// Decode a rerank vector stored at the configured precision.
 fn decode_vector(cfg: &PqHnswConfig, b: &[u8]) -> Result<Vector> {
     match cfg.rerank_precision {
         VectorPrecision::F32 => de::<Vector>(b),
-        other => Err(Error::storage(format!(
-            "vector-persist: rerank precision {other:?} is implemented in a later phase"
-        ))),
+        VectorPrecision::F16 => {
+            let half: Vec<u16> = de(b)?;
+            Ok(half.iter().map(|&h| f16_to_f32(h)).collect())
+        }
+        VectorPrecision::I8 => {
+            let (scale, codes): (f32, Vec<i8>) = de(b)?;
+            Ok(codes.iter().map(|&c| f32::from(c) * scale).collect())
+        }
     }
+}
+
+/// Convert `f32` to IEEE-754 half-precision bits (round to nearest even). Hand-rolled to
+/// stay dependency-free; handles normals, subnormals, zero, overflow, and inf/nan.
+fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let raw_exp = ((bits >> 23) & 0xff) as i32;
+    let mant = bits & 0x007f_ffff;
+    if raw_exp == 0xff {
+        return sign | 0x7c00 | if mant != 0 { 0x0200 } else { 0 }; // inf / nan
+    }
+    let exp = raw_exp - 127 + 15;
+    if exp >= 0x1f {
+        return sign | 0x7c00; // overflow → inf
+    }
+    if exp <= 0 {
+        if exp < -10 {
+            return sign; // underflow → ±0
+        }
+        let m = mant | 0x0080_0000; // restore implicit leading 1
+        let shift = (14 - exp) as u32;
+        let mut half = (m >> shift) as u16;
+        let rem = m & ((1u32 << shift) - 1);
+        let halfway = 1u32 << (shift - 1);
+        if rem > halfway || (rem == halfway && (half & 1) == 1) {
+            half += 1;
+        }
+        return sign | half;
+    }
+    let mut half = sign | ((exp as u16) << 10) | ((mant >> 13) as u16);
+    let rem = mant & 0x1fff;
+    if rem > 0x1000 || (rem == 0x1000 && (half & 1) == 1) {
+        half += 1; // round to nearest even; a carry into the exponent field is correct
+    }
+    half
+}
+
+/// Convert IEEE-754 half-precision bits to `f32`.
+fn f16_to_f32(h: u16) -> f32 {
+    let sign = (u32::from(h) & 0x8000) << 16;
+    let exp = (h >> 10) & 0x1f;
+    let mant = u32::from(h & 0x03ff);
+    let bits = if exp == 0 {
+        if mant == 0 {
+            sign
+        } else {
+            // subnormal → normalize
+            let mut e: i32 = -1;
+            let mut m = mant;
+            loop {
+                e += 1;
+                m <<= 1;
+                if m & 0x0400 != 0 {
+                    break;
+                }
+            }
+            sign | (((127 - 15 - e) as u32) << 23) | ((m & 0x03ff) << 13)
+        }
+    } else if exp == 0x1f {
+        sign | 0x7f80_0000 | (mant << 13) // inf / nan
+    } else {
+        sign | ((u32::from(exp) + 127 - 15) << 23) | (mant << 13)
+    };
+    f32::from_bits(bits)
 }
 
 /// Distance between two raw vectors under a metric (SIMD-backed kernels).
@@ -463,7 +552,8 @@ fn graph_insert(
             .map_err(|e| Error::storage(format!("vector-persist: pq encode: {e}")))?;
         st.codes.insert(elem, code);
     } else {
-        st.vectors.insert(elem, vector.clone());
+        let resident = st.resident_vector(vector)?;
+        st.vectors.insert(elem, resident);
     }
     st.elem_to_row.insert(elem, row_id);
     st.row_to_elem.insert(row_id, elem);
@@ -556,14 +646,9 @@ pub struct PersistentVectorIndex {
 }
 
 impl PersistentVectorIndex {
-    /// Create a new, empty index (PQ inactive — full vectors resident in RAM).
+    /// Create a new, empty index (PQ inactive — full vectors resident in RAM, persisted
+    /// at the configured rerank precision: F32 / F16 / I8).
     pub fn create(db: Arc<DB>, index_id: u64, config: PqHnswConfig) -> Result<Self> {
-        if config.rerank_precision != VectorPrecision::F32 {
-            return Err(Error::storage(format!(
-                "vector-persist: rerank precision {:?} is implemented in a later phase",
-                config.rerank_precision
-            )));
-        }
         let p = prefix(index_id);
         if db.get(key_meta(&p)).map_err(map_db)?.is_some() {
             return Err(Error::storage(format!(
@@ -588,9 +673,6 @@ impl PersistentVectorIndex {
         mut config: PqHnswConfig,
         training: &[Vector],
     ) -> Result<Self> {
-        if config.rerank_precision != VectorPrecision::F32 {
-            return Err(Error::storage("vector-persist: PQ requires F32 rerank precision"));
-        }
         if config.distance_metric != DistanceMetric::L2 {
             return Err(Error::storage("vector-persist: PQ is supported only with the L2 metric"));
         }
@@ -777,7 +859,8 @@ impl PersistentVectorIndex {
         wb.put(key_rmap(&p, row_id), ser(&elem_id)?);
         wb.put(key_lvl(&p, elem_id), ser(&level)?);
 
-        st.vectors.insert(elem_id, vector.clone());
+        let resident = st.resident_vector(vector)?;
+        st.vectors.insert(elem_id, resident);
         st.elem_to_row.insert(elem_id, row_id);
         st.row_to_elem.insert(row_id, elem_id);
         st.levels.insert(elem_id, level);
@@ -1401,11 +1484,18 @@ mod tests {
     }
 
     #[test]
-    fn test_unsupported_precision_is_err() {
+    fn test_exact_f16_index_roundtrips() {
+        // f16 rerank precision is supported (P6); an exact-mode f16 index is searchable.
         let (_dir, db) = test_db();
-        let mut cfg = sample_config();
+        let mut cfg = PqHnswConfig::new(8, DistanceMetric::L2);
         cfg.rerank_precision = VectorPrecision::F16;
-        assert!(PersistentVectorIndex::create(db.clone(), 1, cfg).is_err());
+        let idx = PersistentVectorIndex::create(db.clone(), 1, cfg).unwrap();
+        for i in 0..50u64 {
+            idx.insert(i, &rand_vec(i, 8)).unwrap();
+        }
+        let got = idx.search(&rand_vec(3, 8), 5, 64).unwrap();
+        assert_eq!(got.len(), 5);
+        assert!(got.iter().any(|(r, _)| *r == 3), "exact match should rank near top under f16");
     }
 
     // ── P2: HNSW graph ───────────────────────────────────────────────────────
@@ -1844,5 +1934,97 @@ mod tests {
         }
         let got = idx.search_filtered(&rand_vec(9, dim), 10, 64, |_row| false).unwrap();
         assert!(got.is_empty(), "a filter matching nothing yields no results");
+    }
+
+    // ── P6: multi-precision rerank vectors ───────────────────────────────────
+
+    #[test]
+    fn test_f16_roundtrip_accuracy() {
+        for &x in &[0.0f32, 1.0, -1.0, 0.5, -0.25, 3.141_59, -2.718_28, 100.0, 0.001, 1000.0, -42.5] {
+            let back = f16_to_f32(f32_to_f16(x));
+            let tol = x.abs() * 1e-2 + 1e-3;
+            assert!((back - x).abs() <= tol, "f16 roundtrip {x} -> {back}");
+        }
+        // Exactly representable values are exact.
+        assert_eq!(f16_to_f32(f32_to_f16(0.0)), 0.0);
+        assert_eq!(f16_to_f32(f32_to_f16(1.0)), 1.0);
+        assert_eq!(f16_to_f32(f32_to_f16(0.5)), 0.5);
+    }
+
+    #[test]
+    fn test_precision_encode_sizes() {
+        let v: Vec<f32> = (0..64).map(|i| (i as f32) * 0.013 - 0.4).collect();
+        let mk = |p| {
+            let mut c = PqHnswConfig::new(64, DistanceMetric::L2);
+            c.rerank_precision = p;
+            c
+        };
+        let s32 = encode_vector(&mk(VectorPrecision::F32), &v).unwrap().len();
+        let s16 = encode_vector(&mk(VectorPrecision::F16), &v).unwrap().len();
+        let s8 = encode_vector(&mk(VectorPrecision::I8), &v).unwrap().len();
+        assert!(s16 < s32, "f16 {s16} should be smaller than f32 {s32}");
+        assert!(s8 < s16, "i8 {s8} should be smaller than f16 {s16}");
+
+        let d16 =
+            decode_vector(&mk(VectorPrecision::F16), &encode_vector(&mk(VectorPrecision::F16), &v).unwrap())
+                .unwrap();
+        let d8 =
+            decode_vector(&mk(VectorPrecision::I8), &encode_vector(&mk(VectorPrecision::I8), &v).unwrap())
+                .unwrap();
+        assert_eq!(d16.len(), 64);
+        assert_eq!(d8.len(), 64);
+        for i in 0..64 {
+            assert!((d16[i] - v[i]).abs() < 0.01, "f16 dim {i}");
+            assert!((d8[i] - v[i]).abs() < 0.02, "i8 dim {i}");
+        }
+    }
+
+    #[test]
+    fn test_pq_f16_and_i8_rerank_recall() {
+        for (prec, thresh) in [(VectorPrecision::F16, 0.70f64), (VectorPrecision::I8, 0.60f64)] {
+            let (_dir, db) = test_db();
+            let (dim, n, k, ef) = (64usize, 600usize, 10usize, 100usize);
+            let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
+            let mut cfg = pq_config_dim64();
+            cfg.rerank_precision = prec;
+            let idx = PersistentVectorIndex::create_with_pq(db.clone(), 1, cfg, &data).unwrap();
+            for (i, v) in data.iter().enumerate() {
+                idx.insert(i as u64, v).unwrap();
+            }
+            let mut hits = 0usize;
+            let queries = 40u64;
+            for qi in 0..queries {
+                let q = rand_vec(8_000_000 + qi, dim);
+                let truth: HashSet<u64> = brute_topk(&data, &q, k).into_iter().collect();
+                let got = idx.search(&q, k, ef).unwrap();
+                hits += got.iter().filter(|(r, _)| truth.contains(r)).count();
+            }
+            let recall = hits as f64 / (queries as usize * k) as f64;
+            assert!(recall >= thresh, "PQ {prec:?} rerank recall@{k} = {recall:.3} (>= {thresh})");
+        }
+    }
+
+    #[test]
+    fn test_i8_exact_index_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        let dim = 16;
+        let q = rand_vec(50, dim);
+
+        let before = {
+            let db = Arc::new(DB::open_default(&path).unwrap());
+            let mut cfg = PqHnswConfig::new(dim, DistanceMetric::L2);
+            cfg.rerank_precision = VectorPrecision::I8;
+            let idx = PersistentVectorIndex::create(db.clone(), 1, cfg).unwrap();
+            for i in 0..100u64 {
+                idx.insert(i, &rand_vec(i, dim)).unwrap();
+            }
+            idx.search(&q, 5, 64).unwrap()
+        };
+
+        let db = Arc::new(DB::open_default(&path).unwrap());
+        let idx = PersistentVectorIndex::open(db, 1).unwrap();
+        let after = idx.search(&q, 5, 64).unwrap();
+        assert_eq!(before, after, "i8 exact-mode search must match across reopen");
     }
 }
