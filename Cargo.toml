@@ -197,6 +197,11 @@ server = []  # Server-mode features requiring async runtime
 internal-tests = []  # Internal API tests (disabled for public builds)
 compression = []      # MySQL wire-protocol packet compression (zlib via flate2)
 
+# Persistent vector index (PQ-HNSW) — durable, crash-recoverable vector index in RocksDB.
+# Off by default; the in-RAM vector path is unchanged. See PROPOSAL_PERSISTENT_PQ_HNSW.md.
+# No extra deps — reuses the core rocksdb/bincode/serde stack.
+vector-persist = []
+
 # =============================================================================
 # CODE-GRAPH TRACK (FR 2 / FR 3)
 # =============================================================================

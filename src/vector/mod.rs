@@ -7,10 +7,14 @@
 pub mod biased_descent;
 pub mod hnsw_index;
 pub mod in_descent;
+#[cfg(feature = "vector-persist")]
+pub mod persistent;
 pub mod quantization;
 pub mod quantized_hnsw;
 pub mod simd;
 
+#[cfg(feature = "vector-persist")]
+pub use persistent::{PersistentVectorIndex, PqHnswConfig, VectorPrecision};
 pub use biased_descent::{apply_bias, BiasOptions, CentralityMap};
 pub use in_descent::{search as in_descent_search, Adjacency, InDescentOptions, Positions};
 pub use hnsw_index::{HnswIndex, HnswConfig, MultiMetricHnswIndex};
