@@ -26,7 +26,8 @@ use parking_lot::RwLock;
 use rocksdb::{DB, Direction, IteratorMode, WriteBatch};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::sync::Arc;
 
 /// Internal element identifier within an index.
@@ -499,6 +500,317 @@ impl PersistentVectorIndex {
     }
 }
 
+// ── Phase 2: in-house HNSW graph (build + search) ────────────────────────────
+//
+// A self-contained Hierarchical Navigable Small World graph implemented directly
+// against the persistent substrate above, following the published algorithm
+// (Malkov & Yashunin, arXiv:1603.09320) and the layer-search / greedy-descent
+// pattern already established in this crate's `in_descent` module. Distances use
+// the crate's SIMD-backed metric kernels (`super::l2_distance`, …). No third-party
+// graph code is used; level assignment uses the public-domain SplitMix64 mixer so
+// the build needs no external RNG dependency.
+
+/// Defensive cap on the (geometric) level distribution.
+const MAX_LEVEL: u32 = 31;
+
+/// A `(distance, element)` pair ordered ascending by distance (via `total_cmp`),
+/// tie-broken by id. Used in the search heaps.
+#[derive(Copy, Clone, Debug)]
+struct Cand {
+    dist: f32,
+    id: ElementId,
+}
+impl PartialEq for Cand {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.dist.to_bits() == other.dist.to_bits()
+    }
+}
+impl Eq for Cand {}
+impl PartialOrd for Cand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Cand {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.dist.total_cmp(&other.dist).then(self.id.cmp(&other.id))
+    }
+}
+
+/// SplitMix64 (public domain, Sebastiano Vigna) → uniform f64 in `[0, 1)`.
+fn unit_f64_from(seed: u64) -> f64 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    ((z >> 11) as f64) / ((1u64 << 53) as f64)
+}
+
+/// Assign a level with the standard `floor(-ln(U) * mL)` rule, seeded
+/// deterministically from the element id so builds are reproducible.
+fn random_level(seed: u64, ml: f64) -> u32 {
+    let u = unit_f64_from(seed).max(f64::MIN_POSITIVE);
+    let lvl = (-u.ln() * ml).floor();
+    if lvl <= 0.0 {
+        0
+    } else {
+        (lvl as u32).min(MAX_LEVEL)
+    }
+}
+
+impl IndexState {
+    /// Distance from a query vector to a stored element under the index metric.
+    fn dist(&self, q: &[f32], id: ElementId) -> f32 {
+        match self.vectors.get(&id) {
+            Some(v) => match self.config.distance_metric {
+                DistanceMetric::L2 => super::l2_distance(q, v),
+                DistanceMetric::Cosine => super::cosine_distance(q, v),
+                DistanceMetric::InnerProduct => super::inner_product_distance(q, v),
+            },
+            None => f32::INFINITY,
+        }
+    }
+
+    /// HNSW layer search (Algorithm 2): best-first exploration of `layer` from
+    /// `entry`, returning up to `ef` closest elements sorted ascending by distance.
+    /// Tombstoned elements are traversed for connectivity but never collected.
+    fn search_layer(&self, q: &[f32], entry: &[ElementId], ef: usize, layer: u32) -> Vec<Cand> {
+        let mut visited: HashSet<ElementId> = HashSet::new();
+        let mut frontier: BinaryHeap<Reverse<Cand>> = BinaryHeap::new();
+        let mut best: BinaryHeap<Cand> = BinaryHeap::new();
+        for &e in entry {
+            if !visited.insert(e) {
+                continue;
+            }
+            let d = self.dist(q, e);
+            frontier.push(Reverse(Cand { dist: d, id: e }));
+            if !self.tombstones.contains(&e) {
+                best.push(Cand { dist: d, id: e });
+                if best.len() > ef {
+                    best.pop();
+                }
+            }
+        }
+        while let Some(Reverse(c)) = frontier.pop() {
+            if let Some(worst) = best.peek() {
+                if c.dist > worst.dist && best.len() >= ef {
+                    break;
+                }
+            }
+            let Some(neighbors) = self.adjacency.get(&(layer, c.id)) else {
+                continue;
+            };
+            for &n in neighbors {
+                if !visited.insert(n) {
+                    continue;
+                }
+                let d = self.dist(q, n);
+                let worst = best.peek().map_or(f32::INFINITY, |w| w.dist);
+                if best.len() < ef || d < worst {
+                    frontier.push(Reverse(Cand { dist: d, id: n }));
+                    if !self.tombstones.contains(&n) {
+                        best.push(Cand { dist: d, id: n });
+                        if best.len() > ef {
+                            best.pop();
+                        }
+                    }
+                }
+            }
+        }
+        best.into_sorted_vec()
+    }
+
+    /// Neighbor-selection heuristic (Algorithm 4, base variant): keep a diverse
+    /// set — an element is kept only if it is closer to `base` than to every
+    /// already-selected neighbor. `candidates` carry their distance to `base`.
+    fn select_neighbors(&self, base: &[f32], mut candidates: Vec<Cand>, m: usize) -> Vec<ElementId> {
+        let _ = base; // base distances are precomputed into `candidates`
+        candidates.sort_unstable();
+        let mut result: Vec<ElementId> = Vec::with_capacity(m);
+        for cand in candidates {
+            if result.len() >= m {
+                break;
+            }
+            let Some(cand_vec) = self.vectors.get(&cand.id) else {
+                continue;
+            };
+            let keep = result.iter().all(|&r| self.dist(cand_vec, r) >= cand.dist);
+            if keep {
+                result.push(cand.id);
+            }
+        }
+        result
+    }
+}
+
+impl PersistentVectorIndex {
+    /// Insert a vector into the graph: assign a fresh element id, choose a level,
+    /// connect it to its nearest neighbors at each layer, and persist every touched
+    /// key atomically with the vector. Returns the assigned element id.
+    pub fn insert(&self, row_id: u64, vector: &Vector) -> Result<ElementId> {
+        let mut st = self.state.write();
+        if vector.len() != st.config.dimension {
+            return Err(Error::query_execution(format!(
+                "vector dimension mismatch: expected {}, got {}",
+                st.config.dimension,
+                vector.len()
+            )));
+        }
+        let p = prefix(self.index_id);
+        let elem = st.next_element_id;
+        let level = random_level(elem, st.config.ml);
+        let m = st.config.m;
+        let m0 = st.config.m0;
+        let efc = st.config.ef_construction;
+
+        // Store the element's vector, id mappings, and level.
+        let mut wb = WriteBatch::default();
+        wb.put(key_vec(&p, elem), encode_vector(&st.config, vector)?);
+        wb.put(key_map(&p, elem), ser(&row_id)?);
+        wb.put(key_rmap(&p, row_id), ser(&elem)?);
+        wb.put(key_lvl(&p, elem), ser(&level)?);
+        st.vectors.insert(elem, vector.clone());
+        st.elem_to_row.insert(elem, row_id);
+        st.row_to_elem.insert(row_id, elem);
+        st.levels.insert(elem, level);
+        st.element_count += 1;
+        st.next_element_id = elem + 1;
+
+        let mut touched: Vec<(u32, ElementId)> = Vec::new();
+
+        match st.entry_point {
+            None => {
+                st.entry_point = Some(elem);
+                if (level as usize) + 1 > st.layer_count {
+                    st.layer_count = level as usize + 1;
+                }
+            }
+            Some(ep0) => {
+                let top = (st.layer_count.saturating_sub(1)) as u32;
+                let mut ep = ep0;
+                let mut ep_dist = st.dist(vector, ep);
+
+                // Greedy descent through the layers above the new element's level.
+                let mut layer = top;
+                while layer > level {
+                    let res = st.search_layer(vector, &[ep], 1, layer);
+                    if let Some(c) = res.first() {
+                        if c.dist < ep_dist {
+                            ep = c.id;
+                            ep_dist = c.dist;
+                        }
+                    }
+                    layer -= 1;
+                }
+
+                // Connect from min(level, top) down to layer 0.
+                let start = level.min(top);
+                let mut entry = ep;
+                let mut l = start as i64;
+                while l >= 0 {
+                    let layer_u = l as u32;
+                    let m_l = if layer_u == 0 { m0 } else { m };
+                    let candidates = st.search_layer(vector, &[entry], efc, layer_u);
+                    let selected = st.select_neighbors(vector, candidates.clone(), m_l);
+
+                    st.adjacency.insert((layer_u, elem), selected.clone());
+                    touched.push((layer_u, elem));
+
+                    for &nb in &selected {
+                        let mut nb_list =
+                            st.adjacency.get(&(layer_u, nb)).cloned().unwrap_or_default();
+                        if !nb_list.contains(&elem) {
+                            nb_list.push(elem);
+                        }
+                        let cap = if layer_u == 0 { m0 } else { m };
+                        if nb_list.len() > cap {
+                            if let Some(nb_vec) = st.vectors.get(&nb).cloned() {
+                                let cands: Vec<Cand> = nb_list
+                                    .iter()
+                                    .map(|&x| Cand { dist: st.dist(&nb_vec, x), id: x })
+                                    .collect();
+                                nb_list = st.select_neighbors(&nb_vec, cands, cap);
+                            } else {
+                                nb_list.truncate(cap);
+                            }
+                        }
+                        st.adjacency.insert((layer_u, nb), nb_list);
+                        touched.push((layer_u, nb));
+                    }
+
+                    if let Some(c) = candidates.first() {
+                        entry = c.id;
+                    }
+                    l -= 1;
+                }
+
+                if (level as usize) + 1 > st.layer_count {
+                    st.layer_count = level as usize + 1;
+                }
+                if level > top {
+                    st.entry_point = Some(elem);
+                }
+            }
+        }
+
+        // Persist touched adjacency lists + metadata, atomically with the vector.
+        touched.sort_unstable();
+        touched.dedup();
+        for (layer_u, e) in touched {
+            let nbrs = st.adjacency.get(&(layer_u, e)).cloned().unwrap_or_default();
+            wb.put(key_adj(&p, layer_u, e), ser(&nbrs)?);
+        }
+        wb.put(key_meta(&p), st.meta_bytes()?);
+        self.db.write(wb).map_err(map_db)?;
+        Ok(elem)
+    }
+
+    /// Search the graph for the `k` nearest neighbors of `query`, exploring with a
+    /// candidate-list size of `ef` (clamped up to at least `k`). Returns
+    /// `(row_id, distance)` sorted ascending by distance; tombstoned elements are
+    /// excluded.
+    pub fn search(&self, query: &Vector, k: usize, ef: usize) -> Result<Vec<(u64, f32)>> {
+        let st = self.state.read();
+        if query.len() != st.config.dimension {
+            return Err(Error::query_execution(format!(
+                "query dimension mismatch: expected {}, got {}",
+                st.config.dimension,
+                query.len()
+            )));
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(ep0) = st.entry_point else {
+            return Ok(Vec::new());
+        };
+
+        let top = (st.layer_count.saturating_sub(1)) as u32;
+        let mut ep = ep0;
+        let mut ep_dist = st.dist(query, ep);
+        let mut layer = top;
+        while layer > 0 {
+            let res = st.search_layer(query, &[ep], 1, layer);
+            if let Some(c) = res.first() {
+                if c.dist < ep_dist {
+                    ep = c.id;
+                    ep_dist = c.dist;
+                }
+            }
+            layer -= 1;
+        }
+
+        let ef_eff = ef.max(k);
+        let found = st.search_layer(query, &[ep], ef_eff, 0);
+        let out: Vec<(u64, f32)> = found
+            .into_iter()
+            .filter_map(|c| st.elem_to_row.get(&c.id).map(|&r| (r, c.dist)))
+            .take(k)
+            .collect();
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -629,5 +941,102 @@ mod tests {
         let mut cfg = sample_config();
         cfg.rerank_precision = VectorPrecision::F16;
         assert!(PersistentVectorIndex::create(db.clone(), 1, cfg).is_err());
+    }
+
+    // ── Phase 2: HNSW graph ──────────────────────────────────────────────────
+
+    /// Deterministic pseudo-random vector (no RNG dependency) for graph tests.
+    fn rand_vec(seed: u64, dim: usize) -> Vec<f32> {
+        (0..dim)
+            .map(|j| unit_f64_from(seed.wrapping_mul(0x0100_0193).wrapping_add(j as u64 + 1)) as f32)
+            .collect()
+    }
+
+    fn l2(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt()
+    }
+
+    fn brute_topk(data: &[Vec<f32>], q: &[f32], k: usize) -> Vec<u64> {
+        let mut all: Vec<(usize, f32)> =
+            data.iter().enumerate().map(|(i, v)| (i, l2(q, v))).collect();
+        all.sort_by(|a, b| a.1.total_cmp(&b.1));
+        all.iter().take(k).map(|(i, _)| *i as u64).collect()
+    }
+
+    #[test]
+    fn test_graph_search_finds_self() {
+        let (_dir, db) = test_db();
+        let cfg = PqHnswConfig::new(4, DistanceMetric::L2);
+        let idx = PersistentVectorIndex::create(db.clone(), 1, cfg).unwrap();
+        let vecs = [
+            vec![1.0, 0.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0, 0.0],
+            vec![0.0, 0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 0.0, 1.0],
+            vec![0.5, 0.5, 0.0, 0.0],
+        ];
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        let got = idx.search(&vec![0.0, 0.0, 1.0, 0.0], 1, 32).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].0, 2, "nearest to e_3 is element 2");
+    }
+
+    #[test]
+    fn test_recall_vs_bruteforce_l2() {
+        // Parity gate: in-house HNSW recall@k vs exact ground truth.
+        let (_dir, db) = test_db();
+        let (dim, n, k, ef, queries) = (16usize, 1000usize, 10usize, 100usize, 100u64);
+        let idx =
+            PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
+                .unwrap();
+        let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
+        for (i, v) in data.iter().enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        assert_eq!(idx.len(), n);
+
+        let mut hits = 0usize;
+        for qi in 0..queries {
+            let q = rand_vec(1_000_000 + qi, dim);
+            let truth: HashSet<u64> = brute_topk(&data, &q, k).into_iter().collect();
+            let got = idx.search(&q, k, ef).unwrap();
+            assert_eq!(got.len(), k, "expected {k} results");
+            hits += got.iter().filter(|(row, _)| truth.contains(row)).count();
+        }
+        let recall = hits as f64 / (queries as usize * k) as f64;
+        assert!(recall >= 0.90, "recall@{k} = {recall:.3} (expected >= 0.90)");
+    }
+
+    #[test]
+    fn test_graph_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        let dim = 8;
+        let n = 200u64;
+        let q = rand_vec(99_999, dim);
+
+        let before = {
+            let db = Arc::new(DB::open_default(&path).unwrap());
+            let idx = PersistentVectorIndex::create(
+                db.clone(),
+                1,
+                PqHnswConfig::new(dim, DistanceMetric::L2),
+            )
+            .unwrap();
+            for i in 0..n {
+                idx.insert(i, &rand_vec(i, dim)).unwrap();
+            }
+            let res = idx.search(&q, 5, 64).unwrap();
+            assert_eq!(res.len(), 5);
+            res
+        };
+
+        // Reopen from disk and confirm the recovered graph yields identical results.
+        let db = Arc::new(DB::open_default(&path).unwrap());
+        let idx = PersistentVectorIndex::open(db, 1).unwrap();
+        let after = idx.search(&q, 5, 64).unwrap();
+        assert_eq!(before, after, "search must be identical after crash-recovery reopen");
     }
 }
