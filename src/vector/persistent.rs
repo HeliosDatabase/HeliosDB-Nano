@@ -2027,4 +2027,69 @@ mod tests {
         let after = idx.search(&q, 5, 64).unwrap();
         assert_eq!(before, after, "i8 exact-mode search must match across reopen");
     }
+
+    // ── P7: measurement (ignored; run with `-- --ignored --nocapture`) ───────
+
+    #[test]
+    #[ignore = "benchmark; run explicitly to print recall/latency/memory numbers"]
+    fn bench_persistent_pq_summary() {
+        use std::time::Instant;
+        let (dim, n, k, ef, queries) = (128usize, 2000usize, 10usize, 100usize, 200u64);
+        let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
+        let qs: Vec<Vec<f32>> = (0..queries).map(|qi| rand_vec(9_000_000 + qi, dim)).collect();
+        let truth: Vec<HashSet<u64>> =
+            qs.iter().map(|q| brute_topk(&data, q, k).into_iter().collect()).collect();
+
+        let pq_cfg = || {
+            let mut c = PqHnswConfig::new(dim, DistanceMetric::L2);
+            c.pq_config = Some(ProductQuantizerConfig {
+                num_subquantizers: 32,
+                num_centroids: 256,
+                dimension: dim,
+                training_iterations: 15,
+                min_training_samples: 256,
+            });
+            c
+        };
+
+        let run = |label: &str, idx: &PersistentVectorIndex| {
+            let t = Instant::now();
+            for (i, v) in data.iter().enumerate() {
+                idx.insert(i as u64, v).unwrap();
+            }
+            let build_ms = t.elapsed().as_secs_f64() * 1e3;
+            let t = Instant::now();
+            let mut hits = 0usize;
+            for (qi, q) in qs.iter().enumerate() {
+                let got = idx.search(q, k, ef).unwrap();
+                hits += got.iter().filter(|(r, _)| truth[qi].contains(r)).count();
+            }
+            let q_us = t.elapsed().as_secs_f64() * 1e6 / queries as f64;
+            let recall = hits as f64 / (queries as usize * k) as f64;
+            eprintln!(
+                "[{label}] build {build_ms:6.0}ms  query {q_us:6.0}us  recall@{k} {recall:.3}  ram {:5}KB",
+                idx.ram_vector_bytes() / 1024
+            );
+        };
+
+        eprintln!("dim={dim} n={n} k={k} ef={ef} queries={queries}");
+        let (_d1, db1) = test_db();
+        run(
+            "exact f32   ",
+            &PersistentVectorIndex::create(db1.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
+                .unwrap(),
+        );
+        let (_d2, db2) = test_db();
+        run(
+            "pq f32-rerank",
+            &PersistentVectorIndex::create_with_pq(db2.clone(), 1, pq_cfg(), &data).unwrap(),
+        );
+        let (_d3, db3) = test_db();
+        let mut ci8 = pq_cfg();
+        ci8.rerank_precision = VectorPrecision::I8;
+        run(
+            "pq i8-rerank ",
+            &PersistentVectorIndex::create_with_pq(db3.clone(), 1, ci8, &data).unwrap(),
+        );
+    }
 }
