@@ -1,26 +1,31 @@
-//! Persistent PQ-HNSW vector index — Phase 1: persistence + crash-recovery scaffolding.
+//! Persistent PQ-HNSW vector index (feature `vector-persist`).
 //!
-//! See `PROPOSAL_PERSISTENT_PQ_HNSW.md` for the full design. This phase implements only the
-//! durable storage substrate that later phases populate:
+//! See `PROPOSAL_PERSISTENT_PQ_HNSW.md` for the full design. Implemented in phases:
 //!
-//!   * the RocksDB key schema (`__vidx:<index_id>:…`) for index metadata, rerank vectors,
-//!     per-layer adjacency, id mappings, and the tombstone set;
-//!   * write-through persistence with atomic multi-key writes (`WriteBatch`);
-//!   * crash recovery via [`PersistentVectorIndex::open`] — reload from RocksDB, no rebuild;
-//!   * a single coarse per-index lock (`RwLock`) for structural correctness.
+//!   * **P1** — durable substrate: RocksDB key schema (`__vidx:<index_id>:…`),
+//!     write-through persistence with atomic `WriteBatch`, crash recovery via
+//!     [`PersistentVectorIndex::open`], coarse per-index `RwLock`.
+//!   * **P2** — in-house HNSW graph (level assignment, layer search, neighbor
+//!     heuristic, hierarchical search), following the published algorithm and the
+//!     greedy-descent pattern in this crate's `in_descent` module.
+//!   * **P3** — true online deletes with neighbor repair, plus bulk compaction.
+//!   * **P4** — Product Quantization unified with the graph: PQ codes resident in
+//!     RAM with full vectors on disk, ADC-based traversal, and a two-stage exact
+//!     rerank. Enabled per index via [`PersistentVectorIndex::create_with_pq`];
+//!     when disabled (the default), the index keeps full `f32` vectors in RAM and
+//!     behaves exactly as P1–P3.
 //!
-//! The HNSW graph construction (level assignment, neighbor-selection heuristic, search) and
-//! the PQ/ADC + exact-rerank query path arrive in later phases. This module deliberately
-//! ships the substrate they will write through, behind the opt-in `vector-persist` feature,
-//! so the default vector path (`hnsw_index`, `quantized_hnsw`) is unchanged.
-//!
-//! The persistence layer is grounded in the published HNSW and Product-Quantization
-//! literature and implemented independently against this crate's own storage primitives
-//! (`rocksdb`, `bincode`, `parking_lot`); see the proposal's IP-posture section.
+//! Grounded in published research — HNSW (Malkov & Yashunin, arXiv:1603.09320) and
+//! Product Quantization (Jégou et al., 2011) — and implemented independently against
+//! this crate's own primitives (`rocksdb`, `bincode`, the `quantization` module, the
+//! SIMD distance kernels). Level assignment uses the public-domain SplitMix64 mixer;
+//! no external RNG and no third-party graph code are used. See the proposal's
+//! IP-posture section.
 
 #![allow(clippy::similar_names)]
 
 use crate::{Error, Result};
+use super::quantization::{Codebook, ProductQuantizer, ProductQuantizerConfig, QuantizedVector};
 use super::{DistanceMetric, Vector};
 use parking_lot::RwLock;
 use rocksdb::{DB, Direction, IteratorMode, WriteBatch};
@@ -38,8 +43,8 @@ pub const PERSIST_SCHEMA_VERSION: u32 = 1;
 
 /// Rerank-vector storage precision.
 ///
-/// Only [`VectorPrecision::F32`] is wired in this phase; `F16` / `I8` are accepted on the
-/// config surface but rejected with a clear error until the multi-precision phase lands.
+/// Only [`VectorPrecision::F32`] is wired; `F16` / `I8` are accepted on the config
+/// surface but rejected with a clear error until the multi-precision phase lands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VectorPrecision {
     /// 32-bit float — exact rerank, no compression.
@@ -51,7 +56,7 @@ pub enum VectorPrecision {
 }
 
 /// Configuration for a persistent PQ-HNSW index.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PqHnswConfig {
     /// Vector dimension.
     pub dimension: usize,
@@ -67,8 +72,10 @@ pub struct PqHnswConfig {
     pub ml: f64,
     /// Storage precision for the exact-rerank vectors.
     pub rerank_precision: VectorPrecision,
-    /// Whether Product Quantization codes are stored (wired in a later phase).
+    /// Whether Product Quantization is active (set by `create_with_pq`).
     pub pq_enabled: bool,
+    /// Product Quantization parameters; `None` derives a default from the dimension.
+    pub pq_config: Option<ProductQuantizerConfig>,
 }
 
 impl PqHnswConfig {
@@ -85,13 +92,14 @@ impl PqHnswConfig {
             ml: 1.0 / (m as f64).ln(),
             rerank_precision: VectorPrecision::F32,
             pq_enabled: false,
+            pq_config: None,
         }
     }
 }
 
 /// Metadata persisted under the `…:meta` key — the part of the index state that is not
-/// per-element. Loaded first on `open` so recovery can restore the entry point and counters
-/// before faulting in element data.
+/// per-element. Loaded first on `open` so recovery can restore the entry point and
+/// counters before faulting in element data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedMeta {
     schema_version: u32,
@@ -103,6 +111,10 @@ struct PersistedMeta {
 }
 
 /// In-memory mirror of the index, guarded by the coarse per-index lock.
+///
+/// When PQ is active, `codes` is the resident representation and `vectors` is empty
+/// (full vectors live on disk for rerank). When PQ is inactive, `vectors` holds the
+/// full `f32` vectors and `codes` is empty.
 struct IndexState {
     config: PqHnswConfig,
     entry_point: Option<ElementId>,
@@ -110,6 +122,8 @@ struct IndexState {
     layer_count: usize,
     element_count: u64,
     vectors: HashMap<ElementId, Vector>,
+    codes: HashMap<ElementId, QuantizedVector>,
+    pq: Option<Arc<ProductQuantizer>>,
     levels: HashMap<ElementId, u32>,
     adjacency: HashMap<(u32, ElementId), Vec<ElementId>>,
     elem_to_row: HashMap<ElementId, u64>,
@@ -126,6 +140,8 @@ impl IndexState {
             layer_count: 0,
             element_count: 0,
             vectors: HashMap::new(),
+            codes: HashMap::new(),
+            pq: None,
             levels: HashMap::new(),
             adjacency: HashMap::new(),
             elem_to_row: HashMap::new(),
@@ -145,6 +161,108 @@ impl IndexState {
         };
         ser(&meta)
     }
+
+    /// Resolve an element's vector: cloned from RAM (PQ inactive) or decoded from its
+    /// PQ code (PQ active). Used by the build heuristic and repair.
+    fn element_vector(&self, id: ElementId) -> Option<Vec<f32>> {
+        if let Some(v) = self.vectors.get(&id) {
+            return Some(v.clone());
+        }
+        if let (Some(pq), Some(code)) = (self.pq.as_ref(), self.codes.get(&id)) {
+            return pq.decode(code).ok();
+        }
+        None
+    }
+
+    /// Build a query probe: an ADC distance table when PQ is active, otherwise an
+    /// exact handle on the query vector.
+    fn make_probe<'a>(&self, q: &'a [f32]) -> Probe<'a> {
+        if let Some(pq) = self.pq.as_ref() {
+            if let Ok(table) = pq.precompute_distance_table(&q.to_vec()) {
+                return Probe::Adc(table);
+            }
+        }
+        Probe::Exact(q)
+    }
+
+    /// HNSW layer search (Algorithm 2): best-first exploration of `layer` from
+    /// `entry`, returning up to `ef` closest elements sorted ascending by distance.
+    /// Distances are ADC (PQ active) or exact (PQ inactive). Tombstoned elements are
+    /// traversed for connectivity but never collected.
+    fn search_layer(&self, q: &[f32], entry: &[ElementId], ef: usize, layer: u32) -> Vec<Cand> {
+        let probe = self.make_probe(q);
+        let mut visited: HashSet<ElementId> = HashSet::new();
+        let mut frontier: BinaryHeap<Reverse<Cand>> = BinaryHeap::new();
+        let mut best: BinaryHeap<Cand> = BinaryHeap::new();
+        for &e in entry {
+            if !visited.insert(e) {
+                continue;
+            }
+            let d = probe.dist(self, e);
+            frontier.push(Reverse(Cand { dist: d, id: e }));
+            if !self.tombstones.contains(&e) {
+                best.push(Cand { dist: d, id: e });
+                if best.len() > ef {
+                    best.pop();
+                }
+            }
+        }
+        while let Some(Reverse(c)) = frontier.pop() {
+            if let Some(worst) = best.peek() {
+                if c.dist > worst.dist && best.len() >= ef {
+                    break;
+                }
+            }
+            let Some(neighbors) = self.adjacency.get(&(layer, c.id)) else {
+                continue;
+            };
+            for &n in neighbors {
+                if !visited.insert(n) {
+                    continue;
+                }
+                let d = probe.dist(self, n);
+                let worst = best.peek().map_or(f32::INFINITY, |w| w.dist);
+                if best.len() < ef || d < worst {
+                    frontier.push(Reverse(Cand { dist: d, id: n }));
+                    if !self.tombstones.contains(&n) {
+                        best.push(Cand { dist: d, id: n });
+                        if best.len() > ef {
+                            best.pop();
+                        }
+                    }
+                }
+            }
+        }
+        best.into_sorted_vec()
+    }
+
+    /// Neighbor-selection heuristic (Algorithm 4, base variant): keep a diverse set —
+    /// an element is kept only if it is closer to `base_vec` than to every
+    /// already-selected neighbor. Candidate vectors are resolved via `element_vector`
+    /// (decoded when PQ is active), so the diversity test is consistent within itself.
+    fn select_neighbors(&self, base_vec: &[f32], candidate_ids: &[ElementId], m: usize) -> Vec<ElementId> {
+        let metric = self.config.distance_metric;
+        let mut cands: Vec<(f32, ElementId, Vec<f32>)> = Vec::with_capacity(candidate_ids.len());
+        for &id in candidate_ids {
+            if let Some(v) = self.element_vector(id) {
+                let d = metric_dist(metric, base_vec, &v);
+                cands.push((d, id, v));
+            }
+        }
+        cands.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+
+        let mut result: Vec<(ElementId, Vec<f32>)> = Vec::with_capacity(m);
+        for (d, id, v) in cands {
+            if result.len() >= m {
+                break;
+            }
+            let keep = result.iter().all(|(_, rv)| metric_dist(metric, &v, rv) >= d);
+            if keep {
+                result.push((id, v));
+            }
+        }
+        result.into_iter().map(|(id, _)| id).collect()
+    }
 }
 
 // ── Key schema ──────────────────────────────────────────────────────────────
@@ -159,6 +277,12 @@ fn key_meta(p: &str) -> Vec<u8> {
 }
 fn key_vec(p: &str, e: ElementId) -> Vec<u8> {
     format!("{p}vec:{e}").into_bytes()
+}
+fn key_code(p: &str, e: ElementId) -> Vec<u8> {
+    format!("{p}code:{e}").into_bytes()
+}
+fn key_pq(p: &str) -> Vec<u8> {
+    format!("{p}pq").into_bytes()
 }
 fn key_lvl(p: &str, e: ElementId) -> Vec<u8> {
     format!("{p}lvl:{e}").into_bytes()
@@ -211,11 +335,197 @@ fn decode_vector(cfg: &PqHnswConfig, b: &[u8]) -> Result<Vector> {
     }
 }
 
+/// Distance between two raw vectors under a metric (SIMD-backed kernels).
+fn metric_dist(metric: DistanceMetric, a: &[f32], b: &[f32]) -> f32 {
+    match metric {
+        DistanceMetric::L2 => super::l2_distance(a, b),
+        DistanceMetric::Cosine => super::cosine_distance(a, b),
+        DistanceMetric::InnerProduct => super::inner_product_distance(a, b),
+    }
+}
+
+/// A query distance probe — exact (to a raw query vector) or ADC (precomputed PQ
+/// distance table).
+enum Probe<'a> {
+    Exact(&'a [f32]),
+    Adc(Vec<Vec<f32>>),
+}
+impl Probe<'_> {
+    fn dist(&self, st: &IndexState, id: ElementId) -> f32 {
+        match self {
+            Probe::Exact(q) => match st.vectors.get(&id) {
+                Some(v) => metric_dist(st.config.distance_metric, q, v),
+                None => f32::INFINITY,
+            },
+            Probe::Adc(table) => match (st.pq.as_ref(), st.codes.get(&id)) {
+                (Some(pq), Some(code)) => {
+                    pq.compute_distance_with_table(table, code).unwrap_or(f32::INFINITY)
+                }
+                _ => f32::INFINITY,
+            },
+        }
+    }
+}
+
+// ── In-house HNSW graph ──────────────────────────────────────────────────────
+
+/// Defensive cap on the (geometric) level distribution.
+const MAX_LEVEL: u32 = 31;
+
+/// A `(distance, element)` pair ordered ascending by distance (via `total_cmp`),
+/// tie-broken by id. Used in the search heaps.
+#[derive(Copy, Clone, Debug)]
+struct Cand {
+    dist: f32,
+    id: ElementId,
+}
+impl PartialEq for Cand {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.dist.to_bits() == other.dist.to_bits()
+    }
+}
+impl Eq for Cand {}
+impl PartialOrd for Cand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for Cand {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.dist.total_cmp(&other.dist).then(self.id.cmp(&other.id))
+    }
+}
+
+/// SplitMix64 (public domain, Sebastiano Vigna) → uniform f64 in `[0, 1)`.
+fn unit_f64_from(seed: u64) -> f64 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    ((z >> 11) as f64) / ((1u64 << 53) as f64)
+}
+
+/// Assign a level with the standard `floor(-ln(U) * mL)` rule, seeded deterministically
+/// from the element id so builds are reproducible.
+fn random_level(seed: u64, ml: f64) -> u32 {
+    let u = unit_f64_from(seed).max(f64::MIN_POSITIVE);
+    let lvl = (-u.ln() * ml).floor();
+    if lvl <= 0.0 {
+        0
+    } else {
+        (lvl as u32).min(MAX_LEVEL)
+    }
+}
+
+/// In-memory HNSW insert shared by `insert` (write-through) and `compact` (bulk
+/// rebuild). Mutates `st` only — performs no persistence — and returns the new element
+/// id plus the adjacency keys it touched. When PQ is active, the element is stored as a
+/// code; otherwise as a full vector. Caller validates the dimension and persists.
+fn graph_insert(
+    st: &mut IndexState,
+    row_id: u64,
+    vector: &Vector,
+) -> Result<(ElementId, Vec<(u32, ElementId)>)> {
+    let elem = st.next_element_id;
+    let level = random_level(elem, st.config.ml);
+    let m = st.config.m;
+    let m0 = st.config.m0;
+    let efc = st.config.ef_construction;
+
+    // Store the resident representation.
+    let pq = st.pq.clone();
+    if let Some(pq) = pq.as_ref() {
+        let code = pq
+            .encode(vector)
+            .map_err(|e| Error::storage(format!("vector-persist: pq encode: {e}")))?;
+        st.codes.insert(elem, code);
+    } else {
+        st.vectors.insert(elem, vector.clone());
+    }
+    st.elem_to_row.insert(elem, row_id);
+    st.row_to_elem.insert(row_id, elem);
+    st.levels.insert(elem, level);
+    st.element_count += 1;
+    st.next_element_id = elem + 1;
+
+    let mut touched: Vec<(u32, ElementId)> = Vec::new();
+
+    match st.entry_point {
+        None => {
+            st.entry_point = Some(elem);
+            if (level as usize) + 1 > st.layer_count {
+                st.layer_count = level as usize + 1;
+            }
+        }
+        Some(ep0) => {
+            let top = (st.layer_count.saturating_sub(1)) as u32;
+            let mut ep = ep0;
+            let mut ep_dist = st.make_probe(vector).dist(st, ep);
+
+            // Greedy descent through the layers above the new element's level.
+            let mut layer = top;
+            while layer > level {
+                let res = st.search_layer(vector, &[ep], 1, layer);
+                if let Some(c) = res.first() {
+                    if c.dist < ep_dist {
+                        ep = c.id;
+                        ep_dist = c.dist;
+                    }
+                }
+                layer -= 1;
+            }
+
+            // Connect from min(level, top) down to layer 0.
+            let start = level.min(top);
+            let mut entry = ep;
+            let mut l = start as i64;
+            while l >= 0 {
+                let layer_u = l as u32;
+                let m_l = if layer_u == 0 { m0 } else { m };
+                let candidates = st.search_layer(vector, &[entry], efc, layer_u);
+                let cand_ids: Vec<ElementId> = candidates.iter().map(|c| c.id).collect();
+                let selected = st.select_neighbors(vector, &cand_ids, m_l);
+
+                st.adjacency.insert((layer_u, elem), selected.clone());
+                touched.push((layer_u, elem));
+
+                for &nb in &selected {
+                    let mut nb_list =
+                        st.adjacency.get(&(layer_u, nb)).cloned().unwrap_or_default();
+                    if !nb_list.contains(&elem) {
+                        nb_list.push(elem);
+                    }
+                    let cap = if layer_u == 0 { m0 } else { m };
+                    if nb_list.len() > cap {
+                        if let Some(nb_vec) = st.element_vector(nb) {
+                            nb_list = st.select_neighbors(&nb_vec, &nb_list, cap);
+                        } else {
+                            nb_list.truncate(cap);
+                        }
+                    }
+                    st.adjacency.insert((layer_u, nb), nb_list);
+                    touched.push((layer_u, nb));
+                }
+
+                if let Some(c) = candidates.first() {
+                    entry = c.id;
+                }
+                l -= 1;
+            }
+
+            if (level as usize) + 1 > st.layer_count {
+                st.layer_count = level as usize + 1;
+            }
+            if level > top {
+                st.entry_point = Some(elem);
+            }
+        }
+    }
+
+    Ok((elem, touched))
+}
+
 /// A durable, crash-recoverable vector index backed by RocksDB.
-///
-/// Phase 1 provides the persistence substrate: write-through mutation of the index's
-/// metadata, vectors, adjacency, id mappings, and tombstones, plus full reconstruction on
-/// [`open`](Self::open). Structural mutations are serialized by a single coarse `RwLock`.
 pub struct PersistentVectorIndex {
     db: Arc<DB>,
     index_id: u64,
@@ -223,7 +533,7 @@ pub struct PersistentVectorIndex {
 }
 
 impl PersistentVectorIndex {
-    /// Create a new, empty index and persist its metadata. Errors if one already exists.
+    /// Create a new, empty index (PQ inactive — full vectors resident in RAM).
     pub fn create(db: Arc<DB>, index_id: u64, config: PqHnswConfig) -> Result<Self> {
         if config.rerank_precision != VectorPrecision::F32 {
             return Err(Error::storage(format!(
@@ -246,8 +556,63 @@ impl PersistentVectorIndex {
         })
     }
 
-    /// Open (recover) an existing index from RocksDB. Errors if it does not exist or the
-    /// on-disk schema version is unknown.
+    /// Create a PQ-backed index: train a Product Quantizer on `training` vectors,
+    /// persist the codebook, and store PQ codes in RAM with full vectors on disk
+    /// (faulted in only for the two-stage rerank). PQ is L2-only.
+    pub fn create_with_pq(
+        db: Arc<DB>,
+        index_id: u64,
+        mut config: PqHnswConfig,
+        training: &[Vector],
+    ) -> Result<Self> {
+        if config.rerank_precision != VectorPrecision::F32 {
+            return Err(Error::storage("vector-persist: PQ requires F32 rerank precision"));
+        }
+        if config.distance_metric != DistanceMetric::L2 {
+            return Err(Error::storage("vector-persist: PQ is supported only with the L2 metric"));
+        }
+        if training.is_empty() {
+            return Err(Error::storage("vector-persist: PQ training set is empty"));
+        }
+        let p = prefix(index_id);
+        if db.get(key_meta(&p)).map_err(map_db)?.is_some() {
+            return Err(Error::storage(format!(
+                "vector-persist: index {index_id} already exists"
+            )));
+        }
+
+        let mut pq_cfg = match config.pq_config.clone() {
+            Some(c) => c,
+            None => ProductQuantizerConfig::default_for_dimension(config.dimension)
+                .map_err(|e| Error::storage(format!("vector-persist: pq config: {e}")))?,
+        };
+        // Never reject on sample count — clamp the requirement to what we were given.
+        pq_cfg.min_training_samples = pq_cfg.min_training_samples.min(training.len().max(1));
+        let pq = ProductQuantizer::train(pq_cfg.clone(), training)
+            .map_err(|e| Error::storage(format!("vector-persist: pq train: {e}")))?;
+
+        config.pq_enabled = true;
+        config.pq_config = Some(pq_cfg);
+        let mut state = IndexState::new(config);
+        state.pq = Some(Arc::new(pq));
+
+        let mut wb = WriteBatch::default();
+        wb.put(key_meta(&p), state.meta_bytes()?);
+        if let Some(pq) = state.pq.as_ref() {
+            wb.put(key_pq(&p), ser(&*pq.codebook())?);
+        }
+        db.write(wb).map_err(map_db)?;
+
+        Ok(Self {
+            db,
+            index_id,
+            state: Arc::new(RwLock::new(state)),
+        })
+    }
+
+    /// Open (recover) an existing index from RocksDB. Reconstructs the PQ codebook if
+    /// the index was created with PQ. Errors if it does not exist or the on-disk schema
+    /// version is unknown.
     pub fn open(db: Arc<DB>, index_id: u64) -> Result<Self> {
         let p = prefix(index_id);
         let meta_bytes = db
@@ -268,6 +633,22 @@ impl PersistentVectorIndex {
         st.layer_count = meta.layer_count;
         st.element_count = meta.element_count;
 
+        // Reconstruct the quantizer if a codebook was persisted.
+        let pq_active = if let Some(cb_bytes) = db.get(key_pq(&p)).map_err(map_db)? {
+            let codebook: Codebook = de(&cb_bytes)?;
+            let pq_cfg = match meta.config.pq_config.clone() {
+                Some(c) => c,
+                None => ProductQuantizerConfig::default_for_dimension(meta.config.dimension)
+                    .map_err(|e| Error::storage(format!("vector-persist: pq config: {e}")))?,
+            };
+            let pq = ProductQuantizer::new(pq_cfg, codebook)
+                .map_err(|e| Error::storage(format!("vector-persist: pq reconstruct: {e}")))?;
+            st.pq = Some(Arc::new(pq));
+            true
+        } else {
+            false
+        };
+
         // Scan the contiguous keyspace for this index and rebuild the in-memory mirror.
         let pb = p.as_bytes();
         let iter = db.iterator(IteratorMode::From(pb, Direction::Forward));
@@ -280,14 +661,21 @@ impl PersistentVectorIndex {
                 .map_err(|e| Error::storage(format!("vector-persist: non-utf8 key: {e}")))?;
             let mut parts = suffix.split(':');
             match parts.next() {
-                Some("meta") => {} // already loaded
+                Some("meta") | Some("pq") => {}
                 Some("tomb") => {
                     let set: Vec<ElementId> = de(&v)?;
                     st.tombstones = set.into_iter().collect();
                 }
                 Some("vec") => {
+                    // Full vectors stay on disk when PQ is active (rerank only).
+                    if !pq_active {
+                        let e = parse_id(parts.next())?;
+                        st.vectors.insert(e, decode_vector(&meta.config, &v)?);
+                    }
+                }
+                Some("code") => {
                     let e = parse_id(parts.next())?;
-                    st.vectors.insert(e, decode_vector(&meta.config, &v)?);
+                    st.codes.insert(e, de::<QuantizedVector>(&v)?);
                 }
                 Some("lvl") => {
                     let e = parse_id(parts.next())?;
@@ -306,7 +694,7 @@ impl PersistentVectorIndex {
                     let row = parse_id(parts.next())?;
                     st.row_to_elem.insert(row, de::<ElementId>(&v)?);
                 }
-                _ => {} // unknown sub-key — ignore for forward compatibility
+                _ => {}
             }
         }
 
@@ -339,9 +727,9 @@ impl PersistentVectorIndex {
         Ok(())
     }
 
-    // ── Write-through mutators (coarse-locked) ───────────────────────────────
+    // ── Low-level write-through mutators (substrate; used directly in P1 tests) ──
 
-    /// Store an element's rerank vector, row mapping, and level. Atomic across all keys.
+    /// Store an element's rerank vector, row mapping, and level (no graph edges).
     pub fn put_vector(
         &self,
         elem_id: ElementId,
@@ -413,7 +801,7 @@ impl PersistentVectorIndex {
         Ok(())
     }
 
-    /// Mark an element as soft-deleted (full graph repair lands in a later phase).
+    /// Mark an element as soft-deleted (excluded from search; reclaimed by `compact`).
     pub fn mark_tombstone(&self, elem_id: ElementId) -> Result<()> {
         let mut st = self.state.write();
         st.tombstones.insert(elem_id);
@@ -421,6 +809,301 @@ impl PersistentVectorIndex {
         self.db
             .put(key_tomb(&prefix(self.index_id)), ser(&set)?)
             .map_err(map_db)?;
+        Ok(())
+    }
+
+    // ── Graph build / search / delete ────────────────────────────────────────
+
+    /// Insert a vector into the graph. Persists the full vector (for rerank) plus, when
+    /// PQ is active, its code; the new element's keys + every touched adjacency list +
+    /// metadata are flushed atomically in one batch. Returns the assigned element id.
+    pub fn insert(&self, row_id: u64, vector: &Vector) -> Result<ElementId> {
+        let mut st = self.state.write();
+        if vector.len() != st.config.dimension {
+            return Err(Error::query_execution(format!(
+                "vector dimension mismatch: expected {}, got {}",
+                st.config.dimension,
+                vector.len()
+            )));
+        }
+        let (elem, mut touched) = graph_insert(&mut st, row_id, vector)?;
+
+        let p = prefix(self.index_id);
+        let level = st.levels.get(&elem).copied().unwrap_or(0);
+        let mut wb = WriteBatch::default();
+        wb.put(key_vec(&p, elem), encode_vector(&st.config, vector)?);
+        wb.put(key_map(&p, elem), ser(&row_id)?);
+        wb.put(key_rmap(&p, row_id), ser(&elem)?);
+        wb.put(key_lvl(&p, elem), ser(&level)?);
+        if let Some(code) = st.codes.get(&elem) {
+            wb.put(key_code(&p, elem), ser(code)?);
+        }
+        touched.sort_unstable();
+        touched.dedup();
+        for (layer_u, e) in touched {
+            let nbrs = st.adjacency.get(&(layer_u, e)).cloned().unwrap_or_default();
+            wb.put(key_adj(&p, layer_u, e), ser(&nbrs)?);
+        }
+        wb.put(key_meta(&p), st.meta_bytes()?);
+        self.db.write(wb).map_err(map_db)?;
+        Ok(elem)
+    }
+
+    /// Search for the `k` nearest neighbors of `query` with candidate-list size `ef`
+    /// (clamped up to at least `k`). When PQ is active, traversal uses ADC and the top
+    /// candidates are re-ranked with exact distances from the on-disk full vectors.
+    /// Returns `(row_id, distance)` sorted ascending; tombstoned elements are excluded.
+    pub fn search(&self, query: &Vector, k: usize, ef: usize) -> Result<Vec<(u64, f32)>> {
+        let st = self.state.read();
+        if query.len() != st.config.dimension {
+            return Err(Error::query_execution(format!(
+                "query dimension mismatch: expected {}, got {}",
+                st.config.dimension,
+                query.len()
+            )));
+        }
+        if k == 0 {
+            return Ok(Vec::new());
+        }
+        let Some(ep0) = st.entry_point else {
+            return Ok(Vec::new());
+        };
+
+        let top = (st.layer_count.saturating_sub(1)) as u32;
+        let mut ep = ep0;
+        let mut ep_dist = st.make_probe(query).dist(&st, ep);
+        let mut layer = top;
+        while layer > 0 {
+            let res = st.search_layer(query, &[ep], 1, layer);
+            if let Some(c) = res.first() {
+                if c.dist < ep_dist {
+                    ep = c.id;
+                    ep_dist = c.dist;
+                }
+            }
+            layer -= 1;
+        }
+
+        let ef_eff = ef.max(k);
+        let found = st.search_layer(query, &[ep], ef_eff, 0);
+
+        if st.pq.is_some() {
+            // Two-stage exact rerank: re-score the ADC candidate set with the on-disk
+            // full vectors, then take the true top-k.
+            let p = prefix(self.index_id);
+            let metric = st.config.distance_metric;
+            let mut reranked: Vec<(u64, f32)> = Vec::with_capacity(found.len());
+            for c in &found {
+                let Some(&row) = st.elem_to_row.get(&c.id) else {
+                    continue;
+                };
+                let dist = match self.db.get(key_vec(&p, c.id)).map_err(map_db)? {
+                    Some(bytes) => metric_dist(metric, query, &decode_vector(&st.config, &bytes)?),
+                    None => c.dist,
+                };
+                reranked.push((row, dist));
+            }
+            reranked.sort_by(|a, b| a.1.total_cmp(&b.1));
+            reranked.truncate(k);
+            Ok(reranked)
+        } else {
+            let out: Vec<(u64, f32)> = found
+                .into_iter()
+                .filter_map(|c| st.elem_to_row.get(&c.id).map(|&r| (r, c.dist)))
+                .take(k)
+                .collect();
+            Ok(out)
+        }
+    }
+
+    /// Remove a row from the graph: delete the element and repair every node that
+    /// referenced it by re-selecting connections from the candidate pool left by the
+    /// hole. Promotes the entry point if it was removed. Persisted atomically. Returns
+    /// whether the row existed. No stale edges remain — recall stays stable under churn.
+    pub fn remove(&self, row_id: u64) -> Result<bool> {
+        let mut st = self.state.write();
+        let Some(elem) = st.row_to_elem.get(&row_id).copied() else {
+            return Ok(false);
+        };
+        let level = st.levels.get(&elem).copied().unwrap_or(0);
+        let p = prefix(self.index_id);
+        let mut wb = WriteBatch::default();
+        let mut touched: Vec<(u32, ElementId)> = Vec::new();
+
+        for layer in 0..=level {
+            let x_nbrs: Vec<ElementId> =
+                st.adjacency.get(&(layer, elem)).cloned().unwrap_or_default();
+            let cap = if layer == 0 { st.config.m0 } else { st.config.m };
+
+            let referrers: Vec<ElementId> = st
+                .adjacency
+                .iter()
+                .filter(|(k, v)| k.0 == layer && v.contains(&elem))
+                .map(|(k, _)| k.1)
+                .collect();
+
+            for nb in referrers {
+                if nb == elem {
+                    continue;
+                }
+                let Some(nb_vec) = st.element_vector(nb) else {
+                    continue;
+                };
+                let mut pool: HashSet<ElementId> = HashSet::new();
+                for &c in &x_nbrs {
+                    if c != elem && c != nb {
+                        pool.insert(c);
+                    }
+                }
+                if let Some(cur) = st.adjacency.get(&(layer, nb)) {
+                    for &c in cur {
+                        if c != elem && c != nb {
+                            pool.insert(c);
+                        }
+                    }
+                }
+                let pool_ids: Vec<ElementId> = pool
+                    .into_iter()
+                    .filter(|c| !st.tombstones.contains(c))
+                    .collect();
+                let new_list = st.select_neighbors(&nb_vec, &pool_ids, cap);
+                st.adjacency.insert((layer, nb), new_list);
+                touched.push((layer, nb));
+            }
+
+            st.adjacency.remove(&(layer, elem));
+            wb.delete(key_adj(&p, layer, elem));
+        }
+
+        // Drop the element's own data (both resident forms + on-disk keys).
+        st.vectors.remove(&elem);
+        st.codes.remove(&elem);
+        st.levels.remove(&elem);
+        st.elem_to_row.remove(&elem);
+        st.row_to_elem.remove(&row_id);
+        let was_tomb = st.tombstones.remove(&elem);
+        st.element_count = st.element_count.saturating_sub(1);
+        wb.delete(key_vec(&p, elem));
+        wb.delete(key_code(&p, elem));
+        wb.delete(key_lvl(&p, elem));
+        wb.delete(key_map(&p, elem));
+        wb.delete(key_rmap(&p, row_id));
+
+        if st.entry_point == Some(elem) {
+            st.entry_point = st
+                .levels
+                .iter()
+                .filter(|(id, _)| !st.tombstones.contains(*id))
+                .max_by_key(|(_, lvl)| **lvl)
+                .map(|(id, _)| *id);
+        }
+        st.layer_count = st
+            .levels
+            .iter()
+            .filter(|(id, _)| !st.tombstones.contains(*id))
+            .map(|(_, lvl)| *lvl as usize + 1)
+            .max()
+            .unwrap_or(0);
+
+        touched.sort_unstable();
+        touched.dedup();
+        for (layer, e) in touched {
+            if let Some(nbrs) = st.adjacency.get(&(layer, e)) {
+                wb.put(key_adj(&p, layer, e), ser(nbrs)?);
+            }
+        }
+        if was_tomb {
+            let set: Vec<ElementId> = st.tombstones.iter().copied().collect();
+            wb.put(key_tomb(&p), ser(&set)?);
+        }
+        wb.put(key_meta(&p), st.meta_bytes()?);
+        self.db.write(wb).map_err(map_db)?;
+        Ok(true)
+    }
+
+    /// Rebuild the graph from scratch over the surviving (non-tombstoned) elements,
+    /// reclaiming space and clearing tombstones; persisted atomically. Preserves the PQ
+    /// codebook (when active), reloading full vectors from disk to re-encode.
+    pub fn compact(&self) -> Result<()> {
+        let mut st = self.state.write();
+        let p = prefix(self.index_id);
+
+        // Gather surviving (row, full-vector) pairs.
+        let elem_ids: Vec<ElementId> = if st.pq.is_some() {
+            st.codes.keys().copied().collect()
+        } else {
+            st.vectors.keys().copied().collect()
+        };
+        let mut survivors: Vec<(u64, Vector)> = Vec::with_capacity(elem_ids.len());
+        for elem in elem_ids {
+            if st.tombstones.contains(&elem) {
+                continue;
+            }
+            let Some(&row) = st.elem_to_row.get(&elem) else {
+                continue;
+            };
+            let full = if let Some(v) = st.vectors.get(&elem) {
+                v.clone()
+            } else {
+                match self.db.get(key_vec(&p, elem)).map_err(map_db)? {
+                    Some(bytes) => decode_vector(&st.config, &bytes)?,
+                    None => continue,
+                }
+            };
+            survivors.push((row, full));
+        }
+        survivors.sort_by_key(|(row, _)| *row);
+
+        // Reset the graph, preserving config + PQ codebook, then re-insert survivors.
+        let config = st.config.clone();
+        let pq = st.pq.clone();
+        let mut fresh = IndexState::new(config);
+        fresh.pq = pq;
+        *st = fresh;
+        for (row, v) in &survivors {
+            let _ = graph_insert(&mut st, *row, v)?;
+        }
+
+        // Full rewrite of the keyspace from the rebuilt state + the survivor vectors.
+        let mut wb = WriteBatch::default();
+        let pb = p.as_bytes();
+        let iter = self.db.iterator(IteratorMode::From(pb, Direction::Forward));
+        for item in iter {
+            let (k, _) = item.map_err(map_db)?;
+            if !k.starts_with(pb) {
+                break;
+            }
+            wb.delete(k);
+        }
+        wb.put(key_meta(&p), st.meta_bytes()?);
+        if let Some(pq) = st.pq.as_ref() {
+            wb.put(key_pq(&p), ser(&*pq.codebook())?);
+        }
+        for (&elem, &row) in &st.elem_to_row {
+            wb.put(key_map(&p, elem), ser(&row)?);
+            wb.put(key_rmap(&p, row), ser(&elem)?);
+            if let Some(&lvl) = st.levels.get(&elem) {
+                wb.put(key_lvl(&p, elem), ser(&lvl)?);
+            }
+            if let Some(code) = st.codes.get(&elem) {
+                wb.put(key_code(&p, elem), ser(code)?);
+            }
+            if let Some(v) = st.vectors.get(&elem) {
+                wb.put(key_vec(&p, elem), encode_vector(&st.config, v)?);
+            }
+        }
+        if st.pq.is_some() {
+            // PQ mode keeps full vectors only on disk — write them from the survivors.
+            for (row, v) in &survivors {
+                if let Some(&elem) = st.row_to_elem.get(row) {
+                    wb.put(key_vec(&p, elem), encode_vector(&st.config, v)?);
+                }
+            }
+        }
+        for (&(layer, elem), nbrs) in &st.adjacency {
+            wb.put(key_adj(&p, layer, elem), ser(nbrs)?);
+        }
+        self.db.write(wb).map_err(map_db)?;
         Ok(())
     }
 
@@ -436,15 +1119,36 @@ impl PersistentVectorIndex {
     pub fn config(&self) -> PqHnswConfig {
         self.state.read().config.clone()
     }
+    /// Whether Product Quantization is active for this index.
+    #[must_use]
+    pub fn pq_active(&self) -> bool {
+        self.state.read().pq.is_some()
+    }
     /// Number of stored elements.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.state.read().vectors.len()
+        let st = self.state.read();
+        if st.pq.is_some() {
+            st.codes.len()
+        } else {
+            st.vectors.len()
+        }
     }
     /// Whether the index has no elements.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
+    }
+    /// Estimated resident (RAM) bytes for the vector representation — PQ codes when
+    /// active, full `f32` vectors otherwise. Used to demonstrate the PQ memory win.
+    #[must_use]
+    pub fn ram_vector_bytes(&self) -> usize {
+        let st = self.state.read();
+        if st.pq.is_some() {
+            st.codes.values().map(|c| c.codes.len()).sum()
+        } else {
+            st.vectors.values().map(|v| v.len() * std::mem::size_of::<f32>()).sum()
+        }
     }
     /// The current graph entry point, if any.
     #[must_use]
@@ -461,10 +1165,10 @@ impl PersistentVectorIndex {
     pub fn next_element_id(&self) -> ElementId {
         self.state.read().next_element_id
     }
-    /// A copy of an element's rerank vector.
+    /// A copy of an element's resident vector (decoded from its PQ code when active).
     #[must_use]
     pub fn vector(&self, elem_id: ElementId) -> Option<Vector> {
-        self.state.read().vectors.get(&elem_id).cloned()
+        self.state.read().element_vector(elem_id)
     }
     /// An element's assigned level.
     #[must_use]
@@ -500,502 +1204,6 @@ impl PersistentVectorIndex {
     }
 }
 
-// ── Phase 2: in-house HNSW graph (build + search) ────────────────────────────
-//
-// A self-contained Hierarchical Navigable Small World graph implemented directly
-// against the persistent substrate above, following the published algorithm
-// (Malkov & Yashunin, arXiv:1603.09320) and the layer-search / greedy-descent
-// pattern already established in this crate's `in_descent` module. Distances use
-// the crate's SIMD-backed metric kernels (`super::l2_distance`, …). No third-party
-// graph code is used; level assignment uses the public-domain SplitMix64 mixer so
-// the build needs no external RNG dependency.
-
-/// Defensive cap on the (geometric) level distribution.
-const MAX_LEVEL: u32 = 31;
-
-/// A `(distance, element)` pair ordered ascending by distance (via `total_cmp`),
-/// tie-broken by id. Used in the search heaps.
-#[derive(Copy, Clone, Debug)]
-struct Cand {
-    dist: f32,
-    id: ElementId,
-}
-impl PartialEq for Cand {
-    fn eq(&self, other: &Self) -> bool {
-        self.id == other.id && self.dist.to_bits() == other.dist.to_bits()
-    }
-}
-impl Eq for Cand {}
-impl PartialOrd for Cand {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-impl Ord for Cand {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.dist.total_cmp(&other.dist).then(self.id.cmp(&other.id))
-    }
-}
-
-/// SplitMix64 (public domain, Sebastiano Vigna) → uniform f64 in `[0, 1)`.
-fn unit_f64_from(seed: u64) -> f64 {
-    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    ((z >> 11) as f64) / ((1u64 << 53) as f64)
-}
-
-/// Assign a level with the standard `floor(-ln(U) * mL)` rule, seeded
-/// deterministically from the element id so builds are reproducible.
-fn random_level(seed: u64, ml: f64) -> u32 {
-    let u = unit_f64_from(seed).max(f64::MIN_POSITIVE);
-    let lvl = (-u.ln() * ml).floor();
-    if lvl <= 0.0 {
-        0
-    } else {
-        (lvl as u32).min(MAX_LEVEL)
-    }
-}
-
-/// In-memory HNSW insert shared by `insert` (write-through) and `compact`
-/// (bulk rebuild). Mutates `st` only — performs no persistence — and returns the
-/// new element id plus the adjacency keys it touched (for the caller to flush).
-/// Caller is responsible for validating the vector dimension.
-fn graph_insert(
-    st: &mut IndexState,
-    row_id: u64,
-    vector: &Vector,
-) -> (ElementId, Vec<(u32, ElementId)>) {
-    let elem = st.next_element_id;
-    let level = random_level(elem, st.config.ml);
-    let m = st.config.m;
-    let m0 = st.config.m0;
-    let efc = st.config.ef_construction;
-
-    st.vectors.insert(elem, vector.clone());
-    st.elem_to_row.insert(elem, row_id);
-    st.row_to_elem.insert(row_id, elem);
-    st.levels.insert(elem, level);
-    st.element_count += 1;
-    st.next_element_id = elem + 1;
-
-    let mut touched: Vec<(u32, ElementId)> = Vec::new();
-
-    match st.entry_point {
-        None => {
-            st.entry_point = Some(elem);
-            if (level as usize) + 1 > st.layer_count {
-                st.layer_count = level as usize + 1;
-            }
-        }
-        Some(ep0) => {
-            let top = (st.layer_count.saturating_sub(1)) as u32;
-            let mut ep = ep0;
-            let mut ep_dist = st.dist(vector, ep);
-
-            // Greedy descent through the layers above the new element's level.
-            let mut layer = top;
-            while layer > level {
-                let res = st.search_layer(vector, &[ep], 1, layer);
-                if let Some(c) = res.first() {
-                    if c.dist < ep_dist {
-                        ep = c.id;
-                        ep_dist = c.dist;
-                    }
-                }
-                layer -= 1;
-            }
-
-            // Connect from min(level, top) down to layer 0.
-            let start = level.min(top);
-            let mut entry = ep;
-            let mut l = start as i64;
-            while l >= 0 {
-                let layer_u = l as u32;
-                let m_l = if layer_u == 0 { m0 } else { m };
-                let candidates = st.search_layer(vector, &[entry], efc, layer_u);
-                let selected = st.select_neighbors(vector, candidates.clone(), m_l);
-
-                st.adjacency.insert((layer_u, elem), selected.clone());
-                touched.push((layer_u, elem));
-
-                for &nb in &selected {
-                    let mut nb_list =
-                        st.adjacency.get(&(layer_u, nb)).cloned().unwrap_or_default();
-                    if !nb_list.contains(&elem) {
-                        nb_list.push(elem);
-                    }
-                    let cap = if layer_u == 0 { m0 } else { m };
-                    if nb_list.len() > cap {
-                        if let Some(nb_vec) = st.vectors.get(&nb).cloned() {
-                            let cands: Vec<Cand> = nb_list
-                                .iter()
-                                .map(|&x| Cand { dist: st.dist(&nb_vec, x), id: x })
-                                .collect();
-                            nb_list = st.select_neighbors(&nb_vec, cands, cap);
-                        } else {
-                            nb_list.truncate(cap);
-                        }
-                    }
-                    st.adjacency.insert((layer_u, nb), nb_list);
-                    touched.push((layer_u, nb));
-                }
-
-                if let Some(c) = candidates.first() {
-                    entry = c.id;
-                }
-                l -= 1;
-            }
-
-            if (level as usize) + 1 > st.layer_count {
-                st.layer_count = level as usize + 1;
-            }
-            if level > top {
-                st.entry_point = Some(elem);
-            }
-        }
-    }
-
-    (elem, touched)
-}
-
-impl IndexState {
-    /// Distance from a query vector to a stored element under the index metric.
-    fn dist(&self, q: &[f32], id: ElementId) -> f32 {
-        match self.vectors.get(&id) {
-            Some(v) => match self.config.distance_metric {
-                DistanceMetric::L2 => super::l2_distance(q, v),
-                DistanceMetric::Cosine => super::cosine_distance(q, v),
-                DistanceMetric::InnerProduct => super::inner_product_distance(q, v),
-            },
-            None => f32::INFINITY,
-        }
-    }
-
-    /// HNSW layer search (Algorithm 2): best-first exploration of `layer` from
-    /// `entry`, returning up to `ef` closest elements sorted ascending by distance.
-    /// Tombstoned elements are traversed for connectivity but never collected.
-    fn search_layer(&self, q: &[f32], entry: &[ElementId], ef: usize, layer: u32) -> Vec<Cand> {
-        let mut visited: HashSet<ElementId> = HashSet::new();
-        let mut frontier: BinaryHeap<Reverse<Cand>> = BinaryHeap::new();
-        let mut best: BinaryHeap<Cand> = BinaryHeap::new();
-        for &e in entry {
-            if !visited.insert(e) {
-                continue;
-            }
-            let d = self.dist(q, e);
-            frontier.push(Reverse(Cand { dist: d, id: e }));
-            if !self.tombstones.contains(&e) {
-                best.push(Cand { dist: d, id: e });
-                if best.len() > ef {
-                    best.pop();
-                }
-            }
-        }
-        while let Some(Reverse(c)) = frontier.pop() {
-            if let Some(worst) = best.peek() {
-                if c.dist > worst.dist && best.len() >= ef {
-                    break;
-                }
-            }
-            let Some(neighbors) = self.adjacency.get(&(layer, c.id)) else {
-                continue;
-            };
-            for &n in neighbors {
-                if !visited.insert(n) {
-                    continue;
-                }
-                let d = self.dist(q, n);
-                let worst = best.peek().map_or(f32::INFINITY, |w| w.dist);
-                if best.len() < ef || d < worst {
-                    frontier.push(Reverse(Cand { dist: d, id: n }));
-                    if !self.tombstones.contains(&n) {
-                        best.push(Cand { dist: d, id: n });
-                        if best.len() > ef {
-                            best.pop();
-                        }
-                    }
-                }
-            }
-        }
-        best.into_sorted_vec()
-    }
-
-    /// Neighbor-selection heuristic (Algorithm 4, base variant): keep a diverse
-    /// set — an element is kept only if it is closer to `base` than to every
-    /// already-selected neighbor. `candidates` carry their distance to `base`.
-    fn select_neighbors(&self, base: &[f32], mut candidates: Vec<Cand>, m: usize) -> Vec<ElementId> {
-        let _ = base; // base distances are precomputed into `candidates`
-        candidates.sort_unstable();
-        let mut result: Vec<ElementId> = Vec::with_capacity(m);
-        for cand in candidates {
-            if result.len() >= m {
-                break;
-            }
-            let Some(cand_vec) = self.vectors.get(&cand.id) else {
-                continue;
-            };
-            let keep = result.iter().all(|&r| self.dist(cand_vec, r) >= cand.dist);
-            if keep {
-                result.push(cand.id);
-            }
-        }
-        result
-    }
-}
-
-impl PersistentVectorIndex {
-    /// Insert a vector into the graph: assign a fresh element id, choose a level,
-    /// connect it to its nearest neighbors at each layer, and persist every touched
-    /// key atomically with the vector. Returns the assigned element id.
-    pub fn insert(&self, row_id: u64, vector: &Vector) -> Result<ElementId> {
-        let mut st = self.state.write();
-        if vector.len() != st.config.dimension {
-            return Err(Error::query_execution(format!(
-                "vector dimension mismatch: expected {}, got {}",
-                st.config.dimension,
-                vector.len()
-            )));
-        }
-        let (elem, mut touched) = graph_insert(&mut st, row_id, vector);
-
-        // Flush the new element's keys + every touched adjacency list + metadata,
-        // atomically in one batch.
-        let p = prefix(self.index_id);
-        let level = st.levels.get(&elem).copied().unwrap_or(0);
-        let mut wb = WriteBatch::default();
-        wb.put(key_vec(&p, elem), encode_vector(&st.config, vector)?);
-        wb.put(key_map(&p, elem), ser(&row_id)?);
-        wb.put(key_rmap(&p, row_id), ser(&elem)?);
-        wb.put(key_lvl(&p, elem), ser(&level)?);
-        touched.sort_unstable();
-        touched.dedup();
-        for (layer_u, e) in touched {
-            let nbrs = st.adjacency.get(&(layer_u, e)).cloned().unwrap_or_default();
-            wb.put(key_adj(&p, layer_u, e), ser(&nbrs)?);
-        }
-        wb.put(key_meta(&p), st.meta_bytes()?);
-        self.db.write(wb).map_err(map_db)?;
-        Ok(elem)
-    }
-
-    /// Search the graph for the `k` nearest neighbors of `query`, exploring with a
-    /// candidate-list size of `ef` (clamped up to at least `k`). Returns
-    /// `(row_id, distance)` sorted ascending by distance; tombstoned elements are
-    /// excluded.
-    pub fn search(&self, query: &Vector, k: usize, ef: usize) -> Result<Vec<(u64, f32)>> {
-        let st = self.state.read();
-        if query.len() != st.config.dimension {
-            return Err(Error::query_execution(format!(
-                "query dimension mismatch: expected {}, got {}",
-                st.config.dimension,
-                query.len()
-            )));
-        }
-        if k == 0 {
-            return Ok(Vec::new());
-        }
-        let Some(ep0) = st.entry_point else {
-            return Ok(Vec::new());
-        };
-
-        let top = (st.layer_count.saturating_sub(1)) as u32;
-        let mut ep = ep0;
-        let mut ep_dist = st.dist(query, ep);
-        let mut layer = top;
-        while layer > 0 {
-            let res = st.search_layer(query, &[ep], 1, layer);
-            if let Some(c) = res.first() {
-                if c.dist < ep_dist {
-                    ep = c.id;
-                    ep_dist = c.dist;
-                }
-            }
-            layer -= 1;
-        }
-
-        let ef_eff = ef.max(k);
-        let found = st.search_layer(query, &[ep], ef_eff, 0);
-        let out: Vec<(u64, f32)> = found
-            .into_iter()
-            .filter_map(|c| st.elem_to_row.get(&c.id).map(|&r| (r, c.dist)))
-            .take(k)
-            .collect();
-        Ok(out)
-    }
-
-    /// Remove a row from the graph: delete the element and repair every node that
-    /// referenced it by re-selecting that node's connections from the candidate pool
-    /// left by the hole (the deleted node's other neighbors plus the referrer's own).
-    /// Promotes the entry point if it was removed. Persisted atomically. Returns
-    /// whether the row existed. This keeps recall stable under churn — unlike a
-    /// tombstone-only delete, no stale edges are left behind.
-    pub fn remove(&self, row_id: u64) -> Result<bool> {
-        let mut st = self.state.write();
-        let Some(elem) = st.row_to_elem.get(&row_id).copied() else {
-            return Ok(false);
-        };
-        let level = st.levels.get(&elem).copied().unwrap_or(0);
-        let p = prefix(self.index_id);
-        let mut wb = WriteBatch::default();
-        let mut touched: Vec<(u32, ElementId)> = Vec::new();
-
-        // Edges only exist at layers <= the element's level.
-        for layer in 0..=level {
-            let x_nbrs: Vec<ElementId> =
-                st.adjacency.get(&(layer, elem)).cloned().unwrap_or_default();
-            let cap = if layer == 0 { st.config.m0 } else { st.config.m };
-
-            // Every node that still points at `elem` at this layer must be repaired
-            // (HNSW edges can be asymmetric, so scan rather than trust `x_nbrs`).
-            let referrers: Vec<ElementId> = st
-                .adjacency
-                .iter()
-                .filter(|(k, v)| k.0 == layer && v.contains(&elem))
-                .map(|(k, _)| k.1)
-                .collect();
-
-            for nb in referrers {
-                if nb == elem {
-                    continue;
-                }
-                let Some(nb_vec) = st.vectors.get(&nb).cloned() else {
-                    continue;
-                };
-                // Candidate pool: the hole's other neighbors + the referrer's current
-                // neighbors, minus the deleted node and self, restricted to live nodes.
-                let mut pool: HashSet<ElementId> = HashSet::new();
-                for &c in &x_nbrs {
-                    if c != elem && c != nb {
-                        pool.insert(c);
-                    }
-                }
-                if let Some(cur) = st.adjacency.get(&(layer, nb)) {
-                    for &c in cur {
-                        if c != elem && c != nb {
-                            pool.insert(c);
-                        }
-                    }
-                }
-                let cands: Vec<Cand> = pool
-                    .into_iter()
-                    .filter(|c| st.vectors.contains_key(c) && !st.tombstones.contains(c))
-                    .map(|c| Cand { dist: st.dist(&nb_vec, c), id: c })
-                    .collect();
-                let new_list = st.select_neighbors(&nb_vec, cands, cap);
-                st.adjacency.insert((layer, nb), new_list);
-                touched.push((layer, nb));
-            }
-
-            st.adjacency.remove(&(layer, elem));
-            wb.delete(key_adj(&p, layer, elem));
-        }
-
-        // Drop the element's own data.
-        st.vectors.remove(&elem);
-        st.levels.remove(&elem);
-        st.elem_to_row.remove(&elem);
-        st.row_to_elem.remove(&row_id);
-        let was_tomb = st.tombstones.remove(&elem);
-        st.element_count = st.element_count.saturating_sub(1);
-        wb.delete(key_vec(&p, elem));
-        wb.delete(key_lvl(&p, elem));
-        wb.delete(key_map(&p, elem));
-        wb.delete(key_rmap(&p, row_id));
-
-        // Promote the entry point and recompute the layer count over survivors.
-        if st.entry_point == Some(elem) {
-            st.entry_point = st
-                .levels
-                .iter()
-                .filter(|(id, _)| !st.tombstones.contains(*id))
-                .max_by_key(|(_, lvl)| **lvl)
-                .map(|(id, _)| *id);
-        }
-        st.layer_count = st
-            .levels
-            .iter()
-            .filter(|(id, _)| !st.tombstones.contains(*id))
-            .map(|(_, lvl)| *lvl as usize + 1)
-            .max()
-            .unwrap_or(0);
-
-        touched.sort_unstable();
-        touched.dedup();
-        for (layer, e) in touched {
-            if let Some(nbrs) = st.adjacency.get(&(layer, e)) {
-                wb.put(key_adj(&p, layer, e), ser(nbrs)?);
-            }
-        }
-        if was_tomb {
-            let set: Vec<ElementId> = st.tombstones.iter().copied().collect();
-            wb.put(key_tomb(&p), ser(&set)?);
-        }
-        wb.put(key_meta(&p), st.meta_bytes()?);
-        self.db.write(wb).map_err(map_db)?;
-        Ok(true)
-    }
-
-    /// Rebuild the graph from scratch over the surviving (non-tombstoned) elements,
-    /// reclaiming space and clearing tombstones. A maintenance safety net for
-    /// heavy-churn or soft-delete workloads; persisted atomically.
-    pub fn compact(&self) -> Result<()> {
-        let mut st = self.state.write();
-        let mut survivors: Vec<(u64, Vector)> = st
-            .vectors
-            .iter()
-            .filter(|(elem, _)| !st.tombstones.contains(*elem))
-            .filter_map(|(elem, v)| st.elem_to_row.get(elem).map(|&row| (row, v.clone())))
-            .collect();
-        survivors.sort_by_key(|(row, _)| *row);
-
-        let config = st.config.clone();
-        *st = IndexState::new(config);
-        for (row, v) in &survivors {
-            let _ = graph_insert(&mut st, *row, v);
-        }
-        self.persist_full(&st)?;
-        Ok(())
-    }
-
-    /// Wipe the index's keyspace and re-persist the full in-memory state in one
-    /// atomic batch. Used by `compact`.
-    fn persist_full(&self, st: &IndexState) -> Result<()> {
-        let p = prefix(self.index_id);
-        let pb = p.as_bytes();
-        let mut wb = WriteBatch::default();
-        let iter = self.db.iterator(IteratorMode::From(pb, Direction::Forward));
-        for item in iter {
-            let (k, _) = item.map_err(map_db)?;
-            if !k.starts_with(pb) {
-                break;
-            }
-            wb.delete(k);
-        }
-        wb.put(key_meta(&p), st.meta_bytes()?);
-        for (&elem, vec) in &st.vectors {
-            wb.put(key_vec(&p, elem), encode_vector(&st.config, vec)?);
-            if let Some(&row) = st.elem_to_row.get(&elem) {
-                wb.put(key_map(&p, elem), ser(&row)?);
-                wb.put(key_rmap(&p, row), ser(&elem)?);
-            }
-            if let Some(&lvl) = st.levels.get(&elem) {
-                wb.put(key_lvl(&p, elem), ser(&lvl)?);
-            }
-        }
-        for (&(layer, elem), nbrs) in &st.adjacency {
-            wb.put(key_adj(&p, layer, elem), ser(nbrs)?);
-        }
-        if !st.tombstones.is_empty() {
-            let set: Vec<ElementId> = st.tombstones.iter().copied().collect();
-            wb.put(key_tomb(&p), ser(&set)?);
-        }
-        self.db.write(wb).map_err(map_db)?;
-        Ok(())
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -1012,6 +1220,24 @@ mod tests {
         PqHnswConfig::new(3, DistanceMetric::L2)
     }
 
+    /// Deterministic pseudo-random vector (no RNG dependency) for graph tests.
+    fn rand_vec(seed: u64, dim: usize) -> Vec<f32> {
+        (0..dim)
+            .map(|j| unit_f64_from(seed.wrapping_mul(0x0100_0193).wrapping_add(j as u64 + 1)) as f32)
+            .collect()
+    }
+
+    fn l2(a: &[f32], b: &[f32]) -> f32 {
+        a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt()
+    }
+
+    fn brute_topk(data: &[Vec<f32>], q: &[f32], k: usize) -> Vec<u64> {
+        let mut all: Vec<(usize, f32)> =
+            data.iter().enumerate().map(|(i, v)| (i, l2(q, v))).collect();
+        all.sort_by(|a, b| a.1.total_cmp(&b.1));
+        all.iter().take(k).map(|(i, _)| *i as u64).collect()
+    }
+
     fn populate(idx: &PersistentVectorIndex) {
         idx.put_vector(0, 100, &vec![1.0, 0.0, 0.0], 2).unwrap();
         idx.put_vector(1, 101, &vec![0.0, 1.0, 0.0], 0).unwrap();
@@ -1023,6 +1249,8 @@ mod tests {
         idx.mark_tombstone(1).unwrap();
     }
 
+    // ── P1: persistence substrate ────────────────────────────────────────────
+
     #[test]
     fn test_create_then_open_roundtrip() {
         let (_dir, db) = test_db();
@@ -1033,10 +1261,14 @@ mod tests {
             assert_eq!(idx.entry_point(), Some(0));
         }
         let reopened = PersistentVectorIndex::open(db.clone(), 7).unwrap();
-        assert_eq!(reopened.config(), sample_config());
+        let cfg = reopened.config();
+        assert_eq!(cfg.dimension, 3);
+        assert_eq!(cfg.distance_metric, DistanceMetric::L2);
+        assert_eq!(cfg.m, 16);
+        assert!(!cfg.pq_enabled);
         assert_eq!(reopened.len(), 3);
         assert_eq!(reopened.entry_point(), Some(0));
-        assert_eq!(reopened.layer_count(), 3); // max level 2 ⇒ 3 layers
+        assert_eq!(reopened.layer_count(), 3);
         assert_eq!(reopened.next_element_id(), 3);
         assert_eq!(reopened.vector(0), Some(vec![1.0, 0.0, 0.0]));
         assert_eq!(reopened.level(2), Some(1));
@@ -1057,8 +1289,6 @@ mod tests {
             let db = Arc::new(DB::open_default(&path).unwrap());
             let idx = PersistentVectorIndex::create(db.clone(), 1, sample_config()).unwrap();
             populate(&idx);
-            // Simulate a crash: drop the index handle and close the DB with no explicit
-            // flush/close of the index itself.
         }
         let db = Arc::new(DB::open_default(&path).unwrap());
         let idx = PersistentVectorIndex::open(db, 1).unwrap();
@@ -1097,7 +1327,6 @@ mod tests {
 
     #[test]
     fn test_two_indexes_isolated() {
-        // Guards the prefix-iteration boundary (index 1 vs index 2 share the DB).
         let (_dir, db) = test_db();
         let a = PersistentVectorIndex::create(db.clone(), 1, sample_config()).unwrap();
         let b = PersistentVectorIndex::create(db.clone(), 2, sample_config()).unwrap();
@@ -1117,7 +1346,7 @@ mod tests {
     fn test_dimension_mismatch_is_err() {
         let (_dir, db) = test_db();
         let idx = PersistentVectorIndex::create(db.clone(), 1, sample_config()).unwrap();
-        assert!(idx.put_vector(0, 1, &vec![1.0, 2.0], 0).is_err()); // dim 2 ≠ 3
+        assert!(idx.put_vector(0, 1, &vec![1.0, 2.0], 0).is_err());
     }
 
     #[test]
@@ -1128,25 +1357,7 @@ mod tests {
         assert!(PersistentVectorIndex::create(db.clone(), 1, cfg).is_err());
     }
 
-    // ── Phase 2: HNSW graph ──────────────────────────────────────────────────
-
-    /// Deterministic pseudo-random vector (no RNG dependency) for graph tests.
-    fn rand_vec(seed: u64, dim: usize) -> Vec<f32> {
-        (0..dim)
-            .map(|j| unit_f64_from(seed.wrapping_mul(0x0100_0193).wrapping_add(j as u64 + 1)) as f32)
-            .collect()
-    }
-
-    fn l2(a: &[f32], b: &[f32]) -> f32 {
-        a.iter().zip(b).map(|(x, y)| (x - y) * (x - y)).sum::<f32>().sqrt()
-    }
-
-    fn brute_topk(data: &[Vec<f32>], q: &[f32], k: usize) -> Vec<u64> {
-        let mut all: Vec<(usize, f32)> =
-            data.iter().enumerate().map(|(i, v)| (i, l2(q, v))).collect();
-        all.sort_by(|a, b| a.1.total_cmp(&b.1));
-        all.iter().take(k).map(|(i, _)| *i as u64).collect()
-    }
+    // ── P2: HNSW graph ───────────────────────────────────────────────────────
 
     #[test]
     fn test_graph_search_finds_self() {
@@ -1165,12 +1376,11 @@ mod tests {
         }
         let got = idx.search(&vec![0.0, 0.0, 1.0, 0.0], 1, 32).unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].0, 2, "nearest to e_3 is element 2");
+        assert_eq!(got[0].0, 2);
     }
 
     #[test]
     fn test_recall_vs_bruteforce_l2() {
-        // Parity gate: in-house HNSW recall@k vs exact ground truth.
         let (_dir, db) = test_db();
         let (dim, n, k, ef, queries) = (16usize, 1000usize, 10usize, 100usize, 100u64);
         let idx =
@@ -1187,7 +1397,7 @@ mod tests {
             let q = rand_vec(1_000_000 + qi, dim);
             let truth: HashSet<u64> = brute_topk(&data, &q, k).into_iter().collect();
             let got = idx.search(&q, k, ef).unwrap();
-            assert_eq!(got.len(), k, "expected {k} results");
+            assert_eq!(got.len(), k);
             hits += got.iter().filter(|(row, _)| truth.contains(row)).count();
         }
         let recall = hits as f64 / (queries as usize * k) as f64;
@@ -1218,14 +1428,13 @@ mod tests {
             res
         };
 
-        // Reopen from disk and confirm the recovered graph yields identical results.
         let db = Arc::new(DB::open_default(&path).unwrap());
         let idx = PersistentVectorIndex::open(db, 1).unwrap();
         let after = idx.search(&q, 5, 64).unwrap();
         assert_eq!(before, after, "search must be identical after crash-recovery reopen");
     }
 
-    // ── Phase 3: online deletes + compaction ─────────────────────────────────
+    // ── P3: online deletes + compaction ──────────────────────────────────────
 
     #[test]
     fn test_remove_excludes_and_keeps_searchable() {
@@ -1237,12 +1446,12 @@ mod tests {
         for i in 0..60u64 {
             idx.insert(i, &rand_vec(i, dim)).unwrap();
         }
-        let q = rand_vec(7, dim); // exactly row 7's vector
+        let q = rand_vec(7, dim);
         let before = idx.search(&q, 5, 64).unwrap();
-        assert!(before.iter().any(|(r, _)| *r == 7), "row 7 should be a top hit");
+        assert!(before.iter().any(|(r, _)| *r == 7));
 
         assert!(idx.remove(7).unwrap());
-        assert!(!idx.remove(7).unwrap(), "second remove is a no-op");
+        assert!(!idx.remove(7).unwrap());
         assert_eq!(idx.len(), 59);
 
         let after = idx.search(&q, 5, 64).unwrap();
@@ -1305,8 +1514,6 @@ mod tests {
             live.insert(next, v);
             next += 1;
         }
-        // Interleaved delete/insert rounds — the pattern that collapses a
-        // tombstone-only index's recall.
         for _round in 0..4 {
             let del: Vec<u64> = live.keys().copied().take(60).collect();
             for r in del {
@@ -1320,7 +1527,7 @@ mod tests {
                 next += 1;
             }
         }
-        assert_eq!(idx.len(), live.len(), "element count must track live set");
+        assert_eq!(idx.len(), live.len());
 
         let data: Vec<(u64, Vec<f32>)> = live.iter().map(|(r, v)| (*r, v.clone())).collect();
         let mut hits = 0usize;
@@ -1347,7 +1554,6 @@ mod tests {
         let idx =
             PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
                 .unwrap();
-        // Row i maps to element i in a fresh index.
         for i in 0..100u64 {
             assert_eq!(idx.insert(i, &rand_vec(i, dim)).unwrap(), i);
         }
@@ -1370,5 +1576,101 @@ mod tests {
         for (r, _) in idx.search(&q, 10, 64).unwrap() {
             assert!(r >= 20, "no dropped rows after compact");
         }
+    }
+
+    // ── P4: PQ unified with the graph ────────────────────────────────────────
+
+    /// PQ config giving ~16× compression at dim 64 (16 sub-quantizers, 1-byte codes).
+    fn pq_config_dim64() -> PqHnswConfig {
+        let mut cfg = PqHnswConfig::new(64, DistanceMetric::L2);
+        cfg.pq_config = Some(ProductQuantizerConfig {
+            num_subquantizers: 16,
+            num_centroids: 64,
+            dimension: 64,
+            training_iterations: 10,
+            min_training_samples: 200,
+        });
+        cfg
+    }
+
+    #[test]
+    fn test_pq_memory_and_recall() {
+        let (_dir, db) = test_db();
+        let (dim, n, k, ef) = (64usize, 600usize, 10usize, 100usize);
+        let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
+
+        let idx =
+            PersistentVectorIndex::create_with_pq(db.clone(), 1, pq_config_dim64(), &data).unwrap();
+        assert!(idx.pq_active());
+        for (i, v) in data.iter().enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        assert_eq!(idx.len(), n);
+
+        // Memory gate: PQ codes resident in RAM use >= 8x less than full f32 vectors.
+        let pq_ram = idx.ram_vector_bytes();
+        let full_ram = n * dim * std::mem::size_of::<f32>();
+        assert!(
+            pq_ram * 8 <= full_ram,
+            "PQ RAM {pq_ram} vs full {full_ram} — expected >= 8x reduction"
+        );
+
+        // Recall after two-stage rerank.
+        let mut hits = 0usize;
+        let queries = 60u64;
+        for qi in 0..queries {
+            let q = rand_vec(5_000_000 + qi, dim);
+            let truth: HashSet<u64> = brute_topk(&data, &q, k).into_iter().collect();
+            let got = idx.search(&q, k, ef).unwrap();
+            assert_eq!(got.len(), k);
+            hits += got.iter().filter(|(r, _)| truth.contains(r)).count();
+        }
+        let recall = hits as f64 / (queries as usize * k) as f64;
+        assert!(recall >= 0.75, "PQ recall@{k} = {recall:.3} (expected >= 0.75)");
+    }
+
+    #[test]
+    fn test_pq_survives_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        let (dim, n) = (64usize, 400usize);
+        let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
+        let q = rand_vec(7_777, dim);
+
+        let before = {
+            let db = Arc::new(DB::open_default(&path).unwrap());
+            let idx =
+                PersistentVectorIndex::create_with_pq(db.clone(), 1, pq_config_dim64(), &data)
+                    .unwrap();
+            for (i, v) in data.iter().enumerate() {
+                idx.insert(i as u64, v).unwrap();
+            }
+            idx.search(&q, 10, 100).unwrap()
+        };
+
+        let db = Arc::new(DB::open_default(&path).unwrap());
+        let idx = PersistentVectorIndex::open(db, 1).unwrap();
+        assert!(idx.pq_active(), "PQ must be reconstructed on reopen");
+        assert_eq!(idx.len(), n);
+        let after = idx.search(&q, 10, 100).unwrap();
+        assert_eq!(before, after, "PQ search must be identical after reopen");
+    }
+
+    #[test]
+    fn test_pq_remove() {
+        let (_dir, db) = test_db();
+        let (dim, n) = (64usize, 300usize);
+        let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
+        let idx =
+            PersistentVectorIndex::create_with_pq(db.clone(), 1, pq_config_dim64(), &data).unwrap();
+        for (i, v) in data.iter().enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        let q = rand_vec(5, dim);
+        assert!(idx.remove(5).unwrap());
+        assert_eq!(idx.len(), n - 1);
+        let got = idx.search(&q, 10, 100).unwrap();
+        assert!(!got.iter().any(|(r, _)| *r == 5), "removed row absent under PQ");
+        assert_eq!(got.len(), 10);
     }
 }
