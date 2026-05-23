@@ -558,6 +558,108 @@ fn random_level(seed: u64, ml: f64) -> u32 {
     }
 }
 
+/// In-memory HNSW insert shared by `insert` (write-through) and `compact`
+/// (bulk rebuild). Mutates `st` only — performs no persistence — and returns the
+/// new element id plus the adjacency keys it touched (for the caller to flush).
+/// Caller is responsible for validating the vector dimension.
+fn graph_insert(
+    st: &mut IndexState,
+    row_id: u64,
+    vector: &Vector,
+) -> (ElementId, Vec<(u32, ElementId)>) {
+    let elem = st.next_element_id;
+    let level = random_level(elem, st.config.ml);
+    let m = st.config.m;
+    let m0 = st.config.m0;
+    let efc = st.config.ef_construction;
+
+    st.vectors.insert(elem, vector.clone());
+    st.elem_to_row.insert(elem, row_id);
+    st.row_to_elem.insert(row_id, elem);
+    st.levels.insert(elem, level);
+    st.element_count += 1;
+    st.next_element_id = elem + 1;
+
+    let mut touched: Vec<(u32, ElementId)> = Vec::new();
+
+    match st.entry_point {
+        None => {
+            st.entry_point = Some(elem);
+            if (level as usize) + 1 > st.layer_count {
+                st.layer_count = level as usize + 1;
+            }
+        }
+        Some(ep0) => {
+            let top = (st.layer_count.saturating_sub(1)) as u32;
+            let mut ep = ep0;
+            let mut ep_dist = st.dist(vector, ep);
+
+            // Greedy descent through the layers above the new element's level.
+            let mut layer = top;
+            while layer > level {
+                let res = st.search_layer(vector, &[ep], 1, layer);
+                if let Some(c) = res.first() {
+                    if c.dist < ep_dist {
+                        ep = c.id;
+                        ep_dist = c.dist;
+                    }
+                }
+                layer -= 1;
+            }
+
+            // Connect from min(level, top) down to layer 0.
+            let start = level.min(top);
+            let mut entry = ep;
+            let mut l = start as i64;
+            while l >= 0 {
+                let layer_u = l as u32;
+                let m_l = if layer_u == 0 { m0 } else { m };
+                let candidates = st.search_layer(vector, &[entry], efc, layer_u);
+                let selected = st.select_neighbors(vector, candidates.clone(), m_l);
+
+                st.adjacency.insert((layer_u, elem), selected.clone());
+                touched.push((layer_u, elem));
+
+                for &nb in &selected {
+                    let mut nb_list =
+                        st.adjacency.get(&(layer_u, nb)).cloned().unwrap_or_default();
+                    if !nb_list.contains(&elem) {
+                        nb_list.push(elem);
+                    }
+                    let cap = if layer_u == 0 { m0 } else { m };
+                    if nb_list.len() > cap {
+                        if let Some(nb_vec) = st.vectors.get(&nb).cloned() {
+                            let cands: Vec<Cand> = nb_list
+                                .iter()
+                                .map(|&x| Cand { dist: st.dist(&nb_vec, x), id: x })
+                                .collect();
+                            nb_list = st.select_neighbors(&nb_vec, cands, cap);
+                        } else {
+                            nb_list.truncate(cap);
+                        }
+                    }
+                    st.adjacency.insert((layer_u, nb), nb_list);
+                    touched.push((layer_u, nb));
+                }
+
+                if let Some(c) = candidates.first() {
+                    entry = c.id;
+                }
+                l -= 1;
+            }
+
+            if (level as usize) + 1 > st.layer_count {
+                st.layer_count = level as usize + 1;
+            }
+            if level > top {
+                st.entry_point = Some(elem);
+            }
+        }
+    }
+
+    (elem, touched)
+}
+
 impl IndexState {
     /// Distance from a query vector to a stored element under the index metric.
     fn dist(&self, q: &[f32], id: ElementId) -> f32 {
@@ -656,104 +758,17 @@ impl PersistentVectorIndex {
                 vector.len()
             )));
         }
-        let p = prefix(self.index_id);
-        let elem = st.next_element_id;
-        let level = random_level(elem, st.config.ml);
-        let m = st.config.m;
-        let m0 = st.config.m0;
-        let efc = st.config.ef_construction;
+        let (elem, mut touched) = graph_insert(&mut st, row_id, vector);
 
-        // Store the element's vector, id mappings, and level.
+        // Flush the new element's keys + every touched adjacency list + metadata,
+        // atomically in one batch.
+        let p = prefix(self.index_id);
+        let level = st.levels.get(&elem).copied().unwrap_or(0);
         let mut wb = WriteBatch::default();
         wb.put(key_vec(&p, elem), encode_vector(&st.config, vector)?);
         wb.put(key_map(&p, elem), ser(&row_id)?);
         wb.put(key_rmap(&p, row_id), ser(&elem)?);
         wb.put(key_lvl(&p, elem), ser(&level)?);
-        st.vectors.insert(elem, vector.clone());
-        st.elem_to_row.insert(elem, row_id);
-        st.row_to_elem.insert(row_id, elem);
-        st.levels.insert(elem, level);
-        st.element_count += 1;
-        st.next_element_id = elem + 1;
-
-        let mut touched: Vec<(u32, ElementId)> = Vec::new();
-
-        match st.entry_point {
-            None => {
-                st.entry_point = Some(elem);
-                if (level as usize) + 1 > st.layer_count {
-                    st.layer_count = level as usize + 1;
-                }
-            }
-            Some(ep0) => {
-                let top = (st.layer_count.saturating_sub(1)) as u32;
-                let mut ep = ep0;
-                let mut ep_dist = st.dist(vector, ep);
-
-                // Greedy descent through the layers above the new element's level.
-                let mut layer = top;
-                while layer > level {
-                    let res = st.search_layer(vector, &[ep], 1, layer);
-                    if let Some(c) = res.first() {
-                        if c.dist < ep_dist {
-                            ep = c.id;
-                            ep_dist = c.dist;
-                        }
-                    }
-                    layer -= 1;
-                }
-
-                // Connect from min(level, top) down to layer 0.
-                let start = level.min(top);
-                let mut entry = ep;
-                let mut l = start as i64;
-                while l >= 0 {
-                    let layer_u = l as u32;
-                    let m_l = if layer_u == 0 { m0 } else { m };
-                    let candidates = st.search_layer(vector, &[entry], efc, layer_u);
-                    let selected = st.select_neighbors(vector, candidates.clone(), m_l);
-
-                    st.adjacency.insert((layer_u, elem), selected.clone());
-                    touched.push((layer_u, elem));
-
-                    for &nb in &selected {
-                        let mut nb_list =
-                            st.adjacency.get(&(layer_u, nb)).cloned().unwrap_or_default();
-                        if !nb_list.contains(&elem) {
-                            nb_list.push(elem);
-                        }
-                        let cap = if layer_u == 0 { m0 } else { m };
-                        if nb_list.len() > cap {
-                            if let Some(nb_vec) = st.vectors.get(&nb).cloned() {
-                                let cands: Vec<Cand> = nb_list
-                                    .iter()
-                                    .map(|&x| Cand { dist: st.dist(&nb_vec, x), id: x })
-                                    .collect();
-                                nb_list = st.select_neighbors(&nb_vec, cands, cap);
-                            } else {
-                                nb_list.truncate(cap);
-                            }
-                        }
-                        st.adjacency.insert((layer_u, nb), nb_list);
-                        touched.push((layer_u, nb));
-                    }
-
-                    if let Some(c) = candidates.first() {
-                        entry = c.id;
-                    }
-                    l -= 1;
-                }
-
-                if (level as usize) + 1 > st.layer_count {
-                    st.layer_count = level as usize + 1;
-                }
-                if level > top {
-                    st.entry_point = Some(elem);
-                }
-            }
-        }
-
-        // Persist touched adjacency lists + metadata, atomically with the vector.
         touched.sort_unstable();
         touched.dedup();
         for (layer_u, e) in touched {
@@ -808,6 +823,176 @@ impl PersistentVectorIndex {
             .take(k)
             .collect();
         Ok(out)
+    }
+
+    /// Remove a row from the graph: delete the element and repair every node that
+    /// referenced it by re-selecting that node's connections from the candidate pool
+    /// left by the hole (the deleted node's other neighbors plus the referrer's own).
+    /// Promotes the entry point if it was removed. Persisted atomically. Returns
+    /// whether the row existed. This keeps recall stable under churn — unlike a
+    /// tombstone-only delete, no stale edges are left behind.
+    pub fn remove(&self, row_id: u64) -> Result<bool> {
+        let mut st = self.state.write();
+        let Some(elem) = st.row_to_elem.get(&row_id).copied() else {
+            return Ok(false);
+        };
+        let level = st.levels.get(&elem).copied().unwrap_or(0);
+        let p = prefix(self.index_id);
+        let mut wb = WriteBatch::default();
+        let mut touched: Vec<(u32, ElementId)> = Vec::new();
+
+        // Edges only exist at layers <= the element's level.
+        for layer in 0..=level {
+            let x_nbrs: Vec<ElementId> =
+                st.adjacency.get(&(layer, elem)).cloned().unwrap_or_default();
+            let cap = if layer == 0 { st.config.m0 } else { st.config.m };
+
+            // Every node that still points at `elem` at this layer must be repaired
+            // (HNSW edges can be asymmetric, so scan rather than trust `x_nbrs`).
+            let referrers: Vec<ElementId> = st
+                .adjacency
+                .iter()
+                .filter(|(k, v)| k.0 == layer && v.contains(&elem))
+                .map(|(k, _)| k.1)
+                .collect();
+
+            for nb in referrers {
+                if nb == elem {
+                    continue;
+                }
+                let Some(nb_vec) = st.vectors.get(&nb).cloned() else {
+                    continue;
+                };
+                // Candidate pool: the hole's other neighbors + the referrer's current
+                // neighbors, minus the deleted node and self, restricted to live nodes.
+                let mut pool: HashSet<ElementId> = HashSet::new();
+                for &c in &x_nbrs {
+                    if c != elem && c != nb {
+                        pool.insert(c);
+                    }
+                }
+                if let Some(cur) = st.adjacency.get(&(layer, nb)) {
+                    for &c in cur {
+                        if c != elem && c != nb {
+                            pool.insert(c);
+                        }
+                    }
+                }
+                let cands: Vec<Cand> = pool
+                    .into_iter()
+                    .filter(|c| st.vectors.contains_key(c) && !st.tombstones.contains(c))
+                    .map(|c| Cand { dist: st.dist(&nb_vec, c), id: c })
+                    .collect();
+                let new_list = st.select_neighbors(&nb_vec, cands, cap);
+                st.adjacency.insert((layer, nb), new_list);
+                touched.push((layer, nb));
+            }
+
+            st.adjacency.remove(&(layer, elem));
+            wb.delete(key_adj(&p, layer, elem));
+        }
+
+        // Drop the element's own data.
+        st.vectors.remove(&elem);
+        st.levels.remove(&elem);
+        st.elem_to_row.remove(&elem);
+        st.row_to_elem.remove(&row_id);
+        let was_tomb = st.tombstones.remove(&elem);
+        st.element_count = st.element_count.saturating_sub(1);
+        wb.delete(key_vec(&p, elem));
+        wb.delete(key_lvl(&p, elem));
+        wb.delete(key_map(&p, elem));
+        wb.delete(key_rmap(&p, row_id));
+
+        // Promote the entry point and recompute the layer count over survivors.
+        if st.entry_point == Some(elem) {
+            st.entry_point = st
+                .levels
+                .iter()
+                .filter(|(id, _)| !st.tombstones.contains(*id))
+                .max_by_key(|(_, lvl)| **lvl)
+                .map(|(id, _)| *id);
+        }
+        st.layer_count = st
+            .levels
+            .iter()
+            .filter(|(id, _)| !st.tombstones.contains(*id))
+            .map(|(_, lvl)| *lvl as usize + 1)
+            .max()
+            .unwrap_or(0);
+
+        touched.sort_unstable();
+        touched.dedup();
+        for (layer, e) in touched {
+            if let Some(nbrs) = st.adjacency.get(&(layer, e)) {
+                wb.put(key_adj(&p, layer, e), ser(nbrs)?);
+            }
+        }
+        if was_tomb {
+            let set: Vec<ElementId> = st.tombstones.iter().copied().collect();
+            wb.put(key_tomb(&p), ser(&set)?);
+        }
+        wb.put(key_meta(&p), st.meta_bytes()?);
+        self.db.write(wb).map_err(map_db)?;
+        Ok(true)
+    }
+
+    /// Rebuild the graph from scratch over the surviving (non-tombstoned) elements,
+    /// reclaiming space and clearing tombstones. A maintenance safety net for
+    /// heavy-churn or soft-delete workloads; persisted atomically.
+    pub fn compact(&self) -> Result<()> {
+        let mut st = self.state.write();
+        let mut survivors: Vec<(u64, Vector)> = st
+            .vectors
+            .iter()
+            .filter(|(elem, _)| !st.tombstones.contains(*elem))
+            .filter_map(|(elem, v)| st.elem_to_row.get(elem).map(|&row| (row, v.clone())))
+            .collect();
+        survivors.sort_by_key(|(row, _)| *row);
+
+        let config = st.config.clone();
+        *st = IndexState::new(config);
+        for (row, v) in &survivors {
+            let _ = graph_insert(&mut st, *row, v);
+        }
+        self.persist_full(&st)?;
+        Ok(())
+    }
+
+    /// Wipe the index's keyspace and re-persist the full in-memory state in one
+    /// atomic batch. Used by `compact`.
+    fn persist_full(&self, st: &IndexState) -> Result<()> {
+        let p = prefix(self.index_id);
+        let pb = p.as_bytes();
+        let mut wb = WriteBatch::default();
+        let iter = self.db.iterator(IteratorMode::From(pb, Direction::Forward));
+        for item in iter {
+            let (k, _) = item.map_err(map_db)?;
+            if !k.starts_with(pb) {
+                break;
+            }
+            wb.delete(k);
+        }
+        wb.put(key_meta(&p), st.meta_bytes()?);
+        for (&elem, vec) in &st.vectors {
+            wb.put(key_vec(&p, elem), encode_vector(&st.config, vec)?);
+            if let Some(&row) = st.elem_to_row.get(&elem) {
+                wb.put(key_map(&p, elem), ser(&row)?);
+                wb.put(key_rmap(&p, row), ser(&elem)?);
+            }
+            if let Some(&lvl) = st.levels.get(&elem) {
+                wb.put(key_lvl(&p, elem), ser(&lvl)?);
+            }
+        }
+        for (&(layer, elem), nbrs) in &st.adjacency {
+            wb.put(key_adj(&p, layer, elem), ser(nbrs)?);
+        }
+        if !st.tombstones.is_empty() {
+            let set: Vec<ElementId> = st.tombstones.iter().copied().collect();
+            wb.put(key_tomb(&p), ser(&set)?);
+        }
+        self.db.write(wb).map_err(map_db)?;
+        Ok(())
     }
 }
 
@@ -1038,5 +1223,152 @@ mod tests {
         let idx = PersistentVectorIndex::open(db, 1).unwrap();
         let after = idx.search(&q, 5, 64).unwrap();
         assert_eq!(before, after, "search must be identical after crash-recovery reopen");
+    }
+
+    // ── Phase 3: online deletes + compaction ─────────────────────────────────
+
+    #[test]
+    fn test_remove_excludes_and_keeps_searchable() {
+        let (_dir, db) = test_db();
+        let dim = 8;
+        let idx =
+            PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
+                .unwrap();
+        for i in 0..60u64 {
+            idx.insert(i, &rand_vec(i, dim)).unwrap();
+        }
+        let q = rand_vec(7, dim); // exactly row 7's vector
+        let before = idx.search(&q, 5, 64).unwrap();
+        assert!(before.iter().any(|(r, _)| *r == 7), "row 7 should be a top hit");
+
+        assert!(idx.remove(7).unwrap());
+        assert!(!idx.remove(7).unwrap(), "second remove is a no-op");
+        assert_eq!(idx.len(), 59);
+
+        let after = idx.search(&q, 5, 64).unwrap();
+        assert!(!after.iter().any(|(r, _)| *r == 7), "removed row must not be returned");
+        assert_eq!(after.len(), 5, "graph still returns k after repair");
+        for (r, _) in &after {
+            assert!(idx.elem_of(*r).is_some(), "no stale rows in results");
+        }
+    }
+
+    #[test]
+    fn test_remove_persists_across_reopen() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().to_path_buf();
+        let dim = 8;
+        let q = rand_vec(99, dim);
+        let removed = [3u64, 17, 42, 88];
+
+        let before = {
+            let db = Arc::new(DB::open_default(&path).unwrap());
+            let idx = PersistentVectorIndex::create(
+                db.clone(),
+                1,
+                PqHnswConfig::new(dim, DistanceMetric::L2),
+            )
+            .unwrap();
+            for i in 0..100u64 {
+                idx.insert(i, &rand_vec(i, dim)).unwrap();
+            }
+            for &r in &removed {
+                assert!(idx.remove(r).unwrap());
+            }
+            idx.search(&q, 8, 64).unwrap()
+        };
+
+        let db = Arc::new(DB::open_default(&path).unwrap());
+        let idx = PersistentVectorIndex::open(db, 1).unwrap();
+        assert_eq!(idx.len(), 96);
+        let after = idx.search(&q, 8, 64).unwrap();
+        assert_eq!(before, after, "deletions must survive reopen");
+        for r in removed {
+            assert!(idx.elem_of(r).is_none(), "removed row {r} must be absent after reopen");
+        }
+    }
+
+    #[test]
+    fn test_delete_churn_recall_stable() {
+        use std::collections::BTreeMap;
+        let (_dir, db) = test_db();
+        let (dim, k, ef) = (12usize, 10usize, 100usize);
+        let idx =
+            PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
+                .unwrap();
+
+        let mut live: BTreeMap<u64, Vec<f32>> = BTreeMap::new();
+        let mut next = 0u64;
+        for _ in 0..300 {
+            let v = rand_vec(next, dim);
+            idx.insert(next, &v).unwrap();
+            live.insert(next, v);
+            next += 1;
+        }
+        // Interleaved delete/insert rounds — the pattern that collapses a
+        // tombstone-only index's recall.
+        for _round in 0..4 {
+            let del: Vec<u64> = live.keys().copied().take(60).collect();
+            for r in del {
+                assert!(idx.remove(r).unwrap());
+                live.remove(&r);
+            }
+            for _ in 0..60 {
+                let v = rand_vec(next, dim);
+                idx.insert(next, &v).unwrap();
+                live.insert(next, v);
+                next += 1;
+            }
+        }
+        assert_eq!(idx.len(), live.len(), "element count must track live set");
+
+        let data: Vec<(u64, Vec<f32>)> = live.iter().map(|(r, v)| (*r, v.clone())).collect();
+        let mut hits = 0usize;
+        let queries = 50u64;
+        for qi in 0..queries {
+            let q = rand_vec(3_000_000 + qi, dim);
+            let mut all: Vec<(u64, f32)> = data.iter().map(|(r, v)| (*r, l2(&q, v))).collect();
+            all.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let truth: HashSet<u64> = all.iter().take(k).map(|(r, _)| *r).collect();
+            let got = idx.search(&q, k, ef).unwrap();
+            for (r, _) in &got {
+                assert!(live.contains_key(r), "stale row {r} returned after churn");
+            }
+            hits += got.iter().filter(|(r, _)| truth.contains(r)).count();
+        }
+        let recall = hits as f64 / (queries as usize * k) as f64;
+        assert!(recall >= 0.80, "post-churn recall@{k} = {recall:.3} (expected >= 0.80)");
+    }
+
+    #[test]
+    fn test_compact_drops_tombstoned_and_clears() {
+        let (_dir, db) = test_db();
+        let dim = 8;
+        let idx =
+            PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
+                .unwrap();
+        // Row i maps to element i in a fresh index.
+        for i in 0..100u64 {
+            assert_eq!(idx.insert(i, &rand_vec(i, dim)).unwrap(), i);
+        }
+        for i in 0..20u64 {
+            idx.mark_tombstone(i).unwrap();
+        }
+        assert_eq!(idx.tombstones().len(), 20);
+
+        let q = rand_vec(123, dim);
+        for (r, _) in idx.search(&q, 10, 64).unwrap() {
+            assert!(r >= 20, "soft-deleted row {r} should be excluded from search");
+        }
+
+        idx.compact().unwrap();
+        assert_eq!(idx.len(), 80, "compaction drops tombstoned elements");
+        assert!(idx.tombstones().is_empty(), "compaction clears tombstones");
+        for i in 0..20u64 {
+            assert!(idx.elem_of(i).is_none(), "tombstoned row {i} fully gone after compact");
+        }
+        for (r, _) in idx.search(&q, 10, 64).unwrap() {
+            assert!(r >= 20, "no dropped rows after compact");
+        }
     }
 }
