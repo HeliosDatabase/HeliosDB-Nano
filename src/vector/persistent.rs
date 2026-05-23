@@ -185,11 +185,34 @@ impl IndexState {
         Probe::Exact(q)
     }
 
+    /// Whether an element may be admitted to the result set: not tombstoned, and (if a
+    /// filter is supplied) its row passes the predicate.
+    fn admits(&self, id: ElementId, filter: Option<&dyn Fn(u64) -> bool>) -> bool {
+        if self.tombstones.contains(&id) {
+            return false;
+        }
+        match filter {
+            None => true,
+            Some(f) => self.elem_to_row.get(&id).is_some_and(|&r| f(r)),
+        }
+    }
+
     /// HNSW layer search (Algorithm 2): best-first exploration of `layer` from
-    /// `entry`, returning up to `ef` closest elements sorted ascending by distance.
-    /// Distances are ADC (PQ active) or exact (PQ inactive). Tombstoned elements are
-    /// traversed for connectivity but never collected.
-    fn search_layer(&self, q: &[f32], entry: &[ElementId], ef: usize, layer: u32) -> Vec<Cand> {
+    /// `entry`, returning up to `ef` closest *admitted* elements sorted ascending by
+    /// distance. Distances are ADC (PQ active) or exact (PQ inactive).
+    ///
+    /// Non-admitted elements (tombstoned, or failing `filter`) are still **traversed**
+    /// — pushed to the frontier so the graph stays connected — but never collected.
+    /// This is predicate-during-traversal: it preserves top-k quality under a filter
+    /// where naive post-filtering of an unfiltered top-k would return too few results.
+    fn search_layer(
+        &self,
+        q: &[f32],
+        entry: &[ElementId],
+        ef: usize,
+        layer: u32,
+        filter: Option<&dyn Fn(u64) -> bool>,
+    ) -> Vec<Cand> {
         let probe = self.make_probe(q);
         let mut visited: HashSet<ElementId> = HashSet::new();
         let mut frontier: BinaryHeap<Reverse<Cand>> = BinaryHeap::new();
@@ -200,7 +223,7 @@ impl IndexState {
             }
             let d = probe.dist(self, e);
             frontier.push(Reverse(Cand { dist: d, id: e }));
-            if !self.tombstones.contains(&e) {
+            if self.admits(e, filter) {
                 best.push(Cand { dist: d, id: e });
                 if best.len() > ef {
                     best.pop();
@@ -224,7 +247,7 @@ impl IndexState {
                 let worst = best.peek().map_or(f32::INFINITY, |w| w.dist);
                 if best.len() < ef || d < worst {
                     frontier.push(Reverse(Cand { dist: d, id: n }));
-                    if !self.tombstones.contains(&n) {
+                    if self.admits(n, filter) {
                         best.push(Cand { dist: d, id: n });
                         if best.len() > ef {
                             best.pop();
@@ -465,7 +488,7 @@ fn graph_insert(
             // Greedy descent through the layers above the new element's level.
             let mut layer = top;
             while layer > level {
-                let res = st.search_layer(vector, &[ep], 1, layer);
+                let res = st.search_layer(vector, &[ep], 1, layer, None);
                 if let Some(c) = res.first() {
                     if c.dist < ep_dist {
                         ep = c.id;
@@ -482,7 +505,7 @@ fn graph_insert(
             while l >= 0 {
                 let layer_u = l as u32;
                 let m_l = if layer_u == 0 { m0 } else { m };
-                let candidates = st.search_layer(vector, &[entry], efc, layer_u);
+                let candidates = st.search_layer(vector, &[entry], efc, layer_u, None);
                 let cand_ids: Vec<ElementId> = candidates.iter().map(|c| c.id).collect();
                 let selected = st.select_neighbors(vector, &cand_ids, m_l);
 
@@ -854,6 +877,32 @@ impl PersistentVectorIndex {
     /// candidates are re-ranked with exact distances from the on-disk full vectors.
     /// Returns `(row_id, distance)` sorted ascending; tombstoned elements are excluded.
     pub fn search(&self, query: &Vector, k: usize, ef: usize) -> Result<Vec<(u64, f32)>> {
+        self.search_inner(query, k, ef, None)
+    }
+
+    /// Like [`search`](Self::search), but only returns neighbors whose row id passes
+    /// `filter`. The predicate is applied *during* graph traversal (not after), so a
+    /// full `k` of matching neighbors is returned even for selective filters — where
+    /// post-filtering an unfiltered top-k would fall short. Compose with a widened `ef`
+    /// for very selective predicates.
+    pub fn search_filtered(
+        &self,
+        query: &Vector,
+        k: usize,
+        ef: usize,
+        filter: impl Fn(u64) -> bool,
+    ) -> Result<Vec<(u64, f32)>> {
+        let f: &dyn Fn(u64) -> bool = &filter;
+        self.search_inner(query, k, ef, Some(f))
+    }
+
+    fn search_inner(
+        &self,
+        query: &Vector,
+        k: usize,
+        ef: usize,
+        filter: Option<&dyn Fn(u64) -> bool>,
+    ) -> Result<Vec<(u64, f32)>> {
         let st = self.state.read();
         if query.len() != st.config.dimension {
             return Err(Error::query_execution(format!(
@@ -869,12 +918,14 @@ impl PersistentVectorIndex {
             return Ok(Vec::new());
         };
 
+        // Navigate the upper layers unfiltered (greedy descent), then collect (with the
+        // filter applied) at layer 0.
         let top = (st.layer_count.saturating_sub(1)) as u32;
         let mut ep = ep0;
         let mut ep_dist = st.make_probe(query).dist(&st, ep);
         let mut layer = top;
         while layer > 0 {
-            let res = st.search_layer(query, &[ep], 1, layer);
+            let res = st.search_layer(query, &[ep], 1, layer, None);
             if let Some(c) = res.first() {
                 if c.dist < ep_dist {
                     ep = c.id;
@@ -885,11 +936,11 @@ impl PersistentVectorIndex {
         }
 
         let ef_eff = ef.max(k);
-        let found = st.search_layer(query, &[ep], ef_eff, 0);
+        let found = st.search_layer(query, &[ep], ef_eff, 0, filter);
 
         if st.pq.is_some() {
-            // Two-stage exact rerank: re-score the ADC candidate set with the on-disk
-            // full vectors, then take the true top-k.
+            // Two-stage exact rerank of the (already filtered) candidate set, scored
+            // against the on-disk full vectors.
             let p = prefix(self.index_id);
             let metric = st.config.distance_metric;
             let mut reranked: Vec<(u64, f32)> = Vec::with_capacity(found.len());
@@ -1672,5 +1723,126 @@ mod tests {
         let got = idx.search(&q, 10, 100).unwrap();
         assert!(!got.iter().any(|(r, _)| *r == 5), "removed row absent under PQ");
         assert_eq!(got.len(), 10);
+    }
+
+    // ── P5: filtered KNN (predicate-during-traversal) ────────────────────────
+
+    #[test]
+    fn test_filtered_knn_correctness() {
+        let (_dir, db) = test_db();
+        let (dim, n, k, ef) = (16usize, 1000usize, 10usize, 200usize);
+        let idx =
+            PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
+                .unwrap();
+        let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
+        for (i, v) in data.iter().enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        let pass = |row: u64| row % 5 == 0; // 20% selectivity
+
+        let mut hits = 0usize;
+        let queries = 50u64;
+        for qi in 0..queries {
+            let q = rand_vec(6_000_000 + qi, dim);
+            let mut all: Vec<(u64, f32)> = data
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| pass(*i as u64))
+                .map(|(i, v)| (i as u64, l2(&q, v)))
+                .collect();
+            all.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let truth: HashSet<u64> = all.iter().take(k).map(|(r, _)| *r).collect();
+
+            let got = idx.search_filtered(&q, k, ef, pass).unwrap();
+            assert_eq!(got.len(), k, "filtered search must return k matching results");
+            for (r, _) in &got {
+                assert!(pass(*r), "result {r} must pass the filter");
+            }
+            hits += got.iter().filter(|(r, _)| truth.contains(r)).count();
+        }
+        let recall = hits as f64 / (queries as usize * k) as f64;
+        assert!(recall >= 0.90, "filtered recall@{k} = {recall:.3} (expected >= 0.90)");
+    }
+
+    #[test]
+    fn test_filtered_knn_pq() {
+        let (_dir, db) = test_db();
+        let (dim, n, k, ef) = (64usize, 600usize, 10usize, 200usize);
+        let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
+        let idx =
+            PersistentVectorIndex::create_with_pq(db.clone(), 1, pq_config_dim64(), &data).unwrap();
+        for (i, v) in data.iter().enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        let pass = |row: u64| row % 4 == 0; // 25% selectivity
+
+        let mut hits = 0usize;
+        let queries = 40u64;
+        for qi in 0..queries {
+            let q = rand_vec(7_000_000 + qi, dim);
+            let mut all: Vec<(u64, f32)> = data
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| pass(*i as u64))
+                .map(|(i, v)| (i as u64, l2(&q, v)))
+                .collect();
+            all.sort_by(|a, b| a.1.total_cmp(&b.1));
+            let truth: HashSet<u64> = all.iter().take(k).map(|(r, _)| *r).collect();
+
+            let got = idx.search_filtered(&q, k, ef, pass).unwrap();
+            assert_eq!(got.len(), k);
+            for (r, _) in &got {
+                assert!(pass(*r), "PQ filtered result {r} must pass the filter");
+            }
+            hits += got.iter().filter(|(r, _)| truth.contains(r)).count();
+        }
+        let recall = hits as f64 / (queries as usize * k) as f64;
+        assert!(recall >= 0.70, "PQ filtered recall@{k} = {recall:.3} (expected >= 0.70)");
+    }
+
+    #[test]
+    fn test_filtered_beats_postfilter_completeness() {
+        // The motivating case: a selective filter where post-filtering an unfiltered
+        // top-k loses results that predicate-during-traversal retains.
+        let (_dir, db) = test_db();
+        let (dim, n) = (16usize, 1000usize);
+        let idx =
+            PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
+                .unwrap();
+        for i in 0..n as u64 {
+            idx.insert(i, &rand_vec(i, dim)).unwrap();
+        }
+        let pass = |row: u64| row % 50 == 0; // ~2% selectivity
+        let q = rand_vec(123, dim);
+        let (k, ef) = (5usize, 200usize);
+
+        let filtered = idx.search_filtered(&q, k, ef, pass).unwrap();
+        assert_eq!(filtered.len(), k, "filter-during-traversal returns a full k");
+        for (r, _) in &filtered {
+            assert!(pass(*r));
+        }
+
+        let unfiltered = idx.search(&q, k, ef).unwrap();
+        let post: Vec<_> = unfiltered.into_iter().filter(|(r, _)| pass(*r)).collect();
+        assert!(
+            post.len() < filtered.len(),
+            "post-filtering top-k ({} matches) loses results kept by filtered search ({})",
+            post.len(),
+            filtered.len()
+        );
+    }
+
+    #[test]
+    fn test_filtered_no_matches_returns_empty() {
+        let (_dir, db) = test_db();
+        let dim = 8;
+        let idx =
+            PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
+                .unwrap();
+        for i in 0..50u64 {
+            idx.insert(i, &rand_vec(i, dim)).unwrap();
+        }
+        let got = idx.search_filtered(&rand_vec(9, dim), 10, 64, |_row| false).unwrap();
+        assert!(got.is_empty(), "a filter matching nothing yields no results");
     }
 }
