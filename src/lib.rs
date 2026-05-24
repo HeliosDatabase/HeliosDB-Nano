@@ -3690,6 +3690,16 @@ impl EmbeddedDatabase {
         graph_rag::ingest_qa(self, opts)
     }
 
+    /// Flush buffered in-memory writes (the RocksDB memtable) to disk (SST files).
+    ///
+    /// Forces the memtable→SST split so reads, aggregates, and materialized-view
+    /// (re)materialization can be exercised against data that spans both the
+    /// memtable and flushed SSTs — i.e. the full LSM tree. Useful for tests that
+    /// must reproduce scan-completeness behaviour without a large data set.
+    pub fn flush(&self) -> Result<()> {
+        self.storage.flush()
+    }
+
     pub fn execute(&self, sql: &str) -> Result<u64> {
         use crate::error::LockResultExt;
 
