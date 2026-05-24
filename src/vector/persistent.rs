@@ -2028,6 +2028,41 @@ mod tests {
         assert_eq!(before, after, "i8 exact-mode search must match across reopen");
     }
 
+    #[test]
+    fn test_pq_default_config_recall_is_safe() {
+        // Regression: create_with_pq with the DEFAULT pq_config (None) must not collapse
+        // recall. The old default_for_dimension heuristic picked far too few sub-quantizers
+        // (dim 128 -> 2, i.e. 64 dims/sub-vector), measuring ~0.14 recall@10; the recall-safe
+        // default (~dim/4) keeps it on par with exact. All other PQ tests pass an explicit
+        // config, so this exercises the default path that shipped the footgun.
+        let (_dir, db) = test_db();
+        let (dim, n, k, ef) = (128usize, 1500usize, 10usize, 100usize);
+        let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
+        let cfg = PqHnswConfig::new(dim, DistanceMetric::L2); // pq_config = None on purpose
+        let idx = PersistentVectorIndex::create_with_pq(db.clone(), 1, cfg, &data).unwrap();
+        assert!(idx.config().pq_config.is_some(), "create_with_pq should fill in a config");
+        for (i, v) in data.iter().enumerate() {
+            idx.insert(i as u64, v).unwrap();
+        }
+        let mut hits = 0usize;
+        let queries = 50u64;
+        for qi in 0..queries {
+            let q = rand_vec(9_900_000 + qi, dim);
+            let truth: HashSet<u64> = brute_topk(&data, &q, k).into_iter().collect();
+            hits += idx
+                .search(&q, k, ef)
+                .unwrap()
+                .iter()
+                .filter(|(r, _)| truth.contains(r))
+                .count();
+        }
+        let recall = hits as f64 / (queries as usize * k) as f64;
+        assert!(
+            recall >= 0.75,
+            "default-config PQ recall@{k} = {recall:.3} (expected >= 0.75; old heuristic gave ~0.14)"
+        );
+    }
+
     // ── P7: measurement (ignored; run with `-- --ignored --nocapture`) ───────
 
     #[test]
