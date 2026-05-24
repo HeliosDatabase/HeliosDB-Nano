@@ -5,6 +5,24 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.32.1] - 2026-05-24
+
+### Fixed — PQ default sub-quantizer count collapsed recall
+
+`ProductQuantizerConfig::default_for_dimension` chose far too few sub-quantizers
+for common embedding dimensions (dim 384 → 4 → ~0.026 recall@10; dim 128 → 2 →
+~0.14), silently collapsing recall for any caller relying on the default
+config — the SQL `CREATE INDEX … USING hnsw` PQ path, `quantized_hnsw`, and the
+v3.32.0 `create_with_pq` fallback. It now targets ~4 dimensions per sub-vector
+(≈16× compression), the validated recall-safe operating point (~0.987 recall@10
+vs ~0.989 exact). Added a default-path recall regression test (every prior PQ
+test passed an explicit config, which is how this slipped through).
+
+**Behaviour change:** existing default-config PQ indexes now use larger codes
+(~16× compression instead of up to ~96×) with substantially better recall.
+
+Found by the codekb-mcp team's adoption testing of v3.32.0.
+
 ## [3.32.0] - 2026-05-24
 
 ### Added — Persistent PQ-HNSW vector index (opt-in, `vector-persist` feature)
