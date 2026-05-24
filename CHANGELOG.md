@@ -5,6 +5,38 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.32.0] - 2026-05-24
+
+### Added — Persistent PQ-HNSW vector index (opt-in, `vector-persist` feature)
+
+A new durable, crash-recoverable vector index that unifies graph navigation,
+Product-Quantization compression, persistence, online deletes, filtered KNN,
+and a multi-precision rerank dial in a single index. **Off by default** — the
+existing in-RAM vector path (`hnsw_index`, `quantized_hnsw`) is byte-for-byte
+unchanged (the default build is identical to v3.31.2).
+
+- **Persistence & recovery** — RocksDB-backed (`__vidx:` keyspace); `open()`
+  restores the graph with no rebuild. Coarse per-index locking.
+- **In-house HNSW** — graph build/search (Malkov & Yashunin); no third-party
+  graph crate on the durable path; public-domain SplitMix64 level assignment.
+- **Online deletes + compaction** — `remove()` repairs neighbours so recall
+  stays stable under churn; `compact()` reclaims tombstoned space.
+- **PQ + ADC + two-stage rerank** — codes resident in RAM, full vectors on
+  disk; ~16× less resident RAM at equal recall (measured 0.987 vs 0.989 @10).
+- **Filtered KNN** — `search_filtered()` evaluates a row predicate *during*
+  traversal, preserving top-k quality where post-filtering a top-k falls short.
+- **Multi-precision rerank** — F32 / F16 (hand-rolled IEEE half) / I8 scalar
+  quantization; zero new dependencies.
+
+API: `heliosdb_nano::vector::persistent::PersistentVectorIndex`
+(`create` / `create_with_pq` + `insert` / `search` / `search_filtered` /
+`remove` / `compact`). PQ is L2-only; library API (not yet wired into SQL DDL).
+
+Validated: 26 unit tests; full lib suite green with the feature on (1796
+passed); head-to-head vs main shows performance parity on OLTP / vector paths
+(default binary unchanged). Design + reports on disk: `PROPOSAL_PERSISTENT_PQ_HNSW.md`,
+`VALIDATION_REPORT_persistent_pq_hnsw.md`, `BENCHMARK_main_vs_persistent_pq_hnsw.md`.
+
 ## [3.31.2] - 2026-05-22
 
 ### Fixed — in-txn FK validation ~338× regression (codekb-mcp / KanttBan bulk ingest)
