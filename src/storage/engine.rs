@@ -1423,6 +1423,46 @@ impl StorageEngine {
         }
     }
 
+    /// Unconditionally delete every `data:{table}:*` row for a table, regardless of
+    /// whether catalog metadata still exists.
+    ///
+    /// Clears ORPHANED rows — cases where a table's metadata was removed in a prior
+    /// run while the underlying data rows survived (e.g. an interrupted drop, or a
+    /// metadata-only delete). Re-populating such a table (materialized-view CREATE /
+    /// REFRESH calls `store_view_data`) must not layer freshly computed rows on top
+    /// of a stale slice: that produced the wrong MV aggregate in issue #2, where a
+    /// re-created `__mv_*` table read back an orphaned row instead of the new value.
+    /// Returns the number of rows removed. The row-id counter is intentionally left
+    /// untouched (a stale counter only advances ids, which is harmless).
+    pub fn purge_table_data(&self, table_name: &str) -> Result<u64> {
+        let data_prefix = format!("data:{}:", table_name);
+        let prefix_bytes = data_prefix.as_bytes();
+
+        let mut keys_to_delete = Vec::new();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(false); // prefix seek, like drop_table
+        let iter = self.db.iterator_opt(
+            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
+            read_opts,
+        );
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break; // past the table's key range
+            }
+            keys_to_delete.push(key.to_vec());
+        }
+
+        let removed = keys_to_delete.len() as u64;
+        for key in keys_to_delete {
+            self.delete(&key)?;
+        }
+        if removed > 0 {
+            tracing::debug!("purge_table_data: removed {} orphaned rows for '{}'", removed, table_name);
+        }
+        Ok(removed)
+    }
+
     /// Scan all tuples in a table
     ///
     /// Returns a vector of tuples. In the future, this should return an iterator

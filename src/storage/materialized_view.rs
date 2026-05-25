@@ -271,10 +271,16 @@ impl<'a> MaterializedViewCatalog<'a> {
         let data_table = Self::mv_data_table_name(view_name);
         let catalog = self.storage.catalog();
 
-        // Create or recreate the data table
+        // Create or recreate the data table. Drop catalog metadata if present, then
+        // UNCONDITIONALLY purge any data rows: a prior run may have removed the
+        // data-table metadata while leaving `data:__mv_*` rows behind (issue #2 —
+        // those orphaned rows were read back instead of the freshly materialized
+        // value, so a COUNT(DISTINCT) view returned a stale slice's count). Purging
+        // by key range guarantees the re-populated view contains only new rows.
         if catalog.table_exists(&data_table)? {
             catalog.drop_table(&data_table)?;
         }
+        self.storage.purge_table_data(&data_table)?;
         catalog.create_table(&data_table, schema.clone())?;
 
         // Insert all tuples

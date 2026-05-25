@@ -11,6 +11,27 @@ use super::{PhysicalOperator, Executor};
 use super::scan::{ScanOperator, MaterializedOperator};
 use std::sync::Arc;
 
+/// Optimize a materialized-view query the same way the direct query path does
+/// (`EmbeddedDatabase::query_with_columns`) before materializing it.
+///
+/// Without this, the MV path ran `plan_to_operator` on the *raw* (unoptimized)
+/// plan, which undercounts aggregates at scale — issue #2 / Quirk J: on a
+/// 448k-row table, `COUNT(DISTINCT session_id)` materialized as 4 instead of 265
+/// (and `COUNT(*)+SUM` as ~407) because the optimized plan (notably projection
+/// pruning) is what produces a correct full-table scan for the aggregate input.
+fn optimize_view_query(plan: &LogicalPlan) -> Result<LogicalPlan> {
+    use crate::optimizer;
+    let stats = optimizer::cost::StatsCatalog::new();
+    let rules: Vec<Box<dyn optimizer::rules::OptimizationRule>> = vec![
+        Box::new(optimizer::rules::ConstantFoldingRule::new()),
+        Box::new(optimizer::rules::SelectionPushdownRule::new()),
+        Box::new(optimizer::rules::JoinPredicatePushdownRule::new()),
+        Box::new(optimizer::rules::ProjectionPruningRule::new()),
+    ];
+    let opt = optimizer::Optimizer::with_rules(stats, rules, optimizer::OptimizerConfig::default());
+    opt.optimize_recursive(plan.clone())
+}
+
 /// Count delta operations by type (inserts, updates, deletes)
 fn count_delta_operations(delta_set: &MvDeltaSet) -> (usize, usize, usize) {
     let mut inserts = 0;
@@ -299,15 +320,30 @@ fn handle_create_materialized_view(
         }
     } // Storage borrow ends here
 
-    // Execute the query to get the schema (this needs mutable borrow)
-    let mut query_operator = executor.plan_to_operator(query)?;
+    // Optimize the view query the same way direct queries are (issue #2 / Quirk J):
+    // the raw plan undercounts aggregates at scale. Materialize AND persist the
+    // optimized plan so REFRESH stays correct too.
+    let optimized_query = optimize_view_query(query)?;
+    // Materialize against the current (branch-aware) view via a FRESH executor — NOT
+    // the CREATE statement's executor/transaction. Issue #2 / Quirk J: the inherited
+    // transaction's snapshot under-counts at scale (COUNT(DISTINCT) materialized as 4
+    // instead of 265 on a 448k-row table; COUNT(*)+SUM as ~407), because the
+    // materialization ran under the DDL statement's transaction snapshot rather than
+    // the full current table. A fresh executor with no active txn scans the whole
+    // table, exactly like a direct autocommit query.
+    let storage_arc = executor
+        .storage()
+        .ok_or_else(|| Error::execution("No storage engine available"))?
+        .clone();
+    let mut mat_exec = Executor::with_storage(&storage_arc);
+    let mut query_operator = mat_exec.plan_to_operator(&optimized_query)?;
     let schema = query_operator.schema();
 
     // Extract base tables from the query (simplified - just look at Scan nodes)
     let base_tables = extract_base_tables(query);
 
-    // Serialize the query plan for re-execution during REFRESH
-    let query_plan_bytes = bincode::serialize(query)
+    // Serialize the OPTIMIZED query plan for re-execution during REFRESH
+    let query_plan_bytes = bincode::serialize(&optimized_query)
         .map_err(|e| Error::execution(format!("Failed to serialize query plan: {}", e)))?;
 
     // Store a human-readable query text for display/debugging
@@ -515,7 +551,15 @@ fn handle_refresh_materialized_view(
         tracing::info!("Full refresh for MV '{}'", name);
     }
 
-    let mut query_operator = executor.plan_to_operator(&query_plan)?;
+    // Re-materialize against the current branch-aware view via a FRESH executor —
+    // not the REFRESH statement's transaction snapshot, which under-counts at scale
+    // (issue #2 / Quirk J; see the CREATE path for the full diagnosis).
+    let storage_arc = executor
+        .storage()
+        .ok_or_else(|| Error::execution("No storage engine available"))?
+        .clone();
+    let mut mat_exec = Executor::with_storage(&storage_arc);
+    let mut query_operator = mat_exec.plan_to_operator(&query_plan)?;
     let mut tuples = Vec::new();
     while let Some(tuple) = query_operator.next()? {
         tuples.push(tuple);
