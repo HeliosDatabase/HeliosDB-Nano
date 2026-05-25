@@ -5,6 +5,41 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.32.2] - 2026-05-25
+
+### Fixed — Materialized-view aggregates wrong at scale
+
+`CREATE` / `REFRESH MATERIALIZED VIEW` over a large base table produced wrong
+aggregates — e.g. `COUNT(DISTINCT session_id)` materialized as 4 instead of 265
+on a 448,573-row table. Two compounding causes, both fixed:
+
+1. **Stale snapshot.** The view materialized through the DDL statement's implicit
+   transaction, whose snapshot was a small stale slice of the table rather than the
+   current branch-aware view a direct autocommit query sees. It now materializes
+   (and re-materializes on `REFRESH`) via a fresh executor with no active
+   transaction, and persists the optimized plan so `REFRESH` stays consistent.
+2. **Orphaned `__mv_` data rows.** `store_view_data` only purged the view's data
+   table when catalog metadata still existed; a prior run that dropped the metadata
+   while leaving rows behind caused the freshly computed value to be layered on top
+   of the stale one (and read back first). New `StorageEngine::purge_table_data`
+   does an unconditional key-range delete before re-populating.
+
+Verified against the reporter's 448k-row data dir across `COUNT(DISTINCT)`,
+`COUNT(*)`+`SUM`, `GROUP BY`, `REFRESH`, and reopen (issue #2). Existing
+materialized-view suites (integration, incremental, concurrent, auto-refresh,
+scheduler) all still pass.
+
+### Added — `EmbeddedDatabase::flush()`
+
+Forces the memtable→SST split so reads, aggregates, and materialized-view
+materialization can be exercised across the full LSM tree.
+
+### Docs
+
+`PROPOSAL_PYO3_BINDING.md` — implementation plan for an in-process PyO3 binding
+over `EmbeddedDatabase` (issue #1: the shipped Python "embedded" mode is a REPL
+subprocess pipe that loses to sqlite3 on aggregates).
+
 ## [3.32.1] - 2026-05-24
 
 ### Fixed — PQ default sub-quantizer count collapsed recall
