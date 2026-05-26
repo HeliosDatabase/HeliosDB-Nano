@@ -5,6 +5,40 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.33.0] - 2026-05-26
+
+### Added — In-process Python binding (`bindings/python`, issue #1)
+
+A PyO3 binding exposing `EmbeddedDatabase` directly to Python — no `heliosdb-nano
+repl` subprocess, no wire protocol, no serialization hop. Surface: `EmbeddedDatabase(path)`
+/ `.in_memory()`, `query(sql, params)` → `list[dict]`, `execute(sql, params)`,
+`execute_many(sql, rows)`, `vector_search(store, q, k)`, `create_vector_store` /
+`insert_vectors`, `flush()`. The GIL is released around every engine call, so Python
+threads can query concurrently. Builds a single abi3 wheel (CPython ≥ 3.8) via maturin.
+
+On the reporter's 448k-row workload the in-process path is **1.5–4.7× faster than
+PG-wire** (the access mode their cutover currently uses): `COUNT(*)` 715→153 ms,
+`COUNT(DISTINCT)` 1489→725 ms, `GROUP BY+SUM` 1439→902 ms. It is **not** yet
+sqlite-competitive on full-table aggregates — that gap is the row-store reading and
+materializing whole rows, which needs columnar scans (see `PROPOSAL_COLUMNAR_STORAGE.md`),
+not the access mode.
+
+### Added — `EmbeddedDatabase::query_params_with_columns`
+
+The column-aware, parameter-binding query entry point (rows + output column names with
+`$1..$n`), which the binding routes every `query()` through. Fills the gap between
+`query_with_columns` (columns, no params) and `query_params` (params, no columns).
+
+### Performance — projection-aware prefix decode for table scans
+
+Single-table, non-filtered scans now decode only the leading columns a query actually
+references (via `StorageEngine::scan_table_with_schema_prefix`), stopping before the
+costly tail columns instead of deserializing every column of every row. The needed-column
+analysis is conservative — it falls back to a full decode on any wildcard, subquery,
+join, multi-table plan, or unresolved column, so results are unchanged (verified by the
+full suite plus `tests/scan_prefix_decode.rs`). ~25% on narrow aggregates like
+`COUNT(DISTINCT col)`; larger wins the fewer columns a query needs.
+
 ## [3.32.2] - 2026-05-25
 
 ### Fixed — Materialized-view aggregates wrong at scale

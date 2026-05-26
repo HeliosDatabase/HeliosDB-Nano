@@ -5,6 +5,7 @@
 #![allow(deprecated)]
 
 mod engine;
+mod prefix_decode;
 mod mvcc;
 mod transaction;
 mod wal;

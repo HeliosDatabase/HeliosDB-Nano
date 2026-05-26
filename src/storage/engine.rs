@@ -1475,6 +1475,21 @@ impl StorageEngine {
 
     /// Scan all rows in a table using a pre-fetched schema (avoids duplicate schema lookup).
     pub fn scan_table_with_schema(&self, table_name: &str, schema: &crate::Schema) -> Result<Vec<Tuple>> {
+        self.scan_table_with_schema_opt(table_name, schema, None)
+    }
+
+    /// Like `scan_table_with_schema`, but only the first `prefix_len` column values are
+    /// materialized per row — the rest are left `Null` and their bytes are never parsed
+    /// (issue #1 follow-up). The caller MUST guarantee the query references no column at
+    /// index >= `prefix_len`; the executor only requests this when its needed-column
+    /// analysis is certain (single table, no wildcard/subquery, all columns resolved).
+    pub fn scan_table_with_schema_prefix(&self, table_name: &str, schema: &crate::Schema, prefix_len: usize) -> Result<Vec<Tuple>> {
+        // No benefit (and avoid the seed path) when we'd decode every column anyway.
+        let opt = if prefix_len >= schema.columns.len() { None } else { Some(prefix_len) };
+        self.scan_table_with_schema_opt(table_name, schema, opt)
+    }
+
+    fn scan_table_with_schema_opt(&self, table_name: &str, schema: &crate::Schema, prefix_len: Option<usize>) -> Result<Vec<Tuple>> {
         let scan_start = std::time::Instant::now();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
@@ -1491,12 +1506,20 @@ impl StorageEngine {
 
             // Check if key starts with our prefix (break when past it)
             if key.starts_with(prefix_bytes) {
-                // Deserialize tuple (decrypt first if encryption is enabled)
+                // Deserialize tuple (decrypt first if encryption is enabled). With a
+                // prefix_len, decode only the leading columns and stop — the trailing
+                // (often large) column bytes are never parsed.
                 let mut tuple: Tuple = if let Some(km) = &self.key_manager {
                     let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                    bincode::deserialize(&decrypted)
+                    match prefix_len {
+                        Some(k) => crate::storage::prefix_decode::decode_tuple_prefix(&decrypted, k, schema.columns.len()),
+                        None => bincode::deserialize(&decrypted),
+                    }
                 } else {
-                    bincode::deserialize(&raw_value)
+                    match prefix_len {
+                        Some(k) => crate::storage::prefix_decode::decode_tuple_prefix(&raw_value, k, schema.columns.len()),
+                        None => bincode::deserialize(&raw_value),
+                    }
                 }.map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
 
                 // Extract row_id from key (key format: "data:{table_name}:{row_id}")
@@ -5099,6 +5122,18 @@ impl StorageEngine {
         let catalog = Catalog::new(self);
         let schema = catalog.get_table_schema(table_name)?;
         self.scan_table_branch_aware_with_schema(table_name, &schema)
+    }
+
+    /// Branch-aware scan that materializes only the first `prefix_len` columns per row
+    /// (issue #1 follow-up). On `main` (the common case) this uses the prefix decode; on
+    /// a non-main branch it falls back to a full branch-aware scan (the chain-merge path
+    /// is rare and not worth the extra surface), so correctness is preserved either way.
+    pub fn scan_table_branch_aware_with_schema_prefix(&self, table_name: &str, schema: &crate::Schema, prefix_len: usize) -> Result<Vec<Tuple>> {
+        let branch_name = self.current_branch.lock().clone();
+        if branch_name.is_none() || branch_name.as_deref() == Some("main") {
+            return self.scan_table_with_schema_prefix(table_name, schema, prefix_len);
+        }
+        self.scan_table_branch_aware_with_schema(table_name, schema)
     }
 
     /// Branch-aware scan using a pre-fetched schema (avoids duplicate schema lookup).

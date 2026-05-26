@@ -7424,6 +7424,64 @@ impl EmbeddedDatabase {
         executor.execute(plan)
     }
 
+    /// Run a query with `$1..$n` parameter binding and return the result rows
+    /// **alongside their output column names** — the column-aware counterpart to
+    /// [`query_params`](Self::query_params), and the param-aware counterpart to
+    /// [`query_with_columns`](Self::query_with_columns).
+    ///
+    /// This is the shape language bindings need to build named/dict rows while
+    /// still binding parameters safely (e.g. the PyO3 binding routes every Python
+    /// `query()` call here, with an empty `params` slice when there are none).
+    /// `params` substitute positionally for `$1..$n`; an empty slice behaves like
+    /// `query_with_columns`. Row-level security policies are applied, as in
+    /// `query_params`.
+    pub fn query_params_with_columns(
+        &self,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<(Vec<Tuple>, Vec<String>)> {
+        #[cfg(feature = "code-graph")]
+        let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql);
+        #[cfg(feature = "code-graph")]
+        let sql: &str = &rewritten_owned;
+        #[cfg(not(feature = "code-graph"))]
+        let sql: &str = sql;
+
+        // Plan (mirroring query_with_columns' ShowBranches pre-detect), then apply
+        // RLS for the planned path exactly as query_params does.
+        let plan = if sql::Parser::is_show_branches(sql) {
+            sql::LogicalPlan::ShowBranches
+        } else {
+            let (statement, _) = self.parse_cached(sql)?;
+            let catalog = self.storage.catalog();
+            let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+            let plan = planner.statement_to_plan(statement)?;
+            self.apply_rls_to_plan(plan)?
+        };
+
+        // Same optimization pipeline as query_with_columns.
+        let plan = {
+            let stats = optimizer::cost::StatsCatalog::new();
+            let rules: Vec<Box<dyn optimizer::rules::OptimizationRule>> = vec![
+                Box::new(optimizer::rules::ConstantFoldingRule::new()),
+                Box::new(optimizer::rules::SelectionPushdownRule::new()),
+                Box::new(optimizer::rules::JoinPredicatePushdownRule::new()),
+                Box::new(optimizer::rules::ProjectionPruningRule::new()),
+            ];
+            let opt = optimizer::Optimizer::with_rules(
+                stats,
+                rules,
+                optimizer::OptimizerConfig::default(),
+            );
+            opt.optimize_recursive(plan)?
+        };
+
+        let mut executor = sql::Executor::with_storage(&self.storage)
+            .with_timeout(self.config.storage.query_timeout_ms)
+            .with_parameters(params.to_vec());
+        executor.execute_with_columns(&plan)
+    }
+
     /// Begin an explicit transaction
     ///
     /// This method starts a new transaction. All subsequent SQL operations

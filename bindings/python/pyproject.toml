@@ -1,0 +1,26 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "heliosdb-nano"
+dynamic = ["version"]                       # taken from Cargo.toml by maturin
+description = "In-process Python binding for HeliosDB-Nano (embedded mode) — no subprocess, no wire protocol"
+requires-python = ">=3.8"
+license = { text = "Apache-2.0" }
+readme = "README.md"
+authors = [{ name = "HeliosDB" }]
+keywords = ["database", "embedded", "sql", "vector-search", "hnsw"]
+classifiers = [
+  "Programming Language :: Rust",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: OSI Approved :: Apache Software License",
+  "Topic :: Database :: Database Engines/Servers",
+]
+
+[project.urls]
+Repository = "https://github.com/dimensigon/HDB-HeliosDB-Nano"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "heliosdb_nano"
