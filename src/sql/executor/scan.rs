@@ -7,7 +7,189 @@
 use crate::{Result, Error, Tuple, Schema};
 use crate::sql::LogicalPlan;
 use super::{PhysicalOperator, TimeoutContext, Executor};
+use crate::sql::logical_plan::LogicalExpr;
+use std::collections::HashSet;
 use std::sync::Arc;
+
+/// Compute a conservative single-table prefix-decode hint for a read plan (issue #1
+/// follow-up). `Some((table, prefix_len))` means every column the plan references in
+/// `table` lives at an index `< prefix_len`, so a scan of `table` only needs to decode
+/// that many leading columns. Returns `None` (→ full decode) on anything uncertain:
+/// more than one distinct table, a wildcard (`SELECT *`), any subquery, an unresolved
+/// column, or an unrecognized plan node. The `LogicalExpr` match is intentionally
+/// exhaustive so a newly added expression variant is a compile error here (forcing a
+/// correctness review) rather than a silent miss.
+pub(super) fn compute_scan_prefix_hint(plan: &LogicalPlan) -> Option<(String, usize)> {
+    let mut cols: HashSet<String> = HashSet::new();
+    let mut tables: Vec<(String, Arc<Schema>)> = Vec::new();
+    let mut bail = false;
+    collect_plan_columns(plan, &mut cols, &mut tables, &mut bail);
+    if bail {
+        return None;
+    }
+    // Exactly one distinct table (a repeated table implies a join/union, already bailed).
+    let mut names: Vec<&str> = tables.iter().map(|(n, _)| n.as_str()).collect();
+    names.sort_unstable();
+    names.dedup();
+    if names.len() != 1 {
+        return None;
+    }
+    let (table_name, schema) = &tables[0];
+    let mut max_idx: isize = -1;
+    for c in &cols {
+        // A name that doesn't resolve to a base column is a *derived* column — an
+        // aggregate output (`agg_0`) or a projection alias referenced by a node above
+        // the one that produced it. Its base-column dependencies were already collected
+        // at the producing node's expression, so skipping it here is safe (and never
+        // under-counts the prefix). Only base columns widen the prefix.
+        if let Some(idx) = resolve_col_index(schema, c) {
+            max_idx = max_idx.max(idx as isize);
+        }
+    }
+    // No referenced base columns (e.g. COUNT(*)) → prefix 0 → decode nothing.
+    Some((table_name.clone(), (max_idx + 1) as usize))
+}
+
+fn resolve_col_index(schema: &Schema, name: &str) -> Option<usize> {
+    // Match the bare column (after any "table."/"alias." qualifier), case-insensitively
+    // so a base-column reference is never mistaken for a derived one.
+    let bare = name.rsplit('.').next().unwrap_or(name);
+    schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(bare))
+}
+
+fn collect_plan_columns(
+    plan: &LogicalPlan,
+    cols: &mut HashSet<String>,
+    tables: &mut Vec<(String, Arc<Schema>)>,
+    bail: &mut bool,
+) {
+    if *bail {
+        return;
+    }
+    match plan {
+        LogicalPlan::Scan { table_name, schema, .. } => {
+            tables.push((table_name.clone(), schema.clone()));
+        }
+        LogicalPlan::FilteredScan { table_name, schema, predicate, .. } => {
+            tables.push((table_name.clone(), schema.clone()));
+            if let Some(p) = predicate {
+                collect_expr_columns(p, cols, bail);
+            }
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            collect_expr_columns(predicate, cols, bail);
+            collect_plan_columns(input, cols, tables, bail);
+        }
+        LogicalPlan::Project { input, exprs, distinct_on, .. } => {
+            for e in exprs {
+                collect_expr_columns(e, cols, bail);
+            }
+            if let Some(d) = distinct_on {
+                for e in d {
+                    collect_expr_columns(e, cols, bail);
+                }
+            }
+            collect_plan_columns(input, cols, tables, bail);
+        }
+        LogicalPlan::Aggregate { input, group_by, aggr_exprs, having } => {
+            for e in group_by {
+                collect_expr_columns(e, cols, bail);
+            }
+            for e in aggr_exprs {
+                collect_expr_columns(e, cols, bail);
+            }
+            if let Some(h) = having {
+                collect_expr_columns(h, cols, bail);
+            }
+            collect_plan_columns(input, cols, tables, bail);
+        }
+        LogicalPlan::Sort { input, exprs, .. } => {
+            for e in exprs {
+                collect_expr_columns(e, cols, bail);
+            }
+            collect_plan_columns(input, cols, tables, bail);
+        }
+        LogicalPlan::Limit { input, .. } => collect_plan_columns(input, cols, tables, bail),
+        // Joins, set ops, DML, and anything else: don't optimize (full decode).
+        _ => *bail = true,
+    }
+}
+
+fn collect_expr_columns(expr: &LogicalExpr, cols: &mut HashSet<String>, bail: &mut bool) {
+    if *bail {
+        return;
+    }
+    match expr {
+        LogicalExpr::Column { name, .. } => {
+            cols.insert(name.clone());
+        }
+        LogicalExpr::NewRow { column } | LogicalExpr::OldRow { column } => {
+            cols.insert(column.clone());
+        }
+        // Reading every column / correlated columns we can't bound → full decode.
+        LogicalExpr::Wildcard
+        | LogicalExpr::ScalarSubquery { .. }
+        | LogicalExpr::InSubquery { .. }
+        | LogicalExpr::Exists { .. } => *bail = true,
+        LogicalExpr::BinaryExpr { left, right, .. } => {
+            collect_expr_columns(left, cols, bail);
+            collect_expr_columns(right, cols, bail);
+        }
+        LogicalExpr::UnaryExpr { expr, .. } => collect_expr_columns(expr, cols, bail),
+        LogicalExpr::AggregateFunction { args, .. } | LogicalExpr::ScalarFunction { args, .. } => {
+            for a in args {
+                collect_expr_columns(a, cols, bail);
+            }
+        }
+        LogicalExpr::Case { expr, when_then, else_result } => {
+            if let Some(e) = expr {
+                collect_expr_columns(e, cols, bail);
+            }
+            for (w, t) in when_then {
+                collect_expr_columns(w, cols, bail);
+                collect_expr_columns(t, cols, bail);
+            }
+            if let Some(e) = else_result {
+                collect_expr_columns(e, cols, bail);
+            }
+        }
+        LogicalExpr::Cast { expr, .. } => collect_expr_columns(expr, cols, bail),
+        LogicalExpr::IsNull { expr, .. } => collect_expr_columns(expr, cols, bail),
+        LogicalExpr::Between { expr, low, high, .. } => {
+            collect_expr_columns(expr, cols, bail);
+            collect_expr_columns(low, cols, bail);
+            collect_expr_columns(high, cols, bail);
+        }
+        LogicalExpr::InList { expr, list, .. } => {
+            collect_expr_columns(expr, cols, bail);
+            for i in list {
+                collect_expr_columns(i, cols, bail);
+            }
+        }
+        LogicalExpr::InSet { expr, .. } => collect_expr_columns(expr, cols, bail),
+        LogicalExpr::ArraySubscript { array, index } => {
+            collect_expr_columns(array, cols, bail);
+            collect_expr_columns(index, cols, bail);
+        }
+        LogicalExpr::WindowFunction { args, partition_by, order_by, .. } => {
+            for a in args {
+                collect_expr_columns(a, cols, bail);
+            }
+            for p in partition_by {
+                collect_expr_columns(p, cols, bail);
+            }
+            for (o, _) in order_by {
+                collect_expr_columns(o, cols, bail);
+            }
+        }
+        LogicalExpr::Tuple { items } => {
+            for i in items {
+                collect_expr_columns(i, cols, bail);
+            }
+        }
+        LogicalExpr::Literal(_) | LogicalExpr::Parameter { .. } | LogicalExpr::DefaultValue => {}
+    }
+}
 
 /// Table scan operator
 ///
@@ -423,10 +605,18 @@ pub(super) fn handle_scan(
                     result
                 }
             } else {
-                // Normal scan (current data) with branch isolation
-                // Use actual_table_name to support materialized views
-                // Pass pre-fetched schema to avoid duplicate lookup inside scan_table
-                storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?
+                // Normal scan (current data) with branch isolation.
+                // Use actual_table_name to support materialized views.
+                // Pass pre-fetched schema to avoid duplicate lookup inside scan_table.
+                // Issue #1 follow-up: when the executor's needed-column analysis is
+                // certain (single regular table, no wildcard/subquery), decode only the
+                // leading columns and skip the costly tail.
+                match executor.scan_prefix_hint_for(table_name) {
+                    Some(prefix_len) if actual_table_name == *table_name => {
+                        storage.scan_table_branch_aware_with_schema_prefix(&actual_table_name, &schema, prefix_len)?
+                    }
+                    _ => storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?,
+                }
             };
 
             // Set source_table (alias) and source_table_name (actual) on each column for JOIN disambiguation

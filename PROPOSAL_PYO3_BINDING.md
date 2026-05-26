@@ -1,6 +1,18 @@
 # Proposal: PyO3 binding for `EmbeddedDatabase` (issue #1)
 
-Status: design / implementation-ready · Target: a follow-up minor release · Owner: TBD
+Status: **IMPLEMENTED in v3.33.0** — `bindings/python` (the `#[pymodule]`, abi3 wheel),
+the `query_params_with_columns` core method, and a projection-aware prefix-decode scan
+optimization all shipped. The plan below is preserved as the design record.
+
+**Measured outcome (real 448k-row dir).** In-process beats PG-wire — the access mode the
+dashboard's cutover uses today — by 1.5–4.7×: `COUNT(*)` 715→153 ms, `COUNT(DISTINCT
+session_id)` 1489→725 ms, `WHERE type=…` 1312→852 ms, `GROUP BY+SUM` 1439→902 ms. It is
+**not** sqlite-competitive on full-table aggregates (sqlite: 1.7–145 ms). The binding and
+the prefix decode confirmed, by measurement, that the access mode was *not* the dominant
+cost: a row store reads and materializes the whole row per scan, so even decoding only the
+referenced column prefix (~25% on `COUNT(DISTINCT)`) leaves Nano well above sqlite. True
+parity needs **columnar scans** — see `PROPOSAL_COLUMNAR_STORAGE.md`. The binding remains
+the right access layer; columnar storage is the orthogonal lever underneath it.
 
 Closes the latency gap reported in [issue #1](https://github.com/dimensigon/HDB-HeliosDB-Nano/issues/1):
 the Token-Dashboard team's only Python-accessible "embedded" mode today is the

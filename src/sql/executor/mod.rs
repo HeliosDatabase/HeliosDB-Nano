@@ -275,6 +275,10 @@ pub struct Executor<'a> {
     transaction: Option<&'a crate::storage::Transaction>,
     /// Materialized CTE results (name -> data)
     cte_context: std::collections::HashMap<String, CteData>,
+    /// Single-table prefix-decode hint `(table, prefix_len)`, computed once per
+    /// top-level `execute`/`execute_with_columns`: scans of `table` need only decode the
+    /// first `prefix_len` columns (issue #1 follow-up). `None` = full decode.
+    scan_prefix_hint: Option<(String, usize)>,
 }
 
 impl<'a> Executor<'a> {
@@ -286,6 +290,7 @@ impl<'a> Executor<'a> {
             parameters: Vec::new(),
             transaction: None,
             cte_context: std::collections::HashMap::new(),
+            scan_prefix_hint: None,
         }
     }
 
@@ -297,6 +302,16 @@ impl<'a> Executor<'a> {
             parameters: Vec::new(),
             transaction: None,
             cte_context: std::collections::HashMap::new(),
+            scan_prefix_hint: None,
+        }
+    }
+
+    /// Prefix-decode hint for `table` if the current plan's needed-column analysis was
+    /// certain enough to apply it. See `scan::compute_scan_prefix_hint`.
+    pub(crate) fn scan_prefix_hint_for(&self, table: &str) -> Option<usize> {
+        match &self.scan_prefix_hint {
+            Some((t, k)) if t == table => Some(*k),
+            _ => None,
         }
     }
 
@@ -331,6 +346,7 @@ impl<'a> Executor<'a> {
     /// Execute a logical plan and return all results
     pub fn execute(&mut self, plan: &LogicalPlan) -> Result<Vec<Tuple>> {
         let build_start = Instant::now();
+        self.scan_prefix_hint = scan::compute_scan_prefix_hint(plan);
         let mut operator = self.plan_to_operator(plan)?;
         let build_elapsed = build_start.elapsed();
         tracing::debug!(
@@ -358,6 +374,7 @@ impl<'a> Executor<'a> {
 
     /// Execute a plan and return both tuples and output column names.
     pub fn execute_with_columns(&mut self, plan: &LogicalPlan) -> Result<(Vec<Tuple>, Vec<String>)> {
+        self.scan_prefix_hint = scan::compute_scan_prefix_hint(plan);
         let mut operator = self.plan_to_operator(plan)?;
         let columns: Vec<String> = operator.schema().columns.iter().map(|c| c.name.clone()).collect();
         let mut results = Vec::with_capacity(256);
