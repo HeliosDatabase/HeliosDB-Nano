@@ -2,25 +2,23 @@
 //!
 //! PostgreSQL-style meta commands like \d, \dt, \q, etc.
 
-use crate::{EmbeddedDatabase, Result, Error, Schema, Column, DataType};
-use crate::sql::{Parser, Planner, explain::{ExplainPlanner, ExplainMode, ExplainFormat}};
-use crate::sql::explain_options::{ExplainOptions, ExplainFormatOption};
-use crate::sql::explain_storage::{StorageFeatureCollector, format_storage_features_text};
+use super::formatter;
+use super::help_manager::HelpManager;
+use crate::sql::explain_options::{ExplainFormatOption, ExplainOptions};
+use crate::sql::explain_storage::{format_storage_features_text, StorageFeatureCollector};
+use crate::sql::{
+    explain::{ExplainFormat, ExplainMode, ExplainPlanner},
+    Parser, Planner,
+};
+use crate::{Column, DataType, EmbeddedDatabase, Error, Result, Schema};
 use colored::Colorize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use super::help_manager::HelpManager;
-use super::formatter;
 
 /// Run a SQL query and pretty-print the result table. Used by the
 /// data-listing meta-commands (`\branches`, `\snapshots`, `\dmv`,
 /// `\compression`) that previously stubbed out as hint text.
-fn print_query_table(
-    db: &EmbeddedDatabase,
-    title: &str,
-    sql: &str,
-    empty_msg: &str,
-) -> Result<()> {
+fn print_query_table(db: &EmbeddedDatabase, title: &str, sql: &str, empty_msg: &str) -> Result<()> {
     let (rows, cols) = db.query_with_columns(sql)?;
     println!("\n{}", title.bold());
     if rows.is_empty() {
@@ -28,11 +26,7 @@ fn print_query_table(
         println!();
         return Ok(());
     }
-    let schema = Schema::new(
-        cols.into_iter()
-            .map(|name| Column::new(name, DataType::Text))
-            .collect(),
-    );
+    let schema = Schema::new(cols.into_iter().map(|name| Column::new(name, DataType::Text)).collect());
     println!("{}", formatter::format_results(&rows, &schema));
     println!();
     Ok(())
@@ -160,7 +154,11 @@ pub enum MetaCommand {
     /// \vector `<name>` - Show vector store details
     VectorDetails(String),
     /// \vector create `<name>` `<dims>` `[metric]` - Create vector store
-    VectorCreate { name: String, dimensions: u32, metric: Option<String> },
+    VectorCreate {
+        name: String,
+        dimensions: u32,
+        metric: Option<String>,
+    },
     /// \vector delete `<name>` - Delete vector store
     VectorDelete(String),
     /// \vector stats `<name>` - Show vector statistics
@@ -180,9 +178,17 @@ pub enum MetaCommand {
     /// \doc chunks `<collection>` `<id>` - Show document chunks
     DocumentChunks { collection: String, id: String },
     /// \doc rechunk `<collection>` `<id>` `<size>` - Re-chunk document
-    DocumentRechunk { collection: String, id: String, chunk_size: usize },
+    DocumentRechunk {
+        collection: String,
+        id: String,
+        chunk_size: usize,
+    },
     /// \rag `<collection>` `<query>` `[k]` - RAG search
-    RagSearch { collection: String, query: String, k: usize },
+    RagSearch {
+        collection: String,
+        query: String,
+        k: usize,
+    },
 
     // Performance & Utility Commands
     /// \explain `[options]` `<query>` - Show query execution plan with options
@@ -201,7 +207,11 @@ pub enum MetaCommand {
     /// \tenants - List all tenants
     TenantList,
     /// \tenant create `<name>` `[plan]` `[isolation]` - Create tenant with plan and isolation mode
-    TenantCreate { name: String, plan: Option<String>, isolation: Option<String> },
+    TenantCreate {
+        name: String,
+        plan: Option<String>,
+        isolation: Option<String>,
+    },
     /// \tenant use `<name|id>` - Set current tenant context
     TenantUse(String),
     /// \tenant info `<name|id>` - Show tenant details
@@ -314,14 +324,18 @@ impl MetaCommand {
             Some("h" | "help" | "?") => {
                 if parts.len() > 1 {
                     // \h <category> - Help for specific category
-                    Some(MetaCommand::HelpCategory(parts.get(1).copied().unwrap_or("").to_string()))
+                    Some(MetaCommand::HelpCategory(
+                        parts.get(1).copied().unwrap_or("").to_string(),
+                    ))
                 } else {
                     Some(MetaCommand::Help)
                 }
             }
             Some("d") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::DescribeTable(parts.get(1).copied().unwrap_or("").to_string()))
+                    Some(MetaCommand::DescribeTable(
+                        parts.get(1).copied().unwrap_or("").to_string(),
+                    ))
                 } else {
                     Some(MetaCommand::ListTables)
                 }
@@ -329,7 +343,9 @@ impl MetaCommand {
             Some("dt") => Some(MetaCommand::ListTablesDetailed),
             Some("dS") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::DescribeSystemView(parts.get(1).copied().unwrap_or("").to_string()))
+                    Some(MetaCommand::DescribeSystemView(
+                        parts.get(1).copied().unwrap_or("").to_string(),
+                    ))
                 } else {
                     Some(MetaCommand::ListSystemViews)
                 }
@@ -344,7 +360,9 @@ impl MetaCommand {
             // v3.4 Storage Maintenance
             Some("vacuum") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::Vacuum(Some(parts.get(1).copied().unwrap_or("").to_string())))
+                    Some(MetaCommand::Vacuum(Some(
+                        parts.get(1).copied().unwrap_or("").to_string(),
+                    )))
                 } else {
                     Some(MetaCommand::Vacuum(None))
                 }
@@ -359,7 +377,10 @@ impl MetaCommand {
                         Some("lsn") => Some(MetaCommand::ShowLsn),
                         Some("branch") => Some(MetaCommand::ShowBranch),
                         _ => {
-                            eprintln!("Unknown show command: {}. Try \\show lsn or \\show branch", parts.get(1).copied().unwrap_or(""));
+                            eprintln!(
+                                "Unknown show command: {}. Try \\show lsn or \\show branch",
+                                parts.get(1).copied().unwrap_or("")
+                            );
                             None
                         }
                     }
@@ -384,14 +405,18 @@ impl MetaCommand {
             Some("snapshots") => Some(MetaCommand::ListSnapshots),
             Some("dmv") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::DescribeMaterializedView(parts.get(1).copied().unwrap_or("").to_string()))
+                    Some(MetaCommand::DescribeMaterializedView(
+                        parts.get(1).copied().unwrap_or("").to_string(),
+                    ))
                 } else {
                     Some(MetaCommand::ListMaterializedViews)
                 }
             }
             Some("compression") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::ShowCompressionTable(parts.get(1).copied().unwrap_or("").to_string()))
+                    Some(MetaCommand::ShowCompressionTable(
+                        parts.get(1).copied().unwrap_or("").to_string(),
+                    ))
                 } else {
                     Some(MetaCommand::ShowCompression)
                 }
@@ -401,7 +426,10 @@ impl MetaCommand {
             Some("set") => {
                 if parts.len() > 2 {
                     let value = parts.get(2..).map_or(String::new(), |s| s.join(" "));
-                    Some(MetaCommand::SetVariable(parts.get(1).copied().unwrap_or("").to_string(), value))
+                    Some(MetaCommand::SetVariable(
+                        parts.get(1).copied().unwrap_or("").to_string(),
+                        value,
+                    ))
                 } else {
                     Some(MetaCommand::ShowVariables)
                 }
@@ -451,7 +479,9 @@ impl MetaCommand {
             }
             Some("password") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::ChangePassword(parts.get(1).copied().unwrap_or("").to_string()))
+                    Some(MetaCommand::ChangePassword(
+                        parts.get(1).copied().unwrap_or("").to_string(),
+                    ))
                 } else {
                     None
                 }
@@ -465,14 +495,18 @@ impl MetaCommand {
             }
             Some("optimize") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::OptimizeTable(parts.get(1).copied().unwrap_or("").to_string()))
+                    Some(MetaCommand::OptimizeTable(
+                        parts.get(1).copied().unwrap_or("").to_string(),
+                    ))
                 } else {
                     None
                 }
             }
             Some("indexes") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::ShowIndexes(parts.get(1).copied().unwrap_or("").to_string()))
+                    Some(MetaCommand::ShowIndexes(
+                        parts.get(1).copied().unwrap_or("").to_string(),
+                    ))
                 } else {
                     None
                 }
@@ -486,14 +520,20 @@ impl MetaCommand {
                         Some("templates") => Some(MetaCommand::AiTemplates),
                         Some("template") => {
                             if parts.len() > 2 {
-                                Some(MetaCommand::AiTemplateDetails(parts.get(2).copied().unwrap_or("").to_string()))
+                                Some(MetaCommand::AiTemplateDetails(
+                                    parts.get(2).copied().unwrap_or("").to_string(),
+                                ))
                             } else {
                                 eprintln!("Usage: \\ai template <name>");
                                 None
                             }
                         }
                         Some("infer") => {
-                            let format = if parts.len() > 2 { parts.get(2).copied().unwrap_or("json") } else { "json" };
+                            let format = if parts.len() > 2 {
+                                parts.get(2).copied().unwrap_or("json")
+                            } else {
+                                "json"
+                            };
                             Some(MetaCommand::AiInferSchema(format.to_string()))
                         }
                         Some("generate") => {
@@ -571,7 +611,9 @@ impl MetaCommand {
                         }
                         Some("context") => {
                             if parts.len() >= 3 {
-                                Some(MetaCommand::SessionContext(parts.get(2).copied().unwrap_or("").to_string()))
+                                Some(MetaCommand::SessionContext(
+                                    parts.get(2).copied().unwrap_or("").to_string(),
+                                ))
                             } else {
                                 eprintln!("Usage: \\session context <id>");
                                 None
@@ -590,7 +632,9 @@ impl MetaCommand {
                         }
                         Some("summarize") => {
                             if parts.len() >= 3 {
-                                Some(MetaCommand::SessionSummarize(parts.get(2).copied().unwrap_or("").to_string()))
+                                Some(MetaCommand::SessionSummarize(
+                                    parts.get(2).copied().unwrap_or("").to_string(),
+                                ))
                             } else {
                                 eprintln!("Usage: \\session summarize <id>");
                                 None
@@ -598,7 +642,9 @@ impl MetaCommand {
                         }
                         _ => {
                             // Default: treat as session ID for details
-                            Some(MetaCommand::SessionDetails(parts.get(1).copied().unwrap_or("").to_string()))
+                            Some(MetaCommand::SessionDetails(
+                                parts.get(1).copied().unwrap_or("").to_string(),
+                            ))
                         }
                     }
                 } else {
@@ -608,7 +654,9 @@ impl MetaCommand {
             }
             Some("session-delete") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::SessionDelete(parts.get(1).copied().unwrap_or("").to_string()))
+                    Some(MetaCommand::SessionDelete(
+                        parts.get(1).copied().unwrap_or("").to_string(),
+                    ))
                 } else {
                     eprintln!("Usage: \\session-delete <id>");
                     None
@@ -616,7 +664,9 @@ impl MetaCommand {
             }
             Some("chat") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::ChatSession(parts.get(1).copied().unwrap_or("").to_string()))
+                    Some(MetaCommand::ChatSession(
+                        parts.get(1).copied().unwrap_or("").to_string(),
+                    ))
                 } else {
                     eprintln!("Usage: \\chat <session_id>");
                     None
@@ -624,7 +674,9 @@ impl MetaCommand {
             }
             Some("session-clear") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::SessionClear(parts.get(1).copied().unwrap_or("").to_string()))
+                    Some(MetaCommand::SessionClear(
+                        parts.get(1).copied().unwrap_or("").to_string(),
+                    ))
                 } else {
                     eprintln!("Usage: \\session-clear <id>");
                     None
@@ -641,7 +693,11 @@ impl MetaCommand {
                                 let name = parts.get(2).copied().unwrap_or("").to_string();
                                 let dims = parts.get(3).and_then(|s| s.parse::<u32>().ok()).unwrap_or(384);
                                 let metric = parts.get(4).map(|s| s.to_string());
-                                Some(MetaCommand::VectorCreate { name, dimensions: dims, metric })
+                                Some(MetaCommand::VectorCreate {
+                                    name,
+                                    dimensions: dims,
+                                    metric,
+                                })
                             } else {
                                 eprintln!("Usage: \\vector create <name> <dimensions> [metric]");
                                 eprintln!("  metrics: cosine, l2, inner_product");
@@ -651,7 +707,9 @@ impl MetaCommand {
                         }
                         Some("delete") => {
                             if parts.len() > 2 {
-                                Some(MetaCommand::VectorDelete(parts.get(2).copied().unwrap_or("").to_string()))
+                                Some(MetaCommand::VectorDelete(
+                                    parts.get(2).copied().unwrap_or("").to_string(),
+                                ))
                             } else {
                                 eprintln!("Usage: \\vector delete <name>");
                                 None
@@ -659,7 +717,9 @@ impl MetaCommand {
                         }
                         Some("stats") => {
                             if parts.len() > 2 {
-                                Some(MetaCommand::VectorStats(parts.get(2).copied().unwrap_or("").to_string()))
+                                Some(MetaCommand::VectorStats(
+                                    parts.get(2).copied().unwrap_or("").to_string(),
+                                ))
                             } else {
                                 eprintln!("Usage: \\vector stats <name>");
                                 None
@@ -667,7 +727,9 @@ impl MetaCommand {
                         }
                         _ => {
                             // Default to showing details for the store name
-                            Some(MetaCommand::VectorDetails(parts.get(1).copied().unwrap_or("").to_string()))
+                            Some(MetaCommand::VectorDetails(
+                                parts.get(1).copied().unwrap_or("").to_string(),
+                            ))
                         }
                     }
                 } else {
@@ -680,7 +742,9 @@ impl MetaCommand {
             Some("collections") => Some(MetaCommand::ListCollections),
             Some("collection") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::CollectionDetails(parts.get(1).copied().unwrap_or("").to_string()))
+                    Some(MetaCommand::CollectionDetails(
+                        parts.get(1).copied().unwrap_or("").to_string(),
+                    ))
                 } else {
                     eprintln!("Usage: \\collection <name>");
                     None
@@ -688,7 +752,9 @@ impl MetaCommand {
             }
             Some("docs") => {
                 if parts.len() > 1 {
-                    Some(MetaCommand::ListDocumentsInCollection(parts.get(1).copied().unwrap_or("").to_string()))
+                    Some(MetaCommand::ListDocumentsInCollection(
+                        parts.get(1).copied().unwrap_or("").to_string(),
+                    ))
                 } else {
                     eprintln!("Usage: \\docs <collection>");
                     None
@@ -744,7 +810,13 @@ impl MetaCommand {
                     let k = parts.get(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(5);
                     Some(MetaCommand::RagSearch {
                         collection: parts.get(1).copied().unwrap_or("").to_string(),
-                        query: parts.get(2..).map_or(String::new(), |s| s.iter().filter(|s| s.parse::<usize>().is_err()).cloned().collect::<Vec<_>>().join(" ")),
+                        query: parts.get(2..).map_or(String::new(), |s| {
+                            s.iter()
+                                .filter(|s| s.parse::<usize>().is_err())
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        }),
                         k,
                     })
                 } else {
@@ -773,26 +845,60 @@ impl MetaCommand {
                     while idx < parts.len() {
                         let part_lower = parts.get(idx).map_or(String::new(), |s| s.to_lowercase());
                         match part_lower.as_str() {
-                            "analyze" => { options.analyze = true; idx += 1; }
-                            "verbose" => { options.verbose = true; idx += 1; }
-                            "storage" => { options.storage = true; idx += 1; }
-                            "ai" => { options.ai = true; idx += 1; }
-                            "why_not" | "whynot" => { options.why_not = true; idx += 1; }
-                            "indexes" => { options.indexes = true; idx += 1; }
-                            "stats" | "statistics" => { options.statistics = true; idx += 1; }
-                            "costs" => { options.costs = true; idx += 1; }
-                            "buffers" => { options.buffers = true; idx += 1; }
-                            "timing" => { options.timing = true; idx += 1; }
-                            "summary" => { options.summary = true; idx += 1; }
+                            "analyze" => {
+                                options.analyze = true;
+                                idx += 1;
+                            }
+                            "verbose" => {
+                                options.verbose = true;
+                                idx += 1;
+                            }
+                            "storage" => {
+                                options.storage = true;
+                                idx += 1;
+                            }
+                            "ai" => {
+                                options.ai = true;
+                                idx += 1;
+                            }
+                            "why_not" | "whynot" => {
+                                options.why_not = true;
+                                idx += 1;
+                            }
+                            "indexes" => {
+                                options.indexes = true;
+                                idx += 1;
+                            }
+                            "stats" | "statistics" => {
+                                options.statistics = true;
+                                idx += 1;
+                            }
+                            "costs" => {
+                                options.costs = true;
+                                idx += 1;
+                            }
+                            "buffers" => {
+                                options.buffers = true;
+                                idx += 1;
+                            }
+                            "timing" => {
+                                options.timing = true;
+                                idx += 1;
+                            }
+                            "summary" => {
+                                options.summary = true;
+                                idx += 1;
+                            }
                             "format" => {
                                 if idx + 1 < parts.len() {
-                                    options.format = match parts.get(idx + 1).map_or(String::new(), |s| s.to_lowercase()).as_str() {
-                                        "json" => ExplainFormatOption::Json,
-                                        "yaml" => ExplainFormatOption::Yaml,
-                                        "tree" => ExplainFormatOption::Tree,
-                                        "text" => ExplainFormatOption::Text,
-                                        _ => ExplainFormatOption::Text,
-                                    };
+                                    options.format =
+                                        match parts.get(idx + 1).map_or(String::new(), |s| s.to_lowercase()).as_str() {
+                                            "json" => ExplainFormatOption::Json,
+                                            "yaml" => ExplainFormatOption::Yaml,
+                                            "tree" => ExplainFormatOption::Tree,
+                                            "text" => ExplainFormatOption::Text,
+                                            _ => ExplainFormatOption::Text,
+                                        };
                                     idx += 2;
                                 } else {
                                     idx += 1;
@@ -864,15 +970,29 @@ impl MetaCommand {
                                 eprintln!("  {} - Unlimited resources", "unlimited".green());
                                 eprintln!();
                                 eprintln!("{}", "Isolation Modes:".bold());
-                                eprintln!("  {} (or {}) - SharedSchema with RLS (default)", "shared".yellow(), "rls".yellow());
+                                eprintln!(
+                                    "  {} (or {}) - SharedSchema with RLS (default)",
+                                    "shared".yellow(),
+                                    "rls".yellow()
+                                );
                                 eprintln!("  {}        - Schema per tenant", "schema".yellow());
-                                eprintln!("  {} (or {})  - Database per tenant", "database".yellow(), "db".yellow());
+                                eprintln!(
+                                    "  {} (or {})  - Database per tenant",
+                                    "database".yellow(),
+                                    "db".yellow()
+                                );
                                 eprintln!();
                                 eprintln!("{}", "Examples:".bold());
                                 eprintln!("  {} - Free plan, shared isolation", "\\tenant create AcmeCorp".cyan());
                                 eprintln!("  {} - Starter plan", "\\tenant create AcmeCorp starter".cyan());
-                                eprintln!("  {} - Pro plan, schema isolation", "\\tenant create AcmeCorp pro schema".cyan());
-                                eprintln!("  {} - Enterprise, database isolation", "\\tenant create AcmeCorp enterprise db".cyan());
+                                eprintln!(
+                                    "  {} - Pro plan, schema isolation",
+                                    "\\tenant create AcmeCorp pro schema".cyan()
+                                );
+                                eprintln!(
+                                    "  {} - Enterprise, database isolation",
+                                    "\\tenant create AcmeCorp enterprise db".cyan()
+                                );
                                 None
                             }
                         }
@@ -899,7 +1019,8 @@ impl MetaCommand {
                                 if parts.len() >= 7 {
                                     let tenant = parts.get(3).copied().unwrap_or("").to_string();
                                     let storage_mb = parts.get(4).and_then(|s| s.parse::<u64>().ok()).unwrap_or(1024);
-                                    let max_connections = parts.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
+                                    let max_connections =
+                                        parts.get(5).and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
                                     let max_qps = parts.get(6).and_then(|s| s.parse::<u64>().ok()).unwrap_or(1000);
 
                                     Some(MetaCommand::TenantQuotaSet {
@@ -934,7 +1055,9 @@ impl MetaCommand {
                                     Some("info") => {
                                         // \tenant plan info <plan>
                                         if parts.len() > 3 {
-                                            Some(MetaCommand::TenantPlanInfo(parts.get(3).copied().unwrap_or("").to_string()))
+                                            Some(MetaCommand::TenantPlanInfo(
+                                                parts.get(3).copied().unwrap_or("").to_string(),
+                                            ))
                                         } else {
                                             eprintln!("Usage: \\tenant plan info <plan>");
                                             None
@@ -944,10 +1067,14 @@ impl MetaCommand {
                                         // \tenant plan create <name> <tier> <storage_mb> <conn> <qps>
                                         if parts.len() >= 8 {
                                             let name = parts.get(3).copied().unwrap_or("").to_string();
-                                            let tier_id = parts.get(4).and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
-                                            let storage_mb = parts.get(5).and_then(|s| s.parse::<u64>().ok()).unwrap_or(100);
-                                            let max_connections = parts.get(6).and_then(|s| s.parse::<usize>().ok()).unwrap_or(5);
-                                            let max_qps = parts.get(7).and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
+                                            let tier_id =
+                                                parts.get(4).and_then(|s| s.parse::<u32>().ok()).unwrap_or(100);
+                                            let storage_mb =
+                                                parts.get(5).and_then(|s| s.parse::<u64>().ok()).unwrap_or(100);
+                                            let max_connections =
+                                                parts.get(6).and_then(|s| s.parse::<usize>().ok()).unwrap_or(5);
+                                            let max_qps =
+                                                parts.get(7).and_then(|s| s.parse::<usize>().ok()).unwrap_or(10);
                                             Some(MetaCommand::TenantPlanCreate {
                                                 name,
                                                 tier_id,
@@ -956,7 +1083,9 @@ impl MetaCommand {
                                                 max_qps,
                                             })
                                         } else {
-                                            eprintln!("Usage: \\tenant plan create <name> <tier> <storage_mb> <conn> <qps>");
+                                            eprintln!(
+                                                "Usage: \\tenant plan create <name> <tier> <storage_mb> <conn> <qps>"
+                                            );
                                             eprintln!("  Example: \\tenant plan create Basic 150 500 10 50");
                                             eprintln!("  Plan ID is auto-generated from name (lowercase, no spaces)");
                                             None
@@ -980,7 +1109,9 @@ impl MetaCommand {
                                     Some("enable") => {
                                         // \tenant plan enable <id>
                                         if parts.len() > 3 {
-                                            Some(MetaCommand::TenantPlanEnable(parts.get(3).copied().unwrap_or("").to_string()))
+                                            Some(MetaCommand::TenantPlanEnable(
+                                                parts.get(3).copied().unwrap_or("").to_string(),
+                                            ))
                                         } else {
                                             eprintln!("Usage: \\tenant plan enable <plan_id>");
                                             None
@@ -989,7 +1120,9 @@ impl MetaCommand {
                                     Some("disable") => {
                                         // \tenant plan disable <id>
                                         if parts.len() > 3 {
-                                            Some(MetaCommand::TenantPlanDisable(parts.get(3).copied().unwrap_or("").to_string()))
+                                            Some(MetaCommand::TenantPlanDisable(
+                                                parts.get(3).copied().unwrap_or("").to_string(),
+                                            ))
                                         } else {
                                             eprintln!("Usage: \\tenant plan disable <plan_id>");
                                             None
@@ -998,7 +1131,9 @@ impl MetaCommand {
                                     Some("delete") => {
                                         // \tenant plan delete <id>
                                         if parts.len() > 3 {
-                                            Some(MetaCommand::TenantPlanDelete(parts.get(3).copied().unwrap_or("").to_string()))
+                                            Some(MetaCommand::TenantPlanDelete(
+                                                parts.get(3).copied().unwrap_or("").to_string(),
+                                            ))
                                         } else {
                                             eprintln!("Usage: \\tenant plan delete <plan_id>");
                                             eprintln!("  Note: Tenants on this plan will be downgraded");
@@ -1025,7 +1160,9 @@ impl MetaCommand {
                         }
                         Some("delete") => {
                             if parts.len() > 2 {
-                                Some(MetaCommand::TenantDelete(parts.get(2).copied().unwrap_or("").to_string()))
+                                Some(MetaCommand::TenantDelete(
+                                    parts.get(2).copied().unwrap_or("").to_string(),
+                                ))
                             } else {
                                 eprintln!("Usage: \\tenant delete <name|id>");
                                 None
@@ -1050,7 +1187,9 @@ impl MetaCommand {
                                                 command,
                                             })
                                         } else {
-                                            eprintln!("Usage: \\tenant rls create <table> <policy> <expression> <command>");
+                                            eprintln!(
+                                                "Usage: \\tenant rls create <table> <policy> <expression> <command>"
+                                            );
                                             eprintln!("  Commands: ALL, SELECT, INSERT, UPDATE, DELETE");
                                             eprintln!("  Example: \\tenant rls create customers tenant_filter \"tenant_id=current_tenant()\" ALL");
                                             None
@@ -1059,7 +1198,9 @@ impl MetaCommand {
                                     Some("list") => {
                                         // \tenant rls list <table>
                                         if parts.len() >= 4 {
-                                            Some(MetaCommand::TenantRlsList(parts.get(3).copied().unwrap_or("").to_string()))
+                                            Some(MetaCommand::TenantRlsList(
+                                                parts.get(3).copied().unwrap_or("").to_string(),
+                                            ))
                                         } else {
                                             eprintln!("Usage: \\tenant rls list <table>");
                                             None
@@ -1098,7 +1239,9 @@ impl MetaCommand {
                                     }
                                     Some("export") => {
                                         if parts.len() >= 4 {
-                                            Some(MetaCommand::TenantCdcExport(parts.get(3).copied().unwrap_or("").to_string()))
+                                            Some(MetaCommand::TenantCdcExport(
+                                                parts.get(3).copied().unwrap_or("").to_string(),
+                                            ))
                                         } else {
                                             eprintln!("Usage: \\tenant cdc export <file>");
                                             None
@@ -1121,7 +1264,9 @@ impl MetaCommand {
                                 match parts.get(2).copied() {
                                     Some("to") => {
                                         if parts.len() >= 4 {
-                                            Some(MetaCommand::TenantMigrateTo(parts.get(3).copied().unwrap_or("").to_string()))
+                                            Some(MetaCommand::TenantMigrateTo(
+                                                parts.get(3).copied().unwrap_or("").to_string(),
+                                            ))
                                         } else {
                                             eprintln!("Usage: \\tenant migrate to <target>");
                                             None
@@ -1132,7 +1277,10 @@ impl MetaCommand {
                                         Some(MetaCommand::TenantMigrateStatus(tenant))
                                     }
                                     _ => {
-                                        eprintln!("Unknown migrate subcommand: {}", parts.get(2).copied().unwrap_or(""));
+                                        eprintln!(
+                                            "Unknown migrate subcommand: {}",
+                                            parts.get(2).copied().unwrap_or("")
+                                        );
                                         eprintln!("Available: to, status");
                                         None
                                     }
@@ -1207,16 +1355,15 @@ impl MetaCommand {
 
                 // Check if table exists
                 if !catalog.table_exists(table_name)? {
-                    return Err(Error::query_execution(format!(
-                        "Table '{}' does not exist", table_name
-                    )));
+                    return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
                 }
 
                 let schema = catalog.get_table_schema(table_name)?;
 
                 println!("\n{}: {}", "Table".bold(), table_name.cyan());
                 println!("{}", "─".repeat(50));
-                println!("{:<20} {:<15} {:<10} {}",
+                println!(
+                    "{:<20} {:<15} {:<10} {}",
                     "Column".bold(),
                     "Type".bold(),
                     "Nullable".bold(),
@@ -1225,7 +1372,8 @@ impl MetaCommand {
                 println!("{}", "─".repeat(50));
 
                 for column in &schema.columns {
-                    println!("{:<20} {:<15} {:<10} {}",
+                    println!(
+                        "{:<20} {:<15} {:<10} {}",
                         column.name.green(),
                         format!("{:?}", column.data_type).yellow(),
                         if column.nullable { "YES" } else { "NO" },
@@ -1251,10 +1399,7 @@ impl MetaCommand {
 
                     for table in tables {
                         let schema = catalog.get_table_schema(&table)?;
-                        println!("{:<30} {}",
-                            table.cyan(),
-                            schema.columns.len()
-                        );
+                        println!("{:<30} {}", table.cyan(), schema.columns.len());
                     }
                     println!();
                 }
@@ -1264,10 +1409,7 @@ impl MetaCommand {
 
             MetaCommand::ToggleTiming => {
                 let new_state = !show_timing;
-                println!(
-                    "Timing is {}",
-                    if new_state { "on".green() } else { "off".red() }
-                );
+                println!("Timing is {}", if new_state { "on".green() } else { "off".red() });
                 Ok(MetaCommandResult::ToggleTiming(new_state))
             }
 
@@ -1288,7 +1430,10 @@ impl MetaCommand {
                     if let Some(branch_manager) = db.storage.branch_manager() {
                         match branch_manager.get_branch_by_name(&branch_name) {
                             Ok(metadata) => {
-                                println!("{}", format!("Branch: {} (ID: {})", branch_name.cyan(), metadata.branch_id).bold());
+                                println!(
+                                    "{}",
+                                    format!("Branch: {} (ID: {})", branch_name.cyan(), metadata.branch_id).bold()
+                                );
                             }
                             Err(_) => {
                                 println!("{}", format!("Branch: {} (ID: unknown)", branch_name.cyan()).bold());
@@ -1321,7 +1466,7 @@ impl MetaCommand {
                                 "pg_database_branches" => "Lists all database branches with metadata",
                                 "pg_mv_staleness" => "Shows staleness info for materialized views",
                                 "pg_vector_index_stats" => "Vector index statistics (PQ compression)",
-                                _ => "System view"
+                                _ => "System view",
                             };
                             println!("  {} - {}", view.cyan(), description.dimmed());
                         }
@@ -1342,13 +1487,15 @@ impl MetaCommand {
 
                 let schema = registry.get_schema(&view_name).ok_or_else(|| {
                     Error::query_execution(format!(
-                        "System view '{}' does not exist. Use \\dS to list available views.", view_name
+                        "System view '{}' does not exist. Use \\dS to list available views.",
+                        view_name
                     ))
                 })?;
 
                 println!("\n{}: {}", "System View".bold(), view_name.cyan());
                 println!("{}", "─".repeat(70));
-                println!("{:<25} {:<15} {:<10}",
+                println!(
+                    "{:<25} {:<15} {:<10}",
                     "Column".bold(),
                     "Type".bold(),
                     "Nullable".bold()
@@ -1356,7 +1503,8 @@ impl MetaCommand {
                 println!("{}", "─".repeat(70));
 
                 for column in &schema.columns {
-                    println!("{:<25} {:<15} {:<10}",
+                    println!(
+                        "{:<25} {:<15} {:<10}",
                         column.name.green(),
                         format!("{:?}", column.data_type).yellow(),
                         if column.nullable { "YES" } else { "NO" }
@@ -1431,14 +1579,16 @@ impl MetaCommand {
                     ]);
                     let rows: Vec<crate::Tuple> = snapshots
                         .iter()
-                        .map(|s| crate::Tuple::new(vec![
-                            crate::Value::Int8(s.timestamp as i64),
-                            crate::Value::Int8(s.transaction_id as i64),
-                            crate::Value::Int8(s.scn as i64),
-                            crate::Value::String(s.wall_clock_time.clone()),
-                            crate::Value::Int8(s.active_transactions as i64),
-                            crate::Value::Boolean(s.gc_eligible),
-                        ]))
+                        .map(|s| {
+                            crate::Tuple::new(vec![
+                                crate::Value::Int8(s.timestamp as i64),
+                                crate::Value::Int8(s.transaction_id as i64),
+                                crate::Value::Int8(s.scn as i64),
+                                crate::Value::String(s.wall_clock_time.clone()),
+                                crate::Value::Int8(s.active_transactions as i64),
+                                crate::Value::Boolean(s.gc_eligible),
+                            ])
+                        })
                         .collect();
                     println!("{}", formatter::format_results(&rows, &schema));
                 }
@@ -1498,7 +1648,10 @@ impl MetaCommand {
                 println!("\n{}: {}", "Compression Statistics".bold(), table_name.cyan());
                 println!("{}", "─".repeat(70));
                 println!("{}", "Set compression:".dimmed());
-                println!("  {}", format!("ALTER TABLE {} SET COMPRESSION zstd;", table_name).cyan());
+                println!(
+                    "  {}",
+                    format!("ALTER TABLE {} SET COMPRESSION zstd;", table_name).cyan()
+                );
                 println!();
                 Ok(MetaCommandResult::Continue)
             }
@@ -1569,17 +1722,30 @@ impl MetaCommand {
             }
 
             MetaCommand::UserAdd(name) => {
-                println!("{}", format!("User management not available in REPL mode. User '{}' not added.", name).yellow());
+                println!(
+                    "{}",
+                    format!("User management not available in REPL mode. User '{}' not added.", name).yellow()
+                );
                 Ok(MetaCommandResult::Continue)
             }
 
             MetaCommand::UserRemove(name) => {
-                println!("{}", format!("User management not available in REPL mode. User '{}' not removed.", name).yellow());
+                println!(
+                    "{}",
+                    format!(
+                        "User management not available in REPL mode. User '{}' not removed.",
+                        name
+                    )
+                    .yellow()
+                );
                 Ok(MetaCommandResult::Continue)
             }
 
             MetaCommand::ChangePassword(user) => {
-                println!("{}", format!("Password change not available in REPL mode for user '{}'.", user).yellow());
+                println!(
+                    "{}",
+                    format!("Password change not available in REPL mode for user '{}'.", user).yellow()
+                );
                 Ok(MetaCommandResult::Continue)
             }
 
@@ -1590,10 +1756,31 @@ impl MetaCommand {
                 // REPL configuration
                 println!("{}", "REPL Settings:".bold());
                 if let Some(cfg) = config {
-                    println!("  Timing display:  {}", if cfg.show_timing { "enabled".green() } else { "disabled".yellow() });
+                    println!(
+                        "  Timing display:  {}",
+                        if cfg.show_timing {
+                            "enabled".green()
+                        } else {
+                            "disabled".yellow()
+                        }
+                    );
                     println!("  Output format:   {}", format!("{:?}", cfg.output_format).cyan());
-                    println!("  Show row count:  {}", if cfg.show_row_count { "enabled".green() } else { "disabled".yellow() });
-                    println!("  Auto-commit:     {}", if cfg.auto_commit { "enabled".green() } else { "disabled".yellow() });
+                    println!(
+                        "  Show row count:  {}",
+                        if cfg.show_row_count {
+                            "enabled".green()
+                        } else {
+                            "disabled".yellow()
+                        }
+                    );
+                    println!(
+                        "  Auto-commit:     {}",
+                        if cfg.auto_commit {
+                            "enabled".green()
+                        } else {
+                            "disabled".yellow()
+                        }
+                    );
                     println!("  Null display:    \"{}\"", cfg.null_display);
                     println!("  Max col width:   {}", cfg.max_column_width);
                     println!("  Max history:     {}", cfg.max_history);
@@ -1619,14 +1806,20 @@ impl MetaCommand {
 
                 // Performance configuration
                 println!("{}", "Performance:".bold());
-                println!("  Workers: {}", std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4));
+                println!(
+                    "  Workers: {}",
+                    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+                );
                 println!("  SIMD: {}", "enabled".green());
                 println!();
 
                 if config.map(|c| c.config_path.is_some()).unwrap_or(false) {
                     println!("{}", "Use \\config reload to reload from file".dimmed());
                 } else {
-                    println!("{}", "Start REPL with --config to enable reload: heliosdb-nano repl --config config.toml".dimmed());
+                    println!(
+                        "{}",
+                        "Start REPL with --config to enable reload: heliosdb-nano repl --config config.toml".dimmed()
+                    );
                 }
                 println!();
                 Ok(MetaCommandResult::Continue)
@@ -1635,37 +1828,48 @@ impl MetaCommand {
             MetaCommand::ConfigReload => {
                 // Try to reload configuration from file
                 match config {
-                    Some(cfg) => {
-                        match cfg.reload() {
-                            Ok(new_config) => {
-                                println!("{}", "Configuration reloaded successfully!".green());
-                                println!();
-                                println!("{}", "Updated settings:".bold());
-                                println!("  Timing:         {}", if new_config.show_timing { "enabled".green() } else { "disabled".yellow() });
-                                println!("  Output format:  {:?}", new_config.output_format);
-                                println!("  Show row count: {}", new_config.show_row_count);
-                                println!("  Auto-commit:    {}", new_config.auto_commit);
-                                println!("  Null display:   \"{}\"", new_config.null_display);
-                                println!("  Max col width:  {}", new_config.max_column_width);
-                                if let Some(path) = &new_config.config_path {
-                                    println!("  Config file:    {}", path.display());
+                    Some(cfg) => match cfg.reload() {
+                        Ok(new_config) => {
+                            println!("{}", "Configuration reloaded successfully!".green());
+                            println!();
+                            println!("{}", "Updated settings:".bold());
+                            println!(
+                                "  Timing:         {}",
+                                if new_config.show_timing {
+                                    "enabled".green()
+                                } else {
+                                    "disabled".yellow()
                                 }
-                                println!();
-                                Ok(MetaCommandResult::ConfigReloaded(new_config))
+                            );
+                            println!("  Output format:  {:?}", new_config.output_format);
+                            println!("  Show row count: {}", new_config.show_row_count);
+                            println!("  Auto-commit:    {}", new_config.auto_commit);
+                            println!("  Null display:   \"{}\"", new_config.null_display);
+                            println!("  Max col width:  {}", new_config.max_column_width);
+                            if let Some(path) = &new_config.config_path {
+                                println!("  Config file:    {}", path.display());
                             }
-                            Err(e) => {
-                                println!("{}", format!("Failed to reload configuration: {}", e).red());
-                                if cfg.config_path.is_none() {
-                                    println!("{}", "No configuration file path set.".yellow());
-                                    println!("{}", "Start REPL with: heliosdb-nano repl --config config.toml".dimmed());
-                                }
-                                Ok(MetaCommandResult::Continue)
-                            }
+                            println!();
+                            Ok(MetaCommandResult::ConfigReloaded(new_config))
                         }
-                    }
+                        Err(e) => {
+                            println!("{}", format!("Failed to reload configuration: {}", e).red());
+                            if cfg.config_path.is_none() {
+                                println!("{}", "No configuration file path set.".yellow());
+                                println!(
+                                    "{}",
+                                    "Start REPL with: heliosdb-nano repl --config config.toml".dimmed()
+                                );
+                            }
+                            Ok(MetaCommandResult::Continue)
+                        }
+                    },
                     None => {
                         println!("{}", "Configuration context not available.".yellow());
-                        println!("{}", "Restart REPL with: heliosdb-nano repl --config config.toml".dimmed());
+                        println!(
+                            "{}",
+                            "Restart REPL with: heliosdb-nano repl --config config.toml".dimmed()
+                        );
                         Ok(MetaCommandResult::Continue)
                     }
                 }
@@ -1678,7 +1882,10 @@ impl MetaCommand {
                 println!("  {}", format!("EXPLAIN SELECT * FROM {};", table_name).cyan());
                 println!();
                 println!("{}", "Run index recommender:".dimmed());
-                println!("  {}", format!("SELECT * FROM recommend_indexes('{}');", table_name).cyan());
+                println!(
+                    "  {}",
+                    format!("SELECT * FROM recommend_indexes('{}');", table_name).cyan()
+                );
                 println!();
                 Ok(MetaCommandResult::Continue)
             }
@@ -1689,12 +1896,13 @@ impl MetaCommand {
                 // index metadata.
                 let art = db.storage.art_indexes();
                 let all = art.list_indexes();
-                let filtered: Vec<_> = all.into_iter()
-                    .filter(|(_, t, _, _)| t == table_name)
-                    .collect();
+                let filtered: Vec<_> = all.into_iter().filter(|(_, t, _, _)| t == table_name).collect();
                 println!("\n{}: {}", "Indexes on".bold(), table_name.cyan());
                 if filtered.is_empty() {
-                    println!("{}", "(no user-defined indexes — the implicit PK index is not listed)".dimmed());
+                    println!(
+                        "{}",
+                        "(no user-defined indexes — the implicit PK index is not listed)".dimmed()
+                    );
                 } else {
                     let schema = Schema::new(vec![
                         Column::new("index_name", DataType::Text),
@@ -1703,11 +1911,13 @@ impl MetaCommand {
                     ]);
                     let rows: Vec<crate::Tuple> = filtered
                         .into_iter()
-                        .map(|(name, _table, idx_type, cols)| crate::Tuple::new(vec![
-                            crate::Value::String(name),
-                            crate::Value::String(format!("{:?}", idx_type)),
-                            crate::Value::String(cols.join(", ")),
-                        ]))
+                        .map(|(name, _table, idx_type, cols)| {
+                            crate::Tuple::new(vec![
+                                crate::Value::String(name),
+                                crate::Value::String(format!("{:?}", idx_type)),
+                                crate::Value::String(cols.join(", ")),
+                            ])
+                        })
                         .collect();
                     println!("{}", formatter::format_results(&rows, &schema));
                 }
@@ -1751,7 +1961,10 @@ impl MetaCommand {
                     ("social", "Social network with profiles, posts, follows, likes"),
                     ("inventory", "Inventory management with products, warehouses, stock"),
                     ("crm", "CRM with contacts, deals, activities, pipelines"),
-                    ("rag", "RAG (Retrieval-Augmented Generation) schema with documents, chunks, embeddings"),
+                    (
+                        "rag",
+                        "RAG (Retrieval-Augmented Generation) schema with documents, chunks, embeddings",
+                    ),
                     ("agents", "AI agent memory with sessions, messages, tools, context"),
                     ("vector-store", "Vector database schema with indexes and metadata"),
                     ("chatbot", "Chatbot with conversations, intents, responses"),
@@ -1765,7 +1978,10 @@ impl MetaCommand {
                 println!();
                 println!("{}", "Usage:".dimmed());
                 println!("  {} - Show template DDL", "\\ai template <name>".cyan());
-                println!("  {} - Apply template", "SELECT * FROM apply_template('<name>');".cyan());
+                println!(
+                    "  {} - Apply template",
+                    "SELECT * FROM apply_template('<name>');".cyan()
+                );
                 println!();
                 Ok(MetaCommandResult::Continue)
             }
@@ -1775,7 +1991,8 @@ impl MetaCommand {
                 println!("{}", "═".repeat(70));
 
                 let ddl = match name.as_str() {
-                    "ecommerce" => r#"
+                    "ecommerce" => {
+                        r#"
 -- E-commerce Schema Template
 CREATE TABLE customers (
     id SERIAL PRIMARY KEY,
@@ -1810,8 +2027,10 @@ CREATE TABLE order_items (
 );
 
 CREATE INDEX idx_products_embedding ON products USING hnsw(embedding);
-"#,
-                    "blog" => r#"
+"#
+                    }
+                    "blog" => {
+                        r#"
 -- Blog Schema Template
 CREATE TABLE authors (
     id SERIAL PRIMARY KEY,
@@ -1853,8 +2072,10 @@ CREATE TABLE comments (
 );
 
 CREATE INDEX idx_posts_embedding ON posts USING hnsw(embedding);
-"#,
-                    "rag" => r#"
+"#
+                    }
+                    "rag" => {
+                        r#"
 -- RAG (Retrieval-Augmented Generation) Schema Template
 CREATE TABLE documents (
     id SERIAL PRIMARY KEY,
@@ -1893,8 +2114,10 @@ CREATE TABLE messages (
 CREATE INDEX idx_chunks_embedding ON chunks USING hnsw(embedding);
 CREATE INDEX idx_chunks_document ON chunks(document_id);
 CREATE INDEX idx_messages_conversation ON messages(conversation_id);
-"#,
-                    "agents" => r#"
+"#
+                    }
+                    "agents" => {
+                        r#"
 -- AI Agent Memory Schema Template
 CREATE TABLE sessions (
     id TEXT PRIMARY KEY,
@@ -1936,8 +2159,10 @@ CREATE TABLE tools (
 
 CREATE INDEX idx_messages_session ON messages(session_id);
 CREATE INDEX idx_messages_embedding ON messages USING hnsw(embedding);
-"#,
-                    "vector-store" => r#"
+"#
+                    }
+                    "vector-store" => {
+                        r#"
 -- Vector Store Schema Template
 CREATE TABLE vector_stores (
     id SERIAL PRIMARY KEY,
@@ -1968,7 +2193,8 @@ CREATE TABLE namespaces (
 CREATE INDEX idx_vectors_store ON vectors(store_id);
 CREATE INDEX idx_vectors_namespace ON vectors(namespace);
 CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
-"#,
+"#
+                    }
                     _ => {
                         println!("{}", format!("Template '{}' not found.", name).yellow());
                         println!("{}", "Use \\ai templates to list available templates.".dimmed());
@@ -1996,23 +2222,21 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 println!("{}", "Inferring schema from sample data...".dimmed());
 
                 // Create sample data for demonstration
-                let sample_data = vec![
-                    vec![
-                        crate::Value::String("example".to_string()),
-                        crate::Value::Int4(42),
-                        crate::Value::Boolean(true),
-                    ]
-                ];
+                let sample_data = vec![vec![
+                    crate::Value::String("example".to_string()),
+                    crate::Value::Int4(42),
+                    crate::Value::Boolean(true),
+                ]];
 
                 match db.batch_infer_schema(sample_data) {
                     Ok(schema) => {
                         println!("\n{}", "Inferred Schema:".green().bold());
                         println!("{}", "─".repeat(50));
-                        println!("{:<20} {:<15} {}",
-                            "Column".bold(), "Type".bold(), "Nullable".bold());
+                        println!("{:<20} {:<15} {}", "Column".bold(), "Type".bold(), "Nullable".bold());
                         println!("{}", "─".repeat(50));
                         for col in &schema.columns {
-                            println!("{:<20} {:<15} {}",
+                            println!(
+                                "{:<20} {:<15} {}",
                                 col.name.cyan(),
                                 format!("{:?}", col.data_type).yellow(),
                                 if col.nullable { "YES" } else { "NO" }
@@ -2049,7 +2273,11 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                     }
                     Err(e) => {
                         // If generation fails (e.g., no LLM configured), show templates instead
-                        println!("{}: {}", "Note".yellow(), "Schema generation requires LLM configuration");
+                        println!(
+                            "{}: {}",
+                            "Note".yellow(),
+                            "Schema generation requires LLM configuration"
+                        );
                         println!("  {}", format!("{}", e).dimmed());
                         println!();
                         println!("{}", "Try using a template instead:".dimmed());
@@ -2059,17 +2287,32 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                         // Suggest matching template based on description
                         let desc_lower = description.to_lowercase();
-                        let suggested = if desc_lower.contains("ecommerce") || desc_lower.contains("shop") || desc_lower.contains("store") {
+                        let suggested = if desc_lower.contains("ecommerce")
+                            || desc_lower.contains("shop")
+                            || desc_lower.contains("store")
+                        {
                             "ecommerce"
-                        } else if desc_lower.contains("blog") || desc_lower.contains("post") || desc_lower.contains("article") {
+                        } else if desc_lower.contains("blog")
+                            || desc_lower.contains("post")
+                            || desc_lower.contains("article")
+                        {
                             "blog"
-                        } else if desc_lower.contains("rag") || desc_lower.contains("document") || desc_lower.contains("search") {
+                        } else if desc_lower.contains("rag")
+                            || desc_lower.contains("document")
+                            || desc_lower.contains("search")
+                        {
                             "rag"
-                        } else if desc_lower.contains("agent") || desc_lower.contains("chat") || desc_lower.contains("session") {
+                        } else if desc_lower.contains("agent")
+                            || desc_lower.contains("chat")
+                            || desc_lower.contains("session")
+                        {
                             "agents"
                         } else if desc_lower.contains("vector") || desc_lower.contains("embedding") {
                             "vector-store"
-                        } else if desc_lower.contains("saas") || desc_lower.contains("tenant") || desc_lower.contains("subscription") {
+                        } else if desc_lower.contains("saas")
+                            || desc_lower.contains("tenant")
+                            || desc_lower.contains("subscription")
+                        {
                             "saas"
                         } else {
                             "ecommerce"
@@ -2093,7 +2336,8 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         println!("\n{}", "Current Schema:".bold());
                         println!("{}", "─".repeat(50));
                         for col in &schema.columns {
-                            println!("  {} {} {}",
+                            println!(
+                                "  {} {} {}",
                                 col.name.cyan(),
                                 format!("{:?}", col.data_type).yellow(),
                                 if col.primary_key { "(PK)".green() } else { "".into() }
@@ -2111,28 +2355,22 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                             // Suggest indexes for common patterns
                             if col_lower.contains("id") && !col.primary_key {
-                                recommendations.push(format!(
-                                    "Consider index on '{}' (foreign key pattern)",
-                                    col.name
-                                ));
+                                recommendations.push(format!("Consider index on '{}' (foreign key pattern)", col.name));
                             }
                             if col_lower.contains("email") || col_lower.contains("username") {
-                                recommendations.push(format!(
-                                    "Consider unique index on '{}' (lookup field)",
-                                    col.name
-                                ));
+                                recommendations.push(format!("Consider unique index on '{}' (lookup field)", col.name));
                             }
-                            if col_lower.contains("created") || col_lower.contains("updated") || col_lower.contains("date") {
-                                recommendations.push(format!(
-                                    "Consider index on '{}' (time-based queries)",
-                                    col.name
-                                ));
+                            if col_lower.contains("created")
+                                || col_lower.contains("updated")
+                                || col_lower.contains("date")
+                            {
+                                recommendations.push(format!("Consider index on '{}' (time-based queries)", col.name));
                             }
-                            if col_lower.contains("status") || col_lower.contains("type") || col_lower.contains("category") {
-                                recommendations.push(format!(
-                                    "Consider index on '{}' (filter field)",
-                                    col.name
-                                ));
+                            if col_lower.contains("status")
+                                || col_lower.contains("type")
+                                || col_lower.contains("category")
+                            {
+                                recommendations.push(format!("Consider index on '{}' (filter field)", col.name));
                             }
                             // Vector column recommendations
                             if format!("{:?}", col.data_type).contains("Vector") {
@@ -2155,8 +2393,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         // General tips
                         println!("\n{}", "General Tips:".bold());
                         println!("  • Use {} to analyze query patterns", "EXPLAIN ANALYZE".cyan());
-                        println!("  • Enable compression for large tables: {}",
-                            format!("ALTER TABLE {} SET COMPRESSION zstd;", table_name).cyan());
+                        println!(
+                            "  • Enable compression for large tables: {}",
+                            format!("ALTER TABLE {} SET COMPRESSION zstd;", table_name).cyan()
+                        );
                         println!("  • Consider materialized views for complex aggregations");
                         println!();
                     }
@@ -2223,9 +2463,14 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                             println!("  [{}...]", preview.join(", "));
                             println!();
                             println!("{}", "Use in SQL:".dimmed());
-                            println!("  INSERT INTO docs (text, embedding) VALUES ('{}', '[{}]');",
+                            println!(
+                                "  INSERT INTO docs (text, embedding) VALUES ('{}', '[{}]');",
                                 text.chars().take(20).collect::<String>(),
-                                embedding.iter().map(|v| format!("{:.6}", v)).collect::<Vec<_>>().join(",")
+                                embedding
+                                    .iter()
+                                    .map(|v| format!("{:.6}", v))
+                                    .collect::<Vec<_>>()
+                                    .join(",")
                             );
                         }
                     }
@@ -2256,15 +2501,20 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                     (Ok(schema1_obj), Ok(schema2_obj)) => {
                         match db.compare_schemas(&schema1_obj, &schema2_obj) {
                             Ok(diff) => {
-                                println!("{}", serde_json::to_string_pretty(&diff).unwrap_or_else(|_| format!("{:?}", diff)));
+                                println!(
+                                    "{}",
+                                    serde_json::to_string_pretty(&diff).unwrap_or_else(|_| format!("{:?}", diff))
+                                );
                             }
                             Err(e) => {
                                 // Manual comparison if API fails
                                 println!("{}", "Comparison:".bold());
                                 println!();
 
-                                let cols1: std::collections::HashSet<_> = schema1_obj.columns.iter().map(|c| &c.name).collect();
-                                let cols2: std::collections::HashSet<_> = schema2_obj.columns.iter().map(|c| &c.name).collect();
+                                let cols1: std::collections::HashSet<_> =
+                                    schema1_obj.columns.iter().map(|c| &c.name).collect();
+                                let cols2: std::collections::HashSet<_> =
+                                    schema2_obj.columns.iter().map(|c| &c.name).collect();
 
                                 let only_in_1: Vec<_> = cols1.difference(&cols2).collect();
                                 let only_in_2: Vec<_> = cols2.difference(&cols1).collect();
@@ -2309,11 +2559,11 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         if sessions.is_empty() {
                             println!("{}", "No sessions found.".dimmed());
                         } else {
-                            println!("{:<36} {:<20} {}",
-                                "ID".bold(), "Name".bold(), "Created".bold());
+                            println!("{:<36} {:<20} {}", "ID".bold(), "Name".bold(), "Created".bold());
                             println!("{}", "─".repeat(70));
                             for session in sessions {
-                                println!("{:<36} {:<20} {}",
+                                println!(
+                                    "{:<36} {:<20} {}",
                                     session.id.cyan(),
                                     session.name,
                                     session.created_at.dimmed()
@@ -2349,7 +2599,14 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                     Ok(session) => {
                         println!("\n{}: {}", "Session".bold(), id.cyan());
                         println!("{}", "─".repeat(50));
-                        println!("  Name: {}", if session.name.is_empty() { "(unnamed)" } else { &session.name });
+                        println!(
+                            "  Name: {}",
+                            if session.name.is_empty() {
+                                "(unnamed)"
+                            } else {
+                                &session.name
+                            }
+                        );
                         println!("  Created: {}", session.created_at);
 
                         // Show message count
@@ -2454,7 +2711,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                 match db.get_agent_context(&id) {
                     Ok(context) => {
-                        println!("{}", serde_json::to_string_pretty(&context).unwrap_or_else(|_| format!("{:?}", context)));
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&context).unwrap_or_else(|_| format!("{:?}", context))
+                        );
                     }
                     Err(e) => {
                         println!("{}: {}", "Error".red(), e);
@@ -2478,11 +2738,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                             println!("{}", "─".repeat(70));
                             for (msg, score) in results.iter().take(10) {
                                 let preview: String = msg.content.chars().take(50).collect();
-                                println!("{:<8.4} {:<15} {}",
-                                    score,
-                                    msg.role.cyan(),
-                                    preview.dimmed()
-                                );
+                                println!("{:<8.4} {:<15} {}", score, msg.role.cyan(), preview.dimmed());
                             }
                         }
                     }
@@ -2523,11 +2779,17 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                             println!("{}", "Create one:".dimmed());
                             println!("  {}", "\\vector create mystore 384 cosine".cyan());
                         } else {
-                            println!("{:<20} {:<12} {:<15} {}",
-                                "Name".bold(), "Dimensions".bold(), "Metric".bold(), "Vectors".bold());
+                            println!(
+                                "{:<20} {:<12} {:<15} {}",
+                                "Name".bold(),
+                                "Dimensions".bold(),
+                                "Metric".bold(),
+                                "Vectors".bold()
+                            );
                             println!("{}", "─".repeat(70));
                             for store in stores {
-                                println!("{:<20} {:<12} {:<15} {}",
+                                println!(
+                                    "{:<20} {:<12} {:<15} {}",
                                     store.name.cyan(),
                                     store.dimensions,
                                     store.metric,
@@ -2567,10 +2829,18 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 Ok(MetaCommandResult::Continue)
             }
 
-            MetaCommand::VectorCreate { name, dimensions, metric } => {
+            MetaCommand::VectorCreate {
+                name,
+                dimensions,
+                metric,
+            } => {
                 let metric_str = metric.as_deref().unwrap_or("cosine");
-                println!("Creating vector store: {} ({} dims, {} metric)",
-                    name.cyan(), dimensions, metric_str);
+                println!(
+                    "Creating vector store: {} ({} dims, {} metric)",
+                    name.cyan(),
+                    dimensions,
+                    metric_str
+                );
 
                 match db.create_vector_store(&name, *dimensions) {
                     Ok(store) => {
@@ -2634,15 +2904,16 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                             println!("{}", "No collections found.".dimmed());
                             println!();
                             println!("{}", "Create one:".dimmed());
-                            println!("  {}", "SQL: CREATE TABLE docs (id TEXT, content TEXT, embedding VECTOR(384));".cyan());
+                            println!(
+                                "  {}",
+                                "SQL: CREATE TABLE docs (id TEXT, content TEXT, embedding VECTOR(384));".cyan()
+                            );
                         } else {
                             println!("{:<30} {}", "Name".bold(), "Documents".bold());
                             println!("{}", "─".repeat(60));
                             for name in collections {
                                 // Try to get document count
-                                let count = db.list_documents(&name)
-                                    .map(|docs| docs.len())
-                                    .unwrap_or(0);
+                                let count = db.list_documents(&name).map(|docs| docs.len()).unwrap_or(0);
                                 println!("{:<30} {}", name.cyan(), count);
                             }
                         }
@@ -2685,14 +2956,14 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         if docs.is_empty() {
                             println!("{}", "No documents found.".dimmed());
                         } else {
-                            println!("{:<36} {:<15} {}",
-                                "ID".bold(), "Size".bold(), "Preview".bold());
+                            println!("{:<36} {:<15} {}", "ID".bold(), "Size".bold(), "Preview".bold());
                             println!("{}", "─".repeat(70));
                             for doc in docs.iter().take(20) {
                                 let id = &doc.id;
                                 let size = doc.size;
                                 let preview: String = doc.content.chars().take(30).collect();
-                                println!("{:<36} {:<15} {}",
+                                println!(
+                                    "{:<36} {:<15} {}",
                                     id.cyan(),
                                     format!("{} bytes", size),
                                     preview.dimmed()
@@ -2815,8 +3086,17 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 Ok(MetaCommandResult::Continue)
             }
 
-            MetaCommand::DocumentRechunk { collection, id, chunk_size } => {
-                println!("\n{}: {}/{}", "Re-chunking Document".bold(), collection.cyan(), id.cyan());
+            MetaCommand::DocumentRechunk {
+                collection,
+                id,
+                chunk_size,
+            } => {
+                println!(
+                    "\n{}: {}/{}",
+                    "Re-chunking Document".bold(),
+                    collection.cyan(),
+                    id.cyan()
+                );
                 println!("{}: {} characters", "Chunk size".dimmed(), chunk_size);
                 println!("{}", "─".repeat(60));
 
@@ -2852,11 +3132,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                             println!("{}", "─".repeat(70));
                             for (doc, score, context) in results.iter().take(*k) {
                                 let context_preview: String = context.chars().take(35).collect();
-                                println!("{:<8.4} {:<25} {}",
-                                    score,
-                                    doc.id.cyan(),
-                                    context_preview.dimmed()
-                                );
+                                println!("{:<8.4} {:<25} {}", score, doc.id.cyan(), context_preview.dimmed());
                             }
                         }
                     }
@@ -2890,13 +3166,18 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                         println!("{}", "Execution Metrics:".bold());
                         println!("  Rows returned: {}", row_count.to_string().cyan());
-                        println!("  Total time: {}", format!("{:.3}ms", elapsed.as_secs_f64() * 1000.0).green());
-                        println!("  Time per row: {}",
+                        println!(
+                            "  Total time: {}",
+                            format!("{:.3}ms", elapsed.as_secs_f64() * 1000.0).green()
+                        );
+                        println!(
+                            "  Time per row: {}",
                             if row_count > 0 {
                                 format!("{:.3}µs", (elapsed.as_secs_f64() * 1_000_000.0) / row_count as f64)
                             } else {
                                 "N/A".to_string()
-                            }.dimmed()
+                            }
+                            .dimmed()
                         );
                         println!();
 
@@ -2910,7 +3191,9 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         if !results.is_empty() {
                             println!("{}", "Sample Results (first 3 rows):".bold());
                             for (i, row) in results.iter().take(3).enumerate() {
-                                let row_str: String = row.values.iter()
+                                let row_str: String = row
+                                    .values
+                                    .iter()
                                     .take(5)
                                     .map(|v| format!("{:?}", v))
                                     .collect::<Vec<_>>()
@@ -2924,7 +3207,11 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                     }
                     Err(e) => {
                         let elapsed = start.elapsed();
-                        println!("{}: Query failed after {:.3}ms", "Error".red(), elapsed.as_secs_f64() * 1000.0);
+                        println!(
+                            "{}: Query failed after {:.3}ms",
+                            "Error".red(),
+                            elapsed.as_secs_f64() * 1000.0
+                        );
                         println!("  {}", format!("{}", e).dimmed());
                     }
                 }
@@ -2950,7 +3237,8 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                 // System info
                 println!("\n{}", "System:".bold());
-                println!("  Workers: {}",
+                println!(
+                    "  Workers: {}",
                     std::thread::available_parallelism()
                         .map(|n| n.get().to_string())
                         .unwrap_or_else(|_| "unknown".to_string())
@@ -2980,7 +3268,8 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                             println!("  {}", "None configured".dimmed());
                         } else {
                             for store in stores {
-                                println!("  {} ({} dims, {} vectors)",
+                                println!(
+                                    "  {} ({} dims, {} vectors)",
                                     store.name.cyan(),
                                     store.dimensions,
                                     store.vector_count
@@ -3014,7 +3303,8 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
             }
 
             MetaCommand::Dump(output_path) => {
-                let output_file = output_path.as_ref()
+                let output_file = output_path
+                    .as_ref()
                     .cloned()
                     .unwrap_or_else(|| std::path::PathBuf::from("dump.sql"));
 
@@ -3034,7 +3324,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                         let mut dump_content = String::new();
                         dump_content.push_str("-- HeliosDB Nano Database Dump\n");
-                        dump_content.push_str(&format!("-- Generated: {}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S")));
+                        dump_content.push_str(&format!(
+                            "-- Generated: {}\n",
+                            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+                        ));
                         dump_content.push_str("-- Database: heliosdb-nano\n\n");
 
                         let mut total_rows = 0;
@@ -3051,13 +3344,19 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                                     dump_content.push_str(" (\n");
 
                                     for (i, col) in schema.columns.iter().enumerate() {
-                                        if i > 0 { dump_content.push_str(",\n"); }
+                                        if i > 0 {
+                                            dump_content.push_str(",\n");
+                                        }
                                         dump_content.push_str("  ");
                                         dump_content.push_str(&col.name);
                                         dump_content.push_str(" ");
                                         dump_content.push_str(&format!("{:?}", col.data_type));
-                                        if col.primary_key { dump_content.push_str(" PRIMARY KEY"); }
-                                        if !col.nullable { dump_content.push_str(" NOT NULL"); }
+                                        if col.primary_key {
+                                            dump_content.push_str(" PRIMARY KEY");
+                                        }
+                                        if !col.nullable {
+                                            dump_content.push_str(" NOT NULL");
+                                        }
                                     }
 
                                     dump_content.push_str("\n);\n\n");
@@ -3066,7 +3365,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                                     match db.query(&format!("SELECT * FROM {}", table), &[]) {
                                         Ok(rows) => {
                                             for row in rows {
-                                                dump_content.push_str(&format!("-- Row data would go here ({})\n", total_rows + 1));
+                                                dump_content.push_str(&format!(
+                                                    "-- Row data would go here ({})\n",
+                                                    total_rows + 1
+                                                ));
                                                 total_rows += 1;
                                             }
                                         }
@@ -3115,8 +3417,13 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
             MetaCommand::TenantList => {
                 println!("\n{}", "Tenants:".bold());
                 println!("{}", "─".repeat(90));
-                println!("{:<38} {:<20} {:<15} {}",
-                    "ID".bold(), "Name".bold(), "Isolation".bold(), "Plan".bold());
+                println!(
+                    "{:<38} {:<20} {:<15} {}",
+                    "ID".bold(),
+                    "Name".bold(),
+                    "Isolation".bold(),
+                    "Plan".bold()
+                );
                 println!("{}", "─".repeat(90));
 
                 let tenants = db.tenant_manager.list_tenants();
@@ -3136,7 +3443,8 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         };
                         // Determine plan from limits
                         let plan = Self::limits_to_plan(&tenant.limits);
-                        println!("{:<38} {:<20} {:<15} {}",
+                        println!(
+                            "{:<38} {:<20} {:<15} {}",
                             tenant.id.to_string().cyan(),
                             tenant.name,
                             isolation_str.yellow(),
@@ -3160,18 +3468,20 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                     "schema" => (crate::tenant::IsolationMode::SchemaPerTenant, "SchemaPerTenant"),
                     "database" | "db" => (crate::tenant::IsolationMode::DatabasePerTenant, "DatabasePerTenant"),
                     other => {
-                        println!("{}: Unknown isolation mode '{}', using SharedSchema", "Warning".yellow(), other);
+                        println!(
+                            "{}: Unknown isolation mode '{}', using SharedSchema",
+                            "Warning".yellow(),
+                            other
+                        );
                         println!("  Valid modes: shared, schema, database");
                         (crate::tenant::IsolationMode::SharedSchema, "SharedSchema (RLS)")
                     }
                 };
 
                 // Create tenant with specified plan and isolation mode
-                let tenant = db.tenant_manager.register_tenant_with_plan(
-                    name.clone(),
-                    isolation_mode,
-                    plan_name,
-                );
+                let tenant = db
+                    .tenant_manager
+                    .register_tenant_with_plan(name.clone(), isolation_mode, plan_name);
 
                 println!("{}: Tenant '{}' created", "Success".green(), name.cyan());
                 println!("  ID: {}", tenant.id.to_string().cyan());
@@ -3194,8 +3504,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                 // Find tenant by name or ID
                 let tenant = tenants.iter().find(|t| {
-                    t.name.eq_ignore_ascii_case(&tenant_ref) ||
-                    t.id.to_string().starts_with(tenant_ref.as_str())
+                    t.name.eq_ignore_ascii_case(&tenant_ref) || t.id.to_string().starts_with(tenant_ref.as_str())
                 });
 
                 match tenant {
@@ -3211,7 +3520,14 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                         println!("{}: Now using tenant '{}'", "Success".green(), t.name.cyan());
                         println!("  ID: {}", t.id.to_string().dimmed());
-                        println!("  RLS: {}", if t.rls_enabled { "enabled".green() } else { "disabled".yellow() });
+                        println!(
+                            "  RLS: {}",
+                            if t.rls_enabled {
+                                "enabled".green()
+                            } else {
+                                "disabled".yellow()
+                            }
+                        );
                         println!();
                     }
                     None => {
@@ -3229,8 +3545,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                 // Find tenant by name or ID
                 let tenant = tenants.iter().find(|t| {
-                    t.name.eq_ignore_ascii_case(&tenant_ref) ||
-                    t.id.to_string().starts_with(tenant_ref.as_str())
+                    t.name.eq_ignore_ascii_case(&tenant_ref) || t.id.to_string().starts_with(tenant_ref.as_str())
                 });
 
                 match tenant {
@@ -3250,7 +3565,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                             crate::tenant::IsolationMode::SchemaPerTenant => "Schema per Tenant",
                         };
                         println!("  Mode: {}", isolation_str.yellow());
-                        println!("  RLS Enabled: {}", if t.rls_enabled { "Yes".green() } else { "No".red() });
+                        println!(
+                            "  RLS Enabled: {}",
+                            if t.rls_enabled { "Yes".green() } else { "No".red() }
+                        );
 
                         let plan = Self::limits_to_plan(&t.limits);
                         println!("\n{}", "Plan & Limits:".bold());
@@ -3262,19 +3580,21 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         // Show quota usage if available
                         if let Some(quota) = db.tenant_manager.get_quota_tracking(t.id) {
                             println!("\n{}", "Current Usage:".bold());
-                            let storage_pct = (quota.storage_bytes_used as f64 / t.limits.max_storage_bytes as f64) * 100.0;
-                            println!("  Storage: {} MB / {} MB ({:.1}%)",
+                            let storage_pct =
+                                (quota.storage_bytes_used as f64 / t.limits.max_storage_bytes as f64) * 100.0;
+                            println!(
+                                "  Storage: {} MB / {} MB ({:.1}%)",
                                 quota.storage_bytes_used / 1024 / 1024,
                                 t.limits.max_storage_bytes / 1024 / 1024,
                                 storage_pct
                             );
-                            println!("  Active Connections: {} / {}",
-                                quota.active_connections,
-                                t.limits.max_connections
+                            println!(
+                                "  Active Connections: {} / {}",
+                                quota.active_connections, t.limits.max_connections
                             );
-                            println!("  Queries (window): {} / {}",
-                                quota.queries_this_window,
-                                t.limits.max_qps
+                            println!(
+                                "  Queries (window): {} / {}",
+                                quota.queries_this_window, t.limits.max_qps
                             );
                             println!("  Window Reset: {}", quota.window_reset_at.dimmed());
                         }
@@ -3296,10 +3616,9 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                 // If no tenant specified, use current context
                 let tenant = if let Some(ref tr) = tenant_ref {
-                    tenants.iter().find(|t| {
-                        t.name.eq_ignore_ascii_case(tr) ||
-                        t.id.to_string().starts_with(tr)
-                    })
+                    tenants
+                        .iter()
+                        .find(|t| t.name.eq_ignore_ascii_case(tr) || t.id.to_string().starts_with(tr))
                 } else if let Some(ctx) = db.tenant_manager.get_current_context() {
                     tenants.iter().find(|t| t.id == ctx.tenant_id)
                 } else {
@@ -3313,11 +3632,13 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                         if let Some(quota) = db.tenant_manager.get_quota_tracking(t.id) {
                             // Storage bar
-                            let storage_pct = (quota.storage_bytes_used as f64 / t.limits.max_storage_bytes as f64) * 100.0;
+                            let storage_pct =
+                                (quota.storage_bytes_used as f64 / t.limits.max_storage_bytes as f64) * 100.0;
                             let storage_bar = Self::progress_bar(storage_pct, 30);
                             println!("\n{}", "Storage:".bold());
                             println!("  {} {:.1}%", storage_bar, storage_pct);
-                            println!("  {} MB / {} MB",
+                            println!(
+                                "  {} MB / {} MB",
                                 quota.storage_bytes_used / 1024 / 1024,
                                 t.limits.max_storage_bytes / 1024 / 1024
                             );
@@ -3359,10 +3680,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                 // If no tenant specified, use current context or show all
                 let target_tenants: Vec<_> = if let Some(ref tr) = tenant_ref {
-                    tenants.iter().filter(|t| {
-                        t.name.eq_ignore_ascii_case(tr) ||
-                        t.id.to_string().starts_with(tr)
-                    }).collect()
+                    tenants
+                        .iter()
+                        .filter(|t| t.name.eq_ignore_ascii_case(tr) || t.id.to_string().starts_with(tr))
+                        .collect()
                 } else if let Some(ctx) = db.tenant_manager.get_current_context() {
                     tenants.iter().filter(|t| t.id == ctx.tenant_id).collect()
                 } else {
@@ -3388,7 +3709,12 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                     let plan_name = plan.as_ref().map(|p| p.name.as_str()).unwrap_or("unknown");
 
                     println!();
-                    println!("{} {} ({})", "Tenant:".bold(), tenant.name.cyan(), tenant.plan_id.dimmed());
+                    println!(
+                        "{} {} ({})",
+                        "Tenant:".bold(),
+                        tenant.name.cyan(),
+                        tenant.plan_id.dimmed()
+                    );
                     println!("  Plan: {} | Mode: {:?}", plan_name.green(), tenant.isolation_mode);
 
                     if let Some(quota) = db.tenant_manager.get_quota_tracking(tenant.id) {
@@ -3421,7 +3747,8 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                         println!();
                         println!("  {} {} {:.1}%", "Connections:".bold(), conn_bar, conn_pct);
-                        println!("    Current: {} / {}  |  HWM: {}  |  Avg: {:.1}",
+                        println!(
+                            "    Current: {} / {}  |  HWM: {}  |  Avg: {:.1}",
                             quota.active_connections.to_string().cyan(),
                             conn_limit,
                             quota.connections_hwm.to_string().yellow(),
@@ -3443,7 +3770,8 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                         println!();
                         println!("  {} {} {:.1}%", "QPS:".bold(), qps_bar, qps_pct);
-                        println!("    Current: {} / {}  |  HWM: {}  |  Avg: {:.1}",
+                        println!(
+                            "    Current: {} / {}  |  HWM: {}  |  Avg: {:.1}",
                             quota.queries_this_window.to_string().cyan(),
                             qps_limit,
                             quota.qps_hwm.to_string().yellow(),
@@ -3483,8 +3811,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 println!("{}", "Available Multi-Tenancy Plans".bold());
                 println!();
                 println!("╔══════════════╦═══════╦═════════╦══════════════╦═════════════╦════════════╗");
-                println!("║ {:^12} ║ {:^5} ║ {:^7} ║ {:^12} ║ {:^11} ║ {:^10} ║",
-                    "Plan ID", "Tier", "Status", "Storage", "Connections", "QPS");
+                println!(
+                    "║ {:^12} ║ {:^5} ║ {:^7} ║ {:^12} ║ {:^11} ║ {:^10} ║",
+                    "Plan ID", "Tier", "Status", "Storage", "Connections", "QPS"
+                );
                 println!("╠══════════════╬═══════╬═════════╬══════════════╬═════════════╬════════════╣");
 
                 for plan in &plans {
@@ -3514,7 +3844,8 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         plan.tier_id.to_string()
                     };
 
-                    println!("║ {:^12} ║ {:^5} ║ {:^7} ║ {:>12} ║ {:>11} ║ {:>10} ║",
+                    println!(
+                        "║ {:^12} ║ {:^5} ║ {:^7} ║ {:>12} ║ {:>11} ║ {:>10} ║",
                         plan.id.cyan(),
                         tier_str,
                         status,
@@ -3527,10 +3858,20 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 println!();
                 println!("{}", "Plan Management:".bold());
                 println!("  {} - View plan details", "\\tenant plan info <id>".cyan());
-                println!("  {} - Create new plan (ID auto-generated)", "\\tenant plan create <name> <tier> <storage_mb> <conn> <qps>".cyan());
+                println!(
+                    "  {} - Create new plan (ID auto-generated)",
+                    "\\tenant plan create <name> <tier> <storage_mb> <conn> <qps>".cyan()
+                );
                 println!("  {} - Edit plan", "\\tenant plan edit <id> <field> <value>".cyan());
-                println!("  {} / {} - Toggle plan", "\\tenant plan enable <id>".cyan(), "disable <id>".cyan());
-                println!("  {} - Delete plan (tenants downgraded)", "\\tenant plan delete <id>".cyan());
+                println!(
+                    "  {} / {} - Toggle plan",
+                    "\\tenant plan enable <id>".cyan(),
+                    "disable <id>".cyan()
+                );
+                println!(
+                    "  {} - Delete plan (tenants downgraded)",
+                    "\\tenant plan delete <id>".cyan()
+                );
                 println!("  {} - Real-time usage statistics", "\\tenant usage [name]".cyan());
                 println!();
 
@@ -3584,28 +3925,69 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         println!("  QPS:         {}", qps.cyan());
                         println!();
                         println!("{}", "Features:".bold());
-                        println!("  {} RLS Policies: {}", "•".green(),
-                            if plan.features.rls_enabled { "Yes".green() } else { "No".dimmed() });
-                        println!("  {} CDC Events: {}", "•".green(),
-                            if plan.features.cdc_enabled { "Yes".green() } else { "No".dimmed() });
-                        println!("  {} Migrations: {}", "•".green(),
-                            if plan.features.migrations_enabled { "Yes".green() } else { "No".dimmed() });
-                        println!("  {} Custom Quotas: {}", "•".green(),
-                            if plan.features.custom_quotas_enabled { "Yes".green() } else { "No".dimmed() });
-                        println!("  {} All Isolation Modes: {}", "•".green(),
-                            if plan.features.all_isolation_modes { "Yes".green() } else { "No".dimmed() });
+                        println!(
+                            "  {} RLS Policies: {}",
+                            "•".green(),
+                            if plan.features.rls_enabled {
+                                "Yes".green()
+                            } else {
+                                "No".dimmed()
+                            }
+                        );
+                        println!(
+                            "  {} CDC Events: {}",
+                            "•".green(),
+                            if plan.features.cdc_enabled {
+                                "Yes".green()
+                            } else {
+                                "No".dimmed()
+                            }
+                        );
+                        println!(
+                            "  {} Migrations: {}",
+                            "•".green(),
+                            if plan.features.migrations_enabled {
+                                "Yes".green()
+                            } else {
+                                "No".dimmed()
+                            }
+                        );
+                        println!(
+                            "  {} Custom Quotas: {}",
+                            "•".green(),
+                            if plan.features.custom_quotas_enabled {
+                                "Yes".green()
+                            } else {
+                                "No".dimmed()
+                            }
+                        );
+                        println!(
+                            "  {} All Isolation Modes: {}",
+                            "•".green(),
+                            if plan.features.all_isolation_modes {
+                                "Yes".green()
+                            } else {
+                                "No".dimmed()
+                            }
+                        );
                         println!();
 
                         if !plan.is_default {
                             println!("{}", "Commands:".dimmed());
-                            println!("  {} - Assign tenant to this plan",
-                                format!("\\tenant plan <tenant> {}", plan.id).cyan());
+                            println!(
+                                "  {} - Assign tenant to this plan",
+                                format!("\\tenant plan <tenant> {}", plan.id).cyan()
+                            );
                             if plan.enabled {
-                                println!("  {} - Disable this plan",
-                                    format!("\\tenant plan disable {}", plan.id).cyan());
+                                println!(
+                                    "  {} - Disable this plan",
+                                    format!("\\tenant plan disable {}", plan.id).cyan()
+                                );
                             } else {
-                                println!("  {} - Enable this plan",
-                                    format!("\\tenant plan enable {}", plan.id).cyan());
+                                println!(
+                                    "  {} - Enable this plan",
+                                    format!("\\tenant plan enable {}", plan.id).cyan()
+                                );
                             }
                             println!();
                         }
@@ -3619,7 +4001,13 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 Ok(MetaCommandResult::Continue)
             }
 
-            MetaCommand::TenantPlanCreate { ref name, ref tier_id, ref storage_mb, ref max_connections, ref max_qps } => {
+            MetaCommand::TenantPlanCreate {
+                ref name,
+                ref tier_id,
+                ref storage_mb,
+                ref max_connections,
+                ref max_qps,
+            } => {
                 // Auto-generate ID from name: lowercase, replace spaces with hyphens
                 let id = name.to_lowercase().replace([' ', '_'], "-");
 
@@ -3637,7 +4025,12 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                 match db.tenant_manager.plan_manager.create_plan(plan) {
                     Ok(()) => {
-                        println!("{}: Plan '{}' created (ID: {})", "Success".green(), name.cyan(), id.dimmed());
+                        println!(
+                            "{}: Plan '{}' created (ID: {})",
+                            "Success".green(),
+                            name.cyan(),
+                            id.dimmed()
+                        );
                         println!("  Tier: {}", tier_id);
                         println!("  Storage: {}", Self::format_storage(*storage_mb * 1024 * 1024));
                         println!("  Connections: {}", max_connections);
@@ -3659,69 +4052,61 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 match field.to_lowercase().as_str() {
                     "name" => updates.name = Some(value.clone()),
                     "description" | "desc" => updates.description = Some(value.clone()),
-                    "tier" | "tier_id" => {
-                        match value.parse::<u32>() {
-                            Ok(t) => updates.tier_id = Some(t),
-                            Err(_) => {
-                                println!("{}: Invalid tier ID '{}'", "Error".red(), value);
-                                return Ok(MetaCommandResult::Continue);
+                    "tier" | "tier_id" => match value.parse::<u32>() {
+                        Ok(t) => updates.tier_id = Some(t),
+                        Err(_) => {
+                            println!("{}: Invalid tier ID '{}'", "Error".red(), value);
+                            return Ok(MetaCommandResult::Continue);
+                        }
+                    },
+                    "storage" | "storage_mb" => match value.parse::<u64>() {
+                        Ok(mb) => {
+                            let current = db.tenant_manager.plan_manager.get_plan(&plan_id);
+                            if let Some(p) = current {
+                                updates.limits = Some(crate::tenant::ResourceLimits {
+                                    max_storage_bytes: mb * 1024 * 1024,
+                                    ..p.limits
+                                });
                             }
                         }
-                    }
-                    "storage" | "storage_mb" => {
-                        match value.parse::<u64>() {
-                            Ok(mb) => {
-                                let current = db.tenant_manager.plan_manager.get_plan(&plan_id);
-                                if let Some(p) = current {
-                                    updates.limits = Some(crate::tenant::ResourceLimits {
-                                        max_storage_bytes: mb * 1024 * 1024,
-                                        ..p.limits
-                                    });
-                                }
-                            }
-                            Err(_) => {
-                                println!("{}: Invalid storage value '{}'", "Error".red(), value);
-                                return Ok(MetaCommandResult::Continue);
+                        Err(_) => {
+                            println!("{}: Invalid storage value '{}'", "Error".red(), value);
+                            return Ok(MetaCommandResult::Continue);
+                        }
+                    },
+                    "connections" | "conn" => match value.parse::<usize>() {
+                        Ok(c) => {
+                            let current = db.tenant_manager.plan_manager.get_plan(&plan_id);
+                            if let Some(p) = current {
+                                updates.limits = Some(crate::tenant::ResourceLimits {
+                                    max_connections: c,
+                                    ..p.limits
+                                });
                             }
                         }
-                    }
-                    "connections" | "conn" => {
-                        match value.parse::<usize>() {
-                            Ok(c) => {
-                                let current = db.tenant_manager.plan_manager.get_plan(&plan_id);
-                                if let Some(p) = current {
-                                    updates.limits = Some(crate::tenant::ResourceLimits {
-                                        max_connections: c,
-                                        ..p.limits
-                                    });
-                                }
-                            }
-                            Err(_) => {
-                                println!("{}: Invalid connections value '{}'", "Error".red(), value);
-                                return Ok(MetaCommandResult::Continue);
+                        Err(_) => {
+                            println!("{}: Invalid connections value '{}'", "Error".red(), value);
+                            return Ok(MetaCommandResult::Continue);
+                        }
+                    },
+                    "qps" => match value.parse::<usize>() {
+                        Ok(q) => {
+                            let current = db.tenant_manager.plan_manager.get_plan(&plan_id);
+                            if let Some(p) = current {
+                                updates.limits = Some(crate::tenant::ResourceLimits { max_qps: q, ..p.limits });
                             }
                         }
-                    }
-                    "qps" => {
-                        match value.parse::<usize>() {
-                            Ok(q) => {
-                                let current = db.tenant_manager.plan_manager.get_plan(&plan_id);
-                                if let Some(p) = current {
-                                    updates.limits = Some(crate::tenant::ResourceLimits {
-                                        max_qps: q,
-                                        ..p.limits
-                                    });
-                                }
-                            }
-                            Err(_) => {
-                                println!("{}: Invalid QPS value '{}'", "Error".red(), value);
-                                return Ok(MetaCommandResult::Continue);
-                            }
+                        Err(_) => {
+                            println!("{}: Invalid QPS value '{}'", "Error".red(), value);
+                            return Ok(MetaCommandResult::Continue);
                         }
-                    }
+                    },
                     _ => {
-                        println!("{}: Unknown field '{}'. Valid: name, description, tier, storage, connections, qps",
-                            "Error".red(), field);
+                        println!(
+                            "{}: Unknown field '{}'. Valid: name, description, tier, storage, connections, qps",
+                            "Error".red(),
+                            field
+                        );
                         return Ok(MetaCommandResult::Continue);
                     }
                 }
@@ -3759,7 +4144,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                     Ok(()) => {
                         println!("{}: Plan '{}' disabled", "Success".green(), plan_id.cyan());
                         if tenant_count > 0 {
-                            println!("{}", format!("  {} existing tenant(s) will keep this plan.", tenant_count).yellow());
+                            println!(
+                                "{}",
+                                format!("  {} existing tenant(s) will keep this plan.", tenant_count).yellow()
+                            );
                         }
                         println!("{}", "New tenants cannot be assigned to this plan.".dimmed());
                     }
@@ -3790,8 +4178,12 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         Ok((deleted, fallback_id, downgraded)) => {
                             println!("{}: Plan '{}' deleted", "Success".green(), deleted.name.cyan());
                             println!();
-                            println!("{} {} tenant(s) downgraded to '{}':",
-                                "Warning:".yellow(), downgraded.len(), fallback_id.cyan());
+                            println!(
+                                "{} {} tenant(s) downgraded to '{}':",
+                                "Warning:".yellow(),
+                                downgraded.len(),
+                                fallback_id.cyan()
+                            );
                             for tenant_id in &downgraded {
                                 if let Some(t) = db.tenant_manager.get_tenant(*tenant_id) {
                                     println!("  • {} ({})", t.name, tenant_id.to_string().dimmed());
@@ -3810,10 +4202,9 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 let tenants = db.tenant_manager.list_tenants();
 
                 // Find tenant by name or ID
-                let tenant_obj = tenants.iter().find(|t| {
-                    t.name.eq_ignore_ascii_case(&tenant) ||
-                    t.id.to_string().starts_with(tenant.as_str())
-                });
+                let tenant_obj = tenants
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(&tenant) || t.id.to_string().starts_with(tenant.as_str()));
 
                 match tenant_obj {
                     Some(t) => {
@@ -3847,8 +4238,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                 // Find tenant by name or ID
                 let tenant = tenants.iter().find(|t| {
-                    t.name.eq_ignore_ascii_case(&tenant_ref) ||
-                    t.id.to_string().starts_with(tenant_ref.as_str())
+                    t.name.eq_ignore_ascii_case(&tenant_ref) || t.id.to_string().starts_with(tenant_ref.as_str())
                 });
 
                 match tenant {
@@ -3871,7 +4261,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                                 println!("{}: Tenant '{}' deleted", "Success".green(), tenant_name.cyan());
                                 println!("  ID: {}", tenant_id.to_string().dimmed());
                                 println!();
-                                println!("{}", "Tenant removed from registry, quota tracking, and CDC logs.".dimmed());
+                                println!(
+                                    "{}",
+                                    "Tenant removed from registry, quota tracking, and CDC logs.".dimmed()
+                                );
                                 println!("{}", "Note: Table data persists until explicitly dropped.".dimmed());
                             }
                             Err(e) => {
@@ -3934,7 +4327,12 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 Ok(MetaCommandResult::Continue)
             }
 
-            MetaCommand::TenantRlsCreate { table, policy, expression, command } => {
+            MetaCommand::TenantRlsCreate {
+                table,
+                policy,
+                expression,
+                command,
+            } => {
                 println!("\n{}", "Creating RLS Policy:".bold());
                 println!("{}", "─".repeat(60));
 
@@ -3958,15 +4356,23 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                     policy.clone(),
                     expression.clone(), // condition (same as using_expr for now)
                     rls_cmd,
-                    expression.clone(), // using_expr
+                    expression.clone(),       // using_expr
                     Some(expression.clone()), // with_check_expr (same as using for simplicity)
                 );
 
-                println!("{}: RLS policy '{}' created for table '{}'", "Success".green(), policy.cyan(), table.cyan());
+                println!(
+                    "{}: RLS policy '{}' created for table '{}'",
+                    "Success".green(),
+                    policy.cyan(),
+                    table.cyan()
+                );
                 println!("  Expression: {}", expression.yellow());
                 println!("  Commands: {}", command.to_uppercase().green());
                 println!();
-                println!("{}", "Note: Policy will be enforced on all matching operations.".dimmed());
+                println!(
+                    "{}",
+                    "Note: Policy will be enforced on all matching operations.".dimmed()
+                );
                 println!();
                 Ok(MetaCommandResult::Continue)
             }
@@ -3981,9 +4387,17 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                     println!("{}", "No RLS policies found for this table.".dimmed());
                     println!();
                     println!("{}", "Create a policy:".dimmed());
-                    println!("  {}", format!("\\tenant rls create {} <policy> <expression> <command>", table).cyan());
+                    println!(
+                        "  {}",
+                        format!("\\tenant rls create {} <policy> <expression> <command>", table).cyan()
+                    );
                 } else {
-                    println!("\n{:<20} {:<10} {}", "Policy Name".bold(), "Commands".bold(), "Expression".bold());
+                    println!(
+                        "\n{:<20} {:<10} {}",
+                        "Policy Name".bold(),
+                        "Commands".bold(),
+                        "Expression".bold()
+                    );
                     println!("{}", "─".repeat(80));
 
                     for policy in policies {
@@ -3995,7 +4409,8 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                             crate::tenant::RLSCommand::Delete => "DELETE",
                         };
 
-                        println!("{:<20} {:<10} {}",
+                        println!(
+                            "{:<20} {:<10} {}",
                             policy.name.cyan(),
                             cmd_str.green(),
                             policy.using_expr.yellow()
@@ -4016,7 +4431,12 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 let found = policies.iter().find(|p| &p.name == policy);
 
                 if found.is_some() {
-                    println!("{}: Would delete policy '{}' from table '{}'", "Note".yellow(), policy.cyan(), table.cyan());
+                    println!(
+                        "{}: Would delete policy '{}' from table '{}'",
+                        "Note".yellow(),
+                        policy.cyan(),
+                        table.cyan()
+                    );
                     println!();
                     println!("{}", "⚠ Policy deletion not yet implemented in TenantManager.".yellow());
                     println!("{}", "  Policies persist for the session.".dimmed());
@@ -4050,7 +4470,13 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         let start = events.len().saturating_sub(display_limit);
                         let events_to_show = events.get(start..).unwrap_or(&[]);
 
-                        println!("\n{:<20} {:<10} {:<30} {}", "Timestamp".bold(), "Type".bold(), "Table".bold(), "Row ID".bold());
+                        println!(
+                            "\n{:<20} {:<10} {:<30} {}",
+                            "Timestamp".bold(),
+                            "Type".bold(),
+                            "Table".bold(),
+                            "Row ID".bold()
+                        );
                         println!("{}", "─".repeat(100));
 
                         for event in events_to_show {
@@ -4060,7 +4486,8 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                                 crate::tenant::ChangeType::Delete => "DELETE".red(),
                             };
 
-                            println!("{:<20} {:<10} {:<30} {}",
+                            println!(
+                                "{:<20} {:<10} {:<30} {}",
                                 event.timestamp.to_string().dimmed(),
                                 event_type.to_string(),
                                 event.table_name.cyan(),
@@ -4099,7 +4526,12 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         let filename_display = filename.cyan();
                         match std::fs::write(filename, json_data) {
                             Ok(()) => {
-                                println!("{}: Exported {} events to '{}'", "Success".green(), events.len(), filename_display);
+                                println!(
+                                    "{}: Exported {} events to '{}'",
+                                    "Success".green(),
+                                    events.len(),
+                                    filename_display
+                                );
                                 println!();
                             }
                             Err(e) => {
@@ -4134,14 +4566,17 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                     // Find target tenant by name
                     let tenants = db.tenant_manager.list_tenants();
                     let target_tenant = tenants.iter().find(|tenant| {
-                        tenant.name.eq_ignore_ascii_case(&target) ||
-                        tenant.id.to_string().starts_with(target.as_str())
+                        tenant.name.eq_ignore_ascii_case(&target) || tenant.id.to_string().starts_with(target.as_str())
                     });
 
                     match target_tenant {
                         Some(target_t) => {
                             println!("Migrating tenant: {}", t.name.cyan());
-                            println!("Target: {} ({})", target_t.name.cyan(), target_t.id.to_string().dimmed());
+                            println!(
+                                "Target: {} ({})",
+                                target_t.name.cyan(),
+                                target_t.id.to_string().dimmed()
+                            );
                             println!();
 
                             match db.tenant_manager.start_migration(tenant_id, target_t.id) {
@@ -4177,10 +4612,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 let tenant_id = if let Some(ref tr) = tenant_ref {
                     // Find tenant by name or ID
                     let tenants = db.tenant_manager.list_tenants();
-                    tenants.iter().find(|t| {
-                        t.name.eq_ignore_ascii_case(tr) ||
-                        t.id.to_string().starts_with(tr)
-                    }).map(|t| t.id)
+                    tenants
+                        .iter()
+                        .find(|t| t.name.eq_ignore_ascii_case(tr) || t.id.to_string().starts_with(tr))
+                        .map(|t| t.id)
                 } else if let Some(ctx) = db.tenant_manager.get_current_context() {
                     Some(ctx.tenant_id)
                 } else {
@@ -4200,7 +4635,9 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         } else {
                             for status in migrations {
                                 let target_tenant = db.tenant_manager.get_tenant(status.target_tenant_id);
-                                let target_name = target_tenant.map(|t| t.name).unwrap_or_else(|| status.target_tenant_id.to_string());
+                                let target_name = target_tenant
+                                    .map(|t| t.name)
+                                    .unwrap_or_else(|| status.target_tenant_id.to_string());
 
                                 let state_str = match status.migration_state {
                                     crate::tenant::MigrationState::Pending => "Pending".yellow(),
@@ -4208,15 +4645,18 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                                     crate::tenant::MigrationState::Replicating => "Replicating".cyan(),
                                     crate::tenant::MigrationState::Verifying => "Verifying".cyan(),
                                     crate::tenant::MigrationState::Completed => "Completed".green(),
-                                    crate::tenant::MigrationState::Failed(ref msg) => {
-                                        format!("Failed: {}", msg).red()
-                                    }
+                                    crate::tenant::MigrationState::Failed(ref msg) => format!("Failed: {}", msg).red(),
                                     crate::tenant::MigrationState::Paused => "Paused".yellow(),
                                 };
 
                                 println!("{}: {}", "State".bold(), state_str);
                                 println!("{}: {}", "Target".bold(), target_name.cyan());
-                                println!("{}: {} / {}", "Progress".bold(), status.changes_replicated, status.total_changes);
+                                println!(
+                                    "{}: {} / {}",
+                                    "Progress".bold(),
+                                    status.changes_replicated,
+                                    status.total_changes
+                                );
                                 println!("{}: {}", "Started".bold(), status.started_at.dimmed());
                                 if let Some(ref completed) = status.completed_at {
                                     println!("{}: {}", "Completed".bold(), completed.dimmed());
@@ -4229,21 +4669,28 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                     }
                 } else {
                     println!("{}: No tenant specified and no context set", "Error".red());
-                    println!("{}", "Use: \\tenant migrate status <tenant> or \\tenant use <tenant>".dimmed());
+                    println!(
+                        "{}",
+                        "Use: \\tenant migrate status <tenant> or \\tenant use <tenant>".dimmed()
+                    );
                 }
                 println!();
                 Ok(MetaCommandResult::Continue)
             }
 
-            MetaCommand::TenantQuotaSet { tenant, storage_mb, max_connections, max_qps } => {
+            MetaCommand::TenantQuotaSet {
+                tenant,
+                storage_mb,
+                max_connections,
+                max_qps,
+            } => {
                 println!("\n{}", "Setting Custom Quotas:".bold());
                 println!("{}", "─".repeat(60));
 
                 let tenants = db.tenant_manager.list_tenants();
-                let tenant_obj = tenants.iter().find(|t| {
-                    t.name.eq_ignore_ascii_case(&tenant) ||
-                    t.id.to_string().starts_with(tenant.as_str())
-                });
+                let tenant_obj = tenants
+                    .iter()
+                    .find(|t| t.name.eq_ignore_ascii_case(&tenant) || t.id.to_string().starts_with(tenant.as_str()));
 
                 match tenant_obj {
                     Some(t) => {
@@ -4262,7 +4709,11 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                                 println!("  Connections: {}", max_connections);
                                 println!("  QPS: {}", max_qps);
                                 println!();
-                                println!("{}", "Note: This sets a custom plan. Use \\tenant plan to revert to standard plans.".dimmed());
+                                println!(
+                                    "{}",
+                                    "Note: This sets a custom plan. Use \\tenant plan to revert to standard plans."
+                                        .dimmed()
+                                );
                             }
                             Err(e) => {
                                 println!("{}: Failed to set quotas - {}", "Error".red(), e);
@@ -4332,9 +4783,23 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
                 // Features
                 println!("\n{}", "Features:".cyan());
-                println!("  WAL: {}", if db.config.storage.wal_enabled { "Enabled".green() } else { "Disabled".yellow() });
+                println!(
+                    "  WAL: {}",
+                    if db.config.storage.wal_enabled {
+                        "Enabled".green()
+                    } else {
+                        "Disabled".yellow()
+                    }
+                );
                 println!("  Compression: {}", "Enabled (zstd)".green());
-                println!("  Time-Travel: {}", if db.config.storage.time_travel_enabled { "Enabled".green() } else { "Disabled".yellow() });
+                println!(
+                    "  Time-Travel: {}",
+                    if db.config.storage.time_travel_enabled {
+                        "Enabled".green()
+                    } else {
+                        "Disabled".yellow()
+                    }
+                );
 
                 println!();
                 Ok(MetaCommandResult::Continue)
@@ -4372,12 +4837,23 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
             MetaCommand::Vacuum(table_name) => {
                 use std::time::Instant;
 
-                println!("\n{}", "╔═══════════════════════════════════════════════════════════════╗".yellow());
-                println!("{}", "║                    VACUUM OPERATION                           ║".yellow());
-                println!("{}", "╚═══════════════════════════════════════════════════════════════╝".yellow());
+                println!(
+                    "\n{}",
+                    "╔═══════════════════════════════════════════════════════════════╗".yellow()
+                );
+                println!(
+                    "{}",
+                    "║                    VACUUM OPERATION                           ║".yellow()
+                );
+                println!(
+                    "{}",
+                    "╚═══════════════════════════════════════════════════════════════╝".yellow()
+                );
 
-                println!("\n{}: HeliosDB uses automatic compaction with zstd compression.",
-                    "Note".cyan().bold());
+                println!(
+                    "\n{}: HeliosDB uses automatic compaction with zstd compression.",
+                    "Note".cyan().bold()
+                );
                 println!("Manual vacuum is typically {} unless you have:", "not required".green());
                 println!("  • Performed bulk deletions and want to immediately reclaim space");
                 println!("  • Need to optimize storage before a backup");
@@ -4436,15 +4912,27 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                     }
                 }
 
-                println!("\n{}", "Note: Auto-compaction will continue in the background.".dimmed());
+                println!(
+                    "\n{}",
+                    "Note: Auto-compaction will continue in the background.".dimmed()
+                );
                 println!();
                 Ok(MetaCommandResult::Continue)
             }
 
             MetaCommand::ReplicationStatus => {
-                println!("\n{}", "╔═══════════════════════════════════════════════════════════════╗".cyan());
-                println!("{}", "║                    REPLICATION STATUS                         ║".cyan());
-                println!("{}", "╚═══════════════════════════════════════════════════════════════╝".cyan());
+                println!(
+                    "\n{}",
+                    "╔═══════════════════════════════════════════════════════════════╗".cyan()
+                );
+                println!(
+                    "{}",
+                    "║                    REPLICATION STATUS                         ║".cyan()
+                );
+                println!(
+                    "{}",
+                    "╚═══════════════════════════════════════════════════════════════╝".cyan()
+                );
                 println!();
 
                 // Check WAL status
@@ -4466,7 +4954,11 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 }
                 #[cfg(not(feature = "ha-tier1"))]
                 {
-                    println!("  {}: {} (enable with --features ha-tier1)", "Tier 1".cyan(), "Disabled".dimmed());
+                    println!(
+                        "  {}: {} (enable with --features ha-tier1)",
+                        "Tier 1".cyan(),
+                        "Disabled".dimmed()
+                    );
                 }
                 #[cfg(feature = "ha-tier2")]
                 {
@@ -4474,7 +4966,11 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 }
                 #[cfg(not(feature = "ha-tier2"))]
                 {
-                    println!("  {}: {} (enable with --features ha-tier2)", "Tier 2".cyan(), "Disabled".dimmed());
+                    println!(
+                        "  {}: {} (enable with --features ha-tier2)",
+                        "Tier 2".cyan(),
+                        "Disabled".dimmed()
+                    );
                 }
                 #[cfg(feature = "ha-tier3")]
                 {
@@ -4482,7 +4978,11 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 }
                 #[cfg(not(feature = "ha-tier3"))]
                 {
-                    println!("  {}: {} (enable with --features ha-tier3)", "Tier 3".cyan(), "Disabled".dimmed());
+                    println!(
+                        "  {}: {} (enable with --features ha-tier3)",
+                        "Tier 3".cyan(),
+                        "Disabled".dimmed()
+                    );
                 }
 
                 println!();
@@ -4507,12 +5007,12 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
     fn plan_to_limits(plan: &str) -> crate::tenant::ResourceLimits {
         match plan.to_lowercase().as_str() {
             "free" => crate::tenant::ResourceLimits {
-                max_storage_bytes: 100 * 1024 * 1024,      // 100 MB
+                max_storage_bytes: 100 * 1024 * 1024, // 100 MB
                 max_connections: 5,
                 max_qps: 10,
             },
             "starter" => crate::tenant::ResourceLimits {
-                max_storage_bytes: 1024 * 1024 * 1024,     // 1 GB
+                max_storage_bytes: 1024 * 1024 * 1024, // 1 GB
                 max_connections: 20,
                 max_qps: 100,
             },
@@ -4594,9 +5094,12 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
         // 3. Create ExplainPlanner with storage access for statistics
         let storage_arc = Arc::clone(&db.storage);
-        let mode = if analyze { ExplainMode::Analyze } else { ExplainMode::Standard };
-        let explain_planner = ExplainPlanner::new(mode, ExplainFormat::Text)
-            .with_storage(storage_arc);
+        let mode = if analyze {
+            ExplainMode::Analyze
+        } else {
+            ExplainMode::Standard
+        };
+        let explain_planner = ExplainPlanner::new(mode, ExplainFormat::Text).with_storage(storage_arc);
 
         // 4. Generate execution plan explanation
         let explain_start = Instant::now();
@@ -4623,9 +5126,21 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                             println!();
                             println!("{}", "Execution Results:".bold());
                             println!("  {} {}", "Actual rows returned:".green(), row_count.to_string().cyan());
-                            println!("  {} {:.3}ms", "Actual execution time:".green(), exec_time.as_secs_f64() * 1000.0);
-                            println!("  {} {:.3}ms", "Planning time:".dimmed(), planning_time.as_secs_f64() * 1000.0);
-                            println!("  {} {:.3}ms", "Total time:".green(), (exec_time + planning_time).as_secs_f64() * 1000.0);
+                            println!(
+                                "  {} {:.3}ms",
+                                "Actual execution time:".green(),
+                                exec_time.as_secs_f64() * 1000.0
+                            );
+                            println!(
+                                "  {} {:.3}ms",
+                                "Planning time:".dimmed(),
+                                planning_time.as_secs_f64() * 1000.0
+                            );
+                            println!(
+                                "  {} {:.3}ms",
+                                "Total time:".green(),
+                                (exec_time + planning_time).as_secs_f64() * 1000.0
+                            );
 
                             // Show comparison with estimates
                             println!();
@@ -4633,12 +5148,16 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                             let estimated_rows = output.total_rows;
                             if estimated_rows > 0 {
                                 let accuracy = if row_count > 0 {
-                                    (1.0 - ((estimated_rows as f64 - row_count as f64).abs() / row_count as f64).min(1.0)) * 100.0
+                                    (1.0 - ((estimated_rows as f64 - row_count as f64).abs() / row_count as f64)
+                                        .min(1.0))
+                                        * 100.0
                                 } else {
                                     0.0
                                 };
-                                println!("  Estimated rows: {} vs Actual rows: {} ({:.1}% accuracy)",
-                                    estimated_rows, row_count, accuracy);
+                                println!(
+                                    "  Estimated rows: {} vs Actual rows: {} ({:.1}% accuracy)",
+                                    estimated_rows, row_count, accuracy
+                                );
                             }
 
                             // Memory estimate
@@ -4647,7 +5166,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                             println!("{}", "Resource Usage (estimated):".bold());
                             println!("  Memory: ~{} bytes", mem_estimate);
                             if row_count > 0 {
-                                println!("  Time per row: {:.3}us", (exec_time.as_secs_f64() * 1_000_000.0) / row_count as f64);
+                                println!(
+                                    "  Time per row: {:.3}us",
+                                    (exec_time.as_secs_f64() * 1_000_000.0) / row_count as f64
+                                );
                             }
 
                             // Show storage layer info
@@ -4656,7 +5178,11 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                         Err(e) => {
                             let exec_time = exec_start.elapsed();
                             println!();
-                            println!("{}: Query execution failed after {:.3}ms", "Error".red(), exec_time.as_secs_f64() * 1000.0);
+                            println!(
+                                "{}: Query execution failed after {:.3}ms",
+                                "Error".red(),
+                                exec_time.as_secs_f64() * 1000.0
+                            );
                             println!("  {}", e);
                         }
                     }
@@ -4714,11 +5240,21 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
         // Build mode description
         let mut mode_parts = vec!["EXPLAIN"];
-        if options.analyze { mode_parts.push("ANALYZE"); }
-        if options.verbose { mode_parts.push("VERBOSE"); }
-        if options.storage { mode_parts.push("STORAGE"); }
-        if options.ai { mode_parts.push("AI"); }
-        if options.why_not { mode_parts.push("WHY_NOT"); }
+        if options.analyze {
+            mode_parts.push("ANALYZE");
+        }
+        if options.verbose {
+            mode_parts.push("VERBOSE");
+        }
+        if options.storage {
+            mode_parts.push("STORAGE");
+        }
+        if options.ai {
+            mode_parts.push("AI");
+        }
+        if options.why_not {
+            mode_parts.push("WHY_NOT");
+        }
         if options.format != ExplainFormatOption::Text {
             mode_parts.push(match options.format {
                 ExplainFormatOption::Json => "FORMAT JSON",
@@ -4762,8 +5298,7 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
         let mode = options.to_explain_mode();
         let format = options.to_explain_format();
 
-        let explain_planner = ExplainPlanner::new(mode, format)
-            .with_storage(storage_arc.clone());
+        let explain_planner = ExplainPlanner::new(mode, format).with_storage(storage_arc.clone());
 
         // 4. Generate execution plan explanation
         let explain_start = Instant::now();
@@ -4936,7 +5471,11 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
             println!("  {} {}", "Actual rows returned:".green(), rows.to_string().cyan());
         }
 
-        println!("  {} {:.3}ms", "Planning time:".dimmed(), planning_time.as_secs_f64() * 1000.0);
+        println!(
+            "  {} {:.3}ms",
+            "Planning time:".dimmed(),
+            planning_time.as_secs_f64() * 1000.0
+        );
 
         // Show comparison with estimates
         if let Some(actual_rows) = output.actual_rows {
@@ -4949,8 +5488,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 };
                 println!();
                 println!("{}", "Estimate Accuracy:".bold());
-                println!("  Estimated rows: {} vs Actual rows: {} ({:.1}% accuracy)",
-                    estimated_rows, actual_rows, accuracy);
+                println!(
+                    "  Estimated rows: {} vs Actual rows: {} ({:.1}% accuracy)",
+                    estimated_rows, actual_rows, accuracy
+                );
             }
         }
     }
@@ -4973,8 +5514,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 };
 
                 println!("  Estimate Accuracy:");
-                println!("    Rows: {} actual vs {} estimated ({:.1}%)",
-                    actual_rows, output.total_rows, row_accuracy);
+                println!(
+                    "    Rows: {} actual vs {} estimated ({:.1}%)",
+                    actual_rows, output.total_rows, row_accuracy
+                );
                 println!("    Time: {:.3} ms", actual_time);
             }
         }
@@ -5005,7 +5548,9 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
         // Extract table name if present
         let table_name = if let Some(from_idx) = query_upper.find("FROM") {
             let after_from = &query[from_idx + 5..];
-            after_from.split_whitespace().next()
+            after_from
+                .split_whitespace()
+                .next()
                 .map(|s| s.trim_end_matches([',', ';']))
         } else {
             None
@@ -5015,17 +5560,30 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
         println!("{}", "Storage Layer Capabilities:".bold());
 
         // Show predicate pushdown capabilities
-        println!("  {}: {}", "Predicate Pushdown".cyan(),
-            if query_upper.contains("WHERE") { "Active".green() } else { "Not applicable".dimmed() });
+        println!(
+            "  {}: {}",
+            "Predicate Pushdown".cyan(),
+            if query_upper.contains("WHERE") {
+                "Active".green()
+            } else {
+                "Not applicable".dimmed()
+            }
+        );
 
         // Check for bloom filters and zone maps
         let has_equality = query_upper.contains(" = ");
-        let has_range = query_upper.contains(" > ") || query_upper.contains(" < ") ||
-                        query_upper.contains(" >= ") || query_upper.contains(" <= ") ||
-                        query_upper.contains(" BETWEEN ");
+        let has_range = query_upper.contains(" > ")
+            || query_upper.contains(" < ")
+            || query_upper.contains(" >= ")
+            || query_upper.contains(" <= ")
+            || query_upper.contains(" BETWEEN ");
 
         if has_equality {
-            println!("  {}: {}", "Bloom Filter".cyan(), "Eligible for equality predicates".green());
+            println!(
+                "  {}: {}",
+                "Bloom Filter".cyan(),
+                "Eligible for equality predicates".green()
+            );
         }
         if has_range {
             println!("  {}: {}", "Zone Maps".cyan(), "Eligible for range predicates".green());
@@ -5041,8 +5599,15 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
         // Check for projection pushdown (SELECT specific columns vs *)
         let has_star = query_upper.contains("SELECT *") || query_upper.contains("SELECT  *");
-        println!("  {}: {}", "Projection Pushdown".cyan(),
-            if has_star { "Not used (SELECT *)".yellow() } else { "Active (column pruning)".green() });
+        println!(
+            "  {}: {}",
+            "Projection Pushdown".cyan(),
+            if has_star {
+                "Not used (SELECT *)".yellow()
+            } else {
+                "Active (column pruning)".green()
+            }
+        );
 
         // Show compression info if we have a table name
         if let Some(tname) = table_name {
@@ -5076,15 +5641,30 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
                 let idx_type_str = match &idx.index_type {
                     crate::storage::VectorIndexType::Standard(_) => "HNSW",
                     crate::storage::VectorIndexType::Quantized(_) => "Quantized HNSW",
+                    crate::storage::VectorIndexType::Persistent(cfg) => {
+                        if cfg.pq_enabled {
+                            "Persistent Quantized HNSW"
+                        } else {
+                            "Persistent HNSW"
+                        }
+                    }
                 };
-                println!("  Vector Index: {} on {}.{} ({})",
-                    idx.name.cyan(), idx.table_name, idx.column_name, idx_type_str);
+                println!(
+                    "  Vector Index: {} on {}.{} ({})",
+                    idx.name.cyan(),
+                    idx.table_name,
+                    idx.column_name,
+                    idx_type_str
+                );
             }
 
             if !found_indexes {
                 println!("  {}", "No indexes found on this table".dimmed());
                 if query_upper.contains("WHERE") {
-                    println!("  {}", "Suggestion: Consider adding an index on filtered columns".yellow());
+                    println!(
+                        "  {}",
+                        "Suggestion: Consider adding an index on filtered columns".yellow()
+                    );
                 }
             }
         } else {
@@ -5096,7 +5676,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
             println!();
             println!("{}", "Join Strategy:".bold());
             if query_upper.contains("INNER JOIN") || query_upper.contains("JOIN") {
-                println!("  Strategy: {} (build on smaller table, probe larger)", "Hash Join".cyan());
+                println!(
+                    "  Strategy: {} (build on smaller table, probe larger)",
+                    "Hash Join".cyan()
+                );
             }
             if query_upper.contains("LEFT JOIN") || query_upper.contains("LEFT OUTER JOIN") {
                 println!("  Strategy: {} with build on right table", "Hash Join".cyan());
@@ -5130,12 +5713,18 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
         eprintln!("{}", "Plan Commands:".bold());
         eprintln!("  {} - List all plans", "\\tenant plans".cyan());
         eprintln!("  {} - Show plan details", "\\tenant plan info <id>".cyan());
-        eprintln!("  {} - Create plan (ID auto-generated)", "\\tenant plan create <name> <tier> <storage_mb> <conn> <qps>".cyan());
+        eprintln!(
+            "  {} - Create plan (ID auto-generated)",
+            "\\tenant plan create <name> <tier> <storage_mb> <conn> <qps>".cyan()
+        );
         eprintln!("  {} - Edit plan", "\\tenant plan edit <id> <field> <value>".cyan());
         eprintln!("  {} - Enable plan", "\\tenant plan enable <id>".cyan());
         eprintln!("  {} - Disable plan", "\\tenant plan disable <id>".cyan());
         eprintln!("  {} - Delete plan", "\\tenant plan delete <id>".cyan());
-        eprintln!("  {} - Assign tenant to plan", "\\tenant plan <tenant> <plan_id>".cyan());
+        eprintln!(
+            "  {} - Assign tenant to plan",
+            "\\tenant plan <tenant> <plan_id>".cyan()
+        );
         eprintln!("  {} - Real-time usage with HWM/Avg", "\\tenant usage [name]".cyan());
     }
 
@@ -5145,11 +5734,16 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
         let filled = filled.min(width);
         let empty = width - filled;
 
-        let bar_char = if percentage > 90.0 { "█".red() }
-            else if percentage > 70.0 { "█".yellow() }
-            else { "█".green() };
+        let bar_char = if percentage > 90.0 {
+            "█".red()
+        } else if percentage > 70.0 {
+            "█".yellow()
+        } else {
+            "█".green()
+        };
 
-        format!("[{}{}]",
+        format!(
+            "[{}{}]",
             bar_char.to_string().repeat(filled),
             "░".dimmed().to_string().repeat(empty)
         )
@@ -5157,7 +5751,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
     /// Print help text
     fn print_help() {
-        println!("\n{}", format!("HeliosDB Nano v{} REPL Commands", env!("CARGO_PKG_VERSION")).bold());
+        println!(
+            "\n{}",
+            format!("HeliosDB Nano v{} REPL Commands", env!("CARGO_PKG_VERSION")).bold()
+        );
         println!("{}", "═".repeat(70));
 
         println!("\n{}", "Basic Meta Commands:".bold());
@@ -5180,7 +5777,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
 
         println!("\n{}", "v2.1 Feature Commands:".bold());
         println!("  {}               - Show all settings", "\\set".cyan());
-        println!("  {}    - Set REPL variable (use SQL SET for persistent)", "\\set <var> <value>".cyan());
+        println!(
+            "  {}    - Set REPL variable (use SQL SET for persistent)",
+            "\\set <var> <value>".cyan()
+        );
         println!("  {}      - Show server status", "\\server [status]".cyan());
         println!("  {}   - Start server (use CLI)", "\\server start".cyan());
         println!("  {}    - Stop server (use CLI)", "\\server stop".cyan());
@@ -5205,7 +5805,10 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
         println!("\n{}", "v3.2 Multi-Tenancy Commands:".bold());
         println!("  {}         - List all tenants", "\\tenants".cyan());
         println!("  {}       - List all tenants", "\\tenant list".cyan());
-        println!("  {} - Create tenant", "\\tenant create <name> [plan] [isolation]".cyan());
+        println!(
+            "  {} - Create tenant",
+            "\\tenant create <name> [plan] [isolation]".cyan()
+        );
         println!("  {}      - Set current tenant context", "\\tenant use <name>".cyan());
         println!("  {}     - Show tenant details", "\\tenant info <name>".cyan());
         println!("  {}    - Show quota usage", "\\tenant quota [name]".cyan());
@@ -5216,15 +5819,27 @@ CREATE INDEX idx_vectors_values ON vectors USING hnsw(values);
         println!("\n{}", "v3.3 Plan Management Commands:".bold());
         println!("  {}        - List available plans", "\\tenant plans".cyan());
         println!("  {} - Show plan details", "\\tenant plan info <id>".cyan());
-        println!("  {} - Create plan (ID auto-generated)", "\\tenant plan create <name> <tier> <storage_mb> <conn> <qps>".cyan());
-        println!("  {} - Edit plan field", "\\tenant plan edit <id> <field> <value>".cyan());
+        println!(
+            "  {} - Create plan (ID auto-generated)",
+            "\\tenant plan create <name> <tier> <storage_mb> <conn> <qps>".cyan()
+        );
+        println!(
+            "  {} - Edit plan field",
+            "\\tenant plan edit <id> <field> <value>".cyan()
+        );
         println!("  {} - Enable plan", "\\tenant plan enable <id>".cyan());
         println!("  {} - Disable plan", "\\tenant plan disable <id>".cyan());
-        println!("  {} - Delete plan (tenants downgraded)", "\\tenant plan delete <id>".cyan());
+        println!(
+            "  {} - Delete plan (tenants downgraded)",
+            "\\tenant plan delete <id>".cyan()
+        );
         println!("  {} - Change tenant's plan", "\\tenant plan <tenant> <plan>".cyan());
         println!("  {}  - Real-time usage with HWM/Avg", "\\tenant usage [name]".cyan());
         println!();
-        println!("  {} free, starter, pro, enterprise, unlimited", "Default plans:".dimmed());
+        println!(
+            "  {} free, starter, pro, enterprise, unlimited",
+            "Default plans:".dimmed()
+        );
 
         println!("\n{}", "Database Export Commands:".bold());
         println!("  {}  - Dump database to SQL file", "\\dump [file]".cyan());

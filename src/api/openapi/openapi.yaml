@@ -1157,11 +1157,14 @@ components:
       properties:
         name:
           type: string
-        dimension:
+        dimensions:
           type: integer
         metric:
           type: string
           enum: [cosine, euclidean, dot_product]
+        index_type:
+          type: string
+          enum: [hnsw, persistent_hnsw, persistent_pq_hnsw]
         vector_count:
           type: integer
         created_at:
@@ -1170,11 +1173,11 @@ components:
 
     CreateVectorStoreRequest:
       type: object
-      required: [name, dimension]
+      required: [name, dimensions]
       properties:
         name:
           type: string
-        dimension:
+        dimensions:
           type: integer
         metric:
           type: string
@@ -1182,13 +1185,15 @@ components:
           default: cosine
         index_type:
           type: string
-          enum: [hnsw, ivfflat, flat]
+          enum: [hnsw, persistent_hnsw]
           default: hnsw
 
     UpsertVectorsRequest:
       type: object
       required: [vectors]
       properties:
+        namespace:
+          type: string
         vectors:
           type: array
           items:
@@ -1196,11 +1201,11 @@ components:
 
     VectorEntry:
       type: object
-      required: [id, vector]
+      required: [id, values]
       properties:
         id:
           type: string
-        vector:
+        values:
           type: array
           items:
             type: number
@@ -1229,9 +1234,11 @@ components:
         include_metadata:
           type: boolean
           default: true
-        include_vectors:
+        include_values:
           type: boolean
           default: false
+        namespace:
+          type: string
 
     VectorSearchResponse:
       type: object
@@ -1240,6 +1247,10 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/VectorSearchResult'
+        query_time_ms:
+          type: integer
+        namespace:
+          type: string
 
     VectorSearchResult:
       type: object
@@ -1248,7 +1259,7 @@ components:
           type: string
         score:
           type: number
-        vector:
+        values:
           type: array
           items:
             type: number

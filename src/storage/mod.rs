@@ -4,172 +4,186 @@
 
 #![allow(deprecated)]
 
-mod engine;
-mod prefix_decode;
-mod mvcc;
-mod transaction;
-mod wal;
-mod catalog;
-mod vector_index;
-mod gin_index;
-pub mod time_travel;
 mod branch;
+mod catalog;
+mod dirty_tracker;
+pub mod dump;
+mod engine;
+mod gin_index;
+mod lock_manager;
 mod materialized_view;
-mod view_catalog;
 mod mv_auto_refresh;
 mod mv_delta;
-mod mv_scheduler;
 mod mv_incremental;
+mod mv_scheduler;
 mod mv_system_views;
-mod stats;
-mod dirty_tracker;
-mod lock_manager;
+mod mvcc;
+mod prefix_decode;
 pub mod statistics;
-pub mod dump;
+mod stats;
+pub mod time_travel;
+mod transaction;
+mod vector_index;
+mod view_catalog;
+mod wal;
 
 // Storage-level filtering modules
 pub mod bloom_filter;
-pub mod zone_map;
-pub mod simd_filter;
 pub mod predicate_pushdown;
+pub mod simd_filter;
+pub mod zone_map;
 
 // Lock-free high-performance ingestion subsystem
 pub mod lockfree;
 
 // Per-column storage optimization modules
-pub mod dictionary;
-pub mod content_addr;
 pub mod columnar;
 pub mod compression;
+pub mod content_addr;
+pub mod dictionary;
 
 // Row-level caching
 pub mod row_cache;
 
 // ART (Adaptive Radix Tree) Index
-pub mod art_node;
 pub mod art_index;
 pub mod art_manager;
+pub mod art_node;
 
 // Self-Maintaining Filter Index (SMFI) modules - Phase 1-4
-pub mod filter_index_delta;
-pub mod filter_consolidation_worker;
 pub mod columnar_zone_summary;
-pub mod speculative_filter;
+pub mod filter_consolidation_worker;
+pub mod filter_index_delta;
 pub mod parallel_filter;
+pub mod speculative_filter;
 
-pub use engine::{StorageEngine, StorageStats, DirectBulkLoadResult};
-pub use transaction::Transaction;
-pub use mvcc::{Snapshot, SnapshotId};
-pub use catalog::Catalog;
-pub use vector_index::{VectorIndexManager, VectorIndexMetadata, VectorIndexStats, VectorIndexType};
-pub use gin_index::{GinIndex, GinIndexStats};
-pub use time_travel::{SnapshotManager, SnapshotMetadata, Scn, TransactionId, GcConfig};
 pub use branch::{
-    BranchId, BranchManager, BranchMetadata, BranchOptions, BranchRegistry,
-    BranchState, BranchStats, BranchTransaction, MergeStrategy, MergeConflict, MergeResult,
-    BranchGcConfig, BranchGcMode, GitLinkMetadata,
-    GIT_CONFIG_KEY, GIT_LINK_PREFIX, GIT_COMMIT_PREFIX,
-    GIT_DDL_HISTORY_PREFIX, GIT_SCHEMA_SNAPSHOT_PREFIX, GIT_PR_PREFIX,
+    BranchGcConfig, BranchGcMode, BranchId, BranchManager, BranchMetadata, BranchOptions, BranchRegistry, BranchState,
+    BranchStats, BranchTransaction, GitLinkMetadata, MergeConflict, MergeResult, MergeStrategy, GIT_COMMIT_PREFIX,
+    GIT_CONFIG_KEY, GIT_DDL_HISTORY_PREFIX, GIT_LINK_PREFIX, GIT_PR_PREFIX, GIT_SCHEMA_SNAPSHOT_PREFIX,
 };
+pub use catalog::Catalog;
+pub use dirty_tracker::{Change, ChangeType, DirtyTracker, DirtyTrackerError};
+pub use dump::{
+    CompressionType as DumpCompressionType, DumpManager, DumpMetadata, DumpMode, DumpOptions, DumpOutputFormat,
+    DumpReport, DumpType, RestoreOptions, RestoreReport,
+};
+pub use engine::{DirectBulkLoadResult, StorageEngine, StorageStats};
+pub use gin_index::{GinIndex, GinIndexStats};
+pub use lock_manager::{LockGuard, LockManager, LockState, LockType};
 pub use materialized_view::{MaterializedViewCatalog, MaterializedViewMetadata};
-pub use view_catalog::{ViewCatalog, ViewMetadata};
-pub use mv_auto_refresh::{AutoRefreshWorker, AutoRefreshConfig};
+pub use mv_auto_refresh::{AutoRefreshConfig, AutoRefreshWorker};
 pub use mv_delta::{
-    DeltaTracker as MvDeltaTracker, Delta as MvDelta, DeltaSet as MvDeltaSet,
-    DeltaType as MvDeltaType, DeltaOperation as MvDeltaOperation,
-};
-pub use mv_scheduler::{
-    MVScheduler, SchedulerConfig, Priority, RefreshTask, CpuMonitor, SchedulerStats,
+    Delta as MvDelta, DeltaOperation as MvDeltaOperation, DeltaSet as MvDeltaSet, DeltaTracker as MvDeltaTracker,
+    DeltaType as MvDeltaType,
 };
 pub use mv_incremental::{
-    IncrementalRefresher, RefreshStrategy, RefreshResult, RefreshCost,
-    DeltaTracker as IncDeltaTracker, DeltaOperation, Delta as IncDelta, DeltaSet as IncDeltaSet,
+    Delta as IncDelta, DeltaOperation, DeltaSet as IncDeltaSet, DeltaTracker as IncDeltaTracker, IncrementalRefresher,
+    RefreshCost, RefreshResult, RefreshStrategy,
 };
-pub use mv_system_views::{
-    MvSystemViews, AutoRefreshStatus, CpuUsageInfo,
+pub use mv_scheduler::{CpuMonitor, MVScheduler, Priority, RefreshTask, SchedulerConfig, SchedulerStats};
+pub use mv_system_views::{AutoRefreshStatus, CpuUsageInfo, MvSystemViews};
+pub use mvcc::{Snapshot, SnapshotId};
+pub use statistics::{ColumnStatistics, StatisticsAnalyzer, StatisticsCache, TableStatistics};
+pub use stats::{DatabaseStats, GlobalStatsCollector, ReplicationRole, StatsSnapshot};
+pub use time_travel::{GcConfig, Scn, SnapshotManager, SnapshotMetadata, TransactionId};
+pub use transaction::Transaction;
+pub use vector_index::{
+    StoredVectorRecord, StoredVectorSearchResult, VectorIndexManager, VectorIndexMetadata, VectorIndexStats,
+    VectorIndexType,
 };
+pub use view_catalog::{ViewCatalog, ViewMetadata};
 pub use wal::{
-    WriteAheadLog, WalEntry, WalOperation, WalSyncMode,
-    WalIntegrityReport, ReplayStats, CleanupStats, WalMetrics,
-};
-pub use stats::{DatabaseStats, StatsSnapshot, GlobalStatsCollector, ReplicationRole};
-pub use statistics::{TableStatistics, ColumnStatistics, StatisticsAnalyzer, StatisticsCache};
-pub use dirty_tracker::{DirtyTracker, Change, ChangeType, DirtyTrackerError};
-pub use lock_manager::{LockManager, LockType, LockState, LockGuard};
-pub use dump::{
-    DumpManager, DumpOptions, DumpMode, DumpType, DumpOutputFormat, RestoreOptions, DumpReport, RestoreReport,
-    DumpMetadata, CompressionType as DumpCompressionType,
+    CleanupStats, ReplayStats, WalEntry, WalIntegrityReport, WalMetrics, WalOperation, WalSyncMode, WriteAheadLog,
 };
 
 // Storage-level filtering exports
 pub use bloom_filter::{
-    BloomFilter, BloomFilterConfig, BloomFilterStats,
-    ColumnBloomFilter, BlockBloomFilter, TableBloomFilters,
-};
-pub use zone_map::{
-    ValueRange, ColumnZoneMap, BlockZoneMap, TableZoneMap, RangeOp,
-};
-pub use simd_filter::{
-    FilterPredicate, FilterOp, CombinedPredicate, SimdPredicateFilteringEngine,
-    FilterResult, SimdFilterStats, SimdCapabilities, SimdLevel, simd_capabilities,
+    BlockBloomFilter, BloomFilter, BloomFilterConfig, BloomFilterStats, ColumnBloomFilter, TableBloomFilters,
 };
 pub use predicate_pushdown::{
-    PredicatePushdownManager, PushdownConfig, AnalyzedPredicate,
-    PushdownStats, PredicateOp, PushdownAnalysis, analyze_for_pushdown,
+    analyze_for_pushdown, AnalyzedPredicate, PredicateOp, PredicatePushdownManager, PushdownAnalysis, PushdownConfig,
+    PushdownStats,
 };
+pub use simd_filter::{
+    simd_capabilities, CombinedPredicate, FilterOp, FilterPredicate, FilterResult, SimdCapabilities, SimdFilterStats,
+    SimdLevel, SimdPredicateFilteringEngine,
+};
+pub use zone_map::{BlockZoneMap, ColumnZoneMap, RangeOp, TableZoneMap, ValueRange};
 
 // SMFI exports - Self-Maintaining Filter Index
-pub use filter_index_delta::{
-    FilterIndexDeltaTracker, FilterIndexConfig, FilterDelta, FilterDeltaType,
-    BloomFilterDelta, ZoneMapDelta, TableFilterDeltas, FilterDeltaStats,
-    // Bulk load suspension support
-    BulkLoadGuard, BulkLoadReason, SuspendedTableInfo, BulkLoadResult,
-    DEFAULT_BULK_LOAD_THRESHOLD,
+pub use columnar_zone_summary::{
+    BlockDecision, BlockZoneSummary, ColumnZoneSummary, Histogram, HistogramBucket, HyperLogLog, McvEntry,
+    SummaryMatch, TableZoneSummaries,
 };
 pub use filter_consolidation_worker::{
-    FilterConsolidationWorker, ConsolidationConfig, ConsolidationStats,
-    ConsolidationHistoryEntry,
+    ConsolidationConfig, ConsolidationHistoryEntry, ConsolidationStats, FilterConsolidationWorker,
 };
-pub use columnar_zone_summary::{
-    HyperLogLog, ColumnZoneSummary, BlockZoneSummary, TableZoneSummaries,
-    BlockDecision, SummaryMatch, McvEntry, Histogram, HistogramBucket,
-};
-pub use speculative_filter::{
-    SpeculativeFilterManager, SpeculativeConfig, QueryPattern, PatternType,
-    PatternStats, SpeculativeFilterMeta, FilterStatus, QueryPatternTracker,
-    SpeculativeFilterStats,
+pub use filter_index_delta::{
+    BloomFilterDelta,
+    // Bulk load suspension support
+    BulkLoadGuard,
+    BulkLoadReason,
+    BulkLoadResult,
+    FilterDelta,
+    FilterDeltaStats,
+    FilterDeltaType,
+    FilterIndexConfig,
+    FilterIndexDeltaTracker,
+    SuspendedTableInfo,
+    TableFilterDeltas,
+    ZoneMapDelta,
+    DEFAULT_BULK_LOAD_THRESHOLD,
 };
 pub use parallel_filter::{
-    ParallelFilterEngine, ParallelFilterConfig, ParallelFilterStats,
-    ParallelBlockScanner, AdaptiveParallelFilter,
+    AdaptiveParallelFilter, ParallelBlockScanner, ParallelFilterConfig, ParallelFilterEngine, ParallelFilterStats,
+};
+pub use speculative_filter::{
+    FilterStatus, PatternStats, PatternType, QueryPattern, QueryPatternTracker, SpeculativeConfig,
+    SpeculativeFilterManager, SpeculativeFilterMeta, SpeculativeFilterStats,
 };
 
 // Lock-free ingestion exports
 pub use lockfree::{
-    // Configuration
-    IngestionSafetyLevel, LockFreeIngestionConfig,
     // Row ID generation
-    BatchRowIdAllocator, HierarchicalRowIdGenerator, RowIdGenerator,
-    // Write buffer
-    TransactionBuffer, WriteOp,
-    // WAL management
-    PartitionedWalManager, WalOp, WalPartition, WalRecord, WalRecovery,
+    BatchRowIdAllocator,
     // High-level API
-    BulkInsertResult, IngestionError, IngestionResult, IngestionStats,
-    LockFreeIngestionEngine, RecoveryResult, TransactionHandle,
+    BulkInsertResult,
+    HierarchicalRowIdGenerator,
+    IngestionError,
+    IngestionResult,
+    // Configuration
+    IngestionSafetyLevel,
+    IngestionStats,
+    LockFreeIngestionConfig,
+    LockFreeIngestionEngine,
+    // WAL management
+    PartitionedWalManager,
+    RecoveryResult,
+    RowIdGenerator,
+    // Write buffer
+    TransactionBuffer,
+    TransactionHandle,
+    WalOp,
+    WalPartition,
+    WalRecord,
+    WalRecovery,
+    WriteOp,
 };
 
 // Per-column storage optimization exports
-pub use dictionary::{DictionaryManager, ColumnDictionary, DictionaryStats};
+pub use columnar::{ColumnBatch, ColumnarStats, ColumnarStore, BATCH_SIZE};
+pub use compression::{
+    ColumnCompressionMetadata, CompressionCodec, CompressionConfig, CompressionManager, CompressionStats,
+};
 pub use content_addr::{ContentAddressedStore, CAS_MIN_SIZE};
-pub use columnar::{ColumnarStore, ColumnBatch, ColumnarStats, BATCH_SIZE};
-pub use compression::{CompressionConfig, CompressionStats, CompressionManager, ColumnCompressionMetadata, CompressionCodec};
-pub use row_cache::{RowCache, RowCacheConfig, RowCacheStats, RowCacheKey};
+pub use dictionary::{ColumnDictionary, DictionaryManager, DictionaryStats};
+pub use row_cache::{RowCache, RowCacheConfig, RowCacheKey, RowCacheStats};
 
 // ART Index exports
-pub use art_node::{ArtNode, LeafNode, Node4, Node16, Node48, Node256, NodeHeader, RowId, MAX_PREFIX_LEN};
-pub use art_index::{AdaptiveRadixTree, ArtIndexType, ArtIndexError, ArtIndexStats, ArtResult, ArtIterator};
+pub use art_index::{AdaptiveRadixTree, ArtIndexError, ArtIndexStats, ArtIndexType, ArtIterator, ArtResult};
 pub use art_manager::{ArtIndexManager, ArtManagerStats, ForeignKeyInfo};
+pub use art_node::{ArtNode, LeafNode, Node16, Node256, Node4, Node48, NodeHeader, RowId, MAX_PREFIX_LEN};
 
 use crate::Value;
 
