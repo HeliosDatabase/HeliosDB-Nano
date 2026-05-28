@@ -101,11 +101,13 @@ pub fn detect_with_context(sql: &str) -> Option<(String, WithContextOptions)> {
 
 fn find_toplevel(lower: &str, original: &str, needle: &str) -> Option<usize> {
     let bytes = original.as_bytes();
+    let lower_bytes = lower.as_bytes();
+    let needle_bytes = needle.as_bytes();
     let mut depth = 0i32;
     let mut in_str = false;
     let mut i = 0;
     let mut last_hit: Option<usize> = None;
-    while i + needle.len() <= bytes.len() {
+    while i + needle_bytes.len() <= bytes.len() {
         let b = bytes[i];
         if in_str {
             if b == b'\'' {
@@ -122,13 +124,12 @@ fn find_toplevel(lower: &str, original: &str, needle: &str) -> Option<usize> {
                 b')' => depth -= 1,
                 _ => {
                     if depth == 0 {
-                        let slice = &lower[i..i + needle.len()];
-                        if slice == needle {
+                        if lower_bytes.get(i..i + needle_bytes.len()) == Some(needle_bytes) {
                             let before_ok = i == 0 || {
                                 let c = bytes[i - 1];
                                 !c.is_ascii_alphanumeric() && c != b'_'
                             };
-                            let after_idx = i + needle.len();
+                            let after_idx = i + needle_bytes.len();
                             let after_ok = after_idx == bytes.len() || {
                                 let c = bytes[after_idx];
                                 !c.is_ascii_alphanumeric() && c != b'_'
@@ -467,5 +468,14 @@ mod tests {
     fn detect_ignores_with_context_inside_string() {
         let sql = "SELECT 'WITH CONTEXT (HOPS 9)' FROM t";
         assert!(detect_with_context(sql).is_none());
+    }
+
+    #[test]
+    fn detect_handles_multibyte_before_clause() {
+        let sql = "SELECT 'a—b' AS label FROM _hdb_graph_nodes WITH CONTEXT (HOPS 1)";
+        let (stripped, opts) = detect_with_context(sql).unwrap();
+        assert_eq!(opts.hops, 1);
+        assert!(stripped.contains("'a—b'"));
+        assert!(!stripped.contains("WITH CONTEXT"));
     }
 }

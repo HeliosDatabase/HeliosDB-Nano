@@ -1,7 +1,7 @@
 //! Implementation of dump/restore traits for EmbeddedDatabase
 
-use crate::{EmbeddedDatabase, Result, Tuple, Schema};
 use crate::storage::dump::{DatabaseInterface, DatabaseRestoreInterface, IndexMetadata};
+use crate::{EmbeddedDatabase, Result, Schema, Tuple};
 
 impl DatabaseInterface for EmbeddedDatabase {
     fn list_tables(&self) -> Result<Vec<String>> {
@@ -31,6 +31,13 @@ impl DatabaseInterface for EmbeddedDatabase {
                 let index_type = match &meta.index_type {
                     crate::storage::VectorIndexType::Standard(_) => "hnsw",
                     crate::storage::VectorIndexType::Quantized(_) => "hnsw_pq",
+                    crate::storage::VectorIndexType::Persistent(cfg) => {
+                        if cfg.pq_enabled {
+                            "persistent_hnsw_pq"
+                        } else {
+                            "persistent_hnsw"
+                        }
+                    }
                 };
                 IndexMetadata {
                     name: meta.name,
@@ -57,7 +64,7 @@ impl DatabaseRestoreInterface for EmbeddedDatabase {
         // Handle different index types (hnsw, btree, etc.)
         let using_clause = match index.index_type.as_str() {
             "hnsw" | "hnsw_pq" => "USING hnsw",
-            "btree" => "",  // Default type
+            "btree" => "", // Default type
             "hash" => "USING hash",
             "gin" => "USING gin",
             _ => "", // Default to btree
@@ -68,11 +75,7 @@ impl DatabaseRestoreInterface for EmbeddedDatabase {
 
         let sql = format!(
             "CREATE {}INDEX {} ON {} {} ({})",
-            unique_clause,
-            index.name,
-            table,
-            using_clause,
-            columns
+            unique_clause, index.name, table, using_clause, columns
         );
 
         // Execute the CREATE INDEX statement

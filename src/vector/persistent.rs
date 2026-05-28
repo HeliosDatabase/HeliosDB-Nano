@@ -24,11 +24,11 @@
 
 #![allow(clippy::similar_names)]
 
-use crate::{Error, Result};
 use super::quantization::{Codebook, ProductQuantizer, ProductQuantizerConfig, QuantizedVector};
 use super::{DistanceMetric, Vector};
+use crate::{Error, Result};
 use parking_lot::RwLock;
-use rocksdb::{DB, Direction, IteratorMode, WriteBatch};
+use rocksdb::{Direction, IteratorMode, WriteBatch, DB};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::cmp::{Ordering, Reverse};
@@ -470,9 +470,7 @@ impl Probe<'_> {
                 None => f32::INFINITY,
             },
             Probe::Adc(table) => match (st.pq.as_ref(), st.codes.get(&id)) {
-                (Some(pq), Some(code)) => {
-                    pq.compute_distance_with_table(table, code).unwrap_or(f32::INFINITY)
-                }
+                (Some(pq), Some(code)) => pq.compute_distance_with_table(table, code).unwrap_or(f32::INFINITY),
                 _ => f32::INFINITY,
             },
         }
@@ -533,11 +531,7 @@ fn random_level(seed: u64, ml: f64) -> u32 {
 /// rebuild). Mutates `st` only — performs no persistence — and returns the new element
 /// id plus the adjacency keys it touched. When PQ is active, the element is stored as a
 /// code; otherwise as a full vector. Caller validates the dimension and persists.
-fn graph_insert(
-    st: &mut IndexState,
-    row_id: u64,
-    vector: &Vector,
-) -> Result<(ElementId, Vec<(u32, ElementId)>)> {
+fn graph_insert(st: &mut IndexState, row_id: u64, vector: &Vector) -> Result<(ElementId, Vec<(u32, ElementId)>)> {
     let elem = st.next_element_id;
     let level = random_level(elem, st.config.ml);
     let m = st.config.m;
@@ -603,8 +597,7 @@ fn graph_insert(
                 touched.push((layer_u, elem));
 
                 for &nb in &selected {
-                    let mut nb_list =
-                        st.adjacency.get(&(layer_u, nb)).cloned().unwrap_or_default();
+                    let mut nb_list = st.adjacency.get(&(layer_u, nb)).cloned().unwrap_or_default();
                     if !nb_list.contains(&elem) {
                         nb_list.push(elem);
                     }
@@ -667,14 +660,11 @@ impl PersistentVectorIndex {
     /// Create a PQ-backed index: train a Product Quantizer on `training` vectors,
     /// persist the codebook, and store PQ codes in RAM with full vectors on disk
     /// (faulted in only for the two-stage rerank). PQ is L2-only.
-    pub fn create_with_pq(
-        db: Arc<DB>,
-        index_id: u64,
-        mut config: PqHnswConfig,
-        training: &[Vector],
-    ) -> Result<Self> {
+    pub fn create_with_pq(db: Arc<DB>, index_id: u64, mut config: PqHnswConfig, training: &[Vector]) -> Result<Self> {
         if config.distance_metric != DistanceMetric::L2 {
-            return Err(Error::storage("vector-persist: PQ is supported only with the L2 metric"));
+            return Err(Error::storage(
+                "vector-persist: PQ is supported only with the L2 metric",
+            ));
         }
         if training.is_empty() {
             return Err(Error::storage("vector-persist: PQ training set is empty"));
@@ -832,16 +822,15 @@ impl PersistentVectorIndex {
         Ok(())
     }
 
+    /// Drop this index's persisted RocksDB keyspace.
+    pub fn drop_storage(&self) -> Result<()> {
+        Self::drop_index(&self.db, self.index_id)
+    }
+
     // ── Low-level write-through mutators (substrate; used directly in P1 tests) ──
 
     /// Store an element's rerank vector, row mapping, and level (no graph edges).
-    pub fn put_vector(
-        &self,
-        elem_id: ElementId,
-        row_id: u64,
-        vector: &Vector,
-        level: u32,
-    ) -> Result<()> {
+    pub fn put_vector(&self, elem_id: ElementId, row_id: u64, vector: &Vector, level: u32) -> Result<()> {
         let mut st = self.state.write();
         if vector.len() != st.config.dimension {
             return Err(Error::query_execution(format!(
@@ -878,12 +867,7 @@ impl PersistentVectorIndex {
     }
 
     /// Store an element's neighbor list at a given layer.
-    pub fn put_adjacency(
-        &self,
-        layer: u32,
-        elem_id: ElementId,
-        neighbors: Vec<ElementId>,
-    ) -> Result<()> {
+    pub fn put_adjacency(&self, layer: u32, elem_id: ElementId, neighbors: Vec<ElementId>) -> Result<()> {
         let mut st = self.state.write();
         let p = prefix(self.index_id);
         let mut wb = WriteBatch::default();
@@ -1065,8 +1049,7 @@ impl PersistentVectorIndex {
         let mut touched: Vec<(u32, ElementId)> = Vec::new();
 
         for layer in 0..=level {
-            let x_nbrs: Vec<ElementId> =
-                st.adjacency.get(&(layer, elem)).cloned().unwrap_or_default();
+            let x_nbrs: Vec<ElementId> = st.adjacency.get(&(layer, elem)).cloned().unwrap_or_default();
             let cap = if layer == 0 { st.config.m0 } else { st.config.m };
 
             let referrers: Vec<ElementId> = st
@@ -1096,10 +1079,7 @@ impl PersistentVectorIndex {
                         }
                     }
                 }
-                let pool_ids: Vec<ElementId> = pool
-                    .into_iter()
-                    .filter(|c| !st.tombstones.contains(c))
-                    .collect();
+                let pool_ids: Vec<ElementId> = pool.into_iter().filter(|c| !st.tombstones.contains(c)).collect();
                 let new_list = st.select_neighbors(&nb_vec, &pool_ids, cap);
                 st.adjacency.insert((layer, nb), new_list);
                 touched.push((layer, nb));
@@ -1366,8 +1346,7 @@ mod tests {
     }
 
     fn brute_topk(data: &[Vec<f32>], q: &[f32], k: usize) -> Vec<u64> {
-        let mut all: Vec<(usize, f32)> =
-            data.iter().enumerate().map(|(i, v)| (i, l2(q, v))).collect();
+        let mut all: Vec<(usize, f32)> = data.iter().enumerate().map(|(i, v)| (i, l2(q, v))).collect();
         all.sort_by(|a, b| a.1.total_cmp(&b.1));
         all.iter().take(k).map(|(i, _)| *i as u64).collect()
     }
@@ -1495,7 +1474,10 @@ mod tests {
         }
         let got = idx.search(&rand_vec(3, 8), 5, 64).unwrap();
         assert_eq!(got.len(), 5);
-        assert!(got.iter().any(|(r, _)| *r == 3), "exact match should rank near top under f16");
+        assert!(
+            got.iter().any(|(r, _)| *r == 3),
+            "exact match should rank near top under f16"
+        );
     }
 
     // ── P2: HNSW graph ───────────────────────────────────────────────────────
@@ -1524,9 +1506,7 @@ mod tests {
     fn test_recall_vs_bruteforce_l2() {
         let (_dir, db) = test_db();
         let (dim, n, k, ef, queries) = (16usize, 1000usize, 10usize, 100usize, 100u64);
-        let idx =
-            PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
-                .unwrap();
+        let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
         let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
         for (i, v) in data.iter().enumerate() {
             idx.insert(i as u64, v).unwrap();
@@ -1555,12 +1535,7 @@ mod tests {
 
         let before = {
             let db = Arc::new(DB::open_default(&path).unwrap());
-            let idx = PersistentVectorIndex::create(
-                db.clone(),
-                1,
-                PqHnswConfig::new(dim, DistanceMetric::L2),
-            )
-            .unwrap();
+            let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
             for i in 0..n {
                 idx.insert(i, &rand_vec(i, dim)).unwrap();
             }
@@ -1581,9 +1556,7 @@ mod tests {
     fn test_remove_excludes_and_keeps_searchable() {
         let (_dir, db) = test_db();
         let dim = 8;
-        let idx =
-            PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
-                .unwrap();
+        let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
         for i in 0..60u64 {
             idx.insert(i, &rand_vec(i, dim)).unwrap();
         }
@@ -1613,12 +1586,7 @@ mod tests {
 
         let before = {
             let db = Arc::new(DB::open_default(&path).unwrap());
-            let idx = PersistentVectorIndex::create(
-                db.clone(),
-                1,
-                PqHnswConfig::new(dim, DistanceMetric::L2),
-            )
-            .unwrap();
+            let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
             for i in 0..100u64 {
                 idx.insert(i, &rand_vec(i, dim)).unwrap();
             }
@@ -1643,9 +1611,7 @@ mod tests {
         use std::collections::BTreeMap;
         let (_dir, db) = test_db();
         let (dim, k, ef) = (12usize, 10usize, 100usize);
-        let idx =
-            PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
-                .unwrap();
+        let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
 
         let mut live: BTreeMap<u64, Vec<f32>> = BTreeMap::new();
         let mut next = 0u64;
@@ -1692,9 +1658,7 @@ mod tests {
     fn test_compact_drops_tombstoned_and_clears() {
         let (_dir, db) = test_db();
         let dim = 8;
-        let idx =
-            PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
-                .unwrap();
+        let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
         for i in 0..100u64 {
             assert_eq!(idx.insert(i, &rand_vec(i, dim)).unwrap(), i);
         }
@@ -1740,8 +1704,7 @@ mod tests {
         let (dim, n, k, ef) = (64usize, 600usize, 10usize, 100usize);
         let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
 
-        let idx =
-            PersistentVectorIndex::create_with_pq(db.clone(), 1, pq_config_dim64(), &data).unwrap();
+        let idx = PersistentVectorIndex::create_with_pq(db.clone(), 1, pq_config_dim64(), &data).unwrap();
         assert!(idx.pq_active());
         for (i, v) in data.iter().enumerate() {
             idx.insert(i as u64, v).unwrap();
@@ -1780,9 +1743,7 @@ mod tests {
 
         let before = {
             let db = Arc::new(DB::open_default(&path).unwrap());
-            let idx =
-                PersistentVectorIndex::create_with_pq(db.clone(), 1, pq_config_dim64(), &data)
-                    .unwrap();
+            let idx = PersistentVectorIndex::create_with_pq(db.clone(), 1, pq_config_dim64(), &data).unwrap();
             for (i, v) in data.iter().enumerate() {
                 idx.insert(i as u64, v).unwrap();
             }
@@ -1802,8 +1763,7 @@ mod tests {
         let (_dir, db) = test_db();
         let (dim, n) = (64usize, 300usize);
         let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
-        let idx =
-            PersistentVectorIndex::create_with_pq(db.clone(), 1, pq_config_dim64(), &data).unwrap();
+        let idx = PersistentVectorIndex::create_with_pq(db.clone(), 1, pq_config_dim64(), &data).unwrap();
         for (i, v) in data.iter().enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
@@ -1821,9 +1781,7 @@ mod tests {
     fn test_filtered_knn_correctness() {
         let (_dir, db) = test_db();
         let (dim, n, k, ef) = (16usize, 1000usize, 10usize, 200usize);
-        let idx =
-            PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
-                .unwrap();
+        let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
         let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
         for (i, v) in data.iter().enumerate() {
             idx.insert(i as u64, v).unwrap();
@@ -1859,8 +1817,7 @@ mod tests {
         let (_dir, db) = test_db();
         let (dim, n, k, ef) = (64usize, 600usize, 10usize, 200usize);
         let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
-        let idx =
-            PersistentVectorIndex::create_with_pq(db.clone(), 1, pq_config_dim64(), &data).unwrap();
+        let idx = PersistentVectorIndex::create_with_pq(db.clone(), 1, pq_config_dim64(), &data).unwrap();
         for (i, v) in data.iter().enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
@@ -1887,7 +1844,10 @@ mod tests {
             hits += got.iter().filter(|(r, _)| truth.contains(r)).count();
         }
         let recall = hits as f64 / (queries as usize * k) as f64;
-        assert!(recall >= 0.70, "PQ filtered recall@{k} = {recall:.3} (expected >= 0.70)");
+        assert!(
+            recall >= 0.70,
+            "PQ filtered recall@{k} = {recall:.3} (expected >= 0.70)"
+        );
     }
 
     #[test]
@@ -1896,9 +1856,7 @@ mod tests {
         // top-k loses results that predicate-during-traversal retains.
         let (_dir, db) = test_db();
         let (dim, n) = (16usize, 1000usize);
-        let idx =
-            PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
-                .unwrap();
+        let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
         for i in 0..n as u64 {
             idx.insert(i, &rand_vec(i, dim)).unwrap();
         }
@@ -1926,9 +1884,7 @@ mod tests {
     fn test_filtered_no_matches_returns_empty() {
         let (_dir, db) = test_db();
         let dim = 8;
-        let idx =
-            PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
-                .unwrap();
+        let idx = PersistentVectorIndex::create(db.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap();
         for i in 0..50u64 {
             idx.insert(i, &rand_vec(i, dim)).unwrap();
         }
@@ -1940,7 +1896,9 @@ mod tests {
 
     #[test]
     fn test_f16_roundtrip_accuracy() {
-        for &x in &[0.0f32, 1.0, -1.0, 0.5, -0.25, 3.141_59, -2.718_28, 100.0, 0.001, 1000.0, -42.5] {
+        for &x in &[
+            0.0f32, 1.0, -1.0, 0.5, -0.25, 3.141_59, -2.718_28, 100.0, 0.001, 1000.0, -42.5,
+        ] {
             let back = f16_to_f32(f32_to_f16(x));
             let tol = x.abs() * 1e-2 + 1e-3;
             assert!((back - x).abs() <= tol, "f16 roundtrip {x} -> {back}");
@@ -1965,12 +1923,16 @@ mod tests {
         assert!(s16 < s32, "f16 {s16} should be smaller than f32 {s32}");
         assert!(s8 < s16, "i8 {s8} should be smaller than f16 {s16}");
 
-        let d16 =
-            decode_vector(&mk(VectorPrecision::F16), &encode_vector(&mk(VectorPrecision::F16), &v).unwrap())
-                .unwrap();
-        let d8 =
-            decode_vector(&mk(VectorPrecision::I8), &encode_vector(&mk(VectorPrecision::I8), &v).unwrap())
-                .unwrap();
+        let d16 = decode_vector(
+            &mk(VectorPrecision::F16),
+            &encode_vector(&mk(VectorPrecision::F16), &v).unwrap(),
+        )
+        .unwrap();
+        let d8 = decode_vector(
+            &mk(VectorPrecision::I8),
+            &encode_vector(&mk(VectorPrecision::I8), &v).unwrap(),
+        )
+        .unwrap();
         assert_eq!(d16.len(), 64);
         assert_eq!(d8.len(), 64);
         for i in 0..64 {
@@ -2000,7 +1962,10 @@ mod tests {
                 hits += got.iter().filter(|(r, _)| truth.contains(r)).count();
             }
             let recall = hits as f64 / (queries as usize * k) as f64;
-            assert!(recall >= thresh, "PQ {prec:?} rerank recall@{k} = {recall:.3} (>= {thresh})");
+            assert!(
+                recall >= thresh,
+                "PQ {prec:?} rerank recall@{k} = {recall:.3} (>= {thresh})"
+            );
         }
     }
 
@@ -2040,7 +2005,10 @@ mod tests {
         let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
         let cfg = PqHnswConfig::new(dim, DistanceMetric::L2); // pq_config = None on purpose
         let idx = PersistentVectorIndex::create_with_pq(db.clone(), 1, cfg, &data).unwrap();
-        assert!(idx.config().pq_config.is_some(), "create_with_pq should fill in a config");
+        assert!(
+            idx.config().pq_config.is_some(),
+            "create_with_pq should fill in a config"
+        );
         for (i, v) in data.iter().enumerate() {
             idx.insert(i as u64, v).unwrap();
         }
@@ -2072,8 +2040,10 @@ mod tests {
         let (dim, n, k, ef, queries) = (128usize, 2000usize, 10usize, 100usize, 200u64);
         let data: Vec<Vec<f32>> = (0..n).map(|i| rand_vec(i as u64, dim)).collect();
         let qs: Vec<Vec<f32>> = (0..queries).map(|qi| rand_vec(9_000_000 + qi, dim)).collect();
-        let truth: Vec<HashSet<u64>> =
-            qs.iter().map(|q| brute_topk(&data, q, k).into_iter().collect()).collect();
+        let truth: Vec<HashSet<u64>> = qs
+            .iter()
+            .map(|q| brute_topk(&data, q, k).into_iter().collect())
+            .collect();
 
         let pq_cfg = || {
             let mut c = PqHnswConfig::new(dim, DistanceMetric::L2);
@@ -2111,8 +2081,7 @@ mod tests {
         let (_d1, db1) = test_db();
         run(
             "exact f32   ",
-            &PersistentVectorIndex::create(db1.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2))
-                .unwrap(),
+            &PersistentVectorIndex::create(db1.clone(), 1, PqHnswConfig::new(dim, DistanceMetric::L2)).unwrap(),
         );
         let (_d2, db2) = test_db();
         run(

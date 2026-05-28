@@ -497,6 +497,7 @@ fn coerce_binary_types(left: DataType, right: DataType, op: &BinaryOperator) -> 
     match op {
         // Comparison operators always return boolean
         BinaryOperator::Eq | BinaryOperator::NotEq |
+        BinaryOperator::IsDistinctFrom | BinaryOperator::IsNotDistinctFrom |
         BinaryOperator::Lt | BinaryOperator::LtEq |
         BinaryOperator::Gt | BinaryOperator::GtEq => {
             Ok(DataType::Boolean)

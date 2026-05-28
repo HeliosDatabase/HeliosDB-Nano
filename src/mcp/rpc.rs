@@ -186,9 +186,11 @@ fn tool_to_json(t: ToolDescriptor, verbose: bool) -> JsonValue {
     let mut out = json!({
         "name": t.name,
         "description": t.description,
-        "inputSchema": t.input_schema,
     });
     if verbose {
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("inputSchema".into(), t.input_schema);
+        }
         // `category` distinguishes the unified DB-backed catalogue
         // (heliosdb_*) from the auto-registered helios_* extensions
         // declared via mcp_tool!.  Useful for clients wanting to
@@ -292,6 +294,19 @@ mod tests {
         let resp = handle_rpc(req);
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
         assert!(tools.len() >= 16, "expected 10 DB + 6 in-process tools, got {}", tools.len());
+    }
+
+    #[test]
+    fn tools_list_omits_schema_unless_verbose() {
+        let terse = tools_list_result(false);
+        let terse_tool = &terse["tools"].as_array().unwrap()[0];
+        assert!(terse_tool.get("inputSchema").is_none());
+
+        let verbose = tools_list_result(true);
+        let verbose_tool = &verbose["tools"].as_array().unwrap()[0];
+        assert!(verbose_tool.get("inputSchema").is_some());
+        assert!(verbose_tool.get("category").is_some());
+        assert!(verbose_tool.get("requiresDatabase").is_some());
     }
 
     #[test]

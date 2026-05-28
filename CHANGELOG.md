@@ -5,6 +5,19 @@ All notable changes to HeliosDB Nano will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [3.33.1] - 2026-05-27
+
+### Fixed — Engine FR batch for FK loading, DML routing, Unicode, and MCP tools
+
+- Wired `SET bulk_load_mode = true|false` and `RESET bulk_load_mode` to the storage engine, and deduplicated deferred FK parent probes at commit by referenced table, referenced columns, and parent key.
+- Routed generic query surfaces through the DML executor for `INSERT` / `UPDATE` / `DELETE`, so multi-row `VALUES` inserts on user tables no longer fall into the SELECT executor and `ON CONFLICT` / `RETURNING` semantics are preserved.
+- Fixed Graph-RAG `WITH CONTEXT` detection on SQL containing multibyte characters before the clause, and added a batch execution regression for multibyte string literals.
+- Made MCP `tools/list` omit `inputSchema` unless `verbose=true`, reducing terse tool-list payload size while keeping verbose discovery complete.
+- Added PostgreSQL-compatible `IS DISTINCT FROM` / `IS NOT DISTINCT FROM` null-safe comparisons.
+- Fixed `ON CONFLICT DO UPDATE SET` expression evaluation for nested `CASE` / `COALESCE` forms that mix `EXCLUDED.*` with table-qualified existing-row references.
+- Fixed PostgreSQL wire error-state recovery after constraint violations so an open transaction enters failed state and `ROLLBACK` clears the connection cleanly.
+- Added a regression covering long shared-prefix `UNIQUE TEXT` values to guard against false duplicate detection.
+
 ## [3.33.0] - 2026-05-26
 
 ### Added — In-process Python binding (`bindings/python`, issue #1)

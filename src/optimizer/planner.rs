@@ -4,9 +4,9 @@
 //! The physical planner makes concrete decisions about execution strategies,
 //! index selection, join algorithms, and operator implementations.
 
-use crate::sql::logical_plan::{LogicalPlan, LogicalExpr, JoinType, AsOfClause};
 use crate::optimizer::cost::CostEstimator;
-use crate::{Result, Error, Schema};
+use crate::sql::logical_plan::{AsOfClause, JoinType, LogicalExpr, LogicalPlan};
+use crate::{Error, Result, Schema};
 use std::sync::Arc;
 use tracing::debug;
 
@@ -168,7 +168,13 @@ impl Planner {
     fn plan_recursive(&self, logical: LogicalPlan) -> Result<PhysicalPlan> {
         let physical = match logical {
             // Table scan - direct conversion
-            LogicalPlan::Scan { table_name, alias, schema, projection, as_of } => {
+            LogicalPlan::Scan {
+                table_name,
+                alias,
+                schema,
+                projection,
+                as_of,
+            } => {
                 if self.verbose {
                     debug!("Planning: TableScan({})", table_name);
                 }
@@ -181,7 +187,14 @@ impl Planner {
             }
 
             // Filtered scan - table scan with predicate pushed down to storage layer
-            LogicalPlan::FilteredScan { table_name, alias: _, schema, projection, predicate, as_of } => {
+            LogicalPlan::FilteredScan {
+                table_name,
+                alias: _,
+                schema,
+                projection,
+                predicate,
+                as_of,
+            } => {
                 if self.verbose {
                     debug!("Planning: FilteredScan({})", table_name);
                 }
@@ -215,7 +228,13 @@ impl Planner {
             }
 
             // Projection - plan input, then add projection
-            LogicalPlan::Project { input, exprs, aliases, distinct: _, distinct_on: _ } => {
+            LogicalPlan::Project {
+                input,
+                exprs,
+                aliases,
+                distinct: _,
+                distinct_on: _,
+            } => {
                 if self.verbose {
                     debug!("Planning: Projection ({} columns)", exprs.len());
                 }
@@ -228,7 +247,13 @@ impl Planner {
             }
 
             // Join - use cost-based decision between hash join and nested loop join
-            LogicalPlan::Join { left, right, join_type, on, .. } => {
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                on,
+                ..
+            } => {
                 // Choose join algorithm based on cost estimation (before consuming left/right)
                 let use_hash_join = self.should_use_hash_join(&left, &right, &on)?;
 
@@ -259,7 +284,12 @@ impl Planner {
             }
 
             // Aggregation - use hash aggregation
-            LogicalPlan::Aggregate { input, group_by, aggr_exprs, having } => {
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                having,
+            } => {
                 if self.verbose {
                     debug!("Planning: HashAggregate");
                 }
@@ -289,7 +319,9 @@ impl Planner {
             // discarded here; this physical planner is only wired up
             // for test/demo paths (the main executor reads parameters
             // directly from the LogicalPlan in `executor::mod`).
-            LogicalPlan::Limit { input, limit, offset, .. } => {
+            LogicalPlan::Limit {
+                input, limit, offset, ..
+            } => {
                 if self.verbose {
                     debug!("Planning: Limit({}, offset={})", limit, offset);
                 }
@@ -303,64 +335,65 @@ impl Planner {
 
             // DML/DDL operations - not supported in physical planner
             // These are handled directly by the executor
-            LogicalPlan::Insert { .. } |
-            LogicalPlan::InsertSelect { .. } |
-            LogicalPlan::Update { .. } |
-            LogicalPlan::Delete { .. } |
-            LogicalPlan::CreateTable { .. } |
-            LogicalPlan::DropTable { .. } |
-            LogicalPlan::CreateIndex { .. } |
-            LogicalPlan::CreateSequence { .. } |
-            LogicalPlan::CreateEnumType { .. } |
-            LogicalPlan::DropEnumType { .. } |
-            LogicalPlan::CreateExtension { .. } |
-            LogicalPlan::DropExtension { .. } |
-            LogicalPlan::CreateDatabase { .. } |
-            LogicalPlan::DropDatabase { .. } |
-            LogicalPlan::AlterColumnStorage { .. } |
-            LogicalPlan::AlterTableAddColumn { .. } |
-            LogicalPlan::AlterTableDropColumn { .. } |
-            LogicalPlan::AlterTableRenameColumn { .. } |
-            LogicalPlan::AlterTableRename { .. } |
-            LogicalPlan::AlterTableAddForeignKey { .. } |
-            LogicalPlan::Truncate { .. } |
-            LogicalPlan::CreateBranch { .. } |
-            LogicalPlan::DropBranch { .. } |
-            LogicalPlan::MergeBranch { .. } |
-            LogicalPlan::UseBranch { .. } |
-            LogicalPlan::ShowBranches |
-            LogicalPlan::CreateMaterializedView { .. } |
-            LogicalPlan::RefreshMaterializedView { .. } |
-            LogicalPlan::DropMaterializedView { .. } |
-            LogicalPlan::AlterMaterializedView { .. } |
-            LogicalPlan::CreateView { .. } |
-            LogicalPlan::DropView { .. } |
-            LogicalPlan::SystemView { .. } |
-            LogicalPlan::With { .. } |
-            LogicalPlan::CreateTrigger { .. } |
-            LogicalPlan::DropTrigger { .. } |
-            LogicalPlan::CreateFunction { .. } |
-            LogicalPlan::CreateProcedure { .. } |
-            LogicalPlan::DropFunction { .. } |
-            LogicalPlan::DropProcedure { .. } |
-            LogicalPlan::Call { .. } |
-            LogicalPlan::Explain { .. } |
-            LogicalPlan::StartTransaction |
-            LogicalPlan::Commit |
-            LogicalPlan::Rollback |
-            LogicalPlan::Savepoint { .. } |
-            LogicalPlan::ReleaseSavepoint { .. } |
-            LogicalPlan::RollbackToSavepoint { .. } |
-            LogicalPlan::Prepare { .. } |
-            LogicalPlan::Execute { .. } |
-            LogicalPlan::Deallocate { .. } |
-            LogicalPlan::SetConstraints { .. } |
-            LogicalPlan::Union { .. } |
-            LogicalPlan::Intersect { .. } |
-            LogicalPlan::Except { .. } |
-            LogicalPlan::AlterTableMulti { .. } |
-            LogicalPlan::TableFunction { .. } |
-            LogicalPlan::DualScan => {
+            LogicalPlan::Insert { .. }
+            | LogicalPlan::InsertSelect { .. }
+            | LogicalPlan::Update { .. }
+            | LogicalPlan::Delete { .. }
+            | LogicalPlan::CreateTable { .. }
+            | LogicalPlan::DropTable { .. }
+            | LogicalPlan::CreateIndex { .. }
+            | LogicalPlan::CreateSequence { .. }
+            | LogicalPlan::CreateEnumType { .. }
+            | LogicalPlan::DropEnumType { .. }
+            | LogicalPlan::CreateExtension { .. }
+            | LogicalPlan::DropExtension { .. }
+            | LogicalPlan::CreateDatabase { .. }
+            | LogicalPlan::DropDatabase { .. }
+            | LogicalPlan::AlterColumnStorage { .. }
+            | LogicalPlan::AlterTableAddColumn { .. }
+            | LogicalPlan::AlterTableDropColumn { .. }
+            | LogicalPlan::AlterTableRenameColumn { .. }
+            | LogicalPlan::AlterTableRename { .. }
+            | LogicalPlan::AlterTableAddForeignKey { .. }
+            | LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
+            | LogicalPlan::Truncate { .. }
+            | LogicalPlan::CreateBranch { .. }
+            | LogicalPlan::DropBranch { .. }
+            | LogicalPlan::MergeBranch { .. }
+            | LogicalPlan::UseBranch { .. }
+            | LogicalPlan::ShowBranches
+            | LogicalPlan::CreateMaterializedView { .. }
+            | LogicalPlan::RefreshMaterializedView { .. }
+            | LogicalPlan::DropMaterializedView { .. }
+            | LogicalPlan::AlterMaterializedView { .. }
+            | LogicalPlan::CreateView { .. }
+            | LogicalPlan::DropView { .. }
+            | LogicalPlan::SystemView { .. }
+            | LogicalPlan::With { .. }
+            | LogicalPlan::CreateTrigger { .. }
+            | LogicalPlan::DropTrigger { .. }
+            | LogicalPlan::CreateFunction { .. }
+            | LogicalPlan::CreateProcedure { .. }
+            | LogicalPlan::DropFunction { .. }
+            | LogicalPlan::DropProcedure { .. }
+            | LogicalPlan::Call { .. }
+            | LogicalPlan::Explain { .. }
+            | LogicalPlan::StartTransaction
+            | LogicalPlan::Commit
+            | LogicalPlan::Rollback
+            | LogicalPlan::Savepoint { .. }
+            | LogicalPlan::ReleaseSavepoint { .. }
+            | LogicalPlan::RollbackToSavepoint { .. }
+            | LogicalPlan::Prepare { .. }
+            | LogicalPlan::Execute { .. }
+            | LogicalPlan::Deallocate { .. }
+            | LogicalPlan::SetConstraints { .. }
+            | LogicalPlan::Union { .. }
+            | LogicalPlan::Intersect { .. }
+            | LogicalPlan::Except { .. }
+            | LogicalPlan::AlterTableMulti { .. }
+            | LogicalPlan::TableFunction { .. }
+            | LogicalPlan::DualScan => {
                 return Err(Error::internal(
                     "DML/DDL/CTE/TRIGGER/EXPLAIN/Transaction/Procedural/SetOps/TableFunction/DualScan operations should be executed directly, not planned"
                 ));
@@ -370,31 +403,31 @@ impl Planner {
             #[cfg(feature = "ha-tier1")]
             LogicalPlan::Switchover { .. } => {
                 return Err(Error::internal(
-                    "HA Switchover should be executed directly, not planned"
+                    "HA Switchover should be executed directly, not planned",
                 ));
             }
             #[cfg(feature = "ha-tier1")]
             LogicalPlan::SwitchoverCheck { .. } => {
                 return Err(Error::internal(
-                    "HA SwitchoverCheck should be executed directly, not planned"
+                    "HA SwitchoverCheck should be executed directly, not planned",
                 ));
             }
             #[cfg(feature = "ha-tier1")]
             LogicalPlan::ClusterStatus => {
                 return Err(Error::internal(
-                    "HA ClusterStatus should be executed directly, not planned"
+                    "HA ClusterStatus should be executed directly, not planned",
                 ));
             }
             #[cfg(feature = "ha-tier1")]
             LogicalPlan::SetNodeAlias { .. } => {
                 return Err(Error::internal(
-                    "HA SetNodeAlias should be executed directly, not planned"
+                    "HA SetNodeAlias should be executed directly, not planned",
                 ));
             }
             #[cfg(feature = "ha-tier1")]
             LogicalPlan::ShowTopology => {
                 return Err(Error::internal(
-                    "HA ShowTopology should be executed directly, not planned"
+                    "HA ShowTopology should be executed directly, not planned",
                 ));
             }
         };
@@ -407,12 +440,7 @@ impl Planner {
     /// Uses cost estimation if available, otherwise falls back to heuristics:
     /// - Hash join for large tables with equality predicates
     /// - Nested loop join for small tables or non-equality predicates
-    fn should_use_hash_join(
-        &self,
-        left: &LogicalPlan,
-        right: &LogicalPlan,
-        on: &Option<LogicalExpr>,
-    ) -> Result<bool> {
+    fn should_use_hash_join(&self, left: &LogicalPlan, right: &LogicalPlan, on: &Option<LogicalExpr>) -> Result<bool> {
         // If we have a cost estimator, use cost-based decision
         if let Some(ref estimator) = self.cost_estimator {
             // Estimate cardinality of both sides
@@ -445,9 +473,7 @@ impl Planner {
         // 2. Both tables are very small (heuristic: assume <100 rows)
 
         // Check if join condition contains equality
-        let has_equality = on.as_ref().is_some_and(|expr| {
-            Self::contains_equality(expr)
-        });
+        let has_equality = on.as_ref().is_some_and(|expr| Self::contains_equality(expr));
 
         // If no equality predicate, must use nested loop
         if !has_equality {
@@ -467,15 +493,11 @@ impl Planner {
         use crate::sql::logical_plan::BinaryOperator;
 
         match expr {
-            LogicalExpr::BinaryExpr { left, op, right } => {
-                match op {
-                    BinaryOperator::Eq => true,
-                    BinaryOperator::And => {
-                        Self::contains_equality(left) || Self::contains_equality(right)
-                    }
-                    _ => false,
-                }
-            }
+            LogicalExpr::BinaryExpr { left, op, right } => match op {
+                BinaryOperator::Eq => true,
+                BinaryOperator::And => Self::contains_equality(left) || Self::contains_equality(right),
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -489,7 +511,12 @@ impl Planner {
     fn explain_recursive(plan: &PhysicalPlan, depth: usize) -> String {
         let indent = "  ".repeat(depth);
         match plan {
-            PhysicalPlan::TableScan { table_name, projection, as_of, .. } => {
+            PhysicalPlan::TableScan {
+                table_name,
+                projection,
+                as_of,
+                ..
+            } => {
                 let proj_str = match projection {
                     Some(cols) => format!(" (columns: {:?})", cols),
                     None => " (all columns)".to_string(),
@@ -504,33 +531,65 @@ impl Planner {
                 format!("{}Filter\n{}", indent, Self::explain_recursive(input, depth + 1))
             }
             PhysicalPlan::Projection { input, exprs, .. } => {
-                format!("{}Projection ({} columns)\n{}",
-                    indent, exprs.len(), Self::explain_recursive(input, depth + 1))
+                format!(
+                    "{}Projection ({} columns)\n{}",
+                    indent,
+                    exprs.len(),
+                    Self::explain_recursive(input, depth + 1)
+                )
             }
-            PhysicalPlan::HashJoin { left, right, join_type, .. } => {
-                format!("{}HashJoin ({:?})\n{}\n{}",
-                    indent, join_type,
+            PhysicalPlan::HashJoin {
+                left, right, join_type, ..
+            } => {
+                format!(
+                    "{}HashJoin ({:?})\n{}\n{}",
+                    indent,
+                    join_type,
                     Self::explain_recursive(left, depth + 1),
-                    Self::explain_recursive(right, depth + 1))
+                    Self::explain_recursive(right, depth + 1)
+                )
             }
-            PhysicalPlan::NestedLoopJoin { left, right, join_type, .. } => {
-                format!("{}NestedLoopJoin ({:?})\n{}\n{}",
-                    indent, join_type,
+            PhysicalPlan::NestedLoopJoin {
+                left, right, join_type, ..
+            } => {
+                format!(
+                    "{}NestedLoopJoin ({:?})\n{}\n{}",
+                    indent,
+                    join_type,
                     Self::explain_recursive(left, depth + 1),
-                    Self::explain_recursive(right, depth + 1))
+                    Self::explain_recursive(right, depth + 1)
+                )
             }
-            PhysicalPlan::HashAggregate { input, group_by, aggr_exprs, .. } => {
-                format!("{}HashAggregate (group_by: {}, aggr: {})\n{}",
-                    indent, group_by.len(), aggr_exprs.len(),
-                    Self::explain_recursive(input, depth + 1))
+            PhysicalPlan::HashAggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                ..
+            } => {
+                format!(
+                    "{}HashAggregate (group_by: {}, aggr: {})\n{}",
+                    indent,
+                    group_by.len(),
+                    aggr_exprs.len(),
+                    Self::explain_recursive(input, depth + 1)
+                )
             }
             PhysicalPlan::Sort { input, exprs, .. } => {
-                format!("{}Sort ({} columns)\n{}",
-                    indent, exprs.len(), Self::explain_recursive(input, depth + 1))
+                format!(
+                    "{}Sort ({} columns)\n{}",
+                    indent,
+                    exprs.len(),
+                    Self::explain_recursive(input, depth + 1)
+                )
             }
             PhysicalPlan::Limit { input, limit, offset } => {
-                format!("{}Limit ({}, offset={})\n{}",
-                    indent, limit, offset, Self::explain_recursive(input, depth + 1))
+                format!(
+                    "{}Limit ({}, offset={})\n{}",
+                    indent,
+                    limit,
+                    offset,
+                    Self::explain_recursive(input, depth + 1)
+                )
             }
         }
     }
@@ -551,9 +610,9 @@ mod tests {
                     primary_key: true,
                     source_table: None,
                     source_table_name: None,
-                default_expr: None,
-                unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
                 Column {
                     name: "name".to_string(),
@@ -562,9 +621,9 @@ mod tests {
                     primary_key: false,
                     source_table: None,
                     source_table_name: None,
-                default_expr: None,
-                unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
             ],
         })
@@ -608,7 +667,10 @@ mod tests {
 
         let filter = LogicalPlan::Filter {
             input: Box::new(scan),
-            predicate: LogicalExpr::Column { table: None, name: "id".to_string()  },
+            predicate: LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            },
         };
 
         let physical = planner.plan(filter).unwrap();
