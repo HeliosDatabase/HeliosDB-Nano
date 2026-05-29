@@ -113,6 +113,9 @@ fn run_scan_bench() {
     bench("count_star(id>=r)", &|r| {
         format!("SELECT COUNT(*) FROM wide WHERE id >= {r}")
     });
+    bench("count_star(id=r)", &|r| {
+        format!("SELECT COUNT(*) FROM wide WHERE id = {r}")
+    });
     bench("agg_sum_avg", &|r| {
         format!("SELECT SUM(a), AVG(d), MAX(b) FROM wide WHERE b >= {r}")
     });
