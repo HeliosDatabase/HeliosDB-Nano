@@ -464,27 +464,35 @@ impl WriteAheadLog {
             .write_opt(batch, &self.write_opts)
             .map_err(|e| Error::storage(format!("Failed to append WAL entry: {}", e)))?;
 
-        // Broadcast to standbys for replication (if HA is enabled and we're primary)
+        // Broadcast to standbys (and, in sync/semi-sync mode, wait for first ACK).
+        self.broadcast_after_append(lsn, &entry.operation);
+
+        debug!("Appended WAL entry with LSN {}", lsn);
+        Ok(lsn)
+    }
+
+    /// Broadcast a just-appended WAL entry to HA standbys, and (in sync/semi-sync
+    /// mode) wait for first-ACK. No-op without `ha-tier1` or when no standby is
+    /// configured. Shared by `append` and `append_nosync` so the fsync decision
+    /// can never silently disable replication (see P0#2): an autocommit
+    /// UPDATE/DELETE on the nosync path must still replicate exactly like INSERT.
+    fn broadcast_after_append(&self, lsn: u64, operation: &WalOperation) {
         #[cfg(feature = "ha-tier1")]
         {
-            if let Some(replicated_lsn) = ha_state().broadcast_wal_operation(lsn, &entry.operation) {
+            if let Some(replicated_lsn) = ha_state().broadcast_wal_operation(lsn, operation) {
                 debug!("WAL entry {} replicated to standbys", replicated_lsn);
-
-                // In sync or semi-sync mode, wait for at least 1 standby to ACK
-                // This is the "faster-safe" approach: wait for first ACK, not all
-                // Uses existing wait_for_sync() which already implements first-ACK semantics
-                const DEFAULT_SYNC_TIMEOUT_MS: u64 = 10000; // 10 second timeout
-
+                // Faster-safe: wait for the first standby ACK, not all.
+                const DEFAULT_SYNC_TIMEOUT_MS: u64 = 10000;
                 if let Err(e) = ha_state().wait_for_sync(replicated_lsn, DEFAULT_SYNC_TIMEOUT_MS) {
-                    // Log warning but don't fail - data is safely written locally
-                    // This allows the system to continue in degraded mode
+                    // Log but don't fail — data is written locally; degraded mode.
                     warn!("Sync replication wait for LSN {}: {}", replicated_lsn, e);
                 }
             }
         }
-
-        debug!("Appended WAL entry with LSN {}", lsn);
-        Ok(lsn)
+        #[cfg(not(feature = "ha-tier1"))]
+        {
+            let _ = (lsn, operation);
+        }
     }
 
     /// Append a WAL entry without fsync (for DDL operations where metadata
@@ -505,6 +513,10 @@ impl WriteAheadLog {
         self.db
             .write_opt(batch, &nosync_opts)
             .map_err(|e| Error::storage(format!("Failed to append WAL entry: {}", e)))?;
+
+        // P0#2 fix: still broadcast to HA standbys (and honor sync/semi-sync ACK).
+        // The nosync path only skips the local fsync — it must NOT skip replication.
+        self.broadcast_after_append(lsn, &entry.operation);
 
         Ok(lsn)
     }

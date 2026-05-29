@@ -244,15 +244,18 @@ pub struct StorageConfig {
     /// Default: Some(1000) (1 second)
     #[serde(default = "default_slow_query_threshold")]
     pub slow_query_threshold_ms: Option<u64>,
-    /// Append a per-statement logical WAL entry (with fsync in Sync mode) for
-    /// autocommit UPDATE/DELETE.
+    /// fsync the per-statement logical WAL entry for autocommit UPDATE/DELETE.
     ///
-    /// Default: false. Durability and logical replication then rely on the
-    /// RocksDB WriteBatch written at commit — uniform with the INSERT fast path
-    /// and with explicit transactions (which already never emit per-statement
-    /// logical-WAL entries). Setting this true restores the legacy behavior of
-    /// an extra fsync'd `wal:entries` append per autocommit UPDATE/DELETE, which
-    /// caps durable throughput at the device fsync rate (~tens–hundreds/s).
+    /// Default: false. The logical WAL entry is **always** written and **always**
+    /// broadcast to HA standbys (so crash-recovery replay and replication stay
+    /// correct either way — see `WriteAheadLog::broadcast_after_append`); this
+    /// flag only controls whether the entry is **fsync'd** per statement. With
+    /// `false` (default) the entry is written without a per-statement fsync —
+    /// local durability then relies on RocksDB's own WAL flush (process-crash
+    /// safe; a power-loss window can lose the last few autocommit mutations,
+    /// matching SQLite WAL + `synchronous=NORMAL`). Setting `true` restores the
+    /// legacy fsync-per-statement durability, which caps durable autocommit
+    /// UPDATE/DELETE throughput at the device fsync rate (~tens–hundreds/s).
     #[serde(default)]
     pub logical_wal_per_statement: bool,
 }
