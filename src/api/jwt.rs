@@ -45,12 +45,7 @@ pub struct Claims {
 
 impl Claims {
     /// Create new claims with default values
-    pub fn new(
-        user_id: String,
-        tenant_id: String,
-        client_id: Uuid,
-        expires_in: Duration,
-    ) -> Self {
+    pub fn new(user_id: String, tenant_id: String, client_id: Uuid, expires_in: Duration) -> Self {
         let now = Utc::now();
         let exp = (now + expires_in).timestamp() as u64;
         let iat = now.timestamp() as u64;
@@ -114,12 +109,7 @@ impl JwtManager {
     }
 
     /// Generate an access token
-    pub fn generate_token(
-        &self,
-        user_id: String,
-        tenant_id: String,
-        client_id: Uuid,
-    ) -> Result<String, Error> {
+    pub fn generate_token(&self, user_id: String, tenant_id: String, client_id: Uuid) -> Result<String, Error> {
         let claims = Claims::new(user_id, tenant_id, client_id, self.default_expiry);
         encode(&Header::default(), &claims, &self.encoding_key)
             .map_err(|e| Error::Generic(format!("JWT encode error: {}", e)))
@@ -142,11 +132,7 @@ mod tests {
     fn test_jwt_roundtrip() {
         let manager = JwtManager::new(b"test-secret-key");
         let token = manager
-            .generate_token(
-                "user123".to_string(),
-                "tenant456".to_string(),
-                Uuid::new_v4(),
-            )
+            .generate_token("user123".to_string(), "tenant456".to_string(), Uuid::new_v4())
             .unwrap();
 
         let claims = manager.validate_token(&token).unwrap();

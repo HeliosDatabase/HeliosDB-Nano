@@ -19,11 +19,11 @@
 //! # }
 //! ```
 
-pub mod protocol;
 mod auth;
-mod session;
+pub mod protocol;
 mod server;
+mod session;
 
 // Re-exports
-pub use server::PgServer;
 pub use protocol::{BackendMessage, FrontendMessage, TransactionStatus};
+pub use server::PgServer;

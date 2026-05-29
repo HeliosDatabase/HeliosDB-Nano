@@ -2,9 +2,9 @@
 
 use super::{AuditConfig, AuditEvent, AuditMetadata, OperationType};
 use crate::{Error, Result, Tuple, Value};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::error;
 
@@ -30,10 +30,7 @@ pub struct AuditLogger {
 
 impl AuditLogger {
     /// Create a new audit logger
-    pub fn new(
-        storage: Arc<crate::storage::StorageEngine>,
-        config: AuditConfig,
-    ) -> Result<Self> {
+    pub fn new(storage: Arc<crate::storage::StorageEngine>, config: AuditConfig) -> Result<Self> {
         // Initialize audit tables if not already done
         super::initialize_audit_tables(&storage)?;
 
@@ -159,13 +156,7 @@ impl AuditLogger {
     }
 
     /// Log a SELECT query
-    pub fn log_select(
-        &self,
-        target: &str,
-        query: &str,
-        row_count: u64,
-        execution_time_ms: Option<u64>,
-    ) -> Result<()> {
+    pub fn log_select(&self, target: &str, query: &str, row_count: u64, execution_time_ms: Option<u64>) -> Result<()> {
         if !self.config.log_select {
             return Ok(());
         }
@@ -226,9 +217,8 @@ impl AuditLogger {
 
         // Send to async channel for buffered logging
         if let Some(tx) = &self.event_tx {
-            tx.send(event).map_err(|e| {
-                Error::audit(format!("Failed to send audit event: {}", e))
-            })?;
+            tx.send(event)
+                .map_err(|e| Error::audit(format!("Failed to send audit event: {}", e)))?;
         }
 
         Ok(())
@@ -344,10 +334,7 @@ impl AuditLogger {
     }
 
     /// Flush a buffer of events to storage
-    fn flush_events(
-        storage: &crate::storage::StorageEngine,
-        events: &mut Vec<AuditEvent>,
-    ) -> Result<()> {
+    fn flush_events(storage: &crate::storage::StorageEngine, events: &mut Vec<AuditEvent>) -> Result<()> {
         for event in events.drain(..) {
             // Convert event to tuple
             let tuple = Tuple::new(vec![
@@ -377,7 +364,10 @@ impl AuditLogger {
         let query = if filter_sql.trim().is_empty() {
             "SELECT * FROM __audit_log ORDER BY id DESC LIMIT 1000".to_string()
         } else {
-            format!("SELECT * FROM __audit_log WHERE {} ORDER BY id DESC LIMIT 1000", filter_sql)
+            format!(
+                "SELECT * FROM __audit_log WHERE {} ORDER BY id DESC LIMIT 1000",
+                filter_sql
+            )
         };
 
         // Execute query via storage
@@ -409,9 +399,7 @@ mod tests {
     #[tokio::test]
     async fn test_audit_logger_creation() {
         let config = Config::in_memory();
-        let storage = Arc::new(
-            crate::storage::StorageEngine::open_in_memory(&config).unwrap()
-        );
+        let storage = Arc::new(crate::storage::StorageEngine::open_in_memory(&config).unwrap());
 
         let audit_config = AuditConfig::default();
         let logger = AuditLogger::new(storage, audit_config);
@@ -421,21 +409,13 @@ mod tests {
     #[tokio::test]
     async fn test_log_ddl() {
         let config = Config::in_memory();
-        let storage = Arc::new(
-            crate::storage::StorageEngine::open_in_memory(&config).unwrap()
-        );
+        let storage = Arc::new(crate::storage::StorageEngine::open_in_memory(&config).unwrap());
 
         let mut audit_config = AuditConfig::default();
         audit_config.async_buffer_size = 1; // Flush immediately for testing
         let logger = AuditLogger::new(storage.clone(), audit_config).unwrap();
 
-        let result = logger.log_ddl(
-            "CREATE TABLE",
-            "users",
-            "CREATE TABLE users (id INT)",
-            true,
-            None,
-        );
+        let result = logger.log_ddl("CREATE TABLE", "users", "CREATE TABLE users (id INT)", true, None);
         assert!(result.is_ok());
 
         // Force synchronous flush
@@ -456,9 +436,7 @@ mod tests {
     #[tokio::test]
     async fn test_log_dml() {
         let config = Config::in_memory();
-        let storage = Arc::new(
-            crate::storage::StorageEngine::open_in_memory(&config).unwrap()
-        );
+        let storage = Arc::new(crate::storage::StorageEngine::open_in_memory(&config).unwrap());
 
         let mut audit_config = AuditConfig::default();
         audit_config.async_buffer_size = 1; // Flush immediately for testing
@@ -491,19 +469,12 @@ mod tests {
     #[tokio::test]
     async fn test_select_not_logged_by_default() {
         let config = Config::in_memory();
-        let storage = Arc::new(
-            crate::storage::StorageEngine::open_in_memory(&config).unwrap()
-        );
+        let storage = Arc::new(crate::storage::StorageEngine::open_in_memory(&config).unwrap());
 
         let audit_config = AuditConfig::default();
         let logger = AuditLogger::new(storage.clone(), audit_config).unwrap();
 
-        let result = logger.log_select(
-            "users",
-            "SELECT * FROM users",
-            10,
-            Some(50),
-        );
+        let result = logger.log_select("users", "SELECT * FROM users", 10, Some(50));
         assert!(result.is_ok());
 
         // Give the async task time to process

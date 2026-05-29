@@ -33,11 +33,7 @@ pub fn list_resources() -> Vec<(String, &'static str, &'static str)> {
             "Database Schema",
             "Every table in the public schema.",
         ),
-        (
-            "heliosdb://branches".to_string(),
-            "Branches",
-            "Every database branch.",
-        ),
+        ("heliosdb://branches".to_string(), "Branches", "Every database branch."),
     ]
 }
 
@@ -45,10 +41,7 @@ pub fn list_resources() -> Vec<(String, &'static str, &'static str)> {
 ///
 /// Returns `None` for unrecognised URIs, `Some(Err)` for lookup failures,
 /// `Some(Ok(payload))` otherwise.
-pub fn read_resource(
-    db: &EmbeddedDatabase,
-    uri: &str,
-) -> Option<Result<ResourcePayload, String>> {
+pub fn read_resource(db: &EmbeddedDatabase, uri: &str) -> Option<Result<ResourcePayload, String>> {
     if uri == "heliosdb://schema" {
         return Some(all_tables(db, uri));
     }
@@ -76,8 +69,7 @@ fn all_tables(db: &EmbeddedDatabase, uri: &str) -> Result<ResourcePayload, Strin
     Ok(ResourcePayload {
         uri: uri.to_string(),
         mime_type: "application/json",
-        text: serde_json::to_string_pretty(&json!({ "tables": names }))
-            .unwrap_or_default(),
+        text: serde_json::to_string_pretty(&json!({ "tables": names })).unwrap_or_default(),
     })
 }
 
@@ -92,16 +84,11 @@ fn all_branches(db: &EmbeddedDatabase, uri: &str) -> Result<ResourcePayload, Str
     Ok(ResourcePayload {
         uri: uri.to_string(),
         mime_type: "application/json",
-        text: serde_json::to_string_pretty(&json!({ "branches": names }))
-            .unwrap_or_default(),
+        text: serde_json::to_string_pretty(&json!({ "branches": names })).unwrap_or_default(),
     })
 }
 
-fn table_schema(
-    db: &EmbeddedDatabase,
-    uri: &str,
-    table: &str,
-) -> Result<ResourcePayload, String> {
+fn table_schema(db: &EmbeddedDatabase, uri: &str, table: &str) -> Result<ResourcePayload, String> {
     let schema = db
         .storage
         .catalog()
@@ -130,11 +117,7 @@ fn table_schema(
     })
 }
 
-fn table_stats(
-    db: &EmbeddedDatabase,
-    uri: &str,
-    table: &str,
-) -> Result<ResourcePayload, String> {
+fn table_stats(db: &EmbeddedDatabase, uri: &str, table: &str) -> Result<ResourcePayload, String> {
     // COUNT(*) is the cheapest correct answer Nano gives us today.
     // Catalog doesn't carry maintained row counts; an explicit query is
     // accurate and adapts to whatever branch / time-travel scope the
@@ -175,9 +158,7 @@ mod tests {
     fn schema_all_resolves() {
         let d = db();
         d.execute("CREATE TABLE t (id INT4)").unwrap();
-        let r = read_resource(&d, "heliosdb://schema")
-            .expect("matched")
-            .expect("ok");
+        let r = read_resource(&d, "heliosdb://schema").expect("matched").expect("ok");
         assert_eq!(r.mime_type, "application/json");
         assert!(r.text.contains("\"t\""));
     }

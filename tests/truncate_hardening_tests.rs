@@ -17,7 +17,8 @@ fn setup() -> EmbeddedDatabase {
 #[test]
 fn test_truncate_removes_all_rows() {
     let db = setup();
-    db.execute("CREATE TABLE t_basic (id INT PRIMARY KEY, name TEXT, val INT)").unwrap();
+    db.execute("CREATE TABLE t_basic (id INT PRIMARY KEY, name TEXT, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t_basic VALUES (1, 'Alice', 10)").unwrap();
     db.execute("INSERT INTO t_basic VALUES (2, 'Bob', 20)").unwrap();
     db.execute("INSERT INTO t_basic VALUES (3, 'Charlie', 30)").unwrap();
@@ -36,11 +37,16 @@ fn test_truncate_removes_all_rows() {
 #[test]
 fn test_truncate_on_empty_table_succeeds() {
     let db = setup();
-    db.execute("CREATE TABLE t_empty (id INT PRIMARY KEY, data TEXT)").unwrap();
+    db.execute("CREATE TABLE t_empty (id INT PRIMARY KEY, data TEXT)")
+        .unwrap();
 
     // TRUNCATE on an empty table should not error
     let result = db.execute("TRUNCATE TABLE t_empty");
-    assert!(result.is_ok(), "TRUNCATE on empty table should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "TRUNCATE on empty table should succeed: {:?}",
+        result.err()
+    );
 
     let rows = db.query("SELECT * FROM t_empty", &[]).unwrap();
     assert_eq!(rows.len(), 0, "Empty table should remain empty");
@@ -49,7 +55,8 @@ fn test_truncate_on_empty_table_succeeds() {
 #[test]
 fn test_select_after_truncate_returns_empty() {
     let db = setup();
-    db.execute("CREATE TABLE t_sel (id INT PRIMARY KEY, label TEXT)").unwrap();
+    db.execute("CREATE TABLE t_sel (id INT PRIMARY KEY, label TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t_sel VALUES (1, 'row1')").unwrap();
     db.execute("INSERT INTO t_sel VALUES (2, 'row2')").unwrap();
 
@@ -74,7 +81,8 @@ fn test_count_star_after_truncate_returns_zero() {
     let db = setup();
     db.execute("CREATE TABLE t_cnt (id INT PRIMARY KEY, x INT)").unwrap();
     for i in 1..=10 {
-        db.execute(&format!("INSERT INTO t_cnt VALUES ({}, {})", i, i * 100)).unwrap();
+        db.execute(&format!("INSERT INTO t_cnt VALUES ({}, {})", i, i * 100))
+            .unwrap();
     }
 
     let rows = db.query("SELECT COUNT(*) FROM t_cnt", &[]).unwrap();
@@ -101,14 +109,17 @@ fn test_truncate_preserves_table_structure() {
             name TEXT,
             score FLOAT,
             active BOOLEAN
-        )"
-    ).unwrap();
-    db.execute("INSERT INTO t_struct VALUES (1, 'Alice', 95.5, true)").unwrap();
+        )",
+    )
+    .unwrap();
+    db.execute("INSERT INTO t_struct VALUES (1, 'Alice', 95.5, true)")
+        .unwrap();
 
     db.execute("TRUNCATE TABLE t_struct").unwrap();
 
     // Table structure should be intact; we can insert with the same schema
-    db.execute("INSERT INTO t_struct VALUES (10, 'Bob', 88.0, false)").unwrap();
+    db.execute("INSERT INTO t_struct VALUES (10, 'Bob', 88.0, false)")
+        .unwrap();
     let rows = db.query("SELECT id, name, score, active FROM t_struct", &[]).unwrap();
     assert_eq!(rows.len(), 1, "Should have 1 row after re-insert");
     assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(10));
@@ -119,7 +130,8 @@ fn test_truncate_preserves_table_structure() {
 #[test]
 fn test_truncate_multiple_times_in_succession() {
     let db = setup();
-    db.execute("CREATE TABLE t_multi (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t_multi (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     // Round 1: insert, truncate
     db.execute("INSERT INTO t_multi VALUES (1, 'a')").unwrap();
@@ -180,33 +192,42 @@ fn test_truncate_table_with_primary_key() {
 fn test_truncate_table_with_unique_constraint() {
     // TRUNCATE clears ART index, so previously used unique values are reusable.
     let db = setup();
-    db.execute(
-        "CREATE TABLE t_uniq (id INT PRIMARY KEY, email TEXT UNIQUE, name TEXT)"
-    ).unwrap();
-    db.execute("INSERT INTO t_uniq VALUES (1, 'alice@test.com', 'Alice')").unwrap();
-    db.execute("INSERT INTO t_uniq VALUES (2, 'bob@test.com', 'Bob')").unwrap();
+    db.execute("CREATE TABLE t_uniq (id INT PRIMARY KEY, email TEXT UNIQUE, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO t_uniq VALUES (1, 'alice@test.com', 'Alice')")
+        .unwrap();
+    db.execute("INSERT INTO t_uniq VALUES (2, 'bob@test.com', 'Bob')")
+        .unwrap();
 
     db.execute("TRUNCATE TABLE t_uniq").unwrap();
 
     // Previously used unique values should be reusable after TRUNCATE
-    db.execute("INSERT INTO t_uniq VALUES (1, 'alice@test.com', 'Alice_v2')").unwrap();
-    db.execute("INSERT INTO t_uniq VALUES (3, 'charlie@test.com', 'Charlie')").unwrap();
+    db.execute("INSERT INTO t_uniq VALUES (1, 'alice@test.com', 'Alice_v2')")
+        .unwrap();
+    db.execute("INSERT INTO t_uniq VALUES (3, 'charlie@test.com', 'Charlie')")
+        .unwrap();
     let rows = db.query("SELECT * FROM t_uniq ORDER BY id", &[]).unwrap();
-    assert_eq!(rows.len(), 2, "Should be able to reuse old unique values after TRUNCATE");
+    assert_eq!(
+        rows.len(),
+        2,
+        "Should be able to reuse old unique values after TRUNCATE"
+    );
     assert_eq!(rows[0].get(1).unwrap(), &Value::String("alice@test.com".to_string()));
     assert_eq!(rows[1].get(1).unwrap(), &Value::String("charlie@test.com".to_string()));
 
     // UNIQUE constraint should still be enforced for genuinely duplicate values
     let result = db.execute("INSERT INTO t_uniq VALUES (4, 'charlie@test.com', 'Dup')");
-    assert!(result.is_err(), "UNIQUE constraint should still be enforced after TRUNCATE");
+    assert!(
+        result.is_err(),
+        "UNIQUE constraint should still be enforced after TRUNCATE"
+    );
 }
 
 #[test]
 fn test_truncate_table_with_check_constraint() {
     let db = setup();
-    db.execute(
-        "CREATE TABLE t_check (id INT PRIMARY KEY, age INT CHECK (age >= 0 AND age <= 150))"
-    ).unwrap();
+    db.execute("CREATE TABLE t_check (id INT PRIMARY KEY, age INT CHECK (age >= 0 AND age <= 150))")
+        .unwrap();
     db.execute("INSERT INTO t_check VALUES (1, 25)").unwrap();
     db.execute("INSERT INTO t_check VALUES (2, 50)").unwrap();
 
@@ -215,7 +236,10 @@ fn test_truncate_table_with_check_constraint() {
     // CHECK constraint should still be enforced after TRUNCATE
     db.execute("INSERT INTO t_check VALUES (3, 30)").unwrap();
     let result = db.execute("INSERT INTO t_check VALUES (4, -5)");
-    assert!(result.is_err(), "CHECK constraint should still be enforced after TRUNCATE");
+    assert!(
+        result.is_err(),
+        "CHECK constraint should still be enforced after TRUNCATE"
+    );
 
     let result = db.execute("INSERT INTO t_check VALUES (5, 200)");
     assert!(result.is_err(), "CHECK constraint upper bound should still work");
@@ -227,14 +251,16 @@ fn test_truncate_table_with_check_constraint() {
 #[test]
 fn test_truncate_table_referenced_by_foreign_key() {
     let db = setup();
-    db.execute("CREATE TABLE t_fk_parent (id INT PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE t_fk_parent (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
     db.execute(
         "CREATE TABLE t_fk_child (
             id INT PRIMARY KEY,
             parent_id INT,
             FOREIGN KEY (parent_id) REFERENCES t_fk_parent(id)
-        )"
-    ).unwrap();
+        )",
+    )
+    .unwrap();
 
     db.execute("INSERT INTO t_fk_parent VALUES (1, 'Parent1')").unwrap();
     db.execute("INSERT INTO t_fk_child VALUES (100, 1)").unwrap();
@@ -259,8 +285,9 @@ fn test_truncate_table_with_not_null_columns() {
             id INT PRIMARY KEY,
             required_name TEXT NOT NULL,
             optional_val INT
-        )"
-    ).unwrap();
+        )",
+    )
+    .unwrap();
     db.execute("INSERT INTO t_notnull VALUES (1, 'Alice', 100)").unwrap();
     db.execute("INSERT INTO t_notnull VALUES (2, 'Bob', NULL)").unwrap();
 
@@ -283,10 +310,13 @@ fn test_truncate_constraints_enforced_after() {
             id INT PRIMARY KEY,
             score INT CHECK (score >= 0),
             label TEXT NOT NULL
-        )"
-    ).unwrap();
-    db.execute("INSERT INTO t_all_constraints VALUES (1, 95, 'first')").unwrap();
-    db.execute("INSERT INTO t_all_constraints VALUES (2, 80, 'second')").unwrap();
+        )",
+    )
+    .unwrap();
+    db.execute("INSERT INTO t_all_constraints VALUES (1, 95, 'first')")
+        .unwrap();
+    db.execute("INSERT INTO t_all_constraints VALUES (2, 80, 'second')")
+        .unwrap();
 
     db.execute("TRUNCATE TABLE t_all_constraints").unwrap();
 
@@ -295,7 +325,8 @@ fn test_truncate_constraints_enforced_after() {
     assert!(r.is_err(), "CHECK constraint should be enforced after TRUNCATE");
 
     // Valid insert should work
-    db.execute("INSERT INTO t_all_constraints VALUES (10, 90, 'new_first')").unwrap();
+    db.execute("INSERT INTO t_all_constraints VALUES (10, 90, 'new_first')")
+        .unwrap();
     let rows = db.query("SELECT * FROM t_all_constraints", &[]).unwrap();
     assert_eq!(rows.len(), 1, "Valid insert should succeed after TRUNCATE");
 
@@ -304,7 +335,9 @@ fn test_truncate_constraints_enforced_after() {
     assert!(r.is_err(), "CHECK constraint should still catch negative scores");
 
     // Verify data integrity
-    let rows = db.query("SELECT id, score, label FROM t_all_constraints ORDER BY id", &[]).unwrap();
+    let rows = db
+        .query("SELECT id, score, label FROM t_all_constraints ORDER BY id", &[])
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(10));
     assert_eq!(rows[0].get(1).unwrap(), &Value::Int4(90));
@@ -317,7 +350,8 @@ fn test_truncate_constraints_enforced_after() {
 #[test]
 fn test_insert_after_truncate_generates_row_ids() {
     let db = setup();
-    db.execute("CREATE TABLE t_rowid (id INT PRIMARY KEY, data TEXT)").unwrap();
+    db.execute("CREATE TABLE t_rowid (id INT PRIMARY KEY, data TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t_rowid VALUES (1, 'first')").unwrap();
     db.execute("INSERT INTO t_rowid VALUES (2, 'second')").unwrap();
     db.execute("INSERT INTO t_rowid VALUES (3, 'third')").unwrap();
@@ -340,7 +374,8 @@ fn test_insert_after_truncate_generates_row_ids() {
 fn test_row_ids_after_truncate_with_gaps() {
     // Verify that truncate clears data cleanly even when PKs had gaps
     let db = setup();
-    db.execute("CREATE TABLE t_gaps (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t_gaps (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t_gaps VALUES (10, 'ten')").unwrap();
     db.execute("INSERT INTO t_gaps VALUES (50, 'fifty')").unwrap();
     db.execute("INSERT INTO t_gaps VALUES (100, 'hundred')").unwrap();
@@ -362,14 +397,14 @@ fn test_row_ids_after_truncate_with_gaps() {
 #[test]
 fn test_multiple_truncate_insert_cycles() {
     let db = setup();
-    db.execute("CREATE TABLE t_cycle (id INT PRIMARY KEY, round INT)").unwrap();
+    db.execute("CREATE TABLE t_cycle (id INT PRIMARY KEY, round INT)")
+        .unwrap();
 
     for round in 1..=5 {
         // Insert some rows for this round
         for i in 1..=3 {
-            db.execute(&format!(
-                "INSERT INTO t_cycle VALUES ({}, {})", i, round
-            )).unwrap();
+            db.execute(&format!("INSERT INTO t_cycle VALUES ({}, {})", i, round))
+                .unwrap();
         }
 
         let rows = db.query("SELECT COUNT(*) FROM t_cycle", &[]).unwrap();
@@ -419,7 +454,8 @@ fn test_serial_behavior_after_truncate() {
 #[test]
 fn test_truncate_in_committed_transaction() {
     let db = setup();
-    db.execute("CREATE TABLE t_txn_commit (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t_txn_commit (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t_txn_commit VALUES (1, 'a')").unwrap();
     db.execute("INSERT INTO t_txn_commit VALUES (2, 'b')").unwrap();
     db.execute("INSERT INTO t_txn_commit VALUES (3, 'c')").unwrap();
@@ -435,7 +471,8 @@ fn test_truncate_in_committed_transaction() {
 #[test]
 fn test_truncate_in_rolled_back_transaction() {
     let db = setup();
-    db.execute("CREATE TABLE t_txn_rb (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t_txn_rb (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t_txn_rb VALUES (1, 'a')").unwrap();
     db.execute("INSERT INTO t_txn_rb VALUES (2, 'b')").unwrap();
 
@@ -458,7 +495,8 @@ fn test_truncate_in_rolled_back_transaction() {
 #[test]
 fn test_truncate_then_insert_in_same_transaction() {
     let db = setup();
-    db.execute("CREATE TABLE t_txn_ins (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t_txn_ins (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t_txn_ins VALUES (1, 'old')").unwrap();
 
     db.execute("BEGIN").unwrap();
@@ -475,7 +513,8 @@ fn test_truncate_then_insert_in_same_transaction() {
 #[test]
 fn test_truncate_then_select_in_same_transaction() {
     let db = setup();
-    db.execute("CREATE TABLE t_txn_sel (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t_txn_sel (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO t_txn_sel VALUES (1, 100)").unwrap();
     db.execute("INSERT INTO t_txn_sel VALUES (2, 200)").unwrap();
 
@@ -496,7 +535,8 @@ fn test_multiple_dml_after_truncate_in_transaction() {
     // the transaction are added to storage. The ART index is cleared by TRUNCATE,
     // so old PK values can be reused.
     let db = setup();
-    db.execute("CREATE TABLE t_txn_dml (id INT PRIMARY KEY, name TEXT, score INT)").unwrap();
+    db.execute("CREATE TABLE t_txn_dml (id INT PRIMARY KEY, name TEXT, score INT)")
+        .unwrap();
     db.execute("INSERT INTO t_txn_dml VALUES (1, 'Alice', 90)").unwrap();
     db.execute("INSERT INTO t_txn_dml VALUES (2, 'Bob', 80)").unwrap();
 
@@ -512,11 +552,17 @@ fn test_multiple_dml_after_truncate_in_transaction() {
 
     db.execute("COMMIT").unwrap();
 
-    let rows = db.query("SELECT id, name, score FROM t_txn_dml ORDER BY id", &[]).unwrap();
+    let rows = db
+        .query("SELECT id, name, score FROM t_txn_dml ORDER BY id", &[])
+        .unwrap();
     // After TRUNCATE + 3 inserts + 1 delete: expect 2-3 rows depending on
     // whether DELETE within the same txn as TRUNCATE takes effect.
     // The critical invariant: pre-TRUNCATE rows (Alice, Bob) must be gone.
-    assert!(rows.len() >= 2, "Should have at least 2 rows from post-TRUNCATE DML, got {}", rows.len());
+    assert!(
+        rows.len() >= 2,
+        "Should have at least 2 rows from post-TRUNCATE DML, got {}",
+        rows.len()
+    );
 
     // Old rows (Alice, Bob) should not appear
     for row in &rows {
@@ -526,7 +572,8 @@ fn test_multiple_dml_after_truncate_in_transaction() {
         };
         assert!(
             name == "Charlie" || name == "Diana" || name == "Eve",
-            "Old row '{}' should not exist after TRUNCATE", name
+            "Old row '{}' should not exist after TRUNCATE",
+            name
         );
     }
 }
@@ -538,13 +585,17 @@ fn test_truncate_after_insert_in_same_transaction() {
     // underlying storage. This means TRUNCATE may not remove rows that were
     // inserted in the same transaction (they are in the journal, not yet in storage).
     let db = setup();
-    db.execute("CREATE TABLE t_txn_order (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t_txn_order (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     db.execute("BEGIN").unwrap();
-    db.execute("INSERT INTO t_txn_order VALUES (1, 'before_truncate')").unwrap();
-    db.execute("INSERT INTO t_txn_order VALUES (2, 'before_truncate')").unwrap();
+    db.execute("INSERT INTO t_txn_order VALUES (1, 'before_truncate')")
+        .unwrap();
+    db.execute("INSERT INTO t_txn_order VALUES (2, 'before_truncate')")
+        .unwrap();
     db.execute("TRUNCATE TABLE t_txn_order").unwrap();
-    db.execute("INSERT INTO t_txn_order VALUES (3, 'after_truncate')").unwrap();
+    db.execute("INSERT INTO t_txn_order VALUES (3, 'after_truncate')")
+        .unwrap();
     db.execute("COMMIT").unwrap();
 
     let rows = db.query("SELECT id, val FROM t_txn_order ORDER BY id", &[]).unwrap();
@@ -554,8 +605,7 @@ fn test_truncate_after_insert_in_same_transaction() {
 
     // Verify the post-TRUNCATE insert is always present
     let has_after = rows.iter().any(|r| {
-        r.get(0).unwrap() == &Value::Int4(3)
-            && r.get(1).unwrap() == &Value::String("after_truncate".to_string())
+        r.get(0).unwrap() == &Value::Int4(3) && r.get(1).unwrap() == &Value::String("after_truncate".to_string())
     });
     assert!(has_after, "Post-TRUNCATE insert (id=3) should be present");
 }
@@ -567,7 +617,8 @@ fn test_truncate_after_insert_in_same_transaction() {
 #[test]
 fn test_truncate_table_with_index_empties_index() {
     let db = setup();
-    db.execute("CREATE TABLE t_idx1 (id INT PRIMARY KEY, category TEXT, val INT)").unwrap();
+    db.execute("CREATE TABLE t_idx1 (id INT PRIMARY KEY, category TEXT, val INT)")
+        .unwrap();
     db.execute("CREATE INDEX idx_cat ON t_idx1 (category)").unwrap();
     db.execute("INSERT INTO t_idx1 VALUES (1, 'A', 100)").unwrap();
     db.execute("INSERT INTO t_idx1 VALUES (2, 'B', 200)").unwrap();
@@ -586,7 +637,8 @@ fn test_truncate_table_with_index_empties_index() {
 #[test]
 fn test_insert_after_truncate_index_rebuilt_correctly() {
     let db = setup();
-    db.execute("CREATE TABLE t_idx2 (id INT PRIMARY KEY, name TEXT, score INT)").unwrap();
+    db.execute("CREATE TABLE t_idx2 (id INT PRIMARY KEY, name TEXT, score INT)")
+        .unwrap();
     db.execute("CREATE INDEX idx_score ON t_idx2 (score)").unwrap();
     db.execute("INSERT INTO t_idx2 VALUES (1, 'Alice', 90)").unwrap();
     db.execute("INSERT INTO t_idx2 VALUES (2, 'Bob', 85)").unwrap();
@@ -604,7 +656,9 @@ fn test_insert_after_truncate_index_rebuilt_correctly() {
     assert_eq!(rows[0].get(0).unwrap(), &Value::String("Diana".to_string()));
 
     // Verify ordering still works (indexes should be functional)
-    let rows = db.query("SELECT name, score FROM t_idx2 ORDER BY score DESC", &[]).unwrap();
+    let rows = db
+        .query("SELECT name, score FROM t_idx2 ORDER BY score DESC", &[])
+        .unwrap();
     assert_eq!(rows.len(), 3);
     assert_eq!(rows[0].get(0).unwrap(), &Value::String("Diana".to_string()));
     assert_eq!(rows[1].get(0).unwrap(), &Value::String("Eve".to_string()));
@@ -614,7 +668,8 @@ fn test_insert_after_truncate_index_rebuilt_correctly() {
 #[test]
 fn test_query_using_index_after_truncate_returns_correct_results() {
     let db = setup();
-    db.execute("CREATE TABLE t_idx3 (id INT PRIMARY KEY, tag TEXT)").unwrap();
+    db.execute("CREATE TABLE t_idx3 (id INT PRIMARY KEY, tag TEXT)")
+        .unwrap();
     db.execute("CREATE INDEX idx_tag ON t_idx3 (tag)").unwrap();
     db.execute("INSERT INTO t_idx3 VALUES (1, 'important')").unwrap();
     db.execute("INSERT INTO t_idx3 VALUES (2, 'normal')").unwrap();
@@ -644,8 +699,9 @@ fn test_truncate_with_multiple_indexes() {
             name TEXT,
             category TEXT,
             priority INT
-        )"
-    ).unwrap();
+        )",
+    )
+    .unwrap();
     db.execute("CREATE INDEX idx_name ON t_midx (name)").unwrap();
     db.execute("CREATE INDEX idx_category ON t_midx (category)").unwrap();
     db.execute("CREATE INDEX idx_priority ON t_midx (priority)").unwrap();
@@ -657,7 +713,8 @@ fn test_truncate_with_multiple_indexes() {
             i,
             if i % 2 == 0 { "even" } else { "odd" },
             i % 5
-        )).unwrap();
+        ))
+        .unwrap();
     }
 
     db.execute("TRUNCATE TABLE t_midx").unwrap();
@@ -673,7 +730,8 @@ fn test_truncate_with_multiple_indexes() {
     assert_eq!(rows.len(), 0, "Priority index should return 0");
 
     // Re-insert and verify all indexes rebuild
-    db.execute("INSERT INTO t_midx VALUES (100, 'new_item', 'even', 3)").unwrap();
+    db.execute("INSERT INTO t_midx VALUES (100, 'new_item', 'even', 3)")
+        .unwrap();
     let rows = db.query("SELECT id FROM t_midx WHERE category = 'even'", &[]).unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(100));
@@ -690,14 +748,17 @@ fn test_truncate_vs_delete_same_result() {
     // Table A: use DELETE FROM
     db.execute("CREATE TABLE t_del (id INT PRIMARY KEY, val INT)").unwrap();
     for i in 1..=10 {
-        db.execute(&format!("INSERT INTO t_del VALUES ({}, {})", i, i * 10)).unwrap();
+        db.execute(&format!("INSERT INTO t_del VALUES ({}, {})", i, i * 10))
+            .unwrap();
     }
     db.execute("DELETE FROM t_del").unwrap();
 
     // Table B: use TRUNCATE TABLE
-    db.execute("CREATE TABLE t_trunc (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE t_trunc (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     for i in 1..=10 {
-        db.execute(&format!("INSERT INTO t_trunc VALUES ({}, {})", i, i * 10)).unwrap();
+        db.execute(&format!("INSERT INTO t_trunc VALUES ({}, {})", i, i * 10))
+            .unwrap();
     }
     db.execute("TRUNCATE TABLE t_trunc").unwrap();
 
@@ -723,19 +784,22 @@ fn test_truncate_faster_than_delete_for_large_tables() {
     let row_count = 500;
 
     // Setup table for DELETE
-    db.execute("CREATE TABLE t_perf_del (id INT PRIMARY KEY, payload TEXT)").unwrap();
+    db.execute("CREATE TABLE t_perf_del (id INT PRIMARY KEY, payload TEXT)")
+        .unwrap();
     for i in 1..=row_count {
-        db.execute(&format!(
-            "INSERT INTO t_perf_del VALUES ({}, 'payload_data_{}')", i, i
-        )).unwrap();
+        db.execute(&format!("INSERT INTO t_perf_del VALUES ({}, 'payload_data_{}')", i, i))
+            .unwrap();
     }
 
     // Setup table for TRUNCATE
-    db.execute("CREATE TABLE t_perf_trunc (id INT PRIMARY KEY, payload TEXT)").unwrap();
+    db.execute("CREATE TABLE t_perf_trunc (id INT PRIMARY KEY, payload TEXT)")
+        .unwrap();
     for i in 1..=row_count {
         db.execute(&format!(
-            "INSERT INTO t_perf_trunc VALUES ({}, 'payload_data_{}')", i, i
-        )).unwrap();
+            "INSERT INTO t_perf_trunc VALUES ({}, 'payload_data_{}')",
+            i, i
+        ))
+        .unwrap();
     }
 
     // Time DELETE
@@ -763,8 +827,10 @@ fn test_truncate_faster_than_delete_for_large_tables() {
     // Log timing for diagnostics (no hard assertion on speed since CI can be noisy)
     eprintln!(
         "DELETE {} rows: {:?}, TRUNCATE {} rows: {:?} (ratio: {:.2}x)",
-        row_count, del_time,
-        row_count, trunc_time,
+        row_count,
+        del_time,
+        row_count,
+        trunc_time,
         del_time.as_secs_f64() / trunc_time.as_secs_f64().max(0.000001)
     );
 }
@@ -789,7 +855,10 @@ fn test_truncate_does_not_return_affected_row_count() {
 
     // TRUNCATE goes through executor path, returns 0
     let trunc_count = db.execute("TRUNCATE TABLE t_ret").unwrap();
-    assert_eq!(trunc_count, 0, "TRUNCATE returns 0 via Executor path (DDL-like behavior)");
+    assert_eq!(
+        trunc_count, 0,
+        "TRUNCATE returns 0 via Executor path (DDL-like behavior)"
+    );
 
     // But all rows should still be gone
     let rows = db.query("SELECT * FROM t_ret", &[]).unwrap();
@@ -801,7 +870,8 @@ fn test_truncate_resets_storage_more_aggressively() {
     // After TRUNCATE, old primary keys should be fully reusable, demonstrating
     // storage is cleanly reset rather than just marking rows as deleted
     let db = setup();
-    db.execute("CREATE TABLE t_reset (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t_reset (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     // Insert with specific PKs
     db.execute("INSERT INTO t_reset VALUES (1, 'version1')").unwrap();
@@ -818,8 +888,11 @@ fn test_truncate_resets_storage_more_aggressively() {
     let rows = db.query("SELECT id, val FROM t_reset ORDER BY id", &[]).unwrap();
     assert_eq!(rows.len(), 3);
     for row in &rows {
-        assert_eq!(row.get(1).unwrap(), &Value::String("version2".to_string()),
-            "All rows should be version2, not version1");
+        assert_eq!(
+            row.get(1).unwrap(),
+            &Value::String("version2".to_string()),
+            "All rows should be version2, not version1"
+        );
     }
 
     // Verify no phantom rows from the old data
@@ -842,16 +915,20 @@ fn test_truncate_nonexistent_table_errors() {
     let err = result.unwrap_err().to_string().to_lowercase();
     assert!(
         err.contains("not exist") || err.contains("not found") || err.contains("does_not_exist"),
-        "Error should mention the missing table, got: {}", err
+        "Error should mention the missing table, got: {}",
+        err
     );
 }
 
 #[test]
 fn test_truncate_does_not_affect_other_tables() {
     let db = setup();
-    db.execute("CREATE TABLE t_iso_a (id INT PRIMARY KEY, val TEXT)").unwrap();
-    db.execute("CREATE TABLE t_iso_b (id INT PRIMARY KEY, val TEXT)").unwrap();
-    db.execute("CREATE TABLE t_iso_c (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t_iso_a (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE t_iso_b (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE t_iso_c (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
 
     db.execute("INSERT INTO t_iso_a VALUES (1, 'a1')").unwrap();
     db.execute("INSERT INTO t_iso_a VALUES (2, 'a2')").unwrap();
@@ -884,11 +961,14 @@ fn test_truncate_table_with_wide_schema() {
             col_float FLOAT,
             col_bool BOOLEAN,
             col_bigint BIGINT
-        )"
-    ).unwrap();
+        )",
+    )
+    .unwrap();
 
-    db.execute("INSERT INTO t_wide VALUES (1, 'text1', 42, 3.14, true, 9999999999)").unwrap();
-    db.execute("INSERT INTO t_wide VALUES (2, 'text2', 99, 2.71, false, 1234567890)").unwrap();
+    db.execute("INSERT INTO t_wide VALUES (1, 'text1', 42, 3.14, true, 9999999999)")
+        .unwrap();
+    db.execute("INSERT INTO t_wide VALUES (2, 'text2', 99, 2.71, false, 1234567890)")
+        .unwrap();
 
     db.execute("TRUNCATE TABLE t_wide").unwrap();
 
@@ -896,8 +976,14 @@ fn test_truncate_table_with_wide_schema() {
     assert_eq!(rows.len(), 0);
 
     // Re-insert and verify all column types still work
-    db.execute("INSERT INTO t_wide VALUES (3, 'text3', 7, 1.41, true, 5555555555)").unwrap();
-    let rows = db.query("SELECT col_text, col_int, col_float, col_bool, col_bigint FROM t_wide", &[]).unwrap();
+    db.execute("INSERT INTO t_wide VALUES (3, 'text3', 7, 1.41, true, 5555555555)")
+        .unwrap();
+    let rows = db
+        .query(
+            "SELECT col_text, col_int, col_float, col_bool, col_bigint FROM t_wide",
+            &[],
+        )
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get(0).unwrap(), &Value::String("text3".to_string()));
     assert_eq!(rows[0].get(1).unwrap(), &Value::Int4(7));
@@ -909,7 +995,8 @@ fn test_truncate_with_aggregate_functions_after() {
     let db = setup();
     db.execute("CREATE TABLE t_agg (id INT PRIMARY KEY, val INT)").unwrap();
     for i in 1..=20 {
-        db.execute(&format!("INSERT INTO t_agg VALUES ({}, {})", i, i * 10)).unwrap();
+        db.execute(&format!("INSERT INTO t_agg VALUES ({}, {})", i, i * 10))
+            .unwrap();
     }
 
     db.execute("TRUNCATE TABLE t_agg").unwrap();
@@ -925,8 +1012,7 @@ fn test_truncate_with_aggregate_functions_after() {
     assert_eq!(rows.len(), 1, "SUM on empty table should return a row");
     // SUM of empty set is NULL
     assert!(
-        rows[0].get(0).unwrap() == &Value::Null
-            || matches!(rows[0].get(0).unwrap(), Value::Int4(0) | Value::Int8(0)),
+        rows[0].get(0).unwrap() == &Value::Null || matches!(rows[0].get(0).unwrap(), Value::Int4(0) | Value::Int8(0)),
         "SUM on empty table should be NULL or 0, got {:?}",
         rows[0].get(0).unwrap()
     );
@@ -947,8 +1033,10 @@ fn test_truncate_with_aggregate_functions_after() {
 #[test]
 fn test_truncate_then_join_with_other_table() {
     let db = setup();
-    db.execute("CREATE TABLE t_join_a (id INT PRIMARY KEY, name TEXT)").unwrap();
-    db.execute("CREATE TABLE t_join_b (id INT PRIMARY KEY, a_id INT, detail TEXT)").unwrap();
+    db.execute("CREATE TABLE t_join_a (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("CREATE TABLE t_join_b (id INT PRIMARY KEY, a_id INT, detail TEXT)")
+        .unwrap();
 
     db.execute("INSERT INTO t_join_a VALUES (1, 'Alice')").unwrap();
     db.execute("INSERT INTO t_join_a VALUES (2, 'Bob')").unwrap();
@@ -959,18 +1047,22 @@ fn test_truncate_then_join_with_other_table() {
     db.execute("TRUNCATE TABLE t_join_a").unwrap();
 
     // JOIN should return 0 rows since the left side is empty
-    let rows = db.query(
-        "SELECT t_join_a.name, t_join_b.detail FROM t_join_a INNER JOIN t_join_b ON t_join_a.id = t_join_b.a_id",
-        &[]
-    ).unwrap();
+    let rows = db
+        .query(
+            "SELECT t_join_a.name, t_join_b.detail FROM t_join_a INNER JOIN t_join_b ON t_join_a.id = t_join_b.a_id",
+            &[],
+        )
+        .unwrap();
     assert_eq!(rows.len(), 0, "JOIN with truncated table should return 0 rows");
 
     // Re-insert into A and verify join works again
     db.execute("INSERT INTO t_join_a VALUES (1, 'Alice_v2')").unwrap();
-    let rows = db.query(
-        "SELECT t_join_a.name, t_join_b.detail FROM t_join_a INNER JOIN t_join_b ON t_join_a.id = t_join_b.a_id",
-        &[]
-    ).unwrap();
+    let rows = db
+        .query(
+            "SELECT t_join_a.name, t_join_b.detail FROM t_join_a INNER JOIN t_join_b ON t_join_a.id = t_join_b.a_id",
+            &[],
+        )
+        .unwrap();
     assert_eq!(rows.len(), 1, "JOIN should work after re-insert");
     assert_eq!(rows[0].get(0).unwrap(), &Value::String("Alice_v2".to_string()));
 }
@@ -978,7 +1070,8 @@ fn test_truncate_then_join_with_other_table() {
 #[test]
 fn test_truncate_table_then_drop_and_recreate() {
     let db = setup();
-    db.execute("CREATE TABLE t_drop (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE t_drop (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO t_drop VALUES (1, 'data')").unwrap();
 
     // TRUNCATE then DROP
@@ -986,7 +1079,8 @@ fn test_truncate_table_then_drop_and_recreate() {
     db.execute("DROP TABLE t_drop").unwrap();
 
     // Recreate with different schema
-    db.execute("CREATE TABLE t_drop (id INT PRIMARY KEY, val INT, extra BOOLEAN)").unwrap();
+    db.execute("CREATE TABLE t_drop (id INT PRIMARY KEY, val INT, extra BOOLEAN)")
+        .unwrap();
     db.execute("INSERT INTO t_drop VALUES (1, 42, true)").unwrap();
 
     let rows = db.query("SELECT * FROM t_drop", &[]).unwrap();
@@ -998,14 +1092,14 @@ fn test_truncate_table_then_drop_and_recreate() {
 #[test]
 fn test_truncate_large_payload_rows() {
     let db = setup();
-    db.execute("CREATE TABLE t_large (id INT PRIMARY KEY, payload TEXT)").unwrap();
+    db.execute("CREATE TABLE t_large (id INT PRIMARY KEY, payload TEXT)")
+        .unwrap();
 
     // Insert rows with large text payloads
     for i in 1..=10 {
         let big_text = "x".repeat(1000);
-        db.execute(&format!(
-            "INSERT INTO t_large VALUES ({}, '{}')", i, big_text
-        )).unwrap();
+        db.execute(&format!("INSERT INTO t_large VALUES ({}, '{}')", i, big_text))
+            .unwrap();
     }
 
     let rows = db.query("SELECT COUNT(*) FROM t_large", &[]).unwrap();

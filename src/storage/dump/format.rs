@@ -2,9 +2,9 @@
 //!
 //! Defines the structure and serialization of HeliosDB dump files.
 
+use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use crate::{Result, Error};
 
 /// Magic number for dump file identification: "HELIODMP"
 pub const DUMP_MAGIC_NUMBER: &[u8; 8] = b"HELIODMP";
@@ -99,24 +99,27 @@ impl DumpMetadata {
     /// Write metadata to writer
     pub fn write_to<W: Write>(&self, writer: &mut W) -> Result<()> {
         // Write magic number
-        writer.write_all(DUMP_MAGIC_NUMBER)
+        writer
+            .write_all(DUMP_MAGIC_NUMBER)
             .map_err(|e| Error::io(format!("Failed to write magic number: {}", e)))?;
 
         // Write version
-        writer.write_all(&DUMP_VERSION.to_le_bytes())
+        writer
+            .write_all(&DUMP_VERSION.to_le_bytes())
             .map_err(|e| Error::io(format!("Failed to write version: {}", e)))?;
 
         // Serialize metadata as JSON
-        let json = serde_json::to_vec(self)
-            .map_err(|e| Error::io(format!("Failed to serialize metadata: {}", e)))?;
+        let json = serde_json::to_vec(self).map_err(|e| Error::io(format!("Failed to serialize metadata: {}", e)))?;
 
         // Write metadata length
         let len = json.len() as u32;
-        writer.write_all(&len.to_le_bytes())
+        writer
+            .write_all(&len.to_le_bytes())
             .map_err(|e| Error::io(format!("Failed to write metadata length: {}", e)))?;
 
         // Write metadata
-        writer.write_all(&json)
+        writer
+            .write_all(&json)
             .map_err(|e| Error::io(format!("Failed to write metadata: {}", e)))?;
 
         Ok(())
@@ -126,7 +129,8 @@ impl DumpMetadata {
     pub fn read_from<R: Read>(reader: &mut R) -> Result<Self> {
         // Read and verify magic number
         let mut magic = [0u8; 8];
-        reader.read_exact(&mut magic)
+        reader
+            .read_exact(&mut magic)
             .map_err(|e| Error::io(format!("Failed to read magic number: {}", e)))?;
 
         if &magic != DUMP_MAGIC_NUMBER {
@@ -135,7 +139,8 @@ impl DumpMetadata {
 
         // Read version
         let mut version_bytes = [0u8; 4];
-        reader.read_exact(&mut version_bytes)
+        reader
+            .read_exact(&mut version_bytes)
             .map_err(|e| Error::io(format!("Failed to read version: {}", e)))?;
         let version = u32::from_le_bytes(version_bytes);
 
@@ -148,18 +153,20 @@ impl DumpMetadata {
 
         // Read metadata length
         let mut len_bytes = [0u8; 4];
-        reader.read_exact(&mut len_bytes)
+        reader
+            .read_exact(&mut len_bytes)
             .map_err(|e| Error::io(format!("Failed to read metadata length: {}", e)))?;
         let len = u32::from_le_bytes(len_bytes) as usize;
 
         // Read metadata
         let mut json = vec![0u8; len];
-        reader.read_exact(&mut json)
+        reader
+            .read_exact(&mut json)
             .map_err(|e| Error::io(format!("Failed to read metadata: {}", e)))?;
 
         // Deserialize metadata
-        let metadata: DumpMetadata = serde_json::from_slice(&json)
-            .map_err(|e| Error::io(format!("Failed to deserialize metadata: {}", e)))?;
+        let metadata: DumpMetadata =
+            serde_json::from_slice(&json).map_err(|e| Error::io(format!("Failed to deserialize metadata: {}", e)))?;
 
         Ok(metadata)
     }
@@ -174,27 +181,25 @@ impl DumpFormat {
         match compression {
             CompressionType::None => Ok(data.to_vec()),
             CompressionType::Zstd => {
-                zstd::encode_all(data, 3)
-                    .map_err(|e| Error::io(format!("Zstd compression failed: {}", e)))
+                zstd::encode_all(data, 3).map_err(|e| Error::io(format!("Zstd compression failed: {}", e)))
             }
             CompressionType::Gzip => {
                 use flate2::write::GzEncoder;
                 use flate2::Compression;
                 let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-                encoder.write_all(data)
+                encoder
+                    .write_all(data)
                     .map_err(|e| Error::io(format!("Gzip compression failed: {}", e)))?;
-                encoder.finish()
+                encoder
+                    .finish()
                     .map_err(|e| Error::io(format!("Gzip compression failed: {}", e)))
             }
             CompressionType::Brotli => {
                 use brotli::enc::BrotliEncoderParams;
                 let mut output = Vec::new();
                 let params = BrotliEncoderParams::default();
-                brotli::BrotliCompress(
-                    &mut std::io::Cursor::new(data),
-                    &mut output,
-                    &params,
-                ).map_err(|e| Error::io(format!("Brotli compression failed: {}", e)))?;
+                brotli::BrotliCompress(&mut std::io::Cursor::new(data), &mut output, &params)
+                    .map_err(|e| Error::io(format!("Brotli compression failed: {}", e)))?;
                 Ok(output)
             }
         }
@@ -205,24 +210,22 @@ impl DumpFormat {
         match compression {
             CompressionType::None => Ok(data.to_vec()),
             CompressionType::Zstd => {
-                zstd::decode_all(data)
-                    .map_err(|e| Error::io(format!("Zstd decompression failed: {}", e)))
+                zstd::decode_all(data).map_err(|e| Error::io(format!("Zstd decompression failed: {}", e)))
             }
             CompressionType::Gzip => {
                 use flate2::read::GzDecoder;
                 let mut decoder = GzDecoder::new(data);
                 let mut output = Vec::new();
-                decoder.read_to_end(&mut output)
+                decoder
+                    .read_to_end(&mut output)
                     .map_err(|e| Error::io(format!("Gzip decompression failed: {}", e)))?;
                 Ok(output)
             }
             CompressionType::Brotli => {
                 use brotli::BrotliDecompress;
                 let mut output = Vec::new();
-                BrotliDecompress(
-                    &mut std::io::Cursor::new(data),
-                    &mut output,
-                ).map_err(|e| Error::io(format!("Brotli decompression failed: {}", e)))?;
+                BrotliDecompress(&mut std::io::Cursor::new(data), &mut output)
+                    .map_err(|e| Error::io(format!("Brotli decompression failed: {}", e)))?;
                 Ok(output)
             }
         }

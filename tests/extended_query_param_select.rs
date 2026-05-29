@@ -7,11 +7,14 @@
 //! These tests fail on v3.23.1 main and should pass once the schema-synthesis
 //! and/or RowDescription serialisation fix lands.
 
+use heliosdb_nano::{
+    protocol::postgres::server::{PgServer, PgServerConfig},
+    EmbeddedDatabase,
+};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::timeout;
 use tokio_postgres::NoTls;
-use heliosdb_nano::{EmbeddedDatabase, protocol::postgres::server::{PgServer, PgServerConfig}};
 
 async fn setup() -> (String, tokio::task::JoinHandle<()>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -22,15 +25,22 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>) {
     let config = PgServerConfig::with_address(addr);
     let server = PgServer::new(config, db).expect("server");
     let handle = tokio::spawn(async move {
-        if let Err(e) = server.serve().await { eprintln!("server: {e}"); }
+        if let Err(e) = server.serve().await {
+            eprintln!("server: {e}");
+        }
     });
     tokio::time::sleep(Duration::from_millis(150)).await;
-    (format!("host=127.0.0.1 port={} user=postgres dbname=postgres", port), handle)
+    (
+        format!("host=127.0.0.1 port={} user=postgres dbname=postgres", port),
+        handle,
+    )
 }
 
 async fn connect(s: &str) -> tokio_postgres::Client {
     let (client, conn) = tokio_postgres::connect(s, NoTls).await.expect("connect");
-    tokio::spawn(async move { let _ = conn.await; });
+    tokio::spawn(async move {
+        let _ = conn.await;
+    });
     client
 }
 
@@ -72,10 +82,7 @@ async fn parameterised_select_extended_query_returns_rows() {
     // The headline failing query.
     let rows = timeout(
         Duration::from_secs(5),
-        client.query(
-            "SELECT COUNT(*) FROM pings WHERE week_bucket = $1",
-            &[&"2026-18"],
-        ),
+        client.query("SELECT COUNT(*) FROM pings WHERE week_bucket = $1", &[&"2026-18"]),
     )
     .await
     .expect("timeout — server hung")
@@ -106,10 +113,7 @@ async fn count_distinct_with_extended_param_does_not_silently_return_zero() {
         .expect("create");
     for h in ["abc", "def", "abc"] {
         client
-            .execute(
-                "INSERT INTO pings VALUES ($1, $2, $3)",
-                &[&"2026-18", &h, &"3.23.1"],
-            )
+            .execute("INSERT INTO pings VALUES ($1, $2, $3)", &[&"2026-18", &h, &"3.23.1"])
             .await
             .expect("insert");
     }
@@ -163,7 +167,10 @@ fn describe_returns_well_formed_row_description() {
     rt.block_on(async {
         let (cs, _h) = setup().await;
         let client = connect(&cs).await;
-        client.execute("CREATE TABLE t (a INT, b TEXT)", &[]).await.expect("create");
+        client
+            .execute("CREATE TABLE t (a INT, b TEXT)", &[])
+            .await
+            .expect("create");
 
         // tokio-postgres' `prepare` triggers Parse + Describe; if the resulting
         // RowDescription is malformed, `prepare` itself errors before any rows

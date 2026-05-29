@@ -266,10 +266,7 @@ mod imports_tests {
 /// Works hand-in-hand with [`rebind_via_imports`]: the type name
 /// resulting from this pass is fed back through imports and the
 /// cross-file rebinder.
-pub fn rebind_via_local_types(
-    refs: &mut [ResolvedRef],
-    function_bodies: &[FunctionBody<'_>],
-) {
+pub fn rebind_via_local_types(refs: &mut [ResolvedRef], function_bodies: &[FunctionBody<'_>]) {
     if function_bodies.is_empty() {
         return;
     }
@@ -383,9 +380,7 @@ fn scan_let_typed<'a>(body: &'a str, name: &str) -> Option<&'a str> {
                 let ty = ty.split('<').next().unwrap_or(ty).trim();
                 let ty = ty.trim_end_matches('&').trim();
                 if !ty.is_empty() {
-                    return Some(unsafe {
-                        std::mem::transmute::<&str, &'a str>(ty)
-                    });
+                    return Some(unsafe { std::mem::transmute::<&str, &'a str>(ty) });
                 }
             }
         }

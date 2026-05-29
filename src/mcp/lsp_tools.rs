@@ -13,8 +13,7 @@ use serde::Deserialize;
 use serde_json::{json, Value as JsonValue};
 
 use crate::code_graph::{
-    self, ast_diff, lsp_body_diff, lsp_references_diff, AsOfRef, CallDirection, DefinitionHint,
-    RenameApplyOptions,
+    self, ast_diff, lsp_body_diff, lsp_references_diff, AsOfRef, CallDirection, DefinitionHint, RenameApplyOptions,
 };
 use crate::{EmbeddedDatabase, Value};
 
@@ -32,10 +31,7 @@ struct DefArgs {
     hint_kind: Option<String>,
 }
 
-fn lsp_definition_handler(
-    db: Option<&EmbeddedDatabase>,
-    args: JsonValue,
-) -> ToolOutcome {
+fn lsp_definition_handler(db: Option<&EmbeddedDatabase>, args: JsonValue) -> ToolOutcome {
     let Some(db) = db else {
         return ToolOutcome::err("helios_lsp_definition requires a database connection");
     };
@@ -95,10 +91,7 @@ struct RefsArgs {
     symbol_id: i64,
 }
 
-fn lsp_references_handler(
-    db: Option<&EmbeddedDatabase>,
-    args: JsonValue,
-) -> ToolOutcome {
+fn lsp_references_handler(db: Option<&EmbeddedDatabase>, args: JsonValue) -> ToolOutcome {
     let Some(db) = db else {
         return ToolOutcome::err("helios_lsp_references requires a database connection");
     };
@@ -155,13 +148,14 @@ struct CallArgs {
     depth: u32,
 }
 
-fn default_direction() -> String { "outgoing".to_string() }
-fn default_depth() -> u32 { 3 }
+fn default_direction() -> String {
+    "outgoing".to_string()
+}
+fn default_depth() -> u32 {
+    3
+}
 
-fn lsp_call_hierarchy_handler(
-    db: Option<&EmbeddedDatabase>,
-    args: JsonValue,
-) -> ToolOutcome {
+fn lsp_call_hierarchy_handler(db: Option<&EmbeddedDatabase>, args: JsonValue) -> ToolOutcome {
     let Some(db) = db else {
         return ToolOutcome::err("helios_lsp_call_hierarchy requires a database connection");
     };
@@ -276,10 +270,7 @@ struct DocSymArgs {
     kinds: Vec<String>,
 }
 
-fn lsp_document_symbols_handler(
-    db: Option<&EmbeddedDatabase>,
-    args: JsonValue,
-) -> ToolOutcome {
+fn lsp_document_symbols_handler(db: Option<&EmbeddedDatabase>, args: JsonValue) -> ToolOutcome {
     let Some(db) = db else {
         return ToolOutcome::err("helios_lsp_document_symbols requires a database connection");
     };
@@ -297,7 +288,9 @@ fn lsp_document_symbols_handler(
     if !input.kinds.is_empty() {
         sql.push_str(" AND s.kind IN (");
         for (i, _) in input.kinds.iter().enumerate() {
-            if i > 0 { sql.push(','); }
+            if i > 0 {
+                sql.push(',');
+            }
             sql.push_str(&format!("${}", i + 2));
         }
         sql.push(')');
@@ -361,10 +354,7 @@ struct RenameArgs {
     new_name: String,
 }
 
-fn lsp_rename_preview_handler(
-    db: Option<&EmbeddedDatabase>,
-    args: JsonValue,
-) -> ToolOutcome {
+fn lsp_rename_preview_handler(db: Option<&EmbeddedDatabase>, args: JsonValue) -> ToolOutcome {
     let Some(db) = db else {
         return ToolOutcome::err("helios_lsp_rename_preview requires a database connection");
     };
@@ -481,13 +471,14 @@ struct RenameApplyArgs {
     strict_hash_check: bool,
 }
 
-fn default_strict() -> bool { true }
-fn default_source_table() -> String { "src".to_string() }
+fn default_strict() -> bool {
+    true
+}
+fn default_source_table() -> String {
+    "src".to_string()
+}
 
-fn lsp_rename_apply_handler(
-    db: Option<&EmbeddedDatabase>,
-    args: JsonValue,
-) -> ToolOutcome {
+fn lsp_rename_apply_handler(db: Option<&EmbeddedDatabase>, args: JsonValue) -> ToolOutcome {
     let Some(db) = db else {
         return ToolOutcome::err("helios_lsp_rename_apply requires a database connection");
     };
@@ -553,9 +544,9 @@ fn parse_as_of(v: &JsonValue) -> Result<AsOfRef, String> {
             "as_of must be an object {{ commit | timestamp | now }}, got string '{s}'"
         ));
     }
-    let obj = v.as_object().ok_or_else(|| {
-        "as_of must be an object with one of: commit, timestamp, now=true".to_string()
-    })?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| "as_of must be an object with one of: commit, timestamp, now=true".to_string())?;
     if obj.get("now").and_then(|x| x.as_bool()) == Some(true) {
         return Ok(AsOfRef::Now);
     }
@@ -577,10 +568,7 @@ struct RefDiffArgs {
     at_b: JsonValue,
 }
 
-fn lsp_references_diff_handler(
-    db: Option<&EmbeddedDatabase>,
-    args: JsonValue,
-) -> ToolOutcome {
+fn lsp_references_diff_handler(db: Option<&EmbeddedDatabase>, args: JsonValue) -> ToolOutcome {
     let Some(db) = db else {
         return ToolOutcome::err("helios_lsp_references_diff requires a database connection");
     };
@@ -588,8 +576,14 @@ fn lsp_references_diff_handler(
         Ok(v) => v,
         Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
     };
-    let a = match parse_as_of(&input.at_a) { Ok(x) => x, Err(e) => return ToolOutcome::err(e) };
-    let b = match parse_as_of(&input.at_b) { Ok(x) => x, Err(e) => return ToolOutcome::err(e) };
+    let a = match parse_as_of(&input.at_a) {
+        Ok(x) => x,
+        Err(e) => return ToolOutcome::err(e),
+    };
+    let b = match parse_as_of(&input.at_b) {
+        Ok(x) => x,
+        Err(e) => return ToolOutcome::err(e),
+    };
     match lsp_references_diff(db, input.symbol_id, &a, &b) {
         Ok(rows) => ToolOutcome::ok(json!({
             "symbol_id": input.symbol_id,
@@ -657,8 +651,14 @@ fn lsp_body_diff_handler(db: Option<&EmbeddedDatabase>, args: JsonValue) -> Tool
         Ok(v) => v,
         Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
     };
-    let a = match parse_as_of(&input.at_a) { Ok(x) => x, Err(e) => return ToolOutcome::err(e) };
-    let b = match parse_as_of(&input.at_b) { Ok(x) => x, Err(e) => return ToolOutcome::err(e) };
+    let a = match parse_as_of(&input.at_a) {
+        Ok(x) => x,
+        Err(e) => return ToolOutcome::err(e),
+    };
+    let b = match parse_as_of(&input.at_b) {
+        Ok(x) => x,
+        Err(e) => return ToolOutcome::err(e),
+    };
     match lsp_body_diff(db, input.symbol_id, &a, &b) {
         Ok(rows) => ToolOutcome::ok(json!({
             "symbol_id": input.symbol_id,
@@ -715,8 +715,14 @@ fn ast_diff_handler(db: Option<&EmbeddedDatabase>, args: JsonValue) -> ToolOutco
         Ok(v) => v,
         Err(e) => return ToolOutcome::err(format!("invalid arguments: {e}")),
     };
-    let a = match parse_as_of(&input.at_a) { Ok(x) => x, Err(e) => return ToolOutcome::err(e) };
-    let b = match parse_as_of(&input.at_b) { Ok(x) => x, Err(e) => return ToolOutcome::err(e) };
+    let a = match parse_as_of(&input.at_a) {
+        Ok(x) => x,
+        Err(e) => return ToolOutcome::err(e),
+    };
+    let b = match parse_as_of(&input.at_b) {
+        Ok(x) => x,
+        Err(e) => return ToolOutcome::err(e),
+    };
     match ast_diff(db, &input.path, &a, &b) {
         Ok(rows) => ToolOutcome::ok(json!({
             "path": input.path,

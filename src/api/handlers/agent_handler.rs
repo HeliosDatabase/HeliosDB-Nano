@@ -266,11 +266,11 @@ pub async fn list_sessions(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<Vec<SessionInfo>>>, ApiError> {
-    let limit = params.get("limit")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(100);
+    let limit = params.get("limit").and_then(|s| s.parse().ok()).unwrap_or(100);
 
-    let sessions = state.db.list_agent_sessions()
+    let sessions = state
+        .db
+        .list_agent_sessions()
         .map_err(|e| ApiError::internal(format!("Failed to list sessions: {}", e)))?;
 
     let session_infos: Vec<SessionInfo> = sessions
@@ -301,12 +301,12 @@ pub async fn create_session(
     State(state): State<AppState>,
     Json(req): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<SessionInfo>>), ApiError> {
-    let session_id = req.session_id
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let session_id = req.session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let session = state.db.create_agent_session(
-        &session_id,
-    ).map_err(|e| ApiError::internal(format!("Failed to create session: {}", e)))?;
+    let session = state
+        .db
+        .create_agent_session(&session_id)
+        .map_err(|e| ApiError::internal(format!("Failed to create session: {}", e)))?;
 
     // Convert metadata
     let metadata = match session.metadata {
@@ -331,7 +331,9 @@ pub async fn get_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<ApiResponse<SessionInfo>>, ApiError> {
-    let session = state.db.get_agent_session(&session_id)
+    let session = state
+        .db
+        .get_agent_session(&session_id)
         .map_err(|e| ApiError::not_found(format!("Session not found: {}", e)))?;
 
     // Convert metadata
@@ -359,7 +361,9 @@ pub async fn update_session(
     Json(_req): Json<UpdateSessionRequest>,
 ) -> Result<Json<ApiResponse<SessionInfo>>, ApiError> {
     // Note: update_agent_session method doesn't exist yet, so we'll just retrieve the session
-    let session = state.db.get_agent_session(&session_id)
+    let session = state
+        .db
+        .get_agent_session(&session_id)
         .map_err(|e| ApiError::not_found(format!("Session not found: {}", e)))?;
 
     // Convert metadata
@@ -385,7 +389,9 @@ pub async fn delete_session(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    state.db.delete_agent_session(&session_id)
+    state
+        .db
+        .delete_agent_session(&session_id)
         .map_err(|e| ApiError::internal(format!("Failed to delete session: {}", e)))?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -397,16 +403,16 @@ pub async fn add_message(
     Path(session_id): Path<String>,
     Json(req): Json<AddMessageRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<MemoryMessage>>), ApiError> {
-    let message = state.db.add_agent_message(
-        &session_id,
-        &req.role,
-        &req.content,
-    ).map_err(|e| ApiError::internal(format!("Failed to add message: {}", e)))?;
+    let message = state
+        .db
+        .add_agent_message(&session_id, &req.role, &req.content)
+        .map_err(|e| ApiError::internal(format!("Failed to add message: {}", e)))?;
 
     // Parse function_call JSON string if present
-    let function_call = message.function_call.as_ref().and_then(|fc_str| {
-        serde_json::from_str::<FunctionCall>(fc_str).ok()
-    });
+    let function_call = message
+        .function_call
+        .as_ref()
+        .and_then(|fc_str| serde_json::from_str::<FunctionCall>(fc_str).ok());
 
     // Convert metadata to HashMap
     let metadata = if let serde_json::Value::Object(map) = message.metadata {
@@ -416,14 +422,19 @@ pub async fn add_message(
     };
 
     // Parse tool_calls if present
-    let tool_calls = message.tool_calls.as_ref().and_then(|tc_val| {
-        serde_json::from_value::<Vec<ToolCall>>(tc_val.clone()).ok()
-    });
+    let tool_calls = message
+        .tool_calls
+        .as_ref()
+        .and_then(|tc_val| serde_json::from_value::<Vec<ToolCall>>(tc_val.clone()).ok());
 
     let response = MemoryMessage {
         role: message.role,
         content: message.content,
-        name: if message.name.is_empty() { None } else { Some(message.name) },
+        name: if message.name.is_empty() {
+            None
+        } else {
+            Some(message.name)
+        },
         function_call,
         tool_calls,
         metadata,
@@ -442,17 +453,19 @@ pub async fn add_messages(
     // Note: add_agent_messages_batch doesn't exist, so we'll add them one by one
     let mut count = 0;
     for msg in &req.messages {
-        let _ = state.db.add_agent_message(
-            &session_id,
-            &msg.role,
-            &msg.content,
-        ).map_err(|e| ApiError::internal(format!("Failed to add message: {}", e)))?;
+        let _ = state
+            .db
+            .add_agent_message(&session_id, &msg.role, &msg.content)
+            .map_err(|e| ApiError::internal(format!("Failed to add message: {}", e)))?;
         count += 1;
     }
 
-    Ok((StatusCode::CREATED, Json(ApiResponse::success(serde_json::json!({
-        "added_count": count,
-    })))))
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::success(serde_json::json!({
+            "added_count": count,
+        }))),
+    ))
 }
 
 /// Get messages from session
@@ -461,17 +474,19 @@ pub async fn get_messages(
     Path(session_id): Path<String>,
     Query(query): Query<GetMessagesQuery>,
 ) -> Result<Json<ApiResponse<Vec<MemoryMessage>>>, ApiError> {
-    let messages = state.db.get_agent_messages(
-        &session_id,
-    ).map_err(|e| ApiError::internal(format!("Failed to get messages: {}", e)))?;
+    let messages = state
+        .db
+        .get_agent_messages(&session_id)
+        .map_err(|e| ApiError::internal(format!("Failed to get messages: {}", e)))?;
 
     let response: Vec<MemoryMessage> = messages
         .into_iter()
         .map(|m| {
             // Parse function_call JSON string if present
-            let function_call = m.function_call.as_ref().and_then(|fc_str| {
-                serde_json::from_str::<FunctionCall>(fc_str).ok()
-            });
+            let function_call = m
+                .function_call
+                .as_ref()
+                .and_then(|fc_str| serde_json::from_str::<FunctionCall>(fc_str).ok());
 
             // Convert metadata to HashMap
             let metadata = if let serde_json::Value::Object(map) = m.metadata {
@@ -481,9 +496,10 @@ pub async fn get_messages(
             };
 
             // Parse tool_calls if present
-            let tool_calls = m.tool_calls.as_ref().and_then(|tc_val| {
-                serde_json::from_value::<Vec<ToolCall>>(tc_val.clone()).ok()
-            });
+            let tool_calls = m
+                .tool_calls
+                .as_ref()
+                .and_then(|tc_val| serde_json::from_value::<Vec<ToolCall>>(tc_val.clone()).ok());
 
             MemoryMessage {
                 role: m.role,
@@ -506,19 +522,20 @@ pub async fn search_memory(
     Path(session_id): Path<String>,
     Json(req): Json<SearchMemoryRequest>,
 ) -> Result<Json<ApiResponse<Vec<MemorySearchResult>>>, ApiError> {
-    let raw_results = state.db.search_agent_memory(
-        &session_id,
-        &req.query,
-    ).map_err(|e| ApiError::internal(format!("Memory search failed: {}", e)))?;
+    let raw_results = state
+        .db
+        .search_agent_memory(&session_id, &req.query)
+        .map_err(|e| ApiError::internal(format!("Memory search failed: {}", e)))?;
 
     let response: Vec<MemorySearchResult> = raw_results
         .into_iter()
         .enumerate()
         .map(|(index, (msg, score))| {
             // Parse function_call JSON string if present
-            let function_call = msg.function_call.as_ref().and_then(|fc_str| {
-                serde_json::from_str::<FunctionCall>(fc_str).ok()
-            });
+            let function_call = msg
+                .function_call
+                .as_ref()
+                .and_then(|fc_str| serde_json::from_str::<FunctionCall>(fc_str).ok());
 
             // Convert metadata to HashMap
             let metadata = if let serde_json::Value::Object(map) = msg.metadata {
@@ -528,9 +545,10 @@ pub async fn search_memory(
             };
 
             // Parse tool_calls if present
-            let tool_calls = msg.tool_calls.as_ref().and_then(|tc_val| {
-                serde_json::from_value::<Vec<ToolCall>>(tc_val.clone()).ok()
-            });
+            let tool_calls = msg
+                .tool_calls
+                .as_ref()
+                .and_then(|tc_val| serde_json::from_value::<Vec<ToolCall>>(tc_val.clone()).ok());
 
             MemorySearchResult {
                 message: MemoryMessage {
@@ -557,9 +575,10 @@ pub async fn summarize_memory(
     Path(session_id): Path<String>,
     Json(_req): Json<SummarizeRequest>,
 ) -> Result<Json<ApiResponse<SummaryResponse>>, ApiError> {
-    let summary = state.db.summarize_agent_memory(
-        &session_id,
-    ).map_err(|e| ApiError::internal(format!("Summarization failed: {}", e)))?;
+    let summary = state
+        .db
+        .summarize_agent_memory(&session_id)
+        .map_err(|e| ApiError::internal(format!("Summarization failed: {}", e)))?;
 
     Ok(Json(ApiResponse::success(SummaryResponse {
         summary,
@@ -575,9 +594,10 @@ pub async fn get_context(
     Path(session_id): Path<String>,
     Json(_req): Json<GetContextRequest>,
 ) -> Result<Json<ApiResponse<ContextResponse>>, ApiError> {
-    let _result = state.db.get_agent_context(
-        &session_id,
-    ).map_err(|e| ApiError::internal(format!("Failed to get context: {}", e)))?;
+    let _result = state
+        .db
+        .get_agent_context(&session_id)
+        .map_err(|e| ApiError::internal(format!("Failed to get context: {}", e)))?;
 
     // Since get_agent_context returns serde_json::Value, we can't reliably parse it
     // For now, return an empty context
@@ -595,13 +615,12 @@ pub async fn fork_session(
     Path(session_id): Path<String>,
     Json(req): Json<ForkSessionRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<SessionInfo>>), ApiError> {
-    let new_session_id = req.new_session_id
-        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let new_session_id = req.new_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
-    let session = state.db.fork_agent_session(
-        &session_id,
-        &new_session_id,
-    ).map_err(|e| ApiError::internal(format!("Failed to fork session: {}", e)))?;
+    let session = state
+        .db
+        .fork_agent_session(&session_id, &new_session_id)
+        .map_err(|e| ApiError::internal(format!("Failed to fork session: {}", e)))?;
 
     // Convert metadata
     let metadata = match session.metadata {
@@ -627,9 +646,10 @@ pub async fn clear_messages(
     Path(session_id): Path<String>,
     Json(req): Json<ClearMessagesRequest>,
 ) -> Result<Json<ApiResponse<serde_json::Value>>, ApiError> {
-    state.db.clear_agent_messages(
-        &session_id,
-    ).map_err(|e| ApiError::internal(format!("Failed to clear messages: {}", e)))?;
+    state
+        .db
+        .clear_agent_messages(&session_id)
+        .map_err(|e| ApiError::internal(format!("Failed to clear messages: {}", e)))?;
     let deleted = 0;
 
     Ok(Json(ApiResponse::success(serde_json::json!({

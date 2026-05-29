@@ -5,17 +5,17 @@
 //!
 //! v3.1.0: Enhanced with session-aware locking and isolation level support
 
-use super::{Key, Snapshot, SnapshotId};
-use super::time_travel::SnapshotManager;
-use super::lock_manager::{LockManager, LockType, LockGuard};
 use super::dirty_tracker::DirtyTracker;
+use super::lock_manager::{LockGuard, LockManager, LockType};
+use super::time_travel::SnapshotManager;
+use super::{Key, Snapshot, SnapshotId};
+use crate::session::{IsolationLevel, SessionId};
 use crate::{Error, Result, Tuple};
-use crate::session::{SessionId, IsolationLevel};
-use rocksdb::DB;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU8, Ordering};
 use dashmap::DashMap;
 use parking_lot::RwLock;
+use rocksdb::DB;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
 /// Transaction state
@@ -87,6 +87,12 @@ pub struct Transaction {
     acquired_locks: Arc<RwLock<Vec<LockGuard>>>,
     /// Dirty tracker for dump operations
     dirty_tracker: Option<Arc<DirtyTracker>>,
+    /// Whether to emit MVCC version-history keys (`v:` / `v_idx:`) at commit.
+    /// Mirrors `StorageConfig::time_travel_enabled`. When false, commit writes
+    /// only the `data:` key per row (no version value + index, no double
+    /// serialization) — for read-committed workloads that don't need
+    /// AS OF / snapshot-history reads.
+    versioning_enabled: bool,
 }
 
 impl Transaction {
@@ -114,7 +120,14 @@ impl Transaction {
             lock_manager: None,
             acquired_locks: Arc::new(RwLock::new(Vec::new())),
             dirty_tracker: None,
+            versioning_enabled: true,
         })
+    }
+
+    /// Enable/disable MVCC version-history emission at commit (see field docs).
+    /// Set by the engine from `StorageConfig::time_travel_enabled`.
+    pub fn set_versioning_enabled(&mut self, enabled: bool) {
+        self.versioning_enabled = enabled;
     }
 
     /// Create a new transaction with session and lock manager support
@@ -151,6 +164,7 @@ impl Transaction {
             lock_manager: Some(lock_manager),
             acquired_locks: Arc::new(RwLock::new(Vec::new())),
             dirty_tracker: Some(dirty_tracker),
+            versioning_enabled: true,
         })
     }
 
@@ -216,13 +230,14 @@ impl Transaction {
         const DATA_PREFIX: &[u8] = b"data:";
         if !key.starts_with(DATA_PREFIX) {
             // Not a versioned data key, fallback to simple read
-            return self.db.get(key)
+            return self
+                .db
+                .get(key)
                 .map_err(|e| Error::storage(format!("Transaction get failed: {}", e)));
         }
 
         // Parse key with minimal allocations
-        let key_str = std::str::from_utf8(key)
-            .map_err(|e| Error::storage(format!("Invalid key encoding: {}", e)))?;
+        let key_str = std::str::from_utf8(key).map_err(|e| Error::storage(format!("Invalid key encoding: {}", e)))?;
 
         // Manual parsing without allocation - skip "data:" prefix
         let rest = &key_str[5..];
@@ -232,7 +247,9 @@ impl Transaction {
             Some(pos) => pos,
             None => {
                 // Invalid format, fallback to simple read
-                return self.db.get(key)
+                return self
+                    .db
+                    .get(key)
                     .map_err(|e| Error::storage(format!("Transaction get failed: {}", e)));
             }
         };
@@ -245,7 +262,9 @@ impl Transaction {
             Ok(id) => id,
             Err(_) => {
                 // Invalid row ID format, fallback to simple read
-                return self.db.get(key)
+                return self
+                    .db
+                    .get(key)
                     .map_err(|e| Error::storage(format!("Transaction get failed: {}", e)));
             }
         };
@@ -405,10 +424,7 @@ impl Transaction {
         );
 
         if current.is_err() {
-            warn!(
-                txn_id = self.transaction_id,
-                "Commit failed: transaction not active"
-            );
+            warn!(txn_id = self.transaction_id, "Commit failed: transaction not active");
             return Err(Error::transaction("Transaction is not active"));
         }
 
@@ -424,9 +440,14 @@ impl Transaction {
                 Some(val) => {
                     batch.put(key, val);
 
-                    // Create version index for snapshot reads
-                    if let Ok(key_str) = std::str::from_utf8(key) {
-                        if key_str.starts_with("data:") {
+                    // Create version history (value + reverse-ts index) for AS OF /
+                    // snapshot-history reads. P0#1: skip entirely when versioning is
+                    // disabled — saves 2 extra keys/row and a second serialization of
+                    // the row value. Read-committed reads use the `data:` key directly,
+                    // so they are unaffected.
+                    if self.versioning_enabled {
+                        if let Ok(key_str) = std::str::from_utf8(key) {
+                            if key_str.starts_with("data:") {
                             let rest = &key_str[5..];
                             if let Some(colon_pos) = rest.find(':') {
                                 let table_name = &rest[..colon_pos];
@@ -438,15 +459,11 @@ impl Transaction {
                                     batch.put(v_key.as_bytes(), val);
 
                                     // Create version index entry with BIG ENDIAN commit timestamp
-                                    let v_idx_key = format!(
-                                        "v_idx:{}:{}:{:020}",
-                                        table_name,
-                                        row_id_str,
-                                        reverse_ts
-                                    );
+                                    let v_idx_key = format!("v_idx:{}:{}:{:020}", table_name, row_id_str, reverse_ts);
                                     let ts_bytes = commit_ts.to_be_bytes();
                                     batch.put(v_idx_key.as_bytes(), ts_bytes);
                                 }
+                            }
                             }
                         }
                     }
@@ -525,10 +542,7 @@ impl Transaction {
         );
 
         if current.is_err() {
-            warn!(
-                txn_id = self.transaction_id,
-                "Rollback failed: transaction not active"
-            );
+            warn!(txn_id = self.transaction_id, "Rollback failed: transaction not active");
             return Err(Error::transaction("Transaction is not active"));
         }
 
@@ -539,10 +553,7 @@ impl Transaction {
         // Clear write set (DashMap handles concurrency)
         self.write_set.clear();
 
-        debug!(
-            txn_id = self.transaction_id,
-            "Transaction rolled back successfully"
-        );
+        debug!(txn_id = self.transaction_id, "Transaction rolled back successfully");
 
         Ok(())
     }
@@ -591,15 +602,10 @@ impl Transaction {
     /// * `snapshot` - The write set snapshot captured at savepoint creation time
     pub fn rollback_to_savepoint(&self, snapshot: &[(Key, Option<Vec<u8>>)]) {
         // Build a set of keys that existed at savepoint time for quick lookup
-        let snapshot_keys: std::collections::HashSet<&Key> = snapshot.iter()
-            .map(|(k, _)| k)
-            .collect();
+        let snapshot_keys: std::collections::HashSet<&Key> = snapshot.iter().map(|(k, _)| k).collect();
 
         // Remove keys that were added after the savepoint
-        let current_keys: Vec<Key> = self.write_set
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
+        let current_keys: Vec<Key> = self.write_set.iter().map(|entry| entry.key().clone()).collect();
 
         for key in &current_keys {
             if !snapshot_keys.contains(key) {
@@ -619,10 +625,10 @@ impl Transaction {
     /// It replaces tuples with newer versions in the write set and adds new tuples.
     pub fn merge_with_write_set(&self, table_name: &str, mut tuples: Vec<Tuple>) -> Result<Vec<Tuple>> {
         let prefix = format!("data:{}:", table_name);
-        
+
         // Track which row IDs we've already handled from the base set
         let mut handled_row_ids = std::collections::HashSet::new();
-        
+
         // 1. Update existing tuples from write set and handle tombstones
         let mut i = 0;
         while i < tuples.len() {
@@ -656,7 +662,7 @@ impl Transaction {
                 i += 1;
             }
         }
-        
+
         // 2. Add new tuples from write set that weren't in the base set
         for entry in self.write_set.iter() {
             let key = entry.key();
@@ -675,83 +681,68 @@ impl Transaction {
                 }
             }
         }
-        
+
         Ok(tuples)
     }
-
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::Config;
     use crate::storage::StorageEngine;
+    use crate::Config;
 
     #[test]
     fn test_transaction_commit() {
         let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
 
-        let tx = engine.begin_transaction()
-            .expect("Failed to begin transaction");
+        let tx = engine.begin_transaction().expect("Failed to begin transaction");
 
         let key = b"test_key".to_vec();
         let value = b"test_value".to_vec();
 
-        tx.put(key.clone(), value.clone())
-            .expect("Failed to put value");
-        tx.commit()
-            .expect("Failed to commit transaction");
+        tx.put(key.clone(), value.clone()).expect("Failed to put value");
+        tx.commit().expect("Failed to commit transaction");
 
         // Verify committed
-        let result = engine.get(&key)
-            .expect("Failed to get value");
+        let result = engine.get(&key).expect("Failed to get value");
         assert_eq!(result, Some(value));
     }
 
     #[test]
     fn test_transaction_rollback() {
         let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
 
-        let tx = engine.begin_transaction()
-            .expect("Failed to begin transaction");
+        let tx = engine.begin_transaction().expect("Failed to begin transaction");
 
         let key = b"test_key".to_vec();
         let value = b"test_value".to_vec();
 
-        tx.put(key.clone(), value.clone())
-            .expect("Failed to put value");
-        tx.rollback()
-            .expect("Failed to rollback transaction");
+        tx.put(key.clone(), value.clone()).expect("Failed to put value");
+        tx.rollback().expect("Failed to rollback transaction");
 
         // Verify not committed
-        let result = engine.get(&key)
-            .expect("Failed to get value");
+        let result = engine.get(&key).expect("Failed to get value");
         assert_eq!(result, None);
     }
 
     #[test]
     fn test_read_your_own_writes() {
         let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
 
-        let tx = engine.begin_transaction()
-            .expect("Failed to begin transaction");
+        let tx = engine.begin_transaction().expect("Failed to begin transaction");
 
         let key = b"test_key".to_vec();
         let value = b"test_value".to_vec();
 
-        tx.put(key.clone(), value.clone())
-            .expect("Failed to put value");
+        tx.put(key.clone(), value.clone()).expect("Failed to put value");
 
         // Should see own writes before commit
-        let result = tx.get(&key)
-            .expect("Failed to get value");
+        let result = tx.get(&key).expect("Failed to get value");
         assert_eq!(result, Some(value));
     }
 
@@ -760,8 +751,7 @@ mod tests {
         use crate::{Column, DataType, Schema, Tuple, Value};
 
         let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
 
         // Create a test table
         let schema = Schema {
@@ -792,15 +782,21 @@ mod tests {
         };
 
         let catalog = engine.catalog();
-        catalog.create_table("mvcc_test", schema)
+        catalog
+            .create_table("mvcc_test", schema)
             .expect("Failed to create table");
 
         // Insert initial data and create version
-        let row_id = engine.insert_tuple_versioned("mvcc_test", Tuple {
-            values: vec![Value::Int4(1), Value::String("initial".to_string())],
-            row_id: None,
-            branch_id: None,
-        }).expect("Failed to insert");
+        let row_id = engine
+            .insert_tuple_versioned(
+                "mvcc_test",
+                Tuple {
+                    values: vec![Value::Int4(1), Value::String("initial".to_string())],
+                    row_id: None,
+                    branch_id: None,
+                },
+            )
+            .expect("Failed to insert");
 
         let version1_ts = engine.current_timestamp();
 
@@ -813,13 +809,14 @@ mod tests {
             values: vec![Value::Int4(1), Value::String("version1".to_string())],
             row_id: None,
             branch_id: None,
-        }).expect("Failed to serialize");
-        snapshot_mgr.write_version("mvcc_test", row_id, version1_ts, &value1)
+        })
+        .expect("Failed to serialize");
+        snapshot_mgr
+            .write_version("mvcc_test", row_id, version1_ts, &value1)
             .expect("Failed to write version 1");
 
         // Start transaction 1 at this snapshot
-        let tx1 = engine.begin_transaction()
-            .expect("Failed to begin tx1");
+        let tx1 = engine.begin_transaction().expect("Failed to begin tx1");
 
         // Update to version 2 (after tx1 started)
         let version2_ts = engine.current_timestamp();
@@ -827,25 +824,23 @@ mod tests {
             values: vec![Value::Int4(1), Value::String("version2".to_string())],
             row_id: None,
             branch_id: None,
-        }).expect("Failed to serialize");
-        snapshot_mgr.write_version("mvcc_test", row_id, version2_ts, &value2)
+        })
+        .expect("Failed to serialize");
+        snapshot_mgr
+            .write_version("mvcc_test", row_id, version2_ts, &value2)
             .expect("Failed to write version 2");
 
         // tx1 should still see version1 (snapshot isolation)
-        let result = tx1.get(&key1)
-            .expect("Failed to read in tx1");
+        let result = tx1.get(&key1).expect("Failed to read in tx1");
         assert!(result.is_some(), "tx1 should see version1");
 
         // Start transaction 2 at current snapshot (should see version2)
-        let tx2 = engine.begin_transaction()
-            .expect("Failed to begin tx2");
-        let result2 = tx2.get(&key1)
-            .expect("Failed to read in tx2");
+        let tx2 = engine.begin_transaction().expect("Failed to begin tx2");
+        let result2 = tx2.get(&key1).expect("Failed to read in tx2");
         assert!(result2.is_some(), "tx2 should see version2");
 
         // Verify isolation: tx1 still sees version1 even after tx2 started
-        let result_again = tx1.get(&key1)
-            .expect("Failed to read in tx1 again");
+        let result_again = tx1.get(&key1).expect("Failed to read in tx1 again");
         assert_eq!(result, result_again, "tx1 should see consistent snapshot");
     }
 
@@ -854,36 +849,39 @@ mod tests {
         use crate::{Column, DataType, Schema, Tuple, Value};
 
         let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
 
         // Create table
         let schema = Schema {
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: true,
-                    source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: crate::ColumnStorageMode::Default,
-                },
-            ],
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
+            }],
         };
 
         let catalog = engine.catalog();
-        catalog.create_table("concurrent_test", schema)
+        catalog
+            .create_table("concurrent_test", schema)
             .expect("Failed to create table");
 
         // Insert data
-        let row_id = engine.insert_tuple_versioned("concurrent_test", Tuple {
-            values: vec![Value::Int4(1)],
-            row_id: None,
-            branch_id: None,
-        }).expect("Failed to insert");
+        let row_id = engine
+            .insert_tuple_versioned(
+                "concurrent_test",
+                Tuple {
+                    values: vec![Value::Int4(1)],
+                    row_id: None,
+                    branch_id: None,
+                },
+            )
+            .expect("Failed to insert");
 
         let ts1 = engine.current_timestamp();
         let snapshot_mgr = engine.snapshot_manager();
@@ -893,8 +891,10 @@ mod tests {
             values: vec![Value::Int4(100)],
             row_id: None,
             branch_id: None,
-        }).expect("Failed to serialize");
-        snapshot_mgr.write_version("concurrent_test", row_id, ts1, &value)
+        })
+        .expect("Failed to serialize");
+        snapshot_mgr
+            .write_version("concurrent_test", row_id, ts1, &value)
             .expect("Failed to write version");
 
         // Multiple concurrent transactions reading at same snapshot
@@ -919,36 +919,39 @@ mod tests {
         use crate::{Column, DataType, Schema, Tuple, Value};
 
         let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
 
         // Create table
         let schema = Schema {
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: true,
-                    source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: crate::ColumnStorageMode::Default,
-                },
-            ],
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
+            }],
         };
 
         let catalog = engine.catalog();
-        catalog.create_table("delete_test", schema)
+        catalog
+            .create_table("delete_test", schema)
             .expect("Failed to create table");
 
         // Insert and version data
-        let row_id = engine.insert_tuple_versioned("delete_test", Tuple {
-            values: vec![Value::Int4(1)],
-            row_id: None,
-            branch_id: None,
-        }).expect("Failed to insert");
+        let row_id = engine
+            .insert_tuple_versioned(
+                "delete_test",
+                Tuple {
+                    values: vec![Value::Int4(1)],
+                    row_id: None,
+                    branch_id: None,
+                },
+            )
+            .expect("Failed to insert");
 
         let ts1 = engine.current_timestamp();
         let snapshot_mgr = engine.snapshot_manager();
@@ -957,8 +960,10 @@ mod tests {
             values: vec![Value::Int4(42)],
             row_id: None,
             branch_id: None,
-        }).expect("Failed to serialize");
-        snapshot_mgr.write_version("delete_test", row_id, ts1, &value)
+        })
+        .expect("Failed to serialize");
+        snapshot_mgr
+            .write_version("delete_test", row_id, ts1, &value)
             .expect("Failed to write version");
 
         // Start tx1 (should see the row)
@@ -976,11 +981,9 @@ mod tests {
     #[test]
     fn test_mvcc_read_at_version_parsing() {
         let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
 
-        let tx = engine.begin_transaction()
-            .expect("Failed to begin transaction");
+        let tx = engine.begin_transaction().expect("Failed to begin transaction");
 
         // Test non-versioned key (should fallback to simple read)
         let meta_key = b"meta:some_key".to_vec();

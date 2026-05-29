@@ -101,11 +101,13 @@ pub fn detect_with_context(sql: &str) -> Option<(String, WithContextOptions)> {
 
 fn find_toplevel(lower: &str, original: &str, needle: &str) -> Option<usize> {
     let bytes = original.as_bytes();
+    let lower_bytes = lower.as_bytes();
+    let needle_bytes = needle.as_bytes();
     let mut depth = 0i32;
     let mut in_str = false;
     let mut i = 0;
     let mut last_hit: Option<usize> = None;
-    while i + needle.len() <= bytes.len() {
+    while i + needle_bytes.len() <= bytes.len() {
         let b = bytes[i];
         if in_str {
             if b == b'\'' {
@@ -122,13 +124,12 @@ fn find_toplevel(lower: &str, original: &str, needle: &str) -> Option<usize> {
                 b')' => depth -= 1,
                 _ => {
                     if depth == 0 {
-                        let slice = &lower[i..i + needle.len()];
-                        if slice == needle {
+                        if lower_bytes.get(i..i + needle_bytes.len()) == Some(needle_bytes) {
                             let before_ok = i == 0 || {
                                 let c = bytes[i - 1];
                                 !c.is_ascii_alphanumeric() && c != b'_'
                             };
-                            let after_idx = i + needle.len();
+                            let after_idx = i + needle_bytes.len();
                             let after_ok = after_idx == bytes.len() || {
                                 let c = bytes[after_idx];
                                 !c.is_ascii_alphanumeric() && c != b'_'
@@ -221,11 +222,7 @@ fn split_top_commas(s: &str) -> Vec<&str> {
     out
 }
 
-fn strip_prefix_ci<'a>(
-    original: &'a str,
-    lower: &str,
-    prefix: &str,
-) -> Option<&'a str> {
+fn strip_prefix_ci<'a>(original: &'a str, lower: &str, prefix: &str) -> Option<&'a str> {
     if lower.starts_with(prefix) {
         let after = &original[prefix.len()..];
         // Require a space or `=` between key and value.
@@ -369,12 +366,7 @@ fn load_hit(db: &EmbeddedDatabase, node_id: i64) -> Result<Option<GraphRagHit>> 
     }))
 }
 
-fn fetch_peers(
-    db: &EmbeddedDatabase,
-    seed: i64,
-    direction: Direction,
-    kinds: &[String],
-) -> Result<Vec<i64>> {
+fn fetch_peers(db: &EmbeddedDatabase, seed: i64, direction: Direction, kinds: &[String]) -> Result<Vec<i64>> {
     let kind_filter = if kinds.is_empty() {
         String::new()
     } else {
@@ -413,10 +405,7 @@ fn fetch_peers(
 
 /// Silence the unused `graph_rag_search` re-export when `WITH CONTEXT`
 /// is live but a caller does not also use the typed search API.
-pub fn _graph_rag_search_typed_link(
-    db: &EmbeddedDatabase,
-    opts: &GraphRagOptions,
-) -> Result<Vec<GraphRagHit>> {
+pub fn _graph_rag_search_typed_link(db: &EmbeddedDatabase, opts: &GraphRagOptions) -> Result<Vec<GraphRagHit>> {
     graph_rag_search(db, opts)
 }
 
@@ -467,5 +456,14 @@ mod tests {
     fn detect_ignores_with_context_inside_string() {
         let sql = "SELECT 'WITH CONTEXT (HOPS 9)' FROM t";
         assert!(detect_with_context(sql).is_none());
+    }
+
+    #[test]
+    fn detect_handles_multibyte_before_clause() {
+        let sql = "SELECT 'a—b' AS label FROM _hdb_graph_nodes WITH CONTEXT (HOPS 1)";
+        let (stripped, opts) = detect_with_context(sql).unwrap();
+        assert_eq!(opts.hops, 1);
+        assert!(stripped.contains("'a—b'"));
+        assert!(!stripped.contains("WITH CONTEXT"));
     }
 }

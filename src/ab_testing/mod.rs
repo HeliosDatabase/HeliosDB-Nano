@@ -30,14 +30,14 @@
 //!
 //! Requires `ha-ab-testing` feature to be enabled.
 
-pub mod router;
 pub mod experiment;
 pub mod metrics;
+pub mod router;
 
 // Re-exports
-pub use router::{ABRouter, Assignment, UserContext};
 pub use experiment::{Experiment, ExperimentConfig, ExperimentState};
-pub use metrics::{ABMetrics, ExperimentMetrics, BranchMetrics};
+pub use metrics::{ABMetrics, BranchMetrics, ExperimentMetrics};
+pub use router::{ABRouter, Assignment, UserContext};
 
 use thiserror::Error;
 use uuid::Uuid;
@@ -132,24 +132,12 @@ impl ABTesting {
     }
 
     /// Record a query for metrics
-    pub async fn record_query(
-        &self,
-        experiment: &str,
-        branch: &str,
-        latency_ms: f64,
-        success: bool,
-    ) {
+    pub async fn record_query(&self, experiment: &str, branch: &str, latency_ms: f64, success: bool) {
         self.metrics.record_query(experiment, branch, latency_ms, success).await;
     }
 
     /// Record a custom event
-    pub async fn record_event(
-        &self,
-        experiment: &str,
-        branch: &str,
-        event_name: &str,
-        value: f64,
-    ) {
+    pub async fn record_event(&self, experiment: &str, branch: &str, event_name: &str, value: f64) {
         self.metrics.record_event(experiment, branch, event_name, value).await;
     }
 
@@ -161,7 +149,10 @@ impl ABTesting {
     /// Get overall A/B testing statistics
     pub async fn stats(&self) -> ABStats {
         let experiments = self.router.list_experiments().await;
-        let active = experiments.iter().filter(|e| e.state == ExperimentState::Active).count();
+        let active = experiments
+            .iter()
+            .filter(|e| e.state == ExperimentState::Active)
+            .count();
 
         ABStats {
             total_experiments: experiments.len(),
@@ -203,10 +194,7 @@ mod tests {
         let ab = ABTesting::new();
 
         // Create experiment
-        let exp = Experiment::new(
-            "test_exp",
-            vec!["control".to_string(), "treatment".to_string()],
-        );
+        let exp = Experiment::new("test_exp", vec!["control".to_string(), "treatment".to_string()]);
 
         let id = ab.create_experiment(exp).await.unwrap();
         assert!(!id.is_nil());

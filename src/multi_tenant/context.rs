@@ -2,13 +2,13 @@
 //!
 //! Request-scoped tenant context for multi-tenant operations.
 
+use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
-use serde::{Deserialize, Serialize};
 
-use super::{Tenant, TenantManager, TenantError, TenantStatus};
+use super::{Tenant, TenantError, TenantManager, TenantStatus};
 
 thread_local! {
     static CURRENT_TENANT: RefCell<Option<TenantContext>> = const { RefCell::new(None) };
@@ -310,8 +310,12 @@ impl TenantResolver {
             return Err(TenantError::InvalidId("Invalid API key format".to_string()));
         }
 
-        let tenant_id = parts.first().ok_or_else(|| TenantError::InvalidId("Invalid API key format".to_string()))?;
-        let tenant = self.manager.get_tenant(tenant_id)
+        let tenant_id = parts
+            .first()
+            .ok_or_else(|| TenantError::InvalidId("Invalid API key format".to_string()))?;
+        let tenant = self
+            .manager
+            .get_tenant(tenant_id)
             .ok_or_else(|| TenantError::NotFound(tenant_id.to_string()))?;
 
         if tenant.status != TenantStatus::Active && tenant.status != TenantStatus::Trial {
@@ -327,8 +331,7 @@ impl TenantResolver {
     /// Resolve tenant from JWT token
     pub fn resolve_from_jwt(&self, token: &str) -> Result<TenantContext, TenantError> {
         // Parse JWT header to determine algorithm
-        let header = decode_header(token)
-            .map_err(|e| TenantError::InvalidId(format!("Invalid JWT header: {}", e)))?;
+        let header = decode_header(token).map_err(|e| TenantError::InvalidId(format!("Invalid JWT header: {}", e)))?;
 
         // Build validation configuration
         let mut validation = Validation::new(header.alg);
@@ -355,9 +358,13 @@ impl TenantResolver {
         let claims = token_data.claims;
 
         // Extract tenant ID from claims
-        let tenant_id = claims.tenant_id.clone()
+        let tenant_id = claims
+            .tenant_id
+            .clone()
             .or_else(|| {
-                claims.custom.get(&self.jwt_config.tenant_id_claim)
+                claims
+                    .custom
+                    .get(&self.jwt_config.tenant_id_claim)
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string())
             })
@@ -371,7 +378,9 @@ impl TenantResolver {
             .ok_or_else(|| TenantError::InvalidId("No tenant ID in JWT claims".to_string()))?;
 
         // Get tenant
-        let tenant = self.manager.get_tenant(&tenant_id)
+        let tenant = self
+            .manager
+            .get_tenant(&tenant_id)
             .ok_or_else(|| TenantError::NotFound(tenant_id.clone()))?;
 
         if tenant.status != TenantStatus::Active && tenant.status != TenantStatus::Trial {
@@ -382,10 +391,14 @@ impl TenantResolver {
         let user_id = claims.sub.clone();
 
         // Extract role
-        let role = claims.role.as_ref()
+        let role = claims
+            .role
+            .as_ref()
             .map(|r| TenantRole::from(r.as_str()))
             .or_else(|| {
-                claims.custom.get(&self.jwt_config.role_claim)
+                claims
+                    .custom
+                    .get(&self.jwt_config.role_claim)
                     .and_then(|v| v.as_str())
                     .map(|s| TenantRole::from(s))
             })
@@ -395,8 +408,7 @@ impl TenantResolver {
         self.manager.touch(&tenant_id);
 
         // Build context
-        let mut ctx = TenantContext::new(tenant, user_id, role)
-            .with_jwt_claims(claims.clone());
+        let mut ctx = TenantContext::new(tenant, user_id, role).with_jwt_claims(claims.clone());
 
         if let Some(ref email) = claims.email {
             ctx = ctx.with_email(email.clone());
@@ -409,41 +421,53 @@ impl TenantResolver {
     fn get_decoding_key(&self, algorithm: &Algorithm) -> Result<DecodingKey, TenantError> {
         match algorithm {
             Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
-                let secret = self.jwt_config.secret.as_ref()
+                let secret = self
+                    .jwt_config
+                    .secret
+                    .as_ref()
                     .ok_or_else(|| TenantError::InvalidId("JWT secret not configured".to_string()))?;
                 Ok(DecodingKey::from_secret(secret.as_bytes()))
             }
             Algorithm::RS256 | Algorithm::RS384 | Algorithm::RS512 => {
-                let key = self.jwt_config.public_key.as_ref()
+                let key = self
+                    .jwt_config
+                    .public_key
+                    .as_ref()
                     .ok_or_else(|| TenantError::InvalidId("RSA public key not configured".to_string()))?;
 
                 // Try PEM format first
-                DecodingKey::from_rsa_pem(key.as_bytes())
-                    .or_else(|_| {
-                        // Try DER format
-                        let der_bytes = base64::Engine::decode(
-                            &base64::engine::general_purpose::STANDARD,
-                            key
-                        ).map_err(|_| TenantError::InvalidId("Invalid RSA key format".to_string()))?;
-                        // from_rsa_der returns DecodingKey directly in jsonwebtoken 9.x
-                        Ok(DecodingKey::from_rsa_der(&der_bytes))
-                    })
+                DecodingKey::from_rsa_pem(key.as_bytes()).or_else(|_| {
+                    // Try DER format
+                    let der_bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, key)
+                        .map_err(|_| TenantError::InvalidId("Invalid RSA key format".to_string()))?;
+                    // from_rsa_der returns DecodingKey directly in jsonwebtoken 9.x
+                    Ok(DecodingKey::from_rsa_der(&der_bytes))
+                })
             }
             Algorithm::ES256 | Algorithm::ES384 => {
-                let key = self.jwt_config.public_key.as_ref()
+                let key = self
+                    .jwt_config
+                    .public_key
+                    .as_ref()
                     .ok_or_else(|| TenantError::InvalidId("EC public key not configured".to_string()))?;
 
                 DecodingKey::from_ec_pem(key.as_bytes())
                     .map_err(|e| TenantError::InvalidId(format!("Invalid EC key: {}", e)))
             }
             Algorithm::EdDSA => {
-                let key = self.jwt_config.public_key.as_ref()
+                let key = self
+                    .jwt_config
+                    .public_key
+                    .as_ref()
                     .ok_or_else(|| TenantError::InvalidId("EdDSA public key not configured".to_string()))?;
 
                 DecodingKey::from_ed_pem(key.as_bytes())
                     .map_err(|e| TenantError::InvalidId(format!("Invalid EdDSA key: {}", e)))
             }
-            _ => Err(TenantError::InvalidId(format!("Unsupported algorithm: {:?}", algorithm))),
+            _ => Err(TenantError::InvalidId(format!(
+                "Unsupported algorithm: {:?}",
+                algorithm
+            ))),
         }
     }
 
@@ -455,8 +479,12 @@ impl TenantResolver {
             return Err(TenantError::InvalidId("Cannot determine tenant from host".to_string()));
         }
 
-        let tenant_id = parts.first().ok_or_else(|| TenantError::InvalidId("Cannot determine tenant from host".to_string()))?;
-        let tenant = self.manager.get_tenant(tenant_id)
+        let tenant_id = parts
+            .first()
+            .ok_or_else(|| TenantError::InvalidId("Cannot determine tenant from host".to_string()))?;
+        let tenant = self
+            .manager
+            .get_tenant(tenant_id)
             .ok_or_else(|| TenantError::NotFound(tenant_id.to_string()))?;
 
         Ok(TenantContext::new(tenant, None, TenantRole::Anonymous))
@@ -471,8 +499,12 @@ impl TenantResolver {
             return Err(TenantError::InvalidId("Invalid path format".to_string()));
         }
 
-        let tenant_id = parts.get(1).ok_or_else(|| TenantError::InvalidId("Invalid path format".to_string()))?;
-        let tenant = self.manager.get_tenant(tenant_id)
+        let tenant_id = parts
+            .get(1)
+            .ok_or_else(|| TenantError::InvalidId("Invalid path format".to_string()))?;
+        let tenant = self
+            .manager
+            .get_tenant(tenant_id)
             .ok_or_else(|| TenantError::NotFound(tenant_id.to_string()))?;
 
         Ok(TenantContext::new(tenant, None, TenantRole::Anonymous))
@@ -480,7 +512,9 @@ impl TenantResolver {
 
     /// Resolve tenant from request header
     pub fn resolve_from_header(&self, tenant_id: &str) -> Result<TenantContext, TenantError> {
-        let tenant = self.manager.get_tenant(tenant_id)
+        let tenant = self
+            .manager
+            .get_tenant(tenant_id)
             .ok_or_else(|| TenantError::NotFound(tenant_id.to_string()))?;
 
         if tenant.status != TenantStatus::Active && tenant.status != TenantStatus::Trial {
@@ -493,10 +527,19 @@ impl TenantResolver {
     }
 
     /// Create a JWT token for a tenant and user
-    pub fn create_jwt(&self, tenant_id: &str, user_id: &str, role: TenantRole, expires_in_secs: u64) -> Result<String, TenantError> {
+    pub fn create_jwt(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+        role: TenantRole,
+        expires_in_secs: u64,
+    ) -> Result<String, TenantError> {
         use jsonwebtoken::{encode, EncodingKey, Header};
 
-        let secret = self.jwt_config.secret.as_ref()
+        let secret = self
+            .jwt_config
+            .secret
+            .as_ref()
             .ok_or_else(|| TenantError::InvalidId("JWT secret not configured".to_string()))?;
 
         let now = std::time::SystemTime::now()
@@ -521,8 +564,7 @@ impl TenantResolver {
         let header = Header::new(self.jwt_config.algorithm);
         let key = EncodingKey::from_secret(secret.as_bytes());
 
-        encode(&header, &claims, &key)
-            .map_err(|e| TenantError::InvalidId(format!("Failed to create JWT: {}", e)))
+        encode(&header, &claims, &key).map_err(|e| TenantError::InvalidId(format!("Failed to create JWT: {}", e)))
     }
 }
 
@@ -600,9 +642,7 @@ impl TenantMiddleware {
                         continue;
                     }
                 }
-                ResolutionStrategy::Path => {
-                    self.resolver.resolve_from_path(&request.path)
-                }
+                ResolutionStrategy::Path => self.resolver.resolve_from_path(&request.path),
             };
 
             match result {
@@ -630,8 +670,13 @@ impl RequestInfo {
         Self {
             path: path.to_string(),
             host: headers.get("Host").cloned().or_else(|| headers.get("host").cloned()),
-            tenant_header: headers.get("X-Tenant-ID").cloned().or_else(|| headers.get("x-tenant-id").cloned()),
-            api_key: headers.get("X-API-Key").cloned()
+            tenant_header: headers
+                .get("X-Tenant-ID")
+                .cloned()
+                .or_else(|| headers.get("x-tenant-id").cloned()),
+            api_key: headers
+                .get("X-API-Key")
+                .cloned()
                 .or_else(|| headers.get("x-api-key").cloned()),
             jwt_token: Self::extract_jwt_token(headers),
         }
@@ -639,7 +684,8 @@ impl RequestInfo {
 
     /// Extract JWT token from headers
     fn extract_jwt_token(headers: &HashMap<String, String>) -> Option<String> {
-        headers.get("Authorization")
+        headers
+            .get("Authorization")
             .or_else(|| headers.get("authorization"))
             .and_then(|h| {
                 if let Some(token) = h.strip_prefix("Bearer ") {
@@ -697,7 +743,9 @@ mod tests {
         let resolver = Arc::new(TenantResolver::new(manager.clone()).with_jwt_config(jwt_config));
 
         // Create a JWT token
-        let token = resolver.create_jwt("test-tenant", "user123", TenantRole::Admin, 3600).unwrap();
+        let token = resolver
+            .create_jwt("test-tenant", "user123", TenantRole::Admin, 3600)
+            .unwrap();
 
         // Resolve tenant from JWT
         let ctx = resolver.resolve_from_jwt(&token).unwrap();
@@ -720,12 +768,13 @@ mod tests {
     #[test]
     fn test_middleware_resolution() {
         let manager = Arc::new(TenantManager::new("test"));
-        let _tenant = manager.create_tenant("tenant-abc", "ABC Corp", TenantPlan::Starter).unwrap();
+        let _tenant = manager
+            .create_tenant("tenant-abc", "ABC Corp", TenantPlan::Starter)
+            .unwrap();
         manager.update_status("tenant-abc", TenantStatus::Active).unwrap();
 
         let resolver = Arc::new(TenantResolver::new(manager));
-        let middleware = TenantMiddleware::new(resolver)
-            .with_strategies(vec![ResolutionStrategy::Header]);
+        let middleware = TenantMiddleware::new(resolver).with_strategies(vec![ResolutionStrategy::Header]);
 
         let request = RequestInfo {
             path: "/api/data".to_string(),
@@ -742,7 +791,9 @@ mod tests {
     #[test]
     fn test_api_key_resolution() {
         let manager = Arc::new(TenantManager::new("test"));
-        let _tenant = manager.create_tenant("api-tenant", "API Tenant", TenantPlan::Pro).unwrap();
+        let _tenant = manager
+            .create_tenant("api-tenant", "API Tenant", TenantPlan::Pro)
+            .unwrap();
         manager.update_status("api-tenant", TenantStatus::Active).unwrap();
 
         let resolver = TenantResolver::new(manager);

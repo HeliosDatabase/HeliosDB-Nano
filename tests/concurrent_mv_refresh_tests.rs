@@ -6,16 +6,15 @@
 //! 3. Error handling - cleanup on failures
 //! 4. Data integrity - no data loss or corruption
 
-use heliosdb_nano::{Config, StorageEngine, Column, DataType, Schema, Tuple, Value, Error};
-use heliosdb_nano::sql::{LogicalPlan, Executor};
+use heliosdb_nano::sql::{Executor, LogicalPlan};
+use heliosdb_nano::{Column, Config, DataType, Error, Schema, StorageEngine, Tuple, Value};
 use std::sync::Arc;
 
 #[test]
 fn test_concurrent_mv_refresh_basic() {
     // Create in-memory storage
     let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config)
-        .expect("Failed to open storage");
+    let storage = StorageEngine::open_in_memory(&config).expect("Failed to open storage");
 
     // Create base table
     let schema = Schema::new(vec![
@@ -24,28 +23,44 @@ fn test_concurrent_mv_refresh_basic() {
         Column::new("value", DataType::Int4),
     ]);
 
-    storage.catalog()
+    storage
+        .catalog()
         .create_table("orders", schema.clone())
         .expect("Failed to create table");
 
     // Insert test data
-    storage.insert_tuple("orders", Tuple::new(vec![
-        Value::Int4(1),
-        Value::String("pending".to_string()),
-        Value::Int4(100),
-    ])).expect("Failed to insert tuple 1");
+    storage
+        .insert_tuple(
+            "orders",
+            Tuple::new(vec![
+                Value::Int4(1),
+                Value::String("pending".to_string()),
+                Value::Int4(100),
+            ]),
+        )
+        .expect("Failed to insert tuple 1");
 
-    storage.insert_tuple("orders", Tuple::new(vec![
-        Value::Int4(2),
-        Value::String("completed".to_string()),
-        Value::Int4(200),
-    ])).expect("Failed to insert tuple 2");
+    storage
+        .insert_tuple(
+            "orders",
+            Tuple::new(vec![
+                Value::Int4(2),
+                Value::String("completed".to_string()),
+                Value::Int4(200),
+            ]),
+        )
+        .expect("Failed to insert tuple 2");
 
-    storage.insert_tuple("orders", Tuple::new(vec![
-        Value::Int4(3),
-        Value::String("pending".to_string()),
-        Value::Int4(150),
-    ])).expect("Failed to insert tuple 3");
+    storage
+        .insert_tuple(
+            "orders",
+            Tuple::new(vec![
+                Value::Int4(3),
+                Value::String("pending".to_string()),
+                Value::Int4(150),
+            ]),
+        )
+        .expect("Failed to insert tuple 3");
 
     // Create materialized view
     let mv_catalog = storage.mv_catalog();
@@ -56,7 +71,7 @@ fn test_concurrent_mv_refresh_basic() {
             table_name: "orders".to_string(),
             schema: Arc::new(schema.clone()),
             projection: None,
-        as_of: None,
+            as_of: None,
         }),
         group_by: vec![],
         aggr_exprs: vec![],
@@ -65,9 +80,7 @@ fn test_concurrent_mv_refresh_basic() {
 
     let query_plan_bytes = bincode::serialize(&query_plan).unwrap();
 
-    let mv_schema = Schema::new(vec![
-        Column::new("total_value", DataType::Int8),
-    ]);
+    let mv_schema = Schema::new(vec![Column::new("total_value", DataType::Int8)]);
 
     let metadata = heliosdb_nano::storage::MaterializedViewMetadata::new(
         "order_summary".to_string(),
@@ -80,25 +93,30 @@ fn test_concurrent_mv_refresh_basic() {
     mv_catalog.create_view(metadata).expect("Failed to create MV");
 
     // Initial population
-    let initial_tuples = vec![
-        Tuple::new(vec![Value::Int8(450)]),
-    ];
+    let initial_tuples = vec![Tuple::new(vec![Value::Int8(450)])];
 
-    mv_catalog.store_view_data("order_summary", initial_tuples, &mv_schema)
+    mv_catalog
+        .store_view_data("order_summary", initial_tuples, &mv_schema)
         .expect("Failed to store initial data");
 
     // Verify initial data
-    let data = mv_catalog.read_view_data("order_summary")
+    let data = mv_catalog
+        .read_view_data("order_summary")
         .expect("Failed to read initial data");
     assert_eq!(data.len(), 1);
     assert_eq!(data[0].values[0], Value::Int8(450));
 
     // Insert more data into base table
-    storage.insert_tuple("orders", Tuple::new(vec![
-        Value::Int4(4),
-        Value::String("completed".to_string()),
-        Value::Int4(300),
-    ])).expect("Failed to insert tuple 4");
+    storage
+        .insert_tuple(
+            "orders",
+            Tuple::new(vec![
+                Value::Int4(4),
+                Value::String("completed".to_string()),
+                Value::Int4(300),
+            ]),
+        )
+        .expect("Failed to insert tuple 4");
 
     // CONCURRENT refresh - simulate new data
     let new_tuples = vec![
@@ -106,11 +124,13 @@ fn test_concurrent_mv_refresh_basic() {
     ];
 
     // This should use temporary table and atomic swap
-    mv_catalog.store_view_data_concurrent("order_summary", new_tuples, &mv_schema)
+    mv_catalog
+        .store_view_data_concurrent("order_summary", new_tuples, &mv_schema)
         .expect("Failed to refresh concurrently");
 
     // Verify refreshed data
-    let refreshed_data = mv_catalog.read_view_data("order_summary")
+    let refreshed_data = mv_catalog
+        .read_view_data("order_summary")
         .expect("Failed to read refreshed data");
     assert_eq!(refreshed_data.len(), 1);
     assert_eq!(refreshed_data[0].values[0], Value::Int8(750));
@@ -120,12 +140,9 @@ fn test_concurrent_mv_refresh_basic() {
 fn test_concurrent_mv_refresh_no_old_data() {
     // Test concurrent refresh when no old data exists (first refresh)
     let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config)
-        .expect("Failed to open storage");
+    let storage = StorageEngine::open_in_memory(&config).expect("Failed to open storage");
 
-    let schema = Schema::new(vec![
-        Column::new("count", DataType::Int8),
-    ]);
+    let schema = Schema::new(vec![Column::new("count", DataType::Int8)]);
 
     // Create MV without initial data
     let mv_catalog = storage.mv_catalog();
@@ -153,12 +170,12 @@ fn test_concurrent_mv_refresh_no_old_data() {
     // Concurrent refresh with no old data (should handle gracefully)
     let tuples = vec![Tuple::new(vec![Value::Int8(42)])];
 
-    mv_catalog.store_view_data_concurrent("test_view", tuples, &schema)
+    mv_catalog
+        .store_view_data_concurrent("test_view", tuples, &schema)
         .expect("Failed to refresh concurrently (first time)");
 
     // Verify data was stored
-    let data = mv_catalog.read_view_data("test_view")
-        .expect("Failed to read data");
+    let data = mv_catalog.read_view_data("test_view").expect("Failed to read data");
     assert_eq!(data.len(), 1);
     assert_eq!(data[0].values[0], Value::Int8(42));
 }
@@ -167,12 +184,9 @@ fn test_concurrent_mv_refresh_no_old_data() {
 fn test_concurrent_mv_refresh_multiple_times() {
     // Test multiple consecutive concurrent refreshes
     let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config)
-        .expect("Failed to open storage");
+    let storage = StorageEngine::open_in_memory(&config).expect("Failed to open storage");
 
-    let schema = Schema::new(vec![
-        Column::new("total", DataType::Int4),
-    ]);
+    let schema = Schema::new(vec![Column::new("total", DataType::Int4)]);
 
     let mv_catalog = storage.mv_catalog();
 
@@ -197,32 +211,26 @@ fn test_concurrent_mv_refresh_multiple_times() {
     mv_catalog.create_view(metadata).expect("Failed to create MV");
 
     // Initial data
-    mv_catalog.store_view_data_concurrent(
-        "multi_view",
-        vec![Tuple::new(vec![Value::Int4(100)])],
-        &schema
-    ).expect("Failed to refresh 1");
+    mv_catalog
+        .store_view_data_concurrent("multi_view", vec![Tuple::new(vec![Value::Int4(100)])], &schema)
+        .expect("Failed to refresh 1");
 
     // Verify
     let data = mv_catalog.read_view_data("multi_view").unwrap();
     assert_eq!(data[0].values[0], Value::Int4(100));
 
     // Second refresh
-    mv_catalog.store_view_data_concurrent(
-        "multi_view",
-        vec![Tuple::new(vec![Value::Int4(200)])],
-        &schema
-    ).expect("Failed to refresh 2");
+    mv_catalog
+        .store_view_data_concurrent("multi_view", vec![Tuple::new(vec![Value::Int4(200)])], &schema)
+        .expect("Failed to refresh 2");
 
     let data = mv_catalog.read_view_data("multi_view").unwrap();
     assert_eq!(data[0].values[0], Value::Int4(200));
 
     // Third refresh
-    mv_catalog.store_view_data_concurrent(
-        "multi_view",
-        vec![Tuple::new(vec![Value::Int4(300)])],
-        &schema
-    ).expect("Failed to refresh 3");
+    mv_catalog
+        .store_view_data_concurrent("multi_view", vec![Tuple::new(vec![Value::Int4(300)])], &schema)
+        .expect("Failed to refresh 3");
 
     let data = mv_catalog.read_view_data("multi_view").unwrap();
     assert_eq!(data[0].values[0], Value::Int4(300));
@@ -232,8 +240,7 @@ fn test_concurrent_mv_refresh_multiple_times() {
 fn test_concurrent_refresh_preserves_schema() {
     // Verify that concurrent refresh preserves schema and metadata
     let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config)
-        .expect("Failed to open storage");
+    let storage = StorageEngine::open_in_memory(&config).expect("Failed to open storage");
 
     // Note: compression is managed at RocksDB level with LZ4
 
@@ -279,12 +286,12 @@ fn test_concurrent_refresh_preserves_schema() {
         ]),
     ];
 
-    mv_catalog.store_view_data_concurrent("user_view", tuples, &schema)
+    mv_catalog
+        .store_view_data_concurrent("user_view", tuples, &schema)
         .expect("Failed to refresh");
 
     // Verify schema is preserved
-    let data = mv_catalog.read_view_data("user_view")
-        .expect("Failed to read data");
+    let data = mv_catalog.read_view_data("user_view").expect("Failed to read data");
     assert_eq!(data.len(), 2);
 
     // Verify first row
@@ -299,7 +306,8 @@ fn test_concurrent_refresh_preserves_schema() {
 
     // Get table schema and verify it matches
     let data_table = heliosdb_nano::storage::MaterializedViewCatalog::mv_data_table_name("user_view");
-    let stored_schema = storage.catalog()
+    let stored_schema = storage
+        .catalog()
         .get_table_schema(&data_table)
         .expect("Failed to get schema");
 
@@ -313,14 +321,10 @@ fn test_concurrent_refresh_preserves_schema() {
 fn test_concurrent_vs_nonconcurrent_refresh() {
     // Compare concurrent and non-concurrent refresh results
     let config = Config::in_memory();
-    let storage1 = StorageEngine::open_in_memory(&config)
-        .expect("Failed to open storage 1");
-    let storage2 = StorageEngine::open_in_memory(&config)
-        .expect("Failed to open storage 2");
+    let storage1 = StorageEngine::open_in_memory(&config).expect("Failed to open storage 1");
+    let storage2 = StorageEngine::open_in_memory(&config).expect("Failed to open storage 2");
 
-    let schema = Schema::new(vec![
-        Column::new("total", DataType::Int4),
-    ]);
+    let schema = Schema::new(vec![Column::new("total", DataType::Int4)]);
 
     // Setup MV in both storages
     for (name, storage) in [("mv1", &storage1), ("mv2", &storage2)] {
@@ -331,7 +335,7 @@ fn test_concurrent_vs_nonconcurrent_refresh() {
             table_name: "test".to_string(),
             schema: Arc::new(schema.clone()),
             projection: None,
-        as_of: None,
+            as_of: None,
         };
 
         let query_plan_bytes = bincode::serialize(&query_plan).unwrap();
@@ -350,18 +354,16 @@ fn test_concurrent_vs_nonconcurrent_refresh() {
     let tuples = vec![Tuple::new(vec![Value::Int4(999)])];
 
     // Concurrent refresh
-    storage1.mv_catalog().store_view_data_concurrent(
-        "mv1",
-        tuples.clone(),
-        &schema
-    ).expect("Failed concurrent refresh");
+    storage1
+        .mv_catalog()
+        .store_view_data_concurrent("mv1", tuples.clone(), &schema)
+        .expect("Failed concurrent refresh");
 
     // Non-concurrent refresh
-    storage2.mv_catalog().store_view_data(
-        "mv2",
-        tuples.clone(),
-        &schema
-    ).expect("Failed non-concurrent refresh");
+    storage2
+        .mv_catalog()
+        .store_view_data("mv2", tuples.clone(), &schema)
+        .expect("Failed non-concurrent refresh");
 
     // Both should have the same result
     let data1 = storage1.mv_catalog().read_view_data("mv1").unwrap();
@@ -377,8 +379,7 @@ fn test_concurrent_vs_nonconcurrent_refresh() {
 fn test_catalog_rename_table() {
     // Test the underlying rename_table functionality
     let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config)
-        .expect("Failed to open storage");
+    let storage = StorageEngine::open_in_memory(&config).expect("Failed to open storage");
 
     // Note: compression is managed at RocksDB level with LZ4
 
@@ -390,22 +391,28 @@ fn test_catalog_rename_table() {
         Column::new("name", DataType::Text),
     ]);
 
-    catalog.create_table("old_table", schema.clone())
+    catalog
+        .create_table("old_table", schema.clone())
         .expect("Failed to create table");
 
     // Insert data
-    storage.insert_tuple("old_table", Tuple::new(vec![
-        Value::Int4(1),
-        Value::String("Alice".to_string()),
-    ])).expect("Failed to insert");
+    storage
+        .insert_tuple(
+            "old_table",
+            Tuple::new(vec![Value::Int4(1), Value::String("Alice".to_string())]),
+        )
+        .expect("Failed to insert");
 
-    storage.insert_tuple("old_table", Tuple::new(vec![
-        Value::Int4(2),
-        Value::String("Bob".to_string()),
-    ])).expect("Failed to insert");
+    storage
+        .insert_tuple(
+            "old_table",
+            Tuple::new(vec![Value::Int4(2), Value::String("Bob".to_string())]),
+        )
+        .expect("Failed to insert");
 
     // Rename the table
-    catalog.rename_table("old_table", "new_table")
+    catalog
+        .rename_table("old_table", "new_table")
         .expect("Failed to rename table");
 
     // Verify old table doesn't exist
@@ -415,8 +422,7 @@ fn test_catalog_rename_table() {
     assert!(catalog.table_exists("new_table").unwrap());
 
     // Verify data was moved
-    let data = storage.scan_table("new_table")
-        .expect("Failed to scan renamed table");
+    let data = storage.scan_table("new_table").expect("Failed to scan renamed table");
     assert_eq!(data.len(), 2);
     assert_eq!(data[0].values[0], Value::Int4(1));
     assert_eq!(data[0].values[1], Value::String("Alice".to_string()));
@@ -427,14 +433,11 @@ fn test_catalog_rename_table() {
 #[test]
 fn test_rename_table_errors() {
     let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config)
-        .expect("Failed to open storage");
+    let storage = StorageEngine::open_in_memory(&config).expect("Failed to open storage");
 
     let catalog = storage.catalog();
 
-    let schema = Schema::new(vec![
-        Column::new("id", DataType::Int4),
-    ]);
+    let schema = Schema::new(vec![Column::new("id", DataType::Int4)]);
 
     // Test renaming non-existent table
     let result = catalog.rename_table("nonexistent", "new_name");

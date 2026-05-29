@@ -3,18 +3,18 @@
 //! Provides parallel filter evaluation using rayon for optimizer-driven parallelism.
 //! Supports parallel bloom filter checks, zone map pruning, and SIMD filtering.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::Arc;
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use crate::{Tuple, Schema};
 use super::bloom_filter::TableBloomFilters;
-use super::simd_filter::SimdPredicateFilteringEngine;
+use super::columnar_zone_summary::{BlockDecision, TableZoneSummaries};
 use super::predicate_pushdown::{AnalyzedPredicate, PredicateOp};
-use super::columnar_zone_summary::{TableZoneSummaries, BlockDecision};
+use super::simd_filter::SimdPredicateFilteringEngine;
+use crate::{Schema, Tuple};
 
 /// Configuration for parallel filtering
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,8 +52,8 @@ impl Default for ParallelFilterConfig {
             parallel_simd: true,
             work_stealing: true,
             // Adaptive threshold configuration
-            adaptive_threshold: true,   // Enable by default
-            min_adaptive_threshold: 256, // Don't parallelize under 256 tuples
+            adaptive_threshold: true,     // Enable by default
+            min_adaptive_threshold: 256,  // Don't parallelize under 256 tuples
             max_adaptive_threshold: 5000, // Always parallelize above 5000 tuples
         }
     }
@@ -138,18 +138,15 @@ impl ParallelFilterEngine {
         };
 
         // Check for expensive predicates (LIKE, IN, BETWEEN increase complexity)
-        let has_expensive_predicate = predicates.iter().any(|p| {
-            matches!(p.op, PredicateOp::Like | PredicateOp::In | PredicateOp::Between)
-        });
+        let has_expensive_predicate = predicates
+            .iter()
+            .any(|p| matches!(p.op, PredicateOp::Like | PredicateOp::In | PredicateOp::Between));
         let expensive_factor = if has_expensive_predicate { 0.7 } else { 1.0 };
 
         let adjusted = (base_threshold as f64 * complexity_factor * expensive_factor) as usize;
 
         // Clamp to configured bounds
-        adjusted.clamp(
-            self.config.min_adaptive_threshold,
-            self.config.max_adaptive_threshold,
-        )
+        adjusted.clamp(self.config.min_adaptive_threshold, self.config.max_adaptive_threshold)
     }
 
     /// Update adaptive threshold based on observed performance
@@ -190,10 +187,8 @@ impl ParallelFilterEngine {
                     current
                 };
 
-                let clamped = new_threshold.clamp(
-                    self.config.min_adaptive_threshold,
-                    self.config.max_adaptive_threshold,
-                );
+                let clamped =
+                    new_threshold.clamp(self.config.min_adaptive_threshold, self.config.max_adaptive_threshold);
                 self.adaptive_threshold.store(clamped, Ordering::Relaxed);
             }
         }
@@ -278,7 +273,8 @@ impl ParallelFilterEngine {
 
         // Apply bloom filter if available
         let tuples = if let Some(filters) = bloom_filters {
-            tuples.into_iter()
+            tuples
+                .into_iter()
                 .filter(|tuple| self.check_bloom_filters(tuple, predicates, filters, schema))
                 .collect()
         } else {
@@ -300,7 +296,8 @@ impl ParallelFilterEngine {
         let bloom_checks = AtomicU64::new(0);
         let bloom_hits = AtomicU64::new(0);
 
-        let result: Vec<Tuple> = tuples.into_par_iter()
+        let result: Vec<Tuple> = tuples
+            .into_par_iter()
             .filter(|tuple| {
                 bloom_checks.fetch_add(1, Ordering::Relaxed);
                 let passes = self.check_bloom_filters(tuple, predicates, bloom_filters, schema);
@@ -332,7 +329,11 @@ impl ParallelFilterEngine {
                 continue;
             }
 
-            if let Some(filter) = bloom_filters.column_filters.iter().find(|f| f.column_name == pred.column_name) {
+            if let Some(filter) = bloom_filters
+                .column_filters
+                .iter()
+                .find(|f| f.column_name == pred.column_name)
+            {
                 // If bloom filter says "definitely not present", skip
                 if !filter.might_contain_check(&pred.value) {
                     return true; // Skip this tuple early - it might match
@@ -376,7 +377,8 @@ impl ParallelFilterEngine {
         let zone_skips = AtomicU64::new(0);
 
         // Parallel block processing with zone map pruning
-        let result: Vec<Tuple> = blocks.par_iter()
+        let result: Vec<Tuple> = blocks
+            .par_iter()
             .flat_map(|(block_id, tuples)| {
                 zone_checks.fetch_add(1, Ordering::Relaxed);
 
@@ -418,7 +420,9 @@ impl ParallelFilterEngine {
         limit: usize,
     ) -> Vec<Tuple> {
         if tuples.len() < self.config.parallel_threshold || limit == 0 {
-            return self.simd_engine.filter_batch(&tuples, predicates, schema)
+            return self
+                .simd_engine
+                .filter_batch(&tuples, predicates, schema)
                 .into_iter()
                 .take(limit)
                 .collect();
@@ -534,12 +538,7 @@ impl AdaptiveParallelFilter {
     }
 
     /// Filter with adaptive chunk sizing
-    pub fn filter_adaptive(
-        &self,
-        tuples: Vec<Tuple>,
-        predicates: &[AnalyzedPredicate],
-        schema: &Schema,
-    ) -> Vec<Tuple> {
+    pub fn filter_adaptive(&self, tuples: Vec<Tuple>, predicates: &[AnalyzedPredicate], schema: &Schema) -> Vec<Tuple> {
         let input_count = tuples.len();
         if input_count < 1000 {
             return self.engine.simd_engine.filter_batch(&tuples, predicates, schema);
@@ -574,7 +573,8 @@ impl AdaptiveParallelFilter {
 
         // Find best performing chunk size
         if history.len() >= 5 {
-            let best = history.iter()
+            let best = history
+                .iter()
                 .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal))
                 .map(|(size, _)| *size)
                 .unwrap_or(chunk_size);
@@ -582,9 +582,7 @@ impl AdaptiveParallelFilter {
             // Move towards best with some exploration
             let current = self.optimal_chunk.load(Ordering::Relaxed);
             let new_chunk = match best.cmp(&current) {
-                std::cmp::Ordering::Greater | std::cmp::Ordering::Less => {
-                    usize::midpoint(current, best)
-                }
+                std::cmp::Ordering::Greater | std::cmp::Ordering::Less => usize::midpoint(current, best),
                 std::cmp::Ordering::Equal => current,
             };
 

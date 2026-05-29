@@ -2,20 +2,20 @@
 //!
 //! Provides HTTP REST API endpoints for database operations.
 
-pub mod server;
-pub mod routes;
-pub mod models;
+pub mod auth_bridge;
+pub mod change_notifier;
 pub mod handlers;
-pub mod middleware;
 pub mod jwt;
+pub mod middleware;
+pub mod models;
+pub mod oauth;
 pub mod openapi;
 pub mod rest_executor;
-pub mod auth_bridge;
-pub mod oauth;
-pub mod change_notifier;
+pub mod routes;
+pub mod server;
 
 // Re-exports for convenience
-pub use server::ApiServer;
+pub use middleware::{AuthMiddleware, RateLimitConfig, RateLimitMiddleware, UserContext};
 pub use models::error::ApiError;
-pub use middleware::{AuthMiddleware, UserContext, RateLimitMiddleware, RateLimitConfig};
 pub use openapi::OPENAPI_YAML;
+pub use server::ApiServer;

@@ -60,8 +60,7 @@ fn test_savepoint_begin_savepoint_rollback_to_commit() {
     db.execute("COMMIT").unwrap();
 
     // INSERT is undone by ROLLBACK TO SAVEPOINT: 0 rows after commit.
-    assert_eq!(count_rows(&db), 0,
-        "ROLLBACK TO SAVEPOINT should undo INSERT");
+    assert_eq!(count_rows(&db), 0, "ROLLBACK TO SAVEPOINT should undo INSERT");
 }
 
 #[test]
@@ -72,8 +71,11 @@ fn test_savepoint_outside_transaction_errors() {
     let result = db.execute_returning("SAVEPOINT sp1");
     assert!(result.is_err(), "SAVEPOINT outside transaction should error");
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("within a transaction") || err.contains("SAVEPOINT"),
-        "Error should mention transaction requirement, got: {}", err);
+    assert!(
+        err.contains("within a transaction") || err.contains("SAVEPOINT"),
+        "Error should mention transaction requirement, got: {}",
+        err
+    );
 }
 
 #[test]
@@ -85,8 +87,11 @@ fn test_release_nonexistent_savepoint_errors() {
     let result = db.execute_returning("RELEASE SAVEPOINT ghost");
     assert!(result.is_err(), "RELEASE nonexistent savepoint should error");
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("does not exist"),
-        "Error should mention savepoint does not exist, got: {}", err);
+    assert!(
+        err.contains("does not exist"),
+        "Error should mention savepoint does not exist, got: {}",
+        err
+    );
     db.execute("ROLLBACK").unwrap();
 }
 
@@ -99,8 +104,11 @@ fn test_rollback_to_nonexistent_savepoint_errors() {
     let result = db.execute_returning("ROLLBACK TO SAVEPOINT ghost");
     assert!(result.is_err(), "ROLLBACK TO nonexistent savepoint should error");
     let err = result.unwrap_err().to_string();
-    assert!(err.contains("does not exist"),
-        "Error should mention savepoint does not exist, got: {}", err);
+    assert!(
+        err.contains("does not exist"),
+        "Error should mention savepoint does not exist, got: {}",
+        err
+    );
     db.execute("ROLLBACK").unwrap();
 }
 
@@ -177,7 +185,11 @@ fn test_nested_savepoint_release_inner_then_outer() {
     db.execute_returning("RELEASE SAVEPOINT sp1").unwrap();
     db.execute("COMMIT").unwrap();
 
-    assert_eq!(count_rows(&db), 2, "Both inserts should persist after nested RELEASE + COMMIT");
+    assert_eq!(
+        count_rows(&db),
+        2,
+        "Both inserts should persist after nested RELEASE + COMMIT"
+    );
 }
 
 #[test]
@@ -204,8 +216,11 @@ fn test_nested_rollback_to_outer_removes_inner() {
     db.execute("COMMIT").unwrap();
 
     // Both inserts are undone by ROLLBACK TO sp1: 0 rows after commit.
-    assert_eq!(count_rows(&db), 0,
-        "ROLLBACK TO SAVEPOINT sp1 should undo both inserts (before and after sp2)");
+    assert_eq!(
+        count_rows(&db),
+        0,
+        "ROLLBACK TO SAVEPOINT sp1 should undo both inserts (before and after sp2)"
+    );
 }
 
 #[test]
@@ -300,7 +315,8 @@ fn test_deep_nesting_five_levels() {
     db.execute("BEGIN").unwrap();
     for i in 1..=5 {
         db.execute_returning(&format!("SAVEPOINT sp{}", i)).unwrap();
-        db.execute(&format!("INSERT INTO sp_test VALUES ({}, 'level{}')", i, i)).unwrap();
+        db.execute(&format!("INSERT INTO sp_test VALUES ({}, 'level{}')", i, i))
+            .unwrap();
     }
     // Release in reverse order
     for i in (1..=5).rev() {
@@ -352,8 +368,7 @@ fn test_insert_after_savepoint_rollback_to() {
     db.execute("COMMIT").unwrap();
 
     // INSERT is undone by ROLLBACK TO SAVEPOINT: 0 rows after commit.
-    assert_eq!(count_rows(&db), 0,
-        "ROLLBACK TO SAVEPOINT should undo INSERT");
+    assert_eq!(count_rows(&db), 0, "ROLLBACK TO SAVEPOINT should undo INSERT");
 }
 
 #[test]
@@ -386,8 +401,11 @@ fn test_delete_after_savepoint_rollback_to_stub() {
     db.execute("COMMIT").unwrap();
 
     // DELETE is undone by ROLLBACK TO SAVEPOINT: row preserved.
-    assert_eq!(count_rows(&db), 1,
-        "ROLLBACK TO SAVEPOINT should undo DELETE; row should be preserved");
+    assert_eq!(
+        count_rows(&db),
+        1,
+        "ROLLBACK TO SAVEPOINT should undo DELETE; row should be preserved"
+    );
 }
 
 #[test]
@@ -410,8 +428,11 @@ fn test_multiple_dml_between_savepoints() {
     db.execute("COMMIT").unwrap();
 
     // SQL standard: 2 rows (DELETE removes row 2). Actual: 3 rows (no read-your-own-writes).
-    assert_eq!(count_rows(&db), 3,
-        "KNOWN LIMITATION: DELETE in explicit transaction cannot see own inserts (no RYOW)");
+    assert_eq!(
+        count_rows(&db),
+        3,
+        "KNOWN LIMITATION: DELETE in explicit transaction cannot see own inserts (no RYOW)"
+    );
 }
 
 #[test]
@@ -444,8 +465,11 @@ fn test_dml_before_savepoint_preserved_on_rollback_to() {
     db.execute("COMMIT").unwrap();
 
     // Only the pre-savepoint INSERT is preserved; the post-savepoint INSERT is undone.
-    assert_eq!(count_rows(&db), 1,
-        "Pre-savepoint INSERT preserved, post-savepoint INSERT undone by ROLLBACK TO");
+    assert_eq!(
+        count_rows(&db),
+        1,
+        "Pre-savepoint INSERT preserved, post-savepoint INSERT undone by ROLLBACK TO"
+    );
 }
 
 #[test]
@@ -476,12 +500,16 @@ fn test_query_within_explicit_transaction_no_ryow() {
     let db = setup();
 
     db.execute("BEGIN").unwrap();
-    db.execute("INSERT INTO sp_test VALUES (1, 'invisible_within_txn')").unwrap();
+    db.execute("INSERT INTO sp_test VALUES (1, 'invisible_within_txn')")
+        .unwrap();
 
     // Query within the transaction sees 0 rows (no RYOW)
     let rows = db.query("SELECT * FROM sp_test", &[]).unwrap();
-    assert_eq!(rows.len(), 0,
-        "KNOWN LIMITATION: read-your-own-writes not supported in explicit transactions");
+    assert_eq!(
+        rows.len(),
+        0,
+        "KNOWN LIMITATION: read-your-own-writes not supported in explicit transactions"
+    );
 
     db.execute("ROLLBACK").unwrap();
 }
@@ -549,7 +577,8 @@ fn test_truncate_within_savepoint() {
 fn test_error_after_savepoint_constraint_violation() {
     // Attempt an operation that causes an error after a savepoint.
     let db = EmbeddedDatabase::new_in_memory().unwrap();
-    db.execute("CREATE TABLE sp_uniq (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE sp_uniq (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO sp_uniq VALUES (1, 'existing')").unwrap();
 
     db.execute("BEGIN").unwrap();
@@ -587,7 +616,8 @@ fn test_rollback_to_savepoint_after_error_recovery() {
     }
 
     // Continue with more work after recovery
-    db.execute("INSERT INTO sp_recover VALUES (2, 'after_recovery')").unwrap();
+    db.execute("INSERT INTO sp_recover VALUES (2, 'after_recovery')")
+        .unwrap();
     db.execute("COMMIT").unwrap();
 
     let rows = db.query("SELECT * FROM sp_recover", &[]).unwrap();
@@ -598,7 +628,8 @@ fn test_rollback_to_savepoint_after_error_recovery() {
 fn test_duplicate_key_insert_after_savepoint() {
     // Duplicate key insert after savepoint creation.
     let db = EmbeddedDatabase::new_in_memory().unwrap();
-    db.execute("CREATE TABLE sp_dup (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE sp_dup (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO sp_dup VALUES (1, 'first')").unwrap();
 
     db.execute("BEGIN").unwrap();
@@ -698,7 +729,11 @@ fn test_full_transaction_rollback_with_savepoint() {
     db.execute("INSERT INTO sp_test VALUES (1, 'gone')").unwrap();
     db.execute("ROLLBACK").unwrap();
 
-    assert_eq!(count_rows(&db), 0, "Full ROLLBACK should discard everything including savepoint data");
+    assert_eq!(
+        count_rows(&db),
+        0,
+        "Full ROLLBACK should discard everything including savepoint data"
+    );
 }
 
 #[test]
@@ -721,8 +756,10 @@ fn test_savepoint_in_autocommit_mode() {
     let db = setup();
 
     let result = db.execute_returning("SAVEPOINT sp1");
-    assert!(result.is_err(),
-        "SAVEPOINT in autocommit mode (no active transaction) should error");
+    assert!(
+        result.is_err(),
+        "SAVEPOINT in autocommit mode (no active transaction) should error"
+    );
 }
 
 #[test]
@@ -806,8 +843,10 @@ fn test_full_rollback_does_not_clear_savepoint_stack() {
     db.execute("BEGIN").unwrap();
     let result = db.execute_returning("RELEASE SAVEPOINT sp1");
     // BUG: This succeeds because savepoints were not cleared by ROLLBACK
-    assert!(result.is_ok(),
-        "KNOWN BUG: savepoint stack not cleared on ROLLBACK; old savepoints leak");
+    assert!(
+        result.is_ok(),
+        "KNOWN BUG: savepoint stack not cleared on ROLLBACK; old savepoints leak"
+    );
     db.execute("ROLLBACK").unwrap();
 }
 
@@ -902,7 +941,11 @@ fn test_savepoint_reuse_name_after_release() {
     db.execute_returning("RELEASE SAVEPOINT reusable").unwrap();
 
     db.execute("COMMIT").unwrap();
-    assert_eq!(count_rows(&db), 2, "Both uses of the reused savepoint name should persist");
+    assert_eq!(
+        count_rows(&db),
+        2,
+        "Both uses of the reused savepoint name should persist"
+    );
 }
 
 // ============================================================================
@@ -916,8 +959,7 @@ fn test_savepoint_via_execute_works() {
 
     db.execute("BEGIN").unwrap();
     let result = db.execute("SAVEPOINT sp1");
-    assert!(result.is_ok(),
-        "SAVEPOINT via execute() in BEGIN block should succeed");
+    assert!(result.is_ok(), "SAVEPOINT via execute() in BEGIN block should succeed");
     db.execute("ROLLBACK").unwrap();
 }
 
@@ -965,8 +1007,11 @@ fn test_savepoint_survives_successful_dml() {
     db.execute("COMMIT").unwrap();
 
     // SQL standard: 2 rows (DELETE removes row 2). Actual: 3 rows (no RYOW).
-    assert_eq!(count_rows(&db), 3,
-        "KNOWN LIMITATION: DELETE in explicit transaction cannot see own inserts (no RYOW)");
+    assert_eq!(
+        count_rows(&db),
+        3,
+        "KNOWN LIMITATION: DELETE in explicit transaction cannot see own inserts (no RYOW)"
+    );
 }
 
 #[test]
@@ -1012,8 +1057,11 @@ fn test_rollback_to_preserves_target_savepoint() {
     db.execute("COMMIT").unwrap();
 
     // Both inserts are undone by their respective ROLLBACK TO calls: 0 rows.
-    assert_eq!(count_rows(&db), 0,
-        "Both inserts should be undone by ROLLBACK TO SAVEPOINT");
+    assert_eq!(
+        count_rows(&db),
+        0,
+        "Both inserts should be undone by ROLLBACK TO SAVEPOINT"
+    );
 }
 
 #[test]
@@ -1057,8 +1105,7 @@ fn test_commit_after_rollback_to_savepoint() {
     db.execute("COMMIT").unwrap();
 
     // INSERT is undone by ROLLBACK TO; COMMIT commits the empty write set.
-    assert_eq!(count_rows(&db), 0,
-        "INSERT undone by ROLLBACK TO; nothing committed");
+    assert_eq!(count_rows(&db), 0, "INSERT undone by ROLLBACK TO; nothing committed");
 }
 
 #[test]
@@ -1170,6 +1217,9 @@ fn test_savepoint_create_after_rollback_to() {
     db.execute("COMMIT").unwrap();
 
     // Only the sp2 insert survives; the sp1 insert was undone by ROLLBACK TO.
-    assert_eq!(count_rows(&db), 1,
-        "First INSERT undone by ROLLBACK TO sp1; only sp2 INSERT persists");
+    assert_eq!(
+        count_rows(&db),
+        1,
+        "First INSERT undone by ROLLBACK TO sp1; only sp2 INSERT persists"
+    );
 }

@@ -98,11 +98,7 @@ fn lsp_call_hierarchy_incoming_terminates() -> Result<()> {
 
     let defs = db.lsp_definition("c", &DefinitionHint::default())?;
     let c_id = defs.first().expect("c defined").symbol_id;
-    let rows = db.lsp_call_hierarchy(
-        c_id,
-        heliosdb_nano::code_graph::lsp::CallDirection::Incoming,
-        3,
-    )?;
+    let rows = db.lsp_call_hierarchy(c_id, heliosdb_nano::code_graph::lsp::CallDirection::Incoming, 3)?;
     let names: Vec<&str> = rows.iter().map(|r| r.qualified.as_str()).collect();
     assert!(names.contains(&"b"), "expected b as a direct caller, got {names:?}");
     Ok(())
@@ -111,12 +107,7 @@ fn lsp_call_hierarchy_incoming_terminates() -> Result<()> {
 #[test]
 fn lsp_hover_returns_signature() -> Result<()> {
     let db = setup()?;
-    insert_file(
-        &db,
-        "m.rs",
-        "rust",
-        "pub fn answer() -> i32 { 42 }\n",
-    )?;
+    insert_file(&db, "m.rs", "rust", "pub fn answer() -> i32 { 42 }\n")?;
     db.code_index(CodeIndexOptions::for_table("src"))?;
     let defs = db.lsp_definition("answer", &DefinitionHint::default())?;
     let id = defs.first().unwrap().symbol_id;

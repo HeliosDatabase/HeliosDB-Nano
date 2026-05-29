@@ -150,7 +150,10 @@ impl ABRouter {
         }
 
         self.experiments.write().await.insert(name.clone(), experiment);
-        self.assignments.write().await.insert(name.clone(), Assignment::default());
+        self.assignments
+            .write()
+            .await
+            .insert(name.clone(), Assignment::default());
 
         tracing::info!("Added experiment: {}", name);
         Ok(id)
@@ -182,9 +185,9 @@ impl ABRouter {
     /// Set experiment state
     pub async fn set_experiment_state(&self, name: &str, state: ExperimentState) -> Result<()> {
         let mut experiments = self.experiments.write().await;
-        let exp = experiments.get_mut(name).ok_or_else(|| {
-            ABTestingError::ExperimentNotFound(name.to_string())
-        })?;
+        let exp = experiments
+            .get_mut(name)
+            .ok_or_else(|| ABTestingError::ExperimentNotFound(name.to_string()))?;
 
         match state {
             ExperimentState::Active => exp.start()?,
@@ -204,9 +207,9 @@ impl ABRouter {
     /// Complete an experiment
     pub async fn complete_experiment(&self, name: &str, winner: Option<&str>) -> Result<()> {
         let mut experiments = self.experiments.write().await;
-        let exp = experiments.get_mut(name).ok_or_else(|| {
-            ABTestingError::ExperimentNotFound(name.to_string())
-        })?;
+        let exp = experiments
+            .get_mut(name)
+            .ok_or_else(|| ABTestingError::ExperimentNotFound(name.to_string()))?;
 
         exp.complete(winner.map(String::from))
     }
@@ -236,9 +239,9 @@ impl ABRouter {
     /// Route a user to a branch
     pub async fn route_user(&self, experiment: &str, context: &UserContext) -> Result<String> {
         let experiments = self.experiments.read().await;
-        let exp = experiments.get(experiment).ok_or_else(|| {
-            ABTestingError::ExperimentNotFound(experiment.to_string())
-        })?;
+        let exp = experiments
+            .get(experiment)
+            .ok_or_else(|| ABTestingError::ExperimentNotFound(experiment.to_string()))?;
 
         // Check if experiment accepts traffic
         if !exp.accepts_traffic() {
@@ -248,14 +251,16 @@ impl ABRouter {
         // Check exclusions
         if self.is_user_excluded(exp, context) {
             // Return control branch for excluded users
-            return exp.control_branch()
+            return exp
+                .control_branch()
                 .cloned()
                 .ok_or_else(|| ABTestingError::BranchNotFound("control".to_string()));
         }
 
         // If paused, return control
         if exp.state == ExperimentState::Paused {
-            return exp.control_branch()
+            return exp
+                .control_branch()
                 .cloned()
                 .ok_or_else(|| ABTestingError::BranchNotFound("control".to_string()));
         }
@@ -271,9 +276,7 @@ impl ABRouter {
 
         // Get assignment strategy
         let assignments = self.assignments.read().await;
-        let assignment = assignments.get(experiment)
-            .cloned()
-            .unwrap_or_default();
+        let assignment = assignments.get(experiment).cloned().unwrap_or_default();
         drop(assignments);
 
         // Compute branch
@@ -311,8 +314,7 @@ impl ABRouter {
 
         // Check included groups (if specified, user must be in one)
         if !exp.config.included_groups.is_empty() {
-            let in_included = context.groups.iter()
-                .any(|g| exp.config.included_groups.contains(g));
+            let in_included = context.groups.iter().any(|g| exp.config.included_groups.contains(g));
             if !in_included {
                 return true;
             }
@@ -329,21 +331,11 @@ impl ABRouter {
         assignment: &Assignment,
     ) -> Result<String> {
         match assignment {
-            Assignment::UserIdModulo { divisor } => {
-                self.assign_by_modulo(exp, context, *divisor)
-            }
-            Assignment::UserIdHash => {
-                self.assign_by_hash(exp, context)
-            }
-            Assignment::Attribute { name, mapping } => {
-                self.assign_by_attribute(exp, context, name, mapping)
-            }
-            Assignment::Group { mapping } => {
-                self.assign_by_group(exp, context, mapping)
-            }
-            Assignment::Percentage => {
-                self.assign_by_percentage(exp, context)
-            }
+            Assignment::UserIdModulo { divisor } => self.assign_by_modulo(exp, context, *divisor),
+            Assignment::UserIdHash => self.assign_by_hash(exp, context),
+            Assignment::Attribute { name, mapping } => self.assign_by_attribute(exp, context, name, mapping),
+            Assignment::Group { mapping } => self.assign_by_group(exp, context, mapping),
+            Assignment::Percentage => self.assign_by_percentage(exp, context),
             Assignment::Fixed { branch } => {
                 if exp.branches.contains(branch) {
                     Ok(branch.clone())
@@ -351,9 +343,7 @@ impl ABRouter {
                     Err(ABTestingError::BranchNotFound(branch.clone()))
                 }
             }
-            Assignment::RoundRobin => {
-                self.assign_round_robin(exp).await
-            }
+            Assignment::RoundRobin => self.assign_round_robin(exp).await,
         }
     }
 
@@ -372,7 +362,8 @@ impl ABRouter {
         }
 
         // Fallback to last branch
-        exp.branches.last()
+        exp.branches
+            .last()
             .cloned()
             .ok_or_else(|| ABTestingError::Internal("No branches".to_string()))
     }
@@ -389,7 +380,8 @@ impl ABRouter {
             }
         }
 
-        exp.branches.last()
+        exp.branches
+            .last()
             .cloned()
             .ok_or_else(|| ABTestingError::Internal("No branches".to_string()))
     }
@@ -500,10 +492,7 @@ mod tests {
     async fn test_router_add_experiment() {
         let router = ABRouter::new();
 
-        let exp = Experiment::new(
-            "test_exp",
-            vec!["control".to_string(), "treatment".to_string()],
-        );
+        let exp = Experiment::new("test_exp", vec!["control".to_string(), "treatment".to_string()]);
 
         let id = router.add_experiment(exp).await.unwrap();
         assert!(!id.is_nil());
@@ -529,10 +518,7 @@ mod tests {
     async fn test_route_user() {
         let router = ABRouter::new();
 
-        let mut exp = Experiment::new(
-            "test_exp",
-            vec!["control".to_string(), "treatment".to_string()],
-        );
+        let mut exp = Experiment::new("test_exp", vec!["control".to_string(), "treatment".to_string()]);
         exp.start().unwrap();
 
         router.add_experiment(exp).await.unwrap();
@@ -547,10 +533,7 @@ mod tests {
     async fn test_sticky_sessions() {
         let router = ABRouter::new();
 
-        let mut exp = Experiment::new(
-            "test_exp",
-            vec!["control".to_string(), "treatment".to_string()],
-        );
+        let mut exp = Experiment::new("test_exp", vec!["control".to_string(), "treatment".to_string()]);
         exp.start().unwrap();
 
         router.add_experiment(exp).await.unwrap();
@@ -571,10 +554,7 @@ mod tests {
     async fn test_round_robin() {
         let router = ABRouter::new();
 
-        let mut exp = Experiment::new(
-            "test_exp",
-            vec!["a".to_string(), "b".to_string()],
-        );
+        let mut exp = Experiment::new("test_exp", vec!["a".to_string(), "b".to_string()]);
         exp.start().unwrap();
 
         router.add_experiment(exp).await.unwrap();
@@ -602,14 +582,14 @@ mod tests {
     async fn test_paused_experiment() {
         let router = ABRouter::new();
 
-        let mut exp = Experiment::new(
-            "test_exp",
-            vec!["control".to_string(), "treatment".to_string()],
-        );
+        let mut exp = Experiment::new("test_exp", vec!["control".to_string(), "treatment".to_string()]);
         exp.start().unwrap();
 
         router.add_experiment(exp).await.unwrap();
-        router.set_experiment_state("test_exp", ExperimentState::Paused).await.unwrap();
+        router
+            .set_experiment_state("test_exp", ExperimentState::Paused)
+            .await
+            .unwrap();
 
         let ctx = UserContext::new("user123");
         let branch = router.route_user("test_exp", &ctx).await.unwrap();

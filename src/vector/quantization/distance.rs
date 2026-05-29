@@ -6,7 +6,7 @@
 //! - Pre-compute distance table once per query
 //! - Use table lookups for each database vector (O(M) instead of O(D))
 
-use super::{Codebook, QuantizedVector, PqError, PqResult};
+use super::{Codebook, PqError, PqResult, QuantizedVector};
 use crate::vector::Vector;
 use std::sync::Arc;
 
@@ -28,11 +28,7 @@ impl DistanceComputer {
     /// Compute L2 distance between query and quantized vector
     ///
     /// This is the slow path - use precomputed table for batch queries.
-    pub fn compute_distance(
-        &self,
-        query: &Vector,
-        quantized: &QuantizedVector,
-    ) -> PqResult<f32> {
+    pub fn compute_distance(&self, query: &Vector, quantized: &QuantizedVector) -> PqResult<f32> {
         // Validate dimensions
         let dimension = self.codebook.dimension();
         if query.len() != dimension {
@@ -177,17 +173,14 @@ impl DistanceComputer {
 /// Compute L2 distance squared between two vectors
 #[inline]
 fn l2_distance_squared(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).powi(2))
-        .sum()
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum()
 }
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::*;
     use super::super::Encoder;
+    use super::*;
 
     fn create_test_codebook() -> Codebook {
         let mut codebook = Codebook::new(2, 2, 2);
@@ -217,9 +210,7 @@ mod tests {
         let quantized = encoder.encode(&db_vector).unwrap();
 
         // Compute distance (should be close to actual L2 distance)
-        let pq_distance = distance_computer
-            .compute_distance(&query, &quantized)
-            .unwrap();
+        let pq_distance = distance_computer.compute_distance(&query, &quantized).unwrap();
 
         // Actual L2 distance
         let actual_distance = ((0.5_f32 - 1.0_f32).powi(2)
@@ -238,9 +229,7 @@ mod tests {
         let distance_computer = DistanceComputer::new(codebook);
 
         let query = vec![0.5, 0.5, 2.5, 2.5];
-        let table = distance_computer
-            .precompute_distance_table(&query)
-            .unwrap();
+        let table = distance_computer.precompute_distance_table(&query).unwrap();
 
         // Should have shape [2][2] (2 sub-quantizers, 2 centroids each)
         assert_eq!(table.len(), 2);
@@ -267,9 +256,7 @@ mod tests {
         let db_vector = vec![1.0, 1.0, 3.0, 3.0];
 
         // Precompute table
-        let table = distance_computer
-            .precompute_distance_table(&query)
-            .unwrap();
+        let table = distance_computer.precompute_distance_table(&query).unwrap();
 
         // Encode database vector
         let quantized = encoder.encode(&db_vector).unwrap();
@@ -280,9 +267,7 @@ mod tests {
             .unwrap();
 
         // Compute distance without table
-        let distance_without_table = distance_computer
-            .compute_distance(&query, &quantized)
-            .unwrap();
+        let distance_without_table = distance_computer.compute_distance(&query, &quantized).unwrap();
 
         // Should be identical
         assert!((distance_with_table - distance_without_table).abs() < 0.0001);
@@ -295,26 +280,16 @@ mod tests {
         let encoder = Encoder::new(codebook);
 
         let query = vec![0.5, 0.5, 2.5, 2.5];
-        let db_vectors = vec![
-            vec![0.0, 0.0, 2.0, 2.0],
-            vec![1.0, 1.0, 3.0, 3.0],
-        ];
+        let db_vectors = vec![vec![0.0, 0.0, 2.0, 2.0], vec![1.0, 1.0, 3.0, 3.0]];
 
         // Precompute table
-        let table = distance_computer
-            .precompute_distance_table(&query)
-            .unwrap();
+        let table = distance_computer.precompute_distance_table(&query).unwrap();
 
         // Encode all database vectors
-        let quantized: Vec<_> = db_vectors
-            .iter()
-            .map(|v| encoder.encode(v).unwrap())
-            .collect();
+        let quantized: Vec<_> = db_vectors.iter().map(|v| encoder.encode(v).unwrap()).collect();
 
         // Compute distances in batch
-        let distances = distance_computer
-            .compute_distances_batch(&table, &quantized)
-            .unwrap();
+        let distances = distance_computer.compute_distances_batch(&table, &quantized).unwrap();
 
         assert_eq!(distances.len(), 2);
 

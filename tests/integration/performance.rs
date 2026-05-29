@@ -8,9 +8,9 @@
 
 #![cfg(test)]
 
-use heliosdb_nano::{EmbeddedDatabase, Result, Error};
-use heliosdb_nano::session::IsolationLevel;
 use crate::test_helpers::*;
+use heliosdb_nano::session::IsolationLevel;
+use heliosdb_nano::{EmbeddedDatabase, Error, Result};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -29,14 +29,14 @@ fn test_point_lookup_throughput() -> Result<()> {
         handles.push(thread::spawn(move || {
             let session = db_clone.create_session(&format!("reader_{}", thread_id), IsolationLevel::ReadCommitted)?;
             let mut latencies: Vec<u128> = Vec::with_capacity(100);
-            
+
             for i in 0..100 {
                 let id = (i * 7 + thread_id) % 10000 + 1;
                 let q_start = Instant::now();
                 db_clone.query_in_session(session, &format!("SELECT * FROM users WHERE id = {}", id), &[])?;
                 latencies.push(q_start.elapsed().as_micros());
             }
-            
+
             db_clone.destroy_session(session)?;
             Ok(latencies.iter().sum::<u128>() / 100)
         }));
@@ -49,7 +49,7 @@ fn test_point_lookup_throughput() -> Result<()> {
     let duration = start.elapsed();
     let qps = 800.0 / duration.as_secs_f64();
     println!("Point lookup throughput: {:.2} QPS", qps);
-    
+
     // Target > 10 QPS in debug mode
     assert!(qps > 10.0, "Throughput too low: {:.2} QPS", qps);
 
@@ -70,14 +70,14 @@ fn test_concurrent_write_latency() -> Result<()> {
         handles.push(thread::spawn(move || {
             let session = db_clone.create_session(&format!("writer_{}", thread_id), IsolationLevel::ReadCommitted)?;
             let mut latencies: Vec<u128> = Vec::with_capacity(100);
-            
+
             for i in 0..100 {
                 let id = thread_id * 1000 + i;
                 let q_start = Instant::now();
                 db_clone.execute_in_session(session, &format!("INSERT INTO bench_writes VALUES ({}, 'val')", id))?;
                 latencies.push(q_start.elapsed().as_micros());
             }
-            
+
             db_clone.destroy_session(session)?;
             Ok(latencies.iter().sum::<u128>() / 100)
         }));
@@ -99,15 +99,15 @@ fn test_mixed_workload_performance() -> Result<()> {
     setup_with_test_data(&db, 5000)?;
 
     let mut handles: Vec<std::thread::JoinHandle<Result<()>>> = vec![];
-    
+
     // 4 readers + 2 writers
     for i in 0..6 {
         let db_clone = Arc::clone(&db);
         let is_writer = i < 2;
-        
+
         handles.push(thread::spawn(move || -> Result<()> {
             let session = db_clone.create_session(&format!("user_{}", i), IsolationLevel::ReadCommitted)?;
-            
+
             for _ in 0..100 {
                 if is_writer {
                     db_clone.execute_in_session(session, "UPDATE users SET age = age + 1 WHERE id = 1")?;
@@ -116,7 +116,7 @@ fn test_mixed_workload_performance() -> Result<()> {
                 }
                 thread::sleep(Duration::from_millis(1));
             }
-            
+
             db_clone.destroy_session(session)?;
             Ok(())
         }));
@@ -135,7 +135,7 @@ fn test_scalability_concurrent_connections() -> Result<()> {
     db.execute("CREATE TABLE scalability_test (id INT PRIMARY KEY)")?;
 
     let mut handles: Vec<std::thread::JoinHandle<Result<()>>> = vec![];
-    
+
     // Test 20 concurrent short-lived sessions
     for i in 0..20 {
         let db_clone = Arc::clone(&db);

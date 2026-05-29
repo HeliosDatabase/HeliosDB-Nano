@@ -125,12 +125,7 @@ fn resources_list_surfaces_schema_and_branches() {
 fn resources_read_with_db_returns_schema() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE TABLE t (id INT4)").unwrap();
-    let read = rpc_db(
-        &db,
-        "resources/read",
-        9,
-        json!({ "uri": "heliosdb://schema" }),
-    );
+    let read = rpc_db(&db, "resources/read", 9, json!({ "uri": "heliosdb://schema" }));
     let contents = read["result"]["contents"].as_array().unwrap();
     assert_eq!(contents[0]["uri"], "heliosdb://schema");
     assert!(contents[0]["text"].as_str().unwrap().contains("tables"));

@@ -37,11 +37,7 @@ async fn post_with_session_streams_progress_via_sse() {
     let sse_session = session_id.clone();
     let sse_task: tokio::task::JoinHandle<Vec<String>> = tokio::spawn(async move {
         let url = format!("http://{sse_addr}/sse?session={sse_session}");
-        let resp = reqwest::Client::new()
-            .get(url)
-            .send()
-            .await
-            .expect("sse connect");
+        let resp = reqwest::Client::new().get(url).send().await.expect("sse connect");
         let mut acc: Vec<String> = Vec::new();
         let mut buf = String::new();
         // Drain the SSE stream for a bounded time; we stop once

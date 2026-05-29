@@ -16,9 +16,7 @@ use test_helpers::create_test_db;
 
 /// Helper: create a source table with test data
 fn setup_source_table(db: &EmbeddedDatabase) -> Result<()> {
-    db.execute(
-        "CREATE TABLE source (id INT PRIMARY KEY, name TEXT, dept TEXT, salary INT)"
-    )?;
+    db.execute("CREATE TABLE source (id INT PRIMARY KEY, name TEXT, dept TEXT, salary INT)")?;
     db.execute("INSERT INTO source (id, name, dept, salary) VALUES (1, 'Alice', 'Engineering', 90000)")?;
     db.execute("INSERT INTO source (id, name, dept, salary) VALUES (2, 'Bob', 'Engineering', 85000)")?;
     db.execute("INSERT INTO source (id, name, dept, salary) VALUES (3, 'Carol', 'Marketing', 75000)")?;
@@ -37,9 +35,7 @@ fn test_insert_select_basic() -> Result<()> {
     setup_source_table(&db)?;
 
     // Create target table with same schema
-    db.execute(
-        "CREATE TABLE target (id INT PRIMARY KEY, name TEXT, dept TEXT, salary INT)"
-    )?;
+    db.execute("CREATE TABLE target (id INT PRIMARY KEY, name TEXT, dept TEXT, salary INT)")?;
 
     // INSERT ... SELECT all rows
     let rows = db.execute("INSERT INTO target SELECT * FROM source")?;
@@ -67,14 +63,10 @@ fn test_insert_select_with_where() -> Result<()> {
     let db = create_test_db()?;
     setup_source_table(&db)?;
 
-    db.execute(
-        "CREATE TABLE eng_team (id INT PRIMARY KEY, name TEXT, dept TEXT, salary INT)"
-    )?;
+    db.execute("CREATE TABLE eng_team (id INT PRIMARY KEY, name TEXT, dept TEXT, salary INT)")?;
 
     // Only insert Engineering rows
-    let rows = db.execute(
-        "INSERT INTO eng_team SELECT * FROM source WHERE dept = 'Engineering'"
-    )?;
+    let rows = db.execute("INSERT INTO eng_team SELECT * FROM source WHERE dept = 'Engineering'")?;
     assert_eq!(rows, 2, "Should insert 2 Engineering rows");
 
     let results = db.query("SELECT name FROM eng_team ORDER BY name", &[])?;
@@ -95,14 +87,10 @@ fn test_insert_select_with_column_subset() -> Result<()> {
     setup_source_table(&db)?;
 
     // Target table has fewer columns (name and dept only, plus its own id)
-    db.execute(
-        "CREATE TABLE names_only (name TEXT, dept TEXT)"
-    )?;
+    db.execute("CREATE TABLE names_only (name TEXT, dept TEXT)")?;
 
     // Select only name and dept columns
-    let rows = db.execute(
-        "INSERT INTO names_only SELECT name, dept FROM source"
-    )?;
+    let rows = db.execute("INSERT INTO names_only SELECT name, dept FROM source")?;
     assert_eq!(rows, 5, "Should insert 5 rows");
 
     let results = db.query("SELECT * FROM names_only ORDER BY name", &[])?;
@@ -122,14 +110,10 @@ fn test_insert_select_with_target_columns() -> Result<()> {
     let db = create_test_db()?;
     setup_source_table(&db)?;
 
-    db.execute(
-        "CREATE TABLE partial_target (id INT, name TEXT, notes TEXT)"
-    )?;
+    db.execute("CREATE TABLE partial_target (id INT, name TEXT, notes TEXT)")?;
 
     // Insert only id and name, leaving notes as NULL
-    let rows = db.execute(
-        "INSERT INTO partial_target (id, name) SELECT id, name FROM source WHERE id <= 2"
-    )?;
+    let rows = db.execute("INSERT INTO partial_target (id, name) SELECT id, name FROM source WHERE id <= 2")?;
     assert_eq!(rows, 2);
 
     let results = db.query("SELECT id, name, notes FROM partial_target ORDER BY id", &[])?;
@@ -150,14 +134,11 @@ fn test_insert_select_with_expressions() -> Result<()> {
     let db = create_test_db()?;
     setup_source_table(&db)?;
 
-    db.execute(
-        "CREATE TABLE raised (id INT, name TEXT, new_salary INT)"
-    )?;
+    db.execute("CREATE TABLE raised (id INT, name TEXT, new_salary INT)")?;
 
     // Apply 10% raise via expression in SELECT
-    let rows = db.execute(
-        "INSERT INTO raised SELECT id, name, salary + salary / 10 FROM source WHERE dept = 'Engineering'"
-    )?;
+    let rows =
+        db.execute("INSERT INTO raised SELECT id, name, salary + salary / 10 FROM source WHERE dept = 'Engineering'")?;
     assert_eq!(rows, 2);
 
     let results = db.query("SELECT name, new_salary FROM raised ORDER BY name", &[])?;
@@ -183,18 +164,15 @@ fn test_insert_select_with_aggregates() -> Result<()> {
     let db = create_test_db()?;
     setup_source_table(&db)?;
 
-    db.execute(
-        "CREATE TABLE dept_summary (dept TEXT, emp_count BIGINT, avg_salary BIGINT)"
-    )?;
+    db.execute("CREATE TABLE dept_summary (dept TEXT, emp_count BIGINT, avg_salary BIGINT)")?;
 
     // Aggregate by department
-    let rows = db.execute(
-        "INSERT INTO dept_summary SELECT dept, COUNT(*), AVG(salary) FROM source GROUP BY dept"
-    )?;
+    let rows = db.execute("INSERT INTO dept_summary SELECT dept, COUNT(*), AVG(salary) FROM source GROUP BY dept")?;
     assert_eq!(rows, 3, "Should insert 3 department summaries");
 
     let results = db.query(
-        "SELECT dept, emp_count, avg_salary FROM dept_summary ORDER BY dept", &[]
+        "SELECT dept, emp_count, avg_salary FROM dept_summary ORDER BY dept",
+        &[],
     )?;
     assert_eq!(results.len(), 3);
 
@@ -249,9 +227,7 @@ fn test_insert_select_explicit_column_mismatch() -> Result<()> {
     db.execute("CREATE TABLE target2 (id INT, name TEXT, dept TEXT)")?;
 
     // Specify 2 target columns but SELECT returns 3 columns
-    let result = db.execute(
-        "INSERT INTO target2 (id, name) SELECT id, name, dept FROM source"
-    );
+    let result = db.execute("INSERT INTO target2 (id, name) SELECT id, name, dept FROM source");
     assert!(result.is_err(), "Should fail due to column count mismatch");
     let err_msg = result.unwrap_err().to_string();
     assert!(
@@ -277,9 +253,7 @@ fn test_insert_select_same_table() -> Result<()> {
     db.execute("INSERT INTO items VALUES (3, 'Thingamajig', 'A')")?;
 
     // Copy category A items with new IDs (id + 100)
-    let rows = db.execute(
-        "INSERT INTO items SELECT id + 100, name, category FROM items WHERE category = 'A'"
-    )?;
+    let rows = db.execute("INSERT INTO items SELECT id + 100, name, category FROM items WHERE category = 'A'")?;
     assert_eq!(rows, 2, "Should insert 2 rows from same table");
 
     let results = db.query("SELECT * FROM items ORDER BY id", &[])?;
@@ -305,19 +279,13 @@ fn test_insert_select_with_order_limit() -> Result<()> {
     let db = create_test_db()?;
     setup_source_table(&db)?;
 
-    db.execute(
-        "CREATE TABLE top_earners (id INT, name TEXT, dept TEXT, salary INT)"
-    )?;
+    db.execute("CREATE TABLE top_earners (id INT, name TEXT, dept TEXT, salary INT)")?;
 
     // Insert top 3 earners
-    let rows = db.execute(
-        "INSERT INTO top_earners SELECT * FROM source ORDER BY salary DESC LIMIT 3"
-    )?;
+    let rows = db.execute("INSERT INTO top_earners SELECT * FROM source ORDER BY salary DESC LIMIT 3")?;
     assert_eq!(rows, 3, "Should insert 3 rows");
 
-    let results = db.query(
-        "SELECT name, salary FROM top_earners ORDER BY salary DESC", &[]
-    )?;
+    let results = db.query("SELECT name, salary FROM top_earners ORDER BY salary DESC", &[])?;
     assert_eq!(results.len(), 3);
     assert_eq!(results[0].values[0], Value::String("Alice".to_string()));
     assert_eq!(results[0].values[1], Value::Int4(90000));

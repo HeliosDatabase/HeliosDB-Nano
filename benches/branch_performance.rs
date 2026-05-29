@@ -6,8 +6,11 @@
 //! - Merge performance with various dataset sizes
 //! - GC performance
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use heliosdb_nano::{Config, storage::{StorageEngine, BranchOptions, MergeStrategy}};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use heliosdb_nano::{
+    storage::{BranchOptions, MergeStrategy, StorageEngine},
+    Config,
+};
 
 fn bench_branch_creation(c: &mut Criterion) {
     let mut group = c.benchmark_group("branch_creation");
@@ -24,24 +27,18 @@ fn bench_branch_creation(c: &mut Criterion) {
             engine.put(&key, &value).unwrap();
         }
 
-        group.bench_with_input(
-            BenchmarkId::from_parameter(format!("{}_keys", size)),
-            &size,
-            |b, _| {
-                let mut counter = 0;
-                b.iter(|| {
-                    let branch_name = format!("bench_{}", counter);
-                    counter += 1;
-                    black_box(
-                        engine.create_branch(
-                            &branch_name,
-                            Some("main"),
-                            BranchOptions::default(),
-                        ).unwrap()
-                    )
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(format!("{}_keys", size)), &size, |b, _| {
+            let mut counter = 0;
+            b.iter(|| {
+                let branch_name = format!("bench_{}", counter);
+                counter += 1;
+                black_box(
+                    engine
+                        .create_branch(&branch_name, Some("main"), BranchOptions::default())
+                        .unwrap(),
+                )
+            })
+        });
     }
 
     group.finish();
@@ -61,7 +58,9 @@ fn bench_branch_read_performance(c: &mut Criterion) {
     }
 
     // Create branch
-    engine.create_branch("bench_read", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("bench_read", Some("main"), BranchOptions::default())
+        .unwrap();
 
     // Benchmark: Read from main (baseline)
     group.bench_function("read_from_main", |b| {
@@ -94,7 +93,9 @@ fn bench_branch_write_performance(c: &mut Criterion) {
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
     // Create branch
-    engine.create_branch("bench_write", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("bench_write", Some("main"), BranchOptions::default())
+        .unwrap();
 
     // Benchmark: Write to branch (copy-on-write)
     group.bench_function("write_100_keys", |b| {
@@ -129,7 +130,9 @@ fn bench_merge_performance(c: &mut Criterion) {
 
         // Create branch and make changes
         let branch_name = format!("merge_bench_{}", num_changes);
-        engine.create_branch(&branch_name, Some("main"), BranchOptions::default()).unwrap();
+        engine
+            .create_branch(&branch_name, Some("main"), BranchOptions::default())
+            .unwrap();
 
         let mut tx = engine.begin_branch_transaction(&branch_name).unwrap();
         for i in 0..num_changes {
@@ -146,13 +149,7 @@ fn bench_merge_performance(c: &mut Criterion) {
                 b.iter(|| {
                     // Clone engine state for repeatability
                     // Note: In real benchmark, you'd recreate the scenario each time
-                    black_box(
-                        engine.merge_branch(
-                            &branch_name,
-                            "main",
-                            MergeStrategy::Auto,
-                        )
-                    )
+                    black_box(engine.merge_branch(&branch_name, "main", MergeStrategy::Auto))
                 })
             },
         );
@@ -178,7 +175,9 @@ fn bench_merge_with_conflicts(c: &mut Criterion) {
 
         // Create branch
         let branch_name = format!("conflict_bench_{}", conflict_ratio);
-        engine.create_branch(&branch_name, Some("main"), BranchOptions::default()).unwrap();
+        engine
+            .create_branch(&branch_name, Some("main"), BranchOptions::default())
+            .unwrap();
 
         // Modify keys in branch
         let mut tx = engine.begin_branch_transaction(&branch_name).unwrap();
@@ -199,17 +198,7 @@ fn bench_merge_with_conflicts(c: &mut Criterion) {
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{}%_conflicts", conflict_ratio)),
             &conflict_ratio,
-            |b, _| {
-                b.iter(|| {
-                    black_box(
-                        engine.merge_branch(
-                            &branch_name,
-                            "main",
-                            MergeStrategy::Theirs,
-                        )
-                    )
-                })
-            },
+            |b, _| b.iter(|| black_box(engine.merge_branch(&branch_name, "main", MergeStrategy::Theirs))),
         );
     }
 
@@ -226,17 +215,15 @@ fn bench_list_branches(c: &mut Criterion) {
         // Create multiple branches
         for i in 0..num_branches {
             let branch_name = format!("branch_{}", i);
-            engine.create_branch(&branch_name, Some("main"), BranchOptions::default()).unwrap();
+            engine
+                .create_branch(&branch_name, Some("main"), BranchOptions::default())
+                .unwrap();
         }
 
         group.bench_with_input(
             BenchmarkId::from_parameter(format!("{}_branches", num_branches)),
             &num_branches,
-            |b, _| {
-                b.iter(|| {
-                    black_box(engine.list_branches().unwrap())
-                })
-            },
+            |b, _| b.iter(|| black_box(engine.list_branches().unwrap())),
         );
     }
 
@@ -254,7 +241,9 @@ fn bench_branch_gc(c: &mut Criterion) {
         // Create and populate branches
         for i in 0..num_dropped {
             let branch_name = format!("gc_bench_{}", i);
-            engine.create_branch(&branch_name, Some("main"), BranchOptions::default()).unwrap();
+            engine
+                .create_branch(&branch_name, Some("main"), BranchOptions::default())
+                .unwrap();
 
             // Add some data to each branch
             let mut tx = engine.begin_branch_transaction(&branch_name).unwrap();
@@ -296,7 +285,9 @@ fn bench_branch_hierarchy_depth(c: &mut Criterion) {
         let mut parent = "main".to_string();
         for i in 0..depth {
             let branch_name = format!("level_{}", i);
-            engine.create_branch(&branch_name, Some(&parent), BranchOptions::default()).unwrap();
+            engine
+                .create_branch(&branch_name, Some(&parent), BranchOptions::default())
+                .unwrap();
             parent = branch_name;
         }
 
@@ -338,7 +329,9 @@ fn bench_concurrent_branch_operations(c: &mut Criterion) {
     // Create multiple branches for concurrent access
     for i in 0..4 {
         let branch_name = format!("concurrent_{}", i);
-        engine.create_branch(&branch_name, Some("main"), BranchOptions::default()).unwrap();
+        engine
+            .create_branch(&branch_name, Some("main"), BranchOptions::default())
+            .unwrap();
     }
 
     group.bench_function("4_concurrent_reads", |b| {

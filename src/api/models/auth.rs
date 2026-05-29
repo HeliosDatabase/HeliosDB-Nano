@@ -246,10 +246,7 @@ mod tests {
         assert_eq!(auth.api_key, "test-key-123");
         assert!(auth.description.is_none());
 
-        let auth_with_desc = ApiKeyAuth::with_description(
-            "test-key-456".to_string(),
-            "Test key".to_string(),
-        );
+        let auth_with_desc = ApiKeyAuth::with_description("test-key-456".to_string(), "Test key".to_string());
         assert_eq!(auth_with_desc.api_key, "test-key-456");
         assert_eq!(auth_with_desc.description, Some("Test key".to_string()));
     }

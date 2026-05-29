@@ -4,7 +4,7 @@
 //! For M sub-quantizers with K centroids each, the codebook contains M×K centroids.
 
 use super::{PqError, PqResult};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Codebook: stores centroids for each sub-quantizer
 ///
@@ -38,15 +38,8 @@ pub struct Codebook {
 #[allow(clippy::indexing_slicing)]
 impl Codebook {
     /// Create a new empty codebook
-    pub fn new(
-        num_subquantizers: usize,
-        num_centroids: usize,
-        subvector_dimension: usize,
-    ) -> Self {
-        let centroids = vec![
-            vec![vec![0.0; subvector_dimension]; num_centroids];
-            num_subquantizers
-        ];
+    pub fn new(num_subquantizers: usize, num_centroids: usize, subvector_dimension: usize) -> Self {
+        let centroids = vec![vec![vec![0.0; subvector_dimension]; num_centroids]; num_subquantizers];
 
         Self {
             num_subquantizers,
@@ -59,9 +52,7 @@ impl Codebook {
     /// Create codebook from pre-computed centroids
     pub fn from_centroids(centroids: Vec<Vec<Vec<f32>>>) -> PqResult<Self> {
         if centroids.is_empty() {
-            return Err(PqError::InvalidConfig(
-                "Centroids cannot be empty".to_string(),
-            ));
+            return Err(PqError::InvalidConfig("Centroids cannot be empty".to_string()));
         }
 
         let num_subquantizers = centroids.len();
@@ -114,12 +105,7 @@ impl Codebook {
     }
 
     /// Set centroid for a specific sub-quantizer and centroid index
-    pub fn set_centroid(
-        &mut self,
-        subquantizer_idx: usize,
-        centroid_idx: usize,
-        centroid: Vec<f32>,
-    ) -> PqResult<()> {
+    pub fn set_centroid(&mut self, subquantizer_idx: usize, centroid_idx: usize, centroid: Vec<f32>) -> PqResult<()> {
         if subquantizer_idx >= self.num_subquantizers {
             return Err(PqError::InvalidSubQuantizerIndex(subquantizer_idx));
         }
@@ -171,20 +157,13 @@ impl Codebook {
     /// Calculate memory size in bytes
     pub fn memory_size(&self) -> usize {
         // M × K × (D/M) × sizeof(f32)
-        self.num_subquantizers
-            * self.num_centroids
-            * self.subvector_dimension
-            * std::mem::size_of::<f32>()
+        self.num_subquantizers * self.num_centroids * self.subvector_dimension * std::mem::size_of::<f32>()
     }
 
     /// Find nearest centroid index for a sub-vector
     ///
     /// Used during encoding to find which centroid best represents a sub-vector.
-    pub fn find_nearest_centroid(
-        &self,
-        subquantizer_idx: usize,
-        subvector: &[f32],
-    ) -> PqResult<u8> {
+    pub fn find_nearest_centroid(&self, subquantizer_idx: usize, subvector: &[f32]) -> PqResult<u8> {
         if subquantizer_idx >= self.num_subquantizers {
             return Err(PqError::InvalidSubQuantizerIndex(subquantizer_idx));
         }
@@ -214,9 +193,7 @@ impl Codebook {
     /// Validate codebook integrity
     pub fn validate(&self) -> PqResult<()> {
         if self.num_subquantizers == 0 {
-            return Err(PqError::InvalidConfig(
-                "num_subquantizers must be > 0".to_string(),
-            ));
+            return Err(PqError::InvalidConfig("num_subquantizers must be > 0".to_string()));
         }
 
         if self.num_centroids == 0 || self.num_centroids > 256 {
@@ -227,9 +204,7 @@ impl Codebook {
         }
 
         if self.subvector_dimension == 0 {
-            return Err(PqError::InvalidConfig(
-                "subvector_dimension must be > 0".to_string(),
-            ));
+            return Err(PqError::InvalidConfig("subvector_dimension must be > 0".to_string()));
         }
 
         // Check that all centroids are finite
@@ -252,10 +227,7 @@ impl Codebook {
 
 /// Compute L2 distance squared between two vectors
 fn l2_distance_squared(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).powi(2))
-        .sum()
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum()
 }
 
 #[cfg(test)]
@@ -304,15 +276,11 @@ mod tests {
         codebook.set_centroid(0, 2, vec![0.0, 1.0]).unwrap();
 
         // Test point closest to centroid 1
-        let nearest = codebook
-            .find_nearest_centroid(0, &[0.9, 0.1])
-            .unwrap();
+        let nearest = codebook.find_nearest_centroid(0, &[0.9, 0.1]).unwrap();
         assert_eq!(nearest, 1);
 
         // Test point closest to centroid 2
-        let nearest = codebook
-            .find_nearest_centroid(0, &[0.1, 0.9])
-            .unwrap();
+        let nearest = codebook.find_nearest_centroid(0, &[0.1, 0.9]).unwrap();
         assert_eq!(nearest, 2);
     }
 

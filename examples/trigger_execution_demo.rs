@@ -3,7 +3,7 @@
 //! This example demonstrates how trigger execution is integrated into DML operations.
 //! It shows the execution flow for INSERT, UPDATE, and DELETE with BEFORE and AFTER triggers.
 
-use heliosdb_nano::{EmbeddedDatabase, Result, sql};
+use heliosdb_nano::{sql, EmbeddedDatabase, Result};
 
 fn main() -> Result<()> {
     println!("========================================");
@@ -27,7 +27,7 @@ fn main() -> Result<()> {
         sql::logical_plan::TriggerTiming::Before,
         vec![sql::logical_plan::TriggerEvent::Insert],
         sql::logical_plan::TriggerFor::Row,
-        None, // No WHEN condition
+        None,   // No WHEN condition
         vec![], // Empty body for now (would contain validation logic)
         vec![], // No REFERENCING clause
     );
@@ -59,10 +59,7 @@ fn main() -> Result<()> {
     let triggers = db.trigger_registry.get_triggers_for_table("users")?;
     println!("   Found {} trigger(s) on 'users' table:", triggers.len());
     for trigger in &triggers {
-        println!("     - {} ({:?} {:?})",
-                 trigger.name,
-                 trigger.timing,
-                 trigger.events);
+        println!("     - {} ({:?} {:?})", trigger.name, trigger.timing, trigger.events);
     }
     println!();
 

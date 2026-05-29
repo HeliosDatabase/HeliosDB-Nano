@@ -10,8 +10,8 @@
 //! stays fast on large tables when the application can't use keyset
 //! pagination.
 
-use crate::{Result, Tuple, Schema, Value};
-use super::{PhysicalOperator, TimeoutContext, compare_values};
+use super::{compare_values, PhysicalOperator, TimeoutContext};
+use crate::{Result, Schema, Tuple, Value};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::sync::Arc;
@@ -80,7 +80,11 @@ impl TopKOperator {
 
         // Degenerate case: k == 0 ⇒ no rows to return.
         if k == 0 {
-            return Ok(Self { sorted: Vec::new(), cursor: 0, schema });
+            return Ok(Self {
+                sorted: Vec::new(),
+                cursor: 0,
+                schema,
+            });
         }
 
         let mut heap: BinaryHeap<HeapEntry> = BinaryHeap::with_capacity(k + 1);
@@ -96,7 +100,11 @@ impl TopKOperator {
                     Err(_) => key.push(Value::Null),
                 }
             }
-            let entry = HeapEntry { key, asc: Arc::clone(&asc), tuple };
+            let entry = HeapEntry {
+                key,
+                asc: Arc::clone(&asc),
+                tuple,
+            };
             if heap.len() < k {
                 heap.push(entry);
             } else {
@@ -117,11 +125,17 @@ impl TopKOperator {
         // sort direction directly.
         let sorted: Vec<Tuple> = entries.drain(..).map(|e| e.tuple).collect();
 
-        Ok(Self { sorted, cursor: 0, schema })
+        Ok(Self {
+            sorted,
+            cursor: 0,
+            schema,
+        })
     }
 
     /// No-op — timeout is handled during construction, kept for API symmetry.
-    pub fn with_timeout(self, _: Option<TimeoutContext>) -> Self { self }
+    pub fn with_timeout(self, _: Option<TimeoutContext>) -> Self {
+        self
+    }
 }
 
 impl PhysicalOperator for TopKOperator {

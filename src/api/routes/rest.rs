@@ -3,14 +3,11 @@
 //! Maps the `/rest/v1/` URL namespace to the appropriate handler functions.
 
 use axum::{
-    Router,
     routing::{get, post},
+    Router,
 };
 
-use crate::api::{
-    handlers::rest_handler,
-    server::AppState,
-};
+use crate::api::{handlers::rest_handler, server::AppState};
 
 /// Create PostgREST-compatible REST routes.
 ///

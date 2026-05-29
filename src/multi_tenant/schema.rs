@@ -222,7 +222,8 @@ impl TenantManager {
     /// Update tenant status
     pub fn update_status(&self, id: &str, status: TenantStatus) -> Result<(), TenantError> {
         let mut tenants = self.tenants.write();
-        let tenant = tenants.get_mut(id)
+        let tenant = tenants
+            .get_mut(id)
             .ok_or_else(|| TenantError::NotFound(id.to_string()))?;
 
         tenant.status = status;
@@ -232,7 +233,8 @@ impl TenantManager {
     /// Update tenant plan
     pub fn update_plan(&self, id: &str, plan: TenantPlan) -> Result<(), TenantError> {
         let mut tenants = self.tenants.write();
-        let tenant = tenants.get_mut(id)
+        let tenant = tenants
+            .get_mut(id)
             .ok_or_else(|| TenantError::NotFound(id.to_string()))?;
 
         tenant.plan = plan.clone();
@@ -243,7 +245,8 @@ impl TenantManager {
     /// Update tenant metadata
     pub fn update_metadata(&self, id: &str, metadata: HashMap<String, serde_json::Value>) -> Result<(), TenantError> {
         let mut tenants = self.tenants.write();
-        let tenant = tenants.get_mut(id)
+        let tenant = tenants
+            .get_mut(id)
             .ok_or_else(|| TenantError::NotFound(id.to_string()))?;
 
         tenant.metadata = metadata;
@@ -277,7 +280,8 @@ impl TenantManager {
 
     /// Check if tenant is active
     pub fn is_active(&self, id: &str) -> bool {
-        self.tenants.read()
+        self.tenants
+            .read()
             .get(id)
             .map(|t| t.status == TenantStatus::Active || t.status == TenantStatus::Trial)
             .unwrap_or(false)
@@ -286,8 +290,7 @@ impl TenantManager {
     /// Check if tenant has quota for operation
     pub fn check_quota(&self, id: &str, resource: &str, current: u64) -> Result<(), TenantError> {
         let tenants = self.tenants.read();
-        let tenant = tenants.get(id)
-            .ok_or_else(|| TenantError::NotFound(id.to_string()))?;
+        let tenant = tenants.get(id).ok_or_else(|| TenantError::NotFound(id.to_string()))?;
 
         let limit = match resource {
             "storage" => tenant.quotas.max_storage_bytes,
@@ -323,7 +326,8 @@ impl TenantManager {
                     value JSON,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )", schema
+                )",
+                schema
             ),
             format!(
                 "CREATE TABLE IF NOT EXISTS {}._audit_log (
@@ -335,7 +339,8 @@ impl TenantManager {
                     new_data JSON,
                     user_id TEXT,
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )", schema
+                )",
+                schema
             ),
         ]
     }
@@ -389,7 +394,9 @@ impl SchemaIsolation {
 
     /// Wrap SQL query with tenant schema
     pub fn wrap_query(&self, tenant_id: &str, sql: &str) -> Result<String, TenantError> {
-        let tenant = self.manager.get_tenant(tenant_id)
+        let tenant = self
+            .manager
+            .get_tenant(tenant_id)
             .ok_or_else(|| TenantError::NotFound(tenant_id.to_string()))?;
 
         if tenant.status != TenantStatus::Active && tenant.status != TenantStatus::Trial {
@@ -397,16 +404,14 @@ impl SchemaIsolation {
         }
 
         // Set search path to tenant schema
-        Ok(format!(
-            "SET search_path TO {}; {}",
-            tenant.schema_name,
-            sql
-        ))
+        Ok(format!("SET search_path TO {}; {}", tenant.schema_name, sql))
     }
 
     /// Validate query doesn't access other schemas
     pub fn validate_query(&self, tenant_id: &str, sql: &str) -> Result<(), TenantError> {
-        let tenant = self.manager.get_tenant(tenant_id)
+        let tenant = self
+            .manager
+            .get_tenant(tenant_id)
             .ok_or_else(|| TenantError::NotFound(tenant_id.to_string()))?;
 
         let allowed_schemas = vec![
@@ -460,7 +465,9 @@ mod tests {
     #[test]
     fn test_tenant_creation() {
         let manager = TenantManager::new("tenant");
-        let tenant = manager.create_tenant("test-1", "Test Tenant", TenantPlan::Starter).unwrap();
+        let tenant = manager
+            .create_tenant("test-1", "Test Tenant", TenantPlan::Starter)
+            .unwrap();
 
         assert_eq!(tenant.id, "test-1");
         assert_eq!(tenant.schema_name, "tenant_test1");

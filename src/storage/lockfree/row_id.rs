@@ -120,9 +120,7 @@ impl HierarchicalRowIdGenerator {
     /// Each thread generates IDs independently.
     #[inline]
     pub fn next(&self) -> u64 {
-        let partition = self.forced_partition.unwrap_or_else(|| {
-            PARTITION_ID.with(|p| p.get())
-        });
+        let partition = self.forced_partition.unwrap_or_else(|| PARTITION_ID.with(|p| p.get()));
 
         let (timestamp, sequence) = SEQUENCE.with(|seq| {
             LAST_TIMESTAMP.with(|last_ts| {
@@ -178,9 +176,7 @@ impl HierarchicalRowIdGenerator {
     /// Pack components into a single u64
     #[inline]
     const fn pack(partition: u16, timestamp: u32, sequence: u16) -> u64 {
-        ((partition as u64) << PARTITION_SHIFT)
-            | ((timestamp as u64) << TIMESTAMP_SHIFT)
-            | (sequence as u64)
+        ((partition as u64) << PARTITION_SHIFT) | ((timestamp as u64) << TIMESTAMP_SHIFT) | (sequence as u64)
     }
 
     /// Unpack a row ID into its components
@@ -270,14 +266,17 @@ impl BatchRowIdAllocator {
 
     /// Get or create allocator for table, starting from given ID
     pub fn initialize_table(&self, table: &str, start_id: u64) {
-        self.allocators.entry(table.to_string())
+        self.allocators
+            .entry(table.to_string())
             .or_insert_with(|| BatchState::new(start_id, self.batch_size));
     }
 
     /// Allocate next ID for table (lock-free fast path)
     #[inline]
     pub fn next(&self, table: &str) -> u64 {
-        let state = self.allocators.entry(table.to_string())
+        let state = self
+            .allocators
+            .entry(table.to_string())
             .or_insert_with(|| BatchState::new(1, self.batch_size));
 
         let current = state.current.fetch_add(1, Ordering::Relaxed);
@@ -296,14 +295,15 @@ impl BatchRowIdAllocator {
 
     /// Get maximum allocated ID for table (for checkpointing)
     pub fn max_allocated(&self, table: &str) -> Option<u64> {
-        self.allocators.get(table).map(|state| {
-            state.next_batch.load(Ordering::Relaxed)
-        })
+        self.allocators
+            .get(table)
+            .map(|state| state.next_batch.load(Ordering::Relaxed))
     }
 
     /// Get all tables and their max allocated IDs
     pub fn checkpoint_state(&self) -> Vec<(String, u64)> {
-        self.allocators.iter()
+        self.allocators
+            .iter()
             .map(|entry| {
                 let max = entry.next_batch.load(Ordering::Relaxed);
                 (entry.key().clone(), max)
@@ -314,10 +314,8 @@ impl BatchRowIdAllocator {
     /// Restore from checkpoint (add safety margin)
     pub fn restore_from_checkpoint(&self, table: &str, max_id: u64) {
         let safe_start = max_id + self.batch_size; // Safety margin
-        self.allocators.insert(
-            table.to_string(),
-            BatchState::new(safe_start, self.batch_size)
-        );
+        self.allocators
+            .insert(table.to_string(), BatchState::new(safe_start, self.batch_size));
     }
 }
 
@@ -342,9 +340,7 @@ impl RowIdGenerator {
     pub fn next_batch(&self, table: &str, count: usize) -> Vec<u64> {
         match self {
             Self::Hierarchical(gen) => gen.next_batch(count),
-            Self::Batched(alloc) => {
-                (0..count).map(|_| alloc.next(table)).collect()
-            }
+            Self::Batched(alloc) => (0..count).map(|_| alloc.next(table)).collect(),
         }
     }
 }

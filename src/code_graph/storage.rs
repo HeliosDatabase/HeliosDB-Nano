@@ -150,9 +150,7 @@ impl CodeIndexOptions {
         if let Some(n) = self.parallelism {
             return n.max(1);
         }
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1);
+        let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
         cores.min(8).max(1)
     }
 }
@@ -224,9 +222,7 @@ pub struct AstIndexMeta {
     pub paused: bool,
 }
 
-static AST_INDEXES: std::sync::OnceLock<
-    std::sync::RwLock<HashMap<String, AstIndexMeta>>,
-> = std::sync::OnceLock::new();
+static AST_INDEXES: std::sync::OnceLock<std::sync::RwLock<HashMap<String, AstIndexMeta>>> = std::sync::OnceLock::new();
 
 fn ast_registry() -> &'static std::sync::RwLock<HashMap<String, AstIndexMeta>> {
     AST_INDEXES.get_or_init(|| std::sync::RwLock::new(HashMap::new()))
@@ -372,10 +368,7 @@ pub fn code_index_with_embedder(
         };
         lang_set.insert(file.lang.to_ascii_lowercase());
         let sha = sha256_hex(&file.content);
-        let unchanged = existing_sha
-            .get(&file.path)
-            .map(|s| s == &sha)
-            .unwrap_or(false);
+        let unchanged = existing_sha.get(&file.path).map(|s| s == &sha).unwrap_or(false);
         if unchanged && !opts.force_reparse {
             stats.files_unchanged += 1;
             continue;
@@ -432,9 +425,7 @@ pub fn code_index_with_embedder(
                 .num_threads(workers)
                 .thread_name(|i| format!("hdb-code-index-{i}"))
                 .build()
-                .map_err(|e| Error::query_execution(format!(
-                    "failed to build code-index thread pool ({e})"
-                )))?,
+                .map_err(|e| Error::query_execution(format!("failed to build code-index thread pool ({e})")))?,
         )
     };
 
@@ -460,20 +451,14 @@ pub fn code_index_with_embedder(
     // `path` rows (e.g. a buggy upsert client), subsequent occurrences
     // need the normal delete-stale loop or symbols/refs accumulate.
     // We track which paths we've already drained per call.
-    let mut processed_paths: std::collections::HashSet<String> =
-        std::collections::HashSet::new();
+    let mut processed_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // -------- Per-chunk: parallel parse → transactional drain --------
     for chunk in chunks {
         let parse_started = std::time::Instant::now();
         let parsed: Vec<Result<ParsedFile>> = if let Some(pool) = &pool {
             use rayon::prelude::*;
-            pool.install(|| {
-                chunk
-                    .into_par_iter()
-                    .map(parse_extract_one)
-                    .collect::<Vec<_>>()
-            })
+            pool.install(|| chunk.into_par_iter().map(parse_extract_one).collect::<Vec<_>>())
         } else {
             chunk.into_iter().map(parse_extract_one).collect::<Vec<_>>()
         };
@@ -657,23 +642,15 @@ fn delete_stale_symbols_and_refs(db: &EmbeddedDatabase, file_id: i64) -> Result<
         })
         .collect();
     if !stale_ids.is_empty() {
-        let csv = stale_ids
-            .iter()
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
+        let csv = stale_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
         db.execute(&format!(
             "UPDATE _hdb_code_symbol_refs \
                 SET to_symbol = NULL, resolution = 'unresolved' \
               WHERE to_symbol IN ({csv})"
         ))?;
     }
-    db.execute(&format!(
-        "DELETE FROM _hdb_code_symbol_refs WHERE file_id = {file_id}"
-    ))?;
-    db.execute(&format!(
-        "DELETE FROM _hdb_code_symbols WHERE file_id = {file_id}"
-    ))?;
+    db.execute(&format!("DELETE FROM _hdb_code_symbol_refs WHERE file_id = {file_id}"))?;
+    db.execute(&format!("DELETE FROM _hdb_code_symbols WHERE file_id = {file_id}"))?;
     Ok(())
 }
 
@@ -707,14 +684,9 @@ fn bulk_insert_symbols_batched(
 
     let any_vec = vectors.iter().any(Option::is_some);
     if any_vec {
-        let dim = vectors
-            .iter()
-            .find_map(|v| v.as_ref().map(|v| v.len()))
-            .unwrap_or(0);
+        let dim = vectors.iter().find_map(|v| v.as_ref().map(|v| v.len())).unwrap_or(0);
         if dim == 0 {
-            return Err(Error::query_execution(
-                "embedder returned a zero-length vector",
-            ));
+            return Err(Error::query_execution("embedder returned a zero-length vector"));
         }
         ensure_body_vec_column(db, dim)?;
         for v in &vectors {
@@ -855,7 +827,12 @@ fn write_one_parsed(
     parsed: ParsedFile,
     skip_delete_stale: bool,
 ) -> Result<()> {
-    let ParsedFile { file, sha, symbols, resolved } = parsed;
+    let ParsedFile {
+        file,
+        sha,
+        symbols,
+        resolved,
+    } = parsed;
 
     // Upsert the file row, get back the file_id. This also writes
     // the new sha256 so the next run can short-circuit.
@@ -879,23 +856,15 @@ fn write_one_parsed(
             })
             .collect();
         if !stale_ids.is_empty() {
-            let csv = stale_ids
-                .iter()
-                .map(|i| i.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
+            let csv = stale_ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
             db.execute(&format!(
                 "UPDATE _hdb_code_symbol_refs \
                     SET to_symbol = NULL, resolution = 'unresolved' \
                   WHERE to_symbol IN ({csv})"
             ))?;
         }
-        db.execute(&format!(
-            "DELETE FROM _hdb_code_symbol_refs WHERE file_id = {file_id}"
-        ))?;
-        db.execute(&format!(
-            "DELETE FROM _hdb_code_symbols WHERE file_id = {file_id}"
-        ))?;
+        db.execute(&format!("DELETE FROM _hdb_code_symbol_refs WHERE file_id = {file_id}"))?;
+        db.execute(&format!("DELETE FROM _hdb_code_symbols WHERE file_id = {file_id}"))?;
     }
 
     let symbol_ids = insert_symbols(db, file_id, &symbols, embedder, stats)?;
@@ -921,15 +890,11 @@ struct ParsedFile {
 /// touches no DB state. Errors propagate back to the main thread, which
 /// short-circuits the whole `code_index` call (matching the serial
 /// implementation's `?`-propagation behaviour).
-fn parse_extract_one(
-    item: (SourceFile, String, ParseExtractPair),
-) -> Result<ParsedFile> {
+fn parse_extract_one(item: (SourceFile, String, ParseExtractPair)) -> Result<ParsedFile> {
     let (file, sha, resolution) = item;
     let tree = match &resolution {
         ParseExtractPair::Static(lang) => parse::parse(*lang, &file.content)?,
-        ParseExtractPair::Dynamic { .. } => {
-            parse::parse_by_name(&file.lang, &file.content)?
-        }
+        ParseExtractPair::Dynamic { .. } => parse::parse_by_name(&file.lang, &file.content)?,
     };
     let (symbols, refs) = match &resolution {
         ParseExtractPair::Static(lang) => extract(*lang, &file.content, &tree),
@@ -953,7 +918,12 @@ fn parse_extract_one(
         .collect();
     super::resolver::rebind_via_local_types(&mut resolved, &bodies);
     super::resolver::rebind_via_imports(&mut resolved);
-    Ok(ParsedFile { file, sha, symbols, resolved })
+    Ok(ParsedFile {
+        file,
+        sha,
+        symbols,
+        resolved,
+    })
 }
 
 fn sha256_hex(s: &str) -> String {
@@ -981,10 +951,7 @@ fn resolve_parser_and_extractor(lang: &str) -> Option<ParseExtractPair> {
     // parse to an empty symbol set silently — that's worse than
     // skipping the file outright.
     let canonical = lang.trim().to_ascii_lowercase();
-    if super::parse::registered_grammars()
-        .iter()
-        .any(|g| g == &canonical)
-    {
+    if super::parse::registered_grammars().iter().any(|g| g == &canonical) {
         if let Some(extractor) = super::symbols::registered_extractor(&canonical) {
             return Some(ParseExtractPair::Dynamic { extractor });
         }
@@ -1154,15 +1121,10 @@ fn bootstrap_tables(db: &EmbeddedDatabase) -> Result<()> {
     // file_id-indexed deletes drop that to single-millisecond range
     // and are also the load-bearing index for the cross-file
     // resolver's UPDATE-by-file_id path. Idempotent.
-    let _ = db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_hdb_code_symbols_file_id ON _hdb_code_symbols(file_id)",
-    );
-    let _ = db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_hdb_code_symbol_refs_file_id ON _hdb_code_symbol_refs(file_id)",
-    );
-    let _ = db.execute(
-        "CREATE INDEX IF NOT EXISTS idx_hdb_code_symbol_refs_to_symbol ON _hdb_code_symbol_refs(to_symbol)",
-    );
+    let _ = db.execute("CREATE INDEX IF NOT EXISTS idx_hdb_code_symbols_file_id ON _hdb_code_symbols(file_id)");
+    let _ = db.execute("CREATE INDEX IF NOT EXISTS idx_hdb_code_symbol_refs_file_id ON _hdb_code_symbol_refs(file_id)");
+    let _ =
+        db.execute("CREATE INDEX IF NOT EXISTS idx_hdb_code_symbol_refs_to_symbol ON _hdb_code_symbol_refs(to_symbol)");
     let _ = db.execute(
         "CREATE INDEX IF NOT EXISTS idx_hdb_code_symbol_refs_from_symbol ON _hdb_code_symbol_refs(from_symbol)",
     );
@@ -1203,7 +1165,12 @@ fn fetch_source_files(db: &EmbeddedDatabase, source_table: &str) -> Result<Vec<S
             Some(Value::String(s)) => s.clone(),
             _ => String::new(),
         };
-        out.push(SourceFile { path, lang, content, sha256: None });
+        out.push(SourceFile {
+            path,
+            lang,
+            content,
+            sha256: None,
+        });
     }
     Ok(out)
 }
@@ -1212,12 +1179,7 @@ fn fetch_source_files(db: &EmbeddedDatabase, source_table: &str) -> Result<Vec<S
 // Write helpers
 // ---------------------------------------------------------------------------
 
-fn upsert_file(
-    db: &EmbeddedDatabase,
-    source_table: &str,
-    file: &SourceFile,
-    sha: &str,
-) -> Result<i64> {
+fn upsert_file(db: &EmbeddedDatabase, source_table: &str, file: &SourceFile, sha: &str) -> Result<i64> {
     // Parameterised path — source strings (paths, languages, sha256s)
     // may contain arbitrary characters we refuse to hand-escape.
     let path_val = Value::String(file.path.clone());
@@ -1235,11 +1197,7 @@ fn upsert_file(
             let id = match v {
                 Value::Int4(n) => *n as i64,
                 Value::Int8(n) => *n,
-                other => {
-                    return Err(Error::query_execution(format!(
-                        "unexpected file_id type: {other:?}"
-                    )))
-                }
+                other => return Err(Error::query_execution(format!("unexpected file_id type: {other:?}"))),
             };
             db.execute_params_returning(
                 "UPDATE _hdb_code_files SET lang = $1, sha256 = $2 WHERE node_id = $3",
@@ -1259,9 +1217,7 @@ fn upsert_file(
             return match v {
                 Value::Int4(n) => Ok(*n as i64),
                 Value::Int8(n) => Ok(*n),
-                other => Err(Error::query_execution(format!(
-                    "unexpected file_id type: {other:?}"
-                ))),
+                other => Err(Error::query_execution(format!("unexpected file_id type: {other:?}"))),
             };
         }
     }
@@ -1296,14 +1252,9 @@ fn insert_symbols(
 
     let any_vec = vectors.iter().any(Option::is_some);
     if any_vec {
-        let dim = vectors
-            .iter()
-            .find_map(|v| v.as_ref().map(|v| v.len()))
-            .unwrap_or(0);
+        let dim = vectors.iter().find_map(|v| v.as_ref().map(|v| v.len())).unwrap_or(0);
         if dim == 0 {
-            return Err(Error::query_execution(
-                "embedder returned a zero-length vector",
-            ));
+            return Err(Error::query_execution("embedder returned a zero-length vector"));
         }
         ensure_body_vec_column(db, dim)?;
         for v in &vectors {
@@ -1394,17 +1345,12 @@ fn insert_refs(
 
     let mut tuples: Vec<Tuple> = Vec::with_capacity(resolved.len());
     for r in resolved {
-        let from_id = symbol_ids.get(r.from_idx).copied().ok_or_else(|| {
-            Error::query_execution(format!(
-                "resolver produced invalid from_idx {}",
-                r.from_idx
-            ))
-        })?;
+        let from_id = symbol_ids
+            .get(r.from_idx)
+            .copied()
+            .ok_or_else(|| Error::query_execution(format!("resolver produced invalid from_idx {}", r.from_idx)))?;
         let to_val = match r.to_idx {
-            Some(idx) => symbol_ids
-                .get(idx)
-                .map(|id| Value::Int8(*id))
-                .unwrap_or(Value::Null),
+            Some(idx) => symbol_ids.get(idx).map(|id| Value::Int8(*id)).unwrap_or(Value::Null),
             None => Value::Null,
         };
         let res = match r.resolution {
@@ -1451,10 +1397,7 @@ pub(super) fn file_path_by_id(db: &EmbeddedDatabase, file_id: i64) -> Result<Opt
     }))
 }
 
-pub(super) fn file_id_for_symbol(
-    db: &EmbeddedDatabase,
-    symbol_id: i64,
-) -> Result<Option<i64>> {
+pub(super) fn file_id_for_symbol(db: &EmbeddedDatabase, symbol_id: i64) -> Result<Option<i64>> {
     let rows = db.query(
         &format!("SELECT file_id FROM _hdb_code_symbols WHERE node_id = {symbol_id}"),
         &[],

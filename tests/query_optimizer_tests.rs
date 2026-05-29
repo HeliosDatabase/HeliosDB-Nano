@@ -2,10 +2,10 @@
 //!
 //! Tests all 5 optimization rules with realistic query scenarios
 
+use heliosdb_nano::optimizer::cost::{ColumnStats, StatsCatalog, TableStats};
 use heliosdb_nano::optimizer::{Optimizer, OptimizerConfig};
-use heliosdb_nano::optimizer::cost::{StatsCatalog, TableStats, ColumnStats};
 use heliosdb_nano::sql::logical_plan::*;
-use heliosdb_nano::{Schema, Column, DataType, Value};
+use heliosdb_nano::{Column, DataType, Schema, Value};
 use std::sync::Arc;
 
 // Helper function to create a test schema
@@ -132,12 +132,12 @@ fn create_test_stats() -> StatsCatalog {
         .with_column_stats(
             ColumnStats::new("id".to_string())
                 .with_distinct_count(100_000)
-                .with_index("btree".to_string())
+                .with_index("btree".to_string()),
         )
         .with_column_stats(
             ColumnStats::new("status".to_string())
                 .with_distinct_count(5) // Only 5 statuses
-                .with_index("btree".to_string())
+                .with_index("btree".to_string()),
         );
 
     catalog.add_table_stats(users_stats);
@@ -149,7 +149,7 @@ fn create_test_stats() -> StatsCatalog {
         .with_column_stats(
             ColumnStats::new("user_id".to_string())
                 .with_distinct_count(100_000)
-                .with_index("btree".to_string())
+                .with_index("btree".to_string()),
         );
 
     catalog.add_table_stats(orders_stats);
@@ -179,7 +179,10 @@ fn test_constant_folding_arithmetic() {
     let filter = LogicalPlan::Filter {
         input: Box::new(scan),
         predicate: LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "age".to_string() }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "age".to_string(),
+            }),
             op: BinaryOperator::Gt,
             right: Box::new(LogicalExpr::BinaryExpr {
                 left: Box::new(LogicalExpr::Literal(Value::Int4(10))),
@@ -194,8 +197,10 @@ fn test_constant_folding_arithmetic() {
     // The constant expression (10 + 20) should be folded to 30
     if let LogicalPlan::Filter { predicate, .. } = optimized {
         if let LogicalExpr::BinaryExpr { right, .. } = predicate {
-            assert!(matches!(*right, LogicalExpr::Literal(Value::Int4(30))),
-                "Constant expression should be folded to 30");
+            assert!(
+                matches!(*right, LogicalExpr::Literal(Value::Int4(30))),
+                "Constant expression should be folded to 30"
+            );
         }
     }
 }
@@ -225,7 +230,10 @@ fn test_constant_folding_boolean() {
             }),
             op: BinaryOperator::Or,
             right: Box::new(LogicalExpr::BinaryExpr {
-                left: Box::new(LogicalExpr::Column { table: None, name: "age".to_string() }),
+                left: Box::new(LogicalExpr::Column {
+                    table: None,
+                    name: "age".to_string(),
+                }),
                 op: BinaryOperator::Gt,
                 right: Box::new(LogicalExpr::Literal(Value::Int4(10))),
             }),
@@ -237,8 +245,10 @@ fn test_constant_folding_boolean() {
     // TRUE AND FALSE should be folded to FALSE
     if let LogicalPlan::Filter { predicate, .. } = optimized {
         if let LogicalExpr::BinaryExpr { left, .. } = predicate {
-            assert!(matches!(*left, LogicalExpr::Literal(Value::Boolean(false))),
-                "TRUE AND FALSE should be folded to FALSE");
+            assert!(
+                matches!(*left, LogicalExpr::Literal(Value::Boolean(false))),
+                "TRUE AND FALSE should be folded to FALSE"
+            );
         }
     }
 }
@@ -268,9 +278,18 @@ fn test_selection_pushdown_through_projection() {
     let project = LogicalPlan::Project {
         input: Box::new(scan),
         exprs: vec![
-            LogicalExpr::Column { table: None, name: "id".to_string() },
-            LogicalExpr::Column { table: None, name: "name".to_string() },
-            LogicalExpr::Column { table: None, name: "age".to_string() },
+            LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            },
+            LogicalExpr::Column {
+                table: None,
+                name: "name".to_string(),
+            },
+            LogicalExpr::Column {
+                table: None,
+                name: "age".to_string(),
+            },
         ],
         aliases: vec!["id".to_string(), "name".to_string(), "age".to_string()],
         distinct: false,
@@ -281,7 +300,10 @@ fn test_selection_pushdown_through_projection() {
     let filter = LogicalPlan::Filter {
         input: Box::new(project),
         predicate: LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "age".to_string() }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "age".to_string(),
+            }),
             op: BinaryOperator::Gt,
             right: Box::new(LogicalExpr::Literal(Value::Int4(21))),
         },
@@ -292,8 +314,10 @@ fn test_selection_pushdown_through_projection() {
     // Filter should be pushed below projection
     // Expected: Project -> Filter -> Scan
     if let LogicalPlan::Project { input, .. } = optimized {
-        assert!(matches!(*input, LogicalPlan::Filter { .. }),
-            "Filter should be pushed below projection");
+        assert!(
+            matches!(*input, LogicalPlan::Filter { .. }),
+            "Filter should be pushed below projection"
+        );
     }
 }
 
@@ -316,7 +340,10 @@ fn test_selection_pushdown_merge_filters() {
     let inner_filter = LogicalPlan::Filter {
         input: Box::new(scan),
         predicate: LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "age".to_string() }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "age".to_string(),
+            }),
             op: BinaryOperator::Gt,
             right: Box::new(LogicalExpr::Literal(Value::Int4(21))),
         },
@@ -325,7 +352,10 @@ fn test_selection_pushdown_merge_filters() {
     let outer_filter = LogicalPlan::Filter {
         input: Box::new(inner_filter),
         predicate: LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "age".to_string() }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "age".to_string(),
+            }),
             op: BinaryOperator::Lt,
             right: Box::new(LogicalExpr::Literal(Value::Int4(65))),
         },
@@ -339,15 +369,22 @@ fn test_selection_pushdown_merge_filters() {
         LogicalPlan::Filter { input, predicate } => {
             // Could be merged (AND) or outer filter with inner filter below
             match predicate {
-                LogicalExpr::BinaryExpr { op: BinaryOperator::And, .. } => {
+                LogicalExpr::BinaryExpr {
+                    op: BinaryOperator::And,
+                    ..
+                } => {
                     // Filters were merged - verify input is Scan or FilteredScan
                     assert!(
                         matches!(&**input, LogicalPlan::Scan { .. } | LogicalPlan::FilteredScan { .. }),
                         "Merged filter should have Scan as input"
                     );
                 }
-                LogicalExpr::BinaryExpr { op: BinaryOperator::Lt, .. } |
-                LogicalExpr::BinaryExpr { op: BinaryOperator::Gt, .. } => {
+                LogicalExpr::BinaryExpr {
+                    op: BinaryOperator::Lt, ..
+                }
+                | LogicalExpr::BinaryExpr {
+                    op: BinaryOperator::Gt, ..
+                } => {
                     // Filters not merged - this is valid if cost estimation rejects merge
                     // Just verify the structure is valid
                 }
@@ -356,7 +393,10 @@ fn test_selection_pushdown_merge_filters() {
         }
         LogicalPlan::FilteredScan { predicate: Some(p), .. } => {
             // Storage pushdown was applied - verify predicate exists
-            assert!(matches!(p, LogicalExpr::BinaryExpr { .. }), "FilteredScan should have a predicate");
+            assert!(
+                matches!(p, LogicalExpr::BinaryExpr { .. }),
+                "FilteredScan should have a predicate"
+            );
         }
         other => panic!("Expected Filter or FilteredScan, got {:?}", other),
     }
@@ -384,9 +424,10 @@ fn test_projection_pruning_removes_unused_columns() {
 
     let project = LogicalPlan::Project {
         input: Box::new(scan),
-        exprs: vec![
-            LogicalExpr::Column { table: None, name: "name".to_string() },
-        ],
+        exprs: vec![LogicalExpr::Column {
+            table: None,
+            name: "name".to_string(),
+        }],
         aliases: vec!["name".to_string()],
         distinct: false,
         distinct_on: None,
@@ -399,8 +440,10 @@ fn test_projection_pruning_removes_unused_columns() {
         if let LogicalPlan::Scan { projection, .. } = &*input {
             assert!(projection.is_some(), "Scan should have projection to prune columns");
             // Should only project the 'name' column (index 1)
-            assert!(projection.as_ref().unwrap().len() < schema.columns.len(),
-                "Projection should have fewer columns than full table");
+            assert!(
+                projection.as_ref().unwrap().len() < schema.columns.len(),
+                "Projection should have fewer columns than full table"
+            );
         }
     }
 }
@@ -442,9 +485,15 @@ fn test_join_reordering_puts_small_table_first() {
         right: Box::new(users_scan),
         join_type: JoinType::Inner,
         on: Some(LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "user_id".to_string() }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "user_id".to_string(),
+            }),
             op: BinaryOperator::Eq,
-            right: Box::new(LogicalExpr::Column { table: None, name: "id".to_string() }),
+            right: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            }),
         }),
         lateral: false,
     };
@@ -454,8 +503,10 @@ fn test_join_reordering_puts_small_table_first() {
     // Should swap to put smaller table (users) on left
     if let LogicalPlan::Join { left, .. } = optimized {
         if let LogicalPlan::Scan { table_name, .. } = &*left {
-            assert_eq!(table_name, "users",
-                "Smaller table (users) should be on left side of join");
+            assert_eq!(
+                table_name, "users",
+                "Smaller table (users) should be on left side of join"
+            );
         }
     }
 }
@@ -497,8 +548,7 @@ fn test_join_reordering_preserves_outer_join() {
     // Order should NOT change for outer join
     if let LogicalPlan::Join { left, .. } = optimized {
         if let LogicalPlan::Scan { table_name, .. } = &*left {
-            assert_eq!(table_name, "orders",
-                "LEFT OUTER JOIN order should be preserved");
+            assert_eq!(table_name, "orders", "LEFT OUTER JOIN order should be preserved");
         }
     }
 }
@@ -526,7 +576,10 @@ fn test_index_selection_recognizes_indexed_column() {
     let filter = LogicalPlan::Filter {
         input: Box::new(scan),
         predicate: LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "id".to_string() }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            }),
             op: BinaryOperator::Eq,
             right: Box::new(LogicalExpr::Literal(Value::Int4(42))),
         },
@@ -537,8 +590,7 @@ fn test_index_selection_recognizes_indexed_column() {
     // Should recognize that index can be used
     // Plan structure may be Filter or FilteredScan (if storage pushdown applied)
     assert!(
-        matches!(optimized, LogicalPlan::Filter { .. }) ||
-        matches!(optimized, LogicalPlan::FilteredScan { .. }),
+        matches!(optimized, LogicalPlan::Filter { .. }) || matches!(optimized, LogicalPlan::FilteredScan { .. }),
         "Expected Filter or FilteredScan plan"
     );
 }
@@ -572,7 +624,10 @@ fn test_complex_query_all_optimizations() {
         input: Box::new(scan),
         predicate: LogicalExpr::BinaryExpr {
             left: Box::new(LogicalExpr::BinaryExpr {
-                left: Box::new(LogicalExpr::Column { table: None, name: "age".to_string() }),
+                left: Box::new(LogicalExpr::Column {
+                    table: None,
+                    name: "age".to_string(),
+                }),
                 op: BinaryOperator::Gt,
                 right: Box::new(LogicalExpr::BinaryExpr {
                     left: Box::new(LogicalExpr::Literal(Value::Int4(20))),
@@ -582,7 +637,10 @@ fn test_complex_query_all_optimizations() {
             }),
             op: BinaryOperator::And,
             right: Box::new(LogicalExpr::BinaryExpr {
-                left: Box::new(LogicalExpr::Column { table: None, name: "status".to_string() }),
+                left: Box::new(LogicalExpr::Column {
+                    table: None,
+                    name: "status".to_string(),
+                }),
                 op: BinaryOperator::Eq,
                 right: Box::new(LogicalExpr::Literal(Value::String("active".to_string()))),
             }),
@@ -592,7 +650,10 @@ fn test_complex_query_all_optimizations() {
     // Projection
     let project = LogicalPlan::Project {
         input: Box::new(filter),
-        exprs: vec![LogicalExpr::Column { table: None, name: "name".to_string() }],
+        exprs: vec![LogicalExpr::Column {
+            table: None,
+            name: "name".to_string(),
+        }],
         aliases: vec!["name".to_string()],
         distinct: false,
         distinct_on: None,
@@ -601,7 +662,10 @@ fn test_complex_query_all_optimizations() {
     // Sort
     let sort = LogicalPlan::Sort {
         input: Box::new(project),
-        exprs: vec![LogicalExpr::Column { table: None, name: "name".to_string() }],
+        exprs: vec![LogicalExpr::Column {
+            table: None,
+            name: "name".to_string(),
+        }],
         asc: vec![true],
     };
 
@@ -658,20 +722,25 @@ fn test_optimization_cost_improvement() {
     };
 
     // Measure costs
-    let initial_cost = optimizer.cost_estimator()
+    let initial_cost = optimizer
+        .cost_estimator()
         .estimate_cost(&join)
         .expect("Cost estimation failed");
 
     let optimized = optimizer.optimize(join).expect("Optimization failed");
 
-    let final_cost = optimizer.cost_estimator()
+    let final_cost = optimizer
+        .cost_estimator()
         .estimate_cost(&optimized)
         .expect("Cost estimation failed");
 
     // Final cost should be less than or equal to initial cost
-    assert!(final_cost <= initial_cost,
+    assert!(
+        final_cost <= initial_cost,
         "Optimized plan should not be more expensive: {} vs {}",
-        final_cost, initial_cost);
+        final_cost,
+        initial_cost
+    );
 }
 
 #[test]
@@ -717,9 +786,7 @@ fn test_optimizer_performance_on_large_plan() {
     use std::time::Instant;
 
     let stats = create_test_stats();
-    let config = OptimizerConfig::new()
-        .with_max_passes(100)
-        .with_timeout_ms(5000); // 5 second timeout
+    let config = OptimizerConfig::new().with_max_passes(100).with_timeout_ms(5000); // 5 second timeout
 
     let optimizer = Optimizer::with_config(stats, config);
     let schema = create_users_schema();
@@ -738,7 +805,10 @@ fn test_optimizer_performance_on_large_plan() {
         current_plan = LogicalPlan::Filter {
             input: Box::new(current_plan),
             predicate: LogicalExpr::BinaryExpr {
-                left: Box::new(LogicalExpr::Column { table: None, name: "age".to_string() }),
+                left: Box::new(LogicalExpr::Column {
+                    table: None,
+                    name: "age".to_string(),
+                }),
                 op: BinaryOperator::Gt,
                 right: Box::new(LogicalExpr::Literal(Value::Int4(i))),
             },
@@ -750,8 +820,11 @@ fn test_optimizer_performance_on_large_plan() {
     let duration = start.elapsed();
 
     // Should complete in reasonable time (< 1 second for this simple case)
-    assert!(duration.as_millis() < 1000,
-        "Optimization took too long: {:?}", duration);
+    assert!(
+        duration.as_millis() < 1000,
+        "Optimization took too long: {:?}",
+        duration
+    );
 }
 
 #[test]
@@ -769,7 +842,8 @@ fn test_cardinality_estimation_accuracy() {
     };
 
     // Cardinality of full table scan
-    let scan_card = optimizer.cost_estimator()
+    let scan_card = optimizer
+        .cost_estimator()
         .estimate_cardinality(&scan)
         .expect("Cardinality estimation failed");
 
@@ -779,18 +853,25 @@ fn test_cardinality_estimation_accuracy() {
     let filter = LogicalPlan::Filter {
         input: Box::new(scan),
         predicate: LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "status".to_string() }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "status".to_string(),
+            }),
             op: BinaryOperator::Eq,
             right: Box::new(LogicalExpr::Literal(Value::String("active".to_string()))),
         },
     };
 
-    let filter_card = optimizer.cost_estimator()
+    let filter_card = optimizer
+        .cost_estimator()
         .estimate_cardinality(&filter)
         .expect("Cardinality estimation failed");
 
     // Filter should reduce cardinality
-    assert!(filter_card < scan_card,
+    assert!(
+        filter_card < scan_card,
         "Filter should reduce cardinality: {} vs {}",
-        filter_card, scan_card);
+        filter_card,
+        scan_card
+    );
 }

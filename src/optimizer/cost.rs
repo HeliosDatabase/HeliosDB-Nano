@@ -3,8 +3,8 @@
 //! Provides table statistics, cardinality estimation, and cost calculations
 //! for choosing optimal query execution plans.
 
-use crate::sql::logical_plan::{LogicalPlan, LogicalExpr, BinaryOperator};
-use crate::{Result, Error};
+use crate::sql::logical_plan::{BinaryOperator, LogicalExpr, LogicalPlan};
+use crate::{Error, Result};
 use std::collections::HashMap;
 
 /// Table statistics for cost estimation
@@ -145,8 +145,7 @@ impl ColumnStats {
                     0.9 // Default estimate
                 }
             }
-            BinaryOperator::Lt | BinaryOperator::LtEq |
-            BinaryOperator::Gt | BinaryOperator::GtEq => {
+            BinaryOperator::Lt | BinaryOperator::LtEq | BinaryOperator::Gt | BinaryOperator::GtEq => {
                 // Range predicates - assume 1/3 selectivity
                 0.33
             }
@@ -169,9 +168,7 @@ pub struct StatsCatalog {
 impl StatsCatalog {
     /// Create a new statistics catalog
     pub fn new() -> Self {
-        Self {
-            tables: HashMap::new(),
-        }
+        Self { tables: HashMap::new() }
     }
 
     /// Add or update table statistics
@@ -269,9 +266,9 @@ impl CostEstimator {
     /// Estimate the cost of executing a logical plan
     pub fn estimate_cost(&self, plan: &LogicalPlan) -> Result<f64> {
         match plan {
-            LogicalPlan::Scan { table_name, projection, .. } => {
-                self.estimate_scan_cost(table_name, projection.as_ref())
-            }
+            LogicalPlan::Scan {
+                table_name, projection, ..
+            } => self.estimate_scan_cost(table_name, projection.as_ref()),
             LogicalPlan::Filter { input, predicate } => {
                 let input_cost = self.estimate_cost(input)?;
                 let filter_cost = self.estimate_filter_cost(input, predicate)?;
@@ -283,14 +280,19 @@ impl CostEstimator {
                 let project_cost = cardinality * self.params.cpu_tuple_cost * (exprs.len() as f64);
                 Ok(input_cost + project_cost)
             }
-            LogicalPlan::Join { left, right, .. } => {
-                self.estimate_join_cost(left, right)
-            }
-            LogicalPlan::Aggregate { input, group_by, aggr_exprs, .. } => {
+            LogicalPlan::Join { left, right, .. } => self.estimate_join_cost(left, right),
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                ..
+            } => {
                 let input_cost = self.estimate_cost(input)?;
                 let cardinality = self.estimate_cardinality(input)?;
                 // Cost of aggregation is roughly O(n log n) for sorting/hashing
-                let agg_cost = cardinality * cardinality.ln() * self.params.cpu_tuple_cost
+                let agg_cost = cardinality
+                    * cardinality.ln()
+                    * self.params.cpu_tuple_cost
                     * ((group_by.len() + aggr_exprs.len()) as f64);
                 Ok(input_cost + agg_cost)
             }
@@ -298,8 +300,7 @@ impl CostEstimator {
                 let input_cost = self.estimate_cost(input)?;
                 let cardinality = self.estimate_cardinality(input)?;
                 // O(n log n) sorting cost
-                let sort_cost = cardinality * cardinality.ln() * self.params.cpu_tuple_cost
-                    * (exprs.len() as f64);
+                let sort_cost = cardinality * cardinality.ln() * self.params.cpu_tuple_cost * (exprs.len() as f64);
                 Ok(input_cost + sort_cost)
             }
             LogicalPlan::Limit { input, limit, .. } => {
@@ -320,10 +321,9 @@ impl CostEstimator {
     pub fn estimate_cardinality(&self, plan: &LogicalPlan) -> Result<f64> {
         match plan {
             LogicalPlan::Scan { table_name, .. } => {
-                let stats = self.stats.get_table_stats(table_name)
-                    .ok_or_else(|| Error::query_execution(
-                        format!("No statistics available for table '{}'", table_name)
-                    ))?;
+                let stats = self.stats.get_table_stats(table_name).ok_or_else(|| {
+                    Error::query_execution(format!("No statistics available for table '{}'", table_name))
+                })?;
                 Ok(stats.row_count as f64)
             }
             LogicalPlan::Filter { input, predicate } => {
@@ -356,19 +356,17 @@ impl CostEstimator {
                 // Sort doesn't change cardinality
                 self.estimate_cardinality(input)
             }
-            LogicalPlan::Limit { limit, .. } => {
-                Ok(*limit as f64)
-            }
+            LogicalPlan::Limit { limit, .. } => Ok(*limit as f64),
             _ => Ok(1.0),
         }
     }
 
     /// Estimate scan cost
     fn estimate_scan_cost(&self, table_name: &str, projection: Option<&Vec<usize>>) -> Result<f64> {
-        let stats = self.stats.get_table_stats(table_name)
-            .ok_or_else(|| Error::query_execution(
-                format!("No statistics available for table '{}'", table_name)
-            ))?;
+        let stats = self
+            .stats
+            .get_table_stats(table_name)
+            .ok_or_else(|| Error::query_execution(format!("No statistics available for table '{}'", table_name)))?;
 
         let row_count = stats.row_count as f64;
         let row_size = stats.avg_row_size as f64;
@@ -468,47 +466,37 @@ impl CostEstimator {
             LogicalExpr::BinaryExpr { left, right, .. } => {
                 2.0 + Self::estimate_expr_complexity(left) + Self::estimate_expr_complexity(right)
             }
-            LogicalExpr::UnaryExpr { expr, .. } => {
-                1.5 + Self::estimate_expr_complexity(expr)
-            }
+            LogicalExpr::UnaryExpr { expr, .. } => 1.5 + Self::estimate_expr_complexity(expr),
             LogicalExpr::ScalarFunction { args, .. } => {
-                let arg_complexity: f64 = args.iter()
-                    .map(|arg| Self::estimate_expr_complexity(arg))
-                    .sum();
+                let arg_complexity: f64 = args.iter().map(|arg| Self::estimate_expr_complexity(arg)).sum();
                 5.0 + arg_complexity // Functions are more expensive
             }
             LogicalExpr::AggregateFunction { args, .. } => {
-                let arg_complexity: f64 = args.iter()
-                    .map(|arg| Self::estimate_expr_complexity(arg))
-                    .sum();
+                let arg_complexity: f64 = args.iter().map(|arg| Self::estimate_expr_complexity(arg)).sum();
                 10.0 + arg_complexity // Aggregates are expensive
             }
-            LogicalExpr::Case { when_then, else_result, .. } => {
-                let when_cost: f64 = when_then.iter()
-                    .map(|(cond, result)| {
-                        Self::estimate_expr_complexity(cond) + Self::estimate_expr_complexity(result)
-                    })
+            LogicalExpr::Case {
+                when_then, else_result, ..
+            } => {
+                let when_cost: f64 = when_then
+                    .iter()
+                    .map(|(cond, result)| Self::estimate_expr_complexity(cond) + Self::estimate_expr_complexity(result))
                     .sum();
-                let else_cost = else_result.as_ref()
+                let else_cost = else_result
+                    .as_ref()
                     .map(|e| Self::estimate_expr_complexity(e))
                     .unwrap_or(0.0);
                 3.0 + when_cost + else_cost
             }
-            LogicalExpr::Cast { expr, .. } => {
-                2.0 + Self::estimate_expr_complexity(expr)
-            }
-            LogicalExpr::IsNull { expr, .. } => {
-                1.5 + Self::estimate_expr_complexity(expr)
-            }
+            LogicalExpr::Cast { expr, .. } => 2.0 + Self::estimate_expr_complexity(expr),
+            LogicalExpr::IsNull { expr, .. } => 1.5 + Self::estimate_expr_complexity(expr),
             LogicalExpr::Between { expr, low, high, .. } => {
                 3.0 + Self::estimate_expr_complexity(expr)
                     + Self::estimate_expr_complexity(low)
                     + Self::estimate_expr_complexity(high)
             }
             LogicalExpr::InList { expr, list, .. } => {
-                let list_cost: f64 = list.iter()
-                    .map(|e| Self::estimate_expr_complexity(e))
-                    .sum();
+                let list_cost: f64 = list.iter().map(|e| Self::estimate_expr_complexity(e)).sum();
                 2.0 + Self::estimate_expr_complexity(expr) + list_cost
             }
             LogicalExpr::InSet { expr, values, .. } => {
@@ -532,22 +520,19 @@ impl CostEstimator {
             LogicalExpr::ArraySubscript { array, index } => {
                 3.0 + Self::estimate_expr_complexity(array) + Self::estimate_expr_complexity(index)
             }
-            LogicalExpr::WindowFunction { args, partition_by, order_by, .. } => {
+            LogicalExpr::WindowFunction {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
                 // Window functions are expensive due to partitioning and sorting
-                let arg_cost: f64 = args.iter()
-                    .map(|e| Self::estimate_expr_complexity(e))
-                    .sum();
-                let partition_cost: f64 = partition_by.iter()
-                    .map(|e| Self::estimate_expr_complexity(e))
-                    .sum();
-                let order_cost: f64 = order_by.iter()
-                    .map(|(e, _)| Self::estimate_expr_complexity(e))
-                    .sum();
+                let arg_cost: f64 = args.iter().map(|e| Self::estimate_expr_complexity(e)).sum();
+                let partition_cost: f64 = partition_by.iter().map(|e| Self::estimate_expr_complexity(e)).sum();
+                let order_cost: f64 = order_by.iter().map(|(e, _)| Self::estimate_expr_complexity(e)).sum();
                 50.0 + arg_cost + partition_cost + order_cost
             }
-            LogicalExpr::Tuple { items } => {
-                1.0 + items.iter().map(Self::estimate_expr_complexity).sum::<f64>()
-            }
+            LogicalExpr::Tuple { items } => 1.0 + items.iter().map(Self::estimate_expr_complexity).sum::<f64>(),
             LogicalExpr::Wildcard | LogicalExpr::Parameter { .. } => 1.0,
         }
     }
@@ -556,11 +541,11 @@ impl CostEstimator {
     fn extract_table_name(plan: &LogicalPlan) -> Option<String> {
         match plan {
             LogicalPlan::Scan { table_name, .. } => Some(table_name.clone()),
-            LogicalPlan::Filter { input, .. } |
-            LogicalPlan::Project { input, .. } |
-            LogicalPlan::Sort { input, .. } |
-            LogicalPlan::Limit { input, .. } |
-            LogicalPlan::Aggregate { input, .. } => Self::extract_table_name(input),
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. }
+            | LogicalPlan::Aggregate { input, .. } => Self::extract_table_name(input),
             _ => None,
         }
     }
@@ -570,7 +555,7 @@ impl CostEstimator {
 mod tests {
     use super::*;
     use crate::sql::logical_plan::*;
-    use crate::{Schema, Column, DataType};
+    use crate::{Column, DataType, Schema};
     use std::sync::Arc;
 
     #[test]
@@ -587,8 +572,7 @@ mod tests {
 
     #[test]
     fn test_column_stats_selectivity() {
-        let col_stats = ColumnStats::new("status".to_string())
-            .with_distinct_count(5); // 5 distinct statuses
+        let col_stats = ColumnStats::new("status".to_string()).with_distinct_count(5); // 5 distinct statuses
 
         // Equality on column with 5 distinct values should have ~20% selectivity
         let selectivity = col_stats.estimate_selectivity(&BinaryOperator::Eq);
@@ -599,8 +583,7 @@ mod tests {
     fn test_stats_catalog() {
         let mut catalog = StatsCatalog::new();
 
-        let stats = TableStats::new("users".to_string())
-            .with_row_count(1000);
+        let stats = TableStats::new("users".to_string()).with_row_count(1000);
 
         catalog.add_table_stats(stats);
 
@@ -614,25 +597,23 @@ mod tests {
         stats_catalog.add_table_stats(
             TableStats::new("users".to_string())
                 .with_row_count(1000)
-                .with_avg_row_size(256)
+                .with_avg_row_size(256),
         );
 
         let estimator = CostEstimator::new(stats_catalog);
 
         let schema = Arc::new(Schema {
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: true,
-                    source_table: None,
-                    source_table_name: None,
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
                 default_expr: None,
                 unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                }
-            ],
+            }],
         });
 
         let plan = LogicalPlan::Scan {
@@ -654,25 +635,23 @@ mod tests {
         stats_catalog.add_table_stats(
             TableStats::new("users".to_string())
                 .with_row_count(1000)
-                .with_avg_row_size(256)
+                .with_avg_row_size(256),
         );
 
         let estimator = CostEstimator::new(stats_catalog);
 
         let schema = Arc::new(Schema {
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: true,
-                    source_table: None,
-                    source_table_name: None,
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
                 default_expr: None,
                 unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                }
-            ],
+            }],
         });
 
         let scan = LogicalPlan::Scan {
@@ -686,7 +665,10 @@ mod tests {
         let filter = LogicalPlan::Filter {
             input: Box::new(scan),
             predicate: LogicalExpr::BinaryExpr {
-                left: Box::new(LogicalExpr::Column { table: None, name: "id".to_string()  }),
+                left: Box::new(LogicalExpr::Column {
+                    table: None,
+                    name: "id".to_string(),
+                }),
                 op: BinaryOperator::Eq,
                 right: Box::new(LogicalExpr::Literal(crate::Value::Int4(1))),
             },

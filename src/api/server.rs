@@ -3,33 +3,29 @@
 //! Provides HTTP server with CORS, logging middleware, and route configuration.
 
 use axum::{
-    Router,
     extract::Request,
-    middleware::Next,
     http::{
         header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
         Method, StatusCode,
     },
+    middleware::Next,
     response::Html,
+    Router,
 };
-use tower::ServiceBuilder;
-use tower_http::{
-    cors::CorsLayer,
-    trace::TraceLayer,
-    compression::CompressionLayer,
-};
-use std::sync::Arc;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::TcpListener;
+use tower::ServiceBuilder;
+use tower_http::{compression::CompressionLayer, cors::CorsLayer, trace::TraceLayer};
 use tracing::info;
 
-use crate::{EmbeddedDatabase, Result, Error};
-use crate::compute::QueryRegistry;
-use super::routes;
-use super::middleware::{AuthMiddleware, RateLimitMiddleware, rate_limit_middleware};
 use super::auth_bridge::AuthBridge;
 use super::change_notifier::ChangeNotifier;
+use super::middleware::{rate_limit_middleware, AuthMiddleware, RateLimitMiddleware};
 use super::oauth::OAuthRegistry;
+use super::routes;
+use crate::compute::QueryRegistry;
+use crate::{EmbeddedDatabase, Error, Result};
 
 /// Shared application state
 #[derive(Clone)]
@@ -104,7 +100,13 @@ impl ApiServer {
     ) -> Self {
         Self {
             addr,
-            state: AppState { db, query_registry, auth_bridge: None, oauth_registry: None, change_notifier: None },
+            state: AppState {
+                db,
+                query_registry,
+                auth_bridge: None,
+                oauth_registry: None,
+                change_notifier: None,
+            },
             auth_middleware: None,
             rate_limit_middleware: None,
         }
@@ -206,15 +208,19 @@ impl ApiServer {
             v1_router.layer(axum::middleware::from_fn(move |mut req: Request, next: Next| {
                 let auth = auth_clone.clone();
                 async move {
-                    use axum::http::header;
                     use crate::api::models::ApiError;
+                    use axum::http::header;
 
                     // Extract authentication info from request headers
-                    let auth_header = req.headers().get(header::AUTHORIZATION)
+                    let auth_header = req
+                        .headers()
+                        .get(header::AUTHORIZATION)
                         .and_then(|h| h.to_str().ok())
                         .and_then(|s| s.strip_prefix("Bearer ").map(String::from));
 
-                    let api_key = req.headers().get("x-api-key")
+                    let api_key = req
+                        .headers()
+                        .get("x-api-key")
                         .and_then(|h| h.to_str().ok())
                         .map(String::from);
 
@@ -272,7 +278,10 @@ impl ApiServer {
             .nest("/v1", v1_router)
             .nest("/rest/v1", rest_router)
             .merge(auth_router)
-            .route("/realtime/v1/websocket", axum::routing::get(super::handlers::ws_handler::ws_upgrade))
+            .route(
+                "/realtime/v1/websocket",
+                axum::routing::get(super::handlers::ws_handler::ws_upgrade),
+            )
             .route("/health", axum::routing::get(health_check))
             .route("/version", axum::routing::get(version_info))
             .route("/docs", axum::routing::get(swagger_ui))
@@ -287,16 +296,17 @@ impl ApiServer {
             let mcp_state = crate::mcp::McpState::new(self.state.db.clone());
             let mcp_only = Router::new()
                 .route("/mcp", axum::routing::post(crate::mcp::axum_routes::handle_post))
-                .route("/mcp/ws", axum::routing::get(crate::mcp::axum_routes::handle_ws_upgrade))
+                .route(
+                    "/mcp/ws",
+                    axum::routing::get(crate::mcp::axum_routes::handle_ws_upgrade),
+                )
                 .route("/mcp/sse", axum::routing::get(crate::mcp::axum_routes::handle_sse))
                 .route("/mcp/info", axum::routing::get(crate::mcp::axum_routes::handle_info))
                 .with_state(mcp_state);
             router.merge(mcp_only)
         };
 
-        router
-            .layer(base_middleware)
-            .with_state(self.state.clone())
+        router.layer(base_middleware).with_state(self.state.clone())
     }
 
     /// Start the API server
@@ -407,7 +417,8 @@ async fn version_info() -> axum::Json<serde_json::Value> {
 
 /// Swagger UI HTML page
 async fn swagger_ui() -> Html<&'static str> {
-    Html(r#"<!DOCTYPE html>
+    Html(
+        r#"<!DOCTYPE html>
 <html>
 <head>
   <title>HeliosDB Nano API</title>
@@ -418,14 +429,14 @@ async fn swagger_ui() -> Html<&'static str> {
   <script src="https://cdn.jsdelivr.net/npm/swagger-ui-dist/swagger-ui-bundle.js"></script>
   <script>SwaggerUIBundle({ url: '/openapi.json', dom_id: '#swagger-ui' })</script>
 </body>
-</html>"#)
+</html>"#,
+    )
 }
 
 /// Serve the OpenAPI spec as JSON (converted from the bundled YAML)
 async fn openapi_json() -> std::result::Result<axum::Json<serde_json::Value>, StatusCode> {
     let yaml_bytes = include_str!("openapi/openapi.yaml");
-    let value: serde_json::Value =
-        serde_yaml::from_str(yaml_bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let value: serde_json::Value = serde_yaml::from_str(yaml_bytes).map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     Ok(axum::Json(value))
 }
 
@@ -438,7 +449,13 @@ mod tests {
     fn test_app_state_creation() {
         let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
         let query_registry = Arc::new(QueryRegistry::new());
-        let state = AppState { db, query_registry, auth_bridge: None, oauth_registry: None, change_notifier: None };
+        let state = AppState {
+            db,
+            query_registry,
+            auth_bridge: None,
+            oauth_registry: None,
+            change_notifier: None,
+        };
         assert!(Arc::strong_count(&state.db) >= 1);
     }
 

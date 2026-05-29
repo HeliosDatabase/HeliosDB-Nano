@@ -7,11 +7,11 @@
 //! - System views and functions
 
 pub mod branching;
-pub mod time_travel;
 pub mod materialized_views;
 pub mod system_views;
+pub mod time_travel;
 
 pub use branching::BranchingParser;
-pub use time_travel::TimeTravelParser;
 pub use materialized_views::MaterializedViewParser;
 pub use system_views::SystemViewRegistry;
+pub use time_travel::TimeTravelParser;

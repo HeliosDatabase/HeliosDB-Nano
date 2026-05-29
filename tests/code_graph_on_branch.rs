@@ -12,11 +12,8 @@ use heliosdb_nano::code_graph::CodeIndexOptions;
 use heliosdb_nano::{EmbeddedDatabase, Value};
 
 fn upsert_src(db: &EmbeddedDatabase, path: &str, body: &str) {
-    db.execute_params_returning(
-        "DELETE FROM src WHERE path = $1",
-        &[Value::String(path.into())],
-    )
-    .unwrap();
+    db.execute_params_returning("DELETE FROM src WHERE path = $1", &[Value::String(path.into())])
+        .unwrap();
     db.execute_params_returning(
         "INSERT INTO src (path, lang, content) VALUES ($1, 'rust', $2)",
         &[Value::String(path.into()), Value::String(body.into())],
@@ -42,31 +39,20 @@ fn on_branch_routes_lsp_query_to_branch_data() {
 
     // Back to main.
     db.switch_branch("main").unwrap();
-    let on_main = db
-        .storage
-        .get_current_branch()
-        .unwrap_or_else(|| "main".into());
+    let on_main = db.storage.get_current_branch().unwrap_or_else(|| "main".into());
 
     // Query for `beta` on main — should resolve zero rows.
-    let no_beta = db
-        .query("SELECT * FROM lsp_definition('beta')", &[])
-        .unwrap();
+    let no_beta = db.query("SELECT * FROM lsp_definition('beta')", &[]).unwrap();
     assert!(no_beta.is_empty(), "main should not see beta, got {no_beta:?}");
 
     // Same query routed via `ON BRANCH 'preview'` — should hit beta.
     let with_branch = db
         .query("SELECT * FROM lsp_definition('beta') ON BRANCH 'preview'", &[])
         .unwrap();
-    assert!(
-        !with_branch.is_empty(),
-        "ON BRANCH 'preview' should resolve beta"
-    );
+    assert!(!with_branch.is_empty(), "ON BRANCH 'preview' should resolve beta");
 
     // Active branch must be restored to main.
-    let after = db
-        .storage
-        .get_current_branch()
-        .unwrap_or_else(|| "main".into());
+    let after = db.storage.get_current_branch().unwrap_or_else(|| "main".into());
     assert_eq!(after, on_main, "ON BRANCH must restore the previous branch");
 }
 
@@ -83,10 +69,7 @@ fn on_branch_combined_with_as_of_compiles_and_runs() {
     // call.  (`AS OF NOW` is a planner-side no-op temporal scan
     // and not all join shapes round-trip through it cleanly today.)
     let rows = db
-        .query(
-            "SELECT * FROM lsp_definition('gamma') ON BRANCH 'main'",
-            &[],
-        )
+        .query("SELECT * FROM lsp_definition('gamma') ON BRANCH 'main'", &[])
         .unwrap();
     assert!(!rows.is_empty(), "gamma should resolve");
 }

@@ -73,11 +73,7 @@ async fn http_post_initialize_then_tools_call() {
 async fn http_sse_emits_endpoint_event() {
     let (addr, handle) = bind_router().await;
     let client = reqwest::Client::new();
-    let resp = client
-        .get(format!("http://{addr}/sse"))
-        .send()
-        .await
-        .unwrap();
+    let resp = client.get(format!("http://{addr}/sse")).send().await.unwrap();
     let ct = resp
         .headers()
         .get("content-type")

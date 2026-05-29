@@ -111,7 +111,9 @@ impl QueryCache {
     pub fn get(&self, key: &CacheKey) -> Result<Option<Vec<Tuple>>> {
         use crate::error::LockResultExt;
 
-        let cache = self.cache.read()
+        let cache = self
+            .cache
+            .read()
             .map_lock_err("Failed to acquire read lock on query cache")?;
 
         if let Some(cached) = cache.get(key) {
@@ -119,7 +121,9 @@ impl QueryCache {
                 // Entry exists but is expired - return None
                 // The entry will be cleaned up lazily
                 drop(cache);
-                let mut stats = self.stats.write()
+                let mut stats = self
+                    .stats
+                    .write()
                     .map_lock_err("Failed to acquire write lock on cache stats")?;
                 stats.misses += 1;
                 return Ok(None);
@@ -127,18 +131,24 @@ impl QueryCache {
 
             // Valid cache hit
             drop(cache);
-            let mut stats = self.stats.write()
+            let mut stats = self
+                .stats
+                .write()
                 .map_lock_err("Failed to acquire write lock on cache stats")?;
             stats.hits += 1;
 
             // Re-acquire read lock to return the result
-            let cache = self.cache.read()
+            let cache = self
+                .cache
+                .read()
                 .map_lock_err("Failed to acquire read lock on query cache")?;
             return Ok(cache.get(key).map(|c| c.tuples.clone()));
         }
 
         // Cache miss
-        let mut stats = self.stats.write()
+        let mut stats = self
+            .stats
+            .write()
             .map_lock_err("Failed to acquire write lock on cache stats")?;
         stats.misses += 1;
 
@@ -151,16 +161,12 @@ impl QueryCache {
     }
 
     /// Store a result in the cache with custom TTL
-    pub fn put_with_ttl(
-        &self,
-        key: CacheKey,
-        tuples: Vec<Tuple>,
-        tables: Vec<String>,
-        ttl: Duration,
-    ) -> Result<()> {
+    pub fn put_with_ttl(&self, key: CacheKey, tuples: Vec<Tuple>, tables: Vec<String>, ttl: Duration) -> Result<()> {
         use crate::error::LockResultExt;
 
-        let mut cache = self.cache.write()
+        let mut cache = self
+            .cache
+            .write()
             .map_lock_err("Failed to acquire write lock on query cache")?;
 
         // Check capacity and evict if needed
@@ -179,15 +185,14 @@ impl QueryCache {
             // If still at capacity, evict oldest entry
             if cache.len() >= self.max_entries {
                 // Find oldest entry by cached_at time
-                let oldest_key = cache
-                    .iter()
-                    .min_by_key(|(_, v)| v.cached_at)
-                    .map(|(k, _)| k.clone());
+                let oldest_key = cache.iter().min_by_key(|(_, v)| v.cached_at).map(|(k, _)| k.clone());
 
                 if let Some(key) = oldest_key {
                     cache.remove(&key);
 
-                    let mut stats = self.stats.write()
+                    let mut stats = self
+                        .stats
+                        .write()
                         .map_lock_err("Failed to acquire write lock on cache stats")?;
                     stats.evictions += 1;
                 }
@@ -203,7 +208,9 @@ impl QueryCache {
     pub fn invalidate_table(&self, table_name: &str) -> Result<u64> {
         use crate::error::LockResultExt;
 
-        let mut cache = self.cache.write()
+        let mut cache = self
+            .cache
+            .write()
             .map_lock_err("Failed to acquire write lock on query cache")?;
 
         let keys_to_remove: Vec<CacheKey> = cache
@@ -218,7 +225,9 @@ impl QueryCache {
         }
 
         if count > 0 {
-            let mut stats = self.stats.write()
+            let mut stats = self
+                .stats
+                .write()
                 .map_lock_err("Failed to acquire write lock on cache stats")?;
             stats.invalidations += count;
         }
@@ -230,14 +239,18 @@ impl QueryCache {
     pub fn invalidate_all(&self) -> Result<u64> {
         use crate::error::LockResultExt;
 
-        let mut cache = self.cache.write()
+        let mut cache = self
+            .cache
+            .write()
             .map_lock_err("Failed to acquire write lock on query cache")?;
 
         let count = cache.len() as u64;
         cache.clear();
 
         if count > 0 {
-            let mut stats = self.stats.write()
+            let mut stats = self
+                .stats
+                .write()
                 .map_lock_err("Failed to acquire write lock on cache stats")?;
             stats.invalidations += count;
         }
@@ -249,7 +262,9 @@ impl QueryCache {
     pub fn stats(&self) -> Result<CacheStats> {
         use crate::error::LockResultExt;
 
-        let stats = self.stats.read()
+        let stats = self
+            .stats
+            .read()
             .map_lock_err("Failed to acquire read lock on cache stats")?;
         Ok(stats.clone())
     }
@@ -258,7 +273,9 @@ impl QueryCache {
     pub fn len(&self) -> Result<usize> {
         use crate::error::LockResultExt;
 
-        let cache = self.cache.read()
+        let cache = self
+            .cache
+            .read()
             .map_lock_err("Failed to acquire read lock on query cache")?;
         Ok(cache.len())
     }
@@ -301,7 +318,9 @@ mod tests {
 
         // Store result
         let tuples = vec![Tuple::new(vec![crate::Value::Int4(1)])];
-        cache.put(key.clone(), tuples.clone(), vec!["users".to_string()]).unwrap();
+        cache
+            .put(key.clone(), tuples.clone(), vec!["users".to_string()])
+            .unwrap();
 
         // Cache hit
         let result = cache.get(&key).unwrap();

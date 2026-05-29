@@ -5,8 +5,8 @@
 //! - P1-6: Parse WITH options for CREATE INDEX
 //! - P1-7: AS OF clause parsing in table scans
 
-use heliosdb_nano::{Result, Error};
-use heliosdb_nano::sql::{Parser, Planner, LogicalPlan};
+use heliosdb_nano::sql::{LogicalPlan, Parser, Planner};
+use heliosdb_nano::{Error, Result};
 
 /// Test P1-5: Branch deletion after merge
 ///
@@ -14,7 +14,7 @@ use heliosdb_nano::sql::{Parser, Planner, LogicalPlan};
 /// when the DELETE_BRANCH_AFTER option is set to true.
 #[test]
 fn test_p1_5_branch_delete_after_merge() {
-    use heliosdb_nano::sql::logical_plan::{MergeOption, ConflictResolution};
+    use heliosdb_nano::sql::logical_plan::{ConflictResolution, MergeOption};
 
     // Test with DELETE_BRANCH_AFTER = true
     let options_delete = vec![
@@ -23,9 +23,9 @@ fn test_p1_5_branch_delete_after_merge() {
     ];
 
     // Verify that should_delete_branch_after_merge returns true
-    let should_delete = options_delete.iter().any(|opt| {
-        matches!(opt, MergeOption::DeleteBranchAfter(true))
-    });
+    let should_delete = options_delete
+        .iter()
+        .any(|opt| matches!(opt, MergeOption::DeleteBranchAfter(true)));
     assert!(should_delete, "DELETE_BRANCH_AFTER(true) should be detected");
 
     // Test with DELETE_BRANCH_AFTER = false
@@ -34,20 +34,24 @@ fn test_p1_5_branch_delete_after_merge() {
         MergeOption::ConflictResolution(ConflictResolution::TargetWins),
     ];
 
-    let should_not_delete = options_no_delete.iter().any(|opt| {
-        matches!(opt, MergeOption::DeleteBranchAfter(true))
-    });
-    assert!(!should_not_delete, "DELETE_BRANCH_AFTER(false) should not trigger deletion");
+    let should_not_delete = options_no_delete
+        .iter()
+        .any(|opt| matches!(opt, MergeOption::DeleteBranchAfter(true)));
+    assert!(
+        !should_not_delete,
+        "DELETE_BRANCH_AFTER(false) should not trigger deletion"
+    );
 
     // Test without DELETE_BRANCH_AFTER option
-    let options_default = vec![
-        MergeOption::ConflictResolution(ConflictResolution::BranchWins),
-    ];
+    let options_default = vec![MergeOption::ConflictResolution(ConflictResolution::BranchWins)];
 
-    let default_no_delete = options_default.iter().any(|opt| {
-        matches!(opt, MergeOption::DeleteBranchAfter(true))
-    });
-    assert!(!default_no_delete, "Missing DELETE_BRANCH_AFTER should default to no deletion");
+    let default_no_delete = options_default
+        .iter()
+        .any(|opt| matches!(opt, MergeOption::DeleteBranchAfter(true)));
+    assert!(
+        !default_no_delete,
+        "Missing DELETE_BRANCH_AFTER should default to no deletion"
+    );
 }
 
 /// Test P1-6: Parse CREATE INDEX WITH options
@@ -73,9 +77,9 @@ fn test_p1_6_create_index_with_options() -> Result<()> {
             assert!(!options.is_empty(), "Options should be parsed");
 
             // Verify quantization option is present
-            let has_quantization = options.iter().any(|opt| {
-                matches!(opt, heliosdb_nano::sql::logical_plan::IndexOption::Quantization(_))
-            });
+            let has_quantization = options
+                .iter()
+                .any(|opt| matches!(opt, heliosdb_nano::sql::logical_plan::IndexOption::Quantization(_)));
             assert!(has_quantization, "Quantization option should be parsed");
         }
         _ => panic!("Expected CreateIndex plan"),
@@ -95,15 +99,15 @@ fn test_p1_6_create_index_with_options() -> Result<()> {
             assert_eq!(options.len(), 2, "Should parse 2 options");
 
             // Verify m parameter
-            let has_m = options.iter().any(|opt| {
-                matches!(opt, heliosdb_nano::sql::logical_plan::IndexOption::HnswM(16))
-            });
+            let has_m = options
+                .iter()
+                .any(|opt| matches!(opt, heliosdb_nano::sql::logical_plan::IndexOption::HnswM(16)));
             assert!(has_m, "M parameter should be parsed");
 
             // Verify ef_construction parameter
-            let has_ef = options.iter().any(|opt| {
-                matches!(opt, heliosdb_nano::sql::logical_plan::IndexOption::EfConstruction(200))
-            });
+            let has_ef = options
+                .iter()
+                .any(|opt| matches!(opt, heliosdb_nano::sql::logical_plan::IndexOption::EfConstruction(200)));
             assert!(has_ef, "EF_CONSTRUCTION parameter should be parsed");
         }
         _ => panic!("Expected CreateIndex plan"),
@@ -123,15 +127,15 @@ fn test_p1_6_create_index_with_options() -> Result<()> {
             assert_eq!(options.len(), 2, "Should parse 2 sharding options");
 
             // Verify sharding strategy
-            let has_strategy = options.iter().any(|opt| {
-                matches!(opt, heliosdb_nano::sql::logical_plan::IndexOption::ShardingStrategy(s) if s == "hash")
-            });
+            let has_strategy = options.iter().any(
+                |opt| matches!(opt, heliosdb_nano::sql::logical_plan::IndexOption::ShardingStrategy(s) if s == "hash"),
+            );
             assert!(has_strategy, "Sharding strategy should be parsed");
 
             // Verify shard count
-            let has_count = options.iter().any(|opt| {
-                matches!(opt, heliosdb_nano::sql::logical_plan::IndexOption::ShardCount(16))
-            });
+            let has_count = options
+                .iter()
+                .any(|opt| matches!(opt, heliosdb_nano::sql::logical_plan::IndexOption::ShardCount(16)));
             assert!(has_count, "Shard count should be parsed");
         }
         _ => panic!("Expected CreateIndex plan"),
@@ -151,15 +155,15 @@ fn test_p1_6_create_index_with_options() -> Result<()> {
             assert_eq!(options.len(), 3, "Should parse 3 PQ options");
 
             // Verify pq_subquantizers
-            let has_subquant = options.iter().any(|opt| {
-                matches!(opt, heliosdb_nano::sql::logical_plan::IndexOption::PqSubquantizers(8))
-            });
+            let has_subquant = options
+                .iter()
+                .any(|opt| matches!(opt, heliosdb_nano::sql::logical_plan::IndexOption::PqSubquantizers(8)));
             assert!(has_subquant, "PQ subquantizers should be parsed");
 
             // Verify pq_centroids
-            let has_centroids = options.iter().any(|opt| {
-                matches!(opt, heliosdb_nano::sql::logical_plan::IndexOption::PqCentroids(256))
-            });
+            let has_centroids = options
+                .iter()
+                .any(|opt| matches!(opt, heliosdb_nano::sql::logical_plan::IndexOption::PqCentroids(256)));
             assert!(has_centroids, "PQ centroids should be parsed");
         }
         _ => panic!("Expected CreateIndex plan"),
@@ -189,15 +193,13 @@ fn test_p1_7_as_of_clause_parsing() -> Result<()> {
     // Navigate to the Scan node to verify AS OF clause
     // The planner may generate either Filter(Scan) or FilteredScan (predicate pushdown)
     let as_of = match &plan {
-        LogicalPlan::Filter { input, .. } => {
-            match input.as_ref() {
-                LogicalPlan::Scan { as_of, table_name, .. } => {
-                    assert_eq!(table_name, "orders");
-                    as_of.clone()
-                }
-                _ => panic!("Expected Scan inside Filter"),
+        LogicalPlan::Filter { input, .. } => match input.as_ref() {
+            LogicalPlan::Scan { as_of, table_name, .. } => {
+                assert_eq!(table_name, "orders");
+                as_of.clone()
             }
-        }
+            _ => panic!("Expected Scan inside Filter"),
+        },
         LogicalPlan::FilteredScan { as_of, table_name, .. } => {
             assert_eq!(table_name, "orders");
             as_of.clone()
@@ -205,15 +207,13 @@ fn test_p1_7_as_of_clause_parsing() -> Result<()> {
         LogicalPlan::Project { input, .. } => {
             // May be wrapped in Project
             match input.as_ref() {
-                LogicalPlan::Filter { input: inner, .. } => {
-                    match inner.as_ref() {
-                        LogicalPlan::Scan { as_of, table_name, .. } => {
-                            assert_eq!(table_name, "orders");
-                            as_of.clone()
-                        }
-                        _ => panic!("Expected Scan inside Filter inside Project"),
+                LogicalPlan::Filter { input: inner, .. } => match inner.as_ref() {
+                    LogicalPlan::Scan { as_of, table_name, .. } => {
+                        assert_eq!(table_name, "orders");
+                        as_of.clone()
                     }
-                }
+                    _ => panic!("Expected Scan inside Filter inside Project"),
+                },
                 LogicalPlan::FilteredScan { as_of, table_name, .. } => {
                     assert_eq!(table_name, "orders");
                     as_of.clone()
@@ -344,10 +344,13 @@ fn test_p1_integration_all_fixes() -> Result<()> {
     use heliosdb_nano::sql::logical_plan::MergeOption;
     let merge_options = vec![MergeOption::DeleteBranchAfter(true)];
 
-    let should_delete = merge_options.iter().any(|opt| {
-        matches!(opt, MergeOption::DeleteBranchAfter(true))
-    });
-    assert!(should_delete, "DeleteBranchAfter option should be recognized in integration test");
+    let should_delete = merge_options
+        .iter()
+        .any(|opt| matches!(opt, MergeOption::DeleteBranchAfter(true)));
+    assert!(
+        should_delete,
+        "DeleteBranchAfter option should be recognized in integration test"
+    );
 
     Ok(())
 }
@@ -370,9 +373,10 @@ fn test_p1_6_invalid_index_options() {
 
         if let Err(e) = result {
             let error_msg = format!("{:?}", e);
-            assert!(error_msg.to_lowercase().contains("quantization") ||
-                    error_msg.to_lowercase().contains("invalid"),
-                    "Error should mention quantization or invalid type");
+            assert!(
+                error_msg.to_lowercase().contains("quantization") || error_msg.to_lowercase().contains("invalid"),
+                "Error should mention quantization or invalid type"
+            );
         }
     }
 
@@ -414,12 +418,18 @@ fn test_p1_7_as_of_edge_cases() -> Result<()> {
     assert!(extracted.is_some(), "AS OF should be extracted");
 
     if let Some(clause) = extracted {
-        assert!(clause.contains("TIMESTAMP"), "Extracted clause should contain TIMESTAMP");
+        assert!(
+            clause.contains("TIMESTAMP"),
+            "Extracted clause should contain TIMESTAMP"
+        );
     }
 
     // Test parsing of extracted clause
     let as_of_clause = TimeTravelParser::parse_as_of_clause("TIMESTAMP '2025-11-15 06:00:00'")?;
-    assert!(matches!(as_of_clause, heliosdb_nano::sql::logical_plan::AsOfClause::Timestamp(_)));
+    assert!(matches!(
+        as_of_clause,
+        heliosdb_nano::sql::logical_plan::AsOfClause::Timestamp(_)
+    ));
 
     Ok(())
 }

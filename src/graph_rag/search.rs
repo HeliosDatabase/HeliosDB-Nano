@@ -62,19 +62,17 @@ pub struct GraphRagHit {
 /// filters are pushed down via `FilteredScan` against
 /// `_hdb_graph_nodes` / `_hdb_graph_edges`. Edge-scan bloom filters
 /// help when `edge_kinds` is set.
-pub fn graph_rag_search(
-    db: &EmbeddedDatabase,
-    opts: &GraphRagOptions,
-) -> Result<Vec<GraphRagHit>> {
+pub fn graph_rag_search(db: &EmbeddedDatabase, opts: &GraphRagOptions) -> Result<Vec<GraphRagHit>> {
     if opts.seed_text.trim().is_empty() {
-        return Err(Error::query_execution("graph_rag_search requires a non-empty seed_text"));
+        return Err(Error::query_execution(
+            "graph_rag_search requires a non-empty seed_text",
+        ));
     }
 
     // 1. Seed collection: substring match on title/text (case-insensitive).
     let needle = opts.seed_text.to_lowercase();
-    let mut seed_sql = String::from(
-        "SELECT node_id, node_kind, title, text, source_ref FROM _hdb_graph_nodes WHERE 1 = 1",
-    );
+    let mut seed_sql =
+        String::from("SELECT node_id, node_kind, title, text, source_ref FROM _hdb_graph_nodes WHERE 1 = 1");
     if !opts.seed_kinds.is_empty() {
         seed_sql.push_str(" AND node_kind IN (");
         for (i, k) in opts.seed_kinds.iter().enumerate() {
@@ -91,9 +89,7 @@ pub fn graph_rag_search(
     for row in rows {
         let title = as_string(row.values.get(2)).unwrap_or_default();
         let text = as_string(row.values.get(3)).unwrap_or_default();
-        if !title.to_lowercase().contains(&needle)
-            && !text.to_lowercase().contains(&needle)
-        {
+        if !title.to_lowercase().contains(&needle) && !text.to_lowercase().contains(&needle) {
             continue;
         }
         seeds.push(GraphRagHit {
@@ -179,11 +175,7 @@ fn fetch_neighbours(
     let kind_filter = if kinds.is_empty() {
         String::new()
     } else {
-        let list = kinds
-            .iter()
-            .map(|k| sql_text(k))
-            .collect::<Vec<_>>()
-            .join(",");
+        let list = kinds.iter().map(|k| sql_text(k)).collect::<Vec<_>>().join(",");
         format!(" AND e.edge_kind IN ({list})")
     };
 
@@ -212,11 +204,7 @@ fn fetch_neighbours(
     if ids.is_empty() {
         return Ok(Vec::new());
     }
-    let id_list = ids
-        .iter()
-        .map(|i| i.to_string())
-        .collect::<Vec<_>>()
-        .join(",");
+    let id_list = ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
     let nodes_rows = db.query(
         &format!(
             "SELECT node_id, node_kind, title, text, source_ref \

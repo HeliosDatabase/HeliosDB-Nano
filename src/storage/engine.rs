@@ -5,30 +5,33 @@
 #![allow(unused_variables)]
 #![allow(unused_mut)]
 
-use super::{Key, Transaction, Catalog, VectorIndexManager, SnapshotManager, BranchManager, BranchTransaction, BranchOptions, BranchMetadata, BranchId, DatabaseStats};
-use super::wal::{WriteAheadLog, WalOperation, WalSyncMode};
-use super::predicate_pushdown::{PredicatePushdownManager, PushdownConfig, AnalyzedPredicate};
-use super::bloom_filter::TableBloomFilters;
-use super::zone_map::TableZoneMap;
-use super::filter_index_delta::{FilterIndexDeltaTracker, FilterIndexConfig};
-use super::filter_consolidation_worker::{FilterConsolidationWorker, ConsolidationConfig};
-use super::speculative_filter::{SpeculativeFilterManager, SpeculativeConfig};
-use super::parallel_filter::{ParallelFilterEngine, ParallelFilterConfig};
-use super::mv_scheduler::CpuMonitor;
-use super::dictionary::DictionaryManager;
-use super::content_addr::ContentAddressedStore;
-use super::columnar::ColumnarStore;
 use super::art_manager::ArtIndexManager;
-use crate::ColumnStorageMode;
+use super::bloom_filter::TableBloomFilters;
+use super::columnar::ColumnarStore;
+use super::content_addr::ContentAddressedStore;
+use super::dictionary::DictionaryManager;
+use super::filter_consolidation_worker::{ConsolidationConfig, FilterConsolidationWorker};
+use super::filter_index_delta::{FilterIndexConfig, FilterIndexDeltaTracker};
+use super::mv_scheduler::CpuMonitor;
+use super::parallel_filter::{ParallelFilterConfig, ParallelFilterEngine};
+use super::predicate_pushdown::{AnalyzedPredicate, PredicatePushdownManager, PushdownConfig};
+use super::speculative_filter::{SpeculativeConfig, SpeculativeFilterManager};
+use super::wal::{WalOperation, WalSyncMode, WriteAheadLog};
+use super::zone_map::TableZoneMap;
+use super::{
+    BranchId, BranchManager, BranchMetadata, BranchOptions, BranchTransaction, Catalog, DatabaseStats, Key,
+    SnapshotManager, Transaction, VectorIndexManager,
+};
 use crate::crypto::{self, KeyManager};
+use crate::ColumnStorageMode;
 use crate::{Config, Error, Result, Tuple};
-use rocksdb::{DB, Options, IteratorMode, WriteBatch, BlockBasedOptions, Cache, ReadOptions};
+use parking_lot::RwLock;
+use rocksdb::{BlockBasedOptions, Cache, IteratorMode, Options, ReadOptions, WriteBatch, DB};
 use std::cell::RefCell;
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use parking_lot::RwLock;
+use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 // Thread-local buffer for key generation to avoid per-row allocations
@@ -270,8 +273,7 @@ impl StorageEngine {
         opts.set_bytes_per_sync(1048576); // Sync every 1MB to reduce fsync overhead
         opts.set_enable_pipelined_write(true); // Pipeline WAL + memtable writes
 
-        let db = DB::open(&opts, path)
-            .map_err(|e| Error::storage(format!("Failed to open RocksDB: {}", e)))?;
+        let db = DB::open(&opts, path).map_err(|e| Error::storage(format!("Failed to open RocksDB: {}", e)))?;
 
         let db = Arc::new(db);
 
@@ -301,7 +303,10 @@ impl StorageEngine {
                 Arc::new(RwLock::new(Some(Arc::new(manager))))
             }
             Err(e) => {
-                warn!("Failed to initialize BranchManager: {}. Branch operations will be unavailable.", e);
+                warn!(
+                    "Failed to initialize BranchManager: {}. Branch operations will be unavailable.",
+                    e
+                );
                 Arc::new(RwLock::new(None))
             }
         };
@@ -371,8 +376,7 @@ impl StorageEngine {
         #[cfg(feature = "sync-experimental")]
         let (change_log, node_id) = if config.sync.enabled && config.sync.change_log_enabled {
             let node_id = if let Some(ref id_str) = config.sync.node_id {
-                uuid::Uuid::parse_str(id_str)
-                    .map_err(|e| Error::config(format!("Invalid node_id UUID: {}", e)))?
+                uuid::Uuid::parse_str(id_str).map_err(|e| Error::config(format!("Invalid node_id UUID: {}", e)))?
             } else {
                 uuid::Uuid::new_v4()
             };
@@ -455,8 +459,7 @@ impl StorageEngine {
     pub fn open_in_memory(config: &Config) -> Result<Self> {
         // RocksDB doesn't support true in-memory mode with DB::open
         // We'll use a temporary directory that gets cleaned up
-        let temp_dir = tempfile::tempdir()
-            .map_err(|e| Error::storage(format!("Failed to create temp dir: {}", e)))?;
+        let temp_dir = tempfile::tempdir().map_err(|e| Error::storage(format!("Failed to create temp dir: {}", e)))?;
 
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -502,7 +505,10 @@ impl StorageEngine {
                 Arc::new(RwLock::new(Some(Arc::new(manager))))
             }
             Err(e) => {
-                warn!("Failed to initialize BranchManager: {}. Branch operations will be unavailable.", e);
+                warn!(
+                    "Failed to initialize BranchManager: {}. Branch operations will be unavailable.",
+                    e
+                );
                 Arc::new(RwLock::new(None))
             }
         };
@@ -556,8 +562,7 @@ impl StorageEngine {
         #[cfg(feature = "sync-experimental")]
         let (change_log, node_id) = if config.sync.enabled && config.sync.change_log_enabled {
             let node_id = if let Some(ref id_str) = config.sync.node_id {
-                uuid::Uuid::parse_str(id_str)
-                    .map_err(|e| Error::config(format!("Invalid node_id UUID: {}", e)))?
+                uuid::Uuid::parse_str(id_str).map_err(|e| Error::config(format!("Invalid node_id UUID: {}", e)))?
             } else {
                 uuid::Uuid::new_v4()
             };
@@ -727,10 +732,7 @@ impl StorageEngine {
     /// let config = LockFreeIngestionConfig::for_oltp();
     /// storage.enable_lockfree_ingestion(config)?;
     /// ```
-    pub fn enable_lockfree_ingestion(
-        &self,
-        config: super::lockfree::LockFreeIngestionConfig,
-    ) -> Result<()> {
+    pub fn enable_lockfree_ingestion(&self, config: super::lockfree::LockFreeIngestionConfig) -> Result<()> {
         // Determine WAL path
         let wal_path = if let Some(ref temp) = self._temp_dir {
             temp.path().join("lockfree_wal")
@@ -798,7 +800,8 @@ impl StorageEngine {
     pub fn disable_lockfree_ingestion(&self) -> Result<()> {
         let mut guard = self.lockfree_engine.write();
         if let Some(ref engine) = *guard {
-            engine.shutdown()
+            engine
+                .shutdown()
                 .map_err(|e| Error::storage(format!("Failed to shutdown lock-free engine: {}", e)))?;
         }
         *guard = None;
@@ -832,9 +835,12 @@ impl StorageEngine {
     pub fn lockfree_begin(&self) -> Result<super::lockfree::TransactionHandle> {
         let guard = self.lockfree_engine.read();
         match guard.as_ref() {
-            Some(engine) => engine.begin_transaction()
+            Some(engine) => engine
+                .begin_transaction()
                 .map_err(|e| Error::storage(format!("Lock-free begin failed: {}", e))),
-            None => Err(Error::storage("Lock-free ingestion not enabled. Call enable_lockfree_ingestion first.")),
+            None => Err(Error::storage(
+                "Lock-free ingestion not enabled. Call enable_lockfree_ingestion first.",
+            )),
         }
     }
 
@@ -862,7 +868,8 @@ impl StorageEngine {
     ) -> Result<()> {
         let guard = self.lockfree_engine.read();
         match guard.as_ref() {
-            Some(engine) => engine.insert(handle, table, row_id, data)
+            Some(engine) => engine
+                .insert(handle, table, row_id, data)
                 .map_err(|e| Error::storage(format!("Lock-free insert failed: {}", e))),
             None => Err(Error::storage("Lock-free ingestion not enabled")),
         }
@@ -872,13 +879,11 @@ impl StorageEngine {
     ///
     /// Durability guarantees depend on the configured safety level.
     /// Returns the commit timestamp on success.
-    pub fn lockfree_commit(
-        &self,
-        handle: super::lockfree::TransactionHandle,
-    ) -> Result<u64> {
+    pub fn lockfree_commit(&self, handle: super::lockfree::TransactionHandle) -> Result<u64> {
         let guard = self.lockfree_engine.read();
         match guard.as_ref() {
-            Some(engine) => engine.commit(handle)
+            Some(engine) => engine
+                .commit(handle)
                 .map_err(|e| Error::storage(format!("Lock-free commit failed: {}", e))),
             None => Err(Error::storage("Lock-free ingestion not enabled")),
         }
@@ -887,13 +892,11 @@ impl StorageEngine {
     /// Abort a lock-free transaction
     ///
     /// Discards all buffered writes. No I/O is performed.
-    pub fn lockfree_abort(
-        &self,
-        handle: super::lockfree::TransactionHandle,
-    ) -> Result<()> {
+    pub fn lockfree_abort(&self, handle: super::lockfree::TransactionHandle) -> Result<()> {
         let guard = self.lockfree_engine.read();
         match guard.as_ref() {
-            Some(engine) => engine.abort(handle)
+            Some(engine) => engine
+                .abort(handle)
                 .map_err(|e| Error::storage(format!("Lock-free abort failed: {}", e))),
             None => Err(Error::storage("Lock-free ingestion not enabled")),
         }
@@ -903,17 +906,14 @@ impl StorageEngine {
     ///
     /// Optimized for high-throughput ingestion. Automatically batches
     /// and manages backpressure.
-    pub fn lockfree_bulk_insert<I>(
-        &self,
-        table: &str,
-        rows: I,
-    ) -> Result<super::lockfree::BulkInsertResult>
+    pub fn lockfree_bulk_insert<I>(&self, table: &str, rows: I) -> Result<super::lockfree::BulkInsertResult>
     where
         I: IntoIterator<Item = Vec<u8>>,
     {
         let guard = self.lockfree_engine.read();
         match guard.as_ref() {
-            Some(engine) => engine.bulk_insert(table, rows)
+            Some(engine) => engine
+                .bulk_insert(table, rows)
                 .map_err(|e| Error::storage(format!("Lock-free bulk insert failed: {}", e))),
             None => Err(Error::storage("Lock-free ingestion not enabled")),
         }
@@ -923,7 +923,8 @@ impl StorageEngine {
     pub fn lockfree_sync(&self) -> Result<()> {
         let guard = self.lockfree_engine.read();
         match guard.as_ref() {
-            Some(engine) => engine.force_sync()
+            Some(engine) => engine
+                .force_sync()
                 .map_err(|e| Error::storage(format!("Lock-free sync failed: {}", e))),
             None => Err(Error::storage("Lock-free ingestion not enabled")),
         }
@@ -933,7 +934,8 @@ impl StorageEngine {
     pub fn lockfree_checkpoint(&self) -> Result<()> {
         let guard = self.lockfree_engine.read();
         match guard.as_ref() {
-            Some(engine) => engine.checkpoint()
+            Some(engine) => engine
+                .checkpoint()
                 .map_err(|e| Error::storage(format!("Lock-free checkpoint failed: {}", e))),
             None => Err(Error::storage("Lock-free ingestion not enabled")),
         }
@@ -1018,7 +1020,8 @@ impl StorageEngine {
 
             // Flush batch when full
             if batch_count >= batch_size {
-                self.db.write(batch)
+                self.db
+                    .write(batch)
                     .map_err(|e| Error::storage(format!("WriteBatch failed: {}", e)))?;
                 batch = WriteBatch::default();
                 batch_count = 0;
@@ -1027,7 +1030,8 @@ impl StorageEngine {
 
         // Flush remaining
         if batch_count > 0 {
-            self.db.write(batch)
+            self.db
+                .write(batch)
                 .map_err(|e| Error::storage(format!("Final WriteBatch failed: {}", e)))?;
         }
 
@@ -1038,21 +1042,21 @@ impl StorageEngine {
                 counter.store(max_row_id + 1, Ordering::Release);
             }
         } else {
-            self.row_counters.insert(
-                table.to_string(),
-                std::sync::atomic::AtomicU64::new(max_row_id + 1),
-            );
+            self.row_counters
+                .insert(table.to_string(), std::sync::atomic::AtomicU64::new(max_row_id + 1));
         }
 
         // Persist counter
         let counter_key = format!("meta:counter:{}", table);
         let counter_value = (max_row_id + 1).to_le_bytes();
-        self.db.put(counter_key.as_bytes(), counter_value)
+        self.db
+            .put(counter_key.as_bytes(), counter_value)
             .map_err(|e| Error::storage(format!("Failed to persist counter: {}", e)))?;
 
         // Sync if requested
         if sync_at_end {
-            self.db.flush()
+            self.db
+                .flush()
                 .map_err(|e| Error::storage(format!("Flush failed: {}", e)))?;
         }
 
@@ -1086,7 +1090,8 @@ impl StorageEngine {
         I: IntoIterator<Item = Vec<u8>>,
     {
         // Get starting row ID
-        let start_id = self.row_counters
+        let start_id = self
+            .row_counters
             .entry(table.to_string())
             .or_insert_with(|| std::sync::atomic::AtomicU64::new(1))
             .load(Ordering::Acquire);
@@ -1105,7 +1110,9 @@ impl StorageEngine {
 
     /// Get a value (basic get, no MVCC yet)
     pub fn get(&self, key: &Key) -> Result<Option<Vec<u8>>> {
-        let encrypted_data = self.db.get(key)
+        let encrypted_data = self
+            .db
+            .get(key)
             .map_err(|e| Error::storage(format!("Get failed: {}", e)))?;
 
         // Decrypt if encryption is enabled
@@ -1145,10 +1152,12 @@ impl StorageEngine {
         // Encrypt if encryption is enabled, otherwise write directly (no copy)
         if let Some(km) = &self.key_manager {
             let data = crypto::encrypt(km.key(), value)?;
-            self.db.put(key, data)
+            self.db
+                .put(key, data)
                 .map_err(|e| Error::storage(format!("Put failed: {}", e)))
         } else {
-            self.db.put(key, value)
+            self.db
+                .put(key, value)
                 .map_err(|e| Error::storage(format!("Put failed: {}", e)))
         }
     }
@@ -1175,7 +1184,8 @@ impl StorageEngine {
         }
 
         // Then delete from main database
-        self.db.delete(key)
+        self.db
+            .delete(key)
             .map_err(|e| Error::storage(format!("Delete failed: {}", e)))
     }
 
@@ -1242,6 +1252,41 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Like `log_data_update` but appends without a per-statement fsync.
+    /// The logical WAL entry is still written (so crash-recovery replay and
+    /// logical replication stay consistent), only the synchronous fsync is
+    /// skipped — durability then matches the RocksDB WriteBatch at commit. See
+    /// `StorageConfig::logical_wal_per_statement`.
+    pub fn log_data_update_nosync(&self, table_name: &str, key: &[u8], tuple_data: &[u8]) -> Result<()> {
+        if self.is_replaying.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(wal) = &self.wal {
+            let wal = wal.read();
+            wal.append_nosync(WalOperation::Update {
+                table: table_name.to_string(),
+                key: key.to_vec(),
+                tuple: tuple_data.to_vec(),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Like `log_data_delete` but appends without a per-statement fsync.
+    pub fn log_data_delete_nosync(&self, table_name: &str, key: &[u8]) -> Result<()> {
+        if self.is_replaying.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(wal) = &self.wal {
+            let wal = wal.read();
+            wal.append_nosync(WalOperation::Delete {
+                table: table_name.to_string(),
+                key: key.to_vec(),
+            })?;
+        }
+        Ok(())
+    }
+
     /// Internal put: encrypt and store without WAL logging
     /// Use this for internal metadata like counters, version history, etc.
     fn put_internal(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -1250,14 +1295,17 @@ impl StorageEngine {
         } else {
             value.to_vec()
         };
-        self.db.put(key, data)
+        self.db
+            .put(key, data)
             .map_err(|e| Error::storage(format!("Internal put failed: {}", e)))
     }
 
     /// Internal get: fetch and decrypt without WAL involvement
     /// Use this for internal metadata like counters, version history, etc.
     fn get_internal(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        let encrypted_data = self.db.get(key)
+        let encrypted_data = self
+            .db
+            .get(key)
             .map_err(|e| Error::storage(format!("Internal get failed: {}", e)))?;
 
         match (encrypted_data, &self.key_manager) {
@@ -1282,11 +1330,10 @@ impl StorageEngine {
     /// Begin a transaction
     pub fn begin_transaction(&self) -> Result<Transaction> {
         let snapshot_id = self.next_timestamp();
-        Transaction::new(
-            Arc::clone(&self.db),
-            snapshot_id,
-            Arc::clone(&self.snapshot_manager)
-        )
+        let mut txn = Transaction::new(Arc::clone(&self.db), snapshot_id, Arc::clone(&self.snapshot_manager))?;
+        // P0#1: emit MVCC version-history at commit only when time-travel is on.
+        txn.set_versioning_enabled(self.config.storage.time_travel_enabled);
+        Ok(txn)
     }
 
     /// Get next timestamp (for MVCC)
@@ -1345,7 +1392,9 @@ impl StorageEngine {
                     }
                     ColumnStorageMode::ContentAddressed => {
                         // Use content-addressed storage for large values
-                        let cur_val = transformed_tuple.values.get(idx)
+                        let cur_val = transformed_tuple
+                            .values
+                            .get(idx)
                             .ok_or_else(|| Error::internal("index out of bounds in content-addressed transform"))?;
                         let new_val = ContentAddressedStore::maybe_store(&self.db, cur_val)?;
                         if let Some(val) = transformed_tuple.values.get_mut(idx) {
@@ -1354,7 +1403,9 @@ impl StorageEngine {
                     }
                     ColumnStorageMode::Columnar => {
                         // Store in columnar format separately
-                        let cur_val = transformed_tuple.values.get(idx)
+                        let cur_val = transformed_tuple
+                            .values
+                            .get(idx)
                             .ok_or_else(|| Error::internal("index out of bounds in columnar transform"))?
                             .clone();
                         ColumnarStore::store(&self.db, table_name, &column.name, row_id, cur_val)?;
@@ -1370,7 +1421,11 @@ impl StorageEngine {
             }
 
             // Flush dictionary changes if any
-            if schema.columns.iter().any(|c| c.storage_mode == ColumnStorageMode::Dictionary) {
+            if schema
+                .columns
+                .iter()
+                .any(|c| c.storage_mode == ColumnStorageMode::Dictionary)
+            {
                 self.dict_manager.flush(&self.db)?;
             }
 
@@ -1441,10 +1496,9 @@ impl StorageEngine {
         let mut keys_to_delete = Vec::new();
         let mut read_opts = ReadOptions::default();
         read_opts.set_total_order_seek(false); // prefix seek, like drop_table
-        let iter = self.db.iterator_opt(
-            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
-            read_opts,
-        );
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
         for item in iter {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
             if !key.starts_with(prefix_bytes) {
@@ -1458,7 +1512,11 @@ impl StorageEngine {
             self.delete(&key)?;
         }
         if removed > 0 {
-            tracing::debug!("purge_table_data: removed {} orphaned rows for '{}'", removed, table_name);
+            tracing::debug!(
+                "purge_table_data: removed {} orphaned rows for '{}'",
+                removed,
+                table_name
+            );
         }
         Ok(removed)
     }
@@ -1483,44 +1541,72 @@ impl StorageEngine {
     /// (issue #1 follow-up). The caller MUST guarantee the query references no column at
     /// index >= `prefix_len`; the executor only requests this when its needed-column
     /// analysis is certain (single table, no wildcard/subquery, all columns resolved).
-    pub fn scan_table_with_schema_prefix(&self, table_name: &str, schema: &crate::Schema, prefix_len: usize) -> Result<Vec<Tuple>> {
+    pub fn scan_table_with_schema_prefix(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        prefix_len: usize,
+    ) -> Result<Vec<Tuple>> {
         // No benefit (and avoid the seed path) when we'd decode every column anyway.
-        let opt = if prefix_len >= schema.columns.len() { None } else { Some(prefix_len) };
+        let opt = if prefix_len >= schema.columns.len() {
+            None
+        } else {
+            Some(prefix_len)
+        };
         self.scan_table_with_schema_opt(table_name, schema, opt)
     }
 
-    fn scan_table_with_schema_opt(&self, table_name: &str, schema: &crate::Schema, prefix_len: Option<usize>) -> Result<Vec<Tuple>> {
+    fn scan_table_with_schema_opt(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        prefix_len: Option<usize>,
+    ) -> Result<Vec<Tuple>> {
         let scan_start = std::time::Instant::now();
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
 
-        let mut tuples = Vec::new();
-
-        // Iterate over all keys with the prefix
-        // Use total_order_seek to bypass prefix bloom filter for full table scans
+        // Phase 1: collect raw (key,value) byte pairs (cheap memcpy from RocksDB).
         let mut read_opts = ReadOptions::default();
         read_opts.set_total_order_seek(true);
-        let iter = self.db.iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+        let mut raw_rows: Vec<(Box<[u8]>, Box<[u8]>)> = Vec::new();
         for item in iter {
             let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break; // past the prefix range
+            }
+            raw_rows.push((key, raw_value));
+        }
 
-            // Check if key starts with our prefix (break when past it)
-            if key.starts_with(prefix_bytes) {
+        // Phase 2: decode each row. The per-row decode (decrypt + bincode +
+        // column-storage resolution) is the CPU cost; we parallelize it across
+        // cores for large scans (P1#6 intra-query parallelism). `par_iter`
+        // preserves input order, so the result order matches the serial path.
+        let decode = |key: &[u8], raw_value: &[u8]| -> Result<Tuple> {
+            {
                 // Deserialize tuple (decrypt first if encryption is enabled). With a
                 // prefix_len, decode only the leading columns and stop — the trailing
                 // (often large) column bytes are never parsed.
                 let mut tuple: Tuple = if let Some(km) = &self.key_manager {
                     let decrypted = crypto::decrypt(km.key(), &raw_value)?;
                     match prefix_len {
-                        Some(k) => crate::storage::prefix_decode::decode_tuple_prefix(&decrypted, k, schema.columns.len()),
+                        Some(k) => {
+                            crate::storage::prefix_decode::decode_tuple_prefix(&decrypted, k, schema.columns.len())
+                        }
                         None => bincode::deserialize(&decrypted),
                     }
                 } else {
                     match prefix_len {
-                        Some(k) => crate::storage::prefix_decode::decode_tuple_prefix(&raw_value, k, schema.columns.len()),
+                        Some(k) => {
+                            crate::storage::prefix_decode::decode_tuple_prefix(&raw_value, k, schema.columns.len())
+                        }
                         None => bincode::deserialize(&raw_value),
                     }
-                }.map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+                }
+                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
 
                 // Extract row_id from key (key format: "data:{table_name}:{row_id}")
                 let mut row_id = 0u64;
@@ -1575,12 +1661,28 @@ impl StorageEngine {
                     }
                 }
 
-                tuples.push(tuple);
-            } else {
-                // Past the prefix range — stop iterating
-                break;
+                Ok(tuple)
             }
-        }
+        };
+
+        // Parallelize decode for large scans; stay serial for small ones to
+        // avoid thread-pool dispatch overhead. par_iter preserves order.
+        // HELIOS_SCAN_SERIAL=1 forces the serial path (A/B benchmarking + kill switch).
+        static SCAN_SERIAL: once_cell::sync::Lazy<bool> =
+            once_cell::sync::Lazy::new(|| std::env::var("HELIOS_SCAN_SERIAL").is_ok());
+        const PAR_DECODE_THRESHOLD: usize = 4096;
+        let tuples: Vec<Tuple> = if !*SCAN_SERIAL && raw_rows.len() >= PAR_DECODE_THRESHOLD {
+            use rayon::prelude::*;
+            raw_rows
+                .par_iter()
+                .map(|kv| decode(&kv.0, &kv.1))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            raw_rows
+                .iter()
+                .map(|kv| decode(&kv.0, &kv.1))
+                .collect::<Result<Vec<_>>>()?
+        };
 
         tracing::debug!(
             phase = "storage_scan",
@@ -1599,10 +1701,9 @@ impl StorageEngine {
         let prefix_bytes = prefix.as_bytes();
         let mut read_opts = ReadOptions::default();
         read_opts.set_total_order_seek(true);
-        let iter = self.db.iterator_opt(
-            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
-            read_opts,
-        );
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
         let mut count = 0usize;
         for item in iter {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
@@ -1630,12 +1731,7 @@ impl StorageEngine {
     /// order-statistics index; for truly O(log N) paging, callers should
     /// use keyset pagination (WHERE id > $last) which routes through
     /// `scan_table_pk_range`.
-    pub fn scan_table_with_offset_limit(
-        &self,
-        table_name: &str,
-        offset: usize,
-        limit: usize,
-    ) -> Result<Vec<Tuple>> {
+    pub fn scan_table_with_offset_limit(&self, table_name: &str, offset: usize, limit: usize) -> Result<Vec<Tuple>> {
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let catalog = Catalog::new(self);
@@ -1644,10 +1740,9 @@ impl StorageEngine {
 
         let mut read_opts = ReadOptions::default();
         read_opts.set_total_order_seek(true);
-        let iter = self.db.iterator_opt(
-            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
-            read_opts,
-        );
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
         let mut skipped: usize = 0;
         for item in iter {
             if tuples.len() >= limit {
@@ -1670,7 +1765,8 @@ impl StorageEngine {
                 bincode::deserialize(&decrypted)
             } else {
                 bincode::deserialize(&raw_value)
-            }.map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+            }
+            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if let Some(row_id_str) = key_str.strip_prefix(&prefix) {
                     if let Ok(rid) = row_id_str.parse::<u64>() {
@@ -1680,7 +1776,9 @@ impl StorageEngine {
             }
             // Resolve per-column storage references
             for (idx, column) in schema.columns.iter().enumerate() {
-                if idx >= tuple.values.len() { break; }
+                if idx >= tuple.values.len() {
+                    break;
+                }
                 #[allow(clippy::indexing_slicing)]
                 match column.storage_mode {
                     ColumnStorageMode::Dictionary => {
@@ -1754,7 +1852,9 @@ impl StorageEngine {
             })
             .collect();
         filtered.sort_by_key(|t| t.row_id.unwrap_or(0));
-        if descending { filtered.reverse(); }
+        if descending {
+            filtered.reverse();
+        }
         filtered.truncate(limit);
         Ok(filtered)
     }
@@ -1770,10 +1870,9 @@ impl StorageEngine {
 
         let mut read_opts = ReadOptions::default();
         read_opts.set_total_order_seek(true);
-        let iter = self.db.iterator_opt(
-            IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
-            read_opts,
-        );
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
         for item in iter {
             if tuples.len() >= limit {
                 break;
@@ -1785,7 +1884,8 @@ impl StorageEngine {
                     bincode::deserialize(&decrypted)
                 } else {
                     bincode::deserialize(&raw_value)
-                }.map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+                }
+                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
                 if let Ok(key_str) = std::str::from_utf8(&key) {
                     if let Some(row_id_str) = key_str.strip_prefix(&prefix) {
                         if let Ok(rid) = row_id_str.parse::<u64>() {
@@ -1855,7 +1955,12 @@ impl StorageEngine {
     }
 
     /// PK point lookup using a pre-fetched schema (avoids redundant catalog lookup)
-    pub fn get_row_by_pk_with_schema(&self, table_name: &str, pk_value: &crate::Value, schema: &crate::Schema) -> Result<Option<Tuple>> {
+    pub fn get_row_by_pk_with_schema(
+        &self,
+        table_name: &str,
+        pk_value: &crate::Value,
+        schema: &crate::Schema,
+    ) -> Result<Option<Tuple>> {
         self.get_row_by_pk_inner(table_name, pk_value, Some(schema))
     }
 
@@ -1922,7 +2027,12 @@ impl StorageEngine {
         Ok(Some(tuple))
     }
 
-    fn get_row_by_pk_inner(&self, table_name: &str, pk_value: &crate::Value, schema: Option<&crate::Schema>) -> Result<Option<Tuple>> {
+    fn get_row_by_pk_inner(
+        &self,
+        table_name: &str,
+        pk_value: &crate::Value,
+        schema: Option<&crate::Schema>,
+    ) -> Result<Option<Tuple>> {
         let lookup_start = std::time::Instant::now();
 
         // Coerce the PK value to match the actual PK column type so that the ART
@@ -2052,15 +2162,9 @@ impl StorageEngine {
             (Value::Int8(v), DataType::Int2) => Value::Int2(*v as i16),
             (Value::Int4(v), DataType::Int2) => Value::Int2(*v as i16),
             // String→Int coercion: MySQL sends WHERE ID = '1' via $wpdb->prepare(%s)
-            (Value::String(s), DataType::Int8) => {
-                s.parse::<i64>().map(Value::Int8).unwrap_or_else(|_| value.clone())
-            }
-            (Value::String(s), DataType::Int4) => {
-                s.parse::<i32>().map(Value::Int4).unwrap_or_else(|_| value.clone())
-            }
-            (Value::String(s), DataType::Int2) => {
-                s.parse::<i16>().map(Value::Int2).unwrap_or_else(|_| value.clone())
-            }
+            (Value::String(s), DataType::Int8) => s.parse::<i64>().map(Value::Int8).unwrap_or_else(|_| value.clone()),
+            (Value::String(s), DataType::Int4) => s.parse::<i32>().map(Value::Int4).unwrap_or_else(|_| value.clone()),
+            (Value::String(s), DataType::Int2) => s.parse::<i16>().map(Value::Int2).unwrap_or_else(|_| value.clone()),
             // Already correct type — return as-is
             _ => value.clone(),
         }
@@ -2092,13 +2196,9 @@ impl StorageEngine {
         let tuples = self.scan_table(table_name)?;
 
         // Apply storage-level filtering through predicate pushdown manager
-        let filtered = self.predicate_pushdown.scan_with_pushdown(
-            table_name,
-            tuples,
-            predicates,
-            &schema,
-            limit,
-        );
+        let filtered = self
+            .predicate_pushdown
+            .scan_with_pushdown(table_name, tuples, predicates, &schema, limit);
 
         Ok(filtered)
     }
@@ -2146,7 +2246,9 @@ impl StorageEngine {
 
         // Migrate each row
         for key in keys_to_migrate {
-            let raw_value = self.db.get(&key)
+            let raw_value = self
+                .db
+                .get(&key)
                 .map_err(|e| Error::storage(format!("Failed to read row: {}", e)))?
                 .ok_or_else(|| Error::storage("Row disappeared during migration"))?;
 
@@ -2156,7 +2258,8 @@ impl StorageEngine {
                 bincode::deserialize(&decrypted)
             } else {
                 bincode::deserialize(&raw_value)
-            }.map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+            }
+            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
 
             if col_idx >= tuple.values.len() {
                 continue;
@@ -2174,7 +2277,9 @@ impl StorageEngine {
             };
 
             // Step 1: Decode from old format to original value
-            let cur_val = tuple.values.get(col_idx)
+            let cur_val = tuple
+                .values
+                .get(col_idx)
                 .ok_or_else(|| Error::internal("col_idx out of bounds during migration decode"))?;
             let original_value = match old_mode {
                 ColumnStorageMode::Dictionary => {
@@ -2194,8 +2299,7 @@ impl StorageEngine {
                 }
                 ColumnStorageMode::Columnar => {
                     if matches!(cur_val, crate::Value::ColumnarRef) {
-                        ColumnarStore::get(&self.db, table_name, &column.name, row_id)?
-                            .unwrap_or(crate::Value::Null)
+                        ColumnarStore::get(&self.db, table_name, &column.name, row_id)?.unwrap_or(crate::Value::Null)
                     } else {
                         cur_val.clone()
                     }
@@ -2229,7 +2333,9 @@ impl StorageEngine {
                 }
                 ColumnStorageMode::Default => original_value,
             };
-            *tuple.values.get_mut(col_idx)
+            *tuple
+                .values
+                .get_mut(col_idx)
                 .ok_or_else(|| Error::internal("col_idx out of bounds during migration encode"))? = new_val;
 
             // Step 3: Clean up old columnar data if migrating away from columnar
@@ -2239,8 +2345,8 @@ impl StorageEngine {
             }
 
             // Write back row tuple
-            let new_value = bincode::serialize(&tuple)
-                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+            let new_value =
+                bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
 
             // Encrypt if needed
             let final_value = if let Some(km) = &self.key_manager {
@@ -2249,7 +2355,8 @@ impl StorageEngine {
                 new_value
             };
 
-            self.db.put(&key, &final_value)
+            self.db
+                .put(&key, &final_value)
                 .map_err(|e| Error::storage(format!("Failed to write migrated row: {}", e)))?;
 
             migrated += 1;
@@ -2262,7 +2369,11 @@ impl StorageEngine {
 
         tracing::info!(
             "Migrated {} rows in {}.{} from {:?} to {:?}",
-            migrated, table_name, column.name, old_mode, new_mode
+            migrated,
+            table_name,
+            column.name,
+            old_mode,
+            new_mode
         );
 
         Ok(migrated)
@@ -2315,7 +2426,9 @@ impl StorageEngine {
 
         // Update each row by appending the new column value
         for key in keys_to_update {
-            let raw_value = self.db.get(&key)
+            let raw_value = self
+                .db
+                .get(&key)
                 .map_err(|e| Error::storage(format!("Failed to read row: {}", e)))?
                 .ok_or_else(|| Error::storage("Row disappeared during update"))?;
 
@@ -2325,14 +2438,15 @@ impl StorageEngine {
                 bincode::deserialize(&decrypted)
             } else {
                 bincode::deserialize(&raw_value)
-            }.map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+            }
+            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
 
             // Append the new column value
             tuple.values.push(default_value.clone());
 
             // Serialize and encrypt if needed
-            let new_value = bincode::serialize(&tuple)
-                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+            let new_value =
+                bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
 
             let final_value = if let Some(km) = &self.key_manager {
                 crypto::encrypt(km.key(), &new_value)?
@@ -2340,7 +2454,8 @@ impl StorageEngine {
                 new_value
             };
 
-            self.db.put(&key, &final_value)
+            self.db
+                .put(&key, &final_value)
                 .map_err(|e| Error::storage(format!("Failed to write updated row: {}", e)))?;
 
             updated += 1;
@@ -2360,11 +2475,7 @@ impl StorageEngine {
     ///
     /// # Returns
     /// Number of rows updated
-    pub fn drop_column_from_rows(
-        &self,
-        table_name: &str,
-        col_idx: usize,
-    ) -> Result<usize> {
+    pub fn drop_column_from_rows(&self, table_name: &str, col_idx: usize) -> Result<usize> {
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let mut updated = 0;
@@ -2385,7 +2496,9 @@ impl StorageEngine {
 
         // Update each row by removing the column value
         for key in keys_to_update {
-            let raw_value = self.db.get(&key)
+            let raw_value = self
+                .db
+                .get(&key)
                 .map_err(|e| Error::storage(format!("Failed to read row: {}", e)))?
                 .ok_or_else(|| Error::storage("Row disappeared during update"))?;
 
@@ -2395,7 +2508,8 @@ impl StorageEngine {
                 bincode::deserialize(&decrypted)
             } else {
                 bincode::deserialize(&raw_value)
-            }.map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+            }
+            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
 
             // Remove the column value if it exists
             if col_idx < tuple.values.len() {
@@ -2411,7 +2525,8 @@ impl StorageEngine {
                     new_value
                 };
 
-                self.db.put(&key, &final_value)
+                self.db
+                    .put(&key, &final_value)
                     .map_err(|e| Error::storage(format!("Failed to write updated row: {}", e)))?;
 
                 updated += 1;
@@ -2436,14 +2551,16 @@ impl StorageEngine {
     ///
     /// This enables bloom filter-based row pruning for subsequent scans.
     pub fn register_bloom_filters(&self, table_name: &str, filters: TableBloomFilters) {
-        self.predicate_pushdown.register_bloom_filters(table_name.to_string(), filters);
+        self.predicate_pushdown
+            .register_bloom_filters(table_name.to_string(), filters);
     }
 
     /// Register zone maps for a table
     ///
     /// This enables zone map-based block pruning for subsequent scans.
     pub fn register_zone_maps(&self, table_name: &str, zone_map: TableZoneMap) {
-        self.predicate_pushdown.register_zone_maps(table_name.to_string(), zone_map);
+        self.predicate_pushdown
+            .register_zone_maps(table_name.to_string(), zone_map);
     }
 
     /// Get reference to the predicate pushdown manager
@@ -2529,7 +2646,11 @@ impl StorageEngine {
 
         self.register_bloom_filters(table_name, table_filters);
 
-        debug!("Built bloom filters for table '{}' with {} tuples", table_name, tuples.len());
+        debug!(
+            "Built bloom filters for table '{}' with {} tuples",
+            table_name,
+            tuples.len()
+        );
         Ok(())
     }
 
@@ -2552,8 +2673,12 @@ impl StorageEngine {
 
         self.register_zone_maps(table_name, zone_map);
 
-        debug!("Built zone maps for table '{}' with {} tuples, block_size {}",
-            table_name, tuples.len(), block_size);
+        debug!(
+            "Built zone maps for table '{}' with {} tuples, block_size {}",
+            table_name,
+            tuples.len(),
+            block_size
+        );
         Ok(())
     }
 
@@ -2576,11 +2701,12 @@ impl StorageEngine {
 
         for trigger in triggers {
             if let Err(e) = self.trigger_registry.register_trigger(trigger.clone()) {
-                warn!("Failed to load trigger '{}' on table '{}': {}",
-                    trigger.name, trigger.table_name, e);
+                warn!(
+                    "Failed to load trigger '{}' on table '{}': {}",
+                    trigger.name, trigger.table_name, e
+                );
             } else {
-                debug!("Loaded trigger '{}' on table '{}'",
-                    trigger.name, trigger.table_name);
+                debug!("Loaded trigger '{}' on table '{}'", trigger.name, trigger.table_name);
             }
         }
 
@@ -2618,22 +2744,16 @@ impl StorageEngine {
     ///
     /// Requires branching to be enabled.
     pub fn git_integration_manager(&self) -> Result<crate::git_integration::GitIntegrationManager> {
-        let branch_manager = self.branch_manager()
+        let branch_manager = self
+            .branch_manager()
             .ok_or_else(|| Error::config("Branching must be enabled for Git integration".to_string()))?;
 
-        crate::git_integration::GitIntegrationManager::new(
-            self.db(),
-            branch_manager,
-            self.timestamp(),
-        )
+        crate::git_integration::GitIntegrationManager::new(self.db(), branch_manager, self.timestamp())
     }
 
     /// Get DDL versioning manager for Git integration
     pub fn ddl_versioning_manager(&self) -> Result<crate::git_integration::ddl_versioning::DdlVersioningManager> {
-        crate::git_integration::ddl_versioning::DdlVersioningManager::new(
-            self.db(),
-            self.timestamp(),
-        )
+        crate::git_integration::ddl_versioning::DdlVersioningManager::new(self.db(), self.timestamp())
     }
 
     /// Log a DDL operation to Git integration DDL history
@@ -2647,7 +2767,7 @@ impl StorageEngine {
         object_name: &str,
         ddl_statement: &str,
     ) -> Result<()> {
-        use crate::git_integration::ddl_versioning::{DdlOperation, DdlObjectType};
+        use crate::git_integration::ddl_versioning::{DdlObjectType, DdlOperation};
 
         // Get current branch ID (default to 0 for main)
         // Note: Current branch is tracked at session level, not engine level
@@ -2655,9 +2775,7 @@ impl StorageEngine {
         let branch_id: u64 = 0;
 
         // Get current LSN from WAL if available
-        let lsn = self.wal.as_ref()
-            .map(|w| w.read().current_lsn())
-            .unwrap_or(0);
+        let lsn = self.wal.as_ref().map(|w| w.read().current_lsn()).unwrap_or(0);
 
         // Parse operation
         let op = match operation.to_uppercase().as_str() {
@@ -2760,13 +2878,15 @@ impl StorageEngine {
 
     /// Flush to disk
     pub fn flush(&self) -> Result<()> {
-        self.db.flush()
+        self.db
+            .flush()
             .map_err(|e| Error::storage(format!("Flush failed: {}", e)))
     }
 
     /// Get database statistics
     pub fn get_stats(&self) -> Result<String> {
-        self.db.property_value("rocksdb.stats")
+        self.db
+            .property_value("rocksdb.stats")
             .map_err(|e| Error::storage(format!("Failed to get stats: {}", e)))?
             .ok_or_else(|| Error::storage("Stats not available"))
     }
@@ -2778,9 +2898,9 @@ impl StorageEngine {
 
     /// Get encryption configuration for auditing
     pub fn encryption_info(&self) -> Option<String> {
-        self.key_manager.as_ref().map(|km| {
-            format!("Enabled (AES-256-GCM, source: {:?})", km.source())
-        })
+        self.key_manager
+            .as_ref()
+            .map(|km| format!("Enabled (AES-256-GCM, source: {:?})", km.source()))
     }
 
     // --- Branch Management API ---
@@ -2792,7 +2912,7 @@ impl StorageEngine {
         let manager = self.branch_manager.read();
         if manager.is_none() {
             return Err(Error::storage(
-                "BranchManager not initialized. Branch operations are unavailable."
+                "BranchManager not initialized. Branch operations are unavailable.",
             ));
         }
         drop(manager);
@@ -2803,12 +2923,7 @@ impl StorageEngine {
     ///
     /// Creates a copy-on-write branch from a parent branch (or main if not specified).
     /// The branch is created instantly with minimal overhead.
-    pub fn create_branch(
-        &self,
-        name: &str,
-        parent_name: Option<&str>,
-        options: BranchOptions,
-    ) -> Result<BranchId> {
+    pub fn create_branch(&self, name: &str, parent_name: Option<&str>, options: BranchOptions) -> Result<BranchId> {
         self.create_branch_at_snapshot(name, parent_name, None, options)
     }
 
@@ -2825,7 +2940,8 @@ impl StorageEngine {
     ) -> Result<BranchId> {
         let manager_lock = self.get_or_init_branch_manager()?;
         let manager = manager_lock.read();
-        let mgr = manager.as_ref()
+        let mgr = manager
+            .as_ref()
             .ok_or_else(|| Error::storage("BranchManager not available in read lock"))?;
 
         // Use provided snapshot or current timestamp
@@ -2841,7 +2957,8 @@ impl StorageEngine {
     pub fn drop_branch(&self, name: &str, if_exists: bool) -> Result<()> {
         let manager_lock = self.get_or_init_branch_manager()?;
         let manager = manager_lock.read();
-        let mgr = manager.as_ref()
+        let mgr = manager
+            .as_ref()
             .ok_or_else(|| Error::storage("BranchManager not available in read lock"))?;
 
         mgr.drop_branch(name, if_exists)
@@ -2851,7 +2968,8 @@ impl StorageEngine {
     pub fn get_branch(&self, name: &str) -> Result<BranchMetadata> {
         let manager_lock = self.get_or_init_branch_manager()?;
         let manager = manager_lock.read();
-        let mgr = manager.as_ref()
+        let mgr = manager
+            .as_ref()
             .ok_or_else(|| Error::storage("BranchManager not available in read lock"))?;
 
         mgr.get_branch_by_name(name)
@@ -2861,7 +2979,8 @@ impl StorageEngine {
     pub fn list_branches(&self) -> Result<Vec<BranchMetadata>> {
         let manager_lock = self.get_or_init_branch_manager()?;
         let manager = manager_lock.read();
-        let mgr = manager.as_ref()
+        let mgr = manager
+            .as_ref()
             .ok_or_else(|| Error::storage("BranchManager not available in read lock"))?;
 
         mgr.list_branches()
@@ -2888,7 +3007,8 @@ impl StorageEngine {
         let target_id;
         {
             let manager = manager_lock.read();
-            let mgr = manager.as_ref()
+            let mgr = manager
+                .as_ref()
                 .ok_or_else(|| Error::storage("BranchManager not initialized"))?;
 
             let source = mgr.get_branch_by_name(source_name)?;
@@ -2897,12 +3017,14 @@ impl StorageEngine {
             // Validate branches are active
             if source.state != super::BranchState::Active {
                 return Err(Error::branch_merge(format!(
-                    "Source branch '{}' is not active", source_name
+                    "Source branch '{}' is not active",
+                    source_name
                 )));
             }
             if target.state != super::BranchState::Active {
                 return Err(Error::branch_merge(format!(
-                    "Target branch '{}' is not active", target_name
+                    "Target branch '{}' is not active",
+                    target_name
                 )));
             }
 
@@ -2919,14 +3041,18 @@ impl StorageEngine {
         let tables = catalog.list_tables()?;
 
         // Track deleted rows per table from source branch
-        let mut deleted_rows_by_table: std::collections::HashMap<String, HashSet<u64>> = std::collections::HashMap::new();
+        let mut deleted_rows_by_table: std::collections::HashMap<String, HashSet<u64>> =
+            std::collections::HashMap::new();
 
         // Step 1: Collect delete markers from source branch
         for table_name in &tables {
             let delete_prefix = format!("bdel:{}:{}:", source_id, table_name);
             let delete_prefix_bytes = delete_prefix.as_bytes();
 
-            let iter = self.db.iterator(rocksdb::IteratorMode::From(delete_prefix_bytes, rocksdb::Direction::Forward));
+            let iter = self.db.iterator(rocksdb::IteratorMode::From(
+                delete_prefix_bytes,
+                rocksdb::Direction::Forward,
+            ));
             for item in iter {
                 let (key, _value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
@@ -2952,7 +3078,10 @@ impl StorageEngine {
             let branch_prefix = format!("bdata:{}:{}:", source_id, table_name);
             let branch_prefix_bytes = branch_prefix.as_bytes();
 
-            let iter = self.db.iterator(rocksdb::IteratorMode::From(branch_prefix_bytes, rocksdb::Direction::Forward));
+            let iter = self.db.iterator(rocksdb::IteratorMode::From(
+                branch_prefix_bytes,
+                rocksdb::Direction::Forward,
+            ));
             for item in iter {
                 let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
@@ -2970,7 +3099,8 @@ impl StorageEngine {
                                 format!("bdata:{}:{}:{}", target_id, table_name, row_id)
                             };
 
-                            self.db.put(target_key.as_bytes(), &value)
+                            self.db
+                                .put(target_key.as_bytes(), &value)
                                 .map_err(|e| Error::storage(format!("Failed to merge data: {}", e)))?;
                             merged_keys += 1;
                         }
@@ -2984,7 +3114,8 @@ impl StorageEngine {
             for (table_name, row_ids) in &deleted_rows_by_table {
                 for row_id in row_ids {
                     let target_key = format!("data:{}:{}", table_name, row_id);
-                    self.db.delete(target_key.as_bytes())
+                    self.db
+                        .delete(target_key.as_bytes())
                         .map_err(|e| Error::storage(format!("Failed to apply delete: {}", e)))?;
                 }
             }
@@ -2993,7 +3124,8 @@ impl StorageEngine {
             for (table_name, row_ids) in &deleted_rows_by_table {
                 for row_id in row_ids {
                     let target_key = format!("bdel:{}:{}:{}", target_id, table_name, row_id);
-                    self.db.put(target_key.as_bytes(), b"")
+                    self.db
+                        .put(target_key.as_bytes(), b"")
                         .map_err(|e| Error::storage(format!("Failed to copy delete marker: {}", e)))?;
                 }
             }
@@ -3002,7 +3134,8 @@ impl StorageEngine {
         // Step 4: Update branch metadata to mark as merged
         {
             let manager = manager_lock.read();
-            let mgr = manager.as_ref()
+            let mgr = manager
+                .as_ref()
                 .ok_or_else(|| Error::storage("BranchManager not initialized"))?;
 
             // Call merge_branch on manager just to update metadata (no actual data copy needed)
@@ -3017,13 +3150,16 @@ impl StorageEngine {
             let meta_key = format!("branch:meta:{}", source_name);
             let meta_value = bincode::serialize(&source)
                 .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
-            self.db.put(meta_key.as_bytes(), &meta_value)
+            self.db
+                .put(meta_key.as_bytes(), &meta_value)
                 .map_err(|e| Error::storage(format!("Failed to save merged branch metadata: {}", e)))?;
         }
 
         tracing::info!(
             "Merge completed: {} -> {}, {} keys merged",
-            source_name, target_name, merged_keys
+            source_name,
+            target_name,
+            merged_keys
         );
 
         Ok(super::MergeResult {
@@ -3041,7 +3177,8 @@ impl StorageEngine {
     pub fn begin_branch_transaction(&self, branch_name: &str) -> Result<BranchTransaction> {
         let manager_lock = self.get_or_init_branch_manager()?;
         let manager = manager_lock.read();
-        let mgr = manager.as_ref()
+        let mgr = manager
+            .as_ref()
             .ok_or_else(|| Error::storage("BranchManager not initialized"))?;
 
         // Get branch metadata
@@ -3131,6 +3268,14 @@ impl StorageEngine {
         self.wal.is_some()
     }
 
+    /// Whether autocommit UPDATE/DELETE should append a per-statement logical
+    /// WAL entry (legacy strict-durability behavior). Default false: rely on the
+    /// RocksDB WriteBatch at commit, uniform with the INSERT fast path. See
+    /// `StorageConfig::logical_wal_per_statement`.
+    pub fn logical_wal_per_statement(&self) -> bool {
+        self.config.storage.logical_wal_per_statement
+    }
+
     /// Get current WAL LSN (Log Sequence Number)
     pub fn wal_lsn(&self) -> Option<u64> {
         self.wal.as_ref().map(|wal| wal.read().current_lsn())
@@ -3168,8 +3313,8 @@ impl StorageEngine {
         }
 
         if let Some(wal) = &self.wal {
-            let schema_bytes = bincode::serialize(schema)
-                .map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
+            let schema_bytes =
+                bincode::serialize(schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
             let wal = wal.read();
             // Use nosync for DDL — metadata is already crash-safe in RocksDB
             wal.append_nosync(WalOperation::CreateTable {
@@ -3215,7 +3360,12 @@ impl StorageEngine {
     }
 
     /// Log an AlterColumnStorage operation to WAL
-    pub fn log_alter_column_storage(&self, table_name: &str, column_name: &str, storage_mode: &crate::ColumnStorageMode) -> Result<()> {
+    pub fn log_alter_column_storage(
+        &self,
+        table_name: &str,
+        column_name: &str,
+        storage_mode: &crate::ColumnStorageMode,
+    ) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
@@ -3233,7 +3383,14 @@ impl StorageEngine {
     }
 
     /// Log a CreateIndex operation to WAL
-    pub fn log_create_index(&self, name: &str, table: &str, column: &str, index_type: Option<&str>, options: &[u8]) -> Result<()> {
+    pub fn log_create_index(
+        &self,
+        name: &str,
+        table: &str,
+        column: &str,
+        index_type: Option<&str>,
+        options: &[u8],
+    ) -> Result<()> {
         if self.is_replaying.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
@@ -3257,9 +3414,7 @@ impl StorageEngine {
         }
         if let Some(wal) = &self.wal {
             let wal = wal.read();
-            wal.append(WalOperation::DropIndex {
-                name: name.to_string(),
-            })?;
+            wal.append(WalOperation::DropIndex { name: name.to_string() })?;
         }
         Ok(())
     }
@@ -3317,9 +3472,7 @@ impl StorageEngine {
         }
         if let Some(wal) = &self.wal {
             let wal = wal.read();
-            wal.append(WalOperation::DropFunction {
-                name: name.to_string(),
-            })?;
+            wal.append(WalOperation::DropFunction { name: name.to_string() })?;
         }
         Ok(())
     }
@@ -3346,9 +3499,7 @@ impl StorageEngine {
         }
         if let Some(wal) = &self.wal {
             let wal = wal.read();
-            wal.append(WalOperation::DropProcedure {
-                name: name.to_string(),
-            })?;
+            wal.append(WalOperation::DropProcedure { name: name.to_string() })?;
         }
         Ok(())
     }
@@ -3375,9 +3526,7 @@ impl StorageEngine {
         }
         if let Some(wal) = &self.wal {
             let wal = wal.read();
-            wal.append(WalOperation::DropMaterializedView {
-                name: name.to_string(),
-            })?;
+            wal.append(WalOperation::DropMaterializedView { name: name.to_string() })?;
         }
         Ok(())
     }
@@ -3472,10 +3621,8 @@ impl StorageEngine {
             info!("Replaying {} WAL entries for crash recovery (optimized)", count);
 
             // Track active transactions to handle commits/aborts
-            let mut committed_transactions: std::collections::HashSet<u64> =
-                std::collections::HashSet::new();
-            let mut aborted_transactions: std::collections::HashSet<u64> =
-                std::collections::HashSet::new();
+            let mut committed_transactions: std::collections::HashSet<u64> = std::collections::HashSet::new();
+            let mut aborted_transactions: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
             let mut replayed_count = 0;
             let mut skipped_count = 0;
@@ -3524,7 +3671,8 @@ impl StorageEngine {
 
                         // Flush batch when size reached
                         if batch_count >= BATCH_SIZE {
-                            self.db.write(batch)
+                            self.db
+                                .write(batch)
                                 .map_err(|e| Error::storage(format!("Batch write failed: {}", e)))?;
                             batch = WriteBatch::default();
                             batch_count = 0;
@@ -3552,7 +3700,8 @@ impl StorageEngine {
 
             // Flush remaining operations in batch
             if batch_count > 0 {
-                self.db.write(batch)
+                self.db
+                    .write(batch)
                     .map_err(|e| Error::storage(format!("Final batch write failed: {}", e)))?;
             }
 
@@ -3586,7 +3735,10 @@ impl StorageEngine {
     /// Apply a single WAL operation to restore database state
     fn apply_wal_operation(&self, operation: WalOperation) -> Result<()> {
         // Log the operation type for debugging
-        info!("apply_wal_operation: Processing {:?}", std::mem::discriminant(&operation));
+        info!(
+            "apply_wal_operation: Processing {:?}",
+            std::mem::discriminant(&operation)
+        );
 
         match operation {
             WalOperation::Insert { table, key, tuple } => {
@@ -3639,7 +3791,11 @@ impl StorageEngine {
 
             WalOperation::CreateTable { table, schema } => {
                 // Deserialize the schema and create table
-                info!("apply_wal_operation: CreateTable for '{}', schema_len={}", table, schema.len());
+                info!(
+                    "apply_wal_operation: CreateTable for '{}', schema_len={}",
+                    table,
+                    schema.len()
+                );
                 let catalog = Catalog::new(self);
 
                 // Check if table already exists
@@ -3712,11 +3868,18 @@ impl StorageEngine {
                 Ok(())
             }
 
-            WalOperation::AlterColumnStorage { table, column, storage_mode } => {
+            WalOperation::AlterColumnStorage {
+                table,
+                column,
+                storage_mode,
+            } => {
                 // Deserialize and apply column storage mode change
                 match bincode::deserialize::<crate::ColumnStorageMode>(&storage_mode) {
                     Ok(mode) => {
-                        info!("Replayed alter column storage: table={}, column={}, mode={:?}", table, column, mode);
+                        info!(
+                            "Replayed alter column storage: table={}, column={}, mode={:?}",
+                            table, column, mode
+                        );
                         // The storage mode change is applied via the catalog
                         // For replication, we just ensure the metadata is stored
                         let key = format!("meta:col_storage:{}:{}", table, column).into_bytes();
@@ -3730,8 +3893,17 @@ impl StorageEngine {
                 }
             }
 
-            WalOperation::CreateIndex { name, table, column, index_type, options } => {
-                info!("Replayed create index: name={}, table={}, column={}", name, table, column);
+            WalOperation::CreateIndex {
+                name,
+                table,
+                column,
+                index_type,
+                options,
+            } => {
+                info!(
+                    "Replayed create index: name={}, table={}, column={}",
+                    name, table, column
+                );
                 // Store index metadata for replication
                 let key = format!("meta:index:{}", name).into_bytes();
                 let index_def = bincode::serialize(&(table, column, index_type, options))
@@ -3747,7 +3919,11 @@ impl StorageEngine {
                 Ok(())
             }
 
-            WalOperation::CreateTrigger { name, table, definition } => {
+            WalOperation::CreateTrigger {
+                name,
+                table,
+                definition,
+            } => {
                 // Deserialize trigger definition and store
                 match bincode::deserialize::<crate::sql::TriggerDefinition>(&definition) {
                     Ok(trigger_def) => {
@@ -3826,11 +4002,17 @@ impl StorageEngine {
                 Ok(())
             }
 
-            WalOperation::RefreshMaterializedView { name, concurrent, incremental } => {
+            WalOperation::RefreshMaterializedView {
+                name,
+                concurrent,
+                incremental,
+            } => {
                 // For refresh, we just log it - the actual data refresh happens
                 // via the data replication (INSERT operations)
-                info!("Replayed refresh materialized view: name={}, concurrent={}, incremental={}",
-                    name, concurrent, incremental);
+                info!(
+                    "Replayed refresh materialized view: name={}, concurrent={}, incremental={}",
+                    name, concurrent, incremental
+                );
                 Ok(())
             }
 
@@ -3848,7 +4030,10 @@ impl StorageEngine {
             }
 
             WalOperation::DropConstraint { table, constraint_name } => {
-                info!("Replayed drop constraint: table={}, constraint={}", table, constraint_name);
+                info!(
+                    "Replayed drop constraint: table={}, constraint={}",
+                    table, constraint_name
+                );
                 // Delete constraint metadata
                 let prefix = format!("meta:constraint:{}:", table);
                 // For now, we can't easily identify the exact key without the constraint data
@@ -3880,7 +4065,9 @@ impl StorageEngine {
                 info!("Replayed update counter: table={}, new_value={}", table_name, new_value);
 
                 // Update in-memory counter
-                let counter = self.row_counters.entry(table_name.clone())
+                let counter = self
+                    .row_counters
+                    .entry(table_name.clone())
                     .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
 
                 // Only update if new value is higher (prevent going backwards)
@@ -3903,9 +4090,9 @@ impl StorageEngine {
     /// Extract transaction ID from operation if it's part of a transaction
     fn extract_tx_id(operation: &WalOperation) -> Option<u64> {
         match operation {
-            WalOperation::Begin { tx_id }
-            | WalOperation::Commit { tx_id }
-            | WalOperation::Abort { tx_id } => Some(*tx_id),
+            WalOperation::Begin { tx_id } | WalOperation::Commit { tx_id } | WalOperation::Abort { tx_id } => {
+                Some(*tx_id)
+            }
             _ => None,
         }
     }
@@ -4004,21 +4191,21 @@ impl StorageEngine {
             }
 
             // DDL operations - can't batch, apply via apply_wal_operation
-            WalOperation::Truncate { .. } |
-            WalOperation::AlterColumnStorage { .. } |
-            WalOperation::CreateIndex { .. } |
-            WalOperation::DropIndex { .. } |
-            WalOperation::CreateTrigger { .. } |
-            WalOperation::DropTrigger { .. } |
-            WalOperation::CreateFunction { .. } |
-            WalOperation::DropFunction { .. } |
-            WalOperation::CreateProcedure { .. } |
-            WalOperation::DropProcedure { .. } |
-            WalOperation::CreateMaterializedView { .. } |
-            WalOperation::DropMaterializedView { .. } |
-            WalOperation::RefreshMaterializedView { .. } |
-            WalOperation::AddConstraint { .. } |
-            WalOperation::DropConstraint { .. } => {
+            WalOperation::Truncate { .. }
+            | WalOperation::AlterColumnStorage { .. }
+            | WalOperation::CreateIndex { .. }
+            | WalOperation::DropIndex { .. }
+            | WalOperation::CreateTrigger { .. }
+            | WalOperation::DropTrigger { .. }
+            | WalOperation::CreateFunction { .. }
+            | WalOperation::DropFunction { .. }
+            | WalOperation::CreateProcedure { .. }
+            | WalOperation::DropProcedure { .. }
+            | WalOperation::CreateMaterializedView { .. }
+            | WalOperation::DropMaterializedView { .. }
+            | WalOperation::RefreshMaterializedView { .. }
+            | WalOperation::AddConstraint { .. }
+            | WalOperation::DropConstraint { .. } => {
                 // Apply immediately via the non-batch handler
                 self.apply_wal_operation(operation.clone())?;
                 Ok(false) // Don't count as batch operation
@@ -4041,9 +4228,14 @@ impl StorageEngine {
 
             WalOperation::UpdateCounter { table_name, new_value } => {
                 // Apply counter update immediately (not batchable as it needs atomic operations)
-                debug!("Replaying counter update: table={}, new_value={}", table_name, new_value);
+                debug!(
+                    "Replaying counter update: table={}, new_value={}",
+                    table_name, new_value
+                );
 
-                let counter = self.row_counters.entry(table_name.clone())
+                let counter = self
+                    .row_counters
+                    .entry(table_name.clone())
                     .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
 
                 // Only update if the new value is greater (to handle out-of-order replay)
@@ -4106,7 +4298,12 @@ impl StorageEngine {
     }
 
     /// Insert a tuple with a pre-fetched schema (avoids redundant schema lookup)
-    pub fn insert_tuple_versioned_with_schema(&self, table_name: &str, tuple: Tuple, schema: &crate::Schema) -> Result<u64> {
+    pub fn insert_tuple_versioned_with_schema(
+        &self,
+        table_name: &str,
+        tuple: Tuple,
+        schema: &crate::Schema,
+    ) -> Result<u64> {
         let catalog = Catalog::new(self);
 
         // Get next row ID
@@ -4120,9 +4317,15 @@ impl StorageEngine {
                     if matches!(v, crate::Value::Null) && i < tuple.values.len() {
                         #[allow(clippy::indexing_slicing)]
                         match col.data_type {
-                            crate::DataType::Int2 => { tuple.values[i] = crate::Value::Int2(row_id as i16); }
-                            crate::DataType::Int4 => { tuple.values[i] = crate::Value::Int4(row_id as i32); }
-                            _ => { tuple.values[i] = crate::Value::Int8(row_id as i64); }
+                            crate::DataType::Int2 => {
+                                tuple.values[i] = crate::Value::Int2(row_id as i16);
+                            }
+                            crate::DataType::Int4 => {
+                                tuple.values[i] = crate::Value::Int4(row_id as i32);
+                            }
+                            _ => {
+                                tuple.values[i] = crate::Value::Int8(row_id as i64);
+                            }
                         }
                     }
                 }
@@ -4142,9 +4345,7 @@ impl StorageEngine {
                     col_values.insert(col.name.clone(), v.clone());
                 }
             }
-            if let Err(e) = self.art_index_manager
-                .check_unique_constraints(table_name, &col_values)
-            {
+            if let Err(e) = self.art_index_manager.check_unique_constraints(table_name, &col_values) {
                 return Err(Error::constraint_violation(e.to_string()));
             }
         }
@@ -4153,8 +4354,8 @@ impl StorageEngine {
         let bulk_mode = self.is_bulk_load_mode();
 
         // Serialize tuple directly (RocksDB LZ4 handles compression at block level)
-        let value = bincode::serialize(&tuple)
-            .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+        let value =
+            bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
 
         // Get current timestamp for MVCC
         let timestamp = self.next_timestamp();
@@ -4180,7 +4381,8 @@ impl StorageEngine {
         }
 
         // Write versioned copy (for time-travel queries)
-        self.snapshot_manager.write_version(table_name, row_id, timestamp, &value)?;
+        self.snapshot_manager
+            .write_version(table_name, row_id, timestamp, &value)?;
 
         // Register snapshot with WAL LSN for AS OF TRANSACTION queries
         // This ensures the transaction ID matches what users see in the REPL
@@ -4230,9 +4432,15 @@ impl StorageEngine {
                     if matches!(v, crate::Value::Null) && i < tuple.values.len() {
                         #[allow(clippy::indexing_slicing)]
                         match col.data_type {
-                            crate::DataType::Int2 => { tuple.values[i] = crate::Value::Int2(row_id as i16); }
-                            crate::DataType::Int4 => { tuple.values[i] = crate::Value::Int4(row_id as i32); }
-                            _ => { tuple.values[i] = crate::Value::Int8(row_id as i64); }
+                            crate::DataType::Int2 => {
+                                tuple.values[i] = crate::Value::Int2(row_id as i16);
+                            }
+                            crate::DataType::Int4 => {
+                                tuple.values[i] = crate::Value::Int4(row_id as i32);
+                            }
+                            _ => {
+                                tuple.values[i] = crate::Value::Int8(row_id as i64);
+                            }
                         }
                     }
                 }
@@ -4251,7 +4459,10 @@ impl StorageEngine {
         };
 
         // Check PK constraint
-        let pk_cols: Vec<crate::Value> = schema.columns.iter().enumerate()
+        let pk_cols: Vec<crate::Value> = schema
+            .columns
+            .iter()
+            .enumerate()
             .filter(|(_, c)| c.primary_key)
             .filter_map(|(i, _)| tuple.values.get(i).cloned())
             .collect();
@@ -4266,8 +4477,8 @@ impl StorageEngine {
             return Err(Error::constraint_violation(e.to_string()));
         }
 
-        let value = bincode::serialize(&tuple)
-            .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+        let value =
+            bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
 
         let key = Self::build_data_key(table_name, row_id);
         self.put(&key, &value)?;
@@ -4296,8 +4507,8 @@ impl StorageEngine {
         schema: &crate::Schema,
     ) -> Result<u64> {
         // Serialize new tuple
-        let value = bincode::serialize(&new_tuple)
-            .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+        let value =
+            bincode::serialize(&new_tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
 
         // Overwrite the row in storage
         let key = Self::build_data_key(table_name, row_id);
@@ -4315,7 +4526,10 @@ impl StorageEngine {
                     new_col_values.insert(col.name.clone(), v.clone());
                 }
             }
-            if let Err(e) = self.art_index_manager.on_update(table_name, row_id, &old_col_values, &new_col_values) {
+            if let Err(e) = self
+                .art_index_manager
+                .on_update(table_name, row_id, &old_col_values, &new_col_values)
+            {
                 tracing::debug!("ART index update for table '{}': {}", table_name, e);
             }
         }
@@ -4385,7 +4599,10 @@ impl StorageEngine {
         // This implements MVCC snapshot isolation: we see the most recent
         // version <= snapshot_ts
         for row_id in seen_rows {
-            if let Some(value) = self.snapshot_manager.read_at_snapshot(table_name, row_id, snapshot_ts)? {
+            if let Some(value) = self
+                .snapshot_manager
+                .read_at_snapshot(table_name, row_id, snapshot_ts)?
+            {
                 // Deserialize tuple directly (RocksDB handles decompression)
                 let mut tuple: Tuple = bincode::deserialize(&value)
                     .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
@@ -4418,7 +4635,8 @@ impl StorageEngine {
                 let count: u64 = bincode::deserialize(&value)
                     .map_err(|e| Error::storage(format!("Failed to deserialize counter: {}", e)))?;
 
-                self.row_counters.insert(table_name, std::sync::atomic::AtomicU64::new(count));
+                self.row_counters
+                    .insert(table_name, std::sync::atomic::AtomicU64::new(count));
             } else if key.first() > prefix.first() {
                 break;
             }
@@ -4429,15 +4647,17 @@ impl StorageEngine {
     /// Get next row ID for a table (thread-safe)
     pub fn next_row_id(&self, table_name: &str) -> Result<u64> {
         // Get or initialize counter
-        let counter = self.row_counters.entry(table_name.to_string())
+        let counter = self
+            .row_counters
+            .entry(table_name.to_string())
             .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
 
         let next = counter.fetch_add(1, Ordering::SeqCst) + 1;
 
         // Persist to storage with encryption
         let key = format!("counter:{}", table_name).into_bytes();
-        let value = bincode::serialize(&next)
-            .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
+        let value =
+            bincode::serialize(&next).map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
 
         self.put_internal(&key, &value)?;
 
@@ -4462,7 +4682,9 @@ impl StorageEngine {
     /// call `flush_row_counter()` after the batch to persist the
     /// final counter value. Used by the fast INSERT path.
     pub fn next_row_id_volatile(&self, table_name: &str) -> u64 {
-        let counter = self.row_counters.entry(table_name.to_string())
+        let counter = self
+            .row_counters
+            .entry(table_name.to_string())
             .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
         counter.fetch_add(1, Ordering::SeqCst) + 1
     }
@@ -4472,13 +4694,15 @@ impl StorageEngine {
     /// Called after a batch of volatile row ID allocations to ensure
     /// the counter survives a crash.
     pub fn flush_row_counter(&self, table_name: &str) -> Result<()> {
-        let counter = self.row_counters.entry(table_name.to_string())
+        let counter = self
+            .row_counters
+            .entry(table_name.to_string())
             .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
         let current = counter.load(Ordering::SeqCst);
 
         let key = format!("counter:{}", table_name).into_bytes();
-        let value = bincode::serialize(&current)
-            .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
+        let value =
+            bincode::serialize(&current).map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
         self.put_internal(&key, &value)
     }
 }
@@ -4499,16 +4723,13 @@ mod tests {
     #[test]
     fn test_basic_put_get() {
         let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
 
         let key = b"test_key".to_vec();
         let value = b"test_value".to_vec();
 
-        engine.put(&key, &value)
-            .expect("Failed to put value");
-        let result = engine.get(&key)
-            .expect("Failed to get value");
+        engine.put(&key, &value).expect("Failed to put value");
+        let result = engine.get(&key).expect("Failed to get value");
 
         assert_eq!(result, Some(value));
     }
@@ -4516,18 +4737,14 @@ mod tests {
     #[test]
     fn test_delete() {
         let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
 
         let key = b"test_key".to_vec();
         let value = b"test_value".to_vec();
 
-        engine.put(&key, &value)
-            .expect("Failed to put value");
-        engine.delete(&key)
-            .expect("Failed to delete value");
-        let result = engine.get(&key)
-            .expect("Failed to get value");
+        engine.put(&key, &value).expect("Failed to put value");
+        engine.delete(&key).expect("Failed to delete value");
+        let result = engine.get(&key).expect("Failed to get value");
 
         assert_eq!(result, None);
     }
@@ -4535,8 +4752,7 @@ mod tests {
     #[test]
     fn test_scan_table_at_snapshot_basic() {
         let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
 
         // Create a simple test table
         let schema = Schema {
@@ -4550,7 +4766,7 @@ mod tests {
                     source_table_name: None,
                     default_expr: None,
                     unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
                 Column {
                     name: "value".to_string(),
@@ -4561,56 +4777,52 @@ mod tests {
                     source_table_name: None,
                     default_expr: None,
                     unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
             ],
         };
 
         let catalog = engine.catalog();
-        catalog.create_table("test_table", schema.clone())
+        catalog
+            .create_table("test_table", schema.clone())
             .expect("Failed to create table");
 
         // Insert first tuple (snapshot 1)
         let tuple1 = Tuple {
-            values: vec![
-                Value::Int4(1),
-                Value::String("first".to_string()),
-            ],
+            values: vec![Value::Int4(1), Value::String("first".to_string())],
             row_id: None,
             branch_id: None,
         };
-        engine.insert_tuple_versioned("test_table", tuple1)
+        engine
+            .insert_tuple_versioned("test_table", tuple1)
             .expect("Failed to insert tuple 1");
         let snapshot1_ts = engine.current_timestamp();
 
         // Insert second tuple (snapshot 2)
         let tuple2 = Tuple {
-            values: vec![
-                Value::Int4(2),
-                Value::String("second".to_string()),
-            ],
+            values: vec![Value::Int4(2), Value::String("second".to_string())],
             row_id: None,
             branch_id: None,
         };
-        engine.insert_tuple_versioned("test_table", tuple2)
+        engine
+            .insert_tuple_versioned("test_table", tuple2)
             .expect("Failed to insert tuple 2");
         let snapshot2_ts = engine.current_timestamp();
 
         // Insert third tuple (snapshot 3)
         let tuple3 = Tuple {
-            values: vec![
-                Value::Int4(3),
-                Value::String("third".to_string()),
-            ],
+            values: vec![Value::Int4(3), Value::String("third".to_string())],
             row_id: None,
             branch_id: None,
         };
-        engine.insert_tuple_versioned("test_table", tuple3)
+        engine
+            .insert_tuple_versioned("test_table", tuple3)
             .expect("Failed to insert tuple 3");
         let _snapshot3_ts = engine.current_timestamp();
 
         // Scan at snapshot 1 - should see only first tuple
-        let results1 = engine.scan_table_at_snapshot("test_table", snapshot1_ts)
+        let results1 = engine
+            .scan_table_at_snapshot("test_table", snapshot1_ts)
             .expect("Failed to scan at snapshot 1");
         assert_eq!(results1.len(), 1, "Should see 1 tuple at snapshot 1");
         if let Value::String(ref val) = results1[0].values[1] {
@@ -4620,67 +4832,82 @@ mod tests {
         }
 
         // Scan at snapshot 2 - should see first two tuples
-        let results2 = engine.scan_table_at_snapshot("test_table", snapshot2_ts)
+        let results2 = engine
+            .scan_table_at_snapshot("test_table", snapshot2_ts)
             .expect("Failed to scan at snapshot 2");
         assert_eq!(results2.len(), 2, "Should see 2 tuples at snapshot 2");
 
         // Scan at current snapshot - should see all three tuples
-        let results_current = engine.scan_table("test_table")
-            .expect("Failed to scan current state");
+        let results_current = engine.scan_table("test_table").expect("Failed to scan current state");
         assert_eq!(results_current.len(), 3, "Should see 3 tuples in current state");
     }
 
     #[test]
     fn test_scan_table_at_snapshot_mvcc_consistency() {
         let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
 
         // Create table
         let schema = Schema {
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: true,
-                    source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                },
-            ],
+            }],
         };
 
         let catalog = engine.catalog();
-        catalog.create_table("mvcc_test", schema)
+        catalog
+            .create_table("mvcc_test", schema)
             .expect("Failed to create table");
 
         // Insert data
-        engine.insert_tuple_versioned("mvcc_test", Tuple {
-            values: vec![Value::Int4(1)],
-            row_id: None,
-            branch_id: None,
-        }).expect("Failed to insert");
+        engine
+            .insert_tuple_versioned(
+                "mvcc_test",
+                Tuple {
+                    values: vec![Value::Int4(1)],
+                    row_id: None,
+                    branch_id: None,
+                },
+            )
+            .expect("Failed to insert");
         let snapshot_ts = engine.current_timestamp();
 
         // Insert more data after snapshot
-        engine.insert_tuple_versioned("mvcc_test", Tuple {
-            values: vec![Value::Int4(2)],
-            row_id: None,
-            branch_id: None,
-        }).expect("Failed to insert");
-        engine.insert_tuple_versioned("mvcc_test", Tuple {
-            values: vec![Value::Int4(3)],
-            row_id: None,
-            branch_id: None,
-        }).expect("Failed to insert");
+        engine
+            .insert_tuple_versioned(
+                "mvcc_test",
+                Tuple {
+                    values: vec![Value::Int4(2)],
+                    row_id: None,
+                    branch_id: None,
+                },
+            )
+            .expect("Failed to insert");
+        engine
+            .insert_tuple_versioned(
+                "mvcc_test",
+                Tuple {
+                    values: vec![Value::Int4(3)],
+                    row_id: None,
+                    branch_id: None,
+                },
+            )
+            .expect("Failed to insert");
 
         // Multiple reads at same snapshot should return consistent results
-        let results1 = engine.scan_table_at_snapshot("mvcc_test", snapshot_ts)
+        let results1 = engine
+            .scan_table_at_snapshot("mvcc_test", snapshot_ts)
             .expect("First scan failed");
-        let results2 = engine.scan_table_at_snapshot("mvcc_test", snapshot_ts)
+        let results2 = engine
+            .scan_table_at_snapshot("mvcc_test", snapshot_ts)
             .expect("Second scan failed");
 
         // Should see same data both times (MVCC consistency)
@@ -4688,40 +4915,38 @@ mod tests {
         assert_eq!(results1.len(), 1, "Should only see data up to snapshot");
 
         // Current scan should see all data
-        let current_results = engine.scan_table("mvcc_test")
-            .expect("Current scan failed");
+        let current_results = engine.scan_table("mvcc_test").expect("Current scan failed");
         assert_eq!(current_results.len(), 3, "Current state should have all data");
     }
 
     #[test]
     fn test_scan_table_at_snapshot_empty_table() {
         let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
 
         // Create empty table
         let schema = Schema {
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: true,
-                    source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                },
-            ],
+            }],
         };
 
         let catalog = engine.catalog();
-        catalog.create_table("empty_table", schema)
+        catalog
+            .create_table("empty_table", schema)
             .expect("Failed to create table");
 
         // Scan empty table at current timestamp
-        let results = engine.scan_table_at_snapshot("empty_table", engine.current_timestamp())
+        let results = engine
+            .scan_table_at_snapshot("empty_table", engine.current_timestamp())
             .expect("Failed to scan empty table");
 
         assert_eq!(results.len(), 0, "Empty table should return no results");
@@ -4730,53 +4955,61 @@ mod tests {
     #[test]
     fn test_scan_table_at_snapshot_nonexistent_data() {
         let config = Config::in_memory();
-        let engine = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
 
         // Create table
         let schema = Schema {
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: true,
-                    source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                },
-            ],
+            }],
         };
 
         let catalog = engine.catalog();
-        catalog.create_table("future_test", schema)
+        catalog
+            .create_table("future_test", schema)
             .expect("Failed to create table");
 
         // Try to scan at timestamp before any data was inserted
         let early_snapshot = 1;
-        let results = engine.scan_table_at_snapshot("future_test", early_snapshot)
+        let results = engine
+            .scan_table_at_snapshot("future_test", early_snapshot)
             .expect("Failed to scan at early timestamp");
 
         // Should see no data (data didn't exist yet at that snapshot)
         assert_eq!(results.len(), 0, "Should see no data before inserts");
 
         // Now insert data
-        engine.insert_tuple_versioned("future_test", Tuple {
-            values: vec![Value::Int4(1)],
-            row_id: None,
-            branch_id: None,
-        }).expect("Failed to insert");
+        engine
+            .insert_tuple_versioned(
+                "future_test",
+                Tuple {
+                    values: vec![Value::Int4(1)],
+                    row_id: None,
+                    branch_id: None,
+                },
+            )
+            .expect("Failed to insert");
 
         // Scan at same early timestamp should still see no data
-        let results_after = engine.scan_table_at_snapshot("future_test", early_snapshot)
+        let results_after = engine
+            .scan_table_at_snapshot("future_test", early_snapshot)
             .expect("Failed to scan after insert");
-        assert_eq!(results_after.len(), 0, "Should still see no data at historical snapshot");
+        assert_eq!(
+            results_after.len(),
+            0,
+            "Should still see no data at historical snapshot"
+        );
 
         // But current scan should see the data
-        let current = engine.scan_table("future_test")
-            .expect("Failed to scan current");
+        let current = engine.scan_table("future_test").expect("Failed to scan current");
         assert_eq!(current.len(), 1, "Current state should have data");
     }
 
@@ -4828,10 +5061,10 @@ mod tests {
     #[test]
     fn test_extract_table_from_key_malformed() {
         // Test malformed data keys (missing components)
-        let key = b"data:users";  // Missing row_id
+        let key = b"data:users"; // Missing row_id
         assert_eq!(StorageEngine::extract_table_from_key(key), "unknown");
 
-        let key = b"data:";  // Missing table and row_id
+        let key = b"data:"; // Missing table and row_id
         assert_eq!(StorageEngine::extract_table_from_key(key), "unknown");
 
         // Test invalid UTF-8
@@ -4865,8 +5098,7 @@ mod tests {
         let mut config = Config::in_memory();
         config.storage.wal_enabled = true;
 
-        let engine = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
 
         // Create a test table
         let schema = Schema {
@@ -4880,7 +5112,7 @@ mod tests {
                     source_table_name: None,
                     default_expr: None,
                     unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
                 Column {
                     name: "name".to_string(),
@@ -4891,25 +5123,24 @@ mod tests {
                     source_table_name: None,
                     default_expr: None,
                     unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
             ],
         };
 
         let catalog = engine.catalog();
-        catalog.create_table("test_users", schema)
+        catalog
+            .create_table("test_users", schema)
             .expect("Failed to create table");
 
         // Insert a tuple (which calls put internally)
         let tuple = Tuple {
-            values: vec![
-                Value::Int4(1),
-                Value::String("Alice".to_string()),
-            ],
+            values: vec![Value::Int4(1), Value::String("Alice".to_string())],
             row_id: None,
             branch_id: None,
         };
-        engine.insert_tuple("test_users", tuple)
+        engine
+            .insert_tuple("test_users", tuple)
             .expect("Failed to insert tuple");
 
         // Verify WAL was created and has entries
@@ -4931,7 +5162,10 @@ mod tests {
                 }
             });
 
-            assert!(has_insert_with_table, "WAL should contain insert operation for test_users table");
+            assert!(
+                has_insert_with_table,
+                "WAL should contain insert operation for test_users table"
+            );
         }
     }
 }
@@ -5017,11 +5251,7 @@ impl StorageEngine {
     ///
     /// This method is called during transaction commit to log changes.
     #[cfg(feature = "sync-experimental")]
-    pub(crate) fn capture_change(
-        &self,
-        transaction_id: u64,
-        change_type: crate::sync::ChangeType,
-    ) -> Result<()> {
+    pub(crate) fn capture_change(&self, transaction_id: u64, change_type: crate::sync::ChangeType) -> Result<()> {
         if let Some(ref change_log) = self.change_log {
             let mut vector_clock = crate::sync::VectorClock::new();
             vector_clock.increment(self.node_id);
@@ -5066,7 +5296,10 @@ impl StorageEngine {
         }
 
         let branch_manager = self.branch_manager()?;
-        branch_manager.get_branch_by_name(&branch_name).ok().map(|m| m.branch_id)
+        branch_manager
+            .get_branch_by_name(&branch_name)
+            .ok()
+            .map(|m| m.branch_id)
     }
 
     /// Get the full branch chain from main to current branch (inclusive)
@@ -5076,7 +5309,8 @@ impl StorageEngine {
     /// Returns [branch1_id, branch2_id, branch3_id]
     /// (main is not included as it uses different key format)
     fn get_branch_chain(&self, current_branch_id: u64) -> Result<Vec<u64>> {
-        let branch_manager = self.branch_manager()
+        let branch_manager = self
+            .branch_manager()
             .ok_or_else(|| Error::storage("Branch manager not available"))?;
 
         // Build parent chain (returns parents from immediate parent to root)
@@ -5128,7 +5362,12 @@ impl StorageEngine {
     /// (issue #1 follow-up). On `main` (the common case) this uses the prefix decode; on
     /// a non-main branch it falls back to a full branch-aware scan (the chain-merge path
     /// is rare and not worth the extra surface), so correctness is preserved either way.
-    pub fn scan_table_branch_aware_with_schema_prefix(&self, table_name: &str, schema: &crate::Schema, prefix_len: usize) -> Result<Vec<Tuple>> {
+    pub fn scan_table_branch_aware_with_schema_prefix(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        prefix_len: usize,
+    ) -> Result<Vec<Tuple>> {
         let branch_name = self.current_branch.lock().clone();
         if branch_name.is_none() || branch_name.as_deref() == Some("main") {
             return self.scan_table_with_schema_prefix(table_name, schema, prefix_len);
@@ -5176,7 +5415,10 @@ impl StorageEngine {
         let main_prefix = format!("data:{}:", table_name);
         let main_prefix_bytes = main_prefix.as_bytes();
 
-        let iter = self.db.iterator(rocksdb::IteratorMode::From(main_prefix_bytes, rocksdb::Direction::Forward));
+        let iter = self.db.iterator(rocksdb::IteratorMode::From(
+            main_prefix_bytes,
+            rocksdb::Direction::Forward,
+        ));
         for item in iter {
             let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
@@ -5206,7 +5448,10 @@ impl StorageEngine {
             let delete_prefix = format!("bdel:{}:{}:", chain_branch_id, table_name);
             let delete_prefix_bytes = delete_prefix.as_bytes();
 
-            let iter = self.db.iterator(rocksdb::IteratorMode::From(delete_prefix_bytes, rocksdb::Direction::Forward));
+            let iter = self.db.iterator(rocksdb::IteratorMode::From(
+                delete_prefix_bytes,
+                rocksdb::Direction::Forward,
+            ));
             for item in iter {
                 let (key, _value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
@@ -5227,7 +5472,10 @@ impl StorageEngine {
             let branch_prefix = format!("bdata:{}:{}:", chain_branch_id, table_name);
             let branch_prefix_bytes = branch_prefix.as_bytes();
 
-            let iter = self.db.iterator(rocksdb::IteratorMode::From(branch_prefix_bytes, rocksdb::Direction::Forward));
+            let iter = self.db.iterator(rocksdb::IteratorMode::From(
+                branch_prefix_bytes,
+                rocksdb::Direction::Forward,
+            ));
             for item in iter {
                 let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
@@ -5281,7 +5529,12 @@ impl StorageEngine {
     }
 
     /// Insert a tuple with branch isolation and a pre-fetched schema
-    pub fn insert_tuple_branch_aware_with_schema(&self, table_name: &str, tuple: Tuple, schema: &crate::Schema) -> Result<u64> {
+    pub fn insert_tuple_branch_aware_with_schema(
+        &self,
+        table_name: &str,
+        tuple: Tuple,
+        schema: &crate::Schema,
+    ) -> Result<u64> {
         // Get current branch name
         let branch_name = self.current_branch.lock().clone();
 
@@ -5315,9 +5568,15 @@ impl StorageEngine {
                     if matches!(v, crate::Value::Null) && i < tuple.values.len() {
                         #[allow(clippy::indexing_slicing)]
                         match col.data_type {
-                            crate::DataType::Int2 => { tuple.values[i] = crate::Value::Int2(row_id as i16); }
-                            crate::DataType::Int4 => { tuple.values[i] = crate::Value::Int4(row_id as i32); }
-                            _ => { tuple.values[i] = crate::Value::Int8(row_id as i64); }
+                            crate::DataType::Int2 => {
+                                tuple.values[i] = crate::Value::Int2(row_id as i16);
+                            }
+                            crate::DataType::Int4 => {
+                                tuple.values[i] = crate::Value::Int4(row_id as i32);
+                            }
+                            _ => {
+                                tuple.values[i] = crate::Value::Int8(row_id as i64);
+                            }
                         }
                     }
                 }
@@ -5325,8 +5584,8 @@ impl StorageEngine {
         }
 
         // Serialize tuple directly (RocksDB LZ4 handles compression at block level)
-        let value = bincode::serialize(&tuple)
-            .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+        let value =
+            bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
 
         // Write to branch-specific key
         let key = format!("bdata:{}:{}:{}", branch_id, table_name, row_id).into_bytes();
@@ -5433,8 +5692,8 @@ impl StorageEngine {
             }
 
             // Serialize tuple directly (RocksDB LZ4 handles compression at block level)
-            let value = bincode::serialize(&tuple)
-                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+            let value =
+                bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
 
             // Write updated tuple to current key (overwrites old value)
             self.put(&current_key, &value)?;
@@ -5459,7 +5718,10 @@ impl StorageEngine {
 
             // Record delta for incremental MV refresh
             if let Some(ref old_tuple) = old_tuple_for_delta {
-                if let Err(e) = self.mv_delta_tracker.record_update(table_name, row_id, old_tuple.clone(), tuple.clone()) {
+                if let Err(e) =
+                    self.mv_delta_tracker
+                        .record_update(table_name, row_id, old_tuple.clone(), tuple.clone())
+                {
                     tracing::warn!("Failed to record update delta for table '{}': {}", table_name, e);
                     // Don't fail the update if delta recording fails
                 }
@@ -5467,7 +5729,8 @@ impl StorageEngine {
 
             // Record delta for SMFI (Self-Maintaining Filter Index)
             if let Some(old_tuple) = old_tuple_for_delta.as_ref() {
-                self.filter_delta_tracker.on_update(table_name, row_id, old_tuple, &tuple, &schema);
+                self.filter_delta_tracker
+                    .on_update(table_name, row_id, old_tuple, &tuple, &schema);
             }
 
             // Update speculative filters (track new values)
@@ -5490,11 +5753,7 @@ impl StorageEngine {
     ///
     /// When a branch is active, marks tuples as deleted in branch-specific storage.
     /// Deletions in a branch are isolated from the main branch.
-    pub fn delete_tuples_branch_aware(
-        &self,
-        table_name: &str,
-        row_ids: Vec<u64>,
-    ) -> Result<u64> {
+    pub fn delete_tuples_branch_aware(&self, table_name: &str, row_ids: Vec<u64>) -> Result<u64> {
         tracing::debug!(
             "delete_tuples_branch_aware: called for table '{}' with row_ids {:?}",
             table_name,
@@ -5510,10 +5769,7 @@ impl StorageEngine {
         // Get current branch name
         let branch_name = self.current_branch.lock().clone();
 
-        tracing::debug!(
-            "delete_tuples_branch_aware: branch_name = {:?}",
-            branch_name
-        );
+        tracing::debug!("delete_tuples_branch_aware: branch_name = {:?}", branch_name);
 
         // Validate branch and get ID
         let branch_id = if branch_name.is_none() || branch_name.as_deref() == Some("main") {
@@ -5531,10 +5787,7 @@ impl StorageEngine {
             }
         };
 
-        tracing::debug!(
-            "delete_tuples_branch_aware: resolved branch_id = {:?}",
-            branch_id
-        );
+        tracing::debug!("delete_tuples_branch_aware: resolved branch_id = {:?}", branch_id);
 
         // Check for branch - main branch vs branch-specific delete
         let Some(branch_id) = branch_id else {
@@ -5565,7 +5818,10 @@ impl StorageEngine {
 
                 // Record delta for incremental MV refresh
                 if let Some(ref deleted_tuple) = deleted_tuple_for_delta {
-                    if let Err(e) = self.mv_delta_tracker.record_delete(table_name, *row_id, deleted_tuple.clone()) {
+                    if let Err(e) = self
+                        .mv_delta_tracker
+                        .record_delete(table_name, *row_id, deleted_tuple.clone())
+                    {
                         tracing::warn!("Failed to record delete delta for table '{}': {}", table_name, e);
                         // Don't fail the delete if delta recording fails
                     }
@@ -5606,11 +5862,10 @@ impl StorageEngine {
             let mut deleted_tuple_for_delta: Option<Tuple> = None;
 
             // Try branch-specific key first, then fall back to main branch
-            let old_value = self.get_internal(branch_key.as_bytes()).ok().flatten()
-                .or_else(|| {
-                    let main_key = format!("data:{}:{}", table_name, row_id);
-                    self.get_internal(main_key.as_bytes()).ok().flatten()
-                });
+            let old_value = self.get_internal(branch_key.as_bytes()).ok().flatten().or_else(|| {
+                let main_key = format!("data:{}:{}", table_name, row_id);
+                self.get_internal(main_key.as_bytes()).ok().flatten()
+            });
 
             if let Some(old_value) = old_value {
                 // Deserialize old tuple for delta tracking
@@ -5636,7 +5891,10 @@ impl StorageEngine {
 
             // Record delta for incremental MV refresh
             if let Some(ref deleted_tuple) = deleted_tuple_for_delta {
-                if let Err(e) = self.mv_delta_tracker.record_delete(table_name, row_id, deleted_tuple.clone()) {
+                if let Err(e) = self
+                    .mv_delta_tracker
+                    .record_delete(table_name, row_id, deleted_tuple.clone())
+                {
                     tracing::warn!("Failed to record branch delete delta for table '{}': {}", table_name, e);
                     // Don't fail the delete if delta recording fails
                 }
@@ -5683,7 +5941,8 @@ impl StorageEngine {
     /// Returns storage metrics including approximate size and key count.
     pub fn get_storage_stats(&self) -> Option<StorageStats> {
         let approximate_size = self.get_approximate_size();
-        let key_count = self.db
+        let key_count = self
+            .db
             .property_int_value("rocksdb.estimate-num-keys")
             .ok()
             .flatten()
@@ -5716,10 +5975,8 @@ impl StorageEngine {
         let mut end_key = format!("t:{}:", table_name).into_bytes();
         end_key.push(0xff);
 
-        self.db.compact_range(
-            Some(start_key.as_bytes()),
-            Some(end_key.as_slice()),
-        );
+        self.db
+            .compact_range(Some(start_key.as_bytes()), Some(end_key.as_slice()));
 
         Ok(())
     }

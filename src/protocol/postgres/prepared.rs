@@ -3,8 +3,8 @@
 //! This module implements storage and execution of prepared statements and portals
 //! for the PostgreSQL extended query protocol.
 
-use crate::{Result, Error, Value, Schema, Tuple};
 use crate::sql::logical_plan::LogicalPlan;
+use crate::{Error, Result, Schema, Tuple, Value};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -91,9 +91,13 @@ impl PreparedStatementManager {
     /// Store a prepared statement with LRU eviction
     pub fn store_statement(&self, statement: PreparedStatement) -> Result<()> {
         use crate::error::LockResultExt;
-        let mut statements = self.statements.write()
+        let mut statements = self
+            .statements
+            .write()
             .map_lock_err("Failed to acquire write lock on statements")?;
-        let mut order = self.statement_order.write()
+        let mut order = self
+            .statement_order
+            .write()
             .map_lock_err("Failed to acquire write lock on statement order")?;
 
         let is_new = !statements.contains_key(&statement.name);
@@ -135,7 +139,9 @@ impl PreparedStatementManager {
     /// Get a prepared statement
     pub fn get_statement(&self, name: &str) -> Result<Option<PreparedStatement>> {
         use crate::error::LockResultExt;
-        let statements = self.statements.read()
+        let statements = self
+            .statements
+            .read()
             .map_lock_err("Failed to acquire read lock on statements")?;
         Ok(statements.get(name).cloned())
     }
@@ -143,9 +149,13 @@ impl PreparedStatementManager {
     /// Remove a prepared statement
     pub fn remove_statement(&self, name: &str) -> Result<bool> {
         use crate::error::LockResultExt;
-        let mut statements = self.statements.write()
+        let mut statements = self
+            .statements
+            .write()
             .map_lock_err("Failed to acquire write lock on statements")?;
-        let mut order = self.statement_order.write()
+        let mut order = self
+            .statement_order
+            .write()
             .map_lock_err("Failed to acquire write lock on statement order")?;
 
         let removed = statements.remove(name).is_some();
@@ -158,7 +168,9 @@ impl PreparedStatementManager {
     /// Store a portal
     pub fn store_portal(&self, portal: Portal) -> Result<()> {
         use crate::error::LockResultExt;
-        let mut portals = self.portals.write()
+        let mut portals = self
+            .portals
+            .write()
             .map_lock_err("Failed to acquire write lock on portals")?;
 
         // Check capacity
@@ -176,7 +188,9 @@ impl PreparedStatementManager {
     /// Get a portal
     pub fn get_portal(&self, name: &str) -> Result<Option<Portal>> {
         use crate::error::LockResultExt;
-        let portals = self.portals.read()
+        let portals = self
+            .portals
+            .read()
             .map_lock_err("Failed to acquire read lock on portals")?;
         Ok(portals.get(name).cloned())
     }
@@ -184,7 +198,9 @@ impl PreparedStatementManager {
     /// Update portal state
     pub fn update_portal_state(&self, name: &str, state: PortalState) -> Result<()> {
         use crate::error::LockResultExt;
-        let mut portals = self.portals.write()
+        let mut portals = self
+            .portals
+            .write()
             .map_lock_err("Failed to acquire write lock on portals")?;
 
         if let Some(portal) = portals.get_mut(name) {
@@ -198,7 +214,9 @@ impl PreparedStatementManager {
     /// Remove a portal
     pub fn remove_portal(&self, name: &str) -> Result<bool> {
         use crate::error::LockResultExt;
-        let mut portals = self.portals.write()
+        let mut portals = self
+            .portals
+            .write()
             .map_lock_err("Failed to acquire write lock on portals")?;
         Ok(portals.remove(name).is_some())
     }
@@ -206,11 +224,17 @@ impl PreparedStatementManager {
     /// Clear all statements and portals
     pub fn clear_all(&self) -> Result<()> {
         use crate::error::LockResultExt;
-        let mut statements = self.statements.write()
+        let mut statements = self
+            .statements
+            .write()
             .map_lock_err("Failed to acquire write lock on statements")?;
-        let mut portals = self.portals.write()
+        let mut portals = self
+            .portals
+            .write()
             .map_lock_err("Failed to acquire write lock on portals")?;
-        let mut order = self.statement_order.write()
+        let mut order = self
+            .statement_order
+            .write()
             .map_lock_err("Failed to acquire write lock on statement order")?;
 
         statements.clear();
@@ -222,7 +246,9 @@ impl PreparedStatementManager {
     /// Get statement count
     pub fn statement_count(&self) -> Result<usize> {
         use crate::error::LockResultExt;
-        let statements = self.statements.read()
+        let statements = self
+            .statements
+            .read()
             .map_lock_err("Failed to acquire read lock on statements")?;
         Ok(statements.len())
     }
@@ -230,7 +256,9 @@ impl PreparedStatementManager {
     /// Get portal count
     pub fn portal_count(&self) -> Result<usize> {
         use crate::error::LockResultExt;
-        let portals = self.portals.read()
+        let portals = self
+            .portals
+            .read()
             .map_lock_err("Failed to acquire read lock on portals")?;
         Ok(portals.len())
     }
@@ -243,11 +271,7 @@ impl Default for PreparedStatementManager {
 }
 
 /// Convert PostgreSQL wire format parameter to HeliosDB Value
-pub fn decode_parameter(
-    data: &[u8],
-    format: i16,
-    type_oid: i32,
-) -> Result<Value> {
+pub fn decode_parameter(data: &[u8], format: i16, type_oid: i32) -> Result<Value> {
     // format: 0 = text, 1 = binary
     if format == 0 {
         // Text format
@@ -260,8 +284,7 @@ pub fn decode_parameter(
 
 /// Decode text format parameter
 fn decode_text_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
-    let text = std::str::from_utf8(data)
-        .map_err(|e| Error::protocol(format!("Invalid UTF-8 in parameter: {}", e)))?;
+    let text = std::str::from_utf8(data).map_err(|e| Error::protocol(format!("Invalid UTF-8 in parameter: {}", e)))?;
 
     match type_oid {
         16 => {
@@ -271,31 +294,36 @@ fn decode_text_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
         }
         21 => {
             // Int2
-            let val = text.parse::<i16>()
+            let val = text
+                .parse::<i16>()
                 .map_err(|e| Error::protocol(format!("Invalid Int2 parameter: {}", e)))?;
             Ok(Value::Int2(val))
         }
         23 => {
             // Int4
-            let val = text.parse::<i32>()
+            let val = text
+                .parse::<i32>()
                 .map_err(|e| Error::protocol(format!("Invalid Int4 parameter: {}", e)))?;
             Ok(Value::Int4(val))
         }
         20 => {
             // Int8
-            let val = text.parse::<i64>()
+            let val = text
+                .parse::<i64>()
                 .map_err(|e| Error::protocol(format!("Invalid Int8 parameter: {}", e)))?;
             Ok(Value::Int8(val))
         }
         700 => {
             // Float4
-            let val = text.parse::<f32>()
+            let val = text
+                .parse::<f32>()
                 .map_err(|e| Error::protocol(format!("Invalid Float4 parameter: {}", e)))?;
             Ok(Value::Float4(val))
         }
         701 => {
             // Float8
-            let val = text.parse::<f64>()
+            let val = text
+                .parse::<f64>()
                 .map_err(|e| Error::protocol(format!("Invalid Float8 parameter: {}", e)))?;
             Ok(Value::Float8(val))
         }
@@ -305,8 +333,8 @@ fn decode_text_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
         }
         114 | 3802 => {
             // Json, Jsonb
-            let _json: serde_json::Value = serde_json::from_str(text)
-                .map_err(|e| Error::protocol(format!("Invalid JSON parameter: {}", e)))?;
+            let _json: serde_json::Value =
+                serde_json::from_str(text).map_err(|e| Error::protocol(format!("Invalid JSON parameter: {}", e)))?;
             // Value::Json stores the JSON as a String for bincode compatibility
             Ok(Value::Json(text.to_string()))
         }
@@ -350,7 +378,8 @@ fn decode_binary_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
             if data.len() < 8 {
                 return Err(Error::protocol("Invalid Int8 parameter length"));
             }
-            let bytes: [u8; 8] = data[0..8].try_into()
+            let bytes: [u8; 8] = data[0..8]
+                .try_into()
                 .map_err(|_| Error::protocol("Invalid Int8 parameter"))?;
             let val = i64::from_be_bytes(bytes);
             Ok(Value::Int8(val))
@@ -360,7 +389,8 @@ fn decode_binary_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
             if data.len() < 4 {
                 return Err(Error::protocol("Invalid Float4 parameter length"));
             }
-            let bytes: [u8; 4] = data[0..4].try_into()
+            let bytes: [u8; 4] = data[0..4]
+                .try_into()
                 .map_err(|_| Error::protocol("Invalid Float4 parameter"))?;
             let val = f32::from_be_bytes(bytes);
             Ok(Value::Float4(val))
@@ -370,7 +400,8 @@ fn decode_binary_parameter(data: &[u8], type_oid: i32) -> Result<Value> {
             if data.len() < 8 {
                 return Err(Error::protocol("Invalid Float8 parameter length"));
             }
-            let bytes: [u8; 8] = data[0..8].try_into()
+            let bytes: [u8; 8] = data[0..8]
+                .try_into()
                 .map_err(|_| Error::protocol("Invalid Float8 parameter"))?;
             let val = f64::from_be_bytes(bytes);
             Ok(Value::Float8(val))
@@ -446,10 +477,7 @@ fn value_to_sql_literal(value: &Value) -> String {
         Value::Json(j) => format!("'{}'::jsonb", j.to_string().replace('\'', "''")),
         Value::Timestamp(ts) => format!("'{}'::timestamp", ts.to_rfc3339()),
         Value::Vector(v) => {
-            let arr_str = v.iter()
-                .map(|x| x.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
+            let arr_str = v.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
             format!("ARRAY[{}]", arr_str)
         }
         _ => format!("'{}'", value.to_string().replace('\'', "''")),
@@ -535,10 +563,7 @@ mod tests {
     #[test]
     fn test_substitute_parameters() {
         let sql = "SELECT * FROM users WHERE id = $1 AND name = $2";
-        let params = vec![
-            Value::Int4(123),
-            Value::String("Alice".to_string()),
-        ];
+        let params = vec![Value::Int4(123), Value::String("Alice".to_string())];
 
         let result = substitute_parameters(sql, &params).unwrap();
         assert_eq!(result, "SELECT * FROM users WHERE id = 123 AND name = 'Alice'");
@@ -557,10 +582,7 @@ mod tests {
     fn test_substitute_parameters_with_cast() {
         // $1::text should replace $1 and preserve ::text
         let sql = "SELECT $1::text, $2::int";
-        let params = vec![
-            Value::String("hello".to_string()),
-            Value::Int4(42),
-        ];
+        let params = vec![Value::String("hello".to_string()), Value::Int4(42)];
         let result = substitute_parameters(sql, &params).unwrap();
         assert_eq!(result, "SELECT 'hello'::text, 42::int");
     }
@@ -593,8 +615,14 @@ mod tests {
         assert!(result.is_ok(), "LRU eviction should allow new statement");
 
         // Verify stmt0 was evicted (oldest) and stmt1/stmt3 remain
-        assert!(manager.get_statement("stmt0").unwrap().is_none(), "stmt0 should have been evicted");
-        assert!(manager.get_statement("stmt1").unwrap().is_some(), "stmt1 should still exist");
+        assert!(
+            manager.get_statement("stmt0").unwrap().is_none(),
+            "stmt0 should have been evicted"
+        );
+        assert!(
+            manager.get_statement("stmt1").unwrap().is_some(),
+            "stmt1 should still exist"
+        );
         assert!(manager.get_statement("stmt3").unwrap().is_some(), "stmt3 should exist");
     }
 }

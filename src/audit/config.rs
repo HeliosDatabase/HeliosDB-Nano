@@ -45,13 +45,13 @@ impl Default for AuditConfig {
             enabled: true,
             log_ddl: true,
             log_dml: true,
-            log_select: false,  // Too verbose by default
+            log_select: false, // Too verbose by default
             log_transactions: false,
             log_auth: true,
             retention_days: 90,
             async_buffer_size: 100,
             enable_checksums: true,
-            max_query_length: 10000,  // 10KB
+            max_query_length: 10000, // 10KB
             capture_metadata: MetadataCapture::default(),
         }
     }
@@ -98,12 +98,12 @@ impl AuditConfig {
             enabled: true,
             log_ddl: true,
             log_dml: true,
-            log_select: false,  // SELECT typically doesn't need to be audited for compliance
+            log_select: false, // SELECT typically doesn't need to be audited for compliance
             log_transactions: true,
             log_auth: true,
-            retention_days: 2555,  // 7 years for some compliance standards
+            retention_days: 2555, // 7 years for some compliance standards
             async_buffer_size: 100,
-            enable_checksums: true,  // Tamper detection is critical
+            enable_checksums: true, // Tamper detection is critical
             max_query_length: 10000,
             capture_metadata: MetadataCapture::compliance(),
         }
@@ -122,7 +122,7 @@ impl AuditConfig {
             op if op.is_dml() => self.log_dml,
             op if op.is_transaction() => self.log_transactions,
             op if op.is_auth() => self.log_auth,
-            _ => true,  // Log other operations by default
+            _ => true, // Log other operations by default
         }
     }
 

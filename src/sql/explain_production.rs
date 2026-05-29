@@ -9,13 +9,13 @@
 
 #![allow(unused_variables)]
 
-use crate::Result;
-use super::explain::{ExplainOutput, ExplainPlanner, ExplainMode, ExplainFormat};
+use super::explain::{ExplainFormat, ExplainMode, ExplainOutput, ExplainPlanner};
 use super::logical_plan::LogicalPlan;
+use crate::Result;
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
-use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Production configuration for EXPLAIN
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -198,12 +198,14 @@ impl ProductionExplainService {
 
     fn cache_result(&self, key: String, output: ExplainOutput) {
         if let Ok(mut cache) = self.cache.lock() {
-
-            cache.insert(key, CachedExplain {
-                output,
-                cached_at: Instant::now(),
-                hits: 0,
-            });
+            cache.insert(
+                key,
+                CachedExplain {
+                    output,
+                    cached_at: Instant::now(),
+                    hits: 0,
+                },
+            );
         }
     }
 
@@ -240,14 +242,16 @@ impl ProductionExplainService {
     /// Get current service metrics
     pub fn get_metrics(&self) -> ServiceMetrics {
         let metrics = self.metrics.lock().ok();
-        metrics.map(|m| ServiceMetrics {
-            total_requests: m.total_requests,
-            cache_hits: m.cache_hits,
-            cache_misses: m.cache_misses,
-            errors: m.errors,
-            total_latency_ms: m.total_latency_ms,
-            latencies: m.latencies.clone(),
-        }).unwrap_or_default()
+        metrics
+            .map(|m| ServiceMetrics {
+                total_requests: m.total_requests,
+                cache_hits: m.cache_hits,
+                cache_misses: m.cache_misses,
+                errors: m.errors,
+                total_latency_ms: m.total_latency_ms,
+                latencies: m.latencies.clone(),
+            })
+            .unwrap_or_default()
     }
 
     /// Get memory statistics
@@ -347,47 +351,27 @@ impl ProductionExplainService {
         let mut results = Vec::new();
 
         // Benchmark: Standard EXPLAIN
-        results.push(self.benchmark_operation(
-            "Standard EXPLAIN",
-            iterations,
-            100.0,
-            || self.explain(plan, ExplainMode::Standard),
-        ));
+        results.push(self.benchmark_operation("Standard EXPLAIN", iterations, 100.0, || {
+            self.explain(plan, ExplainMode::Standard)
+        }));
 
         // Benchmark: Verbose EXPLAIN
-        results.push(self.benchmark_operation(
-            "Verbose EXPLAIN",
-            iterations,
-            150.0,
-            || self.explain(plan, ExplainMode::Verbose),
-        ));
+        results.push(self.benchmark_operation("Verbose EXPLAIN", iterations, 150.0, || {
+            self.explain(plan, ExplainMode::Verbose)
+        }));
 
         // Benchmark: AI EXPLAIN
-        results.push(self.benchmark_operation(
-            "AI EXPLAIN",
-            iterations,
-            500.0,
-            || self.explain(plan, ExplainMode::AI),
-        ));
+        results.push(self.benchmark_operation("AI EXPLAIN", iterations, 500.0, || self.explain(plan, ExplainMode::AI)));
 
         // Benchmark: Analyze EXPLAIN
-        results.push(self.benchmark_operation(
-            "Analyze EXPLAIN",
-            iterations,
-            1000.0,
-            || self.explain(plan, ExplainMode::Analyze),
-        ));
+        results.push(self.benchmark_operation("Analyze EXPLAIN", iterations, 1000.0, || {
+            self.explain(plan, ExplainMode::Analyze)
+        }));
 
         results
     }
 
-    fn benchmark_operation<F>(
-        &self,
-        name: &str,
-        iterations: usize,
-        target_ms: f64,
-        mut f: F,
-    ) -> BenchmarkResults
+    fn benchmark_operation<F>(&self, name: &str, iterations: usize, target_ms: f64, mut f: F) -> BenchmarkResults
     where
         F: FnMut() -> Result<ExplainOutput>,
     {
@@ -406,9 +390,7 @@ impl ProductionExplainService {
         let max = times.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
         // Calculate standard deviation
-        let variance = times.iter()
-            .map(|t| (t - avg).powi(2))
-            .sum::<f64>() / times.len() as f64;
+        let variance = times.iter().map(|t| (t - avg).powi(2)).sum::<f64>() / times.len() as f64;
         let std_dev = variance.sqrt();
 
         let memory = self.get_memory_stats();
@@ -471,8 +453,7 @@ impl ProductionExplainService {
         } else {
             issues.push(format!(
                 "Memory usage too high: {:.2}MB (max: {}MB)",
-                memory.current_usage_mb,
-                self.config.max_memory_mb
+                memory.current_usage_mb, self.config.max_memory_mb
             ));
         }
 
@@ -502,9 +483,7 @@ impl ProductionExplainService {
             } else {
                 warnings.push(format!(
                     "{} benchmark failed: {:.2}ms avg (target: <{:.2}ms)",
-                    benchmark.operation,
-                    benchmark.avg_time_ms,
-                    benchmark.target_ms
+                    benchmark.operation, benchmark.avg_time_ms, benchmark.target_ms
                 ));
             }
         }
@@ -550,7 +529,7 @@ fn percentile(sorted_values: &[f64], p: f64) -> f64 {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::{Schema, Column, DataType};
+    use crate::{Column, DataType, Schema};
     use std::sync::Arc;
 
     fn create_test_plan() -> LogicalPlan {
@@ -558,19 +537,17 @@ mod tests {
             table_name: "users".to_string(),
             alias: None,
             schema: Arc::new(Schema {
-                columns: vec![
-                    Column {
-                        name: "id".to_string(),
-                        data_type: DataType::Int4,
-                        nullable: false,
-                        primary_key: true,
-                        source_table: None,
-                        source_table_name: None,
+                columns: vec![Column {
+                    name: "id".to_string(),
+                    data_type: DataType::Int4,
+                    nullable: false,
+                    primary_key: true,
+                    source_table: None,
+                    source_table_name: None,
                     default_expr: None,
                     unique: false,
                     storage_mode: crate::ColumnStorageMode::Default,
-                    },
-                ],
+                }],
             }),
             projection: None,
             as_of: None,

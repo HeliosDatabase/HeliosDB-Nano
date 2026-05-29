@@ -290,8 +290,8 @@ unsafe fn horizontal_sum_avx2(v: std::arch::x86_64::__m256) -> f32 {
 
     // v = [a, b, c, d, e, f, g, h]
     // Extract high and low 128-bit halves
-    let low = _mm256_castps256_ps128(v);           // [a, b, c, d]
-    let high = _mm256_extractf128_ps(v, 1);        // [e, f, g, h]
+    let low = _mm256_castps256_ps128(v); // [a, b, c, d]
+    let high = _mm256_extractf128_ps(v, 1); // [e, f, g, h]
 
     // Add them: [a+e, b+f, c+g, d+h]
     let sum128 = _mm_add_ps(low, high);

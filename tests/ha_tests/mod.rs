@@ -15,5 +15,5 @@
 
 mod cluster_tests;
 mod failover_tests;
-mod streaming_tests;
 mod split_brain_tests;
+mod streaming_tests;

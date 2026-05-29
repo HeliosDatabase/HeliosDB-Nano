@@ -4,18 +4,18 @@
 
 #![allow(unused_variables)]
 
-use crate::{Result, Error, Schema, DataType, Value, Column};
-use crate::storage::Catalog;
+use super::constraints::ConstraintEnforcement;
+use super::explain_options::{ExplainFormatOption, ExplainOptions};
 use super::logical_plan::*;
+use crate::storage::Catalog;
+use crate::{Column, DataType, Error, Result, Schema, Value};
 use sqlparser::ast::{
-    Statement, Query, Select, SelectItem, Expr, TableFactor, TableWithJoins,
-    JoinOperator, JoinConstraint, SetExpr, BinaryOperator as SqlBinaryOp,
-    UnaryOperator as SqlUnaryOp, DataType as SqlDataType, ColumnDef as SqlColumnDef,
-    ColumnOption, ObjectName, TriggerPeriod, TriggerEvent as SqlTriggerEvent,
-    TriggerObject, TriggerReferencing, TriggerExecBody, ConstraintCharacteristics,
-    ReferentialAction as SqlReferentialAction, AnalyzeFormat, UtilityOption,
+    AnalyzeFormat, BinaryOperator as SqlBinaryOp, ColumnDef as SqlColumnDef, ColumnOption, ConstraintCharacteristics,
+    DataType as SqlDataType, Expr, JoinConstraint, JoinOperator, ObjectName, Query,
+    ReferentialAction as SqlReferentialAction, Select, SelectItem, SetExpr, Statement, TableFactor, TableWithJoins,
+    TriggerEvent as SqlTriggerEvent, TriggerExecBody, TriggerObject, TriggerPeriod, TriggerReferencing,
+    UnaryOperator as SqlUnaryOp, UtilityOption,
 };
-use super::explain_options::{ExplainOptions, ExplainFormatOption};
 
 /// Convert sqlparser ReferentialAction to our internal representation
 fn convert_referential_action(action: &SqlReferentialAction) -> ReferentialAction {
@@ -27,10 +27,17 @@ fn convert_referential_action(action: &SqlReferentialAction) -> ReferentialActio
         SqlReferentialAction::SetDefault => ReferentialAction::SetDefault,
     }
 }
-use std::sync::Arc;
+
+fn convert_constraint_enforcement(characteristics: Option<&ConstraintCharacteristics>) -> ConstraintEnforcement {
+    match characteristics.and_then(|c| c.enforced) {
+        Some(false) => ConstraintEnforcement::NotEnforced,
+        _ => ConstraintEnforcement::Immediate,
+    }
+}
+use super::phase3::materialized_views::MaterializedViewParser;
 use std::cell::RefCell;
 use std::collections::HashMap;
-use super::phase3::materialized_views::MaterializedViewParser;
+use std::sync::Arc;
 
 /// Information about an aggregate plan needed to rewrite ORDER BY expressions.
 /// Contains the aggregate expressions and the corresponding output aliases from the
@@ -105,10 +112,7 @@ impl<'a> Planner<'a> {
     }
 
     /// Populate the named window definitions from a SELECT's WINDOW clause.
-    fn populate_named_windows(
-        &self,
-        named_window_defs: &[sqlparser::ast::NamedWindowDefinition],
-    ) -> Result<()> {
+    fn populate_named_windows(&self, named_window_defs: &[sqlparser::ast::NamedWindowDefinition]) -> Result<()> {
         use sqlparser::ast::NamedWindowExpr;
         self.named_windows.borrow_mut().clear();
         for def in named_window_defs {
@@ -116,13 +120,12 @@ impl<'a> Planner<'a> {
             let spec = match &def.1 {
                 NamedWindowExpr::WindowSpec(spec) => {
                     if let Some(ref parent_name) = spec.window_name {
-                        let parent_spec =
-                            self.get_named_window(&parent_name.value).ok_or_else(|| {
-                                Error::query_execution(format!(
-                                    "Window \"{}\" references undefined window \"{}\"",
-                                    name, parent_name.value
-                                ))
-                            })?;
+                        let parent_spec = self.get_named_window(&parent_name.value).ok_or_else(|| {
+                            Error::query_execution(format!(
+                                "Window \"{}\" references undefined window \"{}\"",
+                                name, parent_name.value
+                            ))
+                        })?;
                         Self::merge_window_specs(&parent_spec, spec)?
                     } else {
                         spec.clone()
@@ -153,9 +156,7 @@ impl<'a> Planner<'a> {
             ));
         }
         if !parent.order_by.is_empty() && !child.order_by.is_empty() {
-            return Err(Error::query_execution(
-                "Cannot override ORDER BY of referenced window",
-            ));
+            return Err(Error::query_execution("Cannot override ORDER BY of referenced window"));
         }
         if parent.window_frame.is_some() && child.window_frame.is_some() {
             return Err(Error::query_execution(
@@ -174,10 +175,7 @@ impl<'a> Planner<'a> {
             } else {
                 child.order_by.clone()
             },
-            window_frame: child
-                .window_frame
-                .clone()
-                .or_else(|| parent.window_frame.clone()),
+            window_frame: child.window_frame.clone().or_else(|| parent.window_frame.clone()),
         })
     }
 
@@ -211,7 +209,7 @@ impl<'a> Planner<'a> {
             return Ok(DataType::Numeric);
         }
 
-        if upper.starts_with("VECTOR") {
+        if upper.starts_with("VECTOR") || upper.starts_with("HALFVEC") {
             if let Some(start) = upper.find('(') {
                 if let Some(end) = upper.find(')') {
                     if let Some(dim_str) = upper.get(start + 1..end) {
@@ -243,10 +241,7 @@ impl<'a> Planner<'a> {
             "SERIAL" => Ok(DataType::Int4),
             "BIGSERIAL" => Ok(DataType::Int8),
             "SMALLSERIAL" => Ok(DataType::Int2),
-            _ => Err(Error::query_execution(format!(
-                "Unknown data type: {}",
-                type_str
-            ))),
+            _ => Err(Error::query_execution(format!("Unknown data type: {}", type_str))),
         }
     }
 
@@ -271,12 +266,7 @@ impl<'a> Planner<'a> {
     /// `CREATE TABLE Users` and `SELECT FROM users` resolve to the
     /// same name.
     pub(crate) fn normalize_object_name(name: &sqlparser::ast::ObjectName) -> String {
-        let joined = name
-            .0
-            .iter()
-            .map(Self::normalize_ident)
-            .collect::<Vec<_>>()
-            .join(".");
+        let joined = name.0.iter().map(Self::normalize_ident).collect::<Vec<_>>().join(".");
         // Schema-namespacing alias: `_hdb_code.<table>` → `_hdb_code_<table>`,
         // `_hdb_graph.<table>` → `_hdb_graph_<table>`.  Lets users
         // address the code-graph / graph-rag tables in dotted form
@@ -338,7 +328,9 @@ impl<'a> Planner<'a> {
                 // slot goes through the "omitted" path.
                 let source_opt = insert.source;
                 // Extract RETURNING clause if present
-                let returning = insert.returning.as_ref()
+                let returning = insert
+                    .returning
+                    .as_ref()
                     .map(|ret_items| self.convert_returning(ret_items))
                     .transpose()?;
                 // Extract ON CONFLICT clause if present
@@ -369,37 +361,35 @@ impl<'a> Planner<'a> {
                 let with_options = create_table.with_options;
                 self.create_table_to_plan(name, columns, if_not_exists, constraints, with_options)
             }
-            Statement::Drop { names, if_exists, object_type, .. } => {
+            Statement::Drop {
+                names,
+                if_exists,
+                object_type,
+                ..
+            } => {
                 if names.len() != 1 {
                     return Err(Error::query_execution("Multiple drops not supported"));
                 }
                 // SAFETY: We've verified names.len() == 1 above
                 let name = Self::normalize_object_name(
-                    names.first().ok_or_else(|| Error::query_execution("DROP requires a name"))?
+                    names
+                        .first()
+                        .ok_or_else(|| Error::query_execution("DROP requires a name"))?,
                 );
 
                 match object_type {
                     sqlparser::ast::ObjectType::View => {
                         // DROP VIEW
-                        Ok(LogicalPlan::DropView {
-                            name,
-                            if_exists,
-                        })
+                        Ok(LogicalPlan::DropView { name, if_exists })
                     }
                     sqlparser::ast::ObjectType::Table => {
                         // DROP TABLE
-                        Ok(LogicalPlan::DropTable {
-                            name,
-                            if_exists,
-                        })
+                        Ok(LogicalPlan::DropTable { name, if_exists })
                     }
                     sqlparser::ast::ObjectType::Database => {
                         // DROP DATABASE — Bug 1 mirror; wraps the
                         // tenant-API.
-                        Ok(LogicalPlan::DropDatabase {
-                            name,
-                            if_exists,
-                        })
+                        Ok(LogicalPlan::DropDatabase { name, if_exists })
                     }
                     sqlparser::ast::ObjectType::Type => {
                         // KanttBan #20 (v3.31.0): DROP TYPE removes
@@ -412,17 +402,11 @@ impl<'a> Planner<'a> {
                         // embedded DB the laxer behaviour is more
                         // useful and the CHECK still enforces the
                         // allowed labels).
-                        Ok(LogicalPlan::DropEnumType {
-                            name,
-                            if_exists,
-                        })
+                        Ok(LogicalPlan::DropEnumType { name, if_exists })
                     }
                     _ => {
                         // Default to DROP TABLE for backwards compatibility
-                        Ok(LogicalPlan::DropTable {
-                            name,
-                            if_exists,
-                        })
+                        Ok(LogicalPlan::DropTable { name, if_exists })
                     }
                 }
             }
@@ -433,15 +417,23 @@ impl<'a> Planner<'a> {
                 if table_names.len() > 1 {
                     return Err(Error::query_execution("Multiple table TRUNCATE not supported"));
                 }
-                let first_table = table_names.first()
+                let first_table = table_names
+                    .first()
                     .ok_or_else(|| Error::query_execution("TRUNCATE requires a table name"))?;
                 Ok(LogicalPlan::Truncate {
                     table_name: first_table.to_string(),
                 })
             }
-            Statement::Update { table, assignments, selection, returning, .. } => {
+            Statement::Update {
+                table,
+                assignments,
+                selection,
+                returning,
+                ..
+            } => {
                 // Extract RETURNING clause if present
-                let returning_items = returning.as_ref()
+                let returning_items = returning
+                    .as_ref()
                     .map(|ret_items| self.convert_returning(ret_items))
                     .transpose()?;
                 self.update_to_plan(table, assignments, selection, returning_items)
@@ -453,7 +445,8 @@ impl<'a> Planner<'a> {
                         if tables.len() != 1 {
                             return Err(Error::query_execution("Multi-table DELETE not supported"));
                         }
-                        tables.first()
+                        tables
+                            .first()
                             .ok_or_else(|| Error::query_execution("DELETE requires a table"))?
                             .clone()
                     }
@@ -461,13 +454,16 @@ impl<'a> Planner<'a> {
                         if tables.len() != 1 {
                             return Err(Error::query_execution("Multi-table DELETE not supported"));
                         }
-                        tables.first()
+                        tables
+                            .first()
                             .ok_or_else(|| Error::query_execution("DELETE requires a table"))?
                             .clone()
                     }
                 };
                 // Extract RETURNING clause if present
-                let returning = delete_stmt.returning.as_ref()
+                let returning = delete_stmt
+                    .returning
+                    .as_ref()
                     .map(|ret_items| self.convert_returning(ret_items))
                     .transpose()?;
                 self.delete_to_plan(table, delete_stmt.selection.clone(), returning)
@@ -475,8 +471,10 @@ impl<'a> Planner<'a> {
             Statement::CreateIndex(create_index) => {
                 // Extract index name
                 let index_name = Self::normalize_object_name(
-                    create_index.name.as_ref()
-                        .ok_or_else(|| Error::query_execution("Index name is required"))?
+                    create_index
+                        .name
+                        .as_ref()
+                        .ok_or_else(|| Error::query_execution("Index name is required"))?,
                 );
 
                 // Extract table name
@@ -503,7 +501,7 @@ impl<'a> Planner<'a> {
 
                 if create_index.columns.len() > 1 && is_vector_index {
                     return Err(Error::query_execution(
-                        "Multi-column vector indexes are not supported (HNSW/IVF require a single VECTOR column)"
+                        "Multi-column vector indexes are not supported (HNSW/IVF require a single VECTOR column)",
                     ));
                 }
                 if create_index.columns.len() > 1 {
@@ -515,7 +513,9 @@ impl<'a> Planner<'a> {
                     );
                 }
 
-                let first_col = create_index.columns.first()
+                let first_col = create_index
+                    .columns
+                    .first()
                     .ok_or_else(|| Error::query_execution("At least one column required for index"))?;
                 let column = match &first_col.expr {
                     Expr::Identifier(ident) => Self::normalize_ident(ident),
@@ -551,31 +551,27 @@ impl<'a> Planner<'a> {
                 condition,
                 exec_body,
                 characteristics,
-            } => {
-                self.create_trigger_to_plan(
-                    or_replace,
-                    is_constraint,
-                    name,
-                    period,
-                    events,
-                    table_name,
-                    referenced_table_name,
-                    referencing,
-                    trigger_object,
-                    include_each,
-                    condition,
-                    exec_body,
-                    characteristics,
-                )
-            }
+            } => self.create_trigger_to_plan(
+                or_replace,
+                is_constraint,
+                name,
+                period,
+                events,
+                table_name,
+                referenced_table_name,
+                referencing,
+                trigger_object,
+                include_each,
+                condition,
+                exec_body,
+                characteristics,
+            ),
             Statement::DropTrigger {
                 if_exists,
                 trigger_name,
                 table_name,
                 option,
-            } => {
-                self.drop_trigger_to_plan(if_exists, trigger_name, table_name, option)
-            }
+            } => self.drop_trigger_to_plan(if_exists, trigger_name, table_name, option),
             Statement::CreateView {
                 name,
                 query,
@@ -593,8 +589,8 @@ impl<'a> Planner<'a> {
                     // Extract WITH options as string for parsing
                     let options_str = match options {
                         sqlparser::ast::CreateTableOptions::None => None,
-                        sqlparser::ast::CreateTableOptions::With(opts) |
-                        sqlparser::ast::CreateTableOptions::Options(opts) => {
+                        sqlparser::ast::CreateTableOptions::With(opts)
+                        | sqlparser::ast::CreateTableOptions::Options(opts) => {
                             if opts.is_empty() {
                                 None
                             } else {
@@ -606,11 +602,11 @@ impl<'a> Planner<'a> {
                                                 sqlparser::ast::SqlOption::KeyValue { key, value } => {
                                                     Some(format!("{}={}", key, value))
                                                 }
-                                                _ => None // Skip non-key-value options
+                                                _ => None, // Skip non-key-value options
                                             }
                                         })
                                         .collect::<Vec<_>>()
-                                        .join(", ")
+                                        .join(", "),
                                 )
                             }
                         }
@@ -664,15 +660,21 @@ impl<'a> Planner<'a> {
                     Ok(LogicalPlan::Rollback)
                 }
             }
-            Statement::Savepoint { name } => {
-                Ok(LogicalPlan::Savepoint { name: name.value.clone() })
-            }
-            Statement::ReleaseSavepoint { name } => {
-                Ok(LogicalPlan::ReleaseSavepoint { name: name.value.clone() })
-            }
+            Statement::Savepoint { name } => Ok(LogicalPlan::Savepoint {
+                name: name.value.clone(),
+            }),
+            Statement::ReleaseSavepoint { name } => Ok(LogicalPlan::ReleaseSavepoint {
+                name: name.value.clone(),
+            }),
             // Prepared statements
-            Statement::Prepare { name, data_types, statement, .. } => {
-                let param_types: Vec<DataType> = data_types.iter()
+            Statement::Prepare {
+                name,
+                data_types,
+                statement,
+                ..
+            } => {
+                let param_types: Vec<DataType> = data_types
+                    .iter()
                     .filter_map(|dt| self.sql_data_type_to_data_type(dt).ok())
                     .collect();
                 let inner_plan = self.statement_to_plan(*statement.clone())?;
@@ -683,9 +685,7 @@ impl<'a> Planner<'a> {
                 })
             }
             Statement::Execute { name, parameters, .. } => {
-                let params: Result<Vec<LogicalExpr>> = parameters.iter()
-                    .map(|e| self.expr_to_logical(e))
-                    .collect();
+                let params: Result<Vec<LogicalExpr>> = parameters.iter().map(|e| self.expr_to_logical(e)).collect();
                 Ok(LogicalPlan::Execute {
                     name: name.to_string(),
                     parameters: params?,
@@ -704,34 +704,45 @@ impl<'a> Planner<'a> {
             // track. Dispatches to extension-specific installers at
             // execution time; unknown names error cleanly unless
             // IF NOT EXISTS is set.
-            Statement::CreateExtension { name, if_not_exists, .. } => {
-                Ok(LogicalPlan::CreateExtension {
-                    name: name.value.to_ascii_lowercase(),
-                    if_not_exists,
-                })
-            }
+            Statement::CreateExtension {
+                name, if_not_exists, ..
+            } => Ok(LogicalPlan::CreateExtension {
+                name: name.value.to_ascii_lowercase(),
+                if_not_exists,
+            }),
             // Procedural statements
             Statement::CreateFunction(cf) => self.create_function_to_plan(cf),
-            Statement::CreateProcedure { or_alter, name, params, body } => {
+            Statement::CreateProcedure {
+                or_alter,
+                name,
+                params,
+                body,
+            } => {
                 // ProcedureParam has fields: name: Ident, data_type: DataType (no mode field)
-                let param_list = params.unwrap_or_default().into_iter().map(|p| {
-                    FunctionParam {
-                        name: p.name.value.clone(),
-                        data_type: self.sql_data_type_to_data_type(&p.data_type).unwrap_or(DataType::Text),
-                        mode: ParamMode::In,  // ProcedureParam doesn't have mode field
-                        default: None,
-                    }
-                }).collect();
+                let param_list = params
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|p| {
+                        FunctionParam {
+                            name: p.name.value.clone(),
+                            data_type: self.sql_data_type_to_data_type(&p.data_type).unwrap_or(DataType::Text),
+                            mode: ParamMode::In, // ProcedureParam doesn't have mode field
+                            default: None,
+                        }
+                    })
+                    .collect();
                 let body_str = body.iter().map(|s| format!("{}", s)).collect::<Vec<_>>().join("\n");
                 Ok(LogicalPlan::CreateProcedure {
                     name: name.to_string(),
-                    or_replace: or_alter,  // Map or_alter to or_replace
+                    or_replace: or_alter, // Map or_alter to or_replace
                     params: param_list,
                     body: body_str,
-                    language: "sql".to_string(),  // Default to SQL
+                    language: "sql".to_string(), // Default to SQL
                 })
             }
-            Statement::DropFunction { if_exists, func_desc, .. } => {
+            Statement::DropFunction {
+                if_exists, func_desc, ..
+            } => {
                 if let Some(fd) = func_desc.first() {
                     Ok(LogicalPlan::DropFunction {
                         name: fd.name.to_string(),
@@ -741,7 +752,9 @@ impl<'a> Planner<'a> {
                     Err(Error::query_execution("DROP FUNCTION requires a name"))
                 }
             }
-            Statement::DropProcedure { if_exists, proc_desc, .. } => {
+            Statement::DropProcedure {
+                if_exists, proc_desc, ..
+            } => {
                 if let Some(pd) = proc_desc.first() {
                     Ok(LogicalPlan::DropProcedure {
                         name: pd.name.to_string(),
@@ -758,17 +771,17 @@ impl<'a> Planner<'a> {
                     sqlparser::ast::FunctionArguments::Subquery(_) => {
                         Err(Error::query_execution("CALL with subquery not supported"))
                     }
-                    sqlparser::ast::FunctionArguments::List(arg_list) => {
-                        arg_list.args.into_iter()
-                            .map(|arg| match arg {
-                                sqlparser::ast::FunctionArg::Unnamed(fe) => match fe {
-                                    sqlparser::ast::FunctionArgExpr::Expr(e) => self.expr_to_logical(&e),
-                                    _ => Err(Error::query_execution("Unsupported CALL argument")),
-                                },
-                                _ => Err(Error::query_execution("Named CALL arguments not supported")),
-                            })
-                            .collect()
-                    }
+                    sqlparser::ast::FunctionArguments::List(arg_list) => arg_list
+                        .args
+                        .into_iter()
+                        .map(|arg| match arg {
+                            sqlparser::ast::FunctionArg::Unnamed(fe) => match fe {
+                                sqlparser::ast::FunctionArgExpr::Expr(e) => self.expr_to_logical(&e),
+                                _ => Err(Error::query_execution("Unsupported CALL argument")),
+                            },
+                            _ => Err(Error::query_execution("Named CALL arguments not supported")),
+                        })
+                        .collect(),
                 };
                 Ok(LogicalPlan::Call {
                     name: call.name.to_string(),
@@ -781,16 +794,23 @@ impl<'a> Planner<'a> {
             // `currval`, `setval` read/write the same store. No ORM
             // ownership relationship to columns yet — this is scoped to
             // unblock Prisma / Drizzle migrations that emit sequence DDL.
-            Statement::CreateSequence { name, if_not_exists, .. } => {
+            Statement::CreateSequence {
+                name, if_not_exists, ..
+            } => {
                 let seq_name = Self::normalize_object_name(&name);
-                Ok(LogicalPlan::CreateSequence { name: seq_name, if_not_exists })
+                Ok(LogicalPlan::CreateSequence {
+                    name: seq_name,
+                    if_not_exists,
+                })
             }
             // `CREATE DATABASE name [IF NOT EXISTS]` — Bug 1 from the
             // dashboard-migration triage. Wraps the existing
             // `TenantManager::register_tenant_with_plan` API as a
             // metadata-only DDL. The reserved-name and duplicate
             // semantics live in the executor.
-            Statement::CreateDatabase { db_name, if_not_exists, .. } => {
+            Statement::CreateDatabase {
+                db_name, if_not_exists, ..
+            } => {
                 let name = Self::normalize_object_name(&db_name);
                 Ok(LogicalPlan::CreateDatabase { name, if_not_exists })
             }
@@ -806,8 +826,7 @@ impl<'a> Planner<'a> {
                 use sqlparser::ast::UserDefinedTypeRepresentation;
                 match representation {
                     UserDefinedTypeRepresentation::Enum { labels } => {
-                        let labels: Vec<String> =
-                            labels.into_iter().map(|ident| ident.value).collect();
+                        let labels: Vec<String> = labels.into_iter().map(|ident| ident.value).collect();
                         Ok(LogicalPlan::CreateEnumType {
                             name: normalised,
                             labels,
@@ -830,40 +849,53 @@ impl<'a> Planner<'a> {
     /// Convert CREATE FUNCTION to plan
     fn create_function_to_plan(&self, cf: sqlparser::ast::CreateFunction) -> Result<LogicalPlan> {
         // OperateFunctionArg has: mode: Option<ArgMode>, name: Option<Ident>, data_type: DataType, default_expr: Option<Expr>
-        let params = cf.args.unwrap_or_default().into_iter().map(|arg| {
-            let data_type = self.sql_data_type_to_data_type(&arg.data_type).unwrap_or(DataType::Text);
-            FunctionParam {
-                name: arg.name.map(|n| n.value).unwrap_or_default(),
-                data_type,
-                mode: match arg.mode {
-                    Some(sqlparser::ast::ArgMode::In) => ParamMode::In,
-                    Some(sqlparser::ast::ArgMode::Out) => ParamMode::Out,
-                    Some(sqlparser::ast::ArgMode::InOut) => ParamMode::InOut,
-                    None => ParamMode::In,
-                },
-                default: None,
-            }
-        }).collect();
+        let params = cf
+            .args
+            .unwrap_or_default()
+            .into_iter()
+            .map(|arg| {
+                let data_type = self
+                    .sql_data_type_to_data_type(&arg.data_type)
+                    .unwrap_or(DataType::Text);
+                FunctionParam {
+                    name: arg.name.map(|n| n.value).unwrap_or_default(),
+                    data_type,
+                    mode: match arg.mode {
+                        Some(sqlparser::ast::ArgMode::In) => ParamMode::In,
+                        Some(sqlparser::ast::ArgMode::Out) => ParamMode::Out,
+                        Some(sqlparser::ast::ArgMode::InOut) => ParamMode::InOut,
+                        None => ParamMode::In,
+                    },
+                    default: None,
+                }
+            })
+            .collect();
 
-        let return_type = cf.return_type.as_ref()
+        let return_type = cf
+            .return_type
+            .as_ref()
             .map(|rt| self.sql_data_type_to_data_type(rt))
             .transpose()?;
 
         let body = match cf.function_body {
-            Some(sqlparser::ast::CreateFunctionBody::AsBeforeOptions(expr)) => {
-                match expr {
-                    sqlparser::ast::Expr::Value(sqlparser::ast::Value::DollarQuotedString(dqs)) => dqs.value,
-                    sqlparser::ast::Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => s,
-                    other => format!("{}", other),
+            Some(sqlparser::ast::CreateFunctionBody::AsBeforeOptions(expr)) => match expr {
+                sqlparser::ast::Expr::Value(sqlparser::ast::Value::DollarQuotedString(dqs)) => {
+                    Self::repair_sqlparser_string(&dqs.value)
                 }
-            }
-            Some(sqlparser::ast::CreateFunctionBody::AsAfterOptions(expr)) => {
-                match expr {
-                    sqlparser::ast::Expr::Value(sqlparser::ast::Value::DollarQuotedString(dqs)) => dqs.value,
-                    sqlparser::ast::Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => s,
-                    other => format!("{}", other),
+                sqlparser::ast::Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
+                    Self::repair_sqlparser_string(&s)
                 }
-            }
+                other => format!("{}", other),
+            },
+            Some(sqlparser::ast::CreateFunctionBody::AsAfterOptions(expr)) => match expr {
+                sqlparser::ast::Expr::Value(sqlparser::ast::Value::DollarQuotedString(dqs)) => {
+                    Self::repair_sqlparser_string(&dqs.value)
+                }
+                sqlparser::ast::Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
+                    Self::repair_sqlparser_string(&s)
+                }
+                other => format!("{}", other),
+            },
             Some(sqlparser::ast::CreateFunctionBody::Return(expr)) => format!("RETURN {}", expr),
             None => String::new(),
         };
@@ -892,18 +924,16 @@ impl<'a> Planner<'a> {
 
                 // For recursive CTEs, pre-register a placeholder schema
                 // so that the recursive reference can resolve
-                let column_aliases: Vec<String> = cte.alias.columns
-                    .iter()
-                    .map(|col| col.name.value.clone())
-                    .collect();
+                let column_aliases: Vec<String> = cte.alias.columns.iter().map(|col| col.name.value.clone()).collect();
 
                 if is_recursive && !column_aliases.is_empty() {
                     // Use the explicit column aliases with Int8 as placeholder type
                     // (works for numeric recursion like n+1)
                     let schema = Arc::new(Schema::new(
-                        column_aliases.iter().map(|name| {
-                            Column::new(name, DataType::Int8)
-                        }).collect()
+                        column_aliases
+                            .iter()
+                            .map(|name| Column::new(name, DataType::Int8))
+                            .collect(),
                     ));
                     self.add_cte(cte_name.clone(), schema);
                 }
@@ -917,14 +947,16 @@ impl<'a> Planner<'a> {
                     if column_aliases.len() == original_schema.columns.len() {
                         // Rename columns using the aliases
                         Arc::new(Schema::new(
-                            original_schema.columns.iter()
+                            original_schema
+                                .columns
+                                .iter()
                                 .zip(column_aliases.iter())
                                 .map(|(col, alias)| {
                                     let mut new_col = col.clone();
                                     new_col.name = alias.clone();
                                     new_col
                                 })
-                                .collect()
+                                .collect(),
                         ))
                     } else {
                         // Column count mismatch - use original schema
@@ -963,7 +995,9 @@ impl<'a> Planner<'a> {
             // to column references that the Sort operator can evaluate.
             let aggregate_info = Self::extract_aggregate_info(&plan);
 
-            let exprs: Result<Vec<_>> = order_by.exprs.iter()
+            let exprs: Result<Vec<_>> = order_by
+                .exprs
+                .iter()
                 .map(|order_by_expr| {
                     // Check if this is an ordinal position (literal integer)
                     if let Expr::Value(sqlparser::ast::Value::Number(n, _)) = &order_by_expr.expr {
@@ -997,7 +1031,9 @@ impl<'a> Planner<'a> {
                     }
                 })
                 .collect();
-            let asc: Vec<_> = order_by.exprs.iter()
+            let asc: Vec<_> = order_by
+                .exprs
+                .iter()
                 .map(|order_by_expr| order_by_expr.asc.unwrap_or(true))
                 .collect();
 
@@ -1046,7 +1082,12 @@ impl<'a> Planner<'a> {
 
         match set_expr {
             SetExpr::Select(select) => self.select_to_plan(*select),
-            SetExpr::SetOperation { op, set_quantifier, left, right } => {
+            SetExpr::SetOperation {
+                op,
+                set_quantifier,
+                left,
+                right,
+            } => {
                 let left_plan = self.set_expr_to_plan(*left)?;
                 let right_plan = self.set_expr_to_plan(*right)?;
 
@@ -1085,8 +1126,10 @@ impl<'a> Planner<'a> {
             LogicalPlan::DualScan
         } else if select.from.len() == 1 {
             self.table_with_joins_to_plan(
-                select.from.first()
-                    .ok_or_else(|| Error::query_execution("FROM clause is empty"))?
+                select
+                    .from
+                    .first()
+                    .ok_or_else(|| Error::query_execution("FROM clause is empty"))?,
             )?
         } else {
             // Multiple FROM tables: implicit cross-join (comma-join).
@@ -1136,7 +1179,8 @@ impl<'a> Planner<'a> {
             let group_by = if let sqlparser::ast::GroupByExpr::Expressions(group_by_exprs, _) = &select.group_by {
                 if !group_by_exprs.is_empty() {
                     let num_select_items = select.projection.len();
-                    let group_by: Result<Vec<_>> = group_by_exprs.iter()
+                    let group_by: Result<Vec<_>> = group_by_exprs
+                        .iter()
                         .map(|expr| {
                             // Check if this is an ordinal position (literal integer)
                             if let Expr::Value(sqlparser::ast::Value::Number(n, _)) = expr {
@@ -1149,10 +1193,12 @@ impl<'a> Planner<'a> {
                                         let resolved_expr = match select_item {
                                             SelectItem::UnnamedExpr(e) => e,
                                             SelectItem::ExprWithAlias { expr: e, .. } => e,
-                                            _ => return Err(Error::query_execution(format!(
+                                            _ => {
+                                                return Err(Error::query_execution(format!(
                                                 "GROUP BY position {} refers to a wildcard or unsupported select item",
                                                 ordinal
-                                            ))),
+                                            )))
+                                            }
                                         };
                                         return self.expr_to_logical(resolved_expr);
                                     } else if ordinal >= 1 {
@@ -1203,9 +1249,7 @@ impl<'a> Planner<'a> {
                 match item {
                     SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => {
                         let logical = self.expr_to_logical(expr)?;
-                        let rewritten = Self::rewrite_expr_replace_aggregates(
-                            &logical, &aggr_exprs, &group_by,
-                        );
+                        let rewritten = Self::rewrite_expr_replace_aggregates(&logical, &aggr_exprs, &group_by);
                         output_exprs.push(rewritten);
                     }
                     SelectItem::Wildcard(_) => {
@@ -1247,10 +1291,8 @@ impl<'a> Planner<'a> {
                 Some(sqlparser::ast::Distinct::Distinct) => (true, None),
                 Some(sqlparser::ast::Distinct::On(on_exprs)) => {
                     // DISTINCT ON (expr1, expr2, ...)
-                    let on_parsed: Result<Vec<LogicalExpr>> = on_exprs
-                        .iter()
-                        .map(|e| self.expr_to_logical(e))
-                        .collect();
+                    let on_parsed: Result<Vec<LogicalExpr>> =
+                        on_exprs.iter().map(|e| self.expr_to_logical(e)).collect();
                     (true, Some(on_parsed?))
                 }
             };
@@ -1280,10 +1322,7 @@ impl<'a> Planner<'a> {
             let right = self.table_factor_to_plan(&join.relation)?;
 
             // Check if this is a LATERAL join (right side is a LATERAL subquery)
-            let is_lateral = matches!(
-                &join.relation,
-                TableFactor::Derived { lateral: true, .. }
-            );
+            let is_lateral = matches!(&join.relation, TableFactor::Derived { lateral: true, .. });
 
             let join_type = match &join.join_operator {
                 JoinOperator::Inner(_) => JoinType::Inner,
@@ -1298,9 +1337,9 @@ impl<'a> Planner<'a> {
             let is_natural = matches!(
                 &join.join_operator,
                 JoinOperator::Inner(JoinConstraint::Natural)
-                | JoinOperator::LeftOuter(JoinConstraint::Natural)
-                | JoinOperator::RightOuter(JoinConstraint::Natural)
-                | JoinOperator::FullOuter(JoinConstraint::Natural)
+                    | JoinOperator::LeftOuter(JoinConstraint::Natural)
+                    | JoinOperator::RightOuter(JoinConstraint::Natural)
+                    | JoinOperator::FullOuter(JoinConstraint::Natural)
             );
 
             let on = if is_natural {
@@ -1308,7 +1347,9 @@ impl<'a> Planner<'a> {
                 let left_schema = plan.schema();
                 let right_schema = right.schema();
 
-                let common_columns: Vec<String> = left_schema.columns.iter()
+                let common_columns: Vec<String> = left_schema
+                    .columns
+                    .iter()
                     .filter_map(|lc| {
                         if right_schema.columns.iter().any(|rc| rc.name == lc.name) {
                             Some(lc.name.clone())
@@ -1320,7 +1361,7 @@ impl<'a> Planner<'a> {
 
                 if common_columns.is_empty() {
                     return Err(Error::query_execution(
-                        "NATURAL JOIN requires at least one common column between tables"
+                        "NATURAL JOIN requires at least one common column between tables",
                     ));
                 }
 
@@ -1355,9 +1396,7 @@ impl<'a> Planner<'a> {
                     JoinOperator::Inner(JoinConstraint::On(expr))
                     | JoinOperator::LeftOuter(JoinConstraint::On(expr))
                     | JoinOperator::RightOuter(JoinConstraint::On(expr))
-                    | JoinOperator::FullOuter(JoinConstraint::On(expr)) => {
-                        Some(self.expr_to_logical(expr)?)
-                    }
+                    | JoinOperator::FullOuter(JoinConstraint::On(expr)) => Some(self.expr_to_logical(expr)?),
                     _ => None,
                 }
             };
@@ -1379,21 +1418,19 @@ impl<'a> Planner<'a> {
         let mut logical_args = Vec::new();
         for arg in &tf_args.args {
             match arg {
-                sqlparser::ast::FunctionArg::Unnamed(arg_expr) => {
-                    match arg_expr {
-                        sqlparser::ast::FunctionArgExpr::Expr(e) => {
-                            logical_args.push(self.expr_to_logical(e)?);
-                        }
-                        _ => {
-                            return Err(Error::query_execution(
-                                "Unsupported function argument type in table function"
-                            ));
-                        }
+                sqlparser::ast::FunctionArg::Unnamed(arg_expr) => match arg_expr {
+                    sqlparser::ast::FunctionArgExpr::Expr(e) => {
+                        logical_args.push(self.expr_to_logical(e)?);
                     }
-                }
+                    _ => {
+                        return Err(Error::query_execution(
+                            "Unsupported function argument type in table function",
+                        ));
+                    }
+                },
                 _ => {
                     return Err(Error::query_execution(
-                        "Named arguments are not supported in table functions"
+                        "Named arguments are not supported in table functions",
                     ));
                 }
             }
@@ -1505,19 +1542,17 @@ impl<'a> Planner<'a> {
                 } else {
                     // Fallback to placeholder for tests without storage
                     Arc::new(Schema {
-                        columns: vec![
-                            Column {
-                                name: "id".to_string(),
-                                data_type: DataType::Int4,
-                                nullable: false,
-                                primary_key: false,
-                                source_table: None,
-                                source_table_name: None,
-                                default_expr: None,
-                                unique: false,
-                                storage_mode: crate::ColumnStorageMode::Default,
-                            },
-                        ],
+                        columns: vec![Column {
+                            name: "id".to_string(),
+                            data_type: DataType::Int4,
+                            nullable: false,
+                            primary_key: false,
+                            source_table: None,
+                            source_table_name: None,
+                            default_expr: None,
+                            unique: false,
+                            storage_mode: crate::ColumnStorageMode::Default,
+                        }],
                     })
                 };
 
@@ -1535,7 +1570,11 @@ impl<'a> Planner<'a> {
                     as_of,
                 })
             }
-            TableFactor::Derived { subquery, alias, lateral } => {
+            TableFactor::Derived {
+                subquery,
+                alias,
+                lateral,
+            } => {
                 // Handle subqueries in FROM clause: SELECT * FROM (SELECT ...) AS sub
                 // Also handles LATERAL: SELECT * FROM t, LATERAL (SELECT ... WHERE t.id = ...)
                 let subquery_plan = self.query_to_plan(*subquery.clone())?;
@@ -1562,13 +1601,13 @@ impl<'a> Planner<'a> {
                                                 logical_args.push(self.expr_to_logical(e)?);
                                             } else {
                                                 return Err(Error::query_execution(
-                                                    "Unsupported function argument in TABLE() expression"
+                                                    "Unsupported function argument in TABLE() expression",
                                                 ));
                                             }
                                         }
                                         _ => {
                                             return Err(Error::query_execution(
-                                                "Named arguments not supported in TABLE() expression"
+                                                "Named arguments not supported in TABLE() expression",
                                             ));
                                         }
                                     }
@@ -1590,7 +1629,7 @@ impl<'a> Planner<'a> {
                     _ => Err(Error::query_execution(format!(
                         "Table function expression '{}' not supported",
                         expr
-                    )))
+                    ))),
                 }
             }
             TableFactor::UNNEST { alias, array_exprs, .. } => {
@@ -1698,7 +1737,11 @@ impl<'a> Planner<'a> {
     }
 
     /// Convert SELECT items to expressions and aliases
-    fn select_items_to_exprs(&self, items: &[SelectItem], input: &LogicalPlan) -> Result<(Vec<LogicalExpr>, Vec<String>)> {
+    fn select_items_to_exprs(
+        &self,
+        items: &[SelectItem],
+        input: &LogicalPlan,
+    ) -> Result<(Vec<LogicalExpr>, Vec<String>)> {
         let mut exprs = Vec::new();
         let mut aliases = Vec::new();
 
@@ -1720,20 +1763,33 @@ impl<'a> Planner<'a> {
                     // Expand wildcard to all columns from input schema
                     let schema = input.schema();
                     for column in &schema.columns {
-                        exprs.push(LogicalExpr::Column { table: None, name: column.name.clone() });
+                        exprs.push(LogicalExpr::Column {
+                            table: None,
+                            name: column.name.clone(),
+                        });
                         aliases.push(column.name.clone());
                     }
                 }
                 SelectItem::QualifiedWildcard(object_name, _) => {
                     // Expand alias.* or table.* to all columns from that table
-                    let qualifier = object_name.0.iter().map(|i| i.value.clone()).collect::<Vec<_>>().join(".");
+                    let qualifier = object_name
+                        .0
+                        .iter()
+                        .map(|i| i.value.clone())
+                        .collect::<Vec<_>>()
+                        .join(".");
                     let schema = input.schema();
                     let mut matched = false;
                     for column in &schema.columns {
                         // Match by source_table_name (alias or real table name)
                         let col_table = column.source_table_name.as_deref().unwrap_or("");
-                        if col_table.eq_ignore_ascii_case(&qualifier) || column.name.starts_with(&format!("{}.", qualifier)) {
-                            exprs.push(LogicalExpr::Column { table: Some(qualifier.clone()), name: column.name.clone() });
+                        if col_table.eq_ignore_ascii_case(&qualifier)
+                            || column.name.starts_with(&format!("{}.", qualifier))
+                        {
+                            exprs.push(LogicalExpr::Column {
+                                table: Some(qualifier.clone()),
+                                name: column.name.clone(),
+                            });
                             aliases.push(column.name.clone());
                             matched = true;
                         }
@@ -1742,16 +1798,18 @@ impl<'a> Planner<'a> {
                     // (fallback for when source_table isn't set)
                     if !matched {
                         for column in &schema.columns {
-                            exprs.push(LogicalExpr::Column { table: None, name: column.name.clone() });
+                            exprs.push(LogicalExpr::Column {
+                                table: None,
+                                name: column.name.clone(),
+                            });
                             aliases.push(column.name.clone());
                         }
                     }
-                }
-                // SelectItem is exhaustive across the four variants
-                // above — the explicit fallback was for a pre-0.53
-                // sqlparser shape and the compiler now flags it as
-                // unreachable.  Keep the match exhaustive without
-                // a wildcard.
+                } // SelectItem is exhaustive across the four variants
+                  // above — the explicit fallback was for a pre-0.53
+                  // sqlparser shape and the compiler now flags it as
+                  // unreachable.  Keep the match exhaustive without
+                  // a wildcard.
             }
         }
 
@@ -1766,15 +1824,19 @@ impl<'a> Planner<'a> {
             // Simple column reference: use column name
             Expr::Identifier(ident) => ident.value.clone(),
             // Qualified column: table.column - use column name
-            Expr::CompoundIdentifier(idents) => {
-                idents.last().map(|i| i.value.clone()).unwrap_or_else(|| format!("col_{}", index))
-            }
+            Expr::CompoundIdentifier(idents) => idents
+                .last()
+                .map(|i| i.value.clone())
+                .unwrap_or_else(|| format!("col_{}", index)),
             // Aggregate functions: use function name + column
             Expr::Function(func) => {
                 let func_name = func.name.to_string().to_lowercase();
                 match func.args {
                     sqlparser::ast::FunctionArguments::List(ref list) if !list.args.is_empty() => {
-                        if let Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(inner))) = list.args.first() {
+                        if let Some(sqlparser::ast::FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(
+                            inner,
+                        ))) = list.args.first()
+                        {
                             if let Expr::Identifier(ident) = inner {
                                 return format!("{}({})", func_name, ident.value);
                             }
@@ -1802,8 +1864,12 @@ impl<'a> Planner<'a> {
             // Literal values: use the value representation
             Expr::Value(val) => match val {
                 sqlparser::ast::Value::Number(n, _) => n.clone(),
-                sqlparser::ast::Value::SingleQuotedString(s) => format!("'{}'", s),
-                sqlparser::ast::Value::DoubleQuotedString(s) => format!("\"{}\"", s),
+                sqlparser::ast::Value::SingleQuotedString(s) => {
+                    format!("'{}'", Self::repair_sqlparser_string(s))
+                }
+                sqlparser::ast::Value::DoubleQuotedString(s) => {
+                    format!("\"{}\"", Self::repair_sqlparser_string(s))
+                }
                 sqlparser::ast::Value::Boolean(b) => b.to_string(),
                 sqlparser::ast::Value::Null => "NULL".to_string(),
                 _ => format!("col_{}", index),
@@ -1817,22 +1883,18 @@ impl<'a> Planner<'a> {
     /// Returns None if the plan is not an aggregate query.
     fn extract_aggregate_info(plan: &LogicalPlan) -> Option<AggregateInfo> {
         if let LogicalPlan::Project { input, aliases, .. } = plan {
-            if let LogicalPlan::Aggregate { group_by, aggr_exprs, .. } = input.as_ref() {
+            if let LogicalPlan::Aggregate {
+                group_by, aggr_exprs, ..
+            } = input.as_ref()
+            {
                 let num_groups = group_by.len();
                 let num_aggs = aggr_exprs.len();
 
                 // The Project aliases are ordered: group columns first, then aggregate columns.
                 // aliases[0..num_groups] -> GROUP BY aliases
                 // aliases[num_groups..num_groups+num_aggs] -> aggregate aliases
-                let group_by_aliases: Vec<String> = aliases.iter()
-                    .take(num_groups)
-                    .cloned()
-                    .collect();
-                let aggr_aliases: Vec<String> = aliases.iter()
-                    .skip(num_groups)
-                    .take(num_aggs)
-                    .cloned()
-                    .collect();
+                let group_by_aliases: Vec<String> = aliases.iter().take(num_groups).cloned().collect();
+                let aggr_aliases: Vec<String> = aliases.iter().skip(num_groups).take(num_aggs).cloned().collect();
 
                 return Some(AggregateInfo {
                     aggr_exprs: aggr_exprs.clone(),
@@ -1856,8 +1918,11 @@ impl<'a> Planner<'a> {
                 // Find this aggregate in the plan's aggregate expressions
                 for (i, aggr_expr) in info.aggr_exprs.iter().enumerate() {
                     if let LogicalExpr::AggregateFunction {
-                        fun: aggr_fun, args: aggr_args, distinct: aggr_distinct
-                    } = aggr_expr {
+                        fun: aggr_fun,
+                        args: aggr_args,
+                        distinct: aggr_distinct,
+                    } = aggr_expr
+                    {
                         if fun == aggr_fun && args == aggr_args && distinct == aggr_distinct {
                             // Found a match - replace with column reference to the output alias
                             if let Some(alias) = info.aggr_aliases.get(i) {
@@ -1873,27 +1938,22 @@ impl<'a> Planner<'a> {
                 // for aggregates not in SELECT list)
                 expr.clone()
             }
-            LogicalExpr::BinaryExpr { left, op, right } => {
-                LogicalExpr::BinaryExpr {
-                    left: Box::new(Self::rewrite_order_by_aggregates(left, info)),
-                    op: *op,
-                    right: Box::new(Self::rewrite_order_by_aggregates(right, info)),
-                }
-            }
-            LogicalExpr::UnaryExpr { op, expr: inner } => {
-                LogicalExpr::UnaryExpr {
-                    op: *op,
-                    expr: Box::new(Self::rewrite_order_by_aggregates(inner, info)),
-                }
-            }
-            LogicalExpr::Cast { expr: inner, data_type } => {
-                LogicalExpr::Cast {
-                    expr: Box::new(Self::rewrite_order_by_aggregates(inner, info)),
-                    data_type: data_type.clone(),
-                }
-            }
+            LogicalExpr::BinaryExpr { left, op, right } => LogicalExpr::BinaryExpr {
+                left: Box::new(Self::rewrite_order_by_aggregates(left, info)),
+                op: *op,
+                right: Box::new(Self::rewrite_order_by_aggregates(right, info)),
+            },
+            LogicalExpr::UnaryExpr { op, expr: inner } => LogicalExpr::UnaryExpr {
+                op: *op,
+                expr: Box::new(Self::rewrite_order_by_aggregates(inner, info)),
+            },
+            LogicalExpr::Cast { expr: inner, data_type } => LogicalExpr::Cast {
+                expr: Box::new(Self::rewrite_order_by_aggregates(inner, info)),
+                data_type: data_type.clone(),
+            },
             LogicalExpr::ScalarFunction { fun, args } => {
-                let rewritten_args: Vec<_> = args.iter()
+                let rewritten_args: Vec<_> = args
+                    .iter()
                     .map(|a| Self::rewrite_order_by_aggregates(a, info))
                     .collect();
                 LogicalExpr::ScalarFunction {
@@ -1961,7 +2021,11 @@ impl<'a> Planner<'a> {
             LogicalExpr::Cast { expr: inner, .. } => {
                 Self::collect_aggregates_from_logical(inner, out);
             }
-            LogicalExpr::Case { expr: base, when_then, else_result } => {
+            LogicalExpr::Case {
+                expr: base,
+                when_then,
+                else_result,
+            } => {
                 if let Some(base_expr) = base {
                     Self::collect_aggregates_from_logical(base_expr, out);
                 }
@@ -1976,7 +2040,9 @@ impl<'a> Planner<'a> {
             LogicalExpr::IsNull { expr: inner, .. } => {
                 Self::collect_aggregates_from_logical(inner, out);
             }
-            LogicalExpr::Between { expr: inner, low, high, .. } => {
+            LogicalExpr::Between {
+                expr: inner, low, high, ..
+            } => {
                 Self::collect_aggregates_from_logical(inner, out);
                 Self::collect_aggregates_from_logical(low, out);
                 Self::collect_aggregates_from_logical(high, out);
@@ -2011,10 +2077,7 @@ impl<'a> Planner<'a> {
     /// the same column when unambiguous (B35).
     fn exprs_equivalent(a: &LogicalExpr, b: &LogicalExpr) -> bool {
         match (a, b) {
-            (
-                LogicalExpr::Column { table: t1, name: n1 },
-                LogicalExpr::Column { table: t2, name: n2 },
-            ) => {
+            (LogicalExpr::Column { table: t1, name: n1 }, LogicalExpr::Column { table: t2, name: n2 }) => {
                 if n1 != n2 {
                     return false;
                 }
@@ -2023,17 +2086,22 @@ impl<'a> Planner<'a> {
                     _ => true,
                 }
             }
-            (
-                LogicalExpr::ScalarFunction { fun: f1, args: a1 },
-                LogicalExpr::ScalarFunction { fun: f2, args: a2 },
-            ) => {
+            (LogicalExpr::ScalarFunction { fun: f1, args: a1 }, LogicalExpr::ScalarFunction { fun: f2, args: a2 }) => {
                 f1.eq_ignore_ascii_case(f2)
                     && a1.len() == a2.len()
                     && a1.iter().zip(a2.iter()).all(|(x, y)| Self::exprs_equivalent(x, y))
             }
             (
-                LogicalExpr::AggregateFunction { fun: f1, args: a1, distinct: d1 },
-                LogicalExpr::AggregateFunction { fun: f2, args: a2, distinct: d2 },
+                LogicalExpr::AggregateFunction {
+                    fun: f1,
+                    args: a1,
+                    distinct: d1,
+                },
+                LogicalExpr::AggregateFunction {
+                    fun: f2,
+                    args: a2,
+                    distinct: d2,
+                },
             ) => {
                 f1 == f2
                     && d1 == d2
@@ -2041,20 +2109,29 @@ impl<'a> Planner<'a> {
                     && a1.iter().zip(a2.iter()).all(|(x, y)| Self::exprs_equivalent(x, y))
             }
             (
-                LogicalExpr::BinaryExpr { left: l1, op: op1, right: r1 },
-                LogicalExpr::BinaryExpr { left: l2, op: op2, right: r2 },
-            ) => {
-                op1 == op2
-                    && Self::exprs_equivalent(l1, l2)
-                    && Self::exprs_equivalent(r1, r2)
+                LogicalExpr::BinaryExpr {
+                    left: l1,
+                    op: op1,
+                    right: r1,
+                },
+                LogicalExpr::BinaryExpr {
+                    left: l2,
+                    op: op2,
+                    right: r2,
+                },
+            ) => op1 == op2 && Self::exprs_equivalent(l1, l2) && Self::exprs_equivalent(r1, r2),
+            (LogicalExpr::UnaryExpr { op: op1, expr: e1 }, LogicalExpr::UnaryExpr { op: op2, expr: e2 }) => {
+                op1 == op2 && Self::exprs_equivalent(e1, e2)
             }
             (
-                LogicalExpr::UnaryExpr { op: op1, expr: e1 },
-                LogicalExpr::UnaryExpr { op: op2, expr: e2 },
-            ) => op1 == op2 && Self::exprs_equivalent(e1, e2),
-            (
-                LogicalExpr::Cast { expr: e1, data_type: d1 },
-                LogicalExpr::Cast { expr: e2, data_type: d2 },
+                LogicalExpr::Cast {
+                    expr: e1,
+                    data_type: d1,
+                },
+                LogicalExpr::Cast {
+                    expr: e2,
+                    data_type: d2,
+                },
             ) => d1 == d2 && Self::exprs_equivalent(e1, e2),
             // For everything else fall back on strict PartialEq — this
             // covers Literal, Parameter, IN, BETWEEN, Like, etc.
@@ -2112,64 +2189,74 @@ impl<'a> Planner<'a> {
                 }
                 expr.clone()
             }
-            LogicalExpr::BinaryExpr { left, op, right } => {
-                LogicalExpr::BinaryExpr {
-                    left: Box::new(Self::rewrite_expr_replace_aggregates(left, aggr_exprs, group_by)),
-                    op: *op,
-                    right: Box::new(Self::rewrite_expr_replace_aggregates(right, aggr_exprs, group_by)),
-                }
-            }
-            LogicalExpr::UnaryExpr { op, expr: inner } => {
-                LogicalExpr::UnaryExpr {
-                    op: *op,
-                    expr: Box::new(Self::rewrite_expr_replace_aggregates(inner, aggr_exprs, group_by)),
-                }
-            }
-            LogicalExpr::Cast { expr: inner, data_type } => {
-                LogicalExpr::Cast {
-                    expr: Box::new(Self::rewrite_expr_replace_aggregates(inner, aggr_exprs, group_by)),
-                    data_type: data_type.clone(),
-                }
-            }
-            LogicalExpr::Case { expr: base, when_then, else_result } => {
-                LogicalExpr::Case {
-                    expr: base.as_ref().map(|e| Box::new(Self::rewrite_expr_replace_aggregates(e, aggr_exprs, group_by))),
-                    when_then: when_then.iter().map(|(w, t)| {
+            LogicalExpr::BinaryExpr { left, op, right } => LogicalExpr::BinaryExpr {
+                left: Box::new(Self::rewrite_expr_replace_aggregates(left, aggr_exprs, group_by)),
+                op: *op,
+                right: Box::new(Self::rewrite_expr_replace_aggregates(right, aggr_exprs, group_by)),
+            },
+            LogicalExpr::UnaryExpr { op, expr: inner } => LogicalExpr::UnaryExpr {
+                op: *op,
+                expr: Box::new(Self::rewrite_expr_replace_aggregates(inner, aggr_exprs, group_by)),
+            },
+            LogicalExpr::Cast { expr: inner, data_type } => LogicalExpr::Cast {
+                expr: Box::new(Self::rewrite_expr_replace_aggregates(inner, aggr_exprs, group_by)),
+                data_type: data_type.clone(),
+            },
+            LogicalExpr::Case {
+                expr: base,
+                when_then,
+                else_result,
+            } => LogicalExpr::Case {
+                expr: base
+                    .as_ref()
+                    .map(|e| Box::new(Self::rewrite_expr_replace_aggregates(e, aggr_exprs, group_by))),
+                when_then: when_then
+                    .iter()
+                    .map(|(w, t)| {
                         (
                             Self::rewrite_expr_replace_aggregates(w, aggr_exprs, group_by),
                             Self::rewrite_expr_replace_aggregates(t, aggr_exprs, group_by),
                         )
-                    }).collect(),
-                    else_result: else_result.as_ref().map(|e| Box::new(Self::rewrite_expr_replace_aggregates(e, aggr_exprs, group_by))),
-                }
-            }
-            LogicalExpr::IsNull { expr: inner, is_null } => {
-                LogicalExpr::IsNull {
-                    expr: Box::new(Self::rewrite_expr_replace_aggregates(inner, aggr_exprs, group_by)),
-                    is_null: *is_null,
-                }
-            }
-            LogicalExpr::Between { expr: inner, low, high, negated } => {
-                LogicalExpr::Between {
-                    expr: Box::new(Self::rewrite_expr_replace_aggregates(inner, aggr_exprs, group_by)),
-                    low: Box::new(Self::rewrite_expr_replace_aggregates(low, aggr_exprs, group_by)),
-                    high: Box::new(Self::rewrite_expr_replace_aggregates(high, aggr_exprs, group_by)),
-                    negated: *negated,
-                }
-            }
-            LogicalExpr::InList { expr: inner, list, negated } => {
-                LogicalExpr::InList {
-                    expr: Box::new(Self::rewrite_expr_replace_aggregates(inner, aggr_exprs, group_by)),
-                    list: list.iter().map(|e| Self::rewrite_expr_replace_aggregates(e, aggr_exprs, group_by)).collect(),
-                    negated: *negated,
-                }
-            }
-            LogicalExpr::ScalarFunction { fun, args } => {
-                LogicalExpr::ScalarFunction {
-                    fun: fun.clone(),
-                    args: args.iter().map(|a| Self::rewrite_expr_replace_aggregates(a, aggr_exprs, group_by)).collect(),
-                }
-            }
+                    })
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| Box::new(Self::rewrite_expr_replace_aggregates(e, aggr_exprs, group_by))),
+            },
+            LogicalExpr::IsNull { expr: inner, is_null } => LogicalExpr::IsNull {
+                expr: Box::new(Self::rewrite_expr_replace_aggregates(inner, aggr_exprs, group_by)),
+                is_null: *is_null,
+            },
+            LogicalExpr::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => LogicalExpr::Between {
+                expr: Box::new(Self::rewrite_expr_replace_aggregates(inner, aggr_exprs, group_by)),
+                low: Box::new(Self::rewrite_expr_replace_aggregates(low, aggr_exprs, group_by)),
+                high: Box::new(Self::rewrite_expr_replace_aggregates(high, aggr_exprs, group_by)),
+                negated: *negated,
+            },
+            LogicalExpr::InList {
+                expr: inner,
+                list,
+                negated,
+            } => LogicalExpr::InList {
+                expr: Box::new(Self::rewrite_expr_replace_aggregates(inner, aggr_exprs, group_by)),
+                list: list
+                    .iter()
+                    .map(|e| Self::rewrite_expr_replace_aggregates(e, aggr_exprs, group_by))
+                    .collect(),
+                negated: *negated,
+            },
+            LogicalExpr::ScalarFunction { fun, args } => LogicalExpr::ScalarFunction {
+                fun: fun.clone(),
+                args: args
+                    .iter()
+                    .map(|a| Self::rewrite_expr_replace_aggregates(a, aggr_exprs, group_by))
+                    .collect(),
+            },
             _ => expr.clone(),
         }
     }
@@ -2206,7 +2293,9 @@ impl<'a> Planner<'a> {
                     // Extract args and distinct from FunctionArguments enum
                     let (args, distinct) = match &func.args {
                         sqlparser::ast::FunctionArguments::List(arg_list) => {
-                            let args: Result<Vec<_>> = arg_list.args.iter()
+                            let args: Result<Vec<_>> = arg_list
+                                .args
+                                .iter()
                                 .map(|arg| {
                                     match arg {
                                         sqlparser::ast::FunctionArg::Unnamed(func_arg_expr) => {
@@ -2218,25 +2307,23 @@ impl<'a> Planner<'a> {
                                                     // COUNT(*) uses Wildcard
                                                     Ok(LogicalExpr::Wildcard)
                                                 }
-                                                _ => Err(Error::query_execution("Complex function args not supported"))
+                                                _ => Err(Error::query_execution("Complex function args not supported")),
                                             }
                                         }
-                                        _ => Err(Error::query_execution("Named function args not supported"))
+                                        _ => Err(Error::query_execution("Named function args not supported")),
                                     }
                                 })
                                 .collect();
-                            let distinct = matches!(arg_list.duplicate_treatment,
-                                Some(sqlparser::ast::DuplicateTreatment::Distinct));
+                            let distinct = matches!(
+                                arg_list.duplicate_treatment,
+                                Some(sqlparser::ast::DuplicateTreatment::Distinct)
+                            );
                             (args?, distinct)
                         }
                         _ => (vec![], false),
                     };
 
-                    Ok(Some(LogicalExpr::AggregateFunction {
-                        fun,
-                        args,
-                        distinct,
-                    }))
+                    Ok(Some(LogicalExpr::AggregateFunction { fun, args, distinct }))
                 } else {
                     Ok(None)
                 }
@@ -2250,19 +2337,15 @@ impl<'a> Planner<'a> {
         // Extract args from function
         let args = match &func.args {
             sqlparser::ast::FunctionArguments::List(arg_list) => {
-                let parsed_args: Result<Vec<_>> = arg_list.args.iter()
-                    .map(|arg| {
-                        match arg {
-                            sqlparser::ast::FunctionArg::Unnamed(func_arg_expr) => {
-                                match func_arg_expr {
-                                    sqlparser::ast::FunctionArgExpr::Expr(expr) => {
-                                        self.expr_to_logical(&expr)
-                                    }
-                                    _ => Err(Error::query_execution("STRING_AGG requires value expressions"))
-                                }
-                            }
-                            _ => Err(Error::query_execution("Named function args not supported"))
-                        }
+                let parsed_args: Result<Vec<_>> = arg_list
+                    .args
+                    .iter()
+                    .map(|arg| match arg {
+                        sqlparser::ast::FunctionArg::Unnamed(func_arg_expr) => match func_arg_expr {
+                            sqlparser::ast::FunctionArgExpr::Expr(expr) => self.expr_to_logical(&expr),
+                            _ => Err(Error::query_execution("STRING_AGG requires value expressions")),
+                        },
+                        _ => Err(Error::query_execution("Named function args not supported")),
                     })
                     .collect();
                 parsed_args?
@@ -2271,11 +2354,14 @@ impl<'a> Planner<'a> {
         };
 
         if args.len() != 2 {
-            return Err(Error::query_execution("STRING_AGG requires exactly 2 arguments: value and delimiter"));
+            return Err(Error::query_execution(
+                "STRING_AGG requires exactly 2 arguments: value and delimiter",
+            ));
         }
 
         // Extract delimiter from second argument (must be a literal string)
-        let delimiter_arg = args.get(1)
+        let delimiter_arg = args
+            .get(1)
             .ok_or_else(|| Error::query_execution("STRING_AGG requires a delimiter argument"))?;
         let delimiter = match delimiter_arg {
             LogicalExpr::Literal(crate::Value::String(s)) => s.clone(),
@@ -2284,12 +2370,16 @@ impl<'a> Planner<'a> {
 
         let distinct = match &func.args {
             sqlparser::ast::FunctionArguments::List(arg_list) => {
-                matches!(arg_list.duplicate_treatment, Some(sqlparser::ast::DuplicateTreatment::Distinct))
+                matches!(
+                    arg_list.duplicate_treatment,
+                    Some(sqlparser::ast::DuplicateTreatment::Distinct)
+                )
             }
             _ => false,
         };
 
-        let value_expr = args.first()
+        let value_expr = args
+            .first()
             .ok_or_else(|| Error::query_execution("STRING_AGG requires a value argument"))?;
         Ok(Some(LogicalExpr::AggregateFunction {
             fun: AggregateFunction::StringAgg { delimiter },
@@ -2300,7 +2390,7 @@ impl<'a> Planner<'a> {
 
     /// Parse a window function expression
     fn parse_window_function(&self, func: &sqlparser::ast::Function) -> Result<LogicalExpr> {
-        use super::logical_plan::{WindowFunctionType, WindowFrame, WindowFrameType};
+        use super::logical_plan::{WindowFrame, WindowFrameType, WindowFunctionType};
 
         let func_name = func.name.to_string().to_uppercase();
 
@@ -2323,37 +2413,35 @@ impl<'a> Planner<'a> {
             "AVG" => WindowFunctionType::Aggregate(AggregateFunction::Avg),
             "MIN" => WindowFunctionType::Aggregate(AggregateFunction::Min),
             "MAX" => WindowFunctionType::Aggregate(AggregateFunction::Max),
-            _ => return Err(Error::query_execution(format!(
-                "Unknown window function: {}", func_name
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "Unknown window function: {}",
+                    func_name
+                )))
+            }
         };
 
         // Parse function arguments
         let args = match &func.args {
-            sqlparser::ast::FunctionArguments::List(arg_list) => {
-                arg_list.args.iter()
-                    .filter_map(|arg| {
-                        match arg {
-                            sqlparser::ast::FunctionArg::Unnamed(func_arg_expr) => {
-                                match func_arg_expr {
-                                    sqlparser::ast::FunctionArgExpr::Expr(expr) => {
-                                        self.expr_to_logical(expr).ok()
-                                    }
-                                    _ => None
-                                }
-                            }
-                            _ => None
-                        }
-                    })
-                    .collect()
-            }
+            sqlparser::ast::FunctionArguments::List(arg_list) => arg_list
+                .args
+                .iter()
+                .filter_map(|arg| match arg {
+                    sqlparser::ast::FunctionArg::Unnamed(func_arg_expr) => match func_arg_expr {
+                        sqlparser::ast::FunctionArgExpr::Expr(expr) => self.expr_to_logical(expr).ok(),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect(),
             _ => vec![],
         };
 
         // Parse OVER clause
-        let over = func.over.as_ref().ok_or_else(|| {
-            Error::query_execution("Window function requires OVER clause")
-        })?;
+        let over = func
+            .over
+            .as_ref()
+            .ok_or_else(|| Error::query_execution("Window function requires OVER clause"))?;
 
         // Resolve the window specification: either inline or from a named window reference
         let resolved_spec: Option<sqlparser::ast::WindowSpec>;
@@ -2361,25 +2449,25 @@ impl<'a> Planner<'a> {
             sqlparser::ast::WindowType::WindowSpec(spec) => spec,
             sqlparser::ast::WindowType::NamedWindow(name) => {
                 resolved_spec = Some(
-                    self.get_named_window(&name.value).ok_or_else(|| {
-                        Error::query_execution(format!(
-                            "Window \"{}\" is not defined",
-                            name.value
-                        ))
-                    })?,
+                    self.get_named_window(&name.value)
+                        .ok_or_else(|| Error::query_execution(format!("Window \"{}\" is not defined", name.value)))?,
                 );
-                resolved_spec.as_ref().ok_or_else(|| {
-                    Error::query_execution("Internal error resolving named window")
-                })?
+                resolved_spec
+                    .as_ref()
+                    .ok_or_else(|| Error::query_execution("Internal error resolving named window"))?
             }
         };
 
         // Parse window specification fields from the resolved spec
-        let partition_by: Vec<LogicalExpr> = spec_ref.partition_by.iter()
+        let partition_by: Vec<LogicalExpr> = spec_ref
+            .partition_by
+            .iter()
             .filter_map(|expr| self.expr_to_logical(expr).ok())
             .collect();
 
-        let order_by: Vec<(LogicalExpr, bool)> = spec_ref.order_by.iter()
+        let order_by: Vec<(LogicalExpr, bool)> = spec_ref
+            .order_by
+            .iter()
             .filter_map(|order_expr| {
                 self.expr_to_logical(&order_expr.expr).ok().map(|expr| {
                     let ascending = order_expr.asc.unwrap_or(true);
@@ -2398,11 +2486,7 @@ impl<'a> Planner<'a> {
             let start = Self::parse_frame_bound(&wf.start_bound);
             let end = wf.end_bound.as_ref().map(Self::parse_frame_bound);
 
-            WindowFrame {
-                frame_type,
-                start,
-                end,
-            }
+            WindowFrame { frame_type, start, end }
         });
 
         Ok(LogicalExpr::WindowFunction {
@@ -2443,7 +2527,11 @@ impl<'a> Planner<'a> {
     ///
     /// This method converts a sqlparser AST expression to a LogicalExpr that can be
     /// evaluated by the evaluator. Used by CHECK constraint validation.
-    pub fn convert_expr_to_logical(&self, expr: &sqlparser::ast::Expr, _schema: Option<&crate::Schema>) -> Result<LogicalExpr> {
+    pub fn convert_expr_to_logical(
+        &self,
+        expr: &sqlparser::ast::Expr,
+        _schema: Option<&crate::Schema>,
+    ) -> Result<LogicalExpr> {
         self.expr_to_logical(expr)
     }
 
@@ -2457,18 +2545,26 @@ impl<'a> Planner<'a> {
     fn literal_array_to_list(&self, expr: &Expr) -> Result<Vec<LogicalExpr>> {
         use sqlparser::ast::{Expr as SqlExpr, Value as SqlValue};
         let (inner_str, elem_type) = match expr {
-            SqlExpr::Cast { expr: inner, data_type, .. } => {
+            SqlExpr::Cast {
+                expr: inner, data_type, ..
+            } => {
                 let s = match inner.as_ref() {
-                    SqlExpr::Value(SqlValue::SingleQuotedString(s)) => s.clone(),
-                    _ => return Err(Error::query_execution(format!(
-                        "ANY(array): only literal-array cast supported, got {:?}", inner
-                    ))),
+                    SqlExpr::Value(SqlValue::SingleQuotedString(s)) => Self::repair_sqlparser_string(s),
+                    _ => {
+                        return Err(Error::query_execution(format!(
+                            "ANY(array): only literal-array cast supported, got {:?}",
+                            inner
+                        )))
+                    }
                 };
                 (s, data_type.clone())
             }
-            _ => return Err(Error::query_execution(format!(
-                "ANY(array): only literal-array cast supported, got {:?}", expr
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "ANY(array): only literal-array cast supported, got {:?}",
+                    expr
+                )))
+            }
         };
         // PG array literal syntax: `{a,b,c}` (curly-brace separated).
         let stripped = inner_str.trim_matches(|c: char| c == '{' || c == '}');
@@ -2478,7 +2574,8 @@ impl<'a> Planner<'a> {
         // string-equality semantics will at least cover identical
         // textual comparisons.
         let is_regtype = format!("{:?}", elem_type).to_uppercase().contains("REGTYPE");
-        let items: Vec<LogicalExpr> = labels.into_iter()
+        let items: Vec<LogicalExpr> = labels
+            .into_iter()
             .map(|s| {
                 if is_regtype {
                     let oid = regtype_label_to_oid(s);
@@ -2503,12 +2600,14 @@ impl<'a> Planner<'a> {
                 if idents.len() >= 2 {
                     // SAFETY: len() >= 2 guarantees len()-2 is valid
                     let table_alias = Self::normalize_ident(
-                        idents.get(idents.len() - 2)
-                            .ok_or_else(|| Error::query_execution("Invalid compound identifier"))?
+                        idents
+                            .get(idents.len() - 2)
+                            .ok_or_else(|| Error::query_execution("Invalid compound identifier"))?,
                     );
                     let column_name = Self::normalize_ident(
-                        idents.last()
-                            .ok_or_else(|| Error::query_execution("Empty compound identifier"))?
+                        idents
+                            .last()
+                            .ok_or_else(|| Error::query_execution("Empty compound identifier"))?,
                     );
                     Ok(LogicalExpr::Column {
                         table: Some(table_alias),
@@ -2516,8 +2615,9 @@ impl<'a> Planner<'a> {
                     })
                 } else {
                     let column_name = Self::normalize_ident(
-                        idents.last()
-                            .ok_or_else(|| Error::query_execution("Empty compound identifier"))?
+                        idents
+                            .last()
+                            .ok_or_else(|| Error::query_execution("Empty compound identifier"))?,
                     );
                     Ok(LogicalExpr::Column {
                         table: None,
@@ -2533,15 +2633,16 @@ impl<'a> Planner<'a> {
                         // PostgreSQL-style parameter: $1, $2, etc.
                         if placeholder.starts_with('$') {
                             let index_str = placeholder.get(1..).unwrap_or_default();
-                            let index = index_str.parse::<usize>()
-                                .map_err(|_| Error::query_execution(format!(
+                            let index = index_str.parse::<usize>().map_err(|_| {
+                                Error::query_execution(format!(
                                     "Invalid parameter placeholder: {}. Expected format: $1, $2, etc.",
                                     placeholder
-                                )))?;
+                                ))
+                            })?;
 
                             if index == 0 {
                                 return Err(Error::query_execution(
-                                    "Parameter indices must be 1-based (e.g., $1, $2)"
+                                    "Parameter indices must be 1-based (e.g., $1, $2)",
                                 ));
                             }
 
@@ -2602,7 +2703,21 @@ impl<'a> Planner<'a> {
                 is_null: false,
             }),
 
-            Expr::Like { negated, expr, pattern, .. } => {
+            Expr::IsDistinctFrom(left, right) => Ok(LogicalExpr::BinaryExpr {
+                left: Box::new(self.expr_to_logical(left)?),
+                op: BinaryOperator::IsDistinctFrom,
+                right: Box::new(self.expr_to_logical(right)?),
+            }),
+
+            Expr::IsNotDistinctFrom(left, right) => Ok(LogicalExpr::BinaryExpr {
+                left: Box::new(self.expr_to_logical(left)?),
+                op: BinaryOperator::IsNotDistinctFrom,
+                right: Box::new(self.expr_to_logical(right)?),
+            }),
+
+            Expr::Like {
+                negated, expr, pattern, ..
+            } => {
                 let left_expr = self.expr_to_logical(expr)?;
                 let right_expr = self.expr_to_logical(pattern)?;
                 let op = if *negated {
@@ -2618,7 +2733,9 @@ impl<'a> Planner<'a> {
                 })
             }
 
-            Expr::ILike { negated, expr, pattern, .. } => {
+            Expr::ILike {
+                negated, expr, pattern, ..
+            } => {
                 let left_expr = self.expr_to_logical(expr)?;
                 let right_expr = self.expr_to_logical(pattern)?;
                 let op = if *negated {
@@ -2634,7 +2751,9 @@ impl<'a> Planner<'a> {
                 })
             }
 
-            Expr::SimilarTo { negated, expr, pattern, .. } => {
+            Expr::SimilarTo {
+                negated, expr, pattern, ..
+            } => {
                 let left_expr = self.expr_to_logical(expr)?;
                 let right_expr = self.expr_to_logical(pattern)?;
                 let op = if *negated {
@@ -2650,7 +2769,9 @@ impl<'a> Planner<'a> {
                 })
             }
 
-            Expr::RLike { negated, expr, pattern, .. } => {
+            Expr::RLike {
+                negated, expr, pattern, ..
+            } => {
                 // RLike is MySQL's regex syntax
                 let left_expr = self.expr_to_logical(expr)?;
                 let right_expr = self.expr_to_logical(pattern)?;
@@ -2681,19 +2802,15 @@ impl<'a> Planner<'a> {
                 // Otherwise treat as scalar function
                 let args = match &func.args {
                     sqlparser::ast::FunctionArguments::List(arg_list) => {
-                        let args: Result<Vec<_>> = arg_list.args.iter()
-                            .map(|arg| {
-                                match arg {
-                                    sqlparser::ast::FunctionArg::Unnamed(func_arg_expr) => {
-                                        match func_arg_expr {
-                                            sqlparser::ast::FunctionArgExpr::Expr(expr) => {
-                                                self.expr_to_logical(&expr)
-                                            }
-                                            _ => Err(Error::query_execution("Complex function args not supported"))
-                                        }
-                                    }
-                                    _ => Err(Error::query_execution("Named function args not supported"))
-                                }
+                        let args: Result<Vec<_>> = arg_list
+                            .args
+                            .iter()
+                            .map(|arg| match arg {
+                                sqlparser::ast::FunctionArg::Unnamed(func_arg_expr) => match func_arg_expr {
+                                    sqlparser::ast::FunctionArgExpr::Expr(expr) => self.expr_to_logical(&expr),
+                                    _ => Err(Error::query_execution("Complex function args not supported")),
+                                },
+                                _ => Err(Error::query_execution("Named function args not supported")),
                             })
                             .collect();
                         args?
@@ -2710,7 +2827,9 @@ impl<'a> Planner<'a> {
             // Array literals: ARRAY[1, 2, 3] or '[1.0, 2.0, 3.0]' (for vectors)
             Expr::Array(sqlparser::ast::Array { elem, .. }) => {
                 // Check if all elements are numeric - could be vector or array
-                let all_numeric = elem.iter().all(|e| matches!(e, Expr::Value(sqlparser::ast::Value::Number(_, _))));
+                let all_numeric = elem
+                    .iter()
+                    .all(|e| matches!(e, Expr::Value(sqlparser::ast::Value::Number(_, _))));
                 let has_floats = elem.iter().any(|e| {
                     if let Expr::Value(sqlparser::ast::Value::Number(n, _)) = e {
                         n.contains('.')
@@ -2721,43 +2840,36 @@ impl<'a> Planner<'a> {
 
                 // If all floats, treat as vector for vector search compatibility
                 if all_numeric && has_floats {
-                    let elements: Result<Vec<f32>> = elem.iter()
-                        .map(|e| {
-                            match e {
-                                Expr::Value(sqlparser::ast::Value::Number(n, _)) => {
-                                    n.parse::<f32>()
-                                        .map_err(|e| Error::query_execution(format!("Invalid vector element: {}", e)))
-                                }
-                                _ => Err(Error::query_execution("Vector elements must be numbers"))
-                            }
+                    let elements: Result<Vec<f32>> = elem
+                        .iter()
+                        .map(|e| match e {
+                            Expr::Value(sqlparser::ast::Value::Number(n, _)) => n
+                                .parse::<f32>()
+                                .map_err(|e| Error::query_execution(format!("Invalid vector element: {}", e))),
+                            _ => Err(Error::query_execution("Vector elements must be numbers")),
                         })
                         .collect();
                     Ok(LogicalExpr::Literal(Value::Vector(elements?)))
                 } else {
                     // General array - convert each element to a Value
-                    let elements: Result<Vec<Value>> = elem.iter()
-                        .map(|e| {
-                            match e {
-                                Expr::Value(sqlparser::ast::Value::Number(n, _)) => {
-                                    if let Ok(i) = n.parse::<i32>() {
-                                        Ok(Value::Int4(i))
-                                    } else if let Ok(f) = n.parse::<f64>() {
-                                        Ok(Value::Float8(f))
-                                    } else {
-                                        Err(Error::query_execution(format!("Invalid array element: {}", n)))
-                                    }
+                    let elements: Result<Vec<Value>> = elem
+                        .iter()
+                        .map(|e| match e {
+                            Expr::Value(sqlparser::ast::Value::Number(n, _)) => {
+                                if let Ok(i) = n.parse::<i32>() {
+                                    Ok(Value::Int4(i))
+                                } else if let Ok(f) = n.parse::<f64>() {
+                                    Ok(Value::Float8(f))
+                                } else {
+                                    Err(Error::query_execution(format!("Invalid array element: {}", n)))
                                 }
-                                Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
-                                    Ok(Value::String(s.clone()))
-                                }
-                                Expr::Value(sqlparser::ast::Value::Boolean(b)) => {
-                                    Ok(Value::Boolean(*b))
-                                }
-                                Expr::Value(sqlparser::ast::Value::Null) => {
-                                    Ok(Value::Null)
-                                }
-                                _ => Err(Error::query_execution("Unsupported array element type"))
                             }
+                            Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
+                                Ok(Value::String(Self::repair_sqlparser_string(s)))
+                            }
+                            Expr::Value(sqlparser::ast::Value::Boolean(b)) => Ok(Value::Boolean(*b)),
+                            Expr::Value(sqlparser::ast::Value::Null) => Ok(Value::Null),
+                            _ => Err(Error::query_execution("Unsupported array element type")),
                         })
                         .collect();
                     Ok(LogicalExpr::Literal(Value::Array(elements?)))
@@ -2775,33 +2887,27 @@ impl<'a> Planner<'a> {
                 // planner.rs:3591 enforces it for column types).
                 let target_type = match (data_type, expr.as_ref()) {
                     (sqlparser::ast::DataType::Custom(name, modifiers), inner)
-                        if modifiers.is_empty()
-                            && name.to_string().eq_ignore_ascii_case("vector") =>
+                        if modifiers.is_empty() && name.to_string().eq_ignore_ascii_case("vector") =>
                     {
-                        if let sqlparser::ast::Expr::Value(
-                            sqlparser::ast::Value::SingleQuotedString(s)
-                        ) = inner
-                        {
+                        if let sqlparser::ast::Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) = inner {
                             // Infer dimension by counting elements of the literal.
                             let trimmed = s.trim();
-                            let inner_str = trimmed
-                                .trim_start_matches('[').trim_end_matches(']');
-                            let count = inner_str.split(',')
-                                .map(str::trim)
-                                .filter(|t| !t.is_empty())
-                                .count();
+                            let inner_str = trimmed.trim_start_matches('[').trim_end_matches(']');
+                            let count = inner_str.split(',').map(str::trim).filter(|t| !t.is_empty()).count();
                             if count > 0 {
                                 DataType::Vector(count)
                             } else {
                                 return Err(Error::query_execution(
                                     "bare ::vector cast requires a non-empty literal to infer dimension; \
-                                     use ::vector(N) for parameter or column-typed sources".to_string()
+                                     use ::vector(N) for parameter or column-typed sources"
+                                        .to_string(),
                                 ));
                             }
                         } else {
                             return Err(Error::query_execution(
                                 "bare ::vector cast can only infer dimension from a literal string; \
-                                 use ::vector(N) explicitly otherwise".to_string()
+                                 use ::vector(N) explicitly otherwise"
+                                    .to_string(),
                             ));
                         }
                     }
@@ -2839,7 +2945,12 @@ impl<'a> Planner<'a> {
             // a column or subquery still errors via the catch-all
             // (the executor would need true array support to handle
             // those, which is a bigger lift).
-            Expr::AnyOp { left, compare_op, right, is_some: _ } => {
+            Expr::AnyOp {
+                left,
+                compare_op,
+                right,
+                is_some: _,
+            } => {
                 use sqlparser::ast::BinaryOperator;
                 let negated = matches!(compare_op, BinaryOperator::NotEq);
                 // KanttBan #23 phase 2.11: when the array is a literal
@@ -2879,11 +2990,17 @@ impl<'a> Planner<'a> {
             // `materialize_subqueries`.
             Expr::Subquery(subquery) => {
                 let plan = self.query_to_plan((**subquery).clone())?;
-                Ok(LogicalExpr::ScalarSubquery { subquery: Box::new(plan) })
+                Ok(LogicalExpr::ScalarSubquery {
+                    subquery: Box::new(plan),
+                })
             }
 
             // IN subquery: expr IN (SELECT ...)
-            Expr::InSubquery { expr, subquery, negated } => {
+            Expr::InSubquery {
+                expr,
+                subquery,
+                negated,
+            } => {
                 // Convert subquery to a logical plan (dereference Box and clone Query)
                 let subquery_plan = self.query_to_plan((**subquery).clone())?;
                 let logical_expr = self.expr_to_logical(expr)?;
@@ -2904,17 +3021,25 @@ impl<'a> Planner<'a> {
             }
 
             // BETWEEN: expr BETWEEN low AND high
-            Expr::Between { expr, negated, low, high } => {
-                Ok(LogicalExpr::Between {
-                    expr: Box::new(self.expr_to_logical(expr)?),
-                    low: Box::new(self.expr_to_logical(low)?),
-                    high: Box::new(self.expr_to_logical(high)?),
-                    negated: *negated,
-                })
-            }
+            Expr::Between {
+                expr,
+                negated,
+                low,
+                high,
+            } => Ok(LogicalExpr::Between {
+                expr: Box::new(self.expr_to_logical(expr)?),
+                low: Box::new(self.expr_to_logical(low)?),
+                high: Box::new(self.expr_to_logical(high)?),
+                negated: *negated,
+            }),
 
             // CASE expression
-            Expr::Case { operand, conditions, results, else_result } => {
+            Expr::Case {
+                operand,
+                conditions,
+                results,
+                else_result,
+            } => {
                 // Convert operand (if present)
                 let expr = if let Some(op) = operand {
                     Some(Box::new(self.expr_to_logical(op)?))
@@ -2923,11 +3048,10 @@ impl<'a> Planner<'a> {
                 };
 
                 // Convert WHEN conditions and THEN results
-                let when_then: Vec<(LogicalExpr, LogicalExpr)> = conditions.iter()
+                let when_then: Vec<(LogicalExpr, LogicalExpr)> = conditions
+                    .iter()
                     .zip(results.iter())
-                    .map(|(cond, res)| {
-                        Ok((self.expr_to_logical(cond)?, self.expr_to_logical(res)?))
-                    })
+                    .map(|(cond, res)| Ok((self.expr_to_logical(cond)?, self.expr_to_logical(res)?)))
                     .collect::<Result<Vec<_>>>()?;
 
                 // Convert ELSE result (if present)
@@ -2982,7 +3106,12 @@ impl<'a> Planner<'a> {
             // - `SUBSTRING(s FROM x FOR y)` → `substr(s, x, y)`
             // - `SUBSTRING(s FROM x)`       → `substr(s, x)` (open-ended)
             // - `SUBSTRING(s FOR y)`        → `substr(s, 1, y)` (start at 1)
-            Expr::Substring { expr: inner, substring_from, substring_for, .. } => {
+            Expr::Substring {
+                expr: inner,
+                substring_from,
+                substring_for,
+                ..
+            } => {
                 let s = self.expr_to_logical(inner)?;
                 let mut args = vec![s];
                 match (substring_from, substring_for) {
@@ -3012,6 +3141,26 @@ impl<'a> Planner<'a> {
         }
     }
 
+    /// sqlparser currently returns non-ASCII string literals as UTF-8 bytes
+    /// widened through Latin-1 in some paths (for example `a—b` becomes
+    /// `aâ\u{80}\u{94}b`). Collapse that representation back to UTF-8 when
+    /// it is present, while leaving already-correct Unicode and plain ASCII
+    /// untouched.
+    fn repair_sqlparser_string(s: &str) -> String {
+        let mut bytes = Vec::with_capacity(s.len());
+        for ch in s.chars() {
+            let code = ch as u32;
+            if code > u8::MAX as u32 {
+                return s.to_string();
+            }
+            bytes.push(code as u8);
+        }
+        match String::from_utf8(bytes) {
+            Ok(decoded) if decoded != s => decoded,
+            _ => s.to_string(),
+        }
+    }
+
     /// Convert SQL value to internal Value
     fn sql_value_to_value(&self, value: &sqlparser::ast::Value) -> Result<Value> {
         match value {
@@ -3030,12 +3179,14 @@ impl<'a> Planner<'a> {
                     Err(Error::query_execution(format!("Invalid number: {}", n)))
                 }
             }
-            sqlparser::ast::Value::SingleQuotedString(s) => Ok(Value::String(s.clone())),
+            sqlparser::ast::Value::SingleQuotedString(s) => Ok(Value::String(Self::repair_sqlparser_string(s))),
             // Dollar-quoted strings: `$$hello$$` or `$tag$hello$tag$`. The
             // content is already safely delimited by the parser, so we
             // just lift it to a plain String value — the tag is
             // discarded.
-            sqlparser::ast::Value::DollarQuotedString(dqs) => Ok(Value::String(dqs.value.clone())),
+            sqlparser::ast::Value::DollarQuotedString(dqs) => {
+                Ok(Value::String(Self::repair_sqlparser_string(&dqs.value)))
+            }
             sqlparser::ast::Value::Boolean(b) => Ok(Value::Boolean(*b)),
             sqlparser::ast::Value::Null => Ok(Value::Null),
             _ => Err(Error::query_execution(format!(
@@ -3077,17 +3228,15 @@ impl<'a> Planner<'a> {
             // Postgres FTS match operator: tsvector @@ tsquery
             SqlBinaryOp::AtAt => Ok(BinaryOperator::TsMatch),
             // Vector similarity operators (pgvector compatible)
-            SqlBinaryOp::Custom(op_str) => {
-                match op_str.as_str() {
-                    "<->" => Ok(BinaryOperator::VectorL2Distance),
-                    "<=>" => Ok(BinaryOperator::VectorCosineDistance),
-                    "<#>" => Ok(BinaryOperator::VectorInnerProduct),
-                    _ => Err(Error::query_execution(format!(
-                        "Custom operator not supported: {}",
-                        op_str
-                    ))),
-                }
-            }
+            SqlBinaryOp::Custom(op_str) => match op_str.as_str() {
+                "<->" => Ok(BinaryOperator::VectorL2Distance),
+                "<=>" => Ok(BinaryOperator::VectorCosineDistance),
+                "<#>" => Ok(BinaryOperator::VectorInnerProduct),
+                _ => Err(Error::query_execution(format!(
+                    "Custom operator not supported: {}",
+                    op_str
+                ))),
+            },
             // LIKE is not a binary operator in sqlparser v0.53+, handle separately
             _ => Err(Error::query_execution(format!(
                 "Binary operator not yet supported: {:?}",
@@ -3126,7 +3275,9 @@ impl<'a> Planner<'a> {
                 Some(columns.iter().map(Self::normalize_ident).collect())
             };
 
-            let rows: Result<Vec<Vec<LogicalExpr>>> = values.rows.iter()
+            let rows: Result<Vec<Vec<LogicalExpr>>> = values
+                .rows
+                .iter()
                 .map(|row| {
                     row.iter()
                         .map(|expr| {
@@ -3175,7 +3326,8 @@ impl<'a> Planner<'a> {
                 if source_col_count != cols.len() {
                     return Err(Error::query_execution(format!(
                         "INSERT ... SELECT column count mismatch: {} target columns but SELECT returns {} columns",
-                        cols.len(), source_col_count
+                        cols.len(),
+                        source_col_count
                     )));
                 }
             } else if let Some(catalog) = self.catalog {
@@ -3214,7 +3366,8 @@ impl<'a> Planner<'a> {
             std::collections::HashMap::new()
         };
 
-        let mut column_defs: Vec<_> = columns.iter()
+        let mut column_defs: Vec<_> = columns
+            .iter()
             .map(|col| self.sql_column_def_to_column_def(col))
             .collect::<Result<Vec<_>>>()?;
 
@@ -3226,7 +3379,8 @@ impl<'a> Planner<'a> {
         }
 
         // Convert sqlparser constraints to our TableConstraint type
-        let mut constraints: Vec<_> = sql_constraints.iter()
+        let mut constraints: Vec<_> = sql_constraints
+            .iter()
             .filter_map(|c| self.convert_table_constraint(c, &name))
             .collect();
 
@@ -3239,7 +3393,7 @@ impl<'a> Planner<'a> {
                         referred_columns,
                         on_delete,
                         on_update,
-                        ..
+                        characteristics,
                     } => {
                         // Normalize the referenced table / columns (B36).
                         // See the matching comment on the table-level FK
@@ -3253,6 +3407,7 @@ impl<'a> Planner<'a> {
                             on_update: on_update.as_ref().map(|a| convert_referential_action(a)),
                             deferrable: false,
                             initially_deferred: false,
+                            enforcement: convert_constraint_enforcement(characteristics.as_ref()),
                         };
                         constraints.push(fk_constraint);
                     }
@@ -3283,8 +3438,7 @@ impl<'a> Planner<'a> {
             for col in &columns {
                 if let SqlDataType::Custom(object_name, _) = &col.data_type {
                     let raw_name = object_name.to_string();
-                    let lookup_name = Self::dealias_schema(&raw_name)
-                        .unwrap_or(raw_name);
+                    let lookup_name = Self::dealias_schema(&raw_name).unwrap_or(raw_name);
                     if let Some(labels) = catalog.get_enum_labels(&lookup_name)? {
                         let col_name = Self::normalize_ident(&col.name);
                         let expression = LogicalExpr::InList {
@@ -3298,10 +3452,7 @@ impl<'a> Planner<'a> {
                                 .collect(),
                             negated: false,
                         };
-                        constraints.push(TableConstraint::Check {
-                            name: None,
-                            expression,
-                        });
+                        constraints.push(TableConstraint::Check { name: None, expression });
                     }
                 }
             }
@@ -3313,7 +3464,10 @@ impl<'a> Planner<'a> {
         for constraint in &constraints {
             if let TableConstraint::PrimaryKey { columns: pk_cols, .. } = constraint {
                 for pk_col_name in pk_cols {
-                    if let Some(col_def) = column_defs.iter_mut().find(|c| c.name.eq_ignore_ascii_case(pk_col_name)) {
+                    if let Some(col_def) = column_defs
+                        .iter_mut()
+                        .find(|c| c.name.eq_ignore_ascii_case(pk_col_name))
+                    {
                         col_def.primary_key = true;
                         // Don't override not_null if already set to false by SERIAL detection
                         // (SERIAL columns must stay nullable for auto-fill: INSERT NULL → row_id)
@@ -3330,7 +3484,10 @@ impl<'a> Planner<'a> {
             if let TableConstraint::Unique { columns: uq_cols, .. } = constraint {
                 if uq_cols.len() == 1 {
                     if let Some(uq_col_name) = uq_cols.first() {
-                        if let Some(col_def) = column_defs.iter_mut().find(|c| c.name.eq_ignore_ascii_case(uq_col_name)) {
+                        if let Some(col_def) = column_defs
+                            .iter_mut()
+                            .find(|c| c.name.eq_ignore_ascii_case(uq_col_name))
+                        {
                             col_def.unique = true;
                         }
                     }
@@ -3355,18 +3512,14 @@ impl<'a> Planner<'a> {
         use sqlparser::ast::TableConstraint as SqlTC;
 
         match constraint {
-            SqlTC::PrimaryKey { name, columns, .. } => {
-                Some(TableConstraint::PrimaryKey {
-                    name: name.as_ref().map(|n| n.to_string()),
-                    columns: columns.iter().map(|c| c.to_string()).collect(),
-                })
-            }
-            SqlTC::Unique { name, columns, .. } => {
-                Some(TableConstraint::Unique {
-                    name: name.as_ref().map(|n| n.to_string()),
-                    columns: columns.iter().map(|c| c.to_string()).collect(),
-                })
-            }
+            SqlTC::PrimaryKey { name, columns, .. } => Some(TableConstraint::PrimaryKey {
+                name: name.as_ref().map(|n| n.to_string()),
+                columns: columns.iter().map(|c| c.to_string()).collect(),
+            }),
+            SqlTC::Unique { name, columns, .. } => Some(TableConstraint::Unique {
+                name: name.as_ref().map(|n| n.to_string()),
+                columns: columns.iter().map(|c| c.to_string()).collect(),
+            }),
             SqlTC::ForeignKey {
                 name,
                 columns,
@@ -3379,8 +3532,16 @@ impl<'a> Planner<'a> {
                 // Convert characteristics to deferrable/initially_deferred
                 let (deferrable, initially_deferred) = characteristics
                     .as_ref()
-                    .map(|c| (c.deferrable.unwrap_or(false), c.initially.map(|i| matches!(i, sqlparser::ast::DeferrableInitial::Deferred)).unwrap_or(false)))
+                    .map(|c| {
+                        (
+                            c.deferrable.unwrap_or(false),
+                            c.initially
+                                .map(|i| matches!(i, sqlparser::ast::DeferrableInitial::Deferred))
+                                .unwrap_or(false),
+                        )
+                    })
                     .unwrap_or((false, false));
+                let enforcement = convert_constraint_enforcement(characteristics.as_ref());
 
                 Some(TableConstraint::ForeignKey {
                     name: name.as_ref().map(|n| n.to_string()),
@@ -3398,6 +3559,7 @@ impl<'a> Planner<'a> {
                     on_update: on_update.as_ref().map(|a| convert_referential_action(a)),
                     deferrable,
                     initially_deferred,
+                    enforcement,
                 })
             }
             SqlTC::Check { name, expr } => {
@@ -3422,14 +3584,14 @@ impl<'a> Planner<'a> {
     ) -> Result<LogicalPlan> {
         // Check if operations are empty
         if operations.is_empty() {
-            return Err(Error::query_execution(
-                "ALTER TABLE requires an operation"
-            ));
+            return Err(Error::query_execution("ALTER TABLE requires an operation"));
         }
 
         // Single operation: return directly (no wrapper needed)
         if operations.len() == 1 {
-            let operation = operations.into_iter().next()
+            let operation = operations
+                .into_iter()
+                .next()
                 .ok_or_else(|| Error::query_execution("ALTER TABLE requires an operation"))?;
             return self.alter_table_single_op_to_plan(table_name, operation);
         }
@@ -3451,7 +3613,11 @@ impl<'a> Planner<'a> {
         use sqlparser::ast::AlterTableOperation;
 
         match operation {
-            AlterTableOperation::AddColumn { column_def, if_not_exists, .. } => {
+            AlterTableOperation::AddColumn {
+                column_def,
+                if_not_exists,
+                ..
+            } => {
                 let col_def = self.sql_column_def_to_column_def(&column_def)?;
                 Ok(LogicalPlan::AlterTableAddColumn {
                     table_name,
@@ -3459,27 +3625,28 @@ impl<'a> Planner<'a> {
                     if_not_exists,
                 })
             }
-            AlterTableOperation::DropColumn { column_name, if_exists, cascade } => {
-                Ok(LogicalPlan::AlterTableDropColumn {
-                    table_name,
-                    column_name: column_name.value,
-                    if_exists,
-                    cascade,
-                })
-            }
-            AlterTableOperation::RenameColumn { old_column_name, new_column_name } => {
-                Ok(LogicalPlan::AlterTableRenameColumn {
-                    table_name,
-                    old_column_name: old_column_name.value,
-                    new_column_name: new_column_name.value,
-                })
-            }
-            AlterTableOperation::RenameTable { table_name: new_name } => {
-                Ok(LogicalPlan::AlterTableRename {
-                    table_name,
-                    new_table_name: new_name.to_string(),
-                })
-            }
+            AlterTableOperation::DropColumn {
+                column_name,
+                if_exists,
+                cascade,
+            } => Ok(LogicalPlan::AlterTableDropColumn {
+                table_name,
+                column_name: column_name.value,
+                if_exists,
+                cascade,
+            }),
+            AlterTableOperation::RenameColumn {
+                old_column_name,
+                new_column_name,
+            } => Ok(LogicalPlan::AlterTableRenameColumn {
+                table_name,
+                old_column_name: old_column_name.value,
+                new_column_name: new_column_name.value,
+            }),
+            AlterTableOperation::RenameTable { table_name: new_name } => Ok(LogicalPlan::AlterTableRename {
+                table_name,
+                new_table_name: new_name.to_string(),
+            }),
             // ALTER TABLE … ADD CONSTRAINT … FOREIGN KEY (KanttBan #5
             // against v3.27.0). drizzle-kit / Prisma / Flyway / Liquibase
             // all emit FKs as a separate ALTER TABLE step at the end of
@@ -3499,13 +3666,16 @@ impl<'a> Planner<'a> {
             }) => {
                 let (deferrable, initially_deferred) = characteristics
                     .as_ref()
-                    .map(|c| (
-                        c.deferrable.unwrap_or(false),
-                        c.initially.map(|i| matches!(
-                            i, sqlparser::ast::DeferrableInitial::Deferred
-                        )).unwrap_or(false),
-                    ))
+                    .map(|c| {
+                        (
+                            c.deferrable.unwrap_or(false),
+                            c.initially
+                                .map(|i| matches!(i, sqlparser::ast::DeferrableInitial::Deferred))
+                                .unwrap_or(false),
+                        )
+                    })
                     .unwrap_or((false, false));
+                let enforcement = convert_constraint_enforcement(characteristics.as_ref());
                 Ok(LogicalPlan::AlterTableAddForeignKey {
                     table_name,
                     constraint_name: name.as_ref().map(|n| n.to_string()),
@@ -3516,6 +3686,7 @@ impl<'a> Planner<'a> {
                     on_update: on_update.as_ref().map(convert_referential_action),
                     deferrable,
                     initially_deferred,
+                    enforcement,
                 })
             }
             _ => Err(Error::query_execution(format!(
@@ -3530,10 +3701,10 @@ impl<'a> Planner<'a> {
 
         // Detect SERIAL/BIGSERIAL/SMALLSERIAL types (parsed as Custom)
         let is_serial = matches!(&col.data_type, SqlDataType::Custom(name, _)
-            if {
-                let n = name.to_string().to_uppercase();
-                n == "SERIAL" || n == "BIGSERIAL" || n == "SMALLSERIAL"
-            });
+        if {
+            let n = name.to_string().to_uppercase();
+            n == "SERIAL" || n == "BIGSERIAL" || n == "SMALLSERIAL"
+        });
 
         let mut not_null = false;
         let mut primary_key = false;
@@ -3559,8 +3730,7 @@ impl<'a> Planner<'a> {
                     default = Some(self.expr_to_logical(expr)?);
                 }
                 ColumnOption::Generated {
-                    generated_as: sqlparser::ast::GeneratedAs::Always
-                        | sqlparser::ast::GeneratedAs::ByDefault,
+                    generated_as: sqlparser::ast::GeneratedAs::Always | sqlparser::ast::GeneratedAs::ByDefault,
                     ..
                 } => {
                     is_identity = true;
@@ -3595,8 +3765,8 @@ impl<'a> Planner<'a> {
             SqlDataType::SmallInt(_) | SqlDataType::Int2(_) => Ok(DataType::Int2),
             SqlDataType::Int(_) | SqlDataType::Integer(_) | SqlDataType::Int4(_) => Ok(DataType::Int4),
             SqlDataType::BigInt(_) | SqlDataType::Int8(_) => Ok(DataType::Int8),
-            SqlDataType::Real => Ok(DataType::Float4),  // REAL is Float4 in PostgreSQL
-            SqlDataType::Float(_) => Ok(DataType::Float8),  // FLOAT(n) defaults to Float8
+            SqlDataType::Real => Ok(DataType::Float4), // REAL is Float4 in PostgreSQL
+            SqlDataType::Float(_) => Ok(DataType::Float8), // FLOAT(n) defaults to Float8
             SqlDataType::Float4 => Ok(DataType::Float4),
             SqlDataType::Float8 | SqlDataType::DoublePrecision => Ok(DataType::Float8),
             SqlDataType::Varchar(char_len) => {
@@ -3627,12 +3797,16 @@ impl<'a> Planner<'a> {
                     "SERIAL" => Ok(DataType::Int4),      // SERIAL is Int4 with auto-increment
                     "BIGSERIAL" => Ok(DataType::Int8),   // BIGSERIAL is Int8 with auto-increment
                     "SMALLSERIAL" => Ok(DataType::Int2), // SMALLSERIAL is Int2 with auto-increment
-                    "VECTOR" => {
-                        // Parse dimension from type modifiers: VECTOR(1536)
+                    "VECTOR" | "VECTOR_F16" | "VECTOR_I8" | "VECTOR_I16" | "HALFVEC" => {
+                        // Parse dimension from type modifiers: VECTOR(1536).
+                        // Multi-precision aliases are accepted as schema-level
+                        // compatibility; current row values remain f32 vectors.
                         if type_modifiers.len() == 1 {
-                            let modifier = type_modifiers.first()
+                            let modifier = type_modifiers
+                                .first()
                                 .ok_or_else(|| Error::query_execution("VECTOR type requires dimension"))?;
-                            let dimension = modifier.parse::<usize>()
+                            let dimension = modifier
+                                .parse::<usize>()
                                 .map_err(|e| Error::query_execution(format!("Invalid vector dimension: {}", e)))?;
                             return Ok(DataType::Vector(dimension));
                         }
@@ -3654,9 +3828,8 @@ impl<'a> Planner<'a> {
                     // works against the int OID. The current behaviour
                     // makes the CASE branch in drizzle's query fall
                     // through to format_type, which is what we want.
-                    "REGTYPE" | "REGCLASS" | "REGROLE" | "REGNAMESPACE"
-                    | "REGOPER" | "REGOPERATOR" | "REGPROC" | "REGPROCEDURE"
-                    | "REGCONFIG" | "REGDICTIONARY" => Ok(DataType::Text),
+                    "REGTYPE" | "REGCLASS" | "REGROLE" | "REGNAMESPACE" | "REGOPER" | "REGOPERATOR" | "REGPROC"
+                    | "REGPROCEDURE" | "REGCONFIG" | "REGDICTIONARY" => Ok(DataType::Text),
                     _ => {
                         // KanttBan #20 (v3.31.0): unknown custom type
                         // might be a user-defined enum. Check the
@@ -3668,8 +3841,7 @@ impl<'a> Planner<'a> {
                         // catalog lookup normalises before keying.
                         if let Some(catalog) = self.catalog {
                             let raw_name = object_name.to_string();
-                            let lookup_name = Self::dealias_schema(&raw_name)
-                                .unwrap_or(raw_name);
+                            let lookup_name = Self::dealias_schema(&raw_name).unwrap_or(raw_name);
                             if catalog.enum_type_exists(&lookup_name)? {
                                 return Ok(DataType::Text);
                             }
@@ -3728,7 +3900,8 @@ impl<'a> Planner<'a> {
     fn expr_to_limit_bound(&self, expr: &Expr) -> Result<(usize, Option<usize>)> {
         match expr {
             Expr::Value(sqlparser::ast::Value::Number(n, _)) => {
-                let v = n.parse::<usize>()
+                let v = n
+                    .parse::<usize>()
                     .map_err(|e| Error::query_execution(format!("Invalid number: {}", e)))?;
                 Ok((v, None))
             }
@@ -3751,9 +3924,7 @@ impl<'a> Planner<'a> {
             }
             Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
                 let v = s.parse::<usize>().map_err(|_| {
-                    Error::query_execution(format!(
-                        "LIMIT/OFFSET must be a number (got quoted value '{s}')"
-                    ))
+                    Error::query_execution(format!("LIMIT/OFFSET must be a number (got quoted value '{s}')"))
                 })?;
                 Ok((v, None))
             }
@@ -3779,10 +3950,18 @@ impl<'a> Planner<'a> {
         for expr in with_exprs {
             // Each expression should be a binary operation like "m = 16"
             let (name, value) = match expr {
-                Expr::BinaryOp { left, op: SqlBinaryOp::Eq, right } => {
+                Expr::BinaryOp {
+                    left,
+                    op: SqlBinaryOp::Eq,
+                    right,
+                } => {
                     let name = match left.as_ref() {
                         Expr::Identifier(ident) => ident.value.to_lowercase(),
-                        _ => return Err(Error::query_execution("Expected identifier on left side of WITH option")),
+                        _ => {
+                            return Err(Error::query_execution(
+                                "Expected identifier on left side of WITH option",
+                            ))
+                        }
                     };
                     (name, right.as_ref())
                 }
@@ -3797,10 +3976,12 @@ impl<'a> Planner<'a> {
                             "scalar" => QuantizationType::Scalar,
                             "product" => QuantizationType::Product,
                             "auto" => QuantizationType::Auto,
-                            _ => return Err(Error::query_execution(format!(
-                                "Invalid quantization type: {}. Expected 'none', 'scalar', 'product', or 'auto'",
-                                s
-                            ))),
+                            _ => {
+                                return Err(Error::query_execution(format!(
+                                    "Invalid quantization type: {}. Expected 'none', 'scalar', 'product', or 'auto'",
+                                    s
+                                )))
+                            }
                         };
                         options.push(IndexOption::Quantization(quant_type));
                     } else {
@@ -3809,7 +3990,8 @@ impl<'a> Planner<'a> {
                 }
                 "pq_subquantizers" => {
                     if let Expr::Value(sqlparser::ast::Value::Number(n, _)) = value {
-                        let count = n.parse::<usize>()
+                        let count = n
+                            .parse::<usize>()
                             .map_err(|_| Error::query_execution("Invalid pq_subquantizers value"))?;
                         options.push(IndexOption::PqSubquantizers(count));
                     } else {
@@ -3818,7 +4000,8 @@ impl<'a> Planner<'a> {
                 }
                 "pq_centroids" => {
                     if let Expr::Value(sqlparser::ast::Value::Number(n, _)) = value {
-                        let count = n.parse::<usize>()
+                        let count = n
+                            .parse::<usize>()
                             .map_err(|_| Error::query_execution("Invalid pq_centroids value"))?;
                         options.push(IndexOption::PqCentroids(count));
                     } else {
@@ -3827,7 +4010,8 @@ impl<'a> Planner<'a> {
                 }
                 "m" => {
                     if let Expr::Value(sqlparser::ast::Value::Number(n, _)) = value {
-                        let m_param = n.parse::<usize>()
+                        let m_param = n
+                            .parse::<usize>()
                             .map_err(|_| Error::query_execution("Invalid m value"))?;
                         options.push(IndexOption::HnswM(m_param));
                     } else {
@@ -3836,7 +4020,8 @@ impl<'a> Planner<'a> {
                 }
                 "ef_construction" => {
                     if let Expr::Value(sqlparser::ast::Value::Number(n, _)) = value {
-                        let ef = n.parse::<usize>()
+                        let ef = n
+                            .parse::<usize>()
                             .map_err(|_| Error::query_execution("Invalid ef_construction value"))?;
                         options.push(IndexOption::EfConstruction(ef));
                     } else {
@@ -3852,18 +4037,38 @@ impl<'a> Planner<'a> {
                 }
                 "shard_count" => {
                     if let Expr::Value(sqlparser::ast::Value::Number(n, _)) = value {
-                        let count = n.parse::<usize>()
+                        let count = n
+                            .parse::<usize>()
                             .map_err(|_| Error::query_execution("Invalid shard_count value"))?;
                         options.push(IndexOption::ShardCount(count));
                     } else {
                         return Err(Error::query_execution("shard_count must be a number"));
                     }
                 }
+                "persistent" => {
+                    let enabled = match value {
+                        Expr::Value(sqlparser::ast::Value::Boolean(b)) => *b,
+                        Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) => {
+                            matches!(s.to_ascii_lowercase().as_str(), "true" | "on" | "1" | "yes")
+                        }
+                        Expr::Value(sqlparser::ast::Value::Number(n, _)) => n == "1",
+                        _ => return Err(Error::query_execution("persistent must be a boolean")),
+                    };
+                    options.push(IndexOption::Persistent(enabled));
+                }
+                "rerank_precision" => {
+                    if let Expr::Value(sqlparser::ast::Value::SingleQuotedString(s)) = value {
+                        let lower = s.to_ascii_lowercase();
+                        if !matches!(lower.as_str(), "f32" | "f16" | "i8") {
+                            return Err(Error::query_execution("rerank_precision must be 'f32', 'f16', or 'i8'"));
+                        }
+                        options.push(IndexOption::RerankPrecision(lower));
+                    } else {
+                        return Err(Error::query_execution("rerank_precision must be a string"));
+                    }
+                }
                 _ => {
-                    return Err(Error::query_execution(format!(
-                        "Unknown CREATE INDEX option: {}",
-                        name
-                    )));
+                    return Err(Error::query_execution(format!("Unknown CREATE INDEX option: {}", name)));
                 }
             }
         }
@@ -3882,20 +4087,25 @@ impl<'a> Planner<'a> {
         // Get table name
         let table_name = match &table.relation {
             sqlparser::ast::TableFactor::Table { name, .. } => Self::normalize_object_name(name),
-            _ => return Err(Error::query_execution("Complex table expressions in UPDATE not supported")),
+            _ => {
+                return Err(Error::query_execution(
+                    "Complex table expressions in UPDATE not supported",
+                ))
+            }
         };
 
         // Convert assignments to (column_name, value_expr) pairs
-        let assignments: Result<Vec<_>> = assignments.iter()
+        let assignments: Result<Vec<_>> = assignments
+            .iter()
             .map(|assignment| {
                 // Extract column name from AssignmentTarget
                 let column_name = match &assignment.target {
-                    sqlparser::ast::AssignmentTarget::ColumnName(object_name) => {
-                        object_name.0.iter()
-                            .map(|ident| ident.value.clone())
-                            .collect::<Vec<_>>()
-                            .join(".")
-                    }
+                    sqlparser::ast::AssignmentTarget::ColumnName(object_name) => object_name
+                        .0
+                        .iter()
+                        .map(|ident| ident.value.clone())
+                        .collect::<Vec<_>>()
+                        .join("."),
                     _ => return Err(Error::query_execution("Complex assignment targets not supported")),
                 };
                 let value_expr = self.expr_to_logical(&assignment.value)?;
@@ -3920,12 +4130,11 @@ impl<'a> Planner<'a> {
 
     /// Convert RETURNING clause SelectItems to ReturningItems
     fn convert_returning(&self, items: &[sqlparser::ast::SelectItem]) -> Result<Vec<ReturningItem>> {
-        items.iter()
+        items
+            .iter()
             .map(|item| {
                 match item {
-                    sqlparser::ast::SelectItem::Wildcard(_) => {
-                        Ok(ReturningItem::Wildcard)
-                    }
+                    sqlparser::ast::SelectItem::Wildcard(_) => Ok(ReturningItem::Wildcard),
                     sqlparser::ast::SelectItem::UnnamedExpr(sqlparser::ast::Expr::Identifier(ident)) => {
                         Ok(ReturningItem::Column(Self::normalize_ident(ident)))
                     }
@@ -3933,11 +4142,17 @@ impl<'a> Planner<'a> {
                         // Expression without alias - generate alias from expression text
                         let logical_expr = self.expr_to_logical(expr)?;
                         let alias = format!("{expr}");
-                        Ok(ReturningItem::Expression { expr: logical_expr, alias })
+                        Ok(ReturningItem::Expression {
+                            expr: logical_expr,
+                            alias,
+                        })
                     }
                     sqlparser::ast::SelectItem::ExprWithAlias { expr, alias } => {
                         let logical_expr = self.expr_to_logical(expr)?;
-                        Ok(ReturningItem::Expression { expr: logical_expr, alias: alias.value.clone() })
+                        Ok(ReturningItem::Expression {
+                            expr: logical_expr,
+                            alias: alias.value.clone(),
+                        })
                     }
                     sqlparser::ast::SelectItem::QualifiedWildcard(name, _) => {
                         // table.* - treat as wildcard (single-table DML context)
@@ -3950,42 +4165,40 @@ impl<'a> Planner<'a> {
     }
 
     /// Convert ON CONFLICT clause from sqlparser AST to our internal representation
-    fn convert_on_conflict(
-        &self,
-        on_insert: &Option<sqlparser::ast::OnInsert>,
-    ) -> Result<Option<OnConflictAction>> {
+    fn convert_on_conflict(&self, on_insert: &Option<sqlparser::ast::OnInsert>) -> Result<Option<OnConflictAction>> {
         let on = match on_insert {
             Some(on) => on,
             None => return Ok(None),
         };
         match on {
-            sqlparser::ast::OnInsert::OnConflict(conflict) => {
-                match &conflict.action {
-                    sqlparser::ast::OnConflictAction::DoNothing => {
-                        Ok(Some(OnConflictAction::DoNothing))
-                    }
-                    sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
-                        let assignments = do_update.assignments.iter()
-                            .map(|a| {
-                                let col_name = a.target.to_string();
-                                let expr = self.expr_to_logical(&a.value)?;
-                                Ok((col_name, expr))
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        Ok(Some(OnConflictAction::DoUpdate { assignments }))
-                    }
+            sqlparser::ast::OnInsert::OnConflict(conflict) => match &conflict.action {
+                sqlparser::ast::OnConflictAction::DoNothing => Ok(Some(OnConflictAction::DoNothing)),
+                sqlparser::ast::OnConflictAction::DoUpdate(do_update) => {
+                    let assignments = do_update
+                        .assignments
+                        .iter()
+                        .map(|a| {
+                            let col_name = a.target.to_string();
+                            let expr = self.expr_to_logical(&a.value)?;
+                            Ok((col_name, expr))
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Some(OnConflictAction::DoUpdate { assignments }))
                 }
-            }
+            },
             sqlparser::ast::OnInsert::DuplicateKeyUpdate(assignments) => {
                 // MySQL ON DUPLICATE KEY UPDATE — convert to DoUpdate
-                let assign_pairs = assignments.iter()
+                let assign_pairs = assignments
+                    .iter()
                     .map(|a| {
                         let col_name = a.target.to_string();
                         let expr = self.expr_to_logical(&a.value)?;
                         Ok((col_name, expr))
                     })
                     .collect::<Result<Vec<_>>>()?;
-                Ok(Some(OnConflictAction::DoUpdate { assignments: assign_pairs }))
+                Ok(Some(OnConflictAction::DoUpdate {
+                    assignments: assign_pairs,
+                }))
             }
             _ => {
                 // Future OnInsert variants — unsupported for now
@@ -4004,7 +4217,11 @@ impl<'a> Planner<'a> {
         // Get table name
         let table_name = match &table.relation {
             sqlparser::ast::TableFactor::Table { name, .. } => Self::normalize_object_name(name),
-            _ => return Err(Error::query_execution("Complex table expressions in DELETE not supported")),
+            _ => {
+                return Err(Error::query_execution(
+                    "Complex table expressions in DELETE not supported",
+                ))
+            }
         };
 
         // Convert WHERE clause if present
@@ -4053,21 +4270,20 @@ impl<'a> Planner<'a> {
         };
 
         // Convert events
-        let trigger_events: Result<Vec<TriggerEvent>> = events.iter()
-            .map(|event| {
-                match event {
-                    SqlTriggerEvent::Insert => Ok(TriggerEvent::Insert),
-                    SqlTriggerEvent::Update(cols) => {
-                        let column_names = if cols.is_empty() {
-                            None
-                        } else {
-                            Some(cols.iter().map(|c| c.value.clone()).collect())
-                        };
-                        Ok(TriggerEvent::Update(column_names))
-                    }
-                    SqlTriggerEvent::Delete => Ok(TriggerEvent::Delete),
-                    SqlTriggerEvent::Truncate => Ok(TriggerEvent::Truncate),
+        let trigger_events: Result<Vec<TriggerEvent>> = events
+            .iter()
+            .map(|event| match event {
+                SqlTriggerEvent::Insert => Ok(TriggerEvent::Insert),
+                SqlTriggerEvent::Update(cols) => {
+                    let column_names = if cols.is_empty() {
+                        None
+                    } else {
+                        Some(cols.iter().map(|c| c.value.clone()).collect())
+                    };
+                    Ok(TriggerEvent::Update(column_names))
                 }
+                SqlTriggerEvent::Delete => Ok(TriggerEvent::Delete),
+                SqlTriggerEvent::Truncate => Ok(TriggerEvent::Truncate),
             })
             .collect();
 
@@ -4080,10 +4296,9 @@ impl<'a> Planner<'a> {
         // PostgreSQL compatibility: TRUNCATE triggers must be FOR EACH STATEMENT
         let trigger_events_ref = trigger_events.as_ref();
         if let Ok(events) = trigger_events_ref {
-            if events.iter().any(|e| matches!(e, TriggerEvent::Truncate))
-                && for_each == TriggerFor::Row {
+            if events.iter().any(|e| matches!(e, TriggerEvent::Truncate)) && for_each == TriggerFor::Row {
                 return Err(Error::query_execution(
-                    "TRUNCATE triggers do not support FOR EACH ROW - use FOR EACH STATEMENT"
+                    "TRUNCATE triggers do not support FOR EACH ROW - use FOR EACH STATEMENT",
                 ));
             }
         }
@@ -4106,7 +4321,8 @@ impl<'a> Planner<'a> {
         let from_constraint = referenced_table_name.map(|n| n.to_string());
 
         // Parse REFERENCING clause for transition tables
-        let transition_tables: Vec<TransitionTable> = referencing.iter()
+        let transition_tables: Vec<TransitionTable> = referencing
+            .iter()
             .map(|r| {
                 // TriggerReferencing has refer_type (OLD/NEW), is_table flag, and transition_relation_name
                 // transition_relation_name is an ObjectName - use it directly or provide default
@@ -4124,12 +4340,8 @@ impl<'a> Planner<'a> {
                 };
 
                 match r.refer_type {
-                    sqlparser::ast::TriggerReferencingType::OldTable => {
-                        TransitionTable::OldTable { alias }
-                    }
-                    sqlparser::ast::TriggerReferencingType::NewTable => {
-                        TransitionTable::NewTable { alias }
-                    }
+                    sqlparser::ast::TriggerReferencingType::OldTable => TransitionTable::OldTable { alias },
+                    sqlparser::ast::TriggerReferencingType::NewTable => TransitionTable::NewTable { alias },
                 }
             })
             .collect();
@@ -4137,7 +4349,7 @@ impl<'a> Planner<'a> {
         // Validate: REFERENCING only allowed for FOR EACH STATEMENT triggers
         if !transition_tables.is_empty() && for_each == TriggerFor::Row {
             return Err(Error::query_execution(
-                "REFERENCING clause only valid for FOR EACH STATEMENT triggers"
+                "REFERENCING clause only valid for FOR EACH STATEMENT triggers",
             ));
         }
 
@@ -4147,16 +4359,22 @@ impl<'a> Planner<'a> {
             for tt in &transition_tables {
                 match tt {
                     TransitionTable::OldTable { .. } => {
-                        if !events.iter().any(|e| matches!(e, TriggerEvent::Update(_) | TriggerEvent::Delete)) {
+                        if !events
+                            .iter()
+                            .any(|e| matches!(e, TriggerEvent::Update(_) | TriggerEvent::Delete))
+                        {
                             return Err(Error::query_execution(
-                                "OLD TABLE in REFERENCING clause requires UPDATE or DELETE trigger event"
+                                "OLD TABLE in REFERENCING clause requires UPDATE or DELETE trigger event",
                             ));
                         }
                     }
                     TransitionTable::NewTable { .. } => {
-                        if !events.iter().any(|e| matches!(e, TriggerEvent::Insert | TriggerEvent::Update(_))) {
+                        if !events
+                            .iter()
+                            .any(|e| matches!(e, TriggerEvent::Insert | TriggerEvent::Update(_)))
+                        {
                             return Err(Error::query_execution(
-                                "NEW TABLE in REFERENCING clause requires INSERT or UPDATE trigger event"
+                                "NEW TABLE in REFERENCING clause requires INSERT or UPDATE trigger event",
                             ));
                         }
                     }
@@ -4169,7 +4387,8 @@ impl<'a> Planner<'a> {
             .as_ref()
             .map(|c| {
                 let deferrable = c.deferrable.unwrap_or(false);
-                let initially_deferred = c.initially
+                let initially_deferred = c
+                    .initially
                     .map(|i| matches!(i, sqlparser::ast::DeferrableInitial::Deferred))
                     .unwrap_or(false);
                 TriggerCharacteristics {
@@ -4227,7 +4446,7 @@ impl<'a> Planner<'a> {
                 }
                 _ => {
                     return Err(Error::query_execution(
-                        "Only CASCADE and RESTRICT are supported for DROP TRIGGER"
+                        "Only CASCADE and RESTRICT are supported for DROP TRIGGER",
                     ));
                 }
             }
@@ -4267,7 +4486,7 @@ impl<'a> Planner<'a> {
         let mut opts = ExplainOptions {
             analyze,
             verbose,
-            costs: true, // PostgreSQL default
+            costs: true,     // PostgreSQL default
             timing: analyze, // Default on when ANALYZE is used
             ..ExplainOptions::default()
         };
@@ -4285,7 +4504,9 @@ impl<'a> Planner<'a> {
         if let Some(options) = utility_options {
             for option in options {
                 let name = option.name.value.to_uppercase();
-                let value = option.arg.as_ref()
+                let value = option
+                    .arg
+                    .as_ref()
                     .map(|v| v.to_string().to_uppercase())
                     .unwrap_or_else(|| "TRUE".to_string());
                 let is_true = value == "TRUE" || value == "ON" || value == "1";
@@ -4371,7 +4592,8 @@ mod tests {
     #[test]
     fn test_select_to_plan() {
         let parser = Parser::new();
-        let statement = parser.parse_one("SELECT id, name FROM users WHERE id = 1")
+        let statement = parser
+            .parse_one("SELECT id, name FROM users WHERE id = 1")
             .expect("Failed to parse SQL statement");
 
         let planner = Planner::new();
@@ -4382,9 +4604,9 @@ mod tests {
     #[test]
     fn test_insert_to_plan() {
         let parser = Parser::new();
-        let statement = parser.parse_one(
-            "INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com')"
-        ).expect("Failed to parse SQL statement");
+        let statement = parser
+            .parse_one("INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com')")
+            .expect("Failed to parse SQL statement");
 
         let planner = Planner::new();
         let plan = planner.statement_to_plan(statement);
@@ -4394,9 +4616,9 @@ mod tests {
     #[test]
     fn test_create_table_to_plan() {
         let parser = Parser::new();
-        let statement = parser.parse_one(
-            "CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT NOT NULL)"
-        ).expect("Failed to parse SQL statement");
+        let statement = parser
+            .parse_one("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT NOT NULL)")
+            .expect("Failed to parse SQL statement");
 
         let planner = Planner::new();
         let plan = planner.statement_to_plan(statement);
@@ -4409,15 +4631,27 @@ mod tests {
     #[test]
     fn test_create_trigger_after_insert() {
         let parser = Parser::new();
-        let statement = parser.parse_one(
-            "CREATE TRIGGER audit_insert AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION audit_log()"
-        ).expect("Failed to parse CREATE TRIGGER statement");
+        let statement = parser
+            .parse_one("CREATE TRIGGER audit_insert AFTER INSERT ON users FOR EACH ROW EXECUTE FUNCTION audit_log()")
+            .expect("Failed to parse CREATE TRIGGER statement");
 
         let planner = Planner::new();
         let plan = planner.statement_to_plan(statement);
-        assert!(plan.is_ok(), "Failed to convert CREATE TRIGGER to plan: {:?}", plan.err());
+        assert!(
+            plan.is_ok(),
+            "Failed to convert CREATE TRIGGER to plan: {:?}",
+            plan.err()
+        );
 
-        if let Ok(LogicalPlan::CreateTrigger { name, table_name, timing, events, for_each, .. }) = plan {
+        if let Ok(LogicalPlan::CreateTrigger {
+            name,
+            table_name,
+            timing,
+            events,
+            for_each,
+            ..
+        }) = plan
+        {
             assert_eq!(name, "audit_insert");
             assert_eq!(table_name, "users");
             assert_eq!(timing, TriggerTiming::After);
@@ -4438,15 +4672,26 @@ mod tests {
 
         let planner = Planner::new();
         let plan = planner.statement_to_plan(statement);
-        assert!(plan.is_ok(), "Failed to convert CREATE TRIGGER to plan: {:?}", plan.err());
+        assert!(
+            plan.is_ok(),
+            "Failed to convert CREATE TRIGGER to plan: {:?}",
+            plan.err()
+        );
 
-        if let Ok(LogicalPlan::CreateTrigger { name, table_name, timing, events, .. }) = plan {
+        if let Ok(LogicalPlan::CreateTrigger {
+            name,
+            table_name,
+            timing,
+            events,
+            ..
+        }) = plan
+        {
             assert_eq!(name, "update_timestamp");
             assert_eq!(table_name, "products");
             assert_eq!(timing, TriggerTiming::Before);
             assert_eq!(events.len(), 1);
             match &events[0] {
-                TriggerEvent::Update(None) => {},
+                TriggerEvent::Update(None) => {}
                 _ => panic!("Expected UPDATE event without column list"),
             }
         } else {
@@ -4463,7 +4708,11 @@ mod tests {
 
         let planner = Planner::new();
         let plan = planner.statement_to_plan(statement);
-        assert!(plan.is_ok(), "Failed to convert CREATE TRIGGER to plan: {:?}", plan.err());
+        assert!(
+            plan.is_ok(),
+            "Failed to convert CREATE TRIGGER to plan: {:?}",
+            plan.err()
+        );
 
         if let Ok(LogicalPlan::CreateTrigger { name, events, .. }) = plan {
             assert_eq!(name, "track_price_change");
@@ -4490,7 +4739,11 @@ mod tests {
 
         let planner = Planner::new();
         let plan = planner.statement_to_plan(statement);
-        assert!(plan.is_ok(), "Failed to convert CREATE TRIGGER to plan: {:?}", plan.err());
+        assert!(
+            plan.is_ok(),
+            "Failed to convert CREATE TRIGGER to plan: {:?}",
+            plan.err()
+        );
 
         if let Ok(LogicalPlan::CreateTrigger { timing, events, .. }) = plan {
             assert_eq!(timing, TriggerTiming::InsteadOf);
@@ -4509,7 +4762,11 @@ mod tests {
 
         let planner = Planner::new();
         let plan = planner.statement_to_plan(statement);
-        assert!(plan.is_ok(), "Failed to convert CREATE TRIGGER to plan: {:?}", plan.err());
+        assert!(
+            plan.is_ok(),
+            "Failed to convert CREATE TRIGGER to plan: {:?}",
+            plan.err()
+        );
 
         if let Ok(LogicalPlan::CreateTrigger { for_each, .. }) = plan {
             assert_eq!(for_each, TriggerFor::Statement);
@@ -4527,9 +4784,16 @@ mod tests {
 
         let planner = Planner::new();
         let plan = planner.statement_to_plan(statement);
-        assert!(plan.is_ok(), "Failed to convert CREATE OR REPLACE TRIGGER to plan: {:?}", plan.err());
+        assert!(
+            plan.is_ok(),
+            "Failed to convert CREATE OR REPLACE TRIGGER to plan: {:?}",
+            plan.err()
+        );
 
-        if let Ok(LogicalPlan::CreateTrigger { name, if_not_exists, .. }) = plan {
+        if let Ok(LogicalPlan::CreateTrigger {
+            name, if_not_exists, ..
+        }) = plan
+        {
             assert_eq!(name, "replace_audit");
             assert!(if_not_exists); // OR REPLACE treated as if_not_exists
         } else {
@@ -4546,7 +4810,11 @@ mod tests {
 
         let planner = Planner::new();
         let plan = planner.statement_to_plan(statement);
-        assert!(plan.is_ok(), "Failed to convert CREATE TRIGGER with multiple events to plan: {:?}", plan.err());
+        assert!(
+            plan.is_ok(),
+            "Failed to convert CREATE TRIGGER with multiple events to plan: {:?}",
+            plan.err()
+        );
 
         if let Ok(LogicalPlan::CreateTrigger { events, .. }) = plan {
             assert_eq!(events.len(), 3);
@@ -4561,15 +4829,20 @@ mod tests {
     #[test]
     fn test_drop_trigger() {
         let parser = Parser::new();
-        let statement = parser.parse_one(
-            "DROP TRIGGER audit_insert ON users"
-        ).expect("Failed to parse DROP TRIGGER statement");
+        let statement = parser
+            .parse_one("DROP TRIGGER audit_insert ON users")
+            .expect("Failed to parse DROP TRIGGER statement");
 
         let planner = Planner::new();
         let plan = planner.statement_to_plan(statement);
         assert!(plan.is_ok(), "Failed to convert DROP TRIGGER to plan: {:?}", plan.err());
 
-        if let Ok(LogicalPlan::DropTrigger { name, table_name, if_exists }) = plan {
+        if let Ok(LogicalPlan::DropTrigger {
+            name,
+            table_name,
+            if_exists,
+        }) = plan
+        {
             assert_eq!(name, "audit_insert");
             assert_eq!(table_name, Some("users".to_string()));
             assert!(!if_exists);
@@ -4581,15 +4854,24 @@ mod tests {
     #[test]
     fn test_drop_trigger_if_exists() {
         let parser = Parser::new();
-        let statement = parser.parse_one(
-            "DROP TRIGGER IF EXISTS old_trigger ON products"
-        ).expect("Failed to parse DROP TRIGGER IF EXISTS statement");
+        let statement = parser
+            .parse_one("DROP TRIGGER IF EXISTS old_trigger ON products")
+            .expect("Failed to parse DROP TRIGGER IF EXISTS statement");
 
         let planner = Planner::new();
         let plan = planner.statement_to_plan(statement);
-        assert!(plan.is_ok(), "Failed to convert DROP TRIGGER IF EXISTS to plan: {:?}", plan.err());
+        assert!(
+            plan.is_ok(),
+            "Failed to convert DROP TRIGGER IF EXISTS to plan: {:?}",
+            plan.err()
+        );
 
-        if let Ok(LogicalPlan::DropTrigger { name, table_name, if_exists }) = plan {
+        if let Ok(LogicalPlan::DropTrigger {
+            name,
+            table_name,
+            if_exists,
+        }) = plan
+        {
             assert_eq!(name, "old_trigger");
             assert_eq!(table_name, Some("products".to_string()));
             assert!(if_exists);
@@ -4601,13 +4883,17 @@ mod tests {
     #[test]
     fn test_drop_trigger_cascade() {
         let parser = Parser::new();
-        let statement = parser.parse_one(
-            "DROP TRIGGER legacy_trigger ON orders CASCADE"
-        ).expect("Failed to parse DROP TRIGGER CASCADE statement");
+        let statement = parser
+            .parse_one("DROP TRIGGER legacy_trigger ON orders CASCADE")
+            .expect("Failed to parse DROP TRIGGER CASCADE statement");
 
         let planner = Planner::new();
         let plan = planner.statement_to_plan(statement);
-        assert!(plan.is_ok(), "Failed to convert DROP TRIGGER CASCADE to plan: {:?}", plan.err());
+        assert!(
+            plan.is_ok(),
+            "Failed to convert DROP TRIGGER CASCADE to plan: {:?}",
+            plan.err()
+        );
 
         if let Ok(LogicalPlan::DropTrigger { name, .. }) = plan {
             assert_eq!(name, "legacy_trigger");

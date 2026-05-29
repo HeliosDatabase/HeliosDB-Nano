@@ -9,7 +9,7 @@
 
 #![allow(unused_variables)]
 
-use crate::{Result, Error};
+use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 
 /// Interactive tuning session
@@ -152,10 +152,13 @@ impl InteractiveQueryTuner {
 
     /// Create a new tuning session
     pub fn create_session(&self, query: String) -> Result<TuningSession> {
-        let session_id = format!("session_{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| Error::query_execution(format!("System time error: {}", e)))?
-            .as_secs());
+        let session_id = format!(
+            "session_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| Error::query_execution(format!("System time error: {}", e)))?
+                .as_secs()
+        );
 
         let initial_snapshot = PerformanceSnapshot {
             timestamp: std::time::SystemTime::now()
@@ -260,26 +263,30 @@ impl InteractiveQueryTuner {
     }
 
     /// Apply a modification to a session
-    pub fn apply_modification(
-        &self,
-        session: &mut TuningSession,
-        modification_id: u32,
-    ) -> Result<PerformanceSnapshot> {
+    pub fn apply_modification(&self, session: &mut TuningSession, modification_id: u32) -> Result<PerformanceSnapshot> {
         // Find the modification
-        let mod_idx = session.modifications.iter()
+        let mod_idx = session
+            .modifications
+            .iter()
             .position(|m| m.modification_id == modification_id)
             .ok_or_else(|| Error::Storage("Modification not found".to_string()))?;
 
         // Mark as applied
-        session.modifications.get_mut(mod_idx)
+        session
+            .modifications
+            .get_mut(mod_idx)
             .ok_or_else(|| Error::Storage("Modification index out of bounds".to_string()))?
             .applied = true;
 
         // Calculate new performance
-        let impact = &session.modifications.get(mod_idx)
+        let impact = &session
+            .modifications
+            .get(mod_idx)
             .ok_or_else(|| Error::Storage("Modification index out of bounds".to_string()))?
             .impact;
-        let last_snapshot = session.performance_history.last()
+        let last_snapshot = session
+            .performance_history
+            .last()
             .ok_or_else(|| Error::Storage("No performance history".to_string()))?;
 
         let new_snapshot = PerformanceSnapshot {
@@ -299,27 +306,32 @@ impl InteractiveQueryTuner {
     }
 
     /// Rollback a modification
-    pub fn rollback_modification(
-        &self,
-        session: &mut TuningSession,
-        modification_id: u32,
-    ) -> Result<()> {
-        let mod_idx = session.modifications.iter()
+    pub fn rollback_modification(&self, session: &mut TuningSession, modification_id: u32) -> Result<()> {
+        let mod_idx = session
+            .modifications
+            .iter()
             .position(|m| m.modification_id == modification_id)
             .ok_or_else(|| Error::Storage("Modification not found".to_string()))?;
 
-        if !session.modifications.get(mod_idx)
+        if !session
+            .modifications
+            .get(mod_idx)
             .ok_or_else(|| Error::Storage("Modification index out of bounds".to_string()))?
-            .can_rollback {
+            .can_rollback
+        {
             return Err(Error::Storage("Modification cannot be rolled back".to_string()));
         }
 
-        session.modifications.get_mut(mod_idx)
+        session
+            .modifications
+            .get_mut(mod_idx)
             .ok_or_else(|| Error::Storage("Modification index out of bounds".to_string()))?
             .applied = false;
 
         // Remove the performance snapshot for this modification
-        session.performance_history.retain(|s| s.query_version != format!("mod_{}", modification_id));
+        session
+            .performance_history
+            .retain(|s| s.query_version != format!("mod_{}", modification_id));
 
         Ok(())
     }
@@ -400,11 +412,7 @@ impl InteractiveQueryTuner {
     }
 
     /// Compare before and after optimization
-    pub fn compare_before_after(
-        &self,
-        original: &str,
-        optimized: &str,
-    ) -> Result<BeforeAfterComparison> {
+    pub fn compare_before_after(&self, original: &str, optimized: &str) -> Result<BeforeAfterComparison> {
         let original_metrics = PerformanceMetrics {
             cost: 1000.0,
             estimated_time_ms: 250.0,
@@ -432,25 +440,29 @@ impl InteractiveQueryTuner {
                 metric_name: "Time".to_string(),
                 before_value: original_metrics.estimated_time_ms,
                 after_value: optimized_metrics.estimated_time_ms,
-                improvement_percent: ((original_metrics.estimated_time_ms - optimized_metrics.estimated_time_ms) / original_metrics.estimated_time_ms) * 100.0,
+                improvement_percent: ((original_metrics.estimated_time_ms - optimized_metrics.estimated_time_ms)
+                    / original_metrics.estimated_time_ms)
+                    * 100.0,
             },
             Improvement {
                 metric_name: "CPU".to_string(),
                 before_value: original_metrics.cpu_usage_percent,
                 after_value: optimized_metrics.cpu_usage_percent,
-                improvement_percent: ((original_metrics.cpu_usage_percent - optimized_metrics.cpu_usage_percent) / original_metrics.cpu_usage_percent) * 100.0,
+                improvement_percent: ((original_metrics.cpu_usage_percent - optimized_metrics.cpu_usage_percent)
+                    / original_metrics.cpu_usage_percent)
+                    * 100.0,
             },
             Improvement {
                 metric_name: "I/O".to_string(),
                 before_value: original_metrics.io_operations as f64,
                 after_value: optimized_metrics.io_operations as f64,
-                improvement_percent: ((original_metrics.io_operations - optimized_metrics.io_operations) as f64 / original_metrics.io_operations as f64) * 100.0,
+                improvement_percent: ((original_metrics.io_operations - optimized_metrics.io_operations) as f64
+                    / original_metrics.io_operations as f64)
+                    * 100.0,
             },
         ];
 
-        let overall_score = improvements.iter()
-            .map(|i| i.improvement_percent)
-            .sum::<f64>() / improvements.len() as f64;
+        let overall_score = improvements.iter().map(|i| i.improvement_percent).sum::<f64>() / improvements.len() as f64;
 
         Ok(BeforeAfterComparison {
             original_query: original.to_string(),
@@ -479,11 +491,13 @@ impl InteractiveQueryTuner {
             output.push_str("───────────────────────────────────────────────────────────────\n\n");
 
             for snapshot in &session.performance_history {
-                output.push_str(&format!("• {} - Cost: {:.2}, Time: {:.2}ms, Quality: {:.0}/100\n",
+                output.push_str(&format!(
+                    "• {} - Cost: {:.2}, Time: {:.2}ms, Quality: {:.0}/100\n",
                     snapshot.query_version,
                     snapshot.estimated_cost,
                     snapshot.estimated_time_ms,
-                    snapshot.plan_quality_score));
+                    snapshot.plan_quality_score
+                ));
             }
             output.push_str("\n");
         }
@@ -494,14 +508,20 @@ impl InteractiveQueryTuner {
             output.push_str("───────────────────────────────────────────────────────────────\n\n");
 
             for mod_item in &session.modifications {
-                output.push_str(&format!("{}. {} - {}\n",
+                output.push_str(&format!(
+                    "{}. {} - {}\n",
                     mod_item.modification_id,
-                    if mod_item.applied { "✓ Applied" } else { "○ Available" },
-                    mod_item.description));
-                output.push_str(&format!("   Speedup: {:.1}x, Cost Change: {:.0}%, Risk: {:?}\n",
-                    mod_item.impact.estimated_speedup,
-                    mod_item.impact.cost_change_percent,
-                    mod_item.impact.risk_level));
+                    if mod_item.applied {
+                        "✓ Applied"
+                    } else {
+                        "○ Available"
+                    },
+                    mod_item.description
+                ));
+                output.push_str(&format!(
+                    "   Speedup: {:.1}x, Cost Change: {:.0}%, Risk: {:?}\n",
+                    mod_item.impact.estimated_speedup, mod_item.impact.cost_change_percent, mod_item.impact.risk_level
+                ));
                 output.push_str("\n");
             }
         }
@@ -516,7 +536,10 @@ impl InteractiveQueryTuner {
         let mut output = String::new();
 
         output.push_str("═══════════════════════════════════════════════════════════════\n");
-        output.push_str(&format!("         WHAT-IF SCENARIO: {}                    \n", scenario.scenario_name));
+        output.push_str(&format!(
+            "         WHAT-IF SCENARIO: {}                    \n",
+            scenario.scenario_name
+        ));
         output.push_str("═══════════════════════════════════════════════════════════════\n\n");
 
         output.push_str(&format!("Description: {}\n\n", scenario.description));
@@ -531,27 +554,36 @@ impl InteractiveQueryTuner {
         output.push_str("  BEFORE → AFTER\n");
         output.push_str("───────────────────────────────────────────────────────────────\n\n");
 
-        output.push_str(&format!("Cost:        {:.2} → {:.2} ({:.0}% improvement)\n",
+        output.push_str(&format!(
+            "Cost:        {:.2} → {:.2} ({:.0}% improvement)\n",
             scenario.before.cost,
             scenario.after.cost,
-            ((scenario.before.cost - scenario.after.cost) / scenario.before.cost) * 100.0));
+            ((scenario.before.cost - scenario.after.cost) / scenario.before.cost) * 100.0
+        ));
 
-        output.push_str(&format!("Time:        {:.2}ms → {:.2}ms ({:.0}% faster)\n",
+        output.push_str(&format!(
+            "Time:        {:.2}ms → {:.2}ms ({:.0}% faster)\n",
             scenario.before.estimated_time_ms,
             scenario.after.estimated_time_ms,
-            ((scenario.before.estimated_time_ms - scenario.after.estimated_time_ms) / scenario.before.estimated_time_ms) * 100.0));
+            ((scenario.before.estimated_time_ms - scenario.after.estimated_time_ms)
+                / scenario.before.estimated_time_ms)
+                * 100.0
+        ));
 
-        output.push_str(&format!("CPU:         {:.0}% → {:.0}%\n",
-            scenario.before.cpu_usage_percent,
-            scenario.after.cpu_usage_percent));
+        output.push_str(&format!(
+            "CPU:         {:.0}% → {:.0}%\n",
+            scenario.before.cpu_usage_percent, scenario.after.cpu_usage_percent
+        ));
 
-        output.push_str(&format!("I/O Ops:     {} → {}\n",
-            scenario.before.io_operations,
-            scenario.after.io_operations));
+        output.push_str(&format!(
+            "I/O Ops:     {} → {}\n",
+            scenario.before.io_operations, scenario.after.io_operations
+        ));
 
-        output.push_str(&format!("Memory:      {:.0} MB → {:.0} MB\n\n",
-            scenario.before.memory_mb,
-            scenario.after.memory_mb));
+        output.push_str(&format!(
+            "Memory:      {:.0} MB → {:.0} MB\n\n",
+            scenario.before.memory_mb, scenario.after.memory_mb
+        ));
 
         output.push_str(&format!("Recommendation: {}\n", scenario.recommendation));
 
@@ -579,14 +611,19 @@ impl InteractiveQueryTuner {
         output.push_str("───────────────────────────────────────────────────────────────\n\n");
 
         for improvement in &comparison.improvements {
-            output.push_str(&format!("{}: {:.2} → {:.2} ({:.0}% improvement)\n",
+            output.push_str(&format!(
+                "{}: {:.2} → {:.2} ({:.0}% improvement)\n",
                 improvement.metric_name,
                 improvement.before_value,
                 improvement.after_value,
-                improvement.improvement_percent));
+                improvement.improvement_percent
+            ));
         }
 
-        output.push_str(&format!("\nOverall Score: {:.0}% improvement\n", comparison.overall_score));
+        output.push_str(&format!(
+            "\nOverall Score: {:.0}% improvement\n",
+            comparison.overall_score
+        ));
 
         output.push_str("\n═══════════════════════════════════════════════════════════════\n");
 
@@ -618,7 +655,9 @@ mod tests {
     #[test]
     fn test_suggest_optimizations() {
         let tuner = InteractiveQueryTuner::new();
-        let session = tuner.create_session("SELECT * FROM users WHERE email = 'test'".to_string()).unwrap();
+        let session = tuner
+            .create_session("SELECT * FROM users WHERE email = 'test'".to_string())
+            .unwrap();
         let suggestions = tuner.suggest_optimizations(&session).unwrap();
 
         assert!(!suggestions.is_empty());
@@ -671,10 +710,12 @@ mod tests {
     #[test]
     fn test_before_after_comparison() {
         let tuner = InteractiveQueryTuner::new();
-        let comparison = tuner.compare_before_after(
-            "SELECT * FROM users",
-            "SELECT id, name FROM users WHERE id IN (SELECT DISTINCT user_id FROM orders)",
-        ).unwrap();
+        let comparison = tuner
+            .compare_before_after(
+                "SELECT * FROM users",
+                "SELECT id, name FROM users WHERE id IN (SELECT DISTINCT user_id FROM orders)",
+            )
+            .unwrap();
 
         assert!(!comparison.improvements.is_empty());
         assert!(comparison.overall_score > 0.0);
@@ -693,7 +734,9 @@ mod tests {
     #[test]
     fn test_format_what_if() {
         let tuner = InteractiveQueryTuner::new();
-        let scenario = tuner.explore_what_if("SELECT * FROM users", "parallel_execution").unwrap();
+        let scenario = tuner
+            .explore_what_if("SELECT * FROM users", "parallel_execution")
+            .unwrap();
         let output = tuner.format_what_if(&scenario);
 
         assert!(output.contains("WHAT-IF SCENARIO"));

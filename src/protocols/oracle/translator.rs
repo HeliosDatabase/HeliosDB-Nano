@@ -65,9 +65,7 @@ impl OracleTranslator {
     /// PostgreSQL: SELECT 1
     fn translate_dual_table(&self, sql: &str) -> Result<String> {
         static DUAL_RE: OnceLock<Regex> = OnceLock::new();
-        let re = DUAL_RE.get_or_init(|| {
-            init_regex(r"(?i)\s+FROM\s+DUAL\s*($|;|\s+WHERE|\s+ORDER|\s+LIMIT)")
-        });
+        let re = DUAL_RE.get_or_init(|| init_regex(r"(?i)\s+FROM\s+DUAL\s*($|;|\s+WHERE|\s+ORDER|\s+LIMIT)"));
 
         let result = re.replace_all(sql, "$1");
         Ok(result.to_string())
@@ -111,9 +109,7 @@ impl OracleTranslator {
             let args: Vec<&str> = args_str.split(',').map(|s| s.trim()).collect();
 
             if args.len() < 3 {
-                return Err(Error::query_execution(
-                    "DECODE requires at least 3 arguments"
-                ));
+                return Err(Error::query_execution("DECODE requires at least 3 arguments"));
             }
 
             let expr = match args.first() {
@@ -159,9 +155,7 @@ impl OracleTranslator {
     /// PostgreSQL: CASE WHEN col IS NOT NULL THEN 'not null' ELSE 'is null' END
     fn translate_nvl2(&self, sql: &str) -> Result<String> {
         static NVL2_RE: OnceLock<Regex> = OnceLock::new();
-        let re = NVL2_RE.get_or_init(|| {
-            init_regex(r"(?i)NVL2\s*\(([^,]+),\s*([^,]+),\s*([^)]+)\)")
-        });
+        let re = NVL2_RE.get_or_init(|| init_regex(r"(?i)NVL2\s*\(([^,]+),\s*([^,]+),\s*([^)]+)\)"));
 
         let result = re.replace_all(sql, "CASE WHEN $1 IS NOT NULL THEN $2 ELSE $3 END");
         Ok(result.to_string())
@@ -224,7 +218,7 @@ impl OracleTranslator {
 
         if re.is_match(sql) {
             return Err(Error::query_execution(
-                "Oracle (+) outer join syntax not supported. Use ANSI JOIN syntax instead."
+                "Oracle (+) outer join syntax not supported. Use ANSI JOIN syntax instead.",
             ));
         }
 
@@ -267,22 +261,19 @@ impl OracleTranslator {
         let sql_upper = sql.trim().to_uppercase();
 
         // Check for PL/SQL block keywords
-        if sql_upper.starts_with("BEGIN") ||
-           sql_upper.starts_with("DECLARE") ||
-           sql_upper.contains("BEGIN\n") ||
-           sql_upper.contains("DECLARE\n") {
+        if sql_upper.starts_with("BEGIN")
+            || sql_upper.starts_with("DECLARE")
+            || sql_upper.contains("BEGIN\n")
+            || sql_upper.contains("DECLARE\n")
+        {
             return Err(Error::query_execution(
-                "PL/SQL blocks are not supported. Use simple SQL statements instead."
+                "PL/SQL blocks are not supported. Use simple SQL statements instead.",
             ));
         }
 
         // Check for stored procedure calls
-        if sql_upper.starts_with("EXECUTE") ||
-           sql_upper.starts_with("EXEC") ||
-           sql_upper.starts_with("CALL") {
-            return Err(Error::query_execution(
-                "Stored procedure execution not yet supported."
-            ));
+        if sql_upper.starts_with("EXECUTE") || sql_upper.starts_with("EXEC") || sql_upper.starts_with("CALL") {
+            return Err(Error::query_execution("Stored procedure execution not yet supported."));
         }
 
         Ok(())

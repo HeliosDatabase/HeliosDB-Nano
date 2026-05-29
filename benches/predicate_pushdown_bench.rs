@@ -33,8 +33,8 @@ use heliosdb_nano::{
     optimizer::{
         cost::StatsCatalog,
         rules::{
-            ConstantFoldingRule, JoinPredicatePushdownRule, OptimizationRule,
-            ProjectionPruningRule, SelectionPushdownRule,
+            ConstantFoldingRule, JoinPredicatePushdownRule, OptimizationRule, ProjectionPruningRule,
+            SelectionPushdownRule,
         },
         Optimizer, OptimizerConfig,
     },
@@ -66,8 +66,7 @@ const COUNTRIES: &[(&str, &str, &str)] = &[
 ];
 
 const EVENT_TYPES: &[&str] = &[
-    "view", "click", "scroll", "purchase", "login", "logout", "search", "share",
-    "comment", "like",
+    "view", "click", "scroll", "purchase", "login", "logout", "search", "share", "comment", "like",
 ];
 
 fn dataset_path() -> PathBuf {
@@ -190,11 +189,7 @@ fn seed_events(db: &EmbeddedDatabase, rows: u64) {
             );
         }
     }
-    eprintln!(
-        "  events seeded: {} in {:.1}s",
-        rows,
-        start.elapsed().as_secs_f64()
-    );
+    eprintln!("  events seeded: {} in {:.1}s", rows, start.elapsed().as_secs_f64());
 }
 
 /// The four representative query shapes.
@@ -315,8 +310,7 @@ fn bench_predicate_pushdown(c: &mut Criterion) {
             let id = BenchmarkId::new(*qid, label);
             group.bench_with_input(id, sql, |b, sql| {
                 b.iter(|| {
-                    let (cnt, _t) =
-                        run_query(&db, sql, with_pushdown).expect("query failed mid-bench");
+                    let (cnt, _t) = run_query(&db, sql, with_pushdown).expect("query failed mid-bench");
                     black_box(cnt);
                 });
             });

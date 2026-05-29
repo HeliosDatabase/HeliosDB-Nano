@@ -52,10 +52,7 @@ pub fn ensure_tables(db: &EmbeddedDatabase) -> Result<()> {
 /// `_hdb_code_symbols.node_id` as `"code_symbol:<id>"`, so re-runs
 /// update in place. Edges from `_hdb_code_symbol_refs` are projected
 /// as `CALLS` / `REFERENCES` / etc. — kind names are lifted verbatim.
-pub fn project_code_symbols(
-    db: &EmbeddedDatabase,
-    stats: &mut GraphRagStats,
-) -> Result<()> {
+pub fn project_code_symbols(db: &EmbeddedDatabase, stats: &mut GraphRagStats) -> Result<()> {
     ensure_tables(db)?;
 
     // Be tolerant of callers that run the graph-rag layer before the
@@ -63,10 +60,7 @@ pub fn project_code_symbols(
     // to project. The same `SELECT ... FROM _hdb_code_symbols`
     // later in the pass fails hard if the table never existed, so
     // short-circuit by probing the planner first.
-    let probe = db.query(
-        "SELECT 1 FROM _hdb_code_symbols LIMIT 1",
-        &[],
-    );
+    let probe = db.query("SELECT 1 FROM _hdb_code_symbols LIMIT 1", &[]);
     if probe.is_err() {
         return Ok(());
     }
@@ -136,10 +130,7 @@ pub fn project_code_symbols(
     )?;
     // Build lookup source_ref → node_id for this call (fresh post-insert).
     let mut map: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
-    for row in db.query(
-        "SELECT source_ref, node_id FROM _hdb_graph_nodes",
-        &[],
-    )? {
+    for row in db.query("SELECT source_ref, node_id FROM _hdb_graph_nodes", &[])? {
         let r = match row.values.first() {
             Some(Value::String(s)) => s.clone(),
             _ => continue,
@@ -154,10 +145,7 @@ pub fn project_code_symbols(
 
     // Only insert edges we don't already have (simple dedupe by
     // (from, to, kind)).
-    let existing_edges = db.query(
-        "SELECT from_node, to_node, edge_kind FROM _hdb_graph_edges",
-        &[],
-    )?;
+    let existing_edges = db.query("SELECT from_node, to_node, edge_kind FROM _hdb_graph_edges", &[])?;
     let mut seen: std::collections::HashSet<(i64, i64, String)> = std::collections::HashSet::new();
     for row in existing_edges {
         let f = as_int(row.values.first());

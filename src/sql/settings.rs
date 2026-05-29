@@ -2,7 +2,7 @@
 //!
 //! Provides session-level and global settings management for HeliosDB Lite.
 
-use crate::{Result, Error};
+use crate::{Error, Result};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -26,13 +26,11 @@ impl SettingValue {
         match self {
             SettingValue::Boolean(b) => Some(*b),
             SettingValue::Integer(i) => Some(*i != 0),
-            SettingValue::String(s) => {
-                match s.to_lowercase().as_str() {
-                    "on" | "true" | "yes" | "1" => Some(true),
-                    "off" | "false" | "no" | "0" => Some(false),
-                    _ => None,
-                }
-            }
+            SettingValue::String(s) => match s.to_lowercase().as_str() {
+                "on" | "true" | "yes" | "1" => Some(true),
+                "off" | "false" | "no" | "0" => Some(false),
+                _ => None,
+            },
             _ => None,
         }
     }
@@ -114,19 +112,27 @@ impl SessionSettings {
         settings.insert("shared_buffers".to_string(), SettingValue::Integer(131072)); // KB (128MB)
 
         // Transaction settings
-        settings.insert("transaction_isolation".to_string(),
-            SettingValue::String("READ COMMITTED".to_string()));
+        settings.insert(
+            "transaction_isolation".to_string(),
+            SettingValue::String("READ COMMITTED".to_string()),
+        );
         settings.insert("transaction_read_only".to_string(), SettingValue::Boolean(false));
 
         // Time-travel settings
         settings.insert("time_travel_enabled".to_string(), SettingValue::Boolean(true));
 
         // Compression settings
-        settings.insert("default_compression".to_string(), SettingValue::String("zstd".to_string()));
+        settings.insert(
+            "default_compression".to_string(),
+            SettingValue::String("zstd".to_string()),
+        );
         settings.insert("compression_level".to_string(), SettingValue::Integer(3));
 
         // Vector settings
-        settings.insert("vector_index_type".to_string(), SettingValue::String("hnsw".to_string()));
+        settings.insert(
+            "vector_index_type".to_string(),
+            SettingValue::String("hnsw".to_string()),
+        );
         settings.insert("hnsw_ef_construction".to_string(), SettingValue::Integer(200));
         settings.insert("hnsw_m".to_string(), SettingValue::Integer(16));
 
@@ -153,8 +159,10 @@ impl SessionSettings {
         settings.insert("timezone".to_string(), SettingValue::String("UTC".to_string()));
 
         // Server info (read-only)
-        settings.insert("server_version".to_string(),
-            SettingValue::String(env!("CARGO_PKG_VERSION").to_string()));
+        settings.insert(
+            "server_version".to_string(),
+            SettingValue::String(env!("CARGO_PKG_VERSION").to_string()),
+        );
         settings.insert("server_encoding".to_string(), SettingValue::String("UTF8".to_string()));
 
         Self {
@@ -168,15 +176,15 @@ impl SessionSettings {
 
         // Check if setting is read-only
         if Self::is_read_only(&normalized_name) {
-            return Err(Error::query_execution(format!(
-                "Setting '{}' is read-only", name
-            )));
+            return Err(Error::query_execution(format!("Setting '{}' is read-only", name)));
         }
 
         // Validate setting value
         Self::validate_setting(&normalized_name, &value)?;
 
-        let mut settings = self.settings.write()
+        let mut settings = self
+            .settings
+            .write()
             .map_err(|e| Error::Generic(format!("Failed to acquire settings lock: {}", e)))?;
 
         settings.insert(normalized_name, value);
@@ -192,16 +200,12 @@ impl SessionSettings {
 
     /// Get all settings
     pub fn get_all(&self) -> HashMap<String, SettingValue> {
-        self.settings.read()
-            .map(|s| s.clone())
-            .unwrap_or_default()
+        self.settings.read().map(|s| s.clone()).unwrap_or_default()
     }
 
     /// Check if a setting is read-only
     fn is_read_only(name: &str) -> bool {
-        matches!(name,
-            "server_version" | "server_encoding" | "max_connections" | "port"
-        )
+        matches!(name, "server_version" | "server_encoding" | "max_connections" | "port")
     }
 
     /// Validate setting value
@@ -213,12 +217,13 @@ impl SessionSettings {
                     _ => None,
                 } {
                     let upper = s.to_uppercase();
-                    if !matches!(upper.as_str(),
-                        "READ UNCOMMITTED" | "READ COMMITTED" |
-                        "REPEATABLE READ" | "SERIALIZABLE"
+                    if !matches!(
+                        upper.as_str(),
+                        "READ UNCOMMITTED" | "READ COMMITTED" | "REPEATABLE READ" | "SERIALIZABLE"
                     ) {
                         return Err(Error::query_execution(format!(
-                            "Invalid transaction isolation level: {}", s
+                            "Invalid transaction isolation level: {}",
+                            s
                         )));
                     }
                 }
@@ -230,9 +235,7 @@ impl SessionSettings {
                 } {
                     let lower = s.to_lowercase();
                     if !matches!(lower.as_str(), "none" | "zstd" | "lz4") {
-                        return Err(Error::query_execution(format!(
-                            "Invalid compression type: {}", s
-                        )));
+                        return Err(Error::query_execution(format!("Invalid compression type: {}", s)));
                     }
                 }
             }
@@ -243,18 +246,14 @@ impl SessionSettings {
                 } {
                     let lower = s.to_lowercase();
                     if !matches!(lower.as_str(), "hnsw" | "flat" | "ivf") {
-                        return Err(Error::query_execution(format!(
-                            "Invalid vector index type: {}", s
-                        )));
+                        return Err(Error::query_execution(format!("Invalid vector index type: {}", s)));
                     }
                 }
             }
             "work_mem" | "shared_buffers" => {
                 if let Some(val) = value.as_i64() {
                     if val < 0 {
-                        return Err(Error::query_execution(format!(
-                            "{} must be non-negative", name
-                        )));
+                        return Err(Error::query_execution(format!("{} must be non-negative", name)));
                     }
                 }
             }
@@ -262,7 +261,7 @@ impl SessionSettings {
                 if let Some(val) = value.as_i64() {
                     if !(1..=100).contains(&val) {
                         return Err(Error::query_execution(
-                            "mv_max_cpu_percent must be between 1 and 100".to_string()
+                            "mv_max_cpu_percent must be between 1 and 100".to_string(),
                         ));
                     }
                 }
@@ -271,7 +270,7 @@ impl SessionSettings {
                 if let Some(val) = value.as_i64() {
                     if !(1..=22).contains(&val) {
                         return Err(Error::query_execution(
-                            "compression_level must be between 1 and 22".to_string()
+                            "compression_level must be between 1 and 22".to_string(),
                         ));
                     }
                 }
@@ -286,9 +285,7 @@ impl SessionSettings {
         let normalized_name = name.to_lowercase();
 
         if Self::is_read_only(&normalized_name) {
-            return Err(Error::query_execution(format!(
-                "Setting '{}' is read-only", name
-            )));
+            return Err(Error::query_execution(format!("Setting '{}' is read-only", name)));
         }
 
         // Get default value
@@ -297,9 +294,7 @@ impl SessionSettings {
             self.set(&normalized_name, default_value)?;
             Ok(())
         } else {
-            Err(Error::query_execution(format!(
-                "Unknown setting: {}", name
-            )))
+            Err(Error::query_execution(format!("Unknown setting: {}", name)))
         }
     }
 
@@ -321,9 +316,7 @@ impl SessionSettings {
 
     /// Check if optimizer is enabled
     pub fn optimizer_enabled(&self) -> bool {
-        self.get("optimizer")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true)
+        self.get("optimizer").and_then(|v| v.as_bool()).unwrap_or(true)
     }
 
     /// Check if time-travel is enabled
@@ -374,21 +367,24 @@ mod tests {
         let settings = SessionSettings::new();
 
         // Valid isolation level
-        settings.set("transaction_isolation",
-            SettingValue::String("SERIALIZABLE".to_string())).unwrap();
+        settings
+            .set(
+                "transaction_isolation",
+                SettingValue::String("SERIALIZABLE".to_string()),
+            )
+            .unwrap();
 
         // Invalid isolation level
-        let result = settings.set("transaction_isolation",
-            SettingValue::String("INVALID".to_string()));
+        let result = settings.set("transaction_isolation", SettingValue::String("INVALID".to_string()));
         assert!(result.is_err());
 
         // Valid compression
-        settings.set("default_compression",
-            SettingValue::String("zstd".to_string())).unwrap();
+        settings
+            .set("default_compression", SettingValue::String("zstd".to_string()))
+            .unwrap();
 
         // Invalid compression
-        let result = settings.set("default_compression",
-            SettingValue::String("invalid".to_string()));
+        let result = settings.set("default_compression", SettingValue::String("invalid".to_string()));
         assert!(result.is_err());
     }
 

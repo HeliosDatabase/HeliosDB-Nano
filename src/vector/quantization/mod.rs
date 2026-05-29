@@ -6,21 +6,21 @@
 //! Based on: "Product Quantization for Nearest Neighbor Search" (Jégou et al., CVPR 2011)
 //! Paper: <https://lear.inrialpes.fr/pubs/2011/JDS11/jegou_searching_with_quantization.pdf>
 
-pub mod product_quantizer;
 pub mod codebook;
-pub mod encoder;
 pub mod decoder;
 pub mod distance;
+pub mod encoder;
+pub mod product_quantizer;
 pub mod training;
 
-pub use product_quantizer::{ProductQuantizer, ProductQuantizerConfig};
 pub use codebook::Codebook;
-pub use encoder::Encoder;
 pub use decoder::Decoder;
 pub use distance::DistanceComputer;
+pub use encoder::Encoder;
+pub use product_quantizer::{ProductQuantizer, ProductQuantizerConfig};
 pub use training::train_codebook;
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Quantized vector representation
 ///

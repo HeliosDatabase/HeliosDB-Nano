@@ -4,19 +4,24 @@
 
 #![allow(elided_lifetimes_in_paths)]
 
-use crate::{Result, Error};
-use crate::sql::LogicalPlan;
-use super::{PhysicalOperator, Executor};
 use super::scan::ScanOperator;
+use super::{Executor, PhysicalOperator};
+use crate::sql::LogicalPlan;
+use crate::{Error, Result};
 use rocksdb::{IteratorMode, ReadOptions};
 use std::sync::Arc;
 
 /// Handle CREATE INDEX logical plan node
-pub(super) fn handle_create_index(
-    executor: &Executor,
-    plan: &LogicalPlan,
-) -> Result<Box<dyn PhysicalOperator>> {
-    if let LogicalPlan::CreateIndex { name, table_name, column_name, index_type, if_not_exists, options } = plan {
+pub(super) fn handle_create_index(executor: &Executor, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
+    if let LogicalPlan::CreateIndex {
+        name,
+        table_name,
+        column_name,
+        index_type,
+        if_not_exists,
+        options,
+    } = plan
+    {
         // For now, return an empty result - actual index creation happens in storage layer
         // This is a placeholder until we integrate proper DDL execution
         if let Some(storage) = executor.storage() {
@@ -29,18 +34,18 @@ pub(super) fn handle_create_index(
                     // Check if index already exists
                     if art_manager.index_exists(name) {
                         if *if_not_exists {
-                            return Ok(Box::new(ScanOperator::new(
-                                "".to_string(),
-                                Arc::new(crate::Schema { columns: vec![] }),
-                                None,
-                                vec![],
-                                vec![],
-                            ).with_timeout(executor.timeout_ctx())));
+                            return Ok(Box::new(
+                                ScanOperator::new(
+                                    "".to_string(),
+                                    Arc::new(crate::Schema { columns: vec![] }),
+                                    None,
+                                    vec![],
+                                    vec![],
+                                )
+                                .with_timeout(executor.timeout_ctx()),
+                            ));
                         } else {
-                            return Err(Error::query_execution(format!(
-                                "ART index '{}' already exists",
-                                name
-                            )));
+                            return Err(Error::query_execution(format!("ART index '{}' already exists", name)));
                         }
                     }
 
@@ -58,22 +63,19 @@ pub(super) fn handle_create_index(
 
                     // Create manual ART index
                     let columns = vec![column_name.clone()];
-                    art_manager.create_manual_index(name, table_name, &columns)
-                        .map_err(|e| Error::query_execution(format!(
-                            "Failed to create ART index: {}", e
-                        )))?;
+                    art_manager
+                        .create_manual_index(name, table_name, &columns)
+                        .map_err(|e| Error::query_execution(format!("Failed to create ART index: {}", e)))?;
 
-                    tracing::info!("Created ART index '{}' on table '{}' column '{}'",
-                        name, table_name, column_name);
-
-                    // Log to WAL for replication
-                    if let Err(e) = storage.log_create_index(
+                    tracing::info!(
+                        "Created ART index '{}' on table '{}' column '{}'",
                         name,
                         table_name,
-                        column_name,
-                        Some("art"),
-                        &[],
-                    ) {
+                        column_name
+                    );
+
+                    // Log to WAL for replication
+                    if let Err(e) = storage.log_create_index(name, table_name, column_name, Some("art"), &[]) {
                         tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
                     }
                 } else if idx_type == "gin" || idx_type == "gist" {
@@ -93,11 +95,14 @@ pub(super) fn handle_create_index(
                     tracing::info!(
                         "Accepted CREATE INDEX {} USING {} ON {} ({}) — \
                          DDL-only (no backing index yet)",
-                        name, idx_type, table_name, column_name
+                        name,
+                        idx_type,
+                        table_name,
+                        column_name
                     );
-                    if let Err(e) = storage.log_create_index(
-                        name, table_name, column_name, Some(idx_type.as_str()), &[],
-                    ) {
+                    if let Err(e) =
+                        storage.log_create_index(name, table_name, column_name, Some(idx_type.as_str()), &[])
+                    {
                         tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
                     }
                 } else if idx_type == "hnsw" {
@@ -106,19 +111,19 @@ pub(super) fn handle_create_index(
                     if vector_indexes.index_exists(name) {
                         if *if_not_exists {
                             // IF NOT EXISTS specified, return silently
-                            return Ok(Box::new(ScanOperator::new(
-                                "".to_string(),
-                                Arc::new(crate::Schema { columns: vec![] }),
-                                None,
-                                vec![],
-                                vec![],
-                            ).with_timeout(executor.timeout_ctx())));
+                            return Ok(Box::new(
+                                ScanOperator::new(
+                                    "".to_string(),
+                                    Arc::new(crate::Schema { columns: vec![] }),
+                                    None,
+                                    vec![],
+                                    vec![],
+                                )
+                                .with_timeout(executor.timeout_ctx()),
+                            ));
                         } else {
                             // Error: index already exists
-                            return Err(Error::query_execution(format!(
-                                "Index '{}' already exists",
-                                name
-                            )));
+                            return Err(Error::query_execution(format!("Index '{}' already exists", name)));
                         }
                     }
 
@@ -126,19 +131,19 @@ pub(super) fn handle_create_index(
                     let schema = catalog.get_table_schema(table_name)?;
 
                     // Find the column to index
-                    let column = schema.get_column(column_name)
-                        .ok_or_else(|| Error::query_execution(format!(
-                            "Column '{}' not found in table '{}'",
-                            column_name, table_name
-                        )))?;
+                    let column = schema.get_column(column_name).ok_or_else(|| {
+                        Error::query_execution(format!("Column '{}' not found in table '{}'", column_name, table_name))
+                    })?;
 
                     // Extract vector dimension from Vector(n) type
                     let dimension = match column.data_type {
                         crate::DataType::Vector(dim) => dim,
-                        _ => return Err(Error::query_execution(format!(
-                            "Column '{}' is not a vector type, cannot create HNSW index",
-                            column_name
-                        ))),
+                        _ => {
+                            return Err(Error::query_execution(format!(
+                                "Column '{}' is not a vector type, cannot create HNSW index",
+                                column_name
+                            )))
+                        }
                     };
 
                     // Parse quantization options
@@ -147,14 +152,101 @@ pub(super) fn handle_create_index(
                     let mut quantization_type = QuantizationType::None;
                     let mut pq_subquantizers: Option<usize> = None;
                     let mut pq_centroids: Option<usize> = None;
+                    let mut persistent = false;
+                    #[cfg(feature = "vector-persist")]
+                    let mut rerank_precision: Option<crate::vector::persistent::VectorPrecision> = None;
+                    #[cfg(not(feature = "vector-persist"))]
+                    let rerank_precision: Option<()> = None;
 
                     for option in options {
                         match option {
                             IndexOption::Quantization(qt) => quantization_type = *qt,
                             IndexOption::PqSubquantizers(n) => pq_subquantizers = Some(*n),
                             IndexOption::PqCentroids(n) => pq_centroids = Some(*n),
+                            IndexOption::Persistent(enabled) => persistent = *enabled,
+                            IndexOption::RerankPrecision(precision) => {
+                                #[cfg(feature = "vector-persist")]
+                                {
+                                    rerank_precision = Some(match precision.as_str() {
+                                        "f32" => crate::vector::persistent::VectorPrecision::F32,
+                                        "f16" => crate::vector::persistent::VectorPrecision::F16,
+                                        "i8" => crate::vector::persistent::VectorPrecision::I8,
+                                        other => {
+                                            return Err(Error::query_execution(format!(
+                                                "Unsupported rerank_precision '{}'",
+                                                other
+                                            )))
+                                        }
+                                    });
+                                }
+                                #[cfg(not(feature = "vector-persist"))]
+                                {
+                                    let _ = precision;
+                                }
+                            }
                             _ => {} // Ignore other options for now
                         }
+                    }
+
+                    if persistent {
+                        let tuples = storage.scan_table(table_name)?;
+                        let col_idx = schema.get_column_index(column_name).ok_or_else(|| {
+                            Error::query_execution(format!("Column '{}' not found in schema", column_name))
+                        })?;
+                        let training_vectors: Vec<crate::vector::Vector> = tuples
+                            .iter()
+                            .filter_map(|tuple| {
+                                if let Some(crate::Value::Vector(ref vec)) = tuple.values.get(col_idx) {
+                                    Some(vec.clone())
+                                } else {
+                                    None
+                                }
+                            })
+                            .collect();
+
+                        let pq_config = if quantization_type == QuantizationType::Product {
+                            let mut cfg = crate::vector::ProductQuantizerConfig::default_for_dimension(dimension)
+                                .map_err(|e| Error::query_execution(format!("Invalid PQ config: {}", e)))?;
+                            if let Some(n) = pq_subquantizers {
+                                cfg.num_subquantizers = n;
+                            }
+                            if let Some(n) = pq_centroids {
+                                cfg.num_centroids = n;
+                            }
+                            cfg.validate()
+                                .map_err(|e| Error::query_execution(format!("Invalid PQ config: {}", e)))?;
+                            Some(cfg)
+                        } else {
+                            None
+                        };
+
+                        vector_indexes.create_persistent_index(
+                            name.clone(),
+                            table_name.clone(),
+                            column_name.clone(),
+                            dimension,
+                            crate::vector::DistanceMetric::L2,
+                            pq_config,
+                            rerank_precision,
+                            &training_vectors,
+                            storage.db(),
+                        )?;
+
+                        if let Err(e) =
+                            storage.log_create_index(name, table_name, column_name, Some("persistent_hnsw"), &[])
+                        {
+                            tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
+                        }
+                        return Ok(Box::new(
+                            ScanOperator::new(
+                                "".to_string(),
+                                Arc::new(crate::Schema { columns: vec![] }),
+                                None,
+                                vec![],
+                                vec![],
+                            )
+                            .with_timeout(executor.timeout_ctx()),
+                        ));
                     }
 
                     // Check if we should create a quantized index
@@ -175,18 +267,17 @@ pub(super) fn handle_create_index(
                             }
 
                             // Validate config
-                            pq_config.validate()
+                            pq_config
+                                .validate()
                                 .map_err(|e| Error::query_execution(format!("Invalid PQ config: {}", e)))?;
 
                             // Collect existing vectors from the table for PQ training
                             let tuples = storage.scan_table(table_name)?;
 
                             // Find the vector column index
-                            let col_idx = schema.get_column_index(column_name)
-                                .ok_or_else(|| Error::query_execution(format!(
-                                    "Column '{}' not found in schema",
-                                    column_name
-                                )))?;
+                            let col_idx = schema.get_column_index(column_name).ok_or_else(|| {
+                                Error::query_execution(format!("Column '{}' not found in schema", column_name))
+                            })?;
 
                             // Extract vectors from tuples
                             let training_vectors: Vec<crate::vector::Vector> = tuples
@@ -211,13 +302,9 @@ pub(super) fn handle_create_index(
                             )?;
 
                             // Log to WAL for replication
-                            if let Err(e) = storage.log_create_index(
-                                name,
-                                table_name,
-                                column_name,
-                                Some(idx_type.as_str()),
-                                &[],
-                            ) {
+                            if let Err(e) =
+                                storage.log_create_index(name, table_name, column_name, Some(idx_type.as_str()), &[])
+                            {
                                 tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
                             }
                         }
@@ -232,13 +319,9 @@ pub(super) fn handle_create_index(
                             )?;
 
                             // Log to WAL for replication
-                            if let Err(e) = storage.log_create_index(
-                                name,
-                                table_name,
-                                column_name,
-                                index_type.as_deref(),
-                                &[],
-                            ) {
+                            if let Err(e) =
+                                storage.log_create_index(name, table_name, column_name, index_type.as_deref(), &[])
+                            {
                                 tracing::warn!("Failed to log CREATE INDEX to WAL: {}", e);
                             }
                         }
@@ -248,13 +331,16 @@ pub(super) fn handle_create_index(
         }
 
         // Return empty result set for DDL
-        Ok(Box::new(ScanOperator::new(
-            "".to_string(),
-            Arc::new(crate::Schema { columns: vec![] }),
-            None,
-            vec![],
-            vec![],
-        ).with_timeout(executor.timeout_ctx())))
+        Ok(Box::new(
+            ScanOperator::new(
+                "".to_string(),
+                Arc::new(crate::Schema { columns: vec![] }),
+                None,
+                vec![],
+                vec![],
+            )
+            .with_timeout(executor.timeout_ctx()),
+        ))
     } else {
         Err(Error::query_execution("Expected CreateIndex plan node"))
     }
@@ -282,42 +368,36 @@ pub(super) fn handle_drop_table(
             Err(_) => {
                 // Table doesn't exist
                 if !if_exists {
-                    return Err(Error::query_execution(format!(
-                        "Table '{}' does not exist",
-                        table_name
-                    )));
+                    return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
                 }
                 // If IF EXISTS, silently succeed
             }
         }
 
         // Return empty result set for DDL
-        Ok(Box::new(ScanOperator::new(
-            "".to_string(),
-            Arc::new(crate::Schema { columns: vec![] }),
-            None,
-            vec![],
-            vec![],
-        ).with_timeout(executor.timeout_ctx())))
+        Ok(Box::new(
+            ScanOperator::new(
+                "".to_string(),
+                Arc::new(crate::Schema { columns: vec![] }),
+                None,
+                vec![],
+                vec![],
+            )
+            .with_timeout(executor.timeout_ctx()),
+        ))
     } else {
         Err(Error::query_execution("No storage engine available"))
     }
 }
 
 /// Handle TRUNCATE logical plan node
-pub(super) fn handle_truncate(
-    executor: &Executor,
-    table_name: &str,
-) -> Result<Box<dyn PhysicalOperator>> {
+pub(super) fn handle_truncate(executor: &Executor, table_name: &str) -> Result<Box<dyn PhysicalOperator>> {
     if let Some(storage) = executor.storage() {
         let catalog = storage.catalog();
 
         // Check if table exists
         if catalog.get_table_schema(table_name).is_err() {
-            return Err(Error::query_execution(format!(
-                "Table '{}' does not exist",
-                table_name
-            )));
+            return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
         }
 
         // Delete all rows from the table
@@ -358,7 +438,8 @@ pub(super) fn handle_truncate(
         // Check for user-created branches (exclude the auto-created "main" branch).
         // Branch data uses separate key prefixes and does not share the ART index,
         // but as a safety measure we skip clearing when user branches exist.
-        let has_user_branches = storage.list_branches()
+        let has_user_branches = storage
+            .list_branches()
             .map(|b| b.iter().any(|br| br.name != "main"))
             .unwrap_or(false);
         if !has_user_branches {
@@ -371,13 +452,16 @@ pub(super) fn handle_truncate(
         }
 
         // Return empty result set for DDL
-        Ok(Box::new(ScanOperator::new(
-            "".to_string(),
-            Arc::new(crate::Schema { columns: vec![] }),
-            None,
-            vec![],
-            vec![],
-        ).with_timeout(executor.timeout_ctx())))
+        Ok(Box::new(
+            ScanOperator::new(
+                "".to_string(),
+                Arc::new(crate::Schema { columns: vec![] }),
+                None,
+                vec![],
+                vec![],
+            )
+            .with_timeout(executor.timeout_ctx()),
+        ))
     } else {
         Err(Error::query_execution("No storage engine available"))
     }
@@ -390,24 +474,24 @@ pub(super) fn handle_truncate(
 /// Handle SWITCHOVER to target node
 /// Example: SELECT helios_switchover('node-uuid')
 #[cfg(feature = "ha-tier1")]
-pub(super) fn handle_switchover(
-    _executor: &Executor,
-    target_node: &str,
-) -> Result<Box<dyn PhysicalOperator>> {
-    use uuid::Uuid;
+pub(super) fn handle_switchover(_executor: &Executor, target_node: &str) -> Result<Box<dyn PhysicalOperator>> {
     use crate::replication::ha_state::ha_state;
     use crate::replication::topology_manager;
+    use uuid::Uuid;
 
     // Resolve target node (can be alias or UUID)
-    let target_uuid = topology_manager().resolve_node_id(target_node)
+    let target_uuid = topology_manager()
+        .resolve_node_id(target_node)
         .or_else(|| {
             // Fallback: try parsing as UUID directly if not in topology
             Uuid::parse_str(target_node).ok()
         })
-        .ok_or_else(|| Error::query_execution(format!(
-            "Target node '{}' not found. Specify a valid node alias or UUID.",
-            target_node
-        )))?;
+        .ok_or_else(|| {
+            Error::query_execution(format!(
+                "Target node '{}' not found. Specify a valid node alias or UUID.",
+                target_node
+            ))
+        })?;
 
     // Get HA state registry
     let ha_registry = ha_state();
@@ -415,7 +499,7 @@ pub(super) fn handle_switchover(
     // Check if this node is primary
     if ha_registry.get_role() != crate::replication::ha_state::HARole::Primary {
         return Err(Error::query_execution(
-            "Switchover can only be initiated from the primary node"
+            "Switchover can only be initiated from the primary node",
         ));
     }
 
@@ -449,25 +533,25 @@ pub(super) fn handle_switchover(
 /// Handle SWITCHOVER CHECK to validate preconditions
 /// Example: SELECT helios_switchover_check('node-uuid') or SELECT helios_switchover_check('alias')
 #[cfg(feature = "ha-tier1")]
-pub(super) fn handle_switchover_check(
-    _executor: &Executor,
-    target_node: &str,
-) -> Result<Box<dyn PhysicalOperator>> {
-    use uuid::Uuid;
+pub(super) fn handle_switchover_check(_executor: &Executor, target_node: &str) -> Result<Box<dyn PhysicalOperator>> {
     use crate::replication::ha_state::ha_state;
     use crate::replication::topology_manager;
-    use crate::{Tuple, Value, Schema, Column, DataType};
+    use crate::{Column, DataType, Schema, Tuple, Value};
+    use uuid::Uuid;
 
     // Resolve target node (can be alias or UUID)
-    let target_uuid = topology_manager().resolve_node_id(target_node)
+    let target_uuid = topology_manager()
+        .resolve_node_id(target_node)
         .or_else(|| {
             // Fallback: try parsing as UUID directly if not in topology
             Uuid::parse_str(target_node).ok()
         })
-        .ok_or_else(|| Error::query_execution(format!(
-            "Target node '{}' not found. Specify a valid node alias or UUID.",
-            target_node
-        )))?;
+        .ok_or_else(|| {
+            Error::query_execution(format!(
+                "Target node '{}' not found. Specify a valid node alias or UUID.",
+                target_node
+            ))
+        })?;
 
     // Get HA state registry
     let ha_registry = ha_state();
@@ -532,11 +616,9 @@ pub(super) fn handle_switchover_check(
 /// Handle CLUSTER STATUS query
 /// Example: SELECT * FROM helios_cluster_status()
 #[cfg(feature = "ha-tier1")]
-pub(super) fn handle_cluster_status(
-    _executor: &Executor,
-) -> Result<Box<dyn PhysicalOperator>> {
+pub(super) fn handle_cluster_status(_executor: &Executor) -> Result<Box<dyn PhysicalOperator>> {
     use crate::replication::ha_state::{ha_state, HARole};
-    use crate::{Tuple, Value, Schema, Column, DataType};
+    use crate::{Column, DataType, Schema, Tuple, Value};
 
     let ha_registry = ha_state();
 
@@ -569,7 +651,7 @@ pub(super) fn handle_cluster_status(
             Value::String(config.listen_addr.clone()),
             Value::Boolean(true), // Local node is always "healthy" from its perspective
             Value::Int8(ha_registry.get_lsn() as i64),
-            Value::Int8(0), // No lag for self
+            Value::Int8(0),   // No lag for self
             Value::Int4(100), // Default priority - config doesn't store priority yet
         ]));
     }
@@ -653,19 +735,22 @@ pub(super) fn handle_set_node_alias(
     node_id: &str,
     alias: &Option<String>,
 ) -> Result<Box<dyn PhysicalOperator>> {
-    use uuid::Uuid;
     use crate::replication::topology_manager;
-    use crate::{Tuple, Value, Schema, Column, DataType};
+    use crate::{Column, DataType, Schema, Tuple, Value};
+    use uuid::Uuid;
 
     let topology = topology_manager();
 
     // Resolve the node_id (could be existing alias or UUID)
-    let target_uuid = topology.resolve_node_id(node_id)
+    let target_uuid = topology
+        .resolve_node_id(node_id)
         .or_else(|| Uuid::parse_str(node_id).ok())
-        .ok_or_else(|| Error::query_execution(format!(
-            "Node '{}' not found in cluster topology. Use SHOW TOPOLOGY to see available nodes.",
-            node_id
-        )))?;
+        .ok_or_else(|| {
+            Error::query_execution(format!(
+                "Node '{}' not found in cluster topology. Use SHOW TOPOLOGY to see available nodes.",
+                node_id
+            ))
+        })?;
 
     // Set or clear the alias
     let result_msg = if let Some(ref new_alias) = alias {
@@ -695,9 +780,7 @@ pub(super) fn handle_set_node_alias(
     };
 
     let schema = Arc::new(Schema {
-        columns: vec![
-            Column::new("result", DataType::Text),
-        ],
+        columns: vec![Column::new("result", DataType::Text)],
     });
 
     let tuple = Tuple::new(vec![Value::String(result_msg)]);
@@ -707,12 +790,10 @@ pub(super) fn handle_set_node_alias(
 
 /// Handle SHOW TOPOLOGY command - displays detailed cluster topology
 #[cfg(feature = "ha-tier1")]
-pub(super) fn handle_show_topology(
-    _executor: &Executor,
-) -> Result<Box<dyn PhysicalOperator>> {
+pub(super) fn handle_show_topology(_executor: &Executor) -> Result<Box<dyn PhysicalOperator>> {
     use crate::replication::ha_state::{ha_state, HARole};
     use crate::replication::topology_manager;
-    use crate::{Tuple, Value, Schema, Column, DataType};
+    use crate::{Column, DataType, Schema, Tuple, Value};
 
     let ha_registry = ha_state();
     let topology = topology_manager();
@@ -738,7 +819,8 @@ pub(super) fn handle_show_topology(
 
     // Helper to get alias for a node
     let get_alias = |node_id: uuid::Uuid| -> Value {
-        topology.get_node(node_id)
+        topology
+            .get_node(node_id)
             .and_then(|n| n.alias.clone())
             .map(Value::String)
             .unwrap_or(Value::Null)
@@ -746,7 +828,8 @@ pub(super) fn handle_show_topology(
 
     // Helper to get node info from topology
     let get_topology_info = |node_id: uuid::Uuid| -> (u32, u32, Option<String>) {
-        topology.get_node(node_id)
+        topology
+            .get_node(node_id)
             .map(|n| (n.priority, n.weight, n.health_message.clone()))
             .unwrap_or((100, 100, None))
     };
@@ -790,7 +873,7 @@ pub(super) fn handle_show_topology(
             Value::String("Standby".to_string()),
             Value::String(standby.address.clone()),
             Value::String(standby.address.clone()), // replication addr same as client for now
-            Value::Boolean(true), // Connected standbys are healthy
+            Value::Boolean(true),                   // Connected standbys are healthy
             Value::String(health_msg.unwrap_or_else(|| "Connected".to_string())),
             Value::Int8(0), // last seen
             Value::Int8(standby.apply_lsn as i64),

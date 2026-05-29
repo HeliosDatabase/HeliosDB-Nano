@@ -48,10 +48,7 @@ fn pg_namespace_lists_hdb_schemas() {
         .collect();
     assert!(names.contains(&"public".to_string()), "have: {names:?}");
     assert!(names.contains(&"_hdb_code".to_string()), "have: {names:?}");
-    assert!(
-        names.contains(&"information_schema".to_string()),
-        "have: {names:?}"
-    );
+    assert!(names.contains(&"information_schema".to_string()), "have: {names:?}");
 }
 
 #[test]

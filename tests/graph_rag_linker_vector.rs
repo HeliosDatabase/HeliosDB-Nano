@@ -29,10 +29,7 @@ fn setup() -> (EmbeddedDatabase, i64, i64) {
     // Capture the two code-symbol IDs (alpha, beta) — these are the
     // node_ids the linker will need.
     let rows = db
-        .query(
-            "SELECT name, node_id FROM _hdb_code_symbols ORDER BY line_start",
-            &[],
-        )
+        .query("SELECT name, node_id FROM _hdb_code_symbols ORDER BY line_start", &[])
         .unwrap();
     let mut alpha = 0i64;
     let mut beta = 0i64;
@@ -93,12 +90,16 @@ fn top_k_picks_the_closer_symbol() {
         vector: vec![1.0, 0.0],
     }];
     let targets = vec![
-        SymbolEmbedding { node_id: alpha, vector: vec![1.0, 0.0] },
-        SymbolEmbedding { node_id: beta,  vector: vec![0.0, 1.0] },
+        SymbolEmbedding {
+            node_id: alpha,
+            vector: vec![1.0, 0.0],
+        },
+        SymbolEmbedding {
+            node_id: beta,
+            vector: vec![0.0, 1.0],
+        },
     ];
-    let stats = db
-        .graph_rag_link_vector(&queries, &targets, 1, 0.5)
-        .unwrap();
+    let stats = db.graph_rag_link_vector(&queries, &targets, 1, 0.5).unwrap();
     assert_eq!(stats.mentions_added, 1, "{stats:?}");
 
     // The single MENTIONS edge points at alpha's graph node, with
@@ -130,12 +131,16 @@ fn threshold_filters_low_similarity_pairs() {
     }];
     // Both targets are nearly orthogonal — well below threshold 0.5.
     let targets = vec![
-        SymbolEmbedding { node_id: alpha, vector: vec![0.0, 1.0, 0.0] },
-        SymbolEmbedding { node_id: beta,  vector: vec![0.0, 0.0, 1.0] },
+        SymbolEmbedding {
+            node_id: alpha,
+            vector: vec![0.0, 1.0, 0.0],
+        },
+        SymbolEmbedding {
+            node_id: beta,
+            vector: vec![0.0, 0.0, 1.0],
+        },
     ];
-    let stats = db
-        .graph_rag_link_vector(&queries, &targets, 5, 0.5)
-        .unwrap();
+    let stats = db.graph_rag_link_vector(&queries, &targets, 5, 0.5).unwrap();
     assert_eq!(stats.mentions_added, 0);
     assert!(stats.candidates_seen >= 2);
 }
@@ -152,9 +157,7 @@ fn dimension_mismatch_is_silently_skipped() {
         node_id: alpha,
         vector: vec![1.0, 0.0],
     }];
-    let stats = db
-        .graph_rag_link_vector(&queries, &targets, 5, 0.0)
-        .unwrap();
+    let stats = db.graph_rag_link_vector(&queries, &targets, 5, 0.0).unwrap();
     assert_eq!(stats.mentions_added, 0);
 }
 

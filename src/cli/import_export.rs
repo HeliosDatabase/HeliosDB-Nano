@@ -201,7 +201,10 @@ impl Exporter {
     pub fn build_query(&self) -> String {
         match &self.options.source {
             ExportSource::Table(table) => {
-                let columns = self.options.columns.as_ref()
+                let columns = self
+                    .options
+                    .columns
+                    .as_ref()
                     .map(|c| c.join(", "))
                     .unwrap_or_else(|| "*".to_string());
 
@@ -229,14 +232,9 @@ impl Exporter {
                 )
             }
             ExportSource::BranchDiff { from, to } => {
-                format!(
-                    "SELECT * FROM helios_branch_diff('{}', '{}')",
-                    from, to
-                )
+                format!("SELECT * FROM helios_branch_diff('{}', '{}')", from, to)
             }
-            ExportSource::Schema => {
-                "SELECT * FROM information_schema.tables WHERE table_schema = 'public'".to_string()
-            }
+            ExportSource::Schema => "SELECT * FROM information_schema.tables WHERE table_schema = 'public'".to_string(),
         }
     }
 
@@ -247,7 +245,9 @@ impl Exporter {
         }
 
         let mut output = String::new();
-        let Some(first_row) = rows.first() else { return String::new() };
+        let Some(first_row) = rows.first() else {
+            return String::new();
+        };
         let columns: Vec<&String> = first_row.keys().collect();
 
         // Headers
@@ -258,14 +258,13 @@ impl Exporter {
 
         // Rows
         for row in rows {
-            let values: Vec<String> = columns.iter()
-                .map(|col| {
-                    match row.get(*col) {
-                        Some(serde_json::Value::String(s)) => escape_csv(s),
-                        Some(serde_json::Value::Null) => String::new(),
-                        Some(v) => escape_csv(&v.to_string()),
-                        None => String::new(),
-                    }
+            let values: Vec<String> = columns
+                .iter()
+                .map(|col| match row.get(*col) {
+                    Some(serde_json::Value::String(s)) => escape_csv(s),
+                    Some(serde_json::Value::Null) => String::new(),
+                    Some(v) => escape_csv(&v.to_string()),
+                    None => String::new(),
                 })
                 .collect();
             output.push_str(&values.join(","));
@@ -298,29 +297,32 @@ impl Exporter {
             return String::new();
         }
 
-        let Some(first_row) = rows.first() else { return String::new() };
+        let Some(first_row) = rows.first() else {
+            return String::new();
+        };
         let columns: Vec<&String> = first_row.keys().collect();
         let col_names = columns.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ");
 
         let mut statements = Vec::new();
 
         for row in rows {
-            let values: Vec<String> = columns.iter()
-                .map(|col| {
-                    match row.get(*col) {
-                        Some(serde_json::Value::String(s)) => format!("'{}'", s.replace('\'', "''")),
-                        Some(serde_json::Value::Null) => "NULL".to_string(),
-                        Some(serde_json::Value::Bool(b)) => b.to_string(),
-                        Some(serde_json::Value::Number(n)) => n.to_string(),
-                        Some(v) => format!("'{}'", v.to_string().replace('\'', "''")),
-                        None => "NULL".to_string(),
-                    }
+            let values: Vec<String> = columns
+                .iter()
+                .map(|col| match row.get(*col) {
+                    Some(serde_json::Value::String(s)) => format!("'{}'", s.replace('\'', "''")),
+                    Some(serde_json::Value::Null) => "NULL".to_string(),
+                    Some(serde_json::Value::Bool(b)) => b.to_string(),
+                    Some(serde_json::Value::Number(n)) => n.to_string(),
+                    Some(v) => format!("'{}'", v.to_string().replace('\'', "''")),
+                    None => "NULL".to_string(),
                 })
                 .collect();
 
             statements.push(format!(
                 "INSERT INTO {} ({}) VALUES ({});",
-                table, col_names, values.join(", ")
+                table,
+                col_names,
+                values.join(", ")
             ));
         }
 
@@ -344,9 +346,7 @@ impl Importer {
             return format.clone();
         }
 
-        let ext = self.options.input.extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("");
+        let ext = self.options.input.extension().and_then(|e| e.to_str()).unwrap_or("");
 
         ExportFormat::from_extension(ext).unwrap_or(ExportFormat::Csv)
     }
@@ -380,11 +380,15 @@ impl Importer {
                 }
 
                 // Apply column mapping
-                let target_col = self.options.column_mapping.as_ref()
+                let target_col = self
+                    .options
+                    .column_mapping
+                    .as_ref()
                     .and_then(|m| m.get(header))
                     .unwrap_or(header);
 
-                let value = values.get(i)
+                let value = values
+                    .get(i)
                     .map(|v| infer_json_value(v))
                     .unwrap_or(serde_json::Value::Null);
 
@@ -399,8 +403,7 @@ impl Importer {
 
     /// Parse JSON data
     pub fn parse_json(&self, data: &str) -> Result<Vec<HashMap<String, serde_json::Value>>, String> {
-        serde_json::from_str(data)
-            .map_err(|e| format!("JSON parse error: {}", e))
+        serde_json::from_str(data).map_err(|e| format!("JSON parse error: {}", e))
     }
 
     /// Parse JSON Lines data
@@ -412,8 +415,8 @@ impl Importer {
                 continue;
             }
 
-            let row: HashMap<String, serde_json::Value> = serde_json::from_str(line)
-                .map_err(|e| format!("JSON parse error on line {}: {}", i + 1, e))?;
+            let row: HashMap<String, serde_json::Value> =
+                serde_json::from_str(line).map_err(|e| format!("JSON parse error on line {}: {}", i + 1, e))?;
             rows.push(row);
         }
 
@@ -432,7 +435,8 @@ impl Importer {
             for (key, value) in row {
                 let data_type = infer_sql_type(value);
 
-                columns.entry(key.clone())
+                columns
+                    .entry(key.clone())
                     .and_modify(|col| {
                         // Upgrade type if needed
                         col.data_type = merge_types(&col.data_type, &data_type);
@@ -454,7 +458,8 @@ impl Importer {
 
     /// Generate CREATE TABLE statement
     pub fn generate_create_table(&self, schema: &[ColumnSchema]) -> String {
-        let columns: Vec<String> = schema.iter()
+        let columns: Vec<String> = schema
+            .iter()
             .map(|col| {
                 let mut def = format!("{} {}", col.name, col.data_type);
                 if col.primary_key {
@@ -480,19 +485,21 @@ impl Importer {
             return Vec::new();
         }
 
-        let Some(first_row) = rows.first() else { return Vec::new() };
+        let Some(first_row) = rows.first() else {
+            return Vec::new();
+        };
         let columns: Vec<&String> = first_row.keys().collect();
         let col_names = columns.iter().map(|c| c.as_str()).collect::<Vec<_>>().join(", ");
 
         rows.iter()
             .map(|row| {
-                let values: Vec<String> = columns.iter()
-                    .map(|col| value_to_sql(row.get(*col)))
-                    .collect();
+                let values: Vec<String> = columns.iter().map(|col| value_to_sql(row.get(*col))).collect();
 
                 format!(
                     "INSERT INTO {} ({}) VALUES ({});",
-                    self.options.table, col_names, values.join(", ")
+                    self.options.table,
+                    col_names,
+                    values.join(", ")
                 )
             })
             .collect()
@@ -664,7 +671,10 @@ mod tests {
         let rows = importer.parse_csv(csv).unwrap();
 
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].get("name"), Some(&serde_json::Value::String("Alice".to_string())));
+        assert_eq!(
+            rows[0].get("name"),
+            Some(&serde_json::Value::String("Alice".to_string()))
+        );
     }
 
     #[test]

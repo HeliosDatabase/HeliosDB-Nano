@@ -38,13 +38,13 @@
 #![allow(unused_variables)]
 #![allow(unreachable_patterns)]
 
-use crate::{Result, Error, Tuple, Value, Schema};
-use crate::sql::{LogicalPlan, LogicalExpr, AggregateFunction, BinaryOperator};
-use crate::storage::{StorageEngine, MaterializedViewMetadata};
+use crate::sql::{AggregateFunction, BinaryOperator, LogicalExpr, LogicalPlan};
+use crate::storage::{MaterializedViewMetadata, StorageEngine};
+use crate::{Error, Result, Schema, Tuple, Value};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
 
 /// Refresh strategy for materialized views
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -132,7 +132,8 @@ impl DeltaTracker {
     /// Record an insert operation
     pub fn record_insert(&self, table_name: &str, tuple: Tuple, timestamp: u64) {
         let mut deltas = self.deltas.write();
-        deltas.entry(table_name.to_string())
+        deltas
+            .entry(table_name.to_string())
             .or_insert_with(Vec::new)
             .push(Delta {
                 operation: DeltaOperation::Insert { tuple },
@@ -143,7 +144,8 @@ impl DeltaTracker {
     /// Record a delete operation
     pub fn record_delete(&self, table_name: &str, tuple: Tuple, timestamp: u64) {
         let mut deltas = self.deltas.write();
-        deltas.entry(table_name.to_string())
+        deltas
+            .entry(table_name.to_string())
             .or_insert_with(Vec::new)
             .push(Delta {
                 operation: DeltaOperation::Delete { tuple },
@@ -154,7 +156,8 @@ impl DeltaTracker {
     /// Record an update operation
     pub fn record_update(&self, table_name: &str, old_tuple: Tuple, new_tuple: Tuple, timestamp: u64) {
         let mut deltas = self.deltas.write();
-        deltas.entry(table_name.to_string())
+        deltas
+            .entry(table_name.to_string())
             .or_insert_with(Vec::new)
             .push(Delta {
                 operation: DeltaOperation::Update { old_tuple, new_tuple },
@@ -166,10 +169,7 @@ impl DeltaTracker {
     pub fn get_deltas_since(&self, table_name: &str, since: u64) -> Vec<Delta> {
         let deltas = self.deltas.read();
         if let Some(table_deltas) = deltas.get(table_name) {
-            table_deltas.iter()
-                .filter(|d| d.timestamp > since)
-                .cloned()
-                .collect()
+            table_deltas.iter().filter(|d| d.timestamp > since).cloned().collect()
         } else {
             Vec::new()
         }
@@ -181,9 +181,7 @@ impl DeltaTracker {
         let mut count = 0;
         for table_name in table_names {
             if let Some(table_deltas) = deltas.get(table_name) {
-                count += table_deltas.iter()
-                    .filter(|d| d.timestamp > since)
-                    .count();
+                count += table_deltas.iter().filter(|d| d.timestamp > since).count();
             }
         }
         Ok(count)
@@ -215,10 +213,7 @@ pub struct IncrementalRefresher {
 impl IncrementalRefresher {
     /// Create a new incremental refresher
     pub fn new(storage: Arc<StorageEngine>, delta_tracker: Arc<DeltaTracker>) -> Self {
-        Self {
-            storage,
-            delta_tracker,
-        }
+        Self { storage, delta_tracker }
     }
 
     /// Refresh a materialized view incrementally
@@ -243,7 +238,8 @@ impl IncrementalRefresher {
         }
 
         // Get deltas for base tables
-        let last_refresh = mv_metadata.last_refresh
+        let last_refresh = mv_metadata
+            .last_refresh
             .ok_or_else(|| Error::query_execution("View has never been refreshed"))?
             .timestamp() as u64;
 
@@ -253,7 +249,12 @@ impl IncrementalRefresher {
 
         // Apply incremental refresh based on query type
         match &query_plan {
-            LogicalPlan::Aggregate { input, group_by, aggr_exprs, .. } => {
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                ..
+            } => {
                 // Extract base table from input
                 if let LogicalPlan::Scan { table_name, .. } = input.as_ref() {
                     let deltas = self.delta_tracker.get_deltas_since(table_name, last_refresh);
@@ -262,13 +263,8 @@ impl IncrementalRefresher {
                         deltas,
                     };
 
-                    let (inserted, updated, deleted) = self.refresh_aggregate_incremental(
-                        mv_name,
-                        &mv_metadata,
-                        &delta_set,
-                        group_by,
-                        aggr_exprs,
-                    )?;
+                    let (inserted, updated, deleted) =
+                        self.refresh_aggregate_incremental(mv_name, &mv_metadata, &delta_set, group_by, aggr_exprs)?;
 
                     total_inserted += inserted;
                     total_updated += updated;
@@ -284,12 +280,8 @@ impl IncrementalRefresher {
                         deltas,
                     };
 
-                    let (inserted, updated, deleted) = self.refresh_filter_incremental(
-                        mv_name,
-                        &mv_metadata,
-                        &delta_set,
-                        predicate,
-                    )?;
+                    let (inserted, updated, deleted) =
+                        self.refresh_filter_incremental(mv_name, &mv_metadata, &delta_set, predicate)?;
 
                     total_inserted += inserted;
                     total_updated += updated;
@@ -297,7 +289,13 @@ impl IncrementalRefresher {
                 }
             }
 
-            LogicalPlan::Join { left, right, join_type, on, .. } => {
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                on,
+                ..
+            } => {
                 // Get base tables from left and right
                 let left_table = self.extract_table_name(left)?;
                 let right_table = self.extract_table_name(right)?;
@@ -366,11 +364,11 @@ impl IncrementalRefresher {
     /// Estimate the cost of incremental vs full refresh
     pub fn estimate_refresh_cost(&self, mv_metadata: &MaterializedViewMetadata) -> Result<RefreshCost> {
         // Get delta count
-        let last_refresh = mv_metadata.last_refresh
-            .map(|dt| dt.timestamp() as u64)
-            .unwrap_or(0);
+        let last_refresh = mv_metadata.last_refresh.map(|dt| dt.timestamp() as u64).unwrap_or(0);
 
-        let delta_count = self.delta_tracker.count_deltas_since(&mv_metadata.base_tables, last_refresh)?;
+        let delta_count = self
+            .delta_tracker
+            .count_deltas_since(&mv_metadata.base_tables, last_refresh)?;
 
         // Get MV size
         let mv_data_table = format!("__mv_{}", mv_metadata.view_name);
@@ -642,8 +640,10 @@ impl IncrementalRefresher {
                     }
                 }
                 DeltaOperation::Update { old_tuple, new_tuple } => {
-                    let old_match = self.matches_filter_with_schema(old_tuple, predicate, base_table_schema.as_ref())?;
-                    let new_match = self.matches_filter_with_schema(new_tuple, predicate, base_table_schema.as_ref())?;
+                    let old_match =
+                        self.matches_filter_with_schema(old_tuple, predicate, base_table_schema.as_ref())?;
+                    let new_match =
+                        self.matches_filter_with_schema(new_tuple, predicate, base_table_schema.as_ref())?;
 
                     match (old_match, new_match) {
                         (true, true) => {
@@ -700,12 +700,14 @@ impl IncrementalRefresher {
             )));
         }
 
-        let left_table = mv_metadata.base_tables.first().ok_or_else(|| {
-            Error::query_execution("Join MV missing left base table")
-        })?;
-        let right_table = mv_metadata.base_tables.get(1).ok_or_else(|| {
-            Error::query_execution("Join MV missing right base table")
-        })?;
+        let left_table = mv_metadata
+            .base_tables
+            .first()
+            .ok_or_else(|| Error::query_execution("Join MV missing left base table"))?;
+        let right_table = mv_metadata
+            .base_tables
+            .get(1)
+            .ok_or_else(|| Error::query_execution("Join MV missing right base table"))?;
 
         // Process deltas from each table
         for delta_set in delta_sets {
@@ -726,12 +728,8 @@ impl IncrementalRefresher {
                 match &delta.operation {
                     DeltaOperation::Insert { tuple } => {
                         // Find matching rows in probe table
-                        let matches = self.find_join_matches(
-                            tuple,
-                            &probe_tuples,
-                            on,
-                            &delta_set.table_name == left_table,
-                        )?;
+                        let matches =
+                            self.find_join_matches(tuple, &probe_tuples, on, &delta_set.table_name == left_table)?;
 
                         // Insert joined rows into MV
                         for matched_tuple in matches {
@@ -749,12 +747,8 @@ impl IncrementalRefresher {
                     DeltaOperation::Delete { tuple } => {
                         // For delete, we need to find and remove corresponding MV rows
                         // This is simplified: we find rows that would have been created by this tuple
-                        let matches = self.find_join_matches(
-                            tuple,
-                            &probe_tuples,
-                            on,
-                            &delta_set.table_name == left_table,
-                        )?;
+                        let matches =
+                            self.find_join_matches(tuple, &probe_tuples, on, &delta_set.table_name == left_table)?;
 
                         for matched_tuple in matches {
                             let joined = if delta_set.table_name == *left_table {
@@ -772,12 +766,8 @@ impl IncrementalRefresher {
                     DeltaOperation::Update { old_tuple, new_tuple } => {
                         // Handle update as delete + insert
                         // First, delete old matches
-                        let old_matches = self.find_join_matches(
-                            old_tuple,
-                            &probe_tuples,
-                            on,
-                            &delta_set.table_name == left_table,
-                        )?;
+                        let old_matches =
+                            self.find_join_matches(old_tuple, &probe_tuples, on, &delta_set.table_name == left_table)?;
 
                         for matched_tuple in old_matches {
                             let joined = if delta_set.table_name == *left_table {
@@ -790,12 +780,8 @@ impl IncrementalRefresher {
                         }
 
                         // Then, insert new matches
-                        let new_matches = self.find_join_matches(
-                            new_tuple,
-                            &probe_tuples,
-                            on,
-                            &delta_set.table_name == left_table,
-                        )?;
+                        let new_matches =
+                            self.find_join_matches(new_tuple, &probe_tuples, on, &delta_set.table_name == left_table)?;
 
                         for matched_tuple in new_matches {
                             let joined = if delta_set.table_name == *left_table {
@@ -849,12 +835,7 @@ impl IncrementalRefresher {
     }
 
     /// Evaluate join condition with two tuples
-    fn evaluate_join_condition(
-        &self,
-        expr: &LogicalExpr,
-        left_tuple: &Tuple,
-        right_tuple: &Tuple,
-    ) -> Result<bool> {
+    fn evaluate_join_condition(&self, expr: &LogicalExpr, left_tuple: &Tuple, right_tuple: &Tuple) -> Result<bool> {
         match expr {
             LogicalExpr::BinaryExpr { left, op, right } => {
                 // Evaluate both sides
@@ -874,32 +855,36 @@ impl IncrementalRefresher {
     }
 
     /// Evaluate expression in join context (can reference columns from both tables)
-    fn evaluate_join_expr(
-        &self,
-        expr: &LogicalExpr,
-        left_tuple: &Tuple,
-        right_tuple: &Tuple,
-    ) -> Result<Value> {
+    fn evaluate_join_expr(&self, expr: &LogicalExpr, left_tuple: &Tuple, right_tuple: &Tuple) -> Result<Value> {
         match expr {
             LogicalExpr::Column { name, .. } => {
                 // Parse column reference: might be "table.column" or just "column"
                 // For simplicity, we use index-based access
                 // Format: "$left.0" for left table column 0, "$right.1" for right table column 1
                 if let Some(idx_str) = name.strip_prefix("$left.") {
-                    let idx: usize = idx_str.parse()
+                    let idx: usize = idx_str
+                        .parse()
                         .map_err(|_| Error::query_execution(format!("Invalid column index: {}", idx_str)))?;
 
-                    left_tuple.values.get(idx).cloned()
+                    left_tuple
+                        .values
+                        .get(idx)
+                        .cloned()
                         .ok_or_else(|| Error::query_execution(format!("Column index {} out of bounds", idx)))
                 } else if let Some(idx_str) = name.strip_prefix("$right.") {
-                    let idx: usize = idx_str.parse()
+                    let idx: usize = idx_str
+                        .parse()
                         .map_err(|_| Error::query_execution(format!("Invalid column index: {}", idx_str)))?;
 
-                    right_tuple.values.get(idx).cloned()
+                    right_tuple
+                        .values
+                        .get(idx)
+                        .cloned()
                         .ok_or_else(|| Error::query_execution(format!("Column index {} out of bounds", idx)))
                 } else {
                     // Assume it's an index directly
-                    let idx: usize = name.parse()
+                    let idx: usize = name
+                        .parse()
                         .map_err(|_| Error::query_execution(format!("Invalid column reference: {}", name)))?;
 
                     // Try left first, then right
@@ -907,7 +892,10 @@ impl IncrementalRefresher {
                         Ok(val.clone())
                     } else {
                         let right_idx = idx.saturating_sub(left_tuple.values.len());
-                        right_tuple.values.get(right_idx).cloned()
+                        right_tuple
+                            .values
+                            .get(right_idx)
+                            .cloned()
                             .ok_or_else(|| Error::query_execution(format!("Column index {} out of bounds", idx)))
                     }
                 }
@@ -955,12 +943,7 @@ impl IncrementalRefresher {
     ///
     /// Looks up an aggregate row by group key. If not found, creates a new one with initial values.
     /// The row is stored in the MV data table with the group key columns followed by aggregate columns.
-    fn get_or_create_agg_row(
-        &self,
-        mv_name: &str,
-        group_key: &[Value],
-        aggr_exprs: &[LogicalExpr],
-    ) -> Result<Tuple> {
+    fn get_or_create_agg_row(&self, mv_name: &str, group_key: &[Value], aggr_exprs: &[LogicalExpr]) -> Result<Tuple> {
         let mv_data_table = format!("__mv_{}", mv_name);
 
         // Try to find existing aggregate row
@@ -993,7 +976,11 @@ impl IncrementalRefresher {
             }
         }
 
-        Ok(Tuple { values, row_id: None, branch_id: None })
+        Ok(Tuple {
+            values,
+            row_id: None,
+            branch_id: None,
+        })
     }
 
     /// Get aggregate row by group key
@@ -1074,7 +1061,12 @@ impl IncrementalRefresher {
     }
 
     /// Check if tuple matches filter predicate (with schema)
-    fn matches_filter_with_schema(&self, tuple: &Tuple, predicate: &LogicalExpr, schema: Option<&Schema>) -> Result<bool> {
+    fn matches_filter_with_schema(
+        &self,
+        tuple: &Tuple,
+        predicate: &LogicalExpr,
+        schema: Option<&Schema>,
+    ) -> Result<bool> {
         let result = self.evaluate_expr_with_schema(predicate, tuple, schema)?;
         match result {
             Value::Boolean(b) => Ok(b),
@@ -1096,17 +1088,16 @@ impl IncrementalRefresher {
                     // Find column index by name
                     for (idx, column) in schema.columns.iter().enumerate() {
                         if column.name == *name {
-                            return tuple.values.get(idx).cloned()
-                                .ok_or_else(|| Error::query_execution(format!(
+                            return tuple.values.get(idx).cloned().ok_or_else(|| {
+                                Error::query_execution(format!(
                                     "Column index {} out of bounds for tuple with {} values",
-                                    idx, tuple.values.len()
-                                )));
+                                    idx,
+                                    tuple.values.len()
+                                ))
+                            });
                         }
                     }
-                    Err(Error::query_execution(format!(
-                        "Column '{}' not found in schema",
-                        name
-                    )))
+                    Err(Error::query_execution(format!("Column '{}' not found in schema", name)))
                 } else {
                     Err(Error::query_execution(format!(
                         "Column reference by name '{}' requires schema context",
@@ -1148,9 +1139,13 @@ impl IncrementalRefresher {
             (Value::Int4(a), Value::Int4(b)) => Ok(a.cmp(b) as i32),
             (Value::Int8(a), Value::Int8(b)) => Ok(a.cmp(b) as i32),
             (Value::Float8(a), Value::Float8(b)) => {
-                if a < b { Ok(-1) }
-                else if a > b { Ok(1) }
-                else { Ok(0) }
+                if a < b {
+                    Ok(-1)
+                } else if a > b {
+                    Ok(1)
+                } else {
+                    Ok(0)
+                }
             }
             (Value::String(a), Value::String(b)) => Ok(a.cmp(b) as i32),
             _ => Err(Error::query_execution("Cannot compare incompatible types")),
@@ -1160,16 +1155,14 @@ impl IncrementalRefresher {
     /// Add two values
     fn add_values(&self, left: &Value, right: &Value) -> Result<Value> {
         match (left, right) {
-            (Value::Int4(a), Value::Int4(b)) => {
-                a.checked_add(*b)
-                    .map(Value::Int4)
-                    .ok_or_else(|| Error::query_execution("integer overflow: INT addition"))
-            }
-            (Value::Int8(a), Value::Int8(b)) => {
-                a.checked_add(*b)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition"))
-            }
+            (Value::Int4(a), Value::Int4(b)) => a
+                .checked_add(*b)
+                .map(Value::Int4)
+                .ok_or_else(|| Error::query_execution("integer overflow: INT addition")),
+            (Value::Int8(a), Value::Int8(b)) => a
+                .checked_add(*b)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition")),
             (Value::Float8(a), Value::Float8(b)) => Ok(Value::Float8(a + b)),
             _ => Err(Error::query_execution("Cannot add incompatible types")),
         }
@@ -1178,16 +1171,14 @@ impl IncrementalRefresher {
     /// Subtract two values
     fn subtract_values(&self, left: &Value, right: &Value) -> Result<Value> {
         match (left, right) {
-            (Value::Int4(a), Value::Int4(b)) => {
-                a.checked_sub(*b)
-                    .map(Value::Int4)
-                    .ok_or_else(|| Error::query_execution("integer overflow: INT subtraction"))
-            }
-            (Value::Int8(a), Value::Int8(b)) => {
-                a.checked_sub(*b)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction"))
-            }
+            (Value::Int4(a), Value::Int4(b)) => a
+                .checked_sub(*b)
+                .map(Value::Int4)
+                .ok_or_else(|| Error::query_execution("integer overflow: INT subtraction")),
+            (Value::Int8(a), Value::Int8(b)) => a
+                .checked_sub(*b)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction")),
             (Value::Float8(a), Value::Float8(b)) => Ok(Value::Float8(a - b)),
             _ => Err(Error::query_execution("Cannot subtract incompatible types")),
         }
@@ -1246,7 +1237,7 @@ impl IncrementalRefresher {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Config, Column, DataType, Schema};
+    use crate::{Column, Config, DataType, Schema};
 
     #[test]
     fn test_refresh_strategy() {

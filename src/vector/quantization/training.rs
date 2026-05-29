@@ -5,7 +5,7 @@
 
 #![allow(unused_variables)]
 
-use super::{Codebook, ProductQuantizerConfig, PqError, PqResult};
+use super::{Codebook, PqError, PqResult, ProductQuantizerConfig};
 use crate::vector::Vector;
 use rand::seq::SliceRandom;
 use rand::thread_rng;
@@ -26,10 +26,7 @@ use rand::thread_rng;
 // SAFETY: Vector dimensions are validated against config.dimension before any slicing.
 // Sub-vector slicing uses sq_idx * subvector_dim which is bounded by config.dimension.
 #[allow(clippy::indexing_slicing)]
-pub fn train_codebook(
-    config: &ProductQuantizerConfig,
-    training_vectors: &[Vector],
-) -> PqResult<Codebook> {
+pub fn train_codebook(config: &ProductQuantizerConfig, training_vectors: &[Vector]) -> PqResult<Codebook> {
     config.validate()?;
 
     // Calculate minimum required samples for k-means
@@ -70,17 +67,10 @@ pub fn train_codebook(
         let end = start + subvector_dim;
 
         // Extract all sub-vectors for this sub-quantizer
-        let subvectors: Vec<Vec<f32>> = training_vectors
-            .iter()
-            .map(|v| v[start..end].to_vec())
-            .collect();
+        let subvectors: Vec<Vec<f32>> = training_vectors.iter().map(|v| v[start..end].to_vec()).collect();
 
         // Run k-means to find centroids
-        let centroids = kmeans(
-            &subvectors,
-            num_centroids,
-            config.training_iterations,
-        )?;
+        let centroids = kmeans(&subvectors, num_centroids, config.training_iterations)?;
 
         // Store centroids in codebook
         for (c_idx, centroid) in centroids.into_iter().enumerate() {
@@ -143,7 +133,9 @@ fn kmeans(data: &[Vector], k: usize, max_iterations: usize) -> PqResult<Vec<Vect
             if cluster_points.is_empty() {
                 // Empty cluster: reinitialize with a random point
                 let mut rng = thread_rng();
-                if let Some(&random_point_idx) = data.iter().enumerate()
+                if let Some(&random_point_idx) = data
+                    .iter()
+                    .enumerate()
                     .map(|(idx, _)| idx)
                     .collect::<Vec<_>>()
                     .choose(&mut rng)
@@ -175,7 +167,9 @@ fn kmeans(data: &[Vector], k: usize, max_iterations: usize) -> PqResult<Vec<Vect
         if centroid.len() != dimension {
             return Err(PqError::TrainingError(format!(
                 "k-means produced centroid {} with wrong dimension: expected {}, got {}",
-                idx, dimension, centroid.len()
+                idx,
+                dimension,
+                centroid.len()
             )));
         }
         for (dim, &value) in centroid.iter().enumerate() {
@@ -200,11 +194,7 @@ fn kmeans(data: &[Vector], k: usize, max_iterations: usize) -> PqResult<Vec<Vect
 // SAFETY: All indices into `data` are bounded by data.len() which is validated non-empty.
 // Centroid indices are bounded by the centroids vec length which grows up to k.
 #[allow(clippy::indexing_slicing)]
-fn kmeans_plus_plus_init(
-    data: &[Vector],
-    k: usize,
-    dimension: usize,
-) -> PqResult<Vec<Vector>> {
+fn kmeans_plus_plus_init(data: &[Vector], k: usize, dimension: usize) -> PqResult<Vec<Vector>> {
     let mut rng = thread_rng();
     let mut centroids = Vec::with_capacity(k);
 
@@ -236,9 +226,9 @@ fn kmeans_plus_plus_init(
             loop {
                 if let Some(&idx) = (0..data.len()).collect::<Vec<_>>().choose(&mut rng) {
                     // Check if this point is already a centroid
-                    let is_duplicate = centroids.iter().any(|c| {
-                        c.iter().zip(data[idx].iter()).all(|(a, b)| (a - b).abs() < 1e-9)
-                    });
+                    let is_duplicate = centroids
+                        .iter()
+                        .any(|c| c.iter().zip(data[idx].iter()).all(|(a, b)| (a - b).abs() < 1e-9));
                     if !is_duplicate || attempts > max_attempts {
                         centroids.push(data[idx].clone());
                         break;
@@ -353,18 +343,13 @@ fn vectors_equal(a: &[f32], b: &[f32], tolerance: f32) -> bool {
         return false;
     }
 
-    a.iter()
-        .zip(b.iter())
-        .all(|(x, y)| (x - y).abs() < tolerance)
+    a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < tolerance)
 }
 
 /// Compute L2 distance squared between two vectors
 #[inline]
 fn l2_distance_squared(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| (x - y).powi(2))
-        .sum()
+    a.iter().zip(b.iter()).map(|(x, y)| (x - y).powi(2)).sum()
 }
 
 #[cfg(test)]
@@ -451,11 +436,7 @@ mod tests {
 
     #[test]
     fn test_find_nearest_centroid() {
-        let centroids = vec![
-            vec![0.0, 0.0],
-            vec![1.0, 1.0],
-            vec![2.0, 2.0],
-        ];
+        let centroids = vec![vec![0.0, 0.0], vec![1.0, 1.0], vec![2.0, 2.0]];
 
         let point = vec![0.9, 0.9];
         let nearest = find_nearest_centroid(&point, &centroids);
@@ -464,11 +445,7 @@ mod tests {
 
     #[test]
     fn test_compute_mean() {
-        let data = vec![
-            vec![0.0, 0.0],
-            vec![2.0, 2.0],
-            vec![4.0, 4.0],
-        ];
+        let data = vec![vec![0.0, 0.0], vec![2.0, 2.0], vec![4.0, 4.0]];
 
         let indices = vec![0, 1, 2];
         let mean = compute_mean(&data, &indices, 2);

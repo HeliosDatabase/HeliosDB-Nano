@@ -19,13 +19,15 @@ fn main() -> Result<()> {
 
     // 1. Create a table with a vector column
     println!("1. Creating table with VECTOR column...");
-    db.execute("
+    db.execute(
+        "
         CREATE TABLE documents (
             id INT PRIMARY KEY,
             content TEXT,
             embedding VECTOR(384)
         )
-    ")?;
+    ",
+    )?;
     println!("   ✓ Table 'documents' created\n");
 
     // 2. Insert sample documents with embeddings
@@ -41,7 +43,9 @@ fn main() -> Result<()> {
     for (id, content, embedding) in &sample_docs {
         db.execute(&format!(
             "INSERT INTO documents (id, content, embedding) VALUES ({}, '{}', '{}')",
-            id, content, vector_to_string(embedding)
+            id,
+            content,
+            vector_to_string(embedding)
         ))?;
         println!("   ✓ Inserted: {}", content);
     }
@@ -60,7 +64,7 @@ fn main() -> Result<()> {
              LIMIT 3",
             vector_to_string(&query_vec)
         ),
-        &[]
+        &[],
     )?;
 
     println!("   Results:");
@@ -82,7 +86,7 @@ fn main() -> Result<()> {
              LIMIT 3",
             vector_to_string(&query_vec2)
         ),
-        &[]
+        &[],
     )?;
 
     println!("   Results:");
@@ -93,7 +97,8 @@ fn main() -> Result<()> {
 
     // 5. Demonstrate filtering with vector search
     println!("5. Vector Search with Filtering");
-    db.execute("
+    db.execute(
+        "
         CREATE TABLE products (
             id INT PRIMARY KEY,
             name TEXT,
@@ -101,7 +106,8 @@ fn main() -> Result<()> {
             price INT,
             features VECTOR(128)
         )
-    ")?;
+    ",
+    )?;
 
     // Insert products
     let products = vec![
@@ -116,7 +122,11 @@ fn main() -> Result<()> {
         db.execute(&format!(
             "INSERT INTO products (id, name, category, price, features)
              VALUES ({}, '{}', '{}', {}, '{}')",
-            id, name, category, price, vector_to_string(features)
+            id,
+            name,
+            category,
+            price,
+            vector_to_string(features)
         ))?;
     }
 
@@ -132,26 +142,33 @@ fn main() -> Result<()> {
              LIMIT 2",
             vector_to_string(&query_features)
         ),
-        &[]
+        &[],
     )?;
 
     println!("   Query: Electronics under $1400, similar to query");
     println!("   Results:");
     for (i, row) in results.iter().enumerate() {
-        println!("     {}. {:?} - ${:?}, Distance={:?}",
-            i + 1, row.get(1), row.get(2), row.get(3));
+        println!(
+            "     {}. {:?} - ${:?}, Distance={:?}",
+            i + 1,
+            row.get(1),
+            row.get(2),
+            row.get(3)
+        );
     }
     println!();
 
     // 6. Demonstrate different vector dimensions
     println!("6. Multiple Vector Dimensions");
-    db.execute("
+    db.execute(
+        "
         CREATE TABLE multimodal (
             id INT PRIMARY KEY,
             text_embedding VECTOR(768),
             image_embedding VECTOR(512)
         )
-    ")?;
+    ",
+    )?;
 
     db.execute(&format!(
         "INSERT INTO multimodal (id, text_embedding, image_embedding)
@@ -181,18 +198,13 @@ fn main() -> Result<()> {
 
 /// Generate a deterministic test embedding based on a seed
 fn generate_embedding(dim: usize, seed: i32) -> Vec<f32> {
-    (0..dim)
-        .map(|i| ((i as f32 + seed as f32) * 0.1).sin())
-        .collect()
+    (0..dim).map(|i| ((i as f32 + seed as f32) * 0.1).sin()).collect()
 }
 
 /// Convert a vector to SQL array literal string
 fn vector_to_string(vec: &[f32]) -> String {
     format!(
         "[{}]",
-        vec.iter()
-            .map(|v| format!("{:.6}", v))
-            .collect::<Vec<_>>()
-            .join(", ")
+        vec.iter().map(|v| format!("{:.6}", v)).collect::<Vec<_>>().join(", ")
     )
 }

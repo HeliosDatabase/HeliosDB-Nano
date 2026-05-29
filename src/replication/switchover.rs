@@ -7,16 +7,16 @@
 //! 4. Reconfiguration - Standbys reconnect to new primary
 //! 5. Resumption - Resume normal operations
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use parking_lot::RwLock;
 use tokio::sync::{broadcast, mpsc, oneshot};
 use uuid::Uuid;
 
-use crate::{Result, Error};
-use super::role_manager::{RoleManager, NodeRole, RoleChangeReason, SwitchoverPhase};
 use super::ha_state::HAStateRegistry;
+use super::role_manager::{NodeRole, RoleChangeReason, RoleManager, SwitchoverPhase};
+use crate::{Error, Result};
 
 /// Switchover configuration
 #[derive(Debug, Clone)]
@@ -81,23 +81,16 @@ pub enum SwitchoverCommand {
         response: oneshot::Sender<Result<Uuid>>,
     },
     /// Cancel ongoing switchover
-    Cancel {
-        response: oneshot::Sender<Result<()>>,
-    },
+    Cancel { response: oneshot::Sender<Result<()>> },
     /// Check switchover readiness
     Check {
         target_node: Uuid,
         response: oneshot::Sender<Result<SwitchoverCheck>>,
     },
     /// Report standby LSN progress
-    StandbyProgress {
-        node_id: Uuid,
-        lsn: u64,
-    },
+    StandbyProgress { node_id: Uuid, lsn: u64 },
     /// Standby ready notification
-    StandbyReady {
-        node_id: Uuid,
-    },
+    StandbyReady { node_id: Uuid },
     /// Shutdown coordinator
     Shutdown,
 }
@@ -129,14 +122,9 @@ pub enum SwitchoverEvent {
         duration_ms: u64,
     },
     /// Switchover failed
-    Failed {
-        switchover_id: Uuid,
-        error: String,
-    },
+    Failed { switchover_id: Uuid, error: String },
     /// Switchover cancelled
-    Cancelled {
-        switchover_id: Uuid,
-    },
+    Cancelled { switchover_id: Uuid },
 }
 
 /// Switchover Coordinator
@@ -212,7 +200,8 @@ impl SwitchoverCoordinator {
         if self.writes_blocked.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(Error::ha("Writes blocked during switchover"));
         }
-        self.in_flight_transactions.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.in_flight_transactions
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(TransactionGuard {
             counter: Arc::clone(&self.in_flight_transactions),
         })
@@ -253,9 +242,7 @@ impl SwitchoverCoordinator {
         let (response_tx, response_rx) = oneshot::channel();
 
         self.command_tx
-            .send(SwitchoverCommand::Cancel {
-                response: response_tx,
-            })
+            .send(SwitchoverCommand::Cancel { response: response_tx })
             .await
             .map_err(|_| Error::ha("Coordinator channel closed"))?;
 
@@ -304,10 +291,7 @@ impl SwitchoverCoordinator {
         // Check preconditions
         let check = self.handle_check(target_node).await?;
         if !check.can_proceed {
-            return Err(Error::ha(format!(
-                "Switchover blocked: {}",
-                check.blockers.join(", ")
-            )));
+            return Err(Error::ha(format!("Switchover blocked: {}", check.blockers.join(", "))));
         }
 
         // Begin switchover
@@ -322,7 +306,9 @@ impl SwitchoverCoordinator {
         });
 
         // Execute switchover phases
-        let result = self.execute_switchover(switchover_id, target_node, check.primary_lsn).await;
+        let result = self
+            .execute_switchover(switchover_id, target_node, check.primary_lsn)
+            .await;
 
         match result {
             Ok(()) => {
@@ -332,11 +318,7 @@ impl SwitchoverCoordinator {
                     new_primary: target_node,
                     duration_ms: duration.as_millis() as u64,
                 });
-                tracing::info!(
-                    "Switchover {} completed in {}ms",
-                    switchover_id,
-                    duration.as_millis()
-                );
+                tracing::info!("Switchover {} completed in {}ms", switchover_id, duration.as_millis());
                 Ok(switchover_id)
             }
             Err(e) => {
@@ -352,12 +334,7 @@ impl SwitchoverCoordinator {
     }
 
     /// Execute the 5-phase switchover protocol
-    async fn execute_switchover(
-        &self,
-        switchover_id: Uuid,
-        target_node: Uuid,
-        primary_lsn: u64,
-    ) -> Result<()> {
+    async fn execute_switchover(&self, switchover_id: Uuid, target_node: Uuid, primary_lsn: u64) -> Result<()> {
         let timeout = Instant::now() + self.config.total_timeout;
 
         // Phase 1: Preparation (already done in check)
@@ -379,7 +356,8 @@ impl SwitchoverCoordinator {
         tracing::info!("Writes blocked for switchover synchronization");
 
         // Enter draining state
-        self.role_manager.change_role(NodeRole::Draining, RoleChangeReason::Switchover)?;
+        self.role_manager
+            .change_role(NodeRole::Draining, RoleChangeReason::Switchover)?;
 
         // Wait for in-flight transactions to complete
         let drain_deadline = Instant::now() + self.config.drain_timeout;
@@ -402,16 +380,14 @@ impl SwitchoverCoordinator {
         let sync_deadline = Instant::now() + self.config.sync_timeout;
         loop {
             // Check target standby LSN
-            let standby_info = self.ha_registry.get_standbys()
+            let standby_info = self
+                .ha_registry
+                .get_standbys()
                 .into_iter()
                 .find(|s| s.node_id == target_node);
             if let Some(info) = standby_info {
                 if info.apply_lsn >= final_lsn {
-                    tracing::info!(
-                        "Target standby {} caught up to LSN {}",
-                        target_node,
-                        final_lsn
-                    );
+                    tracing::info!("Target standby {} caught up to LSN {}", target_node, final_lsn);
                     break;
                 }
             }
@@ -433,10 +409,8 @@ impl SwitchoverCoordinator {
         });
 
         // Demote this node to standby
-        self.role_manager.change_role(
-            NodeRole::TransitioningToStandby,
-            RoleChangeReason::Switchover,
-        )?;
+        self.role_manager
+            .change_role(NodeRole::TransitioningToStandby, RoleChangeReason::Switchover)?;
         self.role_manager.demote_to_standby(RoleChangeReason::Switchover)?;
 
         // Notify target to promote (via HA registry broadcast)
@@ -451,7 +425,11 @@ impl SwitchoverCoordinator {
         });
 
         // Notify all standbys of new primary
-        let target_addr = self.node_addresses.read().get(&target_node).cloned()
+        let target_addr = self
+            .node_addresses
+            .read()
+            .get(&target_node)
+            .cloned()
             .unwrap_or_else(|| format!("{}:5433", target_node)); // Default format
 
         let _ = self.event_tx.send(SwitchoverEvent::PrepareNewPrimary {
@@ -502,11 +480,11 @@ impl SwitchoverCoordinator {
 
         // Restore primary role if we were demoted
         let current_role = self.role_manager.role();
-        if matches!(
-            current_role,
-            NodeRole::Draining | NodeRole::TransitioningToStandby
-        ) {
-            if let Err(e) = self.role_manager.change_role(NodeRole::Primary, RoleChangeReason::Switchover) {
+        if matches!(current_role, NodeRole::Draining | NodeRole::TransitioningToStandby) {
+            if let Err(e) = self
+                .role_manager
+                .change_role(NodeRole::Primary, RoleChangeReason::Switchover)
+            {
                 tracing::error!("Failed to rollback to primary: {}", e);
             }
         }
@@ -540,7 +518,9 @@ impl SwitchoverCoordinator {
         }
 
         // Check target node health
-        let standby_info = self.ha_registry.get_standbys()
+        let standby_info = self
+            .ha_registry
+            .get_standbys()
             .into_iter()
             .find(|s| s.node_id == target_node);
         if let Some(info) = standby_info {
@@ -557,10 +537,9 @@ impl SwitchoverCoordinator {
             }
         } else {
             check.can_proceed = false;
-            check.blockers.push(format!(
-                "Target node {} not found or not healthy",
-                target_node
-            ));
+            check
+                .blockers
+                .push(format!("Target node {} not found or not healthy", target_node));
         }
 
         // Check other standbys
@@ -598,11 +577,7 @@ impl SwitchoverCoordinator {
             if node_id == state.target_node {
                 if let Some(target_lsn) = state.target_lsn {
                     if lsn >= target_lsn {
-                        tracing::info!(
-                            "Target standby {} reached target LSN {}",
-                            node_id,
-                            target_lsn
-                        );
+                        tracing::info!("Target standby {} reached target LSN {}", node_id, target_lsn);
                     }
                 }
             }
@@ -703,26 +678,29 @@ impl StandbySwitchoverHandler {
 
     async fn handle_event(&self, event: SwitchoverEvent) {
         match event {
-            SwitchoverEvent::Started { switchover_id, source, target } => {
-                tracing::info!(
-                    "Switchover {} started: {} -> {}",
-                    switchover_id,
-                    source,
-                    target
-                );
+            SwitchoverEvent::Started {
+                switchover_id,
+                source,
+                target,
+            } => {
+                tracing::info!("Switchover {} started: {} -> {}", switchover_id, source, target);
 
                 // If we're the target, prepare for promotion
                 if target == self.node_id {
                     tracing::info!("This node is the switchover target - preparing for promotion");
-                    if let Err(e) = self.role_manager.change_role(
-                        NodeRole::CatchingUp,
-                        RoleChangeReason::Switchover,
-                    ) {
+                    if let Err(e) = self
+                        .role_manager
+                        .change_role(NodeRole::CatchingUp, RoleChangeReason::Switchover)
+                    {
                         tracing::error!("Failed to enter catching up state: {}", e);
                     }
                 }
             }
-            SwitchoverEvent::PrepareNewPrimary { switchover_id, new_primary, new_primary_addr } => {
+            SwitchoverEvent::PrepareNewPrimary {
+                switchover_id,
+                new_primary,
+                new_primary_addr,
+            } => {
                 tracing::info!(
                     "Switchover {}: new primary is {} at {}",
                     switchover_id,
@@ -756,7 +734,11 @@ impl StandbySwitchoverHandler {
                     }
                 }
             }
-            SwitchoverEvent::Completed { switchover_id, new_primary, duration_ms } => {
+            SwitchoverEvent::Completed {
+                switchover_id,
+                new_primary,
+                duration_ms,
+            } => {
                 tracing::info!(
                     "Switchover {} completed in {}ms, new primary: {}",
                     switchover_id,
@@ -768,20 +750,18 @@ impl StandbySwitchoverHandler {
                 tracing::error!("Switchover {} failed: {}", switchover_id, error);
                 // Revert any transitional state
                 if self.role_manager.role().is_transitioning() {
-                    let _ = self.role_manager.change_role(
-                        NodeRole::Standby,
-                        RoleChangeReason::Switchover,
-                    );
+                    let _ = self
+                        .role_manager
+                        .change_role(NodeRole::Standby, RoleChangeReason::Switchover);
                 }
             }
             SwitchoverEvent::Cancelled { switchover_id } => {
                 tracing::info!("Switchover {} cancelled", switchover_id);
                 // Revert any transitional state
                 if self.role_manager.role().is_transitioning() {
-                    let _ = self.role_manager.change_role(
-                        NodeRole::Standby,
-                        RoleChangeReason::Switchover,
-                    );
+                    let _ = self
+                        .role_manager
+                        .change_role(NodeRole::Standby, RoleChangeReason::Switchover);
                 }
             }
             _ => {}

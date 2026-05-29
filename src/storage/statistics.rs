@@ -4,14 +4,14 @@
 //! Statistics are collected during data modification operations and used by
 //! the query planner for cardinality estimation and selectivity calculation.
 
-use crate::{Result, Error, DataType, Value};
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use crate::{DataType, Error, Result, Value};
 use chrono::{DateTime, Utc};
 use lru::LruCache;
-use std::time::{Duration, Instant};
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// Table-level statistics
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,11 +52,7 @@ impl TableStatistics {
     pub fn update(&mut self, row_count: u64, total_size: u64) {
         self.row_count = row_count;
         self.total_size = total_size;
-        self.avg_row_size = if row_count > 0 {
-            total_size / row_count
-        } else {
-            0
-        };
+        self.avg_row_size = if row_count > 0 { total_size / row_count } else { 0 };
         self.last_analyzed = Utc::now();
     }
 }
@@ -203,27 +199,37 @@ impl ColumnStatistics {
         // Try to compute numeric position within [min, max] range
         let position = match (value, min_val, max_val) {
             (Value::Int4(v), Value::Int4(min), Value::Int4(max)) => {
-                if max == min { 0.5 } else {
+                if max == min {
+                    0.5
+                } else {
                     (*v as f64 - *min as f64) / (*max as f64 - *min as f64)
                 }
             }
             (Value::Int8(v), Value::Int8(min), Value::Int8(max)) => {
-                if max == min { 0.5 } else {
+                if max == min {
+                    0.5
+                } else {
                     (*v as f64 - *min as f64) / (*max as f64 - *min as f64)
                 }
             }
             (Value::Float4(v), Value::Float4(min), Value::Float4(max)) => {
-                if (max - min).abs() < f32::EPSILON { 0.5 } else {
+                if (max - min).abs() < f32::EPSILON {
+                    0.5
+                } else {
                     (*v as f64 - *min as f64) / (*max as f64 - *min as f64)
                 }
             }
             (Value::Float8(v), Value::Float8(min), Value::Float8(max)) => {
-                if (max - min).abs() < f64::EPSILON { 0.5 } else {
+                if (max - min).abs() < f64::EPSILON {
+                    0.5
+                } else {
                     (v - min) / (max - min)
                 }
             }
             (Value::Timestamp(v), Value::Timestamp(min), Value::Timestamp(max)) => {
-                if max == min { 0.5 } else {
+                if max == min {
+                    0.5
+                } else {
                     let v_ts = v.timestamp_millis() as f64;
                     let min_ts = min.timestamp_millis() as f64;
                     let max_ts = max.timestamp_millis() as f64;
@@ -257,7 +263,9 @@ impl ColumnStatistics {
 
         // Find the first bound that is >= value
         for i in 0..self.histogram_bounds.len() {
-            let Some(bound) = self.histogram_bounds.get(i) else { break };
+            let Some(bound) = self.histogram_bounds.get(i) else {
+                break;
+            };
             let cmp = StatisticsAnalyzer::compare_values(value, bound);
             if cmp < 0 {
                 // Value is less than this bound
@@ -265,10 +273,7 @@ impl ColumnStatistics {
                     return (0, 0.0); // Before first bucket
                 }
                 // Value is in bucket i-1
-                if let (Some(lower), Some(upper)) = (
-                    self.histogram_bounds.get(i - 1),
-                    self.histogram_bounds.get(i),
-                ) {
+                if let (Some(lower), Some(upper)) = (self.histogram_bounds.get(i - 1), self.histogram_bounds.get(i)) {
                     let position = self.interpolate_position(value, lower, upper);
                     return (i - 1, position);
                 }
@@ -290,27 +295,37 @@ impl ColumnStatistics {
     fn interpolate_position(&self, value: &Value, lower: &Value, upper: &Value) -> f64 {
         match (value, lower, upper) {
             (Value::Int4(v), Value::Int4(lo), Value::Int4(hi)) => {
-                if hi == lo { 0.5 } else {
+                if hi == lo {
+                    0.5
+                } else {
                     (*v as f64 - *lo as f64) / (*hi as f64 - *lo as f64)
                 }
             }
             (Value::Int8(v), Value::Int8(lo), Value::Int8(hi)) => {
-                if hi == lo { 0.5 } else {
+                if hi == lo {
+                    0.5
+                } else {
                     (*v as f64 - *lo as f64) / (*hi as f64 - *lo as f64)
                 }
             }
             (Value::Float8(v), Value::Float8(lo), Value::Float8(hi)) => {
-                if (hi - lo).abs() < f64::EPSILON { 0.5 } else {
+                if (hi - lo).abs() < f64::EPSILON {
+                    0.5
+                } else {
                     (v - lo) / (hi - lo)
                 }
             }
             (Value::Float4(v), Value::Float4(lo), Value::Float4(hi)) => {
-                if (hi - lo).abs() < f32::EPSILON { 0.5 } else {
+                if (hi - lo).abs() < f32::EPSILON {
+                    0.5
+                } else {
                     (*v as f64 - *lo as f64) / (*hi as f64 - *lo as f64)
                 }
             }
             (Value::Timestamp(v), Value::Timestamp(lo), Value::Timestamp(hi)) => {
-                if hi == lo { 0.5 } else {
+                if hi == lo {
+                    0.5
+                } else {
                     let v_ts = v.timestamp_millis() as f64;
                     let lo_ts = lo.timestamp_millis() as f64;
                     let hi_ts = hi.timestamp_millis() as f64;
@@ -319,7 +334,15 @@ impl ColumnStatistics {
             }
             (Value::String(v), Value::String(lo), Value::String(hi)) => {
                 // For strings, use lexicographic comparison
-                if lo == hi { 0.5 } else if v <= lo { 0.0 } else if v >= hi { 1.0 } else { 0.5 }
+                if lo == hi {
+                    0.5
+                } else if v <= lo {
+                    0.0
+                } else if v >= hi {
+                    1.0
+                } else {
+                    0.5
+                }
             }
             _ => 0.5, // Default to middle of bucket
         }
@@ -391,7 +414,10 @@ struct MutationTracker {
 
 impl MutationTracker {
     fn new() -> Self {
-        Self { counts: HashMap::new(), total: 0 }
+        Self {
+            counts: HashMap::new(),
+            total: 0,
+        }
     }
 
     fn increment(&mut self, table_name: &str) {
@@ -451,13 +477,13 @@ impl StatisticsCache {
     ///
     /// Returns an error if cache_size is zero.
     pub fn with_config(cache_size: usize, ttl_seconds: u64) -> Result<Self> {
-        let cache_size_nz = NonZeroUsize::new(cache_size)
-            .ok_or_else(|| Error::config("Cache size must be non-zero"))?;
+        let cache_size_nz =
+            NonZeroUsize::new(cache_size).ok_or_else(|| Error::config("Cache size must be non-zero"))?;
         Ok(Self {
             cache: Arc::new(Mutex::new(LruCache::new(cache_size_nz))),
             default_ttl: Duration::from_secs(ttl_seconds),
-            min_ttl: Duration::from_secs(5),      // Minimum 5 seconds for hot tables
-            max_ttl: Duration::from_secs(120),    // Maximum 2 minutes for stable tables
+            min_ttl: Duration::from_secs(5),   // Minimum 5 seconds for hot tables
+            max_ttl: Duration::from_secs(120), // Maximum 2 minutes for stable tables
             mutations: Arc::new(Mutex::new(MutationTracker::new())),
             mutation_invalidation_threshold: 100, // Invalidate after 100 mutations
         })
@@ -465,14 +491,13 @@ impl StatisticsCache {
 
     /// Get statistics from cache with adaptive invalidation
     pub fn get(&self, table_name: &str) -> Result<Option<Arc<TableStatistics>>> {
-        let cache_guard = self.cache.lock().map_err(|e| {
-            Error::storage(format!("Statistics cache lock error: {}", e))
-        })?;
+        let cache_guard = self
+            .cache
+            .lock()
+            .map_err(|e| Error::storage(format!("Statistics cache lock error: {}", e)))?;
 
         // Get current mutation count for adaptive invalidation
-        let current_mutations = self.mutations.lock()
-            .map(|m| m.get(table_name))
-            .unwrap_or(0);
+        let current_mutations = self.mutations.lock().map(|m| m.get(table_name)).unwrap_or(0);
 
         if let Some(cached) = cache_guard.peek(table_name) {
             if cached.is_valid_with_mutations(current_mutations, self.mutation_invalidation_threshold) {
@@ -502,14 +527,13 @@ impl StatisticsCache {
 
     /// Put statistics into cache with adaptive TTL
     pub fn put(&self, table_name: String, stats: TableStatistics) -> Result<()> {
-        let mut cache_guard = self.cache.lock().map_err(|e| {
-            Error::storage(format!("Statistics cache lock error: {}", e))
-        })?;
+        let mut cache_guard = self
+            .cache
+            .lock()
+            .map_err(|e| Error::storage(format!("Statistics cache lock error: {}", e)))?;
 
         // Get current mutation count
-        let mutation_count = self.mutations.lock()
-            .map(|m| m.get(&table_name))
-            .unwrap_or(0);
+        let mutation_count = self.mutations.lock().map(|m| m.get(&table_name)).unwrap_or(0);
 
         // Calculate adaptive TTL based on recent mutation activity
         let adaptive_ttl = self.calculate_adaptive_ttl(&table_name, mutation_count);
@@ -559,18 +583,20 @@ impl StatisticsCache {
     /// Call this method after INSERT, UPDATE, or DELETE operations
     /// to help the cache adjust TTL for frequently modified tables.
     pub fn record_mutation(&self, table_name: &str) -> Result<()> {
-        let mut mutations = self.mutations.lock().map_err(|e| {
-            Error::storage(format!("Mutation tracker lock error: {}", e))
-        })?;
+        let mut mutations = self
+            .mutations
+            .lock()
+            .map_err(|e| Error::storage(format!("Mutation tracker lock error: {}", e)))?;
         mutations.increment(table_name);
         Ok(())
     }
 
     /// Invalidate statistics for a specific table
     pub fn invalidate(&self, table_name: &str) -> Result<()> {
-        let mut cache_guard = self.cache.lock().map_err(|e| {
-            Error::storage(format!("Statistics cache lock error: {}", e))
-        })?;
+        let mut cache_guard = self
+            .cache
+            .lock()
+            .map_err(|e| Error::storage(format!("Statistics cache lock error: {}", e)))?;
 
         cache_guard.pop(table_name);
         tracing::debug!("Invalidated statistics cache for '{}'", table_name);
@@ -579,9 +605,10 @@ impl StatisticsCache {
 
     /// Invalidate all statistics (e.g., after ANALYZE command)
     pub fn invalidate_all(&self) -> Result<()> {
-        let mut cache_guard = self.cache.lock().map_err(|e| {
-            Error::storage(format!("Statistics cache lock error: {}", e))
-        })?;
+        let mut cache_guard = self
+            .cache
+            .lock()
+            .map_err(|e| Error::storage(format!("Statistics cache lock error: {}", e)))?;
 
         cache_guard.clear();
         tracing::info!("Invalidated entire statistics cache");
@@ -590,9 +617,10 @@ impl StatisticsCache {
 
     /// Get cache statistics
     pub fn cache_stats(&self) -> Result<(usize, usize)> {
-        let cache_guard = self.cache.lock().map_err(|e| {
-            Error::storage(format!("Statistics cache lock error: {}", e))
-        })?;
+        let cache_guard = self
+            .cache
+            .lock()
+            .map_err(|e| Error::storage(format!("Statistics cache lock error: {}", e)))?;
 
         Ok((cache_guard.len(), cache_guard.cap().get()))
     }
@@ -614,11 +642,7 @@ impl StatisticsAnalyzer {
     /// - Row count
     /// - Average row size
     /// - Per-column statistics (distinct values, nulls, min/max)
-    pub fn analyze_table(
-        table_name: &str,
-        tuples: &[crate::Tuple],
-        schema: &crate::Schema,
-    ) -> Result<TableStatistics> {
+    pub fn analyze_table(table_name: &str, tuples: &[crate::Tuple], schema: &crate::Schema) -> Result<TableStatistics> {
         let mut stats = TableStatistics::new(table_name.to_string());
 
         if tuples.is_empty() {
@@ -627,10 +651,7 @@ impl StatisticsAnalyzer {
 
         // Initialize column statistics
         for column in &schema.columns {
-            let col_stats = ColumnStatistics::new(
-                column.name.clone(),
-                column.data_type.clone(),
-            );
+            let col_stats = ColumnStatistics::new(column.name.clone(), column.data_type.clone());
             stats.columns.insert(column.name.clone(), col_stats);
         }
 
@@ -694,12 +715,16 @@ impl StatisticsAnalyzer {
 
                 // Update min/max values
                 if let Some(col_stats) = stats.columns.get_mut(column_name) {
-                    let should_update_min = col_stats.min_value.as_ref()
+                    let should_update_min = col_stats
+                        .min_value
+                        .as_ref()
                         .is_none_or(|min_val| Self::compare_values(value, min_val) < 0);
                     if should_update_min {
                         col_stats.min_value = Some(value.clone());
                     }
-                    let should_update_max = col_stats.max_value.as_ref()
+                    let should_update_max = col_stats
+                        .max_value
+                        .as_ref()
                         .is_none_or(|max_val| Self::compare_values(value, max_val) > 0);
                     if should_update_max {
                         col_stats.max_value = Some(value.clone());
@@ -735,12 +760,10 @@ impl StatisticsAnalyzer {
             if let Some(values) = column_values.get_mut(column_name) {
                 if values.len() >= 10 {
                     // Sort values for histogram generation
-                    values.sort_by(|a, b| {
-                        match Self::compare_values(a, b) {
-                            -1 => std::cmp::Ordering::Less,
-                            1 => std::cmp::Ordering::Greater,
-                            _ => std::cmp::Ordering::Equal,
-                        }
+                    values.sort_by(|a, b| match Self::compare_values(a, b) {
+                        -1 => std::cmp::Ordering::Less,
+                        1 => std::cmp::Ordering::Greater,
+                        _ => std::cmp::Ordering::Equal,
                     });
 
                     // Create equi-depth histogram with ~100 buckets (or fewer if less data)
@@ -830,37 +853,35 @@ impl StatisticsAnalyzer {
     /// Compare two values (returns -1, 0, or 1)
     fn compare_values(a: &Value, b: &Value) -> i32 {
         match (a, b) {
-            (Value::Int4(x), Value::Int4(y)) => {
-                match x.cmp(y) {
-                    std::cmp::Ordering::Less => -1,
-                    std::cmp::Ordering::Greater => 1,
-                    std::cmp::Ordering::Equal => 0,
-                }
-            }
-            (Value::Int8(x), Value::Int8(y)) => {
-                match x.cmp(y) {
-                    std::cmp::Ordering::Less => -1,
-                    std::cmp::Ordering::Greater => 1,
-                    std::cmp::Ordering::Equal => 0,
-                }
-            }
+            (Value::Int4(x), Value::Int4(y)) => match x.cmp(y) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Greater => 1,
+                std::cmp::Ordering::Equal => 0,
+            },
+            (Value::Int8(x), Value::Int8(y)) => match x.cmp(y) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Greater => 1,
+                std::cmp::Ordering::Equal => 0,
+            },
             (Value::Float8(x), Value::Float8(y)) => {
-                if x < y { -1 } else if x > y { 1 } else { 0 }
-            }
-            (Value::String(x), Value::String(y)) => {
-                match x.cmp(y) {
-                    std::cmp::Ordering::Less => -1,
-                    std::cmp::Ordering::Greater => 1,
-                    std::cmp::Ordering::Equal => 0,
+                if x < y {
+                    -1
+                } else if x > y {
+                    1
+                } else {
+                    0
                 }
             }
-            (Value::Timestamp(x), Value::Timestamp(y)) => {
-                match x.cmp(y) {
-                    std::cmp::Ordering::Less => -1,
-                    std::cmp::Ordering::Greater => 1,
-                    std::cmp::Ordering::Equal => 0,
-                }
-            }
+            (Value::String(x), Value::String(y)) => match x.cmp(y) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Greater => 1,
+                std::cmp::Ordering::Equal => 0,
+            },
+            (Value::Timestamp(x), Value::Timestamp(y)) => match x.cmp(y) {
+                std::cmp::Ordering::Less => -1,
+                std::cmp::Ordering::Greater => 1,
+                std::cmp::Ordering::Equal => 0,
+            },
             _ => 0, // Default: consider equal
         }
     }
@@ -874,9 +895,7 @@ mod tests {
 
     #[test]
     fn test_analyze_empty_table() {
-        let schema = Schema::new(vec![
-            Column::new("id", DataType::Int4),
-        ]);
+        let schema = Schema::new(vec![Column::new("id", DataType::Int4)]);
 
         let tuples = vec![];
         let stats = StatisticsAnalyzer::analyze_table("test", &tuples, &schema).unwrap();
@@ -917,9 +936,7 @@ mod tests {
 
     #[test]
     fn test_analyze_with_nulls() {
-        let schema = Schema::new(vec![
-            Column::new("value", DataType::Int4),
-        ]);
+        let schema = Schema::new(vec![Column::new("value", DataType::Int4)]);
 
         let tuples = vec![
             Tuple::new(vec![Value::Int4(1)]),
@@ -937,9 +954,7 @@ mod tests {
 
     #[test]
     fn test_analyze_distinct_count() {
-        let schema = Schema::new(vec![
-            Column::new("category", DataType::Text),
-        ]);
+        let schema = Schema::new(vec![Column::new("category", DataType::Text)]);
 
         let tuples = vec![
             Tuple::new(vec![Value::String("A".to_string())]),
@@ -976,14 +991,10 @@ mod tests {
 
     #[test]
     fn test_histogram_generation() {
-        let schema = Schema::new(vec![
-            Column::new("value", DataType::Int4),
-        ]);
+        let schema = Schema::new(vec![Column::new("value", DataType::Int4)]);
 
         // Create 100 values to trigger histogram generation (needs >= 10)
-        let tuples: Vec<Tuple> = (1..=100)
-            .map(|i| Tuple::new(vec![Value::Int4(i)]))
-            .collect();
+        let tuples: Vec<Tuple> = (1..=100).map(|i| Tuple::new(vec![Value::Int4(i)])).collect();
 
         let stats = StatisticsAnalyzer::analyze_table("test", &tuples, &schema).unwrap();
         let col_stats = stats.columns.get("value").unwrap();
@@ -1016,7 +1027,11 @@ mod tests {
 
         // For ">" operator, should also be ~0.5 selectivity
         let sel_greater = col_stats.estimate_range_selectivity(&Value::Int4(50), ">");
-        assert!(sel_greater > 0.4 && sel_greater < 0.6, "Expected ~0.5, got {}", sel_greater);
+        assert!(
+            sel_greater > 0.4 && sel_greater < 0.6,
+            "Expected ~0.5, got {}",
+            sel_greater
+        );
 
         // Value 25 is at the 1/4 mark
         // For "<" operator, should be ~0.25 selectivity

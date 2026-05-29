@@ -22,12 +22,12 @@
 //! 3. Client sends final message with proof
 //! 4. Server verifies proof and sends server-final-message
 
-use crate::{Result, Error};
-use sha2::{Sha256, Digest};
-#[cfg(feature = "ring-crypto")]
-use ring::pbkdf2;
+use crate::{Error, Result};
 #[cfg(feature = "ring-crypto")]
 use ring::hmac;
+#[cfg(feature = "ring-crypto")]
+use ring::pbkdf2;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 
@@ -53,19 +53,17 @@ use super::password_store::{InMemoryPasswordStore, SharedPasswordStore};
 pub fn parse_scram_client_first(msg: &str) -> Result<(String, String)> {
     // GS2 header: at least 2 commas before the bare body.
     let mut iter = msg.splitn(3, ',');
-    let _gs2_cbind_flag = iter.next().ok_or_else(|| {
-        Error::protocol("Invalid SCRAM client-first-message: missing GS2 channel-binding flag")
-    })?;
-    let _authzid = iter.next().ok_or_else(|| {
-        Error::protocol("Invalid SCRAM client-first-message: missing GS2 authzid slot")
-    })?;
-    let bare = iter.next().ok_or_else(|| {
-        Error::protocol("Invalid SCRAM client-first-message: missing client-first-message-bare")
-    })?;
+    let _gs2_cbind_flag = iter
+        .next()
+        .ok_or_else(|| Error::protocol("Invalid SCRAM client-first-message: missing GS2 channel-binding flag"))?;
+    let _authzid = iter
+        .next()
+        .ok_or_else(|| Error::protocol("Invalid SCRAM client-first-message: missing GS2 authzid slot"))?;
+    let bare = iter
+        .next()
+        .ok_or_else(|| Error::protocol("Invalid SCRAM client-first-message: missing client-first-message-bare"))?;
     if bare.is_empty() {
-        return Err(Error::protocol(
-            "Invalid SCRAM client-first-message: empty bare body",
-        ));
+        return Err(Error::protocol("Invalid SCRAM client-first-message: empty bare body"));
     }
     // Bare body. Username and nonce are required; extensions and
     // reserved-mext may appear in any order before/around them.
@@ -78,12 +76,9 @@ pub fn parse_scram_client_first(msg: &str) -> Result<(String, String)> {
             nonce = Some(rest);
         }
     }
-    let username = username.ok_or_else(|| {
-        Error::protocol("Invalid SCRAM client-first-message: missing username (n=)")
-    })?;
-    let nonce = nonce.ok_or_else(|| {
-        Error::protocol("Invalid SCRAM client-first-message: missing nonce (r=)")
-    })?;
+    let username =
+        username.ok_or_else(|| Error::protocol("Invalid SCRAM client-first-message: missing username (n=)"))?;
+    let nonce = nonce.ok_or_else(|| Error::protocol("Invalid SCRAM client-first-message: missing nonce (r=)"))?;
     // BUG-003 (Perf-73): per RFC 5802 and the Postgres SCRAM profile, the
     // SCRAM `n=` field MUST be empty — the real username comes from the
     // StartupMessage's `user` parameter. libpq, psycopg, pgx and every other
@@ -91,9 +86,7 @@ pub fn parse_scram_client_first(msg: &str) -> Result<(String, String)> {
     // username at this layer; callers must source the actual user name from
     // the connection's startup parameters, not from SCRAM.
     if nonce.is_empty() {
-        return Err(Error::protocol(
-            "Invalid SCRAM client-first-message: empty nonce",
-        ));
+        return Err(Error::protocol("Invalid SCRAM client-first-message: empty nonce"));
     }
     Ok((username.to_string(), nonce.to_string()))
 }
@@ -301,8 +294,8 @@ impl ScramAuthState {
 
     /// Build and get server-first-message
     pub fn build_server_first_message(&mut self) -> Result<String> {
-        let salt_b64 = base64_encode(&self.salt)
-            .map_err(|e| Error::authentication(format!("Failed to encode salt: {}", e)))?;
+        let salt_b64 =
+            base64_encode(&self.salt).map_err(|e| Error::authentication(format!("Failed to encode salt: {}", e)))?;
 
         let msg = format!(
             "r={}{},s={},i={}",
@@ -342,16 +335,15 @@ impl ScramAuthState {
         // Build auth message: client-first-message-bare + "," + server-first-message + "," + client-final-message-without-proof
         let auth_message = format!(
             "{},{},{}",
-            self.client_first_message_bare,
-            self.server_first_message,
-            client_final_message_without_proof
+            self.client_first_message_bare, self.server_first_message, client_final_message_without_proof
         );
 
         // Calculate client signature: HMAC(StoredKey, AuthMessage)
         let client_signature = scram_hmac_sha256(stored_key, auth_message.as_bytes());
 
         // Calculate client key: ClientProof XOR ClientSignature
-        let client_key: Vec<u8> = client_proof.iter()
+        let client_key: Vec<u8> = client_proof
+            .iter()
             .zip(client_signature.iter())
             .map(|(a, b)| a ^ b)
             .collect();
@@ -477,11 +469,7 @@ fn constant_time_compare(a: &[u8], b: &[u8]) -> bool {
 /// Given a password, generates the stored key and server key that should
 /// be saved in the password store. This allows password verification without
 /// storing the actual password.
-pub fn prepare_scram_credentials(
-    password: &str,
-    salt: &[u8],
-    iterations: u32,
-) -> (Vec<u8>, Vec<u8>) {
+pub fn prepare_scram_credentials(password: &str, salt: &[u8], iterations: u32) -> (Vec<u8>, Vec<u8>) {
     let salted_password = scram_salted_password(password, salt, iterations);
     let client_key = scram_client_key(&salted_password);
     let stored_key = scram_stored_key(&client_key);

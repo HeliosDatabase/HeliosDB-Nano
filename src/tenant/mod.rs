@@ -13,13 +13,13 @@
 
 pub mod expression;
 
-use uuid::Uuid;
-use std::sync::Arc;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::cell::RefCell;
+use std::sync::Arc;
+use uuid::Uuid;
 
-pub use expression::{RLSExpressionEvaluator, evaluate_rls_expression};
+pub use expression::{evaluate_rls_expression, RLSExpressionEvaluator};
 
 // Thread-local for current tenant ID (used by SQL functions like current_tenant())
 thread_local! {
@@ -187,11 +187,12 @@ impl PlanManager {
             "Development and testing",
             100,
             ResourceLimits {
-                max_storage_bytes: 100 * 1024 * 1024,      // 100 MB
+                max_storage_bytes: 100 * 1024 * 1024, // 100 MB
                 max_connections: 5,
                 max_qps: 10,
             },
-        ).with_features(PlanFeatures {
+        )
+        .with_features(PlanFeatures {
             rls_enabled: true,
             cdc_enabled: false,
             migrations_enabled: false,
@@ -206,11 +207,12 @@ impl PlanManager {
             "Small teams and startups",
             200,
             ResourceLimits {
-                max_storage_bytes: 1024 * 1024 * 1024,     // 1 GB
+                max_storage_bytes: 1024 * 1024 * 1024, // 1 GB
                 max_connections: 20,
                 max_qps: 100,
             },
-        ).with_features(PlanFeatures {
+        )
+        .with_features(PlanFeatures {
             rls_enabled: true,
             cdc_enabled: true,
             migrations_enabled: false,
@@ -229,7 +231,8 @@ impl PlanManager {
                 max_connections: 100,
                 max_qps: 1000,
             },
-        ).with_features(PlanFeatures {
+        )
+        .with_features(PlanFeatures {
             rls_enabled: true,
             cdc_enabled: true,
             migrations_enabled: true,
@@ -248,7 +251,8 @@ impl PlanManager {
                 max_connections: 1000,
                 max_qps: 10000,
             },
-        ).with_features(PlanFeatures {
+        )
+        .with_features(PlanFeatures {
             rls_enabled: true,
             cdc_enabled: true,
             migrations_enabled: true,
@@ -276,11 +280,7 @@ impl PlanManager {
 
     /// List only enabled plans (sorted by tier_id)
     pub fn list_enabled_plans(&self) -> Vec<Plan> {
-        let mut plans: Vec<_> = self.plans.read()
-            .values()
-            .filter(|p| p.enabled)
-            .cloned()
-            .collect();
+        let mut plans: Vec<_> = self.plans.read().values().filter(|p| p.enabled).cloned().collect();
         plans.sort_by_key(|p| p.tier_id);
         plans
     }
@@ -357,17 +357,21 @@ impl PlanManager {
 
     /// Enable a plan
     pub fn enable_plan(&self, plan_id: &str) -> Result<(), String> {
-        self.update_plan(plan_id, PlanUpdate {
-            enabled: Some(true),
-            ..Default::default()
-        })?;
+        self.update_plan(
+            plan_id,
+            PlanUpdate {
+                enabled: Some(true),
+                ..Default::default()
+            },
+        )?;
         Ok(())
     }
 
     /// Disable a plan (existing tenants keep it, new tenants can't use it)
     pub fn disable_plan(&self, plan_id: &str) -> Result<(), String> {
         let plans = self.plans.read();
-        let plan = plans.get(plan_id)
+        let plan = plans
+            .get(plan_id)
             .ok_or_else(|| format!("Plan '{}' not found", plan_id))?;
 
         if plan.is_default {
@@ -375,10 +379,13 @@ impl PlanManager {
         }
         drop(plans);
 
-        self.update_plan(plan_id, PlanUpdate {
-            enabled: Some(false),
-            ..Default::default()
-        })?;
+        self.update_plan(
+            plan_id,
+            PlanUpdate {
+                enabled: Some(false),
+                ..Default::default()
+            },
+        )?;
         Ok(())
     }
 
@@ -387,7 +394,8 @@ impl PlanManager {
     pub fn delete_plan(&self, plan_id: &str) -> Result<(Plan, PlanId), String> {
         let mut plans = self.plans.write();
 
-        let plan = plans.get(plan_id)
+        let plan = plans
+            .get(plan_id)
             .ok_or_else(|| format!("Plan '{}' not found", plan_id))?;
 
         if plan.is_default {
@@ -398,13 +406,15 @@ impl PlanManager {
         let deleted_plan = plan.clone();
 
         // Find the next lower tier plan, or default if none
-        let fallback_plan_id = plans.values()
+        let fallback_plan_id = plans
+            .values()
             .filter(|p| p.id != plan_id && p.enabled && p.tier_id < deleted_tier)
             .max_by_key(|p| p.tier_id)
             .map(|p| p.id.clone())
             .unwrap_or_else(|| {
                 // No lower tier found, use default (unlimited)
-                plans.values()
+                plans
+                    .values()
                     .find(|p| p.is_default)
                     .map(|p| p.id.clone())
                     .unwrap_or_else(|| "unlimited".to_string())
@@ -417,7 +427,8 @@ impl PlanManager {
 
     /// Get the default/fallback plan
     pub fn get_default_plan(&self) -> Plan {
-        self.plans.read()
+        self.plans
+            .read()
             .values()
             .find(|p| p.is_default)
             .cloned()
@@ -426,7 +437,8 @@ impl PlanManager {
 
     /// Find next lower tier plan (for downgrade)
     pub fn get_downgrade_plan(&self, current_tier: u32) -> Option<Plan> {
-        self.plans.read()
+        self.plans
+            .read()
             .values()
             .filter(|p| p.enabled && p.tier_id < current_tier)
             .max_by_key(|p| p.tier_id)
@@ -435,10 +447,7 @@ impl PlanManager {
 
     /// Check if a plan exists and is enabled
     pub fn is_plan_available(&self, plan_id: &str) -> bool {
-        self.plans.read()
-            .get(plan_id)
-            .map(|p| p.enabled)
-            .unwrap_or(false)
+        self.plans.read().get(plan_id).map(|p| p.enabled).unwrap_or(false)
     }
 }
 
@@ -812,7 +821,9 @@ impl TenantManager {
 
     /// Change a tenant's plan
     pub fn change_tenant_plan(&self, tenant_id: TenantId, new_plan_id: &str) -> Result<Tenant, String> {
-        let plan = self.plan_manager.get_plan(new_plan_id)
+        let plan = self
+            .plan_manager
+            .get_plan(new_plan_id)
             .ok_or_else(|| format!("Plan '{}' not found", new_plan_id))?;
 
         if !plan.enabled {
@@ -820,7 +831,8 @@ impl TenantManager {
         }
 
         let mut tenants = self.tenants.write();
-        let tenant = tenants.get_mut(&tenant_id)
+        let tenant = tenants
+            .get_mut(&tenant_id)
             .ok_or_else(|| format!("Tenant {} not found", tenant_id))?;
 
         tenant.plan_id = plan.id;
@@ -831,7 +843,8 @@ impl TenantManager {
 
     /// Get tenants by plan ID
     pub fn get_tenants_by_plan(&self, plan_id: &str) -> Vec<Tenant> {
-        self.tenants.read()
+        self.tenants
+            .read()
             .values()
             .filter(|t| t.plan_id == plan_id)
             .cloned()
@@ -840,7 +853,9 @@ impl TenantManager {
 
     /// Downgrade all tenants from a plan to another
     pub fn downgrade_tenants(&self, from_plan_id: &str, to_plan_id: &str) -> Result<Vec<TenantId>, String> {
-        let new_plan = self.plan_manager.get_plan(to_plan_id)
+        let new_plan = self
+            .plan_manager
+            .get_plan(to_plan_id)
             .ok_or_else(|| format!("Target plan '{}' not found", to_plan_id))?;
 
         let mut downgraded = Vec::new();
@@ -930,11 +945,7 @@ impl TenantManager {
 
     /// Get RLS policies for table
     pub fn get_rls_policies(&self, table_name: &str) -> Vec<RLSPolicy> {
-        self.rls_policies
-            .read()
-            .get(table_name)
-            .cloned()
-            .unwrap_or_default()
+        self.rls_policies.read().get(table_name).cloned().unwrap_or_default()
     }
 
     /// Check resource quota for tenant
@@ -1142,13 +1153,14 @@ impl TenantManager {
                 let cmd_upper = cmd.to_uppercase();
 
                 // Collect applicable policies
-                let applicable_policies: Vec<_> = policies.iter()
+                let applicable_policies: Vec<_> = policies
+                    .iter()
                     .filter(|p| {
-                        matches!(p.cmd, RLSCommand::All) ||
-                        (matches!(p.cmd, RLSCommand::Select) && cmd_upper == "SELECT") ||
-                        (matches!(p.cmd, RLSCommand::Insert) && cmd_upper == "INSERT") ||
-                        (matches!(p.cmd, RLSCommand::Update) && cmd_upper == "UPDATE") ||
-                        (matches!(p.cmd, RLSCommand::Delete) && cmd_upper == "DELETE")
+                        matches!(p.cmd, RLSCommand::All)
+                            || (matches!(p.cmd, RLSCommand::Select) && cmd_upper == "SELECT")
+                            || (matches!(p.cmd, RLSCommand::Insert) && cmd_upper == "INSERT")
+                            || (matches!(p.cmd, RLSCommand::Update) && cmd_upper == "UPDATE")
+                            || (matches!(p.cmd, RLSCommand::Delete) && cmd_upper == "DELETE")
                     })
                     .collect();
 
@@ -1216,11 +1228,7 @@ impl TenantManager {
     /// Get recent change events (limit to last N)
     pub fn get_recent_changes(&self, tenant_id: TenantId, limit: usize) -> Vec<ChangeEvent> {
         if let Some(log) = self.cdc_logs.read().get(&tenant_id) {
-            log.changes.iter()
-                .rev()
-                .take(limit)
-                .cloned()
-                .collect()
+            log.changes.iter().rev().take(limit).cloned().collect()
         } else {
             Vec::new()
         }
@@ -1230,10 +1238,7 @@ impl TenantManager {
     pub fn clear_cdc_log(&self, tenant_id: TenantId) -> Result<(), String> {
         if self.cdc_logs.write().contains_key(&tenant_id) {
             let mut log = CDCLog::default();
-            log.log_id = self.cdc_logs.read()
-                .get(&tenant_id)
-                .map(|l| l.log_id + 1)
-                .unwrap_or(1);
+            log.log_id = self.cdc_logs.read().get(&tenant_id).map(|l| l.log_id + 1).unwrap_or(1);
             self.cdc_logs.write().insert(tenant_id, log);
             Ok(())
         } else {
@@ -1242,11 +1247,7 @@ impl TenantManager {
     }
 
     /// Start tenant migration (replication to target tenant)
-    pub fn start_migration(
-        &self,
-        source_tenant_id: TenantId,
-        target_tenant_id: TenantId,
-    ) -> Result<(), String> {
+    pub fn start_migration(&self, source_tenant_id: TenantId, target_tenant_id: TenantId) -> Result<(), String> {
         // Verify both tenants exist
         if !self.tenants.read().contains_key(&source_tenant_id) {
             return Err(format!("Source tenant {} not found", source_tenant_id));
@@ -1268,7 +1269,8 @@ impl TenantManager {
             completed_at: None,
         };
 
-        self.replication_targets.write()
+        self.replication_targets
+            .write()
             .entry(source_tenant_id)
             .or_insert_with(Vec::new)
             .push(target);
@@ -1285,11 +1287,15 @@ impl TenantManager {
     ) -> Result<(), String> {
         let mut targets = self.replication_targets.write();
         if let Some(replication_vec) = targets.get_mut(&source_tenant_id) {
-            if let Some(target) = replication_vec.iter_mut()
+            if let Some(target) = replication_vec
+                .iter_mut()
                 .find(|t| t.target_tenant_id == target_tenant_id)
             {
                 target.migration_state = state;
-                if matches!(target.migration_state, MigrationState::Completed | MigrationState::Failed(_)) {
+                if matches!(
+                    target.migration_state,
+                    MigrationState::Completed | MigrationState::Failed(_)
+                ) {
                     target.completed_at = Some(chrono::Utc::now().to_rfc3339());
                 }
                 Ok(())
@@ -1311,7 +1317,8 @@ impl TenantManager {
     ) -> Result<(), String> {
         let mut targets = self.replication_targets.write();
         if let Some(replication_vec) = targets.get_mut(&source_tenant_id) {
-            if let Some(target) = replication_vec.iter_mut()
+            if let Some(target) = replication_vec
+                .iter_mut()
                 .find(|t| t.target_tenant_id == target_tenant_id)
             {
                 target.changes_replicated = changes_replicated;
@@ -1335,7 +1342,8 @@ impl TenantManager {
     ) -> Result<(), String> {
         let mut targets = self.replication_targets.write();
         if let Some(replication_vec) = targets.get_mut(&source_tenant_id) {
-            if let Some(target) = replication_vec.iter_mut()
+            if let Some(target) = replication_vec
+                .iter_mut()
                 .find(|t| t.target_tenant_id == target_tenant_id)
             {
                 target.source_checksum = Some(source_checksum);
@@ -1355,21 +1363,20 @@ impl TenantManager {
         source_tenant_id: TenantId,
         target_tenant_id: TenantId,
     ) -> Option<ReplicationTarget> {
-        self.replication_targets.read()
+        self.replication_targets
+            .read()
             .get(&source_tenant_id)
-            .and_then(|targets| {
-                targets.iter()
-                    .find(|t| t.target_tenant_id == target_tenant_id)
-                    .cloned()
-            })
+            .and_then(|targets| targets.iter().find(|t| t.target_tenant_id == target_tenant_id).cloned())
     }
 
     /// Get all active migrations for a source tenant
     pub fn get_active_migrations(&self, source_tenant_id: TenantId) -> Vec<ReplicationTarget> {
-        self.replication_targets.read()
+        self.replication_targets
+            .read()
             .get(&source_tenant_id)
             .map(|targets| {
-                targets.iter()
+                targets
+                    .iter()
                     .filter(|t| !matches!(t.migration_state, MigrationState::Completed | MigrationState::Failed(_)))
                     .cloned()
                     .collect()
@@ -1378,20 +1385,12 @@ impl TenantManager {
     }
 
     /// Pause migration
-    pub fn pause_migration(
-        &self,
-        source_tenant_id: TenantId,
-        target_tenant_id: TenantId,
-    ) -> Result<(), String> {
+    pub fn pause_migration(&self, source_tenant_id: TenantId, target_tenant_id: TenantId) -> Result<(), String> {
         self.update_migration_state(source_tenant_id, target_tenant_id, MigrationState::Paused)
     }
 
     /// Resume migration
-    pub fn resume_migration(
-        &self,
-        source_tenant_id: TenantId,
-        target_tenant_id: TenantId,
-    ) -> Result<(), String> {
+    pub fn resume_migration(&self, source_tenant_id: TenantId, target_tenant_id: TenantId) -> Result<(), String> {
         self.update_migration_state(source_tenant_id, target_tenant_id, MigrationState::Replicating)
     }
 
@@ -1412,11 +1411,7 @@ impl TenantManager {
     }
 
     /// Rollback migration (undo replication)
-    pub fn rollback_migration(
-        &self,
-        source_tenant_id: TenantId,
-        target_tenant_id: TenantId,
-    ) -> Result<(), String> {
+    pub fn rollback_migration(&self, source_tenant_id: TenantId, target_tenant_id: TenantId) -> Result<(), String> {
         self.update_migration_state(
             source_tenant_id,
             target_tenant_id,
@@ -1465,10 +1460,7 @@ mod tests {
     #[test]
     fn test_register_tenant_basic() {
         let manager = TenantManager::new();
-        let tenant = manager.register_tenant(
-            "TestTenant".to_string(),
-            IsolationMode::SharedSchema,
-        );
+        let tenant = manager.register_tenant("TestTenant".to_string(), IsolationMode::SharedSchema);
 
         assert_eq!(tenant.name, "TestTenant");
         assert_eq!(tenant.isolation_mode, IsolationMode::SharedSchema);
@@ -1540,10 +1532,7 @@ mod tests {
     #[test]
     fn test_shared_schema_enables_rls() {
         let manager = TenantManager::new();
-        let tenant = manager.register_tenant(
-            "Test".to_string(),
-            IsolationMode::SharedSchema,
-        );
+        let tenant = manager.register_tenant("Test".to_string(), IsolationMode::SharedSchema);
 
         assert!(tenant.rls_enabled);
     }
@@ -1551,10 +1540,7 @@ mod tests {
     #[test]
     fn test_db_per_tenant_disables_rls() {
         let manager = TenantManager::new();
-        let tenant = manager.register_tenant(
-            "Test".to_string(),
-            IsolationMode::DatabasePerTenant,
-        );
+        let tenant = manager.register_tenant("Test".to_string(), IsolationMode::DatabasePerTenant);
 
         assert!(!tenant.rls_enabled);
     }
@@ -1562,10 +1548,7 @@ mod tests {
     #[test]
     fn test_schema_per_tenant_disables_rls() {
         let manager = TenantManager::new();
-        let tenant = manager.register_tenant(
-            "Test".to_string(),
-            IsolationMode::SchemaPerTenant,
-        );
+        let tenant = manager.register_tenant("Test".to_string(), IsolationMode::SchemaPerTenant);
 
         assert!(!tenant.rls_enabled);
     }
@@ -1779,14 +1762,16 @@ mod tests {
         let manager = TenantManager::new();
         let tenant = manager.register_tenant("Test".to_string(), IsolationMode::SharedSchema);
 
-        manager.update_resource_limits(
-            tenant.id,
-            ResourceLimits {
-                max_storage_bytes: 100_000_000,
-                max_connections: 2,
-                max_qps: 100,
-            },
-        ).unwrap();
+        manager
+            .update_resource_limits(
+                tenant.id,
+                ResourceLimits {
+                    max_storage_bytes: 100_000_000,
+                    max_connections: 2,
+                    max_qps: 100,
+                },
+            )
+            .unwrap();
 
         // Add connections up to limit
         assert!(manager.add_connection(tenant.id).is_ok());
@@ -1801,14 +1786,16 @@ mod tests {
         let manager = TenantManager::new();
         let tenant = manager.register_tenant("Test".to_string(), IsolationMode::SharedSchema);
 
-        manager.update_resource_limits(
-            tenant.id,
-            ResourceLimits {
-                max_storage_bytes: 1000,
-                max_connections: 10,
-                max_qps: 100,
-            },
-        ).unwrap();
+        manager
+            .update_resource_limits(
+                tenant.id,
+                ResourceLimits {
+                    max_storage_bytes: 1000,
+                    max_connections: 10,
+                    max_qps: 100,
+                },
+            )
+            .unwrap();
 
         // Within limit
         assert!(manager.update_storage_usage(tenant.id, 500).is_ok());
@@ -1822,14 +1809,16 @@ mod tests {
         let manager = TenantManager::new();
         let tenant = manager.register_tenant("Test".to_string(), IsolationMode::SharedSchema);
 
-        manager.update_resource_limits(
-            tenant.id,
-            ResourceLimits {
-                max_storage_bytes: 100_000_000,
-                max_connections: 10,
-                max_qps: 3,
-            },
-        ).unwrap();
+        manager
+            .update_resource_limits(
+                tenant.id,
+                ResourceLimits {
+                    max_storage_bytes: 100_000_000,
+                    max_connections: 10,
+                    max_qps: 3,
+                },
+            )
+            .unwrap();
 
         // Record queries up to limit
         assert!(manager.record_query(tenant.id).is_ok());
@@ -1845,14 +1834,16 @@ mod tests {
         let manager = TenantManager::new();
         let tenant = manager.register_tenant("Test".to_string(), IsolationMode::SharedSchema);
 
-        manager.update_resource_limits(
-            tenant.id,
-            ResourceLimits {
-                max_storage_bytes: 100_000_000,
-                max_connections: 10,
-                max_qps: 2,
-            },
-        ).unwrap();
+        manager
+            .update_resource_limits(
+                tenant.id,
+                ResourceLimits {
+                    max_storage_bytes: 100_000_000,
+                    max_connections: 10,
+                    max_qps: 2,
+                },
+            )
+            .unwrap();
 
         // Hit limit
         manager.record_query(tenant.id).unwrap();
@@ -2043,11 +2034,9 @@ mod tests {
 
         manager.start_migration(source.id, target.id).unwrap();
 
-        manager.update_migration_state(
-            source.id,
-            target.id,
-            MigrationState::Replicating,
-        ).unwrap();
+        manager
+            .update_migration_state(source.id, target.id, MigrationState::Replicating)
+            .unwrap();
 
         let status = manager.get_migration_status(source.id, target.id).unwrap();
         assert_eq!(status.migration_state, MigrationState::Replicating);
@@ -2061,7 +2050,9 @@ mod tests {
 
         manager.start_migration(source.id, target.id).unwrap();
 
-        manager.record_replication_progress(source.id, target.id, 50, 100).unwrap();
+        manager
+            .record_replication_progress(source.id, target.id, 50, 100)
+            .unwrap();
 
         let status = manager.get_migration_status(source.id, target.id).unwrap();
         assert_eq!(status.changes_replicated, 50);
@@ -2076,12 +2067,9 @@ mod tests {
 
         manager.start_migration(source.id, target.id).unwrap();
 
-        manager.set_migration_checksums(
-            source.id,
-            target.id,
-            "abc123".to_string(),
-            "abc123".to_string(),
-        ).unwrap();
+        manager
+            .set_migration_checksums(source.id, target.id, "abc123".to_string(), "abc123".to_string())
+            .unwrap();
 
         let consistent = manager.verify_migration_consistency(source.id, target.id).unwrap();
         assert!(consistent);

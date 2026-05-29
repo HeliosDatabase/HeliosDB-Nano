@@ -11,7 +11,10 @@
 //! of the planner and the next investigation step is the Describe / wire-
 //! encoding path.
 
-use heliosdb_nano::{EmbeddedDatabase, sql::{Parser, Planner}};
+use heliosdb_nano::{
+    sql::{Parser, Planner},
+    EmbeddedDatabase,
+};
 
 fn extract(db: &EmbeddedDatabase, sql: &str) -> Vec<(String, String)> {
     let parser = Parser::new();
@@ -32,7 +35,8 @@ fn extract(db: &EmbeddedDatabase, sql: &str) -> Vec<(String, String)> {
 #[test]
 fn planner_schema_simple_select_with_param() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
-    db.execute("CREATE TABLE pings (week_bucket TEXT, hash TEXT, dashboard_version TEXT)").unwrap();
+    db.execute("CREATE TABLE pings (week_bucket TEXT, hash TEXT, dashboard_version TEXT)")
+        .unwrap();
 
     // Literal form (works on simple-query path today)
     let lit = extract(&db, "SELECT COUNT(*) FROM pings WHERE week_bucket = '2026-18'");
@@ -44,11 +48,17 @@ fn planner_schema_simple_select_with_param() {
 
     // The two schemas should be identical — the WHERE-side $1 doesn't
     // change the projection.
-    assert_eq!(lit, prm, "Bug 8 may live in the planner: parameterised form's schema differs from the literal form's schema");
+    assert_eq!(
+        lit, prm,
+        "Bug 8 may live in the planner: parameterised form's schema differs from the literal form's schema"
+    );
 
     // Sanity: column name must be non-empty.
     assert_eq!(prm.len(), 1);
-    assert!(!prm[0].0.is_empty(), "Bug 8 in planner: COUNT(*) column has empty name in parameterised form");
+    assert!(
+        !prm[0].0.is_empty(),
+        "Bug 8 in planner: COUNT(*) column has empty name in parameterised form"
+    );
 }
 
 #[test]
@@ -65,8 +75,14 @@ fn planner_schema_two_col_select_with_param() {
     assert_eq!(prm.len(), 2);
     assert_eq!(lit[0].0, "a");
     assert_eq!(lit[1].0, "b");
-    assert_eq!(prm[0].0, "a", "Bug 8 in planner: paramised plan's first col missing name");
-    assert_eq!(prm[1].0, "b", "Bug 8 in planner: paramised plan's second col missing name");
+    assert_eq!(
+        prm[0].0, "a",
+        "Bug 8 in planner: paramised plan's first col missing name"
+    );
+    assert_eq!(
+        prm[1].0, "b",
+        "Bug 8 in planner: paramised plan's second col missing name"
+    );
 }
 
 #[test]
@@ -74,14 +90,20 @@ fn planner_schema_count_distinct_with_param() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE TABLE pings (week_bucket TEXT, hash TEXT)").unwrap();
 
-    let lit = extract(&db, "SELECT COUNT(DISTINCT hash) FROM pings WHERE week_bucket = '2026-18'");
+    let lit = extract(
+        &db,
+        "SELECT COUNT(DISTINCT hash) FROM pings WHERE week_bucket = '2026-18'",
+    );
     let prm = extract(&db, "SELECT COUNT(DISTINCT hash) FROM pings WHERE week_bucket = $1");
     eprintln!("literal:   {:?}", lit);
     eprintln!("paramised: {:?}", prm);
 
     assert_eq!(lit, prm, "Bug 9 in planner: parameterised form differs");
     assert_eq!(prm.len(), 1);
-    assert!(!prm[0].0.is_empty(), "Bug 9 in planner: COUNT(DISTINCT) column has empty name");
+    assert!(
+        !prm[0].0.is_empty(),
+        "Bug 9 in planner: COUNT(DISTINCT) column has empty name"
+    );
 }
 
 #[test]

@@ -8,7 +8,7 @@
 //! - Report generation
 //! - Integration with monitoring systems
 
-use crate::{Result, Error};
+use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -16,7 +16,7 @@ use std::collections::HashMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExplainRequest {
     pub query: String,
-    pub mode: String, // "standard", "verbose", "ai", "analyze"
+    pub mode: String,   // "standard", "verbose", "ai", "analyze"
     pub format: String, // "text", "json", "yaml"
     pub options: ExplainOptions,
 }
@@ -222,10 +222,13 @@ impl ExplainApiService {
             }
         }
 
-        let request_id = format!("req_{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| Error::query_execution(format!("System time error: {}", e)))?
-            .as_micros());
+        let request_id = format!(
+            "req_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| Error::query_execution(format!("System time error: {}", e)))?
+                .as_micros()
+        );
 
         // Simulate EXPLAIN plan generation
         let plan = serde_json::json!({
@@ -376,24 +379,21 @@ impl ExplainApiService {
 
     /// Generate report
     pub fn generate_report(&self, request: ReportRequest) -> Result<GeneratedReport> {
-        let report_id = format!("report_{}", std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| Error::query_execution(format!("System time error: {}", e)))?
-            .as_secs());
+        let report_id = format!(
+            "report_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|e| Error::query_execution(format!("System time error: {}", e)))?
+                .as_secs()
+        );
 
         let content = match request.report_type {
-            ReportType::PerformanceSummary => {
-                self.generate_performance_summary(&request.time_range, request.format)
-            }
+            ReportType::PerformanceSummary => self.generate_performance_summary(&request.time_range, request.format),
             ReportType::OptimizationOpportunities => {
                 self.generate_optimization_report(&request.time_range, request.format)
             }
-            ReportType::RegressionAnalysis => {
-                self.generate_regression_report(&request.time_range, request.format)
-            }
-            ReportType::ComparisonReport => {
-                self.generate_comparison_report(&request.time_range, request.format)
-            }
+            ReportType::RegressionAnalysis => self.generate_regression_report(&request.time_range, request.format),
+            ReportType::ComparisonReport => self.generate_comparison_report(&request.time_range, request.format),
         };
 
         Ok(GeneratedReport {
@@ -423,7 +423,8 @@ impl ExplainApiService {
                     "p95_time_ms": 450.0,
                     "p99_time_ms": 890.0
                 }
-            }).to_string(),
+            })
+            .to_string(),
             ReportFormat::Markdown => {
                 format!(
                     "# Performance Summary\n\n\

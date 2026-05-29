@@ -2,10 +2,10 @@
 //!
 //! Standard Volcano model (iterator-based execution).
 
-use crate::{Result, Tuple, Value, Error};
-use super::aggregation::{AggregateState, CountState, create_aggregate};
-use std::collections::HashMap;
+use super::aggregation::{create_aggregate, AggregateState, CountState};
+use crate::{Error, Result, Tuple, Value};
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 /// Executor trait (Volcano model)
 ///
@@ -208,11 +208,7 @@ pub struct NestedLoopJoinExecutor {
 
 impl NestedLoopJoinExecutor {
     /// Create a new nested loop join executor
-    pub fn new(
-        left: Box<dyn Executor>,
-        right: Box<dyn Executor>,
-        condition: JoinConditionFn,
-    ) -> Self {
+    pub fn new(left: Box<dyn Executor>, right: Box<dyn Executor>, condition: JoinConditionFn) -> Self {
         Self {
             left,
             right,
@@ -362,10 +358,7 @@ impl Executor for HashJoinExecutor {
         if !self.built {
             while let Some(tuple) = self.left.next()? {
                 let key = Self::value_to_key(&(self.left_key)(&tuple));
-                self.hash_table
-                    .entry(key)
-                    .or_insert_with(Vec::new)
-                    .push(tuple);
+                self.hash_table.entry(key).or_insert_with(Vec::new).push(tuple);
             }
             self.built = true;
         }
@@ -393,11 +386,7 @@ impl Executor for HashJoinExecutor {
                 Some(right_tuple) => {
                     let key = Self::value_to_key(&(self.right_key)(&right_tuple));
 
-                    self.current_matches = self
-                        .hash_table
-                        .get(&key)
-                        .cloned()
-                        .unwrap_or_default();
+                    self.current_matches = self.hash_table.get(&key).cloned().unwrap_or_default();
                     self.match_position = 0;
                     self.current_right = Some(right_tuple);
                 }
@@ -452,11 +441,7 @@ pub struct AggregateExecutor {
 #[allow(clippy::indexing_slicing)]
 impl AggregateExecutor {
     /// Create a new aggregate executor
-    pub fn new(
-        child: Box<dyn Executor>,
-        group_key: GroupKeyFn,
-        aggregates: Vec<AggregateSpec>,
-    ) -> Self {
+    pub fn new(child: Box<dyn Executor>, group_key: GroupKeyFn, aggregates: Vec<AggregateSpec>) -> Self {
         Self {
             child,
             group_key,
@@ -626,11 +611,7 @@ impl SortExecutor {
             };
 
             // Apply direction
-            let ordering = if key.ascending {
-                ordering
-            } else {
-                ordering.reverse()
-            };
+            let ordering = if key.ascending { ordering } else { ordering.reverse() };
 
             if ordering != Ordering::Equal {
                 return ordering;
@@ -665,11 +646,7 @@ impl SortExecutor {
                     _ => Self::compare_values(a_val, b_val),
                 };
 
-                let ordering = if key.ascending {
-                    ordering
-                } else {
-                    ordering.reverse()
-                };
+                let ordering = if key.ascending { ordering } else { ordering.reverse() };
 
                 if ordering != Ordering::Equal {
                     return ordering;
@@ -791,9 +768,17 @@ mod tests {
 
     fn test_tuples() -> Vec<Tuple> {
         vec![
-            Tuple::new(vec![Value::Int4(1), Value::String("Alice".to_string()), Value::Int4(30)]),
+            Tuple::new(vec![
+                Value::Int4(1),
+                Value::String("Alice".to_string()),
+                Value::Int4(30),
+            ]),
             Tuple::new(vec![Value::Int4(2), Value::String("Bob".to_string()), Value::Int4(25)]),
-            Tuple::new(vec![Value::Int4(3), Value::String("Charlie".to_string()), Value::Int4(35)]),
+            Tuple::new(vec![
+                Value::Int4(3),
+                Value::String("Charlie".to_string()),
+                Value::Int4(35),
+            ]),
         ]
     }
 
@@ -814,9 +799,7 @@ mod tests {
     #[test]
     fn test_filter_executor() {
         let scan = Box::new(ScanExecutor::new(test_tuples()));
-        let predicate: PredicateFn = Box::new(|tuple| {
-            matches!(&tuple.values[2], Value::Int4(age) if *age > 28)
-        });
+        let predicate: PredicateFn = Box::new(|tuple| matches!(&tuple.values[2], Value::Int4(age) if *age > 28));
         let mut filter = FilterExecutor::new(scan, predicate);
         filter.open().unwrap();
 

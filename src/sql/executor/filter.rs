@@ -3,8 +3,8 @@
 //! This module provides the FilterOperator that evaluates predicates
 //! on tuples from input operators.
 
-use crate::{Result, Error, Tuple, Schema};
 use super::{PhysicalOperator, TimeoutContext};
+use crate::{Error, Result, Schema, Tuple};
 use std::sync::Arc;
 
 /// Filter operator

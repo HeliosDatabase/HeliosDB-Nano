@@ -44,40 +44,36 @@ pub fn build_or_refresh(db: &EmbeddedDatabase) -> Result<MerkleStats> {
     let mut stats = MerkleStats::default();
     let mut per_file_syms = 0u64;
 
-    let emit = |db: &EmbeddedDatabase,
-                    stats: &mut MerkleStats,
-                    file_id: i64,
-                    hash: blake3::Hash,
-                    syms: u64|
-     -> Result<()> {
-        let hex = hash.to_hex().to_string();
-        let existing = db.query_params(
-            "SELECT rollup_hash FROM _hdb_code_merkle WHERE file_id = $1",
-            &[Value::Int8(file_id)],
-        )?;
-        let prev = existing.first().and_then(|r| match r.values.first() {
-            Some(Value::String(s)) => Some(s.clone()),
-            _ => None,
-        });
-        if prev.as_deref() == Some(hex.as_str()) {
-            stats.files_unchanged += 1;
-        } else if prev.is_some() {
-            db.execute_params_returning(
-                "UPDATE _hdb_code_merkle SET rollup_hash = $1 WHERE file_id = $2",
-                &[Value::String(hex), Value::Int8(file_id)],
+    let emit =
+        |db: &EmbeddedDatabase, stats: &mut MerkleStats, file_id: i64, hash: blake3::Hash, syms: u64| -> Result<()> {
+            let hex = hash.to_hex().to_string();
+            let existing = db.query_params(
+                "SELECT rollup_hash FROM _hdb_code_merkle WHERE file_id = $1",
+                &[Value::Int8(file_id)],
             )?;
-            stats.files_hashed += 1;
-            stats.symbols_hashed += syms;
-        } else {
-            db.execute_params_returning(
-                "INSERT INTO _hdb_code_merkle (file_id, rollup_hash) VALUES ($1, $2)",
-                &[Value::Int8(file_id), Value::String(hex)],
-            )?;
-            stats.files_hashed += 1;
-            stats.symbols_hashed += syms;
-        }
-        Ok(())
-    };
+            let prev = existing.first().and_then(|r| match r.values.first() {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            });
+            if prev.as_deref() == Some(hex.as_str()) {
+                stats.files_unchanged += 1;
+            } else if prev.is_some() {
+                db.execute_params_returning(
+                    "UPDATE _hdb_code_merkle SET rollup_hash = $1 WHERE file_id = $2",
+                    &[Value::String(hex), Value::Int8(file_id)],
+                )?;
+                stats.files_hashed += 1;
+                stats.symbols_hashed += syms;
+            } else {
+                db.execute_params_returning(
+                    "INSERT INTO _hdb_code_merkle (file_id, rollup_hash) VALUES ($1, $2)",
+                    &[Value::Int8(file_id), Value::String(hex)],
+                )?;
+                stats.files_hashed += 1;
+                stats.symbols_hashed += syms;
+            }
+            Ok(())
+        };
 
     for row in rows {
         let file_id = match row.values.first() {
@@ -148,10 +144,7 @@ fn ensure_rollup_table(db: &EmbeddedDatabase) -> Result<()> {
 /// Return the list of `file_id`s whose roll-up hash is NOT present
 /// in `known` — i.e. the set of files that have changed since the
 /// caller last checked.  Useful for incremental re-embedding.
-pub fn changed_files_since(
-    db: &EmbeddedDatabase,
-    known: &std::collections::HashMap<i64, String>,
-) -> Result<Vec<i64>> {
+pub fn changed_files_since(db: &EmbeddedDatabase, known: &std::collections::HashMap<i64, String>) -> Result<Vec<i64>> {
     let rows = db.query("SELECT file_id, rollup_hash FROM _hdb_code_merkle", &[])?;
     let mut out = Vec::new();
     for row in rows {

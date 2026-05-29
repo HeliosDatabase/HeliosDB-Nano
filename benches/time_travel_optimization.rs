@@ -3,7 +3,7 @@
 //! Compares linear scan O(N) vs reverse index O(log N) performance
 //! for AS OF TIMESTAMP queries.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use heliosdb_nano::storage::time_travel::SnapshotManager;
 use rocksdb::DB;
 use std::sync::Arc;
@@ -31,7 +31,8 @@ fn create_db_with_versions(num_versions: usize) -> (Arc<DB>, tempfile::TempDir, 
     for i in 0..num_versions {
         let timestamp = (i + 1) as u64 * 1000; // Timestamps: 1000, 2000, 3000, ...
         let value = format!("value_at_{}", timestamp);
-        manager.write_version(table_name, row_id, timestamp, value.as_bytes())
+        manager
+            .write_version(table_name, row_id, timestamp, value.as_bytes())
             .unwrap();
     }
 
@@ -46,22 +47,16 @@ fn bench_linear_scan(c: &mut Criterion) {
         let (_db, _temp, manager) = create_db_with_versions(num_versions);
         group.throughput(Throughput::Elements(num_versions as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("linear", num_versions),
-            &num_versions,
-            |b, &size| {
-                // Query at 75% of the timeline
-                let target_ts = (size as u64 * 1000 * 3) / 4;
-                b.iter(|| {
-                    let result = manager.read_at_snapshot_linear(
-                        black_box("test_table"),
-                        black_box(1),
-                        black_box(target_ts),
-                    ).unwrap();
-                    black_box(result)
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("linear", num_versions), &num_versions, |b, &size| {
+            // Query at 75% of the timeline
+            let target_ts = (size as u64 * 1000 * 3) / 4;
+            b.iter(|| {
+                let result = manager
+                    .read_at_snapshot_linear(black_box("test_table"), black_box(1), black_box(target_ts))
+                    .unwrap();
+                black_box(result)
+            });
+        });
     }
 
     group.finish();
@@ -75,22 +70,16 @@ fn bench_indexed_lookup(c: &mut Criterion) {
         let (_db, _temp, manager) = create_db_with_versions(num_versions);
         group.throughput(Throughput::Elements(num_versions as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("indexed", num_versions),
-            &num_versions,
-            |b, &size| {
-                // Query at 75% of the timeline
-                let target_ts = (size as u64 * 1000 * 3) / 4;
-                b.iter(|| {
-                    let result = manager.read_at_snapshot(
-                        black_box("test_table"),
-                        black_box(1),
-                        black_box(target_ts),
-                    ).unwrap();
-                    black_box(result)
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("indexed", num_versions), &num_versions, |b, &size| {
+            // Query at 75% of the timeline
+            let target_ts = (size as u64 * 1000 * 3) / 4;
+            b.iter(|| {
+                let result = manager
+                    .read_at_snapshot(black_box("test_table"), black_box(1), black_box(target_ts))
+                    .unwrap();
+                black_box(result)
+            });
+        });
     }
 
     group.finish();
@@ -105,36 +94,24 @@ fn bench_comparison(c: &mut Criterion) {
         let target_ts = (num_versions as u64 * 1000 * 3) / 4;
 
         // Linear scan
-        group.bench_with_input(
-            BenchmarkId::new("linear", num_versions),
-            &num_versions,
-            |b, _| {
-                b.iter(|| {
-                    let result = manager.read_at_snapshot_linear(
-                        black_box("test_table"),
-                        black_box(1),
-                        black_box(target_ts),
-                    ).unwrap();
-                    black_box(result)
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("linear", num_versions), &num_versions, |b, _| {
+            b.iter(|| {
+                let result = manager
+                    .read_at_snapshot_linear(black_box("test_table"), black_box(1), black_box(target_ts))
+                    .unwrap();
+                black_box(result)
+            });
+        });
 
         // Indexed lookup
-        group.bench_with_input(
-            BenchmarkId::new("indexed", num_versions),
-            &num_versions,
-            |b, _| {
-                b.iter(|| {
-                    let result = manager.read_at_snapshot(
-                        black_box("test_table"),
-                        black_box(1),
-                        black_box(target_ts),
-                    ).unwrap();
-                    black_box(result)
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("indexed", num_versions), &num_versions, |b, _| {
+            b.iter(|| {
+                let result = manager
+                    .read_at_snapshot(black_box("test_table"), black_box(1), black_box(target_ts))
+                    .unwrap();
+                black_box(result)
+            });
+        });
     }
 
     group.finish();
@@ -150,11 +127,9 @@ fn bench_query_positions(c: &mut Criterion) {
     group.bench_function("indexed_10pct", |b| {
         let target_ts = (num_versions as u64 * 1000) / 10;
         b.iter(|| {
-            let result = manager.read_at_snapshot(
-                black_box("test_table"),
-                black_box(1),
-                black_box(target_ts),
-            ).unwrap();
+            let result = manager
+                .read_at_snapshot(black_box("test_table"), black_box(1), black_box(target_ts))
+                .unwrap();
             black_box(result)
         });
     });
@@ -163,11 +138,9 @@ fn bench_query_positions(c: &mut Criterion) {
     group.bench_function("indexed_50pct", |b| {
         let target_ts = (num_versions as u64 * 1000) / 2;
         b.iter(|| {
-            let result = manager.read_at_snapshot(
-                black_box("test_table"),
-                black_box(1),
-                black_box(target_ts),
-            ).unwrap();
+            let result = manager
+                .read_at_snapshot(black_box("test_table"), black_box(1), black_box(target_ts))
+                .unwrap();
             black_box(result)
         });
     });
@@ -176,11 +149,9 @@ fn bench_query_positions(c: &mut Criterion) {
     group.bench_function("indexed_90pct", |b| {
         let target_ts = (num_versions as u64 * 1000 * 9) / 10;
         b.iter(|| {
-            let result = manager.read_at_snapshot(
-                black_box("test_table"),
-                black_box(1),
-                black_box(target_ts),
-            ).unwrap();
+            let result = manager
+                .read_at_snapshot(black_box("test_table"), black_box(1), black_box(target_ts))
+                .unwrap();
             black_box(result)
         });
     });
@@ -211,12 +182,14 @@ fn bench_write_overhead(c: &mut Criterion) {
             counter += 1;
             let timestamp = counter * 1000;
             let value = format!("value_{}", timestamp);
-            manager.write_version(
-                black_box("test_table"),
-                black_box(1),
-                black_box(timestamp),
-                black_box(value.as_bytes()),
-            ).unwrap();
+            manager
+                .write_version(
+                    black_box("test_table"),
+                    black_box(1),
+                    black_box(timestamp),
+                    black_box(value.as_bytes()),
+                )
+                .unwrap();
         });
     });
 
@@ -247,7 +220,8 @@ fn bench_multi_row(c: &mut Criterion) {
         for version in 1..=versions_per_row {
             let timestamp = (version * 1000) as u64;
             let value = format!("row_{}_value_{}", row_id, timestamp);
-            manager.write_version("test_table", row_id, timestamp, value.as_bytes())
+            manager
+                .write_version("test_table", row_id, timestamp, value.as_bytes())
                 .unwrap();
         }
     }
@@ -258,11 +232,9 @@ fn bench_multi_row(c: &mut Criterion) {
         b.iter(|| {
             let mut results = Vec::new();
             for row_id in 1..=num_rows {
-                let result = manager.read_at_snapshot(
-                    black_box("test_table"),
-                    black_box(row_id),
-                    black_box(target_ts),
-                ).unwrap();
+                let result = manager
+                    .read_at_snapshot(black_box("test_table"), black_box(row_id), black_box(target_ts))
+                    .unwrap();
                 results.push(result);
             }
             black_box(results)
@@ -280,11 +252,13 @@ fn bench_edge_cases(c: &mut Criterion) {
     // Query before first version
     group.bench_function("before_first_version", |b| {
         b.iter(|| {
-            let result = manager.read_at_snapshot(
-                black_box("test_table"),
-                black_box(1),
-                black_box(500), // Before first version at 1000
-            ).unwrap();
+            let result = manager
+                .read_at_snapshot(
+                    black_box("test_table"),
+                    black_box(1),
+                    black_box(500), // Before first version at 1000
+                )
+                .unwrap();
             black_box(result)
         });
     });
@@ -292,11 +266,13 @@ fn bench_edge_cases(c: &mut Criterion) {
     // Query after last version
     group.bench_function("after_last_version", |b| {
         b.iter(|| {
-            let result = manager.read_at_snapshot(
-                black_box("test_table"),
-                black_box(1),
-                black_box(1000000), // After last version at 100000
-            ).unwrap();
+            let result = manager
+                .read_at_snapshot(
+                    black_box("test_table"),
+                    black_box(1),
+                    black_box(1000000), // After last version at 100000
+                )
+                .unwrap();
             black_box(result)
         });
     });
@@ -304,11 +280,13 @@ fn bench_edge_cases(c: &mut Criterion) {
     // Query exact version match
     group.bench_function("exact_match", |b| {
         b.iter(|| {
-            let result = manager.read_at_snapshot(
-                black_box("test_table"),
-                black_box(1),
-                black_box(50000), // Exact match
-            ).unwrap();
+            let result = manager
+                .read_at_snapshot(
+                    black_box("test_table"),
+                    black_box(1),
+                    black_box(50000), // Exact match
+                )
+                .unwrap();
             black_box(result)
         });
     });

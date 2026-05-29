@@ -2,13 +2,13 @@
 //!
 //! Evaluates logical expressions against tuples to produce values.
 
-use crate::{Result, Error, Value, Tuple, Schema, DataType};
-use crate::tenant::{get_current_tenant_id, get_current_user_id};
 use super::LogicalExpr;
-use chrono::{Utc, Local, Datelike, Timelike};
-use std::sync::Arc;
-use rust_decimal::Decimal;
+use crate::tenant::{get_current_tenant_id, get_current_user_id};
+use crate::{DataType, Error, Result, Schema, Tuple, Value};
+use chrono::{Datelike, Local, Timelike, Utc};
 use rust_decimal::prelude::ToPrimitive;
+use rust_decimal::Decimal;
+use std::sync::Arc;
 
 /// Expression evaluator
 ///
@@ -76,38 +76,44 @@ impl Evaluator {
                 // PostgreSQL uses 1-based parameter indices
                 if *index == 0 {
                     return Err(Error::query_execution(
-                        "Parameter indices must be 1-based (e.g., $1, $2)"
+                        "Parameter indices must be 1-based (e.g., $1, $2)",
                     ));
                 }
 
                 // Convert to 0-based index for Vec
                 let zero_based_index = index - 1;
 
-                self.parameters.get(zero_based_index)
-                    .cloned()
-                    .ok_or_else(|| Error::query_execution(format!(
+                self.parameters.get(zero_based_index).cloned().ok_or_else(|| {
+                    Error::query_execution(format!(
                         "Parameter ${} not provided. Expected {} parameters, got {}",
                         index,
                         index,
                         self.parameters.len()
-                    )))
+                    ))
+                })
             }
 
             LogicalExpr::Column { table, name } => {
                 // Find column index in schema, using table qualifier for disambiguation if provided
-                let index = self.schema.get_qualified_column_index(table.as_deref(), name)
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "Column '{}' not found in schema",
-                        if let Some(t) = table { format!("{}.{}", t, name) } else { name.clone() }
-                    )))?;
+                let index = self
+                    .schema
+                    .get_qualified_column_index(table.as_deref(), name)
+                    .ok_or_else(|| {
+                        Error::query_execution(format!(
+                            "Column '{}' not found in schema",
+                            if let Some(t) = table {
+                                format!("{}.{}", t, name)
+                            } else {
+                                name.clone()
+                            }
+                        ))
+                    })?;
 
                 // Get value from tuple
-                tuple.get(index)
+                tuple
+                    .get(index)
                     .cloned()
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "Column index {} out of bounds in tuple",
-                        index
-                    )))
+                    .ok_or_else(|| Error::query_execution(format!("Column index {} out of bounds in tuple", index)))
             }
 
             LogicalExpr::BinaryExpr { left, op, right } => {
@@ -157,9 +163,7 @@ impl Evaluator {
                 Ok(Value::Boolean(is_actually_null == *is_null))
             }
 
-            LogicalExpr::ScalarFunction { fun, args } => {
-                self.evaluate_scalar_function(fun, args, tuple)
-            }
+            LogicalExpr::ScalarFunction { fun, args } => self.evaluate_scalar_function(fun, args, tuple),
 
             LogicalExpr::Cast { expr, data_type } => {
                 let value = self.evaluate(expr, tuple)?;
@@ -169,64 +173,54 @@ impl Evaluator {
             LogicalExpr::Wildcard => {
                 // Wildcards should be expanded during planning, not evaluation
                 Err(Error::query_execution(
-                    "Wildcard expressions should be expanded before evaluation"
+                    "Wildcard expressions should be expanded before evaluation",
                 ))
             }
 
             LogicalExpr::NewRow { column } => {
                 // Access NEW row from trigger row context
-                let (ctx, row_schema) = self.trigger_row_context.as_ref()
-                    .ok_or_else(|| Error::query_execution(
-                        "NEW is only valid in trigger context"
-                    ))?;
+                let (ctx, row_schema) = self
+                    .trigger_row_context
+                    .as_ref()
+                    .ok_or_else(|| Error::query_execution("NEW is only valid in trigger context"))?;
 
-                let new_tuple = ctx.new_tuple.as_ref()
-                    .ok_or_else(|| Error::query_execution(
-                        "NEW is not available in this trigger (DELETE triggers only have OLD)"
-                    ))?;
+                let new_tuple = ctx.new_tuple.as_ref().ok_or_else(|| {
+                    Error::query_execution("NEW is not available in this trigger (DELETE triggers only have OLD)")
+                })?;
 
                 // Find column index in trigger row schema
-                let index = row_schema.get_column_index(column)
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "Column '{}' not found in NEW row",
-                        column
-                    )))?;
+                let index = row_schema
+                    .get_column_index(column)
+                    .ok_or_else(|| Error::query_execution(format!("Column '{}' not found in NEW row", column)))?;
 
                 // Get value from NEW tuple
-                new_tuple.get(index)
+                new_tuple
+                    .get(index)
                     .cloned()
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "Column index {} out of bounds in NEW row",
-                        index
-                    )))
+                    .ok_or_else(|| Error::query_execution(format!("Column index {} out of bounds in NEW row", index)))
             }
 
             LogicalExpr::OldRow { column } => {
                 // Access OLD row from trigger row context
-                let (ctx, row_schema) = self.trigger_row_context.as_ref()
-                    .ok_or_else(|| Error::query_execution(
-                        "OLD is only valid in trigger context"
-                    ))?;
+                let (ctx, row_schema) = self
+                    .trigger_row_context
+                    .as_ref()
+                    .ok_or_else(|| Error::query_execution("OLD is only valid in trigger context"))?;
 
-                let old_tuple = ctx.old_tuple.as_ref()
-                    .ok_or_else(|| Error::query_execution(
-                        "OLD is not available in this trigger (INSERT triggers only have NEW)"
-                    ))?;
+                let old_tuple = ctx.old_tuple.as_ref().ok_or_else(|| {
+                    Error::query_execution("OLD is not available in this trigger (INSERT triggers only have NEW)")
+                })?;
 
                 // Find column index in trigger row schema
-                let index = row_schema.get_column_index(column)
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "Column '{}' not found in OLD row",
-                        column
-                    )))?;
+                let index = row_schema
+                    .get_column_index(column)
+                    .ok_or_else(|| Error::query_execution(format!("Column '{}' not found in OLD row", column)))?;
 
                 // Get value from OLD tuple
-                old_tuple.get(index)
+                old_tuple
+                    .get(index)
                     .cloned()
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "Column index {} out of bounds in OLD row",
-                        index
-                    )))
+                    .ok_or_else(|| Error::query_execution(format!("Column index {} out of bounds in OLD row", index)))
             }
 
             LogicalExpr::ArraySubscript { array, index } => {
@@ -288,7 +282,7 @@ impl Evaluator {
                 // Subquery evaluation requires executor context
                 // This should be handled at the executor level, not evaluator
                 Err(Error::query_execution(
-                    "IN subquery evaluation requires executor context. Use executor for subquery evaluation."
+                    "IN subquery evaluation requires executor context. Use executor for subquery evaluation.",
                 ))
             }
 
@@ -296,7 +290,7 @@ impl Evaluator {
                 // `DEFAULT` keyword appearing outside an INSERT VALUES
                 // list — there's no target column to resolve against.
                 Err(Error::query_execution(
-                    "DEFAULT keyword is only valid inside INSERT … VALUES (…)"
+                    "DEFAULT keyword is only valid inside INSERT … VALUES (…)",
                 ))
             }
 
@@ -308,7 +302,7 @@ impl Evaluator {
                 Err(Error::query_execution(
                     "Scalar subquery reached the evaluator without materialisation. \
                      Correlated subqueries are only supported in UPDATE SET at the moment; \
-                     rewrite other uses as UPDATE … FROM joins or plain SELECT expressions."
+                     rewrite other uses as UPDATE … FROM joins or plain SELECT expressions.",
                 ))
             }
 
@@ -316,17 +310,23 @@ impl Evaluator {
                 // EXISTS evaluation requires executor context
                 // This should be handled at the executor level, not evaluator
                 Err(Error::query_execution(
-                    "EXISTS subquery evaluation requires executor context. Use executor for subquery evaluation."
+                    "EXISTS subquery evaluation requires executor context. Use executor for subquery evaluation.",
                 ))
             }
 
-            LogicalExpr::Between { expr, low, high, negated } => {
+            LogicalExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
                 let value = self.evaluate(expr, tuple)?;
                 let low_value = self.evaluate(low, tuple)?;
                 let high_value = self.evaluate(high, tuple)?;
 
                 // NULL handling: if any value is NULL, result is NULL
-                if matches!(value, Value::Null) || matches!(low_value, Value::Null) || matches!(high_value, Value::Null) {
+                if matches!(value, Value::Null) || matches!(low_value, Value::Null) || matches!(high_value, Value::Null)
+                {
                     return Ok(Value::Null);
                 }
 
@@ -341,7 +341,11 @@ impl Evaluator {
                 Ok(Value::Boolean(result))
             }
 
-            LogicalExpr::Case { expr: operand, when_then, else_result } => {
+            LogicalExpr::Case {
+                expr: operand,
+                when_then,
+                else_result,
+            } => {
                 // If there's an operand, we're doing: CASE operand WHEN val THEN result...
                 // Otherwise, we're doing: CASE WHEN condition THEN result...
                 if let Some(op) = operand {
@@ -376,7 +380,7 @@ impl Evaluator {
                 // They need access to all rows in a partition and are handled
                 // by the WindowOperator in the executor
                 Err(Error::query_execution(
-                    "Window functions must be evaluated by WindowOperator, not row-by-row"
+                    "Window functions must be evaluated by WindowOperator, not row-by-row",
                 ))
             }
 
@@ -388,16 +392,9 @@ impl Evaluator {
     }
 
     /// Evaluate a scalar function
-    fn evaluate_scalar_function(
-        &self,
-        fun: &str,
-        args: &[LogicalExpr],
-        tuple: &Tuple,
-    ) -> Result<Value> {
+    fn evaluate_scalar_function(&self, fun: &str, args: &[LogicalExpr], tuple: &Tuple) -> Result<Value> {
         // Evaluate all arguments
-        let arg_values: Result<Vec<Value>> = args.iter()
-            .map(|arg| self.evaluate(arg, tuple))
-            .collect();
+        let arg_values: Result<Vec<Value>> = args.iter().map(|arg| self.evaluate(arg, tuple)).collect();
         let arg_values = arg_values?;
 
         // KanttBan #23 (v3.31.1 phase 1): drizzle-kit / psql /
@@ -405,106 +402,62 @@ impl Evaluator {
         // without the `pg_catalog.` prefix. Strip it so the dispatch
         // arms only need to list the bare name.
         let fun_lower = fun.to_lowercase();
-        let fun_dispatch = fun_lower
-            .strip_prefix("pg_catalog.")
-            .unwrap_or(&fun_lower);
+        let fun_dispatch = fun_lower.strip_prefix("pg_catalog.").unwrap_or(&fun_lower);
         match fun_dispatch {
             // JSONB extraction functions
-            "jsonb_extract_path" | "json_extract_path" => {
-                self.jsonb_extract_path(&arg_values)
-            }
-            "jsonb_extract_path_text" | "json_extract_path_text" => {
-                self.jsonb_extract_path_text(&arg_values)
-            }
+            "jsonb_extract_path" | "json_extract_path" => self.jsonb_extract_path(&arg_values),
+            "jsonb_extract_path_text" | "json_extract_path_text" => self.jsonb_extract_path_text(&arg_values),
 
             // JSONB array functions
-            "jsonb_array_elements" => {
-                self.jsonb_array_elements(&arg_values)
-            }
-            "jsonb_array_elements_text" => {
-                self.jsonb_array_elements_text(&arg_values)
-            }
+            "jsonb_array_elements" => self.jsonb_array_elements(&arg_values),
+            "jsonb_array_elements_text" => self.jsonb_array_elements_text(&arg_values),
 
             // JSONB object functions
-            "jsonb_object_keys" => {
-                self.jsonb_object_keys(&arg_values)
-            }
+            "jsonb_object_keys" => self.jsonb_object_keys(&arg_values),
 
             // JSONB aggregation
-            "jsonb_array_length" => {
-                self.jsonb_array_length(&arg_values)
-            }
+            "jsonb_array_length" => self.jsonb_array_length(&arg_values),
 
             // JSONB type check
-            "jsonb_typeof" => {
-                self.jsonb_typeof(&arg_values)
-            }
+            "jsonb_typeof" => self.jsonb_typeof(&arg_values),
 
             // JSONB path query (basic support)
-            "jsonb_path_query" => {
-                self.jsonb_path_query(&arg_values)
-            }
-            "jsonb_path_query_array" => {
-                self.jsonb_path_query_array(&arg_values)
-            }
-            "jsonb_path_query_first" => {
-                self.jsonb_path_query_first(&arg_values)
-            }
-            "jsonb_path_exists" => {
-                self.jsonb_path_exists(&arg_values)
-            }
-            "jsonb_path_match" => {
-                self.jsonb_path_match(&arg_values)
-            }
+            "jsonb_path_query" => self.jsonb_path_query(&arg_values),
+            "jsonb_path_query_array" => self.jsonb_path_query_array(&arg_values),
+            "jsonb_path_query_first" => self.jsonb_path_query_first(&arg_values),
+            "jsonb_path_exists" => self.jsonb_path_exists(&arg_values),
+            "jsonb_path_match" => self.jsonb_path_match(&arg_values),
 
             // JSONB formatting functions
-            "jsonb_pretty" => {
-                self.jsonb_pretty(&arg_values)
-            }
-            "jsonb_strip_nulls" => {
-                self.jsonb_strip_nulls(&arg_values)
-            }
+            "jsonb_pretty" => self.jsonb_pretty(&arg_values),
+            "jsonb_strip_nulls" => self.jsonb_strip_nulls(&arg_values),
 
             // JSONB construction functions (Phase 1)
-            "jsonb_build_object" | "json_build_object" => {
-                self.jsonb_build_object(&arg_values)
-            }
-            "jsonb_build_array" | "json_build_array" => {
-                self.jsonb_build_array(&arg_values)
-            }
-            "jsonb_set" | "json_set" => {
-                self.jsonb_set(&arg_values)
-            }
-            "jsonb_concat" => {
-                self.jsonb_concat(&arg_values)
-            }
-            "jsonb_delete" => {
-                self.jsonb_delete(&arg_values)
-            }
-            "jsonb_each" => {
-                self.jsonb_each(&arg_values)
-            }
-            "jsonb_each_text" => {
-                self.jsonb_each_text(&arg_values)
-            }
+            "jsonb_build_object" | "json_build_object" => self.jsonb_build_object(&arg_values),
+            "jsonb_build_array" | "json_build_array" => self.jsonb_build_array(&arg_values),
+            "jsonb_set" | "json_set" => self.jsonb_set(&arg_values),
+            "jsonb_concat" => self.jsonb_concat(&arg_values),
+            "jsonb_delete" => self.jsonb_delete(&arg_values),
+            "jsonb_each" => self.jsonb_each(&arg_values),
+            "jsonb_each_text" => self.jsonb_each_text(&arg_values),
 
             // Vector distance functions
-            "cosine_similarity" => {
-                self.vector_cosine_similarity(&arg_values)
-            }
-            "cosine_distance" => {
-                self.vector_cosine_distance(&arg_values)
-            }
-            "l2_distance" | "euclidean_distance" => {
-                self.vector_l2_distance(&arg_values)
-            }
-            "inner_product" => {
-                self.vector_inner_product(&arg_values)
-            }
+            "cosine_similarity" => self.vector_cosine_similarity(&arg_values),
+            "cosine_distance" => self.vector_cosine_distance(&arg_values),
+            "l2_distance" | "euclidean_distance" => self.vector_l2_distance(&arg_values),
+            "inner_product" => self.vector_inner_product(&arg_values),
+
+            // Agentic database surface (MVP): local deterministic inference
+            // smoke tests plus explicit provider hooks for LLM generation.
+            "predict" => Self::predict_builtin(&arg_values),
+            "infer" => Self::infer_builtin(&arg_values),
+            "generate" => Self::generate_hook(&arg_values),
+            "heliosdb_recommend_indexes" => Self::recommend_indexes_json(&arg_values),
+            "heliosdb_self_drive_plan" => Self::self_drive_plan_json(&arg_values),
 
             // Date/Time functions - PostgreSQL, Oracle, SQL Server, MySQL compatible aliases
-            "current_timestamp" | "now" | "sysdate" | "getdate" | "systimestamp" | "sysdatetime"
-            | "getutcdate" | "utc_timestamp" => {
+            "current_timestamp" | "now" | "sysdate" | "getdate" | "systimestamp" | "sysdatetime" | "getutcdate"
+            | "utc_timestamp" => {
                 // Return current timestamp in UTC
                 Ok(Value::Timestamp(Utc::now()))
             }
@@ -623,26 +576,27 @@ impl Evaluator {
             // PG date semantics (psycopg, Drizzle, Prisma, sqlx, …) and the
             // canonical home for date formatting now that we no longer carry
             // SQLite-specific names like STRFTIME / JULIANDAY.
-            "to_char"        => self.func_to_char(&arg_values),
-            "to_date"        => self.func_to_date(&arg_values),
-            "to_timestamp"   => self.func_to_timestamp(&arg_values),
-            "date_trunc"     => self.func_date_trunc(&arg_values),
-            "make_date"      => self.func_make_date(&arg_values),
+            "to_char" => self.func_to_char(&arg_values),
+            "to_date" => self.func_to_date(&arg_values),
+            "to_timestamp" => self.func_to_timestamp(&arg_values),
+            "date_trunc" => self.func_date_trunc(&arg_values),
+            "make_date" => self.func_make_date(&arg_values),
             "make_timestamp" => self.func_make_timestamp(&arg_values),
-            "age"            => self.func_age(&arg_values),
-            "date_part"      => {
+            "age" => self.func_age(&arg_values),
+            "date_part" => {
                 // PostgreSQL alias: date_part('field', expr) ≡ EXTRACT(field FROM expr).
                 let [field_arg, val_arg] = arg_values.as_slice() else {
-                    return Err(Error::query_execution(
-                        "DATE_PART requires exactly 2 arguments"
-                    ));
+                    return Err(Error::query_execution("DATE_PART requires exactly 2 arguments"));
                 };
                 let field = match field_arg {
                     Value::String(s) => s.to_lowercase(),
                     Value::Null => return Ok(Value::Null),
-                    other => return Err(Error::query_execution(format!(
-                        "DATE_PART field must be a string, got {:?}", other
-                    ))),
+                    other => {
+                        return Err(Error::query_execution(format!(
+                            "DATE_PART field must be a string, got {:?}",
+                            other
+                        )))
+                    }
                 };
                 Self::extract_field(&field, std::slice::from_ref(val_arg))
             }
@@ -652,21 +606,13 @@ impl Evaluator {
             "instr" => self.func_instr(&arg_values),
 
             // PostgreSQL compatibility functions (SQLAlchemy, psql, pgAdmin, DBeaver)
-            "version" | "pg_catalog.version" => {
-                Ok(Value::String(format!(
-                    "PostgreSQL 16.0 (HeliosDB Nano {})",
-                    env!("CARGO_PKG_VERSION")
-                )))
-            }
-            "current_schema" => {
-                Ok(Value::String("public".to_string()))
-            }
-            "current_database" => {
-                Ok(Value::String("heliosdb".to_string()))
-            }
-            "current_user" | "session_user" => {
-                Ok(Value::String("heliosdb".to_string()))
-            }
+            "version" | "pg_catalog.version" => Ok(Value::String(format!(
+                "PostgreSQL 16.0 (HeliosDB Nano {})",
+                env!("CARGO_PKG_VERSION")
+            ))),
+            "current_schema" => Ok(Value::String("public".to_string())),
+            "current_database" => Ok(Value::String("heliosdb".to_string())),
+            "current_user" | "session_user" => Ok(Value::String("heliosdb".to_string())),
             // Random UUID v4 — the default for Postgres 13+ PK columns.
             "gen_random_uuid" | "pg_catalog.gen_random_uuid" | "uuid_generate_v4" => {
                 Ok(Value::Uuid(uuid::Uuid::new_v4()))
@@ -679,9 +625,11 @@ impl Evaluator {
                 let name = match arg_values.first() {
                     Some(Value::String(s)) => s.clone(),
                     Some(Value::Null) => return Ok(Value::Null),
-                    _ => return Err(Error::query_execution(
-                        "nextval() requires a text argument (sequence name)",
-                    )),
+                    _ => {
+                        return Err(Error::query_execution(
+                            "nextval() requires a text argument (sequence name)",
+                        ))
+                    }
                 };
                 Ok(Value::Int8(crate::sql::sequences::nextval(&name)))
             }
@@ -689,9 +637,11 @@ impl Evaluator {
                 let name = match arg_values.first() {
                     Some(Value::String(s)) => s.clone(),
                     Some(Value::Null) => return Ok(Value::Null),
-                    _ => return Err(Error::query_execution(
-                        "currval() requires a text argument (sequence name)",
-                    )),
+                    _ => {
+                        return Err(Error::query_execution(
+                            "currval() requires a text argument (sequence name)",
+                        ))
+                    }
                 };
                 Ok(Value::Int8(crate::sql::sequences::currval(&name)))
             }
@@ -699,26 +649,24 @@ impl Evaluator {
                 let name = match arg_values.first() {
                     Some(Value::String(s)) => s.clone(),
                     Some(Value::Null) => return Ok(Value::Null),
-                    _ => return Err(Error::query_execution(
-                        "setval() requires (text, integer) arguments",
-                    )),
+                    _ => return Err(Error::query_execution("setval() requires (text, integer) arguments")),
                 };
                 let value = match arg_values.get(1) {
                     Some(Value::Int8(n)) => *n,
                     Some(Value::Int4(n)) => *n as i64,
                     Some(Value::Int2(n)) => *n as i64,
-                    _ => return Err(Error::query_execution(
-                        "setval() second argument must be an integer",
-                    )),
+                    _ => return Err(Error::query_execution("setval() second argument must be an integer")),
                 };
                 Ok(Value::Int8(crate::sql::sequences::setval(&name, value)))
             }
             // Self-introspection: summarise what HeliosDB Nano supports
             // vs. stock PostgreSQL. Useful for drivers / migration tools
             // to probe at connect-time without guessing.
-            "heliosdb_capability_report" => {
-                Ok(Value::String(concat!(
-                    "HeliosDB Nano ", env!("CARGO_PKG_VERSION"), "\n",
+            "heliosdb_capability_report" => Ok(Value::String(
+                concat!(
+                    "HeliosDB Nano ",
+                    env!("CARGO_PKG_VERSION"),
+                    "\n",
                     "  SERIAL / BIGSERIAL / GENERATED AS IDENTITY  : yes\n",
                     "  ON CONFLICT DO NOTHING / DO UPDATE         : yes\n",
                     "  RETURNING *                                : yes\n",
@@ -735,8 +683,9 @@ impl Evaluator {
                     "  GIN / GiST indexes                         : DDL accepted, no backing store yet\n",
                     "  PL/pgSQL control flow (IF/LOOP/RAISE)      : no — use procedures\n",
                     "  Language-specific FTS stemmers             : no — tokenize + lowercase only\n",
-                ).to_string()))
-            }
+                )
+                .to_string(),
+            )),
 
             // EXTRACT(<field> FROM <expr>) — the planner lowers these
             // to `__extract_<field>(expr)` so we don't need a separate
@@ -753,25 +702,22 @@ impl Evaluator {
             // `config` argument (e.g. 'english') is accepted for
             // compatibility but ignored — we use a single Unicode-word
             // tokenizer regardless.
-            "to_tsvector" | "pg_catalog.to_tsvector" => {
-                Self::fts_build_from_text(&arg_values, "to_tsvector")
-            }
+            "to_tsvector" | "pg_catalog.to_tsvector" => Self::fts_build_from_text(&arg_values, "to_tsvector"),
             // `to_tsquery(text)` / `plainto_tsquery(text)`: same encoding
             // as tsvector. `to_tsquery` normally understands `&`, `|`,
             // `!`, `<->`; we treat those as term separators (no boolean
             // logic, no phrase queries — documented limitation).
-            "to_tsquery" | "plainto_tsquery" | "phraseto_tsquery"
-            | "pg_catalog.to_tsquery" | "pg_catalog.plainto_tsquery" => {
-                Self::fts_build_from_text(&arg_values, fun)
-            }
+            "to_tsquery"
+            | "plainto_tsquery"
+            | "phraseto_tsquery"
+            | "pg_catalog.to_tsquery"
+            | "pg_catalog.plainto_tsquery" => Self::fts_build_from_text(&arg_values, fun),
             // `ts_rank_cd(doc, query)` / `ts_rank(doc, query)`: run BM25
             // against a 1-document index built on the fly. Returns
             // Float8 in the 0..~10 range, higher = more relevant.
             // Optional `weights` and `normalization` args are accepted
             // for signature compatibility but ignored.
-            "ts_rank" | "ts_rank_cd" => {
-                Self::fts_score(&arg_values)
-            }
+            "ts_rank" | "ts_rank_cd" => Self::fts_score(&arg_values),
 
             // `current_setting(name [, missing_ok])` — Postgres GUC
             // accessor. Used by observability tooling (DataDog,
@@ -784,9 +730,11 @@ impl Evaluator {
             "current_setting" => {
                 let name = match arg_values.first() {
                     Some(Value::String(s)) => s.to_lowercase(),
-                    _ => return Err(Error::query_execution(
-                        "current_setting() requires a setting name as its first argument".to_string(),
-                    )),
+                    _ => {
+                        return Err(Error::query_execution(
+                            "current_setting() requires a setting name as its first argument".to_string(),
+                        ))
+                    }
                 };
                 let missing_ok = matches!(arg_values.get(1), Some(Value::Boolean(true)));
                 let value = match name.as_str() {
@@ -795,17 +743,16 @@ impl Evaluator {
                     "server_version_num" => Some("170000".to_string()),
                     // Encoding / locale (default UTF-8 / C)
                     "client_encoding" | "server_encoding" => Some("UTF8".to_string()),
-                    "lc_collate" | "lc_ctype" | "lc_messages" | "lc_monetary"
-                    | "lc_numeric" | "lc_time" => Some("C".to_string()),
+                    "lc_collate" | "lc_ctype" | "lc_messages" | "lc_monetary" | "lc_numeric" | "lc_time" => {
+                        Some("C".to_string())
+                    }
                     "datestyle" => Some("ISO, MDY".to_string()),
                     "timezone" => Some("UTC".to_string()),
                     "standard_conforming_strings" => Some("on".to_string()),
                     "integer_datetimes" => Some("on".to_string()),
                     // Trivia some clients probe
                     "is_superuser" => Some("on".to_string()),
-                    "session_authorization" | "current_user" | "current_role" => {
-                        Some("postgres".to_string())
-                    }
+                    "session_authorization" | "current_user" | "current_role" => Some("postgres".to_string()),
                     "search_path" => Some("\"$user\", public".to_string()),
                     _ => None,
                 };
@@ -860,10 +807,215 @@ impl Evaluator {
                 Ok(Value::String(format_pg_type_oid(oid)))
             }
 
-            _ => Err(Error::query_execution(format!(
-                "Unknown scalar function: {}",
-                fun
+            _ => Err(Error::query_execution(format!("Unknown scalar function: {}", fun))),
+        }
+    }
+
+    fn predict_builtin(args: &[Value]) -> Result<Value> {
+        let model = Self::required_string_arg(args, 0, "predict")?.to_ascii_lowercase();
+        let features = args
+            .get(1)
+            .ok_or_else(|| Error::query_execution("predict() requires model and feature arguments"))?;
+        let vector = Self::numeric_vector_from_value(features)?;
+
+        match model.as_str() {
+            "sum" => Ok(Value::Float8(vector.iter().map(|v| *v as f64).sum())),
+            "mean" | "avg" => {
+                if vector.is_empty() {
+                    return Ok(Value::Null);
+                }
+                let sum: f64 = vector.iter().map(|v| *v as f64).sum();
+                Ok(Value::Float8(sum / vector.len() as f64))
+            }
+            "max" => {
+                let Some(value) = vector.iter().copied().reduce(f32::max) else {
+                    return Ok(Value::Null);
+                };
+                Ok(Value::Float8(value as f64))
+            }
+            "min" => {
+                let Some(value) = vector.iter().copied().reduce(f32::min) else {
+                    return Ok(Value::Null);
+                };
+                Ok(Value::Float8(value as f64))
+            }
+            other => Err(Error::query_execution(format!(
+                "predict() model '{other}' is not registered; configure an external provider or code-embed model"
             ))),
+        }
+    }
+
+    fn infer_builtin(args: &[Value]) -> Result<Value> {
+        let model = Self::required_string_arg(args, 0, "infer")?;
+        let prediction = Self::predict_builtin(args)?;
+        let features = args
+            .get(1)
+            .ok_or_else(|| Error::query_execution("infer() requires model and feature arguments"))?;
+        let vector = Self::numeric_vector_from_value(features)?;
+        let response = serde_json::json!({
+            "model": model,
+            "runtime": "builtin",
+            "input_dimension": vector.len(),
+            "prediction": Self::value_to_json(&prediction),
+        });
+        Ok(Value::Json(response.to_string()))
+    }
+
+    fn generate_hook(args: &[Value]) -> Result<Value> {
+        let prompt = Self::required_string_arg(args, 0, "generate")?;
+        let model = args
+            .get(1)
+            .and_then(|v| match v {
+                Value::String(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .unwrap_or("default");
+        let response = serde_json::json!({
+            "status": "provider_required",
+            "model": model,
+            "prompt_chars": prompt.chars().count(),
+            "message": "SQL generate() is registered; configure an AI provider or call the REST chat/RAG APIs for execution",
+        });
+        Ok(Value::Json(response.to_string()))
+    }
+
+    fn recommend_indexes_json(args: &[Value]) -> Result<Value> {
+        let sql = Self::required_string_arg(args, 0, "heliosdb_recommend_indexes")?;
+        Ok(Value::Json(
+            serde_json::Value::Array(Self::recommendations_for_sql(sql)).to_string(),
+        ))
+    }
+
+    fn self_drive_plan_json(args: &[Value]) -> Result<Value> {
+        let sql = Self::required_string_arg(args, 0, "heliosdb_self_drive_plan")?;
+        let recommendations = Self::recommendations_for_sql(sql);
+        let plan = serde_json::json!({
+            "mode": "preview",
+            "safe_loop": [
+                "create branch",
+                "apply recommended indexes on branch",
+                "benchmark branch against main",
+                "promote only if measured faster"
+            ],
+            "recommendations": recommendations,
+            "auto_promote": false,
+        });
+        Ok(Value::Json(plan.to_string()))
+    }
+
+    fn recommendations_for_sql(sql: &str) -> Vec<serde_json::Value> {
+        let lower = sql.to_ascii_lowercase();
+        let Some(from_pos) = lower.find(" from ") else {
+            return Vec::new();
+        };
+        let after_from = &sql[from_pos + 6..];
+        let table = after_from
+            .split_whitespace()
+            .next()
+            .unwrap_or_default()
+            .trim_matches(|c: char| c == '"' || c == '`' || c == ';');
+        if table.is_empty() {
+            return Vec::new();
+        }
+
+        let Some(where_pos) = lower.find(" where ") else {
+            return Vec::new();
+        };
+        let after_where = &sql[where_pos + 7..];
+        let column = after_where
+            .split(|c: char| c == '=' || c == '<' || c == '>' || c.is_whitespace())
+            .find(|part| {
+                let p = part.trim_matches(|c: char| c == '"' || c == '`' || c == '(' || c == ')');
+                !p.is_empty() && !matches!(p.to_ascii_lowercase().as_str(), "and" | "or" | "not")
+            })
+            .unwrap_or_default()
+            .trim_matches(|c: char| c == '"' || c == '`' || c == '(' || c == ')');
+        if column.is_empty() {
+            return Vec::new();
+        }
+
+        let index_name = format!("idx_{}_{}", table.replace('.', "_"), column);
+        vec![serde_json::json!({
+            "table": table,
+            "columns": [column],
+            "index_type": "btree",
+            "roi_score": 70.0,
+            "reason": "Frequent filtered lookup candidate detected from SQL text",
+            "create_statement": format!("CREATE INDEX {} ON {} ({})", index_name, table, column),
+        })]
+    }
+
+    fn required_string_arg<'a>(args: &'a [Value], index: usize, function_name: &str) -> Result<&'a str> {
+        match args.get(index) {
+            Some(Value::String(s)) => Ok(s.as_str()),
+            Some(Value::Json(s)) => Ok(s.as_str()),
+            Some(Value::Null) | None => Err(Error::query_execution(format!(
+                "{function_name}() requires a text argument at position {}",
+                index + 1
+            ))),
+            Some(_) => Err(Error::query_execution(format!(
+                "{function_name}() argument {} must be text",
+                index + 1
+            ))),
+        }
+    }
+
+    fn numeric_vector_from_value(value: &Value) -> Result<Vec<f32>> {
+        match value {
+            Value::Vector(v) => Ok(v.clone()),
+            Value::Array(values) => values.iter().map(Self::value_to_f32).collect(),
+            Value::Json(s) | Value::String(s) => {
+                let parsed: serde_json::Value = serde_json::from_str(s)
+                    .map_err(|e| Error::query_execution(format!("invalid feature vector JSON: {e}")))?;
+                match parsed {
+                    serde_json::Value::Array(items) => items
+                        .iter()
+                        .map(|item| {
+                            item.as_f64()
+                                .map(|n| n as f32)
+                                .ok_or_else(|| Error::query_execution("feature vector must contain only numbers"))
+                        })
+                        .collect(),
+                    _ => Err(Error::query_execution(
+                        "feature argument must be a vector or numeric JSON array",
+                    )),
+                }
+            }
+            _ => Err(Error::query_execution(
+                "feature argument must be a vector or numeric array",
+            )),
+        }
+    }
+
+    fn value_to_f32(value: &Value) -> Result<f32> {
+        match value {
+            Value::Int2(v) => Ok(*v as f32),
+            Value::Int4(v) => Ok(*v as f32),
+            Value::Int8(v) => Ok(*v as f32),
+            Value::Float4(v) => Ok(*v),
+            Value::Float8(v) => Ok(*v as f32),
+            Value::Numeric(s) => s
+                .parse::<f32>()
+                .map_err(|e| Error::query_execution(format!("invalid numeric feature '{s}': {e}"))),
+            _ => Err(Error::query_execution("feature vector must contain only numbers")),
+        }
+    }
+
+    fn value_to_json(value: &Value) -> serde_json::Value {
+        match value {
+            Value::Null => serde_json::Value::Null,
+            Value::Boolean(v) => serde_json::json!(v),
+            Value::Int2(v) => serde_json::json!(v),
+            Value::Int4(v) => serde_json::json!(v),
+            Value::Int8(v) => serde_json::json!(v),
+            Value::Float4(v) => serde_json::json!(v),
+            Value::Float8(v) => serde_json::json!(v),
+            Value::Numeric(v) => serde_json::json!(v),
+            Value::String(v) => serde_json::json!(v),
+            Value::Vector(v) => serde_json::json!(v),
+            Value::Array(v) => serde_json::Value::Array(v.iter().map(Self::value_to_json).collect()),
+            Value::Json(v) => serde_json::from_str(v).unwrap_or_else(|_| serde_json::json!(v)),
+            other => serde_json::json!(other.to_string()),
         }
     }
 
@@ -883,21 +1035,21 @@ impl Evaluator {
         let text_val = match args.len() {
             1 => &args[0],
             2 => &args[1],
-            n => return Err(Error::query_execution(format!(
-                "{fn_name} expects 1 or 2 arguments, got {n}"
-            ))),
+            n => {
+                return Err(Error::query_execution(format!(
+                    "{fn_name} expects 1 or 2 arguments, got {n}"
+                )))
+            }
         };
         let text = match text_val {
             Value::Null => return Ok(Value::Null),
             Value::String(s) => s.as_str(),
             Value::Json(s) => s.as_str(),
-            _ => return Err(Error::query_execution(format!(
-                "{fn_name} expects text argument"
-            ))),
+            _ => return Err(Error::query_execution(format!("{fn_name} expects text argument"))),
         };
         let tokens = crate::search::tokenizer::tokenize(text);
-        let json = serde_json::to_string(&tokens)
-            .map_err(|e| Error::query_execution(format!("tsvector encode: {e}")))?;
+        let json =
+            serde_json::to_string(&tokens).map_err(|e| Error::query_execution(format!("tsvector encode: {e}")))?;
         Ok(Value::Json(json))
     }
 
@@ -915,10 +1067,13 @@ impl Evaluator {
                 crate::search::tokenizer::tokenize(s)
             }),
             Value::String(s) => crate::search::tokenizer::tokenize(s),
-            Value::Array(items) => items.iter().filter_map(|v| match v {
-                Value::String(s) => Some(s.clone()),
-                _ => None,
-            }).collect(),
+            Value::Array(items) => items
+                .iter()
+                .filter_map(|v| match v {
+                    Value::String(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
             _ => Vec::new(),
         }
     }
@@ -929,11 +1084,13 @@ impl Evaluator {
         // compatibility and ignored.
         let (doc, query) = match args.len() {
             2 => (&args[0], &args[1]),
-            3 => (&args[0], &args[1]),      // weights, doc, query  — ignore weights[0]? no, skip
-            4 => (&args[1], &args[2]),      // weights, doc, query, norm
-            n => return Err(Error::query_execution(format!(
-                "ts_rank expects 2..4 arguments, got {n}"
-            ))),
+            3 => (&args[0], &args[1]), // weights, doc, query  — ignore weights[0]? no, skip
+            4 => (&args[1], &args[2]), // weights, doc, query, norm
+            n => {
+                return Err(Error::query_execution(format!(
+                    "ts_rank expects 2..4 arguments, got {n}"
+                )))
+            }
         };
         // Handle the 3-arg form: PG's 3-arg signature is
         // `ts_rank(doc, query, normalization)`, so check if args[0] is
@@ -973,8 +1130,7 @@ impl Evaluator {
         if q_tokens.is_empty() {
             return Ok(Value::Boolean(false));
         }
-        let doc_set: std::collections::HashSet<&str> =
-            doc_tokens.iter().map(String::as_str).collect();
+        let doc_set: std::collections::HashSet<&str> = doc_tokens.iter().map(String::as_str).collect();
         let matched = q_tokens.iter().any(|t| doc_set.contains(t.as_str()));
         Ok(Value::Boolean(matched))
     }
@@ -985,36 +1141,27 @@ impl Evaluator {
     fn value_to_naive_datetime(val: &Value) -> Result<chrono::NaiveDateTime> {
         match val {
             Value::Timestamp(ts) => Ok(ts.naive_utc()),
-            Value::Date(d) => d.and_hms_opt(0, 0, 0)
+            Value::Date(d) => d
+                .and_hms_opt(0, 0, 0)
                 .ok_or_else(|| Error::query_execution("Invalid date for datetime conversion")),
-            Value::String(s) => {
-                chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-                    .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
-                    .or_else(|e| {
-                        match chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
-                            Ok(d) => match d.and_hms_opt(0, 0, 0) {
-                                Some(ndt) => Ok(ndt),
-                                None => Err(e),
-                            },
-                            Err(e2) => Err(e2),
-                        }
-                    })
-                    .map_err(|e| Error::query_execution(format!("Cannot parse '{}' as datetime: {}", s, e)))
-            }
-            Value::Int8(epoch) => {
-                chrono::DateTime::from_timestamp(*epoch, 0)
-                    .map(|dt| dt.naive_utc())
-                    .ok_or_else(|| Error::query_execution(format!("Invalid unix timestamp: {}", epoch)))
-            }
-            Value::Int4(epoch) => {
-                chrono::DateTime::from_timestamp(i64::from(*epoch), 0)
-                    .map(|dt| dt.naive_utc())
-                    .ok_or_else(|| Error::query_execution(format!("Invalid unix timestamp: {}", epoch)))
-            }
+            Value::String(s) => chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+                .or_else(|_| chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f"))
+                .or_else(|e| match chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+                    Ok(d) => match d.and_hms_opt(0, 0, 0) {
+                        Some(ndt) => Ok(ndt),
+                        None => Err(e),
+                    },
+                    Err(e2) => Err(e2),
+                })
+                .map_err(|e| Error::query_execution(format!("Cannot parse '{}' as datetime: {}", s, e))),
+            Value::Int8(epoch) => chrono::DateTime::from_timestamp(*epoch, 0)
+                .map(|dt| dt.naive_utc())
+                .ok_or_else(|| Error::query_execution(format!("Invalid unix timestamp: {}", epoch))),
+            Value::Int4(epoch) => chrono::DateTime::from_timestamp(i64::from(*epoch), 0)
+                .map(|dt| dt.naive_utc())
+                .ok_or_else(|| Error::query_execution(format!("Invalid unix timestamp: {}", epoch))),
             Value::Null => Err(Error::query_execution("NULL datetime")),
-            _ => Err(Error::query_execution(format!(
-                "Cannot convert {:?} to datetime", val
-            ))),
+            _ => Err(Error::query_execution(format!("Cannot convert {:?} to datetime", val))),
         }
     }
 
@@ -1027,15 +1174,12 @@ impl Evaluator {
                 chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
                     .or_else(|_| {
                         // Also accept datetime strings — just take the date part
-                        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
-                            .map(|ndt| ndt.date())
+                        chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S").map(|ndt| ndt.date())
                     })
                     .map_err(|e| Error::query_execution(format!("Cannot parse '{}' as date: {}", s, e)))
             }
             Value::Null => Err(Error::query_execution("NULL date")),
-            _ => Err(Error::query_execution(format!(
-                "Cannot convert {:?} to date", val
-            ))),
+            _ => Err(Error::query_execution(format!("Cannot convert {:?} to date", val))),
         }
     }
 
@@ -1051,26 +1195,26 @@ impl Evaluator {
         while let Some(ch) = chars.next() {
             if ch == '%' {
                 match chars.next() {
-                    Some('Y') => result.push_str("%Y"),  // 4-digit year
-                    Some('y') => result.push_str("%y"),  // 2-digit year
-                    Some('m') => result.push_str("%m"),  // month 01-12
-                    Some('c') => result.push_str("%-m"), // month 1-12 (no leading zero)
-                    Some('d') => result.push_str("%d"),  // day 01-31
-                    Some('e') => result.push_str("%-d"), // day 1-31 (no leading zero)
-                    Some('H') => result.push_str("%H"),  // hour 00-23
+                    Some('Y') => result.push_str("%Y"),             // 4-digit year
+                    Some('y') => result.push_str("%y"),             // 2-digit year
+                    Some('m') => result.push_str("%m"),             // month 01-12
+                    Some('c') => result.push_str("%-m"),            // month 1-12 (no leading zero)
+                    Some('d') => result.push_str("%d"),             // day 01-31
+                    Some('e') => result.push_str("%-d"),            // day 1-31 (no leading zero)
+                    Some('H') => result.push_str("%H"),             // hour 00-23
                     Some('h') | Some('I') => result.push_str("%I"), // hour 01-12
-                    Some('i') => result.push_str("%M"),  // minutes 00-59 (MySQL %i → chrono %M)
+                    Some('i') => result.push_str("%M"),             // minutes 00-59 (MySQL %i → chrono %M)
                     Some('s') | Some('S') => result.push_str("%S"), // seconds 00-59
-                    Some('p') => result.push_str("%p"),  // AM/PM
-                    Some('W') => result.push_str("%A"),  // full weekday name
-                    Some('a') => result.push_str("%a"),  // abbreviated weekday name
-                    Some('M') => result.push_str("%B"),  // full month name (MySQL %M → chrono %B)
-                    Some('b') => result.push_str("%b"),  // abbreviated month name
-                    Some('j') => result.push_str("%j"),  // day of year 001-366
-                    Some('w') => result.push_str("%w"),  // day of week 0=Sunday
-                    Some('T') => result.push_str("%H:%M:%S"), // time 24-hour
-                    Some('r') => result.push_str("%I:%M:%S %p"), // time 12-hour
-                    Some('%') => result.push('%'),        // literal %
+                    Some('p') => result.push_str("%p"),             // AM/PM
+                    Some('W') => result.push_str("%A"),             // full weekday name
+                    Some('a') => result.push_str("%a"),             // abbreviated weekday name
+                    Some('M') => result.push_str("%B"),             // full month name (MySQL %M → chrono %B)
+                    Some('b') => result.push_str("%b"),             // abbreviated month name
+                    Some('j') => result.push_str("%j"),             // day of year 001-366
+                    Some('w') => result.push_str("%w"),             // day of week 0=Sunday
+                    Some('T') => result.push_str("%H:%M:%S"),       // time 24-hour
+                    Some('r') => result.push_str("%I:%M:%S %p"),    // time 12-hour
+                    Some('%') => result.push('%'),                  // literal %
                     Some(other) => {
                         // Unknown specifier — pass through as-is
                         result.push('%');
@@ -1096,7 +1240,11 @@ impl Evaluator {
         let ndt = Self::value_to_naive_datetime(date_arg)?;
         let format_str = match fmt_arg {
             Value::String(s) => s,
-            _ => return Err(Error::query_execution("DATE_FORMAT second argument must be a format string")),
+            _ => {
+                return Err(Error::query_execution(
+                    "DATE_FORMAT second argument must be a format string",
+                ))
+            }
         };
         let chrono_fmt = Self::mysql_format_to_chrono(format_str);
         Ok(Value::String(ndt.format(&chrono_fmt).to_string()))
@@ -1119,22 +1267,22 @@ impl Evaluator {
             ("MONTH", "\u{1}MONTH\u{2}"),
             ("Month", "\u{1}Month\u{2}"),
             ("month", "\u{1}month\u{2}"),
-            ("YYYY",  "%Y"),
-            ("HH24",  "%H"),
-            ("HH12",  "%I"),
-            ("IYYY",  "%G"),
+            ("YYYY", "%Y"),
+            ("HH24", "%H"),
+            ("HH12", "%I"),
+            ("IYYY", "%G"),
             // 3-char codes.
-            ("DDD",  "%j"),
-            ("DAY",  "\u{1}DAY\u{2}"),
-            ("Day",  "\u{1}Day\u{2}"),
-            ("day",  "\u{1}day\u{2}"),
-            ("MON",  "\u{1}MON\u{2}"),
-            ("Mon",  "\u{1}Mon\u{2}"),
-            ("mon",  "\u{1}mon\u{2}"),
-            ("am" ,  "%P"),
-            ("pm" ,  "%P"),
-            ("AM" ,  "%p"),
-            ("PM" ,  "%p"),
+            ("DDD", "%j"),
+            ("DAY", "\u{1}DAY\u{2}"),
+            ("Day", "\u{1}Day\u{2}"),
+            ("day", "\u{1}day\u{2}"),
+            ("MON", "\u{1}MON\u{2}"),
+            ("Mon", "\u{1}Mon\u{2}"),
+            ("mon", "\u{1}mon\u{2}"),
+            ("am", "%P"),
+            ("pm", "%P"),
+            ("AM", "%p"),
+            ("PM", "%p"),
             // 2-char codes.
             ("YY", "%y"),
             ("MM", "%m"),
@@ -1147,9 +1295,9 @@ impl Evaluator {
             ("US", "%6f"),
             ("IW", "%V"),
             // 1-char codes (matched last so they don't shadow longer codes).
-            ("Q",  "\u{1}Q\u{2}"),
-            ("W",  "\u{1}W\u{2}"),
-            ("D",  "%u"),
+            ("Q", "\u{1}Q\u{2}"),
+            ("W", "\u{1}W\u{2}"),
+            ("D", "%u"),
         ];
         let mut out = String::with_capacity(format.len());
         let bytes = format.as_bytes();
@@ -1183,7 +1331,7 @@ impl Evaluator {
         }
         let month_full = ndt.format("%B").to_string();
         let month_abbr = ndt.format("%b").to_string();
-        let day_full   = ndt.format("%A").to_string();
+        let day_full = ndt.format("%A").to_string();
         let q = ((ndt.month() - 1) / 3 + 1).to_string();
         let w = ((ndt.day() - 1) / 7 + 1).to_string();
         let mut out = String::with_capacity(input.len());
@@ -1205,15 +1353,19 @@ impl Evaluator {
                 "MONTH" => out.push_str(&month_full.to_uppercase()),
                 "Month" => out.push_str(&month_full),
                 "month" => out.push_str(&month_full.to_lowercase()),
-                "MON"   => out.push_str(&month_abbr.to_uppercase()),
-                "Mon"   => out.push_str(&month_abbr),
-                "mon"   => out.push_str(&month_abbr.to_lowercase()),
-                "DAY"   => out.push_str(&day_full.to_uppercase()),
-                "Day"   => out.push_str(&day_full),
-                "day"   => out.push_str(&day_full.to_lowercase()),
-                "Q"     => out.push_str(&q),
-                "W"     => out.push_str(&w),
-                other   => { out.push('\u{1}'); out.push_str(other); out.push('\u{2}'); }
+                "MON" => out.push_str(&month_abbr.to_uppercase()),
+                "Mon" => out.push_str(&month_abbr),
+                "mon" => out.push_str(&month_abbr.to_lowercase()),
+                "DAY" => out.push_str(&day_full.to_uppercase()),
+                "Day" => out.push_str(&day_full),
+                "day" => out.push_str(&day_full.to_lowercase()),
+                "Q" => out.push_str(&q),
+                "W" => out.push_str(&w),
+                other => {
+                    out.push('\u{1}');
+                    out.push_str(other);
+                    out.push('\u{2}');
+                }
             }
         }
         out
@@ -1233,9 +1385,12 @@ impl Evaluator {
         }
         let format_str = match fmt {
             Value::String(s) => s.clone(),
-            other => return Err(Error::query_execution(format!(
-                "TO_CHAR format must be a string, got {:?}", other
-            ))),
+            other => {
+                return Err(Error::query_execution(format!(
+                    "TO_CHAR format must be a string, got {:?}",
+                    other
+                )))
+            }
         };
         match val {
             Value::Date(_) | Value::Timestamp(_) | Value::String(_) => {
@@ -1245,7 +1400,8 @@ impl Evaluator {
                 Ok(Value::String(Self::pg_format_post_substitute(formatted, ndt)))
             }
             other => Err(Error::query_execution(format!(
-                "TO_CHAR({:?}) is not yet supported (date/timestamp only)", other
+                "TO_CHAR({:?}) is not yet supported (date/timestamp only)",
+                other
             ))),
         }
     }
@@ -1261,9 +1417,12 @@ impl Evaluator {
         }
         let s = match text {
             Value::String(s) => s.clone(),
-            other => return Err(Error::query_execution(format!(
-                "TO_DATE input must be a string, got {:?}", other
-            ))),
+            other => {
+                return Err(Error::query_execution(format!(
+                    "TO_DATE input must be a string, got {:?}",
+                    other
+                )))
+            }
         };
         let f = match fmt {
             Value::String(s) => s.clone(),
@@ -1271,9 +1430,7 @@ impl Evaluator {
         };
         let chrono_fmt = Self::pg_format_to_chrono(&f);
         let parsed = chrono::NaiveDate::parse_from_str(&s, &chrono_fmt)
-            .map_err(|e| Error::query_execution(format!(
-                "TO_DATE('{}','{}') failed: {}", s, f, e
-            )))?;
+            .map_err(|e| Error::query_execution(format!("TO_DATE('{}','{}') failed: {}", s, f, e)))?;
         Ok(Value::Date(parsed))
     }
 
@@ -1283,7 +1440,8 @@ impl Evaluator {
     fn func_to_timestamp(&self, args: &[Value]) -> Result<Value> {
         match args.len() {
             1 => {
-                let arg = args.first()
+                let arg = args
+                    .first()
                     .ok_or_else(|| Error::query_execution("TO_TIMESTAMP requires an argument"))?;
                 if matches!(arg, Value::Null) {
                     return Ok(Value::Null);
@@ -1293,16 +1451,17 @@ impl Evaluator {
                     Value::Int8(n) => *n as f64,
                     Value::Float4(f) => *f as f64,
                     Value::Float8(f) => *f,
-                    other => return Err(Error::query_execution(format!(
-                        "TO_TIMESTAMP({:?}) requires a numeric epoch", other
-                    ))),
+                    other => {
+                        return Err(Error::query_execution(format!(
+                            "TO_TIMESTAMP({:?}) requires a numeric epoch",
+                            other
+                        )))
+                    }
                 };
                 let s = secs as i64;
                 let nanos = ((secs - s as f64) * 1e9) as u32;
                 let ts = chrono::DateTime::from_timestamp(s, nanos)
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "TO_TIMESTAMP: invalid epoch {}", secs
-                    )))?;
+                    .ok_or_else(|| Error::query_execution(format!("TO_TIMESTAMP: invalid epoch {}", secs)))?;
                 Ok(Value::Timestamp(ts))
             }
             2 => {
@@ -1313,9 +1472,12 @@ impl Evaluator {
                 }
                 let s = match text {
                     Value::String(s) => s.clone(),
-                    other => return Err(Error::query_execution(format!(
-                        "TO_TIMESTAMP input must be a string, got {:?}", other
-                    ))),
+                    other => {
+                        return Err(Error::query_execution(format!(
+                            "TO_TIMESTAMP input must be a string, got {:?}",
+                            other
+                        )))
+                    }
                 };
                 let f = match fmt {
                     Value::String(s) => s.clone(),
@@ -1323,9 +1485,7 @@ impl Evaluator {
                 };
                 let chrono_fmt = Self::pg_format_to_chrono(&f);
                 let parsed = chrono::NaiveDateTime::parse_from_str(&s, &chrono_fmt)
-                    .map_err(|e| Error::query_execution(format!(
-                        "TO_TIMESTAMP('{}','{}') failed: {}", s, f, e
-                    )))?;
+                    .map_err(|e| Error::query_execution(format!("TO_TIMESTAMP('{}','{}') failed: {}", s, f, e)))?;
                 Ok(Value::Timestamp(parsed.and_utc()))
             }
             _ => Err(Error::query_execution("TO_TIMESTAMP requires 1 or 2 arguments")),
@@ -1345,9 +1505,12 @@ impl Evaluator {
         }
         let field = match field_arg {
             Value::String(s) => s.to_lowercase(),
-            other => return Err(Error::query_execution(format!(
-                "DATE_TRUNC field must be a string, got {:?}", other
-            ))),
+            other => {
+                return Err(Error::query_execution(format!(
+                    "DATE_TRUNC field must be a string, got {:?}",
+                    other
+                )))
+            }
         };
         let was_date = matches!(val_arg, Value::Date(_));
         let ndt = Self::value_to_naive_datetime(val_arg)?;
@@ -1359,14 +1522,16 @@ impl Evaluator {
                 ndt.with_nanosecond(trimmed).unwrap_or(ndt)
             }
             "second" | "seconds" => ndt.with_nanosecond(0).unwrap_or(ndt),
-            "minute" | "minutes" => ndt
-                .with_second(0).unwrap_or(ndt)
-                .with_nanosecond(0).unwrap_or(ndt),
+            "minute" | "minutes" => ndt.with_second(0).unwrap_or(ndt).with_nanosecond(0).unwrap_or(ndt),
             "hour" | "hours" => ndt
-                .with_minute(0).unwrap_or(ndt)
-                .with_second(0).unwrap_or(ndt)
-                .with_nanosecond(0).unwrap_or(ndt),
-            "day" | "days" => ndt.date()
+                .with_minute(0)
+                .unwrap_or(ndt)
+                .with_second(0)
+                .unwrap_or(ndt)
+                .with_nanosecond(0)
+                .unwrap_or(ndt),
+            "day" | "days" => ndt
+                .date()
                 .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default()),
             "week" | "weeks" => {
                 // ISO week: truncate to Monday.
@@ -1402,9 +1567,12 @@ impl Evaluator {
                     .ok_or_else(|| Error::query_execution("DATE_TRUNC(millennium): invalid date"))?
                     .and_time(NaiveTime::from_hms_opt(0, 0, 0).unwrap_or_default())
             }
-            other => return Err(Error::query_execution(format!(
-                "DATE_TRUNC: unsupported field '{}'", other
-            ))),
+            other => {
+                return Err(Error::query_execution(format!(
+                    "DATE_TRUNC: unsupported field '{}'",
+                    other
+                )))
+            }
         };
         if was_date {
             Ok(Value::Date(truncated.date()))
@@ -1426,10 +1594,12 @@ impl Evaluator {
                 Value::Int4(n) => Ok(*n),
                 Value::Int8(n) => Ok(*n as i32),
                 Value::Null => Err(Error::query_execution(format!(
-                    "MAKE_DATE: NULL not allowed for {}", name
+                    "MAKE_DATE: NULL not allowed for {}",
+                    name
                 ))),
                 other => Err(Error::query_execution(format!(
-                    "MAKE_DATE: {} must be integer, got {:?}", name, other
+                    "MAKE_DATE: {} must be integer, got {:?}",
+                    name, other
                 ))),
             }
         };
@@ -1437,9 +1607,7 @@ impl Evaluator {
         let month = to_i32(m, "month")? as u32;
         let day = to_i32(d, "day")? as u32;
         let date = chrono::NaiveDate::from_ymd_opt(year, month, day)
-            .ok_or_else(|| Error::query_execution(format!(
-                "MAKE_DATE: invalid date ({}, {}, {})", year, month, day
-            )))?;
+            .ok_or_else(|| Error::query_execution(format!("MAKE_DATE: invalid date ({}, {}, {})", year, month, day)))?;
         Ok(Value::Date(date))
     }
 
@@ -1449,7 +1617,7 @@ impl Evaluator {
     fn func_make_timestamp(&self, args: &[Value]) -> Result<Value> {
         let [y, mo, d, h, mi, s] = args else {
             return Err(Error::query_execution(
-                "MAKE_TIMESTAMP requires exactly 6 arguments (year, month, day, hour, min, sec)"
+                "MAKE_TIMESTAMP requires exactly 6 arguments (year, month, day, hour, min, sec)",
             ));
         };
         let to_i32 = |v: &Value, name: &str| -> Result<i32> {
@@ -1458,10 +1626,12 @@ impl Evaluator {
                 Value::Int4(n) => Ok(*n),
                 Value::Int8(n) => Ok(*n as i32),
                 Value::Null => Err(Error::query_execution(format!(
-                    "MAKE_TIMESTAMP: NULL not allowed for {}", name
+                    "MAKE_TIMESTAMP: NULL not allowed for {}",
+                    name
                 ))),
                 other => Err(Error::query_execution(format!(
-                    "MAKE_TIMESTAMP: {} must be integer, got {:?}", name, other
+                    "MAKE_TIMESTAMP: {} must be integer, got {:?}",
+                    name, other
                 ))),
             }
         };
@@ -1477,20 +1647,21 @@ impl Evaluator {
             Value::Float4(f) => *f as f64,
             Value::Float8(f) => *f,
             Value::Null => return Err(Error::query_execution("MAKE_TIMESTAMP: NULL second")),
-            other => return Err(Error::query_execution(format!(
-                "MAKE_TIMESTAMP: sec must be numeric, got {:?}", other
-            ))),
+            other => {
+                return Err(Error::query_execution(format!(
+                    "MAKE_TIMESTAMP: sec must be numeric, got {:?}",
+                    other
+                )))
+            }
         };
         let whole = secs.trunc() as u32;
         let nanos = ((secs - secs.trunc()) * 1e9) as u32;
-        let date = chrono::NaiveDate::from_ymd_opt(year, month, day)
-            .ok_or_else(|| Error::query_execution(format!(
-                "MAKE_TIMESTAMP: invalid date ({}, {}, {})", year, month, day
-            )))?;
-        let time = chrono::NaiveTime::from_hms_nano_opt(hour, minute, whole, nanos)
-            .ok_or_else(|| Error::query_execution(format!(
-                "MAKE_TIMESTAMP: invalid time ({}:{}:{})", hour, minute, secs
-            )))?;
+        let date = chrono::NaiveDate::from_ymd_opt(year, month, day).ok_or_else(|| {
+            Error::query_execution(format!("MAKE_TIMESTAMP: invalid date ({}, {}, {})", year, month, day))
+        })?;
+        let time = chrono::NaiveTime::from_hms_nano_opt(hour, minute, whole, nanos).ok_or_else(|| {
+            Error::query_execution(format!("MAKE_TIMESTAMP: invalid time ({}:{}:{})", hour, minute, secs))
+        })?;
         Ok(Value::Timestamp(date.and_time(time).and_utc()))
     }
 
@@ -1557,27 +1728,24 @@ impl Evaluator {
         // (timestamp, date, interval) and returns Float8 (seconds).
         if field == "epoch" {
             let secs = match arg {
-                Value::Timestamp(ts) => {
-                    ts.timestamp() as f64 + ts.timestamp_subsec_nanos() as f64 / 1e9
-                }
+                Value::Timestamp(ts) => ts.timestamp() as f64 + ts.timestamp_subsec_nanos() as f64 / 1e9,
                 Value::Date(d) => d
                     .and_hms_opt(0, 0, 0)
                     .map(|dt| dt.and_utc().timestamp() as f64)
                     .unwrap_or(0.0),
-                Value::Time(t) => {
-                    (t.num_seconds_from_midnight() as f64)
-                        + (t.nanosecond() as f64) / 1e9
-                }
+                Value::Time(t) => (t.num_seconds_from_midnight() as f64) + (t.nanosecond() as f64) / 1e9,
                 Value::Interval(us) => *us as f64 / 1e6,
                 Value::Int8(n) => *n as f64, // treat as unix seconds
                 Value::Int4(n) => *n as f64,
                 Value::String(s) => Self::value_to_naive_datetime(&Value::String(s.clone()))?
                     .and_utc()
                     .timestamp() as f64,
-                _ => return Err(Error::query_execution(format!(
-                    "EXTRACT(EPOCH) does not accept {:?}",
-                    arg
-                ))),
+                _ => {
+                    return Err(Error::query_execution(format!(
+                        "EXTRACT(EPOCH) does not accept {:?}",
+                        arg
+                    )))
+                }
             };
             return Ok(Value::Float8(secs));
         }
@@ -1592,9 +1760,11 @@ impl Evaluator {
                 "hour" | "hours" => ((total_secs / 3600) % 24) as i32,
                 "minute" | "minutes" => ((total_secs / 60) % 60) as i32,
                 "second" | "seconds" => (total_secs % 60) as i32,
-                _ => return Err(Error::query_execution(format!(
-                    "EXTRACT({field}) from interval not supported"
-                ))),
+                _ => {
+                    return Err(Error::query_execution(format!(
+                        "EXTRACT({field}) from interval not supported"
+                    )))
+                }
             }));
         }
 
@@ -1616,18 +1786,12 @@ impl Evaluator {
             "century" => (ndt.year() - 1) / 100 + 1,
             "millennium" => (ndt.year() - 1) / 1000 + 1,
             "millisecond" | "milliseconds" => {
-                return Ok(Value::Float8(
-                    ndt.second() as f64 + ndt.nanosecond() as f64 / 1e6,
-                ))
+                return Ok(Value::Float8(ndt.second() as f64 + ndt.nanosecond() as f64 / 1e6))
             }
             "microsecond" | "microseconds" => {
-                return Ok(Value::Float8(
-                    ndt.second() as f64 * 1e6 + ndt.nanosecond() as f64 / 1e3,
-                ))
+                return Ok(Value::Float8(ndt.second() as f64 * 1e6 + ndt.nanosecond() as f64 / 1e3))
             }
-            _ => return Err(Error::query_execution(format!(
-                "EXTRACT({field}) is not supported"
-            ))),
+            _ => return Err(Error::query_execution(format!("EXTRACT({field}) is not supported"))),
         };
         Ok(Value::Int4(out))
     }
@@ -1676,9 +1840,9 @@ impl Evaluator {
     ///    paired with an optional third argument for the unit
     ///  - A numeric value (N) with a third argument for the unit string
     fn parse_date_add_interval(args: &[Value]) -> Result<(i64, String)> {
-        let interval_arg = args.get(1).ok_or_else(|| Error::query_execution(
-            "DATE_ADD/DATE_SUB requires at least 2 arguments"
-        ))?;
+        let interval_arg = args
+            .get(1)
+            .ok_or_else(|| Error::query_execution("DATE_ADD/DATE_SUB requires at least 2 arguments"))?;
         let unit_arg = args.get(2);
 
         // Case 1: Second arg is an Interval value (microseconds)
@@ -1690,11 +1854,14 @@ impl Evaluator {
         if let Value::String(s) = interval_arg {
             let trimmed = s.trim();
             // Try parsing "INTERVAL N UNIT" format
-            let stripped = trimmed.strip_prefix("INTERVAL ").or_else(|| trimmed.strip_prefix("interval "));
+            let stripped = trimmed
+                .strip_prefix("INTERVAL ")
+                .or_else(|| trimmed.strip_prefix("interval "));
             if let Some(rest) = stripped {
                 let parts: Vec<&str> = rest.split_whitespace().collect();
                 if let (Some(amt_str), Some(unit_str)) = (parts.first(), parts.get(1)) {
-                    let amount: i64 = amt_str.parse()
+                    let amount: i64 = amt_str
+                        .parse()
                         .map_err(|_| Error::query_execution(format!("Invalid interval amount: {}", amt_str)))?;
                     return Ok((amount, unit_str.to_uppercase()));
                 }
@@ -1715,9 +1882,11 @@ impl Evaluator {
             Value::Int4(n) => i64::from(*n),
             Value::Int8(n) => *n,
             Value::Float8(f) => *f as i64,
-            _ => return Err(Error::query_execution(
-                "DATE_ADD/DATE_SUB second argument must be an interval, number, or string"
-            )),
+            _ => {
+                return Err(Error::query_execution(
+                    "DATE_ADD/DATE_SUB second argument must be an interval, number, or string",
+                ))
+            }
         };
         let unit = match unit_arg {
             Some(Value::String(u)) => u.to_uppercase(),
@@ -1733,9 +1902,9 @@ impl Evaluator {
         match unit {
             "SECOND" => Ok(ndt + chrono::Duration::seconds(signed)),
             "MINUTE" => Ok(ndt + chrono::Duration::minutes(signed)),
-            "HOUR"   => Ok(ndt + chrono::Duration::hours(signed)),
-            "DAY"    => Ok(ndt + chrono::Duration::days(signed)),
-            "WEEK"   => Ok(ndt + chrono::Duration::weeks(signed)),
+            "HOUR" => Ok(ndt + chrono::Duration::hours(signed)),
+            "DAY" => Ok(ndt + chrono::Duration::days(signed)),
+            "WEEK" => Ok(ndt + chrono::Duration::weeks(signed)),
             "MONTH" => {
                 // Month arithmetic: shift the month, clamping the day if needed
                 let total_months = i64::from(ndt.year()) * 12 + i64::from(ndt.month0() as i32) + signed;
@@ -1784,36 +1953,48 @@ impl Evaluator {
     fn func_date_add(&self, args: &[Value]) -> Result<Value> {
         if args.len() < 2 || args.len() > 3 {
             return Err(Error::query_execution(
-                "DATE_ADD requires 2 or 3 arguments: DATE_ADD(date, interval [, unit])"
+                "DATE_ADD requires 2 or 3 arguments: DATE_ADD(date, interval [, unit])",
             ));
         }
-        let date_arg = args.first().ok_or_else(|| Error::query_execution("DATE_ADD requires a date argument"))?;
-        let interval_arg = args.get(1).ok_or_else(|| Error::query_execution("DATE_ADD requires an interval argument"))?;
+        let date_arg = args
+            .first()
+            .ok_or_else(|| Error::query_execution("DATE_ADD requires a date argument"))?;
+        let interval_arg = args
+            .get(1)
+            .ok_or_else(|| Error::query_execution("DATE_ADD requires an interval argument"))?;
         if matches!(date_arg, Value::Null) || matches!(interval_arg, Value::Null) {
             return Ok(Value::Null);
         }
         let ndt = Self::value_to_naive_datetime(date_arg)?;
         let (amount, unit) = Self::parse_date_add_interval(args)?;
         let result = Self::apply_interval(ndt, amount, &unit, 1)?;
-        Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(result, Utc)))
+        Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(
+            result, Utc,
+        )))
     }
 
     /// DATE_SUB(date, INTERVAL n unit) — subtract an interval from a date/timestamp.
     fn func_date_sub(&self, args: &[Value]) -> Result<Value> {
         if args.len() < 2 || args.len() > 3 {
             return Err(Error::query_execution(
-                "DATE_SUB requires 2 or 3 arguments: DATE_SUB(date, interval [, unit])"
+                "DATE_SUB requires 2 or 3 arguments: DATE_SUB(date, interval [, unit])",
             ));
         }
-        let date_arg = args.first().ok_or_else(|| Error::query_execution("DATE_SUB requires a date argument"))?;
-        let interval_arg = args.get(1).ok_or_else(|| Error::query_execution("DATE_SUB requires an interval argument"))?;
+        let date_arg = args
+            .first()
+            .ok_or_else(|| Error::query_execution("DATE_SUB requires a date argument"))?;
+        let interval_arg = args
+            .get(1)
+            .ok_or_else(|| Error::query_execution("DATE_SUB requires an interval argument"))?;
         if matches!(date_arg, Value::Null) || matches!(interval_arg, Value::Null) {
             return Ok(Value::Null);
         }
         let ndt = Self::value_to_naive_datetime(date_arg)?;
         let (amount, unit) = Self::parse_date_add_interval(args)?;
         let result = Self::apply_interval(ndt, amount, &unit, -1)?;
-        Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(result, Utc)))
+        Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(
+            result, Utc,
+        )))
     }
 
     /// DATEDIFF(date1, date2) — returns integer number of days between two dates.
@@ -1835,15 +2016,17 @@ impl Evaluator {
     fn func_timestampdiff(&self, args: &[Value]) -> Result<Value> {
         let [unit_arg, start_arg, end_arg] = args else {
             return Err(Error::query_execution(
-                "TIMESTAMPDIFF requires exactly 3 arguments: TIMESTAMPDIFF(unit, start, end)"
+                "TIMESTAMPDIFF requires exactly 3 arguments: TIMESTAMPDIFF(unit, start, end)",
             ));
         };
         let unit = match unit_arg {
             Value::String(s) => s.to_uppercase(),
             Value::Null => return Ok(Value::Null),
-            _ => return Err(Error::query_execution(
-                "TIMESTAMPDIFF first argument must be a unit string (SECOND, MINUTE, HOUR, DAY, MONTH, YEAR)"
-            )),
+            _ => {
+                return Err(Error::query_execution(
+                    "TIMESTAMPDIFF first argument must be a unit string (SECOND, MINUTE, HOUR, DAY, MONTH, YEAR)",
+                ))
+            }
         };
         if matches!(start_arg, Value::Null) || matches!(end_arg, Value::Null) {
             return Ok(Value::Null);
@@ -1853,18 +2036,21 @@ impl Evaluator {
         let diff = match unit.as_str() {
             "SECOND" => (end - start).num_seconds(),
             "MINUTE" => (end - start).num_minutes(),
-            "HOUR"   => (end - start).num_hours(),
-            "DAY"    => (end - start).num_days(),
-            "WEEK"   => (end - start).num_weeks(),
+            "HOUR" => (end - start).num_hours(),
+            "DAY" => (end - start).num_days(),
+            "WEEK" => (end - start).num_weeks(),
             "MONTH" => {
                 let months_end = i64::from(end.year()) * 12 + i64::from(end.month0() as i32);
                 let months_start = i64::from(start.year()) * 12 + i64::from(start.month0() as i32);
                 months_end - months_start
             }
             "YEAR" => i64::from(end.year() - start.year()),
-            _ => return Err(Error::query_execution(format!(
-                "TIMESTAMPDIFF unsupported unit: {}. Use SECOND, MINUTE, HOUR, DAY, MONTH, or YEAR", unit
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "TIMESTAMPDIFF unsupported unit: {}. Use SECOND, MINUTE, HOUR, DAY, MONTH, or YEAR",
+                    unit
+                )))
+            }
         };
         #[allow(clippy::cast_possible_truncation)]
         Ok(Value::Int8(diff))
@@ -1891,10 +2077,12 @@ impl Evaluator {
     fn func_from_unixtime(&self, args: &[Value]) -> Result<Value> {
         if args.is_empty() || args.len() > 2 {
             return Err(Error::query_execution(
-                "FROM_UNIXTIME requires 1 or 2 arguments: FROM_UNIXTIME(unix_ts [, format])"
+                "FROM_UNIXTIME requires 1 or 2 arguments: FROM_UNIXTIME(unix_ts [, format])",
             ));
         }
-        let ts_arg = args.first().ok_or_else(|| Error::query_execution("FROM_UNIXTIME requires an argument"))?;
+        let ts_arg = args
+            .first()
+            .ok_or_else(|| Error::query_execution("FROM_UNIXTIME requires an argument"))?;
         if matches!(ts_arg, Value::Null) {
             return Ok(Value::Null);
         }
@@ -1903,7 +2091,8 @@ impl Evaluator {
             Value::Int4(n) => i64::from(*n),
             Value::Int8(n) => *n,
             Value::Float8(f) => *f as i64,
-            Value::String(s) => s.parse::<i64>()
+            Value::String(s) => s
+                .parse::<i64>()
                 .map_err(|_| Error::query_execution(format!("Invalid unix timestamp: {}", s)))?,
             _ => return Err(Error::query_execution("FROM_UNIXTIME argument must be numeric")),
         };
@@ -1931,11 +2120,15 @@ impl Evaluator {
     fn func_locate(&self, args: &[Value]) -> Result<Value> {
         if args.len() < 2 || args.len() > 3 {
             return Err(Error::query_execution(
-                "LOCATE requires 2 or 3 arguments: LOCATE(substr, str [, pos])"
+                "LOCATE requires 2 or 3 arguments: LOCATE(substr, str [, pos])",
             ));
         }
-        let needle_arg = args.first().ok_or_else(|| Error::query_execution("LOCATE requires arguments"))?;
-        let haystack_arg = args.get(1).ok_or_else(|| Error::query_execution("LOCATE requires 2 arguments"))?;
+        let needle_arg = args
+            .first()
+            .ok_or_else(|| Error::query_execution("LOCATE requires arguments"))?;
+        let haystack_arg = args
+            .get(1)
+            .ok_or_else(|| Error::query_execution("LOCATE requires 2 arguments"))?;
         if matches!(needle_arg, Value::Null) || matches!(haystack_arg, Value::Null) {
             return Ok(Value::Null);
         }
@@ -1983,21 +2176,19 @@ impl Evaluator {
     /// jsonb_extract_path(json, path_elements...)
     /// Extract JSON sub-object at the specified path
     fn jsonb_extract_path(&self, args: &[Value]) -> Result<Value> {
-        let (first, rest) = args.split_first().ok_or_else(|| Error::query_execution(
-            "jsonb_extract_path requires at least one argument"
-        ))?;
+        let (first, rest) = args
+            .split_first()
+            .ok_or_else(|| Error::query_execution("jsonb_extract_path requires at least one argument"))?;
 
         let json_str = match first {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Null),
-            _ => return Err(Error::query_execution(
-                "First argument must be JSON"
-            )),
+            _ => return Err(Error::query_execution("First argument must be JSON")),
         };
 
         // Parse the JSON string
-        let mut current: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let mut current: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         // Navigate through the path
         for path_elem in rest {
@@ -2023,9 +2214,7 @@ impl Evaluator {
                         return Ok(Value::Null);
                     }
                 }
-                _ => return Err(Error::query_execution(
-                    "Path elements must be strings or integers"
-                )),
+                _ => return Err(Error::query_execution("Path elements must be strings or integers")),
             }
         }
 
@@ -2047,7 +2236,7 @@ impl Evaluator {
                 } else {
                     Ok(Value::String(j))
                 }
-            },
+            }
             Value::Null => Ok(Value::Null),
             _ => Ok(Value::String(result.to_string())),
         }
@@ -2058,21 +2247,19 @@ impl Evaluator {
     fn jsonb_array_elements(&self, args: &[Value]) -> Result<Value> {
         let [arg] = args else {
             return Err(Error::query_execution(
-                "jsonb_array_elements requires exactly one argument"
+                "jsonb_array_elements requires exactly one argument",
             ));
         };
 
         let json_str = match arg {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Null),
-            _ => return Err(Error::query_execution(
-                "Argument must be JSON"
-            )),
+            _ => return Err(Error::query_execution("Argument must be JSON")),
         };
 
         // Parse JSON string to serde_json::Value
-        let json_val: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let json_val: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         if let Some(arr) = json_val.as_array() {
             if let Some(first) = arr.first() {
@@ -2081,9 +2268,7 @@ impl Evaluator {
                 Ok(Value::Null)
             }
         } else {
-            Err(Error::query_execution(
-                "Argument must be a JSON array"
-            ))
+            Err(Error::query_execution("Argument must be a JSON array"))
         }
     }
 
@@ -2101,7 +2286,7 @@ impl Evaluator {
                     serde_json::Value::String(s) => Ok(Value::String(s)),
                     _ => Ok(Value::String(json_val.to_string())),
                 }
-            },
+            }
             other => Ok(other),
         }
     }
@@ -2111,31 +2296,25 @@ impl Evaluator {
     fn jsonb_object_keys(&self, args: &[Value]) -> Result<Value> {
         let [arg] = args else {
             return Err(Error::query_execution(
-                "jsonb_object_keys requires exactly one argument"
+                "jsonb_object_keys requires exactly one argument",
             ));
         };
 
         let json_str = match arg {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Null),
-            _ => return Err(Error::query_execution(
-                "Argument must be JSON"
-            )),
+            _ => return Err(Error::query_execution("Argument must be JSON")),
         };
 
         // Parse JSON string to serde_json::Value
-        let json_val: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let json_val: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         if let Some(obj) = json_val.as_object() {
-            let keys: Vec<Value> = obj.keys()
-                .map(|k| Value::String(k.clone()))
-                .collect();
+            let keys: Vec<Value> = obj.keys().map(|k| Value::String(k.clone())).collect();
             Ok(Value::Array(keys))
         } else {
-            Err(Error::query_execution(
-                "Argument must be a JSON object"
-            ))
+            Err(Error::query_execution("Argument must be a JSON object"))
         }
     }
 
@@ -2144,28 +2323,24 @@ impl Evaluator {
     fn jsonb_array_length(&self, args: &[Value]) -> Result<Value> {
         let [arg] = args else {
             return Err(Error::query_execution(
-                "jsonb_array_length requires exactly one argument"
+                "jsonb_array_length requires exactly one argument",
             ));
         };
 
         let json_str = match arg {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Null),
-            _ => return Err(Error::query_execution(
-                "Argument must be JSON"
-            )),
+            _ => return Err(Error::query_execution("Argument must be JSON")),
         };
 
         // Parse JSON string to serde_json::Value
-        let json_val: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let json_val: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         if let Some(arr) = json_val.as_array() {
             Ok(Value::Int4(arr.len() as i32))
         } else {
-            Err(Error::query_execution(
-                "Argument must be a JSON array"
-            ))
+            Err(Error::query_execution("Argument must be a JSON array"))
         }
     }
 
@@ -2173,22 +2348,18 @@ impl Evaluator {
     /// Returns the type of the JSON value as text
     fn jsonb_typeof(&self, args: &[Value]) -> Result<Value> {
         let [arg] = args else {
-            return Err(Error::query_execution(
-                "jsonb_typeof requires exactly one argument"
-            ));
+            return Err(Error::query_execution("jsonb_typeof requires exactly one argument"));
         };
 
         let json_str = match arg {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::String("null".to_string())),
-            _ => return Err(Error::query_execution(
-                "Argument must be JSON"
-            )),
+            _ => return Err(Error::query_execution("Argument must be JSON")),
         };
 
         // Parse JSON string to serde_json::Value
-        let json_val: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let json_val: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         let type_name = match json_val {
             serde_json::Value::Null => "null",
@@ -2207,28 +2378,24 @@ impl Evaluator {
     fn jsonb_path_query(&self, args: &[Value]) -> Result<Value> {
         let [first, second] = args else {
             return Err(Error::query_execution(
-                "jsonb_path_query requires exactly two arguments"
+                "jsonb_path_query requires exactly two arguments",
             ));
         };
 
         let json_str = match first {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Null),
-            _ => return Err(Error::query_execution(
-                "First argument must be JSON"
-            )),
+            _ => return Err(Error::query_execution("First argument must be JSON")),
         };
 
         let path = match second {
             Value::String(s) => s,
-            _ => return Err(Error::query_execution(
-                "Second argument must be string (JSON path)"
-            )),
+            _ => return Err(Error::query_execution("Second argument must be string (JSON path)")),
         };
 
         // Parse JSON string to serde_json::Value
-        let json_val: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let json_val: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         // Simple path parsing: split by '.' and navigate
         let mut current = &json_val;
@@ -2240,7 +2407,7 @@ impl Evaluator {
 
             // Handle array index notation [n]
             if key.starts_with('[') && key.ends_with(']') {
-                if let Ok(idx) = key[1..key.len()-1].parse::<usize>() {
+                if let Ok(idx) = key[1..key.len() - 1].parse::<usize>() {
                     if let Some(arr) = current.as_array() {
                         current = match arr.get(idx) {
                             Some(v) => v,
@@ -2314,7 +2481,9 @@ impl Evaluator {
     /// jsonb_pretty(json)
     /// Pretty print JSON
     fn jsonb_pretty(&self, args: &[Value]) -> Result<Value> {
-        let first = args.first().ok_or_else(|| Error::query_execution("jsonb_pretty requires an argument"))?;
+        let first = args
+            .first()
+            .ok_or_else(|| Error::query_execution("jsonb_pretty requires an argument"))?;
 
         let json_str = match first {
             Value::Json(j) => j,
@@ -2322,8 +2491,8 @@ impl Evaluator {
             _ => return Err(Error::query_execution("Argument must be JSON")),
         };
 
-        let json: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let json: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         let pretty = serde_json::to_string_pretty(&json)
             .map_err(|e| Error::query_execution(format!("Failed to format JSON: {}", e)))?;
@@ -2334,7 +2503,9 @@ impl Evaluator {
     /// jsonb_strip_nulls(json)
     /// Remove null values from JSON
     fn jsonb_strip_nulls(&self, args: &[Value]) -> Result<Value> {
-        let first = args.first().ok_or_else(|| Error::query_execution("jsonb_strip_nulls requires an argument"))?;
+        let first = args
+            .first()
+            .ok_or_else(|| Error::query_execution("jsonb_strip_nulls requires an argument"))?;
 
         let json_str = match first {
             Value::Json(j) => j,
@@ -2342,8 +2513,8 @@ impl Evaluator {
             _ => return Err(Error::query_execution("Argument must be JSON")),
         };
 
-        let json: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let json: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         fn strip_nulls(val: serde_json::Value) -> serde_json::Value {
             match val {
@@ -2355,9 +2526,7 @@ impl Evaluator {
                         .collect();
                     serde_json::Value::Object(new_map)
                 }
-                serde_json::Value::Array(arr) => {
-                    serde_json::Value::Array(arr.into_iter().map(strip_nulls).collect())
-                }
+                serde_json::Value::Array(arr) => serde_json::Value::Array(arr.into_iter().map(strip_nulls).collect()),
                 other => other,
             }
         }
@@ -2371,15 +2540,19 @@ impl Evaluator {
     fn jsonb_build_object(&self, args: &[Value]) -> Result<Value> {
         if args.len() % 2 != 0 {
             return Err(Error::query_execution(
-                "jsonb_build_object requires an even number of arguments (key-value pairs)"
+                "jsonb_build_object requires an even number of arguments (key-value pairs)",
             ));
         }
 
         let mut obj = serde_json::Map::new();
 
         for pair in args.chunks(2) {
-            let key_val = pair.first().ok_or_else(|| Error::query_execution("Missing key in jsonb_build_object"))?;
-            let value = pair.get(1).ok_or_else(|| Error::query_execution("Missing value in jsonb_build_object"))?;
+            let key_val = pair
+                .first()
+                .ok_or_else(|| Error::query_execution("Missing key in jsonb_build_object"))?;
+            let value = pair
+                .get(1)
+                .ok_or_else(|| Error::query_execution("Missing value in jsonb_build_object"))?;
 
             // Convert key to string
             let key = match key_val {
@@ -2425,8 +2598,9 @@ impl Evaluator {
                 }
                 Value::Array(arr) => {
                     // Convert array to JSON array
-                    let json_arr: Vec<serde_json::Value> = arr.iter().map(|v| {
-                        match v {
+                    let json_arr: Vec<serde_json::Value> = arr
+                        .iter()
+                        .map(|v| match v {
                             Value::Null => serde_json::json!(null),
                             Value::Boolean(b) => serde_json::json!(b),
                             Value::Int2(i) => serde_json::json!(i),
@@ -2436,13 +2610,15 @@ impl Evaluator {
                             Value::Float8(f) => serde_json::json!(f),
                             Value::String(s) => serde_json::json!(s),
                             _ => serde_json::json!(v.to_string()),
-                        }
-                    }).collect();
+                        })
+                        .collect();
                     serde_json::json!(json_arr)
                 }
                 Value::Vector(_) => {
                     // Convert vector to JSON array
-                    return Err(Error::query_execution("Vector type not supported in jsonb_build_object"));
+                    return Err(Error::query_execution(
+                        "Vector type not supported in jsonb_build_object",
+                    ));
                 }
                 // Storage references (should be resolved before reaching here)
                 Value::DictRef { dict_id } => serde_json::json!(format!("dict:{}", dict_id)),
@@ -2491,12 +2667,11 @@ impl Evaluator {
                 Value::Timestamp(ts) => serde_json::json!(ts.to_rfc3339()),
                 Value::Date(d) => serde_json::json!(d.format("%Y-%m-%d").to_string()),
                 Value::Time(t) => serde_json::json!(t.format("%H:%M:%S%.f").to_string()),
-                Value::Json(j) => {
-                    serde_json::from_str(j).unwrap_or_else(|_| serde_json::json!(j.as_str()))
-                }
+                Value::Json(j) => serde_json::from_str(j).unwrap_or_else(|_| serde_json::json!(j.as_str())),
                 Value::Array(inner) => {
-                    let json_arr: Vec<serde_json::Value> = inner.iter().map(|v| {
-                        match v {
+                    let json_arr: Vec<serde_json::Value> = inner
+                        .iter()
+                        .map(|v| match v {
                             Value::Null => serde_json::json!(null),
                             Value::Boolean(b) => serde_json::json!(b),
                             Value::Int2(i) => serde_json::json!(i),
@@ -2506,8 +2681,8 @@ impl Evaluator {
                             Value::Float8(f) => serde_json::json!(f),
                             Value::String(s) => serde_json::json!(s),
                             _ => serde_json::json!(v.to_string()),
-                        }
-                    }).collect();
+                        })
+                        .collect();
                     serde_json::json!(json_arr)
                 }
                 Value::Vector(_) => {
@@ -2531,13 +2706,19 @@ impl Evaluator {
     fn jsonb_set(&self, args: &[Value]) -> Result<Value> {
         if args.len() < 3 || args.len() > 4 {
             return Err(Error::query_execution(
-                "jsonb_set requires 3 or 4 arguments: jsonb_set(target, path_array, new_value, [create_missing])"
+                "jsonb_set requires 3 or 4 arguments: jsonb_set(target, path_array, new_value, [create_missing])",
             ));
         }
 
-        let arg0 = args.get(0).ok_or_else(|| Error::query_execution("jsonb_set: missing target"))?;
-        let arg1 = args.get(1).ok_or_else(|| Error::query_execution("jsonb_set: missing path"))?;
-        let arg2 = args.get(2).ok_or_else(|| Error::query_execution("jsonb_set: missing new_value"))?;
+        let arg0 = args
+            .get(0)
+            .ok_or_else(|| Error::query_execution("jsonb_set: missing target"))?;
+        let arg1 = args
+            .get(1)
+            .ok_or_else(|| Error::query_execution("jsonb_set: missing path"))?;
+        let arg2 = args
+            .get(2)
+            .ok_or_else(|| Error::query_execution("jsonb_set: missing new_value"))?;
 
         let json_str = match arg0 {
             Value::Json(j) => j.clone(),
@@ -2568,14 +2749,14 @@ impl Evaluator {
                 Value::Int8(i) => path.push(i.to_string()),
                 _ => {
                     return Err(Error::query_execution(
-                        "Path array elements must be strings or integers"
+                        "Path array elements must be strings or integers",
                     ))
                 }
             }
         }
 
-        let mut current: serde_json::Value = serde_json::from_str(&json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let mut current: serde_json::Value =
+            serde_json::from_str(&json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         // Convert new_value to JSON
         let new_val = match arg2 {
@@ -2682,14 +2863,14 @@ impl Evaluator {
                 Value::Int8(i) => path.push(i.to_string()),
                 _ => {
                     return Err(Error::query_execution(
-                        "Path array elements must be strings or integers"
+                        "Path array elements must be strings or integers",
                     ))
                 }
             }
         }
 
-        let mut current: serde_json::Value = serde_json::from_str(&json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let mut current: serde_json::Value =
+            serde_json::from_str(&json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         self.jsonb_delete_recursive(&mut current, &path, 0)?;
 
@@ -2697,12 +2878,7 @@ impl Evaluator {
     }
 
     /// Helper function for recursive JSON path deletion
-    fn jsonb_delete_recursive(
-        &self,
-        current: &mut serde_json::Value,
-        path: &[String],
-        index: usize,
-    ) -> Result<()> {
+    fn jsonb_delete_recursive(&self, current: &mut serde_json::Value, path: &[String], index: usize) -> Result<()> {
         jsonb_delete_recursive_impl(current, path, index)
     }
 
@@ -2719,8 +2895,8 @@ impl Evaluator {
             _ => return Err(Error::query_execution("Argument must be JSON")),
         };
 
-        let json_val: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let json_val: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         // For MVP, return array of key-value pairs flattened
         let mut result = Vec::new();
@@ -2747,8 +2923,8 @@ impl Evaluator {
             _ => return Err(Error::query_execution("Argument must be JSON")),
         };
 
-        let json_val: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let json_val: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         // For MVP, return array of key-value pairs as text
         let mut result = Vec::new();
@@ -2769,12 +2945,7 @@ impl Evaluator {
     }
 
     /// Evaluate a binary operation
-    fn evaluate_binary_op(
-        &self,
-        left: &Value,
-        op: &super::BinaryOperator,
-        right: &Value,
-    ) -> Result<Value> {
+    fn evaluate_binary_op(&self, left: &Value, op: &super::BinaryOperator, right: &Value) -> Result<Value> {
         use super::BinaryOperator;
 
         match op {
@@ -2782,6 +2953,8 @@ impl Evaluator {
             // Use compare_values for Eq/NotEq to handle cross-type comparisons (e.g., 1 = 1.0)
             BinaryOperator::Eq => self.compare_values(left, right, |cmp| cmp.is_eq()),
             BinaryOperator::NotEq => self.compare_values(left, right, |cmp| cmp.is_ne()),
+            BinaryOperator::IsDistinctFrom => self.evaluate_is_distinct_from(left, right, true),
+            BinaryOperator::IsNotDistinctFrom => self.evaluate_is_distinct_from(left, right, false),
             BinaryOperator::Lt => self.compare_values(left, right, |cmp| cmp.is_lt()),
             BinaryOperator::LtEq => self.compare_values(left, right, |cmp| cmp.is_le()),
             BinaryOperator::Gt => self.compare_values(left, right, |cmp| cmp.is_gt()),
@@ -2808,9 +2981,7 @@ impl Evaluator {
             }
 
             // Vector similarity operators
-            BinaryOperator::VectorL2Distance => {
-                self.vector_distance_op(left, right, crate::vector::l2_distance)
-            }
+            BinaryOperator::VectorL2Distance => self.vector_distance_op(left, right, crate::vector::l2_distance),
             BinaryOperator::VectorCosineDistance => {
                 self.vector_distance_op(left, right, crate::vector::cosine_distance)
             }
@@ -2859,6 +3030,15 @@ impl Evaluator {
         }
     }
 
+    fn evaluate_is_distinct_from(&self, left: &Value, right: &Value, distinct: bool) -> Result<Value> {
+        let is_distinct = match (left, right) {
+            (Value::Null, Value::Null) => false,
+            (Value::Null, _) | (_, Value::Null) => true,
+            _ => !self.values_equal(left, right),
+        };
+        Ok(Value::Boolean(if distinct { is_distinct } else { !is_distinct }))
+    }
+
     /// Evaluate a unary operation
     fn evaluate_unary_op(&self, op: &super::UnaryOperator, value: &Value) -> Result<Value> {
         use super::UnaryOperator;
@@ -2873,13 +3053,16 @@ impl Evaluator {
                 Ok(Value::Boolean(!bool_val))
             }
             UnaryOperator::Minus => match value {
-                Value::Int2(i) => i.checked_neg()
+                Value::Int2(i) => i
+                    .checked_neg()
                     .map(Value::Int2)
                     .ok_or_else(|| Error::query_execution("integer overflow: SMALLINT negation")),
-                Value::Int4(i) => i.checked_neg()
+                Value::Int4(i) => i
+                    .checked_neg()
                     .map(Value::Int4)
                     .ok_or_else(|| Error::query_execution("integer overflow: INT negation")),
-                Value::Int8(i) => i.checked_neg()
+                Value::Int8(i) => i
+                    .checked_neg()
                     .map(Value::Int8)
                     .ok_or_else(|| Error::query_execution("integer overflow: BIGINT negation")),
                 Value::Float4(f) => Ok(Value::Float4(-f)),
@@ -3024,12 +3207,8 @@ impl Evaluator {
             (Value::Int2(a), Value::Int2(b)) => a.cmp(b),
             (Value::Int4(a), Value::Int4(b)) => a.cmp(b),
             (Value::Int8(a), Value::Int8(b)) => a.cmp(b),
-            (Value::Float4(a), Value::Float4(b)) => {
-                a.partial_cmp(b).unwrap_or(Ordering::Equal)
-            }
-            (Value::Float8(a), Value::Float8(b)) => {
-                a.partial_cmp(b).unwrap_or(Ordering::Equal)
-            }
+            (Value::Float4(a), Value::Float4(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+            (Value::Float8(a), Value::Float8(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
             (Value::String(a), Value::String(b)) => a.cmp(b),
 
             // Cross-type integer comparisons (promote to i64)
@@ -3059,118 +3238,131 @@ impl Evaluator {
             (Value::Float8(a), Value::Float4(b)) => a.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal),
 
             // Numeric to Numeric comparisons (same type)
-            (Value::Numeric(a), Value::Numeric(b)) => {
-                match (a.parse::<Decimal>(), b.parse::<Decimal>()) {
-                    (Ok(a_dec), Ok(b_dec)) => a_dec.cmp(&b_dec),
-                    _ => return Err(Error::query_execution(format!(
-                        "Cannot compare invalid NUMERIC values '{}' and '{}'", a, b
-                    ))),
+            (Value::Numeric(a), Value::Numeric(b)) => match (a.parse::<Decimal>(), b.parse::<Decimal>()) {
+                (Ok(a_dec), Ok(b_dec)) => a_dec.cmp(&b_dec),
+                _ => {
+                    return Err(Error::query_execution(format!(
+                        "Cannot compare invalid NUMERIC values '{}' and '{}'",
+                        a, b
+                    )))
                 }
-            }
+            },
 
             // Numeric to Int comparisons
-            (Value::Numeric(a), Value::Int2(b)) => {
-                match a.parse::<Decimal>() {
-                    Ok(a_dec) => a_dec.cmp(&Decimal::from(*b)),
-                    Err(_) => return Err(Error::query_execution(format!(
-                        "Invalid NUMERIC value '{}' in comparison", a
-                    ))),
+            (Value::Numeric(a), Value::Int2(b)) => match a.parse::<Decimal>() {
+                Ok(a_dec) => a_dec.cmp(&Decimal::from(*b)),
+                Err(_) => {
+                    return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison",
+                        a
+                    )))
                 }
-            }
-            (Value::Int2(a), Value::Numeric(b)) => {
-                match b.parse::<Decimal>() {
-                    Ok(b_dec) => Decimal::from(*a).cmp(&b_dec),
-                    Err(_) => return Err(Error::query_execution(format!(
-                        "Invalid NUMERIC value '{}' in comparison", b
-                    ))),
+            },
+            (Value::Int2(a), Value::Numeric(b)) => match b.parse::<Decimal>() {
+                Ok(b_dec) => Decimal::from(*a).cmp(&b_dec),
+                Err(_) => {
+                    return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison",
+                        b
+                    )))
                 }
-            }
-            (Value::Numeric(a), Value::Int4(b)) => {
-                match a.parse::<Decimal>() {
-                    Ok(a_dec) => a_dec.cmp(&Decimal::from(*b)),
-                    Err(_) => return Err(Error::query_execution(format!(
-                        "Invalid NUMERIC value '{}' in comparison", a
-                    ))),
+            },
+            (Value::Numeric(a), Value::Int4(b)) => match a.parse::<Decimal>() {
+                Ok(a_dec) => a_dec.cmp(&Decimal::from(*b)),
+                Err(_) => {
+                    return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison",
+                        a
+                    )))
                 }
-            }
-            (Value::Int4(a), Value::Numeric(b)) => {
-                match b.parse::<Decimal>() {
-                    Ok(b_dec) => Decimal::from(*a).cmp(&b_dec),
-                    Err(_) => return Err(Error::query_execution(format!(
-                        "Invalid NUMERIC value '{}' in comparison", b
-                    ))),
+            },
+            (Value::Int4(a), Value::Numeric(b)) => match b.parse::<Decimal>() {
+                Ok(b_dec) => Decimal::from(*a).cmp(&b_dec),
+                Err(_) => {
+                    return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison",
+                        b
+                    )))
                 }
-            }
-            (Value::Numeric(a), Value::Int8(b)) => {
-                match a.parse::<Decimal>() {
-                    Ok(a_dec) => a_dec.cmp(&Decimal::from(*b)),
-                    Err(_) => return Err(Error::query_execution(format!(
-                        "Invalid NUMERIC value '{}' in comparison", a
-                    ))),
+            },
+            (Value::Numeric(a), Value::Int8(b)) => match a.parse::<Decimal>() {
+                Ok(a_dec) => a_dec.cmp(&Decimal::from(*b)),
+                Err(_) => {
+                    return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison",
+                        a
+                    )))
                 }
-            }
-            (Value::Int8(a), Value::Numeric(b)) => {
-                match b.parse::<Decimal>() {
-                    Ok(b_dec) => Decimal::from(*a).cmp(&b_dec),
-                    Err(_) => return Err(Error::query_execution(format!(
-                        "Invalid NUMERIC value '{}' in comparison", b
-                    ))),
+            },
+            (Value::Int8(a), Value::Numeric(b)) => match b.parse::<Decimal>() {
+                Ok(b_dec) => Decimal::from(*a).cmp(&b_dec),
+                Err(_) => {
+                    return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison",
+                        b
+                    )))
                 }
-            }
+            },
 
             // Numeric to Float comparisons (convert to f64 for comparison)
-            (Value::Numeric(a), Value::Float4(b)) => {
-                match a.parse::<f64>() {
-                    Ok(a_f) => a_f.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal),
-                    Err(_) => return Err(Error::query_execution(format!(
-                        "Invalid NUMERIC value '{}' in comparison", a
-                    ))),
+            (Value::Numeric(a), Value::Float4(b)) => match a.parse::<f64>() {
+                Ok(a_f) => a_f.partial_cmp(&(*b as f64)).unwrap_or(Ordering::Equal),
+                Err(_) => {
+                    return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison",
+                        a
+                    )))
                 }
-            }
-            (Value::Float4(a), Value::Numeric(b)) => {
-                match b.parse::<f64>() {
-                    Ok(b_f) => (*a as f64).partial_cmp(&b_f).unwrap_or(Ordering::Equal),
-                    Err(_) => return Err(Error::query_execution(format!(
-                        "Invalid NUMERIC value '{}' in comparison", b
-                    ))),
+            },
+            (Value::Float4(a), Value::Numeric(b)) => match b.parse::<f64>() {
+                Ok(b_f) => (*a as f64).partial_cmp(&b_f).unwrap_or(Ordering::Equal),
+                Err(_) => {
+                    return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison",
+                        b
+                    )))
                 }
-            }
-            (Value::Numeric(a), Value::Float8(b)) => {
-                match a.parse::<f64>() {
-                    Ok(a_f) => a_f.partial_cmp(b).unwrap_or(Ordering::Equal),
-                    Err(_) => return Err(Error::query_execution(format!(
-                        "Invalid NUMERIC value '{}' in comparison", a
-                    ))),
+            },
+            (Value::Numeric(a), Value::Float8(b)) => match a.parse::<f64>() {
+                Ok(a_f) => a_f.partial_cmp(b).unwrap_or(Ordering::Equal),
+                Err(_) => {
+                    return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison",
+                        a
+                    )))
                 }
-            }
-            (Value::Float8(a), Value::Numeric(b)) => {
-                match b.parse::<f64>() {
-                    Ok(b_f) => a.partial_cmp(&b_f).unwrap_or(Ordering::Equal),
-                    Err(_) => return Err(Error::query_execution(format!(
-                        "Invalid NUMERIC value '{}' in comparison", b
-                    ))),
+            },
+            (Value::Float8(a), Value::Numeric(b)) => match b.parse::<f64>() {
+                Ok(b_f) => a.partial_cmp(&b_f).unwrap_or(Ordering::Equal),
+                Err(_) => {
+                    return Err(Error::query_execution(format!(
+                        "Invalid NUMERIC value '{}' in comparison",
+                        b
+                    )))
                 }
-            }
+            },
 
             // UUID comparisons
             (Value::Uuid(a), Value::Uuid(b)) => a.cmp(b),
             // String-to-UUID coercion (WHERE uuid_col = 'string-literal')
-            (Value::Uuid(a), Value::String(b)) => {
-                match uuid::Uuid::parse_str(b) {
-                    Ok(b_uuid) => a.cmp(&b_uuid),
-                    Err(_) => return Err(Error::query_execution(format!(
-                        "Cannot compare UUID with invalid UUID string '{}'", b
-                    ))),
+            (Value::Uuid(a), Value::String(b)) => match uuid::Uuid::parse_str(b) {
+                Ok(b_uuid) => a.cmp(&b_uuid),
+                Err(_) => {
+                    return Err(Error::query_execution(format!(
+                        "Cannot compare UUID with invalid UUID string '{}'",
+                        b
+                    )))
                 }
-            }
-            (Value::String(a), Value::Uuid(b)) => {
-                match uuid::Uuid::parse_str(a) {
-                    Ok(a_uuid) => a_uuid.cmp(b),
-                    Err(_) => return Err(Error::query_execution(format!(
-                        "Cannot compare invalid UUID string '{}' with UUID", a
-                    ))),
+            },
+            (Value::String(a), Value::Uuid(b)) => match uuid::Uuid::parse_str(a) {
+                Ok(a_uuid) => a_uuid.cmp(b),
+                Err(_) => {
+                    return Err(Error::query_execution(format!(
+                        "Cannot compare invalid UUID string '{}' with UUID",
+                        a
+                    )))
                 }
-            }
+            },
 
             // Boolean comparisons (false < true)
             (Value::Boolean(a), Value::Boolean(b)) => a.cmp(b),
@@ -3188,31 +3380,23 @@ impl Evaluator {
             // JavaScript `Date`s as ISO 8601 strings into gte/lte
             // helpers over OID 1114 columns — without this the
             // analytics endpoints fail with "Cannot compare" (B32).
-            (Value::Timestamp(a), Value::String(b)) => {
-                match Self::parse_timestamp_string(b) {
-                    Some(b_ts) => a.cmp(&b_ts),
-                    None => a.to_rfc3339().as_str().cmp(b.as_str()),
-                }
-            }
-            (Value::String(a), Value::Timestamp(b)) => {
-                match Self::parse_timestamp_string(a) {
-                    Some(a_ts) => a_ts.cmp(b),
-                    None => a.as_str().cmp(b.to_rfc3339().as_str()),
-                }
-            }
+            (Value::Timestamp(a), Value::String(b)) => match Self::parse_timestamp_string(b) {
+                Some(b_ts) => a.cmp(&b_ts),
+                None => a.to_rfc3339().as_str().cmp(b.as_str()),
+            },
+            (Value::String(a), Value::Timestamp(b)) => match Self::parse_timestamp_string(a) {
+                Some(a_ts) => a_ts.cmp(b),
+                None => a.as_str().cmp(b.to_rfc3339().as_str()),
+            },
             // Date ↔ String: same rationale for `date` columns.
-            (Value::Date(a), Value::String(b)) => {
-                match Self::parse_date_string(b) {
-                    Some(b_d) => a.cmp(&b_d),
-                    None => a.to_string().as_str().cmp(b.as_str()),
-                }
-            }
-            (Value::String(a), Value::Date(b)) => {
-                match Self::parse_date_string(a) {
-                    Some(a_d) => a_d.cmp(b),
-                    None => a.as_str().cmp(b.to_string().as_str()),
-                }
-            }
+            (Value::Date(a), Value::String(b)) => match Self::parse_date_string(b) {
+                Some(b_d) => a.cmp(&b_d),
+                None => a.to_string().as_str().cmp(b.as_str()),
+            },
+            (Value::String(a), Value::Date(b)) => match Self::parse_date_string(a) {
+                Some(a_d) => a_d.cmp(b),
+                None => a.as_str().cmp(b.to_string().as_str()),
+            },
 
             // String-to-Integer coercion (MySQL compatibility: WHERE int_col = '0')
             (Value::String(a), Value::Int2(b)) => {
@@ -3356,55 +3540,65 @@ impl Evaluator {
             // Numeric + Numeric: preserve precision
             (Value::Numeric(a), Value::Numeric(b)) => {
                 // Parse both numeric strings and add
-                let a_dec = a.parse::<Decimal>()
+                let a_dec = a
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
-                let b_dec = b.parse::<Decimal>()
+                let b_dec = b
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Numeric(format!("{}", a_dec + b_dec)))
             }
             // Numeric + Int: convert int to numeric
             (Value::Numeric(a), Value::Int4(b)) => {
-                let a_dec = a.parse::<Decimal>()
+                let a_dec = a
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
                 let b_dec = Decimal::from(*b);
                 Ok(Value::Numeric(format!("{}", a_dec + b_dec)))
             }
             (Value::Int4(a), Value::Numeric(b)) => {
                 let a_dec = Decimal::from(*a);
-                let b_dec = b.parse::<Decimal>()
+                let b_dec = b
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Numeric(format!("{}", a_dec + b_dec)))
             }
             (Value::Numeric(a), Value::Int8(b)) => {
-                let a_dec = a.parse::<Decimal>()
+                let a_dec = a
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
                 let b_dec = Decimal::from(*b);
                 Ok(Value::Numeric(format!("{}", a_dec + b_dec)))
             }
             (Value::Int8(a), Value::Numeric(b)) => {
                 let a_dec = Decimal::from(*a);
-                let b_dec = b.parse::<Decimal>()
+                let b_dec = b
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Numeric(format!("{}", a_dec + b_dec)))
             }
             // Numeric + Float: convert to float
             (Value::Numeric(a), Value::Float8(b)) => {
-                let a_f = a.parse::<f64>()
+                let a_f = a
+                    .parse::<f64>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
                 Ok(Value::Float8(a_f + b))
             }
             (Value::Float8(a), Value::Numeric(b)) => {
-                let b_f = b.parse::<f64>()
+                let b_f = b
+                    .parse::<f64>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Float8(a + b_f))
             }
             (Value::Numeric(a), Value::Float4(b)) => {
-                let a_f = a.parse::<f32>()
+                let a_f = a
+                    .parse::<f32>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
                 Ok(Value::Float4(a_f + b))
             }
             (Value::Float4(a), Value::Numeric(b)) => {
-                let b_f = b.parse::<f32>()
+                let b_f = b
+                    .parse::<f32>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Float4(a + b_f))
             }
@@ -3413,23 +3607,20 @@ impl Evaluator {
                 let result = (*a as i64) + (*b as i64);
                 Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
-            (Value::Int8(a), Value::Int8(b)) => {
-                a.checked_add(*b)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition"))
-            }
+            (Value::Int8(a), Value::Int8(b)) => a
+                .checked_add(*b)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition")),
             (Value::Float4(a), Value::Float4(b)) => Ok(Value::Float4(a + b)),
             (Value::Float8(a), Value::Float8(b)) => Ok(Value::Float8(a + b)),
-            (Value::Int4(a), Value::Int8(b)) => {
-                (*a as i64).checked_add(*b)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition"))
-            }
-            (Value::Int8(a), Value::Int4(b)) => {
-                a.checked_add(*b as i64)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition"))
-            }
+            (Value::Int4(a), Value::Int8(b)) => (*a as i64)
+                .checked_add(*b)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition")),
+            (Value::Int8(a), Value::Int4(b)) => a
+                .checked_add(*b as i64)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition")),
             // Cross-type Float/Int coercion
             (Value::Float4(a), Value::Int4(b)) => Ok(Value::Float4(a + (*b as f32))),
             (Value::Int4(a), Value::Float4(b)) => Ok(Value::Float4((*a as f32) + b)),
@@ -3450,16 +3641,14 @@ impl Evaluator {
                 let result = (*a as i64) + (*b as i64);
                 Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
-            (Value::Int2(a), Value::Int8(b)) => {
-                (*a as i64).checked_add(*b)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition"))
-            }
-            (Value::Int8(a), Value::Int2(b)) => {
-                a.checked_add(*b as i64)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition"))
-            }
+            (Value::Int2(a), Value::Int8(b)) => (*a as i64)
+                .checked_add(*b)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition")),
+            (Value::Int8(a), Value::Int2(b)) => a
+                .checked_add(*b as i64)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT addition")),
             (Value::Int2(a), Value::Int2(b)) => {
                 let result = (*a as i32) + (*b as i32);
                 Ok(i16::try_from(result).map_or(Value::Int4(result), Value::Int2))
@@ -3491,13 +3680,8 @@ impl Evaluator {
                 Ok(Value::Date(new_date))
             }
             // Interval + Interval
-            (Value::Interval(a), Value::Interval(b)) => {
-                Ok(Value::Interval(a + b))
-            }
-            _ => Err(Error::query_execution(format!(
-                "Cannot add {:?} and {:?}",
-                left, right
-            ))),
+            (Value::Interval(a), Value::Interval(b)) => Ok(Value::Interval(a + b)),
+            _ => Err(Error::query_execution(format!("Cannot add {:?} and {:?}", left, right))),
         }
     }
 
@@ -3510,55 +3694,65 @@ impl Evaluator {
         match (left, right) {
             // Numeric - Numeric: preserve precision
             (Value::Numeric(a), Value::Numeric(b)) => {
-                let a_dec = a.parse::<Decimal>()
+                let a_dec = a
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
-                let b_dec = b.parse::<Decimal>()
+                let b_dec = b
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Numeric(format!("{}", a_dec - b_dec)))
             }
             // Numeric - Int: convert int to numeric
             (Value::Numeric(a), Value::Int4(b)) => {
-                let a_dec = a.parse::<Decimal>()
+                let a_dec = a
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
                 let b_dec = Decimal::from(*b);
                 Ok(Value::Numeric(format!("{}", a_dec - b_dec)))
             }
             (Value::Int4(a), Value::Numeric(b)) => {
                 let a_dec = Decimal::from(*a);
-                let b_dec = b.parse::<Decimal>()
+                let b_dec = b
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Numeric(format!("{}", a_dec - b_dec)))
             }
             (Value::Numeric(a), Value::Int8(b)) => {
-                let a_dec = a.parse::<Decimal>()
+                let a_dec = a
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
                 let b_dec = Decimal::from(*b);
                 Ok(Value::Numeric(format!("{}", a_dec - b_dec)))
             }
             (Value::Int8(a), Value::Numeric(b)) => {
                 let a_dec = Decimal::from(*a);
-                let b_dec = b.parse::<Decimal>()
+                let b_dec = b
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Numeric(format!("{}", a_dec - b_dec)))
             }
             // Numeric - Float: convert to float
             (Value::Numeric(a), Value::Float8(b)) => {
-                let a_f = a.parse::<f64>()
+                let a_f = a
+                    .parse::<f64>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
                 Ok(Value::Float8(a_f - b))
             }
             (Value::Float8(a), Value::Numeric(b)) => {
-                let b_f = b.parse::<f64>()
+                let b_f = b
+                    .parse::<f64>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Float8(a - b_f))
             }
             (Value::Numeric(a), Value::Float4(b)) => {
-                let a_f = a.parse::<f32>()
+                let a_f = a
+                    .parse::<f32>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
                 Ok(Value::Float4(a_f - b))
             }
             (Value::Float4(a), Value::Numeric(b)) => {
-                let b_f = b.parse::<f32>()
+                let b_f = b
+                    .parse::<f32>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Float4(a - b_f))
             }
@@ -3567,23 +3761,20 @@ impl Evaluator {
                 let result = (*a as i64) - (*b as i64);
                 Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
-            (Value::Int8(a), Value::Int8(b)) => {
-                a.checked_sub(*b)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction"))
-            }
+            (Value::Int8(a), Value::Int8(b)) => a
+                .checked_sub(*b)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction")),
             (Value::Float4(a), Value::Float4(b)) => Ok(Value::Float4(a - b)),
             (Value::Float8(a), Value::Float8(b)) => Ok(Value::Float8(a - b)),
-            (Value::Int4(a), Value::Int8(b)) => {
-                (*a as i64).checked_sub(*b)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction"))
-            }
-            (Value::Int8(a), Value::Int4(b)) => {
-                a.checked_sub(*b as i64)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction"))
-            }
+            (Value::Int4(a), Value::Int8(b)) => (*a as i64)
+                .checked_sub(*b)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction")),
+            (Value::Int8(a), Value::Int4(b)) => a
+                .checked_sub(*b as i64)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction")),
             // Cross-type Float/Int coercion
             (Value::Float4(a), Value::Int4(b)) => Ok(Value::Float4(a - (*b as f32))),
             (Value::Int4(a), Value::Float4(b)) => Ok(Value::Float4((*a as f32) - b)),
@@ -3604,16 +3795,14 @@ impl Evaluator {
                 let result = (*a as i64) - (*b as i64);
                 Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
-            (Value::Int2(a), Value::Int8(b)) => {
-                (*a as i64).checked_sub(*b)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction"))
-            }
-            (Value::Int8(a), Value::Int2(b)) => {
-                a.checked_sub(*b as i64)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction"))
-            }
+            (Value::Int2(a), Value::Int8(b)) => (*a as i64)
+                .checked_sub(*b)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction")),
+            (Value::Int8(a), Value::Int2(b)) => a
+                .checked_sub(*b as i64)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT subtraction")),
             (Value::Int2(a), Value::Int2(b)) => {
                 let result = (*a as i32) - (*b as i32);
                 Ok(i16::try_from(result).map_or(Value::Int4(result), Value::Int2))
@@ -3647,9 +3836,7 @@ impl Evaluator {
                 Ok(Value::Interval(micros))
             }
             // Interval - Interval
-            (Value::Interval(a), Value::Interval(b)) => {
-                Ok(Value::Interval(a - b))
-            }
+            (Value::Interval(a), Value::Interval(b)) => Ok(Value::Interval(a - b)),
             _ => Err(Error::query_execution(format!(
                 "Cannot subtract {:?} and {:?}",
                 left, right
@@ -3666,55 +3853,65 @@ impl Evaluator {
         match (left, right) {
             // Numeric * Numeric: preserve precision
             (Value::Numeric(a), Value::Numeric(b)) => {
-                let a_dec = a.parse::<Decimal>()
+                let a_dec = a
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
-                let b_dec = b.parse::<Decimal>()
+                let b_dec = b
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Numeric(format!("{}", a_dec * b_dec)))
             }
             // Numeric * Int: convert int to numeric
             (Value::Numeric(a), Value::Int4(b)) => {
-                let a_dec = a.parse::<Decimal>()
+                let a_dec = a
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
                 let b_dec = Decimal::from(*b);
                 Ok(Value::Numeric(format!("{}", a_dec * b_dec)))
             }
             (Value::Int4(a), Value::Numeric(b)) => {
                 let a_dec = Decimal::from(*a);
-                let b_dec = b.parse::<Decimal>()
+                let b_dec = b
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Numeric(format!("{}", a_dec * b_dec)))
             }
             (Value::Numeric(a), Value::Int8(b)) => {
-                let a_dec = a.parse::<Decimal>()
+                let a_dec = a
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
                 let b_dec = Decimal::from(*b);
                 Ok(Value::Numeric(format!("{}", a_dec * b_dec)))
             }
             (Value::Int8(a), Value::Numeric(b)) => {
                 let a_dec = Decimal::from(*a);
-                let b_dec = b.parse::<Decimal>()
+                let b_dec = b
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Numeric(format!("{}", a_dec * b_dec)))
             }
             // Numeric * Float: convert to float
             (Value::Numeric(a), Value::Float8(b)) => {
-                let a_f = a.parse::<f64>()
+                let a_f = a
+                    .parse::<f64>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
                 Ok(Value::Float8(a_f * b))
             }
             (Value::Float8(a), Value::Numeric(b)) => {
-                let b_f = b.parse::<f64>()
+                let b_f = b
+                    .parse::<f64>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Float8(a * b_f))
             }
             (Value::Numeric(a), Value::Float4(b)) => {
-                let a_f = a.parse::<f32>()
+                let a_f = a
+                    .parse::<f32>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
                 Ok(Value::Float4(a_f * b))
             }
             (Value::Float4(a), Value::Numeric(b)) => {
-                let b_f = b.parse::<f32>()
+                let b_f = b
+                    .parse::<f32>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Float4(a * b_f))
             }
@@ -3723,23 +3920,20 @@ impl Evaluator {
                 let result = (*a as i64) * (*b as i64);
                 Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
-            (Value::Int8(a), Value::Int8(b)) => {
-                a.checked_mul(*b)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT multiplication"))
-            }
+            (Value::Int8(a), Value::Int8(b)) => a
+                .checked_mul(*b)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT multiplication")),
             (Value::Float4(a), Value::Float4(b)) => Ok(Value::Float4(a * b)),
             (Value::Float8(a), Value::Float8(b)) => Ok(Value::Float8(a * b)),
-            (Value::Int4(a), Value::Int8(b)) => {
-                (*a as i64).checked_mul(*b)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT multiplication"))
-            }
-            (Value::Int8(a), Value::Int4(b)) => {
-                a.checked_mul(*b as i64)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT multiplication"))
-            }
+            (Value::Int4(a), Value::Int8(b)) => (*a as i64)
+                .checked_mul(*b)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT multiplication")),
+            (Value::Int8(a), Value::Int4(b)) => a
+                .checked_mul(*b as i64)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT multiplication")),
             // Cross-type Float/Int coercion
             (Value::Float4(a), Value::Int4(b)) => Ok(Value::Float4(a * (*b as f32))),
             (Value::Int4(a), Value::Float4(b)) => Ok(Value::Float4((*a as f32) * b)),
@@ -3760,16 +3954,14 @@ impl Evaluator {
                 let result = (*a as i64) * (*b as i64);
                 Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
-            (Value::Int2(a), Value::Int8(b)) => {
-                (*a as i64).checked_mul(*b)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT multiplication"))
-            }
-            (Value::Int8(a), Value::Int2(b)) => {
-                a.checked_mul(*b as i64)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT multiplication"))
-            }
+            (Value::Int2(a), Value::Int8(b)) => (*a as i64)
+                .checked_mul(*b)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT multiplication")),
+            (Value::Int8(a), Value::Int2(b)) => a
+                .checked_mul(*b as i64)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT multiplication")),
             (Value::Int2(a), Value::Int2(b)) => {
                 let result = (*a as i32) * (*b as i32);
                 Ok(i16::try_from(result).map_or(Value::Int4(result), Value::Int2))
@@ -3794,55 +3986,65 @@ impl Evaluator {
         match (left, right) {
             // Numeric / Numeric: preserve precision
             (Value::Numeric(a), Value::Numeric(b)) => {
-                let a_dec = a.parse::<Decimal>()
+                let a_dec = a
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
-                let b_dec = b.parse::<Decimal>()
+                let b_dec = b
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Numeric(format!("{}", a_dec / b_dec)))
             }
             // Numeric / Int: convert int to numeric
             (Value::Numeric(a), Value::Int4(b)) => {
-                let a_dec = a.parse::<Decimal>()
+                let a_dec = a
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
                 let b_dec = Decimal::from(*b);
                 Ok(Value::Numeric(format!("{}", a_dec / b_dec)))
             }
             (Value::Int4(a), Value::Numeric(b)) => {
                 let a_dec = Decimal::from(*a);
-                let b_dec = b.parse::<Decimal>()
+                let b_dec = b
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Numeric(format!("{}", a_dec / b_dec)))
             }
             (Value::Numeric(a), Value::Int8(b)) => {
-                let a_dec = a.parse::<Decimal>()
+                let a_dec = a
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
                 let b_dec = Decimal::from(*b);
                 Ok(Value::Numeric(format!("{}", a_dec / b_dec)))
             }
             (Value::Int8(a), Value::Numeric(b)) => {
                 let a_dec = Decimal::from(*a);
-                let b_dec = b.parse::<Decimal>()
+                let b_dec = b
+                    .parse::<Decimal>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Numeric(format!("{}", a_dec / b_dec)))
             }
             // Numeric / Float: convert to float
             (Value::Numeric(a), Value::Float8(b)) => {
-                let a_f = a.parse::<f64>()
+                let a_f = a
+                    .parse::<f64>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
                 Ok(Value::Float8(a_f / b))
             }
             (Value::Float8(a), Value::Numeric(b)) => {
-                let b_f = b.parse::<f64>()
+                let b_f = b
+                    .parse::<f64>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Float8(a / b_f))
             }
             (Value::Numeric(a), Value::Float4(b)) => {
-                let a_f = a.parse::<f32>()
+                let a_f = a
+                    .parse::<f32>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", a, e)))?;
                 Ok(Value::Float4(a_f / b))
             }
             (Value::Float4(a), Value::Numeric(b)) => {
-                let b_f = b.parse::<f32>()
+                let b_f = b
+                    .parse::<f32>()
                     .map_err(|e| Error::query_execution(format!("Invalid numeric value '{}': {}", b, e)))?;
                 Ok(Value::Float4(a / b_f))
             }
@@ -3851,23 +4053,20 @@ impl Evaluator {
                 let result = (*a as i64) / (*b as i64);
                 Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
-            (Value::Int8(a), Value::Int8(b)) => {
-                a.checked_div(*b)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT division"))
-            }
+            (Value::Int8(a), Value::Int8(b)) => a
+                .checked_div(*b)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT division")),
             (Value::Float4(a), Value::Float4(b)) => Ok(Value::Float4(a / b)),
             (Value::Float8(a), Value::Float8(b)) => Ok(Value::Float8(a / b)),
-            (Value::Int4(a), Value::Int8(b)) => {
-                (*a as i64).checked_div(*b)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT division"))
-            }
-            (Value::Int8(a), Value::Int4(b)) => {
-                a.checked_div(*b as i64)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT division"))
-            }
+            (Value::Int4(a), Value::Int8(b)) => (*a as i64)
+                .checked_div(*b)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT division")),
+            (Value::Int8(a), Value::Int4(b)) => a
+                .checked_div(*b as i64)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT division")),
             // Cross-type Float/Int coercion
             (Value::Float4(a), Value::Int4(b)) => Ok(Value::Float4(a / (*b as f32))),
             (Value::Int4(a), Value::Float4(b)) => Ok(Value::Float4((*a as f32) / b)),
@@ -3888,16 +4087,14 @@ impl Evaluator {
                 let result = (*a as i64) / (*b as i64);
                 Ok(i32::try_from(result).map_or(Value::Int8(result), Value::Int4))
             }
-            (Value::Int2(a), Value::Int8(b)) => {
-                (*a as i64).checked_div(*b)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT division"))
-            }
-            (Value::Int8(a), Value::Int2(b)) => {
-                a.checked_div(*b as i64)
-                    .map(Value::Int8)
-                    .ok_or_else(|| Error::query_execution("integer overflow: BIGINT division"))
-            }
+            (Value::Int2(a), Value::Int8(b)) => (*a as i64)
+                .checked_div(*b)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT division")),
+            (Value::Int8(a), Value::Int2(b)) => a
+                .checked_div(*b as i64)
+                .map(Value::Int8)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT division")),
             (Value::Int2(a), Value::Int2(b)) => {
                 let result = (*a as i32) / (*b as i32);
                 Ok(i16::try_from(result).map_or(Value::Int4(result), Value::Int2))
@@ -3918,10 +4115,7 @@ impl Evaluator {
         match value {
             Value::Boolean(b) => Ok(*b),
             Value::Null => Ok(false),
-            _ => Err(Error::query_execution(format!(
-                "Cannot convert {:?} to boolean",
-                value
-            ))),
+            _ => Err(Error::query_execution(format!("Cannot convert {:?} to boolean", value))),
         }
     }
 
@@ -3931,10 +4125,7 @@ impl Evaluator {
         match value {
             Value::Boolean(b) => Ok(Some(*b)),
             Value::Null => Ok(None),
-            _ => Err(Error::query_execution(format!(
-                "Cannot convert {:?} to boolean",
-                value
-            ))),
+            _ => Err(Error::query_execution(format!("Cannot convert {:?} to boolean", value))),
         }
     }
 
@@ -3983,12 +4174,7 @@ impl Evaluator {
     /// Evaluates the left side first. If left is definitively false, returns
     /// false without evaluating the right side (preventing errors like
     /// comparing NULL values on the right side).
-    fn evaluate_and_short_circuit(
-        &self,
-        left: &LogicalExpr,
-        right: &LogicalExpr,
-        tuple: &Tuple,
-    ) -> Result<Value> {
+    fn evaluate_and_short_circuit(&self, left: &LogicalExpr, right: &LogicalExpr, tuple: &Tuple) -> Result<Value> {
         let left_val = self.evaluate(left, tuple)?;
         match &left_val {
             // false AND anything = false (short-circuit)
@@ -4000,7 +4186,8 @@ impl Evaluator {
                     Value::Boolean(b) => Ok(Value::Boolean(*b)),
                     Value::Null => Ok(Value::Null),
                     _ => Err(Error::query_execution(format!(
-                        "Cannot convert {:?} to boolean", right_val
+                        "Cannot convert {:?} to boolean",
+                        right_val
                     ))),
                 }
             }
@@ -4012,12 +4199,14 @@ impl Evaluator {
                     Value::Boolean(false) => Ok(Value::Boolean(false)),
                     Value::Boolean(true) | Value::Null => Ok(Value::Null),
                     _ => Err(Error::query_execution(format!(
-                        "Cannot convert {:?} to boolean", right_val
+                        "Cannot convert {:?} to boolean",
+                        right_val
                     ))),
                 }
             }
             _ => Err(Error::query_execution(format!(
-                "Cannot convert {:?} to boolean", left_val
+                "Cannot convert {:?} to boolean",
+                left_val
             ))),
         }
     }
@@ -4026,12 +4215,7 @@ impl Evaluator {
     ///
     /// Evaluates the left side first. If left is definitively true, returns
     /// true without evaluating the right side.
-    fn evaluate_or_short_circuit(
-        &self,
-        left: &LogicalExpr,
-        right: &LogicalExpr,
-        tuple: &Tuple,
-    ) -> Result<Value> {
+    fn evaluate_or_short_circuit(&self, left: &LogicalExpr, right: &LogicalExpr, tuple: &Tuple) -> Result<Value> {
         let left_val = self.evaluate(left, tuple)?;
         match &left_val {
             // true OR anything = true (short-circuit)
@@ -4043,7 +4227,8 @@ impl Evaluator {
                     Value::Boolean(b) => Ok(Value::Boolean(*b)),
                     Value::Null => Ok(Value::Null),
                     _ => Err(Error::query_execution(format!(
-                        "Cannot convert {:?} to boolean", right_val
+                        "Cannot convert {:?} to boolean",
+                        right_val
                     ))),
                 }
             }
@@ -4055,12 +4240,14 @@ impl Evaluator {
                     Value::Boolean(true) => Ok(Value::Boolean(true)),
                     Value::Boolean(false) | Value::Null => Ok(Value::Null),
                     _ => Err(Error::query_execution(format!(
-                        "Cannot convert {:?} to boolean", right_val
+                        "Cannot convert {:?} to boolean",
+                        right_val
                     ))),
                 }
             }
             _ => Err(Error::query_execution(format!(
-                "Cannot convert {:?} to boolean", left_val
+                "Cannot convert {:?} to boolean",
+                left_val
             ))),
         }
     }
@@ -4081,12 +4268,7 @@ impl Evaluator {
     }
 
     /// Compute vector distance between two vectors
-    fn vector_distance_op<F>(
-        &self,
-        left: &Value,
-        right: &Value,
-        distance_fn: F,
-    ) -> Result<Value>
+    fn vector_distance_op<F>(&self, left: &Value, right: &Value, distance_fn: F) -> Result<Value>
     where
         F: Fn(&[f32], &[f32]) -> f32,
     {
@@ -4107,10 +4289,12 @@ impl Evaluator {
                     .collect();
                 elements?
             }
-            _ => return Err(Error::query_execution(format!(
-                "Vector distance operators require vector operands, got {:?} and {:?}",
-                left, right
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "Vector distance operators require vector operands, got {:?} and {:?}",
+                    left, right
+                )))
+            }
         };
 
         let right_vec = match right {
@@ -4129,10 +4313,12 @@ impl Evaluator {
                     .collect();
                 elements?
             }
-            _ => return Err(Error::query_execution(format!(
-                "Vector distance operators require vector operands, got {:?} and {:?}",
-                left, right
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "Vector distance operators require vector operands, got {:?} and {:?}",
+                    left, right
+                )))
+            }
         };
 
         if left_vec.len() != right_vec.len() {
@@ -4151,7 +4337,7 @@ impl Evaluator {
     fn vector_cosine_similarity(&self, args: &[Value]) -> Result<Value> {
         let [a, b] = args else {
             return Err(Error::query_execution(
-                "COSINE_SIMILARITY requires exactly 2 vector arguments".to_string()
+                "COSINE_SIMILARITY requires exactly 2 vector arguments".to_string(),
             ));
         };
         let distance = self.vector_distance_op(a, b, crate::vector::cosine_distance)?;
@@ -4165,7 +4351,7 @@ impl Evaluator {
     fn vector_cosine_distance(&self, args: &[Value]) -> Result<Value> {
         let [a, b] = args else {
             return Err(Error::query_execution(
-                "COSINE_DISTANCE requires exactly 2 vector arguments".to_string()
+                "COSINE_DISTANCE requires exactly 2 vector arguments".to_string(),
             ));
         };
         self.vector_distance_op(a, b, crate::vector::cosine_distance)
@@ -4175,7 +4361,7 @@ impl Evaluator {
     fn vector_l2_distance(&self, args: &[Value]) -> Result<Value> {
         let [a, b] = args else {
             return Err(Error::query_execution(
-                "L2_DISTANCE requires exactly 2 vector arguments".to_string()
+                "L2_DISTANCE requires exactly 2 vector arguments".to_string(),
             ));
         };
         self.vector_distance_op(a, b, crate::vector::l2_distance)
@@ -4185,7 +4371,7 @@ impl Evaluator {
     fn vector_inner_product(&self, args: &[Value]) -> Result<Value> {
         let [a, b] = args else {
             return Err(Error::query_execution(
-                "INNER_PRODUCT requires exactly 2 vector arguments".to_string()
+                "INNER_PRODUCT requires exactly 2 vector arguments".to_string(),
             ));
         };
         self.vector_distance_op(a, b, crate::vector::inner_product_distance)
@@ -4220,38 +4406,24 @@ impl Evaluator {
     /// PostgreSQL compatible: dimension is typically 1 for one-dimensional arrays
     fn array_length(&self, args: &[Value]) -> Result<Value> {
         let [a, b] = args else {
-            return Err(Error::query_execution(
-                "array_length requires exactly two arguments"
-            ));
+            return Err(Error::query_execution("array_length requires exactly two arguments"));
         };
 
         match (a, b) {
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-            (Value::Array(arr), Value::Int2(dim)) if *dim == 1 => {
-                Ok(Value::Int4(arr.len() as i32))
-            }
-            (Value::Array(arr), Value::Int4(dim)) if *dim == 1 => {
-                Ok(Value::Int4(arr.len() as i32))
-            }
-            (Value::Array(arr), Value::Int8(dim)) if *dim == 1 => {
-                Ok(Value::Int4(arr.len() as i32))
-            }
+            (Value::Array(arr), Value::Int2(dim)) if *dim == 1 => Ok(Value::Int4(arr.len() as i32)),
+            (Value::Array(arr), Value::Int4(dim)) if *dim == 1 => Ok(Value::Int4(arr.len() as i32)),
+            (Value::Array(arr), Value::Int8(dim)) if *dim == 1 => Ok(Value::Int4(arr.len() as i32)),
             // Also support Vector type
-            (Value::Vector(vec), Value::Int2(dim)) if *dim == 1 => {
-                Ok(Value::Int4(vec.len() as i32))
-            }
-            (Value::Vector(vec), Value::Int4(dim)) if *dim == 1 => {
-                Ok(Value::Int4(vec.len() as i32))
-            }
-            (Value::Vector(vec), Value::Int8(dim)) if *dim == 1 => {
-                Ok(Value::Int4(vec.len() as i32))
-            }
+            (Value::Vector(vec), Value::Int2(dim)) if *dim == 1 => Ok(Value::Int4(vec.len() as i32)),
+            (Value::Vector(vec), Value::Int4(dim)) if *dim == 1 => Ok(Value::Int4(vec.len() as i32)),
+            (Value::Vector(vec), Value::Int8(dim)) if *dim == 1 => Ok(Value::Int4(vec.len() as i32)),
             (Value::Array(_), _) | (Value::Vector(_), _) => {
                 // Dimension other than 1 for one-dimensional array returns NULL
                 Ok(Value::Null)
             }
             _ => Err(Error::query_execution(
-                "array_length requires an array and an integer dimension"
+                "array_length requires an array and an integer dimension",
             )),
         }
     }
@@ -4259,25 +4431,17 @@ impl Evaluator {
     /// array_upper(arr, dimension) - returns upper bound of array dimension (1-based)
     fn array_upper(&self, args: &[Value]) -> Result<Value> {
         let [a, b] = args else {
-            return Err(Error::query_execution(
-                "array_upper requires exactly two arguments"
-            ));
+            return Err(Error::query_execution("array_upper requires exactly two arguments"));
         };
 
         match (a, b) {
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
-            (Value::Array(arr), Value::Int2(dim)) if *dim == 1 => {
-                Ok(Value::Int4(arr.len() as i32))
-            }
-            (Value::Array(arr), Value::Int4(dim)) if *dim == 1 => {
-                Ok(Value::Int4(arr.len() as i32))
-            }
-            (Value::Array(arr), Value::Int8(dim)) if *dim == 1 => {
-                Ok(Value::Int4(arr.len() as i32))
-            }
+            (Value::Array(arr), Value::Int2(dim)) if *dim == 1 => Ok(Value::Int4(arr.len() as i32)),
+            (Value::Array(arr), Value::Int4(dim)) if *dim == 1 => Ok(Value::Int4(arr.len() as i32)),
+            (Value::Array(arr), Value::Int8(dim)) if *dim == 1 => Ok(Value::Int4(arr.len() as i32)),
             (Value::Array(_), _) => Ok(Value::Null),
             _ => Err(Error::query_execution(
-                "array_upper requires an array and an integer dimension"
+                "array_upper requires an array and an integer dimension",
             )),
         }
     }
@@ -4285,26 +4449,18 @@ impl Evaluator {
     /// array_lower(arr, dimension) - returns lower bound of array dimension (always 1 in PostgreSQL)
     fn array_lower(&self, args: &[Value]) -> Result<Value> {
         let [a, b] = args else {
-            return Err(Error::query_execution(
-                "array_lower requires exactly two arguments"
-            ));
+            return Err(Error::query_execution("array_lower requires exactly two arguments"));
         };
 
         match (a, b) {
             (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
             (Value::Array(arr), _) if arr.is_empty() => Ok(Value::Null),
-            (Value::Array(_), Value::Int2(dim)) if *dim == 1 => {
-                Ok(Value::Int4(1))
-            }
-            (Value::Array(_), Value::Int4(dim)) if *dim == 1 => {
-                Ok(Value::Int4(1))
-            }
-            (Value::Array(_), Value::Int8(dim)) if *dim == 1 => {
-                Ok(Value::Int4(1))
-            }
+            (Value::Array(_), Value::Int2(dim)) if *dim == 1 => Ok(Value::Int4(1)),
+            (Value::Array(_), Value::Int4(dim)) if *dim == 1 => Ok(Value::Int4(1)),
+            (Value::Array(_), Value::Int8(dim)) if *dim == 1 => Ok(Value::Int4(1)),
             (Value::Array(_), _) => Ok(Value::Null),
             _ => Err(Error::query_execution(
-                "array_lower requires an array and an integer dimension"
+                "array_lower requires an array and an integer dimension",
             )),
         }
     }
@@ -4312,9 +4468,7 @@ impl Evaluator {
     /// array_append(arr, element) - appends element to array
     fn array_append(&self, args: &[Value]) -> Result<Value> {
         let [a, b] = args else {
-            return Err(Error::query_execution(
-                "array_append requires exactly two arguments"
-            ));
+            return Err(Error::query_execution("array_append requires exactly two arguments"));
         };
 
         match (a, b) {
@@ -4323,11 +4477,9 @@ impl Evaluator {
                 result.push(elem.clone());
                 Ok(Value::Array(result))
             }
-            (Value::Null, elem) => {
-                Ok(Value::Array(vec![elem.clone()]))
-            }
+            (Value::Null, elem) => Ok(Value::Array(vec![elem.clone()])),
             _ => Err(Error::query_execution(
-                "array_append requires an array as first argument"
+                "array_append requires an array as first argument",
             )),
         }
     }
@@ -4335,9 +4487,7 @@ impl Evaluator {
     /// array_prepend(element, arr) - prepends element to array
     fn array_prepend(&self, args: &[Value]) -> Result<Value> {
         let [a, b] = args else {
-            return Err(Error::query_execution(
-                "array_prepend requires exactly two arguments"
-            ));
+            return Err(Error::query_execution("array_prepend requires exactly two arguments"));
         };
 
         match (a, b) {
@@ -4346,11 +4496,9 @@ impl Evaluator {
                 result.extend(arr.clone());
                 Ok(Value::Array(result))
             }
-            (elem, Value::Null) => {
-                Ok(Value::Array(vec![elem.clone()]))
-            }
+            (elem, Value::Null) => Ok(Value::Array(vec![elem.clone()])),
             _ => Err(Error::query_execution(
-                "array_prepend requires an array as second argument"
+                "array_prepend requires an array as second argument",
             )),
         }
     }
@@ -4358,9 +4506,7 @@ impl Evaluator {
     /// array_cat(arr1, arr2) - concatenates two arrays
     fn array_cat(&self, args: &[Value]) -> Result<Value> {
         let [a, b] = args else {
-            return Err(Error::query_execution(
-                "array_cat requires exactly two arguments"
-            ));
+            return Err(Error::query_execution("array_cat requires exactly two arguments"));
         };
 
         self.array_concat_op(a, b)
@@ -4369,22 +4515,17 @@ impl Evaluator {
     /// array_remove(arr, element) - removes all occurrences of element from array
     fn array_remove(&self, args: &[Value]) -> Result<Value> {
         let [a, b] = args else {
-            return Err(Error::query_execution(
-                "array_remove requires exactly two arguments"
-            ));
+            return Err(Error::query_execution("array_remove requires exactly two arguments"));
         };
 
         match (a, b) {
             (Value::Array(arr), elem) => {
-                let result: Vec<Value> = arr.iter()
-                    .filter(|v| *v != elem)
-                    .cloned()
-                    .collect();
+                let result: Vec<Value> = arr.iter().filter(|v| *v != elem).cloned().collect();
                 Ok(Value::Array(result))
             }
             (Value::Null, _) => Ok(Value::Null),
             _ => Err(Error::query_execution(
-                "array_remove requires an array as first argument"
+                "array_remove requires an array as first argument",
             )),
         }
     }
@@ -4392,9 +4533,7 @@ impl Evaluator {
     /// array_position(arr, element) - returns 1-based position of first occurrence
     fn array_position(&self, args: &[Value]) -> Result<Value> {
         let [a, b] = args else {
-            return Err(Error::query_execution(
-                "array_position requires exactly two arguments"
-            ));
+            return Err(Error::query_execution("array_position requires exactly two arguments"));
         };
 
         match (a, b) {
@@ -4408,7 +4547,7 @@ impl Evaluator {
             }
             (Value::Null, _) => Ok(Value::Null),
             _ => Err(Error::query_execution(
-                "array_position requires an array as first argument"
+                "array_position requires an array as first argument",
             )),
         }
     }
@@ -4416,18 +4555,14 @@ impl Evaluator {
     /// cardinality(arr) - returns total number of elements in array
     fn array_cardinality(&self, args: &[Value]) -> Result<Value> {
         let [arg] = args else {
-            return Err(Error::query_execution(
-                "cardinality requires exactly one argument"
-            ));
+            return Err(Error::query_execution("cardinality requires exactly one argument"));
         };
 
         match arg {
             Value::Array(arr) => Ok(Value::Int8(arr.len() as i64)),
             Value::Vector(vec) => Ok(Value::Int8(vec.len() as i64)),
             Value::Null => Ok(Value::Null),
-            _ => Err(Error::query_execution(
-                "cardinality requires an array argument"
-            )),
+            _ => Err(Error::query_execution("cardinality requires an array argument")),
         }
     }
 
@@ -4438,15 +4573,17 @@ impl Evaluator {
         let json_str = match json_val {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Null),
-            _ => return Err(Error::query_execution(format!(
-                "Left operand of -> must be JSON, got {:?}",
-                json_val
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "Left operand of -> must be JSON, got {:?}",
+                    json_val
+                )))
+            }
         };
 
         // Parse JSON string to serde_json::Value
-        let json: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let json: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         let key = match key_val {
             Value::String(s) => s.as_str(),
@@ -4476,13 +4613,15 @@ impl Evaluator {
                     };
                 }
                 return Err(Error::query_execution(
-                    "Integer index can only be used with JSON arrays"
+                    "Integer index can only be used with JSON arrays",
                 ));
             }
-            _ => return Err(Error::query_execution(format!(
-                "Right operand of -> must be string or integer, got {:?}",
-                key_val
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "Right operand of -> must be string or integer, got {:?}",
+                    key_val
+                )))
+            }
         };
 
         // Object field access
@@ -4502,9 +4641,7 @@ impl Evaluator {
                 Ok(Value::Null)
             }
         } else {
-            Err(Error::query_execution(
-                "String key can only be used with JSON objects"
-            ))
+            Err(Error::query_execution("String key can only be used with JSON objects"))
         }
     }
 
@@ -4514,26 +4651,30 @@ impl Evaluator {
         let left_json_str = match left {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Boolean(false)),
-            _ => return Err(Error::query_execution(format!(
-                "JSON contains operator requires JSON operands, got {:?}",
-                left
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "JSON contains operator requires JSON operands, got {:?}",
+                    left
+                )))
+            }
         };
 
         let right_json_str = match right {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Boolean(true)), // NULL is contained in any JSON
-            _ => return Err(Error::query_execution(format!(
-                "JSON contains operator requires JSON operands, got {:?}",
-                right
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "JSON contains operator requires JSON operands, got {:?}",
+                    right
+                )))
+            }
         };
 
         // Parse JSON strings to serde_json::Value
-        let left_json: serde_json::Value = serde_json::from_str(left_json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
-        let right_json: serde_json::Value = serde_json::from_str(right_json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let left_json: serde_json::Value =
+            serde_json::from_str(left_json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let right_json: serde_json::Value =
+            serde_json::from_str(right_json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         Ok(Value::Boolean(json_contains(&left_json, &right_json)))
     }
@@ -4544,15 +4685,17 @@ impl Evaluator {
         let json_str = match json_val {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Boolean(false)),
-            _ => return Err(Error::query_execution(format!(
-                "JSON exists operator requires JSON operand, got {:?}",
-                json_val
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "JSON exists operator requires JSON operand, got {:?}",
+                    json_val
+                )))
+            }
         };
 
         // Parse JSON string to serde_json::Value
-        let json: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let json: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         let obj = match json.as_object() {
             Some(o) => o,
@@ -4560,9 +4703,7 @@ impl Evaluator {
         };
 
         match key_val {
-            Value::String(key) => {
-                Ok(Value::Boolean(obj.contains_key(key.as_str())))
-            }
+            Value::String(key) => Ok(Value::Boolean(obj.contains_key(key.as_str()))),
             Value::Array(keys) => {
                 // For ?| (any), return true if any key exists
                 for key in keys {
@@ -4594,15 +4735,17 @@ impl Evaluator {
         let json_str = match json_val {
             Value::Json(j) => j,
             Value::Null => return Ok(Value::Boolean(false)),
-            _ => return Err(Error::query_execution(format!(
-                "JSON exists operator requires JSON operand, got {:?}",
-                json_val
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "JSON exists operator requires JSON operand, got {:?}",
+                    json_val
+                )))
+            }
         };
 
         // Parse JSON string to serde_json::Value
-        let json: serde_json::Value = serde_json::from_str(json_str)
-            .map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
+        let json: serde_json::Value =
+            serde_json::from_str(json_str).map_err(|e| Error::query_execution(format!("Invalid JSON: {}", e)))?;
 
         let obj = match json.as_object() {
             Some(o) => o,
@@ -4611,10 +4754,12 @@ impl Evaluator {
 
         let keys = match keys_val {
             Value::Array(k) => k,
-            _ => return Err(Error::query_execution(format!(
-                "?& operator requires array operand, got {:?}",
-                keys_val
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "?& operator requires array operand, got {:?}",
+                    keys_val
+                )))
+            }
         };
 
         // Check if all keys exist
@@ -4656,10 +4801,24 @@ impl Evaluator {
 
             DataType::Int2 => match value {
                 Value::Int2(i) => Ok(Value::Int2(i)),
-                Value::Int4(i) => i16::try_from(i).map(Value::Int2).map_err(|_| Error::query_execution(format!("value out of range for SMALLINT: {}", i))),
-                Value::Int8(i) => i16::try_from(i).map(Value::Int2).map_err(|_| Error::query_execution(format!("value out of range for SMALLINT: {}", i))),
-                Value::Float4(f) => { let i = f as i64; i16::try_from(i).map(Value::Int2).map_err(|_| Error::query_execution(format!("value out of range for SMALLINT: {}", f))) },
-                Value::Float8(f) => { let i = f as i64; i16::try_from(i).map(Value::Int2).map_err(|_| Error::query_execution(format!("value out of range for SMALLINT: {}", f))) },
+                Value::Int4(i) => i16::try_from(i)
+                    .map(Value::Int2)
+                    .map_err(|_| Error::query_execution(format!("value out of range for SMALLINT: {}", i))),
+                Value::Int8(i) => i16::try_from(i)
+                    .map(Value::Int2)
+                    .map_err(|_| Error::query_execution(format!("value out of range for SMALLINT: {}", i))),
+                Value::Float4(f) => {
+                    let i = f as i64;
+                    i16::try_from(i)
+                        .map(Value::Int2)
+                        .map_err(|_| Error::query_execution(format!("value out of range for SMALLINT: {}", f)))
+                }
+                Value::Float8(f) => {
+                    let i = f as i64;
+                    i16::try_from(i)
+                        .map(Value::Int2)
+                        .map_err(|_| Error::query_execution(format!("value out of range for SMALLINT: {}", f)))
+                }
                 Value::Numeric(n) => {
                     // Parse as decimal, truncate to integer, then to i16
                     n.parse::<Decimal>()
@@ -4670,11 +4829,15 @@ impl Evaluator {
                             if int_val >= i16::MIN as i128 && int_val <= i16::MAX as i128 {
                                 Ok(Value::Int2(int_val as i16))
                             } else {
-                                Err(Error::query_execution(format!("Numeric value {} out of range for INT2", n)))
+                                Err(Error::query_execution(format!(
+                                    "Numeric value {} out of range for INT2",
+                                    n
+                                )))
                             }
                         })
                 }
-                Value::String(s) => s.parse::<i16>()
+                Value::String(s) => s
+                    .parse::<i16>()
                     .map(Value::Int2)
                     .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to INT2: {}", s, e))),
                 _ => Err(Error::query_execution(format!("Cannot cast {:?} to INT2", value))),
@@ -4696,11 +4859,15 @@ impl Evaluator {
                             if int_val >= i32::MIN as i128 && int_val <= i32::MAX as i128 {
                                 Ok(Value::Int4(int_val as i32))
                             } else {
-                                Err(Error::query_execution(format!("Numeric value {} out of range for INT4", n)))
+                                Err(Error::query_execution(format!(
+                                    "Numeric value {} out of range for INT4",
+                                    n
+                                )))
                             }
                         })
                 }
-                Value::String(s) => s.parse::<i32>()
+                Value::String(s) => s
+                    .parse::<i32>()
                     .map(Value::Int4)
                     .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to INT4: {}", s, e))),
                 _ => Err(Error::query_execution(format!("Cannot cast {:?} to INT4", value))),
@@ -4722,11 +4889,15 @@ impl Evaluator {
                             if int_val >= i64::MIN as i128 && int_val <= i64::MAX as i128 {
                                 Ok(Value::Int8(int_val as i64))
                             } else {
-                                Err(Error::query_execution(format!("Numeric value {} out of range for INT8", n)))
+                                Err(Error::query_execution(format!(
+                                    "Numeric value {} out of range for INT8",
+                                    n
+                                )))
                             }
                         })
                 }
-                Value::String(s) => s.parse::<i64>()
+                Value::String(s) => s
+                    .parse::<i64>()
                     .map(Value::Int8)
                     .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to INT8: {}", s, e))),
                 _ => Err(Error::query_execution(format!("Cannot cast {:?} to INT8", value))),
@@ -4743,12 +4914,13 @@ impl Evaluator {
                     n.parse::<Decimal>()
                         .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to FLOAT4: {}", n, e)))
                         .and_then(|dec| {
-                            dec.to_f32()
-                                .map(Value::Float4)
-                                .ok_or_else(|| Error::query_execution(format!("Cannot cast '{}' to FLOAT4: value out of range", n)))
+                            dec.to_f32().map(Value::Float4).ok_or_else(|| {
+                                Error::query_execution(format!("Cannot cast '{}' to FLOAT4: value out of range", n))
+                            })
                         })
                 }
-                Value::String(s) => s.parse::<f32>()
+                Value::String(s) => s
+                    .parse::<f32>()
                     .map(Value::Float4)
                     .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to FLOAT4: {}", s, e))),
                 _ => Err(Error::query_execution(format!("Cannot cast {:?} to FLOAT4", value))),
@@ -4765,12 +4937,13 @@ impl Evaluator {
                     n.parse::<Decimal>()
                         .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to FLOAT8: {}", n, e)))
                         .and_then(|dec| {
-                            dec.to_f64()
-                                .map(Value::Float8)
-                                .ok_or_else(|| Error::query_execution(format!("Cannot cast '{}' to FLOAT8: value out of range", n)))
+                            dec.to_f64().map(Value::Float8).ok_or_else(|| {
+                                Error::query_execution(format!("Cannot cast '{}' to FLOAT8: value out of range", n))
+                            })
                         })
                 }
-                Value::String(s) => s.parse::<f64>()
+                Value::String(s) => s
+                    .parse::<f64>()
                     .map(Value::Float8)
                     .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to FLOAT8: {}", s, e))),
                 _ => Err(Error::query_execution(format!("Cannot cast {:?} to FLOAT8", value))),
@@ -4797,7 +4970,7 @@ impl Evaluator {
                     Value::Uuid(u) => Ok(Value::String(u.to_string())),
                     other => Ok(Value::String(other.to_string())),
                 }
-            },
+            }
 
             DataType::Vector(dimension) => match value {
                 Value::Vector(v) => {
@@ -4806,7 +4979,8 @@ impl Evaluator {
                     } else {
                         Err(Error::query_execution(format!(
                             "Vector dimension mismatch: got {}, expected {}",
-                            v.len(), dimension
+                            v.len(),
+                            dimension
                         )))
                     }
                 }
@@ -4818,9 +4992,9 @@ impl Evaluator {
                     let elements: Result<Vec<f32>> = without_brackets
                         .split(',')
                         .map(|elem| {
-                            elem.trim()
-                                .parse::<f32>()
-                                .map_err(|e| Error::query_execution(format!("Invalid vector element '{}': {}", elem, e)))
+                            elem.trim().parse::<f32>().map_err(|e| {
+                                Error::query_execution(format!("Invalid vector element '{}': {}", elem, e))
+                            })
                         })
                         .collect();
 
@@ -4828,12 +5002,16 @@ impl Evaluator {
                     if vec.len() != *dimension {
                         return Err(Error::query_execution(format!(
                             "Vector dimension mismatch: got {}, expected {}",
-                            vec.len(), dimension
+                            vec.len(),
+                            dimension
                         )));
                     }
                     Ok(Value::Vector(vec))
                 }
-                _ => Err(Error::query_execution(format!("Cannot cast {:?} to VECTOR({})", value, dimension))),
+                _ => Err(Error::query_execution(format!(
+                    "Cannot cast {:?} to VECTOR({})",
+                    value, dimension
+                ))),
             },
 
             DataType::Json => match value {
@@ -4881,23 +5059,19 @@ impl Evaluator {
             DataType::Date => match value {
                 Value::Date(d) => Ok(Value::Date(d)),
                 Value::Timestamp(ts) => Ok(Value::Date(ts.date_naive())),
-                Value::String(s) => {
-                    chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
-                        .map(Value::Date)
-                        .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to DATE: {}", s, e)))
-                }
+                Value::String(s) => chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+                    .map(Value::Date)
+                    .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to DATE: {}", s, e))),
                 _ => Err(Error::query_execution(format!("Cannot cast {:?} to DATE", value))),
             },
 
             DataType::Time => match value {
                 Value::Time(t) => Ok(Value::Time(t)),
                 Value::Timestamp(ts) => Ok(Value::Time(ts.time())),
-                Value::String(s) => {
-                    chrono::NaiveTime::parse_from_str(&s, "%H:%M:%S")
-                        .or_else(|_| chrono::NaiveTime::parse_from_str(&s, "%H:%M:%S%.f"))
-                        .map(Value::Time)
-                        .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to TIME: {}", s, e)))
-                }
+                Value::String(s) => chrono::NaiveTime::parse_from_str(&s, "%H:%M:%S")
+                    .or_else(|_| chrono::NaiveTime::parse_from_str(&s, "%H:%M:%S%.f"))
+                    .map(Value::Time)
+                    .map_err(|e| Error::query_execution(format!("Cannot cast '{}' to TIME: {}", s, e))),
                 _ => Err(Error::query_execution(format!("Cannot cast {:?} to TIME", value))),
             },
 
@@ -4905,9 +5079,12 @@ impl Evaluator {
                 Value::Timestamp(ts) => Ok(Value::Timestamp(ts)),
                 Value::Date(d) => {
                     // Convert date to timestamp at midnight UTC
-                    let datetime = d.and_hms_opt(0, 0, 0)
+                    let datetime = d
+                        .and_hms_opt(0, 0, 0)
                         .ok_or_else(|| Error::query_execution("Invalid date for timestamp conversion"))?;
-                    Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(datetime, Utc)))
+                    Ok(Value::Timestamp(chrono::DateTime::from_naive_utc_and_offset(
+                        datetime, Utc,
+                    )))
                 }
                 Value::String(s) => {
                     // Try RFC3339 format first, then common formats
@@ -4971,15 +5148,9 @@ impl Evaluator {
     /// Returns the nth element of an array (1-based indexing like PostgreSQL)
     fn evaluate_array_subscript(&self, array: &Value, index: &Value) -> Result<Value> {
         match (array, index) {
-            (Value::Array(arr), Value::Int2(idx)) => {
-                self.get_array_element(arr, *idx as i64)
-            }
-            (Value::Array(arr), Value::Int4(idx)) => {
-                self.get_array_element(arr, *idx as i64)
-            }
-            (Value::Array(arr), Value::Int8(idx)) => {
-                self.get_array_element(arr, *idx)
-            }
+            (Value::Array(arr), Value::Int2(idx)) => self.get_array_element(arr, *idx as i64),
+            (Value::Array(arr), Value::Int4(idx)) => self.get_array_element(arr, *idx as i64),
+            (Value::Array(arr), Value::Int8(idx)) => self.get_array_element(arr, *idx),
             (Value::Null, _) => Ok(Value::Null),
             (_, Value::Null) => Ok(Value::Null),
             _ => Err(Error::query_execution(format!(
@@ -5050,36 +5221,16 @@ impl Evaluator {
             (Value::Float8(a), Value::Float4(b)) => *a == (*b as f64),
 
             // Numeric (DECIMAL) cross-type comparisons — Numeric stores decimal as String
-            (Value::Numeric(a), Value::Float8(b)) => {
-                a.parse::<f64>().is_ok_and(|a| a == *b)
-            }
-            (Value::Float8(a), Value::Numeric(b)) => {
-                b.parse::<f64>().is_ok_and(|b| *a == b)
-            }
-            (Value::Numeric(a), Value::Float4(b)) => {
-                a.parse::<f64>().is_ok_and(|a| a == f64::from(*b))
-            }
-            (Value::Float4(a), Value::Numeric(b)) => {
-                b.parse::<f64>().is_ok_and(|b| f64::from(*a) == b)
-            }
-            (Value::Numeric(a), Value::Int2(b)) => {
-                a.parse::<Decimal>().is_ok_and(|a| a == Decimal::from(*b))
-            }
-            (Value::Int2(a), Value::Numeric(b)) => {
-                b.parse::<Decimal>().is_ok_and(|b| Decimal::from(*a) == b)
-            }
-            (Value::Numeric(a), Value::Int4(b)) => {
-                a.parse::<Decimal>().is_ok_and(|a| a == Decimal::from(*b))
-            }
-            (Value::Int4(a), Value::Numeric(b)) => {
-                b.parse::<Decimal>().is_ok_and(|b| Decimal::from(*a) == b)
-            }
-            (Value::Numeric(a), Value::Int8(b)) => {
-                a.parse::<Decimal>().is_ok_and(|a| a == Decimal::from(*b))
-            }
-            (Value::Int8(a), Value::Numeric(b)) => {
-                b.parse::<Decimal>().is_ok_and(|b| Decimal::from(*a) == b)
-            }
+            (Value::Numeric(a), Value::Float8(b)) => a.parse::<f64>().is_ok_and(|a| a == *b),
+            (Value::Float8(a), Value::Numeric(b)) => b.parse::<f64>().is_ok_and(|b| *a == b),
+            (Value::Numeric(a), Value::Float4(b)) => a.parse::<f64>().is_ok_and(|a| a == f64::from(*b)),
+            (Value::Float4(a), Value::Numeric(b)) => b.parse::<f64>().is_ok_and(|b| f64::from(*a) == b),
+            (Value::Numeric(a), Value::Int2(b)) => a.parse::<Decimal>().is_ok_and(|a| a == Decimal::from(*b)),
+            (Value::Int2(a), Value::Numeric(b)) => b.parse::<Decimal>().is_ok_and(|b| Decimal::from(*a) == b),
+            (Value::Numeric(a), Value::Int4(b)) => a.parse::<Decimal>().is_ok_and(|a| a == Decimal::from(*b)),
+            (Value::Int4(a), Value::Numeric(b)) => b.parse::<Decimal>().is_ok_and(|b| Decimal::from(*a) == b),
+            (Value::Numeric(a), Value::Int8(b)) => a.parse::<Decimal>().is_ok_and(|a| a == Decimal::from(*b)),
+            (Value::Int8(a), Value::Numeric(b)) => b.parse::<Decimal>().is_ok_and(|b| Decimal::from(*a) == b),
 
             // String↔Int coercion (MySQL sends WHERE id IN ('9') via $wpdb->prepare)
             (Value::String(s), Value::Int8(n)) | (Value::Int8(n), Value::String(s)) => {
@@ -5100,7 +5251,10 @@ impl Evaluator {
             }
             // String↔Bool coercion
             (Value::String(s), Value::Boolean(b)) | (Value::Boolean(b), Value::String(s)) => {
-                matches!((s.as_str(), b), ("1" | "true" | "TRUE" | "t", true) | ("0" | "false" | "FALSE" | "f", false))
+                matches!(
+                    (s.as_str(), b),
+                    ("1" | "true" | "TRUE" | "t", true) | ("0" | "false" | "FALSE" | "f", false)
+                )
             }
 
             // Null comparisons (SQL: NULL = anything is false, not NULL)
@@ -5195,10 +5349,7 @@ impl Evaluator {
                 let elems: Vec<String> = arr.iter().map(|v| Self::value_to_concat_string(v)).collect();
                 format!("{{{}}}", elems.join(","))
             }
-            Value::Vector(vec) => format!("[{}]", vec.iter()
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-                .join(",")),
+            Value::Vector(vec) => format!("[{}]", vec.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")),
             Value::DictRef { dict_id } => format!("<dict:{}>", dict_id),
             Value::CasRef { hash } => format!("<cas:{}>", hex::encode(&hash[..8])),
             Value::ColumnarRef => "<columnar>".to_string(),
@@ -5216,16 +5367,22 @@ impl Evaluator {
         // Get string values
         let text = match left {
             Value::String(s) => s.as_str(),
-            _ => return Err(Error::query_execution(format!(
-                "LIKE requires string operand, got {:?}", left
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "LIKE requires string operand, got {:?}",
+                    left
+                )))
+            }
         };
 
         let pattern = match right {
             Value::String(s) => s.as_str(),
-            _ => return Err(Error::query_execution(format!(
-                "LIKE pattern must be a string, got {:?}", right
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "LIKE pattern must be a string, got {:?}",
+                    right
+                )))
+            }
         };
 
         // Convert SQL LIKE pattern to regex
@@ -5233,9 +5390,12 @@ impl Evaluator {
 
         let result = match regex::Regex::new(&regex_pattern) {
             Ok(re) => re.is_match(text),
-            Err(e) => return Err(Error::query_execution(format!(
-                "Invalid LIKE pattern '{}': {}", pattern, e
-            ))),
+            Err(e) => {
+                return Err(Error::query_execution(format!(
+                    "Invalid LIKE pattern '{}': {}",
+                    pattern, e
+                )))
+            }
         };
 
         Ok(Value::Boolean(if negated { !result } else { result }))
@@ -5289,16 +5449,22 @@ impl Evaluator {
         // Get string values
         let text = match left {
             Value::String(s) => s.to_lowercase(),
-            _ => return Err(Error::query_execution(format!(
-                "ILIKE requires string operand, got {:?}", left
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "ILIKE requires string operand, got {:?}",
+                    left
+                )))
+            }
         };
 
         let pattern = match right {
             Value::String(s) => s.to_lowercase(),
-            _ => return Err(Error::query_execution(format!(
-                "ILIKE pattern must be a string, got {:?}", right
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "ILIKE pattern must be a string, got {:?}",
+                    right
+                )))
+            }
         };
 
         // Convert SQL LIKE pattern to regex
@@ -5306,9 +5472,12 @@ impl Evaluator {
 
         let result = match regex::Regex::new(&regex_pattern) {
             Ok(re) => re.is_match(&text),
-            Err(e) => return Err(Error::query_execution(format!(
-                "Invalid ILIKE pattern '{}': {}", pattern, e
-            ))),
+            Err(e) => {
+                return Err(Error::query_execution(format!(
+                    "Invalid ILIKE pattern '{}': {}",
+                    pattern, e
+                )))
+            }
         };
 
         Ok(Value::Boolean(if negated { !result } else { result }))
@@ -5324,16 +5493,22 @@ impl Evaluator {
         // Get string values
         let text = match left {
             Value::String(s) => s.as_str(),
-            _ => return Err(Error::query_execution(format!(
-                "Regex match requires string operand, got {:?}", left
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "Regex match requires string operand, got {:?}",
+                    left
+                )))
+            }
         };
 
         let pattern = match right {
             Value::String(s) => s.as_str(),
-            _ => return Err(Error::query_execution(format!(
-                "Regex pattern must be a string, got {:?}", right
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "Regex pattern must be a string, got {:?}",
+                    right
+                )))
+            }
         };
 
         // Build regex with optional case-insensitivity
@@ -5345,9 +5520,12 @@ impl Evaluator {
 
         let result = match regex::Regex::new(&regex_pattern) {
             Ok(re) => re.is_match(text),
-            Err(e) => return Err(Error::query_execution(format!(
-                "Invalid regex pattern '{}': {}", pattern, e
-            ))),
+            Err(e) => {
+                return Err(Error::query_execution(format!(
+                    "Invalid regex pattern '{}': {}",
+                    pattern, e
+                )))
+            }
         };
 
         Ok(Value::Boolean(if negated { !result } else { result }))
@@ -5364,16 +5542,22 @@ impl Evaluator {
         // Get string values
         let text = match left {
             Value::String(s) => s.as_str(),
-            _ => return Err(Error::query_execution(format!(
-                "SIMILAR TO requires string operand, got {:?}", left
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "SIMILAR TO requires string operand, got {:?}",
+                    left
+                )))
+            }
         };
 
         let pattern = match right {
             Value::String(s) => s.as_str(),
-            _ => return Err(Error::query_execution(format!(
-                "SIMILAR TO pattern must be a string, got {:?}", right
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "SIMILAR TO pattern must be a string, got {:?}",
+                    right
+                )))
+            }
         };
 
         // Convert SQL SIMILAR TO pattern to regex
@@ -5381,9 +5565,12 @@ impl Evaluator {
 
         let result = match regex::Regex::new(&regex_pattern) {
             Ok(re) => re.is_match(text),
-            Err(e) => return Err(Error::query_execution(format!(
-                "Invalid SIMILAR TO pattern '{}': {}", pattern, e
-            ))),
+            Err(e) => {
+                return Err(Error::query_execution(format!(
+                    "Invalid SIMILAR TO pattern '{}': {}",
+                    pattern, e
+                )))
+            }
         };
 
         Ok(Value::Boolean(if negated { !result } else { result }))
@@ -5445,38 +5632,50 @@ impl Evaluator {
         }
         match (left, right) {
             (Value::Int2(a), Value::Int2(b)) => {
-                if *b == 0 { return Err(Error::query_execution("Division by zero")); }
+                if *b == 0 {
+                    return Err(Error::query_execution("Division by zero"));
+                }
                 a.checked_rem(*b)
                     .map(Value::Int2)
                     .ok_or_else(|| Error::query_execution("integer overflow: SMALLINT modulo"))
             }
             (Value::Int4(a), Value::Int4(b)) => {
-                if *b == 0 { return Err(Error::query_execution("Division by zero")); }
+                if *b == 0 {
+                    return Err(Error::query_execution("Division by zero"));
+                }
                 a.checked_rem(*b)
                     .map(Value::Int4)
                     .ok_or_else(|| Error::query_execution("integer overflow: INT modulo"))
             }
             (Value::Int8(a), Value::Int8(b)) => {
-                if *b == 0 { return Err(Error::query_execution("Division by zero")); }
+                if *b == 0 {
+                    return Err(Error::query_execution("Division by zero"));
+                }
                 a.checked_rem(*b)
                     .map(Value::Int8)
                     .ok_or_else(|| Error::query_execution("integer overflow: BIGINT modulo"))
             }
             // Cross-type integer modulo
             (Value::Int4(a), Value::Int8(b)) => {
-                if *b == 0 { return Err(Error::query_execution("Division by zero")); }
-                (*a as i64).checked_rem(*b)
+                if *b == 0 {
+                    return Err(Error::query_execution("Division by zero"));
+                }
+                (*a as i64)
+                    .checked_rem(*b)
                     .map(Value::Int8)
                     .ok_or_else(|| Error::query_execution("integer overflow: BIGINT modulo"))
             }
             (Value::Int8(a), Value::Int4(b)) => {
-                if *b == 0 { return Err(Error::query_execution("Division by zero")); }
+                if *b == 0 {
+                    return Err(Error::query_execution("Division by zero"));
+                }
                 a.checked_rem(*b as i64)
                     .map(Value::Int8)
                     .ok_or_else(|| Error::query_execution("integer overflow: BIGINT modulo"))
             }
             _ => Err(Error::query_execution(format!(
-                "Modulo requires integer operands, got {:?} % {:?}", left, right
+                "Modulo requires integer operands, got {:?} % {:?}",
+                left, right
             ))),
         }
     }
@@ -5526,8 +5725,12 @@ impl Evaluator {
             return Err(Error::query_execution("SUBSTR requires 2 or 3 arguments"));
         }
 
-        let arg0 = args.get(0).ok_or_else(|| Error::query_execution("SUBSTR: missing string"))?;
-        let arg1 = args.get(1).ok_or_else(|| Error::query_execution("SUBSTR: missing start"))?;
+        let arg0 = args
+            .get(0)
+            .ok_or_else(|| Error::query_execution("SUBSTR: missing string"))?;
+        let arg1 = args
+            .get(1)
+            .ok_or_else(|| Error::query_execution("SUBSTR: missing start"))?;
 
         let s = match arg0 {
             Value::Null => return Ok(Value::Null),
@@ -5567,7 +5770,9 @@ impl Evaluator {
             return Err(Error::query_execution("TRIM requires 1 or 2 arguments"));
         }
 
-        let first = args.first().ok_or_else(|| Error::query_execution("TRIM requires at least 1 argument"))?;
+        let first = args
+            .first()
+            .ok_or_else(|| Error::query_execution("TRIM requires at least 1 argument"))?;
 
         let s = match first {
             Value::Null => return Ok(Value::Null),
@@ -5608,9 +5813,9 @@ impl Evaluator {
 
     /// CONCAT_WS(separator, str1, str2, ...) - concatenate with separator
     fn func_concat_ws(&self, args: &[Value]) -> Result<Value> {
-        let (first, rest) = args.split_first().ok_or_else(|| {
-            Error::query_execution("CONCAT_WS requires at least one argument")
-        })?;
+        let (first, rest) = args
+            .split_first()
+            .ok_or_else(|| Error::query_execution("CONCAT_WS requires at least one argument"))?;
 
         let sep = match first {
             Value::Null => return Ok(Value::Null),
@@ -5618,7 +5823,8 @@ impl Evaluator {
             other => other.to_string(),
         };
 
-        let parts: Vec<String> = rest.iter()
+        let parts: Vec<String> = rest
+            .iter()
             .filter_map(|arg| match arg {
                 Value::Null => None,
                 Value::String(s) => Some(s.clone()),
@@ -5799,8 +6005,12 @@ impl Evaluator {
         if args.len() < 2 || args.len() > 3 {
             return Err(Error::query_execution("LPAD requires 2 or 3 arguments"));
         }
-        let arg0 = args.get(0).ok_or_else(|| Error::query_execution("LPAD: missing string"))?;
-        let arg1 = args.get(1).ok_or_else(|| Error::query_execution("LPAD: missing length"))?;
+        let arg0 = args
+            .get(0)
+            .ok_or_else(|| Error::query_execution("LPAD: missing string"))?;
+        let arg1 = args
+            .get(1)
+            .ok_or_else(|| Error::query_execution("LPAD: missing length"))?;
 
         let s = match arg0 {
             Value::Null => return Ok(Value::Null),
@@ -5842,8 +6052,12 @@ impl Evaluator {
         if args.len() < 2 || args.len() > 3 {
             return Err(Error::query_execution("RPAD requires 2 or 3 arguments"));
         }
-        let arg0 = args.get(0).ok_or_else(|| Error::query_execution("RPAD: missing string"))?;
-        let arg1 = args.get(1).ok_or_else(|| Error::query_execution("RPAD: missing length"))?;
+        let arg0 = args
+            .get(0)
+            .ok_or_else(|| Error::query_execution("RPAD: missing string"))?;
+        let arg1 = args
+            .get(1)
+            .ok_or_else(|| Error::query_execution("RPAD: missing length"))?;
 
         let s = match arg0 {
             Value::Null => return Ok(Value::Null),
@@ -5889,7 +6103,8 @@ impl Evaluator {
             Value::Int8(n) => Ok(*n as f64),
             Value::Float4(f) => Ok(*f as f64),
             Value::Float8(f) => Ok(*f),
-            Value::Numeric(s) => s.parse::<f64>()
+            Value::Numeric(s) => s
+                .parse::<f64>()
                 .map_err(|_| Error::query_execution("Invalid numeric value")),
             _ => Err(Error::query_execution("Expected numeric value")),
         }
@@ -5923,7 +6138,9 @@ impl Evaluator {
         if args.is_empty() || args.len() > 2 {
             return Err(Error::query_execution("ROUND requires 1 or 2 arguments"));
         }
-        let first = args.first().ok_or_else(|| Error::query_execution("ROUND requires at least 1 argument"))?;
+        let first = args
+            .first()
+            .ok_or_else(|| Error::query_execution("ROUND requires at least 1 argument"))?;
         if matches!(first, Value::Null) {
             return Ok(Value::Null);
         }
@@ -6013,7 +6230,9 @@ impl Evaluator {
         if args.is_empty() || args.len() > 2 {
             return Err(Error::query_execution("TRUNC requires 1 or 2 arguments"));
         }
-        let first = args.first().ok_or_else(|| Error::query_execution("TRUNC requires at least 1 argument"))?;
+        let first = args
+            .first()
+            .ok_or_else(|| Error::query_execution("TRUNC requires at least 1 argument"))?;
         if matches!(first, Value::Null) {
             return Ok(Value::Null);
         }
@@ -6099,16 +6318,26 @@ impl Evaluator {
             Value::Int4(n) => Ok(Value::Int4(n.signum())),
             Value::Int8(n) => Ok(Value::Int4(n.signum() as i32)),
             Value::Float4(f) => {
-                if f.is_nan() { Ok(Value::Float8(f64::NAN)) }
-                else if *f > 0.0 { Ok(Value::Int4(1)) }
-                else if *f < 0.0 { Ok(Value::Int4(-1)) }
-                else { Ok(Value::Int4(0)) }
+                if f.is_nan() {
+                    Ok(Value::Float8(f64::NAN))
+                } else if *f > 0.0 {
+                    Ok(Value::Int4(1))
+                } else if *f < 0.0 {
+                    Ok(Value::Int4(-1))
+                } else {
+                    Ok(Value::Int4(0))
+                }
             }
             Value::Float8(f) => {
-                if f.is_nan() { Ok(Value::Float8(f64::NAN)) }
-                else if *f > 0.0 { Ok(Value::Int4(1)) }
-                else if *f < 0.0 { Ok(Value::Int4(-1)) }
-                else { Ok(Value::Int4(0)) }
+                if f.is_nan() {
+                    Ok(Value::Float8(f64::NAN))
+                } else if *f > 0.0 {
+                    Ok(Value::Int4(1))
+                } else if *f < 0.0 {
+                    Ok(Value::Int4(-1))
+                } else {
+                    Ok(Value::Int4(0))
+                }
             }
             _ => Err(Error::query_execution("SIGN requires a numeric argument")),
         }
@@ -6116,9 +6345,9 @@ impl Evaluator {
 
     /// GREATEST(val1, val2, ...) - returns the largest value
     fn func_greatest(&self, args: &[Value]) -> Result<Value> {
-        let (first, rest) = args.split_first().ok_or_else(|| {
-            Error::query_execution("GREATEST requires at least one argument")
-        })?;
+        let (first, rest) = args
+            .split_first()
+            .ok_or_else(|| Error::query_execution("GREATEST requires at least one argument"))?;
         let mut result = first;
         for arg in rest {
             if matches!(arg, Value::Null) {
@@ -6137,9 +6366,9 @@ impl Evaluator {
 
     /// LEAST(val1, val2, ...) - returns the smallest value
     fn func_least(&self, args: &[Value]) -> Result<Value> {
-        let (first, rest) = args.split_first().ok_or_else(|| {
-            Error::query_execution("LEAST requires at least one argument")
-        })?;
+        let (first, rest) = args
+            .split_first()
+            .ok_or_else(|| Error::query_execution("LEAST requires at least one argument"))?;
         let mut result = first;
         for arg in rest {
             if matches!(arg, Value::Null) {
@@ -6166,14 +6395,13 @@ impl Evaluator {
             (Value::Float4(a), Value::Float4(b)) => Ok(a.partial_cmp(b).unwrap_or(Ordering::Equal)),
             (Value::Float8(a), Value::Float8(b)) => Ok(a.partial_cmp(b).unwrap_or(Ordering::Equal)),
             (Value::String(a), Value::String(b)) => Ok(a.cmp(b)),
-            (Value::Numeric(a), Value::Numeric(b)) => {
-                match (a.parse::<Decimal>(), b.parse::<Decimal>()) {
-                    (Ok(a_dec), Ok(b_dec)) => Ok(a_dec.cmp(&b_dec)),
-                    _ => Err(Error::query_execution(format!(
-                        "Cannot compare invalid NUMERIC values '{}' and '{}'", a, b
-                    ))),
-                }
-            }
+            (Value::Numeric(a), Value::Numeric(b)) => match (a.parse::<Decimal>(), b.parse::<Decimal>()) {
+                (Ok(a_dec), Ok(b_dec)) => Ok(a_dec.cmp(&b_dec)),
+                _ => Err(Error::query_execution(format!(
+                    "Cannot compare invalid NUMERIC values '{}' and '{}'",
+                    a, b
+                ))),
+            },
 
             // Cross-type integer comparisons
             (Value::Int2(a), Value::Int4(b)) => Ok((*a as i32).cmp(b)),
@@ -6193,63 +6421,63 @@ impl Evaluator {
 
             // Numeric (DECIMAL) cross-type comparisons — Numeric stores decimal as String
             (Value::Numeric(a), Value::Float8(b)) => {
-                let af = a.parse::<f64>().map_err(|_| Error::query_execution(format!(
-                    "Invalid NUMERIC value '{}' in comparison", a
-                )))?;
+                let af = a
+                    .parse::<f64>()
+                    .map_err(|_| Error::query_execution(format!("Invalid NUMERIC value '{}' in comparison", a)))?;
                 Ok(af.partial_cmp(b).unwrap_or(Ordering::Equal))
             }
             (Value::Float8(a), Value::Numeric(b)) => {
-                let bf = b.parse::<f64>().map_err(|_| Error::query_execution(format!(
-                    "Invalid NUMERIC value '{}' in comparison", b
-                )))?;
+                let bf = b
+                    .parse::<f64>()
+                    .map_err(|_| Error::query_execution(format!("Invalid NUMERIC value '{}' in comparison", b)))?;
                 Ok(a.partial_cmp(&bf).unwrap_or(Ordering::Equal))
             }
             (Value::Numeric(a), Value::Float4(b)) => {
-                let af = a.parse::<f64>().map_err(|_| Error::query_execution(format!(
-                    "Invalid NUMERIC value '{}' in comparison", a
-                )))?;
+                let af = a
+                    .parse::<f64>()
+                    .map_err(|_| Error::query_execution(format!("Invalid NUMERIC value '{}' in comparison", a)))?;
                 Ok(af.partial_cmp(&f64::from(*b)).unwrap_or(Ordering::Equal))
             }
             (Value::Float4(a), Value::Numeric(b)) => {
-                let bf = b.parse::<f64>().map_err(|_| Error::query_execution(format!(
-                    "Invalid NUMERIC value '{}' in comparison", b
-                )))?;
+                let bf = b
+                    .parse::<f64>()
+                    .map_err(|_| Error::query_execution(format!("Invalid NUMERIC value '{}' in comparison", b)))?;
                 Ok(f64::from(*a).partial_cmp(&bf).unwrap_or(Ordering::Equal))
             }
             (Value::Numeric(a), Value::Int4(b)) => {
-                let ad = a.parse::<Decimal>().map_err(|_| Error::query_execution(format!(
-                    "Invalid NUMERIC value '{}' in comparison", a
-                )))?;
+                let ad = a
+                    .parse::<Decimal>()
+                    .map_err(|_| Error::query_execution(format!("Invalid NUMERIC value '{}' in comparison", a)))?;
                 Ok(ad.cmp(&Decimal::from(*b)))
             }
             (Value::Int4(a), Value::Numeric(b)) => {
-                let bd = b.parse::<Decimal>().map_err(|_| Error::query_execution(format!(
-                    "Invalid NUMERIC value '{}' in comparison", b
-                )))?;
+                let bd = b
+                    .parse::<Decimal>()
+                    .map_err(|_| Error::query_execution(format!("Invalid NUMERIC value '{}' in comparison", b)))?;
                 Ok(Decimal::from(*a).cmp(&bd))
             }
             (Value::Numeric(a), Value::Int8(b)) => {
-                let ad = a.parse::<Decimal>().map_err(|_| Error::query_execution(format!(
-                    "Invalid NUMERIC value '{}' in comparison", a
-                )))?;
+                let ad = a
+                    .parse::<Decimal>()
+                    .map_err(|_| Error::query_execution(format!("Invalid NUMERIC value '{}' in comparison", a)))?;
                 Ok(ad.cmp(&Decimal::from(*b)))
             }
             (Value::Int8(a), Value::Numeric(b)) => {
-                let bd = b.parse::<Decimal>().map_err(|_| Error::query_execution(format!(
-                    "Invalid NUMERIC value '{}' in comparison", b
-                )))?;
+                let bd = b
+                    .parse::<Decimal>()
+                    .map_err(|_| Error::query_execution(format!("Invalid NUMERIC value '{}' in comparison", b)))?;
                 Ok(Decimal::from(*a).cmp(&bd))
             }
             (Value::Numeric(a), Value::Int2(b)) => {
-                let ad = a.parse::<Decimal>().map_err(|_| Error::query_execution(format!(
-                    "Invalid NUMERIC value '{}' in comparison", a
-                )))?;
+                let ad = a
+                    .parse::<Decimal>()
+                    .map_err(|_| Error::query_execution(format!("Invalid NUMERIC value '{}' in comparison", a)))?;
                 Ok(ad.cmp(&Decimal::from(*b)))
             }
             (Value::Int2(a), Value::Numeric(b)) => {
-                let bd = b.parse::<Decimal>().map_err(|_| Error::query_execution(format!(
-                    "Invalid NUMERIC value '{}' in comparison", b
-                )))?;
+                let bd = b
+                    .parse::<Decimal>()
+                    .map_err(|_| Error::query_execution(format!("Invalid NUMERIC value '{}' in comparison", b)))?;
                 Ok(Decimal::from(*a).cmp(&bd))
             }
 
@@ -6557,11 +6785,7 @@ fn jsonb_set_recursive_impl(
 }
 
 /// Standalone recursive helper for JSON path deletion (avoids clippy::only_used_in_recursion)
-fn jsonb_delete_recursive_impl(
-    current: &mut serde_json::Value,
-    path: &[String],
-    index: usize,
-) -> Result<()> {
+fn jsonb_delete_recursive_impl(current: &mut serde_json::Value, path: &[String], index: usize) -> Result<()> {
     let key = match path.get(index) {
         Some(k) => k,
         None => return Ok(()),
@@ -6602,18 +6826,16 @@ fn json_contains(left: &serde_json::Value, right: &serde_json::Value) -> bool {
         (l, r) if l == r => true,
 
         // Object containment: all key-value pairs in right must be in left
-        (JV::Object(left_obj), JV::Object(right_obj)) => {
-            right_obj.iter().all(|(key, right_val)| {
-                left_obj.get(key).is_some_and(|left_val| json_contains(left_val, right_val))
-            })
-        }
+        (JV::Object(left_obj), JV::Object(right_obj)) => right_obj.iter().all(|(key, right_val)| {
+            left_obj
+                .get(key)
+                .is_some_and(|left_val| json_contains(left_val, right_val))
+        }),
 
         // Array containment: all elements in right must be in left
-        (JV::Array(left_arr), JV::Array(right_arr)) => {
-            right_arr.iter().all(|right_elem| {
-                left_arr.iter().any(|left_elem| json_contains(left_elem, right_elem))
-            })
-        }
+        (JV::Array(left_arr), JV::Array(right_arr)) => right_arr
+            .iter()
+            .all(|right_elem| left_arr.iter().any(|left_elem| json_contains(left_elem, right_elem))),
 
         // Otherwise, no containment
         _ => false,
@@ -6624,8 +6846,8 @@ fn json_contains(left: &serde_json::Value, right: &serde_json::Value) -> bool {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::{Column, DataType};
     use crate::sql::BinaryOperator;
+    use crate::{Column, DataType};
 
     fn test_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![
@@ -6636,9 +6858,9 @@ mod tests {
                 primary_key: true,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
             Column {
                 name: "age".to_string(),
@@ -6647,9 +6869,9 @@ mod tests {
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
             Column {
                 name: "name".to_string(),
@@ -6658,9 +6880,9 @@ mod tests {
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
         ]))
     }
@@ -6669,10 +6891,15 @@ mod tests {
     fn test_literal_evaluation() {
         let schema = test_schema();
         let evaluator = Evaluator::new(schema);
-        let tuple = Tuple::new(vec![Value::Int4(1), Value::Int4(30), Value::String("Alice".to_string())]);
+        let tuple = Tuple::new(vec![
+            Value::Int4(1),
+            Value::Int4(30),
+            Value::String("Alice".to_string()),
+        ]);
 
         let expr = LogicalExpr::Literal(Value::Int4(42));
-        let result = evaluator.evaluate(&expr, &tuple)
+        let result = evaluator
+            .evaluate(&expr, &tuple)
             .expect("Failed to evaluate literal expression");
         assert_eq!(result, Value::Int4(42));
     }
@@ -6681,10 +6908,18 @@ mod tests {
     fn test_column_evaluation() {
         let schema = test_schema();
         let evaluator = Evaluator::new(schema);
-        let tuple = Tuple::new(vec![Value::Int4(1), Value::Int4(30), Value::String("Alice".to_string())]);
+        let tuple = Tuple::new(vec![
+            Value::Int4(1),
+            Value::Int4(30),
+            Value::String("Alice".to_string()),
+        ]);
 
-        let expr = LogicalExpr::Column { table: None, name: "age".to_string()  };
-        let result = evaluator.evaluate(&expr, &tuple)
+        let expr = LogicalExpr::Column {
+            table: None,
+            name: "age".to_string(),
+        };
+        let result = evaluator
+            .evaluate(&expr, &tuple)
             .expect("Failed to evaluate column expression");
         assert_eq!(result, Value::Int4(30));
     }
@@ -6693,25 +6928,37 @@ mod tests {
     fn test_comparison_operators() {
         let schema = test_schema();
         let evaluator = Evaluator::new(schema);
-        let tuple = Tuple::new(vec![Value::Int4(1), Value::Int4(30), Value::String("Alice".to_string())]);
+        let tuple = Tuple::new(vec![
+            Value::Int4(1),
+            Value::Int4(30),
+            Value::String("Alice".to_string()),
+        ]);
 
         // age = 30
         let expr = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "age".to_string()  }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "age".to_string(),
+            }),
             op: BinaryOperator::Eq,
             right: Box::new(LogicalExpr::Literal(Value::Int4(30))),
         };
-        let result = evaluator.evaluate(&expr, &tuple)
+        let result = evaluator
+            .evaluate(&expr, &tuple)
             .expect("Failed to evaluate comparison expression");
         assert_eq!(result, Value::Boolean(true));
 
         // age > 25
         let expr = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "age".to_string()  }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "age".to_string(),
+            }),
             op: BinaryOperator::Gt,
             right: Box::new(LogicalExpr::Literal(Value::Int4(25))),
         };
-        let result = evaluator.evaluate(&expr, &tuple)
+        let result = evaluator
+            .evaluate(&expr, &tuple)
             .expect("Failed to evaluate comparison expression");
         assert_eq!(result, Value::Boolean(true));
     }
@@ -6720,15 +6967,23 @@ mod tests {
     fn test_arithmetic_operators() {
         let schema = test_schema();
         let evaluator = Evaluator::new(schema);
-        let tuple = Tuple::new(vec![Value::Int4(1), Value::Int4(30), Value::String("Alice".to_string())]);
+        let tuple = Tuple::new(vec![
+            Value::Int4(1),
+            Value::Int4(30),
+            Value::String("Alice".to_string()),
+        ]);
 
         // age + 10
         let expr = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "age".to_string()  }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "age".to_string(),
+            }),
             op: BinaryOperator::Plus,
             right: Box::new(LogicalExpr::Literal(Value::Int4(10))),
         };
-        let result = evaluator.evaluate(&expr, &tuple)
+        let result = evaluator
+            .evaluate(&expr, &tuple)
             .expect("Failed to evaluate arithmetic expression");
         assert_eq!(result, Value::Int4(40));
     }
@@ -6764,42 +7019,51 @@ mod tests {
         ]));
 
         let evaluator = Evaluator::new(schema);
-        let tuple = Tuple::new(vec![
-            Value::Uuid(uuid_val),
-            Value::String("Alice".to_string()),
-        ]);
+        let tuple = Tuple::new(vec![Value::Uuid(uuid_val), Value::String("Alice".to_string())]);
 
         // UUID column = UUID string literal (the common case: WHERE id = '550e...')
         let expr = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "id".to_string() }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            }),
             op: BinaryOperator::Eq,
             right: Box::new(LogicalExpr::Literal(Value::String(
                 "550e8400-e29b-41d4-a716-446655440000".to_string(),
             ))),
         };
-        let result = evaluator.evaluate(&expr, &tuple)
+        let result = evaluator
+            .evaluate(&expr, &tuple)
             .expect("UUID = String comparison should work");
         assert_eq!(result, Value::Boolean(true));
 
         // Non-matching UUID
         let expr_neq = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "id".to_string() }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            }),
             op: BinaryOperator::Eq,
             right: Box::new(LogicalExpr::Literal(Value::String(
                 "00000000-0000-0000-0000-000000000000".to_string(),
             ))),
         };
-        let result_neq = evaluator.evaluate(&expr_neq, &tuple)
+        let result_neq = evaluator
+            .evaluate(&expr_neq, &tuple)
             .expect("UUID = String comparison should work");
         assert_eq!(result_neq, Value::Boolean(false));
 
         // UUID = UUID direct comparison
         let expr_uuid = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "id".to_string() }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            }),
             op: BinaryOperator::Eq,
             right: Box::new(LogicalExpr::Literal(Value::Uuid(uuid_val))),
         };
-        let result_uuid = evaluator.evaluate(&expr_uuid, &tuple)
+        let result_uuid = evaluator
+            .evaluate(&expr_uuid, &tuple)
             .expect("UUID = UUID comparison should work");
         assert_eq!(result_uuid, Value::Boolean(true));
     }
@@ -6811,25 +7075,20 @@ mod tests {
         let uuid_str = "550e8400-e29b-41d4-a716-446655440000";
 
         // String to UUID cast
-        let result = evaluator.cast_value(
-            Value::String(uuid_str.to_string()),
-            &DataType::Uuid,
-        ).expect("String to UUID cast should work");
+        let result = evaluator
+            .cast_value(Value::String(uuid_str.to_string()), &DataType::Uuid)
+            .expect("String to UUID cast should work");
         assert!(matches!(result, Value::Uuid(_)));
 
         // UUID to UUID cast (identity)
         let uuid_val = uuid::Uuid::parse_str(uuid_str).unwrap();
-        let result2 = evaluator.cast_value(
-            Value::Uuid(uuid_val),
-            &DataType::Uuid,
-        ).expect("UUID to UUID cast should work");
+        let result2 = evaluator
+            .cast_value(Value::Uuid(uuid_val), &DataType::Uuid)
+            .expect("UUID to UUID cast should work");
         assert_eq!(result2, Value::Uuid(uuid_val));
 
         // Invalid UUID string
-        let result3 = evaluator.cast_value(
-            Value::String("not-a-uuid".to_string()),
-            &DataType::Uuid,
-        );
+        let result3 = evaluator.cast_value(Value::String("not-a-uuid".to_string()), &DataType::Uuid);
         assert!(result3.is_err());
     }
 }

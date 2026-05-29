@@ -12,8 +12,8 @@
 #![cfg(feature = "code-graph")]
 
 use heliosdb_nano::code_graph::{
-    ast_diff, lsp_body_diff, lsp_references_diff, rewrite_lsp_calls, AsOfRef,
-    CodeIndexOptions, DefinitionHint, DiffChange,
+    ast_diff, lsp_body_diff, lsp_references_diff, rewrite_lsp_calls, AsOfRef, CodeIndexOptions, DefinitionHint,
+    DiffChange,
 };
 use heliosdb_nano::{EmbeddedDatabase, Result, Value};
 
@@ -37,21 +37,14 @@ fn insert(db: &EmbeddedDatabase, path: &str, lang: &str, content: &str) -> Resul
 
 #[test]
 fn rewriter_propagates_as_of_commit() {
-    let got = rewrite_lsp_calls(
-        "SELECT * FROM lsp_definition('Foo') AS OF COMMIT 'abc123'",
-    );
-    assert!(
-        got.contains("AS OF COMMIT 'abc123'"),
-        "got: {got}"
-    );
+    let got = rewrite_lsp_calls("SELECT * FROM lsp_definition('Foo') AS OF COMMIT 'abc123'");
+    assert!(got.contains("AS OF COMMIT 'abc123'"), "got: {got}");
     assert!(got.contains("_hdb_code_symbols"));
 }
 
 #[test]
 fn rewriter_propagates_as_of_timestamp() {
-    let got = rewrite_lsp_calls(
-        "SELECT * FROM lsp_references(42) AS OF TIMESTAMP '2025-01-02'",
-    );
+    let got = rewrite_lsp_calls("SELECT * FROM lsp_references(42) AS OF TIMESTAMP '2025-01-02'");
     assert!(got.contains("AS OF TIMESTAMP '2025-01-02'"));
     assert!(got.contains("_hdb_code_symbol_refs"));
 }
@@ -64,9 +57,7 @@ fn rewriter_honors_as_of_on_hover() {
 
 #[test]
 fn rewriter_honors_as_of_on_call_hierarchy() {
-    let got = rewrite_lsp_calls(
-        "SELECT * FROM lsp_call_hierarchy(7, 'incoming', 1) AS OF COMMIT 'deadbeef'",
-    );
+    let got = rewrite_lsp_calls("SELECT * FROM lsp_call_hierarchy(7, 'incoming', 1) AS OF COMMIT 'deadbeef'");
     assert!(got.contains("AS OF COMMIT 'deadbeef'"));
 }
 

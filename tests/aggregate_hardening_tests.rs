@@ -51,8 +51,11 @@ mod aggregate_hardening {
 
         let rows = d.query("SELECT COUNT(*) FROM empty_t", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(to_i64(rows[0].get(0).unwrap()), 0,
-            "COUNT(*) on empty table must return 0");
+        assert_eq!(
+            to_i64(rows[0].get(0).unwrap()),
+            0,
+            "COUNT(*) on empty table must return 0"
+        );
     }
 
     #[test]
@@ -62,8 +65,11 @@ mod aggregate_hardening {
 
         let rows = d.query("SELECT COUNT(val) FROM empty_t2", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(to_i64(rows[0].get(0).unwrap()), 0,
-            "COUNT(col) on empty table must return 0");
+        assert_eq!(
+            to_i64(rows[0].get(0).unwrap()),
+            0,
+            "COUNT(col) on empty table must return 0"
+        );
     }
 
     #[test]
@@ -73,8 +79,11 @@ mod aggregate_hardening {
 
         let rows = d.query("SELECT SUM(val) FROM empty_sum", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &Value::Null,
-            "SUM on empty table should return NULL");
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &Value::Null,
+            "SUM on empty table should return NULL"
+        );
     }
 
     #[test]
@@ -84,8 +93,11 @@ mod aggregate_hardening {
 
         let rows = d.query("SELECT AVG(val) FROM empty_avg", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &Value::Null,
-            "AVG on empty table should return NULL");
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &Value::Null,
+            "AVG on empty table should return NULL"
+        );
     }
 
     /// MIN on an empty table returns NULL per SQL standard.
@@ -96,8 +108,11 @@ mod aggregate_hardening {
 
         let rows = d.query("SELECT MIN(val) FROM empty_min", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &Value::Null,
-            "MIN on empty table should return NULL");
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &Value::Null,
+            "MIN on empty table should return NULL"
+        );
     }
 
     /// MAX on an empty table returns NULL per SQL standard.
@@ -108,8 +123,11 @@ mod aggregate_hardening {
 
         let rows = d.query("SELECT MAX(val) FROM empty_max", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &Value::Null,
-            "MAX on empty table should return NULL");
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &Value::Null,
+            "MAX on empty table should return NULL"
+        );
     }
 
     // ========================================================================
@@ -126,8 +144,11 @@ mod aggregate_hardening {
 
         let rows = d.query("SELECT COUNT(*) FROM all_null", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(to_i64(rows[0].get(0).unwrap()), 3,
-            "COUNT(*) counts rows regardless of NULLs");
+        assert_eq!(
+            to_i64(rows[0].get(0).unwrap()),
+            3,
+            "COUNT(*) counts rows regardless of NULLs"
+        );
     }
 
     /// COUNT(col) with all NULL values returns 0 per SQL standard
@@ -142,8 +163,7 @@ mod aggregate_hardening {
         let rows = d.query("SELECT COUNT(val) FROM all_null2", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         let v = to_i64(rows[0].get(0).unwrap());
-        assert_eq!(v, 0,
-            "COUNT(col) should skip NULLs, returning 0 for all-NULL column");
+        assert_eq!(v, 0, "COUNT(col) should skip NULLs, returning 0 for all-NULL column");
     }
 
     #[test]
@@ -155,8 +175,11 @@ mod aggregate_hardening {
 
         let rows = d.query("SELECT SUM(val) FROM sum_null", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &Value::Null,
-            "SUM with all NULLs should return NULL");
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &Value::Null,
+            "SUM with all NULLs should return NULL"
+        );
     }
 
     #[test]
@@ -168,8 +191,11 @@ mod aggregate_hardening {
 
         let rows = d.query("SELECT AVG(val) FROM avg_null", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &Value::Null,
-            "AVG with all NULLs should return NULL");
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &Value::Null,
+            "AVG with all NULLs should return NULL"
+        );
     }
 
     /// MIN with all NULL values returns NULL per SQL standard
@@ -183,8 +209,11 @@ mod aggregate_hardening {
 
         let rows = d.query("SELECT MIN(val) FROM min_null", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &Value::Null,
-            "MIN with all NULLs should return NULL");
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &Value::Null,
+            "MIN with all NULLs should return NULL"
+        );
     }
 
     /// MAX with all NULL values returns NULL per SQL standard
@@ -198,8 +227,11 @@ mod aggregate_hardening {
 
         let rows = d.query("SELECT MAX(val) FROM max_null", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &Value::Null,
-            "MAX with all NULLs should return NULL");
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &Value::Null,
+            "MAX with all NULLs should return NULL"
+        );
     }
 
     // ========================================================================
@@ -216,8 +248,11 @@ mod aggregate_hardening {
         d.execute("INSERT INTO cnt_star VALUES (4, NULL)").unwrap();
 
         let rows = d.query("SELECT COUNT(*) FROM cnt_star", &[]).unwrap();
-        assert_eq!(to_i64(rows[0].get(0).unwrap()), 4,
-            "COUNT(*) should count all 4 rows including NULL-value rows");
+        assert_eq!(
+            to_i64(rows[0].get(0).unwrap()),
+            4,
+            "COUNT(*) should count all 4 rows including NULL-value rows"
+        );
     }
 
     /// COUNT(col) skips NULLs per SQL standard.
@@ -231,8 +266,7 @@ mod aggregate_hardening {
 
         let rows = d.query("SELECT COUNT(val) FROM cnt_col", &[]).unwrap();
         let v = to_i64(rows[0].get(0).unwrap());
-        assert_eq!(v, 2,
-            "COUNT(col) should skip NULLs, returning 2 non-NULL values");
+        assert_eq!(v, 2, "COUNT(col) should skip NULLs, returning 2 non-NULL values");
     }
 
     #[test]
@@ -244,8 +278,11 @@ mod aggregate_hardening {
         d.execute("INSERT INTO cnt_dist VALUES (3, 20)").unwrap();
 
         let rows = d.query("SELECT COUNT(DISTINCT val) FROM cnt_dist", &[]).unwrap();
-        assert_eq!(to_i64(rows[0].get(0).unwrap()), 2,
-            "COUNT(DISTINCT val) should return 2 distinct values (10, 20)");
+        assert_eq!(
+            to_i64(rows[0].get(0).unwrap()),
+            2,
+            "COUNT(DISTINCT val) should return 2 distinct values (10, 20)"
+        );
     }
 
     #[test]
@@ -259,8 +296,11 @@ mod aggregate_hardening {
         d.execute("INSERT INTO cnt_dn VALUES (5, 'A')").unwrap();
 
         let rows = d.query("SELECT COUNT(DISTINCT category) FROM cnt_dn", &[]).unwrap();
-        assert_eq!(to_i64(rows[0].get(0).unwrap()), 2,
-            "COUNT(DISTINCT category) should be 2 (A, B) - NULLs excluded");
+        assert_eq!(
+            to_i64(rows[0].get(0).unwrap()),
+            2,
+            "COUNT(DISTINCT category) should be 2 (A, B) - NULLs excluded"
+        );
     }
 
     #[test]
@@ -270,10 +310,15 @@ mod aggregate_hardening {
         d.execute("INSERT INTO cnt_no_match VALUES (1, 10)").unwrap();
         d.execute("INSERT INTO cnt_no_match VALUES (2, 20)").unwrap();
 
-        let rows = d.query("SELECT COUNT(*) FROM cnt_no_match WHERE val > 100", &[]).unwrap();
+        let rows = d
+            .query("SELECT COUNT(*) FROM cnt_no_match WHERE val > 100", &[])
+            .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(to_i64(rows[0].get(0).unwrap()), 0,
-            "COUNT(*) with non-matching WHERE should return 0");
+        assert_eq!(
+            to_i64(rows[0].get(0).unwrap()),
+            0,
+            "COUNT(*) with non-matching WHERE should return 0"
+        );
     }
 
     #[test]
@@ -284,10 +329,12 @@ mod aggregate_hardening {
         d.execute("INSERT INTO cnt_grp VALUES ('A', 2)").unwrap();
         d.execute("INSERT INTO cnt_grp VALUES ('B', 3)").unwrap();
 
-        let rows = d.query(
-            "SELECT category, COUNT(*) FROM cnt_grp GROUP BY category HAVING COUNT(*) > 10",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT category, COUNT(*) FROM cnt_grp GROUP BY category HAVING COUNT(*) > 10",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 0, "HAVING filtering all groups should yield 0 rows");
     }
 
@@ -317,8 +364,11 @@ mod aggregate_hardening {
         d.execute("INSERT INTO cnt_same VALUES (3, 42)").unwrap();
 
         let rows = d.query("SELECT COUNT(DISTINCT val) FROM cnt_same", &[]).unwrap();
-        assert_eq!(to_i64(rows[0].get(0).unwrap()), 1,
-            "COUNT(DISTINCT val) with all identical values should be 1");
+        assert_eq!(
+            to_i64(rows[0].get(0).unwrap()),
+            1,
+            "COUNT(DISTINCT val) with all identical values should be 1"
+        );
     }
 
     // ========================================================================
@@ -341,8 +391,11 @@ mod aggregate_hardening {
 
         // SUM(DISTINCT val) = 10+20+30 = 60
         let rows_dist = d.query("SELECT SUM(DISTINCT val) FROM sum_d", &[]).unwrap();
-        assert_eq!(to_i64(rows_dist[0].get(0).unwrap()), 60,
-            "SUM(DISTINCT val) should deduplicate before summing");
+        assert_eq!(
+            to_i64(rows_dist[0].get(0).unwrap()),
+            60,
+            "SUM(DISTINCT val) should deduplicate before summing"
+        );
     }
 
     #[test]
@@ -362,12 +415,20 @@ mod aggregate_hardening {
         let rows = d.query("SELECT AVG(DISTINCT val) FROM avg_d", &[]).unwrap();
         let avg_dist = to_f64(rows[0].get(0).unwrap());
 
-        assert!((avg_all - 12.5).abs() < 1.0,
-            "AVG(val) should be ~12.5, got {}", avg_all);
-        assert!((avg_dist - 15.0).abs() < 1.0,
-            "AVG(DISTINCT val) should be ~15.0, got {}", avg_dist);
-        assert!((avg_dist - avg_all).abs() > 0.1,
-            "AVG(DISTINCT) and AVG should differ when there are duplicates");
+        assert!(
+            (avg_all - 12.5).abs() < 1.0,
+            "AVG(val) should be ~12.5, got {}",
+            avg_all
+        );
+        assert!(
+            (avg_dist - 15.0).abs() < 1.0,
+            "AVG(DISTINCT val) should be ~15.0, got {}",
+            avg_dist
+        );
+        assert!(
+            (avg_dist - avg_all).abs() > 0.1,
+            "AVG(DISTINCT) and AVG should differ when there are duplicates"
+        );
     }
 
     #[test]
@@ -381,8 +442,11 @@ mod aggregate_hardening {
         d.execute("INSERT INTO cd_mix VALUES (5, 10)").unwrap();
 
         let rows = d.query("SELECT COUNT(DISTINCT val) FROM cd_mix", &[]).unwrap();
-        assert_eq!(to_i64(rows[0].get(0).unwrap()), 2,
-            "COUNT(DISTINCT val) should be 2, ignoring NULLs");
+        assert_eq!(
+            to_i64(rows[0].get(0).unwrap()),
+            2,
+            "COUNT(DISTINCT val) should be 2, ignoring NULLs"
+        );
     }
 
     #[test]
@@ -394,10 +458,9 @@ mod aggregate_hardening {
         d.execute("INSERT INTO multi_dist VALUES (3, 20, 100)").unwrap();
         d.execute("INSERT INTO multi_dist VALUES (4, 20, 200)").unwrap();
 
-        let rows = d.query(
-            "SELECT COUNT(DISTINCT a), COUNT(DISTINCT b) FROM multi_dist",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query("SELECT COUNT(DISTINCT a), COUNT(DISTINCT b) FROM multi_dist", &[])
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(to_i64(rows[0].get(0).unwrap()), 2, "COUNT(DISTINCT a) should be 2");
         assert_eq!(to_i64(rows[0].get(1).unwrap()), 2, "COUNT(DISTINCT b) should be 2");
@@ -414,16 +477,26 @@ mod aggregate_hardening {
         d.execute("INSERT INTO dist_grp VALUES ('Y', 3)").unwrap();
         d.execute("INSERT INTO dist_grp VALUES ('Y', 3)").unwrap();
 
-        let rows = d.query(
-            "SELECT grp, COUNT(DISTINCT val) FROM dist_grp GROUP BY grp ORDER BY grp",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT grp, COUNT(DISTINCT val) FROM dist_grp GROUP BY grp ORDER BY grp",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2);
 
         // Group X: distinct vals = {1, 2} => 2
-        assert_eq!(to_i64(rows[0].get(1).unwrap()), 2, "Group X should have 2 distinct values");
+        assert_eq!(
+            to_i64(rows[0].get(1).unwrap()),
+            2,
+            "Group X should have 2 distinct values"
+        );
         // Group Y: distinct vals = {3} => 1
-        assert_eq!(to_i64(rows[1].get(1).unwrap()), 1, "Group Y should have 1 distinct value");
+        assert_eq!(
+            to_i64(rows[1].get(1).unwrap()),
+            1,
+            "Group Y should have 1 distinct value"
+        );
     }
 
     #[test]
@@ -435,8 +508,11 @@ mod aggregate_hardening {
         d.execute("INSERT INTO sd_same VALUES (3, 5)").unwrap();
 
         let rows = d.query("SELECT SUM(DISTINCT val) FROM sd_same", &[]).unwrap();
-        assert_eq!(to_i64(rows[0].get(0).unwrap()), 5,
-            "SUM(DISTINCT val) with all same values should be 5");
+        assert_eq!(
+            to_i64(rows[0].get(0).unwrap()),
+            5,
+            "SUM(DISTINCT val) with all same values should be 5"
+        );
     }
 
     // ========================================================================
@@ -452,10 +528,9 @@ mod aggregate_hardening {
         d.execute("INSERT INTO gb_null VALUES (NULL, 30)").unwrap();
         d.execute("INSERT INTO gb_null VALUES (NULL, 40)").unwrap();
 
-        let rows = d.query(
-            "SELECT grp, SUM(val) FROM gb_null GROUP BY grp ORDER BY grp",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query("SELECT grp, SUM(val) FROM gb_null GROUP BY grp ORDER BY grp", &[])
+            .unwrap();
         // NULLs are grouped together per SQL standard
         assert_eq!(rows.len(), 2, "GROUP BY should create 2 groups: NULL and 1");
 
@@ -465,13 +540,11 @@ mod aggregate_hardening {
             match row.get(0).unwrap() {
                 Value::Null => {
                     found_null_group = true;
-                    assert_eq!(to_i64(row.get(1).unwrap()), 70,
-                        "NULL group sum should be 30+40=70");
+                    assert_eq!(to_i64(row.get(1).unwrap()), 70, "NULL group sum should be 30+40=70");
                 }
                 Value::Int4(n) if *n == 1 => {
                     found_one_group = true;
-                    assert_eq!(to_i64(row.get(1).unwrap()), 30,
-                        "Group 1 sum should be 10+20=30");
+                    assert_eq!(to_i64(row.get(1).unwrap()), 30, "Group 1 sum should be 10+20=30");
                 }
                 other => panic!("Unexpected group key: {:?}", other),
             }
@@ -489,10 +562,9 @@ mod aggregate_hardening {
         d.execute("INSERT INTO gb_bool VALUES (FALSE, 5)").unwrap();
         d.execute("INSERT INTO gb_bool VALUES (FALSE, 15)").unwrap();
 
-        let rows = d.query(
-            "SELECT flag, SUM(val) FROM gb_bool GROUP BY flag ORDER BY flag",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query("SELECT flag, SUM(val) FROM gb_bool GROUP BY flag ORDER BY flag", &[])
+            .unwrap();
         assert_eq!(rows.len(), 2, "GROUP BY boolean should produce 2 groups");
 
         // false group (ordered first): sum = 5+15=20
@@ -508,10 +580,12 @@ mod aggregate_hardening {
         d.execute("INSERT INTO gb_havall VALUES ('A', 1)").unwrap();
         d.execute("INSERT INTO gb_havall VALUES ('B', 2)").unwrap();
 
-        let rows = d.query(
-            "SELECT grp, COUNT(*) FROM gb_havall GROUP BY grp HAVING COUNT(*) > 5",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT grp, COUNT(*) FROM gb_havall GROUP BY grp HAVING COUNT(*) > 5",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 0, "HAVING that filters all groups should return no rows");
     }
 
@@ -524,10 +598,9 @@ mod aggregate_hardening {
         d.execute("INSERT INTO gb_multi VALUES ('X', 'Q', 3)").unwrap();
         d.execute("INSERT INTO gb_multi VALUES ('Y', 'P', 4)").unwrap();
 
-        let rows = d.query(
-            "SELECT a, b, SUM(val) FROM gb_multi GROUP BY a, b ORDER BY a, b",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query("SELECT a, b, SUM(val) FROM gb_multi GROUP BY a, b ORDER BY a, b", &[])
+            .unwrap();
         assert_eq!(rows.len(), 3, "Should produce 3 groups: (X,P), (X,Q), (Y,P)");
 
         // (X, P) => sum=3
@@ -548,10 +621,12 @@ mod aggregate_hardening {
         d.execute("INSERT INTO gb_expr VALUES (4, 40)").unwrap();
 
         // GROUP BY id % 2: 1%2=1, 2%2=0, 3%2=1, 4%2=0
-        let rows = d.query(
-            "SELECT id % 2, SUM(val) FROM gb_expr GROUP BY id % 2 ORDER BY id % 2",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT id % 2, SUM(val) FROM gb_expr GROUP BY id % 2 ORDER BY id % 2",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2, "GROUP BY id %% 2 should produce 2 groups");
 
         // Group 0 (even ids 2,4): sum=20+40=60
@@ -576,10 +651,13 @@ mod aggregate_hardening {
         // but the engine may not filter correctly when the aggregate is not in SELECT
         let result = d.query(
             "SELECT grp, COUNT(*) FROM gb_hav_diff GROUP BY grp HAVING SUM(val) > 10",
-            &[]
+            &[],
         );
         // Just verify it does not crash
-        assert!(result.is_ok(), "Query with HAVING using different aggregate should not crash");
+        assert!(
+            result.is_ok(),
+            "Query with HAVING using different aggregate should not crash"
+        );
     }
 
     #[test]
@@ -590,10 +668,9 @@ mod aggregate_hardening {
         d.execute("INSERT INTO gb_single VALUES ('A', 20)").unwrap();
         d.execute("INSERT INTO gb_single VALUES ('A', 30)").unwrap();
 
-        let rows = d.query(
-            "SELECT grp, COUNT(*), SUM(val) FROM gb_single GROUP BY grp",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query("SELECT grp, COUNT(*), SUM(val) FROM gb_single GROUP BY grp", &[])
+            .unwrap();
         assert_eq!(rows.len(), 1, "All same group key should produce 1 group");
         assert_eq!(to_i64(rows[0].get(1).unwrap()), 3);
         assert_eq!(to_i64(rows[0].get(2).unwrap()), 60);
@@ -607,7 +684,9 @@ mod aggregate_hardening {
         d.execute("INSERT INTO no_gb VALUES (2, 20)").unwrap();
         d.execute("INSERT INTO no_gb VALUES (3, 30)").unwrap();
 
-        let rows = d.query("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM no_gb", &[]).unwrap();
+        let rows = d
+            .query("SELECT COUNT(*), SUM(val), MIN(val), MAX(val) FROM no_gb", &[])
+            .unwrap();
         assert_eq!(rows.len(), 1, "Aggregate without GROUP BY should return 1 row");
         assert_eq!(to_i64(rows[0].get(0).unwrap()), 3);
         assert_eq!(to_i64(rows[0].get(1).unwrap()), 60);
@@ -627,10 +706,12 @@ mod aggregate_hardening {
         d.execute("INSERT INTO hav_none VALUES ('B', 2)").unwrap();
         d.execute("INSERT INTO hav_none VALUES ('C', 3)").unwrap();
 
-        let rows = d.query(
-            "SELECT grp, COUNT(*) FROM hav_none GROUP BY grp HAVING COUNT(*) > 100",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT grp, COUNT(*) FROM hav_none GROUP BY grp HAVING COUNT(*) > 100",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 0, "No groups should qualify when threshold is too high");
     }
 
@@ -651,11 +732,10 @@ mod aggregate_hardening {
         // A: count=2, sum=30 => qualifies; B: count=2, sum=20 => qualifies; C: count=1 => does not
         let result = d.query(
             "SELECT grp, SUM(val) FROM hav_and GROUP BY grp HAVING COUNT(*) >= 2 AND SUM(val) > 15",
-            &[]
+            &[],
         );
         // Verify the query does not crash
-        assert!(result.is_ok(),
-            "HAVING with AND should execute without error");
+        assert!(result.is_ok(), "HAVING with AND should execute without error");
     }
 
     #[test]
@@ -667,10 +747,12 @@ mod aggregate_hardening {
         d.execute("INSERT INTO hav_cnt VALUES ('A', 3)").unwrap();
         d.execute("INSERT INTO hav_cnt VALUES ('B', 4)").unwrap();
 
-        let rows = d.query(
-            "SELECT grp, COUNT(*) FROM hav_cnt GROUP BY grp HAVING COUNT(*) >= 2",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT grp, COUNT(*) FROM hav_cnt GROUP BY grp HAVING COUNT(*) >= 2",
+                &[],
+            )
+            .unwrap();
         // Only group A has count >= 2
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("A".to_string()));
@@ -682,10 +764,12 @@ mod aggregate_hardening {
         let d = db();
         d.execute("CREATE TABLE hav_empty (grp TEXT, val INT)").unwrap();
 
-        let rows = d.query(
-            "SELECT grp, COUNT(*) FROM hav_empty GROUP BY grp HAVING COUNT(*) > 0",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT grp, COUNT(*) FROM hav_empty GROUP BY grp HAVING COUNT(*) > 0",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 0, "HAVING on empty table should return no rows");
     }
 
@@ -714,10 +798,12 @@ mod aggregate_hardening {
         d.execute("CREATE TABLE mix_case (id INT, val INT)").unwrap();
         d.execute("INSERT INTO mix_case VALUES (1, 10)").unwrap();
 
-        let rows = d.query(
-            "SELECT CASE WHEN COUNT(*) > 0 THEN 'yes' ELSE 'no' END FROM mix_case",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT CASE WHEN COUNT(*) > 0 THEN 'yes' ELSE 'no' END FROM mix_case",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("yes".to_string()));
     }
@@ -749,8 +835,7 @@ mod aggregate_hardening {
 
         // SUM(val * 2) works: expression inside aggregate
         let rows = d.query("SELECT SUM(val * 2) FROM mix_arith", &[]).unwrap();
-        assert_eq!(to_i64(rows[0].get(0).unwrap()), 120,
-            "SUM(val * 2) = 20+40+60 = 120");
+        assert_eq!(to_i64(rows[0].get(0).unwrap()), 120, "SUM(val * 2) = 20+40+60 = 120");
     }
 
     /// SUM(val) * 2 - aggregate inside expression (now supported).
@@ -794,8 +879,16 @@ mod aggregate_hardening {
 
         let rows = d.query("SELECT MIN(val), MAX(val) FROM minmax1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(to_i64(rows[0].get(0).unwrap()), 42, "MIN of single row should be that value");
-        assert_eq!(to_i64(rows[0].get(1).unwrap()), 42, "MAX of single row should be that value");
+        assert_eq!(
+            to_i64(rows[0].get(0).unwrap()),
+            42,
+            "MIN of single row should be that value"
+        );
+        assert_eq!(
+            to_i64(rows[0].get(1).unwrap()),
+            42,
+            "MAX of single row should be that value"
+        );
     }
 
     #[test]
@@ -821,8 +914,7 @@ mod aggregate_hardening {
         d.execute("INSERT INTO sum_neg VALUES (3, -70)").unwrap();
 
         let rows = d.query("SELECT SUM(val) FROM sum_neg", &[]).unwrap();
-        assert_eq!(to_i64(rows[0].get(0).unwrap()), 0,
-            "SUM(100, -30, -70) should be 0");
+        assert_eq!(to_i64(rows[0].get(0).unwrap()), 0, "SUM(100, -30, -70) should be 0");
     }
 
     #[test]
@@ -833,8 +925,11 @@ mod aggregate_hardening {
 
         let rows = d.query("SELECT AVG(val) FROM avg_single", &[]).unwrap();
         let avg = to_f64(rows[0].get(0).unwrap());
-        assert!((avg - 42.0).abs() < 0.01,
-            "AVG of single value 42 should be 42.0, got {}", avg);
+        assert!(
+            (avg - 42.0).abs() < 0.01,
+            "AVG of single value 42 should be 42.0, got {}",
+            avg
+        );
     }
 
     #[test]
@@ -846,12 +941,14 @@ mod aggregate_hardening {
         d.execute("INSERT INTO cnt_where VALUES (3, 'active')").unwrap();
         d.execute("INSERT INTO cnt_where VALUES (4, 'active')").unwrap();
 
-        let rows = d.query(
-            "SELECT COUNT(*) FROM cnt_where WHERE status = 'active'",
-            &[]
-        ).unwrap();
-        assert_eq!(to_i64(rows[0].get(0).unwrap()), 3,
-            "COUNT(*) with WHERE should count only matching rows");
+        let rows = d
+            .query("SELECT COUNT(*) FROM cnt_where WHERE status = 'active'", &[])
+            .unwrap();
+        assert_eq!(
+            to_i64(rows[0].get(0).unwrap()),
+            3,
+            "COUNT(*) with WHERE should count only matching rows"
+        );
     }
 
     #[test]
@@ -862,18 +959,20 @@ mod aggregate_hardening {
         d.execute("INSERT INTO multi_agg VALUES (2, 20)").unwrap();
         d.execute("INSERT INTO multi_agg VALUES (3, 30)").unwrap();
 
-        let rows = d.query(
-            "SELECT COUNT(val), SUM(val), AVG(val), MIN(val), MAX(val) FROM multi_agg",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT COUNT(val), SUM(val), AVG(val), MIN(val), MAX(val) FROM multi_agg",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         // COUNT(val) - engine counts all rows including NULLs (but no NULLs here)
         assert_eq!(to_i64(rows[0].get(0).unwrap()), 3);
-        assert_eq!(to_i64(rows[0].get(1).unwrap()), 60);    // SUM
+        assert_eq!(to_i64(rows[0].get(1).unwrap()), 60); // SUM
         let avg = to_f64(rows[0].get(2).unwrap());
         assert!((avg - 20.0).abs() < 0.01, "AVG should be 20.0, got {}", avg);
-        assert_eq!(to_i64(rows[0].get(3).unwrap()), 10);    // MIN
-        assert_eq!(to_i64(rows[0].get(4).unwrap()), 30);    // MAX
+        assert_eq!(to_i64(rows[0].get(3).unwrap()), 10); // MIN
+        assert_eq!(to_i64(rows[0].get(4).unwrap()), 30); // MAX
     }
 
     #[test]
@@ -886,10 +985,9 @@ mod aggregate_hardening {
         d.execute("INSERT INTO gb_ord VALUES ('A', 5)").unwrap();
 
         // ORDER BY the group key (grp) which is known to work
-        let rows = d.query(
-            "SELECT grp, SUM(val) FROM gb_ord GROUP BY grp ORDER BY grp",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query("SELECT grp, SUM(val) FROM gb_ord GROUP BY grp ORDER BY grp", &[])
+            .unwrap();
         assert_eq!(rows.len(), 3);
 
         // Ordered by grp: A=15, B=20, C=30
@@ -912,10 +1010,12 @@ mod aggregate_hardening {
         d.execute("INSERT INTO gb_ord2 VALUES ('A', 5)").unwrap();
 
         // ORDER BY SUM(val) DESC should sort by aggregate descending: C=30, B=20, A=15
-        let rows = d.query(
-            "SELECT grp, SUM(val) FROM gb_ord2 GROUP BY grp ORDER BY SUM(val) DESC",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT grp, SUM(val) FROM gb_ord2 GROUP BY grp ORDER BY SUM(val) DESC",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 3, "Should return all 3 groups");
 
         // Verify ordering: C (30), B (20), A (15)
@@ -937,18 +1037,26 @@ mod aggregate_hardening {
         d.execute("INSERT INTO sd_grp VALUES ('B', 5)").unwrap();
         d.execute("INSERT INTO sd_grp VALUES ('B', 5)").unwrap();
 
-        let rows = d.query(
-            "SELECT grp, SUM(DISTINCT val) FROM sd_grp GROUP BY grp ORDER BY grp",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT grp, SUM(DISTINCT val) FROM sd_grp GROUP BY grp ORDER BY grp",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2);
 
         // A: distinct vals {10, 20} => sum = 30
-        assert_eq!(to_i64(rows[0].get(1).unwrap()), 30,
-            "Group A: SUM(DISTINCT val) should be 10+20=30");
+        assert_eq!(
+            to_i64(rows[0].get(1).unwrap()),
+            30,
+            "Group A: SUM(DISTINCT val) should be 10+20=30"
+        );
         // B: distinct vals {5} => sum = 5
-        assert_eq!(to_i64(rows[1].get(1).unwrap()), 5,
-            "Group B: SUM(DISTINCT val) should be 5");
+        assert_eq!(
+            to_i64(rows[1].get(1).unwrap()),
+            5,
+            "Group B: SUM(DISTINCT val) should be 5"
+        );
     }
 
     #[test]
@@ -961,10 +1069,16 @@ mod aggregate_hardening {
 
         let rows = d.query("SELECT MIN(name), MAX(name) FROM minmax_text", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &Value::String("apple".to_string()),
-            "MIN on text should return lexicographically smallest");
-        assert_eq!(rows[0].get(1).unwrap(), &Value::String("cherry".to_string()),
-            "MAX on text should return lexicographically largest");
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &Value::String("apple".to_string()),
+            "MIN on text should return lexicographically smallest"
+        );
+        assert_eq!(
+            rows[0].get(1).unwrap(),
+            &Value::String("cherry".to_string()),
+            "MAX on text should return lexicographically largest"
+        );
     }
 
     // ========================================================================
@@ -1039,10 +1153,12 @@ mod aggregate_hardening {
         d.execute("CREATE TABLE agg_expr5 (id INT)").unwrap();
         d.execute("INSERT INTO agg_expr5 VALUES (1)").unwrap();
 
-        let rows = d.query(
-            "SELECT CASE WHEN COUNT(*) > 0 THEN 'yes' ELSE 'no' END FROM agg_expr5",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT CASE WHEN COUNT(*) > 0 THEN 'yes' ELSE 'no' END FROM agg_expr5",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("yes".to_string()));
     }
@@ -1053,10 +1169,12 @@ mod aggregate_hardening {
         let d = db();
         d.execute("CREATE TABLE agg_expr5b (id INT)").unwrap();
 
-        let rows = d.query(
-            "SELECT CASE WHEN COUNT(*) > 0 THEN 'yes' ELSE 'no' END FROM agg_expr5b",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT CASE WHEN COUNT(*) > 0 THEN 'yes' ELSE 'no' END FROM agg_expr5b",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("no".to_string()));
     }
@@ -1070,10 +1188,12 @@ mod aggregate_hardening {
         d.execute("INSERT INTO agg_expr6 VALUES (15)").unwrap();
         d.execute("INSERT INTO agg_expr6 VALUES (25)").unwrap();
 
-        let rows = d.query(
-            "SELECT SUM(val) * 2, COUNT(*) + 1, MAX(val) - MIN(val) FROM agg_expr6",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT SUM(val) * 2, COUNT(*) + 1, MAX(val) - MIN(val) FROM agg_expr6",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         // SUM(val) = 45, 45 * 2 = 90
         assert_eq!(to_i64(rows[0].get(0).unwrap()), 90);
@@ -1093,10 +1213,12 @@ mod aggregate_hardening {
         d.execute("INSERT INTO agg_expr7 VALUES ('sales', 50)").unwrap();
         d.execute("INSERT INTO agg_expr7 VALUES ('sales', 150)").unwrap();
 
-        let rows = d.query(
-            "SELECT dept, SUM(salary) * 2 FROM agg_expr7 GROUP BY dept ORDER BY dept",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT dept, SUM(salary) * 2 FROM agg_expr7 GROUP BY dept ORDER BY dept",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2);
         // eng: SUM(salary) = 300, 300 * 2 = 600
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("eng".to_string()));
@@ -1116,10 +1238,12 @@ mod aggregate_hardening {
         d.execute("INSERT INTO agg_expr8 VALUES ('eng', 300)").unwrap();
         d.execute("INSERT INTO agg_expr8 VALUES ('sales', 50)").unwrap();
 
-        let rows = d.query(
-            "SELECT dept, SUM(salary) + COUNT(*) FROM agg_expr8 GROUP BY dept HAVING COUNT(*) > 1",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT dept, SUM(salary) + COUNT(*) FROM agg_expr8 GROUP BY dept HAVING COUNT(*) > 1",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         // Only eng has COUNT(*) > 1. SUM(salary) = 600, COUNT(*) = 3, result = 603
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("eng".to_string()));
@@ -1148,10 +1272,9 @@ mod aggregate_hardening {
         d.execute("INSERT INTO agg_expr10 VALUES (10)").unwrap();
         d.execute("INSERT INTO agg_expr10 VALUES (20)").unwrap();
 
-        let rows = d.query(
-            "SELECT SUM(val) + SUM(val), SUM(val) * 3 FROM agg_expr10",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT SUM(val) + SUM(val), SUM(val) * 3 FROM agg_expr10", &[])
+            .unwrap();
         assert_eq!(rows.len(), 1);
         // SUM(val) = 30, 30 + 30 = 60
         assert_eq!(to_i64(rows[0].get(0).unwrap()), 60);
@@ -1174,10 +1297,12 @@ mod aggregate_hardening {
         d.execute("INSERT INTO ob_cnt VALUES ('Eng', 'Eve')").unwrap();
         d.execute("INSERT INTO ob_cnt VALUES ('HR', 'Frank')").unwrap();
 
-        let rows = d.query(
-            "SELECT dept, COUNT(*) FROM ob_cnt GROUP BY dept ORDER BY COUNT(*) DESC",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT dept, COUNT(*) FROM ob_cnt GROUP BY dept ORDER BY COUNT(*) DESC",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 3);
 
         // Sales=3, Eng=2, HR=1
@@ -1199,10 +1324,12 @@ mod aggregate_hardening {
         d.execute("INSERT INTO ob_sum VALUES ('X', 200)").unwrap();
         d.execute("INSERT INTO ob_sum VALUES ('Y', 20)").unwrap();
 
-        let rows = d.query(
-            "SELECT grp, SUM(val) FROM ob_sum GROUP BY grp ORDER BY SUM(val) ASC",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT grp, SUM(val) FROM ob_sum GROUP BY grp ORDER BY SUM(val) ASC",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 3);
 
         // Y=30, Z=50, X=300
@@ -1225,10 +1352,12 @@ mod aggregate_hardening {
         d.execute("INSERT INTO ob_avg VALUES ('C', 70)").unwrap();
         d.execute("INSERT INTO ob_avg VALUES ('C', 70)").unwrap();
 
-        let rows = d.query(
-            "SELECT team, AVG(score) FROM ob_avg GROUP BY team ORDER BY AVG(score) DESC",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT team, AVG(score) FROM ob_avg GROUP BY team ORDER BY AVG(score) DESC",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 3);
 
         // A: avg=85, B: avg=80, C: avg=70
@@ -1255,10 +1384,12 @@ mod aggregate_hardening {
         d.execute("INSERT INTO ob_alias VALUES ('HR', 90)").unwrap();
 
         // ORDER BY alias "total" instead of repeating SUM(salary)
-        let rows = d.query(
-            "SELECT dept, SUM(salary) AS total FROM ob_alias GROUP BY dept ORDER BY total DESC",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT dept, SUM(salary) AS total FROM ob_alias GROUP BY dept ORDER BY total DESC",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 3);
 
         // Eng=220, HR=90, Sales=80
@@ -1284,11 +1415,17 @@ mod aggregate_hardening {
 
         // HAVING filters groups where SUM(amt) < 10, then ORDER BY SUM(amt) DESC
         // A=30, B=8 (filtered), C=90, D=1 (filtered)
-        let rows = d.query(
-            "SELECT cat, SUM(amt) FROM ob_hav GROUP BY cat HAVING SUM(amt) >= 10 ORDER BY SUM(amt) DESC",
-            &[]
-        ).unwrap();
-        assert_eq!(rows.len(), 2, "B (sum=8) and D (sum=1) should be filtered out by HAVING");
+        let rows = d
+            .query(
+                "SELECT cat, SUM(amt) FROM ob_hav GROUP BY cat HAVING SUM(amt) >= 10 ORDER BY SUM(amt) DESC",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "B (sum=8) and D (sum=1) should be filtered out by HAVING"
+        );
 
         // C=90, A=30
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("C".to_string()));
@@ -1300,7 +1437,8 @@ mod aggregate_hardening {
     #[test]
     fn test_order_by_multiple_with_aggregate() {
         let d = db();
-        d.execute("CREATE TABLE ob_multi (region TEXT, dept TEXT, val INT)").unwrap();
+        d.execute("CREATE TABLE ob_multi (region TEXT, dept TEXT, val INT)")
+            .unwrap();
         d.execute("INSERT INTO ob_multi VALUES ('East', 'Sales', 10)").unwrap();
         d.execute("INSERT INTO ob_multi VALUES ('East', 'Sales', 20)").unwrap();
         d.execute("INSERT INTO ob_multi VALUES ('East', 'Eng', 50)").unwrap();
@@ -1308,10 +1446,12 @@ mod aggregate_hardening {
         d.execute("INSERT INTO ob_multi VALUES ('West', 'Eng', 40)").unwrap();
 
         // ORDER BY region ASC, then by SUM(val) DESC within each region
-        let rows = d.query(
-            "SELECT region, dept, SUM(val) FROM ob_multi GROUP BY region, dept ORDER BY region ASC, SUM(val) DESC",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT region, dept, SUM(val) FROM ob_multi GROUP BY region, dept ORDER BY region ASC, SUM(val) DESC",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 4);
 
         // East groups: Eng=50, Sales=30 (sorted by SUM DESC)
@@ -1345,10 +1485,12 @@ mod aggregate_hardening {
         d.execute("INSERT INTO ob_minmax VALUES ('C', 20)").unwrap();
 
         // ORDER BY MIN(val) ASC
-        let rows = d.query(
-            "SELECT grp, MIN(val), MAX(val) FROM ob_minmax GROUP BY grp ORDER BY MIN(val) ASC",
-            &[]
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT grp, MIN(val), MAX(val) FROM ob_minmax GROUP BY grp ORDER BY MIN(val) ASC",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 3);
 
         // B: min=1, A: min=5, C: min=10

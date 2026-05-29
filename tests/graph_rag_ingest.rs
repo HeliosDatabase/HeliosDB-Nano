@@ -3,8 +3,7 @@
 #![cfg(feature = "graph-rag")]
 
 use heliosdb_nano::graph_rag::{
-    ChunkStrategy, IngestDocsOptions, IngestEmailOptions, IngestIssuesOptions,
-    IngestQaOptions,
+    ChunkStrategy, IngestDocsOptions, IngestEmailOptions, IngestIssuesOptions, IngestQaOptions,
 };
 use heliosdb_nano::{EmbeddedDatabase, Result, Value};
 
@@ -25,9 +24,7 @@ fn ingest_docs_headings() -> Result<()> {
         "INSERT INTO docs (id, body) VALUES ($1, $2)",
         &[
             Value::String("readme".into()),
-            Value::String(
-                "# Intro\n\nHello.\n\n## Install\n\nRun cargo.\n".into(),
-            ),
+            Value::String("# Intro\n\nHello.\n\n## Install\n\nRun cargo.\n".into()),
         ],
     )?;
     let stats = db.graph_rag_ingest_docs(&IngestDocsOptions {
@@ -43,8 +40,12 @@ fn ingest_docs_headings() -> Result<()> {
         "SELECT node_kind, count(*) FROM _hdb_graph_nodes GROUP BY node_kind",
         &[],
     )?;
-    let has_section = kinds.iter().any(|r| matches!(&r.values[0], Value::String(s) if s == "DocSection"));
-    let has_chunk = kinds.iter().any(|r| matches!(&r.values[0], Value::String(s) if s == "DocChunk"));
+    let has_section = kinds
+        .iter()
+        .any(|r| matches!(&r.values[0], Value::String(s) if s == "DocSection"));
+    let has_chunk = kinds
+        .iter()
+        .any(|r| matches!(&r.values[0], Value::String(s) if s == "DocChunk"));
     assert!(has_section && has_chunk);
     Ok(())
 }
@@ -103,12 +104,16 @@ fn ingest_email_emits_persons_and_replies() -> Result<()> {
     assert_eq!(stats.rows_seen, 2);
     assert!(stats.nodes_added >= 2);
     // REPLIES_TO edge exists from m2 → m1.
-    let replies =
-        count(&db, "SELECT count(*) FROM _hdb_graph_edges WHERE edge_kind = 'REPLIES_TO'")?;
+    let replies = count(
+        &db,
+        "SELECT count(*) FROM _hdb_graph_edges WHERE edge_kind = 'REPLIES_TO'",
+    )?;
     assert_eq!(replies, 1);
     // AUTHORED_BY + SENT_TO edges exist.
-    let auth =
-        count(&db, "SELECT count(*) FROM _hdb_graph_edges WHERE edge_kind = 'AUTHORED_BY'")?;
+    let auth = count(
+        &db,
+        "SELECT count(*) FROM _hdb_graph_edges WHERE edge_kind = 'AUTHORED_BY'",
+    )?;
     assert!(auth >= 2);
     Ok(())
 }
@@ -127,10 +132,7 @@ fn ingest_issues_parses_comments_and_fixes() -> Result<()> {
             Value::String("bug!".into()),
             Value::String("it's bad".into()),
             Value::String("alice".into()),
-            Value::String(
-                r#"[{"author":"bob","body":"seen it"},{"author":"carol","body":"fixing"}]"#
-                    .into(),
-            ),
+            Value::String(r#"[{"author":"bob","body":"seen it"},{"author":"carol","body":"fixing"}]"#.into()),
             Value::String(r#"["commit:abc123","Fix::apply"]"#.into()),
         ],
     )?;
@@ -144,11 +146,12 @@ fn ingest_issues_parses_comments_and_fixes() -> Result<()> {
         fixed_by_json_col: Some("fixed".into()),
     })?;
     assert!(stats.nodes_added >= 4); // issue + 2 comments + reporter Person
-    let comments =
-        count(&db, "SELECT count(*) FROM _hdb_graph_nodes WHERE node_kind = 'Comment'")?;
+    let comments = count(&db, "SELECT count(*) FROM _hdb_graph_nodes WHERE node_kind = 'Comment'")?;
     assert_eq!(comments, 2);
-    let fixed =
-        count(&db, "SELECT count(*) FROM _hdb_graph_edges WHERE edge_kind = 'FIXED_BY'")?;
+    let fixed = count(
+        &db,
+        "SELECT count(*) FROM _hdb_graph_edges WHERE edge_kind = 'FIXED_BY'",
+    )?;
     assert_eq!(fixed, 2);
     Ok(())
 }
@@ -156,9 +159,7 @@ fn ingest_issues_parses_comments_and_fixes() -> Result<()> {
 #[test]
 fn ingest_qa_emits_question_and_answer() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
-    db.execute(
-        "CREATE TABLE qa (qid TEXT PRIMARY KEY, q TEXT, a TEXT, who_asked TEXT, who_answered TEXT)",
-    )?;
+    db.execute("CREATE TABLE qa (qid TEXT PRIMARY KEY, q TEXT, a TEXT, who_asked TEXT, who_answered TEXT)")?;
     db.execute_params_returning(
         "INSERT INTO qa VALUES ($1,$2,$3,$4,$5)",
         &[
@@ -182,10 +183,7 @@ fn ingest_qa_emits_question_and_answer() -> Result<()> {
         &db,
         "SELECT count(*) FROM _hdb_graph_nodes WHERE node_kind = 'InvestorQuestion'",
     )?;
-    let a = count(
-        &db,
-        "SELECT count(*) FROM _hdb_graph_nodes WHERE node_kind = 'Answer'",
-    )?;
+    let a = count(&db, "SELECT count(*) FROM _hdb_graph_nodes WHERE node_kind = 'Answer'")?;
     assert_eq!(q, 1);
     assert_eq!(a, 1);
     let ab = count(

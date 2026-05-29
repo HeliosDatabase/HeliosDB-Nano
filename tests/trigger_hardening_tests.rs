@@ -59,7 +59,8 @@ fn before_insert_trigger_fires_and_logs() {
 fn before_update_trigger_fires() {
     let db = db();
     db.execute("CREATE TABLE trg_bu_data (id INT, val INT)").unwrap();
-    db.execute("CREATE TABLE trg_bu_log (old_val INT, new_val INT)").unwrap();
+    db.execute("CREATE TABLE trg_bu_log (old_val INT, new_val INT)")
+        .unwrap();
 
     let res = db.execute(
         "CREATE TRIGGER trg_bu_upd BEFORE UPDATE ON trg_bu_data FOR EACH ROW
@@ -177,8 +178,14 @@ fn before_trigger_old_and_new_values() {
             let rows = db.query("SELECT old_v, new_v FROM trg_on_log", &[]).unwrap();
             assert_eq!(rows.len(), 1, "Should have one audit row");
             if let (Some(old), Some(new)) = (
-                rows[0].values.first().and_then(|v| match v { Value::Int4(n) => Some(*n), _ => None }),
-                rows[0].values.get(1).and_then(|v| match v { Value::Int4(n) => Some(*n), _ => None }),
+                rows[0].values.first().and_then(|v| match v {
+                    Value::Int4(n) => Some(*n),
+                    _ => None,
+                }),
+                rows[0].values.get(1).and_then(|v| match v {
+                    Value::Int4(n) => Some(*n),
+                    _ => None,
+                }),
             ) {
                 assert_eq!(old, 100);
                 assert_eq!(new, 200);
@@ -216,7 +223,8 @@ fn after_insert_trigger_audit_logging() {
 fn after_update_trigger_audit_logging() {
     let db = db();
     db.execute("CREATE TABLE trg_au_acct (id INT, bal INT)").unwrap();
-    db.execute("CREATE TABLE trg_au_log (acct INT, old_bal INT, new_bal INT)").unwrap();
+    db.execute("CREATE TABLE trg_au_log (acct INT, old_bal INT, new_bal INT)")
+        .unwrap();
 
     let res = db.execute(
         "CREATE TRIGGER trg_au_upd AFTER UPDATE ON trg_au_acct FOR EACH ROW
@@ -269,7 +277,10 @@ fn after_trigger_on_multiple_events() {
             db.execute("UPDATE trg_me_data SET v = 20 WHERE id = 1").unwrap();
             db.execute("DELETE FROM trg_me_data WHERE id = 1").unwrap();
             let c = count(&db, "trg_me_log");
-            assert!(c >= 3, "Multi-event trigger should fire on INSERT, UPDATE, and DELETE (got {c})");
+            assert!(
+                c >= 3,
+                "Multi-event trigger should fire on INSERT, UPDATE, and DELETE (got {c})"
+            );
         }
         Err(e) => eprintln!("Multi-event AFTER trigger not supported: {e}"),
     }
@@ -412,8 +423,8 @@ fn trigger_when_with_old_new_comparison() {
     match res {
         Ok(_) => {
             db.execute("INSERT INTO trg_wcmp VALUES (1, 50)").unwrap();
-            db.execute("UPDATE trg_wcmp SET score = 80 WHERE id = 1").unwrap();  // increase
-            db.execute("UPDATE trg_wcmp SET score = 30 WHERE id = 1").unwrap();  // decrease
+            db.execute("UPDATE trg_wcmp SET score = 80 WHERE id = 1").unwrap(); // increase
+            db.execute("UPDATE trg_wcmp SET score = 30 WHERE id = 1").unwrap(); // decrease
             assert_eq!(count(&db, "trg_wcmp_up"), 1, "Only score increase should log");
         }
         Err(e) => eprintln!("WHEN with OLD/NEW comparison not supported: {e}"),
@@ -460,13 +471,17 @@ fn drop_trigger_if_exists_nonexistent() {
     let db = db();
     db.execute("CREATE TABLE trg_dne_t (id INT)").unwrap();
     let res = db.execute("DROP TRIGGER IF EXISTS trg_nonexistent ON trg_dne_t");
-    assert!(res.is_ok(), "DROP TRIGGER IF EXISTS should not error on missing trigger");
+    assert!(
+        res.is_ok(),
+        "DROP TRIGGER IF EXISTS should not error on missing trigger"
+    );
 }
 
 #[test]
 fn trigger_on_table_with_primary_key_constraint() {
     let db = db();
-    db.execute("CREATE TABLE trg_pk (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE trg_pk (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("CREATE TABLE trg_pk_log (action TEXT)").unwrap();
 
     let res = db.execute(
@@ -524,7 +539,8 @@ fn trigger_on_table_with_foreign_key() {
     let db = db();
     // FK may or may not be enforced; we test that triggers still fire
     db.execute("CREATE TABLE trg_fk_parent (id INT PRIMARY KEY)").unwrap();
-    db.execute("CREATE TABLE trg_fk_child (id INT, parent_id INT REFERENCES trg_fk_parent(id))").unwrap();
+    db.execute("CREATE TABLE trg_fk_child (id INT, parent_id INT REFERENCES trg_fk_parent(id))")
+        .unwrap();
     db.execute("CREATE TABLE trg_fk_log (child_id INT)").unwrap();
 
     db.execute("INSERT INTO trg_fk_parent VALUES (1)").unwrap();
@@ -592,7 +608,9 @@ fn trigger_with_null_values() {
         Ok(_) => {
             db.execute("INSERT INTO trg_null VALUES (1, NULL)").unwrap();
             db.execute("INSERT INTO trg_null VALUES (2, 'hello')").unwrap();
-            let rows = db.query("SELECT was_null FROM trg_null_log ORDER BY rowid", &[]).unwrap();
+            let rows = db
+                .query("SELECT was_null FROM trg_null_log ORDER BY rowid", &[])
+                .unwrap();
             assert_eq!(rows.len(), 2, "Trigger should fire for both rows");
         }
         Err(e) => eprintln!("Trigger with NULL values not supported: {e}"),
@@ -633,7 +651,8 @@ fn trigger_on_truncate() {
 fn trigger_accessing_other_tables_in_body() {
     let db = db();
     db.execute("CREATE TABLE trg_oth_config (key TEXT, val INT)").unwrap();
-    db.execute("INSERT INTO trg_oth_config VALUES ('max_qty', 100)").unwrap();
+    db.execute("INSERT INTO trg_oth_config VALUES ('max_qty', 100)")
+        .unwrap();
     db.execute("CREATE TABLE trg_oth_orders (id INT, qty INT)").unwrap();
     db.execute("CREATE TABLE trg_oth_alerts (order_id INT)").unwrap();
 
@@ -729,7 +748,8 @@ fn duplicate_trigger_name_errors() {
 #[test]
 fn update_of_specific_column_trigger() {
     let db = db();
-    db.execute("CREATE TABLE trg_col (id INT, name TEXT, price INT)").unwrap();
+    db.execute("CREATE TABLE trg_col (id INT, name TEXT, price INT)")
+        .unwrap();
     db.execute("CREATE TABLE trg_col_log (msg TEXT)").unwrap();
 
     let res = db.execute(

@@ -4,8 +4,8 @@
 
 #![cfg(test)]
 
-use heliosdb_nano::{EmbeddedDatabase, Result};
 use crate::test_helpers::*;
+use heliosdb_nano::{EmbeddedDatabase, Result};
 use std::fs;
 use tempfile::TempDir;
 
@@ -69,7 +69,11 @@ fn test_dump_compression_zstd() -> Result<()> {
     // Create large dataset
     db.execute("CREATE TABLE large_data (id INT PRIMARY KEY, data TEXT)")?;
     for i in 0..100 {
-        db.execute(&format!("INSERT INTO large_data VALUES ({}, '{}')", i, "x".repeat(1000)))?;
+        db.execute(&format!(
+            "INSERT INTO large_data VALUES ({}, '{}')",
+            i,
+            "x".repeat(1000)
+        ))?;
     }
 
     // Dump without compression

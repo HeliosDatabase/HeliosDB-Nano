@@ -73,8 +73,8 @@ static CACHE: Lazy<Mutex<Cache>> = Lazy::new(|| {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(CACHE_CAPACITY);
-    let cap = NonZeroUsize::new(cap.max(1))
-        .unwrap_or_else(|| NonZeroUsize::new(CACHE_CAPACITY).expect("CACHE_CAPACITY > 0"));
+    let cap =
+        NonZeroUsize::new(cap.max(1)).unwrap_or_else(|| NonZeroUsize::new(CACHE_CAPACITY).expect("CACHE_CAPACITY > 0"));
     Mutex::new(Cache {
         lru: LruCache::new(cap),
         generation: 0,
@@ -140,15 +140,10 @@ pub fn writes(tool_name: &str) -> bool {
 fn canonicalise(v: &JsonValue) -> JsonValue {
     match v {
         JsonValue::Object(map) => {
-            let mut entries: Vec<(&String, &JsonValue)> = map
-                .iter()
-                .filter(|(k, _)| !k.starts_with("_meta"))
-                .collect();
+            let mut entries: Vec<(&String, &JsonValue)> = map.iter().filter(|(k, _)| !k.starts_with("_meta")).collect();
             entries.sort_by(|a, b| a.0.cmp(b.0));
-            let new_map: serde_json::Map<String, JsonValue> = entries
-                .into_iter()
-                .map(|(k, v)| (k.clone(), canonicalise(v)))
-                .collect();
+            let new_map: serde_json::Map<String, JsonValue> =
+                entries.into_iter().map(|(k, v)| (k.clone(), canonicalise(v))).collect();
             JsonValue::Object(new_map)
         }
         JsonValue::Array(arr) => JsonValue::Array(arr.iter().map(canonicalise).collect()),
@@ -309,11 +304,7 @@ mod tests {
         // Miss
         assert!(try_get("helios_lsp_definition", &args).is_none());
         // Insert
-        insert(
-            "helios_lsp_definition",
-            &args,
-            &ok_outcome(json!({ "rows": [] })),
-        );
+        insert("helios_lsp_definition", &args, &ok_outcome(json!({ "rows": [] })));
         // Hit
         let hit = try_get("helios_lsp_definition", &args).expect("expected cache hit");
         assert_eq!(hit.payload, json!({ "rows": [] }));
@@ -326,11 +317,7 @@ mod tests {
     fn errors_not_cached() {
         _clear_for_tests();
         let args = json!({ "name": "foo" });
-        insert(
-            "helios_lsp_definition",
-            &args,
-            &ToolOutcome::err("boom"),
-        );
+        insert("helios_lsp_definition", &args, &ToolOutcome::err("boom"));
         assert!(try_get("helios_lsp_definition", &args).is_none());
     }
 

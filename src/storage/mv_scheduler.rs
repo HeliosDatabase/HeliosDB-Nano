@@ -36,16 +36,16 @@
 //! scheduler.schedule_refresh("sales_summary", Priority::High)?;
 //! ```
 
-use crate::{Result, Error};
-use super::{StorageEngine, IncrementalRefresher};
 use super::mv_incremental::DeltaTracker;
-use serde::{Serialize, Deserialize};
+use super::{IncrementalRefresher, StorageEngine};
+use crate::{Error, Result};
+use parking_lot::Mutex;
+use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use parking_lot::Mutex;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 
 /// Priority level for materialized view refresh tasks
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -85,11 +85,10 @@ pub struct RefreshTask {
 impl Ord for RefreshTask {
     fn cmp(&self, other: &Self) -> Ordering {
         // Higher priority first (Critical=3 > High=2 > Normal=1 > Low=0)
-        self.priority.cmp(&other.priority)
-            .then_with(|| {
-                // Earlier scheduled time first (reverse time order)
-                other.scheduled_time.cmp(&self.scheduled_time)
-            })
+        self.priority.cmp(&other.priority).then_with(|| {
+            // Earlier scheduled time first (reverse time order)
+            other.scheduled_time.cmp(&self.scheduled_time)
+        })
     }
 }
 
@@ -221,9 +220,7 @@ impl CpuMonitor {
             return Err(Error::storage("No CPU information available"));
         }
 
-        let total_cpu = cpus.iter()
-            .map(|cpu| cpu.cpu_usage())
-            .sum::<f32>() / cpus.len() as f32;
+        let total_cpu = cpus.iter().map(|cpu| cpu.cpu_usage()).sum::<f32>() / cpus.len() as f32;
 
         Ok(total_cpu as f64)
     }
@@ -299,12 +296,11 @@ pub struct MVScheduler {
 
 impl MVScheduler {
     /// Create a new MV scheduler
-    pub fn new(
-        config: SchedulerConfig,
-        storage: Arc<StorageEngine>,
-    ) -> Self {
-        info!("Initializing MVScheduler with config: max_cpu={}%, check_interval={}s, max_concurrent={}",
-            config.max_cpu_percent, config.check_interval_secs, config.max_concurrent);
+    pub fn new(config: SchedulerConfig, storage: Arc<StorageEngine>) -> Self {
+        info!(
+            "Initializing MVScheduler with config: max_cpu={}%, check_interval={}s, max_concurrent={}",
+            config.max_cpu_percent, config.check_interval_secs, config.max_concurrent
+        );
 
         let delta_tracker = Arc::new(DeltaTracker::new(Arc::clone(&storage)));
         let incremental_refresher = Arc::new(IncrementalRefresher::new(
@@ -378,9 +374,7 @@ impl MVScheduler {
 
             // Check CPU usage (blocking sysinfo call — run off the tokio runtime)
             let monitor = self.cpu_monitor.clone();
-            let cpu_usage = match tokio::task::spawn_blocking(move || {
-                monitor.get_smoothed_cpu_usage()
-            }).await {
+            let cpu_usage = match tokio::task::spawn_blocking(move || monitor.get_smoothed_cpu_usage()).await {
                 Ok(Ok(usage)) => usage,
                 Ok(Err(e)) => {
                     warn!("Failed to get CPU usage: {}", e);
@@ -394,8 +388,10 @@ impl MVScheduler {
 
             let max_cpu = self.config.lock().max_cpu_percent;
             if cpu_usage > max_cpu {
-                debug!("CPU usage {:.1}% exceeds threshold {:.1}%, skipping refresh batch",
-                    cpu_usage, max_cpu);
+                debug!(
+                    "CPU usage {:.1}% exceeds threshold {:.1}%, skipping refresh batch",
+                    cpu_usage, max_cpu
+                );
                 continue;
             }
 
@@ -474,16 +470,17 @@ impl MVScheduler {
         // Execute refresh
         let result = self.perform_refresh(&mv_name).await;
 
-        let duration = start.elapsed()
-            .unwrap_or(Duration::from_secs(0));
+        let duration = start.elapsed().unwrap_or(Duration::from_secs(0));
 
         // Mark as complete
         self.running_tasks.lock().remove(&mv_name);
 
         match result {
             Ok(refresh_result) => {
-                info!("Refreshed MV '{}' in {:?} using {} strategy, {} rows affected",
-                    mv_name, duration, refresh_result.strategy_used, refresh_result.rows_affected);
+                info!(
+                    "Refreshed MV '{}' in {:?} using {} strategy, {} rows affected",
+                    mv_name, duration, refresh_result.strategy_used, refresh_result.rows_affected
+                );
 
                 // Clear retry count on success
                 self.retry_counts.lock().remove(&mv_name);
@@ -502,8 +499,10 @@ impl MVScheduler {
 
                     let max_retries = self.config.lock().max_retries;
                     if *retry_count <= max_retries {
-                        warn!("Rescheduling MV '{}' for retry (attempt {} of {})",
-                            mv_name, retry_count, max_retries);
+                        warn!(
+                            "Rescheduling MV '{}' for retry (attempt {} of {})",
+                            mv_name, retry_count, max_retries
+                        );
 
                         // Reschedule with degraded priority
                         let new_priority = match task.priority {
@@ -516,8 +515,10 @@ impl MVScheduler {
                         drop(retry_counts);
                         self.schedule_refresh(&mv_name, new_priority)?;
                     } else {
-                        error!("MV '{}' exceeded maximum retry attempts ({}), giving up",
-                            mv_name, max_retries);
+                        error!(
+                            "MV '{}' exceeded maximum retry attempts ({}), giving up",
+                            mv_name, max_retries
+                        );
                         retry_counts.remove(&mv_name);
                     }
                 }
@@ -542,16 +543,16 @@ impl MVScheduler {
         // Estimate refresh cost
         let cost = self.incremental_refresher.estimate_refresh_cost(&metadata)?;
 
-        debug!("Refresh cost for '{}': incremental={:.2}s, full={:.2}s, strategy={:?}",
-            mv_name, cost.incremental_cost, cost.full_cost, cost.recommendation);
+        debug!(
+            "Refresh cost for '{}': incremental={:.2}s, full={:.2}s, strategy={:?}",
+            mv_name, cost.incremental_cost, cost.full_cost, cost.recommendation
+        );
 
         // Perform refresh using the recommended strategy
         let refresh_result = self.incremental_refresher.refresh_incremental(mv_name)?;
 
         // Update metadata
-        let rows_affected = refresh_result.rows_inserted
-            + refresh_result.rows_updated
-            + refresh_result.rows_deleted;
+        let rows_affected = refresh_result.rows_inserted + refresh_result.rows_updated + refresh_result.rows_deleted;
 
         metadata.mark_refreshed(rows_affected as u64);
         catalog.update_view(&metadata)?;
@@ -606,8 +607,10 @@ impl MVScheduler {
         }
 
         if config.batch_size != old_batch_size {
-            debug!("Adjusted batch size from {} to {} (CPU: {:.1}%)",
-                old_batch_size, config.batch_size, cpu_usage);
+            debug!(
+                "Adjusted batch size from {} to {} (CPU: {:.1}%)",
+                old_batch_size, config.batch_size, cpu_usage
+            );
         }
     }
 
@@ -635,8 +638,10 @@ impl MVScheduler {
         }
 
         if affected_count > 0 {
-            info!("Scheduled {} dependent MVs for refresh after table '{}' change",
-                affected_count, table_name);
+            info!(
+                "Scheduled {} dependent MVs for refresh after table '{}' change",
+                affected_count, table_name
+            );
         }
 
         Ok(())
@@ -683,7 +688,7 @@ pub struct SchedulerStats {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::{Config, Schema, Column, DataType};
+    use crate::{Column, Config, DataType, Schema};
 
     #[test]
     fn test_priority_ordering() {
@@ -777,9 +782,7 @@ mod tests {
         use crate::sql::LogicalPlan;
 
         let mv_catalog = MaterializedViewCatalog::new(&storage);
-        let schema = Schema::new(vec![
-            Column::new("count", DataType::Int8),
-        ]);
+        let schema = Schema::new(vec![Column::new("count", DataType::Int8)]);
 
         let query_plan = LogicalPlan::Scan {
             alias: None,

@@ -36,13 +36,13 @@ fn test_create_table_all_types() -> Result<()> {
             bigint_col BIGINT,
             text_col TEXT,
             varchar_col VARCHAR(100)
-        )"
+        )",
     )?;
 
     // Verify table creation by inserting data
     db.execute(
         "INSERT INTO all_types (id, bool_col, int_col, bigint_col, text_col, varchar_col)
-         VALUES (1, TRUE, 42, 9223372036854775807, 'text', 'varchar')"
+         VALUES (1, TRUE, 42, 9223372036854775807, 'text', 'varchar')",
     )?;
 
     let results = db.query("SELECT * FROM all_types", &[])?;
@@ -80,7 +80,7 @@ fn test_create_table_with_constraints() -> Result<()> {
             id INT PRIMARY KEY,
             name TEXT NOT NULL,
             email TEXT
-        )"
+        )",
     )?;
 
     // Insert valid data
@@ -101,7 +101,8 @@ fn test_insert_single_row() -> Result<()> {
     let db = create_test_db()?;
     setup_users_table(&db)?;
 
-    let affected = db.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@example.com', 30)")?;
+    let affected =
+        db.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@example.com', 30)")?;
     assert_eq!(affected, 1);
 
     let results = db.query("SELECT * FROM users", &[])?;
@@ -174,14 +175,14 @@ fn test_insert_very_long_strings() -> Result<()> {
 
     // Insert very long string (10KB)
     let long_string = "a".repeat(10_000);
-    db.execute(&format!("INSERT INTO long_strings (id, text_col) VALUES (1, '{}')", long_string))?;
+    db.execute(&format!(
+        "INSERT INTO long_strings (id, text_col) VALUES (1, '{}')",
+        long_string
+    ))?;
 
     let results = db.query("SELECT * FROM long_strings", &[])?;
     assert_eq!(results.len(), 1);
-    assert_eq!(
-        get_string_value(&results[0], 1).unwrap().len(),
-        10_000
-    );
+    assert_eq!(get_string_value(&results[0], 1).unwrap().len(), 10_000);
 
     Ok(())
 }
@@ -245,7 +246,8 @@ fn test_update_multiple_columns() -> Result<()> {
 
     db.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Alice', 'alice@example.com', 30)")?;
 
-    let affected = db.execute("UPDATE users SET name = 'Alicia', age = 31, email = 'alicia@example.com' WHERE id = 1")?;
+    let affected =
+        db.execute("UPDATE users SET name = 'Alicia', age = 31, email = 'alicia@example.com' WHERE id = 1")?;
     assert_eq!(affected, 1);
 
     let results = db.query("SELECT * FROM users WHERE id = 1", &[])?;

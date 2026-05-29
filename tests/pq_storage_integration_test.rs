@@ -12,11 +12,7 @@ mod tests {
         let mut rng = rand::thread_rng();
 
         (0..count)
-            .map(|_| {
-                (0..dimension)
-                    .map(|_| rng.gen_range(-1.0..1.0))
-                    .collect()
-            })
+            .map(|_| (0..dimension).map(|_| rng.gen_range(-1.0..1.0)).collect())
             .collect()
     }
 
@@ -71,15 +67,17 @@ mod tests {
         let pq_config = ProductQuantizerConfig::default_for_dimension(128).unwrap();
 
         // Create quantized index
-        manager.create_quantized_index(
-            "pq_idx".to_string(),
-            "documents".to_string(),
-            "embedding".to_string(),
-            128,
-            DistanceMetric::L2,
-            pq_config,
-            &training_vectors,
-        ).unwrap();
+        manager
+            .create_quantized_index(
+                "pq_idx".to_string(),
+                "documents".to_string(),
+                "embedding".to_string(),
+                128,
+                DistanceMetric::L2,
+                pq_config,
+                &training_vectors,
+            )
+            .unwrap();
 
         // Insert some vectors
         for (i, vector) in training_vectors.iter().take(100).enumerate() {
@@ -110,15 +108,17 @@ mod tests {
         let pq_config = ProductQuantizerConfig::default_for_dimension(128).unwrap();
 
         // Create quantized index
-        manager.create_quantized_index(
-            "pq_idx".to_string(),
-            "documents".to_string(),
-            "embedding".to_string(),
-            128,
-            DistanceMetric::L2,
-            pq_config,
-            &training_vectors,
-        ).unwrap();
+        manager
+            .create_quantized_index(
+                "pq_idx".to_string(),
+                "documents".to_string(),
+                "embedding".to_string(),
+                128,
+                DistanceMetric::L2,
+                pq_config,
+                &training_vectors,
+            )
+            .unwrap();
 
         // Insert vectors
         for (i, vector) in training_vectors.iter().take(100).enumerate() {
@@ -146,15 +146,17 @@ mod tests {
         let pq_config = ProductQuantizerConfig::default_for_dimension(128).unwrap();
 
         // Create quantized index
-        manager.create_quantized_index(
-            "pq_idx".to_string(),
-            "documents".to_string(),
-            "embedding".to_string(),
-            128,
-            DistanceMetric::L2,
-            pq_config,
-            &training_vectors,
-        ).unwrap();
+        manager
+            .create_quantized_index(
+                "pq_idx".to_string(),
+                "documents".to_string(),
+                "embedding".to_string(),
+                128,
+                DistanceMetric::L2,
+                pq_config,
+                &training_vectors,
+            )
+            .unwrap();
 
         // Insert vectors
         for (i, vector) in training_vectors.iter().take(50).enumerate() {
@@ -189,13 +191,15 @@ mod tests {
         let manager = VectorIndexManager::new();
 
         // Create standard index
-        manager.create_index(
-            "std_idx".to_string(),
-            "documents".to_string(),
-            "embedding".to_string(),
-            768,
-            DistanceMetric::L2,
-        ).unwrap();
+        manager
+            .create_index(
+                "std_idx".to_string(),
+                "documents".to_string(),
+                "embedding".to_string(),
+                768,
+                DistanceMetric::L2,
+            )
+            .unwrap();
 
         // Generate training vectors for PQ
         let training_vectors = generate_random_vectors(1000, 768);
@@ -204,15 +208,17 @@ mod tests {
         let pq_config = ProductQuantizerConfig::default_for_dimension(768).unwrap();
 
         // Create quantized index
-        manager.create_quantized_index(
-            "pq_idx".to_string(),
-            "documents".to_string(),
-            "embedding".to_string(),
-            768,
-            DistanceMetric::L2,
-            pq_config,
-            &training_vectors,
-        ).unwrap();
+        manager
+            .create_quantized_index(
+                "pq_idx".to_string(),
+                "documents".to_string(),
+                "embedding".to_string(),
+                768,
+                DistanceMetric::L2,
+                pq_config,
+                &training_vectors,
+            )
+            .unwrap();
 
         // Insert same vectors into both indexes
         for (i, vector) in training_vectors.iter().take(100).enumerate() {
@@ -226,8 +232,10 @@ mod tests {
 
         println!("Standard index memory: {} bytes", std_stats.memory_bytes);
         println!("PQ index memory: {} bytes", pq_stats.memory_bytes);
-        println!("Compression ratio: {:.2}x",
-            std_stats.memory_bytes as f32 / pq_stats.memory_bytes as f32);
+        println!(
+            "Compression ratio: {:.2}x",
+            std_stats.memory_bytes as f32 / pq_stats.memory_bytes as f32
+        );
 
         // Note: For small datasets (100 vectors), PQ overhead (codebooks) may exceed savings
         // Memory efficiency is more visible with larger datasets (1000+ vectors)
@@ -257,7 +265,11 @@ mod tests {
                 &training_vectors,
             );
 
-            assert!(result.is_ok(), "Failed to create index with {} subquantizers", num_subquantizers);
+            assert!(
+                result.is_ok(),
+                "Failed to create index with {} subquantizers",
+                num_subquantizers
+            );
 
             // Insert and search
             for (i, vector) in training_vectors.iter().take(50).enumerate() {
@@ -282,15 +294,17 @@ mod tests {
             let index_name = format!("pq_idx_{}", i);
             let table_name = format!("table_{}", i);
 
-            manager.create_quantized_index(
-                index_name.clone(),
-                table_name,
-                "embedding".to_string(),
-                128,
-                DistanceMetric::L2,
-                pq_config,
-                &training_vectors,
-            ).unwrap();
+            manager
+                .create_quantized_index(
+                    index_name.clone(),
+                    table_name,
+                    "embedding".to_string(),
+                    128,
+                    DistanceMetric::L2,
+                    pq_config,
+                    &training_vectors,
+                )
+                .unwrap();
 
             // Insert vectors
             for (j, vector) in training_vectors.iter().take(50).enumerate() {

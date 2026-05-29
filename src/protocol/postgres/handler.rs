@@ -3,7 +3,7 @@
 //! This module implements the PostgreSQL wire protocol handler that processes
 //! client messages and generates appropriate responses.
 
-use crate::{Result, Error, EmbeddedDatabase, Tuple, Value, Schema};
+use crate::{EmbeddedDatabase, Error, Result, Schema, Tuple, Value};
 
 /// Case-insensitive prefix check without allocating a new String.
 #[inline]
@@ -11,24 +11,20 @@ pub(super) fn starts_with_icase(s: &str, prefix: &str) -> bool {
     // Safety: length is checked on the left side of &&
     #[allow(clippy::indexing_slicing)]
     {
-        s.len() >= prefix.len()
-            && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+        s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
     }
 }
-use super::messages::{
-    FrontendMessage, BackendMessage, AuthenticationMessage,
-    TransactionStatus, FieldDescription,
-};
 use super::auth::{AuthManager, AuthMethod, ScramAuthState};
 use super::catalog::PgCatalog;
+use super::messages::{AuthenticationMessage, BackendMessage, FieldDescription, FrontendMessage, TransactionStatus};
 use super::prepared::PreparedStatementManager;
 use super::ssl::SecureConnection;
-use bytes::{BytesMut, BufMut};
+use bytes::{BufMut, BytesMut};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
 use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
-use std::sync::Arc;
 
 /// PostgreSQL connection handler
 ///
@@ -86,11 +82,7 @@ impl PgConnectionHandler<BufWriter<TcpStream>> {
 #[cfg(unix)]
 impl PgConnectionHandler<BufWriter<UnixStream>> {
     /// Create a new connection handler bound to a Unix domain socket stream.
-    pub fn new_unix(
-        stream: UnixStream,
-        database: Arc<EmbeddedDatabase>,
-        auth_manager: Arc<AuthManager>,
-    ) -> Self {
+    pub fn new_unix(stream: UnixStream, database: Arc<EmbeddedDatabase>, auth_manager: Arc<AuthManager>) -> Self {
         Self {
             stream: BufWriter::new(stream),
             database: database.clone(),
@@ -179,7 +171,7 @@ where
                     tracing::debug!("Received message: {:?}", msg);
                     if let Err(e) = self.handle_message(msg).await {
                         tracing::error!("Error handling message: {}", e);
-                        self.send_error("ERROR", "XX000", &e.to_string(), None, None).await?;
+                        self.send_error_for_query(&e).await?;
                     }
                 }
                 Ok(None) => {
@@ -210,7 +202,9 @@ where
         } else {
             // Read startup message length from stream
             let mut buf = [0u8; 4];
-            self.stream.read_exact(&mut buf).await
+            self.stream
+                .read_exact(&mut buf)
+                .await
                 .map_err(|e| Error::network(format!("Failed to read startup length: {}", e)))?;
             len_buf = buf;
             self.buffer.extend_from_slice(&len_buf);
@@ -224,7 +218,9 @@ where
 
         if bytes_needed > 0 {
             let mut remaining_buf = vec![0u8; bytes_needed];
-            self.stream.read_exact(&mut remaining_buf).await
+            self.stream
+                .read_exact(&mut remaining_buf)
+                .await
                 .map_err(|e| Error::network(format!("Failed to read startup message: {}", e)))?;
             self.buffer.extend_from_slice(&remaining_buf);
         }
@@ -233,7 +229,11 @@ where
         let msg = FrontendMessage::parse_startup(&mut self.buffer)?
             .ok_or_else(|| Error::protocol("Invalid startup message"))?;
 
-        if let FrontendMessage::Startup { protocol_version, params } = msg {
+        if let FrontendMessage::Startup {
+            protocol_version,
+            params,
+        } = msg
+        {
             tracing::info!("Protocol version: {}, params: {:?}", protocol_version, params);
 
             self.username = params.get("user").cloned();
@@ -245,9 +245,7 @@ where
             // are accepted. An empty / missing `database` parameter
             // falls back to the username, matching libpq behaviour;
             // we still validate that fallback.
-            if let Some(requested) = params.get("database").cloned()
-                .or_else(|| params.get("user").cloned())
-            {
+            if let Some(requested) = params.get("database").cloned().or_else(|| params.get("user").cloned()) {
                 if !self.database.database_name_is_valid(&requested) {
                     return Err(Error::authentication(format!(
                         "database \"{requested}\" does not exist"
@@ -262,14 +260,15 @@ where
                     self.send_auth_ok().await?;
                 }
                 AuthMethod::CleartextPassword => {
-                    self.send_message(BackendMessage::Authentication(
-                        AuthenticationMessage::CleartextPassword
-                    )).await?;
+                    self.send_message(BackendMessage::Authentication(AuthenticationMessage::CleartextPassword))
+                        .await?;
                     self.flush().await?; // Client must read challenge before responding
 
                     // Wait for password message
                     if let Some(FrontendMessage::PasswordMessage { password }) = self.read_message().await? {
-                        let username = self.username.as_ref()
+                        let username = self
+                            .username
+                            .as_ref()
                             .ok_or_else(|| Error::authentication("No username provided"))?;
 
                         if self.auth_manager.verify_cleartext(username, &password)? {
@@ -297,7 +296,8 @@ where
             self.send_parameter_status(
                 "server_version",
                 &format!("16.0 (HeliosDB Nano {})", env!("CARGO_PKG_VERSION")),
-            ).await?;
+            )
+            .await?;
             self.send_parameter_status("server_encoding", "UTF8").await?;
             self.send_parameter_status("client_encoding", "UTF8").await?;
             self.send_parameter_status("DateStyle", "ISO, MDY").await?;
@@ -308,7 +308,8 @@ where
             self.send_message(BackendMessage::BackendKeyData {
                 process_id: std::process::id() as i32,
                 secret_key: rand::random(),
-            }).await?;
+            })
+            .await?;
 
             // Send ready for query
             self.send_ready_for_query().await?;
@@ -370,11 +371,22 @@ where
             FrontendMessage::Query { query } => {
                 self.handle_query(&query).await?;
             }
-            FrontendMessage::Parse { statement_name, query, param_types } => {
+            FrontendMessage::Parse {
+                statement_name,
+                query,
+                param_types,
+            } => {
                 self.handle_parse_extended(statement_name, query, param_types).await?;
             }
-            FrontendMessage::Bind { portal_name, statement_name, param_formats, params, result_formats } => {
-                self.handle_bind_extended(portal_name, statement_name, param_formats, params, result_formats).await?;
+            FrontendMessage::Bind {
+                portal_name,
+                statement_name,
+                param_formats,
+                params,
+                result_formats,
+            } => {
+                self.handle_bind_extended(portal_name, statement_name, param_formats, params, result_formats)
+                    .await?;
             }
             FrontendMessage::Execute { portal_name, max_rows } => {
                 self.handle_execute_extended(portal_name, max_rows).await?;
@@ -475,7 +487,11 @@ where
 
         // Handle transaction commands (case-insensitive without allocation)
         let trimmed = query.trim();
-        if trimmed.eq_ignore_ascii_case("BEGIN") || starts_with_icase(trimmed, "BEGIN ") || trimmed.eq_ignore_ascii_case("START TRANSACTION") || starts_with_icase(trimmed, "START TRANSACTION ") {
+        if trimmed.eq_ignore_ascii_case("BEGIN")
+            || starts_with_icase(trimmed, "BEGIN ")
+            || trimmed.eq_ignore_ascii_case("START TRANSACTION")
+            || starts_with_icase(trimmed, "START TRANSACTION ")
+        {
             // Parse isolation level if specified
             // Supported: BEGIN [TRANSACTION] [ISOLATION LEVEL {READ UNCOMMITTED | READ COMMITTED | REPEATABLE READ | SERIALIZABLE}]
             let isolation_level = Self::parse_isolation_level(trimmed);
@@ -487,7 +503,8 @@ where
                     severity: "WARNING".to_string(),
                     code: "25001".to_string(),
                     message: "there is already a transaction in progress".to_string(),
-                }).await?;
+                })
+                .await?;
             } else {
                 // Begin transaction (isolation level would be applied if storage supported it)
                 // For now we just begin - isolation level is informational
@@ -502,20 +519,31 @@ where
             self.send_command_complete("BEGIN").await?;
             self.send_ready_for_query().await?;
             return Ok(());
-        } else if starts_with_icase(trimmed, "SET TRANSACTION ISOLATION LEVEL ") || starts_with_icase(trimmed, "SET SESSION CHARACTERISTICS") {
+        } else if starts_with_icase(trimmed, "SET TRANSACTION ISOLATION LEVEL ")
+            || starts_with_icase(trimmed, "SET SESSION CHARACTERISTICS")
+        {
             // SET TRANSACTION ISOLATION LEVEL is valid before any queries in a transaction
             let level = Self::parse_isolation_level(trimmed);
             if level.is_some() {
                 self.send_command_complete("SET").await?;
             } else {
-                self.send_error("ERROR", "22023", "Invalid isolation level", None, None).await?;
+                self.send_error("ERROR", "22023", "Invalid isolation level", None, None)
+                    .await?;
                 return Ok(());
             }
             self.send_ready_for_query().await?;
             return Ok(());
-        } else if starts_with_icase(trimmed, "SET ") && !starts_with_icase(trimmed, "SET TRANSACTION") && !starts_with_icase(trimmed, "SET SESSION") {
-            // Handle generic SET commands for client compatibility (e.g., SET client_encoding = 'UTF8')
-            // Accept silently - these configure client-side parameters
+        } else if starts_with_icase(trimmed, "SET ")
+            && !starts_with_icase(trimmed, "SET TRANSACTION")
+            && !starts_with_icase(trimmed, "SET SESSION")
+        {
+            if EmbeddedDatabase::is_fk_setting_statement(trimmed) {
+                if let Err(e) = self.database.execute(trimmed) {
+                    self.send_error("ERROR", "22023", &e.to_string(), None, None).await?;
+                    return Ok(());
+                }
+            }
+            // Handle generic SET commands for client compatibility (e.g., SET client_encoding = 'UTF8').
             self.send_command_complete("SET").await?;
             self.send_ready_for_query().await?;
             return Ok(());
@@ -523,9 +551,7 @@ where
             // Handle SHOW commands for client compatibility
             let param = trimmed[5..].trim().trim_end_matches(';').trim();
             let (col_name, value) = Self::resolve_show_parameter(param);
-            let schema = Schema::new(vec![
-                crate::Column::new(&col_name, crate::DataType::Text),
-            ]);
+            let schema = Schema::new(vec![crate::Column::new(&col_name, crate::DataType::Text)]);
             let row = Tuple::new(vec![Value::String(value)]);
             self.send_query_result(schema, vec![row]).await?;
             self.send_ready_for_query().await?;
@@ -540,7 +566,10 @@ where
                     "table_info" => {
                         let table = arg.unwrap_or_default();
                         // strip surrounding quotes / brackets
-                        let table = table.trim().trim_matches(|c| c == '\'' || c == '"' || c == '`').to_string();
+                        let table = table
+                            .trim()
+                            .trim_matches(|c| c == '\'' || c == '"' || c == '`')
+                            .to_string();
                         let rows = self.pragma_table_info(&table)?;
                         let schema = Schema::new(vec![
                             crate::Column::new("cid", crate::DataType::Int4),
@@ -573,12 +602,19 @@ where
             // Handle commit even if no transaction active (PostgreSQL warns but succeeds)
             if self.transaction_status == TransactionStatus::InTransaction {
                 self.database.commit()?;
+            } else if self.transaction_status == TransactionStatus::Failed {
+                self.database.rollback()?;
+                self.transaction_status = TransactionStatus::Idle;
+                self.send_command_complete("ROLLBACK").await?;
+                self.send_ready_for_query().await?;
+                return Ok(());
             } else {
                 self.send_message(BackendMessage::NoticeResponse {
                     severity: "WARNING".to_string(),
                     code: "25P01".to_string(),
                     message: "there is no transaction in progress".to_string(),
-                }).await?;
+                })
+                .await?;
             }
             self.transaction_status = TransactionStatus::Idle;
             self.send_command_complete("COMMIT").await?;
@@ -586,18 +622,34 @@ where
             return Ok(());
         } else if trimmed.eq_ignore_ascii_case("ROLLBACK") {
             // Handle rollback even if no transaction active (PostgreSQL warns but succeeds)
-            if self.transaction_status == TransactionStatus::InTransaction {
+            if matches!(
+                self.transaction_status,
+                TransactionStatus::InTransaction | TransactionStatus::Failed
+            ) {
                 self.database.rollback()?;
             } else {
                 self.send_message(BackendMessage::NoticeResponse {
                     severity: "WARNING".to_string(),
                     code: "25P01".to_string(),
                     message: "there is no transaction in progress".to_string(),
-                }).await?;
+                })
+                .await?;
             }
             self.transaction_status = TransactionStatus::Idle;
             self.send_command_complete("ROLLBACK").await?;
             self.send_ready_for_query().await?;
+            return Ok(());
+        }
+
+        if self.transaction_status == TransactionStatus::Failed {
+            self.send_error(
+                "ERROR",
+                "25P02",
+                "current transaction is aborted, commands ignored until end of transaction block",
+                None,
+                Some("Use ROLLBACK to clear the failed transaction state".to_string()),
+            )
+            .await?;
             return Ok(());
         }
 
@@ -637,7 +689,13 @@ where
                                     self.send_ready_for_query().await?;
                                     return Ok(());
                                 }
-                                Ok(ForwardedResult::Error { severity, code, message, detail, hint }) => {
+                                Ok(ForwardedResult::Error {
+                                    severity,
+                                    code,
+                                    message,
+                                    detail,
+                                    hint,
+                                }) => {
                                     self.send_error(&severity, &code, &message, detail, hint).await?;
                                     self.send_ready_for_query().await?;
                                     return Ok(());
@@ -649,7 +707,8 @@ where
                                         &format!("Failed to forward query to primary: {}", e),
                                         None,
                                         Some("Check primary connectivity".to_string()),
-                                    ).await?;
+                                    )
+                                    .await?;
                                     self.send_ready_for_query().await?;
                                     return Ok(());
                                 }
@@ -662,7 +721,8 @@ where
                                 "cannot execute write operations: primary connection not established",
                                 None,
                                 Some("Standby is still connecting to primary".to_string()),
-                            ).await?;
+                            )
+                            .await?;
                             self.send_ready_for_query().await?;
                             return Ok(());
                         }
@@ -702,23 +762,30 @@ where
         if is_select {
             let (results, columns) = self.database.query_with_columns(query)?;
             let schema = if !columns.is_empty() {
-                Schema::new(columns.iter().enumerate().map(|(i, name)| {
-                    let data_type = results.first()
-                        .and_then(|r| r.values.get(i))
-                        .map(Value::data_type)
-                        .unwrap_or(crate::DataType::Text);
-                    crate::Column {
-                        name: name.clone(),
-                        data_type,
-                        nullable: true,
-                        primary_key: false,
-                        source_table: None,
-                        source_table_name: None,
-                        default_expr: None,
-                        unique: false,
-                        storage_mode: crate::ColumnStorageMode::Default,
-                    }
-                }).collect())
+                Schema::new(
+                    columns
+                        .iter()
+                        .enumerate()
+                        .map(|(i, name)| {
+                            let data_type = results
+                                .first()
+                                .and_then(|r| r.values.get(i))
+                                .map(Value::data_type)
+                                .unwrap_or(crate::DataType::Text);
+                            crate::Column {
+                                name: name.clone(),
+                                data_type,
+                                nullable: true,
+                                primary_key: false,
+                                source_table: None,
+                                source_table_name: None,
+                                default_expr: None,
+                                unique: false,
+                                storage_mode: crate::ColumnStorageMode::Default,
+                            }
+                        })
+                        .collect(),
+                )
             } else if !results.is_empty() {
                 results[0].schema()
             } else {
@@ -734,14 +801,13 @@ where
                 self.send_command_complete(&tag).await?;
             } else {
                 // Derive schema from plan for proper column names
-                let schema = self.derive_returning_schema(query)
-                    .unwrap_or_else(|_| {
-                        if let Some(first) = tuples.first() {
-                            first.schema()
-                        } else {
-                            Schema::new(vec![])
-                        }
-                    });
+                let schema = self.derive_returning_schema(query).unwrap_or_else(|_| {
+                    if let Some(first) = tuples.first() {
+                        first.schema()
+                    } else {
+                        Schema::new(vec![])
+                    }
+                });
                 self.send_query_result(schema, tuples).await?;
             }
         } else {
@@ -761,9 +827,8 @@ where
     #[allow(clippy::indexing_slicing)]
     async fn handle_scram_authentication(&mut self) -> Result<()> {
         // Send AuthenticationSASL with SCRAM-SHA-256 mechanism
-        self.send_message(BackendMessage::Authentication(
-            AuthenticationMessage::ScramSha256
-        )).await?;
+        self.send_message(BackendMessage::Authentication(AuthenticationMessage::ScramSha256))
+            .await?;
         self.flush().await?; // Client must read challenge before responding
 
         // Wait for client-first-message (SASL initial response)
@@ -773,11 +838,8 @@ where
         // "SCRAM-SHA-256" — every libpq client then failed
         // `parse_scram_client_first` with "missing GS2 authzid slot".
         let client_first = match self.read_message().await? {
-            Some(FrontendMessage::SaslInitialResponse { mechanism: _, data }) => {
-                String::from_utf8(data).map_err(|e| {
-                    Error::protocol(format!("SCRAM client-first-message not UTF-8: {}", e))
-                })?
-            }
+            Some(FrontendMessage::SaslInitialResponse { mechanism: _, data }) => String::from_utf8(data)
+                .map_err(|e| Error::protocol(format!("SCRAM client-first-message not UTF-8: {}", e)))?,
             Some(FrontendMessage::PasswordMessage { password }) => password,
             _ => return Err(Error::protocol("Expected SASL initial response")),
         };
@@ -792,23 +854,24 @@ where
         // SCRAM `n=` field is empty. Source the real username from the
         // StartupMessage that was stored on `self.username` during the
         // startup phase.
-        let (_scram_user_unused, client_nonce_owned) =
-            super::auth::parse_scram_client_first(&client_first)?;
-        let username_owned = self.username.clone().ok_or_else(|| {
-            Error::authentication(
-                "SCRAM authentication started without a startup-time user name",
-            )
-        })?;
+        let (_scram_user_unused, client_nonce_owned) = super::auth::parse_scram_client_first(&client_first)?;
+        let username_owned = self
+            .username
+            .clone()
+            .ok_or_else(|| Error::authentication("SCRAM authentication started without a startup-time user name"))?;
         let username: &str = &username_owned;
         let client_nonce: &str = &client_nonce_owned;
 
         tracing::info!("SCRAM authentication for user: {}", username);
 
         // Get user credentials from password store
-        let password_store = self.auth_manager.password_store()
+        let password_store = self
+            .auth_manager
+            .password_store()
             .ok_or_else(|| Error::authentication("SCRAM password store not configured"))?;
 
-        let credentials = password_store.get_credentials(username)
+        let credentials = password_store
+            .get_credentials(username)
             .ok_or_else(|| Error::authentication("User not found"))?;
 
         // Create SCRAM state
@@ -832,18 +895,16 @@ where
         self.send_message(BackendMessage::Authentication(
             AuthenticationMessage::ScramSha256Continue {
                 data: server_first.as_bytes().to_vec(),
-            }
-        )).await?;
+            },
+        ))
+        .await?;
         self.flush().await?; // Client must read continue before responding
 
         // Wait for client-final-message. BUG-003 (Perf-73): SCRAM client-final
         // arrives as a SASLResponse (no mechanism prefix), not a PasswordMessage.
         let client_final = match self.read_message().await? {
-            Some(FrontendMessage::SaslResponse { data }) => {
-                String::from_utf8(data).map_err(|e| {
-                    Error::protocol(format!("SCRAM client-final-message not UTF-8: {}", e))
-                })?
-            }
+            Some(FrontendMessage::SaslResponse { data }) => String::from_utf8(data)
+                .map_err(|e| Error::protocol(format!("SCRAM client-final-message not UTF-8: {}", e)))?,
             Some(FrontendMessage::PasswordMessage { password }) => password,
             _ => return Err(Error::protocol("Expected SASL response")),
         };
@@ -858,17 +919,17 @@ where
         }
 
         // Extract proof
-        let proof_part = final_parts.iter()
+        let proof_part = final_parts
+            .iter()
             .find(|p| p.starts_with("p="))
             .ok_or_else(|| Error::protocol("Missing proof in client-final-message"))?;
-        let client_proof_b64 = proof_part.strip_prefix("p=")
+        let client_proof_b64 = proof_part
+            .strip_prefix("p=")
             .ok_or_else(|| Error::protocol("Invalid proof format"))?;
 
         // Build client-final-message-without-proof
-        let client_final_without_proof: Vec<&str> = final_parts.iter()
-            .filter(|p| !p.starts_with("p="))
-            .copied()
-            .collect();
+        let client_final_without_proof: Vec<&str> =
+            final_parts.iter().filter(|p| !p.starts_with("p=")).copied().collect();
         let client_final_without_proof = client_final_without_proof.join(",");
 
         // Verify client proof and get server signature
@@ -890,8 +951,9 @@ where
         self.send_message(BackendMessage::Authentication(
             AuthenticationMessage::ScramSha256Final {
                 data: server_final.as_bytes().to_vec(),
-            }
-        )).await?;
+            },
+        ))
+        .await?;
 
         // Authentication successful
         self.authenticated = true;
@@ -944,10 +1006,7 @@ where
 
         // Send DataRows
         for row in rows {
-            let values: Vec<Option<Vec<u8>>> = row
-                .iter()
-                .map(|v| v.as_ref().map(|s| s.as_bytes().to_vec()))
-                .collect();
+            let values: Vec<Option<Vec<u8>>> = row.iter().map(|v| v.as_ref().map(|s| s.as_bytes().to_vec())).collect();
             self.send_message(BackendMessage::DataRow { values }).await?;
         }
 
@@ -963,7 +1022,9 @@ where
     pub(super) async fn send_message(&mut self, msg: BackendMessage) -> Result<()> {
         self.write_buf.clear();
         msg.encode(&mut self.write_buf);
-        self.stream.write_all(&self.write_buf).await
+        self.stream
+            .write_all(&self.write_buf)
+            .await
             .map_err(|e| Error::network(format!("Failed to send message: {}", e)))?;
         Ok(())
     }
@@ -1081,7 +1142,9 @@ where
                     self.write_buf.put_i32(0);
                     self.write_buf.put_u8(b'{');
                     for (i, v) in arr.iter().enumerate() {
-                        if i > 0 { self.write_buf.put_u8(b','); }
+                        if i > 0 {
+                            self.write_buf.put_u8(b',');
+                        }
                         match v {
                             Value::String(s) => {
                                 self.write_buf.put_u8(b'"');
@@ -1106,7 +1169,9 @@ where
                     self.write_buf.put_i32(0);
                     self.write_buf.put_u8(b'{');
                     for (i, x) in v.iter().enumerate() {
-                        if i > 0 { self.write_buf.put_u8(b','); }
+                        if i > 0 {
+                            self.write_buf.put_u8(b',');
+                        }
                         let s = ryu_buf.format(*x);
                         self.write_buf.put_slice(s.as_bytes());
                     }
@@ -1135,20 +1200,25 @@ where
         let msg_len = (self.write_buf.len() - length_pos) as i32;
         self.write_buf[length_pos..length_pos + 4].copy_from_slice(&msg_len.to_be_bytes());
 
-        self.stream.write_all(&self.write_buf).await
+        self.stream
+            .write_all(&self.write_buf)
+            .await
             .map_err(|e| Error::network(format!("Failed to send message: {}", e)))?;
         Ok(())
     }
 
     /// Flush all buffered writes to the client.
     async fn flush(&mut self) -> Result<()> {
-        self.stream.flush().await
+        self.stream
+            .flush()
+            .await
             .map_err(|e| Error::network(format!("Failed to flush stream: {}", e)))
     }
 
     /// Send authentication OK
     async fn send_auth_ok(&mut self) -> Result<()> {
-        self.send_message(BackendMessage::Authentication(AuthenticationMessage::Ok)).await
+        self.send_message(BackendMessage::Authentication(AuthenticationMessage::Ok))
+            .await
     }
 
     /// Send parameter status
@@ -1156,7 +1226,8 @@ where
         self.send_message(BackendMessage::ParameterStatus {
             name: name.to_string(),
             value: value.to_string(),
-        }).await
+        })
+        .await
     }
 
     /// Send ready for query (flushes all buffered writes)
@@ -1202,10 +1273,7 @@ where
         for stmt in &statements {
             if let Err(e) = self.database.execute(stmt) {
                 if pg_exception_matches(&exception_codes, &e.to_string()) {
-                    tracing::debug!(
-                        "DO block: caught {:?} via EXCEPTION clause; continuing",
-                        e.to_string()
-                    );
+                    tracing::debug!("DO block: caught {:?} via EXCEPTION clause; continuing", e.to_string());
                     continue;
                 }
                 self.suppress_ready_for_query = prev;
@@ -1226,19 +1294,26 @@ where
         }
         self.send_message(BackendMessage::ReadyForQuery {
             status: self.transaction_status,
-        }).await?;
+        })
+        .await?;
         self.flush().await
     }
 
     /// Send command complete
     pub(super) async fn send_command_complete(&mut self, tag: &str) -> Result<()> {
-        self.send_message(BackendMessage::CommandComplete {
-            tag: tag.to_string(),
-        }).await
+        self.send_message(BackendMessage::CommandComplete { tag: tag.to_string() })
+            .await
     }
 
     /// Send error response
-    async fn send_error(&mut self, severity: &str, code: &str, message: &str, detail: Option<String>, hint: Option<String>) -> Result<()> {
+    async fn send_error(
+        &mut self,
+        severity: &str,
+        code: &str,
+        message: &str,
+        detail: Option<String>,
+        hint: Option<String>,
+    ) -> Result<()> {
         self.send_message(BackendMessage::ErrorResponse {
             severity: severity.to_string(),
             code: code.to_string(),
@@ -1246,8 +1321,42 @@ where
             detail,
             hint,
             position: None,
-        }).await?;
+        })
+        .await?;
         self.send_ready_for_query().await
+    }
+
+    async fn send_error_for_query(&mut self, error: &Error) -> Result<()> {
+        if self.transaction_status == TransactionStatus::InTransaction {
+            self.transaction_status = TransactionStatus::Failed;
+        }
+        self.suppress_ready_for_query = false;
+        let code = Self::sqlstate_for_error(error);
+        self.send_error("ERROR", code, &error.to_string(), None, None).await
+    }
+
+    fn sqlstate_for_error(error: &Error) -> &'static str {
+        match error {
+            Error::ConstraintViolation(message) => {
+                let lower = message.to_ascii_lowercase();
+                if lower.contains("duplicate") || lower.contains("unique") {
+                    "23505"
+                } else if lower.contains("foreign key") {
+                    "23503"
+                } else if lower.contains("check") {
+                    "23514"
+                } else {
+                    "23000"
+                }
+            }
+            Error::SqlParse(_) => "42601",
+            Error::TypeConversion(_) => "42804",
+            Error::Transaction(_) => "25000",
+            Error::Protocol(_) => "08P01",
+            Error::QueryTimeout(_) => "57014",
+            Error::QueryCancelled(_) => "57014",
+            _ => "XX000",
+        }
     }
 
     /// SQLite-shaped `PRAGMA table_info(t)` rows.
@@ -1278,23 +1387,24 @@ where
     /// Derive schema for a DML statement with RETURNING clause
     fn derive_returning_schema(&self, sql: &str) -> Result<Schema> {
         let catalog = self.database.storage.catalog();
-        let planner = crate::sql::planner::Planner::with_catalog(&catalog)
-            .with_sql(sql.to_string());
+        let planner = crate::sql::planner::Planner::with_catalog(&catalog).with_sql(sql.to_string());
         let (statement, _) = self.database.parse_cached(sql)?;
         let plan = planner.statement_to_plan(statement)?;
 
         // Extract table name and returning items from the plan
         let (table_name, returning_items) = match &plan {
-            crate::sql::LogicalPlan::Insert { table_name, returning, .. }
-            | crate::sql::LogicalPlan::InsertSelect { table_name, returning, .. } => {
-                (table_name.as_str(), returning.as_ref())
+            crate::sql::LogicalPlan::Insert {
+                table_name, returning, ..
             }
-            crate::sql::LogicalPlan::Update { table_name, returning, .. } => {
-                (table_name.as_str(), returning.as_ref())
-            }
-            crate::sql::LogicalPlan::Delete { table_name, returning, .. } => {
-                (table_name.as_str(), returning.as_ref())
-            }
+            | crate::sql::LogicalPlan::InsertSelect {
+                table_name, returning, ..
+            } => (table_name.as_str(), returning.as_ref()),
+            crate::sql::LogicalPlan::Update {
+                table_name, returning, ..
+            } => (table_name.as_str(), returning.as_ref()),
+            crate::sql::LogicalPlan::Delete {
+                table_name, returning, ..
+            } => (table_name.as_str(), returning.as_ref()),
             _ => return Err(crate::Error::query_execution("Not a DML statement")),
         };
 
@@ -1345,8 +1455,7 @@ where
             "server_encoding" => "UTF8".to_string(),
             "client_encoding" => "UTF8".to_string(),
             "standard_conforming_strings" => "on".to_string(),
-            "transaction_isolation" | "transaction isolation level" =>
-                "read committed".to_string(),
+            "transaction_isolation" | "transaction isolation level" => "read committed".to_string(),
             "datestyle" => "ISO, MDY".to_string(),
             "timezone" | "time zone" => "UTC".to_string(),
             "integer_datetimes" => "on".to_string(),
@@ -1365,7 +1474,8 @@ where
         // Find "ISOLATION LEVEL" case-insensitively without allocating
         let query_bytes = query.as_bytes();
         let needle = b"ISOLATION LEVEL";
-        let pos = query_bytes.windows(needle.len())
+        let pos = query_bytes
+            .windows(needle.len())
             .position(|w| w.eq_ignore_ascii_case(needle))?;
         let rest = query[pos + needle.len()..].trim();
         if starts_with_icase(rest, "READ UNCOMMITTED") {
@@ -1384,17 +1494,21 @@ where
 
 /// Convert Schema to FieldDescriptions
 pub(super) fn schema_to_field_descriptions(schema: &Schema) -> Vec<FieldDescription> {
-    schema.columns.iter().map(|col| {
-        FieldDescription {
-            name: col.name.clone(),
-            table_oid: 0,
-            column_attr_num: 0,
-            data_type_oid: datatype_to_oid(&col.data_type),
-            data_type_size: datatype_to_size(&col.data_type),
-            type_modifier: -1,
-            format_code: 0, // text format
-        }
-    }).collect()
+    schema
+        .columns
+        .iter()
+        .map(|col| {
+            FieldDescription {
+                name: col.name.clone(),
+                table_oid: 0,
+                column_attr_num: 0,
+                data_type_oid: datatype_to_oid(&col.data_type),
+                data_type_size: datatype_to_size(&col.data_type),
+                type_modifier: -1,
+                format_code: 0, // text format
+            }
+        })
+        .collect()
 }
 
 /// Convert DataType to PostgreSQL OID
@@ -1415,7 +1529,7 @@ pub(super) fn datatype_to_oid(dt: &crate::DataType) -> i32 {
         crate::DataType::Time => 1083,
         crate::DataType::Uuid => 2950,
         crate::DataType::Vector(_) => 1000, // Custom type
-        _ => 705, // Unknown
+        _ => 705,                           // Unknown
     }
 }
 
@@ -1438,78 +1552,85 @@ pub(super) fn datatype_to_size(dt: &crate::DataType) -> i16 {
 /// Convert Tuple to PostgreSQL wire format values.
 /// Uses itoa/ryu for fast numeric formatting (avoids String allocation per value).
 pub(super) fn tuple_to_pg_values(tuple: &Tuple) -> Vec<Option<Vec<u8>>> {
-    tuple.values.iter().map(|val| {
-        match val {
-            Value::Null => None,
-            Value::Boolean(b) => Some(if *b { b"t" } else { b"f" }.to_vec()),
-            Value::Int2(i) => Some(itoa::Buffer::new().format(*i).as_bytes().to_vec()),
-            Value::Int4(i) => Some(itoa::Buffer::new().format(*i).as_bytes().to_vec()),
-            Value::Int8(i) => Some(itoa::Buffer::new().format(*i).as_bytes().to_vec()),
-            Value::Float4(f) => Some(ryu::Buffer::new().format(*f).as_bytes().to_vec()),
-            Value::Float8(f) => Some(ryu::Buffer::new().format(*f).as_bytes().to_vec()),
-            Value::String(s) => Some(s.as_bytes().to_vec()),
-            Value::Bytes(b) => Some(b.clone()),
-            Value::Json(j) => Some(j.to_string().into_bytes()),
-            Value::Numeric(n) => Some(n.as_bytes().to_vec()),
-            Value::Uuid(u) => Some(u.to_string().into_bytes()),
-            // PostgreSQL timestamp wire format: microsecond precision,
-            // space separator, no trailing timezone on `timestamp without
-            // time zone` columns. psycopg's native parser rejects
-            // `rfc3339` nanosecond output ("timestamp too large (after
-            // year 10K)") — PG itself truncates to 6 fractional digits.
-            Value::Timestamp(ts) => Some(
-                ts.naive_utc()
-                    .format("%Y-%m-%d %H:%M:%S%.6f")
-                    .to_string()
-                    .into_bytes()
-            ),
-            Value::Date(d) => Some(d.format("%Y-%m-%d").to_string().into_bytes()),
-            // Same story for TIME — truncate to microseconds.
-            Value::Time(t) => Some(t.format("%H:%M:%S%.6f").to_string().into_bytes()),
-            Value::Interval(micros) => {
-                let total_secs = micros / 1_000_000;
-                let days = total_secs / 86400;
-                let hours = (total_secs % 86400) / 3600;
-                let mins = (total_secs % 3600) / 60;
-                let secs = total_secs % 60;
-                let s = if days > 0 {
-                    format!("{} days {:02}:{:02}:{:02}", days, hours, mins, secs)
-                } else {
-                    format!("{:02}:{:02}:{:02}", hours, mins, secs)
-                };
-                Some(s.into_bytes())
-            }
-            Value::Array(arr) => {
-                let mut buf = String::with_capacity(arr.len() * 8 + 2);
-                buf.push('{');
-                for (i, v) in arr.iter().enumerate() {
-                    if i > 0 { buf.push(','); }
-                    match v {
-                        Value::String(s) => { buf.push('"'); buf.push_str(s); buf.push('"'); }
-                        Value::Null => buf.push_str("NULL"),
-                        other => buf.push_str(&other.to_string()),
+    tuple
+        .values
+        .iter()
+        .map(|val| {
+            match val {
+                Value::Null => None,
+                Value::Boolean(b) => Some(if *b { b"t" } else { b"f" }.to_vec()),
+                Value::Int2(i) => Some(itoa::Buffer::new().format(*i).as_bytes().to_vec()),
+                Value::Int4(i) => Some(itoa::Buffer::new().format(*i).as_bytes().to_vec()),
+                Value::Int8(i) => Some(itoa::Buffer::new().format(*i).as_bytes().to_vec()),
+                Value::Float4(f) => Some(ryu::Buffer::new().format(*f).as_bytes().to_vec()),
+                Value::Float8(f) => Some(ryu::Buffer::new().format(*f).as_bytes().to_vec()),
+                Value::String(s) => Some(s.as_bytes().to_vec()),
+                Value::Bytes(b) => Some(b.clone()),
+                Value::Json(j) => Some(j.to_string().into_bytes()),
+                Value::Numeric(n) => Some(n.as_bytes().to_vec()),
+                Value::Uuid(u) => Some(u.to_string().into_bytes()),
+                // PostgreSQL timestamp wire format: microsecond precision,
+                // space separator, no trailing timezone on `timestamp without
+                // time zone` columns. psycopg's native parser rejects
+                // `rfc3339` nanosecond output ("timestamp too large (after
+                // year 10K)") — PG itself truncates to 6 fractional digits.
+                Value::Timestamp(ts) => Some(ts.naive_utc().format("%Y-%m-%d %H:%M:%S%.6f").to_string().into_bytes()),
+                Value::Date(d) => Some(d.format("%Y-%m-%d").to_string().into_bytes()),
+                // Same story for TIME — truncate to microseconds.
+                Value::Time(t) => Some(t.format("%H:%M:%S%.6f").to_string().into_bytes()),
+                Value::Interval(micros) => {
+                    let total_secs = micros / 1_000_000;
+                    let days = total_secs / 86400;
+                    let hours = (total_secs % 86400) / 3600;
+                    let mins = (total_secs % 3600) / 60;
+                    let secs = total_secs % 60;
+                    let s = if days > 0 {
+                        format!("{} days {:02}:{:02}:{:02}", days, hours, mins, secs)
+                    } else {
+                        format!("{:02}:{:02}:{:02}", hours, mins, secs)
+                    };
+                    Some(s.into_bytes())
+                }
+                Value::Array(arr) => {
+                    let mut buf = String::with_capacity(arr.len() * 8 + 2);
+                    buf.push('{');
+                    for (i, v) in arr.iter().enumerate() {
+                        if i > 0 {
+                            buf.push(',');
+                        }
+                        match v {
+                            Value::String(s) => {
+                                buf.push('"');
+                                buf.push_str(s);
+                                buf.push('"');
+                            }
+                            Value::Null => buf.push_str("NULL"),
+                            other => buf.push_str(&other.to_string()),
+                        }
                     }
+                    buf.push('}');
+                    Some(buf.into_bytes())
                 }
-                buf.push('}');
-                Some(buf.into_bytes())
-            }
-            Value::Vector(v) => {
-                // Format as PostgreSQL array: {1.0,2.0,3.0}
-                let mut buf = String::with_capacity(v.len() * 8 + 2);
-                buf.push('{');
-                let mut ryu_buf = ryu::Buffer::new();
-                for (i, x) in v.iter().enumerate() {
-                    if i > 0 { buf.push(','); }
-                    buf.push_str(ryu_buf.format(*x));
+                Value::Vector(v) => {
+                    // Format as PostgreSQL array: {1.0,2.0,3.0}
+                    let mut buf = String::with_capacity(v.len() * 8 + 2);
+                    buf.push('{');
+                    let mut ryu_buf = ryu::Buffer::new();
+                    for (i, x) in v.iter().enumerate() {
+                        if i > 0 {
+                            buf.push(',');
+                        }
+                        buf.push_str(ryu_buf.format(*x));
+                    }
+                    buf.push('}');
+                    Some(buf.into_bytes())
                 }
-                buf.push('}');
-                Some(buf.into_bytes())
+                Value::DictRef { dict_id } => Some(itoa::Buffer::new().format(*dict_id).as_bytes().to_vec()),
+                Value::CasRef { hash } => Some(hex::encode(hash).into_bytes()),
+                Value::ColumnarRef => Some(b"<columnar>".to_vec()),
             }
-            Value::DictRef { dict_id } => Some(itoa::Buffer::new().format(*dict_id).as_bytes().to_vec()),
-            Value::CasRef { hash } => Some(hex::encode(hash).into_bytes()),
-            Value::ColumnarRef => Some(b"<columnar>".to_vec()),
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 /// Split a SQL string on `;` while respecting single-quoted strings
@@ -1573,7 +1694,9 @@ fn pg_split_sql_respecting_quotes(sql: &str) -> Vec<String> {
                 let tag = &rest[..end];
                 if tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
                     current.push('$');
-                    for c in tag.chars() { current.push(c); }
+                    for c in tag.chars() {
+                        current.push(c);
+                    }
                     current.push('$');
                     i += 1 + end + 1;
                     in_dollar = Some(tag.to_string());
@@ -1582,7 +1705,10 @@ fn pg_split_sql_respecting_quotes(sql: &str) -> Vec<String> {
             }
         }
         match b {
-            b'\'' => { in_single_quote = true; current.push('\''); }
+            b'\'' => {
+                in_single_quote = true;
+                current.push('\'');
+            }
             b';' => {
                 let trimmed = current.trim().to_string();
                 if !trimmed.is_empty() && !pg_stmt_is_only_comment(&trimmed) {
@@ -1612,8 +1738,12 @@ fn pg_split_sql_respecting_quotes(sql: &str) -> Vec<String> {
 fn pg_stmt_is_only_comment(stmt: &str) -> bool {
     for line in stmt.lines() {
         let trimmed = line.trim();
-        if trimmed.is_empty() { continue; }
-        if !trimmed.starts_with("--") { return false; }
+        if trimmed.is_empty() {
+            continue;
+        }
+        if !trimmed.starts_with("--") {
+            return false;
+        }
     }
     true
 }
@@ -1687,10 +1817,18 @@ fn pg_split_exception(body: &str) -> (&str, Vec<String>) {
         .match_indices("EXCEPTION")
         .find(|(idx, _)| {
             let before_ok = *idx == 0
-                || upper.as_bytes().get(*idx - 1).copied().is_some_and(|b| b.is_ascii_whitespace());
+                || upper
+                    .as_bytes()
+                    .get(*idx - 1)
+                    .copied()
+                    .is_some_and(|b| b.is_ascii_whitespace());
             let after_pos = *idx + "EXCEPTION".len();
             let after_ok = after_pos == upper.len()
-                || upper.as_bytes().get(after_pos).copied().is_some_and(|b| b.is_ascii_whitespace());
+                || upper
+                    .as_bytes()
+                    .get(after_pos)
+                    .copied()
+                    .is_some_and(|b| b.is_ascii_whitespace());
             before_ok && after_ok
         })
         .map(|(idx, _)| idx);
@@ -1715,7 +1853,8 @@ fn pg_split_exception(body: &str) -> (&str, Vec<String>) {
         for name in conditions.split(|c: char| c == ',' || c == '|' || c == 'O' && false) {
             // Split conservatively on commas, tabs, OR (matched as an identifier).
             for token in name.split_whitespace() {
-                let cleaned: String = token.chars()
+                let cleaned: String = token
+                    .chars()
                     .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
                     .collect();
                 if cleaned.is_empty() || cleaned.eq_ignore_ascii_case("OR") {
@@ -1744,12 +1883,12 @@ fn pg_exception_matches(codes: &[String], error_message: &str) -> bool {
     for code in codes {
         let matches = match code.as_str() {
             // "already exists" family (drizzle's idempotent ADD)
-            "duplicate_object" | "duplicate_table" | "duplicate_column"
-            | "duplicate_database" | "duplicate_schema" | "duplicate_function"
-            | "duplicate_alias" => lower.contains("already exists"),
+            "duplicate_object" | "duplicate_table" | "duplicate_column" | "duplicate_database" | "duplicate_schema"
+            | "duplicate_function" | "duplicate_alias" => lower.contains("already exists"),
             "unique_violation" => lower.contains("unique") || lower.contains("duplicate key"),
-            "undefined_table" | "undefined_object" | "undefined_column"
-            | "undefined_function" => lower.contains("does not exist") || lower.contains("not found"),
+            "undefined_table" | "undefined_object" | "undefined_column" | "undefined_function" => {
+                lower.contains("does not exist") || lower.contains("not found")
+            }
             // OTHERS catches everything — drizzle uses this rarely.
             "others" => true,
             _ => false,
@@ -1776,9 +1915,7 @@ fn pg_detect_plpgsql(body: &str) -> Option<&'static str> {
     //   DO $$ BEGIN CREATE TABLE IF NOT EXISTS … END $$;
     // and the literal `IF` inside that DDL would otherwise trip the
     // PL/pgSQL `IF` detector below — even though the body is plain SQL.
-    let scrubbed = upper
-        .replace(" IF NOT EXISTS ", " ")
-        .replace(" IF EXISTS ", " ");
+    let scrubbed = upper.replace(" IF NOT EXISTS ", " ").replace(" IF EXISTS ", " ");
     // Whole-word matches — bracket each keyword with a non-alnum
     // lookalike by padding the haystack.
     let padded = format!(" {scrubbed} ");
@@ -1787,9 +1924,16 @@ fn pg_detect_plpgsql(body: &str) -> Option<&'static str> {
     // ALTERs as `DO $$ BEGIN <stmt>; EXCEPTION WHEN duplicate_object
     // THEN null; END $$;` which we now run.
     const KEYWORDS: &[&str] = &[
-        " DECLARE ", " IF ", " LOOP ", " FOR ",
-        " WHILE ", " RAISE ", " RETURN ", " PERFORM ",
-        " EXIT ", " CONTINUE ",
+        " DECLARE ",
+        " IF ",
+        " LOOP ",
+        " FOR ",
+        " WHILE ",
+        " RAISE ",
+        " RETURN ",
+        " PERFORM ",
+        " EXIT ",
+        " CONTINUE ",
     ];
     for kw in KEYWORDS {
         if padded.contains(kw) {
@@ -1874,27 +2018,15 @@ mod plpgsql_detection_tests {
         // KanttBan #14 (v3.30.1): drizzle-kit wraps DDL in
         //   DO $$ BEGIN CREATE TABLE IF NOT EXISTS … END $$;
         // The IF in IF NOT EXISTS must NOT be flagged as PL/pgSQL.
-        assert_eq!(
-            pg_detect_plpgsql("CREATE TABLE IF NOT EXISTS foo (id integer);"),
-            None,
-        );
-        assert_eq!(
-            pg_detect_plpgsql("DROP TABLE IF EXISTS foo;"),
-            None,
-        );
-        assert_eq!(
-            pg_detect_plpgsql("create index if not exists ix_foo on foo(id);"),
-            None,
-        );
+        assert_eq!(pg_detect_plpgsql("CREATE TABLE IF NOT EXISTS foo (id integer);"), None,);
+        assert_eq!(pg_detect_plpgsql("DROP TABLE IF EXISTS foo;"), None,);
+        assert_eq!(pg_detect_plpgsql("create index if not exists ix_foo on foo(id);"), None,);
     }
 
     #[test]
     fn real_plpgsql_if_still_detected() {
         // A genuine PL/pgSQL IF block must still be flagged.
-        assert_eq!(
-            pg_detect_plpgsql("IF x > 0 THEN PERFORM 1; END IF;"),
-            Some("IF"),
-        );
+        assert_eq!(pg_detect_plpgsql("IF x > 0 THEN PERFORM 1; END IF;"), Some("IF"),);
     }
 
     #[test]
@@ -1949,5 +2081,64 @@ mod do_block_split_tests {
         assert!(main.to_ascii_uppercase().contains("MY_EXCEPTION_TABLE"));
         assert!(!main.to_ascii_uppercase().ends_with("EXCEPTION"));
         assert_eq!(codes, vec!["others".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod failed_transaction_state_tests {
+    use super::*;
+    use std::sync::Arc;
+    use tokio::io::DuplexStream;
+
+    fn test_handler(db: Arc<EmbeddedDatabase>) -> (PgConnectionHandler<DuplexStream>, DuplexStream) {
+        let (stream, client) = tokio::io::duplex(4096);
+        (
+            PgConnectionHandler {
+                stream,
+                database: db.clone(),
+                auth_manager: Arc::new(AuthManager::new(AuthMethod::Trust)),
+                catalog: PgCatalog::with_database(db),
+                prepared_statements: PreparedStatementManager::new(),
+                authenticated: true,
+                transaction_status: TransactionStatus::Idle,
+                buffer: BytesMut::with_capacity(8192),
+                username: None,
+                scram_state: None,
+                write_buf: BytesMut::with_capacity(4096),
+                suppress_ready_for_query: false,
+            },
+            client,
+        )
+    }
+
+    #[tokio::test]
+    async fn query_error_marks_open_transaction_failed_and_reenables_ready() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+        let (mut handler, _client) = test_handler(db);
+        handler.transaction_status = TransactionStatus::InTransaction;
+        handler.suppress_ready_for_query = true;
+
+        handler
+            .send_error_for_query(&Error::constraint_violation("duplicate key"))
+            .await
+            .expect("send error");
+
+        assert_eq!(handler.transaction_status, TransactionStatus::Failed);
+        assert!(!handler.suppress_ready_for_query);
+    }
+
+    #[tokio::test]
+    async fn rollback_clears_failed_transaction_state() {
+        let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
+        db.execute("BEGIN").expect("begin");
+        let (mut handler, _client) = test_handler(db);
+        handler.transaction_status = TransactionStatus::Failed;
+
+        handler
+            .handle_single_query("ROLLBACK")
+            .await
+            .expect("rollback after failed transaction");
+
+        assert_eq!(handler.transaction_status, TransactionStatus::Idle);
     }
 }

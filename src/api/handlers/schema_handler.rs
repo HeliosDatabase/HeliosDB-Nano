@@ -396,7 +396,12 @@ pub async fn infer_schema(
                     serde_json::Value::Bool(_) => "BOOLEAN".to_string(),
                     serde_json::Value::Number(n) => {
                         if n.is_i64() {
-                            if options.prefer_narrow_types { "INTEGER" } else { "BIGINT" }.to_string()
+                            if options.prefer_narrow_types {
+                                "INTEGER"
+                            } else {
+                                "BIGINT"
+                            }
+                            .to_string()
                         } else {
                             "NUMERIC".to_string()
                         }
@@ -446,15 +451,19 @@ pub async fn infer_schema(
             name: name.clone(),
             sql_type,
             nullable: is_nullable,
-            unique: options.detect_unique && req.samples.iter()
-                .filter_map(|s| {
-                    if let serde_json::Value::Object(obj) = s {
-                        obj.get(&name)
-                    } else {
-                        None
-                    }
-                })
-                .count() == req.samples.len(), // All have different values = unique
+            unique: options.detect_unique
+                && req
+                    .samples
+                    .iter()
+                    .filter_map(|s| {
+                        if let serde_json::Value::Object(obj) = s {
+                            obj.get(&name)
+                        } else {
+                            None
+                        }
+                    })
+                    .count()
+                    == req.samples.len(), // All have different values = unique
             default: None,
             confidence: if is_nullable { 0.8 } else { 0.95 },
             alternatives: vec![],
@@ -464,7 +473,8 @@ pub async fn infer_schema(
     }
 
     // Generate DDL
-    let column_defs: Vec<String> = columns.iter()
+    let column_defs: Vec<String> = columns
+        .iter()
         .map(|c| format!("{} {} NOT NULL", c.name, c.sql_type))
         .collect();
 
@@ -531,7 +541,12 @@ pub async fn batch_infer_schema(
                         serde_json::Value::Bool(_) => "BOOLEAN".to_string(),
                         serde_json::Value::Number(n) => {
                             if n.is_i64() {
-                                if options.prefer_narrow_types { "INTEGER" } else { "BIGINT" }.to_string()
+                                if options.prefer_narrow_types {
+                                    "INTEGER"
+                                } else {
+                                    "BIGINT"
+                                }
+                                .to_string()
                             } else {
                                 "NUMERIC".to_string()
                             }
@@ -551,7 +566,11 @@ pub async fn batch_infer_schema(
                             }
                         }
                         serde_json::Value::Object(_) => {
-                            if options.detect_json { "JSONB".to_string() } else { "JSON".to_string() }
+                            if options.detect_json {
+                                "JSONB".to_string()
+                            } else {
+                                "JSON".to_string()
+                            }
                         }
                     };
 
@@ -580,15 +599,9 @@ pub async fn batch_infer_schema(
             });
         }
 
-        let column_defs: Vec<String> = columns.iter()
-            .map(|c| format!("{} {}", c.name, c.sql_type))
-            .collect();
+        let column_defs: Vec<String> = columns.iter().map(|c| format!("{} {}", c.name, c.sql_type)).collect();
 
-        let ddl = format!(
-            "CREATE TABLE {} (\n    {}\n);",
-            table.name,
-            column_defs.join(",\n    ")
-        );
+        let ddl = format!("CREATE TABLE {} (\n    {}\n);", table.name, column_defs.join(",\n    "));
 
         all_ddl.push(ddl.clone());
 

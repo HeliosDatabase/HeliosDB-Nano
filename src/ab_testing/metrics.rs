@@ -201,10 +201,13 @@ impl ExperimentMetrics {
         let branch_count = self.branches.len();
         let total_queries = self.total_queries;
 
-        let (best_branch, best_success_rate) = self.branches
+        let (best_branch, best_success_rate) = self
+            .branches
             .iter()
             .max_by(|(_, a), (_, b)| {
-                a.success_rate().partial_cmp(&b.success_rate()).unwrap_or(std::cmp::Ordering::Equal)
+                a.success_rate()
+                    .partial_cmp(&b.success_rate())
+                    .unwrap_or(std::cmp::Ordering::Equal)
             })
             .map(|(name, metrics)| (Some(name.clone()), metrics.success_rate()))
             .unwrap_or((None, 0.0));
@@ -222,9 +225,9 @@ impl ExperimentMetrics {
             best_branch,
             best_success_rate,
             avg_latency_ms: avg_latency,
-            duration: self.started_at.map(|start| {
-                chrono::Utc::now().signed_duration_since(start)
-            }),
+            duration: self
+                .started_at
+                .map(|start| chrono::Utc::now().signed_duration_since(start)),
         }
     }
 }
@@ -292,13 +295,7 @@ impl ABMetrics {
     }
 
     /// Record a query
-    pub async fn record_query(
-        &self,
-        experiment: &str,
-        branch: &str,
-        latency_ms: f64,
-        success: bool,
-    ) {
+    pub async fn record_query(&self, experiment: &str, branch: &str, latency_ms: f64, success: bool) {
         let mut experiments = self.experiments.write().await;
         let metrics = experiments
             .entry(experiment.to_string())
@@ -308,13 +305,7 @@ impl ABMetrics {
     }
 
     /// Record a custom event
-    pub async fn record_event(
-        &self,
-        experiment: &str,
-        branch: &str,
-        event_name: &str,
-        value: f64,
-    ) {
+    pub async fn record_event(&self, experiment: &str, branch: &str, event_name: &str, value: f64) {
         let mut experiments = self.experiments.write().await;
         let metrics = experiments
             .entry(experiment.to_string())
@@ -329,11 +320,7 @@ impl ABMetrics {
     }
 
     /// Get branch metrics
-    pub async fn get_branch_metrics(
-        &self,
-        experiment: &str,
-        branch: &str,
-    ) -> Option<BranchMetrics> {
+    pub async fn get_branch_metrics(&self, experiment: &str, branch: &str) -> Option<BranchMetrics> {
         self.experiments
             .read()
             .await
@@ -342,12 +329,7 @@ impl ABMetrics {
     }
 
     /// Compare branches
-    pub async fn compare_branches(
-        &self,
-        experiment: &str,
-        branch_a: &str,
-        branch_b: &str,
-    ) -> Option<BranchComparison> {
+    pub async fn compare_branches(&self, experiment: &str, branch_a: &str, branch_b: &str) -> Option<BranchComparison> {
         self.experiments
             .read()
             .await
@@ -357,21 +339,12 @@ impl ABMetrics {
 
     /// Get experiment summary
     pub async fn get_summary(&self, experiment: &str) -> Option<ExperimentSummary> {
-        self.experiments
-            .read()
-            .await
-            .get(experiment)
-            .map(|e| e.summary())
+        self.experiments.read().await.get(experiment).map(|e| e.summary())
     }
 
     /// List all experiments with summaries
     pub async fn all_summaries(&self) -> Vec<ExperimentSummary> {
-        self.experiments
-            .read()
-            .await
-            .values()
-            .map(|e| e.summary())
-            .collect()
+        self.experiments.read().await.values().map(|e| e.summary()).collect()
     }
 
     /// Clear metrics for an experiment

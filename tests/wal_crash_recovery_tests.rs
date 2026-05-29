@@ -4,13 +4,10 @@
 //! provides proper durability guarantees.
 
 use heliosdb_nano::{
+    storage::{CleanupStats, ReplayStats, WalIntegrityReport, WalMetrics, WalOperation, WalSyncMode, WriteAheadLog},
     Error, Result,
-    storage::{
-        WriteAheadLog, WalOperation, WalSyncMode,
-        WalIntegrityReport, ReplayStats, CleanupStats, WalMetrics,
-    },
 };
-use rocksdb::{DB, Options};
+use rocksdb::{Options, DB};
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;

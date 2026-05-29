@@ -1,17 +1,17 @@
 //! REPL shell implementation
 
-use crate::{EmbeddedDatabase, Result, Error};
-use super::{ReplConfig, MetaCommand, commands::MetaCommandResult};
 use super::completer::SqlCompleter;
 use super::formatter;
+use super::{commands::MetaCommandResult, MetaCommand, ReplConfig};
+use crate::{EmbeddedDatabase, Error, Result};
+use colored::Colorize;
 use rustyline::error::ReadlineError;
-use rustyline::Editor;
-use rustyline::Helper;
-use rustyline::validate::Validator;
 use rustyline::highlight::Highlighter;
 use rustyline::hint::Hinter;
 use rustyline::history::FileHistory;
-use colored::Colorize;
+use rustyline::validate::Validator;
+use rustyline::Editor;
+use rustyline::Helper;
 use std::time::Instant;
 
 /// REPL shell
@@ -101,7 +101,7 @@ impl ReplShell {
                 // Block comment: /* ... */
                 if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
                     i += 2; // Skip /*
-                    // Find closing */
+                            // Find closing */
                     while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
                         i += 1;
                     }
@@ -132,8 +132,7 @@ impl ReplShell {
 
         let helper = ReplHelper { completer };
 
-        let mut editor = Editor::new()
-            .map_err(|e| Error::Generic(format!("Failed to create editor: {}", e)))?;
+        let mut editor = Editor::new().map_err(|e| Error::Generic(format!("Failed to create editor: {}", e)))?;
         editor.set_helper(Some(helper));
 
         // Load history
@@ -202,8 +201,18 @@ impl ReplShell {
 
                                     // Branch data isolation is now active
                                     if branch_name != "main" {
-                                        println!("{}", format!("Switched to branch '{}' with data isolation enabled.", branch_name).green());
-                                        println!("{}", "  Data changes on this branch are isolated from main.".dimmed());
+                                        println!(
+                                            "{}",
+                                            format!(
+                                                "Switched to branch '{}' with data isolation enabled.",
+                                                branch_name
+                                            )
+                                            .green()
+                                        );
+                                        println!(
+                                            "{}",
+                                            "  Data changes on this branch are isolated from main.".dimmed()
+                                        );
                                     }
                                 }
                                 Ok(MetaCommandResult::ToggleLsn(_)) => {
@@ -221,10 +230,13 @@ impl ReplShell {
                             }
                             continue;
                         } else {
-                            eprintln!("{}", formatter::format_error(&format!(
-                                "Unknown meta command: {}. Type \\h for help.",
-                                trimmed
-                            )));
+                            eprintln!(
+                                "{}",
+                                formatter::format_error(&format!(
+                                    "Unknown meta command: {}. Type \\h for help.",
+                                    trimmed
+                                ))
+                            );
                             continue;
                         }
                     }
@@ -450,12 +462,16 @@ impl ReplShell {
     fn print_banner(&self) {
         println!();
         println!("╔═══════════════════════════════════════════════════════════════╗");
-        println!("║  {} {}{}",
+        println!(
+            "║  {} {}{}",
             "HeliosDB Nano".bold().cyan(),
             format!("v{}", env!("CARGO_PKG_VERSION")).bold().green(),
             "                                    ║"
         );
-        println!("║  {}  ║", "PostgreSQL-compatible database with enterprise features".dimmed());
+        println!(
+            "║  {}  ║",
+            "PostgreSQL-compatible database with enterprise features".dimmed()
+        );
         println!("╚═══════════════════════════════════════════════════════════════╝");
         println!();
 
@@ -470,11 +486,20 @@ impl ReplShell {
         println!();
 
         println!("Mode: {} (single-user, direct access)", "REPL".bold().yellow());
-        println!("      For multi-user access, use: {} {}", "heliosdb-nano start".cyan(), "--help".dimmed());
+        println!(
+            "      For multi-user access, use: {} {}",
+            "heliosdb-nano start".cyan(),
+            "--help".dimmed()
+        );
         println!();
 
-        println!("Commands: {} help | {} list tables | {} system views | {} quit",
-            "\\h".cyan(), "\\d".cyan(), "\\dS".cyan(), "\\q".cyan());
+        println!(
+            "Commands: {} help | {} list tables | {} system views | {} quit",
+            "\\h".cyan(),
+            "\\d".cyan(),
+            "\\dS".cyan(),
+            "\\q".cyan()
+        );
         println!();
     }
 }

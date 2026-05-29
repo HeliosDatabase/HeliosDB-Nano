@@ -14,12 +14,12 @@
 //! - **SET Commands**: Silently acknowledged for client compatibility
 //! - **Authentication**: Trust-based (mysql_native_password wire format)
 
-pub mod handler;
 pub mod compatibility;
 pub mod extended;
 pub mod features;
+pub mod handler;
 pub mod translator;
 
-pub use handler::{handle_mysql_connection, MySqlHandler, MySqlError};
 #[cfg(unix)]
 pub use handler::handle_mysql_connection_unix;
+pub use handler::{handle_mysql_connection, MySqlError, MySqlHandler};

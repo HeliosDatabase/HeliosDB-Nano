@@ -8,20 +8,14 @@ use axum::{
 };
 use std::collections::HashMap;
 use std::time::Instant;
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::api::{
-    models::{
-        ApiError,
-        QueryRequest,
-        QueryResponse,
-        ExecuteRequest,
-        ExecuteResponse,
-    },
+    models::{ApiError, ExecuteRequest, ExecuteResponse, QueryRequest, QueryResponse},
     server::AppState,
 };
 use crate::compute::QueryState;
-use crate::{Value, DataType, Tuple, Schema, Error};
+use crate::{DataType, Error, Schema, Tuple, Value};
 
 /// Execute a read-only SQL query on a branch
 ///
@@ -70,19 +64,19 @@ pub async fn execute_query(
     // Validate branch exists (if branching is enabled)
     if let Some(branch_manager) = state.db.storage.branch_manager() {
         // Check if branch exists
-        let _branch = branch_manager.get_branch_by_name(&branch_name)
-            .map_err(|e| {
-                warn!("Branch '{}' not found: {}", branch_name, e);
-                state.query_registry.fail_query(query_id);
-                ApiError::from(e)
-            })?;
+        let _branch = branch_manager.get_branch_by_name(&branch_name).map_err(|e| {
+            warn!("Branch '{}' not found: {}", branch_name, e);
+            state.query_registry.fail_query(query_id);
+            ApiError::from(e)
+        })?;
     }
 
     // Start timing
     let start = Instant::now();
 
     // Convert parameters if provided
-    let params: Vec<Value> = request.params
+    let params: Vec<Value> = request
+        .params
         .unwrap_or_default()
         .into_iter()
         .map(|p| p.into())
@@ -91,39 +85,41 @@ pub async fn execute_query(
     // Check for cancellation before executing
     if cancel_token.is_cancelled() {
         state.query_registry.update_state(query_id, QueryState::Cancelled);
-        return Err(ApiError::from(Error::query_cancelled("Query cancelled before execution")));
+        return Err(ApiError::from(Error::query_cancelled(
+            "Query cancelled before execution",
+        )));
     }
 
     // Execute query
     let tuples = if params.is_empty() {
-        state.db.query(&request.sql, &[])
-            .map_err(|e| {
-                error!("Query execution failed: {}", e);
-                // Check if it was cancelled
-                if cancel_token.is_cancelled() {
-                    state.query_registry.update_state(query_id, QueryState::Cancelled);
-                } else {
-                    state.query_registry.fail_query(query_id);
-                }
-                ApiError::from(e)
-            })?
+        state.db.query(&request.sql, &[]).map_err(|e| {
+            error!("Query execution failed: {}", e);
+            // Check if it was cancelled
+            if cancel_token.is_cancelled() {
+                state.query_registry.update_state(query_id, QueryState::Cancelled);
+            } else {
+                state.query_registry.fail_query(query_id);
+            }
+            ApiError::from(e)
+        })?
     } else {
-        state.db.query_params(&request.sql, &params)
-            .map_err(|e| {
-                error!("Query execution failed: {}", e);
-                if cancel_token.is_cancelled() {
-                    state.query_registry.update_state(query_id, QueryState::Cancelled);
-                } else {
-                    state.query_registry.fail_query(query_id);
-                }
-                ApiError::from(e)
-            })?
+        state.db.query_params(&request.sql, &params).map_err(|e| {
+            error!("Query execution failed: {}", e);
+            if cancel_token.is_cancelled() {
+                state.query_registry.update_state(query_id, QueryState::Cancelled);
+            } else {
+                state.query_registry.fail_query(query_id);
+            }
+            ApiError::from(e)
+        })?
     };
 
     // Check for cancellation after execution
     if cancel_token.is_cancelled() {
         state.query_registry.update_state(query_id, QueryState::Cancelled);
-        return Err(ApiError::from(Error::query_cancelled("Query cancelled during execution")));
+        return Err(ApiError::from(Error::query_cancelled(
+            "Query cancelled during execution",
+        )));
     }
 
     // Mark query as completed
@@ -153,7 +149,11 @@ pub async fn execute_query(
 
         QueryResponse {
             columns: schema.columns.iter().map(|c| c.name.clone()).collect(),
-            column_types: schema.columns.iter().map(|c| datatype_to_string(&c.data_type)).collect(),
+            column_types: schema
+                .columns
+                .iter()
+                .map(|c| datatype_to_string(&c.data_type))
+                .collect(),
             rows,
             row_count: tuples.len(),
             execution_time_ms,
@@ -162,10 +162,7 @@ pub async fn execute_query(
 
     info!(
         "Query {} on branch '{}' returned {} rows in {}ms",
-        query_id,
-        branch_name,
-        response.row_count,
-        execution_time_ms
+        query_id, branch_name, response.row_count, execution_time_ms
     );
 
     Ok(Json(response))
@@ -217,12 +214,11 @@ pub async fn execute_statement(
     // Validate branch exists (if branching is enabled)
     if let Some(branch_manager) = state.db.storage.branch_manager() {
         // Check if branch exists
-        let _branch = branch_manager.get_branch_by_name(&branch_name)
-            .map_err(|e| {
-                warn!("Branch '{}' not found: {}", branch_name, e);
-                state.query_registry.fail_query(query_id);
-                ApiError::from(e)
-            })?;
+        let _branch = branch_manager.get_branch_by_name(&branch_name).map_err(|e| {
+            warn!("Branch '{}' not found: {}", branch_name, e);
+            state.query_registry.fail_query(query_id);
+            ApiError::from(e)
+        })?;
     }
 
     // Start timing
@@ -232,7 +228,8 @@ pub async fn execute_statement(
     let statement_type = determine_statement_type(&request.sql);
 
     // Convert parameters if provided
-    let params: Vec<Value> = request.params
+    let params: Vec<Value> = request
+        .params
         .unwrap_or_default()
         .into_iter()
         .map(|p| p.into())
@@ -241,38 +238,40 @@ pub async fn execute_statement(
     // Check for cancellation before executing
     if cancel_token.is_cancelled() {
         state.query_registry.update_state(query_id, QueryState::Cancelled);
-        return Err(ApiError::from(Error::query_cancelled("Statement cancelled before execution")));
+        return Err(ApiError::from(Error::query_cancelled(
+            "Statement cancelled before execution",
+        )));
     }
 
     // Execute statement
     let affected_rows = if params.is_empty() {
-        state.db.execute(&request.sql)
-            .map_err(|e| {
-                error!("Statement execution failed: {}", e);
-                if cancel_token.is_cancelled() {
-                    state.query_registry.update_state(query_id, QueryState::Cancelled);
-                } else {
-                    state.query_registry.fail_query(query_id);
-                }
-                ApiError::from(e)
-            })?
+        state.db.execute(&request.sql).map_err(|e| {
+            error!("Statement execution failed: {}", e);
+            if cancel_token.is_cancelled() {
+                state.query_registry.update_state(query_id, QueryState::Cancelled);
+            } else {
+                state.query_registry.fail_query(query_id);
+            }
+            ApiError::from(e)
+        })?
     } else {
-        state.db.execute_params(&request.sql, &params)
-            .map_err(|e| {
-                error!("Statement execution failed: {}", e);
-                if cancel_token.is_cancelled() {
-                    state.query_registry.update_state(query_id, QueryState::Cancelled);
-                } else {
-                    state.query_registry.fail_query(query_id);
-                }
-                ApiError::from(e)
-            })?
+        state.db.execute_params(&request.sql, &params).map_err(|e| {
+            error!("Statement execution failed: {}", e);
+            if cancel_token.is_cancelled() {
+                state.query_registry.update_state(query_id, QueryState::Cancelled);
+            } else {
+                state.query_registry.fail_query(query_id);
+            }
+            ApiError::from(e)
+        })?
     };
 
     // Check for cancellation after execution
     if cancel_token.is_cancelled() {
         state.query_registry.update_state(query_id, QueryState::Cancelled);
-        return Err(ApiError::from(Error::query_cancelled("Statement cancelled during execution")));
+        return Err(ApiError::from(Error::query_cancelled(
+            "Statement cancelled during execution",
+        )));
     }
 
     // Mark as completed
@@ -283,11 +282,13 @@ pub async fn execute_statement(
 
     let message = format!(
         "{} statement executed successfully on branch '{}'",
-        statement_type,
-        branch_name
+        statement_type, branch_name
     );
 
-    info!("Query {} - {} - {} rows affected in {}ms", query_id, message, affected_rows, execution_time_ms);
+    info!(
+        "Query {} - {} - {} rows affected in {}ms",
+        query_id, message, affected_rows, execution_time_ms
+    );
 
     Ok(Json(ExecuteResponse {
         statement_type,
@@ -312,7 +313,10 @@ fn infer_schema_from_tuples(tuples: &[Tuple]) -> Result<Schema, ApiError> {
     let Some(first_tuple) = tuples.first() else {
         return Ok(Schema::new(vec![]));
     };
-    let columns: Vec<crate::Column> = first_tuple.values.iter().enumerate()
+    let columns: Vec<crate::Column> = first_tuple
+        .values
+        .iter()
+        .enumerate()
         .map(|(idx, value)| {
             let data_type = match value {
                 Value::Null => DataType::Text, // Default to text for null
@@ -358,16 +362,19 @@ fn infer_schema_from_tuples(tuples: &[Tuple]) -> Result<Schema, ApiError> {
 
 /// Convert tuples to JSON row format
 fn tuples_to_rows(tuples: &[Tuple], schema: &Schema) -> Vec<HashMap<String, serde_json::Value>> {
-    tuples.iter().map(|tuple| {
-        let mut row = HashMap::new();
-        for (idx, value) in tuple.values.iter().enumerate() {
-            if let Some(column) = schema.columns.get(idx) {
-                let json_value: serde_json::Value = value.into();
-                row.insert(column.name.clone(), json_value);
+    tuples
+        .iter()
+        .map(|tuple| {
+            let mut row = HashMap::new();
+            for (idx, value) in tuple.values.iter().enumerate() {
+                if let Some(column) = schema.columns.get(idx) {
+                    let json_value: serde_json::Value = value.into();
+                    row.insert(column.name.clone(), json_value);
+                }
             }
-        }
-        row
-    }).collect()
+            row
+        })
+        .collect()
 }
 
 /// Convert DataType to string representation
@@ -434,15 +441,21 @@ fn determine_statement_type(sql: &str) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::EmbeddedDatabase;
     use crate::api::models::query::QueryParameter;
     use crate::compute::QueryRegistry;
+    use crate::EmbeddedDatabase;
     use std::sync::Arc;
 
     fn create_test_state() -> AppState {
         let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
         let query_registry = Arc::new(QueryRegistry::new());
-        AppState { db, query_registry, auth_bridge: None, oauth_registry: None, change_notifier: None }
+        AppState {
+            db,
+            query_registry,
+            auth_bridge: None,
+            oauth_registry: None,
+            change_notifier: None,
+        }
     }
 
     #[tokio::test]
@@ -459,11 +472,7 @@ mod tests {
             timeout_ms: None,
         };
 
-        let result = execute_query(
-            State(state),
-            Path("main".to_string()),
-            Json(request),
-        ).await;
+        let result = execute_query(State(state), Path("main".to_string()), Json(request)).await;
 
         assert!(result.is_ok());
         let response = result.unwrap();
@@ -483,11 +492,7 @@ mod tests {
             timeout_ms: None,
         };
 
-        let result = execute_statement(
-            State(state),
-            Path("main".to_string()),
-            Json(request),
-        ).await;
+        let result = execute_statement(State(state), Path("main".to_string()), Json(request)).await;
 
         assert!(result.is_ok());
         let response = result.unwrap();
@@ -510,11 +515,7 @@ mod tests {
             timeout_ms: None,
         };
 
-        let result = execute_query(
-            State(state),
-            Path("main".to_string()),
-            Json(request),
-        ).await;
+        let result = execute_query(State(state), Path("main".to_string()), Json(request)).await;
 
         assert!(result.is_ok());
         let response = result.unwrap();
@@ -542,12 +543,7 @@ mod tests {
 
     #[test]
     fn test_infer_schema_from_tuples() {
-        let tuples = vec![
-            Tuple::new(vec![
-                Value::Int4(1),
-                Value::String("Alice".to_string()),
-            ]),
-        ];
+        let tuples = vec![Tuple::new(vec![Value::Int4(1), Value::String("Alice".to_string())])];
 
         let schema = infer_schema_from_tuples(&tuples).unwrap();
         assert_eq!(schema.columns.len(), 2);

@@ -109,16 +109,8 @@ impl McpServer {
         progress_token: serde_json::Value,
     ) {
         let id = req.id.clone().unwrap_or(serde_json::Value::Null);
-        let name = req
-            .params
-            .get("name")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
-        let args = req
-            .params
-            .get("arguments")
-            .cloned()
-            .unwrap_or(serde_json::Value::Null);
+        let name = req.params.get("name").and_then(|v| v.as_str()).map(str::to_string);
+        let args = req.params.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
 
         let Some(name) = name else {
             let err = serde_json::json!({

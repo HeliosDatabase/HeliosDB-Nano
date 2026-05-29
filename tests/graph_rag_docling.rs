@@ -39,8 +39,7 @@ async fn bind_mock_docling() -> (std::net::SocketAddr, tokio::task::JoinHandle<(
     use axum::{routing::post, Json, Router};
 
     async fn handler(_body: Json<serde_json::Value>) -> Json<serde_json::Value> {
-        let v: serde_json::Value =
-            serde_json::from_str(RECORDED_DOCLING_RESPONSE).unwrap();
+        let v: serde_json::Value = serde_json::from_str(RECORDED_DOCLING_RESPONSE).unwrap();
         Json(v)
     }
 
@@ -65,8 +64,7 @@ async fn ingest_pdf_projects_recorded_document() {
     let db2 = db.clone();
     let endpoint2 = endpoint.clone();
     let stats = tokio::task::spawn_blocking(move || {
-        let opts = DoclingIngestOptions::from_url("https://example.com/paper.pdf")
-            .with_endpoint(endpoint2);
+        let opts = DoclingIngestOptions::from_url("https://example.com/paper.pdf").with_endpoint(endpoint2);
         db2.graph_rag_ingest_pdf(&opts)
     })
     .await
@@ -98,10 +96,7 @@ async fn ingest_pdf_projects_recorded_document() {
 
     // Confirm root node has Pdf kind.
     let roots = db
-        .query(
-            "SELECT title FROM _hdb_graph_nodes WHERE node_kind = 'Pdf'",
-            &[],
-        )
+        .query("SELECT title FROM _hdb_graph_nodes WHERE node_kind = 'Pdf'", &[])
         .unwrap();
     assert_eq!(roots.len(), 1);
 
@@ -117,35 +112,25 @@ async fn ingest_pdf_idempotent_on_re_run() {
     let db2 = db.clone();
     let endpoint2 = endpoint.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        let opts = DoclingIngestOptions::from_url("https://example.com/paper.pdf")
-            .with_endpoint(endpoint2);
+        let opts = DoclingIngestOptions::from_url("https://example.com/paper.pdf").with_endpoint(endpoint2);
         db2.graph_rag_ingest_pdf(&opts)
     })
     .await
     .unwrap()
     .unwrap();
 
-    let count_before = db
-        .query("SELECT COUNT(*) FROM _hdb_graph_nodes", &[])
-        .unwrap()[0]
-        .values[0]
-        .clone();
+    let count_before = db.query("SELECT COUNT(*) FROM _hdb_graph_nodes", &[]).unwrap()[0].values[0].clone();
 
     let db3 = db.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        let opts = DoclingIngestOptions::from_url("https://example.com/paper.pdf")
-            .with_endpoint(endpoint);
+        let opts = DoclingIngestOptions::from_url("https://example.com/paper.pdf").with_endpoint(endpoint);
         db3.graph_rag_ingest_pdf(&opts)
     })
     .await
     .unwrap()
     .unwrap();
 
-    let count_after = db
-        .query("SELECT COUNT(*) FROM _hdb_graph_nodes", &[])
-        .unwrap()[0]
-        .values[0]
-        .clone();
+    let count_after = db.query("SELECT COUNT(*) FROM _hdb_graph_nodes", &[]).unwrap()[0].values[0].clone();
     assert_eq!(count_before, count_after, "second run added rows");
 
     mock_handle.abort();
@@ -163,8 +148,7 @@ async fn ingest_pdf_connection_refused_surfaces_error() {
     let endpoint = format!("http://{addr}/v1/convert/source");
     let db2 = db.clone();
     let r = tokio::task::spawn_blocking(move || {
-        let opts = DoclingIngestOptions::from_url("https://example.com/paper.pdf")
-            .with_endpoint(endpoint);
+        let opts = DoclingIngestOptions::from_url("https://example.com/paper.pdf").with_endpoint(endpoint);
         db2.graph_rag_ingest_pdf(&opts)
     })
     .await

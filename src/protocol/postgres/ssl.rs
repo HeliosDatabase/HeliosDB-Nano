@@ -21,15 +21,15 @@
 
 #![allow(elided_lifetimes_in_paths)]
 
-use crate::{Result, Error};
+use crate::{Error, Result};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ServerConfig;
+use rustls_pemfile::{certs, pkcs8_private_keys, rsa_private_keys};
 use std::fs::File;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
-use rustls::ServerConfig;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls_pemfile::{certs, rsa_private_keys, pkcs8_private_keys};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::TlsAcceptor;
 
 /// SSL/TLS mode configuration
@@ -87,11 +87,7 @@ pub struct SslConfig {
 
 impl SslConfig {
     /// Create a new SSL configuration
-    pub fn new<P: AsRef<Path>>(
-        mode: SslMode,
-        cert_path: P,
-        key_path: P,
-    ) -> Self {
+    pub fn new<P: AsRef<Path>>(mode: SslMode, cert_path: P, key_path: P) -> Self {
         Self {
             mode,
             cert_path: cert_path.as_ref().to_path_buf(),
@@ -171,21 +167,19 @@ impl SslNegotiator {
             None
         };
 
-        Ok(Self {
-            config,
-            acceptor,
-        })
+        Ok(Self { config, acceptor })
     }
 
     /// Load TLS configuration from certificates
     fn load_tls_config(config: &SslConfig) -> Result<TlsAcceptor> {
         // Load server certificate
-        let cert_file = File::open(&config.cert_path)
-            .map_err(|e| Error::io(format!(
+        let cert_file = File::open(&config.cert_path).map_err(|e| {
+            Error::io(format!(
                 "Failed to open certificate {}: {}",
                 config.cert_path.display(),
                 e
-            )))?;
+            ))
+        })?;
         let mut cert_reader = BufReader::new(cert_file);
         let certs_iter = certs(&mut cert_reader);
         let certs: Vec<CertificateDer> = certs_iter
@@ -197,12 +191,13 @@ impl SslNegotiator {
         }
 
         // Load private key
-        let key_file = File::open(&config.key_path)
-            .map_err(|e| Error::io(format!(
+        let key_file = File::open(&config.key_path).map_err(|e| {
+            Error::io(format!(
                 "Failed to open private key {}: {}",
                 config.key_path.display(),
                 e
-            )))?;
+            ))
+        })?;
         let mut key_reader = BufReader::new(key_file);
 
         // Try PKCS#8 first, then RSA
@@ -216,12 +211,13 @@ impl SslNegotiator {
                 PrivateKeyDer::Pkcs8(pkcs8_keys.remove(0))
             } else {
                 // Try RSA format
-                let key_file = File::open(&config.key_path)
-                    .map_err(|e| Error::io(format!(
+                let key_file = File::open(&config.key_path).map_err(|e| {
+                    Error::io(format!(
                         "Failed to open private key {}: {}",
                         config.key_path.display(),
                         e
-                    )))?;
+                    ))
+                })?;
                 let mut key_reader = BufReader::new(key_file);
                 let rsa_keys_iter = rsa_private_keys(&mut key_reader);
                 let mut rsa_keys: Vec<_> = rsa_keys_iter
@@ -255,14 +251,18 @@ impl SslNegotiator {
     {
         // Read message length
         let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await
+        stream
+            .read_exact(&mut len_buf)
+            .await
             .map_err(|e| Error::network(format!("Failed to read message length: {}", e)))?;
 
         let _len = i32::from_be_bytes(len_buf) as usize;
 
         // Read request code
         let mut code_buf = [0u8; 4];
-        stream.read_exact(&mut code_buf).await
+        stream
+            .read_exact(&mut code_buf)
+            .await
             .map_err(|e| Error::network(format!("Failed to read request code: {}", e)))?;
 
         let code = i32::from_be_bytes(code_buf);
@@ -288,18 +288,26 @@ impl SslNegotiator {
             SslMode::Disable => {
                 // SSL is disabled, reject request
                 tracing::debug!("SSL request received but SSL is disabled");
-                stream.write_all(b"N").await
+                stream
+                    .write_all(b"N")
+                    .await
                     .map_err(|e| Error::network(format!("Failed to send SSL rejection: {}", e)))?;
-                stream.flush().await
+                stream
+                    .flush()
+                    .await
                     .map_err(|e| Error::network(format!("Failed to flush stream: {}", e)))?;
                 Ok(false)
             }
             SslMode::Allow | SslMode::Prefer | SslMode::Require | SslMode::VerifyCA | SslMode::VerifyFull => {
                 // SSL is enabled, accept request
                 tracing::debug!("SSL request received, accepting SSL connection");
-                stream.write_all(b"S").await
+                stream
+                    .write_all(b"S")
+                    .await
                     .map_err(|e| Error::network(format!("Failed to send SSL acceptance: {}", e)))?;
-                stream.flush().await
+                stream
+                    .flush()
+                    .await
                     .map_err(|e| Error::network(format!("Failed to flush stream: {}", e)))?;
                 Ok(true)
             }
@@ -403,11 +411,7 @@ mod tests {
 
     #[test]
     fn test_ssl_config_creation() {
-        let config = SslConfig::new(
-            SslMode::Require,
-            "cert.pem",
-            "key.pem",
-        );
+        let config = SslConfig::new(SslMode::Require, "cert.pem", "key.pem");
 
         assert_eq!(config.mode, SslMode::Require);
         assert_eq!(config.cert_path, PathBuf::from("cert.pem"));
@@ -417,11 +421,7 @@ mod tests {
 
     #[test]
     fn test_ssl_config_with_ca() {
-        let config = SslConfig::new(
-            SslMode::VerifyCA,
-            "cert.pem",
-            "key.pem",
-        ).with_ca_cert("ca.pem");
+        let config = SslConfig::new(SslMode::VerifyCA, "cert.pem", "key.pem").with_ca_cert("ca.pem");
 
         assert_eq!(config.ca_cert_path, Some(PathBuf::from("ca.pem")));
     }

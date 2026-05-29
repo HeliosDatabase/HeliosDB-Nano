@@ -54,7 +54,10 @@ pub struct McpState {
 
 impl McpState {
     pub fn new(db: Arc<EmbeddedDatabase>) -> Self {
-        Self { db, auth: McpAuth::Disabled }
+        Self {
+            db,
+            auth: McpAuth::Disabled,
+        }
     }
 
     pub fn with_auth(mut self, auth: McpAuth) -> Self {
@@ -78,10 +81,7 @@ pub fn mcp_router(state: McpState) -> Router {
 /// stateful with `S`. Useful when the host process keeps a richer
 /// `AppState` and just wants to expose `/mcp*` alongside its own
 /// routes.
-pub fn attach<S: Clone + Send + Sync + 'static>(
-    router: Router<S>,
-    state: McpState,
-) -> Router<S> {
+pub fn attach<S: Clone + Send + Sync + 'static>(router: Router<S>, state: McpState) -> Router<S> {
     let mcp = Router::new()
         .route("/mcp", post(handle_post))
         .route("/mcp/ws", get(handle_ws_upgrade))
@@ -150,16 +150,8 @@ async fn dispatch_streaming_post(
 ) -> RpcResponse {
     use super::streaming::call_tool_streaming;
     let id = req.id.clone().unwrap_or(serde_json::Value::Null);
-    let name = req
-        .params
-        .get("name")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let args = req
-        .params
-        .get("arguments")
-        .cloned()
-        .unwrap_or(serde_json::Value::Null);
+    let name = req.params.get("name").and_then(|v| v.as_str()).map(str::to_string);
+    let args = req.params.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
     let Some(name) = name else {
         return RpcResponse::error(id, -32000, "tools/call requires 'name'");
     };
@@ -225,8 +217,7 @@ pub async fn handle_ws_upgrade(
     if let Err(e) = state.auth.check(auth_header, Scope::Write) {
         return (e.status(), e.message()).into_response();
     }
-    ws.on_upgrade(move |socket| handle_ws(socket, state))
-        .into_response()
+    ws.on_upgrade(move |socket| handle_ws(socket, state)).into_response()
 }
 
 async fn handle_ws(mut socket: WebSocket, state: McpState) {
@@ -267,9 +258,8 @@ async fn dispatch_ws_text(socket: &mut WebSocket, state: &McpState, text: &str) 
     let req = match parsed {
         Ok(r) => r,
         Err(e) => {
-            let err = format!(
-                r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32700,"message":"parse error: {e}"}}}}"#
-            );
+            let err =
+                format!(r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32700,"message":"parse error: {e}"}}}}"#);
             return socket.send(Message::Text(err)).await.is_ok();
         }
     };
@@ -286,9 +276,7 @@ async fn dispatch_ws_text(socket: &mut WebSocket, state: &McpState, text: &str) 
 
     let resp = super::rpc::handle_rpc_with_db(state.db.as_ref(), req);
     let json = serde_json::to_string(&resp).unwrap_or_else(|e| {
-        format!(
-            r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"serialize: {e}"}}}}"#
-        )
+        format!(r#"{{"jsonrpc":"2.0","id":null,"error":{{"code":-32603,"message":"serialize: {e}"}}}}"#)
     });
     socket.send(Message::Text(json)).await.is_ok()
 }
@@ -314,11 +302,7 @@ async fn dispatch_streaming_tools_call(
     use super::streaming::call_tool_streaming;
 
     // Pull tool name + arguments from the JSON-RPC params shape.
-    let name = req
-        .params
-        .get("name")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
+    let name = req.params.get("name").and_then(|v| v.as_str()).map(str::to_string);
     let args = req.params.get("arguments").cloned().unwrap_or(serde_json::Value::Null);
 
     let id = req.id.clone().unwrap_or(serde_json::Value::Null);
@@ -328,10 +312,7 @@ async fn dispatch_streaming_tools_call(
             "id": id,
             "error": { "code": -32000, "message": "tools/call requires 'name'" }
         });
-        return socket
-            .send(Message::Text(err.to_string()))
-            .await
-            .is_ok();
+        return socket.send(Message::Text(err.to_string())).await.is_ok();
     };
 
     let (mut rx, handle) = call_tool_streaming(Some(state.db.clone()), name, args);
@@ -358,16 +339,14 @@ async fn dispatch_streaming_tools_call(
             "method": "notifications/progress",
             "params": params,
         });
-        if socket
-            .send(Message::Text(notif.to_string()))
-            .await
-            .is_err()
-        {
+        if socket.send(Message::Text(notif.to_string())).await.is_err() {
             return false;
         }
     }
 
-    let outcome = handle.await.unwrap_or_else(|e| super::tools::ToolOutcome::err(format!("tool task panicked: {e}")));
+    let outcome = handle
+        .await
+        .unwrap_or_else(|e| super::tools::ToolOutcome::err(format!("tool task panicked: {e}")));
     let resp = serde_json::json!({
         "jsonrpc": "2.0",
         "id": id,
@@ -434,11 +413,7 @@ pub async fn handle_sse(
     let combined = initial.chain(progress_stream);
 
     Sse::new(combined)
-        .keep_alive(
-            KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("keep-alive"),
-        )
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("keep-alive"))
         .into_response()
 }
 
@@ -449,10 +424,7 @@ pub async fn handle_sse(
 /// that want a single packet of self-description without doing the
 /// `initialize` → `tools/list?verbose=true` → `resources/list`
 /// dance over JSON-RPC.
-pub async fn handle_info(
-    State(state): State<McpState>,
-    headers: axum::http::HeaderMap,
-) -> axum::response::Response {
+pub async fn handle_info(State(state): State<McpState>, headers: axum::http::HeaderMap) -> axum::response::Response {
     let auth_header = headers
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok());

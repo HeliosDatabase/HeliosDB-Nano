@@ -9,15 +9,9 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_nano::{
-    Config, StorageEngine, Schema, Column, DataType, Tuple, Value,
-    Result,
-};
-use heliosdb_nano::storage::{
-    IncrementalRefresher, DeltaTracker, RefreshStrategy,
-    MaterializedViewMetadata,
-};
 use heliosdb_nano::sql::LogicalPlan;
+use heliosdb_nano::storage::{DeltaTracker, IncrementalRefresher, MaterializedViewMetadata, RefreshStrategy};
+use heliosdb_nano::{Column, Config, DataType, Result, Schema, StorageEngine, Tuple, Value};
 use std::sync::Arc;
 
 #[test]
@@ -68,7 +62,10 @@ fn test_delta_tracker_delete() -> Result<()> {
     assert_eq!(deltas.len(), 1);
 
     if let Some(delta) = deltas.first() {
-        assert!(matches!(delta.operation, heliosdb_nano::storage::DeltaOperation::Delete { .. }));
+        assert!(matches!(
+            delta.operation,
+            heliosdb_nano::storage::DeltaOperation::Delete { .. }
+        ));
     }
 
     Ok(())
@@ -93,7 +90,10 @@ fn test_delta_tracker_update() -> Result<()> {
     assert_eq!(deltas.len(), 1);
 
     if let Some(delta) = deltas.first() {
-        assert!(matches!(delta.operation, heliosdb_nano::storage::DeltaOperation::Update { .. }));
+        assert!(matches!(
+            delta.operation,
+            heliosdb_nano::storage::DeltaOperation::Update { .. }
+        ));
     }
 
     Ok(())
@@ -181,10 +181,7 @@ fn test_cost_estimation_prefers_incremental() -> Result<()> {
     // Insert some rows
     for i in 0..100 {
         let tuple = Tuple {
-            values: vec![
-                Value::Int4(i),
-                Value::String(format!("User{}", i)),
-            ],
+            values: vec![Value::Int4(i), Value::String(format!("User{}", i))],
         };
         storage.insert_tuple("users", tuple)?;
     }
@@ -236,9 +233,7 @@ fn test_cost_estimation_prefers_full() -> Result<()> {
     let refresher = IncrementalRefresher::new(Arc::clone(&storage), tracker);
 
     // Create a small base table
-    let schema = Schema::new(vec![
-        Column::new("id", DataType::Int4),
-    ]);
+    let schema = Schema::new(vec![Column::new("id", DataType::Int4)]);
 
     let catalog = storage.catalog();
     catalog.create_table("users", schema.clone())?;
@@ -288,9 +283,7 @@ fn test_can_refresh_incrementally() -> Result<()> {
     let tracker = Arc::new(DeltaTracker::new(Arc::clone(&storage)));
     let refresher = IncrementalRefresher::new(Arc::clone(&storage), tracker);
 
-    let schema = Schema::new(vec![
-        Column::new("id", DataType::Int4),
-    ]);
+    let schema = Schema::new(vec![Column::new("id", DataType::Int4)]);
 
     // Create a scan plan (supported for incremental refresh)
     let query_plan = LogicalPlan::Scan {
@@ -365,9 +358,7 @@ fn test_incremental_refresh_not_supported_without_first_refresh() -> Result<()> 
     let tracker = Arc::new(DeltaTracker::new(Arc::clone(&storage)));
     let refresher = IncrementalRefresher::new(Arc::clone(&storage), tracker);
 
-    let schema = Schema::new(vec![
-        Column::new("id", DataType::Int4),
-    ]);
+    let schema = Schema::new(vec![Column::new("id", DataType::Int4)]);
 
     let query_plan = LogicalPlan::Scan {
         table_name: "users".to_string(),

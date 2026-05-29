@@ -2,7 +2,7 @@
 //!
 //! Standard aggregations (no online aggregation - that's proprietary IP).
 
-use crate::{Result, Value, Error};
+use crate::{Error, Result, Value};
 
 /// Aggregate function
 pub trait AggregateFunction: Send {
@@ -95,7 +95,12 @@ impl AggregateState for SumState {
             Value::Int8(n) => *n as f64,
             Value::Float4(n) => *n as f64,
             Value::Float8(n) => *n,
-            _ => return Err(Error::Generic(format!("SUM cannot aggregate non-numeric value: {:?}", value))),
+            _ => {
+                return Err(Error::Generic(format!(
+                    "SUM cannot aggregate non-numeric value: {:?}",
+                    value
+                )))
+            }
         };
 
         self.sum = Some(self.sum.unwrap_or(0.0) + num);
@@ -139,7 +144,12 @@ impl AggregateState for AvgState {
             Value::Int8(n) => *n as f64,
             Value::Float4(n) => *n as f64,
             Value::Float8(n) => *n,
-            _ => return Err(Error::Generic(format!("AVG cannot aggregate non-numeric value: {:?}", value))),
+            _ => {
+                return Err(Error::Generic(format!(
+                    "AVG cannot aggregate non-numeric value: {:?}",
+                    value
+                )))
+            }
         };
 
         self.sum += num;
@@ -260,7 +270,7 @@ impl AggregateFunction for StddevFunction {
         Box::new(StddevState {
             count: 0,
             mean: 0.0,
-            m2: 0.0  // Sum of squares of differences from mean (Welford's algorithm)
+            m2: 0.0, // Sum of squares of differences from mean (Welford's algorithm)
         })
     }
 
@@ -285,7 +295,12 @@ impl AggregateState for StddevState {
             Value::Int8(n) => *n as f64,
             Value::Float4(n) => *n as f64,
             Value::Float8(n) => *n,
-            _ => return Err(Error::Generic(format!("STDDEV cannot aggregate non-numeric value: {:?}", value))),
+            _ => {
+                return Err(Error::Generic(format!(
+                    "STDDEV cannot aggregate non-numeric value: {:?}",
+                    value
+                )))
+            }
         };
 
         // Welford's online algorithm for computing variance
@@ -321,7 +336,7 @@ impl AggregateFunction for VarianceFunction {
         Box::new(VarianceState {
             count: 0,
             mean: 0.0,
-            m2: 0.0
+            m2: 0.0,
         })
     }
 
@@ -346,7 +361,12 @@ impl AggregateState for VarianceState {
             Value::Int8(n) => *n as f64,
             Value::Float4(n) => *n as f64,
             Value::Float8(n) => *n,
-            _ => return Err(Error::Generic(format!("VARIANCE cannot aggregate non-numeric value: {:?}", value))),
+            _ => {
+                return Err(Error::Generic(format!(
+                    "VARIANCE cannot aggregate non-numeric value: {:?}",
+                    value
+                )))
+            }
         };
 
         // Welford's online algorithm for computing variance
@@ -385,9 +405,7 @@ fn value_less_than(a: &Value, b: &Value) -> bool {
         (Value::String(x), Value::String(y)) => x < y,
         (Value::Boolean(x), Value::Boolean(y)) => !x && *y, // false < true
         // Cross-type numeric comparisons (convert to f64)
-        (a, b) if is_numeric(a) && is_numeric(b) => {
-            to_f64(a).unwrap_or(f64::NAN) < to_f64(b).unwrap_or(f64::NAN)
-        }
+        (a, b) if is_numeric(a) && is_numeric(b) => to_f64(a).unwrap_or(f64::NAN) < to_f64(b).unwrap_or(f64::NAN),
         _ => false, // Can't compare incompatible types
     }
 }
@@ -403,18 +421,16 @@ fn value_greater_than(a: &Value, b: &Value) -> bool {
         (Value::String(x), Value::String(y)) => x > y,
         (Value::Boolean(x), Value::Boolean(y)) => *x && !y, // true > false
         // Cross-type numeric comparisons (convert to f64)
-        (a, b) if is_numeric(a) && is_numeric(b) => {
-            to_f64(a).unwrap_or(f64::NAN) > to_f64(b).unwrap_or(f64::NAN)
-        }
+        (a, b) if is_numeric(a) && is_numeric(b) => to_f64(a).unwrap_or(f64::NAN) > to_f64(b).unwrap_or(f64::NAN),
         _ => false, // Can't compare incompatible types
     }
 }
 
 /// Check if a value is numeric
 fn is_numeric(v: &Value) -> bool {
-    matches!(v,
-        Value::Int2(_) | Value::Int4(_) | Value::Int8(_) |
-        Value::Float4(_) | Value::Float8(_)
+    matches!(
+        v,
+        Value::Int2(_) | Value::Int4(_) | Value::Int8(_) | Value::Float4(_) | Value::Float8(_)
     )
 }
 
@@ -439,9 +455,7 @@ pub struct JsonAggFunction;
 
 impl AggregateFunction for JsonAggFunction {
     fn init_state(&self) -> Box<dyn AggregateState> {
-        Box::new(JsonAggState {
-            values: Vec::new()
-        })
+        Box::new(JsonAggState { values: Vec::new() })
     }
 
     fn name(&self) -> &'static str {
@@ -478,8 +492,9 @@ impl AggregateState for JsonAggState {
             }
             Value::Array(arr) => {
                 // Recursively convert array elements
-                let json_arr: Vec<serde_json::Value> = arr.iter().map(|v| {
-                    match v {
+                let json_arr: Vec<serde_json::Value> = arr
+                    .iter()
+                    .map(|v| match v {
                         Value::Null => serde_json::Value::Null,
                         Value::Boolean(b) => serde_json::Value::Bool(*b),
                         Value::Int2(n) => serde_json::json!(*n),
@@ -495,8 +510,8 @@ impl AggregateState for JsonAggState {
                             serde_json::from_str(j).unwrap_or_else(|_| serde_json::Value::String(j.clone()))
                         }
                         _ => serde_json::Value::Null,
-                    }
-                }).collect();
+                    })
+                    .collect();
                 serde_json::Value::Array(json_arr)
             }
             _ => serde_json::Value::Null,
@@ -618,7 +633,17 @@ mod tests {
         // Sample variance = 32/7 ≈ 4.5714
         let expected_variance: f64 = 32.0 / 7.0;
         let expected_stddev: f64 = expected_variance.sqrt();
-        assert!((variance - expected_variance).abs() < 0.001, "variance {} != {}", variance, expected_variance);
-        assert!((stddev - expected_stddev).abs() < 0.001, "stddev {} != {}", stddev, expected_stddev);
+        assert!(
+            (variance - expected_variance).abs() < 0.001,
+            "variance {} != {}",
+            variance,
+            expected_variance
+        );
+        assert!(
+            (stddev - expected_stddev).abs() < 0.001,
+            "stddev {} != {}",
+            stddev,
+            expected_stddev
+        );
     }
 }

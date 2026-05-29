@@ -2,8 +2,8 @@
 //
 // This example shows how to use NEW and OLD to access row data in trigger bodies
 
-use heliosdb_nano::sql::{LogicalExpr, Evaluator, triggers::TriggerRowContext};
-use heliosdb_nano::{Schema, Column, DataType, Tuple, Value, ColumnStorageMode};
+use heliosdb_nano::sql::{triggers::TriggerRowContext, Evaluator, LogicalExpr};
+use heliosdb_nano::{Column, ColumnStorageMode, DataType, Schema, Tuple, Value};
 use std::sync::Arc;
 
 fn main() -> heliosdb_nano::Result<()> {
@@ -62,12 +62,7 @@ fn main() -> heliosdb_nano::Result<()> {
     let insert_context = TriggerRowContext::for_insert(new_row.clone());
 
     // Create evaluator with trigger context
-    let evaluator = Evaluator::with_trigger_row_context(
-        schema.clone(),
-        vec![],
-        insert_context,
-        schema.clone(),
-    );
+    let evaluator = Evaluator::with_trigger_row_context(schema.clone(), vec![], insert_context, schema.clone());
 
     // Access NEW.name
     let new_name_expr = LogicalExpr::NewRow {
@@ -104,12 +99,7 @@ fn main() -> heliosdb_nano::Result<()> {
 
     let update_context = TriggerRowContext::for_update(old_row, new_row);
 
-    let evaluator = Evaluator::with_trigger_row_context(
-        schema.clone(),
-        vec![],
-        update_context,
-        schema.clone(),
-    );
+    let evaluator = Evaluator::with_trigger_row_context(schema.clone(), vec![], update_context, schema.clone());
 
     // Access OLD.name
     let old_name_expr = LogicalExpr::OldRow {
@@ -147,12 +137,7 @@ fn main() -> heliosdb_nano::Result<()> {
 
     let delete_context = TriggerRowContext::for_delete(deleted_row);
 
-    let evaluator = Evaluator::with_trigger_row_context(
-        schema.clone(),
-        vec![],
-        delete_context,
-        schema.clone(),
-    );
+    let evaluator = Evaluator::with_trigger_row_context(schema.clone(), vec![], delete_context, schema.clone());
 
     // Access OLD.name
     let result = evaluator.evaluate(&old_name_expr, &empty_tuple)?;

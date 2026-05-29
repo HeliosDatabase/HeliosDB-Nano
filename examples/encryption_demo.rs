@@ -23,8 +23,7 @@ fn main() -> Result<()> {
     println!("1. Creating encrypted in-memory database...");
     let mut config = Config::in_memory();
     config.encryption.enabled = true;
-    config.encryption.key_source =
-        KeySource::Environment("DEMO_ENCRYPTION_KEY".to_string());
+    config.encryption.key_source = KeySource::Environment("DEMO_ENCRYPTION_KEY".to_string());
 
     let storage = heliosdb_nano::storage::StorageEngine::open_in_memory(&config)?;
 
@@ -82,17 +81,23 @@ fn main() -> Result<()> {
 
     // Insert encrypted data
     println!("3. Inserting sensitive data (automatically encrypted)...");
-    storage.insert_tuple("sensitive_data", heliosdb_nano::Tuple::new(vec![
-        heliosdb_nano::Value::Int4(1),
-        heliosdb_nano::Value::String("123-45-6789".to_string()),
-        heliosdb_nano::Value::String("4111-1111-1111-1111".to_string()),
-    ]))?;
+    storage.insert_tuple(
+        "sensitive_data",
+        heliosdb_nano::Tuple::new(vec![
+            heliosdb_nano::Value::Int4(1),
+            heliosdb_nano::Value::String("123-45-6789".to_string()),
+            heliosdb_nano::Value::String("4111-1111-1111-1111".to_string()),
+        ]),
+    )?;
 
-    storage.insert_tuple("sensitive_data", heliosdb_nano::Tuple::new(vec![
-        heliosdb_nano::Value::Int4(2),
-        heliosdb_nano::Value::String("987-65-4321".to_string()),
-        heliosdb_nano::Value::String("5500-0000-0000-0004".to_string()),
-    ]))?;
+    storage.insert_tuple(
+        "sensitive_data",
+        heliosdb_nano::Tuple::new(vec![
+            heliosdb_nano::Value::Int4(2),
+            heliosdb_nano::Value::String("987-65-4321".to_string()),
+            heliosdb_nano::Value::String("5500-0000-0000-0004".to_string()),
+        ]),
+    )?;
 
     println!("   ✓ Inserted 2 records");
     println!();
@@ -115,19 +120,18 @@ fn main() -> Result<()> {
 
         // Mask sensitive data for display
         let ssn_masked = if let heliosdb_nano::Value::String(s) = ssn {
-            format!("***-**-{}", &s[s.len()-4..])
+            format!("***-**-{}", &s[s.len() - 4..])
         } else {
             "???".to_string()
         };
 
         let cc_masked = if let heliosdb_nano::Value::String(s) = cc {
-            format!("****-****-****-{}", &s[s.len()-4..])
+            format!("****-****-****-{}", &s[s.len() - 4..])
         } else {
             "???".to_string()
         };
 
-        println!("   Record {}: ID={:?}, SSN={}, CC={}",
-                 i + 1, id, ssn_masked, cc_masked);
+        println!("   Record {}: ID={:?}, SSN={}, CC={}", i + 1, id, ssn_masked, cc_masked);
     }
     println!();
 
@@ -153,11 +157,14 @@ fn main() -> Result<()> {
     // Encrypted writes
     let start = std::time::Instant::now();
     for i in 0..1000 {
-        storage.insert_tuple("sensitive_data", heliosdb_nano::Tuple::new(vec![
-            heliosdb_nano::Value::Int4(1000 + i),
-            heliosdb_nano::Value::String(format!("SSN-{}", i)),
-            heliosdb_nano::Value::String(format!("CC-{}", i)),
-        ]))?;
+        storage.insert_tuple(
+            "sensitive_data",
+            heliosdb_nano::Tuple::new(vec![
+                heliosdb_nano::Value::Int4(1000 + i),
+                heliosdb_nano::Value::String(format!("SSN-{}", i)),
+                heliosdb_nano::Value::String(format!("CC-{}", i)),
+            ]),
+        )?;
     }
     let encrypted_duration = start.elapsed();
     println!("   Encrypted: 1000 inserts in {:?}", encrypted_duration);
@@ -171,17 +178,20 @@ fn main() -> Result<()> {
 
     let start = std::time::Instant::now();
     for i in 0..1000 {
-        unencrypted_storage.insert_tuple("sensitive_data", heliosdb_nano::Tuple::new(vec![
-            heliosdb_nano::Value::Int4(1000 + i),
-            heliosdb_nano::Value::String(format!("SSN-{}", i)),
-            heliosdb_nano::Value::String(format!("CC-{}", i)),
-        ]))?;
+        unencrypted_storage.insert_tuple(
+            "sensitive_data",
+            heliosdb_nano::Tuple::new(vec![
+                heliosdb_nano::Value::Int4(1000 + i),
+                heliosdb_nano::Value::String(format!("SSN-{}", i)),
+                heliosdb_nano::Value::String(format!("CC-{}", i)),
+            ]),
+        )?;
     }
     let unencrypted_duration = start.elapsed();
     println!("   Unencrypted: 1000 inserts in {:?}", unencrypted_duration);
 
-    let overhead_percent = ((encrypted_duration.as_micros() as f64
-                            / unencrypted_duration.as_micros() as f64) - 1.0) * 100.0;
+    let overhead_percent =
+        ((encrypted_duration.as_micros() as f64 / unencrypted_duration.as_micros() as f64) - 1.0) * 100.0;
     println!("   Encryption overhead: {:.2}%", overhead_percent);
     println!();
 

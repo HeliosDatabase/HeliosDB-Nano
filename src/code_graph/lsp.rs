@@ -65,11 +65,7 @@ pub struct HoverRow {
 // lsp_definition
 // ---------------------------------------------------------------------------
 
-pub fn lsp_definition(
-    db: &EmbeddedDatabase,
-    name: &str,
-    hint: &DefinitionHint,
-) -> Result<Vec<DefinitionRow>> {
+pub fn lsp_definition(db: &EmbeddedDatabase, name: &str, hint: &DefinitionHint) -> Result<Vec<DefinitionRow>> {
     // Storage-level filtering lever: the WHERE clause here is exactly
     // the shape pushed through FilteredScan — Eq on `name` plus an
     // optional Eq on `path`. Both columns are high-cardinality but
@@ -178,11 +174,7 @@ pub fn lsp_call_hierarchy(
         if frontier.is_empty() {
             break;
         }
-        let ids_csv = frontier
-            .iter()
-            .map(|i| i.to_string())
-            .collect::<Vec<_>>()
-            .join(",");
+        let ids_csv = frontier.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",");
         let sql = match direction {
             CallDirection::Incoming => format!(
                 "SELECT r.from_symbol, s.qualified, f.path, s.line_start \
@@ -228,9 +220,7 @@ pub fn lsp_call_hierarchy(
 
 pub fn lsp_hover(db: &EmbeddedDatabase, symbol_id: i64) -> Result<Option<HoverRow>> {
     let rows = db.query(
-        &format!(
-            "SELECT signature FROM _hdb_code_symbols WHERE node_id = {symbol_id}"
-        ),
+        &format!("SELECT signature FROM _hdb_code_symbols WHERE node_id = {symbol_id}"),
         &[],
     )?;
     if let Some(row) = rows.first() {
@@ -270,8 +260,6 @@ fn int_at(row: &crate::Tuple, idx: usize) -> Result<i64> {
         Some(other) => Err(Error::query_execution(format!(
             "expected integer at position {idx}, got {other:?}"
         ))),
-        None => Err(Error::query_execution(format!(
-            "missing column at position {idx}"
-        ))),
+        None => Err(Error::query_execution(format!("missing column at position {idx}"))),
     }
 }

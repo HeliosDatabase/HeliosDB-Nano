@@ -62,24 +62,13 @@ fn test_union_all_preserves_duplicates() {
 
     // UNION ALL should return {1,2,2,3} -- all 4 rows
     let rows = db
-        .query(
-            "SELECT val FROM ua1 UNION ALL SELECT val FROM ua2",
-            &[],
-        )
+        .query("SELECT val FROM ua1 UNION ALL SELECT val FROM ua2", &[])
         .unwrap();
-    assert_eq!(
-        rows.len(),
-        4,
-        "UNION ALL should keep all rows including duplicates"
-    );
+    assert_eq!(rows.len(), 4, "UNION ALL should keep all rows including duplicates");
 
     let mut vals: Vec<i64> = rows.iter().filter_map(|r| get_int_value(r, 0)).collect();
     vals.sort();
-    assert_eq!(
-        vals,
-        vec![1, 2, 2, 3],
-        "UNION ALL should have two copies of 2"
-    );
+    assert_eq!(vals, vec![1, 2, 2, 3], "UNION ALL should have two copies of 2");
 }
 
 #[test]
@@ -90,10 +79,7 @@ fn test_union_uses_first_select_column_names() {
     // SELECT 1 AS first_name UNION SELECT 2 AS second_name
     // Result column should be named 'first_name'
     let rows = db
-        .query(
-            "SELECT 1 AS first_name UNION SELECT 2 AS second_name",
-            &[],
-        )
+        .query("SELECT 1 AS first_name UNION SELECT 2 AS second_name", &[])
         .unwrap();
     assert_eq!(rows.len(), 2, "Should return 2 rows for UNION of 1 and 2");
     // We verify the query succeeds and produces correct data
@@ -106,9 +92,7 @@ fn test_union_uses_first_select_column_names() {
 fn test_union_single_row_each_side() {
     let db = create_test_db().unwrap();
 
-    let rows = db
-        .query("SELECT 42 AS val UNION SELECT 99 AS val", &[])
-        .unwrap();
+    let rows = db.query("SELECT 42 AS val UNION SELECT 99 AS val", &[]).unwrap();
     assert_eq!(rows.len(), 2, "UNION of two single-row SELECTs should give 2 rows");
     let mut vals: Vec<i64> = rows.iter().filter_map(|r| get_int_value(r, 0)).collect();
     vals.sort();
@@ -127,21 +111,23 @@ fn test_union_with_empty_result_on_one_side() {
 
     // UNION with empty right side
     let rows = db
-        .query(
-            "SELECT val FROM ue_full UNION SELECT val FROM ue_empty",
-            &[],
-        )
+        .query("SELECT val FROM ue_full UNION SELECT val FROM ue_empty", &[])
         .unwrap();
-    assert_eq!(rows.len(), 2, "UNION with empty right side should return left side rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "UNION with empty right side should return left side rows"
+    );
 
     // UNION with empty left side
     let rows = db
-        .query(
-            "SELECT val FROM ue_empty UNION SELECT val FROM ue_full",
-            &[],
-        )
+        .query("SELECT val FROM ue_empty UNION SELECT val FROM ue_full", &[])
         .unwrap();
-    assert_eq!(rows.len(), 2, "UNION with empty left side should return right side rows");
+    assert_eq!(
+        rows.len(),
+        2,
+        "UNION with empty left side should return right side rows"
+    );
 }
 
 #[test]
@@ -151,10 +137,7 @@ fn test_union_both_sides_empty() {
     db.execute("CREATE TABLE empty2 (val INT)").unwrap();
 
     let rows = db
-        .query(
-            "SELECT val FROM empty1 UNION SELECT val FROM empty2",
-            &[],
-        )
+        .query("SELECT val FROM empty1 UNION SELECT val FROM empty2", &[])
         .unwrap();
     assert_eq!(rows.len(), 0, "UNION of two empty tables should return 0 rows");
 }
@@ -179,11 +162,7 @@ fn test_intersect_returns_common_rows() {
     let rows = db
         .query("SELECT val FROM ia INTERSECT SELECT val FROM ib", &[])
         .unwrap();
-    assert_eq!(
-        rows.len(),
-        2,
-        "INTERSECT should return only common rows (2 and 3)"
-    );
+    assert_eq!(rows.len(), 2, "INTERSECT should return only common rows (2 and 3)");
     let mut vals: Vec<i64> = rows.iter().filter_map(|r| get_int_value(r, 0)).collect();
     vals.sort();
     assert_eq!(vals, vec![2, 3]);
@@ -203,11 +182,7 @@ fn test_intersect_no_common_rows() {
     let rows = db
         .query("SELECT val FROM in1 INTERSECT SELECT val FROM in2", &[])
         .unwrap();
-    assert_eq!(
-        rows.len(),
-        0,
-        "INTERSECT with no common rows should return empty"
-    );
+    assert_eq!(rows.len(), 0, "INTERSECT with no common rows should return empty");
 }
 
 #[test]
@@ -227,10 +202,7 @@ fn test_intersect_all_preserves_duplicates() {
 
     // INTERSECT ALL: min(left_count, right_count) for each value
     // val=2: min(2,3) = 2 copies; val=3: min(1,1) = 1 copy
-    let result = db.query(
-        "SELECT val FROM ial INTERSECT ALL SELECT val FROM iar",
-        &[],
-    );
+    let result = db.query("SELECT val FROM ial INTERSECT ALL SELECT val FROM iar", &[]);
     match result {
         Ok(rows) => {
             // Expected: 2 copies of 2, 1 copy of 3 = 3 rows total
@@ -246,10 +218,7 @@ fn test_intersect_all_preserves_duplicates() {
         Err(e) => {
             // INTERSECT ALL may not be supported
             let err_str = e.to_string();
-            println!(
-                "INTERSECT ALL not supported (acceptable): {}",
-                err_str
-            );
+            println!("INTERSECT ALL not supported (acceptable): {}", err_str);
         }
     }
 }
@@ -265,29 +234,15 @@ fn test_intersect_with_one_empty_side() {
 
     // INTERSECT with empty right side -> empty
     let rows = db
-        .query(
-            "SELECT val FROM ie_full INTERSECT SELECT val FROM ie_empty",
-            &[],
-        )
+        .query("SELECT val FROM ie_full INTERSECT SELECT val FROM ie_empty", &[])
         .unwrap();
-    assert_eq!(
-        rows.len(),
-        0,
-        "INTERSECT with empty right side should return empty"
-    );
+    assert_eq!(rows.len(), 0, "INTERSECT with empty right side should return empty");
 
     // INTERSECT with empty left side -> empty
     let rows = db
-        .query(
-            "SELECT val FROM ie_empty INTERSECT SELECT val FROM ie_full",
-            &[],
-        )
+        .query("SELECT val FROM ie_empty INTERSECT SELECT val FROM ie_full", &[])
         .unwrap();
-    assert_eq!(
-        rows.len(),
-        0,
-        "INTERSECT with empty left side should return empty"
-    );
+    assert_eq!(rows.len(), 0, "INTERSECT with empty left side should return empty");
 }
 
 #[test]
@@ -300,16 +255,9 @@ fn test_intersect_identical_sets() {
 
     // INTERSECT of table with itself should return all unique rows
     let rows = db
-        .query(
-            "SELECT val FROM iid INTERSECT SELECT val FROM iid",
-            &[],
-        )
+        .query("SELECT val FROM iid INTERSECT SELECT val FROM iid", &[])
         .unwrap();
-    assert_eq!(
-        rows.len(),
-        3,
-        "INTERSECT of identical sets should return all rows"
-    );
+    assert_eq!(rows.len(), 3, "INTERSECT of identical sets should return all rows");
     let mut vals: Vec<i64> = rows.iter().filter_map(|r| get_int_value(r, 0)).collect();
     vals.sort();
     assert_eq!(vals, vec![10, 20, 30]);
@@ -332,9 +280,7 @@ fn test_except_removes_second_from_first() {
     db.execute("INSERT INTO eb VALUES (3)").unwrap();
 
     // EXCEPT should return rows in A not in B: {1}
-    let rows = db
-        .query("SELECT val FROM ea EXCEPT SELECT val FROM eb", &[])
-        .unwrap();
+    let rows = db.query("SELECT val FROM ea EXCEPT SELECT val FROM eb", &[]).unwrap();
     assert_eq!(rows.len(), 1, "EXCEPT should remove common rows from first set");
     assert_eq!(get_int_value(&rows[0], 0).unwrap(), 1);
 }
@@ -355,26 +301,16 @@ fn test_except_all_preserves_duplicates() {
 
     // EXCEPT ALL: subtract one copy of each matching value
     // val=1: 1-0=1; val=2: 3-1=2; val=3: 1-1=0 => {1, 2, 2}
-    let result = db.query(
-        "SELECT val FROM eal EXCEPT ALL SELECT val FROM ear",
-        &[],
-    );
+    let result = db.query("SELECT val FROM eal EXCEPT ALL SELECT val FROM ear", &[]);
     match result {
         Ok(rows) => {
-            assert_eq!(
-                rows.len(),
-                3,
-                "EXCEPT ALL should subtract matching row counts"
-            );
+            assert_eq!(rows.len(), 3, "EXCEPT ALL should subtract matching row counts");
             let mut vals: Vec<i64> = rows.iter().filter_map(|r| get_int_value(r, 0)).collect();
             vals.sort();
             assert_eq!(vals, vec![1, 2, 2]);
         }
         Err(e) => {
-            println!(
-                "EXCEPT ALL not supported (acceptable): {}",
-                e
-            );
+            println!("EXCEPT ALL not supported (acceptable): {}", e);
         }
     }
 }
@@ -391,9 +327,7 @@ fn test_except_no_overlap() {
     db.execute("INSERT INTO en2 VALUES (4)").unwrap();
 
     // EXCEPT with no overlap should return all of first
-    let rows = db
-        .query("SELECT val FROM en1 EXCEPT SELECT val FROM en2", &[])
-        .unwrap();
+    let rows = db.query("SELECT val FROM en1 EXCEPT SELECT val FROM en2", &[]).unwrap();
     assert_eq!(
         rows.len(),
         2,
@@ -418,16 +352,9 @@ fn test_except_second_is_superset() {
 
     // EXCEPT where second is superset => empty result
     let rows = db
-        .query(
-            "SELECT val FROM es_sub EXCEPT SELECT val FROM es_sup",
-            &[],
-        )
+        .query("SELECT val FROM es_sub EXCEPT SELECT val FROM es_sup", &[])
         .unwrap();
-    assert_eq!(
-        rows.len(),
-        0,
-        "EXCEPT where second set is superset should return empty"
-    );
+    assert_eq!(rows.len(), 0, "EXCEPT where second set is superset should return empty");
 }
 
 #[test]
@@ -441,16 +368,9 @@ fn test_except_empty_second_set() {
 
     // EXCEPT with empty right side should return all of left
     let rows = db
-        .query(
-            "SELECT val FROM ees_full EXCEPT SELECT val FROM ees_empty",
-            &[],
-        )
+        .query("SELECT val FROM ees_full EXCEPT SELECT val FROM ees_empty", &[])
         .unwrap();
-    assert_eq!(
-        rows.len(),
-        2,
-        "EXCEPT with empty second set should return all of first"
-    );
+    assert_eq!(rows.len(), 2, "EXCEPT with empty second set should return all of first");
 }
 
 // ============================================================================
@@ -469,16 +389,11 @@ fn test_union_with_null_values() {
     db.execute("INSERT INTO nu2 VALUES (2)").unwrap();
 
     // SQL standard: NULL is treated as equal for UNION dedup purposes
-    let rows = db
-        .query("SELECT val FROM nu1 UNION SELECT val FROM nu2", &[])
-        .unwrap();
+    let rows = db.query("SELECT val FROM nu1 UNION SELECT val FROM nu2", &[]).unwrap();
 
     // Expected: {1, NULL, 2} = 3 rows (NULLs deduplicated)
     // Or {1, NULL, NULL, 2} = 4 rows if NULLs are NOT deduplicated
-    let null_count = rows
-        .iter()
-        .filter(|r| matches!(r.get(0), Some(Value::Null)))
-        .count();
+    let null_count = rows.iter().filter(|r| matches!(r.get(0), Some(Value::Null))).count();
 
     // Document actual behavior
     println!(
@@ -508,16 +423,10 @@ fn test_intersect_with_null_in_both_sides() {
 
     // SQL standard: NULL = NULL for INTERSECT purposes
     let rows = db
-        .query(
-            "SELECT val FROM ni1 INTERSECT SELECT val FROM ni2",
-            &[],
-        )
+        .query("SELECT val FROM ni1 INTERSECT SELECT val FROM ni2", &[])
         .unwrap();
 
-    let null_count = rows
-        .iter()
-        .filter(|r| matches!(r.get(0), Some(Value::Null)))
-        .count();
+    let null_count = rows.iter().filter(|r| matches!(r.get(0), Some(Value::Null))).count();
 
     println!(
         "INTERSECT NULL handling: {} total rows, {} NULL rows (SQL standard: NULL matches NULL)",
@@ -547,15 +456,10 @@ fn test_except_with_null_values() {
     db.execute("INSERT INTO ne2 VALUES (2)").unwrap();
 
     // EXCEPT: {1, NULL, 2} - {NULL, 2} = {1}
-    let rows = db
-        .query("SELECT val FROM ne1 EXCEPT SELECT val FROM ne2", &[])
-        .unwrap();
+    let rows = db.query("SELECT val FROM ne1 EXCEPT SELECT val FROM ne2", &[]).unwrap();
 
     // If NULL=NULL for EXCEPT, result should be {1}
-    let null_count = rows
-        .iter()
-        .filter(|r| matches!(r.get(0), Some(Value::Null)))
-        .count();
+    let null_count = rows.iter().filter(|r| matches!(r.get(0), Some(Value::Null))).count();
     println!(
         "EXCEPT NULL handling: {} total rows, {} NULL rows",
         rows.len(),
@@ -588,25 +492,12 @@ fn test_union_all_with_nulls() {
 
     // UNION ALL should preserve all rows including duplicate NULLs
     let rows = db
-        .query(
-            "SELECT val FROM nua1 UNION ALL SELECT val FROM nua2",
-            &[],
-        )
+        .query("SELECT val FROM nua1 UNION ALL SELECT val FROM nua2", &[])
         .unwrap();
-    assert_eq!(
-        rows.len(),
-        4,
-        "UNION ALL should return all 4 rows (no dedup)"
-    );
+    assert_eq!(rows.len(), 4, "UNION ALL should return all 4 rows (no dedup)");
 
-    let null_count = rows
-        .iter()
-        .filter(|r| matches!(r.get(0), Some(Value::Null)))
-        .count();
-    assert_eq!(
-        null_count, 2,
-        "UNION ALL should preserve both NULL values"
-    );
+    let null_count = rows.iter().filter(|r| matches!(r.get(0), Some(Value::Null))).count();
+    assert_eq!(null_count, 2, "UNION ALL should preserve both NULL values");
 }
 
 #[test]
@@ -618,10 +509,7 @@ fn test_null_only_sets_union() {
     match result {
         Ok(rows) => {
             // SQL standard: NULL = NULL for UNION dedup, so result should be 1 row
-            println!(
-                "NULL UNION NULL: {} rows (SQL standard expects 1)",
-                rows.len()
-            );
+            println!("NULL UNION NULL: {} rows (SQL standard expects 1)", rows.len());
             // Both 1 and 2 are acceptable behaviors depending on NULL dedup semantics
             assert!(
                 rows.len() >= 1 && rows.len() <= 2,
@@ -655,9 +543,7 @@ fn test_union_same_int_types() {
     db.execute("CREATE TABLE ti2 (val INT)").unwrap();
     db.execute("INSERT INTO ti2 VALUES (200)").unwrap();
 
-    let rows = db
-        .query("SELECT val FROM ti1 UNION SELECT val FROM ti2", &[])
-        .unwrap();
+    let rows = db.query("SELECT val FROM ti1 UNION SELECT val FROM ti2", &[]).unwrap();
     assert_eq!(rows.len(), 2, "UNION of same INT types should return 2 rows");
     let mut vals: Vec<i64> = rows.iter().filter_map(|r| get_int_value(r, 0)).collect();
     vals.sort();
@@ -673,24 +559,14 @@ fn test_union_compatible_int_bigint_types() {
     db.execute("CREATE TABLE tc_big (val BIGINT)").unwrap();
     db.execute("INSERT INTO tc_big VALUES (9999999999)").unwrap();
 
-    let result = db.query(
-        "SELECT val FROM tc_int UNION SELECT val FROM tc_big",
-        &[],
-    );
+    let result = db.query("SELECT val FROM tc_int UNION SELECT val FROM tc_big", &[]);
     match result {
         Ok(rows) => {
-            assert_eq!(
-                rows.len(),
-                2,
-                "UNION of INT and BIGINT should return 2 rows"
-            );
+            assert_eq!(rows.len(), 2, "UNION of INT and BIGINT should return 2 rows");
         }
         Err(e) => {
             // Type width mismatch may be rejected
-            println!(
-                "INT/BIGINT UNION type mismatch (acceptable): {}",
-                e
-            );
+            println!("INT/BIGINT UNION type mismatch (acceptable): {}", e);
         }
     }
 }
@@ -738,20 +614,14 @@ fn test_union_text_and_text_columns() {
     db.execute("INSERT INTO tt2 VALUES ('Carol')").unwrap();
 
     let rows = db
-        .query(
-            "SELECT name FROM tt1 UNION SELECT label FROM tt2",
-            &[],
-        )
+        .query("SELECT name FROM tt1 UNION SELECT label FROM tt2", &[])
         .unwrap();
     assert_eq!(
         rows.len(),
         3,
         "UNION of text columns should dedup 'Bob' and return [Alice, Bob, Carol]"
     );
-    let mut vals: Vec<String> = rows
-        .iter()
-        .filter_map(|r| get_string_value(r, 0))
-        .collect();
+    let mut vals: Vec<String> = rows.iter().filter_map(|r| get_string_value(r, 0)).collect();
     vals.sort();
     assert_eq!(vals, vec!["Alice", "Bob", "Carol"]);
 }
@@ -786,30 +656,32 @@ fn test_union_order_by_ordinal_position() {
     let db = create_test_db().unwrap();
 
     // ORDER BY 1 (ordinal position) - standard SQL feature
-    let result = db.query(
-        "SELECT 30 AS val UNION SELECT 10 UNION SELECT 20 ORDER BY 1",
-        &[],
-    );
+    let result = db.query("SELECT 30 AS val UNION SELECT 10 UNION SELECT 20 ORDER BY 1", &[]);
     let rows = result.expect("ORDER BY ordinal position should work");
     assert_eq!(rows.len(), 3, "Should return 3 rows");
     let vals: Vec<i64> = rows.iter().filter_map(|r| get_int_value(r, 0)).collect();
-    assert_eq!(vals, vec![10, 20, 30], "ORDER BY 1 should sort by first column ascending");
+    assert_eq!(
+        vals,
+        vec![10, 20, 30],
+        "ORDER BY 1 should sort by first column ascending"
+    );
 
     // ORDER BY 1 DESC
-    let result = db.query(
-        "SELECT 30 AS val UNION SELECT 10 UNION SELECT 20 ORDER BY 1 DESC",
-        &[],
-    );
+    let result = db.query("SELECT 30 AS val UNION SELECT 10 UNION SELECT 20 ORDER BY 1 DESC", &[]);
     let rows = result.expect("ORDER BY ordinal position DESC should work");
     let vals: Vec<i64> = rows.iter().filter_map(|r| get_int_value(r, 0)).collect();
-    assert_eq!(vals, vec![30, 20, 10], "ORDER BY 1 DESC should sort by first column descending");
+    assert_eq!(
+        vals,
+        vec![30, 20, 10],
+        "ORDER BY 1 DESC should sort by first column descending"
+    );
 
     // ORDER BY with out-of-range ordinal should error
-    let result = db.query(
-        "SELECT 1 AS val UNION SELECT 2 ORDER BY 5",
-        &[],
+    let result = db.query("SELECT 1 AS val UNION SELECT 2 ORDER BY 5", &[]);
+    assert!(
+        result.is_err(),
+        "ORDER BY with out-of-range ordinal should return an error"
     );
-    assert!(result.is_err(), "ORDER BY with out-of-range ordinal should return an error");
 }
 
 #[test]
@@ -822,11 +694,7 @@ fn test_union_with_limit() {
     );
     match result {
         Ok(rows) => {
-            assert_eq!(
-                rows.len(),
-                3,
-                "UNION with LIMIT 3 should return exactly 3 rows"
-            );
+            assert_eq!(rows.len(), 3, "UNION with LIMIT 3 should return exactly 3 rows");
         }
         Err(e) => {
             println!("UNION LIMIT error: {}", e);
@@ -847,10 +715,7 @@ fn test_intersect_with_order_by() {
     db.execute("INSERT INTO io2 VALUES (3)").unwrap();
     db.execute("INSERT INTO io2 VALUES (4)").unwrap();
 
-    let result = db.query(
-        "SELECT val FROM io1 INTERSECT SELECT val FROM io2 ORDER BY val",
-        &[],
-    );
+    let result = db.query("SELECT val FROM io1 INTERSECT SELECT val FROM io2 ORDER BY val", &[]);
     match result {
         Ok(rows) => {
             assert_eq!(rows.len(), 2, "INTERSECT should return [2,3]");
@@ -876,17 +741,10 @@ fn test_except_with_limit() {
     db.execute("INSERT INTO el2 VALUES (2)").unwrap();
 
     // EXCEPT should yield {1,3,4}, then LIMIT 2
-    let result = db.query(
-        "SELECT val FROM el1 EXCEPT SELECT val FROM el2 LIMIT 2",
-        &[],
-    );
+    let result = db.query("SELECT val FROM el1 EXCEPT SELECT val FROM el2 LIMIT 2", &[]);
     match result {
         Ok(rows) => {
-            assert_eq!(
-                rows.len(),
-                2,
-                "EXCEPT with LIMIT 2 should return exactly 2 rows"
-            );
+            assert_eq!(rows.len(), 2, "EXCEPT with LIMIT 2 should return exactly 2 rows");
         }
         Err(e) => {
             println!("EXCEPT LIMIT error: {}", e);
@@ -903,12 +761,7 @@ fn test_three_way_union() {
     let db = create_test_db().unwrap();
 
     // A UNION B UNION C
-    let rows = db
-        .query(
-            "SELECT 1 AS val UNION SELECT 2 UNION SELECT 3",
-            &[],
-        )
-        .unwrap();
+    let rows = db.query("SELECT 1 AS val UNION SELECT 2 UNION SELECT 3", &[]).unwrap();
     assert_eq!(rows.len(), 3, "Three-way UNION should return 3 distinct values");
     let mut vals: Vec<i64> = rows.iter().filter_map(|r| get_int_value(r, 0)).collect();
     vals.sort();
@@ -944,10 +797,7 @@ fn test_union_then_intersect() {
         }
         Err(e) => {
             // Parenthesized set operations may not be supported; try without parens
-            println!(
-                "Parenthesized UNION INTERSECT error: {}, trying flat form",
-                e
-            );
+            println!("Parenthesized UNION INTERSECT error: {}, trying flat form", e);
             // Without parentheses, SQL standard precedence: INTERSECT binds tighter than UNION
             // A UNION B INTERSECT C = A UNION (B INTERSECT C) = {1,2} UNION ({3,4} INTERSECT {1,3}) = {1,2} UNION {3} = {1,2,3}
             let result2 = db.query(
@@ -996,10 +846,7 @@ fn test_except_from_union() {
             assert_eq!(get_int_value(&rows[0], 0).unwrap(), 1);
         }
         Err(e) => {
-            println!(
-                "Parenthesized EXCEPT (UNION) error: {}",
-                e
-            );
+            println!("Parenthesized EXCEPT (UNION) error: {}", e);
         }
     }
 }
@@ -1011,16 +858,10 @@ fn test_mixed_union_all_and_except() {
     // A UNION ALL B EXCEPT C
     // SQL standard: EXCEPT has same precedence as UNION, evaluated left-to-right
     // So: (A UNION ALL B) EXCEPT C
-    let result = db.query(
-        "SELECT 1 AS val UNION ALL SELECT 2 EXCEPT SELECT 2",
-        &[],
-    );
+    let result = db.query("SELECT 1 AS val UNION ALL SELECT 2 EXCEPT SELECT 2", &[]);
     match result {
         Ok(rows) => {
-            println!(
-                "UNION ALL then EXCEPT returned {} rows",
-                rows.len()
-            );
+            println!("UNION ALL then EXCEPT returned {} rows", rows.len());
             // Depends on precedence and whether EXCEPT deduplicates first
             // Document actual behavior
             let vals: Vec<i64> = rows.iter().filter_map(|r| get_int_value(r, 0)).collect();
@@ -1081,10 +922,7 @@ fn test_union_multi_column_results() {
 
     // Multi-column UNION should match tuples (both columns must match for dedup)
     let rows = db
-        .query(
-            "SELECT a, b FROM mc1 UNION SELECT a, b FROM mc2",
-            &[],
-        )
+        .query("SELECT a, b FROM mc1 UNION SELECT a, b FROM mc2", &[])
         .unwrap();
     assert_eq!(
         rows.len(),
@@ -1181,11 +1019,7 @@ fn test_union_with_subquery_on_one_side() {
     match result {
         Ok(rows) => {
             // Left: {1, 2}, Right: {2, 3} => UNION: {1, 2, 3}
-            assert_eq!(
-                rows.len(),
-                3,
-                "UNION with subquery should combine results correctly"
-            );
+            assert_eq!(rows.len(), 3, "UNION with subquery should combine results correctly");
             let mut vals: Vec<i64> = rows.iter().filter_map(|r| get_int_value(r, 0)).collect();
             vals.sort();
             assert_eq!(vals, vec![1, 2, 3]);
@@ -1211,11 +1045,7 @@ fn test_large_union_five_selects() {
             &[],
         )
         .unwrap();
-    assert_eq!(
-        rows.len(),
-        5,
-        "Five-way UNION should return 5 distinct values"
-    );
+    assert_eq!(rows.len(), 5, "Five-way UNION should return 5 distinct values");
     let mut vals: Vec<i64> = rows.iter().filter_map(|r| get_int_value(r, 0)).collect();
     vals.sort();
     assert_eq!(vals, vec![1, 2, 3, 4, 5]);
@@ -1237,10 +1067,7 @@ fn test_union_dedup_multi_column_partial_match() {
     db.execute("INSERT INTO pd2 VALUES (1, 20)").unwrap();
 
     let rows = db
-        .query(
-            "SELECT a, b FROM pd1 UNION SELECT a, b FROM pd2",
-            &[],
-        )
+        .query("SELECT a, b FROM pd1 UNION SELECT a, b FROM pd2", &[])
         .unwrap();
     assert_eq!(
         rows.len(),
@@ -1259,16 +1086,9 @@ fn test_except_self_yields_empty() {
 
     // T EXCEPT T = empty set
     let rows = db
-        .query(
-            "SELECT val FROM es_self EXCEPT SELECT val FROM es_self",
-            &[],
-        )
+        .query("SELECT val FROM es_self EXCEPT SELECT val FROM es_self", &[])
         .unwrap();
-    assert_eq!(
-        rows.len(),
-        0,
-        "Table EXCEPT itself should return empty set"
-    );
+    assert_eq!(rows.len(), 0, "Table EXCEPT itself should return empty set");
 }
 
 #[test]
@@ -1276,17 +1096,8 @@ fn test_union_all_does_not_dedup_identical_rows() {
     let db = create_test_db().unwrap();
 
     // Two identical literal selects with UNION ALL
-    let rows = db
-        .query(
-            "SELECT 42 AS val UNION ALL SELECT 42",
-            &[],
-        )
-        .unwrap();
-    assert_eq!(
-        rows.len(),
-        2,
-        "UNION ALL of identical rows should keep both copies"
-    );
+    let rows = db.query("SELECT 42 AS val UNION ALL SELECT 42", &[]).unwrap();
+    assert_eq!(rows.len(), 2, "UNION ALL of identical rows should keep both copies");
     assert_eq!(get_int_value(&rows[0], 0).unwrap(), 42);
     assert_eq!(get_int_value(&rows[1], 0).unwrap(), 42);
 }
@@ -1305,25 +1116,15 @@ fn test_union_vs_union_all_duplicate_count() {
 
     // UNION should dedup: {1, 2, 3} = 3 rows
     let union_rows = db
-        .query(
-            "SELECT val FROM dup_a UNION SELECT val FROM dup_b",
-            &[],
-        )
+        .query("SELECT val FROM dup_a UNION SELECT val FROM dup_b", &[])
         .unwrap();
     assert_eq!(union_rows.len(), 3, "UNION should return 3 unique values");
 
     // UNION ALL should keep all: {1, 1, 2, 1, 3} = 5 rows
     let union_all_rows = db
-        .query(
-            "SELECT val FROM dup_a UNION ALL SELECT val FROM dup_b",
-            &[],
-        )
+        .query("SELECT val FROM dup_a UNION ALL SELECT val FROM dup_b", &[])
         .unwrap();
-    assert_eq!(
-        union_all_rows.len(),
-        5,
-        "UNION ALL should return all 5 rows"
-    );
+    assert_eq!(union_all_rows.len(), 5, "UNION ALL should return all 5 rows");
 
     assert!(
         union_all_rows.len() > union_rows.len(),
@@ -1346,16 +1147,9 @@ fn test_intersect_multi_column() {
 
     // Only (2, 'y') is in both -- (3, 'z') != (3, 'w')
     let rows = db
-        .query(
-            "SELECT a, b FROM im1 INTERSECT SELECT a, b FROM im2",
-            &[],
-        )
+        .query("SELECT a, b FROM im1 INTERSECT SELECT a, b FROM im2", &[])
         .unwrap();
-    assert_eq!(
-        rows.len(),
-        1,
-        "Multi-column INTERSECT should match on all columns"
-    );
+    assert_eq!(rows.len(), 1, "Multi-column INTERSECT should match on all columns");
     assert_eq!(get_int_value(&rows[0], 0).unwrap(), 2);
     assert_eq!(get_string_value(&rows[0], 1).unwrap(), "y");
 }
@@ -1373,10 +1167,7 @@ fn test_except_multi_column() {
 
     // EXCEPT: {(1,'x'), (2,'y'), (3,'z')} - {(2,'y')} = {(1,'x'), (3,'z')}
     let rows = db
-        .query(
-            "SELECT a, b FROM em1 EXCEPT SELECT a, b FROM em2",
-            &[],
-        )
+        .query("SELECT a, b FROM em1 EXCEPT SELECT a, b FROM em2", &[])
         .unwrap();
     assert_eq!(
         rows.len(),
@@ -1416,10 +1207,7 @@ fn test_union_with_string_duplicates() {
 
     // Test string dedup in UNION
     let rows = db
-        .query(
-            "SELECT 'hello' AS val UNION SELECT 'world' UNION SELECT 'hello'",
-            &[],
-        )
+        .query("SELECT 'hello' AS val UNION SELECT 'world' UNION SELECT 'hello'", &[])
         .unwrap();
     assert_eq!(
         rows.len(),
@@ -1438,10 +1226,7 @@ fn test_large_union_all_preserves_all_rows() {
 
     // UNION ALL of same table twice should double the row count
     let rows = db
-        .query(
-            "SELECT val FROM lu UNION ALL SELECT val FROM lu",
-            &[],
-        )
+        .query("SELECT val FROM lu UNION ALL SELECT val FROM lu", &[])
         .unwrap();
     assert_eq!(
         rows.len(),
@@ -1463,16 +1248,10 @@ fn test_except_asymmetry() {
 
     // A EXCEPT B != B EXCEPT A (set difference is not commutative)
     let a_minus_b = db
-        .query(
-            "SELECT val FROM asym_a EXCEPT SELECT val FROM asym_b",
-            &[],
-        )
+        .query("SELECT val FROM asym_a EXCEPT SELECT val FROM asym_b", &[])
         .unwrap();
     let b_minus_a = db
-        .query(
-            "SELECT val FROM asym_b EXCEPT SELECT val FROM asym_a",
-            &[],
-        )
+        .query("SELECT val FROM asym_b EXCEPT SELECT val FROM asym_a", &[])
         .unwrap();
 
     let a_vals: Vec<i64> = a_minus_b.iter().filter_map(|r| get_int_value(r, 0)).collect();
@@ -1480,8 +1259,5 @@ fn test_except_asymmetry() {
 
     assert_eq!(a_vals, vec![1], "A EXCEPT B should return [1]");
     assert_eq!(b_vals, vec![3], "B EXCEPT A should return [3]");
-    assert_ne!(
-        a_vals, b_vals,
-        "EXCEPT is not commutative: A-B should differ from B-A"
-    );
+    assert_ne!(a_vals, b_vals, "EXCEPT is not commutative: A-B should differ from B-A");
 }

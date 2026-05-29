@@ -188,7 +188,7 @@ fn test_column_not_found() {
     let result = db.query("SELECT nonexistent_column FROM users", &[]);
     // Should error or handle gracefully
     match result {
-        Ok(_) => {},
+        Ok(_) => {}
         Err(_) => {} // Error is acceptable
     }
 }
@@ -203,7 +203,7 @@ fn test_ambiguous_column() {
     let result = db.query("SELECT id FROM t1 INNER JOIN t2 ON t1.id = t2.id", &[]);
     // Should either error or handle gracefully
     match result {
-        Ok(_) => {},
+        Ok(_) => {}
         Err(_) => {}
     }
 }
@@ -215,13 +215,14 @@ fn test_ambiguous_column() {
 #[test]
 fn test_string_in_int_column() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE type_test (id INT PRIMARY KEY, value INT)").unwrap();
+    db.execute("CREATE TABLE type_test (id INT PRIMARY KEY, value INT)")
+        .unwrap();
 
     // Attempt to insert string in INT column
     let result = db.execute("INSERT INTO type_test (id, value) VALUES (1, 'not a number')");
     // Should error
     match result {
-        Ok(_) => {}, // Some systems may coerce types
+        Ok(_) => {} // Some systems may coerce types
         Err(_) => {}
     }
 }
@@ -236,7 +237,7 @@ fn test_comparison_type_mismatch() -> Result<()> {
     // Compare int with string (may succeed or fail depending on implementation)
     let result = db.query("SELECT * FROM users WHERE age = '30'", &[]);
     match result {
-        Ok(_) => {},
+        Ok(_) => {}
         Err(_) => {}
     }
 
@@ -386,7 +387,10 @@ fn test_repeated_operations() -> Result<()> {
     for i in 1..=100 {
         db.execute(&format!(
             "INSERT INTO users (id, name, email, age) VALUES ({}, 'User{}', 'user{}@example.com', {})",
-            i, i, i, 20 + (i % 50)
+            i,
+            i,
+            i,
+            20 + (i % 50)
         ))?;
 
         let results = db.query("SELECT * FROM users", &[])?;
@@ -497,7 +501,9 @@ fn test_sql_with_extra_whitespace() -> Result<()> {
     setup_users_table(&db)?;
 
     // SQL with lots of whitespace
-    db.execute("INSERT   INTO   users   (id,   name,   email,   age)   VALUES   (1,   'Alice',   'alice@example.com',   30)")?;
+    db.execute(
+        "INSERT   INTO   users   (id,   name,   email,   age)   VALUES   (1,   'Alice',   'alice@example.com',   30)",
+    )?;
 
     let results = db.query("SELECT   *   FROM   users", &[])?;
     assert_eq!(results.len(), 1);

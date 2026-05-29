@@ -6,9 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::ai::providers::{
-    ChatMessage, LlmProvider, LlmRequest, MessageRole, ProviderResult,
-};
+use crate::ai::providers::{ChatMessage, LlmProvider, LlmRequest, MessageRole, ProviderResult};
 
 /// RAG configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,12 +177,7 @@ pub trait Retriever: Send + Sync {
 /// Trait for rerankers
 #[async_trait::async_trait]
 pub trait Reranker: Send + Sync {
-    async fn rerank(
-        &self,
-        query: &str,
-        documents: Vec<RagSource>,
-        top_k: usize,
-    ) -> ProviderResult<Vec<RagSource>>;
+    async fn rerank(&self, query: &str, documents: Vec<RagSource>, top_k: usize) -> ProviderResult<Vec<RagSource>>;
 }
 
 impl RagPipeline {
@@ -252,12 +245,9 @@ impl RagPipeline {
     /// Retrieve documents
     async fn retrieve(&self, query: &str, config: &RagConfig) -> ProviderResult<Vec<RagSource>> {
         if let Some(ref retriever) = self.retriever {
-            retriever.retrieve(
-                query,
-                &config.vector_stores,
-                config.top_k,
-                config.min_score,
-            ).await
+            retriever
+                .retrieve(query, &config.vector_stores, config.top_k, config.min_score)
+                .await
         } else {
             // Default: Return empty (would normally call vector store)
             Ok(Vec::new())
@@ -271,11 +261,7 @@ impl RagPipeline {
         let mut total_chars = 0;
 
         for (i, source) in sources.iter().enumerate() {
-            let entry = format!(
-                "[Source {}]: {}\n\n",
-                i + 1,
-                source.content
-            );
+            let entry = format!("[Source {}]: {}\n\n", i + 1, source.content);
 
             if total_chars + entry.len() > max_chars {
                 break;

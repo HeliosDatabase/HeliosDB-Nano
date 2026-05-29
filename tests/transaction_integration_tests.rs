@@ -195,7 +195,8 @@ fn test_in_transaction_state() {
 fn test_multi_statement_transaction() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
-    db.execute("CREATE TABLE orders (id INT, user_id INT, amount INT)").unwrap();
+    db.execute("CREATE TABLE orders (id INT, user_id INT, amount INT)")
+        .unwrap();
 
     // Multi-table transaction
     db.begin().unwrap();
@@ -389,7 +390,11 @@ fn test_acid_atomicity_insert_failure() {
 
     // Verify atomicity: only initial insert remains
     let results = db.query("SELECT * FROM test", &[]).unwrap();
-    assert_eq!(results.len(), 1, "Atomicity: rollback should undo ALL transaction operations");
+    assert_eq!(
+        results.len(),
+        1,
+        "Atomicity: rollback should undo ALL transaction operations"
+    );
 }
 
 #[test]
@@ -578,7 +583,11 @@ fn test_explicit_transaction_isolation() {
 
     // Verify isolation: changes were isolated and rolled back
     let results = db.query("SELECT * FROM test", &[]).unwrap();
-    assert_eq!(results.len(), 1, "Explicit transaction rollback should restore initial state");
+    assert_eq!(
+        results.len(),
+        1,
+        "Explicit transaction rollback should restore initial state"
+    );
 }
 
 #[test]

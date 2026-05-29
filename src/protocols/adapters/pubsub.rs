@@ -4,9 +4,9 @@
 //! LISTEN/NOTIFY mechanism for real-time notifications.
 
 use crate::{Error, Result};
+use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use parking_lot::RwLock;
 use uuid::Uuid;
 
 /// A notification message
@@ -23,11 +23,7 @@ pub struct Notification {
 impl Notification {
     /// Create a new notification
     pub fn new(channel: String, payload: String, pid: u32) -> Self {
-        Self {
-            channel,
-            payload,
-            pid,
-        }
+        Self { channel, payload, pid }
     }
 }
 
@@ -109,18 +105,19 @@ impl PubSubManager {
         // Add subscription
         {
             let mut subs = self.subscriptions.write();
-            subs.insert(id, SubscriptionState {
-                channel: channel.clone(),
-                pending_notifications: Vec::new(),
-            });
+            subs.insert(
+                id,
+                SubscriptionState {
+                    channel: channel.clone(),
+                    pending_notifications: Vec::new(),
+                },
+            );
         }
 
         // Add to channel mapping
         {
             let mut channels = self.channels.write();
-            channels.entry(channel.clone())
-                .or_insert_with(HashSet::new)
-                .insert(id);
+            channels.entry(channel.clone()).or_insert_with(HashSet::new).insert(id);
         }
 
         Ok(Subscription {
@@ -195,7 +192,7 @@ impl PubSubManager {
         // Validate payload size (PostgreSQL limit is 8000 bytes)
         if payload.len() > 8000 {
             return Err(Error::protocol(
-                "Notification payload exceeds maximum size of 8000 bytes"
+                "Notification payload exceeds maximum size of 8000 bytes",
             ));
         }
 
@@ -225,7 +222,8 @@ impl PubSubManager {
     /// Poll for notifications on a subscription (internal)
     fn poll_subscription(&self, id: Uuid) -> Result<Vec<Notification>> {
         let mut subs = self.subscriptions.write();
-        let state = subs.get_mut(&id)
+        let state = subs
+            .get_mut(&id)
             .ok_or_else(|| Error::protocol("Invalid subscription"))?;
 
         // Take all pending notifications

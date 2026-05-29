@@ -3,7 +3,7 @@
 //! Run with: cargo run --example pg_server
 //! Connect with: psql -h localhost -p 5432 -U postgres
 
-use heliosdb_nano::{EmbeddedDatabase, network::PgServer};
+use heliosdb_nano::{network::PgServer, EmbeddedDatabase};
 use std::sync::Arc;
 use tracing_subscriber;
 
@@ -47,9 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Run with Ctrl+C shutdown
     let shutdown = async {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("Failed to listen for Ctrl+C");
+        tokio::signal::ctrl_c().await.expect("Failed to listen for Ctrl+C");
         println!("\nShutdown signal received");
     };
 

@@ -2,10 +2,10 @@
 //!
 //! Reference: <https://www.postgresql.org/docs/current/protocol.html>
 
+use crate::{DataType, Schema, Value};
 use bytes::{Buf, BufMut, BytesMut};
 use std::collections::HashMap;
 use std::io::{self, Cursor};
-use crate::{DataType, Value, Schema};
 
 /// PostgreSQL protocol version (3.0)
 pub const PROTOCOL_VERSION: i32 = 196608; // 3.0 in major.minor format
@@ -22,9 +22,7 @@ pub enum FrontendMessage {
         params: HashMap<String, String>,
     },
     /// Simple query
-    Query {
-        query: String,
-    },
+    Query { query: String },
     /// Parse statement
     Parse {
         statement_name: String,
@@ -40,20 +38,11 @@ pub enum FrontendMessage {
         result_formats: Vec<i16>,
     },
     /// Execute portal
-    Execute {
-        portal_name: String,
-        max_rows: i32,
-    },
+    Execute { portal_name: String, max_rows: i32 },
     /// Describe statement or portal
-    Describe {
-        kind: DescribeKind,
-        name: String,
-    },
+    Describe { kind: DescribeKind, name: String },
     /// Close statement or portal
-    Close {
-        kind: CloseKind,
-        name: String,
-    },
+    Close { kind: CloseKind, name: String },
     /// Sync (end of extended query)
     Sync,
     /// Flush
@@ -61,9 +50,7 @@ pub enum FrontendMessage {
     /// Terminate connection
     Terminate,
     /// Password response
-    PasswordMessage {
-        password: String,
-    },
+    PasswordMessage { password: String },
 }
 
 /// Describe message kind
@@ -90,53 +77,33 @@ pub enum BackendMessage {
     /// Authentication request
     Authentication(AuthenticationMessage),
     /// Backend key data (for cancellation)
-    BackendKeyData {
-        process_id: i32,
-        secret_key: i32,
-    },
+    BackendKeyData { process_id: i32, secret_key: i32 },
     /// Bind complete
     BindComplete,
     /// Close complete
     CloseComplete,
     /// Command complete
-    CommandComplete {
-        tag: String,
-    },
+    CommandComplete { tag: String },
     /// Data row
-    DataRow {
-        values: Vec<Option<Vec<u8>>>,
-    },
+    DataRow { values: Vec<Option<Vec<u8>>> },
     /// Empty query response
     EmptyQueryResponse,
     /// Error response
-    ErrorResponse {
-        fields: HashMap<u8, String>,
-    },
+    ErrorResponse { fields: HashMap<u8, String> },
     /// No data
     NoData,
     /// Notice response
-    NoticeResponse {
-        fields: HashMap<u8, String>,
-    },
+    NoticeResponse { fields: HashMap<u8, String> },
     /// Parameter description
-    ParameterDescription {
-        param_types: Vec<i32>,
-    },
+    ParameterDescription { param_types: Vec<i32> },
     /// Parameter status
-    ParameterStatus {
-        name: String,
-        value: String,
-    },
+    ParameterStatus { name: String, value: String },
     /// Parse complete
     ParseComplete,
     /// Ready for query
-    ReadyForQuery {
-        status: TransactionStatus,
-    },
+    ReadyForQuery { status: TransactionStatus },
     /// Row description
-    RowDescription {
-        fields: Vec<FieldDescription>,
-    },
+    RowDescription { fields: Vec<FieldDescription> },
 }
 
 /// Authentication message types
@@ -149,21 +116,13 @@ pub enum AuthenticationMessage {
     /// Clear text password
     CleartextPassword,
     /// MD5 password
-    MD5Password {
-        salt: [u8; 4],
-    },
+    MD5Password { salt: [u8; 4] },
     /// SCRAM-SHA-256
-    SASL {
-        mechanisms: Vec<String>,
-    },
+    SASL { mechanisms: Vec<String> },
     /// SASL continue
-    SASLContinue {
-        data: Vec<u8>,
-    },
+    SASLContinue { data: Vec<u8> },
     /// SASL final
-    SASLFinal {
-        data: Vec<u8>,
-    },
+    SASLFinal { data: Vec<u8> },
 }
 
 /// Transaction status
@@ -810,7 +769,8 @@ impl MessageDecoder {
         let first_byte = self.buf[0];
 
         // Check if this looks like a regular message type (ASCII letter or known type)
-        let is_regular_message = matches!(first_byte,
+        let is_regular_message = matches!(
+            first_byte,
             b'Q' | b'P' | b'B' | b'E' | b'D' | b'C' | b'S' | b'H' | b'X' | b'p'
         );
 
@@ -820,10 +780,7 @@ impl MessageDecoder {
             let msg_len = cursor.get_i32() as usize;
 
             if msg_len > MAX_MESSAGE_SIZE {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Message too large",
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Message too large"));
             }
 
             // If this looks like a startup message (reasonable length, starts with protocol version)
@@ -852,10 +809,7 @@ impl MessageDecoder {
         };
 
         if msg_len > MAX_MESSAGE_SIZE {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Message too large",
-            ));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Message too large"));
         }
 
         let total_len = 1 + msg_len; // type byte + length field + payload
@@ -1007,10 +961,7 @@ impl MessageDecoder {
         let portal_name = read_cstring(&mut cursor)?;
         let max_rows = cursor.get_i32();
 
-        Ok(Some(FrontendMessage::Execute {
-            portal_name,
-            max_rows,
-        }))
+        Ok(Some(FrontendMessage::Execute { portal_name, max_rows }))
     }
 
     #[allow(clippy::indexing_slicing)]
@@ -1025,10 +976,7 @@ impl MessageDecoder {
             b'S' => DescribeKind::Statement,
             b'P' => DescribeKind::Portal,
             _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid describe kind",
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid describe kind"));
             }
         };
 
@@ -1047,10 +995,7 @@ impl MessageDecoder {
             b'S' => CloseKind::Statement,
             b'P' => CloseKind::Portal,
             _ => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Invalid close kind",
-                ));
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid close kind"));
             }
         };
 
@@ -1090,9 +1035,7 @@ fn read_cstring(cursor: &mut Cursor<&[u8]>) -> io::Result<String> {
         }
         bytes.push(byte);
     }
-    String::from_utf8(bytes).map_err(|e| {
-        io::Error::new(io::ErrorKind::InvalidData, format!("Invalid UTF-8: {}", e))
-    })
+    String::from_utf8(bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("Invalid UTF-8: {}", e)))
 }
 
 /// PostgreSQL type OIDs
@@ -1163,92 +1106,79 @@ pub fn value_to_pg_text(value: &Value) -> Vec<u8> {
 ///
 /// This handles parameter values sent in text format from the client.
 pub fn parse_pg_text_param(data: &[u8], type_oid: i32) -> Result<Value, std::io::Error> {
-    let text = std::str::from_utf8(data).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid UTF-8: {}", e))
-    })?;
+    let text = std::str::from_utf8(data)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid UTF-8: {}", e)))?;
 
     let value = match type_oid {
-        type_oid::BOOL => {
-            match text {
-                "t" | "true" | "TRUE" | "1" => Value::Boolean(true),
-                "f" | "false" | "FALSE" | "0" => Value::Boolean(false),
-                _ => return Err(std::io::Error::new(
+        type_oid::BOOL => match text {
+            "t" | "true" | "TRUE" | "1" => Value::Boolean(true),
+            "f" | "false" | "FALSE" | "0" => Value::Boolean(false),
+            _ => {
+                return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    "Invalid boolean value"
-                )),
+                    "Invalid boolean value",
+                ))
             }
-        }
+        },
         type_oid::INT2 => {
-            let i = text.parse::<i16>().map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid int2: {}", e))
-            })?;
+            let i = text
+                .parse::<i16>()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid int2: {}", e)))?;
             Value::Int4(i as i32) // Store as Int4
         }
         type_oid::INT4 => {
-            let i = text.parse::<i32>().map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid int4: {}", e))
-            })?;
+            let i = text
+                .parse::<i32>()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid int4: {}", e)))?;
             Value::Int4(i)
         }
         type_oid::INT8 => {
-            let i = text.parse::<i64>().map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid int8: {}", e))
-            })?;
+            let i = text
+                .parse::<i64>()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid int8: {}", e)))?;
             Value::Int8(i)
         }
         type_oid::FLOAT4 => {
-            let f = text.parse::<f32>().map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid float4: {}", e))
-            })?;
+            let f = text
+                .parse::<f32>()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid float4: {}", e)))?;
             Value::Float4(f)
         }
         type_oid::FLOAT8 => {
-            let f = text.parse::<f64>().map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid float8: {}", e))
-            })?;
+            let f = text
+                .parse::<f64>()
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid float8: {}", e)))?;
             Value::Float8(f)
         }
-        type_oid::TEXT | type_oid::VARCHAR => {
-            Value::String(text.to_string())
-        }
-        type_oid::BYTEA => {
-            Value::Bytes(data.to_vec())
-        }
+        type_oid::TEXT | type_oid::VARCHAR => Value::String(text.to_string()),
+        type_oid::BYTEA => Value::Bytes(data.to_vec()),
         type_oid::UUID => {
-            let uuid = uuid::Uuid::parse_str(text).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid UUID: {}", e))
-            })?;
+            let uuid = uuid::Uuid::parse_str(text)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid UUID: {}", e)))?;
             Value::Uuid(uuid)
         }
         type_oid::JSON | type_oid::JSONB => {
             // Validate JSON is parseable
-            let _json: serde_json::Value = serde_json::from_str(text).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid JSON: {}", e))
-            })?;
+            let _json: serde_json::Value = serde_json::from_str(text)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid JSON: {}", e)))?;
             // Store as String for bincode compatibility
             Value::Json(text.to_string())
         }
         type_oid::TIMESTAMP | type_oid::TIMESTAMPTZ => {
             let ts = chrono::DateTime::parse_from_rfc3339(text)
-                .map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid timestamp: {}", e))
-                })?
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid timestamp: {}", e)))?
                 .with_timezone(&chrono::Utc);
             Value::Timestamp(ts)
         }
         type_oid::DATE => {
             let date = chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
-                .map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid date: {}", e))
-                })?;
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid date: {}", e)))?;
             Value::Date(date)
         }
         type_oid::TIME => {
             let time = chrono::NaiveTime::parse_from_str(text, "%H:%M:%S")
                 .or_else(|_| chrono::NaiveTime::parse_from_str(text, "%H:%M:%S%.f"))
-                .map_err(|e| {
-                    std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid time: {}", e))
-                })?;
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Invalid time: {}", e)))?;
             Value::Time(time)
         }
         _ => {

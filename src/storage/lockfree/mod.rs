@@ -126,20 +126,16 @@ mod write_buffer;
 pub use config::{IngestionSafetyLevel, LockFreeIngestionConfig};
 
 // Re-export row ID generation
-pub use row_id::{
-    BatchRowIdAllocator, HierarchicalRowIdGenerator, RowIdGenerator,
-};
+pub use row_id::{BatchRowIdAllocator, HierarchicalRowIdGenerator, RowIdGenerator};
 
 // Re-export write buffer types
 pub use write_buffer::{TransactionBuffer, WriteOp};
 
 // Re-export WAL management
-pub use wal_manager::{
-    PartitionedWalManager, WalOp, WalPartition, WalRecord, WalRecovery,
-};
+pub use wal_manager::{PartitionedWalManager, WalOp, WalPartition, WalRecord, WalRecovery};
 
 // Re-export high-level API
 pub use ingestion::{
-    BulkInsertResult, IngestionError, IngestionResult, IngestionStats,
-    LockFreeIngestionEngine, RecoveryResult, TransactionHandle,
+    BulkInsertResult, IngestionError, IngestionResult, IngestionStats, LockFreeIngestionEngine, RecoveryResult,
+    TransactionHandle,
 };

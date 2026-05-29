@@ -15,9 +15,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use super::providers::{
-    ChatMessage, LlmProvider, LlmRequest, MessageRole, ProviderError, ProviderResult,
-};
+use super::providers::{ChatMessage, LlmProvider, LlmRequest, MessageRole, ProviderError, ProviderResult};
 use super::sandbox::{QuerySandbox, SandboxConfig, SandboxResult};
 
 // ============================================================================
@@ -29,15 +27,13 @@ use super::sandbox::{QuerySandbox, SandboxConfig, SandboxResult};
 
 /// Pattern to extract SQL from LLM response
 #[allow(clippy::expect_used)]
-static RE_SQL_BLOCK: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"```(?:sql)?\s*([\s\S]*?)```").expect("Invalid SQL_BLOCK regex")
-});
+static RE_SQL_BLOCK: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"```(?:sql)?\s*([\s\S]*?)```").expect("Invalid SQL_BLOCK regex"));
 
 /// Pattern to match SELECT statement
 #[allow(clippy::expect_used)]
-static RE_SELECT: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?is)(SELECT\s+[\s\S]+?)(?:;|$)").expect("Invalid SELECT regex")
-});
+static RE_SELECT: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?is)(SELECT\s+[\s\S]+?)(?:;|$)").expect("Invalid SELECT regex"));
 
 /// Pattern to detect aggregation keywords
 #[allow(clippy::expect_used)]
@@ -70,8 +66,7 @@ static RE_SORTING: Lazy<Regex> = Lazy::new(|| {
 /// Pattern to detect limit keywords
 #[allow(clippy::expect_used)]
 static RE_LIMIT: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\b(top\s+\d+|\d+\s+(?:results?|rows?|records?)|limit|first\s+\d+)\b")
-        .expect("Invalid LIMIT regex")
+    Regex::new(r"(?i)\b(top\s+\d+|\d+\s+(?:results?|rows?|records?)|limit|first\s+\d+)\b").expect("Invalid LIMIT regex")
 });
 
 // ============================================================================
@@ -653,10 +648,7 @@ impl NlQueryEngine {
             // Auto-correct if needed
             if !result.allowed && config.auto_correct {
                 for _ in 0..config.max_correction_attempts {
-                    if let Ok(corrected) = self
-                        .attempt_correction(&sql, &result, &request, config)
-                        .await
-                    {
+                    if let Ok(corrected) = self.attempt_correction(&sql, &result, &request, config).await {
                         let new_result = self.sandbox.validate(&corrected);
                         if new_result.allowed {
                             sql = corrected;
@@ -721,11 +713,7 @@ impl NlQueryEngine {
 
         // Cache the response
         if let Ok(mut cache) = self.cache.write() {
-            cache.insert(
-                cache_key,
-                response.clone(),
-                Duration::from_secs(config.cache_ttl_secs),
-            );
+            cache.insert(cache_key, response.clone(), Duration::from_secs(config.cache_ttl_secs));
         }
 
         Ok(response)
@@ -804,9 +792,9 @@ impl NlQueryEngine {
 
         QueryAnalysis {
             intent,
-            tables: Vec::new(),    // Will be populated from schema matching
-            columns: Vec::new(),   // Will be populated from schema matching
-            filters: Vec::new(),   // Will be populated from entity extraction
+            tables: Vec::new(),  // Will be populated from schema matching
+            columns: Vec::new(), // Will be populated from schema matching
+            filters: Vec::new(), // Will be populated from entity extraction
             aggregations,
             sorting,
             limit,
@@ -822,10 +810,7 @@ impl NlQueryEngine {
         if lower.contains("how many") || lower.contains("count") || lower.contains("number of") {
             QueryIntent::Count
         } else if RE_AGGREGATION.is_match(&lower)
-            && (lower.contains("total")
-                || lower.contains("sum")
-                || lower.contains("average")
-                || lower.contains("avg"))
+            && (lower.contains("total") || lower.contains("sum") || lower.contains("average") || lower.contains("avg"))
         {
             QueryIntent::Aggregate
         } else if RE_SORTING.is_match(&lower)
@@ -857,10 +842,7 @@ impl NlQueryEngine {
             || lower.contains("associated")
         {
             QueryIntent::Join
-        } else if lower.contains("show")
-            || lower.contains("list")
-            || lower.contains("get")
-            || lower.contains("select")
+        } else if lower.contains("show") || lower.contains("list") || lower.contains("get") || lower.contains("select")
         {
             QueryIntent::Select
         } else {
@@ -977,15 +959,10 @@ impl NlQueryEngine {
     /// Detect limit from question
     fn detect_limit(&self, question: &str) -> Option<usize> {
         // Pattern: "top N", "first N", "N results"
-        let limit_re =
-            Regex::new(r"(?i)(?:top|first|limit)\s+(\d+)|(\d+)\s+(?:results?|rows?|records?)")
-                .ok()?;
+        let limit_re = Regex::new(r"(?i)(?:top|first|limit)\s+(\d+)|(\d+)\s+(?:results?|rows?|records?)").ok()?;
 
         if let Some(cap) = limit_re.captures(question) {
-            let num = cap
-                .get(1)
-                .or_else(|| cap.get(2))
-                .and_then(|m| m.as_str().parse().ok());
+            let num = cap.get(1).or_else(|| cap.get(2)).and_then(|m| m.as_str().parse().ok());
             return num;
         }
 
@@ -1083,10 +1060,7 @@ Important:
 
     /// Build user prompt
     fn build_user_prompt(&self, request: &NlQueryRequest) -> String {
-        format!(
-            "Convert this question to SQL:\n\n{}",
-            request.question
-        )
+        format!("Convert this question to SQL:\n\n{}", request.question)
     }
 
     /// Extract SQL from LLM response
@@ -1175,12 +1149,7 @@ Only output the corrected SQL in a ```sql code block."#,
     }
 
     /// Calculate confidence score
-    fn calculate_confidence(
-        &self,
-        analysis: &QueryAnalysis,
-        validation: &Option<SandboxResult>,
-        sql: &str,
-    ) -> f32 {
+    fn calculate_confidence(&self, analysis: &QueryAnalysis, validation: &Option<SandboxResult>, sql: &str) -> f32 {
         let mut confidence = 0.5; // Base confidence
 
         // Intent detection confidence
@@ -1219,12 +1188,7 @@ Only output the corrected SQL in a ```sql code block."#,
     }
 
     /// Generate explanation for the query
-    fn generate_explanation(
-        &self,
-        question: &str,
-        sql: &str,
-        analysis: &QueryAnalysis,
-    ) -> String {
+    fn generate_explanation(&self, question: &str, sql: &str, analysis: &QueryAnalysis) -> String {
         let mut parts = Vec::new();
 
         // Intent description
@@ -1243,18 +1207,12 @@ Only output the corrected SQL in a ```sql code block."#,
 
         // Tables involved
         if !analysis.tables.is_empty() {
-            parts.push(format!(
-                "It queries the {} table(s).",
-                analysis.tables.join(", ")
-            ));
+            parts.push(format!("It queries the {} table(s).", analysis.tables.join(", ")));
         }
 
         // Aggregations
         if !analysis.aggregations.is_empty() {
-            parts.push(format!(
-                "It uses {} aggregation(s).",
-                analysis.aggregations.join(", ")
-            ));
+            parts.push(format!("It uses {} aggregation(s).", analysis.aggregations.join(", ")));
         }
 
         // Sorting
@@ -1283,11 +1241,7 @@ Only output the corrected SQL in a ```sql code block."#,
     }
 
     /// Generate query suggestions
-    fn generate_suggestions(
-        &self,
-        request: &NlQueryRequest,
-        analysis: &QueryAnalysis,
-    ) -> Vec<QuerySuggestion> {
+    fn generate_suggestions(&self, request: &NlQueryRequest, analysis: &QueryAnalysis) -> Vec<QuerySuggestion> {
         let mut suggestions = Vec::new();
 
         // Suggest adding limit if not present
@@ -1466,10 +1420,7 @@ This will return all active users."#;
                 Ok(vec![])
             }
 
-            async fn chat(
-                &self,
-                _request: LlmRequest,
-            ) -> ProviderResult<super::super::providers::LlmResponse> {
+            async fn chat(&self, _request: LlmRequest) -> ProviderResult<super::super::providers::LlmResponse> {
                 Ok(super::super::providers::LlmResponse {
                     id: "test".to_string(),
                     model: "mock".to_string(),
@@ -1490,12 +1441,7 @@ This will return all active users."#;
                 &self,
                 _request: LlmRequest,
             ) -> ProviderResult<
-                Box<
-                    dyn futures::Stream<
-                            Item = ProviderResult<super::super::providers::StreamChunk>,
-                        > + Send
-                        + Unpin,
-                >,
+                Box<dyn futures::Stream<Item = ProviderResult<super::super::providers::StreamChunk>> + Send + Unpin>,
             > {
                 Err(ProviderError::Api("Not implemented".to_string()))
             }

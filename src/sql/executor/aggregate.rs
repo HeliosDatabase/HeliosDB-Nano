@@ -3,8 +3,8 @@
 //! This module provides operators for GROUP BY, aggregates (COUNT, SUM, AVG, etc.),
 //! and ORDER BY operations.
 
-use crate::{Result, Error, Tuple, Schema};
-use super::{PhysicalOperator, TimeoutContext, compare_values};
+use super::{compare_values, PhysicalOperator, TimeoutContext};
+use crate::{Error, Result, Schema, Tuple};
 use std::sync::Arc;
 
 /// Group key for aggregate grouping
@@ -64,15 +64,14 @@ impl AggregateOperator {
         };
 
         // Build output schema: GROUP BY columns + aggregate columns
-        use crate::DataType;
         use crate::sql::TypeInference;
+        use crate::DataType;
         let mut columns = Vec::new();
 
         // Add GROUP BY columns with type inference
         for (i, expr) in group_by.iter().enumerate() {
             // Infer type from GROUP BY expression, fallback to Text if inference fails
-            let data_type = expr.infer_type(&input_schema)
-                .unwrap_or(DataType::Text);
+            let data_type = expr.infer_type(&input_schema).unwrap_or(DataType::Text);
 
             columns.push(crate::Column {
                 name: format!("group_{}", i),
@@ -80,18 +79,17 @@ impl AggregateOperator {
                 nullable: true,
                 primary_key: false,
                 source_table: None,
-                    source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             });
         }
 
         // Add aggregate columns with type inference
         for (i, expr) in aggr_exprs.iter().enumerate() {
             // Infer type from aggregate expression, fallback to Int8 if inference fails
-            let data_type = expr.infer_type(&input_schema)
-                .unwrap_or(DataType::Int8);
+            let data_type = expr.infer_type(&input_schema).unwrap_or(DataType::Int8);
 
             columns.push(crate::Column {
                 name: format!("agg_{}", i),
@@ -99,10 +97,10 @@ impl AggregateOperator {
                 nullable: true,
                 primary_key: false,
                 source_table: None,
-                    source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             });
         }
 
@@ -114,12 +112,11 @@ impl AggregateOperator {
             let rewritten_having = Self::rewrite_having_expr(&having_expr, &aggr_exprs);
 
             let having_evaluator = crate::sql::Evaluator::new(schema.clone());
-            output_tuples = output_tuples.into_iter()
-                .filter(|tuple| {
-                    match having_evaluator.evaluate(&rewritten_having, tuple) {
-                        Ok(crate::Value::Boolean(true)) => true,
-                        _ => false,
-                    }
+            output_tuples = output_tuples
+                .into_iter()
+                .filter(|tuple| match having_evaluator.evaluate(&rewritten_having, tuple) {
+                    Ok(crate::Value::Boolean(true)) => true,
+                    _ => false,
                 })
                 .collect();
         }
@@ -148,7 +145,7 @@ impl AggregateOperator {
         tuples: &[Tuple],
         evaluator: &crate::sql::Evaluator,
     ) -> Result<crate::Value> {
-        use crate::sql::{LogicalExpr, AggregateFunction};
+        use crate::sql::{AggregateFunction, LogicalExpr};
         use crate::Value;
 
         match expr {
@@ -156,13 +153,13 @@ impl AggregateOperator {
                 // For now, only support single-argument aggregates
                 if args.len() != 1 {
                     return Err(Error::query_execution(
-                        "Aggregate functions must have exactly one argument"
+                        "Aggregate functions must have exactly one argument",
                     ));
                 }
 
-                let arg_expr = args.first().ok_or_else(|| Error::query_execution(
-                    "Aggregate function has no arguments"
-                ))?;
+                let arg_expr = args
+                    .first()
+                    .ok_or_else(|| Error::query_execution("Aggregate function has no arguments"))?;
 
                 // Special case: COUNT(*)
                 if matches!(fun, AggregateFunction::Count) && matches!(arg_expr, LogicalExpr::Wildcard) {
@@ -170,9 +167,8 @@ impl AggregateOperator {
                 }
 
                 // Evaluate argument for each tuple
-                let values: Result<Vec<Value>> = tuples.iter()
-                    .map(|tuple| evaluator.evaluate(arg_expr, tuple))
-                    .collect();
+                let values: Result<Vec<Value>> =
+                    tuples.iter().map(|tuple| evaluator.evaluate(arg_expr, tuple)).collect();
                 let mut values = values?;
 
                 // Handle DISTINCT
@@ -195,7 +191,9 @@ impl AggregateOperator {
                     }
                     AggregateFunction::Sum => {
                         // Check if any value is Numeric or floating-point
-                        let has_decimal = values.iter().any(|v| matches!(v, Value::Numeric(_) | Value::Float4(_) | Value::Float8(_)));
+                        let has_decimal = values
+                            .iter()
+                            .any(|v| matches!(v, Value::Numeric(_) | Value::Float4(_) | Value::Float8(_)));
 
                         if has_decimal {
                             // Sum as Numeric for precision
@@ -236,7 +234,8 @@ impl AggregateOperator {
                                     Value::Int8(i) => i,
                                     _ => return Err(Error::query_execution("SUM requires numeric values")),
                                 };
-                                sum = sum.checked_add(addend)
+                                sum = sum
+                                    .checked_add(addend)
                                     .ok_or_else(|| Error::query_execution("integer overflow: BIGINT SUM"))?;
                             }
                             Ok(Value::Int8(sum))
@@ -267,13 +266,15 @@ impl AggregateOperator {
                     }
                     AggregateFunction::Min => {
                         // SQL standard: MIN on empty set returns NULL
-                        Ok(values.into_iter()
+                        Ok(values
+                            .into_iter()
                             .min_by(|a, b| compare_values(a, b))
                             .unwrap_or(Value::Null))
                     }
                     AggregateFunction::Max => {
                         // SQL standard: MAX on empty set returns NULL
-                        Ok(values.into_iter()
+                        Ok(values
+                            .into_iter()
                             .max_by(|a, b| compare_values(a, b))
                             .unwrap_or(Value::Null))
                     }
@@ -295,13 +296,12 @@ impl AggregateOperator {
                                 Value::Bytes(b) => json!(hex::encode(&b)),
                                 Value::Uuid(u) => json!(u.to_string()),
                                 Value::Timestamp(ts) => json!(ts.to_rfc3339()),
-                                Value::Json(j) => {
-                                    serde_json::from_str(j.as_str()).unwrap_or_else(|_| json!(j))
-                                }
+                                Value::Json(j) => serde_json::from_str(j.as_str()).unwrap_or_else(|_| json!(j)),
                                 Value::Array(arr) => {
                                     // Recursively convert array elements
-                                    let json_arr: Vec<serde_json::Value> = arr.iter().map(|v| {
-                                        match v {
+                                    let json_arr: Vec<serde_json::Value> = arr
+                                        .iter()
+                                        .map(|v| match v {
                                             Value::Null => json!(null),
                                             Value::Boolean(b) => json!(b),
                                             Value::Int2(n) => json!(n),
@@ -313,12 +313,10 @@ impl AggregateOperator {
                                             Value::Bytes(b) => json!(hex::encode(b)),
                                             Value::Uuid(u) => json!(u.to_string()),
                                             Value::Timestamp(ts) => json!(ts.to_rfc3339()),
-                                            Value::Json(j) => {
-                                                serde_json::from_str(j).unwrap_or_else(|_| json!(j))
-                                            }
+                                            Value::Json(j) => serde_json::from_str(j).unwrap_or_else(|_| json!(j)),
                                             _ => json!(null),
-                                        }
-                                    }).collect();
+                                        })
+                                        .collect();
                                     serde_json::Value::Array(json_arr)
                                 }
                                 _ => json!(null),
@@ -362,7 +360,12 @@ impl AggregateOperator {
             LogicalExpr::AggregateFunction { fun, args, distinct } => {
                 // Find this aggregate function in aggr_exprs
                 for (i, aggr_expr) in aggr_exprs.iter().enumerate() {
-                    if let LogicalExpr::AggregateFunction { fun: aggr_fun, args: aggr_args, distinct: aggr_distinct } = aggr_expr {
+                    if let LogicalExpr::AggregateFunction {
+                        fun: aggr_fun,
+                        args: aggr_args,
+                        distinct: aggr_distinct,
+                    } = aggr_expr
+                    {
                         if fun == aggr_fun && args == aggr_args && distinct == aggr_distinct {
                             // Replace with column reference to agg_{i}
                             return LogicalExpr::Column {
@@ -375,19 +378,15 @@ impl AggregateOperator {
                 // If not found, keep as is (will likely fail evaluation, but that's okay)
                 expr.clone()
             }
-            LogicalExpr::BinaryExpr { left, op, right } => {
-                LogicalExpr::BinaryExpr {
-                    left: Box::new(Self::rewrite_having_expr(left, aggr_exprs)),
-                    op: *op,
-                    right: Box::new(Self::rewrite_having_expr(right, aggr_exprs)),
-                }
-            }
-            LogicalExpr::UnaryExpr { op, expr: inner_expr } => {
-                LogicalExpr::UnaryExpr {
-                    op: *op,
-                    expr: Box::new(Self::rewrite_having_expr(inner_expr, aggr_exprs)),
-                }
-            }
+            LogicalExpr::BinaryExpr { left, op, right } => LogicalExpr::BinaryExpr {
+                left: Box::new(Self::rewrite_having_expr(left, aggr_exprs)),
+                op: *op,
+                right: Box::new(Self::rewrite_having_expr(right, aggr_exprs)),
+            },
+            LogicalExpr::UnaryExpr { op, expr: inner_expr } => LogicalExpr::UnaryExpr {
+                op: *op,
+                expr: Box::new(Self::rewrite_having_expr(inner_expr, aggr_exprs)),
+            },
             // For other expression types, just clone them
             _ => expr.clone(),
         }
@@ -395,7 +394,7 @@ impl AggregateOperator {
 
     /// Check if all aggregate expressions can be computed in a single streaming pass
     fn all_streamable(aggr_exprs: &[crate::sql::LogicalExpr]) -> bool {
-        use crate::sql::{LogicalExpr, AggregateFunction};
+        use crate::sql::{AggregateFunction, LogicalExpr};
         aggr_exprs.iter().all(|expr| {
             matches!(expr,
                 LogicalExpr::AggregateFunction { fun, distinct: false, .. }
@@ -415,24 +414,27 @@ impl AggregateOperator {
         evaluator: &crate::sql::Evaluator,
         timeout_ctx: &Option<TimeoutContext>,
     ) -> Result<Vec<crate::Value>> {
-        use crate::sql::{LogicalExpr, AggregateFunction};
+        use crate::sql::{AggregateFunction, LogicalExpr};
         use crate::Value;
 
         // Initialize accumulators for each aggregate expression
-        let mut accumulators: Vec<StreamingAccumulator> = aggr_exprs.iter().map(|expr| {
-            if let LogicalExpr::AggregateFunction { fun, .. } = expr {
-                match fun {
-                    AggregateFunction::Count => StreamingAccumulator::Count(0),
-                    AggregateFunction::Sum => StreamingAccumulator::Sum(SumState::Empty),
-                    AggregateFunction::Avg => StreamingAccumulator::Avg { sum: 0.0, count: 0 },
-                    AggregateFunction::Min => StreamingAccumulator::Min(None),
-                    AggregateFunction::Max => StreamingAccumulator::Max(None),
-                    _ => StreamingAccumulator::Count(0), // unreachable due to all_streamable check
+        let mut accumulators: Vec<StreamingAccumulator> = aggr_exprs
+            .iter()
+            .map(|expr| {
+                if let LogicalExpr::AggregateFunction { fun, .. } = expr {
+                    match fun {
+                        AggregateFunction::Count => StreamingAccumulator::Count(0),
+                        AggregateFunction::Sum => StreamingAccumulator::Sum(SumState::Empty),
+                        AggregateFunction::Avg => StreamingAccumulator::Avg { sum: 0.0, count: 0 },
+                        AggregateFunction::Min => StreamingAccumulator::Min(None),
+                        AggregateFunction::Max => StreamingAccumulator::Max(None),
+                        _ => StreamingAccumulator::Count(0), // unreachable due to all_streamable check
+                    }
+                } else {
+                    StreamingAccumulator::Count(0) // unreachable
                 }
-            } else {
-                StreamingAccumulator::Count(0) // unreachable
-            }
-        }).collect();
+            })
+            .collect();
 
         // Process input tuples one at a time
         while let Some(tuple) = input.next()? {
@@ -443,9 +445,9 @@ impl AggregateOperator {
             // Update each accumulator
             for (i, expr) in aggr_exprs.iter().enumerate() {
                 if let LogicalExpr::AggregateFunction { args, .. } = expr {
-                    let arg_expr = args.first().ok_or_else(|| Error::query_execution(
-                        "Aggregate function has no arguments"
-                    ))?;
+                    let arg_expr = args
+                        .first()
+                        .ok_or_else(|| Error::query_execution("Aggregate function has no arguments"))?;
 
                     // COUNT(*) doesn't need to evaluate the arg
                     let val = if matches!(arg_expr, LogicalExpr::Wildcard) {
@@ -473,8 +475,8 @@ impl AggregateOperator {
         evaluator: &crate::sql::Evaluator,
         timeout_ctx: &Option<TimeoutContext>,
     ) -> Result<Vec<Tuple>> {
-        use std::collections::BTreeMap;
         use crate::Value;
+        use std::collections::BTreeMap;
 
         // Collect all input tuples
         let mut tuples = Vec::new();
@@ -492,9 +494,7 @@ impl AggregateOperator {
             groups.insert(key, tuples);
         } else {
             for tuple in tuples {
-                let key: Result<Vec<Value>> = group_by.iter()
-                    .map(|expr| evaluator.evaluate(expr, &tuple))
-                    .collect();
+                let key: Result<Vec<Value>> = group_by.iter().map(|expr| evaluator.evaluate(expr, &tuple)).collect();
                 let key = GroupKey(key?);
                 groups.entry(key).or_insert_with(Vec::new).push(tuple);
             }
@@ -506,7 +506,8 @@ impl AggregateOperator {
             if let Some(ref ctx) = timeout_ctx {
                 ctx.check_timeout()?;
             }
-            let aggr_values: Result<Vec<Value>> = aggr_exprs.iter()
+            let aggr_values: Result<Vec<Value>> = aggr_exprs
+                .iter()
                 .map(|expr| Self::evaluate_aggregate(expr, &group_tuples, evaluator))
                 .collect();
             let mut aggr_values = aggr_values?;
@@ -546,7 +547,9 @@ impl StreamingAccumulator {
                 }
             }
             Self::Sum(ref mut state) => {
-                if matches!(val, Value::Null) { return Ok(()); }
+                if matches!(val, Value::Null) {
+                    return Ok(());
+                }
                 match val {
                     Value::Int2(i) => match state {
                         SumState::Empty => *state = SumState::Int(*i as i64),
@@ -590,22 +593,47 @@ impl StreamingAccumulator {
                     _ => return Err(Error::query_execution("SUM requires numeric values")),
                 }
             }
-            Self::Avg { ref mut sum, ref mut count } => {
-                if matches!(val, Value::Null) { return Ok(()); }
+            Self::Avg {
+                ref mut sum,
+                ref mut count,
+            } => {
+                if matches!(val, Value::Null) {
+                    return Ok(());
+                }
                 match val {
-                    Value::Int2(i) => { *sum += *i as f64; *count += 1; }
-                    Value::Int4(i) => { *sum += *i as f64; *count += 1; }
-                    Value::Int8(i) => { *sum += *i as f64; *count += 1; }
-                    Value::Float4(f) => { *sum += *f as f64; *count += 1; }
-                    Value::Float8(f) => { *sum += *f; *count += 1; }
+                    Value::Int2(i) => {
+                        *sum += *i as f64;
+                        *count += 1;
+                    }
+                    Value::Int4(i) => {
+                        *sum += *i as f64;
+                        *count += 1;
+                    }
+                    Value::Int8(i) => {
+                        *sum += *i as f64;
+                        *count += 1;
+                    }
+                    Value::Float4(f) => {
+                        *sum += *f as f64;
+                        *count += 1;
+                    }
+                    Value::Float8(f) => {
+                        *sum += *f;
+                        *count += 1;
+                    }
                     Value::Numeric(n) => {
-                        if let Ok(f) = n.parse::<f64>() { *sum += f; *count += 1; }
+                        if let Ok(f) = n.parse::<f64>() {
+                            *sum += f;
+                            *count += 1;
+                        }
                     }
                     _ => return Err(Error::query_execution("AVG requires numeric values")),
                 }
             }
             Self::Min(ref mut current) => {
-                if matches!(val, Value::Null) { return Ok(()); }
+                if matches!(val, Value::Null) {
+                    return Ok(());
+                }
                 match current {
                     None => *current = Some(val.clone()),
                     Some(c) => {
@@ -616,7 +644,9 @@ impl StreamingAccumulator {
                 }
             }
             Self::Max(ref mut current) => {
-                if matches!(val, Value::Null) { return Ok(()); }
+                if matches!(val, Value::Null) {
+                    return Ok(());
+                }
                 match current {
                     None => *current = Some(val.clone()),
                     Some(c) => {
@@ -640,7 +670,11 @@ impl StreamingAccumulator {
                 SumState::Decimal(s) => Ok(Value::Numeric(format!("{s}"))),
             },
             Self::Avg { sum, count } => {
-                if count == 0 { Ok(Value::Null) } else { Ok(Value::Float8(sum / count as f64)) }
+                if count == 0 {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Float8(sum / count as f64))
+                }
             }
             // SQL standard: MIN/MAX on empty set returns NULL
             Self::Min(v) => Ok(v.unwrap_or(Value::Null)),
@@ -655,7 +689,10 @@ impl PhysicalOperator for AggregateOperator {
             return Ok(None);
         }
 
-        let tuple = self.output_tuples.get(self.current_index).cloned()
+        let tuple = self
+            .output_tuples
+            .get(self.current_index)
+            .cloned()
             .ok_or_else(|| Error::query_execution("Aggregate index out of bounds"))?;
         self.current_index += 1;
         Ok(Some(tuple))
@@ -753,7 +790,10 @@ impl PhysicalOperator for SortOperator {
             return Ok(None);
         }
 
-        let tuple = self.sorted_tuples.get(self.current_index).cloned()
+        let tuple = self
+            .sorted_tuples
+            .get(self.current_index)
+            .cloned()
             .ok_or_else(|| Error::query_execution("Sort index out of bounds"))?;
         self.current_index += 1;
         Ok(Some(tuple))

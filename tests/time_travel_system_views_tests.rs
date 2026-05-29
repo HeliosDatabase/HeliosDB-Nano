@@ -8,10 +8,10 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_nano::{Config, StorageEngine, Tuple, Value, Schema, Column, DataType};
-use heliosdb_nano::sql::{LogicalPlan, Executor};
 use heliosdb_nano::sql::logical_plan::AsOfClause;
 use heliosdb_nano::sql::system_views::SystemViewRegistry;
+use heliosdb_nano::sql::{Executor, LogicalPlan};
+use heliosdb_nano::{Column, Config, DataType, Schema, StorageEngine, Tuple, Value};
 use std::sync::Arc;
 
 /// Helper to create a test storage engine with sample data
@@ -19,8 +19,7 @@ fn create_test_engine_with_snapshots() -> StorageEngine {
     let mut config = Config::in_memory();
     config.storage.time_travel_enabled = true;
 
-    let engine = StorageEngine::open_in_memory(&config)
-        .expect("Failed to create storage engine");
+    let engine = StorageEngine::open_in_memory(&config).expect("Failed to create storage engine");
 
     // Create a simple test table
     let schema = Schema {
@@ -41,19 +40,18 @@ fn create_test_engine_with_snapshots() -> StorageEngine {
     };
 
     let catalog = engine.catalog();
-    catalog.create_table("test_table", schema.clone())
+    catalog
+        .create_table("test_table", schema.clone())
         .expect("Failed to create table");
 
     // Insert some data to create snapshots
     for i in 1..=5 {
         let tuple = Tuple {
-            values: vec![
-                Value::Int4(i),
-                Value::String(format!("Data {}", i)),
-            ],
+            values: vec![Value::Int4(i), Value::String(format!("Data {}", i))],
             row_id: None,
         };
-        engine.insert_tuple_versioned("test_table", tuple)
+        engine
+            .insert_tuple_versioned("test_table", tuple)
             .expect(&format!("Failed to insert tuple {}", i));
     }
 
@@ -66,7 +64,8 @@ fn test_pg_snapshots_view() {
     let registry = SystemViewRegistry::new();
 
     // Execute pg_snapshots system view
-    let tuples = registry.execute("pg_snapshots", &engine)
+    let tuples = registry
+        .execute("pg_snapshots", &engine)
         .expect("Failed to execute pg_snapshots view");
 
     // Should have at least 5 snapshots (one per insert)
@@ -80,14 +79,24 @@ fn test_pg_snapshots_view() {
         assert!(matches!(tuple.values[0], Value::Int8(_)), "snapshot_id should be Int8");
         // created_at is Timestamp
         assert!(matches!(tuple.values[2], Value::Int8(_)), "scn should be Int8");
-        assert!(matches!(tuple.values[3], Value::Int8(_)), "transaction_id should be Int8");
-        assert!(matches!(tuple.values[4], Value::String(_)), "description should be String");
+        assert!(
+            matches!(tuple.values[3], Value::Int8(_)),
+            "transaction_id should be Int8"
+        );
+        assert!(
+            matches!(tuple.values[4], Value::String(_)),
+            "description should be String"
+        );
         assert!(matches!(tuple.values[5], Value::Int8(_)), "size_bytes should be Int8");
-        assert!(matches!(tuple.values[6], Value::Boolean(_)), "is_automatic should be Boolean");
+        assert!(
+            matches!(tuple.values[6], Value::Boolean(_)),
+            "is_automatic should be Boolean"
+        );
     }
 
     // Verify snapshots are in order (should be sorted by snapshot_id)
-    let snapshot_ids: Vec<i64> = tuples.iter()
+    let snapshot_ids: Vec<i64> = tuples
+        .iter()
         .filter_map(|t| {
             if let Value::Int8(id) = t.values[0] {
                 Some(id)
@@ -98,8 +107,10 @@ fn test_pg_snapshots_view() {
         .collect();
 
     for i in 1..snapshot_ids.len() {
-        assert!(snapshot_ids[i] >= snapshot_ids[i-1],
-            "Snapshots should be in ascending order");
+        assert!(
+            snapshot_ids[i] >= snapshot_ids[i - 1],
+            "Snapshots should be in ascending order"
+        );
     }
 }
 
@@ -109,25 +120,37 @@ fn test_pg_transaction_map_view() {
     let registry = SystemViewRegistry::new();
 
     // Execute pg_transaction_map system view
-    let tuples = registry.execute("pg_transaction_map", &engine)
+    let tuples = registry
+        .execute("pg_transaction_map", &engine)
         .expect("Failed to execute pg_transaction_map view");
 
     // Should have at least 5 mappings (one per insert)
-    assert!(tuples.len() >= 5, "Expected at least 5 transaction mappings, got {}", tuples.len());
+    assert!(
+        tuples.len() >= 5,
+        "Expected at least 5 transaction mappings, got {}",
+        tuples.len()
+    );
 
     // Verify schema
     for tuple in &tuples {
         assert_eq!(tuple.values.len(), 4, "pg_transaction_map should have 4 columns");
 
         // Verify column types
-        assert!(matches!(tuple.values[0], Value::Int8(_)), "transaction_id should be Int8");
-        assert!(matches!(tuple.values[1], Value::Int8(_)), "snapshot_timestamp should be Int8");
+        assert!(
+            matches!(tuple.values[0], Value::Int8(_)),
+            "transaction_id should be Int8"
+        );
+        assert!(
+            matches!(tuple.values[1], Value::Int8(_)),
+            "snapshot_timestamp should be Int8"
+        );
         assert!(matches!(tuple.values[2], Value::Int8(_)), "scn should be Int8");
         // created_at is Timestamp
     }
 
     // Verify transactions are in order
-    let txn_ids: Vec<i64> = tuples.iter()
+    let txn_ids: Vec<i64> = tuples
+        .iter()
         .filter_map(|t| {
             if let Value::Int8(id) = t.values[0] {
                 Some(id)
@@ -138,8 +161,10 @@ fn test_pg_transaction_map_view() {
         .collect();
 
     for i in 1..txn_ids.len() {
-        assert!(txn_ids[i] > txn_ids[i-1],
-            "Transaction IDs should be in strictly ascending order");
+        assert!(
+            txn_ids[i] > txn_ids[i - 1],
+            "Transaction IDs should be in strictly ascending order"
+        );
     }
 
     // Verify each transaction has a unique ID
@@ -153,11 +178,16 @@ fn test_pg_scn_map_view() {
     let registry = SystemViewRegistry::new();
 
     // Execute pg_scn_map system view
-    let tuples = registry.execute("pg_scn_map", &engine)
+    let tuples = registry
+        .execute("pg_scn_map", &engine)
         .expect("Failed to execute pg_scn_map view");
 
     // Should have at least 5 mappings (one per insert)
-    assert!(tuples.len() >= 5, "Expected at least 5 SCN mappings, got {}", tuples.len());
+    assert!(
+        tuples.len() >= 5,
+        "Expected at least 5 SCN mappings, got {}",
+        tuples.len()
+    );
 
     // Verify schema
     for tuple in &tuples {
@@ -165,13 +195,20 @@ fn test_pg_scn_map_view() {
 
         // Verify column types
         assert!(matches!(tuple.values[0], Value::Int8(_)), "scn should be Int8");
-        assert!(matches!(tuple.values[1], Value::Int8(_)), "snapshot_timestamp should be Int8");
-        assert!(matches!(tuple.values[2], Value::Int8(_)), "transaction_id should be Int8");
+        assert!(
+            matches!(tuple.values[1], Value::Int8(_)),
+            "snapshot_timestamp should be Int8"
+        );
+        assert!(
+            matches!(tuple.values[2], Value::Int8(_)),
+            "transaction_id should be Int8"
+        );
         // created_at is Timestamp
     }
 
     // Verify SCNs are in order
-    let scns: Vec<i64> = tuples.iter()
+    let scns: Vec<i64> = tuples
+        .iter()
         .filter_map(|t| {
             if let Value::Int8(scn) = t.values[0] {
                 Some(scn)
@@ -182,8 +219,7 @@ fn test_pg_scn_map_view() {
         .collect();
 
     for i in 1..scns.len() {
-        assert!(scns[i] > scns[i-1],
-            "SCNs should be in strictly ascending order");
+        assert!(scns[i] > scns[i - 1], "SCNs should be in strictly ascending order");
     }
 
     // Verify each SCN has a unique value
@@ -197,18 +233,27 @@ fn test_system_view_consistency() {
     let registry = SystemViewRegistry::new();
 
     // Execute all three views
-    let snapshots = registry.execute("pg_snapshots", &engine)
+    let snapshots = registry
+        .execute("pg_snapshots", &engine)
         .expect("Failed to execute pg_snapshots");
-    let txn_map = registry.execute("pg_transaction_map", &engine)
+    let txn_map = registry
+        .execute("pg_transaction_map", &engine)
         .expect("Failed to execute pg_transaction_map");
-    let scn_map = registry.execute("pg_scn_map", &engine)
+    let scn_map = registry
+        .execute("pg_scn_map", &engine)
         .expect("Failed to execute pg_scn_map");
 
     // All three views should have the same number of rows
-    assert_eq!(snapshots.len(), txn_map.len(),
-        "pg_snapshots and pg_transaction_map should have same number of rows");
-    assert_eq!(snapshots.len(), scn_map.len(),
-        "pg_snapshots and pg_scn_map should have same number of rows");
+    assert_eq!(
+        snapshots.len(),
+        txn_map.len(),
+        "pg_snapshots and pg_transaction_map should have same number of rows"
+    );
+    assert_eq!(
+        snapshots.len(),
+        scn_map.len(),
+        "pg_snapshots and pg_scn_map should have same number of rows"
+    );
 
     // Verify data consistency across views
     for i in 0..snapshots.len() {
@@ -238,10 +283,14 @@ fn test_system_view_consistency() {
         };
 
         // All three should refer to the same snapshot
-        assert_eq!(snapshot_id, txn_timestamp,
-            "Snapshot ID mismatch between pg_snapshots and pg_transaction_map");
-        assert_eq!(snapshot_id, scn_timestamp,
-            "Snapshot ID mismatch between pg_snapshots and pg_scn_map");
+        assert_eq!(
+            snapshot_id, txn_timestamp,
+            "Snapshot ID mismatch between pg_snapshots and pg_transaction_map"
+        );
+        assert_eq!(
+            snapshot_id, scn_timestamp,
+            "Snapshot ID mismatch between pg_snapshots and pg_scn_map"
+        );
     }
 }
 
@@ -251,7 +300,8 @@ fn test_time_travel_with_system_views() {
     let registry = SystemViewRegistry::new();
 
     // Get transaction map
-    let txn_map = registry.execute("pg_transaction_map", &engine)
+    let txn_map = registry
+        .execute("pg_transaction_map", &engine)
         .expect("Failed to execute pg_transaction_map");
 
     // Use transaction ID from the map
@@ -270,12 +320,17 @@ fn test_time_travel_with_system_views() {
     };
 
     let mut executor = Executor::with_storage(&engine);
-    let results = executor.execute(&plan)
+    let results = executor
+        .execute(&plan)
         .expect("Failed to execute AS OF TRANSACTION query");
 
     // Should see data up to this transaction
     assert!(results.len() >= 1, "Should have at least one row");
-    assert!(results.len() <= 3, "Should not exceed 3 rows for transaction {}", txn_id);
+    assert!(
+        results.len() <= 3,
+        "Should not exceed 3 rows for transaction {}",
+        txn_id
+    );
 }
 
 #[test]
@@ -284,7 +339,8 @@ fn test_scn_based_time_travel() {
     let registry = SystemViewRegistry::new();
 
     // Get SCN map
-    let scn_map = registry.execute("pg_scn_map", &engine)
+    let scn_map = registry
+        .execute("pg_scn_map", &engine)
         .expect("Failed to execute pg_scn_map");
 
     // Use SCN from the map
@@ -303,8 +359,7 @@ fn test_scn_based_time_travel() {
     };
 
     let mut executor = Executor::with_storage(&engine);
-    let results = executor.execute(&plan)
-        .expect("Failed to execute AS OF SCN query");
+    let results = executor.execute(&plan).expect("Failed to execute AS OF SCN query");
 
     // Should see data up to this SCN
     assert!(results.len() >= 1, "Should have at least one row");
@@ -318,23 +373,30 @@ fn test_system_view_caching() {
 
     // Execute view first time
     let start = std::time::Instant::now();
-    let first_result = registry.execute("pg_snapshots", &engine)
+    let first_result = registry
+        .execute("pg_snapshots", &engine)
         .expect("Failed to execute first time");
     let first_duration = start.elapsed();
 
     // Execute view second time (should hit cache)
     let start = std::time::Instant::now();
-    let second_result = registry.execute("pg_snapshots", &engine)
+    let second_result = registry
+        .execute("pg_snapshots", &engine)
         .expect("Failed to execute second time");
     let second_duration = start.elapsed();
 
     // Results should be identical
-    assert_eq!(first_result.len(), second_result.len(),
-        "Cached results should be identical");
+    assert_eq!(
+        first_result.len(),
+        second_result.len(),
+        "Cached results should be identical"
+    );
 
     // Second query should be faster (though this is a soft check)
-    println!("First query: {:?}, Second query (cached): {:?}",
-        first_duration, second_duration);
+    println!(
+        "First query: {:?}, Second query (cached): {:?}",
+        first_duration, second_duration
+    );
 }
 
 #[test]
@@ -343,18 +405,19 @@ fn test_view_cache_stats() {
     let registry = SystemViewRegistry::new();
 
     // Get initial cache stats
-    let (initial_size, capacity) = registry.cache_stats()
-        .expect("Failed to get cache stats");
+    let (initial_size, capacity) = registry.cache_stats().expect("Failed to get cache stats");
 
     assert_eq!(initial_size, 0, "Cache should be empty initially");
     assert!(capacity > 0, "Cache capacity should be positive");
 
     // Execute a view to populate cache
-    registry.execute("pg_snapshots", &engine)
+    registry
+        .execute("pg_snapshots", &engine)
         .expect("Failed to execute view");
 
     // Cache size should increase
-    let (after_size, _) = registry.cache_stats()
+    let (after_size, _) = registry
+        .cache_stats()
         .expect("Failed to get cache stats after execution");
 
     assert_eq!(after_size, 1, "Cache should have 1 entry after one view execution");
@@ -366,19 +429,19 @@ fn test_view_cache_invalidation() {
     let registry = SystemViewRegistry::new();
 
     // Execute view to populate cache
-    registry.execute("pg_snapshots", &engine)
+    registry
+        .execute("pg_snapshots", &engine)
         .expect("Failed to execute view");
 
-    let (size_before, _) = registry.cache_stats()
-        .expect("Failed to get cache stats");
+    let (size_before, _) = registry.cache_stats().expect("Failed to get cache stats");
     assert_eq!(size_before, 1, "Cache should have 1 entry");
 
     // Invalidate cache
-    registry.invalidate_view("pg_snapshots")
+    registry
+        .invalidate_view("pg_snapshots")
         .expect("Failed to invalidate view");
 
-    let (size_after, _) = registry.cache_stats()
-        .expect("Failed to get cache stats");
+    let (size_after, _) = registry.cache_stats().expect("Failed to get cache stats");
     assert_eq!(size_after, 0, "Cache should be empty after invalidation");
 }
 
@@ -388,7 +451,8 @@ fn test_snapshot_size_calculation() {
     let registry = SystemViewRegistry::new();
 
     // Execute pg_snapshots to get size information
-    let snapshots = registry.execute("pg_snapshots", &engine)
+    let snapshots = registry
+        .execute("pg_snapshots", &engine)
         .expect("Failed to execute pg_snapshots");
 
     for snapshot in snapshots {
@@ -409,17 +473,19 @@ fn test_snapshot_size_calculation() {
 #[test]
 fn test_empty_database_system_views() {
     let config = Config::in_memory();
-    let engine = StorageEngine::open_in_memory(&config)
-        .expect("Failed to create storage engine");
+    let engine = StorageEngine::open_in_memory(&config).expect("Failed to create storage engine");
 
     let registry = SystemViewRegistry::new();
 
     // All views should return empty results for empty database
-    let snapshots = registry.execute("pg_snapshots", &engine)
+    let snapshots = registry
+        .execute("pg_snapshots", &engine)
         .expect("Failed to execute pg_snapshots");
-    let txn_map = registry.execute("pg_transaction_map", &engine)
+    let txn_map = registry
+        .execute("pg_transaction_map", &engine)
         .expect("Failed to execute pg_transaction_map");
-    let scn_map = registry.execute("pg_scn_map", &engine)
+    let scn_map = registry
+        .execute("pg_scn_map", &engine)
         .expect("Failed to execute pg_scn_map");
 
     assert_eq!(snapshots.len(), 0, "pg_snapshots should be empty");
@@ -437,6 +503,8 @@ fn test_system_view_error_handling() {
     assert!(result.is_err(), "Should fail for non-existent view");
 
     let err = result.unwrap_err();
-    assert!(err.to_string().contains("Unknown system view"),
-        "Error message should mention unknown view");
+    assert!(
+        err.to_string().contains("Unknown system view"),
+        "Error message should mention unknown view"
+    );
 }

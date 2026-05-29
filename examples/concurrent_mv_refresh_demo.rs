@@ -8,15 +8,13 @@
 //! cargo run --example concurrent_mv_refresh_demo
 //! ```
 
-use heliosdb_nano::{Config, StorageEngine, Column, DataType, Schema, Tuple, Value};
-use heliosdb_nano::sql::{LogicalPlan, Executor};
+use heliosdb_nano::sql::{Executor, LogicalPlan};
+use heliosdb_nano::{Column, Config, DataType, Schema, StorageEngine, Tuple, Value};
 use std::sync::Arc;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing for detailed logs
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
 
     println!("=== CONCURRENT REFRESH MATERIALIZED VIEW Demo ===\n");
 
@@ -34,8 +32,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Column::new("region", DataType::Text),
     ]);
 
-    storage.catalog()
-        .create_table("sales", sales_schema.clone())?;
+    storage.catalog().create_table("sales", sales_schema.clone())?;
 
     // Insert sample sales data
     let sales_data = vec![
@@ -47,12 +44,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     for (idx, (product, amount, region)) in sales_data.iter().enumerate() {
-        storage.insert_tuple("sales", Tuple::new(vec![
-            Value::Int4(idx as i32 + 1),
-            Value::String(product.to_string()),
-            Value::Float8(*amount),
-            Value::String(region.to_string()),
-        ]))?;
+        storage.insert_tuple(
+            "sales",
+            Tuple::new(vec![
+                Value::Int4(idx as i32 + 1),
+                Value::String(product.to_string()),
+                Value::Float8(*amount),
+                Value::String(region.to_string()),
+            ]),
+        )?;
     }
 
     println!("   ✓ Inserted {} sales records\n", sales_data.len());
@@ -122,7 +122,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data = mv_catalog.read_view_data("sales_summary")?;
     for tuple in &data {
         if let (Value::String(region), Value::Float8(total), Value::Int4(count)) =
-            (&tuple.values[0], &tuple.values[1], &tuple.values[2]) {
+            (&tuple.values[0], &tuple.values[1], &tuple.values[2])
+        {
             println!("   {} - Total: ${:.2}, Count: {}", region, total, count);
         }
     }
@@ -138,12 +139,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ];
 
     for (idx, (product, amount, region)) in new_sales.iter().enumerate() {
-        storage.insert_tuple("sales", Tuple::new(vec![
-            Value::Int4((sales_data.len() + idx + 1) as i32),
-            Value::String(product.to_string()),
-            Value::Float8(*amount),
-            Value::String(region.to_string()),
-        ]))?;
+        storage.insert_tuple(
+            "sales",
+            Tuple::new(vec![
+                Value::Int4((sales_data.len() + idx + 1) as i32),
+                Value::String(product.to_string()),
+                Value::Float8(*amount),
+                Value::String(region.to_string()),
+            ]),
+        )?;
     }
 
     println!("   ✓ Inserted {} new sales records\n", new_sales.len());
@@ -154,17 +158,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let updated_summary = vec![
         Tuple::new(vec![
             Value::String("North".to_string()),
-            Value::Float8(2100.0),  // 1300 + 800
+            Value::Float8(2100.0), // 1300 + 800
             Value::Int4(3),
         ]),
         Tuple::new(vec![
             Value::String("South".to_string()),
-            Value::Float8(2000.0),  // 800 + 1200
+            Value::Float8(2000.0), // 800 + 1200
             Value::Int4(2),
         ]),
         Tuple::new(vec![
             Value::String("East".to_string()),
-            Value::Float8(650.0),   // 600 + 50
+            Value::Float8(650.0), // 600 + 50
             Value::Int4(2),
         ]),
         Tuple::new(vec![
@@ -182,7 +186,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("\n   Updated data:");
     for tuple in &data {
         if let (Value::String(region), Value::Float8(total), Value::Int4(count)) =
-            (&tuple.values[0], &tuple.values[1], &tuple.values[2]) {
+            (&tuple.values[0], &tuple.values[1], &tuple.values[2])
+        {
             println!("   {} - Total: ${:.2}, Count: {}", region, total, count);
         }
     }
@@ -192,18 +197,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   (Zero downtime - queries can read during refresh)\n");
 
     // Insert more sales
-    let more_sales = vec![
-        ("Headphones", 200.0, "North"),
-        ("Webcam", 150.0, "South"),
-    ];
+    let more_sales = vec![("Headphones", 200.0, "North"), ("Webcam", 150.0, "South")];
 
     for (idx, (product, amount, region)) in more_sales.iter().enumerate() {
-        storage.insert_tuple("sales", Tuple::new(vec![
-            Value::Int4((sales_data.len() + new_sales.len() + idx + 1) as i32),
-            Value::String(product.to_string()),
-            Value::Float8(*amount),
-            Value::String(region.to_string()),
-        ]))?;
+        storage.insert_tuple(
+            "sales",
+            Tuple::new(vec![
+                Value::Int4((sales_data.len() + new_sales.len() + idx + 1) as i32),
+                Value::String(product.to_string()),
+                Value::Float8(*amount),
+                Value::String(region.to_string()),
+            ]),
+        )?;
     }
 
     println!("   ✓ Inserted {} more sales records", more_sales.len());
@@ -211,12 +216,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let final_summary = vec![
         Tuple::new(vec![
             Value::String("North".to_string()),
-            Value::Float8(2300.0),  // 2100 + 200
+            Value::Float8(2300.0), // 2100 + 200
             Value::Int4(4),
         ]),
         Tuple::new(vec![
             Value::String("South".to_string()),
-            Value::Float8(2150.0),  // 2000 + 150
+            Value::Float8(2150.0), // 2000 + 150
             Value::Int4(3),
         ]),
         Tuple::new(vec![
@@ -243,7 +248,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("   Final materialized view data:");
     for tuple in &final_data {
         if let (Value::String(region), Value::Float8(total), Value::Int4(count)) =
-            (&tuple.values[0], &tuple.values[1], &tuple.values[2]) {
+            (&tuple.values[0], &tuple.values[1], &tuple.values[2])
+        {
             println!("   {} - Total: ${:.2}, Count: {}", region, total, count);
         }
     }

@@ -9,32 +9,26 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_nano::{Config, StorageEngine, Value, Tuple, Column, DataType, Schema};
-use heliosdb_nano::storage::{MvDeltaTracker, MvDeltaOperation, MvDelta};
+use heliosdb_nano::storage::{MvDelta, MvDeltaOperation, MvDeltaTracker};
+use heliosdb_nano::{Column, Config, DataType, Schema, StorageEngine, Tuple, Value};
 use std::sync::Arc;
-use std::time::{SystemTime, Duration};
+use std::time::{Duration, SystemTime};
 
 #[test]
 fn test_delta_tracking_basic_insert() {
     let config = Config::in_memory();
-    let engine = StorageEngine::open_in_memory(&config)
-        .expect("Failed to open storage engine");
+    let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage engine");
 
-    let delta_tracker = MvDeltaTracker::new(Arc::clone(&engine.db))
-        .expect("Failed to create delta tracker");
+    let delta_tracker = MvDeltaTracker::new(Arc::clone(&engine.db)).expect("Failed to create delta tracker");
 
     // Track the users table
-    delta_tracker.track_table("users")
-        .expect("Failed to track table");
+    delta_tracker.track_table("users").expect("Failed to track table");
 
     assert!(delta_tracker.is_tracked("users"));
     assert!(!delta_tracker.is_tracked("products"));
 
     // Create a delta
-    let tuple = Tuple::new(vec![
-        Value::Int4(1),
-        Value::String("Alice".to_string()),
-    ]);
+    let tuple = Tuple::new(vec![Value::Int4(1), Value::String("Alice".to_string())]);
 
     let delta = MvDelta::new(
         "users".to_string(),
@@ -44,12 +38,12 @@ fn test_delta_tracking_basic_insert() {
         100,
     );
 
-    delta_tracker.record_delta(delta)
-        .expect("Failed to record delta");
+    delta_tracker.record_delta(delta).expect("Failed to record delta");
 
     // Retrieve deltas
     let since = SystemTime::now() - Duration::from_secs(60);
-    let delta_set = delta_tracker.get_deltas_since("users", since)
+    let delta_set = delta_tracker
+        .get_deltas_since("users", since)
         .expect("Failed to get deltas");
 
     assert_eq!(delta_set.len(), 1);
@@ -59,14 +53,11 @@ fn test_delta_tracking_basic_insert() {
 #[test]
 fn test_delta_tracking_multiple_operations() {
     let config = Config::in_memory();
-    let engine = StorageEngine::open_in_memory(&config)
-        .expect("Failed to open storage engine");
+    let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage engine");
 
-    let delta_tracker = MvDeltaTracker::new(Arc::clone(&engine.db))
-        .expect("Failed to create delta tracker");
+    let delta_tracker = MvDeltaTracker::new(Arc::clone(&engine.db)).expect("Failed to create delta tracker");
 
-    delta_tracker.track_table("products")
-        .expect("Failed to track table");
+    delta_tracker.track_table("products").expect("Failed to track table");
 
     let now = SystemTime::now();
 
@@ -77,13 +68,17 @@ fn test_delta_tracking_multiple_operations() {
         Value::Float8(19.99),
     ]);
 
-    delta_tracker.record_delta(MvDelta::new(
-        "products".to_string(),
-        1,
-        MvDeltaOperation::Insert { tuple: insert_tuple.clone() },
-        now,
-        1,
-    )).expect("Failed to record insert");
+    delta_tracker
+        .record_delta(MvDelta::new(
+            "products".to_string(),
+            1,
+            MvDeltaOperation::Insert {
+                tuple: insert_tuple.clone(),
+            },
+            now,
+            1,
+        ))
+        .expect("Failed to record insert");
 
     // Update
     let updated_tuple = Tuple::new(vec![
@@ -92,29 +87,34 @@ fn test_delta_tracking_multiple_operations() {
         Value::Float8(24.99),
     ]);
 
-    delta_tracker.record_delta(MvDelta::new(
-        "products".to_string(),
-        1,
-        MvDeltaOperation::Update {
-            old_tuple: insert_tuple.clone(),
-            new_tuple: updated_tuple.clone(),
-        },
-        now + Duration::from_secs(1),
-        2,
-    )).expect("Failed to record update");
+    delta_tracker
+        .record_delta(MvDelta::new(
+            "products".to_string(),
+            1,
+            MvDeltaOperation::Update {
+                old_tuple: insert_tuple.clone(),
+                new_tuple: updated_tuple.clone(),
+            },
+            now + Duration::from_secs(1),
+            2,
+        ))
+        .expect("Failed to record update");
 
     // Delete
-    delta_tracker.record_delta(MvDelta::new(
-        "products".to_string(),
-        1,
-        MvDeltaOperation::Delete { tuple: updated_tuple },
-        now + Duration::from_secs(2),
-        3,
-    )).expect("Failed to record delete");
+    delta_tracker
+        .record_delta(MvDelta::new(
+            "products".to_string(),
+            1,
+            MvDeltaOperation::Delete { tuple: updated_tuple },
+            now + Duration::from_secs(2),
+            3,
+        ))
+        .expect("Failed to record delete");
 
     // Query deltas
     let since = now - Duration::from_secs(10);
-    let delta_set = delta_tracker.get_deltas_since("products", since)
+    let delta_set = delta_tracker
+        .get_deltas_since("products", since)
         .expect("Failed to get deltas");
 
     assert_eq!(delta_set.len(), 3);
@@ -126,11 +126,9 @@ fn test_delta_tracking_multiple_operations() {
 #[test]
 fn test_delta_tracking_multiple_tables() {
     let config = Config::in_memory();
-    let engine = StorageEngine::open_in_memory(&config)
-        .expect("Failed to open storage engine");
+    let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage engine");
 
-    let delta_tracker = MvDeltaTracker::new(Arc::clone(&engine.db))
-        .expect("Failed to create delta tracker");
+    let delta_tracker = MvDeltaTracker::new(Arc::clone(&engine.db)).expect("Failed to create delta tracker");
 
     // Track multiple tables
     delta_tracker.track_table("users").expect("Failed to track users");
@@ -141,30 +139,35 @@ fn test_delta_tracking_multiple_tables() {
     // Record deltas for users
     for i in 1..=3 {
         let tuple = Tuple::new(vec![Value::Int4(i), Value::String(format!("User {}", i))]);
-        delta_tracker.record_delta(MvDelta::new(
-            "users".to_string(),
-            i as u64,
-            MvDeltaOperation::Insert { tuple },
-            now,
-            i as u64,
-        )).expect("Failed to record user delta");
+        delta_tracker
+            .record_delta(MvDelta::new(
+                "users".to_string(),
+                i as u64,
+                MvDeltaOperation::Insert { tuple },
+                now,
+                i as u64,
+            ))
+            .expect("Failed to record user delta");
     }
 
     // Record deltas for orders
     for i in 1..=2 {
         let tuple = Tuple::new(vec![Value::Int4(i), Value::Int4(i)]);
-        delta_tracker.record_delta(MvDelta::new(
-            "orders".to_string(),
-            i as u64,
-            MvDeltaOperation::Insert { tuple },
-            now,
-            (100 + i) as u64,
-        )).expect("Failed to record order delta");
+        delta_tracker
+            .record_delta(MvDelta::new(
+                "orders".to_string(),
+                i as u64,
+                MvDeltaOperation::Insert { tuple },
+                now,
+                (100 + i) as u64,
+            ))
+            .expect("Failed to record order delta");
     }
 
     // Query deltas for multiple tables
     let since = now - Duration::from_secs(10);
-    let delta_sets = delta_tracker.get_deltas_for_tables(&["users", "orders"], since)
+    let delta_sets = delta_tracker
+        .get_deltas_for_tables(&["users", "orders"], since)
         .expect("Failed to get deltas for tables");
 
     assert_eq!(delta_sets.len(), 2);
@@ -175,14 +178,11 @@ fn test_delta_tracking_multiple_tables() {
 #[test]
 fn test_delta_tracking_time_range() {
     let config = Config::in_memory();
-    let engine = StorageEngine::open_in_memory(&config)
-        .expect("Failed to open storage engine");
+    let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage engine");
 
-    let delta_tracker = MvDeltaTracker::new(Arc::clone(&engine.db))
-        .expect("Failed to create delta tracker");
+    let delta_tracker = MvDeltaTracker::new(Arc::clone(&engine.db)).expect("Failed to create delta tracker");
 
-    delta_tracker.track_table("events")
-        .expect("Failed to track table");
+    delta_tracker.track_table("events").expect("Failed to track table");
 
     let t0 = SystemTime::now() - Duration::from_secs(100);
     let t1 = SystemTime::now() - Duration::from_secs(50);
@@ -190,33 +190,39 @@ fn test_delta_tracking_time_range() {
 
     // Insert old delta
     let old_tuple = Tuple::new(vec![Value::Int4(1)]);
-    delta_tracker.record_delta(MvDelta::new(
-        "events".to_string(),
-        1,
-        MvDeltaOperation::Insert { tuple: old_tuple },
-        t0,
-        1,
-    )).expect("Failed to record old delta");
+    delta_tracker
+        .record_delta(MvDelta::new(
+            "events".to_string(),
+            1,
+            MvDeltaOperation::Insert { tuple: old_tuple },
+            t0,
+            1,
+        ))
+        .expect("Failed to record old delta");
 
     // Insert recent delta
     let recent_tuple = Tuple::new(vec![Value::Int4(2)]);
-    delta_tracker.record_delta(MvDelta::new(
-        "events".to_string(),
-        2,
-        MvDeltaOperation::Insert { tuple: recent_tuple },
-        t2,
-        2,
-    )).expect("Failed to record recent delta");
+    delta_tracker
+        .record_delta(MvDelta::new(
+            "events".to_string(),
+            2,
+            MvDeltaOperation::Insert { tuple: recent_tuple },
+            t2,
+            2,
+        ))
+        .expect("Failed to record recent delta");
 
     // Query from t1 (should only get recent delta)
-    let delta_set = delta_tracker.get_deltas_since("events", t1)
+    let delta_set = delta_tracker
+        .get_deltas_since("events", t1)
         .expect("Failed to get deltas");
 
     assert_eq!(delta_set.len(), 1);
     assert_eq!(delta_set.deltas[0].row_id, 2);
 
     // Query from t0 (should get both deltas)
-    let delta_set = delta_tracker.get_deltas_since("events", t0)
+    let delta_set = delta_tracker
+        .get_deltas_since("events", t0)
         .expect("Failed to get deltas");
 
     assert_eq!(delta_set.len(), 2);
@@ -225,14 +231,11 @@ fn test_delta_tracking_time_range() {
 #[test]
 fn test_delta_tracking_compaction() {
     let config = Config::in_memory();
-    let engine = StorageEngine::open_in_memory(&config)
-        .expect("Failed to open storage engine");
+    let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage engine");
 
-    let delta_tracker = MvDeltaTracker::new(Arc::clone(&engine.db))
-        .expect("Failed to create delta tracker");
+    let delta_tracker = MvDeltaTracker::new(Arc::clone(&engine.db)).expect("Failed to create delta tracker");
 
-    delta_tracker.track_table("logs")
-        .expect("Failed to track table");
+    delta_tracker.track_table("logs").expect("Failed to track table");
 
     let old_time = SystemTime::now() - Duration::from_secs(7200); // 2 hours ago
     let recent_time = SystemTime::now();
@@ -240,42 +243,47 @@ fn test_delta_tracking_compaction() {
     // Insert old deltas
     for i in 1..=5 {
         let tuple = Tuple::new(vec![Value::Int4(i)]);
-        delta_tracker.record_delta(MvDelta::new(
-            "logs".to_string(),
-            i as u64,
-            MvDeltaOperation::Insert { tuple },
-            old_time,
-            i as u64,
-        )).expect("Failed to record old delta");
+        delta_tracker
+            .record_delta(MvDelta::new(
+                "logs".to_string(),
+                i as u64,
+                MvDeltaOperation::Insert { tuple },
+                old_time,
+                i as u64,
+            ))
+            .expect("Failed to record old delta");
     }
 
     // Insert recent deltas
     for i in 6..=10 {
         let tuple = Tuple::new(vec![Value::Int4(i)]);
-        delta_tracker.record_delta(MvDelta::new(
-            "logs".to_string(),
-            i as u64,
-            MvDeltaOperation::Insert { tuple },
-            recent_time,
-            i as u64,
-        )).expect("Failed to record recent delta");
+        delta_tracker
+            .record_delta(MvDelta::new(
+                "logs".to_string(),
+                i as u64,
+                MvDeltaOperation::Insert { tuple },
+                recent_time,
+                i as u64,
+            ))
+            .expect("Failed to record recent delta");
     }
 
     // Verify all deltas are present
     let since = old_time - Duration::from_secs(60);
-    let before_compact = delta_tracker.get_deltas_since("logs", since)
+    let before_compact = delta_tracker
+        .get_deltas_since("logs", since)
         .expect("Failed to get deltas");
     assert_eq!(before_compact.len(), 10);
 
     // Compact deltas older than 1 hour
     let cutoff = SystemTime::now() - Duration::from_secs(3600);
-    let deleted_count = delta_tracker.compact(cutoff)
-        .expect("Failed to compact deltas");
+    let deleted_count = delta_tracker.compact(cutoff).expect("Failed to compact deltas");
 
     assert_eq!(deleted_count, 5); // Should delete 5 old deltas
 
     // Verify only recent deltas remain
-    let after_compact = delta_tracker.get_deltas_since("logs", since)
+    let after_compact = delta_tracker
+        .get_deltas_since("logs", since)
         .expect("Failed to get deltas");
     assert_eq!(after_compact.len(), 5);
 }
@@ -283,11 +291,9 @@ fn test_delta_tracking_compaction() {
 #[test]
 fn test_delta_tracking_stats() {
     let config = Config::in_memory();
-    let engine = StorageEngine::open_in_memory(&config)
-        .expect("Failed to open storage engine");
+    let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage engine");
 
-    let delta_tracker = MvDeltaTracker::new(Arc::clone(&engine.db))
-        .expect("Failed to create delta tracker");
+    let delta_tracker = MvDeltaTracker::new(Arc::clone(&engine.db)).expect("Failed to create delta tracker");
 
     // Track multiple tables
     delta_tracker.track_table("table1").expect("Failed to track table1");
@@ -298,30 +304,33 @@ fn test_delta_tracking_stats() {
     // Insert deltas for table1
     for i in 1..=3 {
         let tuple = Tuple::new(vec![Value::Int4(i)]);
-        delta_tracker.record_delta(MvDelta::new(
-            "table1".to_string(),
-            i as u64,
-            MvDeltaOperation::Insert { tuple },
-            now,
-            i as u64,
-        )).expect("Failed to record delta");
+        delta_tracker
+            .record_delta(MvDelta::new(
+                "table1".to_string(),
+                i as u64,
+                MvDeltaOperation::Insert { tuple },
+                now,
+                i as u64,
+            ))
+            .expect("Failed to record delta");
     }
 
     // Insert deltas for table2
     for i in 1..=2 {
         let tuple = Tuple::new(vec![Value::Int4(i)]);
-        delta_tracker.record_delta(MvDelta::new(
-            "table2".to_string(),
-            i as u64,
-            MvDeltaOperation::Insert { tuple },
-            now,
-            (10 + i) as u64,
-        )).expect("Failed to record delta");
+        delta_tracker
+            .record_delta(MvDelta::new(
+                "table2".to_string(),
+                i as u64,
+                MvDeltaOperation::Insert { tuple },
+                now,
+                (10 + i) as u64,
+            ))
+            .expect("Failed to record delta");
     }
 
     // Get stats
-    let stats = delta_tracker.get_stats()
-        .expect("Failed to get stats");
+    let stats = delta_tracker.get_stats().expect("Failed to get stats");
 
     assert_eq!(stats.total_deltas, 5);
     assert_eq!(*stats.deltas_by_table.get("table1").unwrap(), 3);
@@ -333,18 +342,16 @@ fn test_delta_tracking_stats() {
 #[test]
 fn test_delta_tracking_untrack() {
     let config = Config::in_memory();
-    let engine = StorageEngine::open_in_memory(&config)
-        .expect("Failed to open storage engine");
+    let engine = StorageEngine::open_in_memory(&config).expect("Failed to open storage engine");
 
-    let delta_tracker = MvDeltaTracker::new(Arc::clone(&engine.db))
-        .expect("Failed to create delta tracker");
+    let delta_tracker = MvDeltaTracker::new(Arc::clone(&engine.db)).expect("Failed to create delta tracker");
 
     // Track then untrack
-    delta_tracker.track_table("temp_table")
-        .expect("Failed to track table");
+    delta_tracker.track_table("temp_table").expect("Failed to track table");
     assert!(delta_tracker.is_tracked("temp_table"));
 
-    delta_tracker.untrack_table("temp_table")
+    delta_tracker
+        .untrack_table("temp_table")
         .expect("Failed to untrack table");
     assert!(!delta_tracker.is_tracked("temp_table"));
 
@@ -358,12 +365,12 @@ fn test_delta_tracking_untrack() {
         1,
     );
 
-    delta_tracker.record_delta(delta)
-        .expect("Should succeed but ignore");
+    delta_tracker.record_delta(delta).expect("Should succeed but ignore");
 
     // Query should return empty set
     let since = SystemTime::now() - Duration::from_secs(60);
-    let delta_set = delta_tracker.get_deltas_since("temp_table", since)
+    let delta_set = delta_tracker
+        .get_deltas_since("temp_table", since)
         .expect("Failed to get deltas");
 
     assert_eq!(delta_set.len(), 0);

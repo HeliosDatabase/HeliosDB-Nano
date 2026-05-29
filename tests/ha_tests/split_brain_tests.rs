@@ -7,10 +7,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "ha-tier1")]
 use heliosdb_nano::replication::{
-    split_brain::{
-        ClusterNode, ObserverConfig, ProtectionEvent, ProtectionState,
-        SplitBrainProtector,
-    },
+    split_brain::{ClusterNode, ObserverConfig, ProtectionEvent, ProtectionState, SplitBrainProtector},
     transport::{FencingTokenPayload, NodeRole, VoteReason, VoteRequestPayload},
 };
 

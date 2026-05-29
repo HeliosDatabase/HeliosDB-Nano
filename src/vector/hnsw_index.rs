@@ -7,12 +7,12 @@
 #![allow(clippy::similar_names)]
 #![allow(unused_variables)]
 
-use crate::{Result, Error};
-use super::{Vector, DistanceMetric};
+use super::{DistanceMetric, Vector};
+use crate::{Error, Result};
 use hnsw_rs::prelude::*;
 use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use serde::{Serialize, Deserialize};
 
 /// HNSW index configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +130,7 @@ impl HnswIndex {
 
         let index = self.index.read();
         let id_mapping = self.id_mapping.read();
+        let reverse_mapping = self.reverse_mapping.read();
 
         // Calculate dynamic ef_search
         let ef_search = self.calculate_ef_search(k, id_mapping.len());
@@ -142,8 +143,8 @@ impl HnswIndex {
             .into_iter()
             .filter_map(|neighbor| {
                 let hnsw_id = neighbor.d_id as usize;
-                id_mapping.get(hnsw_id).map(|&row_id| {
-                    (row_id, neighbor.distance)
+                id_mapping.get(hnsw_id).and_then(|&row_id| {
+                    (reverse_mapping.get(&row_id) == Some(&hnsw_id)).then_some((row_id, neighbor.distance))
                 })
             })
             .collect();
@@ -188,6 +189,7 @@ impl HnswIndex {
 
         let index = self.index.read();
         let id_mapping = self.id_mapping.read();
+        let reverse_mapping = self.reverse_mapping.read();
 
         // Clamp ef_search to valid range
         let ef_search = ef_search.clamp(k, self.config.ef_search_max);
@@ -198,8 +200,8 @@ impl HnswIndex {
             .into_iter()
             .filter_map(|neighbor| {
                 let hnsw_id = neighbor.d_id as usize;
-                id_mapping.get(hnsw_id).map(|&row_id| {
-                    (row_id, neighbor.distance)
+                id_mapping.get(hnsw_id).and_then(|&row_id| {
+                    (reverse_mapping.get(&row_id) == Some(&hnsw_id)).then_some((row_id, neighbor.distance))
                 })
             })
             .collect();
@@ -230,12 +232,12 @@ impl HnswIndex {
 
     /// Get the number of vectors in the index
     pub fn len(&self) -> usize {
-        self.id_mapping.read().len()
+        self.reverse_mapping.read().len()
     }
 
     /// Check if the index is empty
     pub fn is_empty(&self) -> bool {
-        self.id_mapping.read().is_empty()
+        self.reverse_mapping.read().is_empty()
     }
 
     /// Get the dimension of vectors in this index
@@ -372,14 +374,15 @@ impl CosineHnswIndex {
 
         let index = self.index.read();
         let id_mapping = self.id_mapping.read();
+        let reverse_mapping = self.reverse_mapping.read();
 
         let results = index.search(query.as_slice(), k, 200);
         let mapped_results: Vec<(u64, f32)> = results
             .into_iter()
             .filter_map(|neighbor| {
                 let hnsw_id = neighbor.d_id as usize;
-                id_mapping.get(hnsw_id).map(|&row_id| {
-                    (row_id, neighbor.distance)
+                id_mapping.get(hnsw_id).and_then(|&row_id| {
+                    (reverse_mapping.get(&row_id) == Some(&hnsw_id)).then_some((row_id, neighbor.distance))
                 })
             })
             .collect();
@@ -404,11 +407,11 @@ impl CosineHnswIndex {
     }
 
     pub fn len(&self) -> usize {
-        self.id_mapping.read().len()
+        self.reverse_mapping.read().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.id_mapping.read().is_empty()
+        self.reverse_mapping.read().is_empty()
     }
 }
 
@@ -472,14 +475,15 @@ impl InnerProductHnswIndex {
 
         let index = self.index.read();
         let id_mapping = self.id_mapping.read();
+        let reverse_mapping = self.reverse_mapping.read();
 
         let results = index.search(query.as_slice(), k, 200);
         let mapped_results: Vec<(u64, f32)> = results
             .into_iter()
             .filter_map(|neighbor| {
                 let hnsw_id = neighbor.d_id as usize;
-                id_mapping.get(hnsw_id).map(|&row_id| {
-                    (row_id, neighbor.distance)
+                id_mapping.get(hnsw_id).and_then(|&row_id| {
+                    (reverse_mapping.get(&row_id) == Some(&hnsw_id)).then_some((row_id, neighbor.distance))
                 })
             })
             .collect();
@@ -504,11 +508,11 @@ impl InnerProductHnswIndex {
     }
 
     pub fn len(&self) -> usize {
-        self.id_mapping.read().len()
+        self.reverse_mapping.read().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.id_mapping.read().is_empty()
+        self.reverse_mapping.read().is_empty()
     }
 }
 

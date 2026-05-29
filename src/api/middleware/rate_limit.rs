@@ -8,14 +8,14 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use serde::{Deserialize, Serialize};
 
-use crate::api::models::ApiError;
 use super::auth::UserContext;
+use crate::api::models::ApiError;
 
 /// Rate limit configuration
 #[derive(Debug, Clone)]
@@ -226,8 +226,7 @@ impl RateLimitMiddleware {
         };
 
         // Calculate refill rate: tokens per second to refill max_requests in window
-        let refill_rate = self.config.max_requests as f64
-            / self.config.window_duration.as_secs_f64();
+        let refill_rate = self.config.max_requests as f64 / self.config.window_duration.as_secs_f64();
 
         // Get or create bucket
         let bucket = buckets

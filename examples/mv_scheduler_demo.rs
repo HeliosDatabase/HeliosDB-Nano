@@ -13,8 +13,8 @@
 //! ```
 
 use heliosdb_nano::{
-    EmbeddedDatabase, Config,
-    storage::{MVScheduler, SchedulerConfig, Priority},
+    storage::{MVScheduler, Priority, SchedulerConfig},
+    Config, EmbeddedDatabase,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -23,9 +23,7 @@ use tokio::time::sleep;
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Initialize tracing for logging
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .init();
+    tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).init();
 
     println!("=== CPU-Aware MV Scheduler Demo ===\n");
 
@@ -60,27 +58,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Critical MV: User summary (frequently accessed)
     db.execute(
         "CREATE MATERIALIZED VIEW user_summary AS \
-         SELECT status, COUNT(*) as count FROM users GROUP BY status"
+         SELECT status, COUNT(*) as count FROM users GROUP BY status",
     )?;
 
     // High priority MV: Order statistics
     db.execute(
         "CREATE MATERIALIZED VIEW order_stats AS \
          SELECT user_id, COUNT(*) as order_count, SUM(amount) as total_amount \
-         FROM orders GROUP BY user_id"
+         FROM orders GROUP BY user_id",
     )?;
 
     // Normal priority MV: Product by category
     db.execute(
         "CREATE MATERIALIZED VIEW product_summary AS \
          SELECT category, COUNT(*) as count, AVG(price) as avg_price \
-         FROM products GROUP BY category"
+         FROM products GROUP BY category",
     )?;
 
     // Low priority MV: Detailed product info
     db.execute(
         "CREATE MATERIALIZED VIEW product_details AS \
-         SELECT * FROM products WHERE price > 100"
+         SELECT * FROM products WHERE price > 100",
     )?;
 
     println!("   ✓ Created 4 materialized views\n");
@@ -94,7 +92,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_batch_size(5)                  // Process up to 5 MVs per cycle
         .with_max_concurrent(3)              // Max 3 concurrent refreshes
         .with_adaptive_batch_sizing(true)    // Adjust batch size dynamically
-        .with_auto_retry(true);              // Retry failed refreshes
+        .with_auto_retry(true); // Retry failed refreshes
 
     let scheduler = MVScheduler::new(scheduler_config, Arc::clone(&storage));
 
@@ -210,7 +208,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Schedule multiple refreshes
     for i in 0..5 {
-        scheduler.schedule_refresh(&format!("test_mv_{}", i), Priority::Normal).ok();
+        scheduler
+            .schedule_refresh(&format!("test_mv_{}", i), Priority::Normal)
+            .ok();
     }
 
     let stats = scheduler.get_stats();

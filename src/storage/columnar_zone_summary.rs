@@ -7,11 +7,11 @@
 //! - Most Common Values (MCV) tracking
 //! - Histogram buckets for selectivity estimation
 
+use super::predicate_pushdown::{AnalyzedPredicate, PredicateOp};
+use crate::Value;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use serde::{Deserialize, Serialize};
-use crate::Value;
-use super::predicate_pushdown::{AnalyzedPredicate, PredicateOp};
 
 /// HyperLogLog implementation for approximate distinct counting
 /// Uses the HyperLogLog++ algorithm with bias correction
@@ -61,9 +61,7 @@ impl HyperLogLog {
         let alpha = self.alpha_m();
 
         // Calculate raw estimate
-        let sum: f64 = self.registers.iter()
-            .map(|&r| 2.0_f64.powi(-(r as i32)))
-            .sum();
+        let sum: f64 = self.registers.iter().map(|&r| 2.0_f64.powi(-(r as i32))).sum();
 
         let raw_estimate = alpha * m * m / sum;
 
@@ -202,9 +200,7 @@ impl Histogram {
 
         for bucket in &self.buckets {
             let in_range = match (lower, upper) {
-                (Some(l), Some(u)) => {
-                    Self::value_le(&bucket.upper_bound, u) && Self::value_ge(&bucket.lower_bound, l)
-                }
+                (Some(l), Some(u)) => Self::value_le(&bucket.upper_bound, u) && Self::value_ge(&bucket.lower_bound, l),
                 (Some(l), None) => Self::value_ge(&bucket.upper_bound, l),
                 (None, Some(u)) => Self::value_le(&bucket.lower_bound, u),
                 (None, None) => true,
@@ -358,12 +354,11 @@ impl ColumnZoneSummary {
     }
 
     fn rebuild_mcv(&mut self) {
-        let mut entries: Vec<_> = self.mcv_frequency.iter()
-            .map(|(k, &v)| (k.clone(), v))
-            .collect();
+        let mut entries: Vec<_> = self.mcv_frequency.iter().map(|(k, &v)| (k.clone(), v)).collect();
         entries.sort_by(|a, b| b.1.cmp(&a.1));
 
-        self.mcv = entries.into_iter()
+        self.mcv = entries
+            .into_iter()
             .take(10)
             .filter_map(|(key, freq)| {
                 // Try to parse back to Value (simplified)
@@ -539,7 +534,9 @@ impl BlockZoneSummary {
         self.last_row_id = row_id;
 
         for (col_name, value) in values {
-            let summary = self.columns.entry(col_name.to_string())
+            let summary = self
+                .columns
+                .entry(col_name.to_string())
                 .or_insert_with(|| ColumnZoneSummary::new(col_name));
             summary.update_incremental(value);
         }
@@ -580,8 +577,7 @@ impl BlockZoneSummary {
             PredicateOp::Eq => {
                 // Check if value is within range
                 if let (Some(min), Some(max)) = (&summary.min, &summary.max) {
-                    if ColumnZoneSummary::value_lt(&pred.value, min)
-                        || ColumnZoneSummary::value_gt(&pred.value, max) {
+                    if ColumnZoneSummary::value_lt(&pred.value, min) || ColumnZoneSummary::value_gt(&pred.value, max) {
                         return SummaryMatch::Impossible;
                     }
                 }
@@ -671,7 +667,9 @@ impl BlockZoneSummary {
         self.last_row_id = self.last_row_id.max(other.last_row_id);
 
         for (col_name, other_summary) in &other.columns {
-            let summary = self.columns.entry(col_name.clone())
+            let summary = self
+                .columns
+                .entry(col_name.clone())
                 .or_insert_with(|| ColumnZoneSummary::new(col_name));
 
             // Merge min/max
@@ -738,7 +736,8 @@ impl TableZoneSummaries {
         let block_id = row_id / self.block_size;
         let first_row_id = block_id * self.block_size;
 
-        self.blocks.entry(block_id)
+        self.blocks
+            .entry(block_id)
             .or_insert_with(|| BlockZoneSummary::new(block_id, first_row_id))
     }
 
@@ -751,7 +750,8 @@ impl TableZoneSummaries {
 
     /// Get blocks that might satisfy predicates
     pub fn get_candidate_blocks(&self, predicates: &[AnalyzedPredicate]) -> Vec<u64> {
-        self.blocks.iter()
+        self.blocks
+            .iter()
             .filter(|(_, block)| block.can_satisfy(predicates) != BlockDecision::Skip)
             .map(|(&id, _)| id)
             .collect()
@@ -774,15 +774,8 @@ impl TableZoneSummaries {
                     for pred in predicates {
                         if let Some(summary) = block.columns.get(&pred.column_name) {
                             let pred_selectivity = match pred.op {
-                                PredicateOp::Eq => {
-                                    summary.estimate_equality_selectivity(&pred.value)
-                                }
-                                _ => {
-                                    summary.estimate_range_selectivity(
-                                        Some(&pred.value),
-                                        None,
-                                    )
-                                }
+                                PredicateOp::Eq => summary.estimate_equality_selectivity(&pred.value),
+                                _ => summary.estimate_range_selectivity(Some(&pred.value), None),
                             };
                             block_selectivity *= pred_selectivity;
                         }
@@ -798,8 +791,8 @@ impl TableZoneSummaries {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::predicate_pushdown::PredicateOp;
+    use super::*;
 
     #[test]
     fn test_hyperloglog_basic() {

@@ -73,21 +73,18 @@ impl GinIndex {
 
         // Add to key index
         for key in keys {
-            self.index.entry(key)
-                .or_insert_with(HashSet::new)
-                .insert(row_id);
+            self.index.entry(key).or_insert_with(HashSet::new).insert(row_id);
         }
 
         // Add to path index
         for path in paths {
-            self.path_index.entry(path)
-                .or_insert_with(HashSet::new)
-                .insert(row_id);
+            self.path_index.entry(path).or_insert_with(HashSet::new).insert(row_id);
         }
 
         // Add to value index
         for value_hash in values {
-            self.value_index.entry(value_hash)
+            self.value_index
+                .entry(value_hash)
                 .or_insert_with(HashSet::new)
                 .insert(row_id);
         }
@@ -202,7 +199,9 @@ impl GinIndex {
     /// Search for rows containing a specific value
     pub fn search_value(&self, value: &serde_json::Value) -> Option<Vec<u64>> {
         let value_hash = self.hash_value(value);
-        self.value_index.get(&value_hash).map(|set| set.iter().copied().collect())
+        self.value_index
+            .get(&value_hash)
+            .map(|set| set.iter().copied().collect())
     }
 
     /// Extract keys, paths, and values from JSON recursively
@@ -294,11 +293,7 @@ mod tests {
 
     #[test]
     fn test_gin_index_creation() {
-        let index = GinIndex::new(
-            "test_idx".to_string(),
-            "test_table".to_string(),
-            "data".to_string(),
-        );
+        let index = GinIndex::new("test_idx".to_string(), "test_table".to_string(), "data".to_string());
 
         assert_eq!(index.name, "test_idx");
         assert_eq!(index.total_keys, 0);
@@ -307,11 +302,7 @@ mod tests {
 
     #[test]
     fn test_gin_index_insert() {
-        let mut index = GinIndex::new(
-            "test_idx".to_string(),
-            "test_table".to_string(),
-            "data".to_string(),
-        );
+        let mut index = GinIndex::new("test_idx".to_string(), "test_table".to_string(), "data".to_string());
 
         let json = json!({
             "name": "Alice",
@@ -327,11 +318,7 @@ mod tests {
 
     #[test]
     fn test_gin_index_key_search() {
-        let mut index = GinIndex::new(
-            "test_idx".to_string(),
-            "test_table".to_string(),
-            "data".to_string(),
-        );
+        let mut index = GinIndex::new("test_idx".to_string(), "test_table".to_string(), "data".to_string());
 
         let json1 = json!({"name": "Alice", "city": "NYC"});
         let json2 = json!({"name": "Bob", "country": "USA"});
@@ -351,11 +338,7 @@ mod tests {
 
     #[test]
     fn test_gin_index_any_key_search() {
-        let mut index = GinIndex::new(
-            "test_idx".to_string(),
-            "test_table".to_string(),
-            "data".to_string(),
-        );
+        let mut index = GinIndex::new("test_idx".to_string(), "test_table".to_string(), "data".to_string());
 
         let json1 = json!({"name": "Alice", "city": "NYC"});
         let json2 = json!({"name": "Bob", "country": "USA"});
@@ -371,11 +354,7 @@ mod tests {
 
     #[test]
     fn test_gin_index_all_keys_search() {
-        let mut index = GinIndex::new(
-            "test_idx".to_string(),
-            "test_table".to_string(),
-            "data".to_string(),
-        );
+        let mut index = GinIndex::new("test_idx".to_string(), "test_table".to_string(), "data".to_string());
 
         let json1 = json!({"name": "Alice", "city": "NYC", "age": 30});
         let json2 = json!({"name": "Bob", "country": "USA"});
@@ -392,11 +371,7 @@ mod tests {
 
     #[test]
     fn test_gin_index_delete() {
-        let mut index = GinIndex::new(
-            "test_idx".to_string(),
-            "test_table".to_string(),
-            "data".to_string(),
-        );
+        let mut index = GinIndex::new("test_idx".to_string(), "test_table".to_string(), "data".to_string());
 
         let json = json!({"name": "Alice", "age": 30});
 
@@ -410,11 +385,7 @@ mod tests {
 
     #[test]
     fn test_gin_index_nested_json() {
-        let mut index = GinIndex::new(
-            "test_idx".to_string(),
-            "test_table".to_string(),
-            "data".to_string(),
-        );
+        let mut index = GinIndex::new("test_idx".to_string(), "test_table".to_string(), "data".to_string());
 
         let json = json!({
             "user": {

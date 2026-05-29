@@ -302,10 +302,7 @@ mod tests {
 
     #[test]
     fn test_experiment_new() {
-        let exp = Experiment::new(
-            "test",
-            vec!["control".to_string(), "treatment".to_string()],
-        );
+        let exp = Experiment::new("test", vec!["control".to_string(), "treatment".to_string()]);
 
         assert_eq!(exp.name, "test");
         assert_eq!(exp.branches.len(), 2);
@@ -318,10 +315,7 @@ mod tests {
 
     #[test]
     fn test_experiment_uneven_branches() {
-        let exp = Experiment::new(
-            "test",
-            vec!["a".to_string(), "b".to_string(), "c".to_string()],
-        );
+        let exp = Experiment::new("test", vec!["a".to_string(), "b".to_string(), "c".to_string()]);
 
         // 100 / 3 = 33 each, with remainder on first
         let total: u32 = exp.allocation.values().sum();
@@ -330,10 +324,7 @@ mod tests {
 
     #[test]
     fn test_custom_allocation() {
-        let exp = Experiment::new(
-            "test",
-            vec!["control".to_string(), "treatment".to_string()],
-        );
+        let exp = Experiment::new("test", vec!["control".to_string(), "treatment".to_string()]);
 
         let mut alloc = HashMap::new();
         alloc.insert("control".to_string(), 80);
@@ -346,10 +337,7 @@ mod tests {
 
     #[test]
     fn test_invalid_allocation() {
-        let exp = Experiment::new(
-            "test",
-            vec!["control".to_string(), "treatment".to_string()],
-        );
+        let exp = Experiment::new("test", vec!["control".to_string(), "treatment".to_string()]);
 
         let mut alloc = HashMap::new();
         alloc.insert("control".to_string(), 60);
@@ -361,10 +349,7 @@ mod tests {
 
     #[test]
     fn test_experiment_lifecycle() {
-        let mut exp = Experiment::new(
-            "test",
-            vec!["control".to_string(), "treatment".to_string()],
-        );
+        let mut exp = Experiment::new("test", vec!["control".to_string(), "treatment".to_string()]);
 
         // Start
         exp.start().unwrap();
@@ -387,10 +372,7 @@ mod tests {
 
     #[test]
     fn test_control_branch() {
-        let exp = Experiment::new(
-            "test",
-            vec!["control".to_string(), "treatment".to_string()],
-        );
+        let exp = Experiment::new("test", vec!["control".to_string(), "treatment".to_string()]);
 
         assert_eq!(exp.control_branch(), Some(&"control".to_string()));
     }

@@ -78,10 +78,7 @@ fn setup_demo_data(db: &EmbeddedDatabase) -> Result<()> {
 fn demo_group_by(db: &EmbeddedDatabase) -> Result<()> {
     println!("Query: SELECT dept, COUNT(*), AVG(salary) FROM employees GROUP BY dept\n");
 
-    let results = db.query(
-        "SELECT dept, COUNT(*), AVG(salary) FROM employees GROUP BY dept",
-        &[]
-    )?;
+    let results = db.query("SELECT dept, COUNT(*), AVG(salary) FROM employees GROUP BY dept", &[])?;
 
     println!("Results:");
     println!("{:<15} {:<10} {:<15}", "Department", "Count", "Avg Salary");
@@ -114,7 +111,7 @@ fn demo_having_clause(db: &EmbeddedDatabase) -> Result<()> {
 
     let results = db.query(
         "SELECT dept, COUNT(*), AVG(salary) FROM employees GROUP BY dept HAVING COUNT(*) > 2",
-        &[]
+        &[],
     )?;
 
     println!("Results (departments with more than 2 employees):");
@@ -156,11 +153,14 @@ fn demo_joins(db: &EmbeddedDatabase) -> Result<()> {
 
     let results = db.query(
         "SELECT * FROM emp_dept INNER JOIN departments ON emp_dept.department_id = departments.dept_id",
-        &[]
+        &[],
     )?;
 
     println!("Results (Employee-Department Join):");
-    println!("{:<12} {:<15} {:<15} {:<15}", "Emp Name", "Dept ID", "Dept Name", "Location");
+    println!(
+        "{:<12} {:<15} {:<15} {:<15}",
+        "Emp Name", "Dept ID", "Dept Name", "Location"
+    );
     println!("{:-<65}", "");
 
     for row in &results {
@@ -197,11 +197,14 @@ fn demo_advanced_aggregates(db: &EmbeddedDatabase) -> Result<()> {
 
     let results = db.query(
         "SELECT COUNT(*), MIN(salary), MAX(salary), AVG(salary), SUM(salary) FROM employees",
-        &[]
+        &[],
     )?;
 
     println!("Results (All Employees):");
-    println!("{:<10} {:<12} {:<12} {:<15} {:<15}", "Count", "Min Salary", "Max Salary", "Avg Salary", "Total Salary");
+    println!(
+        "{:<10} {:<12} {:<12} {:<15} {:<15}",
+        "Count", "Min Salary", "Max Salary", "Avg Salary", "Total Salary"
+    );
     println!("{:-<70}", "");
 
     if let Some(row) = results.first() {
@@ -226,17 +229,16 @@ fn demo_advanced_aggregates(db: &EmbeddedDatabase) -> Result<()> {
             _ => 0,
         };
 
-        println!("{:<10} ${:<11} ${:<11} ${:<14.2} ${:<14}",
-            count, min_sal, max_sal, avg_sal, total_sal);
+        println!(
+            "{:<10} ${:<11} ${:<11} ${:<14.2} ${:<14}",
+            count, min_sal, max_sal, avg_sal, total_sal
+        );
     }
 
     // COUNT(DISTINCT) demo
     println!("\nQuery: SELECT COUNT(*), COUNT(DISTINCT dept) FROM employees\n");
 
-    let results = db.query(
-        "SELECT COUNT(*), COUNT(DISTINCT dept) FROM employees",
-        &[]
-    )?;
+    let results = db.query("SELECT COUNT(*), COUNT(DISTINCT dept) FROM employees", &[])?;
 
     if let Some(row) = results.first() {
         let total = match row.get(0).unwrap() {
@@ -261,7 +263,7 @@ fn demo_multi_column_grouping(db: &EmbeddedDatabase) -> Result<()> {
 
     let results = db.query(
         "SELECT region, product, SUM(amount) FROM sales GROUP BY region, product",
-        &[]
+        &[],
     )?;
 
     println!("Results (Sales by Region and Product):");

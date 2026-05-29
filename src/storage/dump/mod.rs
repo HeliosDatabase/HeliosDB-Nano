@@ -3,14 +3,11 @@
 //! This module provides mechanisms for exporting and importing database state
 //! to/from portable dump files, supporting both full and incremental dumps.
 
-mod manager;
 mod format;
+mod manager;
 
+pub use format::{CompressionType, DumpFormat, DumpMetadata as FormatMetadata, DUMP_MAGIC_NUMBER, DUMP_VERSION};
 pub use manager::{
-    DumpManager, DumpOptions, DumpMode, DumpOutputFormat, RestoreOptions, DumpReport, RestoreReport,
-    DumpMetadata, DumpType, IndexMetadata, DirtyTracker,
-    DatabaseInterface, DatabaseRestoreInterface,
-};
-pub use format::{
-    DumpMetadata as FormatMetadata, DumpFormat, CompressionType, DUMP_MAGIC_NUMBER, DUMP_VERSION,
+    DatabaseInterface, DatabaseRestoreInterface, DirtyTracker, DumpManager, DumpMetadata, DumpMode, DumpOptions,
+    DumpOutputFormat, DumpReport, DumpType, IndexMetadata, RestoreOptions, RestoreReport,
 };

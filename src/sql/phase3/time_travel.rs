@@ -6,8 +6,8 @@
 //! - SELECT ... FROM table AS OF SCN 123456789
 //! - SELECT ... FROM table VERSIONS BETWEEN ...
 
-use crate::{Result, Error};
 use super::super::logical_plan::AsOfClause;
+use crate::{Error, Result};
 
 /// Parser for time-travel SQL clauses
 pub struct TimeTravelParser;
@@ -42,7 +42,8 @@ impl TimeTravelParser {
                 .strip_prefix("TRANSACTION")
                 .ok_or_else(|| Error::query_execution("Invalid TRANSACTION syntax"))?
                 .trim();
-            let txn_id = txn_str.parse::<u64>()
+            let txn_id = txn_str
+                .parse::<u64>()
                 .map_err(|_| Error::query_execution("Invalid transaction ID"))?;
             return Ok(AsOfClause::Transaction(txn_id));
         }
@@ -53,7 +54,8 @@ impl TimeTravelParser {
                 .strip_prefix("SCN")
                 .ok_or_else(|| Error::query_execution("Invalid SCN syntax"))?
                 .trim();
-            let scn = scn_str.parse::<u64>()
+            let scn = scn_str
+                .parse::<u64>()
                 .map_err(|_| Error::query_execution("Invalid SCN"))?;
             return Ok(AsOfClause::Scn(scn));
         }
@@ -115,7 +117,8 @@ impl TimeTravelParser {
         let upper = clause_str.to_uppercase();
 
         // Find AND separator
-        let and_pos = upper.find(" AND ")
+        let and_pos = upper
+            .find(" AND ")
             .ok_or_else(|| Error::query_execution("VERSIONS BETWEEN requires AND"))?;
 
         let start_str = &clause_str[..and_pos].trim();

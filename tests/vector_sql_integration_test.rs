@@ -10,11 +10,13 @@ fn test_create_vector_index_sql() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
 
     // Create table with vector column
-    db.execute("CREATE TABLE documents (
+    db.execute(
+        "CREATE TABLE documents (
         id INT4 PRIMARY KEY,
         title TEXT,
         embedding VECTOR(3)
-    )")?;
+    )",
+    )?;
 
     // Create HNSW index
     let result = db.execute("CREATE INDEX embedding_idx ON documents USING hnsw (embedding)");
@@ -49,11 +51,13 @@ fn test_knn_query_pattern() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
 
     // Create table
-    db.execute("CREATE TABLE embeddings (
+    db.execute(
+        "CREATE TABLE embeddings (
         id INT4,
         text TEXT,
         embedding VECTOR(3)
-    )")?;
+    )",
+    )?;
 
     // Create index
     db.execute("CREATE INDEX emb_idx ON embeddings USING hnsw (embedding)")?;
@@ -80,10 +84,12 @@ fn test_vector_index_usage() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
 
     // Create table with many vectors
-    db.execute("CREATE TABLE large_vectors (
+    db.execute(
+        "CREATE TABLE large_vectors (
         id INT4,
         embedding VECTOR(128)
-    )")?;
+    )",
+    )?;
 
     // Create HNSW index
     db.execute("CREATE INDEX large_idx ON large_vectors USING hnsw (embedding)")?;
@@ -182,12 +188,14 @@ fn test_full_vector_search_workflow() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
 
     // 1. Create schema
-    db.execute("CREATE TABLE products (
+    db.execute(
+        "CREATE TABLE products (
         id INT4 PRIMARY KEY,
         name TEXT,
         description TEXT,
         embedding VECTOR(8)
-    )")?;
+    )",
+    )?;
 
     // 2. Create index
     db.execute("CREATE INDEX product_emb_idx ON products USING hnsw (embedding)")?;
@@ -195,7 +203,9 @@ fn test_full_vector_search_workflow() -> Result<()> {
     // 3. Insert data
     db.execute("INSERT INTO products VALUES (1, 'Laptop', 'Gaming laptop', '[1.0,0.8,0.2,0.1,0.3,0.5,0.7,0.9]')")?;
     db.execute("INSERT INTO products VALUES (2, 'Mouse', 'Wireless mouse', '[1.0,0.7,0.3,0.2,0.4,0.6,0.8,0.1]')")?;
-    db.execute("INSERT INTO products VALUES (3, 'Keyboard', 'Mechanical keyboard', '[0.9,0.6,0.4,0.3,0.5,0.7,0.2,0.8]')")?;
+    db.execute(
+        "INSERT INTO products VALUES (3, 'Keyboard', 'Mechanical keyboard', '[0.9,0.6,0.4,0.3,0.5,0.7,0.2,0.8]')",
+    )?;
     db.execute("INSERT INTO products VALUES (4, 'Book', 'Programming book', '[0.1,0.2,0.3,0.9,0.8,0.7,0.6,0.5]')")?;
 
     // 4. Perform similarity search

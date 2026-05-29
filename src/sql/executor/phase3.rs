@@ -4,11 +4,11 @@
 
 #![allow(elided_lifetimes_in_paths)]
 
-use crate::{Result, Error};
+use super::scan::{MaterializedOperator, ScanOperator};
+use super::{Executor, PhysicalOperator};
 use crate::sql::LogicalPlan;
-use crate::storage::{MvDeltaSet, MvDeltaOperation};
-use super::{PhysicalOperator, Executor};
-use super::scan::{ScanOperator, MaterializedOperator};
+use crate::storage::{MvDeltaOperation, MvDeltaSet};
+use crate::{Error, Result};
 use std::sync::Arc;
 
 /// Optimize a materialized-view query the same way the direct query path does
@@ -55,42 +55,43 @@ pub(super) fn handle_phase3_operation(
     plan: &LogicalPlan,
 ) -> Result<Box<dyn PhysicalOperator>> {
     match plan {
-        LogicalPlan::CreateBranch { branch_name, parent, as_of, options } => {
-            handle_create_branch(executor, branch_name, parent, as_of, options)
-        }
-        LogicalPlan::DropBranch { branch_name, if_exists } => {
-            handle_drop_branch(executor, branch_name, *if_exists)
-        }
-        LogicalPlan::MergeBranch { source, target, options } => {
-            handle_merge_branch(executor, source, target, options)
-        }
-        LogicalPlan::UseBranch { branch_name } => {
-            handle_use_branch(executor, branch_name)
-        }
-        LogicalPlan::ShowBranches => {
-            handle_show_branches(executor)
-        }
-        LogicalPlan::CreateMaterializedView { name, query, options, if_not_exists } => {
-            handle_create_materialized_view(executor, name, query, options, *if_not_exists)
-        }
-        LogicalPlan::RefreshMaterializedView { name, concurrent, incremental } => {
-            handle_refresh_materialized_view(executor, name, *concurrent, *incremental)
-        }
+        LogicalPlan::CreateBranch {
+            branch_name,
+            parent,
+            as_of,
+            options,
+        } => handle_create_branch(executor, branch_name, parent, as_of, options),
+        LogicalPlan::DropBranch { branch_name, if_exists } => handle_drop_branch(executor, branch_name, *if_exists),
+        LogicalPlan::MergeBranch {
+            source,
+            target,
+            options,
+        } => handle_merge_branch(executor, source, target, options),
+        LogicalPlan::UseBranch { branch_name } => handle_use_branch(executor, branch_name),
+        LogicalPlan::ShowBranches => handle_show_branches(executor),
+        LogicalPlan::CreateMaterializedView {
+            name,
+            query,
+            options,
+            if_not_exists,
+        } => handle_create_materialized_view(executor, name, query, options, *if_not_exists),
+        LogicalPlan::RefreshMaterializedView {
+            name,
+            concurrent,
+            incremental,
+        } => handle_refresh_materialized_view(executor, name, *concurrent, *incremental),
         LogicalPlan::DropMaterializedView { name, if_exists } => {
             handle_drop_materialized_view(executor, name, *if_exists)
         }
-        LogicalPlan::AlterMaterializedView { name, options } => {
-            handle_alter_materialized_view(executor, name, options)
-        }
-        LogicalPlan::SystemView { name, .. } => {
-            handle_system_view(executor, name)
-        }
-        LogicalPlan::CreateView { name, query_sql, if_not_exists, or_replace } => {
-            handle_create_view(executor, name, query_sql, *if_not_exists, *or_replace)
-        }
-        LogicalPlan::DropView { name, if_exists } => {
-            handle_drop_view(executor, name, *if_exists)
-        }
+        LogicalPlan::AlterMaterializedView { name, options } => handle_alter_materialized_view(executor, name, options),
+        LogicalPlan::SystemView { name, .. } => handle_system_view(executor, name),
+        LogicalPlan::CreateView {
+            name,
+            query_sql,
+            if_not_exists,
+            or_replace,
+        } => handle_create_view(executor, name, query_sql, *if_not_exists, *or_replace),
+        LogicalPlan::DropView { name, if_exists } => handle_drop_view(executor, name, *if_exists),
         _ => Err(Error::query_execution("Unsupported advanced operation")),
     }
 }
@@ -107,7 +108,10 @@ fn handle_create_branch(
 
     tracing::info!(
         "Executing CREATE BRANCH {} FROM {:?} AS OF {:?} WITH {:?}",
-        branch_name, parent, as_of, options
+        branch_name,
+        parent,
+        as_of,
+        options
     );
 
     if let Some(storage) = executor.storage() {
@@ -139,11 +143,7 @@ fn handle_create_branch(
                 let snapshot_manager = storage.snapshot_manager();
                 let resolved_snapshot = snapshot_manager.resolve_as_of(other_as_of)?;
 
-                tracing::debug!(
-                    "Resolved AS OF {:?} to snapshot ID {}",
-                    other_as_of,
-                    resolved_snapshot
-                );
+                tracing::debug!("Resolved AS OF {:?} to snapshot ID {}", other_as_of, resolved_snapshot);
 
                 Some(resolved_snapshot)
             }
@@ -158,12 +158,8 @@ fn handle_create_branch(
         };
 
         // Create the branch at the resolved snapshot
-        let branch_id = storage.create_branch_at_snapshot(
-            branch_name,
-            resolved_parent.as_deref(),
-            snapshot_id,
-            branch_opts,
-        )?;
+        let branch_id =
+            storage.create_branch_at_snapshot(branch_name, resolved_parent.as_deref(), snapshot_id, branch_opts)?;
 
         tracing::info!(
             "Successfully created branch '{}' with ID {} at snapshot {:?}",
@@ -176,25 +172,21 @@ fn handle_create_branch(
     }
 
     // Return empty result set for DDL
-    Ok(Box::new(ScanOperator::new(
-        "".to_string(),
-        Arc::new(crate::Schema { columns: vec![] }),
-        None,
-        vec![],
-        vec![],
-    ).with_timeout(executor.timeout_ctx())))
+    Ok(Box::new(
+        ScanOperator::new(
+            "".to_string(),
+            Arc::new(crate::Schema { columns: vec![] }),
+            None,
+            vec![],
+            vec![],
+        )
+        .with_timeout(executor.timeout_ctx()),
+    ))
 }
 
 /// Handle DROP BRANCH
-fn handle_drop_branch(
-    executor: &Executor,
-    branch_name: &str,
-    if_exists: bool,
-) -> Result<Box<dyn PhysicalOperator>> {
-    tracing::info!(
-        "Executing DROP BRANCH {} (IF EXISTS: {})",
-        branch_name, if_exists
-    );
+fn handle_drop_branch(executor: &Executor, branch_name: &str, if_exists: bool) -> Result<Box<dyn PhysicalOperator>> {
+    tracing::info!("Executing DROP BRANCH {} (IF EXISTS: {})", branch_name, if_exists);
 
     if let Some(storage) = executor.storage() {
         // Drop the branch
@@ -206,13 +198,16 @@ fn handle_drop_branch(
     }
 
     // Return empty result set for DDL
-    Ok(Box::new(ScanOperator::new(
-        "".to_string(),
-        Arc::new(crate::Schema { columns: vec![] }),
-        None,
-        vec![],
-        vec![],
-    ).with_timeout(executor.timeout_ctx())))
+    Ok(Box::new(
+        ScanOperator::new(
+            "".to_string(),
+            Arc::new(crate::Schema { columns: vec![] }),
+            None,
+            vec![],
+            vec![],
+        )
+        .with_timeout(executor.timeout_ctx()),
+    ))
 }
 
 /// Handle MERGE BRANCH
@@ -222,21 +217,14 @@ fn handle_merge_branch(
     target: &str,
     options: &[crate::sql::logical_plan::MergeOption],
 ) -> Result<Box<dyn PhysicalOperator>> {
-    tracing::info!(
-        "Executing MERGE BRANCH {} INTO {} WITH {:?}",
-        source, target, options
-    );
+    tracing::info!("Executing MERGE BRANCH {} INTO {} WITH {:?}", source, target, options);
 
     if let Some(storage) = executor.storage() {
         // Determine merge strategy from options
         let strategy = resolve_merge_strategy(options);
 
         // Perform the merge
-        let result = storage.merge_branch(
-            source,
-            target,
-            strategy,
-        )?;
+        let result = storage.merge_branch(source, target, strategy)?;
 
         // Log results
         if result.completed {
@@ -272,13 +260,16 @@ fn handle_merge_branch(
     }
 
     // Return empty result set for DDL
-    Ok(Box::new(ScanOperator::new(
-        "".to_string(),
-        Arc::new(crate::Schema { columns: vec![] }),
-        None,
-        vec![],
-        vec![],
-    ).with_timeout(executor.timeout_ctx())))
+    Ok(Box::new(
+        ScanOperator::new(
+            "".to_string(),
+            Arc::new(crate::Schema { columns: vec![] }),
+            None,
+            vec![],
+            vec![],
+        )
+        .with_timeout(executor.timeout_ctx()),
+    ))
 }
 
 /// Handle CREATE MATERIALIZED VIEW
@@ -291,26 +282,33 @@ fn handle_create_materialized_view(
 ) -> Result<Box<dyn PhysicalOperator>> {
     tracing::info!(
         "CREATE MATERIALIZED VIEW {} (IF NOT EXISTS: {}) WITH {:?}",
-        name, if_not_exists, options
+        name,
+        if_not_exists,
+        options
     );
 
     // First check: verify storage exists and view doesn't already exist
     // We do this separately to avoid borrow conflicts
     {
-        let storage = executor.storage().ok_or_else(|| Error::execution("No storage engine available"))?;
+        let storage = executor
+            .storage()
+            .ok_or_else(|| Error::execution("No storage engine available"))?;
         let mv_catalog = storage.mv_catalog();
 
         // Check if view already exists
         if mv_catalog.view_exists(name)? {
             if if_not_exists {
                 tracing::info!("Materialized view '{}' already exists (IF NOT EXISTS specified)", name);
-                return Ok(Box::new(ScanOperator::new(
-                    "".to_string(),
-                    Arc::new(crate::Schema { columns: vec![] }),
-                    None,
-                    vec![],
-                    vec![],
-                ).with_timeout(executor.timeout_ctx())));
+                return Ok(Box::new(
+                    ScanOperator::new(
+                        "".to_string(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(executor.timeout_ctx()),
+                ));
             } else {
                 return Err(Error::query_execution(format!(
                     "Materialized view '{}' already exists",
@@ -370,7 +368,9 @@ fn handle_create_materialized_view(
                 metadata.metadata.insert("max_cpu_percent".to_string(), pct.to_string());
             }
             crate::sql::logical_plan::MaterializedViewOption::ThresholdDmlRate(rate) => {
-                metadata.metadata.insert("threshold_dml_rate".to_string(), rate.to_string());
+                metadata
+                    .metadata
+                    .insert("threshold_dml_rate".to_string(), rate.to_string());
             }
             _ => {
                 // Store other options as metadata
@@ -388,7 +388,9 @@ fn handle_create_materialized_view(
 
     // Now access storage again to store the data (mutable borrow is done)
     {
-        let storage = executor.storage().ok_or_else(|| Error::execution("No storage engine available"))?;
+        let storage = executor
+            .storage()
+            .ok_or_else(|| Error::execution("No storage engine available"))?;
         let mv_catalog = storage.mv_catalog();
 
         // Store metadata in catalog
@@ -405,22 +407,33 @@ fn handle_create_materialized_view(
         // This will enable incremental refresh for this materialized view
         tracing::debug!("Initializing delta tracking for base tables: {:?}", base_tables);
         for table_name in &base_tables {
-            tracing::debug!("Delta tracking enabled for table '{}' (used by MV '{}')", table_name, name);
+            tracing::debug!(
+                "Delta tracking enabled for table '{}' (used by MV '{}')",
+                table_name,
+                name
+            );
             // Note: Delta tracking is automatically handled by the MvDeltaTracker
             // which captures all table changes. No explicit registration needed here.
         }
 
-        tracing::info!("Successfully created materialized view '{}' with {} rows (delta tracking active)", name, row_count);
+        tracing::info!(
+            "Successfully created materialized view '{}' with {} rows (delta tracking active)",
+            name,
+            row_count
+        );
     }
 
     // Return empty result set for DDL
-    Ok(Box::new(ScanOperator::new(
-        "".to_string(),
-        Arc::new(crate::Schema { columns: vec![] }),
-        None,
-        vec![],
-        vec![],
-    ).with_timeout(executor.timeout_ctx())))
+    Ok(Box::new(
+        ScanOperator::new(
+            "".to_string(),
+            Arc::new(crate::Schema { columns: vec![] }),
+            None,
+            vec![],
+            vec![],
+        )
+        .with_timeout(executor.timeout_ctx()),
+    ))
 }
 
 /// Handle REFRESH MATERIALIZED VIEW
@@ -432,17 +445,25 @@ fn handle_refresh_materialized_view(
 ) -> Result<Box<dyn PhysicalOperator>> {
     tracing::info!(
         "REFRESH MATERIALIZED VIEW {} (CONCURRENT: {}, INCREMENTALLY: {})",
-        name, concurrent, incremental_requested
+        name,
+        concurrent,
+        incremental_requested
     );
 
     // Phase 1: Read metadata from storage
     let (metadata, delta_count, use_incremental, total_deltas) = {
-        let storage = executor.storage().ok_or_else(|| Error::execution("No storage engine available"))?;
+        let storage = executor
+            .storage()
+            .ok_or_else(|| Error::execution("No storage engine available"))?;
         let mv_catalog = storage.mv_catalog();
 
         // Get view metadata
         let metadata = mv_catalog.get_view(name)?;
-        tracing::debug!("Refreshing materialized view '{}' with query: {}", name, metadata.query_text);
+        tracing::debug!(
+            "Refreshing materialized view '{}' with query: {}",
+            name,
+            metadata.query_text
+        );
 
         // Check if incremental refresh is possible
         let can_use_incremental = metadata.last_refresh.is_some() && !concurrent;
@@ -451,7 +472,8 @@ fn handle_refresh_materialized_view(
         let delta_count = if can_use_incremental {
             if let Some(last_refresh) = metadata.last_refresh {
                 let delta_tracker = storage.mv_delta_tracker();
-                delta_tracker.count_deltas_since(&metadata.base_tables, last_refresh)
+                delta_tracker
+                    .count_deltas_since(&metadata.base_tables, last_refresh)
                     .unwrap_or(0)
             } else {
                 0
@@ -498,7 +520,10 @@ fn handle_refresh_materialized_view(
                             let (inserts, updates, deletes) = count_delta_operations(delta_set);
                             tracing::debug!(
                                 "Table '{}': {} inserts, {} updates, {} deletes",
-                                table_name, inserts, updates, deletes
+                                table_name,
+                                inserts,
+                                updates,
+                                deletes
                             );
                         }
                         delta_map.values().map(|ds| ds.deltas.len()).sum()
@@ -518,7 +543,9 @@ fn handle_refresh_materialized_view(
     // Handle case with no deltas to apply
     if use_incremental && total_deltas == 0 {
         tracing::info!("No deltas to apply, MV '{}' is already up to date", name);
-        let storage = executor.storage().ok_or_else(|| Error::execution("No storage engine available"))?;
+        let storage = executor
+            .storage()
+            .ok_or_else(|| Error::execution("No storage engine available"))?;
         let mv_catalog = storage.mv_catalog();
         let mut updated_metadata = metadata.clone();
         updated_metadata.mark_refreshed(metadata.row_count.unwrap_or(0));
@@ -538,14 +565,12 @@ fn handle_refresh_materialized_view(
     let schema = Arc::new(metadata.schema.clone());
 
     if use_incremental {
-        tracing::info!(
-            "Incremental refresh for MV '{}': {} deltas to apply",
-            name, delta_count
-        );
+        tracing::info!("Incremental refresh for MV '{}': {} deltas to apply", name, delta_count);
     } else if delta_count > 0 {
         tracing::info!(
             "Full refresh for MV '{}': {} deltas (threshold exceeded or concurrent mode)",
-            name, delta_count
+            name,
+            delta_count
         );
     } else {
         tracing::info!("Full refresh for MV '{}'", name);
@@ -568,7 +593,9 @@ fn handle_refresh_materialized_view(
 
     // Phase 3: Store results (re-borrow storage)
     {
-        let storage = executor.storage().ok_or_else(|| Error::execution("No storage engine available"))?;
+        let storage = executor
+            .storage()
+            .ok_or_else(|| Error::execution("No storage engine available"))?;
         let mv_catalog = storage.mv_catalog();
 
         if concurrent {
@@ -592,7 +619,9 @@ fn handle_refresh_materialized_view(
 
             tracing::info!(
                 "Incremental refresh completed for MV '{}': {} rows (processed {} deltas)",
-                name, row_count, total_deltas
+                name,
+                row_count,
+                total_deltas
             );
         } else {
             // Update metadata with new row count and timestamp
@@ -602,8 +631,13 @@ fn handle_refresh_materialized_view(
 
             tracing::info!(
                 "Successfully refreshed materialized view '{}' with {} rows{}",
-                name, row_count,
-                if concurrent { " (CONCURRENT mode - zero downtime)" } else { "" }
+                name,
+                row_count,
+                if concurrent {
+                    " (CONCURRENT mode - zero downtime)"
+                } else {
+                    ""
+                }
             );
         }
     }
@@ -624,10 +658,7 @@ fn handle_drop_materialized_view(
     name: &str,
     if_exists: bool,
 ) -> Result<Box<dyn PhysicalOperator>> {
-    tracing::info!(
-        "DROP MATERIALIZED VIEW {} (IF EXISTS: {})",
-        name, if_exists
-    );
+    tracing::info!("DROP MATERIALIZED VIEW {} (IF EXISTS: {})", name, if_exists);
 
     if let Some(storage) = executor.storage() {
         let mv_catalog = storage.mv_catalog();
@@ -636,13 +667,16 @@ fn handle_drop_materialized_view(
         if !mv_catalog.view_exists(name)? {
             if if_exists {
                 tracing::info!("Materialized view '{}' does not exist (IF EXISTS specified)", name);
-                return Ok(Box::new(ScanOperator::new(
-                    "".to_string(),
-                    Arc::new(crate::Schema { columns: vec![] }),
-                    None,
-                    vec![],
-                    vec![],
-                ).with_timeout(executor.timeout_ctx())));
+                return Ok(Box::new(
+                    ScanOperator::new(
+                        "".to_string(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(executor.timeout_ctx()),
+                ));
             } else {
                 return Err(Error::query_execution(format!(
                     "Materialized view '{}' does not exist",
@@ -660,13 +694,16 @@ fn handle_drop_materialized_view(
     }
 
     // Return empty result set for DDL
-    Ok(Box::new(ScanOperator::new(
-        "".to_string(),
-        Arc::new(crate::Schema { columns: vec![] }),
-        None,
-        vec![],
-        vec![],
-    ).with_timeout(executor.timeout_ctx())))
+    Ok(Box::new(
+        ScanOperator::new(
+            "".to_string(),
+            Arc::new(crate::Schema { columns: vec![] }),
+            None,
+            vec![],
+            vec![],
+        )
+        .with_timeout(executor.timeout_ctx()),
+    ))
 }
 
 /// Handle ALTER MATERIALIZED VIEW
@@ -675,10 +712,7 @@ fn handle_alter_materialized_view(
     name: &str,
     options: &std::collections::HashMap<String, String>,
 ) -> Result<Box<dyn PhysicalOperator>> {
-    tracing::info!(
-        "ALTER MATERIALIZED VIEW {} SET {:?}",
-        name, options
-    );
+    tracing::info!("ALTER MATERIALIZED VIEW {} SET {:?}", name, options);
 
     if let Some(storage) = executor.storage() {
         let mv_catalog = storage.mv_catalog();
@@ -698,7 +732,9 @@ fn handle_alter_materialized_view(
         for (key, value) in options {
             match key.as_str() {
                 "staleness_threshold" => {
-                    metadata.metadata.insert("staleness_threshold".to_string(), value.clone());
+                    metadata
+                        .metadata
+                        .insert("staleness_threshold".to_string(), value.clone());
                 }
                 "max_cpu_percent" => {
                     metadata.metadata.insert("max_cpu_percent".to_string(), value.clone());
@@ -728,26 +764,26 @@ fn handle_alter_materialized_view(
     }
 
     // Return empty result set for DDL
-    Ok(Box::new(ScanOperator::new(
-        "".to_string(),
-        Arc::new(crate::Schema { columns: vec![] }),
-        None,
-        vec![],
-        vec![],
-    ).with_timeout(executor.timeout_ctx())))
+    Ok(Box::new(
+        ScanOperator::new(
+            "".to_string(),
+            Arc::new(crate::Schema { columns: vec![] }),
+            None,
+            vec![],
+            vec![],
+        )
+        .with_timeout(executor.timeout_ctx()),
+    ))
 }
 
 /// Handle SYSTEM VIEW query
-fn handle_system_view(
-    executor: &Executor,
-    name: &str,
-) -> Result<Box<dyn PhysicalOperator>> {
+fn handle_system_view(executor: &Executor, name: &str) -> Result<Box<dyn PhysicalOperator>> {
     // Execute system view query
     use crate::sql::phase3::SystemViewRegistry;
 
-    let storage = executor.storage().ok_or_else(|| {
-        Error::query_execution("System views require storage engine")
-    })?;
+    let storage = executor
+        .storage()
+        .ok_or_else(|| Error::query_execution("System views require storage engine"))?;
 
     let registry = SystemViewRegistry::new();
 
@@ -755,23 +791,19 @@ fn handle_system_view(
     let tuples = registry.execute(name, storage)?;
 
     // Get schema for the view
-    let schema = registry.get_schema(name)
+    let schema = registry
+        .get_schema(name)
         .ok_or_else(|| Error::query_execution(format!("System view '{}' schema not found", name)))?
         .clone();
 
     // Convert tuples to a materialized operator
     // Since we have all the data, we can return a simple in-memory result set
-    Ok(Box::new(MaterializedOperator::new(
-        tuples,
-        Arc::new(schema),
-    )))
+    Ok(Box::new(MaterializedOperator::new(tuples, Arc::new(schema))))
 }
 
 /// Resolve merge strategy from SQL options
-fn resolve_merge_strategy(
-    options: &[crate::sql::logical_plan::MergeOption]
-) -> crate::storage::MergeStrategy {
-    use crate::sql::logical_plan::{MergeOption, ConflictResolution};
+fn resolve_merge_strategy(options: &[crate::sql::logical_plan::MergeOption]) -> crate::storage::MergeStrategy {
+    use crate::sql::logical_plan::{ConflictResolution, MergeOption};
     use crate::storage::MergeStrategy;
 
     // Default strategy
@@ -844,10 +876,7 @@ fn extract_base_tables(plan: &LogicalPlan) -> Vec<String> {
 }
 
 /// Handle USE BRANCH
-fn handle_use_branch(
-    executor: &Executor,
-    branch_name: &str,
-) -> Result<Box<dyn PhysicalOperator>> {
+fn handle_use_branch(executor: &Executor, branch_name: &str) -> Result<Box<dyn PhysicalOperator>> {
     tracing::info!("Executing USE BRANCH {}", branch_name);
 
     if let Some(storage) = executor.storage() {
@@ -870,19 +899,20 @@ fn handle_use_branch(
     }
 
     // Return empty result set
-    Ok(Box::new(ScanOperator::new(
-        "".to_string(),
-        Arc::new(crate::Schema { columns: vec![] }),
-        None,
-        vec![],
-        vec![],
-    ).with_timeout(executor.timeout_ctx())))
+    Ok(Box::new(
+        ScanOperator::new(
+            "".to_string(),
+            Arc::new(crate::Schema { columns: vec![] }),
+            None,
+            vec![],
+            vec![],
+        )
+        .with_timeout(executor.timeout_ctx()),
+    ))
 }
 
 /// Handle SHOW BRANCHES
-fn handle_show_branches(
-    executor: &Executor,
-) -> Result<Box<dyn PhysicalOperator>> {
+fn handle_show_branches(executor: &Executor) -> Result<Box<dyn PhysicalOperator>> {
     tracing::info!("Executing SHOW BRANCHES");
 
     if let Some(storage) = executor.storage() {
@@ -897,7 +927,10 @@ fn handle_show_branches(
             // Format state as string
             let state_str = match branch_meta.state {
                 crate::storage::BranchState::Active => "Active".to_string(),
-                crate::storage::BranchState::Merged { into_branch, at_timestamp } => {
+                crate::storage::BranchState::Merged {
+                    into_branch,
+                    at_timestamp,
+                } => {
                     format!("Merged into branch {} at {}", into_branch, at_timestamp)
                 }
                 crate::storage::BranchState::Dropped { at_timestamp } => {
@@ -916,7 +949,9 @@ fn handle_show_branches(
                 crate::Value::String(branch_meta.name.clone()),
                 crate::Value::Int8(branch_meta.branch_id as i64),
                 parent_name.map(crate::Value::String).unwrap_or(crate::Value::Null),
-                crate::Value::Timestamp(chrono::DateTime::from_timestamp(branch_meta.created_at as i64, 0).unwrap_or_default()),
+                crate::Value::Timestamp(
+                    chrono::DateTime::from_timestamp(branch_meta.created_at as i64, 0).unwrap_or_default(),
+                ),
                 crate::Value::String(state_str),
             ]);
             tuples.push(tuple);
@@ -930,55 +965,55 @@ fn handle_show_branches(
                     data_type: crate::DataType::Text,
                     nullable: false,
                     primary_key: false,
-                source_table: None,
+                    source_table: None,
                     source_table_name: None,
-                default_expr: None,
-                unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
                 crate::Column {
                     name: "branch_id".to_string(),
                     data_type: crate::DataType::Int8,
                     nullable: false,
                     primary_key: false,
-                source_table: None,
+                    source_table: None,
                     source_table_name: None,
-                default_expr: None,
-                unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
                 crate::Column {
                     name: "parent_branch".to_string(),
                     data_type: crate::DataType::Text,
                     nullable: true,
                     primary_key: false,
-                source_table: None,
+                    source_table: None,
                     source_table_name: None,
-                default_expr: None,
-                unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
                 crate::Column {
                     name: "created_at".to_string(),
                     data_type: crate::DataType::Timestamp,
                     nullable: false,
                     primary_key: false,
-                source_table: None,
+                    source_table: None,
                     source_table_name: None,
-                default_expr: None,
-                unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
                 crate::Column {
                     name: "state".to_string(),
                     data_type: crate::DataType::Text,
                     nullable: false,
                     primary_key: false,
-                source_table: None,
+                    source_table: None,
                     source_table_name: None,
-                default_expr: None,
-                unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
             ],
         });
@@ -1001,10 +1036,13 @@ fn handle_create_view(
     tracing::info!(
         "CREATE{}VIEW {} (IF NOT EXISTS: {})",
         if or_replace { " OR REPLACE " } else { " " },
-        name, if_not_exists
+        name,
+        if_not_exists
     );
 
-    let storage = executor.storage().ok_or_else(|| Error::execution("No storage engine available"))?;
+    let storage = executor
+        .storage()
+        .ok_or_else(|| Error::execution("No storage engine available"))?;
 
     // Parse the query to get the schema
     let parser = crate::sql::Parser::new();
@@ -1017,11 +1055,8 @@ fn handle_create_view(
     let schema = (*plan.schema()).clone();
 
     // Create view metadata
-    let metadata = crate::storage::ViewMetadata::new(
-        name.to_string(),
-        query_sql.to_string(),
-        schema,
-    ).with_or_replace(or_replace);
+    let metadata =
+        crate::storage::ViewMetadata::new(name.to_string(), query_sql.to_string(), schema).with_or_replace(or_replace);
 
     // Store the view
     let view_catalog = storage.view_catalog();
@@ -1030,27 +1065,25 @@ fn handle_create_view(
     tracing::info!("Successfully created view '{}'", name);
 
     // Return empty result set for DDL
-    Ok(Box::new(ScanOperator::new(
-        "".to_string(),
-        Arc::new(crate::Schema { columns: vec![] }),
-        None,
-        vec![],
-        vec![],
-    ).with_timeout(executor.timeout_ctx())))
+    Ok(Box::new(
+        ScanOperator::new(
+            "".to_string(),
+            Arc::new(crate::Schema { columns: vec![] }),
+            None,
+            vec![],
+            vec![],
+        )
+        .with_timeout(executor.timeout_ctx()),
+    ))
 }
 
 /// Handle DROP VIEW
-fn handle_drop_view(
-    executor: &Executor,
-    name: &str,
-    if_exists: bool,
-) -> Result<Box<dyn PhysicalOperator>> {
-    tracing::info!(
-        "DROP VIEW {} (IF EXISTS: {})",
-        name, if_exists
-    );
+fn handle_drop_view(executor: &Executor, name: &str, if_exists: bool) -> Result<Box<dyn PhysicalOperator>> {
+    tracing::info!("DROP VIEW {} (IF EXISTS: {})", name, if_exists);
 
-    let storage = executor.storage().ok_or_else(|| Error::execution("No storage engine available"))?;
+    let storage = executor
+        .storage()
+        .ok_or_else(|| Error::execution("No storage engine available"))?;
 
     // Drop the view
     let view_catalog = storage.view_catalog();
@@ -1059,11 +1092,14 @@ fn handle_drop_view(
     tracing::info!("Successfully dropped view '{}'", name);
 
     // Return empty result set for DDL
-    Ok(Box::new(ScanOperator::new(
-        "".to_string(),
-        Arc::new(crate::Schema { columns: vec![] }),
-        None,
-        vec![],
-        vec![],
-    ).with_timeout(executor.timeout_ctx())))
+    Ok(Box::new(
+        ScanOperator::new(
+            "".to_string(),
+            Arc::new(crate::Schema { columns: vec![] }),
+            None,
+            vec![],
+            vec![],
+        )
+        .with_timeout(executor.timeout_ctx()),
+    ))
 }
