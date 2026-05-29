@@ -23,7 +23,7 @@ pub(super) fn compute_scan_prefix_hint(plan: &LogicalPlan) -> Option<(String, us
     let mut cols: HashSet<String> = HashSet::new();
     let mut tables: Vec<(String, Arc<Schema>)> = Vec::new();
     let mut bail = false;
-    collect_plan_columns(plan, &mut cols, &mut tables, &mut bail);
+    collect_plan_columns(plan, &mut cols, &mut tables, &mut bail, true);
     if bail {
         return None;
     }
@@ -57,33 +57,55 @@ fn resolve_col_index(schema: &Schema, name: &str) -> Option<usize> {
     schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(bare))
 }
 
+fn should_use_prefix_decode(prefix_len: usize, total_columns: usize) -> bool {
+    // Prefix decoding has its own branch/deserialization overhead. It wins on
+    // COUNT(*) and early-column plans, but measured slower when it only skips a
+    // narrow suffix. Keep it conservative until column-width stats can guide this.
+    prefix_len < total_columns && prefix_len.saturating_mul(2) <= total_columns
+}
+
 fn collect_plan_columns(
     plan: &LogicalPlan,
     cols: &mut HashSet<String>,
     tables: &mut Vec<(String, Arc<Schema>)>,
     bail: &mut bool,
+    output_required: bool,
 ) {
     if *bail {
         return;
     }
     match plan {
-        LogicalPlan::Scan { table_name, schema, .. } => {
+        LogicalPlan::Scan {
+            table_name,
+            schema,
+            projection,
+            ..
+        } => {
             tables.push((table_name.clone(), schema.clone()));
+            collect_projection_columns(schema, projection.as_ref(), cols, bail);
+            if output_required && projection.is_none() {
+                collect_all_schema_columns(schema, cols);
+            }
         }
         LogicalPlan::FilteredScan {
             table_name,
             schema,
+            projection,
             predicate,
             ..
         } => {
             tables.push((table_name.clone(), schema.clone()));
+            collect_projection_columns(schema, projection.as_ref(), cols, bail);
+            if output_required && projection.is_none() {
+                collect_all_schema_columns(schema, cols);
+            }
             if let Some(p) = predicate {
                 collect_expr_columns(p, cols, bail);
             }
         }
         LogicalPlan::Filter { input, predicate } => {
             collect_expr_columns(predicate, cols, bail);
-            collect_plan_columns(input, cols, tables, bail);
+            collect_plan_columns(input, cols, tables, bail, output_required);
         }
         LogicalPlan::Project {
             input,
@@ -99,7 +121,7 @@ fn collect_plan_columns(
                     collect_expr_columns(e, cols, bail);
                 }
             }
-            collect_plan_columns(input, cols, tables, bail);
+            collect_plan_columns(input, cols, tables, bail, false);
         }
         LogicalPlan::Aggregate {
             input,
@@ -116,17 +138,44 @@ fn collect_plan_columns(
             if let Some(h) = having {
                 collect_expr_columns(h, cols, bail);
             }
-            collect_plan_columns(input, cols, tables, bail);
+            collect_plan_columns(input, cols, tables, bail, false);
         }
         LogicalPlan::Sort { input, exprs, .. } => {
             for e in exprs {
                 collect_expr_columns(e, cols, bail);
             }
-            collect_plan_columns(input, cols, tables, bail);
+            collect_plan_columns(input, cols, tables, bail, output_required);
         }
-        LogicalPlan::Limit { input, .. } => collect_plan_columns(input, cols, tables, bail),
+        LogicalPlan::Limit { input, .. } => collect_plan_columns(input, cols, tables, bail, output_required),
         // Joins, set ops, DML, and anything else: don't optimize (full decode).
         _ => *bail = true,
+    }
+}
+
+fn collect_all_schema_columns(schema: &Schema, cols: &mut HashSet<String>) {
+    for col in &schema.columns {
+        cols.insert(col.name.clone());
+    }
+}
+
+fn collect_projection_columns(
+    schema: &Schema,
+    projection: Option<&Vec<usize>>,
+    cols: &mut HashSet<String>,
+    bail: &mut bool,
+) {
+    if let Some(indices) = projection {
+        for &idx in indices {
+            match schema.columns.get(idx) {
+                Some(col) => {
+                    cols.insert(col.name.clone());
+                }
+                None => {
+                    *bail = true;
+                    return;
+                }
+            }
+        }
     }
 }
 
@@ -510,163 +559,168 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
         }
 
         // Fetch actual schema from storage and scan table
-        let (actual_schema, tuples) =
-            if let Some(storage) = executor.storage() {
-                let catalog = storage.catalog();
-                let mv_catalog = storage.mv_catalog();
+        let (actual_schema, tuples) = if let Some(storage) = executor.storage() {
+            let catalog = storage.catalog();
+            let mv_catalog = storage.mv_catalog();
 
-                // First check if it's a materialized view
-                // We need to do this first because MVs are stored in __mv_<name> tables
-                let (schema, actual_table_name) = if mv_catalog.view_exists(table_name)? {
-                    let mv_metadata = mv_catalog.get_view(table_name)?;
-                    let mv_data_table = crate::storage::MaterializedViewCatalog::mv_data_table_name(table_name);
+            // First check if it's a materialized view
+            // We need to do this first because MVs are stored in __mv_<name> tables
+            let (schema, actual_table_name) = if mv_catalog.view_exists(table_name)? {
+                let mv_metadata = mv_catalog.get_view(table_name)?;
+                let mv_data_table = crate::storage::MaterializedViewCatalog::mv_data_table_name(table_name);
 
-                    // Check if MV data table exists (view has been refreshed)
-                    if !catalog.table_exists(&mv_data_table)? {
-                        return Err(Error::query_execution(format!(
+                // Check if MV data table exists (view has been refreshed)
+                if !catalog.table_exists(&mv_data_table)? {
+                    return Err(Error::query_execution(format!(
                         "Materialized view '{}' exists but has never been refreshed. Run: REFRESH MATERIALIZED VIEW {}",
                         table_name, table_name
                     )));
-                    }
+                }
 
-                    (mv_metadata.schema, mv_data_table)
-                } else {
-                    // Not an MV, try regular table
-                    match catalog.get_table_schema(table_name) {
-                        Ok(schema) => (schema, table_name.clone()),
-                        Err(e) => return Err(e),
-                    }
-                };
-
-                // Handle time-travel or transactional queries
-                let tuples =
-                    if let Some(txn) = executor.transaction() {
-                        // Transactional scan: read at transaction's snapshot
-                        let base_tuples = storage.scan_table_at_snapshot(&actual_table_name, txn.snapshot_id())?;
-
-                        // Merge with write set from transaction for read-your-own-writes
-                        txn.merge_with_write_set(&actual_table_name, base_tuples)?
-                    } else if let Some(as_of_clause) = as_of {
-                        // P0#1: AS OF / historical queries require version history.
-                        // With time_travel_enabled=false the commit path writes no
-                        // versions, so honoring AS OF would silently return current
-                        // state. Error clearly instead of returning a wrong answer.
-                        if !storage.time_travel_enabled() {
-                            return Err(crate::Error::query_execution(
-                                "AS OF / time-travel queries require time_travel_enabled = true",
-                            ));
-                        }
-                        tracing::debug!(
-                            "Time-travel query on table '{}' (actual: '{}') with AS OF clause: {:?}",
-                            table_name,
-                            actual_table_name,
-                            as_of_clause
-                        );
-
-                        let snapshot_mgr = storage.snapshot_manager();
-
-                        // Handle VERSIONS BETWEEN separately - returns all versions in range
-                        if let crate::sql::logical_plan::AsOfClause::VersionsBetween { start, end } = as_of_clause {
-                            tracing::debug!("VERSIONS BETWEEN query: start={:?}, end={:?}", start, end);
-
-                            // Resolve start and end to internal LSN timestamps for version lookup
-                            let start_ts = snapshot_mgr.resolve_timestamp_for_range(start, true)?;
-                            let end_ts = snapshot_mgr.resolve_timestamp_for_range(end, false)?;
-
-                            tracing::debug!("Resolved VERSIONS BETWEEN timestamps: {} to {}", start_ts, end_ts);
-
-                            // Scan all versions in range
-                            let versions = snapshot_mgr.scan_versions_between(&actual_table_name, start_ts, end_ts)?;
-
-                            tracing::debug!(
-                                "VERSIONS BETWEEN scan returned {} versions from table '{}'",
-                                versions.len(),
-                                table_name
-                            );
-
-                            // Convert raw version bytes to tuples (RocksDB handles decompression at block level)
-                            let mut tuples = Vec::with_capacity(versions.len());
-                            for (row_id, timestamp, value_bytes) in versions {
-                                // Deserialize tuple directly (RocksDB LZ4 handles decompression)
-                                match bincode::deserialize::<crate::Tuple>(&value_bytes) {
-                                    Ok(mut tuple) => {
-                                        tuple.row_id = Some(row_id);
-                                        tuples.push(tuple);
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                    "Failed to deserialize version at row_id={}, timestamp={}: {} (data len={})",
-                                    row_id, timestamp, e, value_bytes.len()
-                                );
-                                    }
-                                }
-                            }
-
-                            tuples
-                        } else {
-                            // Regular AS OF query - single point in time
-                            // Resolve AS OF clause to snapshot timestamp
-                            // Supports: AS OF TIMESTAMP '...', AS OF TRANSACTION <id>, AS OF SCN <id>
-                            let snapshot_ts = snapshot_mgr.resolve_as_of(as_of_clause).map_err(|e| {
-                                tracing::error!(
-                                    "Failed to resolve AS OF clause {:?} for table '{}': {}",
-                                    as_of_clause,
-                                    table_name,
-                                    e
-                                );
-                                e
-                            })?;
-
-                            tracing::debug!(
-                                "Resolved AS OF clause to snapshot timestamp {} for table '{}'",
-                                snapshot_ts,
-                                table_name
-                            );
-
-                            // Scan at historical snapshot (use actual_table_name for MV support)
-                            let result = storage.scan_table_at_snapshot(&actual_table_name, snapshot_ts)?;
-
-                            tracing::debug!(
-                                "Time-travel scan returned {} tuples from table '{}' at snapshot {}",
-                                result.len(),
-                                table_name,
-                                snapshot_ts
-                            );
-
-                            result
-                        }
-                    } else {
-                        // Normal scan (current data) with branch isolation.
-                        // Use actual_table_name to support materialized views.
-                        // Pass pre-fetched schema to avoid duplicate lookup inside scan_table.
-                        // Issue #1 follow-up: when the executor's needed-column analysis is
-                        // certain (single regular table, no wildcard/subquery), decode only the
-                        // leading columns and skip the costly tail.
-                        match executor.scan_prefix_hint_for(table_name) {
-                            Some(prefix_len) if actual_table_name == *table_name => storage
-                                .scan_table_branch_aware_with_schema_prefix(&actual_table_name, &schema, prefix_len)?,
-                            _ => storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?,
-                        }
-                    };
-
-                // Set source_table (alias) and source_table_name (actual) on each column for JOIN disambiguation
-                // This allows both `e.name` (alias) and `employees.name` (full name) syntax in queries
-                let schema_with_source = Schema {
-                    columns: schema
-                        .columns
-                        .into_iter()
-                        .map(|mut col| {
-                            col.source_table = Some(source_name.clone());
-                            col.source_table_name = Some(table_name.clone());
-                            col
-                        })
-                        .collect(),
-                };
-                (Arc::new(schema_with_source), tuples)
+                (mv_metadata.schema, mv_data_table)
             } else {
-                // No storage, use placeholder schema from plan
-                (_plan_schema.clone(), Vec::new())
+                // Not an MV, try regular table
+                match catalog.get_table_schema(table_name) {
+                    Ok(schema) => (schema, table_name.clone()),
+                    Err(e) => return Err(e),
+                }
             };
+
+            // Handle time-travel or transactional queries
+            let tuples = if let Some(txn) = executor.transaction() {
+                // Transactional scan: read at transaction's snapshot
+                let base_tuples = storage.scan_table_at_snapshot(&actual_table_name, txn.snapshot_id())?;
+
+                // Merge with write set from transaction for read-your-own-writes
+                txn.merge_with_write_set(&actual_table_name, base_tuples)?
+            } else if let Some(as_of_clause) = as_of {
+                // P0#1: AS OF / historical queries require version history.
+                // With time_travel_enabled=false the commit path writes no
+                // versions, so honoring AS OF would silently return current
+                // state. Error clearly instead of returning a wrong answer.
+                if !storage.time_travel_enabled() {
+                    return Err(crate::Error::query_execution(
+                        "AS OF / time-travel queries require time_travel_enabled = true",
+                    ));
+                }
+                tracing::debug!(
+                    "Time-travel query on table '{}' (actual: '{}') with AS OF clause: {:?}",
+                    table_name,
+                    actual_table_name,
+                    as_of_clause
+                );
+
+                let snapshot_mgr = storage.snapshot_manager();
+
+                // Handle VERSIONS BETWEEN separately - returns all versions in range
+                if let crate::sql::logical_plan::AsOfClause::VersionsBetween { start, end } = as_of_clause {
+                    tracing::debug!("VERSIONS BETWEEN query: start={:?}, end={:?}", start, end);
+
+                    // Resolve start and end to internal LSN timestamps for version lookup
+                    let start_ts = snapshot_mgr.resolve_timestamp_for_range(start, true)?;
+                    let end_ts = snapshot_mgr.resolve_timestamp_for_range(end, false)?;
+
+                    tracing::debug!("Resolved VERSIONS BETWEEN timestamps: {} to {}", start_ts, end_ts);
+
+                    // Scan all versions in range
+                    let versions = snapshot_mgr.scan_versions_between(&actual_table_name, start_ts, end_ts)?;
+
+                    tracing::debug!(
+                        "VERSIONS BETWEEN scan returned {} versions from table '{}'",
+                        versions.len(),
+                        table_name
+                    );
+
+                    // Convert raw version bytes to tuples (RocksDB handles decompression at block level)
+                    let mut tuples = Vec::with_capacity(versions.len());
+                    for (row_id, timestamp, value_bytes) in versions {
+                        // Deserialize tuple directly (RocksDB LZ4 handles decompression)
+                        match bincode::deserialize::<crate::Tuple>(&value_bytes) {
+                            Ok(mut tuple) => {
+                                tuple.row_id = Some(row_id);
+                                tuples.push(tuple);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to deserialize version at row_id={}, timestamp={}: {} (data len={})",
+                                    row_id,
+                                    timestamp,
+                                    e,
+                                    value_bytes.len()
+                                );
+                            }
+                        }
+                    }
+
+                    tuples
+                } else {
+                    // Regular AS OF query - single point in time
+                    // Resolve AS OF clause to snapshot timestamp
+                    // Supports: AS OF TIMESTAMP '...', AS OF TRANSACTION <id>, AS OF SCN <id>
+                    let snapshot_ts = snapshot_mgr.resolve_as_of(as_of_clause).map_err(|e| {
+                        tracing::error!(
+                            "Failed to resolve AS OF clause {:?} for table '{}': {}",
+                            as_of_clause,
+                            table_name,
+                            e
+                        );
+                        e
+                    })?;
+
+                    tracing::debug!(
+                        "Resolved AS OF clause to snapshot timestamp {} for table '{}'",
+                        snapshot_ts,
+                        table_name
+                    );
+
+                    // Scan at historical snapshot (use actual_table_name for MV support)
+                    let result = storage.scan_table_at_snapshot(&actual_table_name, snapshot_ts)?;
+
+                    tracing::debug!(
+                        "Time-travel scan returned {} tuples from table '{}' at snapshot {}",
+                        result.len(),
+                        table_name,
+                        snapshot_ts
+                    );
+
+                    result
+                }
+            } else {
+                // Normal scan (current data) with branch isolation.
+                // Use actual_table_name to support materialized views.
+                // Pass pre-fetched schema to avoid duplicate lookup inside scan_table.
+                // Issue #1 follow-up: when the executor's needed-column analysis is
+                // certain (single regular table, no wildcard/subquery), decode only the
+                // leading columns and skip the costly tail.
+                match executor.scan_prefix_hint_for(table_name) {
+                    Some(prefix_len)
+                        if actual_table_name == *table_name
+                            && should_use_prefix_decode(prefix_len, schema.columns.len()) =>
+                    {
+                        storage.scan_table_branch_aware_with_schema_prefix(&actual_table_name, &schema, prefix_len)?
+                    }
+                    _ => storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?,
+                }
+            };
+
+            // Set source_table (alias) and source_table_name (actual) on each column for JOIN disambiguation
+            // This allows both `e.name` (alias) and `employees.name` (full name) syntax in queries
+            let schema_with_source = Schema {
+                columns: schema
+                    .columns
+                    .into_iter()
+                    .map(|mut col| {
+                        col.source_table = Some(source_name.clone());
+                        col.source_table_name = Some(table_name.clone());
+                        col
+                    })
+                    .collect(),
+            };
+            (Arc::new(schema_with_source), tuples)
+        } else {
+            // No storage, use placeholder schema from plan
+            (_plan_schema.clone(), Vec::new())
+        };
 
         Ok(Box::new(
             ScanOperator::new(
@@ -828,7 +882,15 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                 )
             } else {
                 // Normal filtered scan (current data) with branch isolation
-                let base_tuples = storage.scan_table_branch_aware(&actual_table_name)?;
+                let base_tuples = match executor.scan_prefix_hint_for(table_name) {
+                    Some(prefix_len)
+                        if actual_table_name == *table_name
+                            && should_use_prefix_decode(prefix_len, schema.columns.len()) =>
+                    {
+                        storage.scan_table_branch_aware_with_schema_prefix(&actual_table_name, &schema, prefix_len)?
+                    }
+                    _ => storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?,
+                };
 
                 // Apply storage-level filtering through predicate pushdown manager
                 storage.predicate_pushdown().scan_with_pushdown(
@@ -1126,6 +1188,69 @@ mod tests {
     use super::*;
     use crate::Column;
     use crate::DataType;
+    use crate::Value;
+
+    fn test_schema() -> Arc<Schema> {
+        Arc::new(Schema {
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: DataType::Int4,
+                    nullable: false,
+                    primary_key: true,
+                    source_table: None,
+                    source_table_name: None,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
+                },
+                Column {
+                    name: "k".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    source_table: None,
+                    source_table_name: None,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
+                },
+                Column {
+                    name: "payload".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    source_table: None,
+                    source_table_name: None,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
+                },
+                Column {
+                    name: "note".to_string(),
+                    data_type: DataType::Text,
+                    nullable: true,
+                    primary_key: false,
+                    source_table: None,
+                    source_table_name: None,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
+                },
+            ],
+        })
+    }
+
+    fn id_eq_seven() -> LogicalExpr {
+        LogicalExpr::BinaryExpr {
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            }),
+            op: crate::sql::logical_plan::BinaryOperator::Eq,
+            right: Box::new(LogicalExpr::Literal(Value::Int4(7))),
+        }
+    }
 
     #[test]
     fn test_scan_operator_empty() {
@@ -1145,5 +1270,98 @@ mod tests {
 
         let mut scan = ScanOperator::new("test".to_string(), schema.clone(), None, Vec::new(), Vec::new());
         assert!(scan.next().expect("Failed to execute scan").is_none());
+    }
+
+    #[test]
+    fn filtered_scan_prefix_hint_includes_projection_and_predicate() {
+        let schema = test_schema();
+        let plan = LogicalPlan::FilteredScan {
+            table_name: "w".to_string(),
+            alias: None,
+            schema,
+            projection: Some(vec![1]),
+            predicate: Some(id_eq_seven()),
+            as_of: None,
+        };
+
+        assert_eq!(compute_scan_prefix_hint(&plan), Some(("w".to_string(), 2)));
+    }
+
+    #[test]
+    fn filtered_scan_prefix_hint_widens_for_tail_projection() {
+        let schema = test_schema();
+        let plan = LogicalPlan::FilteredScan {
+            table_name: "w".to_string(),
+            alias: None,
+            schema,
+            projection: Some(vec![3]),
+            predicate: Some(id_eq_seven()),
+            as_of: None,
+        };
+
+        assert_eq!(compute_scan_prefix_hint(&plan), Some(("w".to_string(), 4)));
+    }
+
+    #[test]
+    fn scan_prefix_hint_includes_scan_projection() {
+        let schema = test_schema();
+        let plan = LogicalPlan::Scan {
+            table_name: "w".to_string(),
+            alias: None,
+            schema,
+            projection: Some(vec![2]),
+            as_of: None,
+        };
+
+        assert_eq!(compute_scan_prefix_hint(&plan), Some(("w".to_string(), 3)));
+    }
+
+    #[test]
+    fn prefix_decode_gate_requires_meaningful_suffix_skip() {
+        assert!(should_use_prefix_decode(0, 5));
+        assert!(should_use_prefix_decode(2, 4));
+        assert!(!should_use_prefix_decode(4, 5));
+        assert!(!should_use_prefix_decode(5, 5));
+    }
+
+    #[test]
+    fn root_filtered_scan_without_projection_needs_full_row() {
+        let schema = test_schema();
+        let plan = LogicalPlan::FilteredScan {
+            table_name: "w".to_string(),
+            alias: None,
+            schema,
+            projection: None,
+            predicate: Some(id_eq_seven()),
+            as_of: None,
+        };
+
+        assert_eq!(compute_scan_prefix_hint(&plan), Some(("w".to_string(), 4)));
+    }
+
+    #[test]
+    fn project_over_filter_keeps_prefix_narrow() {
+        let schema = test_schema();
+        let plan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(LogicalPlan::Scan {
+                    table_name: "w".to_string(),
+                    alias: None,
+                    schema,
+                    projection: None,
+                    as_of: None,
+                }),
+                predicate: id_eq_seven(),
+            }),
+            exprs: vec![LogicalExpr::Column {
+                table: None,
+                name: "k".to_string(),
+            }],
+            aliases: vec!["k".to_string()],
+            distinct: false,
+            distinct_on: None,
+        };
+
+        assert_eq!(compute_scan_prefix_hint(&plan), Some(("w".to_string(), 2)));
     }
 }
