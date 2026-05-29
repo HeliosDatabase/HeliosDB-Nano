@@ -10,9 +10,7 @@ fn main() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
 
     // Create a table
-    db.execute(
-        "CREATE TABLE products (id INT PRIMARY KEY, name TEXT NOT NULL, price INT NOT NULL)",
-    )?;
+    db.execute("CREATE TABLE products (id INT PRIMARY KEY, name TEXT NOT NULL, price INT NOT NULL)")?;
 
     // Insert rows
     db.execute("INSERT INTO products (id, name, price) VALUES (1, 'Keyboard', 75)")?;

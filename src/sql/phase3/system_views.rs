@@ -8,8 +8,8 @@
 //! - pg_current_scn() - Current System Change Number
 //! - pg_compare_branches() - Compare two branches
 
-use crate::{Result, Error, Schema, Column, DataType, Value, Tuple, ColumnStorageMode};
 use crate::storage::StorageEngine;
+use crate::{Column, ColumnStorageMode, DataType, Error, Result, Schema, Tuple, Value};
 use std::collections::HashMap;
 
 /// System view registry
@@ -27,9 +27,7 @@ pub struct SystemViewSchema {
 impl SystemViewRegistry {
     /// Create a new system view registry with Phase 3 views
     pub fn new() -> Self {
-        let mut registry = Self {
-            views: HashMap::new(),
-        };
+        let mut registry = Self { views: HashMap::new() };
 
         registry.register_phase3_views();
         registry
@@ -47,77 +45,77 @@ impl SystemViewRegistry {
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "branch_id".to_string(),
                         data_type: DataType::Int8,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "parent_id".to_string(),
                         data_type: DataType::Int8,
                         nullable: true,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "created_at".to_string(),
                         data_type: DataType::Timestamp,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "fork_point_lsn".to_string(),
                         data_type: DataType::Int8,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "size_mb".to_string(),
                         data_type: DataType::Int8,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "status".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                 ],
             },
@@ -134,66 +132,66 @@ impl SystemViewRegistry {
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "base_tables".to_string(),
                         data_type: DataType::Text, // JSON array
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "last_update".to_string(),
                         data_type: DataType::Timestamp,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "pending_changes".to_string(),
                         data_type: DataType::Int8,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "staleness_sec".to_string(),
                         data_type: DataType::Int8,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "status".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                 ],
             },
@@ -210,66 +208,66 @@ impl SystemViewRegistry {
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "num_vectors".to_string(),
                         data_type: DataType::Int8,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "dimensions".to_string(),
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "quantization".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "memory_bytes".to_string(),
                         data_type: DataType::Int8,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "recall_at_10".to_string(),
                         data_type: DataType::Float8,
                         nullable: true,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                 ],
             },
@@ -286,66 +284,66 @@ impl SystemViewRegistry {
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "source_value".to_string(),
                         data_type: DataType::Text,
                         nullable: true,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "target_value".to_string(),
                         data_type: DataType::Text,
                         nullable: true,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "difference_type".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "source_timestamp".to_string(),
                         data_type: DataType::Int8,
                         nullable: true,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "target_timestamp".to_string(),
                         data_type: DataType::Int8,
                         nullable: true,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                 ],
             },
@@ -362,66 +360,66 @@ impl SystemViewRegistry {
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "modified_keys".to_string(),
                         data_type: DataType::Int8,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "storage_bytes".to_string(),
                         data_type: DataType::Int8,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "commit_count".to_string(),
                         data_type: DataType::Int8,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "last_modified".to_string(),
                         data_type: DataType::Timestamp,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "compression_ratio".to_string(),
                         data_type: DataType::Float8,
                         nullable: true,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                 ],
             },
@@ -438,66 +436,66 @@ impl SystemViewRegistry {
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "relname".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "relnamespace".to_string(),
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "reltype".to_string(),
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "relkind".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "relfilenode".to_string(),
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     // KanttBan v3.31.0 release-gate: drizzle-kit's
                     // tables-list query (bin.cjs:19810) reads
@@ -523,77 +521,77 @@ impl SystemViewRegistry {
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "attname".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "atttypid".to_string(),
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "attlen".to_string(),
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "attnotnull".to_string(),
                         data_type: DataType::Boolean,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "attnum".to_string(),
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "atttypmod".to_string(),
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     // KanttBan #23 phase 2.4: drizzle-kit reads these
                     // four per-column attributes. attisdropped is the
@@ -625,66 +623,66 @@ impl SystemViewRegistry {
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "typname".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "typlen".to_string(),
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "typbyval".to_string(),
                         data_type: DataType::Boolean,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "typcategory".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "typnotnull".to_string(),
                         data_type: DataType::Boolean,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     // KanttBan #23 phase 2.6: drizzle's
                     // getColumnsInfoQuery LEFT-JOINs pg_type and then
@@ -777,33 +775,33 @@ impl SystemViewRegistry {
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "nspname".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "nspowner".to_string(),
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                 ],
             },
@@ -820,66 +818,66 @@ impl SystemViewRegistry {
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "indrelid".to_string(),
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "indisprimary".to_string(),
                         data_type: DataType::Boolean,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "indisunique".to_string(),
                         data_type: DataType::Boolean,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "indisexclusion".to_string(),
                         data_type: DataType::Boolean,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "indkey".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                 ],
             },
@@ -896,66 +894,66 @@ impl SystemViewRegistry {
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "conname".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "connamespace".to_string(),
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "contype".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "conrelid".to_string(),
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "confrelid".to_string(),
                         data_type: DataType::Int4,
                         nullable: true,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                 ],
             },
@@ -972,91 +970,91 @@ impl SystemViewRegistry {
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "table_name".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "column_name".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "ordinal_position".to_string(),
                         data_type: DataType::Int4,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "column_default".to_string(),
                         data_type: DataType::Text,
                         nullable: true,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "is_nullable".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "data_type".to_string(),
                         data_type: DataType::Text,
                         nullable: false,
                         primary_key: false,
-                            source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     // KanttBan #23 (v3.31.1 phase 2): identity /
                     // generated-column fields that drizzle-kit's
                     // getColumnsInfoQuery reads.
                     sv_col("udt_name", DataType::Text),
-                    sv_col("is_generated", DataType::Text),       // 'NEVER' or 'ALWAYS'
+                    sv_col("is_generated", DataType::Text), // 'NEVER' or 'ALWAYS'
                     sv_col("generation_expression", DataType::Text),
-                    sv_col("is_identity", DataType::Text),        // 'YES' or 'NO'
+                    sv_col("is_identity", DataType::Text),         // 'YES' or 'NO'
                     sv_col("identity_generation", DataType::Text), // 'ALWAYS' or 'BY DEFAULT' or NULL
                     sv_col("identity_start", DataType::Text),
                     sv_col("identity_increment", DataType::Text),
                     sv_col("identity_maximum", DataType::Text),
                     sv_col("identity_minimum", DataType::Text),
-                    sv_col("identity_cycle", DataType::Text),     // 'YES' or 'NO'
+                    sv_col("identity_cycle", DataType::Text), // 'YES' or 'NO'
                 ],
             },
             description: "Information schema view of all table columns (ANSI SQL standard)".to_string(),
@@ -1076,7 +1074,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "uses".to_string(),
@@ -1087,7 +1085,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "avg_ratio".to_string(),
@@ -1098,7 +1096,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "avg_compress_us".to_string(),
@@ -1109,7 +1107,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "avg_decompress_us".to_string(),
@@ -1120,7 +1118,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "total_bytes_in".to_string(),
@@ -1131,7 +1129,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "total_bytes_out".to_string(),
@@ -1142,7 +1140,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                 ],
             },
@@ -1163,7 +1161,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "detections".to_string(),
@@ -1174,7 +1172,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "best_algorithm".to_string(),
@@ -1185,7 +1183,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "avg_ratio".to_string(),
@@ -1196,7 +1194,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                 ],
             },
@@ -1217,7 +1215,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "table_name".to_string(),
@@ -1228,7 +1226,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "column_name".to_string(),
@@ -1239,7 +1237,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "algorithm".to_string(),
@@ -1250,7 +1248,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "ratio".to_string(),
@@ -1261,7 +1259,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "input_bytes".to_string(),
@@ -1272,7 +1270,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "output_bytes".to_string(),
@@ -1283,7 +1281,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "duration_us".to_string(),
@@ -1294,7 +1292,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                 ],
             },
@@ -1315,7 +1313,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "value".to_string(),
@@ -1326,7 +1324,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                     Column {
                         name: "description".to_string(),
@@ -1337,7 +1335,7 @@ impl SystemViewRegistry {
                         source_table_name: None,
                         default_expr: None,
                         unique: false,
-                    storage_mode: ColumnStorageMode::Default,
+                        storage_mode: ColumnStorageMode::Default,
                     },
                 ],
             },
@@ -2115,13 +2113,15 @@ impl SystemViewRegistry {
         // PK/UNIQUE/FK constraint info. 5-col PG-standard shape.
         self.register_view(SystemViewSchema {
             name: "information_schema.table_constraints".to_string(),
-            schema: Schema { columns: vec![
-                sv_col("constraint_catalog", DataType::Text),
-                sv_col("constraint_schema", DataType::Text),
-                sv_col("constraint_name", DataType::Text),
-                sv_col("table_name", DataType::Text),
-                sv_col("constraint_type", DataType::Text),
-            ] },
+            schema: Schema {
+                columns: vec![
+                    sv_col("constraint_catalog", DataType::Text),
+                    sv_col("constraint_schema", DataType::Text),
+                    sv_col("constraint_name", DataType::Text),
+                    sv_col("table_name", DataType::Text),
+                    sv_col("constraint_type", DataType::Text),
+                ],
+            },
             description: "Standard SQL info_schema.table_constraints (PK/UNIQUE/FK)".to_string(),
         });
 
@@ -2130,14 +2130,16 @@ impl SystemViewRegistry {
         // FK columns to their referenced table/column.
         self.register_view(SystemViewSchema {
             name: "information_schema.key_column_usage".to_string(),
-            schema: Schema { columns: vec![
-                sv_col("constraint_catalog", DataType::Text),
-                sv_col("constraint_schema", DataType::Text),
-                sv_col("constraint_name", DataType::Text),
-                sv_col("table_name", DataType::Text),
-                sv_col("column_name", DataType::Text),
-                sv_col("ordinal_position", DataType::Int4),
-            ] },
+            schema: Schema {
+                columns: vec![
+                    sv_col("constraint_catalog", DataType::Text),
+                    sv_col("constraint_schema", DataType::Text),
+                    sv_col("constraint_name", DataType::Text),
+                    sv_col("table_name", DataType::Text),
+                    sv_col("column_name", DataType::Text),
+                    sv_col("ordinal_position", DataType::Int4),
+                ],
+            },
             description: "Standard SQL info_schema.key_column_usage".to_string(),
         });
 
@@ -2146,15 +2148,17 @@ impl SystemViewRegistry {
         // PK/UNIQUE). drizzle reads this for FK target resolution.
         self.register_view(SystemViewSchema {
             name: "information_schema.constraint_column_usage".to_string(),
-            schema: Schema { columns: vec![
-                sv_col("table_catalog", DataType::Text),
-                sv_col("table_schema", DataType::Text),
-                sv_col("table_name", DataType::Text),
-                sv_col("column_name", DataType::Text),
-                sv_col("constraint_catalog", DataType::Text),
-                sv_col("constraint_schema", DataType::Text),
-                sv_col("constraint_name", DataType::Text),
-            ] },
+            schema: Schema {
+                columns: vec![
+                    sv_col("table_catalog", DataType::Text),
+                    sv_col("table_schema", DataType::Text),
+                    sv_col("table_name", DataType::Text),
+                    sv_col("column_name", DataType::Text),
+                    sv_col("constraint_catalog", DataType::Text),
+                    sv_col("constraint_schema", DataType::Text),
+                    sv_col("constraint_name", DataType::Text),
+                ],
+            },
             description: "Standard SQL info_schema.constraint_column_usage".to_string(),
         });
 
@@ -2162,17 +2166,19 @@ impl SystemViewRegistry {
         // actions (ON UPDATE / ON DELETE) per constraint.
         self.register_view(SystemViewSchema {
             name: "information_schema.referential_constraints".to_string(),
-            schema: Schema { columns: vec![
-                sv_col("constraint_catalog", DataType::Text),
-                sv_col("constraint_schema", DataType::Text),
-                sv_col("constraint_name", DataType::Text),
-                sv_col("unique_constraint_catalog", DataType::Text),
-                sv_col("unique_constraint_schema", DataType::Text),
-                sv_col("unique_constraint_name", DataType::Text),
-                sv_col("match_option", DataType::Text),
-                sv_col("update_rule", DataType::Text),
-                sv_col("delete_rule", DataType::Text),
-            ] },
+            schema: Schema {
+                columns: vec![
+                    sv_col("constraint_catalog", DataType::Text),
+                    sv_col("constraint_schema", DataType::Text),
+                    sv_col("constraint_name", DataType::Text),
+                    sv_col("unique_constraint_catalog", DataType::Text),
+                    sv_col("unique_constraint_schema", DataType::Text),
+                    sv_col("unique_constraint_name", DataType::Text),
+                    sv_col("match_option", DataType::Text),
+                    sv_col("update_rule", DataType::Text),
+                    sv_col("delete_rule", DataType::Text),
+                ],
+            },
             description: "Standard SQL info_schema.referential_constraints (FK actions)".to_string(),
         });
 
@@ -2202,128 +2208,146 @@ impl SystemViewRegistry {
 
         self.register_view(SystemViewSchema {
             name: "pg_sequences".to_string(),
-            schema: Schema { columns: vec![
-                sv_col("schemaname", DataType::Text),
-                sv_col("sequencename", DataType::Text),
-                sv_col("sequenceowner", DataType::Text),
-                sv_col("data_type", DataType::Text),
-                sv_col("start_value", DataType::Int8),
-                sv_col("min_value", DataType::Int8),
-                sv_col("max_value", DataType::Int8),
-                sv_col("increment_by", DataType::Int8),
-                sv_col("cycle", DataType::Boolean),
-                sv_col("cache_size", DataType::Int8),
-                sv_col("last_value", DataType::Int8),
-            ] },
+            schema: Schema {
+                columns: vec![
+                    sv_col("schemaname", DataType::Text),
+                    sv_col("sequencename", DataType::Text),
+                    sv_col("sequenceowner", DataType::Text),
+                    sv_col("data_type", DataType::Text),
+                    sv_col("start_value", DataType::Int8),
+                    sv_col("min_value", DataType::Int8),
+                    sv_col("max_value", DataType::Int8),
+                    sv_col("increment_by", DataType::Int8),
+                    sv_col("cycle", DataType::Boolean),
+                    sv_col("cache_size", DataType::Int8),
+                    sv_col("last_value", DataType::Int8),
+                ],
+            },
             description: "PG-compat sequences view (empty — Nano uses synthetic counters)".to_string(),
         });
 
         self.register_view(SystemViewSchema {
             name: "pg_proc".to_string(),
-            schema: Schema { columns: vec![
-                sv_col("oid", DataType::Int4),
-                sv_col("proname", DataType::Text),
-                sv_col("pronamespace", DataType::Int4),
-                sv_col("proowner", DataType::Int4),
-                sv_col("prolang", DataType::Int4),
-                sv_col("prorettype", DataType::Int4),
-                sv_col("proargtypes", DataType::Text),
-                sv_col("prosrc", DataType::Text),
-            ] },
+            schema: Schema {
+                columns: vec![
+                    sv_col("oid", DataType::Int4),
+                    sv_col("proname", DataType::Text),
+                    sv_col("pronamespace", DataType::Int4),
+                    sv_col("proowner", DataType::Int4),
+                    sv_col("prolang", DataType::Int4),
+                    sv_col("prorettype", DataType::Int4),
+                    sv_col("proargtypes", DataType::Text),
+                    sv_col("prosrc", DataType::Text),
+                ],
+            },
             description: "PG-compat procedures catalogue (empty stub)".to_string(),
         });
 
         self.register_view(SystemViewSchema {
             name: "pg_description".to_string(),
-            schema: Schema { columns: vec![
-                sv_col("objoid", DataType::Int4),
-                sv_col("classoid", DataType::Int4),
-                sv_col("objsubid", DataType::Int4),
-                sv_col("description", DataType::Text),
-            ] },
+            schema: Schema {
+                columns: vec![
+                    sv_col("objoid", DataType::Int4),
+                    sv_col("classoid", DataType::Int4),
+                    sv_col("objsubid", DataType::Int4),
+                    sv_col("description", DataType::Text),
+                ],
+            },
             description: "PG-compat object descriptions (empty — Nano doesn't store COMMENT ON)".to_string(),
         });
 
         self.register_view(SystemViewSchema {
             name: "pg_policies".to_string(),
-            schema: Schema { columns: vec![
-                sv_col("schemaname", DataType::Text),
-                sv_col("tablename", DataType::Text),
-                sv_col("policyname", DataType::Text),
-                sv_col("permissive", DataType::Text),
-                sv_col("roles", DataType::Text),
-                sv_col("cmd", DataType::Text),
-                sv_col("qual", DataType::Text),
-                sv_col("with_check", DataType::Text),
-            ] },
+            schema: Schema {
+                columns: vec![
+                    sv_col("schemaname", DataType::Text),
+                    sv_col("tablename", DataType::Text),
+                    sv_col("policyname", DataType::Text),
+                    sv_col("permissive", DataType::Text),
+                    sv_col("roles", DataType::Text),
+                    sv_col("cmd", DataType::Text),
+                    sv_col("qual", DataType::Text),
+                    sv_col("with_check", DataType::Text),
+                ],
+            },
             description: "PG-compat RLS policies view (empty — Nano RLS via TenantManager)".to_string(),
         });
 
         self.register_view(SystemViewSchema {
             name: "pg_policy".to_string(),
-            schema: Schema { columns: vec![
-                sv_col("oid", DataType::Int4),
-                sv_col("polname", DataType::Text),
-                sv_col("polrelid", DataType::Int4),
-                sv_col("polcmd", DataType::Char(1)),
-                sv_col("polpermissive", DataType::Boolean),
-                sv_col("polroles", DataType::Text),
-                sv_col("polqual", DataType::Text),
-                sv_col("polwithcheck", DataType::Text),
-            ] },
+            schema: Schema {
+                columns: vec![
+                    sv_col("oid", DataType::Int4),
+                    sv_col("polname", DataType::Text),
+                    sv_col("polrelid", DataType::Int4),
+                    sv_col("polcmd", DataType::Char(1)),
+                    sv_col("polpermissive", DataType::Boolean),
+                    sv_col("polroles", DataType::Text),
+                    sv_col("polqual", DataType::Text),
+                    sv_col("polwithcheck", DataType::Text),
+                ],
+            },
             description: "PG-compat RLS policy catalogue (empty stub)".to_string(),
         });
 
         self.register_view(SystemViewSchema {
             name: "pg_matviews".to_string(),
-            schema: Schema { columns: vec![
-                sv_col("schemaname", DataType::Text),
-                sv_col("matviewname", DataType::Text),
-                sv_col("matviewowner", DataType::Text),
-                sv_col("tablespace", DataType::Text),
-                sv_col("hasindexes", DataType::Boolean),
-                sv_col("ispopulated", DataType::Boolean),
-                sv_col("definition", DataType::Text),
-            ] },
+            schema: Schema {
+                columns: vec![
+                    sv_col("schemaname", DataType::Text),
+                    sv_col("matviewname", DataType::Text),
+                    sv_col("matviewowner", DataType::Text),
+                    sv_col("tablespace", DataType::Text),
+                    sv_col("hasindexes", DataType::Boolean),
+                    sv_col("ispopulated", DataType::Boolean),
+                    sv_col("definition", DataType::Text),
+                ],
+            },
             description: "PG-compat matview view (empty — use pg_mv_staleness instead)".to_string(),
         });
 
         self.register_view(SystemViewSchema {
             name: "pg_inherits".to_string(),
-            schema: Schema { columns: vec![
-                sv_col("inhrelid", DataType::Int4),
-                sv_col("inhparent", DataType::Int4),
-                sv_col("inhseqno", DataType::Int4),
-            ] },
+            schema: Schema {
+                columns: vec![
+                    sv_col("inhrelid", DataType::Int4),
+                    sv_col("inhparent", DataType::Int4),
+                    sv_col("inhseqno", DataType::Int4),
+                ],
+            },
             description: "PG-compat inheritance catalogue (empty — Nano has no inheritance)".to_string(),
         });
 
         self.register_view(SystemViewSchema {
             name: "pg_publication".to_string(),
-            schema: Schema { columns: vec![
-                sv_col("oid", DataType::Int4),
-                sv_col("pubname", DataType::Text),
-                sv_col("pubowner", DataType::Int4),
-                sv_col("puballtables", DataType::Boolean),
-                sv_col("pubinsert", DataType::Boolean),
-                sv_col("pubupdate", DataType::Boolean),
-                sv_col("pubdelete", DataType::Boolean),
-                sv_col("pubtruncate", DataType::Boolean),
-            ] },
+            schema: Schema {
+                columns: vec![
+                    sv_col("oid", DataType::Int4),
+                    sv_col("pubname", DataType::Text),
+                    sv_col("pubowner", DataType::Int4),
+                    sv_col("puballtables", DataType::Boolean),
+                    sv_col("pubinsert", DataType::Boolean),
+                    sv_col("pubupdate", DataType::Boolean),
+                    sv_col("pubdelete", DataType::Boolean),
+                    sv_col("pubtruncate", DataType::Boolean),
+                ],
+            },
             description: "PG-compat logical replication publications (empty stub)".to_string(),
         });
 
         self.register_view(SystemViewSchema {
             name: "pg_statistic_ext".to_string(),
-            schema: Schema { columns: vec![
-                sv_col("oid", DataType::Int4),
-                sv_col("stxrelid", DataType::Int4),
-                sv_col("stxnamespace", DataType::Int4),
-                sv_col("stxname", DataType::Text),
-                sv_col("stxkeys", DataType::Text),
-                sv_col("stxkind", DataType::Text),
-                sv_col("stxstattarget", DataType::Int4),
-            ] },
+            schema: Schema {
+                columns: vec![
+                    sv_col("oid", DataType::Int4),
+                    sv_col("stxrelid", DataType::Int4),
+                    sv_col("stxnamespace", DataType::Int4),
+                    sv_col("stxname", DataType::Text),
+                    sv_col("stxkeys", DataType::Text),
+                    sv_col("stxkind", DataType::Text),
+                    sv_col("stxstattarget", DataType::Int4),
+                ],
+            },
             description: "PG-compat extended stats catalogue (empty stub)".to_string(),
         });
 
@@ -2336,13 +2360,15 @@ impl SystemViewRegistry {
         // SERIAL/IDENTITY detection accurate.
         self.register_view(SystemViewSchema {
             name: "pg_attrdef".to_string(),
-            schema: Schema { columns: vec![
-                sv_col("oid", DataType::Int4),
-                sv_col("adrelid", DataType::Int4),
-                sv_col("adnum", DataType::Int2),
-                sv_col("adbin", DataType::Text),
-                sv_col("adsrc", DataType::Text),
-            ] },
+            schema: Schema {
+                columns: vec![
+                    sv_col("oid", DataType::Int4),
+                    sv_col("adrelid", DataType::Int4),
+                    sv_col("adnum", DataType::Int2),
+                    sv_col("adbin", DataType::Text),
+                    sv_col("adsrc", DataType::Text),
+                ],
+            },
             description: "PG-compat column-default catalogue (empty stub; phase-2 will populate)".to_string(),
         });
 
@@ -2398,8 +2424,7 @@ impl SystemViewRegistry {
                     },
                 ],
             },
-            description: "Lists every tree-sitter grammar the indexer can parse"
-                .to_string(),
+            description: "Lists every tree-sitter grammar the indexer can parse".to_string(),
         });
     }
 
@@ -2458,7 +2483,6 @@ fn sv_col(name: &str, data_type: DataType) -> Column {
 }
 
 impl SystemViewRegistry {
-
     /// Get system view schema
     pub fn get_schema(&self, view_name: &str) -> Option<&Schema> {
         self.views.get(view_name).map(|v| &v.schema)
@@ -2479,10 +2503,7 @@ impl SystemViewRegistry {
     /// Queries storage metadata and returns results based on the view type
     pub fn execute(&self, view_name: &str, storage: &StorageEngine) -> Result<Vec<Tuple>> {
         if !self.is_system_view(view_name) {
-            return Err(Error::query_execution(format!(
-                "Unknown system view: {}",
-                view_name
-            )));
+            return Err(Error::query_execution(format!("Unknown system view: {}", view_name)));
         }
 
         match view_name {
@@ -2506,22 +2527,20 @@ impl SystemViewRegistry {
             "information_schema.tables" => Self::execute_information_schema_tables(storage),
             "information_schema.table_constraints" => Self::execute_information_schema_table_constraints(storage),
             "information_schema.key_column_usage" => Self::execute_information_schema_key_column_usage(storage),
-            "information_schema.constraint_column_usage" => Self::execute_information_schema_constraint_column_usage(storage),
-            "information_schema.referential_constraints" => Self::execute_information_schema_referential_constraints(storage),
+            "information_schema.constraint_column_usage" => {
+                Self::execute_information_schema_constraint_column_usage(storage)
+            }
+            "information_schema.referential_constraints" => {
+                Self::execute_information_schema_referential_constraints(storage)
+            }
             "pg_database" => Self::execute_pg_database(),
             // Empty-stub catalogue tables (v3.31.0 slice 5). Schema
             // already registered; rows are always empty because Nano
             // doesn't model these concepts.
             "pg_sequences" => Self::execute_pg_sequences(storage),
             "pg_attrdef" => Self::execute_pg_attrdef(storage),
-            "pg_proc"
-            | "pg_description"
-            | "pg_policies"
-            | "pg_policy"
-            | "pg_matviews"
-            | "pg_inherits"
-            | "pg_publication"
-            | "pg_statistic_ext" => Ok(vec![]),
+            "pg_proc" | "pg_description" | "pg_policies" | "pg_policy" | "pg_matviews" | "pg_inherits"
+            | "pg_publication" | "pg_statistic_ext" => Ok(vec![]),
             "sqlite_master" => Self::execute_sqlite_master(storage),
             "pg_index" => Self::execute_pg_index(storage),
             "pg_constraint" => Self::execute_pg_constraint(storage),
@@ -2585,12 +2604,7 @@ impl SystemViewRegistry {
             rows.sort_by(|a, b| a.0.cmp(&b.0));
             Ok(rows
                 .into_iter()
-                .map(|(n, s)| {
-                    Tuple::new(vec![
-                        Value::String(n),
-                        Value::String(s.to_string()),
-                    ])
-                })
+                .map(|(n, s)| Tuple::new(vec![Value::String(n), Value::String(s.to_string())]))
                 .collect())
         }
         #[cfg(not(feature = "code-graph"))]
@@ -2634,8 +2648,10 @@ impl SystemViewRegistry {
             match mv_catalog.get_view(&view_name) {
                 Ok(metadata) => {
                     // Format base tables as JSON array string
-                    let base_tables = format!("[{}]",
-                        metadata.base_tables
+                    let base_tables = format!(
+                        "[{}]",
+                        metadata
+                            .base_tables
                             .iter()
                             .map(|t| format!("\"{}\"", t))
                             .collect::<Vec<_>>()
@@ -2643,9 +2659,7 @@ impl SystemViewRegistry {
                     );
 
                     // Calculate staleness
-                    let last_update = metadata.last_refresh
-                        .map(|dt| dt.timestamp())
-                        .unwrap_or(0);
+                    let last_update = metadata.last_refresh.map(|dt| dt.timestamp()).unwrap_or(0);
 
                     let staleness_sec = metadata.staleness_seconds().unwrap_or(0);
 
@@ -2730,11 +2744,9 @@ impl SystemViewRegistry {
             };
 
             let last_modified_ts = if branch.stats.last_modified > 0 {
-                chrono::DateTime::from_timestamp(branch.stats.last_modified as i64, 0)
-                    .unwrap_or_default()
+                chrono::DateTime::from_timestamp(branch.stats.last_modified as i64, 0).unwrap_or_default()
             } else {
-                chrono::DateTime::from_timestamp(branch.created_at as i64, 0)
-                    .unwrap_or_default()
+                chrono::DateTime::from_timestamp(branch.created_at as i64, 0).unwrap_or_default()
             };
 
             let tuple = Tuple::new(vec![
@@ -2763,13 +2775,13 @@ impl SystemViewRegistry {
         for (idx, table_name) in tables.iter().enumerate() {
             let oid = oid_counter + (idx as i32);
             let tuple = Tuple::new(vec![
-                Value::Int4(oid),                      // oid
-                Value::String(table_name.clone()),     // relname
-                Value::Int4(2200),                     // relnamespace (public schema)
-                Value::Int4(oid + 1000),               // reltype
-                Value::String("r".to_string()),        // relkind (r = relation/table)
-                Value::Int4(oid),                      // relfilenode
-                Value::Boolean(false),                 // relrowsecurity (Nano RLS is via TenantManager, not pg_catalog)
+                Value::Int4(oid),                  // oid
+                Value::String(table_name.clone()), // relname
+                Value::Int4(2200),                 // relnamespace (public schema)
+                Value::Int4(oid + 1000),           // reltype
+                Value::String("r".to_string()),    // relkind (r = relation/table)
+                Value::Int4(oid),                  // relfilenode
+                Value::Boolean(false),             // relrowsecurity (Nano RLS is via TenantManager, not pg_catalog)
             ]);
             results.push(tuple);
         }
@@ -2826,27 +2838,26 @@ impl SystemViewRegistry {
                 Ok(schema) => {
                     for (col_idx, column) in schema.columns.iter().enumerate() {
                         let type_oid = Self::get_type_oid(&column.data_type);
-                        let is_identity_col = identity_cols.iter()
-                            .any(|c| c.eq_ignore_ascii_case(&column.name));
+                        let is_identity_col = identity_cols.iter().any(|c| c.eq_ignore_ascii_case(&column.name));
                         let ndims: i32 = match &column.data_type {
                             DataType::Array(_) => 1,
                             _ => 0,
                         };
                         let has_default = column.default_expr.is_some() || is_identity_col;
                         let tuple = Tuple::new(vec![
-                            Value::Int4(table_oid),                        // attrelid
-                            Value::String(column.name.clone()),            // attname
-                            Value::Int4(type_oid),                         // atttypid
-                            Value::Int4(-1),                               // attlen
-                            Value::Boolean(!column.nullable),              // attnotnull
-                            Value::Int4((col_idx + 1) as i32),             // attnum
-                            Value::Int4(-1),                               // atttypmod
-                            Value::Boolean(false),                         // attisdropped
-                            Value::Int4(ndims),                            // attndims
+                            Value::Int4(table_oid),                                                  // attrelid
+                            Value::String(column.name.clone()),                                      // attname
+                            Value::Int4(type_oid),                                                   // atttypid
+                            Value::Int4(-1),                                                         // attlen
+                            Value::Boolean(!column.nullable),                                        // attnotnull
+                            Value::Int4((col_idx + 1) as i32),                                       // attnum
+                            Value::Int4(-1),                                                         // atttypmod
+                            Value::Boolean(false),                                                   // attisdropped
+                            Value::Int4(ndims),                                                      // attndims
                             Value::String(if is_identity_col { "d".into() } else { String::new() }), // attidentity
-                            Value::String(String::new()),                  // attgenerated
-                            Value::Boolean(has_default),                   // atthasdef
-                            Value::Int4(0),                                // attcollation (default)
+                            Value::String(String::new()),                                            // attgenerated
+                            Value::Boolean(has_default),                                             // atthasdef
+                            Value::Int4(0), // attcollation (default)
                         ]);
                         results.push(tuple);
                     }
@@ -2878,22 +2889,22 @@ impl SystemViewRegistry {
 
         for (type_name, oid, len, byval, category, notnull) in types {
             let tuple = Tuple::new(vec![
-                Value::Int4(oid),                          // oid
-                Value::String(type_name.to_string()),      // typname
-                Value::Int4(len),                          // typlen
-                Value::Boolean(byval),                     // typbyval
-                Value::String(category.to_string()),       // typcategory
-                Value::Boolean(notnull),                   // typnotnull
+                Value::Int4(oid),                     // oid
+                Value::String(type_name.to_string()), // typname
+                Value::Int4(len),                     // typlen
+                Value::Boolean(byval),                // typbyval
+                Value::String(category.to_string()),  // typcategory
+                Value::Boolean(notnull),              // typnotnull
                 // KanttBan #23 phase 2.6: typnamespace + 4 more
                 // columns drizzle joins / reads. Every built-in
                 // type lives in pg_catalog (OID 11). typtype 'b' =
                 // base type. typowner = postgres (10). typrelid /
                 // typbasetype = 0 for non-composite/non-domain.
-                Value::Int4(11),                           // typnamespace
-                Value::String("b".into()),                 // typtype
-                Value::Int4(10),                           // typowner
-                Value::Int4(0),                            // typrelid
-                Value::Int4(0),                            // typbasetype
+                Value::Int4(11),           // typnamespace
+                Value::String("b".into()), // typtype
+                Value::Int4(10),           // typowner
+                Value::Int4(0),            // typrelid
+                Value::Int4(0),            // typbasetype
             ]);
             results.push(tuple);
         }
@@ -2920,17 +2931,17 @@ impl SystemViewRegistry {
         for table_name in catalog.list_tables()? {
             for col_name in catalog.list_identity_columns(&table_name)? {
                 rows.push(Tuple::new(vec![
-                    Value::String("public".into()),                       // schemaname
-                    Value::String(format!("{table_name}_{col_name}_seq")),// sequencename
-                    Value::String("postgres".into()),                     // sequenceowner
-                    Value::String("bigint".into()),                       // data_type
-                    Value::Int8(1),                                       // start_value
-                    Value::Int8(1),                                       // min_value
-                    Value::Int8(i64::MAX),                                // max_value
-                    Value::Int8(1),                                       // increment_by
-                    Value::Boolean(false),                                // cycle
-                    Value::Int8(1),                                       // cache_size
-                    Value::Null,                                          // last_value (unknown — synthetic counter)
+                    Value::String("public".into()),                        // schemaname
+                    Value::String(format!("{table_name}_{col_name}_seq")), // sequencename
+                    Value::String("postgres".into()),                      // sequenceowner
+                    Value::String("bigint".into()),                        // data_type
+                    Value::Int8(1),                                        // start_value
+                    Value::Int8(1),                                        // min_value
+                    Value::Int8(i64::MAX),                                 // max_value
+                    Value::Int8(1),                                        // increment_by
+                    Value::Boolean(false),                                 // cycle
+                    Value::Int8(1),                                        // cache_size
+                    Value::Null,                                           // last_value (unknown — synthetic counter)
                 ]));
             }
         }
@@ -2958,11 +2969,11 @@ impl SystemViewRegistry {
                     let seq_name = format!("{table_name}_{}_seq", col.name);
                     let adsrc = format!("nextval('{seq_name}'::regclass)");
                     rows.push(Tuple::new(vec![
-                        Value::Int4(oid_counter),                  // oid
-                        Value::Int4(adrelid),                      // adrelid
-                        Value::Int2((col_idx + 1) as i16),         // adnum (1-indexed)
-                        Value::String(adsrc.clone()),              // adbin (node-tree text; same as adsrc for our purposes)
-                        Value::String(adsrc),                      // adsrc
+                        Value::Int4(oid_counter),          // oid
+                        Value::Int4(adrelid),              // adrelid
+                        Value::Int2((col_idx + 1) as i16), // adnum (1-indexed)
+                        Value::String(adsrc.clone()),      // adbin (node-tree text; same as adsrc for our purposes)
+                        Value::String(adsrc),              // adsrc
                     ]));
                     oid_counter += 1;
                 }
@@ -2975,20 +2986,22 @@ impl SystemViewRegistry {
     /// but same two synthetic roles. drizzle-kit's introspection
     /// queries pg_roles directly during pull.
     fn execute_pg_roles() -> Result<Vec<Tuple>> {
-        let role = |oid: i32, name: &str| Tuple::new(vec![
-            Value::Int4(oid),                  // oid
-            Value::String(name.into()),        // rolname
-            Value::Boolean(true),              // rolsuper
-            Value::Boolean(true),              // rolinherit
-            Value::Boolean(true),              // rolcreaterole
-            Value::Boolean(true),              // rolcreatedb
-            Value::Boolean(true),              // rolcanlogin
-            Value::Boolean(true),              // rolreplication
-            Value::Int4(-1),                   // rolconnlimit
-            Value::Null,                       // rolpassword
-            Value::Null,                       // rolvaliduntil
-            Value::Boolean(true),              // rolbypassrls
-        ]);
+        let role = |oid: i32, name: &str| {
+            Tuple::new(vec![
+                Value::Int4(oid),           // oid
+                Value::String(name.into()), // rolname
+                Value::Boolean(true),       // rolsuper
+                Value::Boolean(true),       // rolinherit
+                Value::Boolean(true),       // rolcreaterole
+                Value::Boolean(true),       // rolcreatedb
+                Value::Boolean(true),       // rolcanlogin
+                Value::Boolean(true),       // rolreplication
+                Value::Int4(-1),            // rolconnlimit
+                Value::Null,                // rolpassword
+                Value::Null,                // rolvaliduntil
+                Value::Boolean(true),       // rolbypassrls
+            ])
+        };
         Ok(vec![role(10, "postgres"), role(11, "helios")])
     }
 
@@ -3171,16 +3184,16 @@ impl SystemViewRegistry {
     /// matcher), so there's no current-behaviour regression.
     fn execute_pg_database() -> Result<Vec<Tuple>> {
         Ok(vec![Tuple::new(vec![
-            Value::Int4(1),                       // oid
-            Value::String("heliosdb".into()),     // datname
-            Value::Int4(10),                      // datdba
-            Value::Int4(6),                       // encoding = UTF8
-            Value::String("C.UTF-8".into()),      // datcollate
-            Value::String("C.UTF-8".into()),      // datctype
-            Value::Boolean(false),                // datistemplate
-            Value::Boolean(true),                 // datallowconn
-            Value::Int4(-1),                      // datconnlimit
-            Value::Int4(1663),                    // dattablespace = pg_default
+            Value::Int4(1),                   // oid
+            Value::String("heliosdb".into()), // datname
+            Value::Int4(10),                  // datdba
+            Value::Int4(6),                   // encoding = UTF8
+            Value::String("C.UTF-8".into()),  // datcollate
+            Value::String("C.UTF-8".into()),  // datctype
+            Value::Boolean(false),            // datistemplate
+            Value::Boolean(true),             // datallowconn
+            Value::Int4(-1),                  // datconnlimit
+            Value::Int4(1663),                // dattablespace = pg_default
         ])])
     }
 
@@ -3192,17 +3205,19 @@ impl SystemViewRegistry {
     /// existing introspection sees the schemas / tables as owned by
     /// the postgres super-user.
     fn execute_pg_user() -> Result<Vec<Tuple>> {
-        let role = |name: &str, uid: i32| Tuple::new(vec![
-            Value::String(name.into()),     // usename
-            Value::Int4(uid),                // usesysid
-            Value::Boolean(true),            // usecreatedb
-            Value::Boolean(true),            // usesuper
-            Value::Boolean(true),            // userepl
-            Value::Boolean(true),            // usebypassrls
-            Value::Null,                     // passwd
-            Value::Null,                     // valuntil
-            Value::Null,                     // useconfig
-        ]);
+        let role = |name: &str, uid: i32| {
+            Tuple::new(vec![
+                Value::String(name.into()), // usename
+                Value::Int4(uid),           // usesysid
+                Value::Boolean(true),       // usecreatedb
+                Value::Boolean(true),       // usesuper
+                Value::Boolean(true),       // userepl
+                Value::Boolean(true),       // usebypassrls
+                Value::Null,                // passwd
+                Value::Null,                // valuntil
+                Value::Null,                // useconfig
+            ])
+        };
         Ok(vec![role("postgres", 10), role("helios", 11)])
     }
 
@@ -3251,12 +3266,12 @@ impl SystemViewRegistry {
             table_oid += 1;
             // For each table, create a placeholder primary key index
             let tuple = Tuple::new(vec![
-                Value::Int4(index_oid),                // indexrelid
-                Value::Int4(table_oid),                // indrelid
-                Value::Boolean(true),                  // indisprimary
-                Value::Boolean(false),                 // indisunique
-                Value::Boolean(false),                 // indisexclusion
-                Value::String("1".to_string()),        // indkey (column 1)
+                Value::Int4(index_oid),         // indexrelid
+                Value::Int4(table_oid),         // indrelid
+                Value::Boolean(true),           // indisprimary
+                Value::Boolean(false),          // indisunique
+                Value::Boolean(false),          // indisexclusion
+                Value::String("1".to_string()), // indkey (column 1)
             ]);
             results.push(tuple);
             index_oid += 1;
@@ -3279,12 +3294,12 @@ impl SystemViewRegistry {
             table_oid += 1;
             // Add a primary key constraint for each table
             let tuple = Tuple::new(vec![
-                Value::Int4(constraint_oid),           // oid
+                Value::Int4(constraint_oid),                // oid
                 Value::String(format!("pk_{}", table_oid)), // conname
-                Value::Int4(2200),                     // connamespace
-                Value::String("p".to_string()),        // contype (p = primary key)
-                Value::Int4(table_oid),                // conrelid
-                Value::Null,                           // confrelid (no foreign key)
+                Value::Int4(2200),                          // connamespace
+                Value::String("p".to_string()),             // contype (p = primary key)
+                Value::Int4(table_oid),                     // conrelid
+                Value::Null,                                // confrelid (no foreign key)
             ]);
             results.push(tuple);
             constraint_oid += 1;
@@ -3309,8 +3324,7 @@ impl SystemViewRegistry {
                         let is_nullable = if column.nullable { "YES" } else { "NO" };
                         let data_type = format!("{:?}", column.data_type);
                         let pg_type_name = format_pg_type_name(&column.data_type);
-                        let is_identity_col = identity_cols.iter()
-                            .any(|c| c.eq_ignore_ascii_case(&column.name));
+                        let is_identity_col = identity_cols.iter().any(|c| c.eq_ignore_ascii_case(&column.name));
                         // KanttBan #23 (v3.31.1 phase 2): identity
                         // metadata. We always report BY DEFAULT — we
                         // don't track GENERATED ALWAYS separately
@@ -3320,49 +3334,56 @@ impl SystemViewRegistry {
                         // / identity_maximum / identity_minimum
                         // match the bigint defaults (1 / 1 / max /
                         // 1). identity_cycle = NO.
-                        let (is_identity_str, id_gen, id_start, id_incr, id_max, id_min, id_cycle) =
-                            if is_identity_col {
-                                (
-                                    Value::String("YES".into()),
-                                    Value::String("BY DEFAULT".into()),
-                                    Value::String("1".into()),
-                                    Value::String("1".into()),
-                                    Value::String(i64::MAX.to_string()),
-                                    Value::String("1".into()),
-                                    Value::String("NO".into()),
-                                )
-                            } else {
-                                (Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null, Value::Null)
-                            };
-                        let column_default = if is_identity_col {
-                            Value::String(format!(
-                                "nextval('{table_name}_{}_seq'::regclass)",
-                                column.name,
-                            ))
+                        let (is_identity_str, id_gen, id_start, id_incr, id_max, id_min, id_cycle) = if is_identity_col
+                        {
+                            (
+                                Value::String("YES".into()),
+                                Value::String("BY DEFAULT".into()),
+                                Value::String("1".into()),
+                                Value::String("1".into()),
+                                Value::String(i64::MAX.to_string()),
+                                Value::String("1".into()),
+                                Value::String("NO".into()),
+                            )
                         } else {
-                            column.default_expr.as_ref()
+                            (
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                                Value::Null,
+                            )
+                        };
+                        let column_default = if is_identity_col {
+                            Value::String(format!("nextval('{table_name}_{}_seq'::regclass)", column.name,))
+                        } else {
+                            column
+                                .default_expr
+                                .as_ref()
                                 .map(|s| Value::String(s.clone()))
                                 .unwrap_or(Value::Null)
                         };
 
                         let tuple = Tuple::new(vec![
-                            Value::String("public".to_string()),           // table_schema
-                            Value::String(table_name.clone()),             // table_name
-                            Value::String(column.name.clone()),            // column_name
-                            Value::Int4((col_idx + 1) as i32),             // ordinal_position
-                            column_default,                                // column_default
-                            Value::String(is_nullable.to_string()),        // is_nullable
-                            Value::String(data_type),                      // data_type
-                            Value::String(pg_type_name),                   // udt_name
-                            Value::String("NEVER".into()),                 // is_generated
-                            Value::Null,                                   // generation_expression
-                            is_identity_str,                               // is_identity
-                            id_gen,                                        // identity_generation
-                            id_start,                                      // identity_start
-                            id_incr,                                       // identity_increment
-                            id_max,                                        // identity_maximum
-                            id_min,                                        // identity_minimum
-                            id_cycle,                                      // identity_cycle
+                            Value::String("public".to_string()),    // table_schema
+                            Value::String(table_name.clone()),      // table_name
+                            Value::String(column.name.clone()),     // column_name
+                            Value::Int4((col_idx + 1) as i32),      // ordinal_position
+                            column_default,                         // column_default
+                            Value::String(is_nullable.to_string()), // is_nullable
+                            Value::String(data_type),               // data_type
+                            Value::String(pg_type_name),            // udt_name
+                            Value::String("NEVER".into()),          // is_generated
+                            Value::Null,                            // generation_expression
+                            is_identity_str,                        // is_identity
+                            id_gen,                                 // identity_generation
+                            id_start,                               // identity_start
+                            id_incr,                                // identity_increment
+                            id_max,                                 // identity_maximum
+                            id_min,                                 // identity_minimum
+                            id_cycle,                               // identity_cycle
                         ]);
                         results.push(tuple);
                     }
@@ -3413,7 +3434,7 @@ impl SystemViewRegistry {
         let mut results = Vec::new();
 
         // Aggregate stats by codec
-        let mut alp_stats = (0i64, 0i64, 0i64, 0.0f64);  // (uses, bytes_in, bytes_out, total_ratio)
+        let mut alp_stats = (0i64, 0i64, 0i64, 0.0f64); // (uses, bytes_in, bytes_out, total_ratio)
         let mut fsst_stats = (0i64, 0i64, 0i64, 0.0f64);
         let mut none_stats = (0i64, 0i64, 0i64, 0.0f64);
 
@@ -3449,7 +3470,11 @@ impl SystemViewRegistry {
             results.push(Tuple::new(vec![
                 Value::String("ALP".to_string()),
                 Value::Int8(alp_stats.0),
-                Value::Float8(if alp_stats.2 > 0 { alp_stats.1 as f64 / alp_stats.2 as f64 } else { 1.0 }),
+                Value::Float8(if alp_stats.2 > 0 {
+                    alp_stats.1 as f64 / alp_stats.2 as f64
+                } else {
+                    1.0
+                }),
                 Value::Float8(0.0), // avg_compress_us (not tracked yet)
                 Value::Float8(0.0), // avg_decompress_us
                 Value::Int8(alp_stats.1),
@@ -3462,7 +3487,11 @@ impl SystemViewRegistry {
             results.push(Tuple::new(vec![
                 Value::String("FSST".to_string()),
                 Value::Int8(fsst_stats.0),
-                Value::Float8(if fsst_stats.2 > 0 { fsst_stats.1 as f64 / fsst_stats.2 as f64 } else { 1.0 }),
+                Value::Float8(if fsst_stats.2 > 0 {
+                    fsst_stats.1 as f64 / fsst_stats.2 as f64
+                } else {
+                    1.0
+                }),
                 Value::Float8(0.0),
                 Value::Float8(0.0),
                 Value::Int8(fsst_stats.1),
@@ -3607,7 +3636,7 @@ impl SystemViewRegistry {
     #[cfg(feature = "ha-tier1")]
     fn execute_pg_replication_status() -> Result<Vec<Tuple>> {
         use crate::replication::ha_state;
-        use chrono::{Utc, TimeZone};
+        use chrono::{TimeZone, Utc};
 
         let state = ha_state();
         let config = state.get_config().unwrap_or_default();
@@ -3615,7 +3644,8 @@ impl SystemViewRegistry {
         let standby_count = state.standby_count();
         let is_read_only = state.is_read_only();
 
-        let started_at = Utc.timestamp_opt(config.started_at, 0)
+        let started_at = Utc
+            .timestamp_opt(config.started_at, 0)
             .single()
             .map(|dt| Value::Timestamp(dt))
             .unwrap_or(Value::Null);
@@ -3656,18 +3686,20 @@ impl SystemViewRegistry {
     #[cfg(feature = "ha-tier1")]
     fn execute_pg_replication_standbys() -> Result<Vec<Tuple>> {
         use crate::replication::ha_state;
-        use chrono::{Utc, TimeZone};
+        use chrono::{TimeZone, Utc};
 
         let state = ha_state();
         let standbys = state.get_standbys();
 
         let mut results = Vec::new();
         for standby in standbys {
-            let connected_at = Utc.timestamp_opt(standby.connected_at, 0)
+            let connected_at = Utc
+                .timestamp_opt(standby.connected_at, 0)
                 .single()
                 .map(|dt| Value::Timestamp(dt))
                 .unwrap_or(Value::Null);
-            let last_heartbeat = Utc.timestamp_opt(standby.last_heartbeat, 0)
+            let last_heartbeat = Utc
+                .timestamp_opt(standby.last_heartbeat, 0)
                 .single()
                 .map(|dt| Value::Timestamp(dt))
                 .unwrap_or(Value::Null);
@@ -3701,16 +3733,18 @@ impl SystemViewRegistry {
     #[cfg(feature = "ha-tier1")]
     fn execute_pg_replication_primary() -> Result<Vec<Tuple>> {
         use crate::replication::ha_state;
-        use chrono::{Utc, TimeZone};
+        use chrono::{TimeZone, Utc};
 
         let state = ha_state();
 
         if let Some(primary) = state.get_primary() {
-            let connected_at = Utc.timestamp_opt(primary.connected_at, 0)
+            let connected_at = Utc
+                .timestamp_opt(primary.connected_at, 0)
                 .single()
                 .map(|dt| Value::Timestamp(dt))
                 .unwrap_or(Value::Null);
-            let last_heartbeat = Utc.timestamp_opt(primary.last_heartbeat, 0)
+            let last_heartbeat = Utc
+                .timestamp_opt(primary.last_heartbeat, 0)
                 .single()
                 .map(|dt| Value::Timestamp(dt))
                 .unwrap_or(Value::Null);
@@ -3775,14 +3809,38 @@ impl SystemViewRegistry {
         // Add each metric as a row
         let metrics_data = vec![
             ("wal_writes", metrics.wal_writes, "Total WAL write operations"),
-            ("wal_bytes_written", metrics.wal_bytes_written, "Total bytes written to WAL"),
-            ("records_replicated", metrics.records_replicated, "Total records replicated to standbys"),
-            ("bytes_replicated", metrics.bytes_replicated, "Total bytes replicated to standbys"),
+            (
+                "wal_bytes_written",
+                metrics.wal_bytes_written,
+                "Total bytes written to WAL",
+            ),
+            (
+                "records_replicated",
+                metrics.records_replicated,
+                "Total records replicated to standbys",
+            ),
+            (
+                "bytes_replicated",
+                metrics.bytes_replicated,
+                "Total bytes replicated to standbys",
+            ),
             ("heartbeats_sent", metrics.heartbeats_sent, "Total heartbeats sent"),
-            ("heartbeats_received", metrics.heartbeats_received, "Total heartbeats received"),
-            ("reconnect_count", metrics.reconnect_count, "Number of reconnection attempts"),
+            (
+                "heartbeats_received",
+                metrics.heartbeats_received,
+                "Total heartbeats received",
+            ),
+            (
+                "reconnect_count",
+                metrics.reconnect_count,
+                "Number of reconnection attempts",
+            ),
             ("current_lsn", state.get_lsn(), "Current Log Sequence Number"),
-            ("standby_count", state.standby_count() as u64, "Number of connected standbys"),
+            (
+                "standby_count",
+                state.standby_count() as u64,
+                "Number of connected standbys",
+            ),
         ];
 
         for (name, value, description) in metrics_data {
@@ -3834,8 +3892,7 @@ impl SystemViewRegistry {
             // Get stats without cloning the entire tree
             if let Some(stats) = art_manager.index_stats(&name) {
                 let columns_str = columns.join(", ");
-                let node_count = stats.node4_count + stats.node16_count
-                    + stats.node48_count + stats.node256_count;
+                let node_count = stats.node4_count + stats.node16_count + stats.node48_count + stats.node256_count;
 
                 results.push(Tuple::new(vec![
                     Value::String(name),
@@ -3997,18 +4054,16 @@ mod tests {
     #[test]
     fn test_execute_pg_database_branches() {
         let config = Config::in_memory();
-        let storage = StorageEngine::open_in_memory(&config)
-            .expect("Failed to create storage");
+        let storage = StorageEngine::open_in_memory(&config).expect("Failed to create storage");
 
         // Create a test branch
-        storage.create_branch(
-            "test_branch",
-            Some("main"),
-            crate::storage::BranchOptions::default(),
-        ).expect("Failed to create branch");
+        storage
+            .create_branch("test_branch", Some("main"), crate::storage::BranchOptions::default())
+            .expect("Failed to create branch");
 
         let registry = SystemViewRegistry::new();
-        let results = registry.execute("pg_database_branches", &storage)
+        let results = registry
+            .execute("pg_database_branches", &storage)
             .expect("Failed to execute pg_database_branches");
 
         // Should have at least 2 branches (main + test_branch)
@@ -4021,11 +4076,11 @@ mod tests {
     #[test]
     fn test_execute_pg_mv_staleness() {
         let config = Config::in_memory();
-        let storage = StorageEngine::open_in_memory(&config)
-            .expect("Failed to create storage");
+        let storage = StorageEngine::open_in_memory(&config).expect("Failed to create storage");
 
         let registry = SystemViewRegistry::new();
-        let results = registry.execute("pg_mv_staleness", &storage)
+        let results = registry
+            .execute("pg_mv_staleness", &storage)
             .expect("Failed to execute pg_mv_staleness");
 
         // Should return empty results if no materialized views exist
@@ -4035,11 +4090,11 @@ mod tests {
     #[test]
     fn test_execute_pg_vector_index_stats() {
         let config = Config::in_memory();
-        let storage = StorageEngine::open_in_memory(&config)
-            .expect("Failed to create storage");
+        let storage = StorageEngine::open_in_memory(&config).expect("Failed to create storage");
 
         let registry = SystemViewRegistry::new();
-        let results = registry.execute("pg_vector_index_stats", &storage)
+        let results = registry
+            .execute("pg_vector_index_stats", &storage)
             .expect("Failed to execute pg_vector_index_stats");
 
         // Should return empty results if no vector indexes exist

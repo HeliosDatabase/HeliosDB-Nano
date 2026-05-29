@@ -204,9 +204,10 @@ impl AdaptiveRadixTree {
         // Check for duplicates in PK and UNIQUE indexes
         if matches!(self.index_type, ArtIndexType::PrimaryKey | ArtIndexType::Unique) {
             if self.contains(key) {
-                return Err(ArtIndexError::DuplicateKey(
-                    format!("Key already exists in {} index", self.index_type)
-                ));
+                return Err(ArtIndexError::DuplicateKey(format!(
+                    "Key already exists in {} index",
+                    self.index_type
+                )));
             }
         }
 
@@ -228,7 +229,9 @@ impl AdaptiveRadixTree {
 
     /// Internal recursive insert
     fn insert_recursive(&mut self, key: &[u8], value: RowId, depth: usize) -> ArtResult<()> {
-        let root = self.root.take()
+        let root = self
+            .root
+            .take()
             .ok_or_else(|| ArtIndexError::Internal("Missing root node during insert".to_string()))?;
         self.root = Some(self.insert_into_node(root, key, value, depth)?);
         Ok(())
@@ -317,7 +320,11 @@ impl AdaptiveRadixTree {
                 if !node.header().values.is_empty() {
                     return Err(ArtIndexError::DuplicateKey(format!(
                         "Key already exists in {} index '{}'",
-                        if self.index_type == ArtIndexType::PrimaryKey { "primary key" } else { "unique" },
+                        if self.index_type == ArtIndexType::PrimaryKey {
+                            "primary key"
+                        } else {
+                            "unique"
+                        },
                         self.name
                     )));
                 }
@@ -334,14 +341,16 @@ impl AdaptiveRadixTree {
             match &mut node {
                 ArtNode::Node4(n) => {
                     if let Some(idx) = n.find_child_index(next_byte) {
-                        let child = n.children[idx].take()
+                        let child = n.children[idx]
+                            .take()
                             .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node4 child".to_string()))?;
                         n.children[idx] = Some(self.insert_into_node(child, key, value, new_depth + 1)?);
                     }
                 }
                 ArtNode::Node16(n) => {
                     if let Some(idx) = n.find_child_index(next_byte) {
-                        let child = n.children[idx].take()
+                        let child = n.children[idx]
+                            .take()
                             .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node16 child".to_string()))?;
                         n.children[idx] = Some(self.insert_into_node(child, key, value, new_depth + 1)?);
                     }
@@ -349,13 +358,15 @@ impl AdaptiveRadixTree {
                 ArtNode::Node48(n) => {
                     let idx = n.child_index[next_byte as usize];
                     if idx != 255 {
-                        let child = n.children[idx as usize].take()
+                        let child = n.children[idx as usize]
+                            .take()
                             .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node48 child".to_string()))?;
                         n.children[idx as usize] = Some(self.insert_into_node(child, key, value, new_depth + 1)?);
                     }
                 }
                 ArtNode::Node256(n) => {
-                    let child = n.children[next_byte as usize].take()
+                    let child = n.children[next_byte as usize]
+                        .take()
                         .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node256 child".to_string()))?;
                     n.children[next_byte as usize] = Some(self.insert_into_node(child, key, value, new_depth + 1)?);
                 }
@@ -415,7 +426,14 @@ impl AdaptiveRadixTree {
     }
 
     /// Split a node when prefix doesn't match
-    fn split_node(&mut self, mut node: ArtNode, key: &[u8], value: RowId, depth: usize, mismatch_pos: usize) -> ArtResult<ArtNode> {
+    fn split_node(
+        &mut self,
+        mut node: ArtNode,
+        key: &[u8],
+        value: RowId,
+        depth: usize,
+        mismatch_pos: usize,
+    ) -> ArtResult<ArtNode> {
         let header = node.header();
         let old_prefix = header.get_prefix().to_vec();
         let old_prefix_len = header.prefix_len as usize;
@@ -555,7 +573,9 @@ impl AdaptiveRadixTree {
         }
 
         // Take the root to avoid borrow issues
-        let root = self.root.take()
+        let root = self
+            .root
+            .take()
             .ok_or_else(|| ArtIndexError::Internal("Missing root node during remove".to_string()))?;
         let (new_root, removed_value) = self.remove_recursive(root, key, 0)?;
         self.root = new_root;
@@ -570,7 +590,12 @@ impl AdaptiveRadixTree {
     }
 
     /// Internal recursive remove (removes ALL values for the key)
-    fn remove_recursive(&mut self, node: ArtNode, key: &[u8], depth: usize) -> ArtResult<(Option<ArtNode>, Option<RowId>)> {
+    fn remove_recursive(
+        &mut self,
+        node: ArtNode,
+        key: &[u8],
+        depth: usize,
+    ) -> ArtResult<(Option<ArtNode>, Option<RowId>)> {
         match node {
             ArtNode::Leaf(leaf) => {
                 if leaf.matches(key) {
@@ -617,7 +642,8 @@ impl AdaptiveRadixTree {
                 let removed = match &mut inner {
                     ArtNode::Node4(n) => {
                         if let Some(idx) = n.find_child_index(next_byte) {
-                            let child = n.children[idx].take()
+                            let child = n.children[idx]
+                                .take()
                                 .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node4 child".to_string()))?;
                             let (new_child, value) = self.remove_recursive(child, key, new_depth + 1)?;
                             if new_child.is_some() {
@@ -633,7 +659,8 @@ impl AdaptiveRadixTree {
                     }
                     ArtNode::Node16(n) => {
                         if let Some(idx) = n.find_child_index(next_byte) {
-                            let child = n.children[idx].take()
+                            let child = n.children[idx]
+                                .take()
                                 .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node16 child".to_string()))?;
                             let (new_child, value) = self.remove_recursive(child, key, new_depth + 1)?;
                             if new_child.is_some() {
@@ -649,7 +676,8 @@ impl AdaptiveRadixTree {
                     ArtNode::Node48(n) => {
                         let idx = n.child_index[next_byte as usize];
                         if idx != 255 {
-                            let child = n.children[idx as usize].take()
+                            let child = n.children[idx as usize]
+                                .take()
                                 .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node48 child".to_string()))?;
                             let (new_child, value) = self.remove_recursive(child, key, new_depth + 1)?;
                             if new_child.is_some() {
@@ -693,7 +721,9 @@ impl AdaptiveRadixTree {
             return Ok(false);
         }
 
-        let root = self.root.take()
+        let root = self
+            .root
+            .take()
             .ok_or_else(|| ArtIndexError::Internal("Missing root node during remove_value".to_string()))?;
         let (new_root, removed) = self.remove_value_recursive(root, key, row_id, 0)?;
         self.root = new_root;
@@ -707,7 +737,13 @@ impl AdaptiveRadixTree {
     }
 
     /// Internal recursive remove_value - removes a specific row_id from a key's values
-    fn remove_value_recursive(&mut self, node: ArtNode, key: &[u8], row_id: RowId, depth: usize) -> ArtResult<(Option<ArtNode>, bool)> {
+    fn remove_value_recursive(
+        &mut self,
+        node: ArtNode,
+        key: &[u8],
+        row_id: RowId,
+        depth: usize,
+    ) -> ArtResult<(Option<ArtNode>, bool)> {
         match node {
             ArtNode::Leaf(mut leaf) => {
                 if leaf.matches(key) {
@@ -752,9 +788,11 @@ impl AdaptiveRadixTree {
                 let removed = match &mut inner {
                     ArtNode::Node4(n) => {
                         if let Some(idx) = n.find_child_index(next_byte) {
-                            let child = n.children[idx].take()
+                            let child = n.children[idx]
+                                .take()
                                 .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node4 child".to_string()))?;
-                            let (new_child, removed) = self.remove_value_recursive(child, key, row_id, new_depth + 1)?;
+                            let (new_child, removed) =
+                                self.remove_value_recursive(child, key, row_id, new_depth + 1)?;
                             if new_child.is_some() {
                                 n.children[idx] = new_child;
                             } else {
@@ -767,9 +805,11 @@ impl AdaptiveRadixTree {
                     }
                     ArtNode::Node16(n) => {
                         if let Some(idx) = n.find_child_index(next_byte) {
-                            let child = n.children[idx].take()
+                            let child = n.children[idx]
+                                .take()
                                 .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node16 child".to_string()))?;
-                            let (new_child, removed) = self.remove_value_recursive(child, key, row_id, new_depth + 1)?;
+                            let (new_child, removed) =
+                                self.remove_value_recursive(child, key, row_id, new_depth + 1)?;
                             if new_child.is_some() {
                                 n.children[idx] = new_child;
                             } else {
@@ -783,9 +823,11 @@ impl AdaptiveRadixTree {
                     ArtNode::Node48(n) => {
                         let idx = n.child_index[next_byte as usize];
                         if idx != 255 {
-                            let child = n.children[idx as usize].take()
+                            let child = n.children[idx as usize]
+                                .take()
                                 .ok_or_else(|| ArtIndexError::Internal("Inconsistent Node48 child".to_string()))?;
-                            let (new_child, removed) = self.remove_value_recursive(child, key, row_id, new_depth + 1)?;
+                            let (new_child, removed) =
+                                self.remove_value_recursive(child, key, row_id, new_depth + 1)?;
                             if new_child.is_some() {
                                 n.children[idx as usize] = new_child;
                             } else {
@@ -798,7 +840,8 @@ impl AdaptiveRadixTree {
                     }
                     ArtNode::Node256(n) => {
                         if let Some(child) = n.children[next_byte as usize].take() {
-                            let (new_child, removed) = self.remove_value_recursive(child, key, row_id, new_depth + 1)?;
+                            let (new_child, removed) =
+                                self.remove_value_recursive(child, key, row_id, new_depth + 1)?;
                             n.children[next_byte as usize] = new_child;
                             if n.children[next_byte as usize].is_none() {
                                 n.header.num_children -= 1;
@@ -846,7 +889,8 @@ impl AdaptiveRadixTree {
 
     /// Range scan from start (inclusive) to end (exclusive)
     pub fn range<'a>(&'a self, start: &'a [u8], end: &'a [u8]) -> impl Iterator<Item = (Vec<u8>, RowId)> + 'a {
-        self.iter().filter(move |(k, _)| k.as_slice() >= start && k.as_slice() < end)
+        self.iter()
+            .filter(move |(k, _)| k.as_slice() >= start && k.as_slice() < end)
     }
 
     /// Prefix scan - find all keys with the given prefix
@@ -876,7 +920,10 @@ impl<'a> ArtIterator<'a> {
         if let Some(root) = &tree.root {
             stack.push_back((root, Vec::new()));
         }
-        Self { stack, pending_values: VecDeque::new() }
+        Self {
+            stack,
+            pending_values: VecDeque::new(),
+        }
     }
 }
 

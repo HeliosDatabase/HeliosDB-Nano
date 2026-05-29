@@ -2,15 +2,15 @@
 //!
 //! Provides unified management for multiple protocol servers (Oracle, PostgreSQL, etc.)
 
-use crate::{Result, Error, EmbeddedDatabase};
 use super::oracle::OracleServer;
-use crate::protocols::OracleServerConfig;
-use crate::protocol::postgres::server::{PgServer, PgServerConfig};
 use crate::protocol::postgres::auth::AuthMethod;
-use std::sync::Arc;
+use crate::protocol::postgres::server::{PgServer, PgServerConfig};
+use crate::protocols::OracleServerConfig;
+use crate::{EmbeddedDatabase, Error, Result};
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::sync::broadcast;
-use tracing::{info, error};
+use tracing::{error, info};
 
 /// Server shutdown signal
 type ShutdownSignal = broadcast::Receiver<()>;
@@ -118,16 +118,12 @@ impl ServerManager {
         if self.config.enable_oracle {
             info!(
                 "Starting Oracle TNS server on {}:{}",
-                self.config.oracle_config.listen_addr,
-                self.config.oracle_config.port
+                self.config.oracle_config.listen_addr, self.config.oracle_config.port
             );
 
             // Oracle server uses Arc<StorageEngine> which is now stored in database
             let storage = Arc::clone(&database.storage);
-            let oracle_server = OracleServer::new(
-                storage,
-                self.config.oracle_config.clone(),
-            );
+            let oracle_server = OracleServer::new(storage, self.config.oracle_config.clone());
 
             let mut shutdown_rx = self.shutdown_tx.subscribe();
             let oracle_task = tokio::spawn(async move {
@@ -150,8 +146,7 @@ impl ServerManager {
         if self.config.enable_postgres {
             info!(
                 "Starting PostgreSQL protocol server on {}:{}",
-                self.config.postgres_addr,
-                self.config.postgres_port
+                self.config.postgres_addr, self.config.postgres_port
             );
 
             // Parse PostgreSQL server address
@@ -191,8 +186,7 @@ impl ServerManager {
 
         info!(
             "Protocol servers started: Oracle={}, PostgreSQL={}",
-            self.config.enable_oracle,
-            self.config.enable_postgres
+            self.config.enable_oracle, self.config.enable_postgres
         );
 
         // Wait for Ctrl+C

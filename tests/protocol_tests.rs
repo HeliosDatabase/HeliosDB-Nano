@@ -2,8 +2,8 @@
 //!
 //! Tests for message encoding/decoding and protocol flows
 
-use heliosdb_nano::{Value, Schema, Column, DataType, ColumnStorageMode};
 use bytes::{BufMut, BytesMut};
+use heliosdb_nano::{Column, ColumnStorageMode, DataType, Schema, Value};
 
 /// Helper to write a C string (null-terminated)
 fn write_cstring(buf: &mut BytesMut, s: &str) {
@@ -13,7 +13,7 @@ fn write_cstring(buf: &mut BytesMut, s: &str) {
 
 #[tokio::test]
 async fn test_message_encoding_authentication_ok() {
-    use heliosdb_nano::network::protocol::{MessageEncoder, BackendMessage, AuthenticationMessage};
+    use heliosdb_nano::network::protocol::{AuthenticationMessage, BackendMessage, MessageEncoder};
 
     let mut encoder = MessageEncoder::new();
     let msg = BackendMessage::Authentication(AuthenticationMessage::Ok);
@@ -30,7 +30,7 @@ async fn test_message_encoding_authentication_ok() {
 
 #[tokio::test]
 async fn test_message_encoding_ready_for_query() {
-    use heliosdb_nano::network::protocol::{MessageEncoder, BackendMessage, TransactionStatus};
+    use heliosdb_nano::network::protocol::{BackendMessage, MessageEncoder, TransactionStatus};
 
     let mut encoder = MessageEncoder::new();
     let msg = BackendMessage::ReadyForQuery {
@@ -44,7 +44,7 @@ async fn test_message_encoding_ready_for_query() {
 
 #[tokio::test]
 async fn test_message_encoding_command_complete() {
-    use heliosdb_nano::network::protocol::{MessageEncoder, BackendMessage};
+    use heliosdb_nano::network::protocol::{BackendMessage, MessageEncoder};
 
     let mut encoder = MessageEncoder::new();
     let msg = BackendMessage::CommandComplete {
@@ -53,15 +53,15 @@ async fn test_message_encoding_command_complete() {
     let encoded = encoder.encode(&msg).unwrap();
 
     assert_eq!(encoded[0], b'C'); // CommandComplete message type
-    // Verify the tag is in the message
+                                  // Verify the tag is in the message
     let tag_start = 5; // After type (1) + length (4)
-    let tag_bytes = &encoded[tag_start..encoded.len()-1]; // Exclude null terminator
+    let tag_bytes = &encoded[tag_start..encoded.len() - 1]; // Exclude null terminator
     assert_eq!(std::str::from_utf8(tag_bytes).unwrap(), "SELECT 5");
 }
 
 #[tokio::test]
 async fn test_message_encoding_error_response() {
-    use heliosdb_nano::network::protocol::{MessageEncoder, BackendMessage, error_fields};
+    use heliosdb_nano::network::protocol::{error_fields, BackendMessage, MessageEncoder};
     use std::collections::HashMap;
 
     let mut encoder = MessageEncoder::new();
@@ -84,7 +84,7 @@ async fn test_message_encoding_error_response() {
 
 #[tokio::test]
 async fn test_message_encoding_row_description() {
-    use heliosdb_nano::network::protocol::{MessageEncoder, BackendMessage, FieldDescription};
+    use heliosdb_nano::network::protocol::{BackendMessage, FieldDescription, MessageEncoder};
 
     let mut encoder = MessageEncoder::new();
     let msg = BackendMessage::RowDescription {
@@ -120,7 +120,7 @@ async fn test_message_encoding_row_description() {
 
 #[tokio::test]
 async fn test_message_encoding_data_row() {
-    use heliosdb_nano::network::protocol::{MessageEncoder, BackendMessage};
+    use heliosdb_nano::network::protocol::{BackendMessage, MessageEncoder};
 
     let mut encoder = MessageEncoder::new();
     let msg = BackendMessage::DataRow {
@@ -141,7 +141,7 @@ async fn test_message_encoding_data_row() {
 
 #[tokio::test]
 async fn test_message_decoding_query() {
-    use heliosdb_nano::network::protocol::{MessageDecoder, FrontendMessage};
+    use heliosdb_nano::network::protocol::{FrontendMessage, MessageDecoder};
 
     let mut decoder = MessageDecoder::new();
 
@@ -168,7 +168,7 @@ async fn test_message_decoding_query() {
 
 #[tokio::test]
 async fn test_message_decoding_parse() {
-    use heliosdb_nano::network::protocol::{MessageDecoder, FrontendMessage};
+    use heliosdb_nano::network::protocol::{FrontendMessage, MessageDecoder};
 
     let mut decoder = MessageDecoder::new();
 
@@ -192,7 +192,11 @@ async fn test_message_decoding_parse() {
     let msg = decoder.decode().unwrap();
 
     match msg {
-        Some(FrontendMessage::Parse { statement_name, query: q, param_types }) => {
+        Some(FrontendMessage::Parse {
+            statement_name,
+            query: q,
+            param_types,
+        }) => {
             assert_eq!(statement_name, "");
             assert_eq!(q, "SELECT $1");
             assert_eq!(param_types.len(), 1);
@@ -204,7 +208,7 @@ async fn test_message_decoding_parse() {
 
 #[tokio::test]
 async fn test_message_decoding_bind() {
-    use heliosdb_nano::network::protocol::{MessageDecoder, FrontendMessage};
+    use heliosdb_nano::network::protocol::{FrontendMessage, MessageDecoder};
 
     let mut decoder = MessageDecoder::new();
 
@@ -238,7 +242,12 @@ async fn test_message_decoding_bind() {
     let msg = decoder.decode().unwrap();
 
     match msg {
-        Some(FrontendMessage::Bind { portal_name: p, statement_name: s, params, .. }) => {
+        Some(FrontendMessage::Bind {
+            portal_name: p,
+            statement_name: s,
+            params,
+            ..
+        }) => {
             assert_eq!(p, "");
             assert_eq!(s, "");
             assert_eq!(params.len(), 1);
@@ -250,7 +259,7 @@ async fn test_message_decoding_bind() {
 
 #[tokio::test]
 async fn test_message_decoding_execute() {
-    use heliosdb_nano::network::protocol::{MessageDecoder, FrontendMessage};
+    use heliosdb_nano::network::protocol::{FrontendMessage, MessageDecoder};
 
     let mut decoder = MessageDecoder::new();
 
@@ -270,7 +279,10 @@ async fn test_message_decoding_execute() {
     let msg = decoder.decode().unwrap();
 
     match msg {
-        Some(FrontendMessage::Execute { portal_name: p, max_rows: m }) => {
+        Some(FrontendMessage::Execute {
+            portal_name: p,
+            max_rows: m,
+        }) => {
             assert_eq!(p, "");
             assert_eq!(m, 0);
         }
@@ -280,7 +292,7 @@ async fn test_message_decoding_execute() {
 
 #[tokio::test]
 async fn test_message_decoding_sync() {
-    use heliosdb_nano::network::protocol::{MessageDecoder, FrontendMessage};
+    use heliosdb_nano::network::protocol::{FrontendMessage, MessageDecoder};
 
     let mut decoder = MessageDecoder::new();
 

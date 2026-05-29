@@ -4,8 +4,8 @@
 
 #![cfg(test)]
 
-use heliosdb_nano::{EmbeddedDatabase, Result};
 use heliosdb_nano::session::IsolationLevel;
+use heliosdb_nano::{EmbeddedDatabase, Result};
 
 #[test]
 fn test_session_lifecycle() -> Result<()> {
@@ -13,13 +13,13 @@ fn test_session_lifecycle() -> Result<()> {
 
     // Create session
     let session_id = db.create_session("alice", IsolationLevel::ReadCommitted)?;
-    
+
     // Use session
     db.execute_in_session(session_id, "CREATE TABLE test (id INT)")?;
-    
+
     // Destroy session
     db.destroy_session(session_id)?;
-    
+
     // Using destroyed session should fail
     let result = db.execute_in_session(session_id, "INSERT INTO test VALUES (1)");
     assert!(result.is_err());

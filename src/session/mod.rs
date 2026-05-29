@@ -45,7 +45,5 @@
 mod manager;
 mod types;
 
-pub use manager::{SessionManager, ResourceQuota};
-pub use types::{
-    Session, SessionId, SessionStats, IsolationLevel, UserId, User,
-};
+pub use manager::{ResourceQuota, SessionManager};
+pub use types::{IsolationLevel, Session, SessionId, SessionStats, User, UserId};

@@ -32,9 +32,7 @@ mod plpgsql_hardening_tests {
     fn test_create_procedure_no_params() {
         let db = new_db();
         db.execute("CREATE TABLE plp_nop(id INT)").unwrap();
-        let result = db.execute(
-            "CREATE PROCEDURE plp_nop_proc() LANGUAGE sql AS $$INSERT INTO plp_nop VALUES (1)$$"
-        );
+        let result = db.execute("CREATE PROCEDURE plp_nop_proc() LANGUAGE sql AS $$INSERT INTO plp_nop VALUES (1)$$");
         match result {
             Ok(_) => {
                 // Procedure created successfully; verify it can be called
@@ -83,9 +81,8 @@ mod plpgsql_hardening_tests {
     fn test_call_procedure_basic() {
         let db = new_db();
         db.execute("CREATE TABLE plp_call(val INT)").unwrap();
-        let create = db.execute(
-            "CREATE PROCEDURE plp_call_proc() LANGUAGE sql AS $$INSERT INTO plp_call VALUES (99)$$"
-        );
+        let create =
+            db.execute("CREATE PROCEDURE plp_call_proc() LANGUAGE sql AS $$INSERT INTO plp_call VALUES (99)$$");
         match create {
             Ok(_) => {
                 let result = db.execute("CALL plp_call_proc()");
@@ -108,14 +105,12 @@ mod plpgsql_hardening_tests {
         db.execute("CREATE TABLE plp_repl(val INT)").unwrap();
 
         // Create initial procedure
-        let r1 = db.execute(
-            "CREATE PROCEDURE plp_repl_proc() LANGUAGE sql AS $$INSERT INTO plp_repl VALUES (1)$$"
-        );
+        let r1 = db.execute("CREATE PROCEDURE plp_repl_proc() LANGUAGE sql AS $$INSERT INTO plp_repl VALUES (1)$$");
         match r1 {
             Ok(_) => {
                 // Replace it
                 let r2 = db.execute(
-                    "CREATE OR REPLACE PROCEDURE plp_repl_proc() LANGUAGE sql AS $$INSERT INTO plp_repl VALUES (2)$$"
+                    "CREATE OR REPLACE PROCEDURE plp_repl_proc() LANGUAGE sql AS $$INSERT INTO plp_repl VALUES (2)$$",
                 );
                 match r2 {
                     Ok(_) => {
@@ -135,9 +130,7 @@ mod plpgsql_hardening_tests {
     #[test]
     fn test_drop_procedure() {
         let db = new_db();
-        let create = db.execute(
-            "CREATE PROCEDURE plp_drop_proc() LANGUAGE sql AS $$SELECT 1$$"
-        );
+        let create = db.execute("CREATE PROCEDURE plp_drop_proc() LANGUAGE sql AS $$SELECT 1$$");
         match create {
             Ok(_) => {
                 let drop_result = db.execute("DROP PROCEDURE plp_drop_proc");
@@ -176,7 +169,7 @@ mod plpgsql_hardening_tests {
                 INSERT INTO plp_multi VALUES (1, 'first');\n\
                 INSERT INTO plp_multi VALUES (2, 'second');\n\
             END;\n\
-            $$"
+            $$",
         );
         match result {
             Ok(_) => {
@@ -200,9 +193,8 @@ mod plpgsql_hardening_tests {
     #[test]
     fn test_create_function_returns_type() {
         let db = new_db();
-        let result = db.execute(
-            "CREATE FUNCTION plp_add(a INTEGER, b INTEGER) RETURNS INTEGER LANGUAGE sql AS 'SELECT a + b'"
-        );
+        let result =
+            db.execute("CREATE FUNCTION plp_add(a INTEGER, b INTEGER) RETURNS INTEGER LANGUAGE sql AS 'SELECT a + b'");
         match result {
             Ok(_) => { /* function created */ }
             Err(e) => eprintln!("[NOT IMPLEMENTED] CREATE FUNCTION RETURNS: {}", e),
@@ -214,9 +206,7 @@ mod plpgsql_hardening_tests {
         // NOTE: User-defined functions in SELECT are NOT wired up in the evaluator.
         // This test documents that limitation.
         let db = new_db();
-        let create = db.execute(
-            "CREATE FUNCTION plp_double(x INTEGER) RETURNS INTEGER LANGUAGE sql AS 'SELECT x * 2'"
-        );
+        let create = db.execute("CREATE FUNCTION plp_double(x INTEGER) RETURNS INTEGER LANGUAGE sql AS 'SELECT x * 2'");
         match create {
             Ok(_) => {
                 let result = db.query("SELECT plp_double(5)", &[]);
@@ -240,7 +230,7 @@ mod plpgsql_hardening_tests {
     fn test_function_with_multiple_params() {
         let db = new_db();
         let result = db.execute(
-            "CREATE FUNCTION plp_concat3(a TEXT, b TEXT, c TEXT) RETURNS TEXT LANGUAGE sql AS $$SELECT a || b || c$$"
+            "CREATE FUNCTION plp_concat3(a TEXT, b TEXT, c TEXT) RETURNS TEXT LANGUAGE sql AS $$SELECT a || b || c$$",
         );
         match result {
             Ok(_) => { /* created */ }
@@ -264,9 +254,7 @@ mod plpgsql_hardening_tests {
     #[test]
     fn test_drop_function() {
         let db = new_db();
-        let create = db.execute(
-            "CREATE FUNCTION plp_dropme() RETURNS INTEGER LANGUAGE sql AS 'SELECT 1'"
-        );
+        let create = db.execute("CREATE FUNCTION plp_dropme() RETURNS INTEGER LANGUAGE sql AS 'SELECT 1'");
         match create {
             Ok(_) => {
                 let drop = db.execute("DROP FUNCTION plp_dropme");
@@ -293,21 +281,22 @@ mod plpgsql_hardening_tests {
     fn test_function_overloading() {
         // Same name different param count - registry uses name only (no overloading support expected)
         let db = new_db();
-        let r1 = db.execute(
-            "CREATE FUNCTION plp_overload(a INTEGER) RETURNS INTEGER LANGUAGE sql AS 'SELECT a'"
-        );
+        let r1 = db.execute("CREATE FUNCTION plp_overload(a INTEGER) RETURNS INTEGER LANGUAGE sql AS 'SELECT a'");
         match r1 {
             Ok(_) => {
                 // Try to create same-named function with different params (should fail without OR REPLACE)
                 let r2 = db.execute(
-                    "CREATE FUNCTION plp_overload(a INTEGER, b INTEGER) RETURNS INTEGER LANGUAGE sql AS 'SELECT a + b'"
+                    "CREATE FUNCTION plp_overload(a INTEGER, b INTEGER) RETURNS INTEGER LANGUAGE sql AS 'SELECT a + b'",
                 );
                 match r2 {
                     Ok(_) => eprintln!("[INFO] Function overloading supported (replaced existing)"),
                     Err(e) => {
                         // Expected: function already exists
-                        assert!(e.to_string().to_lowercase().contains("already exists"),
-                            "Expected 'already exists' error, got: {}", e);
+                        assert!(
+                            e.to_string().to_lowercase().contains("already exists"),
+                            "Expected 'already exists' error, got: {}",
+                            e
+                        );
                     }
                 }
             }
@@ -334,7 +323,7 @@ mod plpgsql_hardening_tests {
                     INSERT INTO plp_if VALUES ('small');\n\
                 END IF;\n\
             END;\n\
-            $$"
+            $$",
         );
         match create {
             Ok(_) => {
@@ -367,7 +356,7 @@ mod plpgsql_hardening_tests {
                     EXIT WHEN i >= 3;\n\
                 END LOOP;\n\
             END;\n\
-            $$"
+            $$",
         );
         match create {
             Ok(_) => {
@@ -398,7 +387,7 @@ mod plpgsql_hardening_tests {
                     counter := counter + 1;\n\
                 END LOOP;\n\
             END;\n\
-            $$"
+            $$",
         );
         match create {
             Ok(_) => {
@@ -433,7 +422,7 @@ mod plpgsql_hardening_tests {
                     INSERT INTO plp_for VALUES (i);\n\
                 END LOOP;\n\
             END;\n\
-            $$"
+            $$",
         );
         match create {
             Ok(_) => {
@@ -458,7 +447,7 @@ mod plpgsql_hardening_tests {
             BEGIN\n\
                 RETURN x * 10;\n\
             END;\n\
-            $$"
+            $$",
         );
         match create {
             Ok(_) => {
@@ -497,7 +486,7 @@ mod plpgsql_hardening_tests {
                 y := 20;\n\
                 INSERT INTO plp_decl VALUES (x + y);\n\
             END;\n\
-            $$"
+            $$",
         );
         match create {
             Ok(_) => {
@@ -529,7 +518,7 @@ mod plpgsql_hardening_tests {
                 result := 5 + 3;\n\
                 INSERT INTO plp_assign VALUES (result);\n\
             END;\n\
-            $$"
+            $$",
         );
         match create {
             Ok(_) => {
@@ -557,7 +546,7 @@ mod plpgsql_hardening_tests {
             BEGIN\n\
                 INSERT INTO plp_def VALUES (x);\n\
             END;\n\
-            $$"
+            $$",
         );
         match create {
             Ok(_) => {
@@ -585,7 +574,7 @@ mod plpgsql_hardening_tests {
             BEGIN\n\
                 INSERT INTO plp_cast VALUES (CAST(num AS TEXT));\n\
             END;\n\
-            $$"
+            $$",
         );
         match create {
             Ok(_) => {
@@ -661,7 +650,7 @@ mod plpgsql_hardening_tests {
         db.execute("INSERT INTO plp_del VALUES (1)").unwrap();
         db.execute("INSERT INTO plp_del VALUES (2)").unwrap();
         let create = db.execute(
-            "CREATE PROCEDURE plp_del_proc(p_id INTEGER) LANGUAGE sql AS $$DELETE FROM plp_del WHERE id = $p_id$$"
+            "CREATE PROCEDURE plp_del_proc(p_id INTEGER) LANGUAGE sql AS $$DELETE FROM plp_del WHERE id = $p_id$$",
         );
         match create {
             Ok(_) => {
@@ -693,7 +682,7 @@ mod plpgsql_hardening_tests {
                 SELECT val INTO v_val FROM plp_selinto WHERE id = 1;\n\
                 INSERT INTO plp_selinto_out VALUES (v_val);\n\
             END;\n\
-            $$"
+            $$",
         );
         match create {
             Ok(_) => {
@@ -725,7 +714,7 @@ mod plpgsql_hardening_tests {
                     i := i + 1;\n\
                 END LOOP;\n\
             END;\n\
-            $$"
+            $$",
         );
         match create {
             Ok(_) => {
@@ -765,16 +754,12 @@ mod plpgsql_hardening_tests {
     #[test]
     fn test_create_function_then_drop_then_recreate() {
         let db = new_db();
-        let r1 = db.execute(
-            "CREATE FUNCTION plp_lifecycle() RETURNS INTEGER LANGUAGE sql AS 'SELECT 1'"
-        );
+        let r1 = db.execute("CREATE FUNCTION plp_lifecycle() RETURNS INTEGER LANGUAGE sql AS 'SELECT 1'");
         match r1 {
             Ok(_) => {
                 db.execute("DROP FUNCTION plp_lifecycle").unwrap();
                 // Recreate after drop
-                let r2 = db.execute(
-                    "CREATE FUNCTION plp_lifecycle() RETURNS INTEGER LANGUAGE sql AS 'SELECT 2'"
-                );
+                let r2 = db.execute("CREATE FUNCTION plp_lifecycle() RETURNS INTEGER LANGUAGE sql AS 'SELECT 2'");
                 assert!(r2.is_ok(), "Recreating dropped function should succeed");
             }
             Err(e) => eprintln!("[NOT IMPLEMENTED] Function lifecycle: {}", e),
@@ -784,15 +769,14 @@ mod plpgsql_hardening_tests {
     #[test]
     fn test_create_duplicate_function_fails() {
         let db = new_db();
-        let r1 = db.execute(
-            "CREATE FUNCTION plp_dup() RETURNS INTEGER LANGUAGE sql AS 'SELECT 1'"
-        );
+        let r1 = db.execute("CREATE FUNCTION plp_dup() RETURNS INTEGER LANGUAGE sql AS 'SELECT 1'");
         match r1 {
             Ok(_) => {
-                let r2 = db.execute(
-                    "CREATE FUNCTION plp_dup() RETURNS INTEGER LANGUAGE sql AS 'SELECT 2'"
+                let r2 = db.execute("CREATE FUNCTION plp_dup() RETURNS INTEGER LANGUAGE sql AS 'SELECT 2'");
+                assert!(
+                    r2.is_err(),
+                    "Creating duplicate function without OR REPLACE should fail"
                 );
-                assert!(r2.is_err(), "Creating duplicate function without OR REPLACE should fail");
             }
             Err(e) => eprintln!("[NOT IMPLEMENTED] Duplicate function test: {}", e),
         }

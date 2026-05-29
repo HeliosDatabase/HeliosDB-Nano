@@ -14,10 +14,7 @@ fn create_semantic_hash_index_materialises_rollup() {
         .unwrap();
     db.execute_params_returning(
         "INSERT INTO src VALUES ($1, 'rust', $2)",
-        &[
-            Value::String("a.rs".into()),
-            Value::String("pub fn foo() {}\n".into()),
-        ],
+        &[Value::String("a.rs".into()), Value::String("pub fn foo() {}\n".into())],
     )
     .unwrap();
     db.code_index(CodeIndexOptions::for_table("src")).unwrap();
@@ -47,10 +44,7 @@ fn create_semantic_hash_index_optional_on_clause() {
         .unwrap();
     db.execute_params_returning(
         "INSERT INTO src VALUES ($1, 'rust', $2)",
-        &[
-            Value::String("b.rs".into()),
-            Value::String("pub fn bar() {}\n".into()),
-        ],
+        &[Value::String("b.rs".into()), Value::String("pub fn bar() {}\n".into())],
     )
     .unwrap();
     db.code_index(CodeIndexOptions::for_table("src")).unwrap();

@@ -7,14 +7,14 @@
 //! to the local storage engine, keeping the standby synchronized with the primary.
 
 use super::config::PrimaryConfig;
-use super::wal_replicator::{Lsn, WalEntry};
 use super::ha_state::ha_state;
+use super::wal_replicator::{Lsn, WalEntry};
 use super::{ReplicationError, Result};
-use crate::storage::WalOperation;
 use crate::storage::StorageEngine;
+use crate::storage::WalOperation;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock, broadcast};
-use tracing::{debug, info, error};
+use tokio::sync::{broadcast, mpsc, RwLock};
+use tracing::{debug, error, info};
 
 /// Application result for a WAL entry
 #[derive(Debug, Clone)]
@@ -197,16 +197,13 @@ impl WalApplicator {
 
         // Deserialize the operation from entry data
         let operation: WalOperation = bincode::deserialize(&entry.data)
-            .map_err(|e| ReplicationError::WalStreaming(
-                format!("Failed to deserialize WAL operation: {}", e)
-            ))?;
+            .map_err(|e| ReplicationError::WalStreaming(format!("Failed to deserialize WAL operation: {}", e)))?;
 
         // Apply the operation to storage
         // The storage engine's apply_wal_operation handles all operation types
-        storage.apply_replicated_operation(operation)
-            .map_err(|e| ReplicationError::Storage(
-                format!("Failed to apply WAL operation: {}", e)
-            ))?;
+        storage
+            .apply_replicated_operation(operation)
+            .map_err(|e| ReplicationError::Storage(format!("Failed to apply WAL operation: {}", e)))?;
 
         // Update applied LSN
         *applied_lsn.write().await = entry.lsn;
@@ -331,8 +328,8 @@ impl WalApplicator {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::wal_replicator::WalEntryType;
+    use super::*;
     use std::time::Duration;
 
     #[tokio::test]

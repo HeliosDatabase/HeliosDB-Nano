@@ -6,12 +6,10 @@
 
 #![cfg(feature = "code-graph")]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
-use heliosdb_nano::code_graph::{
-    code_index_with_embedder, CodeIndexOptions, Embedder, NoopEmbedder,
-};
+use heliosdb_nano::code_graph::{code_index_with_embedder, CodeIndexOptions, Embedder, NoopEmbedder};
 use heliosdb_nano::{EmbeddedDatabase, Result, Value};
 
 #[derive(Debug)]
@@ -97,11 +95,7 @@ fn dimension_mismatch_errors_within_one_call() {
     impl Embedder for VarDimEmbedder {
         fn embed(&self, _text: &str) -> Result<Option<Vec<f32>>> {
             let first = self.first_call.swap(false, Ordering::SeqCst);
-            Ok(Some(if first {
-                vec![1.0; 8]
-            } else {
-                vec![1.0; 4]
-            }))
+            Ok(Some(if first { vec![1.0; 8] } else { vec![1.0; 4] }))
         }
     }
     let db = setup();
@@ -120,12 +114,7 @@ fn dimension_mismatch_errors_within_one_call() {
 #[test]
 fn noop_embedder_keeps_legacy_path() {
     let db = setup();
-    code_index_with_embedder(
-        &db,
-        CodeIndexOptions::for_table("src"),
-        Box::new(NoopEmbedder),
-    )
-    .unwrap();
+    code_index_with_embedder(&db, CodeIndexOptions::for_table("src"), Box::new(NoopEmbedder)).unwrap();
     // No vectors → no column.
     let r = db.query("SELECT body_vec FROM _hdb_code_symbols LIMIT 1", &[]);
     assert!(r.is_err());

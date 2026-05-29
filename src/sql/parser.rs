@@ -1,6 +1,6 @@
 //! SQL parser using sqlparser-rs
 
-use crate::{Result, Error, ColumnStorageMode};
+use crate::{ColumnStorageMode, Error, Result};
 use sqlparser::ast::Statement;
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser as SqlParser;
@@ -47,15 +47,29 @@ impl Parser {
 
             // Look for keywords that end the AS OF clause
             let end_keywords = [
-                "WHERE", "GROUP", "ORDER", "LIMIT", "UNION",
-                "INTERSECT", "EXCEPT", ")", ";", "HAVING"
+                "WHERE",
+                "GROUP",
+                "ORDER",
+                "LIMIT",
+                "UNION",
+                "INTERSECT",
+                "EXCEPT",
+                ")",
+                ";",
+                "HAVING",
             ];
 
             let mut end_pos = after_as_of.len();
             for keyword in &end_keywords {
                 if let Some(pos) = upper_after.find(keyword) {
                     // Make sure it's a word boundary (preceded by space or parenthesis)
-                    if pos == 0 || after_as_of.chars().nth(pos - 1).map(|c| c.is_whitespace() || c == ')').unwrap_or(false) {
+                    if pos == 0
+                        || after_as_of
+                            .chars()
+                            .nth(pos - 1)
+                            .map(|c| c.is_whitespace() || c == ')')
+                            .unwrap_or(false)
+                    {
                         end_pos = pos;
                         break;
                     }
@@ -184,7 +198,7 @@ impl Parser {
                 // Block comment: /* ... */
                 if i + 1 < chars.len() && chars[i] == '/' && chars[i + 1] == '*' {
                     i += 2; // Skip /*
-                    // Find closing */
+                            // Find closing */
                     while i + 1 < chars.len() && !(chars[i] == '*' && chars[i + 1] == '/') {
                         i += 1;
                     }
@@ -279,7 +293,9 @@ impl Parser {
         }
 
         // Safe to unwrap here because we checked len() == 1, but use ok_or for safety
-        statements.into_iter().next()
+        statements
+            .into_iter()
+            .next()
             .ok_or_else(|| Error::sql_parse("Unexpected: statement vector empty after length check"))
     }
 
@@ -345,8 +361,7 @@ impl Parser {
 
         // Check for INCREMENTALLY at the end
         let upper_remaining = after_concurrent.to_uppercase();
-        let incremental = upper_remaining.ends_with("INCREMENTALLY")
-            || upper_remaining.ends_with("INCREMENTALLY;");
+        let incremental = upper_remaining.ends_with("INCREMENTALLY") || upper_remaining.ends_with("INCREMENTALLY;");
 
         // Remove INCREMENTALLY from the end if present
         let without_incremental = if incremental {
@@ -358,7 +373,8 @@ impl Parser {
         };
 
         // Extract view name
-        let name_end = without_incremental.find(|c: char| c.is_whitespace() || c == ';')
+        let name_end = without_incremental
+            .find(|c: char| c.is_whitespace() || c == ';')
             .unwrap_or(without_incremental.len());
         let view_name = without_incremental[..name_end].trim().to_string();
 
@@ -396,7 +412,8 @@ impl Parser {
         };
 
         // Extract view name
-        let name_end = remaining.find(|c: char| c.is_whitespace() || c == ';')
+        let name_end = remaining
+            .find(|c: char| c.is_whitespace() || c == ';')
             .unwrap_or(remaining.len());
         let view_name = remaining[..name_end].trim().to_string();
 
@@ -454,7 +471,9 @@ impl Parser {
             if let Some(end) = end_paren {
                 &after_set[1..end]
             } else {
-                return Err(Error::query_execution("ALTER MATERIALIZED VIEW SET requires closing parenthesis"));
+                return Err(Error::query_execution(
+                    "ALTER MATERIALIZED VIEW SET requires closing parenthesis",
+                ));
             }
         } else {
             // Options without parentheses (single option)
@@ -472,16 +491,27 @@ impl Parser {
             let parts: Vec<&str> = pair.splitn(2, '=').collect();
             if parts.len() != 2 {
                 return Err(Error::query_execution(format!(
-                    "Invalid option format '{}', expected 'key = value'", pair
+                    "Invalid option format '{}', expected 'key = value'",
+                    pair
                 )));
             }
 
-            let key = parts.get(0).ok_or_else(|| Error::query_execution(
-                format!("Invalid option format '{}', expected 'key = value'", pair)
-            ))?.trim().to_lowercase();
-            let value = parts.get(1).ok_or_else(|| Error::query_execution(
-                format!("Invalid option format '{}', expected 'key = value'", pair)
-            ))?.trim().trim_matches('\'').trim_matches('"').to_string();
+            let key = parts
+                .get(0)
+                .ok_or_else(|| {
+                    Error::query_execution(format!("Invalid option format '{}', expected 'key = value'", pair))
+                })?
+                .trim()
+                .to_lowercase();
+            let value = parts
+                .get(1)
+                .ok_or_else(|| {
+                    Error::query_execution(format!("Invalid option format '{}', expected 'key = value'", pair))
+                })?
+                .trim()
+                .trim_matches('\'')
+                .trim_matches('"')
+                .to_string();
 
             // Validate known options
             match key.as_str() {
@@ -489,7 +519,8 @@ impl Parser {
                     // Validate numeric
                     if value.parse::<f64>().is_err() {
                         return Err(Error::query_execution(format!(
-                            "Option '{}' requires a numeric value, got '{}'", key, value
+                            "Option '{}' requires a numeric value, got '{}'",
+                            key, value
                         )));
                     }
                 }
@@ -497,7 +528,8 @@ impl Parser {
                     let lower = value.to_lowercase();
                     if !["manual", "auto", "incremental"].contains(&lower.as_str()) {
                         return Err(Error::query_execution(format!(
-                            "refresh_strategy must be 'manual', 'auto', or 'incremental', got '{}'", value
+                            "refresh_strategy must be 'manual', 'auto', or 'incremental', got '{}'",
+                            value
                         )));
                     }
                 }
@@ -505,7 +537,8 @@ impl Parser {
                     let lower = value.to_lowercase();
                     if !["true", "false"].contains(&lower.as_str()) {
                         return Err(Error::query_execution(format!(
-                            "incremental_enabled must be 'true' or 'false', got '{}'", value
+                            "incremental_enabled must be 'true' or 'false', got '{}'",
+                            value
                         )));
                     }
                 }
@@ -519,7 +552,9 @@ impl Parser {
         }
 
         if options.is_empty() {
-            return Err(Error::query_execution("ALTER MATERIALIZED VIEW SET requires at least one option"));
+            return Err(Error::query_execution(
+                "ALTER MATERIALIZED VIEW SET requires at least one option",
+            ));
         }
 
         Ok((view_name, options))
@@ -530,9 +565,7 @@ impl Parser {
     /// Syntax: ALTER TABLE `<table>` ALTER COLUMN `<column>` SET STORAGE `<mode>`
     pub fn is_alter_column_storage(sql: &str) -> bool {
         let upper = sql.trim().to_uppercase();
-        upper.starts_with("ALTER TABLE") &&
-        upper.contains("ALTER COLUMN") &&
-        upper.contains("SET STORAGE")
+        upper.starts_with("ALTER TABLE") && upper.contains("ALTER COLUMN") && upper.contains("SET STORAGE")
     }
 
     /// Parse ALTER TABLE ALTER COLUMN SET STORAGE statement
@@ -548,15 +581,16 @@ impl Parser {
         let cleaned = sql.trim();
 
         // Skip "ALTER TABLE"
-        let after_alter = cleaned.get(11..).ok_or_else(||
-            Error::query_execution("Invalid ALTER TABLE statement")
-        )?.trim_start();
+        let after_alter = cleaned
+            .get(11..)
+            .ok_or_else(|| Error::query_execution("Invalid ALTER TABLE statement"))?
+            .trim_start();
 
         // Extract table name (ends at ALTER)
         let upper_after = after_alter.to_uppercase();
-        let alter_pos = upper_after.find(" ALTER ").ok_or_else(||
-            Error::query_execution("ALTER TABLE requires ALTER COLUMN clause")
-        )?;
+        let alter_pos = upper_after
+            .find(" ALTER ")
+            .ok_or_else(|| Error::query_execution("ALTER TABLE requires ALTER COLUMN clause"))?;
 
         let table_name = after_alter[..alter_pos].trim().to_string();
         if table_name.is_empty() {
@@ -564,24 +598,26 @@ impl Parser {
         }
 
         // Skip " ALTER COLUMN "
-        let after_column = after_alter.get(alter_pos + 7..).ok_or_else(||
-            Error::query_execution("Invalid ALTER COLUMN clause")
-        )?.trim_start();
+        let after_column = after_alter
+            .get(alter_pos + 7..)
+            .ok_or_else(|| Error::query_execution("Invalid ALTER COLUMN clause"))?
+            .trim_start();
 
         let upper_column = after_column.to_uppercase();
         if !upper_column.starts_with("COLUMN ") {
             return Err(Error::query_execution("Expected COLUMN keyword after ALTER"));
         }
 
-        let after_col_keyword = after_column.get(7..).ok_or_else(||
-            Error::query_execution("Invalid ALTER COLUMN clause")
-        )?.trim_start();
+        let after_col_keyword = after_column
+            .get(7..)
+            .ok_or_else(|| Error::query_execution("Invalid ALTER COLUMN clause"))?
+            .trim_start();
 
         // Find SET STORAGE
         let upper_rest = after_col_keyword.to_uppercase();
-        let set_pos = upper_rest.find(" SET STORAGE").ok_or_else(||
-            Error::query_execution("ALTER COLUMN requires SET STORAGE clause")
-        )?;
+        let set_pos = upper_rest
+            .find(" SET STORAGE")
+            .ok_or_else(|| Error::query_execution("ALTER COLUMN requires SET STORAGE clause"))?;
 
         let column_name = after_col_keyword[..set_pos].trim().to_string();
         if column_name.is_empty() {
@@ -589,9 +625,10 @@ impl Parser {
         }
 
         // Extract storage mode (after " SET STORAGE ")
-        let after_storage = after_col_keyword.get(set_pos + 12..).ok_or_else(||
-            Error::query_execution("Invalid SET STORAGE clause")
-        )?.trim_start();
+        let after_storage = after_col_keyword
+            .get(set_pos + 12..)
+            .ok_or_else(|| Error::query_execution("Invalid SET STORAGE clause"))?
+            .trim_start();
 
         let mode_str = after_storage.trim_end_matches(';').trim().to_uppercase();
 
@@ -600,10 +637,12 @@ impl Parser {
             "DICTIONARY" => ColumnStorageMode::Dictionary,
             "CONTENT_ADDRESSED" => ColumnStorageMode::ContentAddressed,
             "COLUMNAR" => ColumnStorageMode::Columnar,
-            _ => return Err(Error::query_execution(format!(
-                "Invalid storage mode '{}'. Expected: DEFAULT, DICTIONARY, CONTENT_ADDRESSED, or COLUMNAR",
-                mode_str
-            ))),
+            _ => {
+                return Err(Error::query_execution(format!(
+                    "Invalid storage mode '{}'. Expected: DEFAULT, DICTIONARY, CONTENT_ADDRESSED, or COLUMNAR",
+                    mode_str
+                )))
+            }
         };
 
         Ok((table_name, column_name, storage_mode))
@@ -665,15 +704,19 @@ impl Parser {
 
                 // Skip if it looks like a constraint (PRIMARY, FOREIGN, UNIQUE, CHECK)
                 let first_word = col_name.to_uppercase();
-                if first_word == "PRIMARY" || first_word == "FOREIGN" ||
-                   first_word == "UNIQUE" || first_word == "CHECK" ||
-                   first_word == "CONSTRAINT" {
+                if first_word == "PRIMARY"
+                    || first_word == "FOREIGN"
+                    || first_word == "UNIQUE"
+                    || first_word == "CHECK"
+                    || first_word == "CONSTRAINT"
+                {
                     continue;
                 }
 
                 // Extract storage mode
                 let after_storage = &col_upper[storage_pos + 9..]; // " STORAGE ".len() = 9
-                let mode_end = after_storage.find(|c: char| !c.is_alphabetic() && c != '_')
+                let mode_end = after_storage
+                    .find(|c: char| !c.is_alphabetic() && c != '_')
                     .unwrap_or(after_storage.len());
                 let mode_str = after_storage[..mode_end].trim();
 
@@ -728,10 +771,18 @@ impl Parser {
                 let abs = i + p;
                 // Confirm word-bounded on both sides (so `IDENTITYX` isn't a hit).
                 let before_ok = abs == 0
-                    || !sql.as_bytes().get(abs - 1).map(|b| b.is_ascii_alphanumeric() || *b == b'_').unwrap_or(false);
+                    || !sql
+                        .as_bytes()
+                        .get(abs - 1)
+                        .map(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                        .unwrap_or(false);
                 let end_kw = abs + "AS IDENTITY".len();
                 let after_ok = end_kw >= n
-                    || !sql.as_bytes().get(end_kw).map(|b| b.is_ascii_alphanumeric() || *b == b'_').unwrap_or(false);
+                    || !sql
+                        .as_bytes()
+                        .get(end_kw)
+                        .map(|b| b.is_ascii_alphanumeric() || *b == b'_')
+                        .unwrap_or(false);
                 if !(before_ok && after_ok) {
                     // Copy through and continue past this occurrence.
                     let advance = (abs - i) + "AS IDENTITY".len();
@@ -792,7 +843,12 @@ impl Parser {
         let mut result = sql.to_string();
 
         // Remove all variations of STORAGE clause
-        for mode in &["STORAGE DICTIONARY", "STORAGE CONTENT_ADDRESSED", "STORAGE COLUMNAR", "STORAGE DEFAULT"] {
+        for mode in &[
+            "STORAGE DICTIONARY",
+            "STORAGE CONTENT_ADDRESSED",
+            "STORAGE COLUMNAR",
+            "STORAGE DEFAULT",
+        ] {
             loop {
                 let upper_result = result.to_uppercase();
                 if let Some(pos) = upper_result.find(mode) {
@@ -870,17 +926,17 @@ impl Parser {
     /// sqlparser expects: CREATE PROCEDURE name(...) AS BEGIN ... END
     pub fn is_pg_create_procedure(sql: &str) -> bool {
         let upper = sql.trim().to_uppercase();
-        upper.starts_with("CREATE PROCEDURE") &&
-        upper.contains("LANGUAGE") &&
-        (upper.contains(" AS ") || upper.contains(" AS$"))
+        upper.starts_with("CREATE PROCEDURE")
+            && upper.contains("LANGUAGE")
+            && (upper.contains(" AS ") || upper.contains(" AS$"))
     }
 
     /// Check if SQL is a PostgreSQL-style CREATE OR REPLACE PROCEDURE statement
     pub fn is_pg_create_or_replace_procedure(sql: &str) -> bool {
         let upper = sql.trim().to_uppercase();
-        upper.starts_with("CREATE OR REPLACE PROCEDURE") &&
-        upper.contains("LANGUAGE") &&
-        (upper.contains(" AS ") || upper.contains(" AS$"))
+        upper.starts_with("CREATE OR REPLACE PROCEDURE")
+            && upper.contains("LANGUAGE")
+            && (upper.contains(" AS ") || upper.contains(" AS$"))
     }
 
     /// Parse PostgreSQL-style CREATE [OR REPLACE] PROCEDURE statement
@@ -905,7 +961,8 @@ impl Parser {
         let after_create = cleaned[name_start..].trim_start();
 
         // Find the opening parenthesis for parameters
-        let paren_pos = after_create.find('(')
+        let paren_pos = after_create
+            .find('(')
             .ok_or_else(|| Error::sql_parse("CREATE PROCEDURE requires parameter list"))?;
 
         let proc_name = after_create[..paren_pos].trim().to_string();
@@ -928,14 +985,14 @@ impl Parser {
         let upper_after = after_params.to_uppercase();
 
         // Find LANGUAGE
-        let lang_pos = upper_after.find("LANGUAGE")
+        let lang_pos = upper_after
+            .find("LANGUAGE")
             .ok_or_else(|| Error::sql_parse("CREATE PROCEDURE requires LANGUAGE clause"))?;
 
         let after_lang = after_params[lang_pos + 8..].trim_start(); // "LANGUAGE".len() = 8
 
         // Extract language name (ends at whitespace or AS)
-        let lang_end = after_lang.find(|c: char| c.is_whitespace())
-            .unwrap_or(after_lang.len());
+        let lang_end = after_lang.find(|c: char| c.is_whitespace()).unwrap_or(after_lang.len());
         let language = after_lang[..lang_end].trim().to_string();
 
         // Find AS
@@ -1067,7 +1124,9 @@ impl Parser {
             return Err(Error::sql_parse("Unterminated string in procedure body"));
         }
 
-        Err(Error::sql_parse("Procedure body must be quoted with $$ or single quotes"))
+        Err(Error::sql_parse(
+            "Procedure body must be quoted with $$ or single quotes",
+        ))
     }
 
     /// Check if SQL is a CREATE INDEX with USING clause
@@ -1106,7 +1165,8 @@ impl Parser {
         if has_paren_before {
             // SQLite style: CREATE INDEX idx ON table(col) USING hnsw
             // Extract just the index type (word after USING, stop at whitespace/semicolon/paren)
-            let index_type_end = after_using.find(|c: char| c.is_whitespace() || c == ';' || c == '(')
+            let index_type_end = after_using
+                .find(|c: char| c.is_whitespace() || c == ';' || c == '(')
                 .unwrap_or(after_using.len());
             let index_type = after_using[..index_type_end].trim().to_string();
             let remaining = after_using[index_type_end..].trim();
@@ -1124,7 +1184,8 @@ impl Parser {
         } else {
             // PostgreSQL style: CREATE INDEX idx ON table USING hnsw(col vector_ops) WITH (...)
             // Extract index type (hnsw or ivfflat) - ends at '(' or whitespace
-            let index_type_end = after_using.find(|c: char| c == '(' || c.is_whitespace())
+            let index_type_end = after_using
+                .find(|c: char| c == '(' || c.is_whitespace())
                 .unwrap_or(after_using.len());
             let index_type = after_using[..index_type_end].trim().to_string();
             let remaining = after_using[index_type_end..].trim_start();
@@ -1146,7 +1207,12 @@ impl Parser {
                     let cleaned_sql = if after_paren.is_empty() || after_paren == ";" {
                         format!("{} ({});", before_using, column_spec)
                     } else {
-                        format!("{} ({}) {};", before_using, column_spec, after_paren.trim_end_matches(';'))
+                        format!(
+                            "{} ({}) {};",
+                            before_using,
+                            column_spec,
+                            after_paren.trim_end_matches(';')
+                        )
                     };
 
                     return (cleaned_sql, Some(index_type));
@@ -1176,7 +1242,8 @@ impl Parser {
             let upper_result = result.to_uppercase();
             let upper_op = op_class.to_uppercase();
             if let Some(pos) = upper_result.find(&upper_op) {
-                result = format!("{}{}",
+                result = format!(
+                    "{}{}",
                     result[..pos].trim_end(),
                     result[pos + op_class.len()..].trim_start()
                 );
@@ -1265,18 +1332,19 @@ impl Parser {
         // including the quotes, making the branch unfindable).
         let (branch_name, name_end) = if after_create.starts_with('\'') {
             let rest = &after_create[1..];
-            let close = rest.find('\'').ok_or_else(|| {
-                Error::query_execution("CREATE BRANCH: unterminated quoted branch name")
-            })?;
+            let close = rest
+                .find('\'')
+                .ok_or_else(|| Error::query_execution("CREATE BRANCH: unterminated quoted branch name"))?;
             (rest[..close].to_string(), 1 + close + 1)
         } else if after_create.starts_with('"') {
             let rest = &after_create[1..];
-            let close = rest.find('"').ok_or_else(|| {
-                Error::query_execution("CREATE BRANCH: unterminated double-quoted branch name")
-            })?;
+            let close = rest
+                .find('"')
+                .ok_or_else(|| Error::query_execution("CREATE BRANCH: unterminated double-quoted branch name"))?;
             (rest[..close].to_string(), 1 + close + 1)
         } else {
-            let end = after_create.find(|c: char| c.is_whitespace() || c == ';')
+            let end = after_create
+                .find(|c: char| c.is_whitespace() || c == ';')
                 .unwrap_or(after_create.len());
             (after_create[..end].to_string(), end)
         };
@@ -1292,7 +1360,8 @@ impl Parser {
         // Look for FROM clause (optional parent)
         let parent = if let Some(from_pos) = upper_remaining.find("FROM ") {
             let after_from = remaining[from_pos + 5..].trim_start();
-            let from_end = after_from.find(|c: char| c.is_whitespace() || c == ';')
+            let from_end = after_from
+                .find(|c: char| c.is_whitespace() || c == ';')
                 .unwrap_or(after_from.len());
             let from_name = after_from[..from_end].trim().to_string();
             if from_name.is_empty() || from_name.to_uppercase() == "CURRENT" {
@@ -1305,19 +1374,25 @@ impl Parser {
         };
 
         // Find AS OF clause (required)
-        let as_of_pos = upper_remaining.find("AS OF")
+        let as_of_pos = upper_remaining
+            .find("AS OF")
             .ok_or_else(|| Error::query_execution("CREATE BRANCH requires AS OF clause"))?;
 
         let after_as_of = remaining[as_of_pos + 5..].trim_start();
 
         // Find end of AS OF clause (WITH, WHERE, GROUP, ORDER, LIMIT, UNION, ;, or end)
         let as_of_end_keywords = ["WITH", "WHERE", "GROUP", "ORDER", "LIMIT", "UNION", ";"];
-        let as_of_end = as_of_end_keywords.iter()
+        let as_of_end = as_of_end_keywords
+            .iter()
             .filter_map(|&kw| {
                 if let Some(pos) = after_as_of.to_uppercase().find(kw) {
-                    if pos == 0 || after_as_of.chars().nth(pos.saturating_sub(1))
-                        .map(|c| c.is_whitespace())
-                        .unwrap_or(true) {
+                    if pos == 0
+                        || after_as_of
+                            .chars()
+                            .nth(pos.saturating_sub(1))
+                            .map(|c| c.is_whitespace())
+                            .unwrap_or(true)
+                    {
                         return Some(pos);
                     }
                 }
@@ -1338,7 +1413,11 @@ impl Parser {
             // Extract until semicolon or end
             let with_end = after_with.find(';').unwrap_or(after_with.len());
             let opts = after_with[..with_end].trim().to_string();
-            if opts.is_empty() { None } else { Some(opts) }
+            if opts.is_empty() {
+                None
+            } else {
+                Some(opts)
+            }
         } else {
             None
         };
@@ -1373,7 +1452,8 @@ impl Parser {
         };
 
         // Extract branch name
-        let name_end = remaining.find(|c: char| c.is_whitespace() || c == ';')
+        let name_end = remaining
+            .find(|c: char| c.is_whitespace() || c == ';')
             .unwrap_or(remaining.len());
         let branch_name = remaining[..name_end].trim().to_string();
 
@@ -1403,7 +1483,8 @@ impl Parser {
         let after_merge = cleaned[name_start..].trim_start();
 
         // Extract source branch name
-        let source_end = after_merge.find(|c: char| c.is_whitespace())
+        let source_end = after_merge
+            .find(|c: char| c.is_whitespace())
             .unwrap_or(after_merge.len());
         let source = after_merge[..source_end].to_string();
 
@@ -1422,7 +1503,8 @@ impl Parser {
         let after_into = remaining[4..].trim_start(); // "INTO".len() = 4
 
         // Extract target branch name
-        let target_end = after_into.find(|c: char| c.is_whitespace() || c == ';')
+        let target_end = after_into
+            .find(|c: char| c.is_whitespace() || c == ';')
             .unwrap_or(after_into.len());
         let target = after_into[..target_end].to_string();
 
@@ -1435,7 +1517,11 @@ impl Parser {
             let after_with = remaining[with_pos + 4..].trim_start();
             let with_end = after_with.find(';').unwrap_or(after_with.len());
             let opts = after_with[..with_end].trim().to_string();
-            if opts.is_empty() { None } else { Some(opts) }
+            if opts.is_empty() {
+                None
+            } else {
+                Some(opts)
+            }
         } else {
             None
         };
@@ -1462,7 +1548,8 @@ impl Parser {
         let after_use = cleaned[name_start..].trim_start();
 
         // Extract branch name
-        let name_end = after_use.find(|c: char| c.is_whitespace() || c == ';')
+        let name_end = after_use
+            .find(|c: char| c.is_whitespace() || c == ';')
             .unwrap_or(after_use.len());
         let branch_name = after_use[..name_end].trim().to_string();
 
@@ -1493,9 +1580,9 @@ impl Parser {
     #[cfg(feature = "ha-tier1")]
     pub fn is_cluster_status(sql: &str) -> bool {
         let upper = sql.trim().to_uppercase();
-        upper.starts_with("SHOW CLUSTER STATUS") ||
-        upper.starts_with("SHOW HA STATUS") ||
-        upper.starts_with("SHOW REPLICATION STATUS")
+        upper.starts_with("SHOW CLUSTER STATUS")
+            || upper.starts_with("SHOW HA STATUS")
+            || upper.starts_with("SHOW REPLICATION STATUS")
     }
 
     /// Parse SWITCHOVER TO statement to extract target node ID
@@ -1510,7 +1597,8 @@ impl Parser {
         let upper = cleaned.to_uppercase();
 
         // Find position after SWITCHOVER TO
-        let to_pos = upper.find("TO ")
+        let to_pos = upper
+            .find("TO ")
             .ok_or_else(|| Error::query_execution("SWITCHOVER statement requires TO clause"))?;
 
         let after_to = cleaned[to_pos + 3..].trim_start();
@@ -1519,18 +1607,22 @@ impl Parser {
         let node_id = if after_to.starts_with('\'') || after_to.starts_with('"') {
             // Quoted identifier
             let quote_char = if after_to.starts_with('\'') { '\'' } else { '"' };
-            let end_quote = after_to[1..].find(quote_char)
+            let end_quote = after_to[1..]
+                .find(quote_char)
                 .ok_or_else(|| Error::query_execution("Unterminated quote in node identifier"))?;
             after_to[1..=end_quote].to_string()
         } else {
             // Unquoted identifier
-            let end_pos = after_to.find(|c: char| c.is_whitespace() || c == ';')
+            let end_pos = after_to
+                .find(|c: char| c.is_whitespace() || c == ';')
                 .unwrap_or(after_to.len());
             after_to[..end_pos].to_string()
         };
 
         if node_id.is_empty() {
-            return Err(Error::query_execution("SWITCHOVER TO requires a target node identifier"));
+            return Err(Error::query_execution(
+                "SWITCHOVER TO requires a target node identifier",
+            ));
         }
 
         Ok(node_id)
@@ -1548,7 +1640,8 @@ impl Parser {
         let upper = cleaned.to_uppercase();
 
         // Find position after SWITCHOVER CHECK
-        let check_pos = upper.find("CHECK ")
+        let check_pos = upper
+            .find("CHECK ")
             .ok_or_else(|| Error::query_execution("SWITCHOVER CHECK statement malformed"))?;
 
         let after_check = cleaned[check_pos + 6..].trim_start();
@@ -1557,18 +1650,22 @@ impl Parser {
         let node_id = if after_check.starts_with('\'') || after_check.starts_with('"') {
             // Quoted identifier
             let quote_char = if after_check.starts_with('\'') { '\'' } else { '"' };
-            let end_quote = after_check[1..].find(quote_char)
+            let end_quote = after_check[1..]
+                .find(quote_char)
                 .ok_or_else(|| Error::query_execution("Unterminated quote in node identifier"))?;
             after_check[1..=end_quote].to_string()
         } else {
             // Unquoted identifier
-            let end_pos = after_check.find(|c: char| c.is_whitespace() || c == ';')
+            let end_pos = after_check
+                .find(|c: char| c.is_whitespace() || c == ';')
                 .unwrap_or(after_check.len());
             after_check[..end_pos].to_string()
         };
 
         if node_id.is_empty() {
-            return Err(Error::query_execution("SWITCHOVER CHECK requires a target node identifier"));
+            return Err(Error::query_execution(
+                "SWITCHOVER CHECK requires a target node identifier",
+            ));
         }
 
         Ok(node_id)
@@ -1606,7 +1703,8 @@ impl Parser {
 
         // Find positions
         let alias_start = "SET NODE ALIAS".len();
-        let for_pos = upper.find(" FOR ")
+        let for_pos = upper
+            .find(" FOR ")
             .ok_or_else(|| Error::query_execution("SET NODE ALIAS requires FOR clause"))?;
 
         // Extract alias (between SET NODE ALIAS and FOR)
@@ -1615,7 +1713,8 @@ impl Parser {
             None
         } else if alias_part.starts_with('\'') || alias_part.starts_with('"') {
             let quote_char = if alias_part.starts_with('\'') { '\'' } else { '"' };
-            let end_quote = alias_part[1..].find(quote_char)
+            let end_quote = alias_part[1..]
+                .find(quote_char)
                 .ok_or_else(|| Error::query_execution("Unterminated quote in alias"))?;
             Some(alias_part[1..=end_quote].to_string())
         } else {
@@ -1626,17 +1725,21 @@ impl Parser {
         let after_for = cleaned[for_pos + 5..].trim();
         let node_id = if after_for.starts_with('\'') || after_for.starts_with('"') {
             let quote_char = if after_for.starts_with('\'') { '\'' } else { '"' };
-            let end_quote = after_for[1..].find(quote_char)
+            let end_quote = after_for[1..]
+                .find(quote_char)
                 .ok_or_else(|| Error::query_execution("Unterminated quote in node identifier"))?;
             after_for[1..=end_quote].to_string()
         } else {
-            let end_pos = after_for.find(|c: char| c.is_whitespace() || c == ';')
+            let end_pos = after_for
+                .find(|c: char| c.is_whitespace() || c == ';')
                 .unwrap_or(after_for.len());
             after_for[..end_pos].to_string()
         };
 
         if node_id.is_empty() {
-            return Err(Error::query_execution("SET NODE ALIAS requires a node identifier after FOR"));
+            return Err(Error::query_execution(
+                "SET NODE ALIAS requires a node identifier after FOR",
+            ));
         }
 
         Ok((node_id, alias))
@@ -1664,18 +1767,14 @@ mod tests {
     #[test]
     fn test_parse_create_table() {
         let parser = Parser::new();
-        let result = parser.parse_one(
-            "CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT NOT NULL)"
-        );
+        let result = parser.parse_one("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT NOT NULL)");
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_parse_insert() {
         let parser = Parser::new();
-        let result = parser.parse_one(
-            "INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com')"
-        );
+        let result = parser.parse_one("INSERT INTO users (name, email) VALUES ('Alice', 'alice@example.com')");
         assert!(result.is_ok());
     }
 

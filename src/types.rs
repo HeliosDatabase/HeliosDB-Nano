@@ -342,10 +342,11 @@ impl fmt::Display for Value {
                 }
                 write!(f, "}}")
             }
-            Value::Vector(vec) => write!(f, "[{}]", vec.iter()
-                .map(|v| v.to_string())
-                .collect::<Vec<_>>()
-                .join(", ")),
+            Value::Vector(vec) => write!(
+                f,
+                "[{}]",
+                vec.iter().map(|v| v.to_string()).collect::<Vec<_>>().join(", ")
+            ),
             Value::DictRef { dict_id } => write!(f, "<dict:{}>", dict_id),
             Value::CasRef { hash } => write!(f, "<cas:{}>", hex::encode(&hash[..8])),
             Value::ColumnarRef => write!(f, "<columnar>"),
@@ -391,24 +392,40 @@ pub struct Tuple {
 
 impl Default for Tuple {
     fn default() -> Self {
-        Self { values: vec![], row_id: None, branch_id: None }
+        Self {
+            values: vec![],
+            row_id: None,
+            branch_id: None,
+        }
     }
 }
 
 impl Tuple {
     /// Create a new tuple
     pub fn new(values: Vec<Value>) -> Self {
-        Self { values, row_id: None, branch_id: None }
+        Self {
+            values,
+            row_id: None,
+            branch_id: None,
+        }
     }
 
     /// Create a new tuple with row ID
     pub fn with_row_id(values: Vec<Value>, row_id: u64) -> Self {
-        Self { values, row_id: Some(row_id), branch_id: None }
+        Self {
+            values,
+            row_id: Some(row_id),
+            branch_id: None,
+        }
     }
 
     /// Create a new tuple with row ID and branch ID
     pub fn with_row_and_branch_id(values: Vec<Value>, row_id: u64, branch_id: u64) -> Self {
-        Self { values, row_id: Some(row_id), branch_id: Some(branch_id) }
+        Self {
+            values,
+            row_id: Some(row_id),
+            branch_id: Some(branch_id),
+        }
     }
 
     /// Get value at index
@@ -432,21 +449,20 @@ impl Tuple {
     /// This is a runtime type inspection and should be used with care
     /// as it cannot detect all type nuances (e.g., VARCHAR vs TEXT).
     pub fn schema(&self) -> Schema {
-        let columns: Vec<Column> = self.values
+        let columns: Vec<Column> = self
+            .values
             .iter()
             .enumerate()
-            .map(|(i, val)| {
-                Column {
-                    name: format!("column_{}", i),
-                    data_type: val.data_type(),
-                    nullable: matches!(val, Value::Null),
-                    primary_key: false,
-                    source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: ColumnStorageMode::Default,
-                }
+            .map(|(i, val)| Column {
+                name: format!("column_{}", i),
+                data_type: val.data_type(),
+                nullable: matches!(val, Value::Null),
+                primary_key: false,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: ColumnStorageMode::Default,
             })
             .collect();
 
@@ -618,9 +634,8 @@ impl Schema {
         if let Some(table_name) = table {
             // Look for column with matching source_table (alias) OR source_table_name (actual name)
             self.columns.iter().position(|c| {
-                (c.source_table.as_deref() == Some(table_name)
-                    || c.source_table_name.as_deref() == Some(table_name))
-                && c.name == name
+                (c.source_table.as_deref() == Some(table_name) || c.source_table_name.as_deref() == Some(table_name))
+                    && c.name == name
             })
         } else {
             // No table qualifier - use simple name lookup
@@ -685,10 +700,7 @@ impl Schema {
     ///
     /// Returns a new schema containing only the columns at the specified indices.
     pub fn project(&self, indices: &[usize]) -> Self {
-        let columns = indices
-            .iter()
-            .filter_map(|&i| self.columns.get(i).cloned())
-            .collect();
+        let columns = indices.iter().filter_map(|&i| self.columns.get(i).cloned()).collect();
         Self { columns }
     }
 }

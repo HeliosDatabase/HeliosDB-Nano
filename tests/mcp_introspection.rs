@@ -57,7 +57,10 @@ fn tools_list_verbose_adds_category_and_db_flag() {
         "heliosdb_graph_path",
         "heliosdb_embed_and_store",
     ] {
-        assert!(names_without_db.contains(&n), "{n} should be marked DB-free; have: {names_without_db:?}");
+        assert!(
+            names_without_db.contains(&n),
+            "{n} should be marked DB-free; have: {names_without_db:?}"
+        );
     }
 }
 
@@ -81,8 +84,13 @@ fn helios_info_rpc_includes_cache_stats() {
     let cache = &resp["result"]["cache"];
     assert!(cache.is_object(), "expected `cache` field on helios/info");
     for key in [
-        "size", "capacity", "generation", "hits", "misses",
-        "evictions", "hit_rate",
+        "size",
+        "capacity",
+        "generation",
+        "hits",
+        "misses",
+        "evictions",
+        "hit_rate",
     ] {
         assert!(
             cache.get(key).is_some(),

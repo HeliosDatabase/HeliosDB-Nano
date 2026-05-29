@@ -5,11 +5,8 @@
 //! - `DROP DATABASE BRANCH [IF EXISTS] <name>`
 //! - `MERGE DATABASE BRANCH <source> INTO <target>`
 
-use crate::{Result, Error};
-use super::super::logical_plan::{
-    LogicalPlan, AsOfClause, BranchOption, MergeOption,
-    ConflictResolution,
-};
+use super::super::logical_plan::{AsOfClause, BranchOption, ConflictResolution, LogicalPlan, MergeOption};
+use crate::{Error, Result};
 
 /// Parser for database branching SQL
 pub struct BranchingParser;
@@ -76,7 +73,8 @@ impl BranchingParser {
                 .strip_prefix("TRANSACTION")
                 .ok_or_else(|| Error::query_execution("Invalid TRANSACTION syntax"))?
                 .trim();
-            let txn_id = txn_str.parse::<u64>()
+            let txn_id = txn_str
+                .parse::<u64>()
                 .map_err(|_| Error::query_execution("Invalid transaction ID"))?;
             return Ok(AsOfClause::Transaction(txn_id));
         }
@@ -87,7 +85,8 @@ impl BranchingParser {
                 .strip_prefix("SCN")
                 .ok_or_else(|| Error::query_execution("Invalid SCN syntax"))?
                 .trim();
-            let scn = scn_str.parse::<u64>()
+            let scn = scn_str
+                .parse::<u64>()
                 .map_err(|_| Error::query_execution("Invalid SCN"))?;
             return Ok(AsOfClause::Scn(scn));
         }
@@ -110,11 +109,15 @@ impl BranchingParser {
             }
 
             let key = parts.first().map(|s| s.to_lowercase()).unwrap_or_default();
-            let value = parts.get(1).map(|s| s.trim_matches('\'').trim_matches('"')).unwrap_or_default();
+            let value = parts
+                .get(1)
+                .map(|s| s.trim_matches('\'').trim_matches('"'))
+                .unwrap_or_default();
 
             match key.as_str() {
                 "replication_factor" => {
-                    let rf = value.parse::<usize>()
+                    let rf = value
+                        .parse::<usize>()
                         .map_err(|_| Error::query_execution("Invalid replication_factor"))?;
                     options.push(BranchOption::ReplicationFactor(rf));
                 }
@@ -136,14 +139,8 @@ impl BranchingParser {
     /// ```sql
     /// DROP DATABASE BRANCH [IF EXISTS] <branch_name>
     /// ```
-    pub fn parse_drop_branch(
-        branch_name: String,
-        if_exists: bool,
-    ) -> Result<LogicalPlan> {
-        Ok(LogicalPlan::DropBranch {
-            branch_name,
-            if_exists,
-        })
+    pub fn parse_drop_branch(branch_name: String, if_exists: bool) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::DropBranch { branch_name, if_exists })
     }
 
     /// Parse MERGE DATABASE BRANCH statement
@@ -153,11 +150,7 @@ impl BranchingParser {
     /// MERGE DATABASE BRANCH <source> INTO <target>
     /// [WITH (<option> = <value>, ...)]
     /// ```
-    pub fn parse_merge_branch(
-        source: String,
-        target: String,
-        options_str: Option<&str>,
-    ) -> Result<LogicalPlan> {
+    pub fn parse_merge_branch(source: String, target: String, options_str: Option<&str>) -> Result<LogicalPlan> {
         let options = if let Some(opts) = options_str {
             Self::parse_merge_options(opts)?
         } else {
@@ -182,7 +175,10 @@ impl BranchingParser {
             }
 
             let key = parts.first().map(|s| s.to_lowercase()).unwrap_or_default();
-            let value = parts.get(1).map(|s| s.trim_matches('\'').trim_matches('"')).unwrap_or_default();
+            let value = parts
+                .get(1)
+                .map(|s| s.trim_matches('\'').trim_matches('"'))
+                .unwrap_or_default();
 
             match key.as_str() {
                 "conflict_resolution" => {
@@ -190,9 +186,12 @@ impl BranchingParser {
                         "branch_wins" => ConflictResolution::BranchWins,
                         "target_wins" => ConflictResolution::TargetWins,
                         "fail" => ConflictResolution::Fail,
-                        _ => return Err(Error::query_execution(
-                            format!("Invalid conflict_resolution: {}", value)
-                        )),
+                        _ => {
+                            return Err(Error::query_execution(format!(
+                                "Invalid conflict_resolution: {}",
+                                value
+                            )))
+                        }
                     };
                     options.push(MergeOption::ConflictResolution(resolution));
                 }
@@ -246,10 +245,16 @@ mod tests {
             None, // CURRENT
             "NOW",
             None,
-        ).unwrap();
+        )
+        .unwrap();
 
         match plan {
-            LogicalPlan::CreateBranch { branch_name, parent, as_of, .. } => {
+            LogicalPlan::CreateBranch {
+                branch_name,
+                parent,
+                as_of,
+                ..
+            } => {
                 assert_eq!(branch_name, "test");
                 assert_eq!(parent, None);
                 assert_eq!(as_of, AsOfClause::Now);
@@ -277,10 +282,15 @@ mod tests {
             "staging".to_string(),
             "main".to_string(),
             Some("conflict_resolution='branch_wins'"),
-        ).unwrap();
+        )
+        .unwrap();
 
         match plan {
-            LogicalPlan::MergeBranch { source, target, options } => {
+            LogicalPlan::MergeBranch {
+                source,
+                target,
+                options,
+            } => {
                 assert_eq!(source, "staging");
                 assert_eq!(target, "main");
                 assert_eq!(options.len(), 1);

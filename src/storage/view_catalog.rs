@@ -5,10 +5,10 @@
 //! Unlike materialized views, they don't store data - the query is executed
 //! at query time by expanding the view definition.
 
-use crate::{Result, Error, Schema};
 use super::StorageEngine;
+use crate::{Error, Result, Schema};
 use chrono::{DateTime, Utc};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Key prefix for view metadata in storage
 const VIEW_METADATA_PREFIX: &str = "__view_metadata__";
@@ -104,14 +104,9 @@ impl<'a> ViewCatalog<'a> {
     pub fn get_view(&self, view_name: &str) -> Result<ViewMetadata> {
         let key = Self::view_key(view_name);
         match self.storage.get(&key)? {
-            Some(data) => {
-                bincode::deserialize(&data)
-                    .map_err(|e| Error::storage(format!("Failed to deserialize view metadata: {}", e)))
-            }
-            None => Err(Error::query_execution(format!(
-                "View '{}' does not exist",
-                view_name
-            ))),
+            Some(data) => bincode::deserialize(&data)
+                .map_err(|e| Error::storage(format!("Failed to deserialize view metadata: {}", e))),
+            None => Err(Error::query_execution(format!("View '{}' does not exist", view_name))),
         }
     }
 
@@ -123,10 +118,7 @@ impl<'a> ViewCatalog<'a> {
             if if_exists {
                 return Ok(());
             } else {
-                return Err(Error::query_execution(format!(
-                    "View '{}' does not exist",
-                    view_name
-                )));
+                return Err(Error::query_execution(format!("View '{}' does not exist", view_name)));
             }
         }
 
@@ -145,8 +137,7 @@ impl<'a> ViewCatalog<'a> {
         let db = self.storage.db();
         let iter = db.prefix_iterator(prefix);
         for item in iter {
-            let (key, _value) = item
-                .map_err(|e| Error::storage(format!("Failed to iterate views: {}", e)))?;
+            let (key, _value) = item.map_err(|e| Error::storage(format!("Failed to iterate views: {}", e)))?;
 
             // Extract view name from key
             if let Ok(key_str) = std::str::from_utf8(&key) {
@@ -164,8 +155,8 @@ impl<'a> ViewCatalog<'a> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::{Column, DataType};
     use crate::Config;
+    use crate::{Column, DataType};
     use tempfile::tempdir;
 
     #[test]
@@ -199,19 +190,11 @@ mod tests {
 
         let schema = Schema::new(vec![Column::new("id", DataType::Int4)]);
 
-        let metadata1 = ViewMetadata::new(
-            "test_view".to_string(),
-            "SELECT id FROM t1".to_string(),
-            schema.clone(),
-        );
+        let metadata1 = ViewMetadata::new("test_view".to_string(), "SELECT id FROM t1".to_string(), schema.clone());
         catalog.create_view(metadata1, false, false).unwrap();
 
         // Should fail without OR REPLACE
-        let metadata2 = ViewMetadata::new(
-            "test_view".to_string(),
-            "SELECT id FROM t2".to_string(),
-            schema.clone(),
-        );
+        let metadata2 = ViewMetadata::new("test_view".to_string(), "SELECT id FROM t2".to_string(), schema.clone());
         assert!(catalog.create_view(metadata2.clone(), false, false).is_err());
 
         // Should succeed with OR REPLACE
@@ -229,11 +212,7 @@ mod tests {
         let catalog = ViewCatalog::new(&storage);
 
         let schema = Schema::new(vec![Column::new("id", DataType::Int4)]);
-        let metadata = ViewMetadata::new(
-            "test_view".to_string(),
-            "SELECT id FROM t".to_string(),
-            schema,
-        );
+        let metadata = ViewMetadata::new("test_view".to_string(), "SELECT id FROM t".to_string(), schema);
 
         catalog.create_view(metadata, false, false).unwrap();
         assert!(catalog.view_exists("test_view").unwrap());

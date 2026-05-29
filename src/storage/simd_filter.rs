@@ -10,12 +10,12 @@
 //! - Statistics tracking for optimization decisions
 //! - Support for all Value types
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use parking_lot::RwLock;
 
-use crate::{Value, Tuple, Schema};
 use super::predicate_pushdown::{AnalyzedPredicate, PredicateOp};
+use crate::{Schema, Tuple, Value};
 
 /// Filter operation types
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -230,12 +230,8 @@ impl FilterPredicate {
             // pushdown rejects the row even though the evaluator's
             // generic compare_values would accept it (root cause
             // of the CloudV2 admin_db persistence bug, #205).
-            (Value::Uuid(a), Value::String(b)) => uuid::Uuid::parse_str(b)
-                .map(|u| *a == u)
-                .unwrap_or(false),
-            (Value::String(a), Value::Uuid(b)) => uuid::Uuid::parse_str(a)
-                .map(|u| u == *b)
-                .unwrap_or(false),
+            (Value::Uuid(a), Value::String(b)) => uuid::Uuid::parse_str(b).map(|u| *a == u).unwrap_or(false),
+            (Value::String(a), Value::Uuid(b)) => uuid::Uuid::parse_str(a).map(|u| u == *b).unwrap_or(false),
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
             (Value::Numeric(a), Value::Numeric(b)) => a == b,
             (Value::Json(a), Value::Json(b)) => a == b,
@@ -728,11 +724,7 @@ impl SimdPredicateFilteringEngine {
     /// Filter with multiple AND predicates (optimized order)
     // SAFETY: pred.column_index is bounds-checked (>= row.len()) before indexing.
     #[allow(clippy::indexing_slicing)]
-    pub fn filter_and_predicates(
-        &self,
-        rows: &[Vec<Value>],
-        predicates: &[FilterPredicate],
-    ) -> FilterResult {
+    pub fn filter_and_predicates(&self, rows: &[Vec<Value>], predicates: &[FilterPredicate]) -> FilterResult {
         if predicates.is_empty() {
             return FilterResult {
                 matched_indices: (0..rows.len()).collect(),
@@ -782,9 +774,7 @@ impl SimdPredicateFilteringEngine {
         {
             if caps.avx2 && values.len() >= 8 {
                 // AVX2 path - process 8 i32s at a time
-                let matched = unsafe {
-                    self.filter_int32_avx2(values, op, compare_value)
-                };
+                let matched = unsafe { self.filter_int32_avx2(values, op, compare_value) };
                 result.matched_indices = matched;
                 result.matched_count = result.matched_indices.len();
 
@@ -992,21 +982,16 @@ impl SimdPredicateFilteringEngine {
     /// Filter a batch of tuples using analyzed predicates
     // SAFETY: idx is bounds-checked (< tuple.values.len()) before indexing.
     #[allow(clippy::indexing_slicing)]
-    pub fn filter_batch(
-        &self,
-        tuples: &[Tuple],
-        predicates: &[AnalyzedPredicate],
-        schema: &Schema,
-    ) -> Vec<Tuple> {
+    pub fn filter_batch(&self, tuples: &[Tuple], predicates: &[AnalyzedPredicate], schema: &Schema) -> Vec<Tuple> {
         let start = std::time::Instant::now();
         let input_count = tuples.len();
 
-        let result: Vec<Tuple> = tuples.iter()
+        let result: Vec<Tuple> = tuples
+            .iter()
             .filter(|tuple| {
                 predicates.iter().all(|pred| {
                     // Find column index by name
-                    let col_idx = schema.columns.iter()
-                        .position(|c| c.name == pred.column_name);
+                    let col_idx = schema.columns.iter().position(|c| c.name == pred.column_name);
 
                     if let Some(idx) = col_idx {
                         if idx < tuple.values.len() {
@@ -1187,8 +1172,18 @@ mod tests {
     #[test]
     fn test_combined_predicate_and() {
         let pred = CombinedPredicate::And(vec![
-            CombinedPredicate::Single(FilterPredicate::compare(0, "age".to_string(), FilterOp::GtEq, Value::Int8(18))),
-            CombinedPredicate::Single(FilterPredicate::compare(1, "status".to_string(), FilterOp::Eq, Value::String("active".to_string()))),
+            CombinedPredicate::Single(FilterPredicate::compare(
+                0,
+                "age".to_string(),
+                FilterOp::GtEq,
+                Value::Int8(18),
+            )),
+            CombinedPredicate::Single(FilterPredicate::compare(
+                1,
+                "status".to_string(),
+                FilterOp::Eq,
+                Value::String("active".to_string()),
+            )),
         ]);
 
         assert!(pred.evaluate(&[Value::Int8(21), Value::String("active".to_string())]));
@@ -1199,8 +1194,16 @@ mod tests {
     #[test]
     fn test_combined_predicate_or() {
         let pred = CombinedPredicate::Or(vec![
-            CombinedPredicate::Single(FilterPredicate::eq(0, "status".to_string(), Value::String("active".to_string()))),
-            CombinedPredicate::Single(FilterPredicate::eq(0, "status".to_string(), Value::String("pending".to_string()))),
+            CombinedPredicate::Single(FilterPredicate::eq(
+                0,
+                "status".to_string(),
+                Value::String("active".to_string()),
+            )),
+            CombinedPredicate::Single(FilterPredicate::eq(
+                0,
+                "status".to_string(),
+                Value::String("pending".to_string()),
+            )),
         ]);
 
         assert!(pred.evaluate(&[Value::String("active".to_string())]));

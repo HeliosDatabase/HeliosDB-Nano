@@ -1,10 +1,10 @@
 //! Restore command implementation
 
-use crate::{EmbeddedDatabase, Result, Error};
-use crate::storage::{DumpManager, RestoreOptions, DumpCompressionType};
-use std::path::PathBuf;
-use indicatif::{ProgressBar, ProgressStyle};
+use crate::storage::{DumpCompressionType, DumpManager, RestoreOptions};
+use crate::{EmbeddedDatabase, Error, Result};
 use colored::Colorize;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::path::PathBuf;
 
 /// Restore command
 pub struct RestoreCommand {
@@ -30,16 +30,14 @@ impl RestoreCommand {
 
         // Verify input file exists
         if !self.input.exists() {
-            return Err(Error::io(format!(
-                "Dump file not found: {}",
-                self.input.display()
-            )));
+            return Err(Error::io(format!("Dump file not found: {}", self.input.display())));
         }
 
         // Determine target directory
-        let target_dir = self.target.clone().unwrap_or_else(|| {
-            PathBuf::from("./heliosdb-data-restored")
-        });
+        let target_dir = self
+            .target
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("./heliosdb-data-restored"));
 
         if self.verbose {
             println!("{} {}", "Input file:".dimmed(), self.input.display());
@@ -56,7 +54,7 @@ impl RestoreCommand {
         // Open database
         let mut db = if let Some(ref _conn) = self.connection {
             return Err(Error::config(
-                "Server mode restore not yet implemented. Use --target for embedded mode.".to_string()
+                "Server mode restore not yet implemented. Use --target for embedded mode.".to_string(),
             ));
         } else {
             if self.verbose {
@@ -93,7 +91,7 @@ impl RestoreCommand {
             pb.set_style(
                 ProgressStyle::default_spinner()
                     .template("{spinner:.green} {msg}")
-                    .map_err(|e| Error::io(format!("Failed to set progress style: {}", e)))?
+                    .map_err(|e| Error::io(format!("Failed to set progress style: {}", e)))?,
             );
             pb.set_message("Restoring database...");
             pb.enable_steady_tick(std::time::Duration::from_millis(100));

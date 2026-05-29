@@ -42,10 +42,16 @@ impl Default for RenameApplyOptions {
 
 impl RenameApplyOptions {
     pub fn dry_run() -> Self {
-        Self { dry_run: true, ..Self::default() }
+        Self {
+            dry_run: true,
+            ..Self::default()
+        }
     }
     pub fn apply() -> Self {
-        Self { dry_run: false, ..Self::default() }
+        Self {
+            dry_run: false,
+            ..Self::default()
+        }
     }
     pub fn with_source_table(mut self, t: impl Into<String>) -> Self {
         self.source_table = t.into();
@@ -75,17 +81,13 @@ pub fn rename_apply(
     opts: &RenameApplyOptions,
 ) -> Result<RenameApplyStats> {
     if new_name.trim().is_empty() {
-        return Err(Error::query_execution(
-            "rename_apply: new_name must not be empty",
-        ));
+        return Err(Error::query_execution("rename_apply: new_name must not be empty"));
     }
 
     // Symbol → its name.  Inline integer literal: symbol_id is a
     // server-generated BIGSERIAL we already trust.
     let sym_rows = db.query(
-        &format!(
-            "SELECT s.name FROM _hdb_code_symbols s WHERE s.node_id = {symbol_id}"
-        ),
+        &format!("SELECT s.name FROM _hdb_code_symbols s WHERE s.node_id = {symbol_id}"),
         &[],
     )?;
     let Some(row) = sym_rows.into_iter().next() else {
@@ -143,8 +145,7 @@ pub fn rename_apply(
     )?;
     // Dedup paths; track the indexed sha256 per path for the
     // conflict-detection step.
-    let mut paths: std::collections::BTreeMap<String, Option<String>> =
-        std::collections::BTreeMap::new();
+    let mut paths: std::collections::BTreeMap<String, Option<String>> = std::collections::BTreeMap::new();
     paths.insert(def_path.clone(), def_sha);
     for r in ref_rows {
         if let Some(p) = r.values.first().and_then(string_of) {

@@ -129,12 +129,7 @@ impl ArtIndexManager {
         }
 
         // Create the index
-        let index = AdaptiveRadixTree::new(
-            &index_name,
-            table,
-            columns.to_vec(),
-            ArtIndexType::PrimaryKey,
-        );
+        let index = AdaptiveRadixTree::new(&index_name, table, columns.to_vec(), ArtIndexType::PrimaryKey);
 
         // Register the index
         {
@@ -181,12 +176,7 @@ impl ArtIndexManager {
         // (This would be checked during DDL execution)
 
         // Create the index
-        let index = AdaptiveRadixTree::new(
-            &index_name,
-            table,
-            columns.to_vec(),
-            ArtIndexType::ForeignKey,
-        );
+        let index = AdaptiveRadixTree::new(&index_name, table, columns.to_vec(), ArtIndexType::ForeignKey);
 
         // Create FK info
         let fk_info = ForeignKeyInfo {
@@ -227,7 +217,12 @@ impl ArtIndexManager {
     }
 
     /// Create a unique constraint index (auto-called on CREATE TABLE UNIQUE or ALTER TABLE ADD UNIQUE)
-    pub fn create_unique_index(&self, table: &str, columns: &[String], constraint_name: Option<&str>) -> ArtResult<String> {
+    pub fn create_unique_index(
+        &self,
+        table: &str,
+        columns: &[String],
+        constraint_name: Option<&str>,
+    ) -> ArtResult<String> {
         let index_name = constraint_name
             .map(|n| n.to_string())
             .unwrap_or_else(|| Self::unique_index_name(table, columns));
@@ -241,12 +236,7 @@ impl ArtIndexManager {
         }
 
         // Create the index
-        let index = AdaptiveRadixTree::new(
-            &index_name,
-            table,
-            columns.to_vec(),
-            ArtIndexType::Unique,
-        );
+        let index = AdaptiveRadixTree::new(&index_name, table, columns.to_vec(), ArtIndexType::Unique);
 
         // Register the index
         {
@@ -389,7 +379,8 @@ impl ArtIndexManager {
             for (name, idx) in indexes.iter() {
                 if idx.table() == old_table {
                     // Generate new index name by replacing table name
-                    let new_name = name.replace(&format!("_{}_", old_table), &format!("_{}_", new_table))
+                    let new_name = name
+                        .replace(&format!("_{}_", old_table), &format!("_{}_", new_table))
                         .replace(&format!("pk_{}", old_table), &format!("pk_{}", new_table))
                         .replace(&format!("fk_{}", old_table), &format!("fk_{}", new_table))
                         .replace(&format!("unique_{}", old_table), &format!("unique_{}", new_table));
@@ -424,7 +415,8 @@ impl ArtIndexManager {
             {
                 let mut fk_indexes = self.fk_indexes.write().unwrap_or_else(|e| e.into_inner());
                 if let Some(fks) = fk_indexes.remove(old_table) {
-                    let new_fks: Vec<String> = fks.iter()
+                    let new_fks: Vec<String> = fks
+                        .iter()
                         .map(|n| if n == &old_name { new_name.clone() } else { n.clone() })
                         .collect();
                     fk_indexes.insert(new_table.to_string(), new_fks);
@@ -435,7 +427,8 @@ impl ArtIndexManager {
             {
                 let mut unique_indexes = self.unique_indexes.write().unwrap_or_else(|e| e.into_inner());
                 if let Some(uniques) = unique_indexes.remove(old_table) {
-                    let new_uniques: Vec<String> = uniques.iter()
+                    let new_uniques: Vec<String> = uniques
+                        .iter()
                         .map(|n| if n == &old_name { new_name.clone() } else { n.clone() })
                         .collect();
                     unique_indexes.insert(new_table.to_string(), new_uniques);
@@ -479,10 +472,7 @@ impl ArtIndexManager {
             fk_indexes.get(table).cloned().unwrap_or_default()
         };
 
-        fk_names
-            .iter()
-            .filter_map(|name| self.get_index(name))
-            .collect()
+        fk_names.iter().filter_map(|name| self.get_index(name)).collect()
     }
 
     /// Get all unique indexes for a table
@@ -492,10 +482,7 @@ impl ArtIndexManager {
             unique_indexes.get(table).cloned().unwrap_or_default()
         };
 
-        unique_names
-            .iter()
-            .filter_map(|name| self.get_index(name))
-            .collect()
+        unique_names.iter().filter_map(|name| self.get_index(name)).collect()
     }
 
     /// Get FK info by index name
@@ -575,13 +562,7 @@ impl ArtIndexManager {
         indexes
             .values()
             .filter(|idx| idx.table() == table)
-            .map(|idx| {
-                (
-                    idx.name().to_string(),
-                    idx.index_type(),
-                    idx.columns().to_vec(),
-                )
-            })
+            .map(|idx| (idx.name().to_string(), idx.index_type(), idx.columns().to_vec()))
             .collect()
     }
 
@@ -1019,7 +1000,9 @@ mod tests {
     #[test]
     fn test_unique_constraint_check() {
         let manager = ArtIndexManager::new();
-        manager.create_unique_index("users", &["email".to_string()], None).unwrap();
+        manager
+            .create_unique_index("users", &["email".to_string()], None)
+            .unwrap();
 
         // Insert first row
         let mut values = HashMap::new();
@@ -1043,7 +1026,9 @@ mod tests {
         let manager = ArtIndexManager::new();
 
         manager.create_pk_index("users", &["id".to_string()]).unwrap();
-        manager.create_unique_index("users", &["email".to_string()], None).unwrap();
+        manager
+            .create_unique_index("users", &["email".to_string()], None)
+            .unwrap();
 
         assert_eq!(manager.stats().total_indexes, 2);
 
@@ -1057,8 +1042,12 @@ mod tests {
         let manager = ArtIndexManager::new();
 
         manager.create_pk_index("users", &["id".to_string()]).unwrap();
-        manager.create_unique_index("users", &["email".to_string()], None).unwrap();
-        manager.create_manual_index("users_name_idx", "users", &["name".to_string()]).unwrap();
+        manager
+            .create_unique_index("users", &["email".to_string()], None)
+            .unwrap();
+        manager
+            .create_manual_index("users_name_idx", "users", &["name".to_string()])
+            .unwrap();
 
         let indexes = manager.list_indexes();
         assert_eq!(indexes.len(), 3);

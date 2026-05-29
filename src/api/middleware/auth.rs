@@ -99,8 +99,8 @@ impl AuthMiddleware {
 
     /// Create from environment variable or default
     pub fn from_env_or_default() -> Self {
-        let secret = std::env::var("HELIOSDB_JWT_SECRET")
-            .unwrap_or_else(|_| "default-secret-change-in-production".to_string());
+        let secret =
+            std::env::var("HELIOSDB_JWT_SECRET").unwrap_or_else(|_| "default-secret-change-in-production".to_string());
         Self::new(secret.as_bytes())
     }
 
@@ -115,13 +115,16 @@ impl AuthMiddleware {
         name: String,
     ) -> Self {
         let mut keys = (*self.api_keys).clone();
-        keys.insert(key, ApiKeyInfo {
-            user_id,
-            tenant_id,
-            client_id,
-            scopes,
-            name,
-        });
+        keys.insert(
+            key,
+            ApiKeyInfo {
+                user_id,
+                tenant_id,
+                client_id,
+                scopes,
+                name,
+            },
+        );
         self.api_keys = Arc::new(keys);
         self
     }
@@ -149,7 +152,8 @@ impl AuthMiddleware {
 
     /// Authenticate using JWT token
     pub async fn authenticate_jwt(&self, token: &str) -> Result<UserContext, ApiError> {
-        let claims = self.jwt_manager
+        let claims = self
+            .jwt_manager
             .validate_token(token)
             .map_err(|_| ApiError::unauthorized("Invalid or expired JWT token"))?;
 
@@ -158,7 +162,8 @@ impl AuthMiddleware {
 
     /// Authenticate using API key
     pub async fn authenticate_api_key(&self, api_key: &str) -> Result<UserContext, ApiError> {
-        let key_info = self.api_keys
+        let key_info = self
+            .api_keys
             .get(api_key)
             .ok_or_else(|| ApiError::unauthorized("Invalid API key"))?;
 
@@ -201,16 +206,15 @@ where
 {
     type Rejection = ApiError;
 
-    async fn from_request_parts(
-        parts: &mut axum::http::request::Parts,
-        _state: &S,
-    ) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(parts: &mut axum::http::request::Parts, _state: &S) -> Result<Self, Self::Rejection> {
         parts
             .extensions
             .get::<UserContext>()
             .cloned()
             .map(AuthUser)
-            .ok_or_else(|| ApiError::unauthorized("User context not found. Authentication middleware may not be configured."))
+            .ok_or_else(|| {
+                ApiError::unauthorized("User context not found. Authentication middleware may not be configured.")
+            })
     }
 }
 
@@ -266,11 +270,7 @@ mod tests {
         let client_id = Uuid::new_v4();
 
         let token = jwt_manager
-            .generate_token(
-                "user123".to_string(),
-                "tenant456".to_string(),
-                client_id,
-            )
+            .generate_token("user123".to_string(), "tenant456".to_string(), client_id)
             .unwrap();
 
         let auth = AuthMiddleware::new(b"test-secret");
@@ -293,15 +293,14 @@ mod tests {
     #[tokio::test]
     async fn test_auth_middleware_api_key() {
         let client_id = Uuid::new_v4();
-        let auth = AuthMiddleware::new(b"test-secret")
-            .with_api_key(
-                "test-key-123".to_string(),
-                "user123".to_string(),
-                "tenant456".to_string(),
-                client_id,
-                vec!["read".to_string(), "write".to_string()],
-                "Test Key".to_string(),
-            );
+        let auth = AuthMiddleware::new(b"test-secret").with_api_key(
+            "test-key-123".to_string(),
+            "user123".to_string(),
+            "tenant456".to_string(),
+            client_id,
+            vec!["read".to_string(), "write".to_string()],
+            "Test Key".to_string(),
+        );
 
         // Create mock request with API key
         let req = Request::builder()
@@ -324,9 +323,7 @@ mod tests {
         let auth = AuthMiddleware::new(b"test-secret");
 
         // Create mock request without auth
-        let req = Request::builder()
-            .body(axum::body::Body::empty())
-            .unwrap();
+        let req = Request::builder().body(axum::body::Body::empty()).unwrap();
 
         let result = auth.authenticate(&req).await;
         assert!(result.is_err());

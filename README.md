@@ -133,7 +133,10 @@ $ open http://localhost:8080/docs
 
 ## Vector Search
 
-Native HNSW indexes — no extensions, no separate vector database.
+Native HNSW indexes — no extensions, no separate vector database. The default
+path is in-process HNSW; `--features vector-persist` enables RocksDB-backed
+persistent HNSW/PQ with `persistent = true`, `quantization = 'product'`, and
+`rerank_precision = 'f32' | 'f16' | 'i8'`.
 
 ```sql
 -- From any client (psql / mysql / REPL):
@@ -144,6 +147,8 @@ CREATE TABLE docs (
 );
 
 CREATE INDEX ON docs USING hnsw (embedding vector_cosine_ops);
+CREATE INDEX docs_embedding_persistent ON docs USING hnsw (embedding)
+WITH (persistent = true, quantization = 'product', rerank_precision = 'i8');
 
 INSERT INTO docs (title, embedding)
 VALUES ('Intro', '[0.1, 0.2, 0.3, ...]');
@@ -156,6 +161,8 @@ LIMIT 10;
 ```
 
 Distance operators: `<->` (cosine), `<~>` (L2), `<#>` (inner product).
+Vector store IDs are namespace-scoped, and metadata/namespace filters are
+applied before top-k selection in the REST/embedded vector-store API.
 
 Via REST:
 
@@ -307,11 +314,12 @@ All PostgreSQL types plus MySQL type aliases (automatically translated):
 - **JSONB**: `->`, `->>`, `@>`, `?` operators
 - **Full-text search**: `tsvector`, `tsquery`, `@@`, `ts_rank_cd`, `CREATE INDEX ... USING gin` (see [FTS scope](docs/compatibility/fts.md))
 - **Keyset pagination**: row-constructor comparison `WHERE (col, id) < ($1, $2)`; top-K sort; constant-time deep OFFSET
-- **Foreign keys**: CASCADE, SET NULL, RESTRICT
+- **Foreign keys**: CASCADE, SET NULL, RESTRICT, deferred/audit/off validation modes, `NOT ENFORCED` constraints
 - **Triggers**: BEFORE/AFTER INSERT/UPDATE/DELETE
 - **Row-Level Security**: Per-tenant data isolation via policies
 - **EXPLAIN**: Cost-based optimizer, ANALYZE, JSON/XML/YAML output
 - **Code-graph** *(opt-in, `--features code-graph`)*: tree-sitter-backed AST index + `lsp_definition` / `lsp_references` / `lsp_call_hierarchy` / `lsp_hover` as Rust API & SQL table functions — see [code-graph overview](docs/code_graph/overview.md)
+- **Agentic SQL hooks**: `predict`, `infer`, `generate`, and preview-only self-driving optimizer plans
 - **Backup/Restore**: Compressed dumps (zstd/gzip/brotli)
 - **Import/Export**: CSV, JSON, JSONL, Parquet, Arrow, SQL
 - **Audit logging**: Tamper-proof trail (SHA-256 checksums)

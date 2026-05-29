@@ -87,10 +87,7 @@ impl RateLimiter {
 
     /// Get current count for tenant
     pub fn current_count(&self, tenant_id: &str) -> u64 {
-        self.windows.read()
-            .get(tenant_id)
-            .map(|w| w.count)
-            .unwrap_or(0)
+        self.windows.read().get(tenant_id).map(|w| w.count).unwrap_or(0)
     }
 
     /// Get remaining quota
@@ -127,10 +124,7 @@ impl QuotaService {
 
     /// Get current usage for tenant
     pub fn get_usage(&self, tenant_id: &str) -> TenantUsage {
-        self.usage.read()
-            .get(tenant_id)
-            .cloned()
-            .unwrap_or_default()
+        self.usage.read().get(tenant_id).cloned().unwrap_or_default()
     }
 
     /// Update usage metrics
@@ -169,44 +163,31 @@ impl QuotaService {
     }
 
     /// Check quota before operation
-    pub fn check_quota(&self, tenant_id: &str, quotas: &TenantQuotas, resource: QuotaResource) -> Result<(), TenantError> {
+    pub fn check_quota(
+        &self,
+        tenant_id: &str,
+        quotas: &TenantQuotas,
+        resource: QuotaResource,
+    ) -> Result<(), TenantError> {
         let usage = self.get_usage(tenant_id);
 
         let (current, limit, resource_name) = match resource {
-            QuotaResource::Storage(additional) => (
-                usage.storage_bytes + additional,
-                quotas.max_storage_bytes,
-                "storage"
-            ),
-            QuotaResource::Tables => (
-                usage.table_count as u64 + 1,
-                quotas.max_tables as u64,
-                "tables"
-            ),
-            QuotaResource::RowsPerTable(table_rows) => (
-                table_rows,
-                quotas.max_rows_per_table,
-                "rows_per_table"
-            ),
+            QuotaResource::Storage(additional) => {
+                (usage.storage_bytes + additional, quotas.max_storage_bytes, "storage")
+            }
+            QuotaResource::Tables => (usage.table_count as u64 + 1, quotas.max_tables as u64, "tables"),
+            QuotaResource::RowsPerTable(table_rows) => (table_rows, quotas.max_rows_per_table, "rows_per_table"),
             QuotaResource::VectorStores => (
                 usage.vector_store_count as u64 + 1,
                 quotas.max_vector_stores as u64,
-                "vector_stores"
+                "vector_stores",
             ),
-            QuotaResource::Vectors(additional) => (
-                usage.vector_count + additional,
-                quotas.max_vectors,
-                "vectors"
-            ),
-            QuotaResource::Branches => (
-                usage.branch_count as u64 + 1,
-                quotas.max_branches as u64,
-                "branches"
-            ),
+            QuotaResource::Vectors(additional) => (usage.vector_count + additional, quotas.max_vectors, "vectors"),
+            QuotaResource::Branches => (usage.branch_count as u64 + 1, quotas.max_branches as u64, "branches"),
             QuotaResource::Connections => (
                 usage.active_connections as u64 + 1,
                 quotas.max_connections as u64,
-                "connections"
+                "connections",
             ),
             QuotaResource::Query => {
                 // Use rate limiter for QPM

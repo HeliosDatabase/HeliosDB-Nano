@@ -10,7 +10,7 @@
 //! - `POST /api/webhooks/generic` - Provider-agnostic webhook
 
 use axum::{
-    extract::{State, Json},
+    extract::{Json, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::post,
@@ -20,8 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::server::AppState;
 use crate::git_integration::webhooks::{
-    WebhookHandler, WebhookConfig, WebhookResult, WebhookEvent,
-    GitProvider, WebhookEventType, StorageWebhookHandler,
+    GitProvider, StorageWebhookHandler, WebhookConfig, WebhookEvent, WebhookEventType, WebhookHandler, WebhookResult,
 };
 
 /// Webhook response
@@ -85,22 +84,16 @@ async fn health_check() -> impl IntoResponse {
 /// - Header `X-GitHub-Event`: Event type (e.g., "pull_request")
 /// - Header `X-Hub-Signature-256`: HMAC signature (optional, for validation)
 /// - Body: JSON payload
-async fn handle_github_webhook(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: String,
-) -> impl IntoResponse {
+async fn handle_github_webhook(State(state): State<AppState>, headers: HeaderMap, body: String) -> impl IntoResponse {
     // Get event type header
     let event_type = match headers.get("X-GitHub-Event") {
         Some(v) => v.to_str().unwrap_or("unknown"),
         None => {
             return (
                 StatusCode::BAD_REQUEST,
-                Json(WebhookError::new(
-                    "Missing X-GitHub-Event header",
-                    "MISSING_EVENT_TYPE",
-                )),
-            ).into_response();
+                Json(WebhookError::new("Missing X-GitHub-Event header", "MISSING_EVENT_TYPE")),
+            )
+                .into_response();
         }
     };
 
@@ -115,11 +108,9 @@ async fn handle_github_webhook(
             Ok(false) => {
                 return (
                     StatusCode::UNAUTHORIZED,
-                    Json(WebhookError::new(
-                        "Invalid webhook signature",
-                        "INVALID_SIGNATURE",
-                    )),
-                ).into_response();
+                    Json(WebhookError::new("Invalid webhook signature", "INVALID_SIGNATURE")),
+                )
+                    .into_response();
             }
             Err(e) => {
                 return (
@@ -128,7 +119,8 @@ async fn handle_github_webhook(
                         format!("Signature validation error: {}", e),
                         "SIGNATURE_ERROR",
                     )),
-                ).into_response();
+                )
+                    .into_response();
             }
             Ok(true) => {}
         }
@@ -144,7 +136,8 @@ async fn handle_github_webhook(
                     format!("Failed to parse webhook: {}", e),
                     "PARSE_ERROR",
                 )),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -159,15 +152,11 @@ async fn handle_github_webhook(
             };
             (status, Json(WebhookResponse::from(result))).into_response()
         }
-        Err(e) => {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(WebhookError::new(
-                    format!("Handler error: {}", e),
-                    "HANDLER_ERROR",
-                )),
-            ).into_response()
-        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(WebhookError::new(format!("Handler error: {}", e), "HANDLER_ERROR")),
+        )
+            .into_response(),
     }
 }
 
@@ -177,11 +166,7 @@ async fn handle_github_webhook(
 /// - Header `X-Gitlab-Event`: Event type
 /// - Header `X-Gitlab-Token`: Secret token (optional, for validation)
 /// - Body: JSON payload
-async fn handle_gitlab_webhook(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: String,
-) -> impl IntoResponse {
+async fn handle_gitlab_webhook(State(state): State<AppState>, headers: HeaderMap, body: String) -> impl IntoResponse {
     // Get webhook config from state
     let config = get_webhook_config(&state);
     let handler = WebhookHandler::new(config);
@@ -193,11 +178,9 @@ async fn handle_gitlab_webhook(
             Ok(false) => {
                 return (
                     StatusCode::UNAUTHORIZED,
-                    Json(WebhookError::new(
-                        "Invalid GitLab token",
-                        "INVALID_TOKEN",
-                    )),
-                ).into_response();
+                    Json(WebhookError::new("Invalid GitLab token", "INVALID_TOKEN")),
+                )
+                    .into_response();
             }
             Err(e) => {
                 return (
@@ -206,7 +189,8 @@ async fn handle_gitlab_webhook(
                         format!("Token validation error: {}", e),
                         "TOKEN_ERROR",
                     )),
-                ).into_response();
+                )
+                    .into_response();
             }
             Ok(true) => {}
         }
@@ -222,7 +206,8 @@ async fn handle_gitlab_webhook(
                     format!("Failed to parse webhook: {}", e),
                     "PARSE_ERROR",
                 )),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -237,15 +222,11 @@ async fn handle_gitlab_webhook(
             };
             (status, Json(WebhookResponse::from(result))).into_response()
         }
-        Err(e) => {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(WebhookError::new(
-                    format!("Handler error: {}", e),
-                    "HANDLER_ERROR",
-                )),
-            ).into_response()
-        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(WebhookError::new(format!("Handler error: {}", e), "HANDLER_ERROR")),
+        )
+            .into_response(),
     }
 }
 
@@ -297,11 +278,9 @@ async fn handle_generic_webhook(
             if auth_str != expected {
                 return (
                     StatusCode::UNAUTHORIZED,
-                    Json(WebhookError::new(
-                        "Invalid authorization",
-                        "INVALID_AUTH",
-                    )),
-                ).into_response();
+                    Json(WebhookError::new("Invalid authorization", "INVALID_AUTH")),
+                )
+                    .into_response();
             }
         }
     }
@@ -322,7 +301,8 @@ async fn handle_generic_webhook(
                     format!("Unknown event type: {}", payload.event_type),
                     "UNKNOWN_EVENT_TYPE",
                 )),
-            ).into_response();
+            )
+                .into_response();
         }
     };
 
@@ -363,15 +343,11 @@ async fn handle_generic_webhook(
             };
             (status, Json(WebhookResponse::from(result))).into_response()
         }
-        Err(e) => {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(WebhookError::new(
-                    format!("Handler error: {}", e),
-                    "HANDLER_ERROR",
-                )),
-            ).into_response()
-        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(WebhookError::new(format!("Handler error: {}", e), "HANDLER_ERROR")),
+        )
+            .into_response(),
     }
 }
 
@@ -380,10 +356,7 @@ async fn handle_generic_webhook(
 /// If the database has branching enabled, uses StorageWebhookHandler
 /// to actually create/merge/drop branches. Otherwise falls back to
 /// the basic WebhookHandler that just logs events.
-fn handle_event_with_storage(
-    state: &AppState,
-    event: &WebhookEvent,
-) -> Result<WebhookResult, crate::Error> {
+fn handle_event_with_storage(state: &AppState, event: &WebhookEvent) -> Result<WebhookResult, crate::Error> {
     let config = get_webhook_config(state);
 
     // Try to use storage-aware handler if branching is enabled

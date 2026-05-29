@@ -60,10 +60,7 @@ fn snapshot_indexed_tables(db: &EmbeddedDatabase) -> Vec<(String, Vec<Vec<String
             _ => "1",
         };
         let rows = db
-            .query(
-                &format!("SELECT * FROM {t} ORDER BY {order_by}"),
-                &[],
-            )
+            .query(&format!("SELECT * FROM {t} ORDER BY {order_by}"), &[])
             .unwrap();
         let mut serialised: Vec<Vec<String>> = Vec::with_capacity(rows.len());
         for row in rows {
@@ -148,17 +145,13 @@ fn force_reparse_false_honours_hash_gate() {
     let db = EmbeddedDatabase::new_in_memory().expect("db");
     populate_corpus(&db);
 
-    let first = db
-        .code_index(CodeIndexOptions::for_table("src"))
-        .expect("first index");
+    let first = db.code_index(CodeIndexOptions::for_table("src")).expect("first index");
     assert!(first.files_parsed > 0);
     assert_eq!(first.files_unchanged, 0);
 
     // Re-run without changing any rows. Every file should match the
     // stored sha256 and short-circuit before reaching the parse phase.
-    let second = db
-        .code_index(CodeIndexOptions::for_table("src"))
-        .expect("re-index");
+    let second = db.code_index(CodeIndexOptions::for_table("src")).expect("re-index");
     assert_eq!(second.files_parsed, 0);
     assert_eq!(
         second.files_unchanged as usize,
@@ -171,15 +164,19 @@ fn force_reparse_false_honours_hash_gate() {
 fn telemetry_records_parse_and_write_timings() {
     let db = EmbeddedDatabase::new_in_memory().expect("db");
     populate_corpus(&db);
-    let stats = db
-        .code_index(CodeIndexOptions::for_table("src"))
-        .expect("indexed");
+    let stats = db.code_index(CodeIndexOptions::for_table("src")).expect("indexed");
     // Parse phase must have run on *something*. Write phase must
     // also have run since files_parsed > 0. Both should be > 0 on
     // any reasonably non-trivial corpus.
     assert!(stats.files_parsed > 0);
-    assert!(stats.parse_elapsed_ms < 60_000, "parse > 60s on tiny corpus is suspicious");
-    assert!(stats.write_elapsed_ms < 60_000, "write > 60s on tiny corpus is suspicious");
+    assert!(
+        stats.parse_elapsed_ms < 60_000,
+        "parse > 60s on tiny corpus is suspicious"
+    );
+    assert!(
+        stats.write_elapsed_ms < 60_000,
+        "write > 60s on tiny corpus is suspicious"
+    );
 }
 
 #[test]
@@ -247,9 +244,7 @@ fn force_reparse_against_populated_kb_truncates() {
         .expect("first index");
     let mut opts = CodeIndexOptions::for_table("src");
     opts.force_reparse = true;
-    let stats_force = db_pre_populated
-        .code_index(opts)
-        .expect("force-reparse index");
+    let stats_force = db_pre_populated.code_index(opts).expect("force-reparse index");
 
     let db_cold = EmbeddedDatabase::new_in_memory().expect("db");
     populate_corpus(&db_cold);
@@ -266,10 +261,7 @@ fn force_reparse_against_populated_kb_truncates() {
     // actually use. Sort both projections and assert equality.
     fn symbol_signatures(db: &EmbeddedDatabase) -> Vec<String> {
         let mut sigs: Vec<String> = db
-            .query(
-                "SELECT name, qualified, kind, line_start FROM _hdb_code_symbols",
-                &[],
-            )
+            .query("SELECT name, qualified, kind, line_start FROM _hdb_code_symbols", &[])
             .unwrap()
             .into_iter()
             .map(|r| format!("{:?}", r.values))
@@ -281,10 +273,7 @@ fn force_reparse_against_populated_kb_truncates() {
 
     fn ref_signatures(db: &EmbeddedDatabase) -> Vec<String> {
         let mut sigs: Vec<String> = db
-            .query(
-                "SELECT to_name, kind, line, resolution FROM _hdb_code_symbol_refs",
-                &[],
-            )
+            .query("SELECT to_name, kind, line, resolution FROM _hdb_code_symbol_refs", &[])
             .unwrap()
             .into_iter()
             .map(|r| format!("{:?}", r.values))

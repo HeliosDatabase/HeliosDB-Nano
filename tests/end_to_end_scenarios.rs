@@ -79,7 +79,10 @@ fn test_scenario_data_migration() -> Result<()> {
 
         db.execute(&format!(
             "INSERT INTO new_users (id, name, email, age) VALUES ({}, '{}', '{}@example.com', {})",
-            id, name, name.to_lowercase(), age
+            id,
+            name,
+            name.to_lowercase(),
+            age
         ))?;
     }
 
@@ -156,7 +159,8 @@ fn test_scenario_transaction_rollback_on_error() -> Result<()> {
     tx.execute("INSERT INTO users (id, name, email, age) VALUES (2, 'Bob', 'bob@example.com', 25)")?;
 
     // Try to insert duplicate ID (should fail if PRIMARY KEY is enforced)
-    let result = tx.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Charlie', 'charlie@example.com', 35)");
+    let result =
+        tx.execute("INSERT INTO users (id, name, email, age) VALUES (1, 'Charlie', 'charlie@example.com', 35)");
     // Note: PRIMARY KEY constraint enforcement may vary; test rollback regardless
     if result.is_err() {
         println!("Duplicate ID correctly rejected");
@@ -178,7 +182,10 @@ fn test_scenario_transaction_rollback_on_error() -> Result<()> {
         println!("Transaction rollback working correctly");
     } else {
         // Transaction rollback may not be fully implemented yet
-        println!("Note: Transaction rollback isolation not fully enforced ({} rows exist)", results.len());
+        println!(
+            "Note: Transaction rollback isolation not fully enforced ({} rows exist)",
+            results.len()
+        );
     }
 
     Ok(())
@@ -456,7 +463,10 @@ fn test_scenario_stress_test() -> Result<()> {
         // Insert
         db.execute(&format!(
             "INSERT INTO users (id, name, email, age) VALUES ({}, 'User{}', 'user{}@example.com', {})",
-            i, i, i, 20 + (i % 60)
+            i,
+            i,
+            i,
+            20 + (i % 60)
         ))?;
 
         // Query

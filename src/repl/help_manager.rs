@@ -40,16 +40,25 @@ impl HelpManager {
 
     /// Get terminal width, defaulting to 80 if detection fails
     fn get_terminal_width() -> usize {
-        terminal_size::terminal_size()
-            .map(|(w, _)| w.0 as usize)
-            .unwrap_or(80)
+        terminal_size::terminal_size().map(|(w, _)| w.0 as usize).unwrap_or(80)
     }
 
     /// Print 2-column layout for narrow terminals (< 120 cols)
     fn print_help_2col() {
-        println!("\n{}", "╔══════════════════════════════════════════════════════════════════════════════╗".cyan());
-        println!("{}", "║              HeliosDB Nano - Interactive SQL REPL Help                      ║".cyan().bold());
-        println!("{}", "╚══════════════════════════════════════════════════════════════════════════════╝".cyan());
+        println!(
+            "\n{}",
+            "╔══════════════════════════════════════════════════════════════════════════════╗".cyan()
+        );
+        println!(
+            "{}",
+            "║              HeliosDB Nano - Interactive SQL REPL Help                      ║"
+                .cyan()
+                .bold()
+        );
+        println!(
+            "{}",
+            "╚══════════════════════════════════════════════════════════════════════════════╝".cyan()
+        );
 
         println!("\n{}", "Quick Start:".yellow().bold());
         println!("  {}  Show this help", "\\h".cyan());
@@ -83,24 +92,46 @@ impl HelpManager {
         println!("{}", "╚══════════════════════════════════════════════════════════════════════════════════════════════════════════════════╝".cyan());
 
         println!("\n{}", "Quick Start:".yellow().bold());
-        println!("  {}  Show this help  │  {}  Show category help  │  {}  Exit REPL",
-                 "\\h".cyan(), "\\h <category>".cyan(), "\\q".cyan());
+        println!(
+            "  {}  Show this help  │  {}  Show category help  │  {}  Exit REPL",
+            "\\h".cyan(),
+            "\\h <category>".cyan(),
+            "\\q".cyan()
+        );
 
         println!("\n{}", "Help Categories:".yellow().bold());
-        println!("  {}  REPL basics       │  {}  Schema exploration  │  {}  Branch workflows",
-                 "basics".cyan(), "schema".cyan(), "branching".cyan());
-        println!("  {}  Time-travel queries  │  {}  Vector search      │  {}  Document storage",
-                 "time-travel".cyan(), "vectors".cyan(), "documents".cyan());
-        println!("  {}  AI agents        │  {}  AI inference       │  {}  Multi-tenancy",
-                 "agents".cyan(), "ai".cyan(), "tenants".cyan());
-        println!("  {}  Configuration    │  {}  SQL examples      │  {}  SQL syntax",
-                 "settings".cyan(), "examples".cyan(), "sql".cyan());
+        println!(
+            "  {}  REPL basics       │  {}  Schema exploration  │  {}  Branch workflows",
+            "basics".cyan(),
+            "schema".cyan(),
+            "branching".cyan()
+        );
+        println!(
+            "  {}  Time-travel queries  │  {}  Vector search      │  {}  Document storage",
+            "time-travel".cyan(),
+            "vectors".cyan(),
+            "documents".cyan()
+        );
+        println!(
+            "  {}  AI agents        │  {}  AI inference       │  {}  Multi-tenancy",
+            "agents".cyan(),
+            "ai".cyan(),
+            "tenants".cyan()
+        );
+        println!(
+            "  {}  Configuration    │  {}  SQL examples      │  {}  SQL syntax",
+            "settings".cyan(),
+            "examples".cyan(),
+            "sql".cyan()
+        );
 
         println!("\n{}", "Usage:".dimmed());
-        println!("  {}  {}  {}",
-                 "\\h vectors".dimmed(),
-                 "- Show vector search help".dimmed(),
-                 "│  \\h branching - Show branching help".dimmed());
+        println!(
+            "  {}  {}  {}",
+            "\\h vectors".dimmed(),
+            "- Show vector search help".dimmed(),
+            "│  \\h branching - Show branching help".dimmed()
+        );
         println!();
     }
 
@@ -205,9 +236,15 @@ impl HelpManager {
         Self::print_example("SELECT * FROM orders AS OF TRANSACTION 12345");
 
         println!("\n{}", "Snapshots:".yellow());
-        println!("  {}", "(Coming in v3.2.0 - Named snapshots for point-in-time recovery)".dimmed());
+        println!(
+            "  {}",
+            "(Coming in v3.2.0 - Named snapshots for point-in-time recovery)".dimmed()
+        );
         Self::print_command("\\snapshots", "List available snapshots (v3.2.0+)");
-        Self::print_command("CREATE SNAPSHOT <name> [AT TIMESTAMP <ts>]", "Create named snapshot (v3.2.0+)");
+        Self::print_command(
+            "CREATE SNAPSHOT <name> [AT TIMESTAMP <ts>]",
+            "Create named snapshot (v3.2.0+)",
+        );
         Self::print_example("CREATE SNAPSHOT pre_migration AT TIMESTAMP '2024-01-15 10:00:00'");
         Self::print_command("DROP SNAPSHOT <name> [CASCADE]", "Delete snapshot (v3.2.0+)");
 
@@ -243,7 +280,10 @@ impl HelpManager {
         Self::print_command("CREATE TABLE t (embedding VECTOR(384))", "Define vector column");
         Self::print_command("CREATE INDEX idx ON t USING hnsw(embedding)", "Create HNSW index");
         Self::print_command("SELECT * FROM t ORDER BY embedding <-> query LIMIT 10", "K-NN search");
-        println!("  {}", "Operators: <-> (L2), <#> (inner product), <=> (cosine)".dimmed());
+        println!(
+            "  {}",
+            "Operators: <-> (L2), <#> (inner product), <=> (cosine)".dimmed()
+        );
 
         println!("\n{}", "Search:".yellow());
         Self::print_command("\\vector search <store> <query>", "Search vectors");
@@ -279,7 +319,9 @@ impl HelpManager {
 
         println!("\n{}", "SQL Integration:".yellow());
         Self::print_command("INSERT INTO documents (collection, data) VALUES (...)", "Add document");
-        Self::print_example("INSERT INTO documents (collection, data) VALUES ('articles', '{\"title\": \"...\"}'::json)");
+        Self::print_example(
+            "INSERT INTO documents (collection, data) VALUES ('articles', '{\"title\": \"...\"}'::json)",
+        );
 
         println!("\n{}", "Advanced Document Operations:".yellow());
         Self::print_command("\\doc chunks <collection> <id>", "Show document chunks");
@@ -412,7 +454,10 @@ impl HelpManager {
         println!("\n{}", "Quota Management:".yellow());
         Self::print_command("\\tenant quota <tenant>", "Show quota usage");
         Self::print_example("\\tenant quota acme-corp");
-        Self::print_command("\\tenant quota-set <tenant> <storage_mb> <conns> <qps>", "Set custom quotas");
+        Self::print_command(
+            "\\tenant quota-set <tenant> <storage_mb> <conns> <qps>",
+            "Set custom quotas",
+        );
         Self::print_example("\\tenant quota-set acme-corp 5000 25 10000");
         println!("  {}", "Arguments: storage_mb, max_connections, max_qps".dimmed());
 
@@ -448,7 +493,10 @@ impl HelpManager {
         println!("  {}", "-- Switch context".dimmed());
         println!("  {}", "\\tenant use acme-corp".dimmed());
         println!("  {}", "-- All queries now isolated to acme-corp".dimmed());
-        println!("  {}", "INSERT INTO customers VALUES (1, 'acme-corp', 'Alice', 'alice@acme.com')".dimmed());
+        println!(
+            "  {}",
+            "INSERT INTO customers VALUES (1, 'acme-corp', 'Alice', 'alice@acme.com')".dimmed()
+        );
         println!("  {}", "SELECT * FROM customers;  -- Only sees acme-corp data".dimmed());
         println!("  {}", "-- Upgrade plan".dimmed());
         println!("  {}", "\\tenant plan acme-corp pro".dimmed());
@@ -471,12 +519,24 @@ impl HelpManager {
         Self::print_example("\\set cache_size 512MB");
 
         println!("\n{}", "Performance Commands:".yellow());
-        Self::print_command("\\explain <query>", "Show query execution plan with storage layer analysis");
+        Self::print_command(
+            "\\explain <query>",
+            "Show query execution plan with storage layer analysis",
+        );
         Self::print_example("\\explain SELECT * FROM users WHERE id = 1");
-        Self::print_command("\\explain analyze <query>", "Execute query and show actual timing and row counts");
+        Self::print_command(
+            "\\explain analyze <query>",
+            "Execute query and show actual timing and row counts",
+        );
         Self::print_example("\\explain analyze SELECT * FROM users");
-        println!("  {}", "EXPLAIN shows: plan tree, filter pushdown, index usage, compression info".dimmed());
-        println!("  {}", "EXPLAIN ANALYZE also shows: actual execution time, row count accuracy".dimmed());
+        println!(
+            "  {}",
+            "EXPLAIN shows: plan tree, filter pushdown, index usage, compression info".dimmed()
+        );
+        println!(
+            "  {}",
+            "EXPLAIN ANALYZE also shows: actual execution time, row count accuracy".dimmed()
+        );
         Self::print_command("\\profile <query>", "Profile query with timing");
         Self::print_example("\\profile SELECT * FROM orders WHERE total > 1000");
         Self::print_command("\\telemetry", "Show database statistics");
@@ -507,11 +567,20 @@ impl HelpManager {
 
         println!("\n{}", "Vector Search Example:".yellow());
         println!("  {}", "-- Create table with vector column".dimmed());
-        println!("  {}", "CREATE TABLE products (id INT, name TEXT, embedding VECTOR(384))".dimmed());
+        println!(
+            "  {}",
+            "CREATE TABLE products (id INT, name TEXT, embedding VECTOR(384))".dimmed()
+        );
         println!("  {}", "-- Insert with embedding".dimmed());
-        println!("  {}", "INSERT INTO products VALUES (1, 'Widget', '[0.1, 0.2, ...]')".dimmed());
+        println!(
+            "  {}",
+            "INSERT INTO products VALUES (1, 'Widget', '[0.1, 0.2, ...]')".dimmed()
+        );
         println!("  {}", "-- Search similar products".dimmed());
-        println!("  {}", "SELECT * FROM vector_search('products', '[0.5, ...]', 10)".dimmed());
+        println!(
+            "  {}",
+            "SELECT * FROM vector_search('products', '[0.5, ...]', 10)".dimmed()
+        );
 
         println!("\n{}", "Time-Travel Analysis:".yellow());
         println!("  {}", "-- Compare data before and after migration".dimmed());
@@ -531,7 +600,10 @@ impl HelpManager {
         println!("\n{}", "Hybrid Search (Fulltext + Vector):".yellow());
         println!("  {}", "WITH text_results AS (".dimmed());
         println!("  {}", "  SELECT id, ts_rank(content_fts, query) as rank".dimmed());
-        println!("  {}", "  FROM articles, to_tsquery('machine & learning') query".dimmed());
+        println!(
+            "  {}",
+            "  FROM articles, to_tsquery('machine & learning') query".dimmed()
+        );
         println!("  {}", "  WHERE content_fts @@ query".dimmed());
         println!("  {}", "),".dimmed());
         println!("  {}", "vector_results AS (".dimmed());
@@ -584,7 +656,10 @@ impl HelpManager {
         println!("  {}", "vector_search(<store>, <vec>, <k>)  - K-NN search".cyan());
         println!("  {}", "cosine_similarity(<v1>, <v2>)       - Vector similarity".cyan());
         println!("  {}", "to_tsquery(<text>)                   - Fulltext query".cyan());
-        println!("  {}", "ts_rank(<fts>, <query>)              - Relevance ranking".cyan());
+        println!(
+            "  {}",
+            "ts_rank(<fts>, <query>)              - Relevance ranking".cyan()
+        );
 
         println!("\n{}", "For more examples, use:".green().bold());
         println!("  {}", "\\h examples".dimmed());
@@ -677,8 +752,18 @@ mod tests {
     #[test]
     fn test_all_categories_render() {
         let categories = vec![
-            "basics", "schema", "branching", "time-travel", "vectors",
-            "documents", "agents", "ai", "tenants", "settings", "examples", "sql",
+            "basics",
+            "schema",
+            "branching",
+            "time-travel",
+            "vectors",
+            "documents",
+            "agents",
+            "ai",
+            "tenants",
+            "settings",
+            "examples",
+            "sql",
         ];
 
         for cat in categories {

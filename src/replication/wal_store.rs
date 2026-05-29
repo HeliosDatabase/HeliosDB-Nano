@@ -294,16 +294,13 @@ impl WalStore {
 
         let _version = u32::from_le_bytes([header[4], header[5], header[6], header[7]]);
         let segment_id = u64::from_le_bytes([
-            header[8], header[9], header[10], header[11],
-            header[12], header[13], header[14], header[15],
+            header[8], header[9], header[10], header[11], header[12], header[13], header[14], header[15],
         ]);
         let start_lsn = u64::from_le_bytes([
-            header[16], header[17], header[18], header[19],
-            header[20], header[21], header[22], header[23],
+            header[16], header[17], header[18], header[19], header[20], header[21], header[22], header[23],
         ]);
         let entry_count = u64::from_le_bytes([
-            header[24], header[25], header[26], header[27],
-            header[28], header[29], header[30], header[31],
+            header[24], header[25], header[26], header[27], header[28], header[29], header[30], header[31],
         ]);
 
         // Scan to find end_lsn and actual entry count
@@ -317,12 +314,17 @@ impl WalStore {
                 break;
             }
 
-            let length = u32::from_le_bytes([
-                entry_header[0], entry_header[1], entry_header[2], entry_header[3],
-            ]) as usize;
+            let length =
+                u32::from_le_bytes([entry_header[0], entry_header[1], entry_header[2], entry_header[3]]) as usize;
             let lsn = u64::from_le_bytes([
-                entry_header[5], entry_header[6], entry_header[7], entry_header[8],
-                entry_header[9], entry_header[10], entry_header[11], entry_header[12],
+                entry_header[5],
+                entry_header[6],
+                entry_header[7],
+                entry_header[8],
+                entry_header[9],
+                entry_header[10],
+                entry_header[11],
+                entry_header[12],
             ]);
 
             // Skip data
@@ -349,12 +351,12 @@ impl WalStore {
 
     /// Load segment entries into memory
     async fn load_segment_entries(&self, path: &PathBuf, info: &WalSegmentInfo) -> Result<()> {
-        let file = File::open(path)
-            .map_err(|e| ReplicationError::Storage(format!("Failed to open segment: {}", e)))?;
+        let file = File::open(path).map_err(|e| ReplicationError::Storage(format!("Failed to open segment: {}", e)))?;
         let mut reader = BufReader::new(file);
 
         // Skip header
-        reader.seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))
+        reader
+            .seek(SeekFrom::Start(SEGMENT_HEADER_SIZE as u64))
             .map_err(|e| ReplicationError::Storage(format!("Seek failed: {}", e)))?;
 
         let mut entries = self.entries.write().await;
@@ -366,17 +368,20 @@ impl WalStore {
                 break;
             }
 
-            let length = u32::from_le_bytes([
-                entry_header[0], entry_header[1], entry_header[2], entry_header[3],
-            ]) as usize;
+            let length =
+                u32::from_le_bytes([entry_header[0], entry_header[1], entry_header[2], entry_header[3]]) as usize;
             let entry_type = entry_header[4];
             let lsn = u64::from_le_bytes([
-                entry_header[5], entry_header[6], entry_header[7], entry_header[8],
-                entry_header[9], entry_header[10], entry_header[11], entry_header[12],
+                entry_header[5],
+                entry_header[6],
+                entry_header[7],
+                entry_header[8],
+                entry_header[9],
+                entry_header[10],
+                entry_header[11],
+                entry_header[12],
             ]);
-            let checksum = u32::from_le_bytes([
-                entry_header[13], entry_header[14], entry_header[15], entry_header[16],
-            ]);
+            let checksum = u32::from_le_bytes([entry_header[13], entry_header[14], entry_header[15], entry_header[16]]);
 
             // Read data
             let mut data = vec![0u8; length];
@@ -387,7 +392,12 @@ impl WalStore {
             // Verify checksum
             let computed_checksum = crc32fast::hash(&data);
             if computed_checksum != checksum {
-                tracing::warn!("Checksum mismatch for LSN {}: expected {}, got {}", lsn, checksum, computed_checksum);
+                tracing::warn!(
+                    "Checksum mismatch for LSN {}: expected {}, got {}",
+                    lsn,
+                    checksum,
+                    computed_checksum
+                );
                 continue;
             }
 
@@ -458,11 +468,13 @@ impl WalStore {
         header[16..24].copy_from_slice(&start_lsn.to_le_bytes());
         // entry_count will be updated on close
 
-        writer.write_all(&header)
+        writer
+            .write_all(&header)
             .map_err(|e| ReplicationError::Storage(format!("Failed to write header: {}", e)))?;
 
         if self.config.fsync_on_write {
-            writer.flush()
+            writer
+                .flush()
                 .map_err(|e| ReplicationError::Storage(format!("Flush failed: {}", e)))?;
         }
 
@@ -486,8 +498,8 @@ impl WalStore {
         let needs_new_segment = match &*writer_guard {
             None => true,
             Some(w) => {
-                w.entry_count >= self.config.max_entries_per_segment as u64 ||
-                w.offset >= self.config.max_segment_size as u64
+                w.entry_count >= self.config.max_entries_per_segment as u64
+                    || w.offset >= self.config.max_segment_size as u64
             }
         };
 
@@ -509,19 +521,31 @@ impl WalStore {
             let length = entry.data.len() as u32;
             let entry_type = Self::entry_type_to_u8(entry.entry_type);
 
-            writer.file.write_all(&length.to_le_bytes())
+            writer
+                .file
+                .write_all(&length.to_le_bytes())
                 .map_err(|e| ReplicationError::Storage(format!("Write failed: {}", e)))?;
-            writer.file.write_all(&[entry_type])
+            writer
+                .file
+                .write_all(&[entry_type])
                 .map_err(|e| ReplicationError::Storage(format!("Write failed: {}", e)))?;
-            writer.file.write_all(&entry.lsn.to_le_bytes())
+            writer
+                .file
+                .write_all(&entry.lsn.to_le_bytes())
                 .map_err(|e| ReplicationError::Storage(format!("Write failed: {}", e)))?;
-            writer.file.write_all(&entry.checksum.to_le_bytes())
+            writer
+                .file
+                .write_all(&entry.checksum.to_le_bytes())
                 .map_err(|e| ReplicationError::Storage(format!("Write failed: {}", e)))?;
-            writer.file.write_all(&entry.data)
+            writer
+                .file
+                .write_all(&entry.data)
                 .map_err(|e| ReplicationError::Storage(format!("Write failed: {}", e)))?;
 
             if self.config.fsync_on_write {
-                writer.file.flush()
+                writer
+                    .file
+                    .flush()
                     .map_err(|e| ReplicationError::Storage(format!("Flush failed: {}", e)))?;
             }
 
@@ -541,7 +565,9 @@ impl WalStore {
     /// Close and finalize a segment
     async fn close_segment(&self, writer: &mut SegmentWriter) -> Result<()> {
         // Flush remaining data
-        writer.file.flush()
+        writer
+            .file
+            .flush()
             .map_err(|e| ReplicationError::Storage(format!("Flush failed: {}", e)))?;
 
         // Update header with entry count
@@ -664,10 +690,13 @@ impl WalStore {
 
         // Check if there are more entries after this batch
         if !has_more && actual_end_lsn < end_lsn {
-            has_more = entries.range((
-                std::ops::Bound::Excluded(actual_end_lsn),
-                std::ops::Bound::Included(end_lsn),
-            )).next().is_some();
+            has_more = entries
+                .range((
+                    std::ops::Bound::Excluded(actual_end_lsn),
+                    std::ops::Bound::Included(end_lsn),
+                ))
+                .next()
+                .is_some();
         }
 
         Ok(BatchResult {
@@ -682,10 +711,7 @@ impl WalStore {
     /// Get all entries in a range (for small ranges)
     pub async fn get_range(&self, start_lsn: Lsn, end_lsn: Lsn) -> Vec<WalEntry> {
         let entries = self.entries.read().await;
-        entries
-            .range(start_lsn..=end_lsn)
-            .map(|(_, e)| e.clone())
-            .collect()
+        entries.range(start_lsn..=end_lsn).map(|(_, e)| e.clone()).collect()
     }
 
     /// Get current write LSN
@@ -776,7 +802,9 @@ impl WalStore {
         {
             let mut writer_guard = self.writer.write().await;
             if let Some(ref mut writer) = *writer_guard {
-                writer.file.flush()
+                writer
+                    .file
+                    .flush()
                     .map_err(|e| ReplicationError::Storage(format!("Flush failed: {}", e)))?;
                 if let Ok(file) = writer.file.get_mut().try_clone() {
                     let _ = file.sync_all();
@@ -952,7 +980,11 @@ impl BatchStreamState {
         self.request.to_lsn.map(|to| {
             let total = to.saturating_sub(self.request.from_lsn) as f64;
             let done = self.last_sent_lsn.saturating_sub(self.request.from_lsn) as f64;
-            if total > 0.0 { done / total * 100.0 } else { 100.0 }
+            if total > 0.0 {
+                done / total * 100.0
+            } else {
+                100.0
+            }
         })
     }
 }

@@ -7,8 +7,8 @@
 //! - Query plan library (save common patterns)
 //! - Historical analysis (plan evolution)
 
-use crate::{Result, Error};
-use super::explain::{ExplainOutput, PlanNode, ConfigSnapshot};
+use super::explain::{ConfigSnapshot, ExplainOutput, PlanNode};
+use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -102,21 +102,16 @@ impl PlanVersionManager {
 
     /// Get specific version
     pub fn get_version(&self, version_id: &str) -> Option<&PlanVersion> {
-        self.versions
-            .values()
-            .flatten()
-            .find(|v| v.version_id == version_id)
+        self.versions.values().flatten().find(|v| v.version_id == version_id)
     }
 
     /// Compare two versions
-    pub fn compare_versions(
-        &self,
-        version1_id: &str,
-        version2_id: &str,
-    ) -> Result<PlanDiff> {
-        let v1 = self.get_version(version1_id)
+    pub fn compare_versions(&self, version1_id: &str, version2_id: &str) -> Result<PlanDiff> {
+        let v1 = self
+            .get_version(version1_id)
             .ok_or_else(|| Error::Storage(format!("Version {} not found", version1_id)))?;
-        let v2 = self.get_version(version2_id)
+        let v2 = self
+            .get_version(version2_id)
             .ok_or_else(|| Error::Storage(format!("Version {} not found", version2_id)))?;
 
         Ok(PlanDiff::compute(&v1.plan, &v2.plan))
@@ -138,8 +133,7 @@ impl PlanVersionManager {
             events.push(TimelineEvent {
                 timestamp: version.created_at,
                 event_type: TimelineEventType::PlanChange,
-                description: format!("Plan version {} created by {}",
-                    version.version_id, version.created_by),
+                description: format!("Plan version {} created by {}", version.version_id, version.created_by),
                 version_id: Some(version.version_id.clone()),
                 cost_change: None,
             });
@@ -243,12 +237,8 @@ impl PlanDiff {
 
         // Detect feature changes
         let mut feature_changes = Vec::new();
-        let old_features: HashMap<_, _> = old.features.iter()
-            .map(|f| (f.name.clone(), f))
-            .collect();
-        let new_features: HashMap<_, _> = new.features.iter()
-            .map(|f| (f.name.clone(), f))
-            .collect();
+        let old_features: HashMap<_, _> = old.features.iter().map(|f| (f.name.clone(), f)).collect();
+        let new_features: HashMap<_, _> = new.features.iter().map(|f| (f.name.clone(), f)).collect();
 
         for name in new_features.keys() {
             if !old_features.contains_key(name) {
@@ -320,8 +310,10 @@ impl PlanDiff {
                 let child_path = format!("{}/child[{}]", path, i);
                 changes.push(StructureChange {
                     change_type: StructureChangeType::NodeAdded,
-                    description: format!("New node added: {} ({})",
-                        new.children[i].node_type, new.children[i].operation),
+                    description: format!(
+                        "New node added: {} ({})",
+                        new.children[i].node_type, new.children[i].operation
+                    ),
                     location: child_path,
                 });
             }
@@ -330,8 +322,10 @@ impl PlanDiff {
                 let child_path = format!("{}/child[{}]", path, i);
                 changes.push(StructureChange {
                     change_type: StructureChangeType::NodeRemoved,
-                    description: format!("Node removed: {} ({})",
-                        old.children[i].node_type, old.children[i].operation),
+                    description: format!(
+                        "Node removed: {} ({})",
+                        old.children[i].node_type, old.children[i].operation
+                    ),
                     location: child_path,
                 });
             }
@@ -346,18 +340,16 @@ impl PlanDiff {
             if old.children[i].node_type != new.children[i].node_type {
                 changes.push(StructureChange {
                     change_type: StructureChangeType::NodeReordered,
-                    description: format!("Node at position {} changed from {} to {}",
-                        i, old.children[i].node_type, new.children[i].node_type),
+                    description: format!(
+                        "Node at position {} changed from {} to {}",
+                        i, old.children[i].node_type, new.children[i].node_type
+                    ),
                     location: child_path.clone(),
                 });
             }
 
             // Recurse into children
-            let child_changes = Self::compute_tree_diff(
-                &old.children[i],
-                &new.children[i],
-                &child_path
-            );
+            let child_changes = Self::compute_tree_diff(&old.children[i], &new.children[i], &child_path);
             changes.extend(child_changes);
         }
 
@@ -449,16 +441,12 @@ impl PlanDiff {
         if cost_change.improved {
             summary.push_str(&format!(
                 "✅ Plan improved: Cost reduced by {:.1}% ({:.2} → {:.2})\n",
-                -cost_change.change_percent,
-                cost_change.old_cost,
-                cost_change.new_cost
+                -cost_change.change_percent, cost_change.old_cost, cost_change.new_cost
             ));
         } else if cost_change.change_percent > 10.0 {
             summary.push_str(&format!(
                 "⚠️ Plan regressed: Cost increased by {:.1}% ({:.2} → {:.2})\n",
-                cost_change.change_percent,
-                cost_change.old_cost,
-                cost_change.new_cost
+                cost_change.change_percent, cost_change.old_cost, cost_change.new_cost
             ));
         } else {
             summary.push_str("ℹ️ Plan cost unchanged (within 10% tolerance)\n");
@@ -765,27 +753,25 @@ pub struct EvolutionAnalysis {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::*;
-    use crate::{Schema, Column, DataType};
-    use crate::sql::logical_plan::LogicalPlan;
-    use std::sync::Arc;
     use super::super::explain::*;
+    use super::*;
+    use crate::sql::logical_plan::LogicalPlan;
+    use crate::{Column, DataType, Schema};
+    use std::sync::Arc;
 
     fn create_test_output() -> ExplainOutput {
         let schema = Arc::new(Schema {
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: true,
-                    source_table: None,
-                    source_table_name: None,
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
                 default_expr: None,
                 unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                },
-            ],
+            }],
         });
 
         let plan = LogicalPlan::Scan {
@@ -864,12 +850,7 @@ mod tests {
             "dev".to_string(),
         );
 
-        manager.store_version(
-            "query-456".to_string(),
-            plan,
-            "bob".to_string(),
-            "staging".to_string(),
-        );
+        manager.store_version("query-456".to_string(), plan, "bob".to_string(), "staging".to_string());
 
         let timeline = manager.get_timeline("query-456");
         assert_eq!(timeline.events.len(), 2);

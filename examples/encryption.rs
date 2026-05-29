@@ -1,6 +1,6 @@
 //! Example: Encryption usage
 
-use heliosdb_nano::crypto::{encrypt, decrypt, derive_key_from_password};
+use heliosdb_nano::crypto::{decrypt, derive_key_from_password, encrypt};
 use heliosdb_nano::Result;
 
 fn main() -> Result<()> {
@@ -15,8 +15,11 @@ fn main() -> Result<()> {
     // Encrypt data
     let plaintext = b"Sensitive data to protect";
     let ciphertext = encrypt(&key, plaintext)?;
-    println!("✓ Data encrypted ({} bytes → {} bytes)",
-        plaintext.len(), ciphertext.len());
+    println!(
+        "✓ Data encrypted ({} bytes → {} bytes)",
+        plaintext.len(),
+        ciphertext.len()
+    );
 
     // Decrypt data
     let decrypted = decrypt(&key, &ciphertext)?;

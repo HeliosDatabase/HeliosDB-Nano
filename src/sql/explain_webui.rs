@@ -382,11 +382,13 @@ impl WebUIRenderer {
       to { opacity: 1; transform: translateY(0); }
     }
   </style>
-"#.to_string()
+"#
+        .to_string()
     }
 
     fn generate_header(&self, output: &ExplainOutput) -> String {
-        format!(r#"
+        format!(
+            r#"
   <div class="container">
     <header class="header">
       <h1>HeliosDB EXPLAIN Analysis</h1>
@@ -410,7 +412,12 @@ impl WebUIRenderer {
         </div>
       </div>
     </header>
-"#, output.total_cost, output.total_rows, output.planning_time_ms, output.features.len())
+"#,
+            output.total_cost,
+            output.total_rows,
+            output.planning_time_ms,
+            output.features.len()
+        )
     }
 
     fn generate_controls(&self) -> String {
@@ -432,7 +439,8 @@ impl WebUIRenderer {
         📋 Copy
       </button>
     </div>
-"#.to_string()
+"#
+        .to_string()
     }
 
     fn generate_plan_visualization(&self, output: &ExplainOutput) -> String {
@@ -451,16 +459,28 @@ impl WebUIRenderer {
 
         html.push_str("      <div class=\"plan-node fade-in\">\n");
         html.push_str("        <div class=\"node-header\">\n");
-        html.push_str(&format!("          <span class=\"node-operation\">{}</span>\n", node.operation));
+        html.push_str(&format!(
+            "          <span class=\"node-operation\">{}</span>\n",
+            node.operation
+        ));
         html.push_str("          <div class=\"node-stats\">\n");
-        html.push_str(&format!("            <span title=\"Estimated cost\">Cost: {:.2}</span>\n", node.cost));
-        html.push_str(&format!("            <span title=\"Estimated rows\">Rows: {}</span>\n", node.rows));
+        html.push_str(&format!(
+            "            <span title=\"Estimated cost\">Cost: {:.2}</span>\n",
+            node.cost
+        ));
+        html.push_str(&format!(
+            "            <span title=\"Estimated rows\">Rows: {}</span>\n",
+            node.rows
+        ));
         html.push_str("          </div>\n");
         html.push_str("        </div>\n");
 
         if !node.details.is_empty() {
             for (key, value) in &node.details {
-                html.push_str(&format!("        <div class=\"node-detail\"><strong>{}:</strong> {}</div>\n", key, value));
+                html.push_str(&format!(
+                    "        <div class=\"node-detail\"><strong>{}:</strong> {}</div>\n",
+                    key, value
+                ));
             }
         }
 
@@ -509,11 +529,20 @@ impl WebUIRenderer {
 
         for feature in &output.features {
             html.push_str("        <div class=\"feature-card\">\n");
-            html.push_str(&format!("          <div class=\"feature-name\">{}</div>\n", feature.name));
-            html.push_str(&format!("          <div class=\"feature-benefit\">{}</div>\n", feature.benefit));
+            html.push_str(&format!(
+                "          <div class=\"feature-name\">{}</div>\n",
+                feature.name
+            ));
+            html.push_str(&format!(
+                "          <div class=\"feature-benefit\">{}</div>\n",
+                feature.benefit
+            ));
 
             if let Some(savings) = feature.savings_percent {
-                html.push_str(&format!("          <span class=\"savings\">-{:.1}% Cost</span>\n", savings));
+                html.push_str(&format!(
+                    "          <span class=\"savings\">-{:.1}% Cost</span>\n",
+                    savings
+                ));
             }
 
             html.push_str("        </div>\n");
@@ -573,7 +602,8 @@ impl WebUIRenderer {
     });
   </script>
   </div>
-"#.to_string()
+"#
+        .to_string()
     }
 
     /// Generate SVG visualization
@@ -603,13 +633,16 @@ impl WebUIRenderer {
         // Draw node rectangle
         svg.push_str(&format!(
             "  <rect class=\"node\" x=\"{}\" y=\"{}\" width=\"200\" height=\"60\" rx=\"5\"/>\n",
-            x - 100, y
+            x - 100,
+            y
         ));
 
         // Draw node text
         svg.push_str(&format!(
             "  <text class=\"node-text\" x=\"{}\" y=\"{}\" text-anchor=\"middle\">{}</text>\n",
-            x, y + 20, node.operation
+            x,
+            y + 20,
+            node.operation
         ));
 
         svg.push_str(&format!(
@@ -628,7 +661,10 @@ impl WebUIRenderer {
             // Draw edge
             svg.push_str(&format!(
                 "  <line class=\"edge\" x1=\"{}\" y1=\"{}\" x2=\"{}\" y2=\"{}\"/>\n",
-                x, y + 60, child_x, child_y
+                x,
+                y + 60,
+                child_x,
+                child_y
             ));
 
             // Recursively draw child
@@ -660,9 +696,7 @@ impl ExportFormat {
                 let renderer = WebUIRenderer::new(WebUIConfig::default());
                 renderer.render_svg(output)
             }
-            ExportFormat::JSON => {
-                serde_json::to_string_pretty(output).unwrap_or_default()
-            }
+            ExportFormat::JSON => serde_json::to_string_pretty(output).unwrap_or_default(),
             ExportFormat::PNG | ExportFormat::PDF => {
                 "PNG/PDF export requires additional rendering libraries".to_string()
             }
@@ -673,27 +707,25 @@ impl ExportFormat {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
-    use super::*;
-    use crate::{Schema, Column, DataType};
-    use crate::sql::logical_plan::LogicalPlan;
-    use std::sync::Arc;
     use super::super::explain::*;
+    use super::*;
+    use crate::sql::logical_plan::LogicalPlan;
+    use crate::{Column, DataType, Schema};
+    use std::sync::Arc;
 
     fn create_test_output() -> ExplainOutput {
         let schema = Arc::new(Schema {
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: true,
-                    source_table: None,
-                    source_table_name: None,
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
                 default_expr: None,
                 unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                },
-            ],
+            }],
         });
 
         let plan = LogicalPlan::Scan {

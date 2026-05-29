@@ -121,17 +121,16 @@ fn main() {
 
     // Encode a vector
     let start = std::time::Instant::now();
-    let codes = simd::quantization::encode_vector_simd(
-        &query_vec,
-        &codebooks,
-        num_subquantizers,
-        codebook_size,
-        subvector_dim,
-    );
+    let codes =
+        simd::quantization::encode_vector_simd(&query_vec, &codebooks, num_subquantizers, codebook_size, subvector_dim);
     let encode_time = start.elapsed();
 
-    println!("Encoded {} dimensional vector into {} codes in {:?}",
-             query_vec.len(), codes.len(), encode_time);
+    println!(
+        "Encoded {} dimensional vector into {} codes in {:?}",
+        query_vec.len(),
+        codes.len(),
+        encode_time
+    );
 
     // Compute distance table
     let start = std::time::Instant::now();

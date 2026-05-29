@@ -152,10 +152,7 @@ impl WalReplicator {
             ));
         }
 
-        tracing::info!(
-            "Starting WAL Replicator with {} standbys",
-            self.standbys.len()
-        );
+        tracing::info!("Starting WAL Replicator with {} standbys", self.standbys.len());
 
         // Initialize standby states
         {
@@ -198,8 +195,7 @@ impl WalReplicator {
                 for (id, state) in states.iter_mut() {
                     if state.connected {
                         let elapsed = now - state.last_heartbeat;
-                        if elapsed > chrono::Duration::from_std(heartbeat_timeout).unwrap_or_default()
-                        {
+                        if elapsed > chrono::Duration::from_std(heartbeat_timeout).unwrap_or_default() {
                             tracing::warn!("Standby {} heartbeat timeout, marking disconnected", id);
                             state.connected = false;
                         }
@@ -236,10 +232,7 @@ impl WalReplicator {
             let mut handles = self.task_handles.write().await;
             for handle in handles.drain(..) {
                 // Give each task 5 seconds to complete
-                let _ = tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
-                    handle,
-                ).await;
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
             }
         }
 
@@ -356,15 +349,13 @@ mod tests {
         use super::super::config::SyncMode;
 
         let config = WalStreamingConfig::default();
-        let standbys = vec![
-            StandbyConfig {
-                node_id: Uuid::new_v4(),
-                host: "standby1.example.com".to_string(),
-                port: 5433,
-                sync_mode: SyncMode::Async,
-                priority: 1,
-            },
-        ];
+        let standbys = vec![StandbyConfig {
+            node_id: Uuid::new_v4(),
+            host: "standby1.example.com".to_string(),
+            port: 5433,
+            sync_mode: SyncMode::Async,
+            priority: 1,
+        }];
         let replicator = WalReplicator::new(config, standbys);
 
         // Should not be running initially

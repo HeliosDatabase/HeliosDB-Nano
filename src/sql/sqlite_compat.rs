@@ -124,9 +124,7 @@ pub fn rewrite_question_placeholders(sql: &str) -> Result<String> {
         if c == b'$' {
             let tag_start = i + 1;
             let mut tag_end = tag_start;
-            while tag_end < bytes.len()
-                && (bytes[tag_end].is_ascii_alphanumeric() || bytes[tag_end] == b'_')
-            {
+            while tag_end < bytes.len() && (bytes[tag_end].is_ascii_alphanumeric() || bytes[tag_end] == b'_') {
                 tag_end += 1;
             }
 
@@ -193,9 +191,7 @@ pub fn rewrite_question_placeholders(sql: &str) -> Result<String> {
 /// MySQL `AUTO_INCREMENT`) are handled separately in the MySQL translator.
 fn rewrite_autoincrement(sql: &str) -> String {
     static RE: OnceLock<Regex> = OnceLock::new();
-    let re = RE.get_or_init(|| {
-        init_regex(r"(?i)\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b")
-    });
+    let re = RE.get_or_init(|| init_regex(r"(?i)\bINTEGER\s+PRIMARY\s+KEY\s+AUTOINCREMENT\b"));
     re.replace_all(sql, "BIGSERIAL PRIMARY KEY").to_string()
 }
 
@@ -359,9 +355,7 @@ fn split_statements_quote_aware(sql: &str) -> Vec<String> {
         if c == b'$' {
             let tag_start = i + 1;
             let mut tag_end = tag_start;
-            while tag_end < bytes.len()
-                && (bytes[tag_end].is_ascii_alphanumeric() || bytes[tag_end] == b'_')
-            {
+            while tag_end < bytes.len() && (bytes[tag_end].is_ascii_alphanumeric() || bytes[tag_end] == b'_') {
                 tag_end += 1;
             }
             if bytes.get(tag_end) == Some(&b'$') {
@@ -494,9 +488,7 @@ mod tests {
 
     #[test]
     fn insert_or_replace_with_cols() {
-        let r = rewrite_insert_or_replace(
-            "INSERT OR REPLACE INTO t (a, b, c) VALUES (1, 2, 3)",
-        );
+        let r = rewrite_insert_or_replace("INSERT OR REPLACE INTO t (a, b, c) VALUES (1, 2, 3)");
         assert_eq!(
             r,
             "INSERT INTO t (a, b, c) VALUES (1, 2, 3) ON CONFLICT DO UPDATE SET a = EXCLUDED.a, b = EXCLUDED.b, c = EXCLUDED.c"

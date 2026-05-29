@@ -8,12 +8,8 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_nano::{Config, storage::StorageEngine};
-use heliosdb_nano::protocols::{
-    ServerManager,
-    ServerManagerConfig,
-    oracle::OracleServerConfig,
-};
+use heliosdb_nano::protocols::{oracle::OracleServerConfig, ServerManager, ServerManagerConfig};
+use heliosdb_nano::{storage::StorageEngine, Config};
 use std::sync::Arc;
 use tokio::time::{sleep, Duration};
 
@@ -78,9 +74,7 @@ async fn test_server_startup_shutdown() {
     let manager = ServerManager::new(storage, server_config);
 
     // Start server in background
-    let server_task = tokio::spawn(async move {
-        manager.start().await
-    });
+    let server_task = tokio::spawn(async move { manager.start().await });
 
     // Give server time to start
     sleep(Duration::from_millis(100)).await;
@@ -119,23 +113,23 @@ fn test_oracle_server_custom_config() {
 fn test_protocol_module_exports() {
     // This test ensures all exports are available
     use heliosdb_nano::protocols::{
-        // Adapters
-        StorageAdapter,
-        QueryExecutorAdapter,
-        PubSubAdapter,
-        LiteStorageAdapter,
-        LiteQueryExecutorAdapter,
-        PubSubManager,
         ConnectionPool,
-        PoolConfig,
+        LiteQueryExecutorAdapter,
+        LiteStorageAdapter,
+        OracleProtocolHandler,
         // Oracle
         OracleServer,
         OracleTranslator,
-        OracleProtocolHandler,
+        PoolConfig,
+        PubSubAdapter,
+        PubSubManager,
+        QueryExecutorAdapter,
+        ServerHealth,
         // Server Manager
         ServerManager,
         ServerManagerConfig,
-        ServerHealth,
+        // Adapters
+        StorageAdapter,
     };
 
     // Just ensuring they compile
@@ -194,7 +188,7 @@ fn test_connection_pool_integration() {
         min_size: 2,
         max_size: 10,
         connection_timeout: Duration::from_secs(5),
-        db_path: None,  // In-memory
+        db_path: None, // In-memory
         db_config: Config::in_memory(),
     };
 

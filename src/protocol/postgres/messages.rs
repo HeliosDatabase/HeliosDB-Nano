@@ -7,7 +7,7 @@
 
 #![allow(unused_variables)]
 
-use crate::{Result, Error};
+use crate::{Error, Result};
 use bytes::{Buf, BufMut, BytesMut};
 use std::collections::HashMap;
 
@@ -63,9 +63,7 @@ pub enum FrontendMessage {
     },
 
     /// Simple query protocol
-    Query {
-        query: String,
-    },
+    Query { query: String },
 
     /// Extended protocol - Parse
     Parse {
@@ -84,22 +82,13 @@ pub enum FrontendMessage {
     },
 
     /// Extended protocol - Execute
-    Execute {
-        portal_name: String,
-        max_rows: i32,
-    },
+    Execute { portal_name: String, max_rows: i32 },
 
     /// Extended protocol - Describe
-    Describe {
-        target: DescribeTarget,
-        name: String,
-    },
+    Describe { target: DescribeTarget, name: String },
 
     /// Extended protocol - Close
-    Close {
-        target: DescribeTarget,
-        name: String,
-    },
+    Close { target: DescribeTarget, name: String },
 
     /// Sync (complete extended protocol sequence)
     Sync,
@@ -115,20 +104,13 @@ pub enum FrontendMessage {
     Terminate,
 
     /// Password message
-    PasswordMessage {
-        password: String,
-    },
+    PasswordMessage { password: String },
 
     /// SASL initial response
-    SaslInitialResponse {
-        mechanism: String,
-        data: Vec<u8>,
-    },
+    SaslInitialResponse { mechanism: String, data: Vec<u8> },
 
     /// SASL response (continue)
-    SaslResponse {
-        data: Vec<u8>,
-    },
+    SaslResponse { data: Vec<u8> },
 }
 
 /// Describe target (statement or portal)
@@ -145,10 +127,7 @@ pub enum BackendMessage {
     Authentication(AuthenticationMessage),
 
     /// Backend key data (for cancel requests)
-    BackendKeyData {
-        process_id: i32,
-        secret_key: i32,
-    },
+    BackendKeyData { process_id: i32, secret_key: i32 },
 
     /// Bind complete
     BindComplete,
@@ -157,14 +136,10 @@ pub enum BackendMessage {
     CloseComplete,
 
     /// Command completion
-    CommandComplete {
-        tag: String,
-    },
+    CommandComplete { tag: String },
 
     /// Data row
-    DataRow {
-        values: Vec<Option<Vec<u8>>>,
-    },
+    DataRow { values: Vec<Option<Vec<u8>>> },
 
     /// Empty query response
     EmptyQueryResponse,
@@ -190,28 +165,19 @@ pub enum BackendMessage {
     },
 
     /// Parameter description
-    ParameterDescription {
-        param_types: Vec<i32>,
-    },
+    ParameterDescription { param_types: Vec<i32> },
 
     /// Parameter status
-    ParameterStatus {
-        name: String,
-        value: String,
-    },
+    ParameterStatus { name: String, value: String },
 
     /// Parse complete
     ParseComplete,
 
     /// Ready for query
-    ReadyForQuery {
-        status: TransactionStatus,
-    },
+    ReadyForQuery { status: TransactionStatus },
 
     /// Row description (result set metadata)
-    RowDescription {
-        fields: Vec<FieldDescription>,
-    },
+    RowDescription { fields: Vec<FieldDescription> },
 }
 
 /// Authentication message types
@@ -224,22 +190,16 @@ pub enum AuthenticationMessage {
     CleartextPassword,
 
     /// MD5 password required
-    Md5Password {
-        salt: [u8; 4],
-    },
+    Md5Password { salt: [u8; 4] },
 
     /// SCRAM-SHA-256 authentication
     ScramSha256,
 
     /// SCRAM-SHA-256 continue
-    ScramSha256Continue {
-        data: Vec<u8>,
-    },
+    ScramSha256Continue { data: Vec<u8> },
 
     /// SCRAM-SHA-256 final
-    ScramSha256Final {
-        data: Vec<u8>,
-    },
+    ScramSha256Final { data: Vec<u8> },
 }
 
 /// Transaction status indicator
@@ -298,16 +258,16 @@ impl FrontendMessage {
             b'S' => {
                 buf.advance(len);
                 FrontendMessage::Sync
-            },
+            }
             b'H' => {
                 // Flush has no payload beyond the length header.
                 buf.advance(len);
                 FrontendMessage::Flush
-            },
+            }
             b'X' => {
                 buf.advance(len);
                 FrontendMessage::Terminate
-            },
+            }
             b'p' => Self::parse_password(buf, len)?,
             _ => {
                 return Err(Error::protocol(format!(
@@ -426,10 +386,7 @@ impl FrontendMessage {
         buf.advance(4); // Skip length
         let portal_name = read_cstring(buf)?;
         let max_rows = buf.get_i32();
-        Ok(FrontendMessage::Execute {
-            portal_name,
-            max_rows,
-        })
+        Ok(FrontendMessage::Execute { portal_name, max_rows })
     }
 
     fn parse_describe(buf: &mut BytesMut, len: usize) -> Result<Self> {
@@ -457,7 +414,9 @@ impl FrontendMessage {
         buf.advance(4); // Skip length field
         let body_len = len.saturating_sub(4);
         if body_len == 0 {
-            return Ok(FrontendMessage::PasswordMessage { password: String::new() });
+            return Ok(FrontendMessage::PasswordMessage {
+                password: String::new(),
+            });
         }
         // Peek the body to see if it contains a null byte.
         let has_null = buf.chunk().iter().take(body_len).any(|b| *b == 0);
@@ -477,23 +436,16 @@ impl FrontendMessage {
         }
         // SaslInitialResponse: cstring + i32 data_len + data.
         if body_left < 4 || buf.remaining() < 4 {
-            return Err(Error::protocol(
-                "SASL InitialResponse: truncated data length",
-            ));
+            return Err(Error::protocol("SASL InitialResponse: truncated data length"));
         }
         let data_len_raw = buf.get_i32();
         let data_len = if data_len_raw < 0 { 0 } else { data_len_raw as usize };
         if buf.remaining() < data_len {
-            return Err(Error::protocol(
-                "SASL InitialResponse: truncated response data",
-            ));
+            return Err(Error::protocol("SASL InitialResponse: truncated response data"));
         }
         let mut data = vec![0u8; data_len];
         buf.copy_to_slice(&mut data);
-        Ok(FrontendMessage::SaslInitialResponse {
-            mechanism: first,
-            data,
-        })
+        Ok(FrontendMessage::SaslInitialResponse { mechanism: first, data })
     }
 
     fn parse_close(buf: &mut BytesMut, len: usize) -> Result<Self> {
@@ -617,7 +569,14 @@ impl BackendMessage {
                 buf.put_u8(BackendMessageType::CloseComplete as u8);
                 buf.put_i32(4);
             }
-            BackendMessage::ErrorResponse { severity, code, message, detail, hint, position } => {
+            BackendMessage::ErrorResponse {
+                severity,
+                code,
+                message,
+                detail,
+                hint,
+                position,
+            } => {
                 buf.put_u8(BackendMessageType::ErrorResponse as u8);
 
                 let mut len = 4 + 1; // length + terminator
@@ -716,8 +675,7 @@ fn read_cstring(buf: &mut BytesMut) -> Result<String> {
         }
         bytes.push(byte);
     }
-    String::from_utf8(bytes)
-        .map_err(|e| Error::protocol(format!("Invalid UTF-8 in C string: {}", e)))
+    String::from_utf8(bytes).map_err(|e| Error::protocol(format!("Invalid UTF-8 in C string: {}", e)))
 }
 
 /// Write a null-terminated C string to buffer

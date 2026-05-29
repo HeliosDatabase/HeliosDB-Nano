@@ -40,7 +40,10 @@ pub fn register(session_id: String) -> mpsc::UnboundedReceiver<Event> {
     let (tx, rx) = mpsc::unbounded_channel();
     SESSIONS.insert(
         session_id,
-        Session { sender: tx, last_seen: Instant::now() },
+        Session {
+            sender: tx,
+            last_seen: Instant::now(),
+        },
     );
     rx
 }
@@ -65,10 +68,7 @@ pub fn session_count() -> usize {
 
 fn sweep_expired() {
     let now = Instant::now();
-    SESSIONS.retain(|_, s| {
-        now.duration_since(s.last_seen) < SESSION_TTL
-            && !s.sender.is_closed()
-    });
+    SESSIONS.retain(|_, s| now.duration_since(s.last_seen) < SESSION_TTL && !s.sender.is_closed());
 }
 
 #[cfg(test)]

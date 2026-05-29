@@ -299,7 +299,10 @@ fn test_custom_plan_names() {
         assert!(cmd.is_some());
 
         match cmd.unwrap() {
-            MetaCommand::TenantCreate { name, plan: parsed_plan } => {
+            MetaCommand::TenantCreate {
+                name,
+                plan: parsed_plan,
+            } => {
                 assert_eq!(parsed_plan, Some(plan.to_string()));
             }
             _ => panic!("Expected TenantCreate"),
@@ -329,24 +332,24 @@ fn test_tenant_workflow_commands_parseable() {
 
     for (i, command) in workflow.iter().enumerate() {
         let cmd = MetaCommand::parse(command);
-        assert!(cmd.is_some(),
-                "Command {} failed to parse: {}", i + 1, command);
+        assert!(cmd.is_some(), "Command {} failed to parse: {}", i + 1, command);
     }
 }
 
 #[test]
 fn test_tenant_list_aliases() {
     // Test all ways to list tenants
-    let aliases = vec![
-        "\\tenants",
-        "\\tenant list",
-    ];
+    let aliases = vec!["\\tenants", "\\tenant list"];
 
     for alias in aliases {
         let cmd = MetaCommand::parse(alias);
         assert!(cmd.is_some());
-        assert_eq!(cmd.unwrap(), MetaCommand::TenantList,
-                   "Alias '{}' should map to TenantList", alias);
+        assert_eq!(
+            cmd.unwrap(),
+            MetaCommand::TenantList,
+            "Alias '{}' should map to TenantList",
+            alias
+        );
     }
 }
 
@@ -413,8 +416,7 @@ fn test_tenant_command_examples_from_help() {
 
     for (command, description) in examples {
         let cmd = MetaCommand::parse(command);
-        assert!(cmd.is_some(),
-                "Example failed: {} ({})", command, description);
+        assert!(cmd.is_some(), "Example failed: {} ({})", command, description);
     }
 }
 
@@ -536,8 +538,10 @@ fn test_create_then_use_workflow() {
         MetaCommand::parse("\\tenant current"),
     ];
 
-    assert!(commands.iter().all(|c| c.is_some()),
-            "Create-use-current workflow should parse");
+    assert!(
+        commands.iter().all(|c| c.is_some()),
+        "Create-use-current workflow should parse"
+    );
 }
 
 #[test]
@@ -548,8 +552,10 @@ fn test_info_then_plan_workflow() {
         MetaCommand::parse("\\tenant quota acme"),
     ];
 
-    assert!(commands.iter().all(|c| c.is_some()),
-            "Info-plan-quota workflow should parse");
+    assert!(
+        commands.iter().all(|c| c.is_some()),
+        "Info-plan-quota workflow should parse"
+    );
 }
 
 // ============================================================================

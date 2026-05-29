@@ -26,11 +26,7 @@ use super::storage::{code_index, CodeIndexOptions};
 
 /// Run the hook. `stdin` is line-delimited paths relative to
 /// `repo_root`. Returns the resulting `CodeIndexStats`.
-pub fn run_from_stdin(
-    data_dir: &Path,
-    repo_root: &Path,
-    source_table: &str,
-) -> Result<super::storage::CodeIndexStats> {
+pub fn run_from_stdin(data_dir: &Path, repo_root: &Path, source_table: &str) -> Result<super::storage::CodeIndexStats> {
     let paths: Vec<String> = io::stdin()
         .lock()
         .lines()
@@ -52,8 +48,7 @@ pub fn run(
     let db = if data_dir.as_os_str().is_empty() {
         EmbeddedDatabase::new_in_memory()?
     } else {
-        fs::create_dir_all(data_dir)
-            .map_err(|e| Error::storage(format!("create {data_dir:?}: {e}")))?;
+        fs::create_dir_all(data_dir).map_err(|e| Error::storage(format!("create {data_dir:?}: {e}")))?;
         EmbeddedDatabase::new(data_dir)?
     };
 
@@ -140,8 +135,7 @@ mod tests {
         std::fs::create_dir_all(&repo).unwrap();
         std::fs::write(repo.join("a.rs"), "pub fn a() {}\n").unwrap();
         std::fs::write(repo.join("b.rs"), "pub fn b() {}\n").unwrap();
-        let stats =
-            run(&data, &repo, "src", &["a.rs".into(), "b.rs".into()]).unwrap();
+        let stats = run(&data, &repo, "src", &["a.rs".into(), "b.rs".into()]).unwrap();
         assert_eq!(stats.files_parsed, 2);
 
         // Modify one, hook reports only that one. code_index scans

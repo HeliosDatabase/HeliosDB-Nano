@@ -157,11 +157,9 @@ impl ValueRange {
     /// Check if this range might contain values less than the given value
     pub fn might_contain_less_than(&self, value: &Value) -> bool {
         match &self.min {
-            Some(min) => {
-                Self::compare_values(min, value)
-                    .map(|o| o == Ordering::Less)
-                    .unwrap_or(false)
-            }
+            Some(min) => Self::compare_values(min, value)
+                .map(|o| o == Ordering::Less)
+                .unwrap_or(false),
             None => false,
         }
     }
@@ -169,11 +167,9 @@ impl ValueRange {
     /// Check if this range might contain values less than or equal to the given value
     pub fn might_contain_less_or_equal(&self, value: &Value) -> bool {
         match &self.min {
-            Some(min) => {
-                Self::compare_values(min, value)
-                    .map(|o| o != Ordering::Greater)
-                    .unwrap_or(false)
-            }
+            Some(min) => Self::compare_values(min, value)
+                .map(|o| o != Ordering::Greater)
+                .unwrap_or(false),
             None => false,
         }
     }
@@ -181,11 +177,9 @@ impl ValueRange {
     /// Check if this range might contain values greater than the given value
     pub fn might_contain_greater_than(&self, value: &Value) -> bool {
         match &self.max {
-            Some(max) => {
-                Self::compare_values(max, value)
-                    .map(|o| o == Ordering::Greater)
-                    .unwrap_or(false)
-            }
+            Some(max) => Self::compare_values(max, value)
+                .map(|o| o == Ordering::Greater)
+                .unwrap_or(false),
             None => false,
         }
     }
@@ -193,11 +187,9 @@ impl ValueRange {
     /// Check if this range might contain values greater than or equal to the given value
     pub fn might_contain_greater_or_equal(&self, value: &Value) -> bool {
         match &self.max {
-            Some(max) => {
-                Self::compare_values(max, value)
-                    .map(|o| o != Ordering::Less)
-                    .unwrap_or(false)
-            }
+            Some(max) => Self::compare_values(max, value)
+                .map(|o| o != Ordering::Less)
+                .unwrap_or(false),
             None => false,
         }
     }
@@ -349,12 +341,7 @@ impl BlockZoneMap {
     }
 
     /// Check if this block might match a range predicate
-    pub fn might_match_range(
-        &self,
-        column_name: &str,
-        op: RangeOp,
-        value: &Value,
-    ) -> bool {
+    pub fn might_match_range(&self, column_name: &str, op: RangeOp, value: &Value) -> bool {
         match self.columns.get(column_name) {
             Some(czm) => match op {
                 RangeOp::Eq => czm.range.might_contain(value),
@@ -369,12 +356,7 @@ impl BlockZoneMap {
     }
 
     /// Check if this block might match a BETWEEN predicate
-    pub fn might_match_between(
-        &self,
-        column_name: &str,
-        low: &Value,
-        high: &Value,
-    ) -> bool {
+    pub fn might_match_between(&self, column_name: &str, low: &Value, high: &Value) -> bool {
         match self.columns.get(column_name) {
             Some(czm) => czm.range.might_overlap(low, high),
             None => true,
@@ -498,12 +480,7 @@ impl TableZoneMap {
     }
 
     /// Get blocks that might match a range predicate
-    pub fn get_matching_blocks_range(
-        &mut self,
-        column_name: &str,
-        op: RangeOp,
-        value: &Value,
-    ) -> Vec<u64> {
+    pub fn get_matching_blocks_range(&mut self, column_name: &str, op: RangeOp, value: &Value) -> Vec<u64> {
         let mut matching = Vec::new();
 
         for block in &self.blocks {
@@ -522,7 +499,9 @@ impl TableZoneMap {
     /// Build zone maps from existing tuples
     pub fn build_from_tuples(&mut self, tuples: &[crate::Tuple], schema: &crate::Schema) {
         for (row_id, tuple) in tuples.iter().enumerate() {
-            let values: Vec<(String, Value)> = schema.columns.iter()
+            let values: Vec<(String, Value)> = schema
+                .columns
+                .iter()
                 .zip(tuple.values.iter())
                 .map(|(col, val)| (col.name.clone(), val.clone()))
                 .collect();
@@ -531,12 +510,7 @@ impl TableZoneMap {
     }
 
     /// Get blocks that might match a BETWEEN predicate
-    pub fn get_matching_blocks_between(
-        &mut self,
-        column_name: &str,
-        low: &Value,
-        high: &Value,
-    ) -> Vec<u64> {
+    pub fn get_matching_blocks_between(&mut self, column_name: &str, low: &Value, high: &Value) -> Vec<u64> {
         let mut matching = Vec::new();
 
         for block in &self.blocks {
@@ -693,14 +667,20 @@ mod tests {
     fn test_block_zone_map() {
         let mut bzm = BlockZoneMap::new(0, 0);
 
-        bzm.add_row(0, &[
-            ("id".to_string(), Value::Int8(1)),
-            ("name".to_string(), Value::String("Alice".to_string())),
-        ]);
-        bzm.add_row(1, &[
-            ("id".to_string(), Value::Int8(5)),
-            ("name".to_string(), Value::String("Bob".to_string())),
-        ]);
+        bzm.add_row(
+            0,
+            &[
+                ("id".to_string(), Value::Int8(1)),
+                ("name".to_string(), Value::String("Alice".to_string())),
+            ],
+        );
+        bzm.add_row(
+            1,
+            &[
+                ("id".to_string(), Value::Int8(5)),
+                ("name".to_string(), Value::String("Bob".to_string())),
+            ],
+        );
 
         assert!(bzm.might_contain("id", &Value::Int8(3)));
         assert!(!bzm.might_contain("id", &Value::Int8(10)));
@@ -714,10 +694,16 @@ mod tests {
         let mut tzm = TableZoneMap::new("users".to_string(), 10);
 
         for i in 0..25 {
-            tzm.add_row(i, &[
-                ("id".to_string(), Value::Int8(i as i64)),
-                ("status".to_string(), Value::String(if i % 2 == 0 { "active" } else { "inactive" }.to_string())),
-            ]);
+            tzm.add_row(
+                i,
+                &[
+                    ("id".to_string(), Value::Int8(i as i64)),
+                    (
+                        "status".to_string(),
+                        Value::String(if i % 2 == 0 { "active" } else { "inactive" }.to_string()),
+                    ),
+                ],
+            );
         }
 
         // Should have 3 blocks (0-9, 10-19, 20-24)
@@ -741,11 +727,7 @@ mod tests {
             tzm.add_row(i, &[("val".to_string(), Value::Int8(i as i64))]);
         }
 
-        let matching = tzm.get_matching_blocks_between(
-            "val",
-            &Value::Int8(5),
-            &Value::Int8(15),
-        );
+        let matching = tzm.get_matching_blocks_between("val", &Value::Int8(5), &Value::Int8(15));
 
         // Should match blocks 0 and 1 (values 0-9 and 10-19)
         assert!(matching.contains(&0));

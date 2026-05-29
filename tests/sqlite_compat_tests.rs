@@ -47,9 +47,7 @@ mod sqlite_compat {
         // (psycopg / SDK handles parameter binding); here we exercise that
         // the parser ACCEPTS the rewritten form when literals are inlined.
         db.execute("INSERT INTO t (id, name) VALUES (1, 'alice')").unwrap();
-        let rows = db
-            .query("SELECT name FROM t WHERE id = 1", &[])
-            .unwrap();
+        let rows = db.query("SELECT name FROM t WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(to_str(&rows[0].values[0]), "alice");
     }
@@ -74,9 +72,7 @@ mod sqlite_compat {
             .unwrap();
         db.execute("INSERT INTO notes (body) VALUES ('first')").unwrap();
         db.execute("INSERT INTO notes (body) VALUES ('second')").unwrap();
-        let rows = db
-            .query("SELECT id, body FROM notes ORDER BY id", &[])
-            .unwrap();
+        let rows = db.query("SELECT id, body FROM notes ORDER BY id", &[]).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(to_i64(&rows[0].values[0]), 1);
         assert_eq!(to_i64(&rows[1].values[0]), 2);
@@ -87,8 +83,10 @@ mod sqlite_compat {
     #[test]
     fn datetime_now_resolves_to_current_timestamp() {
         let db = db();
-        db.execute("CREATE TABLE events (id INT PRIMARY KEY, ts TIMESTAMP)").unwrap();
-        db.execute("INSERT INTO events (id, ts) VALUES (1, DATETIME('now'))").unwrap();
+        db.execute("CREATE TABLE events (id INT PRIMARY KEY, ts TIMESTAMP)")
+            .unwrap();
+        db.execute("INSERT INTO events (id, ts) VALUES (1, DATETIME('now'))")
+            .unwrap();
         let rows = db.query("SELECT ts FROM events", &[]).unwrap();
         // Just verify the row exists and has a non-null timestamp.
         assert_eq!(rows.len(), 1);
@@ -103,8 +101,7 @@ mod sqlite_compat {
         db.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)").unwrap();
         db.execute("INSERT INTO kv (k, v) VALUES ('a', '1')").unwrap();
         // Second insert with same key: must NOT raise, must NOT overwrite.
-        db.execute("INSERT OR IGNORE INTO kv (k, v) VALUES ('a', '2')")
-            .unwrap();
+        db.execute("INSERT OR IGNORE INTO kv (k, v) VALUES ('a', '2')").unwrap();
         let rows = db.query("SELECT v FROM kv WHERE k = 'a'", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(to_str(&rows[0].values[0]), "1");
@@ -119,10 +116,8 @@ mod sqlite_compat {
             .unwrap();
         db.execute("INSERT INTO files (path, mtime, size) VALUES ('/a', 1.0, 100)")
             .unwrap();
-        db.execute(
-            "INSERT OR REPLACE INTO files (path, mtime, size) VALUES ('/a', 2.0, 200)",
-        )
-        .unwrap();
+        db.execute("INSERT OR REPLACE INTO files (path, mtime, size) VALUES ('/a', 2.0, 200)")
+            .unwrap();
         let rows = db
             .query("SELECT mtime, size FROM files WHERE path = '/a'", &[])
             .unwrap();
@@ -144,10 +139,7 @@ mod sqlite_compat {
         db.execute("CREATE TABLE alpha (a INT PRIMARY KEY)").unwrap();
         db.execute("CREATE TABLE beta (b INT PRIMARY KEY)").unwrap();
         let rows = db
-            .query(
-                "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
-                &[],
-            )
+            .query("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name", &[])
             .unwrap();
         let names: Vec<String> = rows.iter().map(|r| to_str(&r.values[0])).collect();
         assert!(names.contains(&"alpha".to_string()), "names: {:?}", names);
@@ -172,10 +164,8 @@ mod sqlite_compat {
     #[test]
     fn pragma_table_info_returns_columns() {
         let db = db();
-        db.execute(
-            "CREATE TABLE schema_probe (id INTEGER PRIMARY KEY, name TEXT NOT NULL, weight REAL)",
-        )
-        .unwrap();
+        db.execute("CREATE TABLE schema_probe (id INTEGER PRIMARY KEY, name TEXT NOT NULL, weight REAL)")
+            .unwrap();
         let rows = db.query("PRAGMA table_info(schema_probe)", &[]).unwrap();
         assert_eq!(rows.len(), 3);
         // SQLite shape: (cid, name, type, notnull, dflt_value, pk).
@@ -247,9 +237,7 @@ mod sqlite_compat {
         assert_eq!(names, vec!["path", "mtime", "size"]);
 
         // Final state.
-        let final_rows = db
-            .query("SELECT size FROM files WHERE path='/x'", &[])
-            .unwrap();
+        let final_rows = db.query("SELECT size FROM files WHERE path='/x'", &[]).unwrap();
         assert_eq!(final_rows.len(), 1);
         assert_eq!(to_i64(&final_rows[0].values[0]), 20);
     }

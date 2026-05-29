@@ -3,15 +3,15 @@
 //! Provides lightweight synchronous filter updates during DML operations.
 //! Designed for minimal overhead (~150ns per row) with background consolidation.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
-use std::sync::Arc;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
-use crate::{Value, Tuple};
-use crate::Schema;
 use super::bloom_filter::BloomFilter;
+use crate::Schema;
+use crate::{Tuple, Value};
 
 /// Default threshold for automatic bulk load detection (number of rows)
 /// Can be overridden via FilterIndexConfig or SET smfi_bulk_load_threshold
@@ -506,8 +506,8 @@ impl FilterIndexDeltaTracker {
 
     /// Hash a value for bloom filter
     fn hash_value(&self, value: &Value) -> (u64, u64) {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher1 = DefaultHasher::new();
         self.hash_seed1.hash(&mut hasher1);
@@ -579,7 +579,9 @@ impl FilterIndexDeltaTracker {
                     .zone_deltas
                     .entry(zone_delta.block_id)
                     .or_insert_with(|| ZoneMapDelta::new(zone_delta.block_id, zone_delta.delta_type));
-                existing.column_updates.extend(zone_delta.column_updates.iter().cloned());
+                existing
+                    .column_updates
+                    .extend(zone_delta.column_updates.iter().cloned());
                 existing.rows_affected += zone_delta.rows_affected;
             }
 

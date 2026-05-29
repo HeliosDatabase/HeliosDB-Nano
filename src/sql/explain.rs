@@ -10,9 +10,9 @@
 
 #![allow(unused_variables)]
 
-use crate::Result;
-use crate::storage::StorageEngine;
 use super::logical_plan::LogicalPlan;
+use crate::storage::StorageEngine;
+use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -79,7 +79,6 @@ pub struct ExplainOutput {
     // ─────────────────────────────────────────────────────────────────────────
     // EXPLAIN ANALYZE execution results
     // ─────────────────────────────────────────────────────────────────────────
-
     /// Actual rows returned (if ANALYZE was used)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actual_rows: Option<usize>,
@@ -144,12 +143,12 @@ pub struct ActiveFeature {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum FeatureCategory {
-    Pushdown,       // Predicate/projection pushdown
-    Pruning,        // Partition/projection pruning
-    Indexing,       // Index selection
-    Vectorization,  // SIMD/JIT
-    Parallelism,    // Parallel execution
-    Caching,        // Result caching
+    Pushdown,      // Predicate/projection pushdown
+    Pruning,       // Partition/projection pruning
+    Indexing,      // Index selection
+    Vectorization, // SIMD/JIT
+    Parallelism,   // Parallel execution
+    Caching,       // Result caching
 }
 
 /// Optimizer decision point
@@ -339,7 +338,12 @@ impl ExplainPlanner {
     /// Convert logical plan to plan node tree
     fn plan_to_node(&self, plan: &LogicalPlan) -> Result<PlanNode> {
         match plan {
-            LogicalPlan::Scan { table_name, schema, projection, .. } => {
+            LogicalPlan::Scan {
+                table_name,
+                schema,
+                projection,
+                ..
+            } => {
                 let mut details = HashMap::new();
                 details.insert("table".to_string(), table_name.clone());
                 details.insert("columns".to_string(), format!("{}", schema.columns.len()));
@@ -385,7 +389,13 @@ impl ExplainPlanner {
                 })
             }
 
-            LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => {
+            LogicalPlan::Project {
+                input,
+                exprs,
+                aliases,
+                distinct,
+                distinct_on,
+            } => {
                 let input_node = self.plan_to_node(input)?;
 
                 let mut details = HashMap::new();
@@ -412,7 +422,12 @@ impl ExplainPlanner {
                 })
             }
 
-            LogicalPlan::Aggregate { input, group_by, aggr_exprs, having } => {
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                having,
+            } => {
                 let input_node = self.plan_to_node(input)?;
 
                 let mut details = HashMap::new();
@@ -434,7 +449,13 @@ impl ExplainPlanner {
                 })
             }
 
-            LogicalPlan::Join { left, right, join_type, on, lateral } => {
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                on,
+                lateral,
+            } => {
                 let left_node = self.plan_to_node(left)?;
                 let right_node = self.plan_to_node(right)?;
 
@@ -484,7 +505,9 @@ impl ExplainPlanner {
                 })
             }
 
-            LogicalPlan::Limit { input, limit, offset, .. } => {
+            LogicalPlan::Limit {
+                input, limit, offset, ..
+            } => {
                 let input_node = self.plan_to_node(input)?;
 
                 let mut details = HashMap::new();
@@ -524,7 +547,7 @@ impl ExplainPlanner {
                     node_type: "ShowBranches".to_string(),
                     operation: "SHOW BRANCHES".to_string(),
                     cost: 10.0, // Small cost for reading branch metadata
-                    rows: 10, // Estimate ~10 branches
+                    rows: 10,   // Estimate ~10 branches
                     details,
                     children: vec![],
                 })
@@ -600,7 +623,7 @@ impl ExplainPlanner {
         let mut decisions = Vec::new();
 
         // Track join strategy decisions
-        if let LogicalPlan::Join {  .. } = plan {
+        if let LogicalPlan::Join { .. } = plan {
             decisions.push(OptimizerDecision {
                 decision_point: "Join Strategy Selection".to_string(),
                 chosen: ChosenOption {
@@ -635,15 +658,14 @@ impl ExplainPlanner {
                     cost: 100.0,
                     rows: 1000,
                 },
-                rejected: vec![
-                    RejectedOption {
-                        name: "Index Scan".to_string(),
-                        cost: 150.0,
-                        reason: "No suitable index for predicates".to_string(),
-                        cost_multiplier: 1.5,
-                    },
-                ],
-                reasoning: "Sequential scan chosen - no matching index found. Table is small enough for full scan.".to_string(),
+                rejected: vec![RejectedOption {
+                    name: "Index Scan".to_string(),
+                    cost: 150.0,
+                    reason: "No suitable index for predicates".to_string(),
+                    cost_multiplier: 1.5,
+                }],
+                reasoning: "Sequential scan chosen - no matching index found. Table is small enough for full scan."
+                    .to_string(),
             });
         }
 
@@ -712,7 +734,7 @@ impl ExplainPlanner {
         plan: &LogicalPlan,
         node: &PlanNode,
         total_cost: f64,
-        total_rows: usize
+        total_rows: usize,
     ) -> Result<AIExplanation> {
         // In production, this would call an LLM API
         // For now, generate rule-based explanations
@@ -736,12 +758,17 @@ impl ExplainPlanner {
         let plan = _plan;
         match plan {
             LogicalPlan::Scan { table_name, .. } => {
-                format!("This query performs a full table scan on '{}', reading approximately {} rows.",
-                    table_name, node.rows)
+                format!(
+                    "This query performs a full table scan on '{}', reading approximately {} rows.",
+                    table_name, node.rows
+                )
             }
             LogicalPlan::Filter { .. } => {
-                format!("This query filters data, reducing {} rows to approximately {} rows after applying predicates.",
-                    node.children.get(0).map(|c| c.rows).unwrap_or(0), node.rows)
+                format!(
+                    "This query filters data, reducing {} rows to approximately {} rows after applying predicates.",
+                    node.children.get(0).map(|c| c.rows).unwrap_or(0),
+                    node.rows
+                )
             }
             LogicalPlan::Join { join_type, .. } => {
                 format!("This query performs a {:?} join operation, combining data from two sources to produce approximately {} rows.",
@@ -751,7 +778,10 @@ impl ExplainPlanner {
                 if group_by.is_empty() {
                     "This query computes aggregate functions (SUM, COUNT, etc.) over all rows, producing a single result row.".to_string()
                 } else {
-                    format!("This query groups data and computes aggregates, producing approximately {} groups.", node.rows)
+                    format!(
+                        "This query groups data and computes aggregates, producing approximately {} groups.",
+                        node.rows
+                    )
                 }
             }
             _ => format!("This query executes a {} operation.", node.operation),
@@ -777,28 +807,40 @@ impl ExplainPlanner {
         // Add current node
         let step_desc = match node.node_type.as_str() {
             "Scan" => {
-                format!("Step {}: Read {} rows from table {} (Cost: {:.2})",
-                    step, node.rows, node.details.get("table").unwrap_or(&"unknown".to_string()), node.cost)
+                format!(
+                    "Step {}: Read {} rows from table {} (Cost: {:.2})",
+                    step,
+                    node.rows,
+                    node.details.get("table").unwrap_or(&"unknown".to_string()),
+                    node.cost
+                )
             }
             "Filter" => {
-                format!("Step {}: Filter rows using predicate, keeping {} rows (Cost: {:.2})",
-                    step, node.rows, node.cost)
+                format!(
+                    "Step {}: Filter rows using predicate, keeping {} rows (Cost: {:.2})",
+                    step, node.rows, node.cost
+                )
             }
             "Join" => {
-                format!("Step {}: Join {} rows from left input with right input using hash join (Cost: {:.2})",
-                    step, node.rows, node.cost)
+                format!(
+                    "Step {}: Join {} rows from left input with right input using hash join (Cost: {:.2})",
+                    step, node.rows, node.cost
+                )
             }
             "Aggregate" => {
-                format!("Step {}: Group and aggregate data into {} groups (Cost: {:.2})",
-                    step, node.rows, node.cost)
+                format!(
+                    "Step {}: Group and aggregate data into {} groups (Cost: {:.2})",
+                    step, node.rows, node.cost
+                )
             }
             "Sort" => {
-                format!("Step {}: Sort {} rows (Cost: {:.2})",
-                    step, node.rows, node.cost)
+                format!("Step {}: Sort {} rows (Cost: {:.2})", step, node.rows, node.cost)
             }
             "Limit" => {
-                format!("Step {}: Limit output to {} rows (Cost: {:.2})",
-                    step, node.rows, node.cost)
+                format!(
+                    "Step {}: Limit output to {} rows (Cost: {:.2})",
+                    step, node.rows, node.cost
+                )
             }
             _ => {
                 format!("Step {}: {} (Cost: {:.2})", step, node.operation, node.cost)
@@ -813,18 +855,30 @@ impl ExplainPlanner {
         let (category, estimated_time_ms, bottlenecks) = if total_cost < 100.0 {
             ("Fast", total_cost / 10.0, vec![])
         } else if total_cost < 1000.0 {
-            ("Moderate", total_cost / 5.0, vec!["Sequential scan on moderately sized table".to_string()])
+            (
+                "Moderate",
+                total_cost / 5.0,
+                vec!["Sequential scan on moderately sized table".to_string()],
+            )
         } else if total_cost < 10000.0 {
-            ("Slow", total_cost / 2.0, vec![
-                "Large table scan without index".to_string(),
-                "Consider adding indexes".to_string(),
-            ])
+            (
+                "Slow",
+                total_cost / 2.0,
+                vec![
+                    "Large table scan without index".to_string(),
+                    "Consider adding indexes".to_string(),
+                ],
+            )
         } else {
-            ("Very Slow", total_cost, vec![
-                "Expensive join operation".to_string(),
-                "Possible cartesian product".to_string(),
-                "Review query structure and indexes".to_string(),
-            ])
+            (
+                "Very Slow",
+                total_cost,
+                vec![
+                    "Expensive join operation".to_string(),
+                    "Possible cartesian product".to_string(),
+                    "Review query structure and indexes".to_string(),
+                ],
+            )
         };
 
         let explanation = format!(
@@ -861,14 +915,13 @@ impl ExplainPlanner {
         }
 
         if let LogicalPlan::Join { .. } = plan {
-            suggestions.push(
-                "Ensure join columns are indexed on both tables for optimal performance.".to_string()
-            );
+            suggestions.push("Ensure join columns are indexed on both tables for optimal performance.".to_string());
         }
 
         if let LogicalPlan::Sort { .. } = plan {
             suggestions.push(
-                "If sorting by indexed columns, the sort operation might be eliminated by using an index scan.".to_string()
+                "If sorting by indexed columns, the sort operation might be eliminated by using an index scan."
+                    .to_string(),
             );
         }
 
@@ -879,21 +932,20 @@ impl ExplainPlanner {
         let mut warnings = Vec::new();
 
         if node.cost > 10000.0 {
-            warnings.push(
-                "High query cost detected. Consider optimizing predicates or adding indexes.".to_string()
-            );
+            warnings.push("High query cost detected. Consider optimizing predicates or adding indexes.".to_string());
         }
 
         if node.rows > 100000 {
             warnings.push(
-                "Query will process a large number of rows. Consider adding LIMIT if not all rows are needed.".to_string()
+                "Query will process a large number of rows. Consider adding LIMIT if not all rows are needed."
+                    .to_string(),
             );
         }
 
         if let LogicalPlan::Join { .. } = plan {
             if node.rows > 1000000 {
                 warnings.push(
-                    "Large join result detected. Review join conditions to avoid cartesian products.".to_string()
+                    "Large join result detected. Review join conditions to avoid cartesian products.".to_string(),
                 );
             }
         }
@@ -966,7 +1018,10 @@ impl ExplainPlanner {
 
             result.push_str("Performance Prediction:\n");
             result.push_str(&format!("  Category: {}\n", ai.performance.category));
-            result.push_str(&format!("  Estimated Time: {:.2}ms\n", ai.performance.estimated_time_ms));
+            result.push_str(&format!(
+                "  Estimated Time: {:.2}ms\n",
+                ai.performance.estimated_time_ms
+            ));
             result.push_str(&format!("  {}\n\n", ai.performance.explanation));
 
             if !ai.suggestions.is_empty() {
@@ -1012,15 +1067,19 @@ impl ExplainPlanner {
 
             for (i, decision) in output.decisions.iter().enumerate() {
                 result.push_str(&format!("Decision {}: {}\n", i + 1, decision.decision_point));
-                result.push_str(&format!("  CHOSEN: {} (cost: {:.2}, rows: {})\n",
-                    decision.chosen.name, decision.chosen.cost, decision.chosen.rows));
+                result.push_str(&format!(
+                    "  CHOSEN: {} (cost: {:.2}, rows: {})\n",
+                    decision.chosen.name, decision.chosen.cost, decision.chosen.rows
+                ));
                 result.push_str(&format!("  Reasoning: {}\n", decision.reasoning));
 
                 if !decision.rejected.is_empty() {
                     result.push_str("  Rejected alternatives:\n");
                     for rejected in &decision.rejected {
-                        result.push_str(&format!("    • {} (cost: {:.2}, {:.1}x more expensive)\n",
-                            rejected.name, rejected.cost, rejected.cost_multiplier));
+                        result.push_str(&format!(
+                            "    • {} (cost: {:.2}, {:.1}x more expensive)\n",
+                            rejected.name, rejected.cost, rejected.cost_multiplier
+                        ));
                         result.push_str(&format!("      Reason: {}\n", rejected.reason));
                     }
                 }
@@ -1099,8 +1158,10 @@ impl ExplainPlanner {
         let indent = "  ".repeat(depth);
         let mut result = String::new();
 
-        result.push_str(&format!("{}→ {} [cost={:.2}, rows={}]\n",
-            indent, node.operation, node.cost, node.rows));
+        result.push_str(&format!(
+            "{}→ {} [cost={:.2}, rows={}]\n",
+            indent, node.operation, node.cost, node.rows
+        ));
 
         if !node.details.is_empty() {
             for (key, value) in &node.details {
@@ -1155,7 +1216,7 @@ impl ExplainPlanner {
 
     /// Estimate predicate selectivity using column statistics
     fn estimate_predicate_selectivity(&self, predicate: &super::logical_plan::LogicalExpr) -> f64 {
-        use super::logical_plan::{LogicalExpr, BinaryOperator, UnaryOperator};
+        use super::logical_plan::{BinaryOperator, LogicalExpr, UnaryOperator};
 
         match predicate {
             LogicalExpr::BinaryExpr { left, op, right } => {
@@ -1186,7 +1247,7 @@ impl ExplainPlanner {
                         let right_sel = self.estimate_predicate_selectivity(right);
                         left_sel + right_sel - (left_sel * right_sel)
                     }
-                    _ => 0.1 // Default estimate
+                    _ => 0.1, // Default estimate
                 }
             }
             LogicalExpr::UnaryExpr { op, expr } => {
@@ -1196,7 +1257,7 @@ impl ExplainPlanner {
                         let inner_sel = self.estimate_predicate_selectivity(expr);
                         1.0 - inner_sel
                     }
-                    _ => 0.1 // Default estimate
+                    _ => 0.1, // Default estimate
                 }
             }
             LogicalExpr::IsNull { expr, is_null } => {
@@ -1214,7 +1275,7 @@ impl ExplainPlanner {
                     0.95 // Default estimate
                 }
             }
-            _ => 0.1 // Default estimate for unknown predicates
+            _ => 0.1, // Default estimate for unknown predicates
         }
     }
 
@@ -1278,7 +1339,7 @@ impl ExplainPlanner {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::{Schema, Column, DataType};
+    use crate::{Column, DataType, Schema};
     use std::sync::Arc;
 
     #[test]
@@ -1292,9 +1353,9 @@ mod tests {
                     primary_key: true,
                     source_table: None,
                     source_table_name: None,
-                default_expr: None,
-                unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
                 Column {
                     name: "name".to_string(),
@@ -1303,9 +1364,9 @@ mod tests {
                     primary_key: false,
                     source_table: None,
                     source_table_name: None,
-                default_expr: None,
-                unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
             ],
         });
@@ -1329,19 +1390,17 @@ mod tests {
     #[test]
     fn test_explain_with_filter() {
         let schema = Arc::new(Schema {
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: true,
-                    source_table: None,
-                    source_table_name: None,
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
                 default_expr: None,
                 unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                },
-            ],
+            }],
         });
 
         let scan = LogicalPlan::Scan {
@@ -1370,19 +1429,17 @@ mod tests {
     #[test]
     fn test_explain_ai_mode() {
         let schema = Arc::new(Schema {
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: true,
-                    source_table: None,
-                    source_table_name: None,
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
                 default_expr: None,
                 unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                },
-            ],
+            }],
         });
 
         let plan = LogicalPlan::Scan {
@@ -1405,19 +1462,17 @@ mod tests {
     #[test]
     fn test_explain_analyze_mode() {
         let schema = Arc::new(Schema {
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: true,
-                    source_table: None,
-                    source_table_name: None,
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
                 default_expr: None,
                 unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                },
-            ],
+            }],
         });
 
         let plan = LogicalPlan::Scan {
@@ -1438,19 +1493,17 @@ mod tests {
     #[test]
     fn test_feature_detection() {
         let schema = Arc::new(Schema {
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: true,
-                    source_table: None,
-                    source_table_name: None,
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
                 default_expr: None,
                 unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                },
-            ],
+            }],
         });
 
         let scan = LogicalPlan::Scan {
@@ -1479,19 +1532,17 @@ mod tests {
     #[test]
     fn test_format_json() {
         let schema = Arc::new(Schema {
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: true,
-                    source_table: None,
-                    source_table_name: None,
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
                 default_expr: None,
                 unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                },
-            ],
+            }],
         });
 
         let plan = LogicalPlan::Scan {

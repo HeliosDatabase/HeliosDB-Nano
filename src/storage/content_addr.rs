@@ -66,7 +66,8 @@ impl ContentAddressedStore {
         let key = Self::cas_key(&hash);
 
         // Store if not already present (idempotent)
-        let exists = db.get(&key)
+        let exists = db
+            .get(&key)
             .map_err(|e| Error::storage(format!("CAS lookup failed: {}", e)))?
             .is_some();
 
@@ -94,7 +95,8 @@ impl ContentAddressedStore {
         let key = Self::cas_key(&hash);
 
         // Store if not already present (idempotent)
-        let exists = db.get(&key)
+        let exists = db
+            .get(&key)
             .map_err(|e| Error::storage(format!("CAS lookup failed: {}", e)))?
             .is_some();
 
@@ -118,12 +120,10 @@ impl ContentAddressedStore {
     pub fn resolve(db: &DB, hash: &[u8; 32], target_type: &DataType) -> Result<Value> {
         let key = Self::cas_key(hash);
 
-        let bytes = db.get(&key)
+        let bytes = db
+            .get(&key)
             .map_err(|e| Error::storage(format!("CAS resolve failed: {}", e)))?
-            .ok_or_else(|| Error::storage(format!(
-                "CAS reference not found: {}",
-                hex::encode(&hash[..8])
-            )))?;
+            .ok_or_else(|| Error::storage(format!("CAS reference not found: {}", hex::encode(&hash[..8]))))?;
 
         match target_type {
             DataType::Text | DataType::Varchar(_) | DataType::Char(_) | DataType::Json | DataType::Jsonb => {

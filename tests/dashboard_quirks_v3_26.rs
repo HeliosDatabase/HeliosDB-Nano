@@ -94,10 +94,12 @@ fn create_branch_then_show_branches_lists_it() {
     db.execute("CREATE DATABASE BRANCH verify_branch FROM main AS OF NOW")
         .expect("create branch");
 
-    let (rows, _cols) = db
-        .query_with_columns("SHOW BRANCHES")
-        .expect("show branches");
-    assert!(rows.len() >= 2, "SHOW BRANCHES must list main + verify_branch, got {}", rows.len());
+    let (rows, _cols) = db.query_with_columns("SHOW BRANCHES").expect("show branches");
+    assert!(
+        rows.len() >= 2,
+        "SHOW BRANCHES must list main + verify_branch, got {}",
+        rows.len()
+    );
 
     let any_named = rows.iter().any(|r| {
         r.values
@@ -115,7 +117,10 @@ fn create_branch_then_show_branches_lists_it() {
             .iter()
             .any(|v| matches!(v, Value::String(s) if s == "verify_branch"))
     });
-    assert!(any_named2, "pg_database_branches() must list verify_branch; rows={rows2:?}");
+    assert!(
+        any_named2,
+        "pg_database_branches() must list verify_branch; rows={rows2:?}"
+    );
 }
 
 #[test]
@@ -132,7 +137,8 @@ fn create_branch_with_quoted_name_strips_quotes() {
     let (rows, _) = db
         .query_with_columns("SELECT * FROM pg_database_branches()")
         .expect("pg_database_branches");
-    let names: Vec<&str> = rows.iter()
+    let names: Vec<&str> = rows
+        .iter()
         .filter_map(|r| match r.values.first() {
             Some(Value::String(s)) => Some(s.as_str()),
             _ => None,
@@ -153,9 +159,11 @@ fn create_branch_with_quoted_name_strips_quotes() {
 #[test]
 fn cte_with_parameter_in_outer_where_returns_rows() {
     let db = EmbeddedDatabase::new_in_memory().expect("db");
-    db.execute("CREATE TABLE messages (id INT, billable INT)").expect("create");
+    db.execute("CREATE TABLE messages (id INT, billable INT)")
+        .expect("create");
     for (i, b) in [(1, 100), (2, 50), (3, 200), (4, 150)] {
-        db.execute(&format!("INSERT INTO messages VALUES ({i}, {b})")).expect("insert");
+        db.execute(&format!("INSERT INTO messages VALUES ({i}, {b})"))
+            .expect("insert");
     }
 
     // Flat WHERE form: works today.
@@ -204,11 +212,16 @@ fn cte_with_computed_column_alias_and_parameter_returns_rows() {
     // computed column with COALESCE + arithmetic + AS alias, and the
     // outer SELECT references that alias in a parameterised WHERE.
     let db = EmbeddedDatabase::new_in_memory().expect("db");
-    db.execute("CREATE TABLE messages (uuid TEXT, type TEXT, input_tokens INT, output_tokens INT)").expect("create");
-    db.execute("INSERT INTO messages VALUES ('a', 'assistant', 80, 20)").expect("ins a"); // 100
-    db.execute("INSERT INTO messages VALUES ('b', 'assistant', 200, 50)").expect("ins b"); // 250
-    db.execute("INSERT INTO messages VALUES ('c', 'user', 999, 999)").expect("ins c"); // user — filtered out
-    db.execute("INSERT INTO messages VALUES ('d', 'assistant', 30, 10)").expect("ins d"); // 40 — below threshold
+    db.execute("CREATE TABLE messages (uuid TEXT, type TEXT, input_tokens INT, output_tokens INT)")
+        .expect("create");
+    db.execute("INSERT INTO messages VALUES ('a', 'assistant', 80, 20)")
+        .expect("ins a"); // 100
+    db.execute("INSERT INTO messages VALUES ('b', 'assistant', 200, 50)")
+        .expect("ins b"); // 250
+    db.execute("INSERT INTO messages VALUES ('c', 'user', 999, 999)")
+        .expect("ins c"); // user — filtered out
+    db.execute("INSERT INTO messages VALUES ('d', 'assistant', 30, 10)")
+        .expect("ins d"); // 40 — below threshold
 
     let sql = "WITH spend AS (\
         SELECT uuid, COALESCE(input_tokens,0)+COALESCE(output_tokens,0) AS billable \
@@ -231,9 +244,12 @@ fn cte_with_post_substitution_sql_returns_rows() {
     // into the SQL textually, then calls `db.query()` on the resulting
     // string. Verify that path also surfaces the rows.
     let db = EmbeddedDatabase::new_in_memory().expect("db");
-    db.execute("CREATE TABLE messages (uuid TEXT, type TEXT, input_tokens INT, output_tokens INT)").expect("create");
-    db.execute("INSERT INTO messages VALUES ('a', 'assistant', 80, 20)").expect("ins a");
-    db.execute("INSERT INTO messages VALUES ('b', 'assistant', 200, 50)").expect("ins b");
+    db.execute("CREATE TABLE messages (uuid TEXT, type TEXT, input_tokens INT, output_tokens INT)")
+        .expect("create");
+    db.execute("INSERT INTO messages VALUES ('a', 'assistant', 80, 20)")
+        .expect("ins a");
+    db.execute("INSERT INTO messages VALUES ('b', 'assistant', 200, 50)")
+        .expect("ins b");
 
     // What the PG-wire path would actually run after substitution.
     let post_sub = "WITH spend AS (\
@@ -286,7 +302,9 @@ fn substring_special_form_from_only_works() {
     db.execute("CREATE TABLE t (s TEXT)").expect("create");
     db.execute("INSERT INTO t VALUES ('helloworld')").expect("insert");
 
-    let r = db.query("SELECT SUBSTRING(s FROM 6) FROM t", &[]).expect("substring from");
+    let r = db
+        .query("SELECT SUBSTRING(s FROM 6) FROM t", &[])
+        .expect("substring from");
     let v = match r[0].values.first() {
         Some(Value::String(s)) => s.clone(),
         other => panic!("expected text, got {other:?}"),

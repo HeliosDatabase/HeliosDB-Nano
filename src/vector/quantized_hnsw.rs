@@ -7,15 +7,12 @@
 #![allow(clippy::similar_names)]
 #![allow(unused_variables)]
 
-use crate::{Result, Error};
-use super::{
-    Vector, DistanceMetric, ProductQuantizer, ProductQuantizerConfig,
-    QuantizedVector,
-};
+use super::{DistanceMetric, ProductQuantizer, ProductQuantizerConfig, QuantizedVector, Vector};
+use crate::{Error, Result};
 use parking_lot::RwLock;
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use serde::{Serialize, Deserialize};
+use std::sync::Arc;
 
 /// Configuration for Quantized HNSW Index
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,10 +153,7 @@ impl QuantizedHnswIndex {
     ///
     /// This will train the Product Quantizer on the provided vectors
     /// and create the index structure.
-    pub fn train(
-        config: QuantizedHnswConfig,
-        training_vectors: &[Vector],
-    ) -> Result<Self> {
+    pub fn train(config: QuantizedHnswConfig, training_vectors: &[Vector]) -> Result<Self> {
         // Train Product Quantizer
         let pq = ProductQuantizer::train(config.pq_config.clone(), training_vectors)
             .map_err(|e| Error::query_execution(format!("PQ training failed: {}", e)))?;
@@ -179,7 +173,9 @@ impl QuantizedHnswIndex {
         }
 
         // Encode vector using PQ
-        let quantized = self.pq.encode(vector)
+        let quantized = self
+            .pq
+            .encode(vector)
             .map_err(|e| Error::query_execution(format!("Encoding failed: {}", e)))?;
 
         let mut quantized_vectors = self.quantized_vectors.write();
@@ -234,13 +230,16 @@ impl QuantizedHnswIndex {
 
         let quantized_vectors = self.quantized_vectors.read();
         let id_mapping = self.id_mapping.read();
+        let reverse_mapping = self.reverse_mapping.read();
 
         if quantized_vectors.is_empty() {
             return Ok(Vec::new());
         }
 
         // Precompute distance table for ADC
-        let distance_table = self.pq.precompute_distance_table(query)
+        let distance_table = self
+            .pq
+            .precompute_distance_table(query)
             .map_err(|e| Error::query_execution(format!("Distance table computation failed: {}", e)))?;
 
         // Compute distances to all vectors using ADC
@@ -256,16 +255,16 @@ impl QuantizedHnswIndex {
             .collect();
 
         // Sort by distance and take top k
-        distances.sort_by(|a, b| {
-            a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         distances.truncate(k);
 
         // Map internal IDs to row IDs
         let results: Vec<(u64, f32)> = distances
             .into_iter()
             .filter_map(|(internal_id, dist)| {
-                id_mapping.get(internal_id).map(|&row_id| (row_id, dist))
+                id_mapping
+                    .get(internal_id)
+                    .and_then(|&row_id| (reverse_mapping.get(&row_id) == Some(&internal_id)).then_some((row_id, dist)))
             })
             .collect();
 
@@ -301,8 +300,8 @@ impl QuantizedHnswIndex {
 
         // Reverse mapping storage: HashMap<u64, usize>
         // Each entry is approximately: u64 (key) + usize (value) + HashMap overhead
-        let reverse_mapping_size = reverse_mapping.len() *
-            (std::mem::size_of::<u64>() + std::mem::size_of::<usize>() + 16); // +16 for HashMap overhead
+        let reverse_mapping_size =
+            reverse_mapping.len() * (std::mem::size_of::<u64>() + std::mem::size_of::<usize>() + 16); // +16 for HashMap overhead
 
         // Graph storage: Vec<HashMap<usize, Vec<usize>>>
         // This is a rough estimate - actual size depends on graph structure
@@ -371,7 +370,7 @@ impl QuantizedHnswIndex {
 
     /// Get number of vectors in the index
     pub fn len(&self) -> usize {
-        self.quantized_vectors.read().len()
+        self.reverse_mapping.read().len()
     }
 
     /// Check if index is empty
@@ -405,8 +404,7 @@ impl QuantizedHnswIndex {
             id_mapping,
         };
 
-        bincode::serialize(&serialized)
-            .map_err(|e| Error::query_execution(format!("Failed to serialize index: {}", e)))
+        bincode::serialize(&serialized).map_err(|e| Error::query_execution(format!("Failed to serialize index: {}", e)))
     }
 
     /// Deserialize the index from bytes
@@ -503,11 +501,7 @@ mod tests {
         let mut rng = rand::thread_rng();
 
         (0..count)
-            .map(|_| {
-                (0..dimension)
-                    .map(|_| rng.gen_range(-1.0..1.0))
-                    .collect()
-            })
+            .map(|_| (0..dimension).map(|_| rng.gen_range(-1.0..1.0)).collect())
             .collect()
     }
 

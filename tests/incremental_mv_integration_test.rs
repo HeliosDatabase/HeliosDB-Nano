@@ -43,10 +43,13 @@ fn test_incremental_mv_full_integration() -> Result<()> {
     assert_eq!(result.len(), 3, "Should have 3 completed orders after refresh");
 
     // Verify the new completed order is present
-    let order_4_present = result.iter().any(|tuple| {
-        tuple.values.len() >= 1 && tuple.values[0] == heliosdb_nano::Value::Int4(4)
-    });
-    assert!(order_4_present, "New completed order (ID 4) should be in materialized view");
+    let order_4_present = result
+        .iter()
+        .any(|tuple| tuple.values.len() >= 1 && tuple.values[0] == heliosdb_nano::Value::Int4(4));
+    assert!(
+        order_4_present,
+        "New completed order (ID 4) should be in materialized view"
+    );
 
     println!("✓ Incremental MV integration test passed!");
     Ok(())
@@ -152,7 +155,11 @@ fn test_mv_schema_mapping() -> Result<()> {
 
     // Verify schema mapping worked correctly
     let result = db.query("SELECT * FROM tool_products", &[])?;
-    assert_eq!(result.len(), 3, "Should have 3 tool products after refresh with schema mapping");
+    assert_eq!(
+        result.len(),
+        3,
+        "Should have 3 tool products after refresh with schema mapping"
+    );
 
     println!("✓ MV schema mapping test passed!");
     Ok(())
@@ -302,7 +309,8 @@ fn test_alter_mv_invalid_option_value() -> Result<()> {
     let error_msg = result.unwrap_err().to_string();
     assert!(
         error_msg.contains("numeric") || error_msg.contains("requires"),
-        "Error message should mention numeric requirement: {}", error_msg
+        "Error message should mention numeric requirement: {}",
+        error_msg
     );
 
     // Try to set invalid refresh_strategy - should fail

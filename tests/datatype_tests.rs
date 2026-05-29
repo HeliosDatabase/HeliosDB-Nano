@@ -25,7 +25,7 @@ fn test_int4_type() -> Result<()> {
 
     // Test various integer values
     db.execute("INSERT INTO test_int4 (id, value) VALUES (1, 0)")?;
-    db.execute("INSERT INTO test_int4 (id, value) VALUES (3, 2147483647)")?;  // MAX INT4
+    db.execute("INSERT INTO test_int4 (id, value) VALUES (3, 2147483647)")?; // MAX INT4
     db.execute("INSERT INTO test_int4 (id, value) VALUES (5, 100)")?;
 
     let results = db.query("SELECT * FROM test_int4", &[])?;
@@ -45,7 +45,7 @@ fn test_int8_bigint_type() -> Result<()> {
 
     // Test large integer values (skip MIN value as it's parsed as MAX+1)
     db.execute("INSERT INTO test_int8 (id, value) VALUES (1, 0)")?;
-    db.execute("INSERT INTO test_int8 (id, value) VALUES (3, 9223372036854775807)")?;  // MAX INT8
+    db.execute("INSERT INTO test_int8 (id, value) VALUES (3, 9223372036854775807)")?; // MAX INT8
     db.execute("INSERT INTO test_int8 (id, value) VALUES (4, 1000000000000)")?;
 
     let results = db.query("SELECT * FROM test_int8", &[])?;
@@ -172,7 +172,10 @@ fn test_very_long_text() -> Result<()> {
 
     // Test 1MB string
     let long_text = "a".repeat(1_000_000);
-    db.execute(&format!("INSERT INTO test_long_text (id, value) VALUES (1, '{}')", long_text))?;
+    db.execute(&format!(
+        "INSERT INTO test_long_text (id, value) VALUES (1, '{}')",
+        long_text
+    ))?;
 
     let results = db.query("SELECT * FROM test_long_text", &[])?;
     assert_eq!(results.len(), 1);
@@ -319,22 +322,22 @@ fn test_all_types_in_one_table() -> Result<()> {
             text_val TEXT,
             varchar_val VARCHAR(50),
             bool_val BOOLEAN
-        )"
+        )",
     )?;
 
     db.execute(
         "INSERT INTO all_types (id, int_val, bigint_val, text_val, varchar_val, bool_val)
-         VALUES (1, 42, 9223372036854775807, 'Hello World', 'Short text', TRUE)"
+         VALUES (1, 42, 9223372036854775807, 'Hello World', 'Short text', TRUE)",
     )?;
 
     db.execute(
         "INSERT INTO all_types (id, int_val, bigint_val, text_val, varchar_val, bool_val)
-         VALUES (2, 100, 1000000, 'Unicode: 日本語', 'Más texto', FALSE)"
+         VALUES (2, 100, 1000000, 'Unicode: 日本語', 'Más texto', FALSE)",
     )?;
 
     db.execute(
         "INSERT INTO all_types (id, int_val, bigint_val, text_val, varchar_val, bool_val)
-         VALUES (3, NULL, NULL, NULL, NULL, NULL)"
+         VALUES (3, NULL, NULL, NULL, NULL, NULL)",
     )?;
 
     let results = db.query("SELECT * FROM all_types", &[])?;

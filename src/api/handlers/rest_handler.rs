@@ -10,13 +10,9 @@ use axum::{
     Json,
 };
 use std::collections::HashMap;
-use tracing::{info, warn, debug};
+use tracing::{debug, info, warn};
 
-use crate::api::{
-    models::ApiError,
-    server::AppState,
-    rest_executor::RestExecutor,
-};
+use crate::api::{models::ApiError, rest_executor::RestExecutor, server::AppState};
 
 /// Reserved query-string keys that are NOT filter columns.
 const RESERVED_KEYS: &[&str] = &["select", "order", "limit", "offset", "apikey"];
@@ -31,7 +27,8 @@ fn value_to_json(val: &crate::Value) -> serde_json::Value {
 /// Everything that is NOT a reserved key (`select`, `order`, `limit`, `offset`)
 /// is treated as a `column=operator.value` filter.
 fn collect_filters(params: &HashMap<String, String>) -> Vec<(String, String)> {
-    params.iter()
+    params
+        .iter()
         .filter(|(k, _)| !RESERVED_KEYS.contains(&k.as_str()))
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect()
@@ -129,15 +126,18 @@ pub async fn rest_select(
             })?
     };
 
-    let rows: Vec<serde_json::Value> = tuples.iter().map(|tuple| {
-        let mut obj = serde_json::Map::new();
-        for (i, col) in columns.iter().enumerate() {
-            if let Some(val) = tuple.values.get(i) {
-                obj.insert(col.clone(), value_to_json(val));
+    let rows: Vec<serde_json::Value> = tuples
+        .iter()
+        .map(|tuple| {
+            let mut obj = serde_json::Map::new();
+            for (i, col) in columns.iter().enumerate() {
+                if let Some(val) = tuple.values.get(i) {
+                    obj.insert(col.clone(), value_to_json(val));
+                }
             }
-        }
-        serde_json::Value::Object(obj)
-    }).collect();
+            serde_json::Value::Object(obj)
+        })
+        .collect();
 
     Ok(Json(rows))
 }
@@ -160,9 +160,11 @@ pub async fn rest_insert(
     let rows: Vec<serde_json::Value> = match body.clone() {
         serde_json::Value::Array(arr) => arr,
         obj @ serde_json::Value::Object(_) => vec![obj],
-        _ => return Err(ApiError::bad_request(
-            "Request body must be a JSON object or array of objects"
-        )),
+        _ => {
+            return Err(ApiError::bad_request(
+                "Request body must be a JSON object or array of objects",
+            ))
+        }
     };
 
     let (affected, _, _) = executor.insert(&table, &rows).map_err(|e| {
@@ -214,10 +216,12 @@ pub async fn rest_update(
     };
 
     let affected = if user_id.is_some() && !bypass_rls {
-        executor.update_with_rls(&table, &body, &filters, user_id.as_deref()).map_err(|e| {
-            warn!(table = %table, error = %e, "REST UPDATE (RLS) failed");
-            ApiError::from(e)
-        })?
+        executor
+            .update_with_rls(&table, &body, &filters, user_id.as_deref())
+            .map_err(|e| {
+                warn!(table = %table, error = %e, "REST UPDATE (RLS) failed");
+                ApiError::from(e)
+            })?
     } else {
         executor.update(&table, &body, &filters).map_err(|e| {
             warn!(table = %table, error = %e, "REST UPDATE failed");
@@ -263,10 +267,12 @@ pub async fn rest_delete(
     };
 
     let affected = if user_id.is_some() && !bypass_rls {
-        executor.delete_with_rls(&table, &filters, user_id.as_deref()).map_err(|e| {
-            warn!(table = %table, error = %e, "REST DELETE (RLS) failed");
-            ApiError::from(e)
-        })?
+        executor
+            .delete_with_rls(&table, &filters, user_id.as_deref())
+            .map_err(|e| {
+                warn!(table = %table, error = %e, "REST DELETE (RLS) failed");
+                ApiError::from(e)
+            })?
     } else {
         executor.delete(&table, &filters).map_err(|e| {
             warn!(table = %table, error = %e, "REST DELETE failed");
@@ -311,19 +317,28 @@ pub async fn rest_rpc(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::EmbeddedDatabase;
     use crate::compute::QueryRegistry;
+    use crate::EmbeddedDatabase;
     use std::sync::Arc;
 
     fn test_state() -> AppState {
         let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
         let query_registry = Arc::new(QueryRegistry::new());
-        AppState { db, query_registry, auth_bridge: None, oauth_registry: None, change_notifier: None }
+        AppState {
+            db,
+            query_registry,
+            auth_bridge: None,
+            oauth_registry: None,
+            change_notifier: None,
+        }
     }
 
     fn test_state_with_table() -> AppState {
         let state = test_state();
-        state.db.execute("CREATE TABLE users (id INT, name TEXT, age INT)").unwrap();
+        state
+            .db
+            .execute("CREATE TABLE users (id INT, name TEXT, age INT)")
+            .unwrap();
         state.db.execute("INSERT INTO users VALUES (1, 'Alice', 30)").unwrap();
         state.db.execute("INSERT INTO users VALUES (2, 'Bob', 25)").unwrap();
         state.db.execute("INSERT INTO users VALUES (3, 'Carol', 35)").unwrap();
@@ -339,12 +354,7 @@ mod tests {
         let state = test_state_with_table();
         let params = HashMap::new();
 
-        let result = rest_select(
-            State(state),
-            Path("users".to_string()),
-            Query(params),
-            empty_headers(),
-        ).await;
+        let result = rest_select(State(state), Path("users".to_string()), Query(params), empty_headers()).await;
 
         assert!(result.is_ok());
         let rows = result.unwrap().0;
@@ -357,12 +367,7 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("name".to_string(), "eq.Alice".to_string());
 
-        let result = rest_select(
-            State(state),
-            Path("users".to_string()),
-            Query(params),
-            empty_headers(),
-        ).await;
+        let result = rest_select(State(state), Path("users".to_string()), Query(params), empty_headers()).await;
 
         assert!(result.is_ok());
         let rows = result.unwrap().0;
@@ -375,12 +380,7 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("limit".to_string(), "2".to_string());
 
-        let result = rest_select(
-            State(state),
-            Path("users".to_string()),
-            Query(params),
-            empty_headers(),
-        ).await;
+        let result = rest_select(State(state), Path("users".to_string()), Query(params), empty_headers()).await;
 
         assert!(result.is_ok());
         let rows = result.unwrap().0;
@@ -394,11 +394,7 @@ mod tests {
 
         let body = serde_json::json!({"id": 1, "label": "test"});
 
-        let result = rest_insert(
-            State(state),
-            Path("items".to_string()),
-            Json(body),
-        ).await;
+        let result = rest_insert(State(state), Path("items".to_string()), Json(body)).await;
 
         assert!(result.is_ok());
         let (status, json) = result.unwrap();
@@ -416,11 +412,7 @@ mod tests {
             {"id": 2, "label": "b"},
         ]);
 
-        let result = rest_insert(
-            State(state),
-            Path("items".to_string()),
-            Json(body),
-        ).await;
+        let result = rest_insert(State(state), Path("items".to_string()), Json(body)).await;
 
         assert!(result.is_ok());
         let (_, json) = result.unwrap();
@@ -441,7 +433,8 @@ mod tests {
             Query(params),
             empty_headers(),
             Json(body),
-        ).await;
+        )
+        .await;
 
         assert!(result.is_ok());
         let json = result.unwrap().0;
@@ -459,7 +452,8 @@ mod tests {
             Path("users".to_string()),
             Query(params),
             empty_headers(),
-        ).await;
+        )
+        .await;
 
         assert!(result.is_ok());
         let json = result.unwrap().0;
@@ -479,7 +473,8 @@ mod tests {
             Path("nonexistent".to_string()),
             Query(params),
             empty_headers(),
-        ).await;
+        )
+        .await;
 
         assert!(result.is_err());
     }
@@ -491,11 +486,7 @@ mod tests {
 
         let body = serde_json::json!("not an object");
 
-        let result = rest_insert(
-            State(state),
-            Path("t".to_string()),
-            Json(body),
-        ).await;
+        let result = rest_insert(State(state), Path("t".to_string()), Json(body)).await;
 
         assert!(result.is_err());
     }
@@ -505,16 +496,26 @@ mod tests {
         // Without an auth bridge, RLS is effectively disabled.
         let state = test_state_with_table();
         state.db.execute("ALTER TABLE users ADD COLUMN owner_id TEXT").unwrap();
-        state.db.execute("UPDATE users SET owner_id = 'u1' WHERE id = 1").unwrap();
-        state.db.execute("UPDATE users SET owner_id = 'u2' WHERE id = 2").unwrap();
-        state.db.execute("UPDATE users SET owner_id = 'u1' WHERE id = 3").unwrap();
+        state
+            .db
+            .execute("UPDATE users SET owner_id = 'u1' WHERE id = 1")
+            .unwrap();
+        state
+            .db
+            .execute("UPDATE users SET owner_id = 'u2' WHERE id = 2")
+            .unwrap();
+        state
+            .db
+            .execute("UPDATE users SET owner_id = 'u1' WHERE id = 3")
+            .unwrap();
 
         let result = rest_select(
             State(state),
             Path("users".to_string()),
             Query(HashMap::new()),
             empty_headers(),
-        ).await;
+        )
+        .await;
 
         assert!(result.is_ok());
         // No auth bridge = no RLS filtering = all 3 rows.

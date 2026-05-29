@@ -128,7 +128,7 @@ fn main() -> Result<()> {
         "SELECT customers.name, orders.amount, orders.region
          FROM customers
          INNER JOIN orders ON customers.id = orders.customer_id",
-        &[]
+        &[],
     )?;
     println!("Customer orders:");
     for row in &joined {

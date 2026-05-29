@@ -5,8 +5,8 @@
 //! - `REFRESH MATERIALIZED VIEW [CONCURRENTLY] ...`
 //! - `DROP MATERIALIZED VIEW [IF EXISTS] ...`
 
-use crate::{Result, Error};
 use super::super::logical_plan::{LogicalPlan, MaterializedViewOption};
+use crate::{Error, Result};
 
 /// Parser for materialized view SQL
 pub struct MaterializedViewParser;
@@ -39,7 +39,10 @@ impl MaterializedViewParser {
             }
 
             let key = parts.first().map(|s| s.to_lowercase()).unwrap_or_default();
-            let value = parts.get(1).map(|s| s.trim_matches('\'').trim_matches('"')).unwrap_or_default();
+            let value = parts
+                .get(1)
+                .map(|s| s.trim_matches('\'').trim_matches('"'))
+                .unwrap_or_default();
 
             match key.as_str() {
                 "auto_refresh" => {
@@ -50,12 +53,14 @@ impl MaterializedViewParser {
                     options.push(MaterializedViewOption::ThresholdTableSize(value.to_string()));
                 }
                 "threshold_dml_rate" => {
-                    let rate = value.parse::<usize>()
+                    let rate = value
+                        .parse::<usize>()
                         .map_err(|_| Error::query_execution("Invalid threshold_dml_rate"))?;
                     options.push(MaterializedViewOption::ThresholdDmlRate(rate));
                 }
                 "max_cpu_percent" => {
-                    let percent = value.parse::<f32>()
+                    let percent = value
+                        .parse::<f32>()
                         .map_err(|_| Error::query_execution("Invalid max_cpu_percent"))?;
                     options.push(MaterializedViewOption::MaxCpuPercent(percent));
                 }
@@ -70,7 +75,8 @@ impl MaterializedViewParser {
                     options.push(MaterializedViewOption::Distribution(value.to_string()));
                 }
                 "replication_factor" => {
-                    let rf = value.parse::<usize>()
+                    let rf = value
+                        .parse::<usize>()
                         .map_err(|_| Error::query_execution("Invalid replication_factor"))?;
                     options.push(MaterializedViewOption::ReplicationFactor(rf));
                 }
@@ -107,11 +113,7 @@ impl MaterializedViewParser {
     }
 
     /// Parse REFRESH MATERIALIZED VIEW statement
-    pub fn parse_refresh_mv(
-        name: String,
-        concurrent: bool,
-        incremental: bool,
-    ) -> Result<LogicalPlan> {
+    pub fn parse_refresh_mv(name: String, concurrent: bool, incremental: bool) -> Result<LogicalPlan> {
         Ok(LogicalPlan::RefreshMaterializedView {
             name,
             concurrent,
@@ -120,14 +122,8 @@ impl MaterializedViewParser {
     }
 
     /// Parse DROP MATERIALIZED VIEW statement
-    pub fn parse_drop_mv(
-        name: String,
-        if_exists: bool,
-    ) -> Result<LogicalPlan> {
-        Ok(LogicalPlan::DropMaterializedView {
-            name,
-            if_exists,
-        })
+    pub fn parse_drop_mv(name: String, if_exists: bool) -> Result<LogicalPlan> {
+        Ok(LogicalPlan::DropMaterializedView { name, if_exists })
     }
 
     /// Detect if SQL contains materialized view syntax
@@ -155,14 +151,14 @@ mod tests {
 
     #[test]
     fn test_parse_refresh_mv() {
-        let plan = MaterializedViewParser::parse_refresh_mv(
-            "user_stats".to_string(),
-            true,
-            false,
-        ).unwrap();
+        let plan = MaterializedViewParser::parse_refresh_mv("user_stats".to_string(), true, false).unwrap();
 
         match plan {
-            LogicalPlan::RefreshMaterializedView { name, concurrent, incremental } => {
+            LogicalPlan::RefreshMaterializedView {
+                name,
+                concurrent,
+                incremental,
+            } => {
                 assert_eq!(name, "user_stats");
                 assert_eq!(concurrent, true);
                 assert_eq!(incremental, false);
@@ -173,10 +169,7 @@ mod tests {
 
     #[test]
     fn test_parse_drop_mv() {
-        let plan = MaterializedViewParser::parse_drop_mv(
-            "user_stats".to_string(),
-            true,
-        ).unwrap();
+        let plan = MaterializedViewParser::parse_drop_mv("user_stats".to_string(), true).unwrap();
 
         match plan {
             LogicalPlan::DropMaterializedView { name, if_exists } => {

@@ -27,15 +27,18 @@ fn quirk_h_delete_with_fk_is_fast() {
     // 1000-row child table with an FK at PK level. DELETE-all on the
     // PARENT must finish in well under a second on the index path.
     let db = EmbeddedDatabase::new_in_memory().expect("db");
-    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, name TEXT)").expect("p");
+    db.execute("CREATE TABLE p (id INTEGER PRIMARY KEY, name TEXT)")
+        .expect("p");
     db.execute("CREATE TABLE c (id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES p(id))")
         .expect("c");
 
     // Populate parents 1..N and one child each pointing at the parent.
     const N: i32 = 1000;
     for i in 1..=N {
-        db.execute(&format!("INSERT INTO p (id, name) VALUES ({i}, 'p{i}')")).expect("p ins");
-        db.execute(&format!("INSERT INTO c (id, parent_id) VALUES ({i}, {i})")).expect("c ins");
+        db.execute(&format!("INSERT INTO p (id, name) VALUES ({i}, 'p{i}')"))
+            .expect("p ins");
+        db.execute(&format!("INSERT INTO c (id, parent_id) VALUES ({i}, {i})"))
+            .expect("c ins");
     }
 
     // First, delete the children (so subsequent parent DELETE is FK-clean).
@@ -65,14 +68,16 @@ fn quirk_i_on_conflict_do_update_is_fast() {
     // within a small constant factor of bare INSERT throughput, not
     // 400× slower.
     let db = EmbeddedDatabase::new_in_memory().expect("db");
-    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT)").expect("t");
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT UNIQUE, name TEXT)")
+        .expect("t");
 
     // Pre-populate 1000 rows with PK 1..1000 and emails e1..e1000.
     const N: i32 = 1000;
     for i in 1..=N {
         db.execute(&format!(
             "INSERT INTO t (id, email, name) VALUES ({i}, 'e{i}@x', 'name{i}')"
-        )).expect("ins");
+        ))
+        .expect("ins");
     }
 
     // Now hammer with ON CONFLICT DO UPDATE on the email UNIQUE
@@ -83,8 +88,12 @@ fn quirk_i_on_conflict_do_update_is_fast() {
         db.execute(&format!(
             "INSERT INTO t (id, email, name) VALUES ({}, 'e{}@x', 'updated{}')
              ON CONFLICT (email) DO UPDATE SET name = 'updated{}'",
-            N + i, i, i, i
-        )).expect("on conflict do update");
+            N + i,
+            i,
+            i,
+            i
+        ))
+        .expect("on conflict do update");
     }
     let dt = start.elapsed();
     eprintln!("1000 ON CONFLICT DO UPDATE on populated table: {:?}", dt);
@@ -110,7 +119,8 @@ fn quirk_h_drop_table_with_fk_completes() {
         .expect("c");
     for i in 1..=500 {
         db.execute(&format!("INSERT INTO p (id) VALUES ({i})")).expect("p");
-        db.execute(&format!("INSERT INTO c (id, parent_id) VALUES ({i}, {i})")).expect("c");
+        db.execute(&format!("INSERT INTO c (id, parent_id) VALUES ({i}, {i})"))
+            .expect("c");
     }
 
     // Drop child first (so FK doesn't block), then parent. If either

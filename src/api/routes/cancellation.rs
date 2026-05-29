@@ -3,14 +3,11 @@
 //! Provides REST endpoints for managing and cancelling running queries.
 
 use axum::{
-    Router,
     routing::{get, post},
+    Router,
 };
 
-use crate::api::{
-    handlers::cancellation_handler,
-    server::AppState,
-};
+use crate::api::{handlers::cancellation_handler, server::AppState};
 
 /// Create query cancellation routes
 ///
@@ -109,15 +106,21 @@ pub fn routes() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::EmbeddedDatabase;
     use crate::compute::QueryRegistry;
+    use crate::EmbeddedDatabase;
     use std::sync::Arc;
 
     #[test]
     fn test_routes_creation() {
         let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
         let query_registry = Arc::new(QueryRegistry::new());
-        let state = AppState { db, query_registry, auth_bridge: None, oauth_registry: None, change_notifier: None };
+        let state = AppState {
+            db,
+            query_registry,
+            auth_bridge: None,
+            oauth_registry: None,
+            change_notifier: None,
+        };
         let router: axum::Router<()> = routes().with_state(state);
         drop(router);
     }

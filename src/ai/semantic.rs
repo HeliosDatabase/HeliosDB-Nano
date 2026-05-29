@@ -3,10 +3,10 @@
 //! Advanced semantic search capabilities with hybrid retrieval,
 //! reranking, and multi-modal support.
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 use crate::storage::VectorIndexManager;
 
@@ -334,9 +334,7 @@ impl Bm25Index {
         let n = self.num_docs as f32;
         for (term, df) in self.idf.iter_mut() {
             // Calculate document frequency from scratch
-            let doc_freq = self.doc_terms.values()
-                .filter(|terms| terms.contains_key(term))
-                .count() as f32;
+            let doc_freq = self.doc_terms.values().filter(|terms| terms.contains_key(term)).count() as f32;
             *df = ((n - doc_freq + 0.5) / (doc_freq + 0.5) + 1.0).ln();
         }
     }
@@ -369,7 +367,8 @@ impl Bm25Index {
         results.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         results.truncate(top_k);
 
-        results.into_iter()
+        results
+            .into_iter()
             .map(|(id, score)| {
                 let content = self.doc_content.get(&id).cloned();
                 (id, score, content)
@@ -440,7 +439,9 @@ impl EmbeddingCache {
     fn set(&mut self, key: String, vector: Vec<f32>) {
         // Evict oldest entries if at capacity
         if self.entries.len() >= self.max_entries {
-            let oldest_key = self.entries.iter()
+            let oldest_key = self
+                .entries
+                .iter()
                 .min_by_key(|(_, v)| v.timestamp)
                 .map(|(k, _)| k.clone());
             if let Some(key) = oldest_key {
@@ -448,10 +449,13 @@ impl EmbeddingCache {
             }
         }
 
-        self.entries.insert(key, CacheEntry {
-            vector,
-            timestamp: std::time::Instant::now(),
-        });
+        self.entries.insert(
+            key,
+            CacheEntry {
+                vector,
+                timestamp: std::time::Instant::now(),
+            },
+        );
     }
 
     fn clear(&mut self) {
@@ -563,19 +567,13 @@ impl SemanticSearch {
 
         // Step 3: Execute search based on mode
         let mut results = match request.mode {
-            SearchMode::Semantic => {
-                self.vector_search(&query_vectors, &request).await?
-            }
-            SearchMode::Keyword => {
-                self.keyword_search(&queries, &request).await?
-            }
+            SearchMode::Semantic => self.vector_search(&query_vectors, &request).await?,
+            SearchMode::Keyword => self.keyword_search(&queries, &request).await?,
             SearchMode::Hybrid => {
                 let alpha = request.alpha.unwrap_or(0.5);
                 self.hybrid_search(&queries, &query_vectors, alpha, &request).await?
             }
-            SearchMode::MultiModal => {
-                self.multimodal_search(&request.query, &request).await?
-            }
+            SearchMode::MultiModal => self.multimodal_search(&request.query, &request).await?,
         };
 
         // Step 4: Apply filters
@@ -623,13 +621,18 @@ impl SemanticSearch {
             embedding_time_ms: Some(embedding_time),
             rerank_time_ms: rerank_time,
             expanded_queries: if request.expand_query {
-                Some(queries.iter().filter_map(|q| {
-                    if let SearchQuery::Text(t) = q {
-                        Some(t.clone())
-                    } else {
-                        None
-                    }
-                }).collect())
+                Some(
+                    queries
+                        .iter()
+                        .filter_map(|q| {
+                            if let SearchQuery::Text(t) = q {
+                                Some(t.clone())
+                            } else {
+                                None
+                            }
+                        })
+                        .collect(),
+                )
             } else {
                 None
             },
@@ -656,7 +659,8 @@ impl SemanticSearch {
                 if words.len() > 1 {
                     // Add individual important words as queries
                     for word in &words {
-                        if word.len() > 4 { // Only longer words
+                        if word.len() > 4 {
+                            // Only longer words
                             expanded.push(SearchQuery::Text(word.to_string()));
                         }
                     }
@@ -664,9 +668,7 @@ impl SemanticSearch {
 
                 Ok(expanded)
             }
-            SearchQuery::MultiQuery(texts) => {
-                Ok(texts.iter().map(|t| SearchQuery::Text(t.clone())).collect())
-            }
+            SearchQuery::MultiQuery(texts) => Ok(texts.iter().map(|t| SearchQuery::Text(t.clone())).collect()),
             _ => Ok(vec![query.clone()]),
         }
     }
@@ -767,7 +769,9 @@ impl SemanticSearch {
         let mut all_results = Vec::new();
 
         if let Some(ref index) = self.vector_index {
-            let stores = request.stores.clone()
+            let stores = request
+                .stores
+                .clone()
                 .unwrap_or_else(|| vec![self.config.default_store.clone()]);
 
             for store in stores {
@@ -792,7 +796,11 @@ impl SemanticSearch {
                                 id: doc_id,
                                 score,
                                 content,
-                                vector: if request.include_vectors { Some(vector.clone()) } else { None },
+                                vector: if request.include_vectors {
+                                    Some(vector.clone())
+                                } else {
+                                    None
+                                },
                                 metadata,
                                 highlights: None,
                                 store: store.clone(),
@@ -815,7 +823,11 @@ impl SemanticSearch {
                         id: doc_id.clone(),
                         score,
                         content: Some(doc.content.clone()),
-                        vector: if request.include_vectors { Some(doc_vec.clone()) } else { None },
+                        vector: if request.include_vectors {
+                            Some(doc_vec.clone())
+                        } else {
+                            None
+                        },
                         metadata: doc.metadata.clone(),
                         highlights: None,
                         store: doc.store.clone(),
@@ -850,7 +862,10 @@ impl SemanticSearch {
                 for (id, score, content) in results {
                     let doc_store = self.document_store.read();
                     let metadata = doc_store.get(&id).and_then(|d| d.metadata.clone());
-                    let store = doc_store.get(&id).map(|d| d.store.clone()).unwrap_or_else(|| self.config.default_store.clone());
+                    let store = doc_store
+                        .get(&id)
+                        .map(|d| d.store.clone())
+                        .unwrap_or_else(|| self.config.default_store.clone());
                     let namespace = doc_store.get(&id).and_then(|d| d.namespace.clone());
 
                     all_results.push(SearchResult {
@@ -889,10 +904,7 @@ impl SemanticSearch {
         let keyword_results = self.keyword_search(queries, request).await?;
 
         // Merge with reciprocal rank fusion
-        let merged = self.reciprocal_rank_fusion(
-            &[vector_results, keyword_results],
-            &[alpha, 1.0 - alpha],
-        );
+        let merged = self.reciprocal_rank_fusion(&[vector_results, keyword_results], &[alpha, 1.0 - alpha]);
 
         Ok(merged)
     }
@@ -910,12 +922,11 @@ impl SemanticSearch {
 
     /// Apply metadata filters to results
     fn apply_filters(&self, results: Vec<SearchResult>, filters: &[MetadataFilter]) -> Vec<SearchResult> {
-        results.into_iter()
+        results
+            .into_iter()
             .filter(|result| {
                 if let Some(ref metadata) = result.metadata {
-                    filters.iter().all(|filter| {
-                        self.evaluate_filter(metadata, filter)
-                    })
+                    filters.iter().all(|filter| self.evaluate_filter(metadata, filter))
                 } else {
                     filters.is_empty()
                 }
@@ -934,9 +945,15 @@ impl SemanticSearch {
             FilterOperator::Eq => value == &filter.value,
             FilterOperator::Ne => value != &filter.value,
             FilterOperator::Gt => compare_json_values(value, &filter.value) == Some(std::cmp::Ordering::Greater),
-            FilterOperator::Gte => matches!(compare_json_values(value, &filter.value), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)),
+            FilterOperator::Gte => matches!(
+                compare_json_values(value, &filter.value),
+                Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+            ),
             FilterOperator::Lt => compare_json_values(value, &filter.value) == Some(std::cmp::Ordering::Less),
-            FilterOperator::Lte => matches!(compare_json_values(value, &filter.value), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)),
+            FilterOperator::Lte => matches!(
+                compare_json_values(value, &filter.value),
+                Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+            ),
             FilterOperator::In => {
                 if let serde_json::Value::Array(arr) = &filter.value {
                     arr.contains(value)
@@ -978,8 +995,14 @@ impl SemanticSearch {
             FilterOperator::Between => {
                 if let serde_json::Value::Array(arr) = &filter.value {
                     if let (Some(low), Some(high)) = (arr.first(), arr.get(1)) {
-                        let gte = matches!(compare_json_values(value, low), Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal));
-                        let lte = matches!(compare_json_values(value, high), Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal));
+                        let gte = matches!(
+                            compare_json_values(value, low),
+                            Some(std::cmp::Ordering::Greater | std::cmp::Ordering::Equal)
+                        );
+                        let lte = matches!(
+                            compare_json_values(value, high),
+                            Some(std::cmp::Ordering::Less | std::cmp::Ordering::Equal)
+                        );
                         gte && lte
                     } else {
                         false
@@ -990,9 +1013,7 @@ impl SemanticSearch {
             }
             FilterOperator::Regex => {
                 if let (serde_json::Value::String(s), serde_json::Value::String(pattern)) = (value, &filter.value) {
-                    regex::Regex::new(pattern)
-                        .map(|re| re.is_match(s))
-                        .unwrap_or(false)
+                    regex::Regex::new(pattern).map(|re| re.is_match(s)).unwrap_or(false)
                 } else {
                     false
                 }
@@ -1008,7 +1029,8 @@ impl SemanticSearch {
     ) -> Result<Vec<SearchResult>, SearchError> {
         // Simple reranking based on exact match boosting
         // In production, would use a cross-encoder model
-        let query_terms: Vec<String> = queries.iter()
+        let query_terms: Vec<String> = queries
+            .iter()
             .filter_map(|q| {
                 if let SearchQuery::Text(t) = q {
                     Some(Bm25Index::tokenize(t))
@@ -1041,7 +1063,8 @@ impl SemanticSearch {
         }
 
         results.sort_by(|a, b| {
-            b.rerank_score.unwrap_or(b.score)
+            b.rerank_score
+                .unwrap_or(b.score)
                 .partial_cmp(&a.rerank_score.unwrap_or(a.score))
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
@@ -1050,11 +1073,7 @@ impl SemanticSearch {
     }
 
     /// Reciprocal rank fusion for combining result sets
-    fn reciprocal_rank_fusion(
-        &self,
-        result_sets: &[Vec<SearchResult>],
-        weights: &[f32],
-    ) -> Vec<SearchResult> {
+    fn reciprocal_rank_fusion(&self, result_sets: &[Vec<SearchResult>], weights: &[f32]) -> Vec<SearchResult> {
         let k = 60.0; // RRF constant
         let mut scores: HashMap<String, (f32, SearchResult)> = HashMap::new();
 
@@ -1062,13 +1081,15 @@ impl SemanticSearch {
             for (rank, result) in results.iter().enumerate() {
                 let rrf_score = weight / (k + rank as f32 + 1.0);
 
-                scores.entry(result.id.clone())
+                scores
+                    .entry(result.id.clone())
                     .and_modify(|(score, _)| *score += rrf_score)
                     .or_insert((rrf_score, result.clone()));
             }
         }
 
-        let mut merged: Vec<SearchResult> = scores.into_values()
+        let mut merged: Vec<SearchResult> = scores
+            .into_values()
             .map(|(score, mut result)| {
                 result.score = score;
                 result
@@ -1084,7 +1105,9 @@ impl SemanticSearch {
         let mut groups: HashMap<String, Vec<SearchResult>> = HashMap::new();
 
         for result in results {
-            let key = result.metadata.as_ref()
+            let key = result
+                .metadata
+                .as_ref()
                 .and_then(|m| m.get(field))
                 .map(|v| v.to_string())
                 .unwrap_or_else(|| "_none_".to_string());
@@ -1093,7 +1116,8 @@ impl SemanticSearch {
         }
 
         // Take best from each group
-        groups.into_values()
+        groups
+            .into_values()
             .filter_map(|mut group| {
                 group.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
                 group.into_iter().next()
@@ -1105,9 +1129,12 @@ impl SemanticSearch {
     fn distinct_results(&self, results: Vec<SearchResult>, field: &str) -> Vec<SearchResult> {
         let mut seen: HashMap<String, bool> = HashMap::new();
 
-        results.into_iter()
+        results
+            .into_iter()
             .filter(|result| {
-                let key = result.metadata.as_ref()
+                let key = result
+                    .metadata
+                    .as_ref()
                     .and_then(|m| m.get(field))
                     .map(|v| v.to_string())
                     .unwrap_or_else(|| result.id.clone());
@@ -1124,7 +1151,8 @@ impl SemanticSearch {
 
     /// Add highlights to results
     fn add_highlights(&self, mut results: Vec<SearchResult>, queries: &[SearchQuery]) -> Vec<SearchResult> {
-        let query_terms: Vec<String> = queries.iter()
+        let query_terms: Vec<String> = queries
+            .iter()
             .filter_map(|q| {
                 if let SearchQuery::Text(t) = q {
                     Some(Bm25Index::tokenize(t))
@@ -1243,12 +1271,8 @@ fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// Compare two JSON values
 fn compare_json_values(a: &serde_json::Value, b: &serde_json::Value) -> Option<std::cmp::Ordering> {
     match (a, b) {
-        (serde_json::Value::Number(n1), serde_json::Value::Number(n2)) => {
-            n1.as_f64().partial_cmp(&n2.as_f64())
-        }
-        (serde_json::Value::String(s1), serde_json::Value::String(s2)) => {
-            Some(s1.cmp(s2))
-        }
+        (serde_json::Value::Number(n1), serde_json::Value::Number(n2)) => n1.as_f64().partial_cmp(&n2.as_f64()),
+        (serde_json::Value::String(s1), serde_json::Value::String(s2)) => Some(s1.cmp(s2)),
         _ => None,
     }
 }
@@ -1364,27 +1388,27 @@ mod tests {
         let config = SemanticSearchConfig::default();
         let search = SemanticSearch::new(config);
 
-        search.index_document(IndexedDocument {
-            id: "doc1".to_string(),
-            content: "Machine learning is a subset of artificial intelligence".to_string(),
-            vector: None,
-            metadata: Some(HashMap::from([
-                ("category".to_string(), serde_json::json!("tech")),
-            ])),
-            namespace: None,
-            store: "default".to_string(),
-        }).unwrap();
+        search
+            .index_document(IndexedDocument {
+                id: "doc1".to_string(),
+                content: "Machine learning is a subset of artificial intelligence".to_string(),
+                vector: None,
+                metadata: Some(HashMap::from([("category".to_string(), serde_json::json!("tech"))])),
+                namespace: None,
+                store: "default".to_string(),
+            })
+            .unwrap();
 
-        search.index_document(IndexedDocument {
-            id: "doc2".to_string(),
-            content: "Deep learning uses neural networks for pattern recognition".to_string(),
-            vector: None,
-            metadata: Some(HashMap::from([
-                ("category".to_string(), serde_json::json!("tech")),
-            ])),
-            namespace: None,
-            store: "default".to_string(),
-        }).unwrap();
+        search
+            .index_document(IndexedDocument {
+                id: "doc2".to_string(),
+                content: "Deep learning uses neural networks for pattern recognition".to_string(),
+                vector: None,
+                metadata: Some(HashMap::from([("category".to_string(), serde_json::json!("tech"))])),
+                namespace: None,
+                store: "default".to_string(),
+            })
+            .unwrap();
 
         let request = SemanticSearchRequest {
             query: SearchQuery::Text("machine learning AI".to_string()),

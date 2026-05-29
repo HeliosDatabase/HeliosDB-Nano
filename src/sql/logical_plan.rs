@@ -4,12 +4,13 @@
 //! The logical plan is a tree of operators that represents the semantics
 //! of a query without specifying how it should be executed.
 
-use crate::{Schema, DataType, Value};
 #[cfg(feature = "ha-tier1")]
 use crate::Column;
-use serde::{Serialize, Deserialize};
+use crate::{DataType, Schema, Value};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
+use super::constraints::ConstraintEnforcement;
 use super::explain_options::ExplainOptions;
 
 /// Helper module for `Arc<Schema>` serialization
@@ -467,10 +468,7 @@ pub enum LogicalPlan {
     /// `DROP EXTENSION <name>` — uninstall. Phase 1 drops the
     /// `_hdb_code_*` tables (cascade-style); future phases may keep
     /// data and only unregister functions.
-    DropExtension {
-        name: String,
-        if_exists: bool,
-    },
+    DropExtension { name: String, if_exists: bool },
 
     /// Alter column storage mode
     /// Changes per-column storage mode (Dictionary, Content-Addressed, Columnar)
@@ -484,7 +482,6 @@ pub enum LogicalPlan {
     },
 
     // === ALTER TABLE operations ===
-
     /// Add a column to an existing table
     AlterTableAddColumn {
         /// Table name
@@ -548,6 +545,18 @@ pub enum LogicalPlan {
         deferrable: bool,
         /// INITIALLY DEFERRED
         initially_deferred: bool,
+        /// Runtime enforcement mode
+        enforcement: ConstraintEnforcement,
+    },
+
+    /// Change an existing FK constraint's enforcement mode.
+    AlterTableAlterConstraintEnforcement {
+        /// Table name owning the constraint
+        table_name: String,
+        /// Constraint name
+        constraint_name: String,
+        /// New enforcement mode
+        enforcement: ConstraintEnforcement,
     },
 
     /// Multiple ALTER TABLE operations in a single statement
@@ -557,7 +566,6 @@ pub enum LogicalPlan {
     },
 
     // === Phase 3: Database Branching ===
-
     /// Create a database branch
     CreateBranch {
         /// Branch name
@@ -598,7 +606,6 @@ pub enum LogicalPlan {
     ShowBranches,
 
     // === Phase 3: Materialized Views ===
-
     /// Create materialized view
     CreateMaterializedView {
         /// View name
@@ -638,7 +645,6 @@ pub enum LogicalPlan {
     },
 
     // === Regular Views (non-materialized) ===
-
     /// Create a regular view (virtual table)
     CreateView {
         /// View name
@@ -660,7 +666,6 @@ pub enum LogicalPlan {
     },
 
     // === Phase 3: System Views ===
-
     /// Query a system view (e.g., pg_database_branches())
     SystemView {
         /// View name
@@ -670,7 +675,6 @@ pub enum LogicalPlan {
     },
 
     // === Table Functions ===
-
     /// Table-valued function (e.g., generate_series, unnest)
     ///
     /// Produces a virtual table from a function call in the FROM clause.
@@ -742,7 +746,6 @@ pub enum LogicalPlan {
     },
 
     // === Transaction Control ===
-
     /// Start a transaction
     StartTransaction,
 
@@ -771,7 +774,6 @@ pub enum LogicalPlan {
     },
 
     // === Prepared Statements ===
-
     /// Prepare a statement for later execution
     Prepare {
         /// Statement name
@@ -805,7 +807,6 @@ pub enum LogicalPlan {
     },
 
     // === Procedural ===
-
     /// Create a stored function
     CreateFunction {
         /// Function name
@@ -863,13 +864,11 @@ pub enum LogicalPlan {
     },
 
     // === Utility ===
-
     /// Dual scan for SELECT without FROM (like Oracle's DUAL)
     /// Returns a single row with no columns for expression evaluation
     DualScan,
 
     // === HA Operations ===
-
     /// Controlled switchover to a target standby node
     /// Example: SELECT helios_switchover('node-uuid')
     #[cfg(feature = "ha-tier1")]
@@ -1214,6 +1213,8 @@ pub enum BinaryOperator {
     // Comparison
     Eq,
     NotEq,
+    IsDistinctFrom,
+    IsNotDistinctFrom,
     Lt,
     LtEq,
     Gt,
@@ -1300,7 +1301,9 @@ pub enum AggregateFunction {
     /// ARRAY_AGG - collect values into an array
     ArrayAgg,
     /// STRING_AGG(value, delimiter) - concatenate strings with delimiter
-    StringAgg { delimiter: String },
+    StringAgg {
+        delimiter: String,
+    },
 }
 
 /// Join type
@@ -1377,6 +1380,8 @@ pub enum TableConstraint {
         deferrable: bool,
         /// If deferrable, whether initially deferred
         initially_deferred: bool,
+        /// Runtime enforcement mode
+        enforcement: ConstraintEnforcement,
     },
     /// CHECK constraint
     Check {
@@ -1444,6 +1449,10 @@ pub enum IndexOption {
     ShardingStrategy(String),
     /// shard_count = 16
     ShardCount(usize),
+    /// persistent = true
+    Persistent(bool),
+    /// rerank_precision = 'f32' | 'f16' | 'i8'
+    RerankPrecision(String),
 }
 
 /// Quantization type for vector indexes
@@ -1579,9 +1588,7 @@ impl LogicalPlan {
         match self {
             LogicalPlan::Scan { schema, projection, .. } => {
                 if let Some(indices) = projection {
-                    let columns: Vec<_> = indices.iter()
-                        .filter_map(|&i| schema.columns.get(i).cloned())
-                        .collect();
+                    let columns: Vec<_> = indices.iter().filter_map(|&i| schema.columns.get(i).cloned()).collect();
                     Arc::new(Schema { columns })
                 } else {
                     schema.clone()
@@ -1589,19 +1596,20 @@ impl LogicalPlan {
             }
             LogicalPlan::FilteredScan { schema, projection, .. } => {
                 if let Some(indices) = projection {
-                    let columns: Vec<_> = indices.iter()
-                        .filter_map(|&i| schema.columns.get(i).cloned())
-                        .collect();
+                    let columns: Vec<_> = indices.iter().filter_map(|&i| schema.columns.get(i).cloned()).collect();
                     Arc::new(Schema { columns })
                 } else {
                     schema.clone()
                 }
             }
             LogicalPlan::Filter { input, .. } => input.schema(),
-            LogicalPlan::Project { input, exprs, aliases, .. } => {
+            LogicalPlan::Project {
+                input, exprs, aliases, ..
+            } => {
                 use crate::sql::type_inference::TypeInference;
                 let input_schema = input.schema();
-                let columns = aliases.iter()
+                let columns = aliases
+                    .iter()
                     .zip(exprs.iter())
                     .map(|(alias, expr)| {
                         // Use the new to_column method for complete type + nullability inference
@@ -1610,7 +1618,12 @@ impl LogicalPlan {
                     .collect();
                 Arc::new(Schema { columns })
             }
-            LogicalPlan::Aggregate { input, group_by, aggr_exprs, .. } => {
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                ..
+            } => {
                 use crate::sql::type_inference::TypeInference;
                 let input_schema = input.schema();
                 let mut columns = Vec::new();
@@ -1643,12 +1656,8 @@ impl LogicalPlan {
                 // Insert doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
             }
-            LogicalPlan::CreateTable { .. } => {
-                Arc::new(Schema { columns: vec![] })
-            }
-            LogicalPlan::DropTable { .. } => {
-                Arc::new(Schema { columns: vec![] })
-            }
+            LogicalPlan::CreateTable { .. } => Arc::new(Schema { columns: vec![] }),
+            LogicalPlan::DropTable { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::Truncate { .. } => {
                 // Truncate doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
@@ -1672,9 +1681,7 @@ impl LogicalPlan {
             LogicalPlan::CreateExtension { .. }
             | LogicalPlan::DropExtension { .. }
             | LogicalPlan::CreateDatabase { .. }
-            | LogicalPlan::DropDatabase { .. } => {
-                Arc::new(Schema { columns: vec![] })
-            }
+            | LogicalPlan::DropDatabase { .. } => Arc::new(Schema { columns: vec![] }),
             LogicalPlan::AlterColumnStorage { .. } => {
                 // AlterColumnStorage doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
@@ -1695,7 +1702,7 @@ impl LogicalPlan {
                 // ALTER TABLE RENAME doesn't have output schema
                 Arc::new(Schema { columns: vec![] })
             }
-            LogicalPlan::AlterTableAddForeignKey { .. } => {
+            LogicalPlan::AlterTableAddForeignKey { .. } | LogicalPlan::AlterTableAlterConstraintEnforcement { .. } => {
                 Arc::new(Schema { columns: vec![] })
             }
             LogicalPlan::AlterTableMulti { .. } => {
@@ -1846,19 +1853,17 @@ impl LogicalPlan {
                 // EXPLAIN returns a single text column with the query plan
                 use crate::DataType;
                 Arc::new(Schema {
-                    columns: vec![
-                        crate::Column {
-                            name: "QUERY PLAN".to_string(),
-                            data_type: DataType::Text,
-                            nullable: false,
-                            primary_key: false,
-                            source_table: None,
-                            source_table_name: None,
-                            default_expr: None,
-                            unique: false,
-                            storage_mode: Default::default(),
-                        },
-                    ],
+                    columns: vec![crate::Column {
+                        name: "QUERY PLAN".to_string(),
+                        data_type: DataType::Text,
+                        nullable: false,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: Default::default(),
+                    }],
                 })
             }
             // Transaction control - no output schema
@@ -1898,9 +1903,7 @@ impl LogicalPlan {
             LogicalPlan::Switchover { .. } => {
                 // Returns status message
                 Arc::new(Schema {
-                    columns: vec![
-                        Column::new("result", DataType::Text),
-                    ],
+                    columns: vec![Column::new("result", DataType::Text)],
                 })
             }
             #[cfg(feature = "ha-tier1")]
@@ -1937,9 +1940,7 @@ impl LogicalPlan {
             LogicalPlan::SetNodeAlias { .. } => {
                 // Returns confirmation message
                 Arc::new(Schema {
-                    columns: vec![
-                        Column::new("result", DataType::Text),
-                    ],
+                    columns: vec![Column::new("result", DataType::Text)],
                 })
             }
             #[cfg(feature = "ha-tier1")]
@@ -2059,19 +2060,17 @@ mod tests {
     #[test]
     fn test_scan_with_time_travel() {
         let schema = Arc::new(Schema {
-            columns: vec![
-                crate::Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: false,
-                    source_table: None,
-                    source_table_name: None,
-                    default_expr: None,
-                    unique: false,
-                    storage_mode: Default::default(),
-                },
-            ],
+            columns: vec![crate::Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: false,
+                source_table: None,
+                source_table_name: None,
+                default_expr: None,
+                unique: false,
+                storage_mode: Default::default(),
+            }],
         });
 
         let plan = LogicalPlan::Scan {

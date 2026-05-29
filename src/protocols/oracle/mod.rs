@@ -7,15 +7,15 @@
 //!
 //! Reference: Oracle Database Net Services Reference
 
-pub mod tns;
-pub mod ttc;
-pub mod translator;
 pub mod handler;
 pub mod server;
+pub mod tns;
+pub mod translator;
+pub mod ttc;
 
+pub use handler::OracleProtocolHandler;
 pub use server::{OracleServer, OracleServerConfig};
 pub use translator::OracleTranslator;
-pub use handler::OracleProtocolHandler;
 
 /// Oracle protocol version
 pub const ORACLE_PROTOCOL_VERSION: u16 = 319; // Oracle 19c

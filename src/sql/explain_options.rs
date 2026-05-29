@@ -41,7 +41,6 @@ pub struct ExplainOptions {
     // ─────────────────────────────────────────────────────────────────────────
     // Core options (PostgreSQL-compatible)
     // ─────────────────────────────────────────────────────────────────────────
-
     /// Execute query and show actual statistics (EXPLAIN ANALYZE)
     pub analyze: bool,
 
@@ -66,7 +65,6 @@ pub struct ExplainOptions {
     // ─────────────────────────────────────────────────────────────────────────
     // HeliosDB Extensions
     // ─────────────────────────────────────────────────────────────────────────
-
     /// Show storage layer details (column modes, bloom filters, zone maps, compression)
     pub storage: bool,
 
@@ -89,9 +87,9 @@ impl Default for ExplainOptions {
             analyze: false,
             verbose: false,
             format: ExplainFormatOption::Text,
-            costs: true,  // PostgreSQL default
+            costs: true, // PostgreSQL default
             buffers: false,
-            timing: true,  // Default on when ANALYZE is used
+            timing: true, // Default on when ANALYZE is used
             summary: false,
             storage: false,
             ai: false,
@@ -141,7 +139,7 @@ impl ExplainOptions {
             timing: true,
             summary: true,
             storage: true,
-            ai: false,  // AI requires LLM endpoint
+            ai: false, // AI requires LLM endpoint
             why_not: true,
             indexes: true,
             statistics: true,
@@ -265,7 +263,7 @@ impl ExplainFormatOption {
             "JSON" => Self::Json,
             "YAML" => Self::Yaml,
             "TREE" => Self::Tree,
-            "XML" => Self::Text,  // XML not supported, fallback to Text
+            "XML" => Self::Text, // XML not supported, fallback to Text
             _ => Self::Text,
         }
     }

@@ -3,11 +3,11 @@
 //! This module provides storage and execution of user-defined functions and procedures.
 //! Functions are stored in-memory and can be called from SQL queries.
 
-use crate::{Result, Error, Value, DataType};
-use super::logical_plan::{FunctionParam, ParamMode};
-use super::procedural::{ProceduralParser, ProceduralExecutor, ExecutionContext};
 use super::evaluator::Evaluator;
-use serde::{Serialize, Deserialize};
+use super::logical_plan::{FunctionParam, ParamMode};
+use super::procedural::{ExecutionContext, ProceduralExecutor, ProceduralParser};
+use crate::{DataType, Error, Result, Value};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -68,7 +68,9 @@ impl FunctionRegistry {
 
     /// Register a function
     pub fn register_function(&self, func: StoredFunction) -> Result<()> {
-        let mut functions = self.functions.write()
+        let mut functions = self
+            .functions
+            .write()
             .map_err(|e| Error::internal(format!("Failed to acquire function lock: {}", e)))?;
 
         let name = func.name.to_lowercase();
@@ -86,7 +88,9 @@ impl FunctionRegistry {
 
     /// Register a procedure
     pub fn register_procedure(&self, proc: StoredProcedure) -> Result<()> {
-        let mut procedures = self.procedures.write()
+        let mut procedures = self
+            .procedures
+            .write()
             .map_err(|e| Error::internal(format!("Failed to acquire procedure lock: {}", e)))?;
 
         let name = proc.name.to_lowercase();
@@ -116,7 +120,9 @@ impl FunctionRegistry {
 
     /// Drop a function
     pub fn drop_function(&self, name: &str, if_exists: bool) -> Result<bool> {
-        let mut functions = self.functions.write()
+        let mut functions = self
+            .functions
+            .write()
             .map_err(|e| Error::internal(format!("Failed to acquire function lock: {}", e)))?;
 
         let name_lower = name.to_lowercase();
@@ -126,16 +132,15 @@ impl FunctionRegistry {
         } else if if_exists {
             Ok(false)
         } else {
-            Err(Error::query_execution(format!(
-                "Function '{}' does not exist",
-                name
-            )))
+            Err(Error::query_execution(format!("Function '{}' does not exist", name)))
         }
     }
 
     /// Drop a procedure
     pub fn drop_procedure(&self, name: &str, if_exists: bool) -> Result<bool> {
-        let mut procedures = self.procedures.write()
+        let mut procedures = self
+            .procedures
+            .write()
             .map_err(|e| Error::internal(format!("Failed to acquire procedure lock: {}", e)))?;
 
         let name_lower = name.to_lowercase();
@@ -145,37 +150,38 @@ impl FunctionRegistry {
         } else if if_exists {
             Ok(false)
         } else {
-            Err(Error::query_execution(format!(
-                "Procedure '{}' does not exist",
-                name
-            )))
+            Err(Error::query_execution(format!("Procedure '{}' does not exist", name)))
         }
     }
 
     /// Check if a function exists
     pub fn function_exists(&self, name: &str) -> bool {
-        self.functions.read()
+        self.functions
+            .read()
             .map(|f| f.contains_key(&name.to_lowercase()))
             .unwrap_or(false)
     }
 
     /// Check if a procedure exists
     pub fn procedure_exists(&self, name: &str) -> bool {
-        self.procedures.read()
+        self.procedures
+            .read()
             .map(|p| p.contains_key(&name.to_lowercase()))
             .unwrap_or(false)
     }
 
     /// List all function names
     pub fn list_functions(&self) -> Vec<String> {
-        self.functions.read()
+        self.functions
+            .read()
             .map(|f| f.keys().cloned().collect())
             .unwrap_or_default()
     }
 
     /// List all procedure names
     pub fn list_procedures(&self) -> Vec<String> {
-        self.procedures.read()
+        self.procedures
+            .read()
             .map(|p| p.keys().cloned().collect())
             .unwrap_or_default()
     }
@@ -187,32 +193,34 @@ impl FunctionRegistry {
         args: &[Value],
         sql_executor: impl FnMut(&str) -> Result<Vec<Vec<Value>>>,
     ) -> Result<Value> {
-        let func = self.get_function(name)
-            .ok_or_else(|| Error::query_execution(format!(
-                "Function '{}' does not exist",
-                name
-            )))?;
+        let func = self
+            .get_function(name)
+            .ok_or_else(|| Error::query_execution(format!("Function '{}' does not exist", name)))?;
 
         // Validate argument count
-        let required_params: Vec<_> = func.params.iter()
+        let required_params: Vec<_> = func
+            .params
+            .iter()
             .filter(|p| p.default.is_none() && p.mode != ParamMode::Out)
             .collect();
 
         if args.len() < required_params.len() {
             return Err(Error::query_execution(format!(
                 "Function '{}' requires at least {} arguments, got {}",
-                name, required_params.len(), args.len()
+                name,
+                required_params.len(),
+                args.len()
             )));
         }
 
-        let max_in_params = func.params.iter()
-            .filter(|p| p.mode != ParamMode::Out)
-            .count();
+        let max_in_params = func.params.iter().filter(|p| p.mode != ParamMode::Out).count();
 
         if args.len() > max_in_params {
             return Err(Error::query_execution(format!(
                 "Function '{}' accepts at most {} arguments, got {}",
-                name, max_in_params, args.len()
+                name,
+                max_in_params,
+                args.len()
             )));
         }
 
@@ -276,11 +284,9 @@ impl FunctionRegistry {
     ) -> Result<Value> {
         // Parse the function body into a procedural block
         let mut parser = ProceduralParser::new(&func.body);
-        let block = parser.parse_block()
-            .map_err(|e| Error::query_execution(format!(
-                "Failed to parse function body: {}",
-                e
-            )))?;
+        let block = parser
+            .parse_block()
+            .map_err(|e| Error::query_execution(format!("Failed to parse function body: {}", e)))?;
 
         // Create execution context
         let schema = Arc::new(crate::Schema { columns: vec![] });
@@ -326,11 +332,9 @@ impl FunctionRegistry {
         args: &[Value],
         sql_executor: impl FnMut(&str) -> Result<Vec<Vec<Value>>>,
     ) -> Result<()> {
-        let proc = self.get_procedure(name)
-            .ok_or_else(|| Error::query_execution(format!(
-                "Procedure '{}' does not exist",
-                name
-            )))?;
+        let proc = self
+            .get_procedure(name)
+            .ok_or_else(|| Error::query_execution(format!("Procedure '{}' does not exist", name)))?;
 
         // Execute based on language
         match proc.language.to_lowercase().as_str() {
@@ -381,11 +385,9 @@ impl FunctionRegistry {
         sql_executor: impl FnMut(&str) -> Result<Vec<Vec<Value>>>,
     ) -> Result<()> {
         let mut parser = ProceduralParser::new(&proc.body);
-        let block = parser.parse_block()
-            .map_err(|e| Error::query_execution(format!(
-                "Failed to parse procedure body: {}",
-                e
-            )))?;
+        let block = parser
+            .parse_block()
+            .map_err(|e| Error::query_execution(format!("Failed to parse procedure body: {}", e)))?;
 
         let schema = Arc::new(crate::Schema { columns: vec![] });
         let evaluator = Evaluator::new(schema);
@@ -581,14 +583,12 @@ mod tests {
         let func = StoredFunction {
             name: "double_it".to_string(),
             or_replace: false,
-            params: vec![
-                FunctionParam {
-                    name: "x".to_string(),
-                    data_type: DataType::Int4,
-                    mode: ParamMode::In,
-                    default: None,
-                },
-            ],
+            params: vec![FunctionParam {
+                name: "x".to_string(),
+                data_type: DataType::Int4,
+                mode: ParamMode::In,
+                default: None,
+            }],
             return_type: Some(DataType::Int4),
             body: "SELECT $1 * 2".to_string(),
             language: "sql".to_string(),
@@ -599,15 +599,13 @@ mod tests {
         registry.register_function(func).unwrap();
 
         // Mock SQL executor
-        let result = registry.execute_function(
-            "double_it",
-            &[Value::Int4(21)],
-            |sql| {
+        let result = registry
+            .execute_function("double_it", &[Value::Int4(21)], |sql| {
                 // The SQL should be "SELECT 21 * 2"
                 assert!(sql.contains("21"));
                 Ok(vec![vec![Value::Int4(42)]])
-            },
-        ).unwrap();
+            })
+            .unwrap();
 
         assert_eq!(result, Value::Int4(42));
     }

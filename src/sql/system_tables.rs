@@ -3,10 +3,10 @@
 //! Provides system tables and views for tracking active database sessions,
 //! compatible with both PostgreSQL and Oracle conventions.
 
-use std::sync::{Arc, RwLock};
+use crate::error::{Error, Result};
 use std::collections::HashMap;
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use crate::error::{Result, Error};
 
 /// Session state enumeration
 #[derive(Debug, Clone, PartialEq)]
@@ -129,21 +129,19 @@ impl SessionRegistry {
         client_address: String,
         client_port: i32,
     ) -> Result<i64> {
-        let mut next_id = self.next_session_id.write()
+        let mut next_id = self
+            .next_session_id
+            .write()
             .map_err(|e| Error::Generic(format!("Failed to acquire session ID lock: {}", e)))?;
 
         let session_id = *next_id;
         *next_id += 1;
 
-        let session = SessionInfo::new(
-            session_id,
-            protocol,
-            username,
-            client_address,
-            client_port,
-        );
+        let session = SessionInfo::new(session_id, protocol, username, client_address, client_port);
 
-        let mut sessions = self.sessions.write()
+        let mut sessions = self
+            .sessions
+            .write()
             .map_err(|e| Error::Generic(format!("Failed to acquire sessions lock: {}", e)))?;
 
         sessions.insert(session_id, session);
@@ -153,7 +151,9 @@ impl SessionRegistry {
 
     /// Unregister a session
     pub fn unregister_session(&self, session_id: i64) -> Result<()> {
-        let mut sessions = self.sessions.write()
+        let mut sessions = self
+            .sessions
+            .write()
             .map_err(|e| Error::Generic(format!("Failed to acquire sessions lock: {}", e)))?;
 
         sessions.remove(&session_id);
@@ -162,7 +162,9 @@ impl SessionRegistry {
 
     /// Update session query
     pub fn update_session_query(&self, session_id: i64, query: String) -> Result<()> {
-        let mut sessions = self.sessions.write()
+        let mut sessions = self
+            .sessions
+            .write()
             .map_err(|e| Error::Generic(format!("Failed to acquire sessions lock: {}", e)))?;
 
         if let Some(session) = sessions.get_mut(&session_id) {
@@ -174,7 +176,9 @@ impl SessionRegistry {
 
     /// Clear session query
     pub fn clear_session_query(&self, session_id: i64) -> Result<()> {
-        let mut sessions = self.sessions.write()
+        let mut sessions = self
+            .sessions
+            .write()
             .map_err(|e| Error::Generic(format!("Failed to acquire sessions lock: {}", e)))?;
 
         if let Some(session) = sessions.get_mut(&session_id) {
@@ -186,7 +190,9 @@ impl SessionRegistry {
 
     /// Get all sessions
     pub fn get_all_sessions(&self) -> Result<Vec<SessionInfo>> {
-        let sessions = self.sessions.read()
+        let sessions = self
+            .sessions
+            .read()
             .map_err(|e| Error::Generic(format!("Failed to acquire sessions lock: {}", e)))?;
 
         Ok(sessions.values().cloned().collect())
@@ -194,18 +200,19 @@ impl SessionRegistry {
 
     /// Get sessions filtered by protocol
     pub fn get_sessions_by_protocol(&self, protocol: ProtocolType) -> Result<Vec<SessionInfo>> {
-        let sessions = self.sessions.read()
+        let sessions = self
+            .sessions
+            .read()
             .map_err(|e| Error::Generic(format!("Failed to acquire sessions lock: {}", e)))?;
 
-        Ok(sessions.values()
-            .filter(|s| s.protocol == protocol)
-            .cloned()
-            .collect())
+        Ok(sessions.values().filter(|s| s.protocol == protocol).cloned().collect())
     }
 
     /// Get a specific session
     pub fn get_session(&self, session_id: i64) -> Result<Option<SessionInfo>> {
-        let sessions = self.sessions.read()
+        let sessions = self
+            .sessions
+            .read()
             .map_err(|e| Error::Generic(format!("Failed to acquire sessions lock: {}", e)))?;
 
         Ok(sessions.get(&session_id).cloned())
@@ -310,19 +317,18 @@ mod tests {
         let registry = SessionRegistry::new();
 
         // Register sessions
-        let session_id1 = registry.register_session(
-            ProtocolType::PostgreSQL,
-            "user1".to_string(),
-            "127.0.0.1".to_string(),
-            5432,
-        ).unwrap();
+        let session_id1 = registry
+            .register_session(
+                ProtocolType::PostgreSQL,
+                "user1".to_string(),
+                "127.0.0.1".to_string(),
+                5432,
+            )
+            .unwrap();
 
-        let session_id2 = registry.register_session(
-            ProtocolType::Oracle,
-            "user2".to_string(),
-            "127.0.0.1".to_string(),
-            1521,
-        ).unwrap();
+        let session_id2 = registry
+            .register_session(ProtocolType::Oracle, "user2".to_string(), "127.0.0.1".to_string(), 1521)
+            .unwrap();
 
         // Verify sessions are registered
         assert_eq!(session_id1, 1);
@@ -337,7 +343,9 @@ mod tests {
         assert_eq!(pg_sessions[0].username, "user1");
 
         // Test query update
-        registry.update_session_query(session_id1, "SELECT * FROM test".to_string()).unwrap();
+        registry
+            .update_session_query(session_id1, "SELECT * FROM test".to_string())
+            .unwrap();
         let session = registry.get_session(session_id1).unwrap().unwrap();
         assert_eq!(session.state, SessionState::Active);
         assert!(session.current_query.is_some());

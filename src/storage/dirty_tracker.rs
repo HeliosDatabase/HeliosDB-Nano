@@ -4,11 +4,11 @@
 //! Provides lock-free dirty state management with sequential numbering
 //! for incremental dump support.
 
+use parking_lot::RwLock;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
-use parking_lot::RwLock;
 use std::time::Instant;
-use std::collections::VecDeque;
 
 /// Type of change operation
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -55,7 +55,11 @@ impl std::fmt::Display for DirtyTrackerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::BufferOverflow { max_size, current_size } => {
-                write!(f, "Buffer overflow: current size {} exceeds max {}", current_size, max_size)
+                write!(
+                    f,
+                    "Buffer overflow: current size {} exceeds max {}",
+                    current_size, max_size
+                )
             }
             Self::LockError(msg) => write!(f, "Lock error: {}", msg),
             Self::InvalidParameter(msg) => write!(f, "Invalid parameter: {}", msg),
@@ -157,7 +161,7 @@ impl DirtyTracker {
     pub fn track_insert(&self, table: &str, row_key: &str, values: &[u8]) -> Result<()> {
         if table.is_empty() || row_key.is_empty() {
             return Err(DirtyTrackerError::InvalidParameter(
-                "Table name and row key cannot be empty".to_string()
+                "Table name and row key cannot be empty".to_string(),
             ));
         }
 
@@ -186,16 +190,10 @@ impl DirtyTracker {
     /// * `row_key` - Row key (primary key)
     /// * `old_values` - Serialized old row values
     /// * `new_values` - Serialized new row values
-    pub fn track_update(
-        &self,
-        table: &str,
-        row_key: &str,
-        old_values: &[u8],
-        new_values: &[u8],
-    ) -> Result<()> {
+    pub fn track_update(&self, table: &str, row_key: &str, old_values: &[u8], new_values: &[u8]) -> Result<()> {
         if table.is_empty() || row_key.is_empty() {
             return Err(DirtyTrackerError::InvalidParameter(
-                "Table name and row key cannot be empty".to_string()
+                "Table name and row key cannot be empty".to_string(),
             ));
         }
 
@@ -226,7 +224,7 @@ impl DirtyTracker {
     pub fn track_delete(&self, table: &str, row_key: &str, values: &[u8]) -> Result<()> {
         if table.is_empty() || row_key.is_empty() {
             return Err(DirtyTrackerError::InvalidParameter(
-                "Table name and row key cannot be empty".to_string()
+                "Table name and row key cannot be empty".to_string(),
             ));
         }
 
@@ -257,10 +255,7 @@ impl DirtyTracker {
     pub fn get_dirty_count(&self) -> u64 {
         let buffer = self.changes.read();
         let last_dump = self.last_dump_seq.load(Ordering::Acquire);
-        buffer.changes
-            .iter()
-            .filter(|c| c.sequence_number > last_dump)
-            .count() as u64
+        buffer.changes.iter().filter(|c| c.sequence_number > last_dump).count() as u64
     }
 
     /// Get list of tables with dirty changes

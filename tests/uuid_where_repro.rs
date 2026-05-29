@@ -19,10 +19,8 @@ fn uuid_pk_round_trips_through_where() {
     let db = EmbeddedDatabase::new_in_memory().expect("db");
     db.execute("CREATE TABLE t (id UUID PRIMARY KEY, name TEXT)").unwrap();
     let uuid_str = uuid::Uuid::new_v4().to_string();
-    db.execute(&format!(
-        "INSERT INTO t VALUES ('{uuid_str}', 'foo')"
-    ))
-    .unwrap();
+    db.execute(&format!("INSERT INTO t VALUES ('{uuid_str}', 'foo')"))
+        .unwrap();
 
     // SELECT * with no WHERE — should see the row.
     let all = db.query("SELECT id FROM t", &[]).unwrap();
@@ -31,19 +29,13 @@ fn uuid_pk_round_trips_through_where() {
 
     // SELECT … WHERE id = '<uuid>' — the broken case.
     let filtered = db
-        .query(
-            &format!("SELECT id FROM t WHERE id = '{uuid_str}'"),
-            &[],
-        )
+        .query(&format!("SELECT id FROM t WHERE id = '{uuid_str}'"), &[])
         .unwrap();
     eprintln!("[probe] SELECT id WHERE id rows = {}", filtered.len());
 
     // Also try SELECT * which routes through try_fast_select.
     let star = db
-        .query(
-            &format!("SELECT * FROM t WHERE id = '{uuid_str}'"),
-            &[],
-        )
+        .query(&format!("SELECT * FROM t WHERE id = '{uuid_str}'"), &[])
         .unwrap();
     eprintln!("[probe] SELECT *  WHERE id rows = {}", star.len());
     assert_eq!(
@@ -56,18 +48,12 @@ fn uuid_pk_round_trips_through_where() {
     // Parameterised form should also match.
     let p_uuid: uuid::Uuid = uuid_str.parse().unwrap();
     let parameterised = db
-        .query_params(
-            "SELECT id FROM t WHERE id = $1",
-            &[Value::Uuid(p_uuid)],
-        )
+        .query_params("SELECT id FROM t WHERE id = $1", &[Value::Uuid(p_uuid)])
         .unwrap();
     assert_eq!(parameterised.len(), 1);
 
     let parameterised_str = db
-        .query_params(
-            "SELECT id FROM t WHERE id = $1",
-            &[Value::String(uuid_str.clone())],
-        )
+        .query_params("SELECT id FROM t WHERE id = $1", &[Value::String(uuid_str.clone())])
         .unwrap();
     assert_eq!(parameterised_str.len(), 1, "string-typed param mismatch");
 }

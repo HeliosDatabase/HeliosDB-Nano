@@ -18,8 +18,8 @@
 
 use super::config::{FailoverConfig, NodeHealth, StandbyConfig};
 use super::transport::{
-    Capabilities, HandshakeRequest, HeartbeatPayload, HealthStatus, MessageType,
-    NodeRole as TransportNodeRole, ReplicationConnection, SyncModeConfig,
+    Capabilities, HandshakeRequest, HealthStatus, HeartbeatPayload, MessageType, NodeRole as TransportNodeRole,
+    ReplicationConnection, SyncModeConfig,
 };
 use super::wal_replicator::Lsn;
 use super::{ReplicationError, Result};
@@ -42,7 +42,10 @@ pub enum FailoverEvent {
     /// Failover initiated
     FailoverStarted { target_standby: Uuid },
     /// Failover completed
-    FailoverCompleted { new_primary: Uuid, old_primary: Option<Uuid> },
+    FailoverCompleted {
+        new_primary: Uuid,
+        old_primary: Option<Uuid>,
+    },
     /// Failover failed
     FailoverFailed { reason: String },
     /// Standby promoted
@@ -145,11 +148,7 @@ impl FailoverWatcher {
     }
 
     /// Create a failover watcher with minimal configuration (for backward compatibility)
-    pub fn new_simple(
-        config: FailoverConfig,
-        primary_id: Uuid,
-        standbys: Vec<StandbyConfig>,
-    ) -> Self {
+    pub fn new_simple(config: FailoverConfig, primary_id: Uuid, standbys: Vec<StandbyConfig>) -> Self {
         Self::new(config, Uuid::new_v4(), primary_id, None, standbys)
     }
 
@@ -176,7 +175,9 @@ impl FailoverWatcher {
     /// Spawns background tasks for health monitoring.
     pub async fn start(&self) -> Result<()> {
         if self.is_running.swap(true, Ordering::SeqCst) {
-            return Err(ReplicationError::Failover("Failover watcher already running".to_string()));
+            return Err(ReplicationError::Failover(
+                "Failover watcher already running".to_string(),
+            ));
         }
 
         if !self.config.auto_failover {
@@ -194,7 +195,9 @@ impl FailoverWatcher {
 
         let Some(mut shutdown_rx) = shutdown_rx else {
             self.is_running.store(false, Ordering::SeqCst);
-            return Err(ReplicationError::Failover("Shutdown receiver already taken".to_string()));
+            return Err(ReplicationError::Failover(
+                "Shutdown receiver already taken".to_string(),
+            ));
         };
 
         // Clone Arc references for the spawned task
@@ -375,41 +378,36 @@ impl FailoverWatcher {
         // Attempt TCP connection with timeout
         let result = tokio::time::timeout(timeout, async {
             Self::do_health_check(this_node_id, target_node_id, addr).await
-        }).await;
+        })
+        .await;
 
         let elapsed = start.elapsed();
 
         match result {
-            Ok(Ok((health, lsn))) => {
-                HealthCheckResult {
-                    node_id: target_node_id,
-                    health,
-                    response_time_ms: Some(elapsed.as_millis() as u64),
-                    current_lsn: lsn,
-                    error: None,
-                    checked_at: chrono::Utc::now(),
-                }
-            }
-            Ok(Err(e)) => {
-                HealthCheckResult {
-                    node_id: target_node_id,
-                    health: NodeHealth::Failed,
-                    response_time_ms: Some(elapsed.as_millis() as u64),
-                    current_lsn: None,
-                    error: Some(e.to_string()),
-                    checked_at: chrono::Utc::now(),
-                }
-            }
-            Err(_) => {
-                HealthCheckResult {
-                    node_id: target_node_id,
-                    health: NodeHealth::Unreachable,
-                    response_time_ms: Some(elapsed.as_millis() as u64),
-                    current_lsn: None,
-                    error: Some("Connection timeout".to_string()),
-                    checked_at: chrono::Utc::now(),
-                }
-            }
+            Ok(Ok((health, lsn))) => HealthCheckResult {
+                node_id: target_node_id,
+                health,
+                response_time_ms: Some(elapsed.as_millis() as u64),
+                current_lsn: lsn,
+                error: None,
+                checked_at: chrono::Utc::now(),
+            },
+            Ok(Err(e)) => HealthCheckResult {
+                node_id: target_node_id,
+                health: NodeHealth::Failed,
+                response_time_ms: Some(elapsed.as_millis() as u64),
+                current_lsn: None,
+                error: Some(e.to_string()),
+                checked_at: chrono::Utc::now(),
+            },
+            Err(_) => HealthCheckResult {
+                node_id: target_node_id,
+                health: NodeHealth::Unreachable,
+                response_time_ms: Some(elapsed.as_millis() as u64),
+                current_lsn: None,
+                error: Some("Connection timeout".to_string()),
+                checked_at: chrono::Utc::now(),
+            },
         }
     }
 
@@ -436,7 +434,9 @@ impl FailoverWatcher {
 
         if !handshake_response.accepted {
             return Err(ReplicationError::Failover(
-                handshake_response.error.unwrap_or_else(|| "Handshake rejected".to_string())
+                handshake_response
+                    .error
+                    .unwrap_or_else(|| "Handshake rejected".to_string()),
             ));
         }
 
@@ -458,12 +458,9 @@ impl FailoverWatcher {
         conn.send(MessageType::Heartbeat, Bytes::from(payload)).await?;
 
         // Wait for heartbeat response
-        let response = tokio::time::timeout(
-            Duration::from_secs(5),
-            conn.recv()
-        ).await
-            .map_err(|_| ReplicationError::Failover("Heartbeat response timeout".to_string()))?
-            ?;
+        let response = tokio::time::timeout(Duration::from_secs(5), conn.recv())
+            .await
+            .map_err(|_| ReplicationError::Failover("Heartbeat response timeout".to_string()))??;
 
         if response.header.msg_type == MessageType::HeartbeatResponse {
             let heartbeat_resp: HeartbeatPayload = bincode::deserialize(&response.payload)
@@ -504,10 +501,7 @@ impl FailoverWatcher {
             .collect();
 
         // Sort by priority (lower first), then by LSN (higher first - most up-to-date)
-        candidates.sort_by(|a, b| {
-            a.1.cmp(&b.1)
-                .then_with(|| b.2.cmp(&a.2))
-        });
+        candidates.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| b.2.cmp(&a.2)));
 
         candidates.first().map(|(id, _, _)| *id)
     }
@@ -584,11 +578,7 @@ impl FailoverWatcher {
             .collect();
 
         // Sort by priority (lower first), then by lag (lower first)
-        candidates.sort_by(|a, b| {
-            a.priority
-                .cmp(&b.priority)
-                .then_with(|| a.lag_bytes.cmp(&b.lag_bytes))
-        });
+        candidates.sort_by(|a, b| a.priority.cmp(&b.priority).then_with(|| a.lag_bytes.cmp(&b.lag_bytes)));
 
         candidates
     }
@@ -613,9 +603,12 @@ impl FailoverWatcher {
             .ok_or_else(|| ReplicationError::Failover("No healthy standbys available".to_string()))?;
 
         // Send event
-        let _ = self.event_tx.send(FailoverEvent::FailoverStarted {
-            target_standby: candidate.node_id,
-        }).await;
+        let _ = self
+            .event_tx
+            .send(FailoverEvent::FailoverStarted {
+                target_standby: candidate.node_id,
+            })
+            .await;
 
         tracing::info!(
             "Initiating failover to standby {} at LSN {}",
@@ -655,14 +648,15 @@ impl FailoverWatcher {
         if candidate.lag_bytes > self.config.max_replication_lag {
             let lag_error = format!(
                 "Standby {} has excessive lag ({} bytes > {} max)",
-                candidate.node_id,
-                candidate.lag_bytes,
-                self.config.max_replication_lag
+                candidate.node_id, candidate.lag_bytes, self.config.max_replication_lag
             );
             tracing::error!("{}", lag_error);
-            let _ = self.event_tx.send(FailoverEvent::FailoverFailed {
-                reason: lag_error.clone(),
-            }).await;
+            let _ = self
+                .event_tx
+                .send(FailoverEvent::FailoverFailed {
+                    reason: lag_error.clone(),
+                })
+                .await;
             *self.failover_in_progress.write().await = false;
             return Err(ReplicationError::Failover(lag_error));
         }
@@ -675,8 +669,7 @@ impl FailoverWatcher {
 
         // Step 3: Promote standby
         // Send promotion notification to the standby
-        let standby_config = self.standbys.iter()
-            .find(|s| s.node_id == candidate.node_id);
+        let standby_config = self.standbys.iter().find(|s| s.node_id == candidate.node_id);
 
         if let Some(config) = standby_config {
             let addr_str = format!("{}:{}", config.host, config.port);
@@ -685,17 +678,23 @@ impl FailoverWatcher {
                 match Self::send_promote_request(self.node_id, candidate.node_id, addr, target_lsn).await {
                     Ok(()) => {
                         tracing::info!("Standby {} promoted successfully", candidate.node_id);
-                        let _ = self.event_tx.send(FailoverEvent::StandbyPromoted {
-                            standby_id: candidate.node_id,
-                            at_lsn: candidate.applied_lsn,
-                        }).await;
+                        let _ = self
+                            .event_tx
+                            .send(FailoverEvent::StandbyPromoted {
+                                standby_id: candidate.node_id,
+                                at_lsn: candidate.applied_lsn,
+                            })
+                            .await;
                     }
                     Err(e) => {
                         let promote_error = format!("Failed to promote standby: {}", e);
                         tracing::error!("{}", promote_error);
-                        let _ = self.event_tx.send(FailoverEvent::FailoverFailed {
-                            reason: promote_error.clone(),
-                        }).await;
+                        let _ = self
+                            .event_tx
+                            .send(FailoverEvent::FailoverFailed {
+                                reason: promote_error.clone(),
+                            })
+                            .await;
                         *self.failover_in_progress.write().await = false;
                         return Err(ReplicationError::Failover(promote_error));
                     }
@@ -714,10 +713,13 @@ impl FailoverWatcher {
         );
 
         // Step 5: Notify completion
-        let _ = self.event_tx.send(FailoverEvent::FailoverCompleted {
-            new_primary: candidate.node_id,
-            old_primary: Some(self.primary_id),
-        }).await;
+        let _ = self
+            .event_tx
+            .send(FailoverEvent::FailoverCompleted {
+                new_primary: candidate.node_id,
+                old_primary: Some(self.primary_id),
+            })
+            .await;
 
         *self.failover_in_progress.write().await = false;
 
@@ -727,7 +729,10 @@ impl FailoverWatcher {
     /// Request manual failover
     pub async fn request_manual_failover(&self, target: Option<Uuid>) -> Result<()> {
         // Record the request
-        let _ = self.event_tx.send(FailoverEvent::ManualFailoverRequested { target: target.clone() }).await;
+        let _ = self
+            .event_tx
+            .send(FailoverEvent::ManualFailoverRequested { target: target.clone() })
+            .await;
 
         if self.config.require_confirmation {
             // Just record the request, don't execute automatically
@@ -738,18 +743,17 @@ impl FailoverWatcher {
         // Get the current LSN for failover
         let primary_lsn = {
             let states = self.health_states.read().await;
-            states.get(&self.primary_id)
-                .and_then(|s| s.current_lsn)
-                .unwrap_or(0)
+            states.get(&self.primary_id).and_then(|s| s.current_lsn).unwrap_or(0)
         };
 
         // If target specified, verify it's a valid standby
         if let Some(target_id) = target {
             let candidates = self.get_candidates(primary_lsn).await;
             if !candidates.iter().any(|c| c.node_id == target_id) {
-                return Err(ReplicationError::Failover(
-                    format!("Target {} is not a valid failover candidate", target_id)
-                ));
+                return Err(ReplicationError::Failover(format!(
+                    "Target {} is not a valid failover candidate",
+                    target_id
+                )));
             }
         }
 
@@ -761,11 +765,7 @@ impl FailoverWatcher {
     }
 
     /// Send a fence request to the primary to stop accepting writes
-    async fn send_fence_request(
-        _this_node_id: Uuid,
-        _target_node_id: Uuid,
-        addr: SocketAddr,
-    ) -> Result<()> {
+    async fn send_fence_request(_this_node_id: Uuid, _target_node_id: Uuid, addr: SocketAddr) -> Result<()> {
         // Attempt to connect and send a fence command
         // In a full implementation, this would:
         // 1. Connect to the primary
@@ -780,12 +780,8 @@ impl FailoverWatcher {
                 // In a full implementation, send the fence command here
                 Ok(())
             }
-            Ok(Err(e)) => {
-                Err(ReplicationError::Failover(format!("Cannot connect to fence: {}", e)))
-            }
-            Err(_) => {
-                Err(ReplicationError::Failover("Fence connection timeout".to_string()))
-            }
+            Ok(Err(e)) => Err(ReplicationError::Failover(format!("Cannot connect to fence: {}", e))),
+            Err(_) => Err(ReplicationError::Failover("Fence connection timeout".to_string())),
         }
     }
 
@@ -810,12 +806,8 @@ impl FailoverWatcher {
                 // In a full implementation, send the promote command here
                 Ok(())
             }
-            Ok(Err(e)) => {
-                Err(ReplicationError::Failover(format!("Cannot connect to promote: {}", e)))
-            }
-            Err(_) => {
-                Err(ReplicationError::Failover("Promote connection timeout".to_string()))
-            }
+            Ok(Err(e)) => Err(ReplicationError::Failover(format!("Cannot connect to promote: {}", e))),
+            Err(_) => Err(ReplicationError::Failover("Promote connection timeout".to_string())),
         }
     }
 
@@ -837,10 +829,13 @@ impl FailoverWatcher {
     /// Mark failover as completed
     pub async fn complete_failover(&self, new_primary: Uuid) {
         *self.failover_in_progress.write().await = false;
-        let _ = self.event_tx.send(FailoverEvent::FailoverCompleted {
-            new_primary,
-            old_primary: Some(self.primary_id),
-        }).await;
+        let _ = self
+            .event_tx
+            .send(FailoverEvent::FailoverCompleted {
+                new_primary,
+                old_primary: Some(self.primary_id),
+            })
+            .await;
     }
 
     /// Mark failover as failed
@@ -854,8 +849,8 @@ impl FailoverWatcher {
 // AUTOMATIC FAILOVER COORDINATOR
 // =============================================================================
 
-use super::split_brain::{SplitBrainProtector, ProtectionEvent, ProtectionState};
-use super::switchover::{SwitchoverCoordinator, SwitchoverCommand, SwitchoverEvent};
+use super::split_brain::{ProtectionEvent, ProtectionState, SplitBrainProtector};
+use super::switchover::{SwitchoverCommand, SwitchoverCoordinator, SwitchoverEvent};
 use super::transport::VoteReason;
 
 /// Automatic Failover Coordinator
@@ -886,10 +881,7 @@ pub struct AutomaticFailoverCoordinator {
 
 impl AutomaticFailoverCoordinator {
     /// Create a new automatic failover coordinator
-    pub fn new(
-        mut failover_watcher: FailoverWatcher,
-        switchover_coordinator: &SwitchoverCoordinator,
-    ) -> Option<Self> {
+    pub fn new(mut failover_watcher: FailoverWatcher, switchover_coordinator: &SwitchoverCoordinator) -> Option<Self> {
         let event_rx = failover_watcher.take_event_receiver()?;
         let switchover_tx = switchover_coordinator.command_sender();
         let switchover_rx = switchover_coordinator.subscribe();
@@ -1037,9 +1029,12 @@ impl AutomaticFailoverCoordinator {
                     let state = protector.current_state().await;
                     if state == ProtectionState::SplitBrain {
                         tracing::error!("Split-brain detected - manual intervention required");
-                        let _ = self.failover_callback_tx.send(FailoverEvent::FailoverFailed {
-                            reason: "Split-brain detected - manual intervention required".to_string(),
-                        }).await;
+                        let _ = self
+                            .failover_callback_tx
+                            .send(FailoverEvent::FailoverFailed {
+                                reason: "Split-brain detected - manual intervention required".to_string(),
+                            })
+                            .await;
                         return;
                     }
 
@@ -1071,45 +1066,57 @@ impl AutomaticFailoverCoordinator {
                 let (response_tx, response_rx) = tokio::sync::oneshot::channel();
 
                 // Send initiate command to switchover coordinator
-                let result = self.switchover_tx.send(SwitchoverCommand::Initiate {
-                    target_node: target_standby,
-                    response: response_tx,
-                }).await;
+                let result = self
+                    .switchover_tx
+                    .send(SwitchoverCommand::Initiate {
+                        target_node: target_standby,
+                        response: response_tx,
+                    })
+                    .await;
 
                 if let Err(e) = result {
                     tracing::error!("Failed to send switchover command: {}", e);
-                    let _ = self.failover_callback_tx.send(FailoverEvent::FailoverFailed {
-                        reason: format!("Switchover command failed: {}", e),
-                    }).await;
+                    let _ = self
+                        .failover_callback_tx
+                        .send(FailoverEvent::FailoverFailed {
+                            reason: format!("Switchover command failed: {}", e),
+                        })
+                        .await;
                     return;
                 }
 
                 // Wait for response (with timeout)
                 match tokio::time::timeout(Duration::from_secs(120), response_rx).await {
                     Ok(Ok(Ok(switchover_id))) => {
-                        tracing::info!(
-                            "Switchover initiated successfully: {}",
-                            switchover_id
-                        );
+                        tracing::info!("Switchover initiated successfully: {}", switchover_id);
                         // The switchover completion will be handled via switchover events
                     }
                     Ok(Ok(Err(e))) => {
                         tracing::error!("Switchover failed: {}", e);
-                        let _ = self.failover_callback_tx.send(FailoverEvent::FailoverFailed {
-                            reason: format!("Switchover error: {}", e),
-                        }).await;
+                        let _ = self
+                            .failover_callback_tx
+                            .send(FailoverEvent::FailoverFailed {
+                                reason: format!("Switchover error: {}", e),
+                            })
+                            .await;
                     }
                     Ok(Err(_)) => {
                         tracing::error!("Switchover response channel closed");
-                        let _ = self.failover_callback_tx.send(FailoverEvent::FailoverFailed {
-                            reason: "Switchover response channel closed".to_string(),
-                        }).await;
+                        let _ = self
+                            .failover_callback_tx
+                            .send(FailoverEvent::FailoverFailed {
+                                reason: "Switchover response channel closed".to_string(),
+                            })
+                            .await;
                     }
                     Err(_) => {
                         tracing::error!("Switchover response timeout");
-                        let _ = self.failover_callback_tx.send(FailoverEvent::FailoverFailed {
-                            reason: "Switchover timeout".to_string(),
-                        }).await;
+                        let _ = self
+                            .failover_callback_tx
+                            .send(FailoverEvent::FailoverFailed {
+                                reason: "Switchover timeout".to_string(),
+                            })
+                            .await;
                     }
                 }
             }
@@ -1133,7 +1140,11 @@ impl AutomaticFailoverCoordinator {
     /// Handle a switchover coordinator event
     async fn handle_switchover_event(&self, event: SwitchoverEvent) {
         match event {
-            SwitchoverEvent::Completed { new_primary, duration_ms, .. } => {
+            SwitchoverEvent::Completed {
+                new_primary,
+                duration_ms,
+                ..
+            } => {
                 tracing::info!(
                     "Switchover completed in {}ms, new primary: {}",
                     duration_ms,
@@ -1151,22 +1162,29 @@ impl AutomaticFailoverCoordinator {
                     );
                 }
 
-                let _ = self.failover_callback_tx.send(FailoverEvent::FailoverCompleted {
-                    new_primary,
-                    old_primary: None, // Set by the caller
-                }).await;
+                let _ = self
+                    .failover_callback_tx
+                    .send(FailoverEvent::FailoverCompleted {
+                        new_primary,
+                        old_primary: None, // Set by the caller
+                    })
+                    .await;
             }
             SwitchoverEvent::Failed { error, .. } => {
                 tracing::error!("Switchover failed: {}", error);
-                let _ = self.failover_callback_tx.send(FailoverEvent::FailoverFailed {
-                    reason: error,
-                }).await;
+                let _ = self
+                    .failover_callback_tx
+                    .send(FailoverEvent::FailoverFailed { reason: error })
+                    .await;
             }
             SwitchoverEvent::Cancelled { .. } => {
                 tracing::info!("Switchover cancelled");
-                let _ = self.failover_callback_tx.send(FailoverEvent::FailoverFailed {
-                    reason: "Switchover cancelled".to_string(),
-                }).await;
+                let _ = self
+                    .failover_callback_tx
+                    .send(FailoverEvent::FailoverFailed {
+                        reason: "Switchover cancelled".to_string(),
+                    })
+                    .await;
             }
             _ => {
                 // Other switchover events are informational
@@ -1177,7 +1195,11 @@ impl AutomaticFailoverCoordinator {
     /// Handle a split-brain protection event
     async fn handle_split_brain_event(&self, event: ProtectionEvent) {
         match event {
-            ProtectionEvent::PrimaryElected { node_id, term, fencing_token } => {
+            ProtectionEvent::PrimaryElected {
+                node_id,
+                term,
+                fencing_token,
+            } => {
                 tracing::info!(
                     "Split-brain: Primary elected - node: {}, term: {}, fencing_token: {}",
                     node_id,
@@ -1185,7 +1207,10 @@ impl AutomaticFailoverCoordinator {
                     fencing_token
                 );
             }
-            ProtectionEvent::PrimaryLost { previous_primary, reason } => {
+            ProtectionEvent::PrimaryLost {
+                previous_primary,
+                reason,
+            } => {
                 tracing::warn!(
                     "Split-brain: Primary lost - previous: {}, reason: {}",
                     previous_primary,
@@ -1194,11 +1219,7 @@ impl AutomaticFailoverCoordinator {
                 // This may trigger automatic failover via the health check loop
             }
             ProtectionEvent::FencingTokenChanged { old_token, new_token } => {
-                tracing::info!(
-                    "Split-brain: Fencing token updated {} -> {}",
-                    old_token,
-                    new_token
-                );
+                tracing::info!("Split-brain: Fencing token updated {} -> {}", old_token, new_token);
             }
             ProtectionEvent::SplitBrainDetected { primaries } => {
                 tracing::error!(
@@ -1206,32 +1227,21 @@ impl AutomaticFailoverCoordinator {
                     primaries
                 );
                 // Send failure event to halt any ongoing failover
-                let _ = self.failover_callback_tx.send(FailoverEvent::FailoverFailed {
-                    reason: format!(
-                        "Split-brain detected: {} primaries found",
-                        primaries.len()
-                    ),
-                }).await;
+                let _ = self
+                    .failover_callback_tx
+                    .send(FailoverEvent::FailoverFailed {
+                        reason: format!("Split-brain detected: {} primaries found", primaries.len()),
+                    })
+                    .await;
             }
             ProtectionEvent::ElectionStarted { term, reason } => {
-                tracing::info!(
-                    "Split-brain: Election started - term: {}, reason: {:?}",
-                    term,
-                    reason
-                );
+                tracing::info!("Split-brain: Election started - term: {}, reason: {:?}", term, reason);
             }
             ProtectionEvent::ElectionCompleted { winner, term } => {
-                tracing::info!(
-                    "Split-brain: Election completed - term: {}, winner: {:?}",
-                    term,
-                    winner
-                );
+                tracing::info!("Split-brain: Election completed - term: {}, winner: {:?}", term, winner);
             }
             ProtectionEvent::ElectionNeeded { reason } => {
-                tracing::info!(
-                    "Split-brain: Election needed - reason: {:?}",
-                    reason
-                );
+                tracing::info!("Split-brain: Election needed - reason: {:?}", reason);
                 // The election should be started by the split-brain protector
                 // We just log the event here
             }
@@ -1324,15 +1334,8 @@ impl AutomaticFailoverBuilder {
             self.standbys,
         );
 
-        if let (Some(protector), Some(rx)) =
-            (self.split_brain_protector.take(), self.split_brain_rx.take())
-        {
-            AutomaticFailoverCoordinator::with_split_brain_protection(
-                watcher,
-                switchover_coordinator,
-                protector,
-                rx,
-            )
+        if let (Some(protector), Some(rx)) = (self.split_brain_protector.take(), self.split_brain_rx.take()) {
+            AutomaticFailoverCoordinator::with_split_brain_protection(watcher, switchover_coordinator, protector, rx)
         } else {
             AutomaticFailoverCoordinator::new(watcher, switchover_coordinator)
         }
@@ -1396,22 +1399,28 @@ mod tests {
         // Mark both as healthy
         {
             let mut states = watcher.health_states.write().await;
-            states.insert(standby1.node_id, HealthCheckResult {
-                node_id: standby1.node_id,
-                health: NodeHealth::Healthy,
-                response_time_ms: Some(10),
-                current_lsn: Some(100),
-                error: None,
-                checked_at: chrono::Utc::now(),
-            });
-            states.insert(standby2.node_id, HealthCheckResult {
-                node_id: standby2.node_id,
-                health: NodeHealth::Healthy,
-                response_time_ms: Some(10),
-                current_lsn: Some(100),
-                error: None,
-                checked_at: chrono::Utc::now(),
-            });
+            states.insert(
+                standby1.node_id,
+                HealthCheckResult {
+                    node_id: standby1.node_id,
+                    health: NodeHealth::Healthy,
+                    response_time_ms: Some(10),
+                    current_lsn: Some(100),
+                    error: None,
+                    checked_at: chrono::Utc::now(),
+                },
+            );
+            states.insert(
+                standby2.node_id,
+                HealthCheckResult {
+                    node_id: standby2.node_id,
+                    health: NodeHealth::Healthy,
+                    response_time_ms: Some(10),
+                    current_lsn: Some(100),
+                    error: None,
+                    checked_at: chrono::Utc::now(),
+                },
+            );
         }
 
         let candidates = watcher.get_candidates(100).await;
@@ -1426,13 +1435,7 @@ mod tests {
         let primary_id = Uuid::new_v4();
         let primary_addr: SocketAddr = "127.0.0.1:5433".parse().unwrap();
 
-        let watcher = FailoverWatcher::new(
-            config,
-            node_id,
-            primary_id,
-            Some(primary_addr),
-            vec![],
-        );
+        let watcher = FailoverWatcher::new(config, node_id, primary_id, Some(primary_addr), vec![]);
 
         assert_eq!(watcher.primary_id, primary_id);
         assert_eq!(watcher.primary_addr, Some(primary_addr));

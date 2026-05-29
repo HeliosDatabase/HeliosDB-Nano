@@ -38,10 +38,7 @@ fn elapsed_ms(start: Instant) -> f64 {
 
 fn report(label: &str, ms: f64, n: usize) {
     let rate = if ms > 0.0 { n as f64 / (ms / 1000.0) } else { 0.0 };
-    println!(
-        "  {:<40} {:>10.2} ms  ({:>10.0} ops/s)",
-        label, ms, rate
-    );
+    println!("  {:<40} {:>10.2} ms  ({:>10.0} ops/s)", label, ms, rate);
 }
 
 fn setup(db: &EmbeddedDatabase) -> Result<()> {
@@ -233,12 +230,14 @@ fn bench_repeated_query(db: &EmbeddedDatabase) {
     }
     let start = Instant::now();
     for _ in 0..REPEATED_RUNS {
-        let _ = db
-            .query("SELECT * FROM bench_main WHERE id = 1", &[])
-            .unwrap();
+        let _ = db.query("SELECT * FROM bench_main WHERE id = 1", &[]).unwrap();
     }
     let total = elapsed_ms(start);
-    report(&format!("Repeated query x{} (cached)", REPEATED_RUNS), total, REPEATED_RUNS);
+    report(
+        &format!("Repeated query x{} (cached)", REPEATED_RUNS),
+        total,
+        REPEATED_RUNS,
+    );
 }
 
 fn main() -> Result<()> {
@@ -253,7 +252,10 @@ fn main() -> Result<()> {
 
     let db = EmbeddedDatabase::new(&setup_path)?;
     let setup_ms = time_ms(|| setup(&db));
-    println!("Setup: {:.0} ms ({} main + {} orders rows seeded)", setup_ms, NUM_MAIN_ROWS, NUM_ORDER_ROWS);
+    println!(
+        "Setup: {:.0} ms ({} main + {} orders rows seeded)",
+        setup_ms, NUM_MAIN_ROWS, NUM_ORDER_ROWS
+    );
     println!();
 
     println!("WRITE PERFORMANCE");

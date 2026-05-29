@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use futures::Stream;
 
 use super::{
-    ChatMessage, LlmProvider, LlmProviderConfig, LlmRequest, LlmResponse,
-    MessageRole, ModelInfo, ProviderError, ProviderResult, StreamChunk, TokenUsage,
+    ChatMessage, LlmProvider, LlmProviderConfig, LlmRequest, LlmResponse, MessageRole, ModelInfo, ProviderError,
+    ProviderResult, StreamChunk, TokenUsage,
 };
 
 /// Google Gemini provider
@@ -18,16 +18,19 @@ pub struct GoogleProvider {
 impl GoogleProvider {
     /// Create new Google provider
     pub fn new(config: &LlmProviderConfig) -> ProviderResult<Self> {
-        let api_key = config.api_key.clone()
+        let api_key = config
+            .api_key
+            .clone()
             .or_else(|| std::env::var("GOOGLE_API_KEY").ok())
             .or_else(|| std::env::var("GEMINI_API_KEY").ok())
             .ok_or_else(|| ProviderError::Config("Google API key required".into()))?;
 
-        let endpoint = config.endpoint.clone()
+        let endpoint = config
+            .endpoint
+            .clone()
             .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".into());
 
-        let default_model = config.model.clone()
-            .unwrap_or_else(|| "gemini-1.5-pro".into());
+        let default_model = config.model.clone().unwrap_or_else(|| "gemini-1.5-pro".into());
 
         Ok(Self {
             api_key,
@@ -162,24 +165,25 @@ impl LlmProvider for GoogleProvider {
 
         // Add tools if specified
         if let Some(ref tools) = request.tools {
-            let gemini_tools: Vec<serde_json::Value> = tools.iter().map(|t| {
-                serde_json::json!({
-                    "functionDeclarations": [{
-                        "name": t.function.name,
-                        "description": t.function.description,
-                        "parameters": t.function.parameters,
-                    }]
+            let gemini_tools: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "functionDeclarations": [{
+                            "name": t.function.name,
+                            "description": t.function.description,
+                            "parameters": t.function.parameters,
+                        }]
+                    })
                 })
-            }).collect();
+                .collect();
             body["tools"] = serde_json::json!(gemini_tools);
         }
 
         // Build URL
         let url = format!(
             "{}/models/{}:generateContent?key={}",
-            self.endpoint,
-            model,
-            self.api_key
+            self.endpoint, model, self.api_key
         );
 
         // Make API request
@@ -201,8 +205,7 @@ impl LlmProvider for GoogleProvider {
             return Err(ProviderError::Api(error_text));
         }
 
-        let result: serde_json::Value = response.json().await
-            .map_err(|e| ProviderError::Api(e.to_string()))?;
+        let result: serde_json::Value = response.json().await.map_err(|e| ProviderError::Api(e.to_string()))?;
 
         // Parse response
         let candidate = &result["candidates"][0];
@@ -286,24 +289,25 @@ impl LlmProvider for GoogleProvider {
         }
 
         if let Some(ref tools) = request.tools {
-            let gemini_tools: Vec<serde_json::Value> = tools.iter().map(|t| {
-                serde_json::json!({
-                    "functionDeclarations": [{
-                        "name": t.function.name,
-                        "description": t.function.description,
-                        "parameters": t.function.parameters,
-                    }]
+            let gemini_tools: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "functionDeclarations": [{
+                            "name": t.function.name,
+                            "description": t.function.description,
+                            "parameters": t.function.parameters,
+                        }]
+                    })
                 })
-            }).collect();
+                .collect();
             body["tools"] = serde_json::json!(gemini_tools);
         }
 
         // Build streaming URL
         let url = format!(
             "{}/models/{}:streamGenerateContent?key={}&alt=sse",
-            self.endpoint,
-            model,
-            self.api_key
+            self.endpoint, model, self.api_key
         );
 
         // Make streaming API request

@@ -15,10 +15,7 @@ mod string_concat_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT 'hello' || ' world'", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("hello world".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("hello world".to_string()));
     }
 
     #[test]
@@ -26,10 +23,7 @@ mod string_concat_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT 'a' || 'b' || 'c'", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("abc".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("abc".to_string()));
     }
 
     #[test]
@@ -65,29 +59,31 @@ mod string_concat_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT 'count: ' || 42", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("count: 42".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("count: 42".to_string()));
     }
 
     #[test]
     fn test_concat_with_columns() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE users (first_name TEXT, last_name TEXT)").unwrap();
+        db.execute("CREATE TABLE users (first_name TEXT, last_name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO users VALUES ('John', 'Doe')").unwrap();
         db.execute("INSERT INTO users VALUES ('Jane', 'Smith')").unwrap();
 
         let rows = db
-            .query("SELECT first_name || ' ' || last_name AS full_name FROM users ORDER BY first_name", &[])
+            .query(
+                "SELECT first_name || ' ' || last_name AS full_name FROM users ORDER BY first_name",
+                &[],
+            )
             .unwrap();
         assert_eq!(rows.len(), 2);
-        let mut names: Vec<String> = rows.iter().map(|r| {
-            match r.get(0).unwrap() {
+        let mut names: Vec<String> = rows
+            .iter()
+            .map(|r| match r.get(0).unwrap() {
                 Value::String(s) => s.clone(),
                 other => panic!("Expected String, got {:?}", other),
-            }
-        }).collect();
+            })
+            .collect();
         names.sort();
         assert_eq!(names, vec!["Jane Smith", "John Doe"]);
     }
@@ -97,10 +93,7 @@ mod string_concat_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT '' || 'text'", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("text".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("text".to_string()));
     }
 
     #[test]
@@ -114,10 +107,7 @@ mod string_concat_tests {
             .query("SELECT name FROM items WHERE name || suffix = 'test_value'", &[])
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("test".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("test".to_string()));
     }
 
     #[test]

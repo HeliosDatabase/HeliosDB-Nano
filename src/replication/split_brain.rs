@@ -40,8 +40,8 @@
 //! - 2 nodes + 2 observers: quorum = 2 (can lose 2 nodes)
 
 use super::transport::{
-    FencingTokenPayload, Message, MessageType, NodeRole, ReplicationConnection,
-    VoteReason, VoteRequestPayload, VoteResponsePayload,
+    FencingTokenPayload, Message, MessageType, NodeRole, ReplicationConnection, VoteReason, VoteRequestPayload,
+    VoteResponsePayload,
 };
 use super::{ReplicationError, Result};
 use bytes::Bytes;
@@ -161,7 +161,11 @@ pub struct SplitBrainProtector {
 #[derive(Debug, Clone)]
 pub enum ProtectionEvent {
     /// Primary elected
-    PrimaryElected { node_id: Uuid, term: u64, fencing_token: u64 },
+    PrimaryElected {
+        node_id: Uuid,
+        term: u64,
+        fencing_token: u64,
+    },
     /// Primary lost
     PrimaryLost { previous_primary: Uuid, reason: String },
     /// Fencing token changed
@@ -178,11 +182,7 @@ pub enum ProtectionEvent {
 
 impl SplitBrainProtector {
     /// Create a new split-brain protector
-    pub fn new(
-        node_id: Uuid,
-        role: NodeRole,
-        config: ObserverConfig,
-    ) -> (Self, mpsc::Receiver<ProtectionEvent>) {
+    pub fn new(node_id: Uuid, role: NodeRole, config: ObserverConfig) -> (Self, mpsc::Receiver<ProtectionEvent>) {
         let (shutdown_tx, _) = broadcast::channel(1);
         let (event_tx, event_rx) = mpsc::channel(100);
 
@@ -255,42 +255,36 @@ impl SplitBrainProtector {
             while is_running.load(Ordering::SeqCst) {
                 // Receive responses from the observer
                 match tokio::time::timeout(Duration::from_secs(30), msg_rx.recv()).await {
-                    Ok(Some(msg)) => {
-                        match msg.header.msg_type {
-                            MessageType::VoteResponse => {
-                                if let Ok(response) = bincode::deserialize::<VoteResponsePayload>(&msg.payload) {
-                                    if response.vote_granted {
-                                        let mut state = vote_state.write().await;
-                                        if response.term == state.term {
-                                            state.votes_received.insert(response.voter_id);
-                                            tracing::info!(
-                                                "Received vote from {} for term {} (total: {})",
-                                                response.voter_id,
-                                                response.term,
-                                                state.votes_received.len()
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                            MessageType::FencingToken => {
-                                if let Ok(payload) = bincode::deserialize::<FencingTokenPayload>(&msg.payload) {
-                                    let current_token = fencing_token.load(Ordering::SeqCst);
-                                    if payload.token > current_token {
-                                        fencing_token.store(payload.token, Ordering::SeqCst);
+                    Ok(Some(msg)) => match msg.header.msg_type {
+                        MessageType::VoteResponse => {
+                            if let Ok(response) = bincode::deserialize::<VoteResponsePayload>(&msg.payload) {
+                                if response.vote_granted {
+                                    let mut state = vote_state.write().await;
+                                    if response.term == state.term {
+                                        state.votes_received.insert(response.voter_id);
                                         tracing::info!(
-                                            "Updated fencing token: {} -> {}",
-                                            current_token,
-                                            payload.token
+                                            "Received vote from {} for term {} (total: {})",
+                                            response.voter_id,
+                                            response.term,
+                                            state.votes_received.len()
                                         );
                                     }
                                 }
                             }
-                            _ => {
-                                tracing::trace!("Received message type: {:?}", msg.header.msg_type);
+                        }
+                        MessageType::FencingToken => {
+                            if let Ok(payload) = bincode::deserialize::<FencingTokenPayload>(&msg.payload) {
+                                let current_token = fencing_token.load(Ordering::SeqCst);
+                                if payload.token > current_token {
+                                    fencing_token.store(payload.token, Ordering::SeqCst);
+                                    tracing::info!("Updated fencing token: {} -> {}", current_token, payload.token);
+                                }
                             }
                         }
-                    }
+                        _ => {
+                            tracing::trace!("Received message type: {:?}", msg.header.msg_type);
+                        }
+                    },
                     Ok(None) => {
                         tracing::warn!("Observer connection closed");
                         break;
@@ -386,22 +380,23 @@ impl SplitBrainProtector {
                         if primary.last_heartbeat.elapsed() > election_timeout {
                             drop(nodes);
 
-                            tracing::warn!(
-                                "Primary {} heartbeat timeout, considering election",
-                                primary_id
-                            );
+                            tracing::warn!("Primary {} heartbeat timeout, considering election", primary_id);
 
                             *state.write().await = ProtectionState::Election;
-                            let _ = event_tx.send(ProtectionEvent::PrimaryLost {
-                                previous_primary: primary_id,
-                                reason: "Heartbeat timeout".to_string(),
-                            }).await;
+                            let _ = event_tx
+                                .send(ProtectionEvent::PrimaryLost {
+                                    previous_primary: primary_id,
+                                    reason: "Heartbeat timeout".to_string(),
+                                })
+                                .await;
 
                             // Signal that an election should start
                             // The actual election is coordinated through request_votes()
-                            let _ = event_tx.send(ProtectionEvent::ElectionNeeded {
-                                reason: VoteReason::PrimaryFailure,
-                            }).await;
+                            let _ = event_tx
+                                .send(ProtectionEvent::ElectionNeeded {
+                                    reason: VoteReason::PrimaryFailure,
+                                })
+                                .await;
                         }
                     }
                 }
@@ -433,10 +428,10 @@ impl SplitBrainProtector {
 
         *self.state.write().await = ProtectionState::Election;
 
-        let _ = self.event_tx.send(ProtectionEvent::ElectionStarted {
-            term: new_term,
-            reason,
-        }).await;
+        let _ = self
+            .event_tx
+            .send(ProtectionEvent::ElectionStarted { term: new_term, reason })
+            .await;
 
         // Create vote request
         let vote_request = VoteRequestPayload {
@@ -447,8 +442,7 @@ impl SplitBrainProtector {
             reason,
         };
 
-        let payload = bincode::serialize(&vote_request)
-            .map_err(|e| ReplicationError::Internal(e.to_string()))?;
+        let payload = bincode::serialize(&vote_request).map_err(|e| ReplicationError::Internal(e.to_string()))?;
 
         let msg = Message::new(MessageType::VoteRequest, Bytes::from(payload), 0);
 
@@ -508,10 +502,13 @@ impl SplitBrainProtector {
             self.become_primary(new_term).await?;
         }
 
-        let _ = self.event_tx.send(ProtectionEvent::ElectionCompleted {
-            winner: if won { Some(self.node_id) } else { None },
-            term: new_term,
-        }).await;
+        let _ = self
+            .event_tx
+            .send(ProtectionEvent::ElectionCompleted {
+                winner: if won { Some(self.node_id) } else { None },
+                term: new_term,
+            })
+            .await;
 
         Ok(won)
     }
@@ -535,11 +532,14 @@ impl SplitBrainProtector {
         // Broadcast new fencing token
         self.broadcast_fencing_token(new_token).await?;
 
-        let _ = self.event_tx.send(ProtectionEvent::PrimaryElected {
-            node_id: self.node_id,
-            term,
-            fencing_token: new_token,
-        }).await;
+        let _ = self
+            .event_tx
+            .send(ProtectionEvent::PrimaryElected {
+                node_id: self.node_id,
+                term,
+                fencing_token: new_token,
+            })
+            .await;
 
         Ok(())
     }
@@ -553,8 +553,7 @@ impl SplitBrainProtector {
             timestamp_ms: chrono::Utc::now().timestamp_millis() as u64,
         };
 
-        let payload_bytes = bincode::serialize(&payload)
-            .map_err(|e| ReplicationError::Internal(e.to_string()))?;
+        let payload_bytes = bincode::serialize(&payload).map_err(|e| ReplicationError::Internal(e.to_string()))?;
 
         let msg = Message::new(MessageType::FencingToken, Bytes::from(payload_bytes), 0);
 
@@ -696,10 +695,13 @@ impl SplitBrainProtector {
                 *self.role.write().await = NodeRole::Standby;
             }
 
-            let _ = self.event_tx.send(ProtectionEvent::FencingTokenChanged {
-                old_token,
-                new_token: payload.token,
-            }).await;
+            let _ = self
+                .event_tx
+                .send(ProtectionEvent::FencingTokenChanged {
+                    old_token,
+                    new_token: payload.token,
+                })
+                .await;
         }
     }
 
@@ -810,11 +812,7 @@ impl ObserverNode {
             .await
             .map_err(|e| ReplicationError::Network(format!("Bind failed: {}", e)))?;
 
-        tracing::info!(
-            "Observer node {} listening on {}",
-            self.node_id,
-            self.listen_addr
-        );
+        tracing::info!("Observer node {} listening on {}", self.node_id, self.listen_addr);
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
@@ -868,7 +866,8 @@ impl ObserverNode {
                                     &known_primary,
                                     &vote_state,
                                     request,
-                                ).await;
+                                )
+                                .await;
 
                                 let payload = match bincode::serialize(&response) {
                                     Ok(p) => p,
@@ -885,10 +884,10 @@ impl ObserverNode {
                                     };
 
                                 // Update known nodes
-                                known_nodes.write().await.insert(
-                                    heartbeat.node_id,
-                                    (conn.remote_addr(), Instant::now()),
-                                );
+                                known_nodes
+                                    .write()
+                                    .await
+                                    .insert(heartbeat.node_id, (conn.remote_addr(), Instant::now()));
 
                                 // Track primary
                                 if heartbeat.role == NodeRole::Primary {
@@ -896,11 +895,10 @@ impl ObserverNode {
                                 }
                             }
                             MessageType::FencingToken => {
-                                let payload: FencingTokenPayload =
-                                    match bincode::deserialize(&msg.payload) {
-                                        Ok(p) => p,
-                                        Err(_) => continue,
-                                    };
+                                let payload: FencingTokenPayload = match bincode::deserialize(&msg.payload) {
+                                    Ok(p) => p,
+                                    Err(_) => continue,
+                                };
 
                                 let current = fencing_token.load(Ordering::SeqCst);
                                 if payload.token > current {

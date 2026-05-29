@@ -16,15 +16,14 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_nano::{Config, Column, DataType, Schema, Tuple, Value};
 use heliosdb_nano::storage::{
-    StorageEngine, BranchOptions, MaterializedViewCatalog, MaterializedViewMetadata,
-    MVScheduler, SchedulerConfig, Priority, AutoRefreshWorker, AutoRefreshConfig,
-    MvSystemViews,
+    AutoRefreshConfig, AutoRefreshWorker, BranchOptions, MVScheduler, MaterializedViewCatalog,
+    MaterializedViewMetadata, MvSystemViews, Priority, SchedulerConfig, StorageEngine,
 };
+use heliosdb_nano::{Column, Config, DataType, Schema, Tuple, Value};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 // ============================================================================
 // Test Helpers
@@ -57,11 +56,7 @@ fn create_test_schema() -> Schema {
 
 fn create_test_tuple(id: i32, name: &str, value: f64) -> Tuple {
     Tuple {
-        values: vec![
-            Value::Int4(id),
-            Value::String(name.to_string()),
-            Value::Float8(value),
-        ],
+        values: vec![Value::Int4(id), Value::String(name.to_string()), Value::Float8(value)],
     }
 }
 
@@ -87,7 +82,8 @@ fn test_01_branch_creation_and_listing() {
     assert_eq!(branches[0].name, "main");
 
     // Create dev branch
-    let dev_id = storage.create_branch("dev", Some("main"), BranchOptions::default())
+    let dev_id = storage
+        .create_branch("dev", Some("main"), BranchOptions::default())
         .expect("Failed to create dev branch");
     assert!(dev_id > 1, "Dev branch should have ID > 1");
 
@@ -109,19 +105,23 @@ fn test_02_branch_isolation_with_transactions() {
     storage.put(&b"key1".to_vec(), b"value_main").expect("Failed to put");
 
     // Create branch
-    storage.create_branch("feature", Some("main"), BranchOptions::default())
+    storage
+        .create_branch("feature", Some("main"), BranchOptions::default())
         .expect("Failed to create branch");
 
     // Read from feature (should see main's value)
-    let mut feature_tx = storage.begin_branch_transaction("feature")
+    let mut feature_tx = storage
+        .begin_branch_transaction("feature")
         .expect("Failed to begin branch transaction");
     let value = feature_tx.get(&b"key1".to_vec()).expect("Failed to get");
     assert_eq!(value, Some(b"value_main".to_vec()));
 
     // Write in feature
-    feature_tx.put(b"key1".to_vec(), b"value_feature".to_vec())
+    feature_tx
+        .put(b"key1".to_vec(), b"value_feature".to_vec())
         .expect("Failed to put in feature");
-    feature_tx.put(b"key2".to_vec(), b"new_in_feature".to_vec())
+    feature_tx
+        .put(b"key2".to_vec(), b"new_in_feature".to_vec())
         .expect("Failed to put new key");
     feature_tx.commit().expect("Failed to commit");
 
@@ -134,7 +134,8 @@ fn test_02_branch_isolation_with_transactions() {
     assert_eq!(main_key2, None, "Main should not see feature's new key");
 
     // Verify feature has updated values
-    let feature_tx = storage.begin_branch_transaction("feature")
+    let feature_tx = storage
+        .begin_branch_transaction("feature")
         .expect("Failed to begin transaction");
     assert_eq!(
         feature_tx.get(&b"key1".to_vec()).expect("Failed to get"),
@@ -160,15 +161,21 @@ fn test_03_copy_on_write_performance() {
 
     // Create branch (should be instant due to copy-on-write)
     let start = std::time::Instant::now();
-    storage.create_branch("test_perf", Some("main"), BranchOptions::default())
+    storage
+        .create_branch("test_perf", Some("main"), BranchOptions::default())
         .expect("Failed to create branch");
     let elapsed = start.elapsed();
 
     println!("Branch creation with 1000 keys: {:?}", elapsed);
-    assert!(elapsed.as_millis() < 100, "Branch creation should be <100ms, got {:?}", elapsed);
+    assert!(
+        elapsed.as_millis() < 100,
+        "Branch creation should be <100ms, got {:?}",
+        elapsed
+    );
 
     // Verify all keys are accessible from branch
-    let tx = storage.begin_branch_transaction("test_perf")
+    let tx = storage
+        .begin_branch_transaction("test_perf")
         .expect("Failed to begin transaction");
 
     for i in 0..10 {
@@ -184,11 +191,13 @@ fn test_04_hierarchical_branching() {
     let storage = StorageEngine::open_in_memory(&config).expect("Failed to create storage");
 
     // Create staging from main
-    storage.create_branch("staging", Some("main"), BranchOptions::default())
+    storage
+        .create_branch("staging", Some("main"), BranchOptions::default())
         .expect("Failed to create staging");
 
     // Create feature from staging
-    storage.create_branch("feature", Some("staging"), BranchOptions::default())
+    storage
+        .create_branch("feature", Some("staging"), BranchOptions::default())
         .expect("Failed to create feature");
 
     // Verify all branches exist
@@ -211,29 +220,41 @@ fn test_05_snapshot_creation_and_retrieval() {
     let storage = Arc::new(StorageEngine::open_in_memory(&config).expect("Failed to create storage"));
 
     // Create table
-    storage.catalog().create_table("history_test", create_test_schema())
+    storage
+        .catalog()
+        .create_table("history_test", create_test_schema())
         .expect("Failed to create table");
 
     // Insert version 1
-    storage.catalog().insert("history_test", create_test_tuple(1, "v1", 100.0))
+    storage
+        .catalog()
+        .insert("history_test", create_test_tuple(1, "v1", 100.0))
         .expect("Failed to insert v1");
 
     let snapshot1 = current_timestamp_ms();
-    storage.snapshot_manager().create_snapshot(snapshot1, 1001)
+    storage
+        .snapshot_manager()
+        .create_snapshot(snapshot1, 1001)
         .expect("Failed to create snapshot 1");
 
     thread::sleep(Duration::from_millis(10));
 
     // Insert version 2
-    storage.catalog().insert("history_test", create_test_tuple(1, "v2", 200.0))
+    storage
+        .catalog()
+        .insert("history_test", create_test_tuple(1, "v2", 200.0))
         .expect("Failed to insert v2");
 
     let snapshot2 = current_timestamp_ms();
-    storage.snapshot_manager().create_snapshot(snapshot2, 1002)
+    storage
+        .snapshot_manager()
+        .create_snapshot(snapshot2, 1002)
         .expect("Failed to create snapshot 2");
 
     // Verify snapshots are created
-    let snapshots = storage.snapshot_manager().list_snapshots()
+    let snapshots = storage
+        .snapshot_manager()
+        .list_snapshots()
         .expect("Failed to list snapshots");
     assert!(snapshots.len() >= 2, "Should have at least 2 snapshots");
 }
@@ -248,21 +269,29 @@ fn test_06_transaction_to_snapshot_mapping() {
     let txn_id2 = 2002_u64;
 
     let snapshot1 = current_timestamp_ms();
-    storage.snapshot_manager().create_snapshot(snapshot1, txn_id1)
+    storage
+        .snapshot_manager()
+        .create_snapshot(snapshot1, txn_id1)
         .expect("Failed to create snapshot 1");
 
     thread::sleep(Duration::from_millis(10));
 
     let snapshot2 = current_timestamp_ms();
-    storage.snapshot_manager().create_snapshot(snapshot2, txn_id2)
+    storage
+        .snapshot_manager()
+        .create_snapshot(snapshot2, txn_id2)
         .expect("Failed to create snapshot 2");
 
     // Verify transaction mapping
-    let ts1 = storage.snapshot_manager().get_timestamp_for_transaction(txn_id1)
+    let ts1 = storage
+        .snapshot_manager()
+        .get_timestamp_for_transaction(txn_id1)
         .expect("Failed to get timestamp");
     assert_eq!(ts1, Some(snapshot1));
 
-    let ts2 = storage.snapshot_manager().get_timestamp_for_transaction(txn_id2)
+    let ts2 = storage
+        .snapshot_manager()
+        .get_timestamp_for_transaction(txn_id2)
         .expect("Failed to get timestamp");
     assert_eq!(ts2, Some(snapshot2));
 }
@@ -275,14 +304,18 @@ fn test_07_scn_mapping() {
     // Create snapshots with SCN
     for scn in 3001..=3005 {
         let timestamp = current_timestamp_ms();
-        storage.snapshot_manager().create_snapshot_with_scn(timestamp, scn)
+        storage
+            .snapshot_manager()
+            .create_snapshot_with_scn(timestamp, scn)
             .expect("Failed to create snapshot with SCN");
         thread::sleep(Duration::from_millis(5));
     }
 
     // Verify SCN mappings
     for scn in 3001..=3005 {
-        let ts = storage.snapshot_manager().get_timestamp_for_scn(scn)
+        let ts = storage
+            .snapshot_manager()
+            .get_timestamp_for_scn(scn)
             .expect("Failed to get timestamp for SCN");
         assert!(ts.is_some(), "SCN {} should map to timestamp", scn);
     }
@@ -297,14 +330,18 @@ fn test_08_snapshot_gc_policy() {
     let mut snapshot_ids = Vec::new();
     for i in 0..5 {
         let snapshot = current_timestamp_ms();
-        storage.snapshot_manager().create_snapshot(snapshot, 4000 + i)
+        storage
+            .snapshot_manager()
+            .create_snapshot(snapshot, 4000 + i)
             .expect("Failed to create snapshot");
         snapshot_ids.push(snapshot);
         thread::sleep(Duration::from_millis(5));
     }
 
     // List snapshots
-    let snapshots = storage.snapshot_manager().list_snapshots()
+    let snapshots = storage
+        .snapshot_manager()
+        .list_snapshots()
         .expect("Failed to list snapshots");
     assert!(snapshots.len() >= 5, "Should have at least 5 snapshots");
 }
@@ -333,27 +370,33 @@ async fn test_10_mv_scheduler_priority_queue() {
     let storage = Arc::new(StorageEngine::open_in_memory(&config).expect("Failed to create storage"));
 
     // Create test table
-    storage.catalog().create_table("test_data", create_test_schema())
+    storage
+        .catalog()
+        .create_table("test_data", create_test_schema())
         .expect("Failed to create table");
 
     // Create MV
     let mv_catalog = MaterializedViewCatalog::new(storage.inner_db());
-    mv_catalog.create_materialized_view(MaterializedViewMetadata {
-        name: "test_mv".to_string(),
-        query: "SELECT * FROM test_data".to_string(),
-        schema: create_test_schema(),
-        created_at: current_timestamp_ms(),
-        last_refresh_at: current_timestamp_ms(),
-        auto_refresh: false,
-    }).expect("Failed to create MV");
+    mv_catalog
+        .create_materialized_view(MaterializedViewMetadata {
+            name: "test_mv".to_string(),
+            query: "SELECT * FROM test_data".to_string(),
+            schema: create_test_schema(),
+            created_at: current_timestamp_ms(),
+            last_refresh_at: current_timestamp_ms(),
+            auto_refresh: false,
+        })
+        .expect("Failed to create MV");
 
     let scheduler_config = SchedulerConfig::default();
     let scheduler = MVScheduler::new(scheduler_config, Arc::clone(&storage));
 
     // Schedule with different priorities
-    scheduler.schedule_refresh("test_mv", Priority::Low)
+    scheduler
+        .schedule_refresh("test_mv", Priority::Low)
         .expect("Failed to schedule low priority");
-    scheduler.schedule_refresh("test_mv", Priority::High)
+    scheduler
+        .schedule_refresh("test_mv", Priority::High)
         .expect("Failed to schedule high priority");
 
     let stats = scheduler.get_stats();
@@ -417,14 +460,16 @@ async fn test_13_mv_system_views() {
     let mv_catalog = MaterializedViewCatalog::new(storage.inner_db());
 
     // Create test MV
-    mv_catalog.create_materialized_view(MaterializedViewMetadata {
-        name: "system_view_test".to_string(),
-        query: "SELECT 1".to_string(),
-        schema: Schema { columns: vec![] },
-        created_at: current_timestamp_ms(),
-        last_refresh_at: current_timestamp_ms(),
-        auto_refresh: true,
-    }).expect("Failed to create MV");
+    mv_catalog
+        .create_materialized_view(MaterializedViewMetadata {
+            name: "system_view_test".to_string(),
+            query: "SELECT 1".to_string(),
+            schema: Schema { columns: vec![] },
+            created_at: current_timestamp_ms(),
+            last_refresh_at: current_timestamp_ms(),
+            auto_refresh: true,
+        })
+        .expect("Failed to create MV");
 
     // Query system views
     let system_views = MvSystemViews::new(storage.inner_db());
@@ -444,32 +489,46 @@ fn test_14_branching_with_time_travel() {
     let storage = Arc::new(StorageEngine::open_in_memory(&config).expect("Failed to create storage"));
 
     // Create table and insert data
-    storage.catalog().create_table("versioned", create_test_schema())
+    storage
+        .catalog()
+        .create_table("versioned", create_test_schema())
         .expect("Failed to create table");
-    storage.catalog().insert("versioned", create_test_tuple(1, "main_v1", 100.0))
+    storage
+        .catalog()
+        .insert("versioned", create_test_tuple(1, "main_v1", 100.0))
         .expect("Failed to insert");
 
     // Create snapshot
     let snapshot1 = current_timestamp_ms();
-    storage.snapshot_manager().create_snapshot(snapshot1, 5001)
+    storage
+        .snapshot_manager()
+        .create_snapshot(snapshot1, 5001)
         .expect("Failed to create snapshot");
 
     // Create branch
-    storage.create_branch("versioned_dev", Some("main"), BranchOptions::default())
+    storage
+        .create_branch("versioned_dev", Some("main"), BranchOptions::default())
         .expect("Failed to create branch");
 
     // Update on main
-    storage.catalog().insert("versioned", create_test_tuple(1, "main_v2", 200.0))
+    storage
+        .catalog()
+        .insert("versioned", create_test_tuple(1, "main_v2", 200.0))
         .expect("Failed to update");
 
     // Create another snapshot
     let snapshot2 = current_timestamp_ms();
-    storage.snapshot_manager().create_snapshot(snapshot2, 5002)
+    storage
+        .snapshot_manager()
+        .create_snapshot(snapshot2, 5002)
         .expect("Failed to create snapshot");
 
     // Verify branch and snapshot coexist
     let branches = storage.list_branches().expect("Failed to list branches");
-    let snapshots = storage.snapshot_manager().list_snapshots().expect("Failed to list snapshots");
+    let snapshots = storage
+        .snapshot_manager()
+        .list_snapshots()
+        .expect("Failed to list snapshots");
 
     assert_eq!(branches.len(), 2, "Should have 2 branches");
     assert!(snapshots.len() >= 2, "Should have at least 2 snapshots");
@@ -481,22 +540,27 @@ async fn test_15_mv_with_branching() {
     let storage = Arc::new(StorageEngine::open_in_memory(&config).expect("Failed to create storage"));
 
     // Create table
-    storage.catalog().create_table("mv_branch_test", create_test_schema())
+    storage
+        .catalog()
+        .create_table("mv_branch_test", create_test_schema())
         .expect("Failed to create table");
 
     // Create MV
     let mv_catalog = MaterializedViewCatalog::new(storage.inner_db());
-    mv_catalog.create_materialized_view(MaterializedViewMetadata {
-        name: "mv_on_main".to_string(),
-        query: "SELECT * FROM mv_branch_test".to_string(),
-        schema: create_test_schema(),
-        created_at: current_timestamp_ms(),
-        last_refresh_at: current_timestamp_ms(),
-        auto_refresh: false,
-    }).expect("Failed to create MV");
+    mv_catalog
+        .create_materialized_view(MaterializedViewMetadata {
+            name: "mv_on_main".to_string(),
+            query: "SELECT * FROM mv_branch_test".to_string(),
+            schema: create_test_schema(),
+            created_at: current_timestamp_ms(),
+            last_refresh_at: current_timestamp_ms(),
+            auto_refresh: false,
+        })
+        .expect("Failed to create MV");
 
     // Create branch
-    storage.create_branch("mv_dev", Some("main"), BranchOptions::default())
+    storage
+        .create_branch("mv_dev", Some("main"), BranchOptions::default())
         .expect("Failed to create branch");
 
     // Verify both exist
@@ -513,36 +577,48 @@ async fn test_16_full_stack_integration() {
     let storage = Arc::new(StorageEngine::open_in_memory(&config).expect("Failed to create storage"));
 
     // Create table
-    storage.catalog().create_table("full_stack", create_test_schema())
+    storage
+        .catalog()
+        .create_table("full_stack", create_test_schema())
         .expect("Failed to create table");
 
     // Insert data
-    storage.catalog().insert("full_stack", create_test_tuple(1, "test", 123.0))
+    storage
+        .catalog()
+        .insert("full_stack", create_test_tuple(1, "test", 123.0))
         .expect("Failed to insert");
 
     // Create snapshot
     let snapshot = current_timestamp_ms();
-    storage.snapshot_manager().create_snapshot(snapshot, 6001)
+    storage
+        .snapshot_manager()
+        .create_snapshot(snapshot, 6001)
         .expect("Failed to create snapshot");
 
     // Create branch
-    storage.create_branch("full_dev", Some("main"), BranchOptions::default())
+    storage
+        .create_branch("full_dev", Some("main"), BranchOptions::default())
         .expect("Failed to create branch");
 
     // Create MV
     let mv_catalog = MaterializedViewCatalog::new(storage.inner_db());
-    mv_catalog.create_materialized_view(MaterializedViewMetadata {
-        name: "full_mv".to_string(),
-        query: "SELECT * FROM full_stack".to_string(),
-        schema: create_test_schema(),
-        created_at: current_timestamp_ms(),
-        last_refresh_at: current_timestamp_ms(),
-        auto_refresh: true,
-    }).expect("Failed to create MV");
+    mv_catalog
+        .create_materialized_view(MaterializedViewMetadata {
+            name: "full_mv".to_string(),
+            query: "SELECT * FROM full_stack".to_string(),
+            schema: create_test_schema(),
+            created_at: current_timestamp_ms(),
+            last_refresh_at: current_timestamp_ms(),
+            auto_refresh: true,
+        })
+        .expect("Failed to create MV");
 
     // Verify everything exists together
     let branches = storage.list_branches().expect("Failed to list branches");
-    let snapshots = storage.snapshot_manager().list_snapshots().expect("Failed to list snapshots");
+    let snapshots = storage
+        .snapshot_manager()
+        .list_snapshots()
+        .expect("Failed to list snapshots");
     let mvs = mv_catalog.list_all().expect("Failed to list MVs");
 
     assert_eq!(branches.len(), 2, "Should have 2 branches");
@@ -568,7 +644,8 @@ fn test_17_branch_creation_performance() {
     // Measure branch creation time
     let start = std::time::Instant::now();
     for i in 0..10 {
-        storage.create_branch(&format!("perf_branch_{}", i), Some("main"), BranchOptions::default())
+        storage
+            .create_branch(&format!("perf_branch_{}", i), Some("main"), BranchOptions::default())
             .expect("Failed to create branch");
     }
     let elapsed = start.elapsed();
@@ -576,7 +653,11 @@ fn test_17_branch_creation_performance() {
     let avg_per_branch = elapsed.as_micros() / 10;
     println!("Branch creation - Average: {} µs", avg_per_branch);
 
-    assert!(avg_per_branch < 50_000, "Branch creation should be <50ms, got {} µs", avg_per_branch);
+    assert!(
+        avg_per_branch < 50_000,
+        "Branch creation should be <50ms, got {} µs",
+        avg_per_branch
+    );
 }
 
 #[test]
@@ -588,7 +669,9 @@ fn test_18_snapshot_creation_performance() {
     let start = std::time::Instant::now();
     for i in 0..50 {
         let timestamp = current_timestamp_ms() + i;
-        storage.snapshot_manager().create_snapshot(timestamp, 7000 + i)
+        storage
+            .snapshot_manager()
+            .create_snapshot(timestamp, 7000 + i)
             .expect("Failed to create snapshot");
     }
     let elapsed = start.elapsed();
@@ -596,7 +679,11 @@ fn test_18_snapshot_creation_performance() {
     let avg_per_snapshot = elapsed.as_micros() / 50;
     println!("Snapshot creation - Average: {} µs", avg_per_snapshot);
 
-    assert!(avg_per_snapshot < 10_000, "Snapshot creation should be <10ms, got {} µs", avg_per_snapshot);
+    assert!(
+        avg_per_snapshot < 10_000,
+        "Snapshot creation should be <10ms, got {} µs",
+        avg_per_snapshot
+    );
 }
 
 #[tokio::test]
@@ -605,19 +692,23 @@ async fn test_19_scheduler_task_throughput() {
     let storage = Arc::new(StorageEngine::open_in_memory(&config).expect("Failed to create storage"));
 
     // Create test MVs
-    storage.catalog().create_table("throughput_test", create_test_schema())
+    storage
+        .catalog()
+        .create_table("throughput_test", create_test_schema())
         .expect("Failed to create table");
 
     let mv_catalog = MaterializedViewCatalog::new(storage.inner_db());
     for i in 0..5 {
-        mv_catalog.create_materialized_view(MaterializedViewMetadata {
-            name: format!("throughput_mv_{}", i),
-            query: "SELECT * FROM throughput_test".to_string(),
-            schema: create_test_schema(),
-            created_at: current_timestamp_ms(),
-            last_refresh_at: current_timestamp_ms(),
-            auto_refresh: false,
-        }).expect("Failed to create MV");
+        mv_catalog
+            .create_materialized_view(MaterializedViewMetadata {
+                name: format!("throughput_mv_{}", i),
+                query: "SELECT * FROM throughput_test".to_string(),
+                schema: create_test_schema(),
+                created_at: current_timestamp_ms(),
+                last_refresh_at: current_timestamp_ms(),
+                auto_refresh: false,
+            })
+            .expect("Failed to create MV");
     }
 
     let scheduler_config = SchedulerConfig::default();
@@ -626,13 +717,18 @@ async fn test_19_scheduler_task_throughput() {
     // Schedule all refreshes
     let start = std::time::Instant::now();
     for i in 0..5 {
-        scheduler.schedule_refresh(&format!("throughput_mv_{}", i), Priority::Normal)
+        scheduler
+            .schedule_refresh(&format!("throughput_mv_{}", i), Priority::Normal)
             .expect("Failed to schedule");
     }
     let elapsed = start.elapsed();
 
     println!("Scheduled 5 tasks in: {:?}", elapsed);
-    assert!(elapsed.as_millis() < 100, "Scheduling should be fast, got {:?}", elapsed);
+    assert!(
+        elapsed.as_millis() < 100,
+        "Scheduling should be fast, got {:?}",
+        elapsed
+    );
 }
 
 // ============================================================================

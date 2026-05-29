@@ -7,11 +7,11 @@
 
 use super::{Key, Transaction};
 use crate::{Error, Result};
+use parking_lot::RwLock;
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 /// Snapshot identifier (timestamp-based versioning)
 pub type SnapshotId = u64;
@@ -334,11 +334,7 @@ impl BranchManager {
     }
 
     /// Create new branch manager with custom GC configuration
-    pub fn with_gc_config(
-        db: Arc<DB>,
-        timestamp: Arc<RwLock<u64>>,
-        gc_config: BranchGcConfig,
-    ) -> Result<Self> {
+    pub fn with_gc_config(db: Arc<DB>, timestamp: Arc<RwLock<u64>>, gc_config: BranchGcConfig) -> Result<Self> {
         let registry = Self::load_or_create_registry(&db)?;
 
         // Load pending GC queue from storage
@@ -357,10 +353,8 @@ impl BranchManager {
     /// Load registry from storage or create new one
     fn load_or_create_registry(db: &DB) -> Result<BranchRegistry> {
         match db.get(BRANCH_REGISTRY_KEY) {
-            Ok(Some(data)) => {
-                bincode::deserialize(&data)
-                    .map_err(|e| Error::storage(format!("Failed to deserialize registry: {}", e)))
-            }
+            Ok(Some(data)) => bincode::deserialize(&data)
+                .map_err(|e| Error::storage(format!("Failed to deserialize registry: {}", e))),
             Ok(None) => {
                 // Create new registry with main branch
                 let registry = BranchRegistry::new();
@@ -402,7 +396,8 @@ impl BranchManager {
         let registry = self.registry.read();
         let value = bincode::serialize(&*registry)
             .map_err(|e| Error::storage(format!("Failed to serialize registry: {}", e)))?;
-        self.db.put(BRANCH_REGISTRY_KEY, &value)
+        self.db
+            .put(BRANCH_REGISTRY_KEY, &value)
             .map_err(|e| Error::storage(format!("Failed to save registry: {}", e)))
     }
 
@@ -411,10 +406,8 @@ impl BranchManager {
         const PENDING_GC_KEY: &[u8] = b"branch:pending_gc";
 
         match db.get(PENDING_GC_KEY) {
-            Ok(Some(data)) => {
-                bincode::deserialize(&data)
-                    .map_err(|e| Error::storage(format!("Failed to deserialize pending GC queue: {}", e)))
-            }
+            Ok(Some(data)) => bincode::deserialize(&data)
+                .map_err(|e| Error::storage(format!("Failed to deserialize pending GC queue: {}", e))),
             Ok(None) => Ok(HashMap::new()),
             Err(e) => Err(Error::storage(format!("Failed to load pending GC queue: {}", e))),
         }
@@ -427,7 +420,8 @@ impl BranchManager {
         let pending = self.pending_gc.read();
         let value = bincode::serialize(&*pending)
             .map_err(|e| Error::storage(format!("Failed to serialize pending GC queue: {}", e)))?;
-        self.db.put(PENDING_GC_KEY, &value)
+        self.db
+            .put(PENDING_GC_KEY, &value)
             .map_err(|e| Error::storage(format!("Failed to save pending GC queue: {}", e)))
     }
 
@@ -478,7 +472,8 @@ impl BranchManager {
         let meta_key = encode_branch_meta_key(name);
         let meta_value = bincode::serialize(&metadata)
             .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
-        self.db.put(&meta_key, &meta_value)
+        self.db
+            .put(&meta_key, &meta_value)
             .map_err(|e| Error::storage(format!("Failed to save branch metadata: {}", e)))?;
 
         // Update registry
@@ -533,7 +528,8 @@ impl BranchManager {
         let meta_key = encode_branch_meta_key(name);
         let meta_value = bincode::serialize(&updated_meta)
             .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
-        self.db.put(&meta_key, &meta_value)
+        self.db
+            .put(&meta_key, &meta_value)
             .map_err(|e| Error::storage(format!("Failed to save updated metadata: {}", e)))?;
 
         // Remove from registry
@@ -573,7 +569,11 @@ impl BranchManager {
                 Ok(())
             }
             BranchGcMode::Deferred => {
-                tracing::debug!("Scheduling deferred GC for branch '{}' (ID: {})", branch_name, branch_id);
+                tracing::debug!(
+                    "Scheduling deferred GC for branch '{}' (ID: {})",
+                    branch_name,
+                    branch_id
+                );
 
                 // Add to pending GC queue
                 self.pending_gc.write().insert(branch_id, current_ts);
@@ -604,15 +604,15 @@ impl BranchManager {
         // Collect all keys with this prefix
         let iter = self.db.prefix_iterator(&prefix);
         for item in iter {
-            let (key, _value) = item
-                .map_err(|e| Error::storage(format!("GC iterator error: {}", e)))?;
+            let (key, _value) = item.map_err(|e| Error::storage(format!("GC iterator error: {}", e)))?;
 
             keys_to_delete.push(key.to_vec());
         }
 
         // Delete collected keys
         for key in keys_to_delete {
-            self.db.delete(&key)
+            self.db
+                .delete(&key)
                 .map_err(|e| Error::storage(format!("Failed to delete branch data: {}", e)))?;
             delete_count += 1;
         }
@@ -662,11 +662,7 @@ impl BranchManager {
                     tracing::info!("Successfully GC'd branch ID {}", branch_id);
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "Failed to GC branch ID {}: {}. Will retry later.",
-                        branch_id,
-                        e
-                    );
+                    tracing::warn!("Failed to GC branch ID {}: {}. Will retry later.", branch_id, e);
                     // Keep in queue for retry
                 }
             }
@@ -705,12 +701,13 @@ impl BranchManager {
     /// Get branch metadata by name
     pub fn get_branch_by_name(&self, name: &str) -> Result<BranchMetadata> {
         let meta_key = encode_branch_meta_key(name);
-        let data = self.db.get(&meta_key)
+        let data = self
+            .db
+            .get(&meta_key)
             .map_err(|e| Error::storage(format!("Failed to read branch metadata: {}", e)))?
             .ok_or_else(|| Error::storage(format!("Branch '{}' not found", name)))?;
 
-        bincode::deserialize(&data)
-            .map_err(|e| Error::storage(format!("Failed to deserialize metadata: {}", e)))
+        bincode::deserialize(&data).map_err(|e| Error::storage(format!("Failed to deserialize metadata: {}", e)))
     }
 
     /// Get branch metadata by ID
@@ -721,7 +718,9 @@ impl BranchManager {
         }
 
         // Get branch name from registry
-        let name = self.registry.read()
+        let name = self
+            .registry
+            .read()
             .get_name(branch_id)
             .ok_or_else(|| Error::storage(format!("Branch ID {} not found", branch_id)))?
             .to_string();
@@ -773,7 +772,8 @@ impl BranchManager {
 
         let value = bincode::serialize(&children)
             .map_err(|e| Error::storage(format!("Failed to serialize children: {}", e)))?;
-        self.db.put(&key, &value)
+        self.db
+            .put(&key, &value)
             .map_err(|e| Error::storage(format!("Failed to save children: {}", e)))
     }
 
@@ -805,12 +805,7 @@ impl BranchManager {
     ///
     /// Performs a three-way merge using the common ancestor as the merge base.
     /// Supports multiple merge strategies for conflict resolution.
-    pub fn merge_branch(
-        &self,
-        source_name: &str,
-        target_name: &str,
-        strategy: MergeStrategy,
-    ) -> Result<MergeResult> {
+    pub fn merge_branch(&self, source_name: &str, target_name: &str, strategy: MergeStrategy) -> Result<MergeResult> {
         tracing::info!(
             "Starting merge: {} -> {} (strategy: {:?})",
             source_name,
@@ -839,10 +834,7 @@ impl BranchManager {
         // Find common ancestor (merge base)
         let merge_base = self.find_merge_base(source.branch_id, target.branch_id)?;
 
-        tracing::debug!(
-            "Merge base found: snapshot_id = {}",
-            merge_base
-        );
+        tracing::debug!("Merge base found: snapshot_id = {}", merge_base);
 
         // Collect all modified keys from both branches
         let source_keys = self.collect_modified_keys(source.branch_id, merge_base)?;
@@ -897,7 +889,8 @@ impl BranchManager {
         let meta_key = encode_branch_meta_key(source_name);
         let meta_value = bincode::serialize(&updated_source)
             .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
-        self.db.put(&meta_key, &meta_value)
+        self.db
+            .put(&meta_key, &meta_value)
             .map_err(|e| Error::storage(format!("Failed to save merged branch metadata: {}", e)))?;
 
         // Update cache
@@ -910,7 +903,8 @@ impl BranchManager {
         let target_meta_key = encode_branch_meta_key(target_name);
         let target_meta_value = bincode::serialize(&updated_target)
             .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
-        self.db.put(&target_meta_key, &target_meta_value)
+        self.db
+            .put(&target_meta_key, &target_meta_value)
             .map_err(|e| Error::storage(format!("Failed to save target branch metadata: {}", e)))?;
 
         // Update cache
@@ -939,10 +933,7 @@ impl BranchManager {
         let target_chain = self.build_parent_chain(target_id)?;
 
         // Convert chains to sets for O(1) lookup
-        let source_snapshots: HashSet<SnapshotId> = source_chain
-            .iter()
-            .map(|(_, snapshot)| *snapshot)
-            .collect();
+        let source_snapshots: HashSet<SnapshotId> = source_chain.iter().map(|(_, snapshot)| *snapshot).collect();
 
         // Find first common snapshot in target chain (most recent ancestor)
         for (_, target_snapshot) in &target_chain {
@@ -963,20 +954,13 @@ impl BranchManager {
         // Fallback: use the earlier creation snapshot
         let merge_base = source_meta.created_from_snapshot.min(target_meta.created_from_snapshot);
 
-        tracing::warn!(
-            "No common ancestor found, using earlier snapshot: {}",
-            merge_base
-        );
+        tracing::warn!("No common ancestor found, using earlier snapshot: {}", merge_base);
 
         Ok(merge_base)
     }
 
     /// Collect all modified keys in a branch since merge base
-    fn collect_modified_keys(
-        &self,
-        branch_id: BranchId,
-        since_snapshot: SnapshotId,
-    ) -> Result<HashSet<String>> {
+    fn collect_modified_keys(&self, branch_id: BranchId, since_snapshot: SnapshotId) -> Result<HashSet<String>> {
         let mut keys = HashSet::new();
 
         // Build key prefix for this branch
@@ -1064,9 +1048,7 @@ impl BranchManager {
         let mut merged_count = 0;
 
         // Build conflict set for quick lookup
-        let conflict_keys: HashSet<String> = conflicts.iter()
-            .map(|c| c.key.clone())
-            .collect();
+        let conflict_keys: HashSet<String> = conflicts.iter().map(|c| c.key.clone()).collect();
 
         // Merge keys from source branch
         for key in source_keys {
@@ -1110,13 +1092,7 @@ impl BranchManager {
     }
 
     /// Copy a key from source branch to target branch
-    fn copy_key_to_branch(
-        &self,
-        source_id: BranchId,
-        target_id: BranchId,
-        key: &str,
-        timestamp: u64,
-    ) -> Result<()> {
+    fn copy_key_to_branch(&self, source_id: BranchId, target_id: BranchId, key: &str, timestamp: u64) -> Result<()> {
         // Get value from source
         let value = self.get_latest_key_value(source_id, key)?;
 
@@ -1125,11 +1101,13 @@ impl BranchManager {
 
         if let Some((data, _ts)) = value {
             // Write to target
-            self.db.put(&target_key, &data)
+            self.db
+                .put(&target_key, &data)
                 .map_err(|e| Error::storage(format!("Failed to copy key: {}", e)))?;
         } else {
             // Tombstone (deleted key)
-            self.db.delete(&target_key)
+            self.db
+                .delete(&target_key)
                 .map_err(|e| Error::storage(format!("Failed to delete key: {}", e)))?;
         }
 
@@ -1249,11 +1227,7 @@ impl BranchTransaction {
         let user_key = String::from_utf8_lossy(key);
 
         // Try current branch first
-        let branch_key = encode_branch_data_key(
-            self.branch_id,
-            &user_key,
-            self.tx.snapshot_id(),
-        );
+        let branch_key = encode_branch_data_key(self.branch_id, &user_key, self.tx.snapshot_id());
 
         // Check if exists in current branch
         if let Some(value) = self.tx.get(&branch_key)? {
@@ -1272,8 +1246,11 @@ impl BranchTransaction {
                 encode_branch_data_key(*parent_id, &user_key, 0) // timestamp unused
             };
 
-            if let Some(value) = self.db.get(&parent_key)
-                .map_err(|e| Error::storage(format!("Parent read failed: {}", e)))? {
+            if let Some(value) = self
+                .db
+                .get(&parent_key)
+                .map_err(|e| Error::storage(format!("Parent read failed: {}", e)))?
+            {
                 return Ok(Some(value));
             }
         }
@@ -1284,11 +1261,7 @@ impl BranchTransaction {
     /// Write to branch (copy-on-write)
     pub fn put(&mut self, key: Key, value: Vec<u8>) -> Result<()> {
         let user_key = String::from_utf8_lossy(&key);
-        let branch_key = encode_branch_data_key(
-            self.branch_id,
-            &user_key,
-            self.tx.snapshot_id(),
-        );
+        let branch_key = encode_branch_data_key(self.branch_id, &user_key, self.tx.snapshot_id());
 
         self.tx.put(branch_key, value)
     }
@@ -1296,11 +1269,7 @@ impl BranchTransaction {
     /// Delete from branch
     pub fn delete(&mut self, key: Key) -> Result<()> {
         let user_key = String::from_utf8_lossy(&key);
-        let branch_key = encode_branch_data_key(
-            self.branch_id,
-            &user_key,
-            self.tx.snapshot_id(),
-        );
+        let branch_key = encode_branch_data_key(self.branch_id, &user_key, self.tx.snapshot_id());
 
         self.tx.delete(branch_key)
     }
@@ -1343,11 +1312,7 @@ fn encode_branch_children_key(parent_id: BranchId) -> Vec<u8> {
 /// Note: timestamp parameter is kept for backward compatibility but not used in the key
 /// The key must NOT include the timestamp because each transaction has its own snapshot ID,
 /// which would make reads from subsequent transactions unable to find previous writes
-pub fn encode_branch_data_key(
-    branch_id: BranchId,
-    user_key: &str,
-    _timestamp: u64,
-) -> Vec<u8> {
+pub fn encode_branch_data_key(branch_id: BranchId, user_key: &str, _timestamp: u64) -> Vec<u8> {
     let mut key = Vec::new();
     key.extend_from_slice(BRANCH_DATA_PREFIX);
     key.extend_from_slice(&branch_id.to_be_bytes());
@@ -1390,8 +1355,8 @@ pub fn decode_branch_data_key(key: &[u8]) -> Option<(BranchId, String)> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::Config;
     use crate::storage::StorageEngine;
+    use crate::Config;
 
     #[test]
     fn test_branch_key_encoding() {
@@ -1407,10 +1372,7 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).unwrap();
 
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        );
+        let manager = BranchManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp));
 
         assert!(manager.is_ok());
     }
@@ -1420,17 +1382,11 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).unwrap();
 
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        ).unwrap();
+        let manager = BranchManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp)).unwrap();
 
-        let branch_id = manager.create_branch(
-            "dev",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        let branch_id = manager
+            .create_branch("dev", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
         assert!(branch_id > 1); // main is 1
 
@@ -1447,18 +1403,12 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).unwrap();
 
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        ).unwrap();
+        let manager = BranchManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp)).unwrap();
 
         // Create and drop branch
-        manager.create_branch(
-            "temp",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        manager
+            .create_branch("temp", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
         manager.drop_branch("temp", false).unwrap();
 
@@ -1474,10 +1424,7 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).unwrap();
 
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        ).unwrap();
+        let manager = BranchManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp)).unwrap();
 
         let result = manager.drop_branch("main", false);
         assert!(result.is_err());
@@ -1488,25 +1435,16 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).unwrap();
 
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        ).unwrap();
+        let manager = BranchManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp)).unwrap();
 
         // Create parent and child
-        manager.create_branch(
-            "parent",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        manager
+            .create_branch("parent", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
-        manager.create_branch(
-            "child",
-            Some("parent"),
-            200,
-            BranchOptions::default(),
-        ).unwrap();
+        manager
+            .create_branch("child", Some("parent"), 200, BranchOptions::default())
+            .unwrap();
 
         // Try to drop parent
         let result = manager.drop_branch("parent", false);
@@ -1518,14 +1456,15 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).unwrap();
 
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        ).unwrap();
+        let manager = BranchManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp)).unwrap();
 
         // Create branches
-        manager.create_branch("dev", Some("main"), 100, BranchOptions::default()).unwrap();
-        manager.create_branch("staging", Some("main"), 200, BranchOptions::default()).unwrap();
+        manager
+            .create_branch("dev", Some("main"), 100, BranchOptions::default())
+            .unwrap();
+        manager
+            .create_branch("staging", Some("main"), 200, BranchOptions::default())
+            .unwrap();
 
         let branches = manager.list_branches().unwrap();
         assert_eq!(branches.len(), 3); // main, dev, staging
@@ -1541,25 +1480,16 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).unwrap();
 
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        ).unwrap();
+        let manager = BranchManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp)).unwrap();
 
         // Create hierarchy: main -> dev -> feature
-        let dev_id = manager.create_branch(
-            "dev",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        let dev_id = manager
+            .create_branch("dev", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
-        let feature_id = manager.create_branch(
-            "feature",
-            Some("dev"),
-            200,
-            BranchOptions::default(),
-        ).unwrap();
+        let feature_id = manager
+            .create_branch("feature", Some("dev"), 200, BranchOptions::default())
+            .unwrap();
 
         // Build parent chain for feature
         let chain = manager.build_parent_chain(feature_id).unwrap();
@@ -1574,25 +1504,16 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).unwrap();
 
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        ).unwrap();
+        let manager = BranchManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp)).unwrap();
 
         // Create two branches from main
-        let dev_id = manager.create_branch(
-            "dev",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        let dev_id = manager
+            .create_branch("dev", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
-        let staging_id = manager.create_branch(
-            "staging",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        let staging_id = manager
+            .create_branch("staging", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
         // Find merge base (should be snapshot 100)
         let merge_base = manager.find_merge_base(dev_id, staging_id).unwrap();
@@ -1604,28 +1525,18 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).unwrap();
 
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        ).unwrap();
+        let manager = BranchManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp)).unwrap();
 
         // Create dev branch from main
-        manager.create_branch(
-            "dev",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        manager
+            .create_branch("dev", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
         // Simulate adding keys to dev branch (would normally come from transactions)
         // For testing, we'll just test the merge infrastructure
 
         // Perform merge
-        let result = manager.merge_branch(
-            "dev",
-            "main",
-            MergeStrategy::Auto,
-        ).unwrap();
+        let result = manager.merge_branch("dev", "main", MergeStrategy::Auto).unwrap();
 
         assert!(result.completed);
         assert_eq!(result.conflicts.len(), 0);
@@ -1636,25 +1547,15 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).unwrap();
 
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        ).unwrap();
+        let manager = BranchManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp)).unwrap();
 
         // Create staging branch from main
-        manager.create_branch(
-            "staging",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        manager
+            .create_branch("staging", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
         // Merge with manual strategy (no conflicts)
-        let result = manager.merge_branch(
-            "staging",
-            "main",
-            MergeStrategy::Manual,
-        ).unwrap();
+        let result = manager.merge_branch("staging", "main", MergeStrategy::Manual).unwrap();
 
         assert!(result.completed);
         assert_eq!(result.conflicts.len(), 0);
@@ -1665,24 +1566,14 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).unwrap();
 
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        ).unwrap();
+        let manager = BranchManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp)).unwrap();
 
         // Create and merge feature branch
-        manager.create_branch(
-            "feature",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        manager
+            .create_branch("feature", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
-        manager.merge_branch(
-            "feature",
-            "main",
-            MergeStrategy::Auto,
-        ).unwrap();
+        manager.merge_branch("feature", "main", MergeStrategy::Auto).unwrap();
 
         // Verify feature branch is marked as merged
         let feature_meta = manager.get_branch_by_name("feature").unwrap();
@@ -1699,27 +1590,17 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).unwrap();
 
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        ).unwrap();
+        let manager = BranchManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp)).unwrap();
 
         // Create and drop a branch
-        manager.create_branch(
-            "temp",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        manager
+            .create_branch("temp", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
         manager.drop_branch("temp", false).unwrap();
 
         // Try to merge dropped branch
-        let result = manager.merge_branch(
-            "temp",
-            "main",
-            MergeStrategy::Auto,
-        );
+        let result = manager.merge_branch("temp", "main", MergeStrategy::Auto);
 
         assert!(result.is_err());
     }
@@ -1729,25 +1610,15 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).unwrap();
 
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        ).unwrap();
+        let manager = BranchManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp)).unwrap();
 
         // Create hotfix branch
-        manager.create_branch(
-            "hotfix",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        manager
+            .create_branch("hotfix", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
         // Merge with Theirs strategy (prefer source)
-        let result = manager.merge_branch(
-            "hotfix",
-            "main",
-            MergeStrategy::Theirs,
-        ).unwrap();
+        let result = manager.merge_branch("hotfix", "main", MergeStrategy::Theirs).unwrap();
 
         assert!(result.completed);
     }
@@ -1757,25 +1628,17 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).unwrap();
 
-        let manager = BranchManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        ).unwrap();
+        let manager = BranchManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp)).unwrap();
 
         // Create experimental branch
-        manager.create_branch(
-            "experimental",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        manager
+            .create_branch("experimental", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
         // Merge with Ours strategy (prefer target)
-        let result = manager.merge_branch(
-            "experimental",
-            "main",
-            MergeStrategy::Ours,
-        ).unwrap();
+        let result = manager
+            .merge_branch("experimental", "main", MergeStrategy::Ours)
+            .unwrap();
 
         assert!(result.completed);
     }
@@ -1802,19 +1665,13 @@ mod tests {
             gc_mode: BranchGcMode::Immediate,
         };
 
-        let manager = BranchManager::with_gc_config(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-            gc_config,
-        ).unwrap();
+        let manager =
+            BranchManager::with_gc_config(Arc::clone(&engine.db), Arc::clone(&engine.timestamp), gc_config).unwrap();
 
         // Create and drop a branch
-        let branch_id = manager.create_branch(
-            "test_gc",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        let branch_id = manager
+            .create_branch("test_gc", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
         // Insert some data for the branch
         let key = encode_branch_data_key(branch_id, "test_key", 100);
@@ -1845,19 +1702,13 @@ mod tests {
             gc_mode: BranchGcMode::Deferred,
         };
 
-        let manager = BranchManager::with_gc_config(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-            gc_config,
-        ).unwrap();
+        let manager =
+            BranchManager::with_gc_config(Arc::clone(&engine.db), Arc::clone(&engine.timestamp), gc_config).unwrap();
 
         // Create and drop a branch
-        let branch_id = manager.create_branch(
-            "test_deferred",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        let branch_id = manager
+            .create_branch("test_deferred", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
         // Insert some data for the branch
         let key = encode_branch_data_key(branch_id, "test_key", 100);
@@ -1901,19 +1752,13 @@ mod tests {
             gc_mode: BranchGcMode::Immediate,
         };
 
-        let manager = BranchManager::with_gc_config(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-            gc_config,
-        ).unwrap();
+        let manager =
+            BranchManager::with_gc_config(Arc::clone(&engine.db), Arc::clone(&engine.timestamp), gc_config).unwrap();
 
         // Create and drop a branch
-        let branch_id = manager.create_branch(
-            "test_no_gc",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        let branch_id = manager
+            .create_branch("test_no_gc", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
         // Insert some data for the branch
         let key = encode_branch_data_key(branch_id, "test_key", 100);
@@ -1941,21 +1786,15 @@ mod tests {
             gc_mode: BranchGcMode::Deferred,
         };
 
-        let manager = BranchManager::with_gc_config(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-            gc_config,
-        ).unwrap();
+        let manager =
+            BranchManager::with_gc_config(Arc::clone(&engine.db), Arc::clone(&engine.timestamp), gc_config).unwrap();
 
         // Create and drop multiple branches
         for i in 0..5 {
             let branch_name = format!("branch_{}", i);
-            let branch_id = manager.create_branch(
-                &branch_name,
-                Some("main"),
-                100 + i as u64,
-                BranchOptions::default(),
-            ).unwrap();
+            let branch_id = manager
+                .create_branch(&branch_name, Some("main"), 100 + i as u64, BranchOptions::default())
+                .unwrap();
 
             // Add data
             let key = encode_branch_data_key(branch_id, "key", 100 + i as u64);
@@ -1994,19 +1833,13 @@ mod tests {
             gc_mode: BranchGcMode::Deferred,
         };
 
-        let manager = BranchManager::with_gc_config(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-            gc_config,
-        ).unwrap();
+        let manager =
+            BranchManager::with_gc_config(Arc::clone(&engine.db), Arc::clone(&engine.timestamp), gc_config).unwrap();
 
         // Create and drop branch
-        let branch_id = manager.create_branch(
-            "test_retention",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        let branch_id = manager
+            .create_branch("test_retention", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
         let key = encode_branch_data_key(branch_id, "key", 100);
         manager.db.put(&key, b"value").unwrap();
@@ -2053,18 +1886,13 @@ mod tests {
 
         // Create manager and drop a branch
         {
-            let manager = BranchManager::with_gc_config(
-                Arc::clone(&engine.db),
-                Arc::clone(&engine.timestamp),
-                gc_config.clone(),
-            ).unwrap();
+            let manager =
+                BranchManager::with_gc_config(Arc::clone(&engine.db), Arc::clone(&engine.timestamp), gc_config.clone())
+                    .unwrap();
 
-            manager.create_branch(
-                "test_persist",
-                Some("main"),
-                100,
-                BranchOptions::default(),
-            ).unwrap();
+            manager
+                .create_branch("test_persist", Some("main"), 100, BranchOptions::default())
+                .unwrap();
 
             manager.drop_branch("test_persist", false).unwrap();
 
@@ -2072,11 +1900,8 @@ mod tests {
         }
 
         // Create new manager (simulates restart)
-        let manager2 = BranchManager::with_gc_config(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-            gc_config,
-        ).unwrap();
+        let manager2 =
+            BranchManager::with_gc_config(Arc::clone(&engine.db), Arc::clone(&engine.timestamp), gc_config).unwrap();
 
         // Verify pending GC was persisted and restored
         assert_eq!(manager2.pending_gc_count(), 1);
@@ -2093,18 +1918,12 @@ mod tests {
             gc_mode: BranchGcMode::Immediate,
         };
 
-        let manager = BranchManager::with_gc_config(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-            gc_config,
-        ).unwrap();
+        let manager =
+            BranchManager::with_gc_config(Arc::clone(&engine.db), Arc::clone(&engine.timestamp), gc_config).unwrap();
 
-        let branch_id = manager.create_branch(
-            "multi_key",
-            Some("main"),
-            100,
-            BranchOptions::default(),
-        ).unwrap();
+        let branch_id = manager
+            .create_branch("multi_key", Some("main"), 100, BranchOptions::default())
+            .unwrap();
 
         // Insert multiple keys for the branch
         for i in 0..100 {

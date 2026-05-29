@@ -4,9 +4,9 @@
 //! - Foreign Key constraints with IMMEDIATE/DEFERRED/LOCK-FREE modes
 //! - Constraint validation during INSERT/UPDATE/DELETE operations
 
+use crate::{Error, Result, Schema, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use crate::{Error, Result, Value, Schema};
 
 /// Referential action for ON DELETE / ON UPDATE clauses
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -49,6 +49,8 @@ pub enum ConstraintEnforcement {
     Immediate,
     /// Check constraint at transaction COMMIT
     Deferred,
+    /// Record the constraint but do not enforce it.
+    NotEnforced,
     /// Async validation for bulk operations (eventual consistency)
     LockFree,
 }
@@ -58,6 +60,7 @@ impl std::fmt::Display for ConstraintEnforcement {
         match self {
             ConstraintEnforcement::Immediate => write!(f, "IMMEDIATE"),
             ConstraintEnforcement::Deferred => write!(f, "DEFERRED"),
+            ConstraintEnforcement::NotEnforced => write!(f, "NOT ENFORCED"),
             ConstraintEnforcement::LockFree => write!(f, "LOCK-FREE"),
         }
     }
@@ -340,11 +343,7 @@ impl ForeignKeyValidator {
         self.validation_stack.insert(fk.table_name.clone());
 
         // Check if the referenced row exists
-        let exists = check_reference_exists(
-            &fk.references_table,
-            &fk.references_columns,
-            fk_values,
-        )?;
+        let exists = check_reference_exists(&fk.references_table, &fk.references_columns, fk_values)?;
 
         self.validation_stack.remove(&fk.table_name);
 
@@ -367,11 +366,7 @@ impl ForeignKeyValidator {
         check_referencing_exists: impl FnOnce(&str, &[String], &[Value]) -> Result<bool>,
     ) -> Result<ReferentialAction> {
         // Check if any rows in the FK table reference this row
-        let has_references = check_referencing_exists(
-            &fk.table_name,
-            &fk.columns,
-            deleted_values,
-        )?;
+        let has_references = check_referencing_exists(&fk.table_name, &fk.columns, deleted_values)?;
 
         if !has_references {
             return Ok(ReferentialAction::NoAction);
@@ -379,12 +374,10 @@ impl ForeignKeyValidator {
 
         // There are referencing rows, apply the ON DELETE action
         match fk.on_delete {
-            ReferentialAction::NoAction | ReferentialAction::Restrict => {
-                Err(Error::constraint_violation(format!(
-                    "Foreign key constraint '{}' violated: cannot delete row from '{}' - referenced by '{}'",
-                    fk.name, fk.references_table, fk.table_name
-                )))
-            }
+            ReferentialAction::NoAction | ReferentialAction::Restrict => Err(Error::constraint_violation(format!(
+                "Foreign key constraint '{}' violated: cannot delete row from '{}' - referenced by '{}'",
+                fk.name, fk.references_table, fk.table_name
+            ))),
             action => Ok(action), // CASCADE, SET NULL, SET DEFAULT - caller handles these
         }
     }
@@ -404,11 +397,7 @@ impl ForeignKeyValidator {
         }
 
         // Check if any rows in the FK table reference the old values
-        let has_references = check_referencing_exists(
-            &fk.table_name,
-            &fk.columns,
-            old_values,
-        )?;
+        let has_references = check_referencing_exists(&fk.table_name, &fk.columns, old_values)?;
 
         if !has_references {
             return Ok(ReferentialAction::NoAction);
@@ -416,12 +405,10 @@ impl ForeignKeyValidator {
 
         // There are referencing rows, apply the ON UPDATE action
         match fk.on_update {
-            ReferentialAction::NoAction | ReferentialAction::Restrict => {
-                Err(Error::constraint_violation(format!(
-                    "Foreign key constraint '{}' violated: cannot update row in '{}' - referenced by '{}'",
-                    fk.name, fk.references_table, fk.table_name
-                )))
-            }
+            ReferentialAction::NoAction | ReferentialAction::Restrict => Err(Error::constraint_violation(format!(
+                "Foreign key constraint '{}' violated: cannot update row in '{}' - referenced by '{}'",
+                fk.name, fk.references_table, fk.table_name
+            ))),
             action => Ok(action), // CASCADE, SET NULL, SET DEFAULT - caller handles these
         }
     }
@@ -520,11 +507,7 @@ mod tests {
 
     #[test]
     fn test_generate_constraint_name() {
-        let name = ForeignKeyConstraint::generate_name(
-            "orders",
-            &["customer_id".to_string()],
-            "customers",
-        );
+        let name = ForeignKeyConstraint::generate_name("orders", &["customer_id".to_string()], "customers");
         assert_eq!(name, "fk_orders_customer_id__customers");
     }
 

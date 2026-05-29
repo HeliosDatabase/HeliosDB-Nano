@@ -4,11 +4,11 @@
 //! in HeliosDB Nano.
 
 use heliosdb_nano::{
-    EmbeddedDatabase, Result, Value,
     sql::{
-        TriggerRegistry, TriggerDefinition, TriggerContext,
-        logical_plan::{TriggerTiming, TriggerEvent, TriggerFor, LogicalPlan},
+        logical_plan::{LogicalPlan, TriggerEvent, TriggerFor, TriggerTiming},
+        TriggerContext, TriggerDefinition, TriggerRegistry,
     },
+    EmbeddedDatabase, Result, Value,
 };
 
 fn main() -> Result<()> {
@@ -31,7 +31,7 @@ fn main() -> Result<()> {
         TriggerTiming::Before,
         vec![TriggerEvent::Insert],
         TriggerFor::Row,
-        None, // No WHEN condition
+        None,   // No WHEN condition
         vec![], // Empty body for demonstration
         vec![], // No REFERENCING clause
     );
@@ -76,21 +76,14 @@ fn main() -> Result<()> {
     let user_triggers = trigger_registry.get_triggers_for_table("users")?;
     println!("   Found {} triggers:", user_triggers.len());
     for trigger in &user_triggers {
-        println!("     - {} ({:?}, {:?})",
-            trigger.name,
-            trigger.timing,
-            trigger.for_each
-        );
+        println!("     - {} ({:?}, {:?})", trigger.name, trigger.timing, trigger.for_each);
     }
     println!();
 
     // Example 5: Query triggers for specific event
     println!("5. Querying BEFORE INSERT triggers...");
-    let before_insert_triggers = trigger_registry.get_triggers_for_event(
-        "users",
-        &TriggerEvent::Insert,
-        &TriggerTiming::Before,
-    )?;
+    let before_insert_triggers =
+        trigger_registry.get_triggers_for_event("users", &TriggerEvent::Insert, &TriggerTiming::Before)?;
     println!("   Found {} BEFORE INSERT triggers:", before_insert_triggers.len());
     for trigger in &before_insert_triggers {
         println!("     - {}", trigger.name);
@@ -102,21 +95,13 @@ fn main() -> Result<()> {
     trigger_registry.disable_trigger("users", "audit_insert")?;
     println!("   ✓ Trigger 'audit_insert' disabled");
 
-    let triggers = trigger_registry.get_triggers_for_event(
-        "users",
-        &TriggerEvent::Insert,
-        &TriggerTiming::Before,
-    )?;
+    let triggers = trigger_registry.get_triggers_for_event("users", &TriggerEvent::Insert, &TriggerTiming::Before)?;
     println!("   Active BEFORE INSERT triggers: {}", triggers.len());
 
     trigger_registry.enable_trigger("users", "audit_insert")?;
     println!("   ✓ Trigger 'audit_insert' re-enabled");
 
-    let triggers = trigger_registry.get_triggers_for_event(
-        "users",
-        &TriggerEvent::Insert,
-        &TriggerTiming::Before,
-    )?;
+    let triggers = trigger_registry.get_triggers_for_event("users", &TriggerEvent::Insert, &TriggerTiming::Before)?;
     println!("   Active BEFORE INSERT triggers: {}\n", triggers.len());
 
     // Example 7: Trigger cascading depth tracking
@@ -136,7 +121,10 @@ fn main() -> Result<()> {
     println!();
 
     // Example 8: Test depth limit
-    println!("8. Testing maximum depth limit ({})", heliosdb_nano::sql::MAX_TRIGGER_DEPTH);
+    println!(
+        "8. Testing maximum depth limit ({})",
+        heliosdb_nano::sql::MAX_TRIGGER_DEPTH
+    );
     let mut context = TriggerContext::new();
 
     // Fill to max depth

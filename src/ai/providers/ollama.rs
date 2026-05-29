@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use futures::Stream;
 
 use super::{
-    ChatMessage, LlmProvider, LlmProviderConfig, LlmRequest, LlmResponse,
-    MessageRole, ModelInfo, ProviderError, ProviderResult, StreamChunk, TokenUsage,
+    ChatMessage, LlmProvider, LlmProviderConfig, LlmRequest, LlmResponse, MessageRole, ModelInfo, ProviderError,
+    ProviderResult, StreamChunk, TokenUsage,
 };
 
 /// Ollama provider for local models
@@ -17,11 +17,12 @@ pub struct OllamaProvider {
 impl OllamaProvider {
     /// Create new Ollama provider
     pub fn new(config: &LlmProviderConfig) -> ProviderResult<Self> {
-        let endpoint = config.endpoint.clone()
+        let endpoint = config
+            .endpoint
+            .clone()
             .unwrap_or_else(|| "http://localhost:11434".into());
 
-        let default_model = config.model.clone()
-            .unwrap_or_else(|| "llama3.2".into());
+        let default_model = config.model.clone().unwrap_or_else(|| "llama3.2".into());
 
         Ok(Self {
             endpoint,
@@ -128,32 +129,30 @@ impl LlmProvider for OllamaProvider {
     async fn list_models(&self) -> ProviderResult<Vec<ModelInfo>> {
         // Try to fetch from Ollama API
         let client = reqwest::Client::new();
-        let response = client
-            .get(format!("{}/api/tags", self.endpoint))
-            .send()
-            .await;
+        let response = client.get(format!("{}/api/tags", self.endpoint)).send().await;
 
         match response {
             Ok(resp) if resp.status().is_success() => {
-                let result: serde_json::Value = resp.json().await
-                    .map_err(|e| ProviderError::Api(e.to_string()))?;
+                let result: serde_json::Value = resp.json().await.map_err(|e| ProviderError::Api(e.to_string()))?;
 
                 let models: Vec<ModelInfo> = result["models"]
                     .as_array()
                     .map(|arr| {
-                        arr.iter().map(|m| {
-                            let name = m["name"].as_str().unwrap_or("unknown");
-                            ModelInfo {
-                                id: name.to_string(),
-                                name: name.to_string(),
-                                provider: "ollama".into(),
-                                context_length: 4096, // Default, actual varies
-                                supports_functions: false,
-                                supports_vision: false,
-                                input_cost_per_1k: None,
-                                output_cost_per_1k: None,
-                            }
-                        }).collect()
+                        arr.iter()
+                            .map(|m| {
+                                let name = m["name"].as_str().unwrap_or("unknown");
+                                ModelInfo {
+                                    id: name.to_string(),
+                                    name: name.to_string(),
+                                    provider: "ollama".into(),
+                                    context_length: 4096, // Default, actual varies
+                                    supports_functions: false,
+                                    supports_vision: false,
+                                    input_cost_per_1k: None,
+                                    output_cost_per_1k: None,
+                                }
+                            })
+                            .collect()
                     })
                     .unwrap_or_else(|| Self::common_models());
 
@@ -169,17 +168,21 @@ impl LlmProvider for OllamaProvider {
         let model = request.model.as_deref().unwrap_or(&self.default_model);
 
         // Convert messages to Ollama format
-        let messages: Vec<serde_json::Value> = request.messages.iter().map(|m| {
-            serde_json::json!({
-                "role": match m.role {
-                    MessageRole::System => "system",
-                    MessageRole::User => "user",
-                    MessageRole::Assistant => "assistant",
-                    _ => "user",
-                },
-                "content": m.content,
+        let messages: Vec<serde_json::Value> = request
+            .messages
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "role": match m.role {
+                        MessageRole::System => "system",
+                        MessageRole::User => "user",
+                        MessageRole::Assistant => "assistant",
+                        _ => "user",
+                    },
+                    "content": m.content,
+                })
             })
-        }).collect();
+            .collect();
 
         // Build request body
         let mut body = serde_json::json!({
@@ -221,8 +224,7 @@ impl LlmProvider for OllamaProvider {
             return Err(ProviderError::Api(error_text));
         }
 
-        let result: serde_json::Value = response.json().await
-            .map_err(|e| ProviderError::Api(e.to_string()))?;
+        let result: serde_json::Value = response.json().await.map_err(|e| ProviderError::Api(e.to_string()))?;
 
         // Parse response
         let content = result["message"]["content"].as_str().unwrap_or("").to_string();
@@ -240,8 +242,8 @@ impl LlmProvider for OllamaProvider {
         let usage = Some(TokenUsage {
             prompt_tokens: result["prompt_eval_count"].as_u64().unwrap_or(0) as usize,
             completion_tokens: result["eval_count"].as_u64().unwrap_or(0) as usize,
-            total_tokens: (result["prompt_eval_count"].as_u64().unwrap_or(0) +
-                          result["eval_count"].as_u64().unwrap_or(0)) as usize,
+            total_tokens: (result["prompt_eval_count"].as_u64().unwrap_or(0)
+                + result["eval_count"].as_u64().unwrap_or(0)) as usize,
         });
 
         Ok(LlmResponse {
@@ -263,17 +265,21 @@ impl LlmProvider for OllamaProvider {
         let model = request.model.clone().unwrap_or_else(|| self.default_model.clone());
 
         // Convert messages to Ollama format
-        let messages: Vec<serde_json::Value> = request.messages.iter().map(|m| {
-            serde_json::json!({
-                "role": match m.role {
-                    MessageRole::System => "system",
-                    MessageRole::User => "user",
-                    MessageRole::Assistant => "assistant",
-                    _ => "user",
-                },
-                "content": m.content,
+        let messages: Vec<serde_json::Value> = request
+            .messages
+            .iter()
+            .map(|m| {
+                serde_json::json!({
+                    "role": match m.role {
+                        MessageRole::System => "system",
+                        MessageRole::User => "user",
+                        MessageRole::Assistant => "assistant",
+                        _ => "user",
+                    },
+                    "content": m.content,
+                })
             })
-        }).collect();
+            .collect();
 
         // Build request body with streaming enabled
         let mut body = serde_json::json!({

@@ -49,10 +49,7 @@ mod imp {
                 let _ = std::fs::remove_file(&self.path);
             }
             let listener = UnixListener::bind(&self.path).map_err(|e| {
-                crate::Error::Generic(format!(
-                    "MCP unix socket bind failed at {}: {e}",
-                    self.path.display()
-                ))
+                crate::Error::Generic(format!("MCP unix socket bind failed at {}: {e}", self.path.display()))
             })?;
             info!(path = %self.path.display(), "mcp unix-socket server listening");
 
@@ -219,7 +216,10 @@ pub mod imp {
 
     impl UnixSocketServer {
         pub fn new(path: impl Into<PathBuf>, db: Arc<EmbeddedDatabase>) -> Self {
-            Self { _path: path.into(), _db: db }
+            Self {
+                _path: path.into(),
+                _db: db,
+            }
         }
         pub async fn run(&self) -> crate::Result<()> {
             Err(crate::Error::Generic(

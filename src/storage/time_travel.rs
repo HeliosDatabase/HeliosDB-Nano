@@ -25,14 +25,14 @@
 //! - SCN mapping: `scn_map:{scn}`
 
 use crate::{Error, Result};
+use chrono::{DateTime, NaiveDateTime, Utc};
+use lru::LruCache;
+use parking_lot::{Mutex, RwLock};
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::Arc;
-use parking_lot::{RwLock, Mutex};
-use chrono::{DateTime, NaiveDateTime, Utc};
-use lru::LruCache;
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 
 /// System Change Number (Oracle-compatible)
 pub type Scn = u64;
@@ -271,20 +271,14 @@ impl SnapshotManager {
                 // Get current timestamp
                 Ok(self.get_current_timestamp())
             }
-            AsOfClause::Timestamp(ts_str) => {
-                self.resolve_timestamp(ts_str)
-            }
-            AsOfClause::Transaction(txn_id) => {
-                self.resolve_transaction(*txn_id)
-            }
-            AsOfClause::Scn(scn) => {
-                self.resolve_scn(*scn)
-            }
+            AsOfClause::Timestamp(ts_str) => self.resolve_timestamp(ts_str),
+            AsOfClause::Transaction(txn_id) => self.resolve_transaction(*txn_id),
+            AsOfClause::Scn(scn) => self.resolve_scn(*scn),
             AsOfClause::VersionsBetween { .. } => {
                 // VersionsBetween cannot be resolved to a single timestamp
                 // The executor should handle this variant separately
                 Err(Error::query_execution(
-                    "VERSIONS BETWEEN cannot be resolved to a single timestamp. Use scan_versions_between instead."
+                    "VERSIONS BETWEEN cannot be resolved to a single timestamp. Use scan_versions_between instead.",
                 ))
             }
             AsOfClause::Commit(sha) => {
@@ -325,19 +319,18 @@ impl SnapshotManager {
             }
         }
 
-        best_match.ok_or_else(|| {
-            Error::query_execution(format!(
-                "No snapshot found for timestamp '{}'",
-                ts_str
-            ))
-        })
+        best_match.ok_or_else(|| Error::query_execution(format!("No snapshot found for timestamp '{}'", ts_str)))
     }
 
     /// Resolve timestamp for VERSIONS BETWEEN range queries
     ///
     /// Returns internal LSN timestamp for use in version range queries.
     /// For timestamps, finds the nearest snapshot or uses boundary values.
-    pub fn resolve_timestamp_for_range(&self, as_of: &crate::sql::logical_plan::AsOfClause, is_start: bool) -> Result<u64> {
+    pub fn resolve_timestamp_for_range(
+        &self,
+        as_of: &crate::sql::logical_plan::AsOfClause,
+        is_start: bool,
+    ) -> Result<u64> {
         use crate::sql::logical_plan::AsOfClause;
 
         match as_of {
@@ -401,17 +394,11 @@ impl SnapshotManager {
                 // If no matching snapshot found, use boundary values
                 Ok(best_match.unwrap_or(if is_start { 0 } else { u64::MAX }))
             }
-            AsOfClause::Transaction(txn_id) => {
-                self.resolve_transaction(*txn_id)
-            }
-            AsOfClause::Scn(scn) => {
-                self.resolve_scn(*scn)
-            }
-            AsOfClause::VersionsBetween { .. } => {
-                Err(Error::query_execution(
-                    "Cannot resolve VersionsBetween to a single timestamp"
-                ))
-            }
+            AsOfClause::Transaction(txn_id) => self.resolve_transaction(*txn_id),
+            AsOfClause::Scn(scn) => self.resolve_scn(*scn),
+            AsOfClause::VersionsBetween { .. } => Err(Error::query_execution(
+                "Cannot resolve VersionsBetween to a single timestamp",
+            )),
             AsOfClause::Commit(sha) => {
                 // AS OF COMMIT queries should be handled by git_integration::CommitTracker
                 Err(Error::query_execution(format!(
@@ -424,16 +411,12 @@ impl SnapshotManager {
 
     /// Resolve transaction ID to snapshot timestamp
     fn resolve_transaction(&self, txn_id: TransactionId) -> Result<u64> {
-        self.txn_to_timestamp
-            .read()
-            .get(&txn_id)
-            .copied()
-            .ok_or_else(|| {
-                Error::query_execution(format!(
-                    "Transaction {} not found or has been garbage collected",
-                    txn_id
-                ))
-            })
+        self.txn_to_timestamp.read().get(&txn_id).copied().ok_or_else(|| {
+            Error::query_execution(format!(
+                "Transaction {} not found or has been garbage collected",
+                txn_id
+            ))
+        })
     }
 
     /// Resolve SCN to snapshot timestamp
@@ -442,23 +425,13 @@ impl SnapshotManager {
             .read()
             .get(&scn)
             .copied()
-            .ok_or_else(|| {
-                Error::query_execution(format!(
-                    "SCN {} not found or has been garbage collected",
-                    scn
-                ))
-            })
+            .ok_or_else(|| Error::query_execution(format!("SCN {} not found or has been garbage collected", scn)))
     }
 
     /// Get current timestamp
     fn get_current_timestamp(&self) -> u64 {
         // Get the latest snapshot timestamp
-        self.snapshots
-            .read()
-            .values()
-            .map(|m| m.timestamp)
-            .max()
-            .unwrap_or(1)
+        self.snapshots.read().values().map(|m| m.timestamp).max().unwrap_or(1)
     }
 
     /// Read a versioned value at a specific snapshot (legacy - linear scan)
@@ -466,12 +439,7 @@ impl SnapshotManager {
     /// This implements the core time-travel query logic with O(N) complexity.
     /// Use read_at_snapshot_indexed() for O(log N) performance.
     #[allow(dead_code)]
-    pub fn read_at_snapshot_linear(
-        &self,
-        table_name: &str,
-        row_id: u64,
-        snapshot_ts: u64,
-    ) -> Result<Option<Vec<u8>>> {
+    pub fn read_at_snapshot_linear(&self, table_name: &str, row_id: u64, snapshot_ts: u64) -> Result<Option<Vec<u8>>> {
         // Build key prefix for all versions of this row
         let prefix = format!("v:{}:{}:", table_name, row_id);
 
@@ -481,9 +449,7 @@ impl SnapshotManager {
 
         let iter = self.db.iterator(rocksdb::IteratorMode::Start);
         for item in iter {
-            let (key, value) = item.map_err(|e| {
-                Error::storage(format!("Iterator error: {}", e))
-            })?;
+            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             // Parse key: v:{table}:{row_id}:{timestamp}
             if let Ok(key_str) = std::str::from_utf8(&key) {
@@ -515,12 +481,7 @@ impl SnapshotManager {
     /// This implements O(log N) time-travel queries using a reverse timestamp index.
     /// The reverse index uses `u64::MAX - timestamp` to enable efficient lookups.
     /// Additionally, uses an LRU cache for frequently accessed snapshots.
-    pub fn read_at_snapshot(
-        &self,
-        table_name: &str,
-        row_id: u64,
-        snapshot_ts: u64,
-    ) -> Result<Option<Vec<u8>>> {
+    pub fn read_at_snapshot(&self, table_name: &str, row_id: u64, snapshot_ts: u64) -> Result<Option<Vec<u8>>> {
         // Check cache first if enabled
         if self.cache_config.enabled {
             let cache_key = (table_name.to_string(), row_id, snapshot_ts);
@@ -545,12 +506,7 @@ impl SnapshotManager {
     /// Read a versioned value without using cache (internal method)
     ///
     /// This is the core implementation that performs the actual database lookup.
-    fn read_at_snapshot_uncached(
-        &self,
-        table_name: &str,
-        row_id: u64,
-        snapshot_ts: u64,
-    ) -> Result<Option<Vec<u8>>> {
+    fn read_at_snapshot_uncached(&self, table_name: &str, row_id: u64, snapshot_ts: u64) -> Result<Option<Vec<u8>>> {
         // Use reverse timestamp index for O(log N) lookup
         // Reverse timestamp allows us to find the latest version <= snapshot_ts
         let reverse_ts = u64::MAX - snapshot_ts;
@@ -564,7 +520,7 @@ impl SnapshotManager {
         // (which have reverse_ts >= our target reverse_ts)
         let mut iter = self.db.iterator(rocksdb::IteratorMode::From(
             seek_key.as_bytes(),
-            rocksdb::Direction::Forward
+            rocksdb::Direction::Forward,
         ));
 
         let expected_prefix = format!("v_idx:{}:{}:", table_name, row_id);
@@ -576,10 +532,11 @@ impl SnapshotManager {
                     // Decode the actual timestamp from the index value
                     if value.len() >= 8 {
                         let actual_ts = u64::from_be_bytes(
-                            value.get(0..8)
+                            value
+                                .get(0..8)
                                 .ok_or_else(|| Error::storage("Timestamp bytes too short"))?
                                 .try_into()
-                                .map_err(|e| Error::storage(format!("Invalid timestamp bytes: {}", e)))?
+                                .map_err(|e| Error::storage(format!("Invalid timestamp bytes: {}", e)))?,
                         );
 
                         // Verify this version is visible to our snapshot
@@ -599,7 +556,7 @@ impl SnapshotManager {
         let any_prefix = format!("v_idx:{}:{}:", table_name, row_id);
         let any_iter = self.db.iterator(rocksdb::IteratorMode::From(
             any_prefix.as_bytes(),
-            rocksdb::Direction::Forward
+            rocksdb::Direction::Forward,
         ));
         let has_any_versions = any_iter
             .take(1)
@@ -610,7 +567,9 @@ impl SnapshotManager {
             // No MVCC versions at all — row was written via non-versioned path.
             // Read from the data key directly (pre-MVCC data visible to all snapshots).
             let data_key = format!("data:{}:{}", table_name, row_id);
-            return self.db.get(data_key.as_bytes())
+            return self
+                .db
+                .get(data_key.as_bytes())
                 .map_err(|e| Error::storage(format!("Failed to read data key fallback: {}", e)))
                 .map(|opt| opt.map(|v| v.to_vec()));
         }
@@ -623,14 +582,10 @@ impl SnapshotManager {
     /// Get a specific version by exact timestamp
     ///
     /// Helper method used by the indexed lookup.
-    fn get_version_by_exact_timestamp(
-        &self,
-        table_name: &str,
-        row_id: u64,
-        timestamp: u64,
-    ) -> Result<Option<Vec<u8>>> {
+    fn get_version_by_exact_timestamp(&self, table_name: &str, row_id: u64, timestamp: u64) -> Result<Option<Vec<u8>>> {
         let key = format!("v:{}:{}:{}", table_name, row_id, timestamp);
-        self.db.get(key.as_bytes())
+        self.db
+            .get(key.as_bytes())
             .map_err(|e| Error::storage(format!("Failed to read version: {}", e)))
             .map(|opt| opt.map(|v| v.to_vec()))
     }
@@ -640,16 +595,11 @@ impl SnapshotManager {
     /// Called when a transaction commits to create a new historical version.
     /// Also creates a reverse timestamp index entry for efficient lookups.
     /// Invalidates cache entries for this row.
-    pub fn write_version(
-        &self,
-        table_name: &str,
-        row_id: u64,
-        timestamp: u64,
-        value: &[u8],
-    ) -> Result<()> {
+    pub fn write_version(&self, table_name: &str, row_id: u64, timestamp: u64, value: &[u8]) -> Result<()> {
         // Write the actual versioned data
         let key = format!("v:{}:{}:{}", table_name, row_id, timestamp);
-        self.db.put(key.as_bytes(), value)
+        self.db
+            .put(key.as_bytes(), value)
             .map_err(|e| Error::storage(format!("Failed to write version: {}", e)))?;
 
         // Create reverse timestamp index entry
@@ -677,7 +627,8 @@ impl SnapshotManager {
         let mut cache = self.snapshot_cache.lock();
 
         // Collect keys to remove (we can't modify while iterating)
-        let keys_to_remove: Vec<SnapshotCacheKey> = cache.iter()
+        let keys_to_remove: Vec<SnapshotCacheKey> = cache
+            .iter()
             .filter_map(|(key, _)| {
                 if key.0 == table_name && key.1 == row_id {
                     Some(key.clone())
@@ -697,42 +648,41 @@ impl SnapshotManager {
     ///
     /// Index structure: v_idx:{table}:{row_id}:{reverse_ts} -> {actual_ts}
     /// Reverse timestamp allows RocksDB to find "latest before X" efficiently.
-    fn create_reverse_timestamp_index(
-        &self,
-        table_name: &str,
-        row_id: u64,
-        timestamp: u64,
-    ) -> Result<()> {
+    fn create_reverse_timestamp_index(&self, table_name: &str, row_id: u64, timestamp: u64) -> Result<()> {
         let reverse_ts = u64::MAX - timestamp;
         let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, reverse_ts);
 
         // Store the actual timestamp as the value (8 bytes, big-endian)
         let timestamp_bytes = timestamp.to_be_bytes();
 
-        self.db.put(index_key.as_bytes(), timestamp_bytes)
+        self.db
+            .put(index_key.as_bytes(), timestamp_bytes)
             .map_err(|e| Error::storage(format!("Failed to create reverse index: {}", e)))
     }
 
     /// Persist snapshot metadata to disk
     fn persist_snapshot_metadata(&self, metadata: &SnapshotMetadata) -> Result<()> {
         let key = format!("snapshot:{}", metadata.timestamp);
-        let value = bincode::serialize(metadata)
-            .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
+        let value =
+            bincode::serialize(metadata).map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
 
-        self.db.put(key.as_bytes(), value)
+        self.db
+            .put(key.as_bytes(), value)
             .map_err(|e| Error::storage(format!("Failed to persist metadata: {}", e)))?;
 
         // Also persist mappings
         let txn_key = format!("txn_map:{}", metadata.transaction_id);
         let txn_value = bincode::serialize(&metadata.timestamp)
             .map_err(|e| Error::storage(format!("Failed to serialize txn mapping: {}", e)))?;
-        self.db.put(txn_key.as_bytes(), txn_value)
+        self.db
+            .put(txn_key.as_bytes(), txn_value)
             .map_err(|e| Error::storage(format!("Failed to persist txn mapping: {}", e)))?;
 
         let scn_key = format!("scn_map:{}", metadata.scn);
         let scn_value = bincode::serialize(&metadata.timestamp)
             .map_err(|e| Error::storage(format!("Failed to serialize scn mapping: {}", e)))?;
-        self.db.put(scn_key.as_bytes(), scn_value)
+        self.db
+            .put(scn_key.as_bytes(), scn_value)
             .map_err(|e| Error::storage(format!("Failed to persist scn mapping: {}", e)))?;
 
         Ok(())
@@ -851,16 +801,16 @@ impl SnapshotManager {
         let iter = self.db.iterator(rocksdb::IteratorMode::Start);
 
         for item in iter {
-            let (key, value) = item.map_err(|e| {
-                Error::storage(format!("Iterator error during recovery: {}", e))
-            })?;
+            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error during recovery: {}", e)))?;
 
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 if key_str.starts_with("snapshot:") {
                     if let Ok(metadata) = bincode::deserialize::<SnapshotMetadata>(&value) {
                         // Restore in-memory state
                         self.snapshots.write().insert(metadata.timestamp, metadata.clone());
-                        self.txn_to_timestamp.write().insert(metadata.transaction_id, metadata.timestamp);
+                        self.txn_to_timestamp
+                            .write()
+                            .insert(metadata.transaction_id, metadata.timestamp);
                         self.scn_to_timestamp.write().insert(metadata.scn, metadata.timestamp);
 
                         // Update counters
@@ -913,9 +863,8 @@ impl SnapshotManager {
         ));
 
         for item in iter {
-            let (key, value) = item.map_err(|e| {
-                Error::storage(format!("Iterator error during size calculation: {}", e))
-            })?;
+            let (key, value) =
+                item.map_err(|e| Error::storage(format!("Iterator error during size calculation: {}", e)))?;
 
             if let Ok(key_str) = std::str::from_utf8(&key) {
                 // Version keys: v:{table}:{row_id}:{timestamp}
@@ -963,9 +912,8 @@ impl SnapshotManager {
         ));
 
         for item in iter {
-            let (key, value) = item.map_err(|e| {
-                Error::storage(format!("Iterator error during version scan: {}", e))
-            })?;
+            let (key, value) =
+                item.map_err(|e| Error::storage(format!("Iterator error during version scan: {}", e)))?;
 
             // Stop if we've moved past this table's version keys
             if !key.starts_with(prefix.as_bytes()) {
@@ -976,10 +924,7 @@ impl SnapshotManager {
                 // Parse key: v:{table}:{row_id}:{timestamp}
                 let parts: Vec<&str> = key_str.split(':').collect();
                 if let (Some(p2), Some(p3)) = (parts.get(2), parts.get(3)) {
-                    if let (Ok(row_id), Ok(ts)) = (
-                        p2.parse::<u64>(),
-                        p3.parse::<u64>(),
-                    ) {
+                    if let (Ok(row_id), Ok(ts)) = (p2.parse::<u64>(), p3.parse::<u64>()) {
                         // Check if timestamp is within range
                         if ts >= start_ts && ts <= end_ts {
                             versions.push((row_id, ts, value.to_vec()));

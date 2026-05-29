@@ -18,12 +18,13 @@ fn test_generate_series_basic() -> Result<()> {
     assert_eq!(results.len(), 5, "generate_series(1, 5) should produce 5 rows");
 
     // Verify values are 1, 2, 3, 4, 5
-    let values: Vec<i64> = results.iter().map(|t| {
-        match &t.values[0] {
+    let values: Vec<i64> = results
+        .iter()
+        .map(|t| match &t.values[0] {
             Value::Int8(v) => *v,
             other => panic!("Expected Int8, got {:?}", other),
-        }
-    }).collect();
+        })
+        .collect();
     assert_eq!(values, vec![1, 2, 3, 4, 5]);
 
     Ok(())
@@ -37,14 +38,19 @@ fn test_generate_series_basic() -> Result<()> {
 fn test_generate_series_with_step() -> Result<()> {
     let db = create_test_db()?;
     let results = db.query("SELECT * FROM generate_series(1, 10, 2)", &[])?;
-    assert_eq!(results.len(), 5, "generate_series(1, 10, 2) should produce 5 odd numbers");
+    assert_eq!(
+        results.len(),
+        5,
+        "generate_series(1, 10, 2) should produce 5 odd numbers"
+    );
 
-    let values: Vec<i64> = results.iter().map(|t| {
-        match &t.values[0] {
+    let values: Vec<i64> = results
+        .iter()
+        .map(|t| match &t.values[0] {
             Value::Int8(v) => *v,
             other => panic!("Expected Int8, got {:?}", other),
-        }
-    }).collect();
+        })
+        .collect();
     assert_eq!(values, vec![1, 3, 5, 7, 9]);
 
     Ok(())
@@ -58,14 +64,19 @@ fn test_generate_series_with_step() -> Result<()> {
 fn test_generate_series_descending() -> Result<()> {
     let db = create_test_db()?;
     let results = db.query("SELECT * FROM generate_series(5, 1, -1)", &[])?;
-    assert_eq!(results.len(), 5, "generate_series(5, 1, -1) should produce 5 rows descending");
+    assert_eq!(
+        results.len(),
+        5,
+        "generate_series(5, 1, -1) should produce 5 rows descending"
+    );
 
-    let values: Vec<i64> = results.iter().map(|t| {
-        match &t.values[0] {
+    let values: Vec<i64> = results
+        .iter()
+        .map(|t| match &t.values[0] {
             Value::Int8(v) => *v,
             other => panic!("Expected Int8, got {:?}", other),
-        }
-    }).collect();
+        })
+        .collect();
     assert_eq!(values, vec![5, 4, 3, 2, 1]);
 
     Ok(())
@@ -97,7 +108,11 @@ fn test_generate_series_single_value() -> Result<()> {
 fn test_generate_series_empty_wrong_direction() -> Result<()> {
     let db = create_test_db()?;
     let results = db.query("SELECT * FROM generate_series(5, 1)", &[])?;
-    assert_eq!(results.len(), 0, "generate_series(5, 1) with default step=1 should produce 0 rows");
+    assert_eq!(
+        results.len(),
+        0,
+        "generate_series(5, 1) with default step=1 should produce 0 rows"
+    );
 
     Ok(())
 }
@@ -116,10 +131,7 @@ fn test_generate_series_in_cross_join() -> Result<()> {
     db.execute("INSERT INTO colors (id, name) VALUES (2, 'blue')")?;
 
     // Cross join with generate_series using explicit CROSS JOIN
-    let results = db.query(
-        "SELECT * FROM colors CROSS JOIN generate_series(1, 3) g",
-        &[],
-    )?;
+    let results = db.query("SELECT * FROM colors CROSS JOIN generate_series(1, 3) g", &[])?;
     // 2 colors x 3 series values = 6 rows
     assert_eq!(results.len(), 6, "Cross join should produce 2 * 3 = 6 rows");
 
@@ -133,18 +145,20 @@ fn test_generate_series_in_cross_join() -> Result<()> {
 #[test]
 fn test_generate_series_with_where() -> Result<()> {
     let db = create_test_db()?;
-    let results = db.query(
-        "SELECT * FROM generate_series(1, 10) WHERE generate_series > 5",
-        &[],
-    )?;
-    assert_eq!(results.len(), 5, "generate_series(1, 10) WHERE > 5 should produce 5 rows");
+    let results = db.query("SELECT * FROM generate_series(1, 10) WHERE generate_series > 5", &[])?;
+    assert_eq!(
+        results.len(),
+        5,
+        "generate_series(1, 10) WHERE > 5 should produce 5 rows"
+    );
 
-    let values: Vec<i64> = results.iter().map(|t| {
-        match &t.values[0] {
+    let values: Vec<i64> = results
+        .iter()
+        .map(|t| match &t.values[0] {
             Value::Int8(v) => *v,
             other => panic!("Expected Int8, got {:?}", other),
-        }
-    }).collect();
+        })
+        .collect();
     assert_eq!(values, vec![6, 7, 8, 9, 10]);
 
     Ok(())
@@ -157,10 +171,7 @@ fn test_generate_series_with_where() -> Result<()> {
 #[test]
 fn test_generate_series_in_subquery() -> Result<()> {
     let db = create_test_db()?;
-    let results = db.query(
-        "SELECT * FROM (SELECT * FROM generate_series(1, 5)) AS sub",
-        &[],
-    )?;
+    let results = db.query("SELECT * FROM (SELECT * FROM generate_series(1, 5)) AS sub", &[])?;
     assert_eq!(results.len(), 5, "Subquery with generate_series should produce 5 rows");
 
     Ok(())
@@ -176,12 +187,13 @@ fn test_generate_series_large_step() -> Result<()> {
     let results = db.query("SELECT * FROM generate_series(0, 100, 25)", &[])?;
     assert_eq!(results.len(), 5, "generate_series(0, 100, 25) should produce 5 rows");
 
-    let values: Vec<i64> = results.iter().map(|t| {
-        match &t.values[0] {
+    let values: Vec<i64> = results
+        .iter()
+        .map(|t| match &t.values[0] {
             Value::Int8(v) => *v,
             other => panic!("Expected Int8, got {:?}", other),
-        }
-    }).collect();
+        })
+        .collect();
     assert_eq!(values, vec![0, 25, 50, 75, 100]);
 
     Ok(())
@@ -197,12 +209,13 @@ fn test_generate_series_negative_numbers() -> Result<()> {
     let results = db.query("SELECT * FROM generate_series(-3, 3)", &[])?;
     assert_eq!(results.len(), 7, "generate_series(-3, 3) should produce 7 rows");
 
-    let values: Vec<i64> = results.iter().map(|t| {
-        match &t.values[0] {
+    let values: Vec<i64> = results
+        .iter()
+        .map(|t| match &t.values[0] {
             Value::Int8(v) => *v,
             other => panic!("Expected Int8, got {:?}", other),
-        }
-    }).collect();
+        })
+        .collect();
     assert_eq!(values, vec![-3, -2, -1, 0, 1, 2, 3]);
 
     Ok(())
@@ -218,12 +231,13 @@ fn test_generate_series_descending_step2() -> Result<()> {
     let results = db.query("SELECT * FROM generate_series(10, 1, -2)", &[])?;
     assert_eq!(results.len(), 5, "generate_series(10, 1, -2) should produce 5 rows");
 
-    let values: Vec<i64> = results.iter().map(|t| {
-        match &t.values[0] {
+    let values: Vec<i64> = results
+        .iter()
+        .map(|t| match &t.values[0] {
             Value::Int8(v) => *v,
             other => panic!("Expected Int8, got {:?}", other),
-        }
-    }).collect();
+        })
+        .collect();
     assert_eq!(values, vec![10, 8, 6, 4, 2]);
 
     Ok(())

@@ -34,23 +34,26 @@ struct SearchArgs {
     limit: usize,
 }
 
-fn default_hops() -> u32 { 2 }
-fn default_limit() -> usize { 50 }
-fn default_direction() -> String { "both".to_string() }
+fn default_hops() -> u32 {
+    2
+}
+fn default_limit() -> usize {
+    50
+}
+fn default_direction() -> String {
+    "both".to_string()
+}
 
 fn parse_direction(s: &str) -> Result<Direction, String> {
     match s.to_ascii_lowercase().as_str() {
-        "out" | "outgoing" | "->"  => Ok(Direction::Out),
-        "in"  | "incoming" | "<-"  => Ok(Direction::In),
-        "both" | "bi" | "<->"      => Ok(Direction::Both),
+        "out" | "outgoing" | "->" => Ok(Direction::Out),
+        "in" | "incoming" | "<-" => Ok(Direction::In),
+        "both" | "bi" | "<->" => Ok(Direction::Both),
         other => Err(format!("unknown direction '{other}' (expected out / in / both)")),
     }
 }
 
-fn graphrag_search_handler(
-    db: Option<&EmbeddedDatabase>,
-    args: JsonValue,
-) -> ToolOutcome {
+fn graphrag_search_handler(db: Option<&EmbeddedDatabase>, args: JsonValue) -> ToolOutcome {
     let Some(db) = db else {
         return ToolOutcome::err("helios_graphrag_search requires a database connection");
     };
@@ -152,8 +155,7 @@ mod tests {
 
     #[test]
     fn missing_db_errors() {
-        let r = try_call(None, "helios_graphrag_search", json!({ "seed_text": "x" }))
-            .expect("matched");
+        let r = try_call(None, "helios_graphrag_search", json!({ "seed_text": "x" })).expect("matched");
         assert!(r.is_error);
         assert!(r.payload["error"].as_str().unwrap().contains("requires a database"));
     }

@@ -4,12 +4,7 @@
 //! WINDOW with only ORDER BY, error on undefined window name, and window
 //! inheritance (w2 extending w1).
 
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod named_window_tests {
     use heliosdb_nano::{EmbeddedDatabase, Value};
 
@@ -43,12 +38,18 @@ mod named_window_tests {
     fn setup_employees(d: &EmbeddedDatabase) {
         d.execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept TEXT, salary INT)")
             .unwrap();
-        d.execute("INSERT INTO employees VALUES (1, 'Alice',   'Engineering', 120000)").unwrap();
-        d.execute("INSERT INTO employees VALUES (2, 'Bob',     'Engineering', 110000)").unwrap();
-        d.execute("INSERT INTO employees VALUES (3, 'Charlie', 'Engineering', 105000)").unwrap();
-        d.execute("INSERT INTO employees VALUES (4, 'Dave',    'Sales',        90000)").unwrap();
-        d.execute("INSERT INTO employees VALUES (5, 'Eve',     'Sales',        95000)").unwrap();
-        d.execute("INSERT INTO employees VALUES (6, 'Frank',   'Marketing',    80000)").unwrap();
+        d.execute("INSERT INTO employees VALUES (1, 'Alice',   'Engineering', 120000)")
+            .unwrap();
+        d.execute("INSERT INTO employees VALUES (2, 'Bob',     'Engineering', 110000)")
+            .unwrap();
+        d.execute("INSERT INTO employees VALUES (3, 'Charlie', 'Engineering', 105000)")
+            .unwrap();
+        d.execute("INSERT INTO employees VALUES (4, 'Dave',    'Sales',        90000)")
+            .unwrap();
+        d.execute("INSERT INTO employees VALUES (5, 'Eve',     'Sales',        95000)")
+            .unwrap();
+        d.execute("INSERT INTO employees VALUES (6, 'Frank',   'Marketing',    80000)")
+            .unwrap();
     }
 
     // ========================================================================
@@ -61,14 +62,16 @@ mod named_window_tests {
         setup_employees(&d);
 
         // Use WINDOW w to define the spec once, reference it from two functions
-        let rows = d.query(
-            "SELECT name, dept, \
+        let rows = d
+            .query(
+                "SELECT name, dept, \
                 ROW_NUMBER() OVER w, \
                 SUM(salary) OVER w \
              FROM employees \
              WINDOW w AS (PARTITION BY dept ORDER BY salary)",
-            &[],
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
 
         assert_eq!(rows.len(), 6);
 
@@ -105,12 +108,14 @@ mod named_window_tests {
         let d = db();
         setup_employees(&d);
 
-        let rows = d.query(
-            "SELECT name, dept, RANK() OVER w \
+        let rows = d
+            .query(
+                "SELECT name, dept, RANK() OVER w \
              FROM employees \
              WINDOW w AS (PARTITION BY dept ORDER BY salary DESC)",
-            &[],
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
 
         assert_eq!(rows.len(), 6);
 
@@ -144,15 +149,17 @@ mod named_window_tests {
 
         // Two named windows: w1 and w2 with same partition and order,
         // used by different window functions to verify both resolve correctly
-        let rows = d.query(
-            "SELECT name, dept, salary, \
+        let rows = d
+            .query(
+                "SELECT name, dept, salary, \
                 ROW_NUMBER() OVER w1, \
                 SUM(salary) OVER w2 \
              FROM employees \
              WINDOW w1 AS (PARTITION BY dept ORDER BY salary), \
                     w2 AS (PARTITION BY dept ORDER BY salary)",
-            &[],
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
 
         assert_eq!(rows.len(), 6);
 
@@ -188,14 +195,16 @@ mod named_window_tests {
 
         // w1 is a named window; the second function uses an inline OVER clause
         // Both use the same partitioning to avoid multi-partition executor issues
-        let rows = d.query(
-            "SELECT name, dept, salary, \
+        let rows = d
+            .query(
+                "SELECT name, dept, salary, \
                 ROW_NUMBER() OVER w1, \
                 RANK() OVER (PARTITION BY dept ORDER BY salary DESC) \
              FROM employees \
              WINDOW w1 AS (PARTITION BY dept ORDER BY salary ASC)",
-            &[],
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
 
         assert_eq!(rows.len(), 6);
 
@@ -207,7 +216,8 @@ mod named_window_tests {
             if dept == "Engineering" {
                 // 3 employees: rn_asc + rn_desc = 4
                 assert_eq!(
-                    rn_named + rn_inline, 4,
+                    rn_named + rn_inline,
+                    4,
                     "Engineering: named(asc) + inline(desc) rank should sum to 4"
                 );
             } else if dept == "Marketing" {
@@ -251,12 +261,14 @@ mod named_window_tests {
         let d = db();
         setup_employees(&d);
 
-        let rows = d.query(
-            "SELECT name, salary, ROW_NUMBER() OVER w \
+        let rows = d
+            .query(
+                "SELECT name, salary, ROW_NUMBER() OVER w \
              FROM employees \
              WINDOW w AS (ORDER BY salary DESC)",
-            &[],
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
 
         assert_eq!(rows.len(), 6);
 
@@ -284,19 +296,20 @@ mod named_window_tests {
         setup_employees(&d);
 
         // w1 defines PARTITION BY, w2 inherits partition and adds ORDER BY
-        let rows = d.query(
-            "SELECT name, dept, salary, ROW_NUMBER() OVER w2 \
+        let rows = d
+            .query(
+                "SELECT name, dept, salary, ROW_NUMBER() OVER w2 \
              FROM employees \
              WINDOW w1 AS (PARTITION BY dept), \
                     w2 AS (w1 ORDER BY salary)",
-            &[],
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
 
         assert_eq!(rows.len(), 6);
 
         // w2 should effectively be (PARTITION BY dept ORDER BY salary)
-        let mut dept_data: std::collections::HashMap<String, Vec<(i64, i64)>> =
-            std::collections::HashMap::new();
+        let mut dept_data: std::collections::HashMap<String, Vec<(i64, i64)>> = std::collections::HashMap::new();
         for row in &rows {
             let dept = to_string(row.get(1).unwrap());
             let salary = to_i64(row.get(2).unwrap());
@@ -327,21 +340,24 @@ mod named_window_tests {
     #[test]
     fn test_named_window_aggregate_function() {
         let d = db();
-        d.execute("CREATE TABLE scores (id INT PRIMARY KEY, team TEXT, score INT)").unwrap();
+        d.execute("CREATE TABLE scores (id INT PRIMARY KEY, team TEXT, score INT)")
+            .unwrap();
         d.execute("INSERT INTO scores VALUES (1, 'A', 10)").unwrap();
         d.execute("INSERT INTO scores VALUES (2, 'A', 20)").unwrap();
         d.execute("INSERT INTO scores VALUES (3, 'A', 30)").unwrap();
         d.execute("INSERT INTO scores VALUES (4, 'B', 5)").unwrap();
         d.execute("INSERT INTO scores VALUES (5, 'B', 15)").unwrap();
 
-        let rows = d.query(
-            "SELECT team, score, \
+        let rows = d
+            .query(
+                "SELECT team, score, \
                 SUM(score) OVER w, \
                 COUNT(score) OVER w \
              FROM scores \
              WINDOW w AS (PARTITION BY team ORDER BY score)",
-            &[],
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
 
         assert_eq!(rows.len(), 5);
 

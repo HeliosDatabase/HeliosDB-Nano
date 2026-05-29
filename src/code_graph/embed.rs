@@ -132,7 +132,9 @@ mod fastembed_impl {
             let opts = fastembed::InitOptions::new(model);
             let inner = fastembed::TextEmbedding::try_new(opts)
                 .map_err(|e| Error::query_execution(format!("fastembed init: {e}")))?;
-            Ok(Self { inner: Mutex::new(inner) })
+            Ok(Self {
+                inner: Mutex::new(inner),
+            })
         }
     }
 

@@ -7,10 +7,10 @@
 // This test file is temporarily disabled pending implementation of visual explain features
 #![cfg(feature = "visual_explain_not_implemented")]
 
-use std::sync::Arc;
 use std::collections::HashMap;
-use std::time::Duration;
+use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 #[test]
 fn test_placeholder() {

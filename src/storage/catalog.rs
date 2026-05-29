@@ -2,11 +2,11 @@
 //!
 //! Handles table schemas, row IDs, and metadata storage in RocksDB.
 
-use crate::{Schema, Result, Error};
-use super::StorageEngine;
 use super::compression::{CompressionConfig, CompressionStats};
 use super::statistics::TableStatistics;
-use crate::sql::{TriggerPersistence, TriggerDefinition};
+use super::StorageEngine;
+use crate::sql::{TriggerDefinition, TriggerPersistence};
+use crate::{Error, Result, Schema};
 
 /// Catalog manager for table metadata
 pub struct Catalog<'a> {
@@ -28,10 +28,7 @@ impl<'a> Catalog<'a> {
     pub fn create_table(&self, table_name: &str, schema: Schema) -> Result<()> {
         // Check if table already exists
         if self.table_exists(table_name)? {
-            return Err(Error::query_execution(format!(
-                "Table '{}' already exists",
-                table_name
-            )));
+            return Err(Error::query_execution(format!("Table '{}' already exists", table_name)));
         }
 
         // Log CreateTable to WAL first (for replication to standbys)
@@ -41,8 +38,8 @@ impl<'a> Catalog<'a> {
 
         // Store schema
         let key = Self::table_metadata_key(table_name);
-        let value = bincode::serialize(&schema)
-            .map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
+        let value =
+            bincode::serialize(&schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
 
         self.storage.put(&key, &value)?;
 
@@ -51,15 +48,16 @@ impl<'a> Catalog<'a> {
 
         // Initialize row counter to 0
         let counter_key = Self::table_counter_key(table_name);
-        let counter_value = bincode::serialize(&0u64)
-            .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
+        let counter_value =
+            bincode::serialize(&0u64).map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
         self.storage.put(&counter_key, &counter_value)?;
 
         // Auto-create ART indexes for PRIMARY KEY and UNIQUE constraints
         let art_manager = self.storage.art_indexes();
 
         // Collect PRIMARY KEY columns
-        let pk_columns: Vec<String> = schema.columns
+        let pk_columns: Vec<String> = schema
+            .columns
             .iter()
             .filter(|c| c.primary_key)
             .map(|c| c.name.clone())
@@ -69,7 +67,11 @@ impl<'a> Catalog<'a> {
             if let Err(e) = art_manager.create_pk_index(table_name, &pk_columns) {
                 tracing::warn!("Failed to create PK ART index for table '{}': {}", table_name, e);
             } else {
-                tracing::debug!("Created PK ART index for table '{}' on columns {:?}", table_name, pk_columns);
+                tracing::debug!(
+                    "Created PK ART index for table '{}' on columns {:?}",
+                    table_name,
+                    pk_columns
+                );
             }
         }
 
@@ -78,11 +80,18 @@ impl<'a> Catalog<'a> {
             if col.unique && !col.primary_key {
                 let unique_columns = vec![col.name.clone()];
                 if let Err(e) = art_manager.create_unique_index(table_name, &unique_columns, Some(&col.name)) {
-                    tracing::warn!("Failed to create UNIQUE ART index for table '{}' column '{}': {}",
-                        table_name, col.name, e);
+                    tracing::warn!(
+                        "Failed to create UNIQUE ART index for table '{}' column '{}': {}",
+                        table_name,
+                        col.name,
+                        e
+                    );
                 } else {
-                    tracing::debug!("Created UNIQUE ART index for table '{}' on column '{}'",
-                        table_name, col.name);
+                    tracing::debug!(
+                        "Created UNIQUE ART index for table '{}' on column '{}'",
+                        table_name,
+                        col.name
+                    );
                 }
             }
         }
@@ -125,10 +134,7 @@ impl<'a> Catalog<'a> {
                     self.storage.cache_schema(table_name, mv_metadata.schema.clone());
                     Ok(mv_metadata.schema)
                 } else {
-                    Err(Error::query_execution(format!(
-                        "Table '{}' does not exist",
-                        table_name
-                    )))
+                    Err(Error::query_execution(format!("Table '{}' does not exist", table_name)))
                 }
             }
         }
@@ -142,16 +148,13 @@ impl<'a> Catalog<'a> {
     pub fn update_table_schema(&self, table_name: &str, schema: &Schema) -> Result<()> {
         // Verify table exists
         if !self.table_exists(table_name)? {
-            return Err(Error::query_execution(format!(
-                "Table '{}' does not exist",
-                table_name
-            )));
+            return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
         }
 
         // Store updated schema
         let key = Self::table_metadata_key(table_name);
-        let value = bincode::serialize(schema)
-            .map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
+        let value =
+            bincode::serialize(schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
 
         self.storage.put(&key, &value)?;
 
@@ -164,10 +167,7 @@ impl<'a> Catalog<'a> {
     /// Drop a table
     pub fn drop_table(&self, table_name: &str) -> Result<()> {
         if !self.table_exists(table_name)? {
-            return Err(Error::query_execution(format!(
-                "Table '{}' does not exist",
-                table_name
-            )));
+            return Err(Error::query_execution(format!("Table '{}' does not exist", table_name)));
         }
 
         // Log DropTable to WAL first (for replication to standbys)
@@ -193,7 +193,9 @@ impl<'a> Catalog<'a> {
             batch.delete(Self::table_counter_key(table_name));
             batch.delete(Self::compression_config_key(table_name));
             batch.delete(Self::compression_stats_key(table_name));
-            self.storage.db.write(batch)
+            self.storage
+                .db
+                .write(batch)
                 .map_err(|e| crate::Error::storage(format!("Batch delete failed: {}", e)))?;
         }
 
@@ -332,14 +334,17 @@ impl<'a> Catalog<'a> {
                 Err(e) => {
                     tracing::warn!(
                         "Index rebuild: skipping table {} — schema load failed: {}",
-                        table_name, e
+                        table_name,
+                        e
                     );
                     continue;
                 }
             };
 
             // (Re)register the PK index structure if the table has one.
-            let pk_columns: Vec<String> = schema.columns.iter()
+            let pk_columns: Vec<String> = schema
+                .columns
+                .iter()
                 .filter(|c| c.primary_key)
                 .map(|c| c.name.clone())
                 .collect();
@@ -347,10 +352,7 @@ impl<'a> Catalog<'a> {
                 if let Err(e) = art_manager.create_pk_index(&table_name, &pk_columns) {
                     // IndexAlreadyExists is expected if create_table ran in
                     // the same process; log at debug, continue.
-                    tracing::debug!(
-                        "Index rebuild: PK index for {} already registered: {}",
-                        table_name, e
-                    );
+                    tracing::debug!("Index rebuild: PK index for {} already registered: {}", table_name, e);
                 }
             }
 
@@ -358,12 +360,12 @@ impl<'a> Catalog<'a> {
             for col in &schema.columns {
                 if col.unique && !col.primary_key {
                     let cols = vec![col.name.clone()];
-                    if let Err(e) = art_manager.create_unique_index(
-                        &table_name, &cols, Some(&col.name),
-                    ) {
+                    if let Err(e) = art_manager.create_unique_index(&table_name, &cols, Some(&col.name)) {
                         tracing::debug!(
                             "Index rebuild: UNIQUE index for {}.{} already registered: {}",
-                            table_name, col.name, e
+                            table_name,
+                            col.name,
+                            e
                         );
                     }
                 }
@@ -379,10 +381,7 @@ impl<'a> Catalog<'a> {
                         &fk.references_columns,
                         Some(&fk.name),
                     ) {
-                        tracing::debug!(
-                            "Index rebuild: FK index {} already registered: {}",
-                            fk.name, e
-                        );
+                        tracing::debug!("Index rebuild: FK index {} already registered: {}", fk.name, e);
                     }
                 }
             }
@@ -392,10 +391,7 @@ impl<'a> Catalog<'a> {
             let tuples = match self.storage.scan_table_with_schema(&table_name, &schema) {
                 Ok(t) => t,
                 Err(e) => {
-                    tracing::warn!(
-                        "Index rebuild: scan failed for table {}: {}",
-                        table_name, e
-                    );
+                    tracing::warn!("Index rebuild: scan failed for table {}: {}", table_name, e);
                     continue;
                 }
             };
@@ -414,7 +410,9 @@ impl<'a> Catalog<'a> {
                 if let Err(e) = art_manager.on_insert(&table_name, row_id, &col_values) {
                     tracing::debug!(
                         "Index rebuild: on_insert skipped for {} row {}: {}",
-                        table_name, row_id, e
+                        table_name,
+                        row_id,
+                        e
                     );
                 }
                 total_rows += 1;
@@ -439,18 +437,12 @@ impl<'a> Catalog<'a> {
     pub fn rename_table(&self, old_name: &str, new_name: &str) -> Result<()> {
         // Check that old table exists
         if !self.table_exists(old_name)? {
-            return Err(Error::query_execution(format!(
-                "Table '{}' does not exist",
-                old_name
-            )));
+            return Err(Error::query_execution(format!("Table '{}' does not exist", old_name)));
         }
 
         // Check that new table name is not already in use
         if self.table_exists(new_name)? {
-            return Err(Error::query_execution(format!(
-                "Table '{}' already exists",
-                new_name
-            )));
+            return Err(Error::query_execution(format!("Table '{}' already exists", new_name)));
         }
 
         // Get the schema from old table
@@ -462,8 +454,7 @@ impl<'a> Catalog<'a> {
             Some(data) => data,
             None => {
                 // Default to 0 if counter doesn't exist
-                bincode::serialize(&0u64)
-                    .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?
+                bincode::serialize(&0u64).map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?
             }
         };
 
@@ -475,8 +466,8 @@ impl<'a> Catalog<'a> {
 
         // Create new table metadata with the same schema
         let new_metadata_key = Self::table_metadata_key(new_name);
-        let schema_bytes = bincode::serialize(&schema)
-            .map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
+        let schema_bytes =
+            bincode::serialize(&schema).map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
         self.storage.put(&new_metadata_key, &schema_bytes)?;
 
         // Create new counter
@@ -498,22 +489,25 @@ impl<'a> Catalog<'a> {
         let old_prefix_bytes = old_data_prefix.as_bytes();
         let new_data_prefix = format!("data:{}:", new_name);
 
-        // Collect all old keys and their values
+        // Collect all old keys and their values. Seek to the table's data
+        // prefix instead of scanning from the start of the keyspace.
         let mut rows_to_move = Vec::new();
-        let iter = self.storage.db.iterator(rocksdb::IteratorMode::Start);
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(old_prefix_bytes, rocksdb::Direction::Forward),
+            read_opts,
+        );
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
-            if key.starts_with(old_prefix_bytes) {
-                // Extract row_id from old key: data:{old_name}:{row_id}
-                let key_str = String::from_utf8_lossy(&key);
-                if let Some(row_id_str) = key_str.strip_prefix(&old_data_prefix) {
-                    rows_to_move.push((row_id_str.to_string(), value.to_vec()));
-                }
-            } else if let (Some(&k0), Some(&p0)) = (key.first(), old_prefix_bytes.first()) {
-                if k0 > p0 {
-                    break;
-                }
+            if !key.starts_with(old_prefix_bytes) {
+                break;
+            }
+            // Extract row_id from old key: data:{old_name}:{row_id}
+            let key_str = String::from_utf8_lossy(&key);
+            if let Some(row_id_str) = key_str.strip_prefix(&old_data_prefix) {
+                rows_to_move.push((row_id_str.to_string(), value.to_vec()));
             }
         }
 
@@ -534,7 +528,12 @@ impl<'a> Catalog<'a> {
         // Rename ART indexes
         let art_manager = self.storage.art_indexes();
         if let Err(e) = art_manager.rename_table_indexes(old_name, new_name) {
-            tracing::warn!("Failed to rename ART indexes from '{}' to '{}': {}", old_name, new_name, e);
+            tracing::warn!(
+                "Failed to rename ART indexes from '{}' to '{}': {}",
+                old_name,
+                new_name,
+                e
+            );
         }
 
         // Delete old table metadata
@@ -583,8 +582,7 @@ impl<'a> Catalog<'a> {
     /// `enum_type_exists` first.
     pub fn register_enum_type(&self, name: &str, labels: &[String]) -> Result<()> {
         let key = Self::enum_type_key(name);
-        let value = bincode::serialize(labels)
-            .map_err(|e| Error::query_execution(format!("enum serialize: {e}")))?;
+        let value = bincode::serialize(labels).map_err(|e| Error::query_execution(format!("enum serialize: {e}")))?;
         self.storage.put(&key, &value)
     }
 
@@ -641,8 +639,8 @@ impl<'a> Catalog<'a> {
             self.storage.delete(&key)?;
             return Ok(());
         }
-        let value = bincode::serialize(columns)
-            .map_err(|e| Error::query_execution(format!("identity serialize: {e}")))?;
+        let value =
+            bincode::serialize(columns).map_err(|e| Error::query_execution(format!("identity serialize: {e}")))?;
         self.storage.put(&key, &value)
     }
 
@@ -651,8 +649,9 @@ impl<'a> Catalog<'a> {
     pub fn list_identity_columns(&self, table_name: &str) -> Result<Vec<String>> {
         let key = Self::identity_key(table_name);
         match self.storage.get(&key)? {
-            Some(bytes) => bincode::deserialize(&bytes)
-                .map_err(|e| Error::query_execution(format!("identity deserialize: {e}"))),
+            Some(bytes) => {
+                bincode::deserialize(&bytes).map_err(|e| Error::query_execution(format!("identity deserialize: {e}")))
+            }
             None => Ok(Vec::new()),
         }
     }
@@ -830,17 +829,18 @@ impl<'a> Catalog<'a> {
         let prefix = b"trigger:";
         let mut triggers = Vec::new();
 
-        let iter = self.storage.db.iterator(rocksdb::IteratorMode::Start);
+        // Seek to the `trigger:` prefix instead of scanning from keyspace start.
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix.as_slice(), rocksdb::Direction::Forward),
+            read_opts,
+        );
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(prefix) {
-                if let (Some(&k0), Some(&p0)) = (key.first(), prefix.first()) {
-                    if k0 > p0 {
-                        break;
-                    }
-                }
-                continue;
+                break;
             }
 
             // Deserialize trigger definition
@@ -858,17 +858,20 @@ impl<'a> Catalog<'a> {
         let prefix_bytes = prefix.as_bytes();
         let mut keys_to_delete = Vec::new();
 
-        let iter = self.storage.db.iterator(rocksdb::IteratorMode::Start);
+        // Seek to the `trigger:{table}:` prefix instead of scanning from start.
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
+            read_opts,
+        );
         for item in iter {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
-            if key.starts_with(prefix_bytes) {
-                keys_to_delete.push(key.to_vec());
-            } else if let (Some(&k0), Some(&p0)) = (key.first(), prefix_bytes.first()) {
-                if k0 > p0 {
-                    break;
-                }
+            if !key.starts_with(prefix_bytes) {
+                break;
             }
+            keys_to_delete.push(key.to_vec());
         }
 
         let count = keys_to_delete.len();
@@ -903,10 +906,8 @@ impl<'a> Catalog<'a> {
     pub fn load_table_constraints(&self, table_name: &str) -> Result<crate::sql::TableConstraints> {
         let key = Self::table_constraints_key(table_name);
         match self.storage.get(&key)? {
-            Some(data) => {
-                bincode::deserialize(&data)
-                    .map_err(|e| Error::storage(format!("Failed to deserialize table constraints: {}", e)))
-            }
+            Some(data) => bincode::deserialize(&data)
+                .map_err(|e| Error::storage(format!("Failed to deserialize table constraints: {}", e))),
             None => Ok(crate::sql::TableConstraints::default()),
         }
     }
@@ -928,8 +929,11 @@ impl<'a> Catalog<'a> {
         ) {
             tracing::warn!("Failed to create FK ART index for constraint '{}': {}", fk.name, e);
         } else {
-            tracing::debug!("Created FK ART index for constraint '{}' on table '{}'",
-                fk.name, fk.table_name);
+            tracing::debug!(
+                "Created FK ART index for constraint '{}' on table '{}'",
+                fk.name,
+                fk.table_name
+            );
         }
 
         Ok(())
@@ -940,17 +944,24 @@ impl<'a> Catalog<'a> {
         let mut result = Vec::new();
         let prefix = b"table_constraints:";
 
-        let iter = self.storage.db.iterator(rocksdb::IteratorMode::Start);
+        // Seek directly to the `table_constraints:` prefix instead of iterating
+        // from the start of the keyspace. With `IteratorMode::Start` this walked
+        // every `data:` row key (which sort before `table_constraints:`), making
+        // every reverse-FK lookup -- and therefore every DELETE -- O(table rows).
+        // `total_order_seek` is required because the DB uses a 5-byte prefix extractor.
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            read_opts,
+        );
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(prefix) {
-                if let (Some(&k0), Some(&p0)) = (key.first(), prefix.first()) {
-                    if k0 > p0 {
-                        break;
-                    }
-                }
-                continue;
+                // We seeked to `table_constraints:`; the first key that no longer
+                // shares the prefix means the whole group has been read.
+                break;
             }
 
             let constraints: crate::sql::TableConstraints = bincode::deserialize(&value)
@@ -980,13 +991,15 @@ impl<'a> Catalog<'a> {
         let initial_check_len = constraints.check_constraints.len();
 
         // Find FK constraint to drop its ART index
-        let fk_to_drop = constraints.foreign_keys
+        let fk_to_drop = constraints
+            .foreign_keys
             .iter()
             .find(|fk| fk.name == constraint_name)
             .cloned();
 
         // Find unique constraint to drop its ART index
-        let unique_to_drop = constraints.unique_constraints
+        let unique_to_drop = constraints
+            .unique_constraints
             .iter()
             .find(|u| u.name == constraint_name)
             .cloned();
@@ -995,7 +1008,8 @@ impl<'a> Catalog<'a> {
         constraints.check_constraints.retain(|c| c.name != constraint_name);
         constraints.unique_constraints.retain(|u| u.name != constraint_name);
 
-        let final_len = constraints.foreign_keys.len() + constraints.check_constraints.len() + constraints.unique_constraints.len();
+        let final_len =
+            constraints.foreign_keys.len() + constraints.check_constraints.len() + constraints.unique_constraints.len();
         let initial_len = initial_fk_len + initial_check_len + initial_unique_len;
 
         if initial_len != final_len {
@@ -1050,13 +1064,12 @@ impl TriggerPersistence for Catalog<'_> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::{Column, DataType, Config};
+    use crate::{Column, Config, DataType};
 
     #[test]
     fn test_create_table() {
         let config = Config::in_memory();
-        let storage = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let storage = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
         let catalog = Catalog::new(&storage);
 
         let schema = Schema::new(vec![
@@ -1084,32 +1097,27 @@ mod tests {
             },
         ]);
 
-        catalog.create_table("users", schema.clone())
+        catalog
+            .create_table("users", schema.clone())
             .expect("Failed to create table");
 
         // Verify table exists
-        assert!(catalog.table_exists("users")
-            .expect("Failed to check if table exists"));
+        assert!(catalog.table_exists("users").expect("Failed to check if table exists"));
 
         // Verify schema
-        let retrieved_schema = catalog.get_table_schema("users")
-            .expect("Failed to get table schema");
+        let retrieved_schema = catalog.get_table_schema("users").expect("Failed to get table schema");
         assert_eq!(retrieved_schema, schema);
     }
 
     #[test]
     fn test_next_row_id() {
         let config = Config::in_memory();
-        let storage = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let storage = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
         let catalog = Catalog::new(&storage);
 
-        let schema = Schema::new(vec![
-            Column::new("id", DataType::Int4),
-        ]);
+        let schema = Schema::new(vec![Column::new("id", DataType::Int4)]);
 
-        catalog.create_table("test", schema)
-            .expect("Failed to create table");
+        catalog.create_table("test", schema).expect("Failed to create table");
 
         // Get sequential row IDs
         assert_eq!(catalog.next_row_id("test").expect("Failed to get row ID 1"), 1);
@@ -1120,30 +1128,24 @@ mod tests {
     #[test]
     fn test_drop_table() {
         let config = Config::in_memory();
-        let storage = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let storage = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
         let catalog = Catalog::new(&storage);
 
-        let schema = Schema::new(vec![
-            Column::new("id", DataType::Int4),
-        ]);
+        let schema = Schema::new(vec![Column::new("id", DataType::Int4)]);
 
-        catalog.create_table("temp", schema)
-            .expect("Failed to create table");
-        assert!(catalog.table_exists("temp")
-            .expect("Failed to check if table exists"));
+        catalog.create_table("temp", schema).expect("Failed to create table");
+        assert!(catalog.table_exists("temp").expect("Failed to check if table exists"));
 
-        catalog.drop_table("temp")
-            .expect("Failed to drop table");
-        assert!(!catalog.table_exists("temp")
+        catalog.drop_table("temp").expect("Failed to drop table");
+        assert!(!catalog
+            .table_exists("temp")
             .expect("Failed to check if table exists after drop"));
     }
 
     #[test]
     fn test_drop_table_deletes_data_rows() {
         let config = Config::in_memory();
-        let storage = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open in-memory storage");
+        let storage = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
         let catalog = Catalog::new(&storage);
 
         let schema = Schema::new(vec![
@@ -1152,37 +1154,25 @@ mod tests {
         ]);
 
         // Create table and insert some data
-        catalog.create_table("users", schema)
-            .expect("Failed to create table");
+        catalog.create_table("users", schema).expect("Failed to create table");
 
         // Insert test data rows using the storage engine
         use crate::Value;
-        let tuple1 = crate::Tuple::new(vec![
-            Value::Int4(1),
-            Value::String("Alice".to_string()),
-        ]);
-        let tuple2 = crate::Tuple::new(vec![
-            Value::Int4(2),
-            Value::String("Bob".to_string()),
-        ]);
+        let tuple1 = crate::Tuple::new(vec![Value::Int4(1), Value::String("Alice".to_string())]);
+        let tuple2 = crate::Tuple::new(vec![Value::Int4(2), Value::String("Bob".to_string())]);
 
-        storage.insert_tuple("users", tuple1)
-            .expect("Failed to insert tuple 1");
-        storage.insert_tuple("users", tuple2)
-            .expect("Failed to insert tuple 2");
+        storage.insert_tuple("users", tuple1).expect("Failed to insert tuple 1");
+        storage.insert_tuple("users", tuple2).expect("Failed to insert tuple 2");
 
         // Verify data exists before drop
-        let data_before = storage.scan_table("users")
-            .expect("Failed to scan table before drop");
+        let data_before = storage.scan_table("users").expect("Failed to scan table before drop");
         assert_eq!(data_before.len(), 2, "Should have 2 rows before drop");
 
         // Drop the table
-        catalog.drop_table("users")
-            .expect("Failed to drop table");
+        catalog.drop_table("users").expect("Failed to drop table");
 
         // Verify metadata is gone
-        assert!(!catalog.table_exists("users")
-            .expect("Failed to check if table exists"));
+        assert!(!catalog.table_exists("users").expect("Failed to check if table exists"));
 
         // Verify data rows are actually deleted by checking the raw database
         let data_prefix = b"data:users:";
@@ -1197,7 +1187,8 @@ mod tests {
         }
 
         assert_eq!(
-            orphaned_keys.len(), 0,
+            orphaned_keys.len(),
+            0,
             "Should have no orphaned data rows, found: {:?}",
             orphaned_keys
         );

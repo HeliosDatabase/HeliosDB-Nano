@@ -41,7 +41,10 @@ fn columns_and_param_binding() {
 
     // Aggregate keeps its alias as the column name.
     let (rows, cols) = db
-        .query_params_with_columns("SELECT COUNT(*) AS n FROM t WHERE name = $1", &[Value::String("a".into())])
+        .query_params_with_columns(
+            "SELECT COUNT(*) AS n FROM t WHERE name = $1",
+            &[Value::String("a".into())],
+        )
         .unwrap();
     assert_eq!(cols, vec!["n".to_string()]);
     assert_eq!(as_i64(&rows[0].values[0]), 2);

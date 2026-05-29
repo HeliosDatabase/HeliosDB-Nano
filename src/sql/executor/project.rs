@@ -2,8 +2,8 @@
 //!
 //! This module provides operators for SELECT column projection and LIMIT/OFFSET.
 
-use crate::{Result, Tuple, Schema};
 use super::{PhysicalOperator, TimeoutContext};
+use crate::{Result, Schema, Tuple};
 use std::sync::Arc;
 
 /// Project operator
@@ -46,12 +46,12 @@ impl ProjectOperator {
 
         // Build output schema with type inference
         use crate::sql::TypeInference;
-        let columns = aliases.iter()
+        let columns = aliases
+            .iter()
             .zip(exprs.iter())
             .map(|(alias, expr)| {
                 // Infer type from expression, fallback to Text if inference fails
-                let data_type = expr.infer_type(&input_schema)
-                    .unwrap_or(crate::DataType::Text);
+                let data_type = expr.infer_type(&input_schema).unwrap_or(crate::DataType::Text);
 
                 crate::Column {
                     name: alias.clone(),
@@ -98,7 +98,9 @@ impl PhysicalOperator for ProjectOperator {
                 None => return Ok(None),
                 Some(tuple) => {
                     // Evaluate each expression to produce output values
-                    let output_values: Result<Vec<crate::Value>> = self.exprs.iter()
+                    let output_values: Result<Vec<crate::Value>> = self
+                        .exprs
+                        .iter()
                         .map(|expr| self.evaluator.evaluate(expr, &tuple))
                         .collect();
 
@@ -109,13 +111,13 @@ impl PhysicalOperator for ProjectOperator {
                     // Handle DISTINCT ON (PostgreSQL extension)
                     // Only return the first row for each unique combination of DISTINCT ON expressions
                     if let Some(ref distinct_on_exprs) = self.distinct_on_exprs {
-                        let key_values: Result<Vec<crate::Value>> = distinct_on_exprs.iter()
+                        let key_values: Result<Vec<crate::Value>> = distinct_on_exprs
+                            .iter()
                             .map(|expr| self.evaluator.evaluate(expr, &tuple))
                             .collect();
-                        let key = bincode::serialize(&key_values?)
-                            .map_err(|e| crate::Error::query_execution(
-                                format!("Failed to serialize DISTINCT ON key: {}", e)
-                            ))?;
+                        let key = bincode::serialize(&key_values?).map_err(|e| {
+                            crate::Error::query_execution(format!("Failed to serialize DISTINCT ON key: {}", e))
+                        })?;
 
                         if self.seen.contains(&key) {
                             // Skip rows with duplicate DISTINCT ON values
@@ -125,10 +127,9 @@ impl PhysicalOperator for ProjectOperator {
                     } else if self.distinct {
                         // Regular DISTINCT - check for duplicates using full tuple values
                         // Serialize only the values for deduplication (not row_id or branch_id)
-                        let serialized = bincode::serialize(&output_tuple.values)
-                            .map_err(|e| crate::Error::query_execution(
-                                format!("Failed to serialize tuple for DISTINCT: {}", e)
-                            ))?;
+                        let serialized = bincode::serialize(&output_tuple.values).map_err(|e| {
+                            crate::Error::query_execution(format!("Failed to serialize tuple for DISTINCT: {}", e))
+                        })?;
 
                         // Check if we've seen this tuple before
                         if self.seen.contains(&serialized) {
@@ -217,9 +218,9 @@ impl PhysicalOperator for LimitOperator {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::sql::executor::ScanOperator;
     use crate::Column;
     use crate::DataType;
-    use crate::sql::executor::ScanOperator;
 
     #[test]
     fn test_limit_operator() {
@@ -232,9 +233,9 @@ mod tests {
                 primary_key: true,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             }],
         });
 

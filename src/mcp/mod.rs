@@ -19,39 +19,36 @@
 //! matching the warmth semantics of the earlier `mcp_extensions`
 //! module.
 
-pub mod protocol;
-pub mod tools;
-pub mod resources;
-pub mod rpc;
-pub mod server;
-pub mod axum_routes;
-pub mod auto_register;
 pub mod auth;
-pub mod progress;
-pub mod result_cache;
-pub mod session;
-pub mod streaming;
-pub mod unix_socket;
-#[cfg(feature = "code-graph")]
-pub mod lsp_tools;
+pub mod auto_register;
+pub mod axum_routes;
 #[cfg(feature = "graph-rag")]
 pub mod graphrag_tools;
+#[cfg(feature = "code-graph")]
+pub mod lsp_tools;
+pub mod progress;
+pub mod protocol;
+pub mod resources;
+pub mod result_cache;
+pub mod rpc;
+pub mod server;
+pub mod session;
+pub mod streaming;
+pub mod tools;
+pub mod unix_socket;
 
+pub use auth::{bind_safety_check, AuthError, McpAuth, Scope};
+pub use axum_routes::{attach as attach_mcp_routes, mcp_router, McpState};
+pub use progress::{emit as emit_progress, ChannelProgressSink, NoopProgressSink, ProgressEvent, ProgressSink};
 pub use protocol::{
-    Capabilities, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse,
-    Prompt, PromptArgument, PromptContent, PromptMessage, PromptsCapability, Resource,
-    ResourceContent, ResourceReference, ResourcesCapability, ServerInfo, Tool, ToolContent,
-    ToolResult, ToolsCapability, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST,
+    Capabilities, InitializeResult, JsonRpcError, JsonRpcRequest, JsonRpcResponse, Prompt, PromptArgument,
+    PromptContent, PromptMessage, PromptsCapability, Resource, ResourceContent, ResourceReference, ResourcesCapability,
+    ServerInfo, Tool, ToolContent, ToolResult, ToolsCapability, INTERNAL_ERROR, INVALID_PARAMS, INVALID_REQUEST,
     METHOD_NOT_FOUND, PARSE_ERROR,
 };
 pub use resources::{list_resources, read_resource, ResourcePayload};
 pub use rpc::{handle_rpc, handle_rpc_with_db, RpcError, RpcRequest, RpcResponse};
 pub use server::McpServer;
-pub use tools::{call_tool, list_tools, ToolDescriptor, ToolOutcome, BM25_INDEXES, GRAPH_STORE};
-pub use axum_routes::{attach as attach_mcp_routes, mcp_router, McpState};
-pub use auth::{bind_safety_check, AuthError, McpAuth, Scope};
-pub use progress::{
-    emit as emit_progress, ChannelProgressSink, NoopProgressSink, ProgressEvent, ProgressSink,
-};
 pub use streaming::call_tool_streaming;
+pub use tools::{call_tool, list_tools, ToolDescriptor, ToolOutcome, BM25_INDEXES, GRAPH_STORE};
 pub use unix_socket::UnixSocketServer;

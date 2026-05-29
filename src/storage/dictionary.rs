@@ -19,10 +19,10 @@
 //! );
 //! ```
 
-use std::collections::HashMap;
-use serde::{Deserialize, Serialize};
 use parking_lot::RwLock;
 use rocksdb::DB;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 use crate::{Error, Result};
 
@@ -127,11 +127,12 @@ impl DictionaryManager {
     /// Load a dictionary from RocksDB
     fn load_dict(db: &DB, table: &str, column: &str) -> Result<ColumnDictionary> {
         let key = Self::dict_key(table, column);
-        match db.get(&key).map_err(|e| Error::storage(format!("Failed to load dictionary: {}", e)))? {
-            Some(data) => {
-                bincode::deserialize(&data)
-                    .map_err(|e| Error::storage(format!("Failed to deserialize dictionary: {}", e)))
-            }
+        match db
+            .get(&key)
+            .map_err(|e| Error::storage(format!("Failed to load dictionary: {}", e)))?
+        {
+            Some(data) => bincode::deserialize(&data)
+                .map_err(|e| Error::storage(format!("Failed to deserialize dictionary: {}", e))),
             None => Ok(ColumnDictionary::new()),
         }
     }
@@ -139,8 +140,8 @@ impl DictionaryManager {
     /// Save a dictionary to RocksDB
     fn save_dict(db: &DB, table: &str, column: &str, dict: &ColumnDictionary) -> Result<()> {
         let key = Self::dict_key(table, column);
-        let data = bincode::serialize(dict)
-            .map_err(|e| Error::storage(format!("Failed to serialize dictionary: {}", e)))?;
+        let data =
+            bincode::serialize(dict).map_err(|e| Error::storage(format!("Failed to serialize dictionary: {}", e)))?;
         db.put(&key, &data)
             .map_err(|e| Error::storage(format!("Failed to save dictionary: {}", e)))?;
         Ok(())
@@ -179,7 +180,8 @@ impl DictionaryManager {
         }
 
         // Get mutable reference to entry
-        let entry = cache.get_mut(&cache_key)
+        let entry = cache
+            .get_mut(&cache_key)
             .ok_or_else(|| Error::storage("Dictionary cache entry missing"))?;
 
         // Encode the value (may insert new entry)
@@ -227,14 +229,15 @@ impl DictionaryManager {
         }
 
         // Decode the value
-        let entry = cache.get(&cache_key)
+        let entry = cache
+            .get(&cache_key)
             .ok_or_else(|| Error::storage("Dictionary cache entry missing"))?;
 
-        entry.dict.decode(dict_id)
+        entry
+            .dict
+            .decode(dict_id)
             .map(|s| s.to_string())
-            .ok_or_else(|| Error::storage(format!(
-                "Invalid dict_id {} for {}.{}", dict_id, table, column
-            )))
+            .ok_or_else(|| Error::storage(format!("Invalid dict_id {} for {}.{}", dict_id, table, column)))
     }
 
     /// Flush all dirty dictionaries to RocksDB

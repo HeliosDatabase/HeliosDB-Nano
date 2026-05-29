@@ -3,10 +3,10 @@
 //! This module provides a trait-based adapter that bridges HeliosDB Full's
 //! QueryExecutor interface to HeliosDB Lite's SQL executor.
 
-use crate::{Error, Result, StorageEngine, Tuple};
 use crate::sql::{Executor, LogicalPlan, Parser, Planner};
-use std::sync::Arc;
+use crate::{Error, Result, StorageEngine, Tuple};
 use parking_lot::RwLock;
+use std::sync::Arc;
 
 /// Query result set
 ///
@@ -65,11 +65,7 @@ pub struct PreparedStatement {
 impl PreparedStatement {
     /// Create a new prepared statement
     pub fn new(sql: String, plan: LogicalPlan, param_count: usize) -> Self {
-        Self {
-            sql,
-            plan,
-            param_count,
-        }
+        Self { sql, plan, param_count }
     }
 
     /// Get the SQL text
@@ -122,11 +118,7 @@ pub trait QueryExecutorAdapter: Send + Sync {
     /// # Returns
     /// * `Ok(result)` with query results
     /// * `Err(error)` if an error occurs
-    fn execute_prepared(
-        &self,
-        statement: &PreparedStatement,
-        params: &[Vec<u8>],
-    ) -> Result<QueryResult>;
+    fn execute_prepared(&self, statement: &PreparedStatement, params: &[Vec<u8>]) -> Result<QueryResult>;
 
     /// Set query timeout in milliseconds
     ///
@@ -173,16 +165,21 @@ impl QueryExecutorAdapter for LiteQueryExecutorAdapter {
 
         // Create planner and convert to logical plan
         let planner = Planner::new();
-        let first_stmt = statements.first()
-            .ok_or_else(|| Error::sql_parse("Empty query"))?;
+        let first_stmt = statements.first().ok_or_else(|| Error::sql_parse("Empty query"))?;
         let plan = planner.statement_to_plan(first_stmt.clone())?;
 
         // Check if this is a DDL/DML statement that needs special handling
         let rows = match &plan {
-            LogicalPlan::CreateTable { name, columns, if_not_exists, .. } => {
+            LogicalPlan::CreateTable {
+                name,
+                columns,
+                if_not_exists,
+                ..
+            } => {
                 // Convert columns to Schema
-                let schema_columns: Vec<crate::types::Column> = columns.iter().map(|col| {
-                    crate::types::Column {
+                let schema_columns: Vec<crate::types::Column> = columns
+                    .iter()
+                    .map(|col| crate::types::Column {
                         name: col.name.clone(),
                         data_type: col.data_type.clone(),
                         nullable: !col.not_null,
@@ -192,8 +189,8 @@ impl QueryExecutorAdapter for LiteQueryExecutorAdapter {
                         default_expr: None,
                         unique: false,
                         storage_mode: col.storage_mode,
-                    }
-                }).collect();
+                    })
+                    .collect();
 
                 let schema = crate::types::Schema::new(schema_columns);
 
@@ -223,7 +220,7 @@ impl QueryExecutorAdapter for LiteQueryExecutorAdapter {
                             }
                             _ => {
                                 return Err(Error::query_execution(
-                                    "Only literal values are supported in INSERT via adapter"
+                                    "Only literal values are supported in INSERT via adapter",
                                 ));
                             }
                         }
@@ -276,8 +273,7 @@ impl QueryExecutorAdapter for LiteQueryExecutorAdapter {
 
         // Create planner and convert to logical plan
         let planner = Planner::new();
-        let first_stmt = statements.first()
-            .ok_or_else(|| Error::sql_parse("Empty query"))?;
+        let first_stmt = statements.first().ok_or_else(|| Error::sql_parse("Empty query"))?;
         let plan = planner.statement_to_plan(first_stmt.clone())?;
 
         // Count parameters (simple implementation - could be enhanced)
@@ -286,11 +282,7 @@ impl QueryExecutorAdapter for LiteQueryExecutorAdapter {
         Ok(PreparedStatement::new(sql.to_string(), plan, param_count))
     }
 
-    fn execute_prepared(
-        &self,
-        statement: &PreparedStatement,
-        _params: &[Vec<u8>],
-    ) -> Result<QueryResult> {
+    fn execute_prepared(&self, statement: &PreparedStatement, _params: &[Vec<u8>]) -> Result<QueryResult> {
         let start = std::time::Instant::now();
 
         // For now, we execute the plan directly

@@ -6,13 +6,13 @@
     clippy::too_many_lines,
     clippy::single_match_else,
     clippy::match_wildcard_for_single_variants,
-    clippy::manual_string_new,
+    clippy::manual_string_new
 )]
 
-use heliosdb_nano::{Config, EmbeddedDatabase, Result, Error};
+use clap::{Parser, Subcommand};
+use heliosdb_nano::{Config, EmbeddedDatabase, Error, Result};
 use std::path::PathBuf;
 use tracing::info;
-use clap::{Parser, Subcommand};
 
 /// HA Replication Configuration
 #[derive(Debug, Clone)]
@@ -279,18 +279,44 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command {
-        Commands::Start { data_dir, memory, port, listen, config, daemon, pid_file, dump_on_shutdown, dump_schedule, tls_cert, tls_key, auth, password, replication_role, replication_port, primary_host, standby_hosts, observer_hosts, sync_mode, http_port, node_id, mysql, mysql_listen, mysql_socket, pg_socket_dir } => {
+        Commands::Start {
+            data_dir,
+            memory,
+            port,
+            listen,
+            config,
+            daemon,
+            pid_file,
+            dump_on_shutdown,
+            dump_schedule,
+            tls_cert,
+            tls_key,
+            auth,
+            password,
+            replication_role,
+            replication_port,
+            primary_host,
+            standby_hosts,
+            observer_hosts,
+            sync_mode,
+            http_port,
+            node_id,
+            mysql,
+            mysql_listen,
+            mysql_socket,
+            pg_socket_dir,
+        } => {
             // Validate that either --data-dir or --memory is specified
             if !memory && data_dir.is_none() {
                 return Err(Error::config(
-                    "Either --data-dir or --memory must be specified. Use --help for more information.".to_string()
+                    "Either --data-dir or --memory must be specified. Use --help for more information.".to_string(),
                 ));
             }
 
             // Validate TLS options
             if tls_cert.is_some() != tls_key.is_some() {
                 return Err(Error::config(
-                    "Both --tls-cert and --tls-key must be specified together for TLS.".to_string()
+                    "Both --tls-cert and --tls-key must be specified together for TLS.".to_string(),
                 ));
             }
 
@@ -298,7 +324,8 @@ async fn main() -> Result<()> {
             let auth_lower = auth.to_lowercase();
             if auth_lower != "trust" && password.is_none() {
                 return Err(Error::config(format!(
-                    "Authentication method '{}' requires --password to be set.", auth
+                    "Authentication method '{}' requires --password to be set.",
+                    auth
                 )));
             }
 
@@ -322,24 +349,57 @@ async fn main() -> Result<()> {
             };
 
             if daemon {
-                start_server_daemon(resolved_data_dir, port, listen, config, pid_file, tls_cert, tls_key, auth, password, ha_config).await
+                start_server_daemon(
+                    resolved_data_dir,
+                    port,
+                    listen,
+                    config,
+                    pid_file,
+                    tls_cert,
+                    tls_key,
+                    auth,
+                    password,
+                    ha_config,
+                )
+                .await
             } else {
-                start_server(resolved_data_dir, port, listen, config, memory, dump_on_shutdown, tls_cert, tls_key, auth, password, ha_config, mysql, mysql_listen, mysql_socket, pg_socket_dir).await
+                start_server(
+                    resolved_data_dir,
+                    port,
+                    listen,
+                    config,
+                    memory,
+                    dump_on_shutdown,
+                    tls_cert,
+                    tls_key,
+                    auth,
+                    password,
+                    ha_config,
+                    mysql,
+                    mysql_listen,
+                    mysql_socket,
+                    pg_socket_dir,
+                )
+                .await
             }
         }
-        Commands::Stop { ref pid_file } => {
-            stop_server(pid_file)
-        }
-        Commands::Status { ref pid_file } => {
-            check_server_status(pid_file)
-        }
-        Commands::Init { ref data_dir } => {
-            init_database(data_dir)
-        }
-        Commands::Repl { data_dir, memory, dump_on_shutdown, dump_file } => {
-            run_repl(data_dir, memory, dump_on_shutdown, dump_file)
-        }
-        Commands::Dump { output, data_dir, append, compression, connection, verbose } => {
+        Commands::Stop { ref pid_file } => stop_server(pid_file),
+        Commands::Status { ref pid_file } => check_server_status(pid_file),
+        Commands::Init { ref data_dir } => init_database(data_dir),
+        Commands::Repl {
+            data_dir,
+            memory,
+            dump_on_shutdown,
+            dump_file,
+        } => run_repl(data_dir, memory, dump_on_shutdown, dump_file),
+        Commands::Dump {
+            output,
+            data_dir,
+            append,
+            compression,
+            connection,
+            verbose,
+        } => {
             use heliosdb_nano::cli::DumpCommand;
             let cmd = DumpCommand {
                 output,
@@ -352,7 +412,13 @@ async fn main() -> Result<()> {
             };
             cmd.execute()
         }
-        Commands::Restore { input, target, verify, connection, verbose } => {
+        Commands::Restore {
+            input,
+            target,
+            verify,
+            connection,
+            verbose,
+        } => {
             use heliosdb_nano::cli::RestoreCommand;
             let cmd = RestoreCommand {
                 input,
@@ -366,10 +432,12 @@ async fn main() -> Result<()> {
 
         #[cfg(feature = "code-graph")]
         Commands::CodeGraph { action } => match action {
-            CodeGraphAction::Hook { data_dir, repo_root, source_table } => {
-                let stats = heliosdb_nano::code_graph::git_hook::run_from_stdin(
-                    &data_dir, &repo_root, &source_table,
-                )?;
+            CodeGraphAction::Hook {
+                data_dir,
+                repo_root,
+                source_table,
+            } => {
+                let stats = heliosdb_nano::code_graph::git_hook::run_from_stdin(&data_dir, &repo_root, &source_table)?;
                 println!(
                     "code-graph hook: files_seen={} parsed={} unchanged={} skipped={} symbols={} refs={}",
                     stats.files_seen,
@@ -403,15 +471,15 @@ async fn start_server(
     mysql_socket: Option<PathBuf>,
     pg_socket_dir: Option<PathBuf>,
 ) -> Result<()> {
-    use heliosdb_nano::protocol::postgres::server::{PgServer, PgServerConfig};
-    use heliosdb_nano::protocol::postgres::auth::{AuthMethod, AuthManager};
-    use heliosdb_nano::protocol::postgres::ssl::{SslConfig, SslMode};
-    use heliosdb_nano::protocol::postgres::{InMemoryPasswordStore, SharedPasswordStore, PasswordStore};
-    use heliosdb_nano::storage::{DumpManager, DumpOptions, DumpMode, DumpCompressionType};
-    use std::sync::Arc;
-    use std::net::SocketAddr;
-    use std::time::Instant;
     use colored::Colorize;
+    use heliosdb_nano::protocol::postgres::auth::{AuthManager, AuthMethod};
+    use heliosdb_nano::protocol::postgres::server::{PgServer, PgServerConfig};
+    use heliosdb_nano::protocol::postgres::ssl::{SslConfig, SslMode};
+    use heliosdb_nano::protocol::postgres::{InMemoryPasswordStore, PasswordStore, SharedPasswordStore};
+    use heliosdb_nano::storage::{DumpCompressionType, DumpManager, DumpMode, DumpOptions};
+    use std::net::SocketAddr;
+    use std::sync::Arc;
+    use std::time::Instant;
 
     let startup_time = Instant::now();
 
@@ -443,7 +511,8 @@ async fn start_server(
     println!("      Database initialized successfully");
 
     // Configure PostgreSQL server
-    let pg_addr: SocketAddr = format!("{listen}:{port}").parse()
+    let pg_addr: SocketAddr = format!("{listen}:{port}")
+        .parse()
         .map_err(|e| Error::config(format!("Invalid listen address: {e}")))?;
 
     // Parse authentication method
@@ -452,9 +521,12 @@ async fn start_server(
         "password" => AuthMethod::CleartextPassword,
         "md5" => AuthMethod::Md5,
         "scram-sha-256" | "scram" => AuthMethod::ScramSha256,
-        other => return Err(Error::config(format!(
-            "Unknown authentication method: '{}'. Use: trust, password, md5, scram-sha-256", other
-        ))),
+        other => {
+            return Err(Error::config(format!(
+                "Unknown authentication method: '{}'. Use: trust, password, md5, scram-sha-256",
+                other
+            )))
+        }
     };
     let auth_display = match &auth_method {
         AuthMethod::Trust => "Trust (development mode)",
@@ -503,12 +575,19 @@ async fn start_server(
     }
 
     // Create PostgreSQL server with appropriate auth configuration
-    let pg_server = if matches!(auth_method, AuthMethod::CleartextPassword | AuthMethod::Md5 | AuthMethod::ScramSha256) {
+    let pg_server = if matches!(
+        auth_method,
+        AuthMethod::CleartextPassword | AuthMethod::Md5 | AuthMethod::ScramSha256
+    ) {
         if let Some(ref pwd) = password {
             // Create password store with default users
             let mut store = InMemoryPasswordStore::new();
-            store.add_user("postgres", pwd).map_err(|e| Error::config(format!("Failed to add user: {e}")))?;
-            store.add_user("helios", pwd).map_err(|e| Error::config(format!("Failed to add user: {e}")))?;
+            store
+                .add_user("postgres", pwd)
+                .map_err(|e| Error::config(format!("Failed to add user: {e}")))?;
+            store
+                .add_user("helios", pwd)
+                .map_err(|e| Error::config(format!("Failed to add user: {e}")))?;
             let shared_store = SharedPasswordStore::new(store);
             let auth_manager = AuthManager::with_password_store(auth_method, shared_store);
             PgServer::with_auth_manager(pg_config, Arc::clone(&db), auth_manager)?
@@ -522,7 +601,10 @@ async fn start_server(
     println!("[4/4] Starting server...");
     println!();
     println!("════════════════════════════════════════════════════════════════");
-    println!("  Server ready! Started in {:.2}s", startup_time.elapsed().as_secs_f64());
+    println!(
+        "  Server ready! Started in {:.2}s",
+        startup_time.elapsed().as_secs_f64()
+    );
     println!("════════════════════════════════════════════════════════════════");
     println!();
     println!("  Connect using:");
@@ -538,14 +620,22 @@ async fn start_server(
     println!("      Known gaps:  SELECT heliosdb_capability_report();");
     if mysql_enabled {
         println!();
-        println!("    mysql:      mysql -h {} -P {}", mysql_listen.split(':').next().unwrap_or("127.0.0.1"),
-            mysql_listen.split(':').nth(1).unwrap_or("3306"));
-        println!("    PyMySQL:    pymysql.connect(host='{}', port={})",
+        println!(
+            "    mysql:      mysql -h {} -P {}",
             mysql_listen.split(':').next().unwrap_or("127.0.0.1"),
-            mysql_listen.split(':').nth(1).unwrap_or("3306"));
+            mysql_listen.split(':').nth(1).unwrap_or("3306")
+        );
+        println!(
+            "    PyMySQL:    pymysql.connect(host='{}', port={})",
+            mysql_listen.split(':').next().unwrap_or("127.0.0.1"),
+            mysql_listen.split(':').nth(1).unwrap_or("3306")
+        );
     }
     println!();
-    println!("  For REPL mode (single-user):  heliosdb-nano repl -d {}", data_dir.display());
+    println!(
+        "  For REPL mode (single-user):  heliosdb-nano repl -d {}",
+        data_dir.display()
+    );
     println!();
     println!("  Press Ctrl+C to shut down");
     println!("────────────────────────────────────────────────────────────────");
@@ -575,7 +665,8 @@ async fn start_server(
     // `--http-port 0` opts out (no health endpoint, no listener).
     let http_health_disabled = ha_config.http_port == 0;
     if !http_health_disabled {
-        let http_addr: SocketAddr = format!("{}:{}", listen, ha_config.http_port).parse()
+        let http_addr: SocketAddr = format!("{}:{}", listen, ha_config.http_port)
+            .parse()
             .map_err(|e| Error::config(format!("Invalid HTTP address: {e}")))?;
         match tokio::net::TcpListener::bind(http_addr).await {
             Ok(listener) => {
@@ -591,7 +682,9 @@ async fn start_server(
                     "Failed to bind HTTP health endpoint on {}: {} (os error {:?}). \
                      The database listener stays up; pass --http-port <free> or \
                      --http-port 0 to silence this.",
-                    http_addr, e, e.raw_os_error(),
+                    http_addr,
+                    e,
+                    e.raw_os_error(),
                 );
             }
         }
@@ -601,7 +694,8 @@ async fn start_server(
 
     // Start MySQL listener if enabled
     let mysql_handle = if mysql_enabled {
-        let mysql_addr: SocketAddr = mysql_listen.parse()
+        let mysql_addr: SocketAddr = mysql_listen
+            .parse()
             .map_err(|e| Error::config(format!("Invalid MySQL listen address '{}': {}", mysql_listen, e)))?;
         let mysql_db = Arc::clone(&db);
         info!("MySQL protocol listening on {}", mysql_addr);
@@ -621,9 +715,9 @@ async fn start_server(
                         let db_clone = Arc::clone(&mysql_db);
                         let conn_id = conn_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         tokio::spawn(async move {
-                            if let Err(e) = heliosdb_nano::protocol::mysql::handle_mysql_connection(
-                                db_clone, stream, conn_id
-                            ).await {
+                            if let Err(e) =
+                                heliosdb_nano::protocol::mysql::handle_mysql_connection(db_clone, stream, conn_id).await
+                            {
                                 tracing::debug!("MySQL connection error: {}", e);
                             }
                         });
@@ -659,10 +753,7 @@ async fn start_server(
                 }
             };
             // Permissive mode so non-root clients can connect
-            let _ = std::fs::set_permissions(
-                &path,
-                std::os::unix::fs::PermissionsExt::from_mode(0o777),
-            );
+            let _ = std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o777));
             loop {
                 match listener.accept().await {
                     Ok((stream, _)) => {
@@ -671,7 +762,9 @@ async fn start_server(
                         tokio::spawn(async move {
                             if let Err(e) = heliosdb_nano::protocol::mysql::handler::handle_mysql_connection_unix(
                                 db_clone, stream, conn_id,
-                            ).await {
+                            )
+                            .await
+                            {
                                 tracing::debug!("MySQL UDS connection error: {}", e);
                             }
                         });
@@ -707,10 +800,7 @@ async fn start_server(
                     return;
                 }
             };
-            let _ = std::fs::set_permissions(
-                &sock_path,
-                std::os::unix::fs::PermissionsExt::from_mode(0o777),
-            );
+            let _ = std::fs::set_permissions(&sock_path, std::os::unix::fs::PermissionsExt::from_mode(0o777));
             let conn_counter = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(2_000_000));
             loop {
                 match listener.accept().await {
@@ -720,7 +810,9 @@ async fn start_server(
                         tokio::spawn(async move {
                             if let Err(e) = heliosdb_nano::protocol::postgres::handler::handle_connection_unix(
                                 db_clone, stream, conn_id,
-                            ).await {
+                            )
+                            .await
+                            {
                                 tracing::debug!("PG UDS connection error: {}", e);
                             }
                         });
@@ -838,9 +930,9 @@ fn init_database(data_dir: &PathBuf) -> Result<()> {
 }
 
 fn run_repl(data_dir: PathBuf, memory: bool, dump_on_shutdown: bool, dump_file: Option<PathBuf>) -> Result<()> {
-    use heliosdb_nano::repl::{ReplShell, ReplConfig};
-    use heliosdb_nano::storage::{DumpManager, DumpOptions, DumpMode, DumpCompressionType};
     use colored::Colorize;
+    use heliosdb_nano::repl::{ReplConfig, ReplShell};
+    use heliosdb_nano::storage::{DumpCompressionType, DumpManager, DumpMode, DumpOptions};
 
     // Open database with user-friendly output
     let db = if memory {
@@ -1004,8 +1096,7 @@ async fn start_server_daemon(
     // Fork the process
     #[cfg(unix)]
     {
-        let exe = std::env::current_exe()
-            .map_err(|e| Error::io(format!("Failed to get current executable: {e}")))?;
+        let exe = std::env::current_exe().map_err(|e| Error::io(format!("Failed to get current executable: {e}")))?;
 
         let mut child = Command::new(&exe)
             .args(&args)
@@ -1052,7 +1143,9 @@ async fn start_server_daemon(
                     format!("127.0.0.1:{port}").parse().expect("valid loopback addr")
                 }),
                 std::time::Duration::from_millis(200),
-            ).is_ok() {
+            )
+            .is_ok()
+            {
                 break;
             }
             if std::time::Instant::now() >= deadline {
@@ -1076,8 +1169,7 @@ async fn start_server_daemon(
         std::mem::forget(child);
 
         // Write PID file (we already verified the worker is up).
-        std::fs::write(&pid_file, pid.to_string())
-            .map_err(|e| Error::io(format!("Failed to write PID file: {e}")))?;
+        std::fs::write(&pid_file, pid.to_string()).map_err(|e| Error::io(format!("Failed to write PID file: {e}")))?;
 
         println!();
         println!("╔═══════════════════════════════════════════════════════════════╗");
@@ -1115,10 +1207,11 @@ fn stop_server(pid_file: &PathBuf) -> Result<()> {
         )));
     }
 
-    let pid_str = std::fs::read_to_string(pid_file)
-        .map_err(|e| Error::io(format!("Failed to read PID file: {e}")))?;
+    let pid_str = std::fs::read_to_string(pid_file).map_err(|e| Error::io(format!("Failed to read PID file: {e}")))?;
 
-    let pid = pid_str.trim().parse::<i32>()
+    let pid = pid_str
+        .trim()
+        .parse::<i32>()
         .map_err(|e| Error::io(format!("Invalid PID in file: {e}")))?;
 
     println!("Stopping HeliosDB server (PID: {pid})...");
@@ -1159,13 +1252,14 @@ fn stop_server(pid_file: &PathBuf) -> Result<()> {
             }
 
             // Remove PID file
-            std::fs::remove_file(pid_file)
-                .map_err(|e| Error::io(format!("Failed to remove PID file: {e}")))?;
+            std::fs::remove_file(pid_file).map_err(|e| Error::io(format!("Failed to remove PID file: {e}")))?;
 
             println!("Server stopped successfully");
             Ok(())
         } else {
-            Err(Error::io(format!("Failed to stop server. Process {pid} may not exist.")))
+            Err(Error::io(format!(
+                "Failed to stop server. Process {pid} may not exist."
+            )))
         }
     }
 
@@ -1182,10 +1276,11 @@ fn check_server_status(pid_file: &PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    let pid_str = std::fs::read_to_string(pid_file)
-        .map_err(|e| Error::io(format!("Failed to read PID file: {e}")))?;
+    let pid_str = std::fs::read_to_string(pid_file).map_err(|e| Error::io(format!("Failed to read PID file: {e}")))?;
 
-    let pid = pid_str.trim().parse::<i32>()
+    let pid = pid_str
+        .trim()
+        .parse::<i32>()
         .map_err(|e| Error::io(format!("Invalid PID in file: {e}")))?;
 
     #[cfg(unix)]
@@ -1253,16 +1348,16 @@ async fn start_ha_components(
     storage: std::sync::Arc<heliosdb_nano::storage::StorageEngine>,
 ) -> Result<HAHandles> {
     use heliosdb_nano::replication::{
-        streaming::{StreamingServer, StreamingServerConfig, StreamingClient, StreamingClientConfig},
-        wal_store::{WalStore, WalStoreConfig},
-        wal_applicator::WalApplicator,
         config::PrimaryConfig,
+        ha_state::{ha_state, HARole, NodeConfig, SyncMode as HASyncMode},
+        streaming::{StreamingClient, StreamingClientConfig, StreamingServer, StreamingServerConfig},
+        wal_applicator::WalApplicator,
+        wal_store::{WalStore, WalStoreConfig},
         SyncModeConfig,
-        ha_state::{ha_state, HARole, SyncMode as HASyncMode, NodeConfig},
     };
     use std::sync::Arc;
-    use uuid::Uuid;
     use std::time::Duration;
+    use uuid::Uuid;
 
     let node_id = if let Some(ref id) = ha_config.node_id {
         Uuid::parse_str(id).map_err(|e| Error::config(format!("Invalid node ID: {e}")))?
@@ -1283,9 +1378,12 @@ async fn start_ha_components(
             min_applied: 1,
             timeout_ms: 10000,
         },
-        other => return Err(Error::config(format!(
-            "Unknown sync mode: '{}'. Use: async, semi-sync, sync", other
-        ))),
+        other => {
+            return Err(Error::config(format!(
+                "Unknown sync mode: '{}'. Use: async, semi-sync, sync",
+                other
+            )))
+        }
     };
 
     let role = ha_config.role.to_lowercase();
@@ -1311,11 +1409,15 @@ async fn start_ha_components(
     match role.as_str() {
         "primary" => {
             // Start streaming server for primary
-            let repl_addr = format!("{}:{}", listen, ha_config.replication_port).parse()
+            let repl_addr = format!("{}:{}", listen, ha_config.replication_port)
+                .parse()
                 .map_err(|e| Error::config(format!("Invalid replication address: {e}")))?;
 
             let wal_store = Arc::new(WalStore::new(WalStoreConfig::default()));
-            wal_store.init().await.map_err(|e| Error::io(format!("WAL store init failed: {e}")))?;
+            wal_store
+                .init()
+                .await
+                .map_err(|e| Error::io(format!("WAL store init failed: {e}")))?;
 
             let server_config = StreamingServerConfig {
                 listen_addr: repl_addr,
@@ -1341,7 +1443,9 @@ async fn start_ha_components(
         }
         "standby" => {
             // Start streaming client for standby
-            let primary_host = ha_config.primary_host.as_ref()
+            let primary_host = ha_config
+                .primary_host
+                .as_ref()
                 .ok_or_else(|| Error::config("--primary-host required for standby role".to_string()))?;
 
             // Resolve hostname to IP address (supports Docker DNS)
@@ -1398,7 +1502,9 @@ async fn start_ha_components(
             let applicator = Arc::new(WalApplicator::new(applicator_config));
 
             // Start the WAL applicator with storage engine
-            applicator.start_with_storage(storage.clone()).await
+            applicator
+                .start_with_storage(storage.clone())
+                .await
                 .map_err(|e| Error::io(format!("Failed to start WAL applicator: {}", e)))?;
             info!("WAL Applicator started, ready to apply replicated entries");
 
@@ -1438,12 +1544,10 @@ async fn start_ha_components(
             info!("Starting as observer node");
             Ok(HAHandles::default())
         }
-        _ => {
-            Err(Error::config(format!(
-                "Unknown replication role: '{}'. Use: standalone, primary, standby, observer",
-                ha_config.role
-            )))
-        }
+        _ => Err(Error::config(format!(
+            "Unknown replication role: '{}'. Use: standalone, primary, standby, observer",
+            ha_config.role
+        ))),
     }
 }
 

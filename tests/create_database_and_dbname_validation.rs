@@ -12,7 +12,7 @@
 //! database against the tenant list and the reserved names (`heliosdb`,
 //! `postgres`); unknown names are rejected.
 
-use heliosdb_nano::{EmbeddedDatabase, Value, tenant::IsolationMode};
+use heliosdb_nano::{tenant::IsolationMode, EmbeddedDatabase, Value};
 
 #[test]
 fn create_database_via_sql_succeeds() {
@@ -48,7 +48,12 @@ fn create_database_if_not_exists_is_idempotent() {
     db.execute("CREATE DATABASE IF NOT EXISTS foo").expect("idempotent");
 
     // Still exactly one 'foo' tenant.
-    let count = db.tenant_manager.list_tenants().iter().filter(|t| t.name == "foo").count();
+    let count = db
+        .tenant_manager
+        .list_tenants()
+        .iter()
+        .filter(|t| t.name == "foo")
+        .count();
     assert_eq!(count, 1, "duplicate IF NOT EXISTS must not create a second tenant");
 }
 
@@ -69,7 +74,8 @@ fn drop_database_removes_tenant() {
 fn drop_database_if_exists_is_idempotent() {
     let db = EmbeddedDatabase::new_in_memory().expect("db");
     // No error on a name that doesn't exist.
-    db.execute("DROP DATABASE IF EXISTS never_existed").expect("if-exists no-op");
+    db.execute("DROP DATABASE IF EXISTS never_existed")
+        .expect("if-exists no-op");
 
     // Without IF EXISTS, should error.
     let err = db.execute("DROP DATABASE never_existed");
@@ -106,8 +112,10 @@ fn create_reserved_database_names_is_refused() {
         );
     }
     // IF NOT EXISTS must succeed silently for reserved names (idempotent shape).
-    db.execute("CREATE DATABASE IF NOT EXISTS heliosdb").expect("reserved IF NOT EXISTS");
-    db.execute("CREATE DATABASE IF NOT EXISTS postgres").expect("reserved IF NOT EXISTS");
+    db.execute("CREATE DATABASE IF NOT EXISTS heliosdb")
+        .expect("reserved IF NOT EXISTS");
+    db.execute("CREATE DATABASE IF NOT EXISTS postgres")
+        .expect("reserved IF NOT EXISTS");
 }
 
 #[test]
@@ -121,8 +129,8 @@ fn current_database_returns_default_when_no_active_tenant() {
 
 #[test]
 fn pg_wire_database_validation_via_catalog_api() {
-    use std::sync::Arc;
     use heliosdb_nano::protocol::postgres::catalog::PgCatalog;
+    use std::sync::Arc;
 
     // Build a DB with a known tenant.
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));

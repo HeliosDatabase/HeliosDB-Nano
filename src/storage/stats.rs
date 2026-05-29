@@ -272,12 +272,7 @@ pub struct QueryHistoryEntry {
 
 impl QueryHistoryEntry {
     /// Create a new query history entry for a starting query
-    pub fn new_running(
-        query_id: u64,
-        query_text: String,
-        user_name: String,
-        database_name: String,
-    ) -> Self {
+    pub fn new_running(query_id: u64, query_text: String, user_name: String, database_name: String) -> Self {
         let query_hash = Self::compute_query_hash(&query_text);
         let query_type = Self::extract_query_type(&query_text);
 
@@ -316,9 +311,7 @@ impl QueryHistoryEntry {
     pub fn mark_completed(&mut self, rows_returned: u64, rows_examined: u64) {
         let end_time = Utc::now();
         self.end_time = Some(end_time);
-        self.duration_ms = Some(
-            (end_time - self.start_time).num_milliseconds().max(0) as u64
-        );
+        self.duration_ms = Some((end_time - self.start_time).num_milliseconds().max(0) as u64);
         self.rows_returned = rows_returned;
         self.rows_examined = rows_examined;
         self.status = QueryStatus::Completed;
@@ -328,9 +321,7 @@ impl QueryHistoryEntry {
     pub fn mark_failed(&mut self, error: String) {
         let end_time = Utc::now();
         self.end_time = Some(end_time);
-        self.duration_ms = Some(
-            (end_time - self.start_time).num_milliseconds().max(0) as u64
-        );
+        self.duration_ms = Some((end_time - self.start_time).num_milliseconds().max(0) as u64);
         self.status = QueryStatus::Failed;
         self.error_message = Some(error);
     }
@@ -339,9 +330,7 @@ impl QueryHistoryEntry {
     pub fn mark_cancelled(&mut self) {
         let end_time = Utc::now();
         self.end_time = Some(end_time);
-        self.duration_ms = Some(
-            (end_time - self.start_time).num_milliseconds().max(0) as u64
-        );
+        self.duration_ms = Some((end_time - self.start_time).num_milliseconds().max(0) as u64);
         self.status = QueryStatus::Cancelled;
     }
 
@@ -351,11 +340,7 @@ impl QueryHistoryEntry {
         use std::hash::{Hash, Hasher};
 
         // Simple normalization: lowercase and collapse whitespace
-        let normalized = query
-            .to_lowercase()
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let normalized = query.to_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
 
         let mut hasher = DefaultHasher::new();
         normalized.hash(&mut hasher);
@@ -368,11 +353,9 @@ impl QueryHistoryEntry {
         let first_word = trimmed.split_whitespace().next().unwrap_or("UNKNOWN");
 
         match first_word {
-            "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "CREATE" | "DROP" |
-            "ALTER" | "TRUNCATE" | "BEGIN" | "COMMIT" | "ROLLBACK" | "EXPLAIN" |
-            "ANALYZE" | "VACUUM" | "COPY" | "GRANT" | "REVOKE" | "SET" | "SHOW" => {
-                first_word.to_string()
-            }
+            "SELECT" | "INSERT" | "UPDATE" | "DELETE" | "CREATE" | "DROP" | "ALTER" | "TRUNCATE" | "BEGIN"
+            | "COMMIT" | "ROLLBACK" | "EXPLAIN" | "ANALYZE" | "VACUUM" | "COPY" | "GRANT" | "REVOKE" | "SET"
+            | "SHOW" => first_word.to_string(),
             "WITH" => "SELECT".to_string(), // CTEs are typically SELECTs
             _ => "OTHER".to_string(),
         }
@@ -425,19 +408,9 @@ impl QueryHistoryTracker {
     }
 
     /// Start tracking a new query, returns query ID
-    pub fn start_query(
-        &self,
-        query_text: String,
-        user_name: String,
-        database_name: String,
-    ) -> u64 {
+    pub fn start_query(&self, query_text: String, user_name: String, database_name: String) -> u64 {
         let query_id = self.next_query_id.fetch_add(1, Ordering::SeqCst);
-        let entry = QueryHistoryEntry::new_running(
-            query_id,
-            query_text,
-            user_name,
-            database_name,
-        );
+        let entry = QueryHistoryEntry::new_running(query_id, query_text, user_name, database_name);
 
         if let Ok(mut running) = self.running_queries.write() {
             running.insert(query_id, entry);
@@ -518,21 +491,24 @@ impl QueryHistoryTracker {
 
     /// Get all history entries
     pub fn get_history(&self) -> Vec<QueryHistoryEntry> {
-        self.entries.read()
+        self.entries
+            .read()
             .map(|e| e.iter().cloned().collect())
             .unwrap_or_default()
     }
 
     /// Get recent history entries (up to limit)
     pub fn get_recent(&self, limit: usize) -> Vec<QueryHistoryEntry> {
-        self.entries.read()
+        self.entries
+            .read()
             .map(|e| e.iter().rev().take(limit).cloned().collect())
             .unwrap_or_default()
     }
 
     /// Get currently running queries
     pub fn get_running(&self) -> Vec<QueryHistoryEntry> {
-        self.running_queries.read()
+        self.running_queries
+            .read()
             .map(|r| r.values().cloned().collect())
             .unwrap_or_default()
     }
@@ -562,7 +538,8 @@ impl QueryHistoryTracker {
         let total_queries = entries.as_ref().map(|e| e.len()).unwrap_or(0);
         let running_queries = running.as_ref().map(|r| r.len()).unwrap_or(0);
 
-        let (completed, failed, cancelled) = entries.as_ref()
+        let (completed, failed, cancelled) = entries
+            .as_ref()
             .map(|e| {
                 let mut completed = 0u64;
                 let mut failed = 0u64;
@@ -579,11 +556,10 @@ impl QueryHistoryTracker {
             })
             .unwrap_or((0, 0, 0));
 
-        let avg_duration_ms = entries.as_ref()
+        let avg_duration_ms = entries
+            .as_ref()
             .map(|e| {
-                let durations: Vec<u64> = e.iter()
-                    .filter_map(|entry| entry.duration_ms)
-                    .collect();
+                let durations: Vec<u64> = e.iter().filter_map(|entry| entry.duration_ms).collect();
                 if durations.is_empty() {
                     0.0
                 } else {
@@ -696,12 +672,7 @@ pub struct TransactionEntry {
 
 impl TransactionEntry {
     /// Create a new transaction entry
-    pub fn new(
-        xact_id: u64,
-        user_name: String,
-        database_name: String,
-        backend_pid: u32,
-    ) -> Self {
+    pub fn new(xact_id: u64, user_name: String, database_name: String, backend_pid: u32) -> Self {
         Self {
             xact_id,
             start_time: Utc::now(),
@@ -774,12 +745,7 @@ impl TransactionTracker {
     }
 
     /// Start a new transaction, returns transaction ID
-    pub fn start_transaction(
-        &self,
-        user_name: String,
-        database_name: String,
-        backend_pid: u32,
-    ) -> u64 {
+    pub fn start_transaction(&self, user_name: String, database_name: String, backend_pid: u32) -> u64 {
         let xact_id = self.next_xact_id.fetch_add(1, Ordering::SeqCst);
         let entry = TransactionEntry::new(xact_id, user_name, database_name, backend_pid);
 
@@ -841,23 +807,23 @@ impl TransactionTracker {
 
     /// Get all active transactions
     pub fn get_active(&self) -> Vec<TransactionEntry> {
-        self.active_transactions.read()
+        self.active_transactions
+            .read()
             .map(|a| a.values().cloned().collect())
             .unwrap_or_default()
     }
 
     /// Get transaction by ID
     pub fn get_transaction(&self, xact_id: u64) -> Option<TransactionEntry> {
-        self.active_transactions.read()
+        self.active_transactions
+            .read()
             .ok()
             .and_then(|a| a.get(&xact_id).cloned())
     }
 
     /// Get transaction statistics
     pub fn get_stats(&self) -> TransactionTrackerStats {
-        let active_count = self.active_transactions.read()
-            .map(|a| a.len() as u64)
-            .unwrap_or(0);
+        let active_count = self.active_transactions.read().map(|a| a.len() as u64).unwrap_or(0);
 
         TransactionTrackerStats {
             active_transactions: active_count,
@@ -870,7 +836,9 @@ impl TransactionTracker {
 
     /// Get longest running transactions
     pub fn get_longest_running(&self, limit: usize) -> Vec<TransactionEntry> {
-        let mut entries: Vec<TransactionEntry> = self.active_transactions.read()
+        let mut entries: Vec<TransactionEntry> = self
+            .active_transactions
+            .read()
             .map(|a| a.values().cloned().collect())
             .unwrap_or_default();
 
@@ -1121,9 +1089,7 @@ impl ReplicationStatus {
 
     /// Get current role
     pub fn get_role(&self) -> ReplicationRole {
-        self.role.read()
-            .map(|r| *r)
-            .unwrap_or(ReplicationRole::Standalone)
+        self.role.read().map(|r| *r).unwrap_or(ReplicationRole::Standalone)
     }
 
     /// Get current state
@@ -1133,23 +1099,20 @@ impl ReplicationStatus {
 
     /// Get current LSN
     pub fn get_lsn(&self) -> String {
-        self.current_lsn.read()
+        self.current_lsn
+            .read()
             .map(|l| l.clone())
             .unwrap_or_else(|_| "0/0".to_string())
     }
 
     /// Get all replicas
     pub fn get_replicas(&self) -> Vec<ReplicaStatus> {
-        self.replicas.read()
-            .map(|r| r.clone())
-            .unwrap_or_default()
+        self.replicas.read().map(|r| r.clone()).unwrap_or_default()
     }
 
     /// Get all slots
     pub fn get_slots(&self) -> Vec<ReplicationSlot> {
-        self.slots.read()
-            .map(|s| s.clone())
-            .unwrap_or_default()
+        self.slots.read().map(|s| s.clone()).unwrap_or_default()
     }
 
     /// Get summary status
@@ -1405,17 +1368,13 @@ mod tests {
         let tracker = QueryHistoryTracker::new(3); // Small buffer
 
         for i in 0..5 {
-            let qid = tracker.start_query(
-                format!("SELECT {}", i),
-                "admin".to_string(),
-                "testdb".to_string(),
-            );
+            let qid = tracker.start_query(format!("SELECT {}", i), "admin".to_string(), "testdb".to_string());
             tracker.complete_query(qid, i as u64, 0);
         }
 
         let history = tracker.get_history();
         assert_eq!(history.len(), 3); // Only 3 entries kept
-        // Should have queries 2, 3, 4 (oldest dropped)
+                                      // Should have queries 2, 3, 4 (oldest dropped)
         assert!(history[0].query_text.contains("2"));
         assert!(history[1].query_text.contains("3"));
         assert!(history[2].query_text.contains("4"));
@@ -1453,7 +1412,12 @@ mod tests {
         let entry = QueryHistoryEntry::new_running(3, "  update t set x = 1".into(), "u".into(), "d".into());
         assert_eq!(entry.query_type, "UPDATE");
 
-        let entry = QueryHistoryEntry::new_running(4, "WITH cte AS (SELECT 1) SELECT * FROM cte".into(), "u".into(), "d".into());
+        let entry = QueryHistoryEntry::new_running(
+            4,
+            "WITH cte AS (SELECT 1) SELECT * FROM cte".into(),
+            "u".into(),
+            "d".into(),
+        );
         assert_eq!(entry.query_type, "SELECT");
     }
 
@@ -1462,11 +1426,7 @@ mod tests {
     fn test_transaction_start_and_commit() {
         let tracker = TransactionTracker::new();
 
-        let xact_id = tracker.start_transaction(
-            "admin".to_string(),
-            "testdb".to_string(),
-            1234,
-        );
+        let xact_id = tracker.start_transaction("admin".to_string(), "testdb".to_string(), 1234);
 
         assert!(xact_id > 0);
 
@@ -1491,11 +1451,7 @@ mod tests {
     fn test_transaction_rollback() {
         let tracker = TransactionTracker::new();
 
-        let xact_id = tracker.start_transaction(
-            "admin".to_string(),
-            "testdb".to_string(),
-            1234,
-        );
+        let xact_id = tracker.start_transaction("admin".to_string(), "testdb".to_string(), 1234);
 
         tracker.rollback(xact_id);
 
@@ -1507,11 +1463,7 @@ mod tests {
     fn test_transaction_state_changes() {
         let tracker = TransactionTracker::new();
 
-        let xact_id = tracker.start_transaction(
-            "admin".to_string(),
-            "testdb".to_string(),
-            1234,
-        );
+        let xact_id = tracker.start_transaction("admin".to_string(), "testdb".to_string(), 1234);
 
         // Initial state should be Idle
         let tx = tracker.get_transaction(xact_id).unwrap();
@@ -1643,11 +1595,9 @@ mod tests {
         collector.database_stats.increment_tup_inserted(10);
 
         // Start a query
-        let qid = collector.query_history.start_query(
-            "SELECT 1".to_string(),
-            "admin".to_string(),
-            "db".to_string(),
-        );
+        let qid = collector
+            .query_history
+            .start_query("SELECT 1".to_string(), "admin".to_string(), "db".to_string());
         collector.query_history.complete_query(qid, 1, 1);
 
         // Get snapshot

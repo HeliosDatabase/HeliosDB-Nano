@@ -103,13 +103,12 @@ impl TtcHeader {
         let seq_num = cursor.get_u8();
         let flags = cursor.get_u8();
 
-        let function = TtcFunction::from_u8(function_code)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Invalid TTC function code: {}", function_code),
-                )
-            })?;
+        let function = TtcFunction::from_u8(function_code).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid TTC function code: {}", function_code),
+            )
+        })?;
 
         Ok(Self {
             function,
@@ -184,17 +183,9 @@ impl TtcParse {
 
         // Simple parsing - in reality TTC uses a complex wire format
         // This is a simplified version for basic functionality
-        let cursor_id = if cursor.remaining() >= 2 {
-            cursor.get_u16()
-        } else {
-            1
-        };
+        let cursor_id = if cursor.remaining() >= 2 { cursor.get_u16() } else { 1 };
 
-        let options = if cursor.remaining() >= 4 {
-            cursor.get_u32()
-        } else {
-            0
-        };
+        let options = if cursor.remaining() >= 4 { cursor.get_u32() } else { 0 };
 
         // Remaining bytes are SQL text
         let sql_bytes: Vec<u8> = data.get(cursor.position() as usize..).unwrap_or(&[]).to_vec();
@@ -224,23 +215,11 @@ impl TtcExecute {
     pub fn parse(data: &[u8]) -> io::Result<Self> {
         let mut cursor = Cursor::new(data);
 
-        let cursor_id = if cursor.remaining() >= 2 {
-            cursor.get_u16()
-        } else {
-            1
-        };
+        let cursor_id = if cursor.remaining() >= 2 { cursor.get_u16() } else { 1 };
 
-        let iterations = if cursor.remaining() >= 4 {
-            cursor.get_u32()
-        } else {
-            1
-        };
+        let iterations = if cursor.remaining() >= 4 { cursor.get_u32() } else { 1 };
 
-        let options = if cursor.remaining() >= 4 {
-            cursor.get_u32()
-        } else {
-            0
-        };
+        let options = if cursor.remaining() >= 4 { cursor.get_u32() } else { 0 };
 
         Ok(Self {
             cursor_id,
@@ -264,22 +243,11 @@ impl TtcFetch {
     pub fn parse(data: &[u8]) -> io::Result<Self> {
         let mut cursor = Cursor::new(data);
 
-        let cursor_id = if cursor.remaining() >= 2 {
-            cursor.get_u16()
-        } else {
-            1
-        };
+        let cursor_id = if cursor.remaining() >= 2 { cursor.get_u16() } else { 1 };
 
-        let num_rows = if cursor.remaining() >= 4 {
-            cursor.get_u32()
-        } else {
-            1
-        };
+        let num_rows = if cursor.remaining() >= 4 { cursor.get_u32() } else { 1 };
 
-        Ok(Self {
-            cursor_id,
-            num_rows,
-        })
+        Ok(Self { cursor_id, num_rows })
     }
 }
 

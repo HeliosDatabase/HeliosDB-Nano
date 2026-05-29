@@ -13,29 +13,29 @@ pub mod config;
 #[cfg(feature = "ha-tier1")]
 pub mod ha_state;
 #[cfg(feature = "ha-tier1")]
-pub use ha_state::{ha_state, HAStateRegistry, HARole, SyncMode, NodeConfig, StandbyInfo, PrimaryInfo};
+pub use ha_state::{ha_state, HARole, HAStateRegistry, NodeConfig, PrimaryInfo, StandbyInfo, SyncMode};
 
 // Tier 1: Warm Standby (ha-tier1)
 #[cfg(feature = "ha-tier1")]
-pub mod wal_replicator;
-#[cfg(feature = "ha-tier1")]
-pub mod wal_applicator;
-#[cfg(feature = "ha-tier1")]
 pub mod failover_watcher;
-#[cfg(feature = "ha-tier1")]
-pub mod lsn_manager;
-#[cfg(feature = "ha-tier1")]
-pub mod transport;
-#[cfg(feature = "ha-tier1")]
-pub mod streaming;
-#[cfg(feature = "ha-tier1")]
-pub mod wal_store;
-#[cfg(feature = "ha-tier1")]
-pub mod split_brain;
 #[cfg(feature = "ha-tier1")]
 pub mod logical_replication;
 #[cfg(feature = "ha-tier1")]
+pub mod lsn_manager;
+#[cfg(feature = "ha-tier1")]
 pub mod query_forwarder;
+#[cfg(feature = "ha-tier1")]
+pub mod split_brain;
+#[cfg(feature = "ha-tier1")]
+pub mod streaming;
+#[cfg(feature = "ha-tier1")]
+pub mod transport;
+#[cfg(feature = "ha-tier1")]
+pub mod wal_applicator;
+#[cfg(feature = "ha-tier1")]
+pub mod wal_replicator;
+#[cfg(feature = "ha-tier1")]
+pub mod wal_store;
 
 // Controlled Switchover (ha-tier1)
 #[cfg(feature = "ha-tier1")]
@@ -45,56 +45,56 @@ pub mod switchover;
 #[cfg(feature = "ha-tier1")]
 pub mod topology;
 #[cfg(feature = "ha-tier1")]
-pub use role_manager::{RoleManager, NodeRole, RoleChangeEvent, RoleChangeReason, SwitchoverPhase};
+pub use role_manager::{NodeRole, RoleChangeEvent, RoleChangeReason, RoleManager, SwitchoverPhase};
 #[cfg(feature = "ha-tier1")]
-pub use switchover::{SwitchoverCoordinator, SwitchoverConfig, SwitchoverEvent, SwitchoverCheck};
+pub use switchover::{SwitchoverCheck, SwitchoverConfig, SwitchoverCoordinator, SwitchoverEvent};
 #[cfg(feature = "ha-tier1")]
-pub use topology::{TopologyManager, NodeInfo, TopologyEvent, ClusterSummary, topology_manager};
+pub use topology::{topology_manager, ClusterSummary, NodeInfo, TopologyEvent, TopologyManager};
 
 // Re-exports for convenience
 pub use config::*;
 
 #[cfg(feature = "ha-tier1")]
-pub use wal_replicator::{WalReplicator, Lsn};
-#[cfg(feature = "ha-tier1")]
-pub use wal_applicator::WalApplicator;
-#[cfg(feature = "ha-tier1")]
 pub use failover_watcher::{
-    FailoverWatcher, FailoverEvent, HealthCheckResult, FailoverCandidate,
-    AutomaticFailoverCoordinator, AutomaticFailoverBuilder,
+    AutomaticFailoverBuilder, AutomaticFailoverCoordinator, FailoverCandidate, FailoverEvent, FailoverWatcher,
+    HealthCheckResult,
+};
+#[cfg(feature = "ha-tier1")]
+pub use logical_replication::{
+    ChangeEvent, ChangeOperation, ChangeRow, ColumnMapping, ColumnTransform, FieldValue, LogicalReplicationConfig,
+    LogicalReplicationPipeline, RowFilter, TableFilter,
 };
 #[cfg(feature = "ha-tier1")]
 pub use lsn_manager::LsnManager;
 #[cfg(feature = "ha-tier1")]
-pub use transport::{
-    ReplicationConnection, ReplicationServer, SyncModeConfig,
-    AckType, HealthStatus, MessageType, Capabilities,
-    NodeRole as WireNodeRole, // Renamed to avoid conflict with role_manager::NodeRole
-};
-#[cfg(feature = "ha-tier1")]
-pub use streaming::{
-    StreamingServer, StreamingServerConfig, StreamingClient, StreamingClientConfig,
-    StreamingClientState,
-};
-#[cfg(feature = "ha-tier1")]
-pub use wal_store::{
-    WalStore, WalStoreConfig, BatchRequest, BatchResult, BatchStreamState,
+pub use query_forwarder::{
+    init_query_forwarder, query_forwarder, ColumnInfo, ForwardedResult, ForwarderError, QueryForwarder,
 };
 #[cfg(feature = "ha-tier1")]
 pub use split_brain::{
-    SplitBrainProtector, ObserverNode, ObserverConfig, ProtectionState, ProtectionEvent,
-    ClusterNode,
+    ClusterNode, ObserverConfig, ObserverNode, ProtectionEvent, ProtectionState, SplitBrainProtector,
 };
 #[cfg(feature = "ha-tier1")]
-pub use logical_replication::{
-    LogicalReplicationPipeline, LogicalReplicationConfig, TableFilter, RowFilter,
-    ColumnMapping, ColumnTransform, ChangeEvent, ChangeOperation, ChangeRow, FieldValue,
+pub use streaming::{
+    StreamingClient, StreamingClientConfig, StreamingClientState, StreamingServer, StreamingServerConfig,
 };
 #[cfg(feature = "ha-tier1")]
-pub use query_forwarder::{
-    QueryForwarder, ForwardedResult, ForwarderError, ColumnInfo,
-    init_query_forwarder, query_forwarder,
+pub use transport::{
+    AckType,
+    Capabilities,
+    HealthStatus,
+    MessageType,
+    NodeRole as WireNodeRole, // Renamed to avoid conflict with role_manager::NodeRole
+    ReplicationConnection,
+    ReplicationServer,
+    SyncModeConfig,
 };
+#[cfg(feature = "ha-tier1")]
+pub use wal_applicator::WalApplicator;
+#[cfg(feature = "ha-tier1")]
+pub use wal_replicator::{Lsn, WalReplicator};
+#[cfg(feature = "ha-tier1")]
+pub use wal_store::{BatchRequest, BatchResult, BatchStreamState, WalStore, WalStoreConfig};
 
 use thiserror::Error;
 

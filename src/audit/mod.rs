@@ -35,15 +35,15 @@
 //! # }
 //! ```
 
-mod logger;
-mod events;
 mod config;
+mod events;
+mod logger;
 mod query;
 
-pub use logger::AuditLogger;
-pub use events::{AuditEvent, OperationType, AuditMetadata};
 pub use config::AuditConfig;
-pub use query::{AuditQuery, AuditFilter};
+pub use events::{AuditEvent, AuditMetadata, OperationType};
+pub use logger::AuditLogger;
+pub use query::{AuditFilter, AuditQuery};
 
 use crate::Result;
 
@@ -59,7 +59,7 @@ pub fn initialize_audit_tables(storage: &crate::storage::StorageEngine) -> Resul
 
     if !table_exists {
         // Create __audit_log table
-        use crate::{Schema, Column, DataType};
+        use crate::{Column, DataType, Schema};
         let schema = Schema::new(vec![
             Column {
                 name: "id".to_string(),
@@ -68,9 +68,9 @@ pub fn initialize_audit_tables(storage: &crate::storage::StorageEngine) -> Resul
                 primary_key: true,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
             Column {
                 name: "timestamp".to_string(),
@@ -79,9 +79,9 @@ pub fn initialize_audit_tables(storage: &crate::storage::StorageEngine) -> Resul
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
             Column {
                 name: "session_id".to_string(),
@@ -90,9 +90,9 @@ pub fn initialize_audit_tables(storage: &crate::storage::StorageEngine) -> Resul
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
             Column {
                 name: "user".to_string(),
@@ -101,9 +101,9 @@ pub fn initialize_audit_tables(storage: &crate::storage::StorageEngine) -> Resul
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
             Column {
                 name: "operation".to_string(),
@@ -112,9 +112,9 @@ pub fn initialize_audit_tables(storage: &crate::storage::StorageEngine) -> Resul
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
             Column {
                 name: "target".to_string(),
@@ -123,9 +123,9 @@ pub fn initialize_audit_tables(storage: &crate::storage::StorageEngine) -> Resul
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
             Column {
                 name: "query".to_string(),
@@ -134,9 +134,9 @@ pub fn initialize_audit_tables(storage: &crate::storage::StorageEngine) -> Resul
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
             Column {
                 name: "affected_rows".to_string(),
@@ -145,9 +145,9 @@ pub fn initialize_audit_tables(storage: &crate::storage::StorageEngine) -> Resul
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
             Column {
                 name: "success".to_string(),
@@ -156,9 +156,9 @@ pub fn initialize_audit_tables(storage: &crate::storage::StorageEngine) -> Resul
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
             Column {
                 name: "error".to_string(),
@@ -167,9 +167,9 @@ pub fn initialize_audit_tables(storage: &crate::storage::StorageEngine) -> Resul
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
             Column {
                 name: "checksum".to_string(),
@@ -178,9 +178,9 @@ pub fn initialize_audit_tables(storage: &crate::storage::StorageEngine) -> Resul
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
         ]);
 
@@ -202,7 +202,7 @@ pub fn initialize_audit_tables(storage: &crate::storage::StorageEngine) -> Resul
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::{Config, storage::StorageEngine};
+    use crate::{storage::StorageEngine, Config};
 
     #[test]
     fn test_initialize_audit_tables() {

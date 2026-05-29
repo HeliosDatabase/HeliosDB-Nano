@@ -15,15 +15,10 @@ fn main() {
 
     // 50 hand-crafted code symbols across 10 files.
     for f in 0..10 {
-        let body: String = (0..5)
-            .map(|i| format!("pub fn sym_{f}_{i}() {{}}\n"))
-            .collect();
+        let body: String = (0..5).map(|i| format!("pub fn sym_{f}_{i}() {{}}\n")).collect();
         db.execute_params_returning(
             "INSERT INTO src VALUES ($1, 'rust', $2)",
-            &[
-                Value::String(format!("file_{f}.rs")),
-                Value::String(body),
-            ],
+            &[Value::String(format!("file_{f}.rs")), Value::String(body)],
         )
         .unwrap();
     }
@@ -37,9 +32,7 @@ fn main() {
         let f = k / 10;
         let i = k % 5;
         let qualified = format!("sym_{f}_{i}");
-        let text = format!(
-            "This document references {qualified} in passing. Also mentions some unrelated content."
-        );
+        let text = format!("This document references {qualified} in passing. Also mentions some unrelated content.");
         pairs.push((text, qualified));
     }
 
@@ -75,10 +68,7 @@ fn main() {
         let rows = db
             .query_params(
                 &q,
-                &[
-                    Value::String(format!("doc:{k}")),
-                    Value::String(qualified.clone()),
-                ],
+                &[Value::String(format!("doc:{k}")), Value::String(qualified.clone())],
             )
             .unwrap();
         let n = match rows.first().and_then(|r| r.values.first()) {

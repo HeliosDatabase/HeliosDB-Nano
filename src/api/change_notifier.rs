@@ -168,12 +168,7 @@ mod tests {
 
         let mut rx = n.subscribe();
 
-        n.notify(
-            "orders",
-            "INSERT",
-            Some(serde_json::json!({"id": 1})),
-            None,
-        );
+        n.notify("orders", "INSERT", Some(serde_json::json!({"id": 1})), None);
 
         let event = rx.recv().await.unwrap();
         assert_eq!(event.table, "orders");

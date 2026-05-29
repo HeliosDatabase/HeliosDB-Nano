@@ -13,10 +13,7 @@ fn setup_seeded() -> Result<EmbeddedDatabase> {
         &[
             Value::String("m.py".into()),
             Value::String("python".into()),
-            Value::String(
-                "def helper():\n    return 1\n\ndef caller():\n    return helper()\n"
-                    .into(),
-            ),
+            Value::String("def helper():\n    return 1\n\ndef caller():\n    return helper()\n".into()),
         ],
     )?;
     db.code_index(CodeIndexOptions::for_table("src"))?;
@@ -56,10 +53,7 @@ fn with_context_rejects_missing_hops() -> Result<()> {
     // regular planner and the "WITH CONTEXT" literal survives → parse
     // error from the normal engine path.
     let db = setup_seeded()?;
-    let err = db.query(
-        "SELECT node_id FROM _hdb_graph_nodes WITH CONTEXT (EDGES CALLS)",
-        &[],
-    );
+    let err = db.query("SELECT node_id FROM _hdb_graph_nodes WITH CONTEXT (EDGES CALLS)", &[]);
     assert!(err.is_err(), "expected error, got {err:?}");
     Ok(())
 }

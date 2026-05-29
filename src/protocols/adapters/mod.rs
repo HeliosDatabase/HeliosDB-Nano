@@ -56,35 +56,15 @@
 //! using `Arc`. The storage engine and connection pool use internal locking
 //! to ensure safe concurrent access.
 
-mod storage;
 mod executor;
-mod pubsub;
 mod pool;
+mod pubsub;
+mod storage;
 
-pub use storage::{
-    StorageAdapter,
-    TransactionAdapter,
-    LiteStorageAdapter,
-};
+pub use storage::{LiteStorageAdapter, StorageAdapter, TransactionAdapter};
 
-pub use executor::{
-    QueryExecutorAdapter,
-    LiteQueryExecutorAdapter,
-    QueryResult,
-    PreparedStatement,
-};
+pub use executor::{LiteQueryExecutorAdapter, PreparedStatement, QueryExecutorAdapter, QueryResult};
 
-pub use pubsub::{
-    PubSubAdapter,
-    PubSubManager,
-    Notification,
-    Subscription,
-    SubscriptionHandle,
-};
+pub use pubsub::{Notification, PubSubAdapter, PubSubManager, Subscription, SubscriptionHandle};
 
-pub use pool::{
-    ConnectionPool,
-    PoolConfig,
-    PooledConnection,
-    PoolStats,
-};
+pub use pool::{ConnectionPool, PoolConfig, PoolStats, PooledConnection};

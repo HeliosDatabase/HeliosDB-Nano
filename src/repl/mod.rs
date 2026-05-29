@@ -7,20 +7,19 @@
 //! - Meta commands (\d, \dt, \q, etc.)
 //! - Pretty-printed results
 
-mod shell;
+mod commands;
 mod completer;
 mod formatter;
-mod commands;
 mod help_manager;
+mod shell;
 
-pub use shell::ReplShell;
 pub use commands::MetaCommand;
-pub use help_manager::HelpManager;
 pub use commands::MetaCommandResult;
+pub use help_manager::HelpManager;
+pub use shell::ReplShell;
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-
 
 /// REPL configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,14 +53,30 @@ pub struct ReplConfig {
     pub max_column_width: usize,
 }
 
-fn default_show_timing() -> bool { true }
-fn default_history_path() -> Option<String> { Some(".heliosdb_history".to_string()) }
-fn default_max_history() -> usize { 1000 }
-fn default_output_format() -> OutputFormat { OutputFormat::Table }
-fn default_show_row_count() -> bool { true }
-fn default_auto_commit() -> bool { true }
-fn default_null_display() -> String { "NULL".to_string() }
-fn default_max_column_width() -> usize { 50 }
+fn default_show_timing() -> bool {
+    true
+}
+fn default_history_path() -> Option<String> {
+    Some(".heliosdb_history".to_string())
+}
+fn default_max_history() -> usize {
+    1000
+}
+fn default_output_format() -> OutputFormat {
+    OutputFormat::Table
+}
+fn default_show_row_count() -> bool {
+    true
+}
+fn default_auto_commit() -> bool {
+    true
+}
+fn default_null_display() -> String {
+    "NULL".to_string()
+}
+fn default_max_column_width() -> usize {
+    50
+}
 
 /// Output format for query results
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -141,7 +156,7 @@ impl ReplConfig {
         match &self.config_path {
             Some(path) => Self::from_file(path),
             None => Err(crate::Error::config(
-                "No configuration file path set. Start REPL with --config to enable reload."
+                "No configuration file path set. Start REPL with --config to enable reload.",
             )),
         }
     }
@@ -198,7 +213,9 @@ mod tests {
         "#;
 
         let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
-        temp_file.write_all(toml_content.as_bytes()).expect("Failed to write temp file");
+        temp_file
+            .write_all(toml_content.as_bytes())
+            .expect("Failed to write temp file");
 
         let config = ReplConfig::from_file(temp_file.path()).expect("Failed to load config");
 
@@ -225,7 +242,9 @@ mod tests {
         "#;
 
         let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
-        temp_file.write_all(toml_content.as_bytes()).expect("Failed to write temp file");
+        temp_file
+            .write_all(toml_content.as_bytes())
+            .expect("Failed to write temp file");
 
         let config = ReplConfig::from_file(temp_file.path()).expect("Failed to load config");
 
@@ -242,7 +261,9 @@ mod tests {
         "#;
 
         let mut temp_file = NamedTempFile::new().expect("Failed to create temp file");
-        temp_file.write_all(toml_content.as_bytes()).expect("Failed to write temp file");
+        temp_file
+            .write_all(toml_content.as_bytes())
+            .expect("Failed to write temp file");
 
         let config = ReplConfig::from_file(temp_file.path()).expect("Failed to load config");
         assert!(config.show_timing);
@@ -297,12 +318,8 @@ mod tests {
 
     #[test]
     fn test_config_with_path() {
-        let config = ReplConfig::default()
-            .with_config_path("/some/path/config.toml");
+        let config = ReplConfig::default().with_config_path("/some/path/config.toml");
 
-        assert_eq!(
-            config.config_path,
-            Some(PathBuf::from("/some/path/config.toml"))
-        );
+        assert_eq!(config.config_path, Some(PathBuf::from("/some/path/config.toml")));
     }
 }

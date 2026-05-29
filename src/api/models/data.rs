@@ -2,9 +2,9 @@
 //!
 //! Request and response models for data CRUD operations.
 
+use crate::{Column, Schema, Tuple, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use crate::{Tuple, Value, Schema, Column};
 
 /// Response for listing tables
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -235,16 +235,12 @@ pub fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Int2(i) => serde_json::Value::Number((*i).into()),
         Value::Int4(i) => serde_json::Value::Number((*i).into()),
         Value::Int8(i) => serde_json::Value::Number((*i).into()),
-        Value::Float4(f) => {
-            serde_json::Number::from_f64(*f as f64)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
-        }
-        Value::Float8(f) => {
-            serde_json::Number::from_f64(*f)
-                .map(serde_json::Value::Number)
-                .unwrap_or(serde_json::Value::Null)
-        }
+        Value::Float4(f) => serde_json::Number::from_f64(*f as f64)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
+        Value::Float8(f) => serde_json::Number::from_f64(*f)
+            .map(serde_json::Value::Number)
+            .unwrap_or(serde_json::Value::Null),
         Value::Numeric(n) => {
             // Try to parse as a JSON number, preserving precision
             n.parse::<serde_json::Number>()
@@ -260,22 +256,14 @@ pub fn value_to_json(value: &Value) -> serde_json::Value {
         Value::Timestamp(ts) => serde_json::Value::String(ts.to_rfc3339()),
         Value::Date(d) => serde_json::Value::String(d.format("%Y-%m-%d").to_string()),
         Value::Time(t) => serde_json::Value::String(t.format("%H:%M:%S%.f").to_string()),
-        Value::Json(json_str) => {
-            serde_json::from_str(json_str).unwrap_or(serde_json::Value::String(json_str.clone()))
-        }
-        Value::Array(arr) => {
-            serde_json::Value::Array(
-                arr.iter().map(value_to_json).collect()
-            )
-        }
-        Value::Vector(vec) => {
-            serde_json::Value::Array(
-                vec.iter()
-                    .filter_map(|f| serde_json::Number::from_f64(*f as f64))
-                    .map(serde_json::Value::Number)
-                    .collect()
-            )
-        }
+        Value::Json(json_str) => serde_json::from_str(json_str).unwrap_or(serde_json::Value::String(json_str.clone())),
+        Value::Array(arr) => serde_json::Value::Array(arr.iter().map(value_to_json).collect()),
+        Value::Vector(vec) => serde_json::Value::Array(
+            vec.iter()
+                .filter_map(|f| serde_json::Number::from_f64(*f as f64))
+                .map(serde_json::Value::Number)
+                .collect(),
+        ),
         // Storage references (should be resolved before JSON conversion)
         Value::DictRef { dict_id } => serde_json::Value::String(format!("dict:{}", dict_id)),
         Value::CasRef { hash } => serde_json::Value::String(format!("cas:{}", hex::encode(hash))),
@@ -345,36 +333,32 @@ pub fn json_to_value(json: &serde_json::Value, target_type: &crate::DataType) ->
     match (json, target_type) {
         (serde_json::Value::Null, _) => Ok(Value::Null),
         (serde_json::Value::Bool(b), crate::DataType::Boolean) => Ok(Value::Boolean(*b)),
-        (serde_json::Value::Number(n), crate::DataType::Int2) => {
-            n.as_i64()
-                .and_then(|i| i16::try_from(i).ok())
-                .map(Value::Int2)
-                .ok_or_else(|| format!("Invalid Int2 value: {}", n))
-        }
-        (serde_json::Value::Number(n), crate::DataType::Int4) => {
-            n.as_i64()
-                .and_then(|i| i32::try_from(i).ok())
-                .map(Value::Int4)
-                .ok_or_else(|| format!("Invalid Int4 value: {}", n))
-        }
-        (serde_json::Value::Number(n), crate::DataType::Int8) => {
-            n.as_i64()
-                .map(Value::Int8)
-                .ok_or_else(|| format!("Invalid Int8 value: {}", n))
-        }
-        (serde_json::Value::Number(n), crate::DataType::Float4) => {
-            n.as_f64()
-                .map(|f| Value::Float4(f as f32))
-                .ok_or_else(|| format!("Invalid Float4 value: {}", n))
-        }
-        (serde_json::Value::Number(n), crate::DataType::Float8) => {
-            n.as_f64()
-                .map(Value::Float8)
-                .ok_or_else(|| format!("Invalid Float8 value: {}", n))
-        }
-        (serde_json::Value::String(s), crate::DataType::Text | crate::DataType::Varchar(_) | crate::DataType::Char(_)) => {
-            Ok(Value::String(s.clone()))
-        }
+        (serde_json::Value::Number(n), crate::DataType::Int2) => n
+            .as_i64()
+            .and_then(|i| i16::try_from(i).ok())
+            .map(Value::Int2)
+            .ok_or_else(|| format!("Invalid Int2 value: {}", n)),
+        (serde_json::Value::Number(n), crate::DataType::Int4) => n
+            .as_i64()
+            .and_then(|i| i32::try_from(i).ok())
+            .map(Value::Int4)
+            .ok_or_else(|| format!("Invalid Int4 value: {}", n)),
+        (serde_json::Value::Number(n), crate::DataType::Int8) => n
+            .as_i64()
+            .map(Value::Int8)
+            .ok_or_else(|| format!("Invalid Int8 value: {}", n)),
+        (serde_json::Value::Number(n), crate::DataType::Float4) => n
+            .as_f64()
+            .map(|f| Value::Float4(f as f32))
+            .ok_or_else(|| format!("Invalid Float4 value: {}", n)),
+        (serde_json::Value::Number(n), crate::DataType::Float8) => n
+            .as_f64()
+            .map(Value::Float8)
+            .ok_or_else(|| format!("Invalid Float8 value: {}", n)),
+        (
+            serde_json::Value::String(s),
+            crate::DataType::Text | crate::DataType::Varchar(_) | crate::DataType::Char(_),
+        ) => Ok(Value::String(s.clone())),
         (serde_json::Value::String(s), crate::DataType::Bytea) => {
             // Decode base64 or hex string to bytes
             use base64::Engine;
@@ -385,33 +369,33 @@ pub fn json_to_value(json: &serde_json::Value, target_type: &crate::DataType) ->
                     .map_err(|e| format!("Invalid hex bytes: {}", e))
             } else {
                 // Try base64 decode
-                base64::prelude::BASE64_STANDARD.decode(s.as_bytes())
+                base64::prelude::BASE64_STANDARD
+                    .decode(s.as_bytes())
                     .map(Value::Bytes)
                     .map_err(|e| format!("Invalid base64 bytes: {}", e))
             }
         }
-        (serde_json::Value::String(s), crate::DataType::Uuid) => {
-            s.parse::<uuid::Uuid>()
-                .map(Value::Uuid)
-                .map_err(|e| format!("Invalid UUID: {}", e))
-        }
-        (serde_json::Value::String(s), crate::DataType::Timestamp | crate::DataType::Timestamptz) => {
-            s.parse::<chrono::DateTime<chrono::Utc>>()
-                .map(Value::Timestamp)
-                .map_err(|e| format!("Invalid timestamp: {}", e))
-        }
-        (serde_json::Value::String(s), crate::DataType::Json | crate::DataType::Jsonb) => {
-            Ok(Value::Json(s.clone()))
-        }
-        (serde_json::Value::Object(_) | serde_json::Value::Array(_), crate::DataType::Json | crate::DataType::Jsonb) => {
-            Ok(Value::Json(json.to_string()))
-        }
+        (serde_json::Value::String(s), crate::DataType::Uuid) => s
+            .parse::<uuid::Uuid>()
+            .map(Value::Uuid)
+            .map_err(|e| format!("Invalid UUID: {}", e)),
+        (serde_json::Value::String(s), crate::DataType::Timestamp | crate::DataType::Timestamptz) => s
+            .parse::<chrono::DateTime<chrono::Utc>>()
+            .map(Value::Timestamp)
+            .map_err(|e| format!("Invalid timestamp: {}", e)),
+        (serde_json::Value::String(s), crate::DataType::Json | crate::DataType::Jsonb) => Ok(Value::Json(s.clone())),
+        (
+            serde_json::Value::Object(_) | serde_json::Value::Array(_),
+            crate::DataType::Json | crate::DataType::Jsonb,
+        ) => Ok(Value::Json(json.to_string())),
         (serde_json::Value::Array(arr), crate::DataType::Vector(expected_dim)) => {
-            let values: Result<Vec<f32>, String> = arr.iter()
-                .map(|v| v.as_f64()
-                    .map(|f| f as f32)
-                    .ok_or_else(|| format!("Invalid vector element: {}", v))
-                )
+            let values: Result<Vec<f32>, String> = arr
+                .iter()
+                .map(|v| {
+                    v.as_f64()
+                        .map(|f| f as f32)
+                        .ok_or_else(|| format!("Invalid vector element: {}", v))
+                })
                 .collect();
 
             let values = values?;
@@ -426,11 +410,7 @@ pub fn json_to_value(json: &serde_json::Value, target_type: &crate::DataType) ->
 
             Ok(Value::Vector(values))
         }
-        _ => Err(format!(
-            "Cannot convert {:?} to {:?}",
-            json,
-            target_type
-        )),
+        _ => Err(format!("Cannot convert {:?} to {:?}", json, target_type)),
     }
 }
 
@@ -445,7 +425,10 @@ mod tests {
         assert_eq!(value_to_json(&Value::Null), serde_json::Value::Null);
         assert_eq!(value_to_json(&Value::Boolean(true)), serde_json::Value::Bool(true));
         assert_eq!(value_to_json(&Value::Int4(42)), serde_json::Value::Number(42.into()));
-        assert_eq!(value_to_json(&Value::String("test".to_string())), serde_json::Value::String("test".to_string()));
+        assert_eq!(
+            value_to_json(&Value::String("test".to_string())),
+            serde_json::Value::String("test".to_string())
+        );
     }
 
     #[test]
@@ -470,9 +453,9 @@ mod tests {
             primary_key: true,
             source_table: None,
             source_table_name: None,
-        default_expr: None,
-        unique: false,
-        storage_mode: crate::ColumnStorageMode::Default,
+            default_expr: None,
+            unique: false,
+            storage_mode: crate::ColumnStorageMode::Default,
         };
 
         let info = ColumnInfo::from(&column);
@@ -491,9 +474,9 @@ mod tests {
                 primary_key: true,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
             Column {
                 name: "name".to_string(),
@@ -502,16 +485,13 @@ mod tests {
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
         ]);
 
-        let tuple = Tuple::new(vec![
-            Value::Int4(1),
-            Value::String("Alice".to_string()),
-        ]);
+        let tuple = Tuple::new(vec![Value::Int4(1), Value::String("Alice".to_string())]);
 
         let map = tuple_to_map(&tuple, &schema);
         assert_eq!(map.len(), 2);

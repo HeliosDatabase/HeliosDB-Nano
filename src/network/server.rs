@@ -2,8 +2,8 @@
 //!
 //! Listens for client connections and spawns session handlers
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
@@ -89,7 +89,10 @@ impl PgServer {
             .await
             .map_err(|e| Error::protocol(format!("Failed to bind to {}: {}", self.address, e)))?;
 
-        info!("HeliosDB PostgreSQL server listening on {} (max_connections: {})", self.address, self.max_connections);
+        info!(
+            "HeliosDB PostgreSQL server listening on {} (max_connections: {})",
+            self.address, self.max_connections
+        );
         let parts: Vec<&str> = self.address.split(':').collect();
         let host = parts.first().unwrap_or(&"localhost");
         let port = parts.get(1).unwrap_or(&"5432");
@@ -109,7 +112,10 @@ impl PgServer {
             let permit = match Arc::clone(&self.connection_limiter).try_acquire_owned() {
                 Ok(permit) => permit,
                 Err(_) => {
-                    warn!("Connection limit reached ({}), rejecting {}", self.max_connections, addr);
+                    warn!(
+                        "Connection limit reached ({}), rejecting {}",
+                        self.max_connections, addr
+                    );
                     drop(stream);
                     continue;
                 }
@@ -121,8 +127,7 @@ impl PgServer {
             info!("New connection from {} (session {})", addr, session_id);
 
             // Create session
-            let session = Session::new(Arc::clone(&self.db), session_id)
-                        .with_idle_timeout(self.idle_timeout_secs);
+            let session = Session::new(Arc::clone(&self.db), session_id).with_idle_timeout(self.idle_timeout_secs);
 
             // Spawn handler task (permit released when task completes)
             tokio::spawn(async move {
@@ -150,7 +155,10 @@ impl PgServer {
             .await
             .map_err(|e| Error::protocol(format!("Failed to bind to {}: {}", self.address, e)))?;
 
-        info!("HeliosDB PostgreSQL server listening on {} (max_connections: {})", self.address, self.max_connections);
+        info!(
+            "HeliosDB PostgreSQL server listening on {} (max_connections: {})",
+            self.address, self.max_connections
+        );
         let parts: Vec<&str> = self.address.split(':').collect();
         let host = parts.first().unwrap_or(&"localhost");
         let port = parts.get(1).unwrap_or(&"5432");

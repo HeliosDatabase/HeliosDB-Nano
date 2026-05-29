@@ -2,8 +2,8 @@
 //!
 //! Benchmarks for HNSW index performance with different dataset sizes.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use heliosdb_nano::vector::{HnswConfig, HnswIndex, DistanceMetric};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use heliosdb_nano::vector::{DistanceMetric, HnswConfig, HnswIndex};
 
 fn generate_random_vector(dim: usize, seed: u64) -> Vec<f32> {
     use std::collections::hash_map::RandomState;
@@ -86,47 +86,26 @@ fn benchmark_vector_distances(c: &mut Criterion) {
         let v1 = generate_random_vector(*dim, 1);
         let v2 = generate_random_vector(*dim, 2);
 
-        group.bench_with_input(
-            BenchmarkId::new("l2", dim),
-            dim,
-            |b, _| {
-                b.iter(|| {
-                    let dist = heliosdb_nano::vector::l2_distance(
-                        black_box(&v1),
-                        black_box(&v2)
-                    );
-                    black_box(dist);
-                });
-            }
-        );
+        group.bench_with_input(BenchmarkId::new("l2", dim), dim, |b, _| {
+            b.iter(|| {
+                let dist = heliosdb_nano::vector::l2_distance(black_box(&v1), black_box(&v2));
+                black_box(dist);
+            });
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("cosine", dim),
-            dim,
-            |b, _| {
-                b.iter(|| {
-                    let dist = heliosdb_nano::vector::cosine_distance(
-                        black_box(&v1),
-                        black_box(&v2)
-                    );
-                    black_box(dist);
-                });
-            }
-        );
+        group.bench_with_input(BenchmarkId::new("cosine", dim), dim, |b, _| {
+            b.iter(|| {
+                let dist = heliosdb_nano::vector::cosine_distance(black_box(&v1), black_box(&v2));
+                black_box(dist);
+            });
+        });
 
-        group.bench_with_input(
-            BenchmarkId::new("inner_product", dim),
-            dim,
-            |b, _| {
-                b.iter(|| {
-                    let dist = heliosdb_nano::vector::inner_product_distance(
-                        black_box(&v1),
-                        black_box(&v2)
-                    );
-                    black_box(dist);
-                });
-            }
-        );
+        group.bench_with_input(BenchmarkId::new("inner_product", dim), dim, |b, _| {
+            b.iter(|| {
+                let dist = heliosdb_nano::vector::inner_product_distance(black_box(&v1), black_box(&v2));
+                black_box(dist);
+            });
+        });
     }
 
     group.finish();

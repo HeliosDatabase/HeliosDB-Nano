@@ -3,7 +3,7 @@
 //! This module provides utilities for generating and managing SSL/TLS certificates
 //! for testing and development purposes.
 
-use crate::{Result, Error};
+use crate::{Error, Result};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -26,22 +26,16 @@ impl CertificateManager {
     /// # Returns
     ///
     /// Returns Ok(()) if successful, or an error if certificate generation fails.
-    pub fn generate_self_signed<P: AsRef<Path>>(
-        cert_path: P,
-        key_path: P,
-        common_name: &str,
-    ) -> Result<()> {
+    pub fn generate_self_signed<P: AsRef<Path>>(cert_path: P, key_path: P, common_name: &str) -> Result<()> {
         let cert_path = cert_path.as_ref();
         let key_path = key_path.as_ref();
 
         // Create directories if they don't exist
         if let Some(parent) = cert_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| Error::io(format!("Failed to create cert directory: {}", e)))?;
+            fs::create_dir_all(parent).map_err(|e| Error::io(format!("Failed to create cert directory: {}", e)))?;
         }
         if let Some(parent) = key_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| Error::io(format!("Failed to create key directory: {}", e)))?;
+            fs::create_dir_all(parent).map_err(|e| Error::io(format!("Failed to create key directory: {}", e)))?;
         }
 
         // Generate certificate using OpenSSL command
@@ -50,12 +44,17 @@ impl CertificateManager {
             .args([
                 "req",
                 "-x509",
-                "-newkey", "rsa:2048",
+                "-newkey",
+                "rsa:2048",
                 "-nodes",
-                "-keyout", key_path.to_str().ok_or_else(|| Error::io("Invalid key path"))?,
-                "-out", cert_path.to_str().ok_or_else(|| Error::io("Invalid cert path"))?,
-                "-days", "365",
-                "-subj", &format!("/CN={}", common_name),
+                "-keyout",
+                key_path.to_str().ok_or_else(|| Error::io("Invalid key path"))?,
+                "-out",
+                cert_path.to_str().ok_or_else(|| Error::io("Invalid cert path"))?,
+                "-days",
+                "365",
+                "-subj",
+                &format!("/CN={}", common_name),
             ])
             .output()
             .map_err(|e| Error::io(format!("Failed to execute openssl: {}", e)))?;
@@ -135,35 +134,30 @@ GNTvYWQXgmFnJnXpQpPqCBbPqJQXLd2jJmMQ==
     }
 
     /// Save certificate and key to files
-    pub fn save_cert_files<P: AsRef<Path>>(
-        cert_pem: &str,
-        key_pem: &str,
-        cert_path: P,
-        key_path: P,
-    ) -> Result<()> {
+    pub fn save_cert_files<P: AsRef<Path>>(cert_pem: &str, key_pem: &str, cert_path: P, key_path: P) -> Result<()> {
         let cert_path = cert_path.as_ref();
         let key_path = key_path.as_ref();
 
         // Create directories
         if let Some(parent) = cert_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| Error::io(format!("Failed to create cert directory: {}", e)))?;
+            fs::create_dir_all(parent).map_err(|e| Error::io(format!("Failed to create cert directory: {}", e)))?;
         }
         if let Some(parent) = key_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| Error::io(format!("Failed to create key directory: {}", e)))?;
+            fs::create_dir_all(parent).map_err(|e| Error::io(format!("Failed to create key directory: {}", e)))?;
         }
 
         // Write certificate
-        let mut cert_file = File::create(cert_path)
-            .map_err(|e| Error::io(format!("Failed to create cert file: {}", e)))?;
-        cert_file.write_all(cert_pem.as_bytes())
+        let mut cert_file =
+            File::create(cert_path).map_err(|e| Error::io(format!("Failed to create cert file: {}", e)))?;
+        cert_file
+            .write_all(cert_pem.as_bytes())
             .map_err(|e| Error::io(format!("Failed to write cert file: {}", e)))?;
 
         // Write key with restricted permissions
-        let mut key_file = File::create(key_path)
-            .map_err(|e| Error::io(format!("Failed to create key file: {}", e)))?;
-        key_file.write_all(key_pem.as_bytes())
+        let mut key_file =
+            File::create(key_path).map_err(|e| Error::io(format!("Failed to create key file: {}", e)))?;
+        key_file
+            .write_all(key_pem.as_bytes())
             .map_err(|e| Error::io(format!("Failed to write key file: {}", e)))?;
 
         // Set restrictive permissions on key file (Unix only)
@@ -218,18 +212,15 @@ GNTvYWQXgmFnJnXpQpPqCBbPqJQXLd2jJmMQ==
         }
 
         if !key_path.exists() {
-            return Err(Error::io(format!(
-                "Private key file not found: {}",
-                key_path.display()
-            )));
+            return Err(Error::io(format!("Private key file not found: {}", key_path.display())));
         }
 
         // Try to read the files
-        let cert_data = fs::read_to_string(cert_path)
-            .map_err(|e| Error::io(format!("Failed to read certificate: {}", e)))?;
+        let cert_data =
+            fs::read_to_string(cert_path).map_err(|e| Error::io(format!("Failed to read certificate: {}", e)))?;
 
-        let key_data = fs::read_to_string(key_path)
-            .map_err(|e| Error::io(format!("Failed to read private key: {}", e)))?;
+        let key_data =
+            fs::read_to_string(key_path).map_err(|e| Error::io(format!("Failed to read private key: {}", e)))?;
 
         // Basic validation
         if !cert_data.contains("BEGIN CERTIFICATE") {
@@ -251,8 +242,7 @@ mod tests {
 
     #[test]
     fn test_generate_test_cert() {
-        let (cert, key) = CertificateManager::generate_test_cert()
-            .expect("Failed to generate test cert");
+        let (cert, key) = CertificateManager::generate_test_cert().expect("Failed to generate test cert");
 
         assert!(cert.contains("BEGIN CERTIFICATE"));
         assert!(cert.contains("END CERTIFICATE"));
@@ -266,8 +256,7 @@ mod tests {
         let cert_path = temp_dir.path().join("test.crt");
         let key_path = temp_dir.path().join("test.key");
 
-        let (cert_pem, key_pem) = CertificateManager::generate_test_cert()
-            .expect("Failed to generate test cert");
+        let (cert_pem, key_pem) = CertificateManager::generate_test_cert().expect("Failed to generate test cert");
 
         CertificateManager::save_cert_files(&cert_pem, &key_pem, &cert_path, &key_path)
             .expect("Failed to save cert files");
@@ -276,10 +265,8 @@ mod tests {
         assert!(key_path.exists());
 
         // Verify contents
-        let saved_cert = fs::read_to_string(&cert_path)
-            .expect("Failed to read cert");
-        let saved_key = fs::read_to_string(&key_path)
-            .expect("Failed to read key");
+        let saved_cert = fs::read_to_string(&cert_path).expect("Failed to read cert");
+        let saved_key = fs::read_to_string(&key_path).expect("Failed to read key");
 
         assert_eq!(saved_cert, cert_pem);
         assert_eq!(saved_key, key_pem);
@@ -295,8 +282,7 @@ mod tests {
         assert!(CertificateManager::verify_cert_files(&cert_path, &key_path).is_err());
 
         // Create valid files
-        let (cert_pem, key_pem) = CertificateManager::generate_test_cert()
-            .expect("Failed to generate test cert");
+        let (cert_pem, key_pem) = CertificateManager::generate_test_cert().expect("Failed to generate test cert");
         CertificateManager::save_cert_files(&cert_pem, &key_pem, &cert_path, &key_path)
             .expect("Failed to save cert files");
 

@@ -70,9 +70,7 @@ fn populate_db(db: &EmbeddedDatabase, corpus: &[(PathBuf, String)]) {
     }
 }
 
-fn measure(corpus: &[(PathBuf, String)], parallelism: usize, chunk_size: Option<usize>)
-    -> (u128, u64, u64, u64)
-{
+fn measure(corpus: &[(PathBuf, String)], parallelism: usize, chunk_size: Option<usize>) -> (u128, u64, u64, u64) {
     let db = EmbeddedDatabase::new_in_memory().expect("in-memory db");
     populate_db(&db, corpus);
     let mut opts = CodeIndexOptions::for_table("src");
@@ -81,7 +79,12 @@ fn measure(corpus: &[(PathBuf, String)], parallelism: usize, chunk_size: Option<
     let started = Instant::now();
     let stats = db.code_index(opts).expect("code_index");
     let total_ms = started.elapsed().as_millis();
-    (total_ms, stats.parse_elapsed_ms, stats.write_elapsed_ms, stats.files_parsed)
+    (
+        total_ms,
+        stats.parse_elapsed_ms,
+        stats.write_elapsed_ms,
+        stats.files_parsed,
+    )
 }
 
 #[test]
@@ -95,11 +98,12 @@ fn field_benchmark_nano_src_tree() {
     println!("Corpus: {} Rust files", corpus.len());
     assert!(corpus.len() >= 100, "expected ≥100 files in src/, got {}", corpus.len());
 
-    let cores = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1);
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
     let parallel_workers = cores.min(8);
-    println!("Available cores: {} — using {} workers for parallel run", cores, parallel_workers);
+    println!(
+        "Available cores: {} — using {} workers for parallel run",
+        cores, parallel_workers
+    );
 
     // Serial baseline.
     let (total_serial, parse_s, write_s, files_s) = measure(&corpus, 1, None);
@@ -156,7 +160,8 @@ fn field_benchmark_nano_src_tree() {
         assert!(
             parse_speedup >= 1.5,
             "parse_speedup {:.2}× is below the 1.5× regression floor (parallelism={})",
-            parse_speedup, parallel_workers
+            parse_speedup,
+            parallel_workers
         );
     }
 
@@ -167,6 +172,7 @@ fn field_benchmark_nano_src_tree() {
     assert!(
         parse_c <= parse_p.saturating_mul(2).max(5_000),
         "chunked parse {}ms is more than 2× unchunked parse {}ms — overhead is too high",
-        parse_c, parse_p
+        parse_c,
+        parse_p
     );
 }

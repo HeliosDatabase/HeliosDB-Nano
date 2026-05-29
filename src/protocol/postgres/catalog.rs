@@ -5,7 +5,7 @@
 //! Many PostgreSQL clients query these system tables during connection
 //! and for introspection.
 
-use crate::{Result, Schema, Tuple, Value, Column, DataType, EmbeddedDatabase};
+use crate::{Column, DataType, EmbeddedDatabase, Result, Schema, Tuple, Value};
 use std::sync::Arc;
 
 /// PostgreSQL catalog emulator
@@ -22,7 +22,9 @@ impl PgCatalog {
 
     /// Create a new catalog emulator with database access for real table/column metadata
     pub fn with_database(database: Arc<EmbeddedDatabase>) -> Self {
-        Self { database: Some(database) }
+        Self {
+            database: Some(database),
+        }
     }
 
     /// Handle catalog queries
@@ -71,8 +73,7 @@ impl PgCatalog {
         //   SELECT … FROM pg_tables WHERE schemaname NOT IN
         //   ('pg_catalog','information_schema');
         let has_information_schema_ref =
-            query_lower.contains("information_schema.")
-            || query_lower.contains(" information_schema ");
+            query_lower.contains("information_schema.") || query_lower.contains(" information_schema ");
         let result = if has_information_schema_ref {
             if query_lower.contains("information_schema.columns") {
                 // KanttBan #23 (v3.31.1 phase 2): migrated to the
@@ -146,35 +147,39 @@ impl PgCatalog {
             // Direct ORM queries against pg_inherits still get the
             // empty rowset via this route — same behaviour as the
             // registry would have produced.
-            Some((Schema::new(vec![
-                Column::new("oid", DataType::Text),
-                Column::new("relkind", DataType::Char(1)),
-                Column::new("partbound", DataType::Text),
-            ]), vec![]))
+            Some((
+                Schema::new(vec![
+                    Column::new("oid", DataType::Text),
+                    Column::new("relkind", DataType::Char(1)),
+                    Column::new("partbound", DataType::Text),
+                ]),
+                vec![],
+            ))
         } else if query_lower.contains("pg_publication") {
             // Same carve-out as pg_inherits: psql `\d` joins this with
             // `pg_relation_is_publishable(<oid>)`, which the planner
             // doesn't implement. Empty 1-col `pubname` response.
-            Some((Schema::new(vec![
-                Column::new("pubname", DataType::Text),
-            ]), vec![]))
+            Some((Schema::new(vec![Column::new("pubname", DataType::Text)]), vec![]))
         } else if query_lower.contains("pg_statistic_ext") {
             // Same carve-out: psql's `\d` query against pg_statistic_ext
             // projects `stxrelid::pg_catalog.regclass` and
             // `stxnamespace::pg_catalog.regnamespace`, both regclass-family
             // type casts the planner doesn't handle. Empty 9-col shape
             // matches the slice 5 registry registration.
-            Some((Schema::new(vec![
-                Column::new("oid", DataType::Int4),
-                Column::new("stxrelid", DataType::Text),
-                Column::new("nsp", DataType::Text),
-                Column::new("stxname", DataType::Text),
-                Column::new("columns", DataType::Text),
-                Column::new("ndist_enabled", DataType::Boolean),
-                Column::new("deps_enabled", DataType::Boolean),
-                Column::new("mcv_enabled", DataType::Boolean),
-                Column::new("stxstattarget", DataType::Int4),
-            ]), vec![]))
+            Some((
+                Schema::new(vec![
+                    Column::new("oid", DataType::Int4),
+                    Column::new("stxrelid", DataType::Text),
+                    Column::new("nsp", DataType::Text),
+                    Column::new("stxname", DataType::Text),
+                    Column::new("columns", DataType::Text),
+                    Column::new("ndist_enabled", DataType::Boolean),
+                    Column::new("deps_enabled", DataType::Boolean),
+                    Column::new("mcv_enabled", DataType::Boolean),
+                    Column::new("stxstattarget", DataType::Int4),
+                ]),
+                vec![],
+            ))
         } else if query_lower.contains("pg_indexes") {
             // pg_indexes (the user-facing view) — not in the registry
             // yet. Leave as fixed-shape until migrated.
@@ -256,7 +261,9 @@ impl PgCatalog {
             let mut end = after.len();
             for t in [" order by ", " having ", " limit ", " offset ", ";"] {
                 if let Some(p) = after.find(t) {
-                    if p < end { end = p; }
+                    if p < end {
+                        end = p;
+                    }
                 }
             }
             after[..end].trim().to_string()
@@ -271,10 +278,7 @@ impl PgCatalog {
                 .trim()
                 .trim_matches('"')
                 .to_lowercase();
-            let col_idx = schema
-                .columns
-                .iter()
-                .position(|c| c.name.to_lowercase() == group_col)?;
+            let col_idx = schema.columns.iter().position(|c| c.name.to_lowercase() == group_col)?;
 
             let mut buckets: Vec<(Value, i64)> = Vec::new();
             for row in rows {
@@ -289,10 +293,7 @@ impl PgCatalog {
             // Safety: col_idx came from `position` above.
             #[allow(clippy::indexing_slicing)]
             let group_col_meta = schema.columns[col_idx].clone();
-            let out_schema = Schema::new(vec![
-                group_col_meta,
-                Column::new("count", DataType::Int8),
-            ]);
+            let out_schema = Schema::new(vec![group_col_meta, Column::new("count", DataType::Int8)]);
             let out_rows: Vec<Tuple> = buckets
                 .into_iter()
                 .map(|(v, c)| Tuple::new(vec![v, Value::Int8(c)]))
@@ -323,21 +324,30 @@ impl PgCatalog {
         // Find `where ` and collect the text up to the next clause
         // keyword (`order by`, `group by`, `limit`, `;`, end).
         let where_kw = " where ";
-        let start = match q.find(where_kw) { Some(p) => p + where_kw.len(), None => return rows };
+        let start = match q.find(where_kw) {
+            Some(p) => p + where_kw.len(),
+            None => return rows,
+        };
         let terminators = [" order by ", " group by ", " limit ", " offset ", ";"];
         let mut end = q.len();
         for t in &terminators {
             if let Some(p) = q[start..].find(t) {
                 let cand = start + p;
-                if cand < end { end = cand; }
+                if cand < end {
+                    end = cand;
+                }
             }
         }
         let predicate = q[start..end].trim();
-        if predicate.is_empty() { return rows; }
+        if predicate.is_empty() {
+            return rows;
+        }
 
         // Split on " and " at the top level (we don't handle parens).
         let preds: Vec<&str> = predicate.split(" and ").map(str::trim).collect();
-        rows.into_iter().filter(|row| preds.iter().all(|p| Self::eval_simple_pred(p, schema, row))).collect()
+        rows.into_iter()
+            .filter(|row| preds.iter().all(|p| Self::eval_simple_pred(p, schema, row)))
+            .collect()
     }
 
     /// Evaluate one of the predicate shapes supported by
@@ -394,7 +404,8 @@ impl PgCatalog {
     }
 
     fn parse_in_list(s: &str) -> Vec<String> {
-        s.trim().trim_matches(|c: char| c == '(' || c == ')')
+        s.trim()
+            .trim_matches(|c: char| c == '(' || c == ')')
             .split(',')
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty())
@@ -444,8 +455,12 @@ impl PgCatalog {
             };
         }
         // Bool
-        if lit.eq_ignore_ascii_case("true") { return matches!(val, Value::Boolean(true)); }
-        if lit.eq_ignore_ascii_case("false") { return matches!(val, Value::Boolean(false)); }
+        if lit.eq_ignore_ascii_case("true") {
+            return matches!(val, Value::Boolean(true));
+        }
+        if lit.eq_ignore_ascii_case("false") {
+            return matches!(val, Value::Boolean(false));
+        }
         false
     }
 
@@ -531,7 +546,11 @@ impl PgCatalog {
                         Value::String(table_name.clone()),
                         Value::String(col.name.clone()),
                         Value::String(col.data_type.to_string()),
-                        Value::String(if col.nullable { "YES".to_string() } else { "NO".to_string() }),
+                        Value::String(if col.nullable {
+                            "YES".to_string()
+                        } else {
+                            "NO".to_string()
+                        }),
                         Value::Int4((i + 1) as i32),
                         Value::Boolean(col.primary_key),
                     ]));
@@ -583,9 +602,7 @@ impl PgCatalog {
         // Build index map: for each requested column, find its position in the full schema
         let col_indices: Vec<usize> = select_cols
             .iter()
-            .filter_map(|requested| {
-                schema.columns.iter().position(|c| c.name == *requested)
-            })
+            .filter_map(|requested| schema.columns.iter().position(|c| c.name == *requested))
             .collect();
 
         // If no columns matched, return all (safety fallback)
@@ -597,7 +614,7 @@ impl PgCatalog {
         let projected_schema = Schema::new(
             // Safety: col_indices validated against schema.columns.len() above
             #[allow(clippy::indexing_slicing)]
-            col_indices.iter().map(|&i| schema.columns[i].clone()).collect()
+            col_indices.iter().map(|&i| schema.columns[i].clone()).collect(),
         );
 
         // Build projected rows
@@ -606,9 +623,7 @@ impl PgCatalog {
             .map(|row| {
                 let values: Vec<Value> = col_indices
                     .iter()
-                    .map(|&i| {
-                        row.values.get(i).cloned().unwrap_or(Value::Null)
-                    })
+                    .map(|&i| row.values.get(i).cloned().unwrap_or(Value::Null))
                     .collect();
                 Tuple::new(values)
             })
@@ -693,9 +708,7 @@ impl PgCatalog {
 
     /// Return PostgreSQL-compatible version string
     fn query_version(&self) -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![
-            Column::new("version", DataType::Text),
-        ]);
+        let schema = Schema::new(vec![Column::new("version", DataType::Text)]);
         let row = Tuple::new(vec![Value::String(format!(
             "PostgreSQL 16.0 (HeliosDB Nano {})",
             env!("CARGO_PKG_VERSION")
@@ -705,27 +718,21 @@ impl PgCatalog {
 
     /// Return current schema (always "public")
     fn query_current_schema() -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![
-            Column::new("current_schema", DataType::Text),
-        ]);
+        let schema = Schema::new(vec![Column::new("current_schema", DataType::Text)]);
         let row = Tuple::new(vec![Value::String("public".to_string())]);
         Ok((schema, vec![row]))
     }
 
     /// Return current database name
     fn query_current_database() -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![
-            Column::new("current_database", DataType::Text),
-        ]);
+        let schema = Schema::new(vec![Column::new("current_database", DataType::Text)]);
         let row = Tuple::new(vec![Value::String("heliosdb".to_string())]);
         Ok((schema, vec![row]))
     }
 
     /// Return current user
     fn query_current_user() -> Result<(Schema, Vec<Tuple>)> {
-        let schema = Schema::new(vec![
-            Column::new("current_user", DataType::Text),
-        ]);
+        let schema = Schema::new(vec![Column::new("current_user", DataType::Text)]);
         let row = Tuple::new(vec![Value::String("heliosdb".to_string())]);
         Ok((schema, vec![row]))
     }
@@ -743,52 +750,88 @@ impl PgCatalog {
         let rows = vec![
             // Common types
             Tuple::new(vec![
-                Value::Int4(16), Value::String("bool".to_string()), Value::Int4(11),
-                Value::Int2(1), Value::String("b".to_string()),
+                Value::Int4(16),
+                Value::String("bool".to_string()),
+                Value::Int4(11),
+                Value::Int2(1),
+                Value::String("b".to_string()),
             ]),
             Tuple::new(vec![
-                Value::Int4(20), Value::String("int8".to_string()), Value::Int4(11),
-                Value::Int2(8), Value::String("b".to_string()),
+                Value::Int4(20),
+                Value::String("int8".to_string()),
+                Value::Int4(11),
+                Value::Int2(8),
+                Value::String("b".to_string()),
             ]),
             Tuple::new(vec![
-                Value::Int4(21), Value::String("int2".to_string()), Value::Int4(11),
-                Value::Int2(2), Value::String("b".to_string()),
+                Value::Int4(21),
+                Value::String("int2".to_string()),
+                Value::Int4(11),
+                Value::Int2(2),
+                Value::String("b".to_string()),
             ]),
             Tuple::new(vec![
-                Value::Int4(23), Value::String("int4".to_string()), Value::Int4(11),
-                Value::Int2(4), Value::String("b".to_string()),
+                Value::Int4(23),
+                Value::String("int4".to_string()),
+                Value::Int4(11),
+                Value::Int2(4),
+                Value::String("b".to_string()),
             ]),
             Tuple::new(vec![
-                Value::Int4(25), Value::String("text".to_string()), Value::Int4(11),
-                Value::Int2(-1), Value::String("b".to_string()),
+                Value::Int4(25),
+                Value::String("text".to_string()),
+                Value::Int4(11),
+                Value::Int2(-1),
+                Value::String("b".to_string()),
             ]),
             Tuple::new(vec![
-                Value::Int4(700), Value::String("float4".to_string()), Value::Int4(11),
-                Value::Int2(4), Value::String("b".to_string()),
+                Value::Int4(700),
+                Value::String("float4".to_string()),
+                Value::Int4(11),
+                Value::Int2(4),
+                Value::String("b".to_string()),
             ]),
             Tuple::new(vec![
-                Value::Int4(701), Value::String("float8".to_string()), Value::Int4(11),
-                Value::Int2(8), Value::String("b".to_string()),
+                Value::Int4(701),
+                Value::String("float8".to_string()),
+                Value::Int4(11),
+                Value::Int2(8),
+                Value::String("b".to_string()),
             ]),
             Tuple::new(vec![
-                Value::Int4(1043), Value::String("varchar".to_string()), Value::Int4(11),
-                Value::Int2(-1), Value::String("b".to_string()),
+                Value::Int4(1043),
+                Value::String("varchar".to_string()),
+                Value::Int4(11),
+                Value::Int2(-1),
+                Value::String("b".to_string()),
             ]),
             Tuple::new(vec![
-                Value::Int4(1114), Value::String("timestamp".to_string()), Value::Int4(11),
-                Value::Int2(8), Value::String("b".to_string()),
+                Value::Int4(1114),
+                Value::String("timestamp".to_string()),
+                Value::Int4(11),
+                Value::Int2(8),
+                Value::String("b".to_string()),
             ]),
             Tuple::new(vec![
-                Value::Int4(2950), Value::String("uuid".to_string()), Value::Int4(11),
-                Value::Int2(16), Value::String("b".to_string()),
+                Value::Int4(2950),
+                Value::String("uuid".to_string()),
+                Value::Int4(11),
+                Value::Int2(16),
+                Value::String("b".to_string()),
             ]),
             Tuple::new(vec![
-                Value::Int4(114), Value::String("json".to_string()), Value::Int4(11),
-                Value::Int2(-1), Value::String("b".to_string()),
+                Value::Int4(114),
+                Value::String("json".to_string()),
+                Value::Int4(11),
+                Value::Int2(-1),
+                Value::String("b".to_string()),
             ]),
             Tuple::new(vec![
-                Value::Int4(3802), Value::String("jsonb".to_string()), Value::Int4(11),
-                Value::Int2(-1), Value::String("b".to_string()),
+                Value::Int4(3802),
+                Value::String("jsonb".to_string()),
+                Value::Int4(11),
+                Value::Int2(-1),
+                Value::String("b".to_string()),
             ]),
         ];
 
@@ -818,9 +861,9 @@ impl PgCatalog {
             rows.push(Tuple::new(vec![
                 Value::Int4((16384 + i) as i32), // Start OIDs at 16384 (user tables)
                 Value::String(name.clone()),
-                Value::Int4(2200), // public namespace
+                Value::Int4(2200),              // public namespace
                 Value::String("r".to_string()), // regular table
-                Value::Int4(10), // owner
+                Value::Int4(10),                // owner
             ]));
         }
 
@@ -866,14 +909,12 @@ impl PgCatalog {
         // every ORM that calls `pg_database` see only the default DB
         // even after `CREATE DATABASE foo` succeeded — KanttBan #16
         // partial fix against v3.28.0.
-        let mut rows = vec![
-            Tuple::new(vec![
-                Value::Int4(1),
-                Value::String("heliosdb".to_string()),
-                Value::Int4(10),
-                Value::Int4(6), // UTF8
-            ]),
-        ];
+        let mut rows = vec![Tuple::new(vec![
+            Value::Int4(1),
+            Value::String("heliosdb".to_string()),
+            Value::Int4(10),
+            Value::Int4(6), // UTF8
+        ])];
         if let Some(db) = self.database.as_ref() {
             for (i, t) in db.tenant_manager.list_tenants().iter().enumerate() {
                 // Skip the implicit system database — already in the list.
@@ -1037,7 +1078,9 @@ impl PgCatalog {
             let mut rows = Vec::new();
             for (ti, name) in catalog.list_tables()?.iter().enumerate() {
                 if let Some(ref p) = pat {
-                    if name != p { continue; }
+                    if name != p {
+                        continue;
+                    }
                 }
                 rows.push(Tuple::new(vec![
                     Value::Int4((16384 + ti) as i32),
@@ -1084,9 +1127,7 @@ impl PgCatalog {
         // ---- \du / \dg (list roles) --------------------------------------------
         // psql sends a SELECT of 11 columns from pg_catalog.pg_roles.
         // Mirror its exact shape so psql's client-side formatter accepts it.
-        if q.contains("pg_catalog.pg_roles") && q.contains("rolname")
-            && q.contains("rolsuper")
-        {
+        if q.contains("pg_catalog.pg_roles") && q.contains("rolname") && q.contains("rolsuper") {
             let schema = Schema::new(vec![
                 Column::new("rolname", DataType::Text),
                 Column::new("rolsuper", DataType::Boolean),
@@ -1100,19 +1141,21 @@ impl PgCatalog {
                 Column::new("rolreplication", DataType::Boolean),
                 Column::new("rolbypassrls", DataType::Boolean),
             ]);
-            let role = |name: &str| Tuple::new(vec![
-                Value::String(name.into()),
-                Value::Boolean(true),  // rolsuper
-                Value::Boolean(true),  // rolinherit
-                Value::Boolean(true),  // rolcreaterole
-                Value::Boolean(true),  // rolcreatedb
-                Value::Boolean(true),  // rolcanlogin
-                Value::Int4(-1),       // rolconnlimit (unlimited)
-                Value::Null,           // rolvaliduntil
-                Value::String("{}".into()), // memberof
-                Value::Boolean(true),  // rolreplication
-                Value::Boolean(true),  // rolbypassrls
-            ]);
+            let role = |name: &str| {
+                Tuple::new(vec![
+                    Value::String(name.into()),
+                    Value::Boolean(true),       // rolsuper
+                    Value::Boolean(true),       // rolinherit
+                    Value::Boolean(true),       // rolcreaterole
+                    Value::Boolean(true),       // rolcreatedb
+                    Value::Boolean(true),       // rolcanlogin
+                    Value::Int4(-1),            // rolconnlimit (unlimited)
+                    Value::Null,                // rolvaliduntil
+                    Value::String("{}".into()), // memberof
+                    Value::Boolean(true),       // rolreplication
+                    Value::Boolean(true),       // rolbypassrls
+                ])
+            };
             let rows = vec![role("postgres"), role("helios")];
             return Ok(Some((schema, rows)));
         }
@@ -1156,7 +1199,9 @@ impl PgCatalog {
             let name_filter = Self::extract_psql_relname_filter(q);
             for name in catalog.list_tables()? {
                 if let Some(ref pat) = name_filter {
-                    if !Self::sql_like_match(&name, pat) { continue; }
+                    if !Self::sql_like_match(&name, pat) {
+                        continue;
+                    }
                 }
                 rows.push(Tuple::new(vec![
                     Value::String("public".into()),
@@ -1216,28 +1261,30 @@ impl PgCatalog {
             for (ti, name) in table_names.iter().enumerate() {
                 let table_oid = (16384 + ti) as i32;
                 if let Some(t) = target_oid {
-                    if t != table_oid { continue; }
+                    if t != table_oid {
+                        continue;
+                    }
                 }
                 let has_index = catalog
                     .get_table_schema(name)
                     .map(|s| s.columns.iter().any(|c| c.primary_key || c.unique))
                     .unwrap_or(false);
                 rows.push(Tuple::new(vec![
-                    Value::Int2(0),                   // relchecks
-                    Value::String("r".into()),        // relkind = ordinary table
-                    Value::Boolean(has_index),        // relhasindex
-                    Value::Boolean(false),            // relhasrules
-                    Value::Boolean(false),            // relhastriggers
-                    Value::Boolean(false),            // relrowsecurity
-                    Value::Boolean(false),            // relforcerowsecurity
-                    Value::Boolean(false),            // relhasoids
-                    Value::Boolean(false),            // relispartition
-                    Value::String(String::new()),     // (literal '' from psql query)
-                    Value::Int4(0),                   // reltablespace = pg_default
-                    Value::String(String::new()),     // CASE reloftype → ''
-                    Value::String("p".into()),        // relpersistence = permanent
-                    Value::String("d".into()),        // relreplident = default
-                    Value::String("heap".into()),     // am.amname
+                    Value::Int2(0),               // relchecks
+                    Value::String("r".into()),    // relkind = ordinary table
+                    Value::Boolean(has_index),    // relhasindex
+                    Value::Boolean(false),        // relhasrules
+                    Value::Boolean(false),        // relhastriggers
+                    Value::Boolean(false),        // relrowsecurity
+                    Value::Boolean(false),        // relforcerowsecurity
+                    Value::Boolean(false),        // relhasoids
+                    Value::Boolean(false),        // relispartition
+                    Value::String(String::new()), // (literal '' from psql query)
+                    Value::Int4(0),               // reltablespace = pg_default
+                    Value::String(String::new()), // CASE reloftype → ''
+                    Value::String("p".into()),    // relpersistence = permanent
+                    Value::String("d".into()),    // relreplident = default
+                    Value::String("heap".into()), // am.amname
                 ]));
             }
             return Ok(Some((schema, rows)));
@@ -1302,12 +1349,17 @@ impl PgCatalog {
                         rows.push(Tuple::new(vec![
                             Value::String(col.name.clone()),
                             Value::String(Self::pg_format_type(&col.data_type)),
-                            col.default_expr.as_ref()
+                            col.default_expr
+                                .as_ref()
                                 .map(|d| Value::String(d.clone()))
                                 .unwrap_or(Value::Null),
                             Value::Boolean(!col.nullable),
                             Value::Null, // collation
-                            Value::String(if col.primary_key { "d".to_string() } else { "".to_string() }),
+                            Value::String(if col.primary_key {
+                                "d".to_string()
+                            } else {
+                                "".to_string()
+                            }),
                             Value::String(String::new()), // attgenerated — Nano has no GENERATED columns
                         ]));
                     }
@@ -1332,10 +1384,7 @@ impl PgCatalog {
         // hence "column number 7 is out of range 0..4" on the v3.30.1
         // smoke (KanttBan #7 follow-up). Emit one row per PRIMARY KEY
         // and per UNIQUE column on the target relation.
-        if q.contains("pg_get_indexdef")
-            && q.contains("pg_get_constraintdef")
-            && q.contains("c2.relname")
-        {
+        if q.contains("pg_get_indexdef") && q.contains("pg_get_constraintdef") && q.contains("c2.relname") {
             let schema = Schema::new(vec![
                 Column::new("relname", DataType::Text),
                 Column::new("indisprimary", DataType::Boolean),
@@ -1355,10 +1404,14 @@ impl PgCatalog {
             for (ti, name) in catalog.list_tables()?.iter().enumerate() {
                 let table_oid = (16384 + ti) as i32;
                 if let Some(t) = target_oid {
-                    if t != table_oid { continue; }
+                    if t != table_oid {
+                        continue;
+                    }
                 }
                 if let Ok(ts) = catalog.get_table_schema(name) {
-                    let pk_cols: Vec<&str> = ts.columns.iter()
+                    let pk_cols: Vec<&str> = ts
+                        .columns
+                        .iter()
                         .filter(|c| c.primary_key)
                         .map(|c| c.name.as_str())
                         .collect();
@@ -1541,10 +1594,25 @@ impl PgCatalog {
     /// Check whether a query touches any pg_catalog table we emulate.
     fn is_catalog_query(q: &str) -> bool {
         const MARKERS: &[&str] = &[
-            "pg_catalog", "pg_type", "pg_class", "pg_namespace", "pg_attribute",
-            "pg_database", "pg_index", "pg_indexes", "pg_sequences", "pg_tables",
-            "pg_views", "pg_constraint", "pg_description", "pg_roles", "pg_user",
-            "pg_proc", "pg_settings", "pg_policies", "pg_matviews",
+            "pg_catalog",
+            "pg_type",
+            "pg_class",
+            "pg_namespace",
+            "pg_attribute",
+            "pg_database",
+            "pg_index",
+            "pg_indexes",
+            "pg_sequences",
+            "pg_tables",
+            "pg_views",
+            "pg_constraint",
+            "pg_description",
+            "pg_roles",
+            "pg_user",
+            "pg_proc",
+            "pg_settings",
+            "pg_policies",
+            "pg_matviews",
         ];
         MARKERS.iter().any(|m| q.contains(m))
     }
@@ -1570,7 +1638,9 @@ impl PgCatalog {
             let table_oid = (16384 + ti) as i32;
             if let Ok(tschema) = catalog.get_table_schema(name) {
                 // Primary key: any column flagged primary_key
-                let pk_cols: Vec<String> = tschema.columns.iter()
+                let pk_cols: Vec<String> = tschema
+                    .columns
+                    .iter()
                     .enumerate()
                     .filter(|(_, c)| c.primary_key)
                     .map(|(i, _)| (i + 1).to_string())
@@ -1579,8 +1649,8 @@ impl PgCatalog {
                     rows.push(Tuple::new(vec![
                         Value::Int4(table_oid + 100_000), // synthetic index oid
                         Value::Int4(table_oid),
-                        Value::Boolean(true),  // indisunique
-                        Value::Boolean(true),  // indisprimary
+                        Value::Boolean(true), // indisunique
+                        Value::Boolean(true), // indisprimary
                         Value::String(pk_cols.join(" ")),
                     ]));
                 }
@@ -1619,7 +1689,9 @@ impl PgCatalog {
         let mut rows = Vec::new();
         for name in &tables {
             if let Ok(tschema) = catalog.get_table_schema(name) {
-                let pk_cols: Vec<String> = tschema.columns.iter()
+                let pk_cols: Vec<String> = tschema
+                    .columns
+                    .iter()
                     .filter(|c| c.primary_key)
                     .map(|c| c.name.clone())
                     .collect();
@@ -1627,7 +1699,9 @@ impl PgCatalog {
                     let idx_name = format!("{}_pkey", name);
                     let def = format!(
                         "CREATE UNIQUE INDEX {} ON public.{} USING btree ({})",
-                        idx_name, name, pk_cols.join(", ")
+                        idx_name,
+                        name,
+                        pk_cols.join(", ")
                     );
                     rows.push(Tuple::new(vec![
                         Value::String("public".into()),
@@ -1672,15 +1746,18 @@ impl PgCatalog {
             None => return Ok((schema, vec![])),
         };
         let tables = db.storage.catalog().list_tables()?;
-        let rows = tables.into_iter().map(|t| {
-            Tuple::new(vec![
-                Value::String("public".into()),
-                Value::String(t),
-                Value::String("heliosdb".into()),
-                Value::Null,
-                Value::Boolean(true),
-            ])
-        }).collect();
+        let rows = tables
+            .into_iter()
+            .map(|t| {
+                Tuple::new(vec![
+                    Value::String("public".into()),
+                    Value::String(t),
+                    Value::String("heliosdb".into()),
+                    Value::Null,
+                    Value::Boolean(true),
+                ])
+            })
+            .collect();
         Ok((schema, rows))
     }
 
@@ -1714,7 +1791,9 @@ impl PgCatalog {
         for (ti, name) in tables.iter().enumerate() {
             let table_oid = (16384 + ti) as i32;
             if let Ok(tschema) = catalog.get_table_schema(name) {
-                let pk_cols: Vec<String> = tschema.columns.iter()
+                let pk_cols: Vec<String> = tschema
+                    .columns
+                    .iter()
                     .enumerate()
                     .filter(|(_, c)| c.primary_key)
                     .map(|(i, _)| (i + 1).to_string())
@@ -1896,7 +1975,11 @@ impl PgCatalog {
             .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
             .unwrap_or(tail.len());
         let name = tail.get(..end)?.to_string();
-        if name.is_empty() { None } else { Some(name) }
+        if name.is_empty() {
+            None
+        } else {
+            Some(name)
+        }
     }
 
     /// Whitelist of SQL-standard `information_schema` view names that Nano
@@ -2186,14 +2269,18 @@ mod tests {
         let result = catalog
             .handle_query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
             .unwrap();
-        assert!(result.is_none(), "information_schema.tables falls through; got {result:?}");
+        assert!(
+            result.is_none(),
+            "information_schema.tables falls through; got {result:?}"
+        );
     }
 
     #[test]
     #[ignore = "v3.31.1 phase 2: information_schema.columns migrated to the registry; this test asserts the old contract. Replace with a planner-level test."]
     fn test_handle_query_information_schema_columns() {
         let catalog = PgCatalog::new();
-        let result = catalog.handle_query("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'test'");
+        let result = catalog
+            .handle_query("SELECT column_name, data_type FROM information_schema.columns WHERE table_name = 'test'");
         assert!(result.is_ok());
         // project_columns reduces to only the requested columns (column_name, data_type)
         let (schema, rows) = result.unwrap().unwrap();
@@ -2214,7 +2301,10 @@ mod tests {
     #[test]
     fn test_extract_like_filter() {
         let query = "select table_name from information_schema.tables where table_name like 'tenant_abc__%'";
-        assert_eq!(PgCatalog::extract_like_filter(query, "table_name"), Some("tenant_abc__%".to_string()));
+        assert_eq!(
+            PgCatalog::extract_like_filter(query, "table_name"),
+            Some("tenant_abc__%".to_string())
+        );
 
         let query = "select table_name from information_schema.tables where table_schema = 'public'";
         assert_eq!(PgCatalog::extract_like_filter(query, "table_name"), None);
@@ -2223,7 +2313,10 @@ mod tests {
     #[test]
     fn test_extract_eq_filter() {
         let query = "select column_name from information_schema.columns c where table_name = 'my_table'";
-        assert_eq!(PgCatalog::extract_eq_filter(query, "table_name"), Some("my_table".to_string()));
+        assert_eq!(
+            PgCatalog::extract_eq_filter(query, "table_name"),
+            Some("my_table".to_string())
+        );
     }
 
     // -------------------------------------------------------------------
@@ -2243,10 +2336,11 @@ mod tests {
     #[test]
     fn count_star_pg_namespace_falls_through_to_planner() {
         let catalog = PgCatalog::new();
-        let result = catalog
-            .handle_query("select count(*) from pg_namespace")
-            .unwrap();
-        assert!(result.is_none(), "pg_namespace should fall through to planner; got {result:?}");
+        let result = catalog.handle_query("select count(*) from pg_namespace").unwrap();
+        assert!(
+            result.is_none(),
+            "pg_namespace should fall through to planner; got {result:?}"
+        );
     }
 
     #[test]
@@ -2257,7 +2351,10 @@ mod tests {
         let result = catalog
             .handle_query("select count(*) from pg_namespace where nspname is null")
             .unwrap();
-        assert!(result.is_none(), "pg_namespace WHERE IS NULL should fall through; got {result:?}");
+        assert!(
+            result.is_none(),
+            "pg_namespace WHERE IS NULL should fall through; got {result:?}"
+        );
     }
 
     #[test]
@@ -2266,7 +2363,10 @@ mod tests {
         let result = catalog
             .handle_query("select count(*) from pg_namespace where nspname is not null")
             .unwrap();
-        assert!(result.is_none(), "pg_namespace WHERE IS NOT NULL should fall through; got {result:?}");
+        assert!(
+            result.is_none(),
+            "pg_namespace WHERE IS NOT NULL should fall through; got {result:?}"
+        );
     }
 
     #[test]
@@ -2279,11 +2379,12 @@ mod tests {
         // operator, not the catalog handler's apply_aggregate.
         let catalog = PgCatalog::new();
         let result = catalog
-            .handle_query(
-                "select table_schema, count(*) from information_schema.tables group by table_schema",
-            )
+            .handle_query("select table_schema, count(*) from information_schema.tables group by table_schema")
             .unwrap();
-        assert!(result.is_none(), "information_schema.tables should fall through; got {result:?}");
+        assert!(
+            result.is_none(),
+            "information_schema.tables should fall through; got {result:?}"
+        );
     }
 
     #[test]

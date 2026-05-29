@@ -16,20 +16,14 @@ use heliosdb_nano::{
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    let idx = args
-        .get(1)
-        .cloned()
-        .unwrap_or_else(|| ".helios-index".into());
+    let idx = args.get(1).cloned().unwrap_or_else(|| ".helios-index".into());
     let data = PathBuf::from(&idx).join("heliosdb-data");
     let db = EmbeddedDatabase::new(data)?;
 
     println!("=== inspect {idx} ===");
 
     // Distribution of symbol kinds
-    let rows = db.query(
-        "SELECT kind, count(*) FROM _hdb_code_symbols GROUP BY kind",
-        &[],
-    )?;
+    let rows = db.query("SELECT kind, count(*) FROM _hdb_code_symbols GROUP BY kind", &[])?;
     println!();
     println!("-- symbols by kind --");
     for row in rows {
@@ -77,8 +71,10 @@ fn main() -> Result<()> {
             .first()
             .map(|d| format!("{}@{}", d.path, d.line))
             .unwrap_or_else(|| "<none>".into());
-        println!("def {name:<18} {defs_len:>3} hits {ms:>4} ms  {def}",
-            defs_len = defs.len());
+        println!(
+            "def {name:<18} {defs_len:>3} hits {ms:>4} ms  {def}",
+            defs_len = defs.len()
+        );
         if let Some(d) = defs.first() {
             let t = Instant::now();
             let refs = db.lsp_references(d.symbol_id)?;

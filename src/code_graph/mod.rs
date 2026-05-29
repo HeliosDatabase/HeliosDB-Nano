@@ -22,42 +22,39 @@
 //! - Temporal / branch `AS OF` variants (phase 2 = FR 3)
 //! - Semantic-Merkle subtree hashing (phase 3)
 
-pub mod parse;
-pub mod symbols;
-pub mod resolver;
-pub mod storage;
-pub mod lsp;
-pub mod embed;
-pub mod sql_rewrite;
-pub mod git_hook;
 pub mod diff;
-pub mod semantic_merkle;
+pub mod embed;
+pub mod git_hook;
+pub mod lsp;
+pub mod parse;
 pub mod refactor;
+pub mod resolver;
+pub mod semantic_merkle;
+pub mod sql_rewrite;
+pub mod storage;
+pub mod symbols;
 
-pub use semantic_merkle::{build_or_refresh as merkle_refresh, MerkleStats};
 pub use refactor::{rename_apply, RenameApplyOptions, RenameApplyStats};
+pub use semantic_merkle::{build_or_refresh as merkle_refresh, MerkleStats};
 
 pub use diff::{
-    ast_diff, lsp_body_diff, lsp_references_diff, AsOfRef, AstDiffRow, BodyDiffLine,
-    BodyOp, DiffChange, RefDiffRow,
+    ast_diff, lsp_body_diff, lsp_references_diff, AsOfRef, AstDiffRow, BodyDiffLine, BodyOp, DiffChange, RefDiffRow,
 };
-pub use embed::{Embedder, NoopEmbedder, HttpEmbedder};
 #[cfg(feature = "code-embed")]
 pub use embed::FastEmbedder;
+pub use embed::{Embedder, HttpEmbedder, NoopEmbedder};
 pub use lsp::{
-    lsp_call_hierarchy, lsp_definition, lsp_hover, lsp_references, CallDirection,
-    CallHierarchyRow, DefinitionHint, DefinitionRow, HoverRow, ReferenceRow,
+    lsp_call_hierarchy, lsp_definition, lsp_hover, lsp_references, CallDirection, CallHierarchyRow, DefinitionHint,
+    DefinitionRow, HoverRow, ReferenceRow,
 };
 pub use sql_rewrite::{
-    detect_create_ast_index, detect_create_semantic_hash_index, detect_pause_resume,
-    rewrite_lsp_calls, rewrite_lsp_calls_full, AstIndexDdl, LspRewrite, PauseResume,
-    SemanticHashIndexDdl,
+    detect_create_ast_index, detect_create_semantic_hash_index, detect_pause_resume, rewrite_lsp_calls,
+    rewrite_lsp_calls_full, AstIndexDdl, LspRewrite, PauseResume, SemanticHashIndexDdl,
 };
 pub use storage::{
-    code_index_with_embedder, register_ast_index, AstIndexMeta, CodeIndexOptions,
-    CodeIndexStats, SupportedLanguage,
+    code_index_with_embedder, register_ast_index, AstIndexMeta, CodeIndexOptions, CodeIndexStats, SupportedLanguage,
 };
 pub use symbols::{
-    register_extractor, registered_extractor, registered_extractors, unregister_extractor,
-    StaticLanguageExtractor, Symbol, SymbolExtractor, SymbolKind, SymbolRef, SymbolRefKind,
+    register_extractor, registered_extractor, registered_extractors, unregister_extractor, StaticLanguageExtractor,
+    Symbol, SymbolExtractor, SymbolKind, SymbolRef, SymbolRefKind,
 };

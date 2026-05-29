@@ -7,8 +7,8 @@
 //! - v2.1 feature views
 
 use heliosdb_nano::{
-    Config, StorageEngine, Schema, Column, DataType, Value, Tuple,
-    sql::{SystemViewRegistry, SessionRegistry, ProtocolType},
+    sql::{ProtocolType, SessionRegistry, SystemViewRegistry},
+    Column, Config, DataType, Schema, StorageEngine, Tuple, Value,
 };
 
 #[test]
@@ -17,19 +17,36 @@ fn test_system_view_registry_initialization() {
 
     // Verify all 18 views are registered
     let all_views = registry.list_views();
-    assert!(all_views.len() >= 18, "Expected at least 18 views, got {}", all_views.len());
+    assert!(
+        all_views.len() >= 18,
+        "Expected at least 18 views, got {}",
+        all_views.len()
+    );
 
     // Verify specific views exist
     let expected_views = vec![
         // Core catalog (8)
-        "pg_tables", "pg_views", "pg_indexes", "pg_attribute",
-        "pg_database", "pg_namespace", "pg_class", "pg_type",
+        "pg_tables",
+        "pg_views",
+        "pg_indexes",
+        "pg_attribute",
+        "pg_database",
+        "pg_namespace",
+        "pg_class",
+        "pg_type",
         // Session/Activity (3)
-        "pg_stat_activity", "pg_stat_database", "pg_settings",
+        "pg_stat_activity",
+        "pg_stat_database",
+        "pg_settings",
         // v2.0 Features (3)
-        "pg_branches", "pg_matviews", "pg_snapshots",
+        "pg_branches",
+        "pg_matviews",
+        "pg_snapshots",
         // v2.1 Features (4)
-        "pg_stat_ssl", "pg_authid", "pg_stat_optimizer", "pg_compression_stats",
+        "pg_stat_ssl",
+        "pg_authid",
+        "pg_stat_optimizer",
+        "pg_compression_stats",
     ];
 
     for view_name in expected_views {
@@ -118,13 +135,16 @@ fn test_pg_indexes_vector_indexes() {
 
     // Create vector index
     use heliosdb_nano::vector::DistanceMetric;
-    storage.vector_indexes().create_index(
-        "doc_embedding_idx".to_string(),
-        "documents".to_string(),
-        "embedding".to_string(),
-        128,
-        DistanceMetric::Cosine,
-    ).unwrap();
+    storage
+        .vector_indexes()
+        .create_index(
+            "doc_embedding_idx".to_string(),
+            "documents".to_string(),
+            "embedding".to_string(),
+            128,
+            DistanceMetric::Cosine,
+        )
+        .unwrap();
 
     let registry = SystemViewRegistry::new();
     let results = registry.execute("pg_indexes", &storage).unwrap();
@@ -254,9 +274,9 @@ fn test_pg_namespace_public_schema() {
     assert!(results.len() >= 1, "Expected at least 1 namespace");
 
     // Find public schema
-    let public_schema = results.iter().find(|t| {
-        matches!(&t.values[0], Value::String(name) if name == "public")
-    });
+    let public_schema = results
+        .iter()
+        .find(|t| matches!(&t.values[0], Value::String(name) if name == "public"));
 
     assert!(public_schema.is_some(), "Expected to find 'public' schema");
 }
@@ -303,7 +323,8 @@ fn test_pg_type_builtin_types() {
     assert!(results.len() >= 10, "Expected at least 10 built-in types");
 
     // Verify we have common types
-    let type_names: Vec<String> = results.iter()
+    let type_names: Vec<String> = results
+        .iter()
         .filter_map(|t| match &t.values[0] {
             Value::String(name) => Some(name.clone()),
             _ => None,
@@ -329,19 +350,23 @@ fn test_pg_stat_activity_with_sessions() {
     let session_registry = std::sync::Arc::new(SessionRegistry::new());
 
     // Register some sessions
-    session_registry.register_session(
-        ProtocolType::PostgreSQL,
-        "user1".to_string(),
-        "127.0.0.1".to_string(),
-        5432,
-    ).unwrap();
+    session_registry
+        .register_session(
+            ProtocolType::PostgreSQL,
+            "user1".to_string(),
+            "127.0.0.1".to_string(),
+            5432,
+        )
+        .unwrap();
 
-    session_registry.register_session(
-        ProtocolType::Oracle,
-        "user2".to_string(),
-        "192.168.1.100".to_string(),
-        1521,
-    ).unwrap();
+    session_registry
+        .register_session(
+            ProtocolType::Oracle,
+            "user2".to_string(),
+            "192.168.1.100".to_string(),
+            1521,
+        )
+        .unwrap();
 
     // Create registry with session tracking
     let registry = SystemViewRegistry::with_session_registry(session_registry.clone());
@@ -411,7 +436,8 @@ fn test_pg_settings_configuration() {
     }
 
     // Verify we have expected settings
-    let setting_names: Vec<String> = results.iter()
+    let setting_names: Vec<String> = results
+        .iter()
         .filter_map(|t| match &t.values[0] {
             Value::String(name) => Some(name.clone()),
             _ => None,
@@ -429,11 +455,9 @@ fn test_pg_branches_database_branching() {
 
     // Create a test branch
     use heliosdb_nano::storage::BranchOptions;
-    storage.create_branch(
-        "feature_branch",
-        Some("main"),
-        BranchOptions::default(),
-    ).unwrap();
+    storage
+        .create_branch("feature_branch", Some("main"), BranchOptions::default())
+        .unwrap();
 
     let registry = SystemViewRegistry::new();
     let results = registry.execute("pg_branches", &storage).unwrap();
@@ -469,10 +493,9 @@ fn test_pg_matviews_materialized_views() {
     storage.catalog().create_table("base_table", schema.clone()).unwrap();
 
     // Insert some data
-    storage.insert_tuple("base_table", Tuple::new(vec![
-        Value::Int4(1),
-        Value::Int4(100),
-    ])).unwrap();
+    storage
+        .insert_tuple("base_table", Tuple::new(vec![Value::Int4(1), Value::Int4(100)]))
+        .unwrap();
 
     // Create a materialized view
     use heliosdb_nano::sql::LogicalPlan;
@@ -525,10 +548,7 @@ fn test_pg_snapshots_time_travel() {
 
     // Create a snapshot
     use std::time::{SystemTime, UNIX_EPOCH};
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
     storage.snapshot_manager().register_snapshot(timestamp).unwrap();
 
     let registry = SystemViewRegistry::new();
@@ -556,12 +576,14 @@ fn test_pg_stat_ssl_connection_info() {
 
     // Create session registry with sessions
     let session_registry = std::sync::Arc::new(SessionRegistry::new());
-    session_registry.register_session(
-        ProtocolType::PostgreSQL,
-        "user1".to_string(),
-        "127.0.0.1".to_string(),
-        5432,
-    ).unwrap();
+    session_registry
+        .register_session(
+            ProtocolType::PostgreSQL,
+            "user1".to_string(),
+            "127.0.0.1".to_string(),
+            5432,
+        )
+        .unwrap();
 
     let registry = SystemViewRegistry::with_session_registry(session_registry);
     let results = registry.execute("pg_stat_ssl", &storage).unwrap();
@@ -623,7 +645,10 @@ fn test_pg_compression_stats() {
         min_compression_ratio: 1.2,
         column_overrides: HashMap::new(),
     };
-    storage.catalog().set_compression_config("compressed_table", &compression_config).unwrap();
+    storage
+        .catalog()
+        .set_compression_config("compressed_table", &compression_config)
+        .unwrap();
 
     // Set mock compression stats
     use heliosdb_nano::storage::compression::CompressionStats;
@@ -633,7 +658,10 @@ fn test_pg_compression_stats() {
         overall_ratio: 4.0,
         column_stats: HashMap::new(),
     };
-    storage.catalog().set_compression_stats("compressed_table", &stats).unwrap();
+    storage
+        .catalog()
+        .set_compression_stats("compressed_table", &stats)
+        .unwrap();
 
     let registry = SystemViewRegistry::new();
     let results = registry.execute("pg_compression_stats", &storage).unwrap();
@@ -657,7 +685,8 @@ fn test_all_views_have_valid_schemas() {
     let registry = SystemViewRegistry::new();
 
     for view_name in registry.list_views() {
-        let schema = registry.get_schema(view_name)
+        let schema = registry
+            .get_schema(view_name)
             .unwrap_or_else(|| panic!("View '{}' should have a schema", view_name));
 
         assert!(
@@ -731,49 +760,63 @@ fn test_integration_full_workflow() {
     storage.catalog().create_table("products", schema.clone()).unwrap();
 
     // Insert data
-    storage.insert_tuple("products", Tuple::new(vec![
-        Value::Int4(1),
-        Value::String("Product 1".to_string()),
-        Value::Vector(vec![0.1; 128]),
-    ])).unwrap();
+    storage
+        .insert_tuple(
+            "products",
+            Tuple::new(vec![
+                Value::Int4(1),
+                Value::String("Product 1".to_string()),
+                Value::Vector(vec![0.1; 128]),
+            ]),
+        )
+        .unwrap();
 
     // Create vector index
     use heliosdb_nano::vector::DistanceMetric;
-    storage.vector_indexes().create_index(
-        "products_embedding_idx".to_string(),
-        "products".to_string(),
-        "embedding".to_string(),
-        128,
-        DistanceMetric::Cosine,
-    ).unwrap();
+    storage
+        .vector_indexes()
+        .create_index(
+            "products_embedding_idx".to_string(),
+            "products".to_string(),
+            "embedding".to_string(),
+            128,
+            DistanceMetric::Cosine,
+        )
+        .unwrap();
 
     // Create branch
     use heliosdb_nano::storage::BranchOptions;
-    storage.create_branch(
-        "dev_branch",
-        Some("main"),
-        BranchOptions::default(),
-    ).unwrap();
+    storage
+        .create_branch("dev_branch", Some("main"), BranchOptions::default())
+        .unwrap();
 
     // Create session
     let session_registry = std::sync::Arc::new(SessionRegistry::new());
-    session_registry.register_session(
-        ProtocolType::PostgreSQL,
-        "testuser".to_string(),
-        "127.0.0.1".to_string(),
-        5432,
-    ).unwrap();
+    session_registry
+        .register_session(
+            ProtocolType::PostgreSQL,
+            "testuser".to_string(),
+            "127.0.0.1".to_string(),
+            5432,
+        )
+        .unwrap();
 
     let registry = SystemViewRegistry::with_session_registry(session_registry);
 
     // Test all views work
     let views_to_test = vec![
-        "pg_tables", "pg_indexes", "pg_attribute", "pg_database",
-        "pg_stat_activity", "pg_settings", "pg_branches",
+        "pg_tables",
+        "pg_indexes",
+        "pg_attribute",
+        "pg_database",
+        "pg_stat_activity",
+        "pg_settings",
+        "pg_branches",
     ];
 
     for view_name in views_to_test {
-        let results = registry.execute(view_name, &storage)
+        let results = registry
+            .execute(view_name, &storage)
             .unwrap_or_else(|e| panic!("Failed to execute {}: {}", view_name, e));
 
         assert!(

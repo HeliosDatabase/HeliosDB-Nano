@@ -1,10 +1,10 @@
 //! Dump command implementation
 
-use crate::{EmbeddedDatabase, Result, Error};
-use crate::storage::{DumpManager, DumpOptions, DumpMode, DumpCompressionType};
-use std::path::PathBuf;
-use indicatif::{ProgressBar, ProgressStyle};
+use crate::storage::{DumpCompressionType, DumpManager, DumpMode, DumpOptions};
+use crate::{EmbeddedDatabase, Error, Result};
 use colored::Colorize;
+use indicatif::{ProgressBar, ProgressStyle};
+use std::path::PathBuf;
 
 /// Dump command
 pub struct DumpCommand {
@@ -38,7 +38,7 @@ impl DumpCommand {
         // Determine data directory
         let data_dir = if self.memory {
             return Err(Error::config(
-                "Cannot dump from in-memory database without data directory".to_string()
+                "Cannot dump from in-memory database without data directory".to_string(),
             ));
         } else if let Some(ref data_dir) = self.data_dir {
             if self.verbose {
@@ -47,11 +47,11 @@ impl DumpCommand {
             data_dir.clone()
         } else if let Some(ref _conn) = self.connection {
             return Err(Error::config(
-                "Server mode dump not yet implemented. Use --data-dir for embedded mode.".to_string()
+                "Server mode dump not yet implemented. Use --data-dir for embedded mode.".to_string(),
             ));
         } else {
             return Err(Error::config(
-                "Either --data-dir or --connection must be specified".to_string()
+                "Either --data-dir or --connection must be specified".to_string(),
             ));
         };
 
@@ -95,7 +95,7 @@ impl DumpCommand {
             pb.set_style(
                 ProgressStyle::default_spinner()
                     .template("{spinner:.green} {msg}")
-                    .map_err(|e| Error::io(format!("Failed to set progress style: {}", e)))?
+                    .map_err(|e| Error::io(format!("Failed to set progress style: {}", e)))?,
             );
             pb.set_message("Dumping database...");
             pb.enable_steady_tick(std::time::Duration::from_millis(100));

@@ -3,17 +3,12 @@
 //! This test suite validates the production behavior of the auto-refresh
 //! background worker with real materialized views and storage.
 
-use heliosdb_nano::{Config, Column, DataType, Schema};
-use heliosdb_nano::storage::{
-    StorageEngine,
-    MaterializedViewCatalog,
-    MaterializedViewMetadata,
-    AutoRefreshWorker,
-    AutoRefreshConfig,
-    MVScheduler,
-    SchedulerConfig,
-};
 use heliosdb_nano::sql::LogicalPlan;
+use heliosdb_nano::storage::{
+    AutoRefreshConfig, AutoRefreshWorker, MVScheduler, MaterializedViewCatalog, MaterializedViewMetadata,
+    SchedulerConfig, StorageEngine,
+};
+use heliosdb_nano::{Column, Config, DataType, Schema};
 use std::sync::Arc;
 use tokio::time::Duration;
 
@@ -30,11 +25,7 @@ fn create_test_scheduler(storage: Arc<StorageEngine>) -> Arc<MVScheduler> {
 }
 
 /// Helper to create a test materialized view
-fn create_test_mv(
-    storage: &Arc<StorageEngine>,
-    name: &str,
-    auto_refresh: bool,
-) {
+fn create_test_mv(storage: &Arc<StorageEngine>, name: &str, auto_refresh: bool) {
     let catalog = MaterializedViewCatalog::new(storage.as_ref());
     let schema = Schema::new(vec![
         Column::new("id", DataType::Int4),
@@ -48,8 +39,7 @@ fn create_test_mv(
         projection: None,
         as_of: None,
     };
-    let query_plan_bytes = bincode::serialize(&query_plan)
-        .expect("Failed to serialize query plan");
+    let query_plan_bytes = bincode::serialize(&query_plan).expect("Failed to serialize query plan");
 
     let mut metadata = MaterializedViewMetadata::new(
         name.to_string(),
@@ -71,9 +61,7 @@ async fn test_auto_refresh_worker_lifecycle() {
     let storage = create_test_storage();
     let scheduler = create_test_scheduler(Arc::clone(&storage));
 
-    let config = AutoRefreshConfig::new()
-        .with_enabled(true)
-        .with_interval_seconds(1);
+    let config = AutoRefreshConfig::new().with_enabled(true).with_interval_seconds(1);
 
     let mut worker = AutoRefreshWorker::new(config, storage, scheduler);
 
@@ -183,9 +171,7 @@ async fn test_auto_refresh_check_now_command() {
 
     create_test_mv(&storage, "test_view", true);
 
-    let config = AutoRefreshConfig::new()
-        .with_enabled(true)
-        .with_interval_seconds(60); // Long interval
+    let config = AutoRefreshConfig::new().with_enabled(true).with_interval_seconds(60); // Long interval
 
     let mut worker = AutoRefreshWorker::new(config, Arc::clone(&storage), scheduler);
 
@@ -294,9 +280,7 @@ async fn test_auto_refresh_multiple_start_stop_cycles() {
     let storage = create_test_storage();
     let scheduler = create_test_scheduler(Arc::clone(&storage));
 
-    let config = AutoRefreshConfig::new()
-        .with_enabled(true)
-        .with_interval_seconds(1);
+    let config = AutoRefreshConfig::new().with_enabled(true).with_interval_seconds(1);
 
     let mut worker = AutoRefreshWorker::new(config, storage, scheduler);
 
@@ -327,9 +311,7 @@ async fn test_auto_refresh_empty_catalog() {
     let scheduler = create_test_scheduler(Arc::clone(&storage));
 
     // No views created
-    let config = AutoRefreshConfig::new()
-        .with_enabled(true)
-        .with_interval_seconds(1);
+    let config = AutoRefreshConfig::new().with_enabled(true).with_interval_seconds(1);
 
     let mut worker = AutoRefreshWorker::new(config, storage, scheduler);
 

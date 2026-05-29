@@ -46,31 +46,17 @@
 //! - **Protocol**: PostgreSQL wire protocol
 
 // Strict code quality lints - prevent unsafe patterns in production code
-#![deny(
-    clippy::unwrap_used,
-    clippy::todo,
-    clippy::unimplemented,
-)]
-
+#![deny(clippy::unwrap_used, clippy::todo, clippy::unimplemented)]
 // Warn on patterns that should be reviewed but don't block compilation
-#![warn(
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-)]
-
+#![warn(clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 // Standard Rust warnings
 // TODO: Re-enable missing_docs once documentation is added
 #![allow(missing_docs)]
 #![warn(rust_2018_idioms)]
-
 // Recommended pedantic warnings for code quality
-#![warn(
-    clippy::pedantic,
-    clippy::nursery,
-    clippy::cargo,
-)]
-#![allow(clippy::cargo_common_metadata)] // No readme needed for internal packages
+#![warn(clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![allow(clippy::cargo_common_metadata)]
+// No readme needed for internal packages
 
 // Allow certain pedantic lints that are too strict or conflict with our style
 #![allow(
@@ -250,33 +236,32 @@
     // Lazy static using once_cell is idiomatic
     clippy::non_std_lazy_statics,
 )]
-
 // Allow unused code for GA - these are reserved for future implementation
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
 // Public modules
-pub mod storage;
+pub mod ai; // AI/NL query module
+pub mod api; // REST API module
+pub mod audit;
+pub mod cli; // CLI module
 pub mod compute;
+pub mod crypto;
+pub mod git_integration; // Git workflow integration
+pub mod graph; // Native graph adjacency lists & traversal (RAG-native)
+pub mod multi_tenant; // Multi-tenant support
+pub mod network;
 pub mod optimizer;
-pub mod vector;
 pub mod protocol;
 pub mod protocols; // Protocol integration layer (adapters)
-pub mod crypto;
-pub mod tenant;
-pub mod sql;
-pub mod audit;
-pub mod network;
 pub mod repl;
-pub mod api; // REST API module
-pub mod cli; // CLI module
-pub mod session; // Multi-user session management
-pub mod ai; // AI/NL query module
-pub mod multi_tenant; // Multi-tenant support
-pub mod git_integration; // Git workflow integration
 pub mod runtime; // Per-request runtime helpers (bump arena, ...)
-pub mod graph;   // Native graph adjacency lists & traversal (RAG-native)
-pub mod search;  // BM25 + hybrid search + RRF/MMR rerankers (RAG-native)
+pub mod search;
+pub mod session; // Multi-user session management
+pub mod sql;
+pub mod storage;
+pub mod tenant;
+pub mod vector; // BM25 + hybrid search + RRF/MMR rerankers (RAG-native)
 
 // Code-graph track (FR 2 / FR 3) — tree-sitter-backed AST index,
 // `_hdb_code_*` tables, LSP-shaped queries. Opt-in.
@@ -333,17 +318,22 @@ pub mod config;
 mod embedded_db_dump;
 
 // Re-exports
-pub use error::{Error, Result};
-pub use types::{DataType, Value, Tuple, Schema, Column, ColumnStorageMode, VectorStoreInfo, AgentSession, AgentMessage, DocumentData, DocumentMetadata};
-pub use config::{Config, KeySource, ZkeMode, ZkeEncryptionConfig};
-pub use storage::StorageEngine;
+pub use config::{Config, KeySource, ZkeEncryptionConfig, ZkeMode};
 pub use crypto::{
-    ZkeConfig, ZkeDerivedKeys, ZkeKeyDerivation, ZkeRequestContext,
-    ZeroKnowledgeSession, NonceTracker, TimestampValidator,
+    NonceTracker, TimestampValidator, ZeroKnowledgeSession, ZkeConfig, ZkeDerivedKeys, ZkeKeyDerivation,
+    ZkeRequestContext,
+};
+pub use error::{Error, Result};
+pub use storage::StorageEngine;
+pub use types::{
+    AgentMessage, AgentSession, Column, ColumnStorageMode, DataType, DocumentData, DocumentMetadata, Schema, Tuple,
+    Value, VectorStoreInfo,
 };
 
 /// Convert logical plan ReferentialAction to constraints module ReferentialAction
-fn convert_logical_referential_action(action: &sql::logical_plan::ReferentialAction) -> sql::constraints::ReferentialAction {
+fn convert_logical_referential_action(
+    action: &sql::logical_plan::ReferentialAction,
+) -> sql::constraints::ReferentialAction {
     match action {
         sql::logical_plan::ReferentialAction::NoAction => sql::constraints::ReferentialAction::NoAction,
         sql::logical_plan::ReferentialAction::Restrict => sql::constraints::ReferentialAction::Restrict,
@@ -406,7 +396,13 @@ pub struct EmbeddedDatabase {
     result_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<Vec<Tuple>>>>>,
     /// ART index undo log for transaction rollback: (table, row_id, col_values)
     /// Cleared on commit, replayed as on_delete on rollback
-    art_undo_log: std::sync::Arc<parking_lot::RwLock<Vec<(String, u64, std::collections::HashMap<String, Value>)>>>,
+    art_undo_log: std::sync::Arc<parking_lot::RwLock<Vec<ArtUndoOp>>>,
+    /// Session-level FK validation mode used by embedded and protocol paths.
+    fk_validation_mode: std::sync::Arc<parking_lot::RwLock<FkValidationMode>>,
+    /// Source trusted for FK validation hints. Engine remains default.
+    fk_validation_source: std::sync::Arc<parking_lot::RwLock<FkValidationSource>>,
+    /// Deferred FK checks queued until COMMIT.
+    deferred_fk_checks: std::sync::Arc<parking_lot::Mutex<Vec<PendingFkCheck>>>,
 }
 
 impl Drop for EmbeddedDatabase {
@@ -450,13 +446,119 @@ struct SavepointState {
     write_set_snapshot: Vec<(Vec<u8>, Option<Vec<u8>>)>,
 }
 
+#[derive(Clone)]
+enum ArtUndoOp {
+    RemoveInserted {
+        table_name: String,
+        row_id: u64,
+        col_values: std::collections::HashMap<String, Value>,
+    },
+    RestoreDeleted {
+        table_name: String,
+        row_id: u64,
+        col_values: std::collections::HashMap<String, Value>,
+    },
+    RestoreUpdated {
+        table_name: String,
+        row_id: u64,
+        old_col_values: std::collections::HashMap<String, Value>,
+        new_col_values: std::collections::HashMap<String, Value>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FkValidationMode {
+    Enforced,
+    Deferred,
+    Audit,
+    Off,
+}
+
+impl FkValidationMode {
+    fn parse(value: &str) -> Option<Self> {
+        match value
+            .trim()
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "enforced" | "on" | "true" => Some(Self::Enforced),
+            "deferred" => Some(Self::Deferred),
+            "audit" => Some(Self::Audit),
+            "off" | "false" => Some(Self::Off),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Enforced => "enforced",
+            Self::Deferred => "deferred",
+            Self::Audit => "audit",
+            Self::Off => "off",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FkValidationSource {
+    Engine,
+    Proxy,
+    Both,
+}
+
+impl FkValidationSource {
+    fn parse(value: &str) -> Option<Self> {
+        match value
+            .trim()
+            .trim_matches('\'')
+            .trim_matches('"')
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "engine" => Some(Self::Engine),
+            "proxy" => Some(Self::Proxy),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Engine => "engine",
+            Self::Proxy => "proxy",
+            Self::Both => "both",
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PendingFkCheck {
+    fk: sql::ForeignKeyConstraint,
+    parent_values: Vec<Value>,
+}
+
+fn parse_vector_metric(metric: &str) -> Result<vector::DistanceMetric> {
+    match metric.to_ascii_lowercase().as_str() {
+        "cosine" => Ok(vector::DistanceMetric::Cosine),
+        "l2" | "euclidean" => Ok(vector::DistanceMetric::L2),
+        "dot" | "dot_product" | "inner_product" => Ok(vector::DistanceMetric::InnerProduct),
+        other => Err(Error::query_execution(format!(
+            "Unsupported vector metric '{}'; expected cosine, euclidean/l2, or dot_product",
+            other
+        ))),
+    }
+}
+
 /// Case-insensitive prefix check without allocating a new String.
 #[inline]
 fn starts_with_icase(s: &str, prefix: &str) -> bool {
     // Safety: length is checked on the left side of &&
     #[allow(clippy::indexing_slicing)]
-    { s.len() >= prefix.len()
-        && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes()) }
+    {
+        s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    }
 }
 
 /// RAII guard that swaps the active branch for the duration of a
@@ -474,7 +576,11 @@ struct CodeGraphBranchGuard<'a> {
 #[cfg(feature = "code-graph")]
 impl<'a> CodeGraphBranchGuard<'a> {
     fn noop() -> Self {
-        Self { db: None, previous: None, target: None }
+        Self {
+            db: None,
+            previous: None,
+            target: None,
+        }
     }
 
     fn switch_to(db: &'a EmbeddedDatabase, target: String) -> Self {
@@ -488,7 +594,11 @@ impl<'a> CodeGraphBranchGuard<'a> {
         // gets the underlying error on the first read/write rather
         // than a guard-construction failure.
         let _ = db.switch_branch(&target);
-        Self { db: Some(db), previous, target: Some(target) }
+        Self {
+            db: Some(db),
+            previous,
+            target: Some(target),
+        }
     }
 }
 
@@ -513,10 +623,10 @@ impl EmbeddedDatabase {
     /// Check if a SQL statement is a transaction control statement (zero-allocation)
     fn is_transaction_control(sql: &str) -> bool {
         let trimmed = sql.trim().trim_end_matches(';').trim();
-        starts_with_icase(trimmed, "BEGIN") ||
-        starts_with_icase(trimmed, "START TRANSACTION") ||
-        trimmed.eq_ignore_ascii_case("COMMIT") ||
-        trimmed.eq_ignore_ascii_case("ROLLBACK")
+        starts_with_icase(trimmed, "BEGIN")
+            || starts_with_icase(trimmed, "START TRANSACTION")
+            || trimmed.eq_ignore_ascii_case("COMMIT")
+            || trimmed.eq_ignore_ascii_case("ROLLBACK")
     }
 
     /// Handle transaction control statements (BEGIN, COMMIT, ROLLBACK)
@@ -537,10 +647,135 @@ impl EmbeddedDatabase {
         }
     }
 
+    pub(crate) fn is_fk_setting_statement(sql: &str) -> bool {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let upper = trimmed.to_ascii_uppercase();
+        (upper.starts_with("SET ") || upper.starts_with("RESET "))
+            && (upper.contains("FK_VALIDATION")
+                || upper.contains("FOREIGN_KEY_CHECKS")
+                || upper.contains("BULK_LOAD_MODE"))
+    }
+
+    fn try_handle_fk_setting(&self, sql: &str) -> Result<Option<u64>> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if upper.starts_with("RESET ") {
+            let name = trimmed[6..].trim().to_ascii_lowercase();
+            match name.as_str() {
+                "helios.fk_validation" | "fk_validation" | "foreign_key_checks" => {
+                    *self.fk_validation_mode.write() = FkValidationMode::Enforced;
+                    Ok(Some(0))
+                }
+                "helios.fk_validation_source" | "fk_validation_source" => {
+                    *self.fk_validation_source.write() = FkValidationSource::Engine;
+                    Ok(Some(0))
+                }
+                "helios.bulk_load_mode" | "bulk_load_mode" => {
+                    self.storage.set_bulk_load_mode(false);
+                    Ok(Some(0))
+                }
+                _ => Ok(None),
+            }
+        } else if upper.starts_with("SET ") {
+            let mut body = trimmed[4..].trim();
+            if body.to_ascii_uppercase().starts_with("LOCAL ") {
+                body = body[6..].trim();
+            }
+            let Some(eq_pos) = body.find('=') else {
+                return Ok(None);
+            };
+            let name = body[..eq_pos].trim().to_ascii_lowercase();
+            let value = body[eq_pos + 1..].trim();
+            match name.as_str() {
+                "helios.fk_validation" | "fk_validation" => {
+                    let mode = FkValidationMode::parse(value).ok_or_else(|| {
+                        Error::query_execution(format!(
+                            "Invalid fk_validation value '{}'; expected enforced, deferred, audit, or off",
+                            value
+                        ))
+                    })?;
+                    *self.fk_validation_mode.write() = mode;
+                    Ok(Some(0))
+                }
+                "foreign_key_checks" => {
+                    let mode = match value.trim().trim_matches('\'').trim_matches('"') {
+                        "0" => FkValidationMode::Off,
+                        "1" => FkValidationMode::Enforced,
+                        other => FkValidationMode::parse(other).ok_or_else(|| {
+                            Error::query_execution("FOREIGN_KEY_CHECKS accepts 0/1, on/off, or true/false".to_string())
+                        })?,
+                    };
+                    *self.fk_validation_mode.write() = mode;
+                    Ok(Some(0))
+                }
+                "helios.fk_validation_source" | "fk_validation_source" => {
+                    let source = FkValidationSource::parse(value).ok_or_else(|| {
+                        Error::query_execution(format!(
+                            "Invalid fk_validation_source value '{}'; expected engine, proxy, or both",
+                            value
+                        ))
+                    })?;
+                    *self.fk_validation_source.write() = source;
+                    Ok(Some(0))
+                }
+                "helios.bulk_load_mode" | "bulk_load_mode" => {
+                    let normalized = value.trim().trim_matches('\'').trim_matches('"').to_ascii_lowercase();
+                    let enabled = match normalized.as_str() {
+                        "1" | "true" | "on" | "yes" => true,
+                        "0" | "false" | "off" | "no" => false,
+                        _ => {
+                            return Err(Error::query_execution(
+                                "bulk_load_mode accepts 0/1, on/off, or true/false".to_string(),
+                            ));
+                        }
+                    };
+                    self.storage.set_bulk_load_mode(enabled);
+                    Ok(Some(0))
+                }
+                _ => Ok(None),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn try_parse_alter_constraint_enforcement(sql: &str) -> Result<Option<sql::LogicalPlan>> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let tokens: Vec<&str> = trimmed.split_whitespace().collect();
+        if tokens.len() < 7 {
+            return Ok(None);
+        }
+        if !tokens[0].eq_ignore_ascii_case("ALTER")
+            || !tokens[1].eq_ignore_ascii_case("TABLE")
+            || !tokens[3].eq_ignore_ascii_case("ALTER")
+            || !tokens[4].eq_ignore_ascii_case("CONSTRAINT")
+        {
+            return Ok(None);
+        }
+        let enforcement = if tokens[5 + 1].eq_ignore_ascii_case("ENFORCED") {
+            sql::ConstraintEnforcement::Immediate
+        } else if tokens.len() >= 8
+            && tokens[6].eq_ignore_ascii_case("NOT")
+            && tokens[7].eq_ignore_ascii_case("ENFORCED")
+        {
+            sql::ConstraintEnforcement::NotEnforced
+        } else {
+            return Ok(None);
+        };
+
+        Ok(Some(sql::LogicalPlan::AlterTableAlterConstraintEnforcement {
+            table_name: tokens[2].trim_matches('"').trim_matches('`').to_string(),
+            constraint_name: tokens[5].trim_matches('"').trim_matches('`').to_string(),
+            enforcement,
+        }))
+    }
+
     /// Internal method to begin a transaction
     fn begin_transaction_internal(&self) -> Result<()> {
         use crate::error::LockResultExt;
-        let mut txn_ref = self.current_transaction.lock()
+        let mut txn_ref = self
+            .current_transaction
+            .lock()
             .map_lock_err("Failed to acquire transaction lock for begin")?;
         if txn_ref.is_some() {
             return Err(Error::transaction("Transaction already active"));
@@ -553,12 +788,18 @@ impl EmbeddedDatabase {
     /// Internal method to commit the current transaction
     fn commit_internal(&self) -> Result<()> {
         use crate::error::LockResultExt;
-        let mut txn_ref = self.current_transaction.lock()
+        let mut txn_ref = self
+            .current_transaction
+            .lock()
             .map_lock_err("Failed to acquire transaction lock for commit")?;
+        if let Some(txn) = txn_ref.as_ref() {
+            self.validate_deferred_fk_checks(Some(txn))?;
+        }
         if let Some(txn) = txn_ref.take() {
             txn.commit()?;
             // Clear ART undo log (changes are now committed)
             self.art_undo_log.write().clear();
+            self.deferred_fk_checks.lock().clear();
             // Increment LSN to track transaction commits
             self.storage.increment_lsn();
             Ok(())
@@ -570,20 +811,64 @@ impl EmbeddedDatabase {
     /// Internal method to rollback the current transaction
     fn rollback_internal(&self) -> Result<()> {
         use crate::error::LockResultExt;
-        let mut txn_ref = self.current_transaction.lock()
+        let mut txn_ref = self
+            .current_transaction
+            .lock()
             .map_lock_err("Failed to acquire transaction lock for rollback")?;
         if let Some(txn) = txn_ref.take() {
             txn.rollback()?;
-            // Undo ART index insertions made during the transaction
-            let undo_entries: Vec<_> = self.art_undo_log.write().drain(..).collect();
-            for (table_name, row_id, col_values) in undo_entries {
-                if let Err(e) = self.storage.art_indexes().on_delete(&table_name, row_id, &col_values) {
-                    tracing::debug!("ART rollback for '{}' row {}: {}", table_name, row_id, e);
-                }
-            }
+            self.rollback_art_undo_log();
+            self.deferred_fk_checks.lock().clear();
             Ok(())
         } else {
             Err(Error::transaction("No active transaction to rollback"))
+        }
+    }
+
+    fn rollback_art_undo_log(&self) {
+        let undo_entries: Vec<_> = self.art_undo_log.write().drain(..).collect();
+        for op in undo_entries.into_iter().rev() {
+            match op {
+                ArtUndoOp::RemoveInserted {
+                    table_name,
+                    row_id,
+                    col_values,
+                } => {
+                    if let Err(e) = self.storage.art_indexes().on_delete(&table_name, row_id, &col_values) {
+                        tracing::debug!("ART rollback remove insert for '{}' row {}: {}", table_name, row_id, e);
+                    }
+                }
+                ArtUndoOp::RestoreDeleted {
+                    table_name,
+                    row_id,
+                    col_values,
+                } => {
+                    if let Err(e) = self.storage.art_indexes().on_insert(&table_name, row_id, &col_values) {
+                        tracing::debug!("ART rollback restore delete for '{}' row {}: {}", table_name, row_id, e);
+                    }
+                }
+                ArtUndoOp::RestoreUpdated {
+                    table_name,
+                    row_id,
+                    old_col_values,
+                    new_col_values,
+                } => {
+                    if let Err(e) = self
+                        .storage
+                        .art_indexes()
+                        .on_delete(&table_name, row_id, &new_col_values)
+                    {
+                        tracing::debug!("ART rollback remove update for '{}' row {}: {}", table_name, row_id, e);
+                    }
+                    if let Err(e) = self
+                        .storage
+                        .art_indexes()
+                        .on_insert(&table_name, row_id, &old_col_values)
+                    {
+                        tracing::debug!("ART rollback restore update for '{}' row {}: {}", table_name, row_id, e);
+                    }
+                }
+            }
         }
     }
 
@@ -658,10 +943,16 @@ impl EmbeddedDatabase {
         self.execute_in_transaction_inner(sql, txn, true)
     }
 
-    fn execute_in_transaction_inner(&self, sql: &str, txn: &storage::Transaction, skip_fast_paths: bool) -> Result<u64> {
+    fn execute_in_transaction_inner(
+        &self,
+        sql: &str,
+        txn: &storage::Transaction,
+        skip_fast_paths: bool,
+    ) -> Result<u64> {
         // Record query for quota tracking (QPS enforcement)
         if let Some(context) = self.tenant_manager.get_current_context() {
-            self.tenant_manager.record_query(context.tenant_id)
+            self.tenant_manager
+                .record_query(context.tenant_id)
                 .map_err(|e| Error::query_execution(format!("Quota exceeded: {}", e)))?;
         }
 
@@ -705,11 +996,7 @@ impl EmbeddedDatabase {
         } else if sql::Parser::is_merge_branch(sql) {
             // Parse MERGE DATABASE BRANCH statement
             let (source, target, with_options) = sql::Parser::parse_merge_branch_sql(sql)?;
-            sql::phase3::branching::BranchingParser::parse_merge_branch(
-                source,
-                target,
-                with_options.as_deref(),
-            )?
+            sql::phase3::branching::BranchingParser::parse_merge_branch(source, target, with_options.as_deref())?
         } else if sql::Parser::is_use_branch(sql) {
             // Parse USE BRANCH statement
             let branch_name = sql::Parser::parse_use_branch_sql(sql)?;
@@ -747,17 +1034,20 @@ impl EmbeddedDatabase {
                 column_name,
                 storage_mode,
             }
+        } else if let Some(plan) = Self::try_parse_alter_constraint_enforcement(sql)? {
+            plan
         } else if sql::Parser::is_pg_create_procedure(sql) || sql::Parser::is_pg_create_or_replace_procedure(sql) {
             // Parse PostgreSQL-style CREATE [OR REPLACE] PROCEDURE statement
             let (name, or_replace, params, language, body) = sql::Parser::parse_pg_create_procedure(sql)?;
-            let param_list: Vec<sql::logical_plan::FunctionParam> = params.into_iter().map(|(pname, ptype)| {
-                sql::logical_plan::FunctionParam {
+            let param_list: Vec<sql::logical_plan::FunctionParam> = params
+                .into_iter()
+                .map(|(pname, ptype)| sql::logical_plan::FunctionParam {
                     name: pname,
                     data_type: sql::Planner::parse_data_type_string(&ptype).unwrap_or(DataType::Text),
                     mode: sql::logical_plan::ParamMode::In,
                     default: None,
-                }
-            }).collect();
+                })
+                .collect();
             sql::LogicalPlan::CreateProcedure {
                 name,
                 or_replace,
@@ -774,48 +1064,58 @@ impl EmbeddedDatabase {
 
             // Create logical plan with catalog access and original SQL for time-travel parsing
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog)
-                .with_sql(sql.to_string());
+            let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
             planner.statement_to_plan(statement)?
         };
 
         // Invalidate plan cache on DDL operations that affect schema (including MV operations)
-        if matches!(&plan,
-            sql::LogicalPlan::CreateTable { .. } |
-            sql::LogicalPlan::DropTable { .. } |
-            sql::LogicalPlan::CreateMaterializedView { .. } |
-            sql::LogicalPlan::DropMaterializedView { .. } |
-            sql::LogicalPlan::Truncate { .. }
+        if matches!(
+            &plan,
+            sql::LogicalPlan::CreateTable { .. }
+                | sql::LogicalPlan::DropTable { .. }
+                | sql::LogicalPlan::CreateMaterializedView { .. }
+                | sql::LogicalPlan::DropMaterializedView { .. }
+                | sql::LogicalPlan::Truncate { .. }
         ) {
             self.invalidate_plan_cache();
         }
 
         // Execute plan based on type
         match &plan {
-            sql::LogicalPlan::CreateTable { name, columns, constraints, if_not_exists, .. } => {
+            sql::LogicalPlan::CreateTable {
+                name,
+                columns,
+                constraints,
+                if_not_exists,
+                ..
+            } => {
                 // Handle IF NOT EXISTS: silently succeed when table already exists
                 if *if_not_exists && self.storage.catalog().table_exists(name).unwrap_or(false) {
                     return Ok(0);
                 }
 
-                let schema_columns: Vec<Column> = columns.iter().map(|col_def| {
-                    // Serialize default expression to JSON for storage
-                    let default_expr = col_def.default.as_ref().map(|expr| {
-                        serde_json::to_string(expr).unwrap_or_default()
-                    });
+                let schema_columns: Vec<Column> = columns
+                    .iter()
+                    .map(|col_def| {
+                        // Serialize default expression to JSON for storage
+                        let default_expr = col_def
+                            .default
+                            .as_ref()
+                            .map(|expr| serde_json::to_string(expr).unwrap_or_default());
 
-                    Column {
-                        name: col_def.name.clone(),
-                        data_type: col_def.data_type.clone(),
-                        nullable: !col_def.not_null,
-                        primary_key: col_def.primary_key,
-                        source_table: None,
-                        source_table_name: None,
-                        default_expr,
-                        unique: col_def.unique,
-                        storage_mode: col_def.storage_mode,
-                    }
-                }).collect();
+                        Column {
+                            name: col_def.name.clone(),
+                            data_type: col_def.data_type.clone(),
+                            nullable: !col_def.not_null,
+                            primary_key: col_def.primary_key,
+                            source_table: None,
+                            source_table_name: None,
+                            default_expr,
+                            unique: col_def.unique,
+                            storage_mode: col_def.storage_mode,
+                        }
+                    })
+                    .collect();
 
                 let schema = Schema::new(schema_columns);
                 let catalog = self.storage.catalog();
@@ -831,7 +1131,8 @@ impl EmbeddedDatabase {
                 // IDENTITY / SERIAL columns to a side-table so
                 // pg_sequences / pg_attrdef / information_schema.columns
                 // can surface them to drizzle-kit's introspection.
-                let identity_cols: Vec<String> = columns.iter()
+                let identity_cols: Vec<String> = columns
+                    .iter()
                     .filter(|c| c.is_identity)
                     .map(|c| c.name.clone())
                     .collect();
@@ -853,6 +1154,7 @@ impl EmbeddedDatabase {
                                 on_update,
                                 deferrable,
                                 initially_deferred,
+                                enforcement,
                             } => {
                                 let fk = sql::ForeignKeyConstraint::new(
                                     fk_name.clone().unwrap_or_else(|| {
@@ -878,9 +1180,13 @@ impl EmbeddedDatabase {
                                 } else {
                                     fk
                                 };
+                                let fk = fk.with_enforcement(*enforcement);
                                 table_constraints.add_foreign_key(fk);
                             }
-                            sql::logical_plan::TableConstraint::PrimaryKey { name: pk_name, columns: pk_cols } => {
+                            sql::logical_plan::TableConstraint::PrimaryKey {
+                                name: pk_name,
+                                columns: pk_cols,
+                            } => {
                                 table_constraints.add_unique(sql::UniqueConstraint::new(
                                     pk_name.clone().unwrap_or_else(|| format!("{}_pkey", name)),
                                     name.clone(),
@@ -888,7 +1194,10 @@ impl EmbeddedDatabase {
                                     true,
                                 ));
                             }
-                            sql::logical_plan::TableConstraint::Unique { name: uq_name, columns: uq_cols } => {
+                            sql::logical_plan::TableConstraint::Unique {
+                                name: uq_name,
+                                columns: uq_cols,
+                            } => {
                                 table_constraints.add_unique(sql::UniqueConstraint::new(
                                     uq_name.clone().unwrap_or_else(|| format!("{}_unique", name)),
                                     name.clone(),
@@ -896,7 +1205,10 @@ impl EmbeddedDatabase {
                                     false,
                                 ));
                             }
-                            sql::logical_plan::TableConstraint::Check { name: ck_name, expression } => {
+                            sql::logical_plan::TableConstraint::Check {
+                                name: ck_name,
+                                expression,
+                            } => {
                                 table_constraints.add_check(sql::CheckConstraint::new(
                                     ck_name.clone().unwrap_or_else(|| format!("{}_check", name)),
                                     name.clone(),
@@ -952,12 +1264,16 @@ impl EmbeddedDatabase {
 
                 Ok(1)
             }
-            sql::LogicalPlan::Insert { table_name, columns, values, returning, on_conflict } => {
+            sql::LogicalPlan::Insert {
+                table_name,
+                columns,
+                values,
+                returning,
+                on_conflict,
+            } => {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
-                let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema {
-                    columns: vec![],
-                }));
+                let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema { columns: vec![] }));
                 let empty_tuple = Tuple::new(vec![]);
 
                 // Auto-suspend SMFI tracking for bulk inserts (>= bulk_load_threshold rows)
@@ -965,10 +1281,10 @@ impl EmbeddedDatabase {
                 // The guard will automatically resume tracking and schedule rebuild when dropped
                 let bulk_threshold = self.storage.smfi_bulk_load_threshold();
                 let _smfi_guard = if values.len() >= bulk_threshold {
-                    Some(self.storage.suspend_smfi_for_bulk_load(
-                        table_name,
-                        storage::BulkLoadReason::MultiRowInsert,
-                    ))
+                    Some(
+                        self.storage
+                            .suspend_smfi_for_bulk_load(table_name, storage::BulkLoadReason::MultiRowInsert),
+                    )
                 } else {
                     None
                 };
@@ -983,11 +1299,13 @@ impl EmbeddedDatabase {
                 let has_returning = returning.is_some();
 
                 // Pre-parse default expressions for columns (lazy evaluation)
-                let default_exprs: Vec<Option<sql::LogicalExpr>> = schema.columns.iter()
+                let default_exprs: Vec<Option<sql::LogicalExpr>> = schema
+                    .columns
+                    .iter()
                     .map(|col| {
-                        col.default_expr.as_ref().and_then(|json| {
-                            serde_json::from_str(json).ok()
-                        })
+                        col.default_expr
+                            .as_ref()
+                            .and_then(|json| serde_json::from_str(json).ok())
                     })
                     .collect();
 
@@ -1007,11 +1325,11 @@ impl EmbeddedDatabase {
                     for (val_idx, expr) in value_row.iter().enumerate() {
                         let target_col_idx = if let Some(ref indices) = column_indices {
                             if val_idx >= indices.len() {
-                                return Err(Error::query_execution(
-                                    "More values than columns specified"
-                                ));
+                                return Err(Error::query_execution("More values than columns specified"));
                             }
-                            *indices.get(val_idx).ok_or_else(|| Error::internal("column index out of bounds"))?
+                            *indices
+                                .get(val_idx)
+                                .ok_or_else(|| Error::internal("column index out of bounds"))?
                         } else {
                             val_idx
                         };
@@ -1025,18 +1343,19 @@ impl EmbeddedDatabase {
                             continue;
                         }
 
-                        let target_col = schema.get_column_at(target_col_idx)
-                            .ok_or_else(|| Error::query_execution(format!(
+                        let target_col = schema.get_column_at(target_col_idx).ok_or_else(|| {
+                            Error::query_execution(format!(
                                 "Too many values for INSERT: table has {} columns",
                                 schema.columns.len()
-                            )))?;
+                            ))
+                        })?;
 
                         let target_type = &target_col.data_type;
                         let mut value = evaluator.evaluate(expr, &empty_tuple)?;
 
                         let needs_cast = match (&value, target_type) {
                             (Value::Null, _) => false,
-                            (Value::Vector(_), DataType::Vector(_)) => false,
+                            (Value::Vector(_), DataType::Vector(_)) => true,
                             (Value::String(_), DataType::Vector(_)) => true,
                             (Value::String(_), DataType::Json | DataType::Jsonb) => true,
                             (Value::Int4(_), DataType::Int4) => false,
@@ -1063,7 +1382,8 @@ impl EmbeddedDatabase {
                             }
                         }
 
-                        let tv = tuple_values.get_mut(target_col_idx)
+                        let tv = tuple_values
+                            .get_mut(target_col_idx)
                             .ok_or_else(|| Error::internal("column index out of bounds"))?;
                         *tv = Some(value);
                     }
@@ -1077,7 +1397,8 @@ impl EmbeddedDatabase {
                                 Ok(val)
                             } else {
                                 // Column not provided, use default or NULL
-                                let col = schema.get_column_at(idx)
+                                let col = schema
+                                    .get_column_at(idx)
                                     .ok_or_else(|| Error::internal("column index out of bounds"))?;
                                 if let Some(ref default_expr) = default_exprs.get(idx).and_then(|d| d.as_ref()) {
                                     // Evaluate default expression
@@ -1123,50 +1444,12 @@ impl EmbeddedDatabase {
 
                     let mut tuple = Tuple::new(final_values_vec.clone());
 
-                    // Validate foreign key constraints via ART index (O(1) lookup)
-                    let table_constraints = catalog.load_table_constraints(table_name)?;
-                    for fk in &table_constraints.foreign_keys {
-                        if fk.enforcement == sql::ConstraintEnforcement::Immediate {
-                            let fk_values: Vec<Value> = fk.columns.iter()
-                                .map(|col_name| {
-                                    schema.columns.iter()
-                                        .position(|c| &c.name == col_name)
-                                        .and_then(|idx| final_values_vec.get(idx).cloned())
-                                        .unwrap_or(Value::Null)
-                                })
-                                .collect();
-                            if fk_values.iter().any(|v| matches!(v, Value::Null)) {
-                                continue;
-                            }
-                            // Try ART PK index lookup on referenced table (O(1), zero-copy)
-                            let key = crate::storage::ArtIndexManager::encode_key(&fk_values);
-                            let exists = if let Some(found) = self.storage.art_indexes().pk_index_contains(&fk.references_table, &key) {
-                                found
-                            } else {
-                                // No ART index — fall back to scan
-                                self.check_foreign_key_exists(
-                                    &fk.references_table,
-                                    &fk.references_columns,
-                                    &fk_values,
-                                )?
-                            };
-                            if !exists {
-                                return Err(Error::constraint_violation(format!(
-                                    "Foreign key constraint '{}' violated: referenced row in table '{}' does not exist",
-                                    fk.name, fk.references_table
-                                )));
-                            }
-                        }
-                    }
-
                     // Validate CHECK constraints
+                    let table_constraints = catalog.load_table_constraints(table_name)?;
                     for check in &table_constraints.check_constraints {
                         // Parse and evaluate the CHECK expression
-                        let check_result = self.evaluate_check_constraint(
-                            &check.expression,
-                            &schema,
-                            &final_values_vec,
-                        )?;
+                        let check_result =
+                            self.evaluate_check_constraint(&check.expression, &schema, &final_values_vec)?;
 
                         if !check_result {
                             return Err(Error::constraint_violation(format!(
@@ -1185,7 +1468,11 @@ impl EmbeddedDatabase {
                                 col_values_map.insert(col.name.clone(), v.clone());
                             }
                         }
-                        if let Err(e) = self.storage.art_indexes().check_unique_constraints(table_name, &col_values_map) {
+                        if let Err(e) = self
+                            .storage
+                            .art_indexes()
+                            .check_unique_constraints(table_name, &col_values_map)
+                        {
                             match on_conflict {
                                 Some(sql::logical_plan::OnConflictAction::DoNothing) => {
                                     // Skip this row silently
@@ -1220,7 +1507,12 @@ impl EmbeddedDatabase {
                                                         // Scan table for existing row with this UNIQUE value
                                                         let scan_sql = format!(
                                                             "SELECT {} FROM {} WHERE {} = '{}'",
-                                                            schema.columns.iter().find(|c| c.primary_key).map(|c| c.name.as_str()).unwrap_or("rowid"),
+                                                            schema
+                                                                .columns
+                                                                .iter()
+                                                                .find(|c| c.primary_key)
+                                                                .map(|c| c.name.as_str())
+                                                                .unwrap_or("rowid"),
                                                             table_name,
                                                             col.name,
                                                             val.to_string().trim_matches('\'')
@@ -1229,14 +1521,20 @@ impl EmbeddedDatabase {
                                                             if let Some(row) = rows.first() {
                                                                 if let Some(pk_val) = row.values.first() {
                                                                     match pk_val {
-                                                                        Value::Int8(id) => { found_row_id = Some(*id as u64); }
-                                                                        Value::Int4(id) => { found_row_id = Some(*id as u64); }
+                                                                        Value::Int8(id) => {
+                                                                            found_row_id = Some(*id as u64);
+                                                                        }
+                                                                        Value::Int4(id) => {
+                                                                            found_row_id = Some(*id as u64);
+                                                                        }
                                                                         _ => {}
                                                                     }
                                                                 }
                                                             }
                                                         }
-                                                        if found_row_id.is_some() { break; }
+                                                        if found_row_id.is_some() {
+                                                            break;
+                                                        }
                                                     }
                                                 }
                                             }
@@ -1244,21 +1542,31 @@ impl EmbeddedDatabase {
 
                                         // Strategy 2: Try PK lookup (for PK conflicts)
                                         if found_row_id.is_none() {
-                                            let pk_cols: Vec<(usize, &crate::Column)> = schema.columns.iter().enumerate()
+                                            let pk_cols: Vec<(usize, &crate::Column)> = schema
+                                                .columns
+                                                .iter()
+                                                .enumerate()
                                                 .filter(|(_, c)| c.primary_key)
                                                 .collect();
-                                            let pk_values: Vec<Value> = pk_cols.iter()
+                                            let pk_values: Vec<Value> = pk_cols
+                                                .iter()
                                                 .filter_map(|(idx, _)| final_values_vec.get(*idx).cloned())
                                                 .collect();
-                                            if !pk_values.is_empty() && !pk_values.iter().any(|v| matches!(v, Value::Null)) {
+                                            if !pk_values.is_empty()
+                                                && !pk_values.iter().any(|v| matches!(v, Value::Null))
+                                            {
                                                 let pk_key = crate::storage::ArtIndexManager::encode_key(&pk_values);
-                                                found_row_id = self.storage.art_indexes().pk_index_lookup(table_name, &pk_key);
+                                                found_row_id =
+                                                    self.storage.art_indexes().pk_index_lookup(table_name, &pk_key);
                                             }
                                         }
 
-                                        found_row_id.ok_or_else(|| Error::query_execution(
-                                            format!("ON CONFLICT DO UPDATE: could not find existing row ({})", err_msg)
-                                        ))?
+                                        found_row_id.ok_or_else(|| {
+                                            Error::query_execution(format!(
+                                                "ON CONFLICT DO UPDATE: could not find existing row ({})",
+                                                err_msg
+                                            ))
+                                        })?
                                     };
 
                                     // Read existing row through the transaction so that rows
@@ -1269,29 +1577,41 @@ impl EmbeddedDatabase {
                                     let existing_key = self.storage.branch_aware_data_key(table_name, existing_row_id);
                                     let existing_raw = match txn.get(&existing_key)? {
                                         Some(raw) => raw,
-                                        None => self.storage.get(&existing_key)?
-                                            .ok_or_else(|| Error::query_execution(
-                                                "ON CONFLICT DO UPDATE: existing row not found in storage"
-                                            ))?,
+                                        None => self.storage.get(&existing_key)?.ok_or_else(|| {
+                                            Error::query_execution(
+                                                "ON CONFLICT DO UPDATE: existing row not found in storage",
+                                            )
+                                        })?,
                                     };
-                                    let mut existing_tuple: Tuple = bincode::deserialize(&existing_raw)
-                                        .map_err(|err| Error::storage(format!("Failed to deserialize tuple: {}", err)))?;
+                                    let mut existing_tuple: Tuple =
+                                        bincode::deserialize(&existing_raw).map_err(|err| {
+                                            Error::storage(format!("Failed to deserialize tuple: {}", err))
+                                        })?;
                                     existing_tuple.row_id = Some(existing_row_id);
 
                                     // Apply assignments, resolving EXCLUDED references
-                                    let update_evaluator = sql::Evaluator::new(std::sync::Arc::new(schema.clone()));
+                                    let update_evaluator = sql::Evaluator::new(std::sync::Arc::new(
+                                        schema.clone().with_source_table_name(table_name),
+                                    ));
                                     for (col_name, expr) in assignments {
-                                        let target_idx = schema.columns.iter()
+                                        let target_idx = schema
+                                            .columns
+                                            .iter()
                                             .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                                            .ok_or_else(|| Error::query_execution(format!(
-                                                "ON CONFLICT DO UPDATE: column '{}' not found", col_name
-                                            )))?;
+                                            .ok_or_else(|| {
+                                                Error::query_execution(format!(
+                                                    "ON CONFLICT DO UPDATE: column '{}' not found",
+                                                    col_name
+                                                ))
+                                            })?;
 
                                         // Resolve EXCLUDED references in the expression
                                         let resolved_expr = Self::resolve_excluded_refs(expr, &excluded_map);
                                         let mut new_val = update_evaluator.evaluate(&resolved_expr, &existing_tuple)?;
                                         // Cast if needed
-                                        let target_type = &schema.columns.get(target_idx)
+                                        let target_type = &schema
+                                            .columns
+                                            .get(target_idx)
                                             .ok_or_else(|| Error::internal("column index out of bounds"))?
                                             .data_type;
                                         if new_val.data_type() != *target_type && !matches!(new_val, Value::Null) {
@@ -1299,7 +1619,9 @@ impl EmbeddedDatabase {
                                         }
                                         if target_idx < existing_tuple.values.len() {
                                             #[allow(clippy::indexing_slicing)]
-                                            { existing_tuple.values[target_idx] = new_val; }
+                                            {
+                                                existing_tuple.values[target_idx] = new_val;
+                                            }
                                         }
                                     }
 
@@ -1317,8 +1639,16 @@ impl EmbeddedDatabase {
                                             }
                                         }
                                         // Remove old entry and insert new one
-                                        let _ = self.storage.art_indexes().on_delete(table_name, existing_row_id, &col_values_map);
-                                        let _ = self.storage.art_indexes().on_insert(table_name, existing_row_id, &updated_col_values);
+                                        let _ = self.storage.art_indexes().on_delete(
+                                            table_name,
+                                            existing_row_id,
+                                            &col_values_map,
+                                        );
+                                        let _ = self.storage.art_indexes().on_insert(
+                                            table_name,
+                                            existing_row_id,
+                                            &updated_col_values,
+                                        );
                                     }
 
                                     // Log to WAL for replication
@@ -1333,7 +1663,9 @@ impl EmbeddedDatabase {
 
                                     // Collect for RETURNING if needed
                                     if has_returning {
-                                        if let Some(projected) = Self::project_returning_columns(&existing_tuple, &schema, returning) {
+                                        if let Some(projected) =
+                                            Self::project_returning_columns(&existing_tuple, &schema, returning)
+                                        {
                                             returned_tuples.push(projected);
                                         }
                                     }
@@ -1350,10 +1682,11 @@ impl EmbeddedDatabase {
                     if has_triggers {
                         let row_context = sql::triggers::TriggerRowContext::for_insert(tuple.clone());
                         let db_ref = self.clone_for_trigger();
-                        let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
-                            db_ref.execute_plan_internal(stmt)?;
-                            Ok(())
-                        };
+                        let mut executor_fn =
+                            |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                                db_ref.execute_plan_internal(stmt)?;
+                                Ok(())
+                            };
 
                         let action = self.trigger_registry.execute_triggers(
                             table_name,
@@ -1393,9 +1726,15 @@ impl EmbeddedDatabase {
                                     if i < tuple.values.len() {
                                         #[allow(clippy::indexing_slicing)]
                                         match col.data_type {
-                                            DataType::Int2 => { tuple.values[i] = Value::Int2(row_id as i16); }
-                                            DataType::Int4 => { tuple.values[i] = Value::Int4(row_id as i32); }
-                                            _ => { tuple.values[i] = Value::Int8(row_id as i64); }
+                                            DataType::Int2 => {
+                                                tuple.values[i] = Value::Int2(row_id as i16);
+                                            }
+                                            DataType::Int4 => {
+                                                tuple.values[i] = Value::Int4(row_id as i32);
+                                            }
+                                            _ => {
+                                                tuple.values[i] = Value::Int8(row_id as i64);
+                                            }
                                         }
                                     }
                                 }
@@ -1433,10 +1772,11 @@ impl EmbeddedDatabase {
                         if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
                             tracing::debug!("ART index insert for '{}': {}", table_name, e);
                         }
-                        // Track ART insertion for rollback (explicit transactions only)
-                        if skip_fast_paths {
-                            self.art_undo_log.write().push((table_name.clone(), row_id, col_values));
-                        }
+                        self.art_undo_log.write().push(ArtUndoOp::RemoveInserted {
+                            table_name: table_name.clone(),
+                            row_id,
+                            col_values,
+                        });
                     }
 
                     count += 1;
@@ -1466,8 +1806,7 @@ impl EmbeddedDatabase {
                         }
 
                         // Record CDC event for INSERT
-                        let new_values = serde_json::to_string(&tuple.values)
-                            .unwrap_or_else(|_| "[]".to_string());
+                        let new_values = serde_json::to_string(&tuple.values).unwrap_or_else(|_| "[]".to_string());
 
                         self.tenant_manager.record_change_event(
                             crate::tenant::ChangeType::Insert,
@@ -1484,10 +1823,11 @@ impl EmbeddedDatabase {
                     if has_triggers {
                         let row_context = sql::triggers::TriggerRowContext::for_insert(tuple.clone());
                         let db_ref = self.clone_for_trigger();
-                        let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
-                            db_ref.execute_plan_internal(stmt)?;
-                            Ok(())
-                        };
+                        let mut executor_fn =
+                            |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                                db_ref.execute_plan_internal(stmt)?;
+                                Ok(())
+                            };
                         let action = self.trigger_registry.execute_triggers(
                             table_name,
                             &trigger_event,
@@ -1498,24 +1838,30 @@ impl EmbeddedDatabase {
                             &mut executor_fn,
                         )?;
                         if let sql::triggers::TriggerAction::Abort(msg) = action {
-                            return Err(Error::query_execution(format!("INSERT aborted by AFTER trigger: {}", msg)));
+                            return Err(Error::query_execution(format!(
+                                "INSERT aborted by AFTER trigger: {}",
+                                msg
+                            )));
                         }
                     }
                 }
                 // Return count (RETURNING clause results handled separately)
                 Ok(count)
             }
-            sql::LogicalPlan::InsertSelect { table_name, columns, source, returning } => {
+            sql::LogicalPlan::InsertSelect {
+                table_name,
+                columns,
+                source,
+                returning,
+            } => {
                 // Execute the source SELECT plan to get rows
-                let mut executor = sql::Executor::with_storage(&self.storage)
-                    .with_timeout(self.config.storage.query_timeout_ms);
+                let mut executor =
+                    sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
                 let source_rows = executor.execute(source)?;
 
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
-                let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema {
-                    columns: vec![],
-                }));
+                let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema { columns: vec![] }));
                 let empty_tuple = Tuple::new(vec![]);
 
                 // Build column index mapping for INSERT with explicit column list
@@ -1526,11 +1872,13 @@ impl EmbeddedDatabase {
                 });
 
                 // Pre-parse default expressions for columns
-                let default_exprs: Vec<Option<sql::LogicalExpr>> = schema.columns.iter()
+                let default_exprs: Vec<Option<sql::LogicalExpr>> = schema
+                    .columns
+                    .iter()
                     .map(|col| {
-                        col.default_expr.as_ref().and_then(|json| {
-                            serde_json::from_str(json).ok()
-                        })
+                        col.default_expr
+                            .as_ref()
+                            .and_then(|json| serde_json::from_str(json).ok())
                     })
                     .collect();
 
@@ -1545,10 +1893,10 @@ impl EmbeddedDatabase {
                 // Auto-suspend SMFI tracking for bulk inserts
                 let bulk_threshold = self.storage.smfi_bulk_load_threshold();
                 let _smfi_guard = if source_rows.len() >= bulk_threshold {
-                    Some(self.storage.suspend_smfi_for_bulk_load(
-                        table_name,
-                        storage::BulkLoadReason::MultiRowInsert,
-                    ))
+                    Some(
+                        self.storage
+                            .suspend_smfi_for_bulk_load(table_name, storage::BulkLoadReason::MultiRowInsert),
+                    )
                 } else {
                     None
                 };
@@ -1562,20 +1910,21 @@ impl EmbeddedDatabase {
                     for (val_idx, value) in source_row.values.iter().enumerate() {
                         let target_col_idx = if let Some(ref indices) = column_indices {
                             if val_idx >= indices.len() {
-                                return Err(Error::query_execution(
-                                    "More values than columns specified"
-                                ));
+                                return Err(Error::query_execution("More values than columns specified"));
                             }
-                            *indices.get(val_idx).ok_or_else(|| Error::internal("column index out of bounds"))?
+                            *indices
+                                .get(val_idx)
+                                .ok_or_else(|| Error::internal("column index out of bounds"))?
                         } else {
                             val_idx
                         };
 
-                        let target_col = schema.get_column_at(target_col_idx)
-                            .ok_or_else(|| Error::query_execution(format!(
+                        let target_col = schema.get_column_at(target_col_idx).ok_or_else(|| {
+                            Error::query_execution(format!(
                                 "Too many values for INSERT: table has {} columns",
                                 schema.columns.len()
-                            )))?;
+                            ))
+                        })?;
 
                         let target_type = &target_col.data_type;
                         let mut val = value.clone();
@@ -1583,7 +1932,7 @@ impl EmbeddedDatabase {
                         // Auto-cast if needed
                         let needs_cast = match (&val, target_type) {
                             (Value::Null, _) => false,
-                            (Value::Vector(_), DataType::Vector(_)) => false,
+                            (Value::Vector(_), DataType::Vector(_)) => true,
                             (Value::String(_), DataType::Vector(_)) => true,
                             (Value::String(_), DataType::Json | DataType::Jsonb) => true,
                             (Value::Int4(_), DataType::Int4) => false,
@@ -1610,7 +1959,8 @@ impl EmbeddedDatabase {
                             }
                         }
 
-                        let tv = tuple_values.get_mut(target_col_idx)
+                        let tv = tuple_values
+                            .get_mut(target_col_idx)
                             .ok_or_else(|| Error::internal("column index out of bounds"))?;
                         *tv = Some(val);
                     }
@@ -1623,7 +1973,8 @@ impl EmbeddedDatabase {
                             if let Some(val) = opt_val {
                                 Ok(val)
                             } else {
-                                let col = schema.get_column_at(idx)
+                                let col = schema
+                                    .get_column_at(idx)
                                     .ok_or_else(|| Error::internal("column index out of bounds"))?;
                                 if let Some(ref default_expr) = default_exprs.get(idx).and_then(|d| d.as_ref()) {
                                     let mut value = evaluator.evaluate(default_expr, &empty_tuple)?;
@@ -1654,9 +2005,13 @@ impl EmbeddedDatabase {
                     let table_constraints = catalog.load_table_constraints(table_name)?;
                     for fk in &table_constraints.foreign_keys {
                         if fk.enforcement == sql::ConstraintEnforcement::Immediate {
-                            let fk_values: Vec<Value> = fk.columns.iter()
+                            let fk_values: Vec<Value> = fk
+                                .columns
+                                .iter()
                                 .map(|col_name| {
-                                    schema.columns.iter()
+                                    schema
+                                        .columns
+                                        .iter()
                                         .position(|c| &c.name == col_name)
                                         .and_then(|idx| final_values_vec.get(idx).cloned())
                                         .unwrap_or(Value::Null)
@@ -1666,14 +2021,12 @@ impl EmbeddedDatabase {
                                 continue;
                             }
                             let key = crate::storage::ArtIndexManager::encode_key(&fk_values);
-                            let exists = if let Some(found) = self.storage.art_indexes().pk_index_contains(&fk.references_table, &key) {
+                            let exists = if let Some(found) =
+                                self.storage.art_indexes().pk_index_contains(&fk.references_table, &key)
+                            {
                                 found
                             } else {
-                                self.check_foreign_key_exists(
-                                    &fk.references_table,
-                                    &fk.references_columns,
-                                    &fk_values,
-                                )?
+                                self.check_foreign_key_exists(&fk.references_table, &fk.references_columns, &fk_values)?
                             };
                             if !exists {
                                 return Err(Error::constraint_violation(format!(
@@ -1686,11 +2039,8 @@ impl EmbeddedDatabase {
 
                     // Validate CHECK constraints
                     for check in &table_constraints.check_constraints {
-                        let check_result = self.evaluate_check_constraint(
-                            &check.expression,
-                            &schema,
-                            &final_values_vec,
-                        )?;
+                        let check_result =
+                            self.evaluate_check_constraint(&check.expression, &schema, &final_values_vec)?;
 
                         if !check_result {
                             return Err(Error::constraint_violation(format!(
@@ -1703,9 +2053,13 @@ impl EmbeddedDatabase {
                     // Validate UNIQUE constraints
                     if !table_constraints.unique_constraints.is_empty() {
                         for uc in &table_constraints.unique_constraints {
-                            let uc_values: Vec<Value> = uc.columns.iter()
+                            let uc_values: Vec<Value> = uc
+                                .columns
+                                .iter()
                                 .map(|col_name| {
-                                    schema.columns.iter()
+                                    schema
+                                        .columns
+                                        .iter()
                                         .position(|c| &c.name == col_name)
                                         .and_then(|idx| final_values_vec.get(idx).cloned())
                                         .unwrap_or(Value::Null)
@@ -1729,10 +2083,11 @@ impl EmbeddedDatabase {
                     if has_triggers {
                         let row_context = sql::triggers::TriggerRowContext::for_insert(tuple.clone());
                         let db_ref = self.clone_for_trigger();
-                        let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
-                            db_ref.execute_plan_internal(stmt)?;
-                            Ok(())
-                        };
+                        let mut executor_fn =
+                            |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                                db_ref.execute_plan_internal(stmt)?;
+                                Ok(())
+                            };
                         let action = self.trigger_registry.execute_triggers(
                             table_name,
                             &trigger_event,
@@ -1755,7 +2110,9 @@ impl EmbeddedDatabase {
                     }
 
                     // Insert the tuple
-                    let row_id = self.storage.insert_tuple_branch_aware_with_schema(table_name, tuple.clone(), &schema)?;
+                    let row_id =
+                        self.storage
+                            .insert_tuple_branch_aware_with_schema(table_name, tuple.clone(), &schema)?;
 
                     // Update ART index
                     {
@@ -1785,10 +2142,11 @@ impl EmbeddedDatabase {
                     if has_triggers {
                         let row_context = sql::triggers::TriggerRowContext::for_insert(tuple.clone());
                         let db_ref = self.clone_for_trigger();
-                        let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
-                            db_ref.execute_plan_internal(stmt)?;
-                            Ok(())
-                        };
+                        let mut executor_fn =
+                            |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                                db_ref.execute_plan_internal(stmt)?;
+                                Ok(())
+                            };
                         let action = self.trigger_registry.execute_triggers(
                             table_name,
                             &trigger_event,
@@ -1799,22 +2157,27 @@ impl EmbeddedDatabase {
                             &mut executor_fn,
                         )?;
                         if let sql::triggers::TriggerAction::Abort(msg) = action {
-                            return Err(Error::query_execution(format!("INSERT aborted by AFTER trigger: {}", msg)));
+                            return Err(Error::query_execution(format!(
+                                "INSERT aborted by AFTER trigger: {}",
+                                msg
+                            )));
                         }
                     }
                 }
                 Ok(count)
             }
-            sql::LogicalPlan::Update { table_name, assignments, selection, returning } => {
+            sql::LogicalPlan::Update {
+                table_name,
+                assignments,
+                selection,
+                returning,
+            } => {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
                 // Stamp source_table_name so qualified predicates
                 // `WHERE "t"."col" = …` resolve (B31).
                 let eval_schema = schema.clone().with_source_table_name(table_name);
-                let evaluator = sql::Evaluator::with_parameters(
-                    std::sync::Arc::new(eval_schema),
-                    vec![],
-                );
+                let evaluator = sql::Evaluator::with_parameters(std::sync::Arc::new(eval_schema), vec![]);
 
                 // Initialize trigger context
                 let mut trigger_context = sql::TriggerContext::new();
@@ -1839,7 +2202,7 @@ impl EmbeddedDatabase {
                 } else {
                     self.storage.scan_table_branch_aware(table_name)?
                 };
-                let mut updates: Vec<(u64, Tuple)> = Vec::new();
+                let mut updates: Vec<(u64, Tuple, Tuple)> = Vec::new();
 
                 for old_tuple in tuples {
                     let matches = if let Some(predicate) = selection {
@@ -1862,46 +2225,52 @@ impl EmbeddedDatabase {
                             // refs with literals and executes the
                             // plan once per row. No-op for expressions
                             // without subqueries.
-                            let bound = self.materialize_scalar_subqueries_for_row(
-                                value_expr, &old_tuple, &schema, table_name,
-                            )?;
+                            let bound = self
+                                .materialize_scalar_subqueries_for_row(value_expr, &old_tuple, &schema, table_name)?;
                             let mut new_value = evaluator.evaluate(&bound, &old_tuple)?;
-                            let col_index = evaluator.schema().get_column_index(col_name)
+                            let col_index = evaluator
+                                .schema()
+                                .get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
                             // Auto-cast SET values to target column type (B34).
-                            let target_col = schema.get_column_at(col_index)
+                            let target_col = schema
+                                .get_column_at(col_index)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
                             let target_type = &target_col.data_type;
                             let needs_cast = !matches!(&new_value, Value::Null)
                                 && !matches!(
                                     (&new_value, target_type),
                                     (Value::Vector(_), DataType::Vector(_))
-                                    | (Value::Int2(_), DataType::Int2)
-                                    | (Value::Int4(_), DataType::Int4)
-                                    | (Value::Int8(_), DataType::Int8)
-                                    | (Value::Float4(_), DataType::Float4)
-                                    | (Value::Float8(_), DataType::Float8)
-                                    | (Value::String(_), DataType::Text | DataType::Varchar(_))
-                                    | (Value::Boolean(_), DataType::Boolean)
-                                    | (Value::Json(_), DataType::Json | DataType::Jsonb)
-                                    | (Value::Timestamp(_), DataType::Timestamp | DataType::Timestamptz)
-                                    | (Value::Date(_), DataType::Date)
+                                        | (Value::Int2(_), DataType::Int2)
+                                        | (Value::Int4(_), DataType::Int4)
+                                        | (Value::Int8(_), DataType::Int8)
+                                        | (Value::Float4(_), DataType::Float4)
+                                        | (Value::Float8(_), DataType::Float8)
+                                        | (Value::String(_), DataType::Text | DataType::Varchar(_))
+                                        | (Value::Boolean(_), DataType::Boolean)
+                                        | (Value::Json(_), DataType::Json | DataType::Jsonb)
+                                        | (Value::Timestamp(_), DataType::Timestamp | DataType::Timestamptz)
+                                        | (Value::Date(_), DataType::Date)
                                 );
                             if needs_cast {
                                 new_value = evaluator.cast_value(new_value, target_type)?;
                             }
-                            *new_tuple.values.get_mut(col_index)
+                            *new_tuple
+                                .values
+                                .get_mut(col_index)
                                 .ok_or_else(|| Error::internal("column index out of bounds"))? = new_value;
                         }
 
                         // Execute BEFORE UPDATE triggers (skip if no triggers)
                         if has_triggers {
-                            let row_context = sql::triggers::TriggerRowContext::for_update(old_tuple.clone(), new_tuple.clone());
+                            let row_context =
+                                sql::triggers::TriggerRowContext::for_update(old_tuple.clone(), new_tuple.clone());
                             let db_ref = self.clone_for_trigger();
-                            let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
-                                db_ref.execute_plan_internal(stmt)?;
-                                Ok(())
-                            };
+                            let mut executor_fn =
+                                |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                                    db_ref.execute_plan_internal(stmt)?;
+                                    Ok(())
+                                };
 
                             let action = self.trigger_registry.execute_triggers(
                                 table_name,
@@ -1940,14 +2309,14 @@ impl EmbeddedDatabase {
                         self.check_fk_constraints_on_write(table_name, &new_col_values, Some(txn))?;
 
                         let row_id = new_tuple.row_id.unwrap_or(0);
-                        updates.push((row_id, new_tuple.clone()));
+                        updates.push((row_id, old_tuple.clone(), new_tuple.clone()));
 
                         // Record CDC event for UPDATE
                         if let Some(context) = self.tenant_manager.get_current_context() {
-                            let old_values = serde_json::to_string(&old_tuple.values)
-                                .unwrap_or_else(|_| "[]".to_string());
-                            let new_values = serde_json::to_string(&new_tuple.values)
-                                .unwrap_or_else(|_| "[]".to_string());
+                            let old_values =
+                                serde_json::to_string(&old_tuple.values).unwrap_or_else(|_| "[]".to_string());
+                            let new_values =
+                                serde_json::to_string(&new_tuple.values).unwrap_or_else(|_| "[]".to_string());
 
                             self.tenant_manager.record_change_event(
                                 crate::tenant::ChangeType::Update,
@@ -1962,12 +2331,14 @@ impl EmbeddedDatabase {
 
                         // Execute AFTER UPDATE triggers (skip if no triggers)
                         if has_triggers {
-                            let row_context = sql::triggers::TriggerRowContext::for_update(old_tuple.clone(), new_tuple.clone());
+                            let row_context =
+                                sql::triggers::TriggerRowContext::for_update(old_tuple.clone(), new_tuple.clone());
                             let db_ref = self.clone_for_trigger();
-                            let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
-                                db_ref.execute_plan_internal(stmt)?;
-                                Ok(())
-                            };
+                            let mut executor_fn =
+                                |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                                    db_ref.execute_plan_internal(stmt)?;
+                                    Ok(())
+                                };
                             let action = self.trigger_registry.execute_triggers(
                                 table_name,
                                 &trigger_event,
@@ -1980,7 +2351,10 @@ impl EmbeddedDatabase {
 
                             // Handle AFTER trigger action
                             if let sql::triggers::TriggerAction::Abort(msg) = action {
-                                return Err(Error::query_execution(format!("UPDATE aborted by AFTER trigger: {}", msg)));
+                                return Err(Error::query_execution(format!(
+                                    "UPDATE aborted by AFTER trigger: {}",
+                                    msg
+                                )));
                             }
                         }
                     }
@@ -1990,16 +2364,55 @@ impl EmbeddedDatabase {
                 // Buffer updates in transaction write set for ACID guarantees
                 // Updates are only visible after transaction commits
                 // Use branch-aware keys so updates on branches don't pollute main
-                for (row_id, tuple) in &updates {
+                for (row_id, old_tuple, tuple) in &updates {
                     let key = self.storage.branch_aware_data_key(table_name, *row_id);
                     let value = bincode::serialize(tuple)
                         .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
                     txn.put(key.clone(), value.clone())?;
 
-                    // Log to WAL for crash recovery (skip in explicit transactions —
-                    // WAL entries should only reflect committed changes)
+                    let mut old_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+                    let mut new_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+                    for (i, col) in schema.columns.iter().enumerate() {
+                        if let Some(v) = old_tuple.values.get(i) {
+                            old_col_values.insert(col.name.clone(), v.clone());
+                        }
+                        if let Some(v) = tuple.values.get(i) {
+                            new_col_values.insert(col.name.clone(), v.clone());
+                        }
+                    }
+                    if let Err(e) = self
+                        .storage
+                        .art_indexes()
+                        .on_delete(table_name, *row_id, &old_col_values)
+                    {
+                        tracing::debug!("ART index update/delete-old for '{}': {}", table_name, e);
+                    }
+                    if let Err(e) = self
+                        .storage
+                        .art_indexes()
+                        .on_insert(table_name, *row_id, &new_col_values)
+                    {
+                        tracing::debug!("ART index update/insert-new for '{}': {}", table_name, e);
+                    }
+                    self.art_undo_log.write().push(ArtUndoOp::RestoreUpdated {
+                        table_name: table_name.clone(),
+                        row_id: *row_id,
+                        old_col_values,
+                        new_col_values,
+                    });
+
+                    // P0#2: still append the logical WAL entry (so crash-recovery
+                    // replay and logical replication stay consistent), but WITHOUT a
+                    // per-statement fsync by default — durability matches the RocksDB
+                    // WriteBatch at commit. The legacy fsync-per-statement behavior
+                    // (which capped durable UPDATE throughput at the device fsync rate)
+                    // is opt-in via storage.logical_wal_per_statement.
                     if !skip_fast_paths && self.storage.is_wal_enabled() {
-                        self.storage.log_data_update(table_name, &key, &value)?;
+                        if self.storage.logical_wal_per_statement() {
+                            self.storage.log_data_update(table_name, &key, &value)?;
+                        } else {
+                            self.storage.log_data_update_nosync(table_name, &key, &value)?;
+                        }
                     }
 
                     // Invalidate row cache (stale after update)
@@ -2010,7 +2423,7 @@ impl EmbeddedDatabase {
                 if let Some(context) = self.tenant_manager.get_current_context() {
                     // Calculate storage change from updates
                     let mut storage_delta: i64 = 0;
-                    for (_row_id, new_tuple) in &updates {
+                    for (_row_id, _old_tuple, new_tuple) in &updates {
                         let new_size = bincode::serialize(new_tuple)
                             .map(|bytes| bytes.len() as i64)
                             .unwrap_or(256);
@@ -2029,8 +2442,9 @@ impl EmbeddedDatabase {
 
                 // Project RETURNING clause columns from updated tuples
                 let returned_tuples: Vec<Tuple> = if returning.is_some() {
-                    updates.iter()
-                        .filter_map(|(_, tuple)| Self::project_returning_columns(tuple, &schema, returning))
+                    updates
+                        .iter()
+                        .filter_map(|(_, _, tuple)| Self::project_returning_columns(tuple, &schema, returning))
                         .collect()
                 } else {
                     Vec::new()
@@ -2039,19 +2453,18 @@ impl EmbeddedDatabase {
 
                 Ok(update_count)
             }
-            sql::LogicalPlan::Delete { table_name, selection, returning } => {
+            sql::LogicalPlan::Delete {
+                table_name,
+                selection,
+                returning,
+            } => {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
                 let schema_arc = std::sync::Arc::new(schema);
                 // Stamp source_table_name so qualified predicates
                 // `WHERE "t"."col" = …` resolve (B31).
-                let eval_schema = std::sync::Arc::new(
-                    (*schema_arc).clone().with_source_table_name(table_name),
-                );
-                let evaluator = sql::Evaluator::with_parameters(
-                    eval_schema,
-                    vec![],
-                );
+                let eval_schema = std::sync::Arc::new((*schema_arc).clone().with_source_table_name(table_name));
+                let evaluator = sql::Evaluator::with_parameters(eval_schema, vec![]);
 
                 // Initialize trigger context
                 let mut trigger_context = sql::TriggerContext::new();
@@ -2099,10 +2512,11 @@ impl EmbeddedDatabase {
                         if has_triggers {
                             let row_context = sql::triggers::TriggerRowContext::for_delete(tuple.clone());
                             let db_ref = self.clone_for_trigger();
-                            let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
-                                db_ref.execute_plan_internal(stmt)?;
-                                Ok(())
-                            };
+                            let mut executor_fn =
+                                |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                                    db_ref.execute_plan_internal(stmt)?;
+                                    Ok(())
+                                };
 
                             let action = self.trigger_registry.execute_triggers(
                                 table_name,
@@ -2131,13 +2545,23 @@ impl EmbeddedDatabase {
 
                         if let Some(row_id) = tuple.row_id {
                             // Validate FK constraints - check if any other table references this row
-                            let referencing_fks = catalog.get_referencing_fks(table_name)?;
+                            let referencing_fks = if *self.fk_validation_mode.read() == FkValidationMode::Off
+                                || *self.fk_validation_source.read() == FkValidationSource::Proxy
+                            {
+                                Vec::new()
+                            } else {
+                                catalog.get_referencing_fks(table_name)?
+                            };
                             for fk in &referencing_fks {
                                 if fk.enforcement == sql::ConstraintEnforcement::Immediate {
                                     // Get the referenced column values from the tuple being deleted
-                                    let ref_values: Vec<Value> = fk.references_columns.iter()
+                                    let ref_values: Vec<Value> = fk
+                                        .references_columns
+                                        .iter()
                                         .map(|col_name| {
-                                            schema_arc.columns.iter()
+                                            schema_arc
+                                                .columns
+                                                .iter()
                                                 .position(|c| &c.name == col_name)
                                                 .and_then(|idx| tuple.values.get(idx).cloned())
                                                 .unwrap_or(Value::Null)
@@ -2159,8 +2583,8 @@ impl EmbeddedDatabase {
 
                                     if has_refs {
                                         match fk.on_delete {
-                                            sql::constraints::ReferentialAction::NoAction |
-                                            sql::constraints::ReferentialAction::Restrict => {
+                                            sql::constraints::ReferentialAction::NoAction
+                                            | sql::constraints::ReferentialAction::Restrict => {
                                                 return Err(Error::constraint_violation(format!(
                                                     "Foreign key constraint '{}' violated: cannot delete row from '{}' - referenced by '{}'",
                                                     fk.name, table_name, fk.table_name
@@ -2199,15 +2623,16 @@ impl EmbeddedDatabase {
 
                             // Collect tuple for RETURNING clause before deletion
                             if has_returning {
-                                if let Some(projected) = Self::project_returning_columns(&tuple, &schema_arc, returning) {
+                                if let Some(projected) = Self::project_returning_columns(&tuple, &schema_arc, returning)
+                                {
                                     returned_tuples.push(projected);
                                 }
                             }
 
                             // Record CDC event for DELETE
                             if let Some(context) = self.tenant_manager.get_current_context() {
-                                let old_values = serde_json::to_string(&tuple.values)
-                                    .unwrap_or_else(|_| "[]".to_string());
+                                let old_values =
+                                    serde_json::to_string(&tuple.values).unwrap_or_else(|_| "[]".to_string());
 
                                 self.tenant_manager.record_change_event(
                                     crate::tenant::ChangeType::Delete,
@@ -2225,10 +2650,11 @@ impl EmbeddedDatabase {
                         if has_triggers {
                             let row_context = sql::triggers::TriggerRowContext::for_delete(tuple.clone());
                             let db_ref = self.clone_for_trigger();
-                            let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
-                                db_ref.execute_plan_internal(stmt)?;
-                                Ok(())
-                            };
+                            let mut executor_fn =
+                                |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                                    db_ref.execute_plan_internal(stmt)?;
+                                    Ok(())
+                                };
                             let action = self.trigger_registry.execute_triggers(
                                 table_name,
                                 &trigger_event,
@@ -2241,7 +2667,10 @@ impl EmbeddedDatabase {
 
                             // Handle AFTER trigger action
                             if let sql::triggers::TriggerAction::Abort(msg) = action {
-                                return Err(Error::query_execution(format!("DELETE aborted by AFTER trigger: {}", msg)));
+                                return Err(Error::query_execution(format!(
+                                    "DELETE aborted by AFTER trigger: {}",
+                                    msg
+                                )));
                             }
                         }
                     }
@@ -2273,10 +2702,17 @@ impl EmbeddedDatabase {
                         let key = format!("data:{}:{}", table_name, row_id).into_bytes();
                         txn.delete(key.clone())?;
 
-                        // Log to WAL for crash recovery (skip in explicit transactions —
-                        // WAL entries should only reflect committed changes)
+                        // P0#2: append the logical WAL entry without a per-statement
+                        // fsync by default (recovery replay + replication stay
+                        // consistent; durability matches the RocksDB WriteBatch at
+                        // commit). Legacy fsync-per-DELETE is opt-in via
+                        // storage.logical_wal_per_statement.
                         if !skip_fast_paths && self.storage.is_wal_enabled() {
-                            self.storage.log_data_delete(table_name, &key)?;
+                            if self.storage.logical_wal_per_statement() {
+                                self.storage.log_data_delete(table_name, &key)?;
+                            } else {
+                                self.storage.log_data_delete_nosync(table_name, &key)?;
+                            }
                         }
 
                         // Invalidate row cache (row deleted)
@@ -2303,13 +2739,26 @@ impl EmbeddedDatabase {
                     if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
                         tracing::debug!("ART index delete for table '{}': {}", table_name, e);
                     }
+                    self.art_undo_log.write().push(ArtUndoOp::RestoreDeleted {
+                        table_name: table_name.clone(),
+                        row_id: *row_id,
+                        col_values,
+                    });
                 }
 
                 let _ = returned_tuples; // RETURNING clause results handled separately
 
                 Ok(delete_count)
             }
-            sql::LogicalPlan::CreateFunction { name, or_replace, params, return_type, body, language, volatility } => {
+            sql::LogicalPlan::CreateFunction {
+                name,
+                or_replace,
+                params,
+                return_type,
+                body,
+                language,
+                volatility,
+            } => {
                 // Store function in registry
                 let stored_func = sql::StoredFunction {
                     name: name.clone(),
@@ -2334,7 +2783,13 @@ impl EmbeddedDatabase {
                 }
                 Ok(0)
             }
-            sql::LogicalPlan::CreateProcedure { name, or_replace, params, body, language } => {
+            sql::LogicalPlan::CreateProcedure {
+                name,
+                or_replace,
+                params,
+                body,
+                language,
+            } => {
                 // Store procedure in registry
                 let stored_proc = sql::StoredProcedure {
                     name: name.clone(),
@@ -2433,7 +2888,11 @@ impl EmbeddedDatabase {
 
                 Ok(0)
             }
-            sql::LogicalPlan::DropTrigger { name, table_name, if_exists } => {
+            sql::LogicalPlan::DropTrigger {
+                name,
+                table_name,
+                if_exists,
+            } => {
                 // Drop trigger from registry - table_name is required
                 let tbl = table_name.as_ref().ok_or_else(|| {
                     Error::query_execution("DROP TRIGGER requires ON <table_name> clause".to_string())
@@ -2461,7 +2920,8 @@ impl EmbeddedDatabase {
                 let evaluator = sql::Evaluator::new(schema);
 
                 // Evaluate arguments
-                let arg_values: Vec<Value> = args.iter()
+                let arg_values: Vec<Value> = args
+                    .iter()
                     .map(|expr| evaluator.evaluate(expr, &Tuple::new(vec![])))
                     .collect::<Result<Vec<_>>>()?;
 
@@ -2480,10 +2940,15 @@ impl EmbeddedDatabase {
                     }
                 };
 
-                self.function_registry.execute_procedure(name, &arg_values, sql_executor)?;
+                self.function_registry
+                    .execute_procedure(name, &arg_values, sql_executor)?;
                 Ok(0)
             }
-            sql::LogicalPlan::AlterColumnStorage { table_name, column_name, storage_mode } => {
+            sql::LogicalPlan::AlterColumnStorage {
+                table_name,
+                column_name,
+                storage_mode,
+            } => {
                 // ALTER TABLE t ALTER COLUMN c SET STORAGE mode
                 // Migrates existing data to the new storage format online
 
@@ -2491,13 +2956,16 @@ impl EmbeddedDatabase {
                 let mut schema = catalog.get_table_schema(table_name)?;
 
                 // Find column index
-                let col_idx = schema.columns.iter()
+                let col_idx = schema
+                    .columns
+                    .iter()
                     .position(|c| c.name == *column_name)
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "Column '{}' not found in table '{}'", column_name, table_name
-                    )))?;
+                    .ok_or_else(|| {
+                        Error::query_execution(format!("Column '{}' not found in table '{}'", column_name, table_name))
+                    })?;
 
-                let col_ref = schema.get_column_at(col_idx)
+                let col_ref = schema
+                    .get_column_at(col_idx)
                     .ok_or_else(|| Error::internal("column index out of bounds"))?;
                 let old_mode = col_ref.storage_mode;
                 if old_mode == *storage_mode {
@@ -2507,33 +2975,41 @@ impl EmbeddedDatabase {
 
                 // Migrate existing data online
                 let column = col_ref.clone();
-                let rows_migrated = self.storage.migrate_column_storage(
-                    table_name,
-                    col_idx,
-                    &column,
-                    old_mode,
-                    *storage_mode,
-                )?;
+                let rows_migrated =
+                    self.storage
+                        .migrate_column_storage(table_name, col_idx, &column, old_mode, *storage_mode)?;
 
                 // Update schema with new storage mode
-                schema.get_column_at_mut(col_idx)
+                schema
+                    .get_column_at_mut(col_idx)
                     .ok_or_else(|| Error::internal("column index out of bounds"))?
                     .storage_mode = *storage_mode;
                 catalog.update_table_schema(table_name, &schema)?;
 
                 // Log to WAL for replication
-                if let Err(e) = self.storage.log_alter_column_storage(table_name, column_name, storage_mode) {
+                if let Err(e) = self
+                    .storage
+                    .log_alter_column_storage(table_name, column_name, storage_mode)
+                {
                     tracing::warn!("Failed to log ALTER COLUMN STORAGE to WAL: {}", e);
                 }
 
                 tracing::info!(
                     "Altered {}.{} storage from {:?} to {:?}, migrated {} rows",
-                    table_name, column_name, old_mode, storage_mode, rows_migrated
+                    table_name,
+                    column_name,
+                    old_mode,
+                    storage_mode,
+                    rows_migrated
                 );
 
                 Ok(rows_migrated as u64)
             }
-            sql::LogicalPlan::AlterTableAddColumn { table_name, column_def, if_not_exists } => {
+            sql::LogicalPlan::AlterTableAddColumn {
+                table_name,
+                column_def,
+                if_not_exists,
+            } => {
                 let catalog = self.storage.catalog();
                 let mut schema = catalog.get_table_schema(table_name)?;
 
@@ -2543,7 +3019,8 @@ impl EmbeddedDatabase {
                         return Ok(0);
                     }
                     return Err(Error::query_execution(format!(
-                        "Column '{}' already exists in table '{}'", column_def.name, table_name
+                        "Column '{}' already exists in table '{}'",
+                        column_def.name, table_name
                     )));
                 }
 
@@ -2565,35 +3042,40 @@ impl EmbeddedDatabase {
                 catalog.update_table_schema(table_name, &schema)?;
 
                 // Update existing rows with NULL (or default) for the new column
-                let rows_updated = self.storage.add_column_to_rows(
-                    table_name,
-                    &column_def.default,
-                )?;
+                let rows_updated = self.storage.add_column_to_rows(table_name, &column_def.default)?;
 
                 tracing::info!(
                     "Added column '{}' to table '{}', updated {} rows",
-                    column_def.name, table_name, rows_updated
+                    column_def.name,
+                    table_name,
+                    rows_updated
                 );
 
                 Ok(rows_updated as u64)
             }
-            sql::LogicalPlan::AlterTableDropColumn { table_name, column_name, if_exists, cascade } => {
+            sql::LogicalPlan::AlterTableDropColumn {
+                table_name,
+                column_name,
+                if_exists,
+                cascade,
+            } => {
                 let catalog = self.storage.catalog();
                 let mut schema = catalog.get_table_schema(table_name)?;
 
                 // Find column index
-                let col_idx = schema.columns.iter()
-                    .position(|c| c.name == *column_name);
+                let col_idx = schema.columns.iter().position(|c| c.name == *column_name);
 
                 match col_idx {
                     Some(idx) => {
                         // Check if column is primary key
-                        let is_pk = schema.get_column_at(idx)
+                        let is_pk = schema
+                            .get_column_at(idx)
                             .ok_or_else(|| Error::internal("column index out of bounds"))?
                             .primary_key;
                         if is_pk && !cascade {
                             return Err(Error::query_execution(format!(
-                                "Cannot drop primary key column '{}' without CASCADE", column_name
+                                "Cannot drop primary key column '{}' without CASCADE",
+                                column_name
                             )));
                         }
 
@@ -2606,7 +3088,9 @@ impl EmbeddedDatabase {
 
                         tracing::info!(
                             "Dropped column '{}' from table '{}', updated {} rows",
-                            column_name, table_name, rows_updated
+                            column_name,
+                            table_name,
+                            rows_updated
                         );
 
                         Ok(rows_updated as u64)
@@ -2616,59 +3100,74 @@ impl EmbeddedDatabase {
                             Ok(0)
                         } else {
                             Err(Error::query_execution(format!(
-                                "Column '{}' does not exist in table '{}'", column_name, table_name
+                                "Column '{}' does not exist in table '{}'",
+                                column_name, table_name
                             )))
                         }
                     }
                 }
             }
-            sql::LogicalPlan::AlterTableRenameColumn { table_name, old_column_name, new_column_name } => {
+            sql::LogicalPlan::AlterTableRenameColumn {
+                table_name,
+                old_column_name,
+                new_column_name,
+            } => {
                 let catalog = self.storage.catalog();
                 let mut schema = catalog.get_table_schema(table_name)?;
 
                 // Check if new column name already exists
                 if schema.columns.iter().any(|c| c.name == *new_column_name) {
                     return Err(Error::query_execution(format!(
-                        "Column '{}' already exists in table '{}'", new_column_name, table_name
+                        "Column '{}' already exists in table '{}'",
+                        new_column_name, table_name
                     )));
                 }
 
                 // Find and rename column
-                let col_idx = schema.columns.iter()
+                let col_idx = schema
+                    .columns
+                    .iter()
                     .position(|c| c.name == *old_column_name)
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "Column '{}' does not exist in table '{}'", old_column_name, table_name
-                    )))?;
+                    .ok_or_else(|| {
+                        Error::query_execution(format!(
+                            "Column '{}' does not exist in table '{}'",
+                            old_column_name, table_name
+                        ))
+                    })?;
 
-                schema.get_column_at_mut(col_idx)
+                schema
+                    .get_column_at_mut(col_idx)
                     .ok_or_else(|| Error::internal("column index out of bounds"))?
                     .name = new_column_name.clone();
                 catalog.update_table_schema(table_name, &schema)?;
 
                 tracing::info!(
                     "Renamed column '{}' to '{}' in table '{}'",
-                    old_column_name, new_column_name, table_name
+                    old_column_name,
+                    new_column_name,
+                    table_name
                 );
 
                 Ok(0)
             }
-            sql::LogicalPlan::AlterTableRename { table_name, new_table_name } => {
+            sql::LogicalPlan::AlterTableRename {
+                table_name,
+                new_table_name,
+            } => {
                 let catalog = self.storage.catalog();
 
                 // Check if new table name already exists
                 if catalog.get_table_schema(new_table_name).is_ok() {
                     return Err(Error::query_execution(format!(
-                        "Table '{}' already exists", new_table_name
+                        "Table '{}' already exists",
+                        new_table_name
                     )));
                 }
 
                 // Rename table
                 self.storage.rename_table(table_name, new_table_name)?;
 
-                tracing::info!(
-                    "Renamed table '{}' to '{}'",
-                    table_name, new_table_name
-                );
+                tracing::info!("Renamed table '{}' to '{}'", table_name, new_table_name);
 
                 Ok(0)
             }
@@ -2682,6 +3181,7 @@ impl EmbeddedDatabase {
                 on_update,
                 deferrable,
                 initially_deferred,
+                enforcement,
             } => {
                 // Validate the parent table exists.
                 let catalog = self.storage.catalog();
@@ -2690,9 +3190,7 @@ impl EmbeddedDatabase {
 
                 let fk_name = constraint_name
                     .clone()
-                    .unwrap_or_else(|| sql::ForeignKeyConstraint::generate_name(
-                        table_name, columns, references_table,
-                    ));
+                    .unwrap_or_else(|| sql::ForeignKeyConstraint::generate_name(table_name, columns, references_table));
                 let mut fk = sql::ForeignKeyConstraint::new(
                     fk_name,
                     table_name.clone(),
@@ -2709,7 +3207,31 @@ impl EmbeddedDatabase {
                 if *deferrable {
                     fk = fk.deferrable(*initially_deferred);
                 }
+                fk = fk.with_enforcement(*enforcement);
                 catalog.add_foreign_key(fk)?;
+                Ok(0)
+            }
+            sql::LogicalPlan::AlterTableAlterConstraintEnforcement {
+                table_name,
+                constraint_name,
+                enforcement,
+            } => {
+                let catalog = self.storage.catalog();
+                let mut constraints = catalog.load_table_constraints(table_name)?;
+                let mut found = false;
+                for fk in &mut constraints.foreign_keys {
+                    if fk.name.eq_ignore_ascii_case(constraint_name) {
+                        fk.enforcement = *enforcement;
+                        found = true;
+                    }
+                }
+                if !found {
+                    return Err(Error::query_execution(format!(
+                        "Foreign key constraint '{}' not found on table '{}'",
+                        constraint_name, table_name
+                    )));
+                }
+                catalog.save_table_constraints(table_name, &constraints)?;
                 Ok(0)
             }
             sql::LogicalPlan::AlterTableMulti { operations } => {
@@ -2740,8 +3262,7 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::RollbackToSavepoint { ref name } => {
                 let savepoints = self.savepoints.read();
                 if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
-                    let snapshot = savepoints.get(pos)
-                        .map(|s| s.write_set_snapshot.clone());
+                    let snapshot = savepoints.get(pos).map(|s| s.write_set_snapshot.clone());
                     drop(savepoints);
                     if let Some(snapshot) = snapshot {
                         txn.rollback_to_savepoint(&snapshot);
@@ -2789,17 +3310,18 @@ impl EmbeddedDatabase {
                     .with_transaction(txn);
                 let results = executor.execute(&plan)?;
                 // Return results as tuples for SELECT queries, empty for DDL
-                let is_select = matches!(plan,
-                    sql::LogicalPlan::Scan { .. } |
-                    sql::LogicalPlan::Filter { .. } |
-                    sql::LogicalPlan::Project { .. } |
-                    sql::LogicalPlan::Aggregate { .. } |
-                    sql::LogicalPlan::Join { .. } |
-                    sql::LogicalPlan::Sort { .. } |
-                    sql::LogicalPlan::Limit { .. } |
-                    sql::LogicalPlan::With { .. } |
-                    sql::LogicalPlan::TableFunction { .. } |
-                    sql::LogicalPlan::SystemView { .. }
+                let is_select = matches!(
+                    plan,
+                    sql::LogicalPlan::Scan { .. }
+                        | sql::LogicalPlan::Filter { .. }
+                        | sql::LogicalPlan::Project { .. }
+                        | sql::LogicalPlan::Aggregate { .. }
+                        | sql::LogicalPlan::Join { .. }
+                        | sql::LogicalPlan::Sort { .. }
+                        | sql::LogicalPlan::Limit { .. }
+                        | sql::LogicalPlan::With { .. }
+                        | sql::LogicalPlan::TableFunction { .. }
+                        | sql::LogicalPlan::SystemView { .. }
                 );
                 let _ = is_select; // Results handled by execute_returning
                 Ok(results.len() as u64)
@@ -2868,10 +3390,19 @@ impl EmbeddedDatabase {
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
             prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
-            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero")))),
-            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).expect("512 is non-zero")))),
-            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(128).expect("128 is non-zero")))),
+            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(256).expect("256 is non-zero"),
+            ))),
+            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(512).expect("512 is non-zero"),
+            ))),
+            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
+            ))),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
+            fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
+            fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
+            deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         })
     }
 
@@ -2900,10 +3431,8 @@ impl EmbeddedDatabase {
 
         // Use temporary directory for in-memory DB dumps if not specified
         let dump_path = std::env::temp_dir().join("heliosdb_dumps");
-        let dump_manager = std::sync::Arc::new(storage::DumpManager::new(
-            dump_path,
-            storage::DumpCompressionType::Zstd,
-        ));
+        let dump_manager =
+            std::sync::Arc::new(storage::DumpManager::new(dump_path, storage::DumpCompressionType::Zstd));
 
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
         let lock_manager = std::sync::Arc::new(storage::LockManager::with_default_timeout());
@@ -2925,10 +3454,19 @@ impl EmbeddedDatabase {
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
             prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
-            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero")))),
-            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).expect("512 is non-zero")))),
-            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(128).expect("128 is non-zero")))),
+            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(256).expect("256 is non-zero"),
+            ))),
+            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(512).expect("512 is non-zero"),
+            ))),
+            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
+            ))),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
+            fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
+            fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
+            deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         })
     }
 
@@ -2952,7 +3490,10 @@ impl EmbeddedDatabase {
         let storage = std::sync::Arc::new(if memory_only {
             storage::StorageEngine::open_in_memory(&config)?
         } else {
-            let path = config.storage.path.as_ref()
+            let path = config
+                .storage
+                .path
+                .as_ref()
                 .ok_or_else(|| Error::config("Storage path not specified for non-memory database".to_string()))?;
             storage::StorageEngine::open(path, &config)?
         });
@@ -2967,10 +3508,8 @@ impl EmbeddedDatabase {
             std::env::temp_dir().join("heliosdb_dumps")
         };
 
-        let dump_manager = std::sync::Arc::new(storage::DumpManager::new(
-            dump_path,
-            storage::DumpCompressionType::Zstd,
-        ));
+        let dump_manager =
+            std::sync::Arc::new(storage::DumpManager::new(dump_path, storage::DumpCompressionType::Zstd));
 
         let session_manager = std::sync::Arc::new(crate::session::SessionManager::new());
         let lock_manager = std::sync::Arc::new(storage::LockManager::with_default_timeout());
@@ -3002,10 +3541,19 @@ impl EmbeddedDatabase {
             session_transactions: std::sync::Arc::new(dashmap::DashMap::new()),
             prepared_statements: std::sync::Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             savepoints: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
-            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(256).expect("256 is non-zero")))),
-            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(512).expect("512 is non-zero")))),
-            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(std::num::NonZeroUsize::new(128).expect("128 is non-zero")))),
+            plan_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(256).expect("256 is non-zero"),
+            ))),
+            parse_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(512).expect("512 is non-zero"),
+            ))),
+            result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+                std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
+            ))),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
+            fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
+            fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
+            deferred_fk_checks: std::sync::Arc::new(parking_lot::Mutex::new(Vec::new())),
         })
     }
 
@@ -3102,7 +3650,11 @@ impl EmbeddedDatabase {
 
         let txn_start = std::time::Instant::now();
         let txn = self.storage.begin_transaction()?;
-        tracing::trace!(phase = "txn_begin", duration_us = txn_start.elapsed().as_micros() as u64, "Batch transaction started");
+        tracing::trace!(
+            phase = "txn_begin",
+            duration_us = txn_start.elapsed().as_micros() as u64,
+            "Batch transaction started"
+        );
 
         let mut total_rows = 0u64;
         for sql in statements {
@@ -3110,18 +3662,37 @@ impl EmbeddedDatabase {
                 Ok(count) => total_rows += count,
                 Err(e) => {
                     let _ = txn.rollback();
+                    self.rollback_art_undo_log();
+                    self.deferred_fk_checks.lock().clear();
                     return Err(e);
                 }
             }
         }
 
         let commit_start = std::time::Instant::now();
+        if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
+            let _ = txn.rollback();
+            self.rollback_art_undo_log();
+            return Err(e);
+        }
         txn.commit()?;
+        self.art_undo_log.write().clear();
+        self.deferred_fk_checks.lock().clear();
         self.storage.increment_lsn();
-        tracing::debug!(phase = "txn_commit", duration_us = commit_start.elapsed().as_micros() as u64, rows = total_rows, "Batch transaction committed");
+        tracing::debug!(
+            phase = "txn_commit",
+            duration_us = commit_start.elapsed().as_micros() as u64,
+            rows = total_rows,
+            "Batch transaction committed"
+        );
 
         let elapsed = start.elapsed();
-        tracing::debug!(phase = "execute", duration_us = elapsed.as_micros() as u64, "Batch executed ({} statements)", statements.len());
+        tracing::debug!(
+            phase = "execute",
+            duration_us = elapsed.as_micros() as u64,
+            "Batch executed ({} statements)",
+            statements.len()
+        );
 
         Ok(total_rows)
     }
@@ -3207,10 +3778,7 @@ impl EmbeddedDatabase {
 
     /// Drop a registered extractor.
     #[cfg(feature = "code-graph")]
-    pub fn unregister_extractor(
-        &self,
-        name: &str,
-    ) -> Option<std::sync::Arc<dyn code_graph::SymbolExtractor>> {
+    pub fn unregister_extractor(&self, name: &str) -> Option<std::sync::Arc<dyn code_graph::SymbolExtractor>> {
         code_graph::unregister_extractor(name)
     }
 
@@ -3221,10 +3789,7 @@ impl EmbeddedDatabase {
     }
 
     #[cfg(feature = "code-graph")]
-    pub fn code_index(
-        &self,
-        opts: code_graph::CodeIndexOptions,
-    ) -> Result<code_graph::CodeIndexStats> {
+    pub fn code_index(&self, opts: code_graph::CodeIndexOptions) -> Result<code_graph::CodeIndexStats> {
         let stats = code_graph::storage::code_index(self, opts)?;
         // Incremental projection: when graph-rag is enabled, mirror
         // new code symbols + refs into the universal `_hdb_graph_*`
@@ -3253,10 +3818,7 @@ impl EmbeddedDatabase {
     /// "Who uses `symbol_id`?" — enumerates every row in
     /// `_hdb_code_symbol_refs` where `to_symbol = symbol_id`.
     #[cfg(feature = "code-graph")]
-    pub fn lsp_references(
-        &self,
-        symbol_id: i64,
-    ) -> Result<Vec<code_graph::ReferenceRow>> {
+    pub fn lsp_references(&self, symbol_id: i64) -> Result<Vec<code_graph::ReferenceRow>> {
         code_graph::lsp::lsp_references(self, symbol_id)
     }
 
@@ -3318,9 +3880,7 @@ impl EmbeddedDatabase {
     /// `_hdb_code_merkle`.  Idempotent.  Files whose member symbols
     /// haven't changed keep the same roll-up hash.
     #[cfg(feature = "code-graph")]
-    pub fn code_graph_merkle_refresh(
-        &self,
-    ) -> Result<code_graph::MerkleStats> {
+    pub fn code_graph_merkle_refresh(&self) -> Result<code_graph::MerkleStats> {
         code_graph::merkle_refresh(self)
     }
 
@@ -3343,13 +3903,8 @@ impl EmbeddedDatabase {
     /// expands the graph subgraph per the clause options.  Result
     /// tuples: `(node_id, node_kind, title, text, source_ref, hop_distance)`.
     #[cfg(feature = "graph-rag")]
-    fn run_with_context(
-        &self,
-        inner_sql: &str,
-        opts: &graph_rag::WithContextOptions,
-    ) -> Result<Vec<Tuple>> {
-        let hits =
-            graph_rag::graph_rag_expand_with_context(self, inner_sql, opts)?;
+    fn run_with_context(&self, inner_sql: &str, opts: &graph_rag::WithContextOptions) -> Result<Vec<Tuple>> {
+        let hits = graph_rag::graph_rag_expand_with_context(self, inner_sql, opts)?;
         Ok(hits
             .into_iter()
             .map(|h| {
@@ -3404,10 +3959,7 @@ impl EmbeddedDatabase {
     /// in the process-local AST-index registry, then does an initial
     /// `code_index` pass so every existing source row is indexed.
     #[cfg(feature = "code-graph")]
-    fn handle_create_ast_index(
-        &self,
-        ddl: code_graph::AstIndexDdl,
-    ) -> Result<u64> {
+    fn handle_create_ast_index(&self, ddl: code_graph::AstIndexDdl) -> Result<u64> {
         let existing = code_graph::storage::get_ast_index(&ddl.index_name);
         if existing.is_some() && !ddl.if_not_exists {
             return Err(Error::query_execution(format!(
@@ -3450,10 +4002,7 @@ impl EmbeddedDatabase {
     /// `IF NOT EXISTS` gates rebuilding when the merkle table is
     /// already populated — a re-run is otherwise free to call.
     #[cfg(feature = "code-graph")]
-    fn handle_create_semantic_hash_index(
-        &self,
-        ddl: code_graph::SemanticHashIndexDdl,
-    ) -> Result<u64> {
+    fn handle_create_semantic_hash_index(&self, ddl: code_graph::SemanticHashIndexDdl) -> Result<u64> {
         // The roll-up table is created on demand inside merkle_refresh,
         // so the DDL itself is little more than a wrapper around
         // build_or_refresh that records the index name in process-
@@ -3474,18 +4023,13 @@ impl EmbeddedDatabase {
     /// rows affected either way; surfaces an error only when the
     /// named index is not registered.
     #[cfg(feature = "code-graph")]
-    fn handle_pause_resume(
-        &self,
-        pr: code_graph::PauseResume,
-    ) -> Result<u64> {
+    fn handle_pause_resume(&self, pr: code_graph::PauseResume) -> Result<u64> {
         let (name, paused) = match pr {
             code_graph::PauseResume::Pause(n) => (n, true),
             code_graph::PauseResume::Resume(n) => (n, false),
         };
         if !code_graph::storage::set_ast_index_paused(&name, paused) {
-            return Err(Error::query_execution(format!(
-                "AST index '{name}' is not registered"
-            )));
+            return Err(Error::query_execution(format!("AST index '{name}' is not registered")));
         }
         Ok(0)
     }
@@ -3581,10 +4125,7 @@ impl EmbeddedDatabase {
     /// storage-level bloom / zone-map / SIMD pipeline carries the
     /// weight at corpus scale.
     #[cfg(feature = "graph-rag")]
-    pub fn graph_rag_search(
-        &self,
-        opts: &graph_rag::GraphRagOptions,
-    ) -> Result<Vec<graph_rag::GraphRagHit>> {
+    pub fn graph_rag_search(&self, opts: &graph_rag::GraphRagOptions) -> Result<Vec<graph_rag::GraphRagHit>> {
         graph_rag::graph_rag_search(self, opts)
     }
 
@@ -3594,10 +4135,7 @@ impl EmbeddedDatabase {
     /// node's title/text.  Idempotent.  `extra_kinds` adds more
     /// text-bearing `node_kind`s to the match set beyond the default.
     #[cfg(feature = "graph-rag")]
-    pub fn graph_rag_link_exact(
-        &self,
-        extra_kinds: &[&str],
-    ) -> Result<graph_rag::LinkerStats> {
+    pub fn graph_rag_link_exact(&self, extra_kinds: &[&str]) -> Result<graph_rag::LinkerStats> {
         graph_rag::link_exact_qualified(self, extra_kinds)
     }
 
@@ -3622,71 +4160,47 @@ impl EmbeddedDatabase {
     /// Ingest markdown / plain text rows as DocChunk / DocSection
     /// nodes.  See `graph_rag::IngestDocsOptions`.
     #[cfg(feature = "graph-rag")]
-    pub fn graph_rag_ingest_docs(
-        &self,
-        opts: &graph_rag::IngestDocsOptions,
-    ) -> Result<graph_rag::IngestStats> {
+    pub fn graph_rag_ingest_docs(&self, opts: &graph_rag::IngestDocsOptions) -> Result<graph_rag::IngestStats> {
         graph_rag::ingest_docs(self, opts)
     }
 
     /// Ingest a PDF / DOCX / image / audio file via docling-serve.
     /// See `graph_rag::DoclingIngestOptions`.
     #[cfg(feature = "graph-rag")]
-    pub fn graph_rag_ingest_pdf(
-        &self,
-        opts: &graph_rag::DoclingIngestOptions,
-    ) -> Result<graph_rag::IngestStats> {
+    pub fn graph_rag_ingest_pdf(&self, opts: &graph_rag::DoclingIngestOptions) -> Result<graph_rag::IngestStats> {
         graph_rag::docling_ingest_pdf(self, opts)
     }
 
     #[cfg(feature = "graph-rag")]
-    pub fn graph_rag_ingest_office(
-        &self,
-        opts: &graph_rag::DoclingIngestOptions,
-    ) -> Result<graph_rag::IngestStats> {
+    pub fn graph_rag_ingest_office(&self, opts: &graph_rag::DoclingIngestOptions) -> Result<graph_rag::IngestStats> {
         graph_rag::docling_ingest_office(self, opts)
     }
 
     #[cfg(feature = "graph-rag")]
-    pub fn graph_rag_ingest_audio(
-        &self,
-        opts: &graph_rag::DoclingIngestOptions,
-    ) -> Result<graph_rag::IngestStats> {
+    pub fn graph_rag_ingest_audio(&self, opts: &graph_rag::DoclingIngestOptions) -> Result<graph_rag::IngestStats> {
         graph_rag::docling_ingest_audio(self, opts)
     }
 
     #[cfg(feature = "graph-rag")]
-    pub fn graph_rag_ingest_image(
-        &self,
-        opts: &graph_rag::DoclingIngestOptions,
-    ) -> Result<graph_rag::IngestStats> {
+    pub fn graph_rag_ingest_image(&self, opts: &graph_rag::DoclingIngestOptions) -> Result<graph_rag::IngestStats> {
         graph_rag::docling_ingest_image(self, opts)
     }
 
     /// Ingest structured email rows into Email + Person nodes.
     #[cfg(feature = "graph-rag")]
-    pub fn graph_rag_ingest_email(
-        &self,
-        opts: &graph_rag::IngestEmailOptions,
-    ) -> Result<graph_rag::IngestStats> {
+    pub fn graph_rag_ingest_email(&self, opts: &graph_rag::IngestEmailOptions) -> Result<graph_rag::IngestStats> {
         graph_rag::ingest_email(self, opts)
     }
 
     /// Ingest structured issue rows into Issue + Comment + Person nodes.
     #[cfg(feature = "graph-rag")]
-    pub fn graph_rag_ingest_issues(
-        &self,
-        opts: &graph_rag::IngestIssuesOptions,
-    ) -> Result<graph_rag::IngestStats> {
+    pub fn graph_rag_ingest_issues(&self, opts: &graph_rag::IngestIssuesOptions) -> Result<graph_rag::IngestStats> {
         graph_rag::ingest_issues(self, opts)
     }
 
     /// Ingest structured Q&A rows into InvestorQuestion + Answer + Person.
     #[cfg(feature = "graph-rag")]
-    pub fn graph_rag_ingest_qa(
-        &self,
-        opts: &graph_rag::IngestQaOptions,
-    ) -> Result<graph_rag::IngestStats> {
+    pub fn graph_rag_ingest_qa(&self, opts: &graph_rag::IngestQaOptions) -> Result<graph_rag::IngestStats> {
         graph_rag::ingest_qa(self, opts)
     }
 
@@ -3737,6 +4251,10 @@ impl EmbeddedDatabase {
 
         let start = std::time::Instant::now();
 
+        if let Some(count) = self.try_handle_fk_setting(sql)? {
+            return Ok(count);
+        }
+
         // Check if this is a transaction control statement
         if Self::is_transaction_control(sql) {
             return self.handle_transaction_control(sql);
@@ -3744,16 +4262,21 @@ impl EmbeddedDatabase {
 
         // Check if we have an active transaction
         let has_active_txn = {
-            let txn_lock = self.current_transaction.lock()
+            let txn_lock = self
+                .current_transaction
+                .lock()
                 .map_lock_err("Failed to acquire transaction lock for execute")?;
             txn_lock.is_some()
         };
 
         let result = if has_active_txn {
             // Execute within existing transaction context
-            let txn_lock = self.current_transaction.lock()
+            let txn_lock = self
+                .current_transaction
+                .lock()
                 .map_lock_err("Failed to acquire transaction lock for execute")?;
-            let txn_ref = txn_lock.as_ref()
+            let txn_ref = txn_lock
+                .as_ref()
                 .ok_or_else(|| Error::transaction("Transaction lock in invalid state"))?;
             self.execute_in_transaction_no_fast_path(sql, txn_ref)
         } else {
@@ -3818,25 +4341,47 @@ impl EmbeddedDatabase {
         // Begin implicit transaction
         let txn_start = std::time::Instant::now();
         let txn = self.storage.begin_transaction()?;
-        tracing::trace!(phase = "txn_begin", duration_us = txn_start.elapsed().as_micros() as u64, "Transaction started");
+        tracing::trace!(
+            phase = "txn_begin",
+            duration_us = txn_start.elapsed().as_micros() as u64,
+            "Transaction started"
+        );
 
         // Execute the query within transaction context
         let exec_start = std::time::Instant::now();
         let result = self.execute_in_transaction(sql, &txn);
-        tracing::debug!(phase = "execute", duration_us = exec_start.elapsed().as_micros() as u64, "Query executed");
+        tracing::debug!(
+            phase = "execute",
+            duration_us = exec_start.elapsed().as_micros() as u64,
+            "Query executed"
+        );
 
         // Commit or rollback based on result
         match result {
             Ok(count) => {
                 let commit_start = std::time::Instant::now();
+                if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
+                    let _ = txn.rollback();
+                    self.rollback_art_undo_log();
+                    return Err(e);
+                }
                 txn.commit()?;
+                self.art_undo_log.write().clear();
+                self.deferred_fk_checks.lock().clear();
                 // Increment LSN to track transaction commits
                 self.storage.increment_lsn();
-                tracing::debug!(phase = "txn_commit", duration_us = commit_start.elapsed().as_micros() as u64, rows = count, "Transaction committed");
+                tracing::debug!(
+                    phase = "txn_commit",
+                    duration_us = commit_start.elapsed().as_micros() as u64,
+                    rows = count,
+                    "Transaction committed"
+                );
                 Ok(count)
             }
             Err(e) => {
                 let _ = txn.rollback(); // Ignore rollback errors
+                self.rollback_art_undo_log();
+                self.deferred_fk_checks.lock().clear();
                 Err(e)
             }
         }
@@ -3909,7 +4454,11 @@ impl EmbeddedDatabase {
     /// execution across different code paths.
     fn execute_alter_table_op(&self, plan: &sql::LogicalPlan) -> Result<u64> {
         match plan {
-            sql::LogicalPlan::AlterTableAddColumn { table_name, column_def, if_not_exists } => {
+            sql::LogicalPlan::AlterTableAddColumn {
+                table_name,
+                column_def,
+                if_not_exists,
+            } => {
                 let catalog = self.storage.catalog();
                 let mut schema = catalog.get_table_schema(table_name)?;
 
@@ -3918,7 +4467,8 @@ impl EmbeddedDatabase {
                         return Ok(0);
                     }
                     return Err(Error::query_execution(format!(
-                        "Column '{}' already exists in table '{}'", column_def.name, table_name
+                        "Column '{}' already exists in table '{}'",
+                        column_def.name, table_name
                     )));
                 }
 
@@ -3937,33 +4487,38 @@ impl EmbeddedDatabase {
                 schema.columns.push(new_column);
                 catalog.update_table_schema(table_name, &schema)?;
 
-                let rows_updated = self.storage.add_column_to_rows(
-                    table_name,
-                    &column_def.default,
-                )?;
+                let rows_updated = self.storage.add_column_to_rows(table_name, &column_def.default)?;
 
                 tracing::info!(
                     "Added column '{}' to table '{}', updated {} rows",
-                    column_def.name, table_name, rows_updated
+                    column_def.name,
+                    table_name,
+                    rows_updated
                 );
 
                 Ok(rows_updated as u64)
             }
-            sql::LogicalPlan::AlterTableDropColumn { table_name, column_name, if_exists, cascade } => {
+            sql::LogicalPlan::AlterTableDropColumn {
+                table_name,
+                column_name,
+                if_exists,
+                cascade,
+            } => {
                 let catalog = self.storage.catalog();
                 let mut schema = catalog.get_table_schema(table_name)?;
 
-                let col_idx = schema.columns.iter()
-                    .position(|c| c.name == *column_name);
+                let col_idx = schema.columns.iter().position(|c| c.name == *column_name);
 
                 match col_idx {
                     Some(idx) => {
-                        let is_pk = schema.get_column_at(idx)
+                        let is_pk = schema
+                            .get_column_at(idx)
                             .ok_or_else(|| Error::internal("column index out of bounds"))?
                             .primary_key;
                         if is_pk && !cascade {
                             return Err(Error::query_execution(format!(
-                                "Cannot drop primary key column '{}' without CASCADE", column_name
+                                "Cannot drop primary key column '{}' without CASCADE",
+                                column_name
                             )));
                         }
 
@@ -3974,7 +4529,9 @@ impl EmbeddedDatabase {
 
                         tracing::info!(
                             "Dropped column '{}' from table '{}', updated {} rows",
-                            column_name, table_name, rows_updated
+                            column_name,
+                            table_name,
+                            rows_updated
                         );
 
                         Ok(rows_updated as u64)
@@ -3984,55 +4541,70 @@ impl EmbeddedDatabase {
                             Ok(0)
                         } else {
                             Err(Error::query_execution(format!(
-                                "Column '{}' does not exist in table '{}'", column_name, table_name
+                                "Column '{}' does not exist in table '{}'",
+                                column_name, table_name
                             )))
                         }
                     }
                 }
             }
-            sql::LogicalPlan::AlterTableRenameColumn { table_name, old_column_name, new_column_name } => {
+            sql::LogicalPlan::AlterTableRenameColumn {
+                table_name,
+                old_column_name,
+                new_column_name,
+            } => {
                 let catalog = self.storage.catalog();
                 let mut schema = catalog.get_table_schema(table_name)?;
 
                 if schema.columns.iter().any(|c| c.name == *new_column_name) {
                     return Err(Error::query_execution(format!(
-                        "Column '{}' already exists in table '{}'", new_column_name, table_name
+                        "Column '{}' already exists in table '{}'",
+                        new_column_name, table_name
                     )));
                 }
 
-                let col_idx = schema.columns.iter()
+                let col_idx = schema
+                    .columns
+                    .iter()
                     .position(|c| c.name == *old_column_name)
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "Column '{}' does not exist in table '{}'", old_column_name, table_name
-                    )))?;
+                    .ok_or_else(|| {
+                        Error::query_execution(format!(
+                            "Column '{}' does not exist in table '{}'",
+                            old_column_name, table_name
+                        ))
+                    })?;
 
-                schema.get_column_at_mut(col_idx)
+                schema
+                    .get_column_at_mut(col_idx)
                     .ok_or_else(|| Error::internal("column index out of bounds"))?
                     .name = new_column_name.clone();
                 catalog.update_table_schema(table_name, &schema)?;
 
                 tracing::info!(
                     "Renamed column '{}' to '{}' in table '{}'",
-                    old_column_name, new_column_name, table_name
+                    old_column_name,
+                    new_column_name,
+                    table_name
                 );
 
                 Ok(0)
             }
-            sql::LogicalPlan::AlterTableRename { table_name, new_table_name } => {
+            sql::LogicalPlan::AlterTableRename {
+                table_name,
+                new_table_name,
+            } => {
                 let catalog = self.storage.catalog();
 
                 if catalog.get_table_schema(new_table_name).is_ok() {
                     return Err(Error::query_execution(format!(
-                        "Table '{}' already exists", new_table_name
+                        "Table '{}' already exists",
+                        new_table_name
                     )));
                 }
 
                 self.storage.rename_table(table_name, new_table_name)?;
 
-                tracing::info!(
-                    "Renamed table '{}' to '{}'",
-                    table_name, new_table_name
-                );
+                tracing::info!("Renamed table '{}' to '{}'", table_name, new_table_name);
 
                 Ok(0)
             }
@@ -4064,8 +4636,11 @@ impl EmbeddedDatabase {
 
         // Bail on complex features (case-insensitive substring check)
         let upper = trimmed.to_ascii_uppercase();
-        if upper.contains("RETURNING") || upper.contains("ON CONFLICT")
-            || upper.contains("DEFAULT") || upper.contains("SELECT") {
+        if upper.contains("RETURNING")
+            || upper.contains("ON CONFLICT")
+            || upper.contains("DEFAULT")
+            || upper.contains("SELECT")
+        {
             return None;
         }
 
@@ -4189,9 +4764,7 @@ impl EmbeddedDatabase {
         // Apply DEFAULT expressions for omitted columns and enforce
         // NOT NULL (B24 / B26). Evaluator errors here bubble up as the
         // Result from this fast path — caller handles accordingly.
-        if let Err(e) = Self::apply_defaults_and_check_not_null(
-            &mut tuple_values, &schema, &user_provided,
-        ) {
+        if let Err(e) = Self::apply_defaults_and_check_not_null(&mut tuple_values, &schema, &user_provided) {
             return Some(Err(e));
         }
 
@@ -4200,7 +4773,11 @@ impl EmbeddedDatabase {
         if self.storage.get_current_branch_id().is_none() {
             Some(self.storage.insert_tuple_fast(table_name, tuple, &schema).map(|_| 1))
         } else {
-            Some(self.storage.insert_tuple_branch_aware_with_schema(table_name, tuple, &schema).map(|_| 1))
+            Some(
+                self.storage
+                    .insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)
+                    .map(|_| 1),
+            )
         }
     }
 
@@ -4216,9 +4793,13 @@ impl EmbeddedDatabase {
 
         // Bail on complex features
         let upper = trimmed.to_ascii_uppercase();
-        if upper.contains("RETURNING") || upper.contains("JOIN")
-            || upper.contains("FROM") || upper.contains("SELECT")
-            || upper.contains("CASE") || upper.contains("COALESCE") {
+        if upper.contains("RETURNING")
+            || upper.contains("JOIN")
+            || upper.contains("FROM")
+            || upper.contains("SELECT")
+            || upper.contains("CASE")
+            || upper.contains("COALESCE")
+        {
             return None;
         }
 
@@ -4244,9 +4825,13 @@ impl EmbeddedDatabase {
             let upper_rest = after_set.to_ascii_uppercase();
             let pos = upper_rest.find("WHERE")?;
             // Ensure WHERE is word-bounded (preceded by whitespace)
-            if pos == 0 { return None; }
+            if pos == 0 {
+                return None;
+            }
             let prev = after_set.as_bytes().get(pos - 1)?;
-            if !prev.is_ascii_whitespace() { return None; }
+            if !prev.is_ascii_whitespace() {
+                return None;
+            }
             pos
         };
 
@@ -4269,8 +4854,11 @@ impl EmbeddedDatabase {
         let where_clause = where_clause.strip_suffix(';').unwrap_or(where_clause).trim();
         // Bail on complex WHERE (AND, OR, etc.)
         let where_upper = where_clause.to_ascii_uppercase();
-        if where_upper.contains("AND") || where_upper.contains("OR")
-            || where_upper.contains("IN") || where_upper.contains("BETWEEN") {
+        if where_upper.contains("AND")
+            || where_upper.contains("OR")
+            || where_upper.contains("IN")
+            || where_upper.contains("BETWEEN")
+        {
             return None;
         }
         let weq_pos = where_clause.find('=')?;
@@ -4356,7 +4944,8 @@ impl EmbeddedDatabase {
         // Check NOT NULL constraint
         if !set_column.nullable && matches!(new_value, Value::Null) {
             return Some(Err(Error::constraint_violation(format!(
-                "Column '{}' cannot be null", set_col
+                "Column '{}' cannot be null",
+                set_col
             ))));
         }
 
@@ -4365,7 +4954,9 @@ impl EmbeddedDatabase {
         if set_col_idx < new_values.len() {
             // Safety: bounds checked on the line above
             #[allow(clippy::indexing_slicing)]
-            { new_values[set_col_idx] = new_value; }
+            {
+                new_values[set_col_idx] = new_value;
+            }
         } else {
             return None;
         }
@@ -4373,7 +4964,10 @@ impl EmbeddedDatabase {
         let new_tuple = Tuple::new(new_values);
 
         // Use fast update storage path
-        Some(self.storage.update_tuple_fast(table_name, row_id, new_tuple, &existing_row, &schema))
+        Some(
+            self.storage
+                .update_tuple_fast(table_name, row_id, new_tuple, &existing_row, &schema),
+        )
     }
 
     /// Fast path for SELECT: `SELECT * FROM table WHERE pk_col = literal`
@@ -4416,9 +5010,13 @@ impl EmbeddedDatabase {
 
         // Bail on complex WHERE
         let upper = where_clause.to_ascii_uppercase();
-        if upper.contains("AND") || upper.contains("OR")
-            || upper.contains("JOIN") || upper.contains("ORDER")
-            || upper.contains("GROUP") || upper.contains("LIMIT") {
+        if upper.contains("AND")
+            || upper.contains("OR")
+            || upper.contains("JOIN")
+            || upper.contains("ORDER")
+            || upper.contains("GROUP")
+            || upper.contains("LIMIT")
+        {
             return None;
         }
 
@@ -4492,21 +5090,66 @@ impl EmbeddedDatabase {
 
         // Parse the operand as a number
         match (current, op) {
-            (Value::Int2(v), '+') => { let n: i16 = operand_str.parse().ok()?; Some(Value::Int2(v.checked_add(n)?)) }
-            (Value::Int2(v), '-') => { let n: i16 = operand_str.parse().ok()?; Some(Value::Int2(v.checked_sub(n)?)) }
-            (Value::Int2(v), '*') => { let n: i16 = operand_str.parse().ok()?; Some(Value::Int2(v.checked_mul(n)?)) }
-            (Value::Int4(v), '+') => { let n: i32 = operand_str.parse().ok()?; Some(Value::Int4(v.checked_add(n)?)) }
-            (Value::Int4(v), '-') => { let n: i32 = operand_str.parse().ok()?; Some(Value::Int4(v.checked_sub(n)?)) }
-            (Value::Int4(v), '*') => { let n: i32 = operand_str.parse().ok()?; Some(Value::Int4(v.checked_mul(n)?)) }
-            (Value::Int8(v), '+') => { let n: i64 = operand_str.parse().ok()?; Some(Value::Int8(v.checked_add(n)?)) }
-            (Value::Int8(v), '-') => { let n: i64 = operand_str.parse().ok()?; Some(Value::Int8(v.checked_sub(n)?)) }
-            (Value::Int8(v), '*') => { let n: i64 = operand_str.parse().ok()?; Some(Value::Int8(v.checked_mul(n)?)) }
-            (Value::Float4(v), '+') => { let n: f32 = operand_str.parse().ok()?; Some(Value::Float4(v + n)) }
-            (Value::Float4(v), '-') => { let n: f32 = operand_str.parse().ok()?; Some(Value::Float4(v - n)) }
-            (Value::Float4(v), '*') => { let n: f32 = operand_str.parse().ok()?; Some(Value::Float4(v * n)) }
-            (Value::Float8(v), '+') => { let n: f64 = operand_str.parse().ok()?; Some(Value::Float8(v + n)) }
-            (Value::Float8(v), '-') => { let n: f64 = operand_str.parse().ok()?; Some(Value::Float8(v - n)) }
-            (Value::Float8(v), '*') => { let n: f64 = operand_str.parse().ok()?; Some(Value::Float8(v * n)) }
+            (Value::Int2(v), '+') => {
+                let n: i16 = operand_str.parse().ok()?;
+                Some(Value::Int2(v.checked_add(n)?))
+            }
+            (Value::Int2(v), '-') => {
+                let n: i16 = operand_str.parse().ok()?;
+                Some(Value::Int2(v.checked_sub(n)?))
+            }
+            (Value::Int2(v), '*') => {
+                let n: i16 = operand_str.parse().ok()?;
+                Some(Value::Int2(v.checked_mul(n)?))
+            }
+            (Value::Int4(v), '+') => {
+                let n: i32 = operand_str.parse().ok()?;
+                Some(Value::Int4(v.checked_add(n)?))
+            }
+            (Value::Int4(v), '-') => {
+                let n: i32 = operand_str.parse().ok()?;
+                Some(Value::Int4(v.checked_sub(n)?))
+            }
+            (Value::Int4(v), '*') => {
+                let n: i32 = operand_str.parse().ok()?;
+                Some(Value::Int4(v.checked_mul(n)?))
+            }
+            (Value::Int8(v), '+') => {
+                let n: i64 = operand_str.parse().ok()?;
+                Some(Value::Int8(v.checked_add(n)?))
+            }
+            (Value::Int8(v), '-') => {
+                let n: i64 = operand_str.parse().ok()?;
+                Some(Value::Int8(v.checked_sub(n)?))
+            }
+            (Value::Int8(v), '*') => {
+                let n: i64 = operand_str.parse().ok()?;
+                Some(Value::Int8(v.checked_mul(n)?))
+            }
+            (Value::Float4(v), '+') => {
+                let n: f32 = operand_str.parse().ok()?;
+                Some(Value::Float4(v + n))
+            }
+            (Value::Float4(v), '-') => {
+                let n: f32 = operand_str.parse().ok()?;
+                Some(Value::Float4(v - n))
+            }
+            (Value::Float4(v), '*') => {
+                let n: f32 = operand_str.parse().ok()?;
+                Some(Value::Float4(v * n))
+            }
+            (Value::Float8(v), '+') => {
+                let n: f64 = operand_str.parse().ok()?;
+                Some(Value::Float8(v + n))
+            }
+            (Value::Float8(v), '-') => {
+                let n: f64 = operand_str.parse().ok()?;
+                Some(Value::Float8(v - n))
+            }
+            (Value::Float8(v), '*') => {
+                let n: f64 = operand_str.parse().ok()?;
+                Some(Value::Float8(v * n))
+            }
             _ => None,
         }
     }
@@ -4617,8 +5260,11 @@ impl EmbeddedDatabase {
             // Reject string literals for numeric/boolean target types — bail to
             // the normal parser which will produce a proper type mismatch error
             match target_type {
-                DataType::Int2 | DataType::Int4 | DataType::Int8
-                | DataType::Float4 | DataType::Float8
+                DataType::Int2
+                | DataType::Int4
+                | DataType::Int8
+                | DataType::Float4
+                | DataType::Float8
                 | DataType::Boolean => return None,
                 _ => {}
             }
@@ -4694,8 +5340,7 @@ impl EmbeddedDatabase {
 
         // Number: integer or float (possibly negative)
         if first.is_ascii_digit() || *first == b'-' || *first == b'+' || *first == b'.' {
-            let end = s.find([',', ')', ' '])
-                .unwrap_or(s.len());
+            let end = s.find([',', ')', ' ']).unwrap_or(s.len());
             let num_str = s.get(..end)?.trim();
             let rest = s.get(end..)?;
 
@@ -4769,7 +5414,8 @@ impl EmbeddedDatabase {
     fn execute_internal(&self, sql: &str) -> Result<u64> {
         // 1. Record query for quota tracking (QPS enforcement)
         if let Some(context) = self.tenant_manager.get_current_context() {
-            self.tenant_manager.record_query(context.tenant_id)
+            self.tenant_manager
+                .record_query(context.tenant_id)
                 .map_err(|e| Error::query_execution(format!("Quota exceeded: {}", e)))?;
         }
 
@@ -4778,9 +5424,17 @@ impl EmbeddedDatabase {
         let (statement, parse_cached) = self.parse_cached(sql)?;
         let parse_elapsed = parse_start.elapsed();
         if parse_cached {
-            tracing::debug!(phase = "parse", duration_us = parse_elapsed.as_micros() as u64, "SQL parsed (AST cached)");
+            tracing::debug!(
+                phase = "parse",
+                duration_us = parse_elapsed.as_micros() as u64,
+                "SQL parsed (AST cached)"
+            );
         } else {
-            tracing::debug!(phase = "parse", duration_us = parse_elapsed.as_micros() as u64, "SQL parsed");
+            tracing::debug!(
+                phase = "parse",
+                duration_us = parse_elapsed.as_micros() as u64,
+                "SQL parsed"
+            );
         }
 
         // 3. Create logical plan with catalog access
@@ -4789,48 +5443,62 @@ impl EmbeddedDatabase {
         let planner = sql::Planner::with_catalog(&catalog);
         let plan = planner.statement_to_plan(statement)?;
         let plan_elapsed = plan_start.elapsed();
-        tracing::debug!(phase = "plan", duration_us = plan_elapsed.as_micros() as u64, "Logical plan created");
+        tracing::debug!(
+            phase = "plan",
+            duration_us = plan_elapsed.as_micros() as u64,
+            "Logical plan created"
+        );
 
         // Invalidate plan cache on DDL operations (schema changes)
-        if matches!(&plan,
-            sql::LogicalPlan::CreateTable { .. } |
-            sql::LogicalPlan::DropTable { .. } |
-            sql::LogicalPlan::AlterTableAddColumn { .. } |
-            sql::LogicalPlan::AlterTableDropColumn { .. } |
-            sql::LogicalPlan::AlterTableRename { .. } |
-            sql::LogicalPlan::AlterTableRenameColumn { .. } |
-            sql::LogicalPlan::AlterTableAddForeignKey { .. } |
-            sql::LogicalPlan::AlterTableMulti { .. } |
-            sql::LogicalPlan::CreateIndex { .. } |
-            sql::LogicalPlan::Truncate { .. } |
-            sql::LogicalPlan::CreateMaterializedView { .. } |
-            sql::LogicalPlan::DropMaterializedView { .. }
+        if matches!(
+            &plan,
+            sql::LogicalPlan::CreateTable { .. }
+                | sql::LogicalPlan::DropTable { .. }
+                | sql::LogicalPlan::AlterTableAddColumn { .. }
+                | sql::LogicalPlan::AlterTableDropColumn { .. }
+                | sql::LogicalPlan::AlterTableRename { .. }
+                | sql::LogicalPlan::AlterTableRenameColumn { .. }
+                | sql::LogicalPlan::AlterTableAddForeignKey { .. }
+                | sql::LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
+                | sql::LogicalPlan::AlterTableMulti { .. }
+                | sql::LogicalPlan::CreateIndex { .. }
+                | sql::LogicalPlan::Truncate { .. }
+                | sql::LogicalPlan::CreateMaterializedView { .. }
+                | sql::LogicalPlan::DropMaterializedView { .. }
         ) {
             self.invalidate_plan_cache();
         }
 
         // 3. Execute plan based on type
         match &plan {
-            sql::LogicalPlan::CreateTable { name, columns, if_not_exists, .. } => {
+            sql::LogicalPlan::CreateTable {
+                name,
+                columns,
+                if_not_exists,
+                ..
+            } => {
                 // Handle IF NOT EXISTS: silently succeed when table already exists
                 if *if_not_exists && self.storage.catalog().table_exists(name).unwrap_or(false) {
                     return Ok(0);
                 }
 
                 // Convert ColumnDef to Column
-                let schema_columns: Vec<Column> = columns.iter().map(|col_def| {
-                    Column {
-                        name: col_def.name.clone(),
-                        data_type: col_def.data_type.clone(),
-                        nullable: !col_def.not_null, // nullable is opposite of not_null
-                        primary_key: col_def.primary_key,
-                        source_table: None,
-                        source_table_name: None,
-                        default_expr: None,
-                        unique: false,
-                        storage_mode: col_def.storage_mode,
-                    }
-                }).collect();
+                let schema_columns: Vec<Column> = columns
+                    .iter()
+                    .map(|col_def| {
+                        Column {
+                            name: col_def.name.clone(),
+                            data_type: col_def.data_type.clone(),
+                            nullable: !col_def.not_null, // nullable is opposite of not_null
+                            primary_key: col_def.primary_key,
+                            source_table: None,
+                            source_table_name: None,
+                            default_expr: None,
+                            unique: false,
+                            storage_mode: col_def.storage_mode,
+                        }
+                    })
+                    .collect();
 
                 let schema = Schema::new(schema_columns);
                 let catalog = self.storage.catalog();
@@ -4843,7 +5511,13 @@ impl EmbeddedDatabase {
                 catalog.create_table(name, schema)?;
                 Ok(1) // 1 table created
             }
-            sql::LogicalPlan::Insert { table_name, columns, values, returning, on_conflict: _ } => {
+            sql::LogicalPlan::Insert {
+                table_name,
+                columns,
+                values,
+                returning,
+                on_conflict: _,
+            } => {
                 // Check for RLS enforcement (with_check_expr)
                 let rls_enforced = self.tenant_manager.should_apply_rls(table_name, "INSERT");
                 let rls_check = if rls_enforced {
@@ -4873,20 +5547,23 @@ impl EmbeddedDatabase {
                         // Determine target column type for auto-casting
                         let target_col_idx = if let Some(ref cols) = columns {
                             // Explicit column list - find index
-                            let col_name = cols.get(col_idx)
+                            let col_name = cols
+                                .get(col_idx)
                                 .ok_or_else(|| Error::internal("column index out of bounds"))?;
-                            schema.get_column_index(col_name)
+                            schema
+                                .get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?
                         } else {
                             // No column list - use position
                             col_idx
                         };
 
-                        let target_col = schema.get_column_at(target_col_idx)
-                            .ok_or_else(|| Error::query_execution(format!(
+                        let target_col = schema.get_column_at(target_col_idx).ok_or_else(|| {
+                            Error::query_execution(format!(
                                 "Too many values for INSERT: table has {} columns",
                                 schema.columns.len()
-                            )))?;
+                            ))
+                        })?;
 
                         let target_type = &target_col.data_type;
 
@@ -4896,7 +5573,7 @@ impl EmbeddedDatabase {
                         // Auto-cast if value type doesn't match column type
                         let needs_cast = match (&value, target_type) {
                             (Value::Null, _) => false, // NULL is compatible with any type
-                            (Value::Vector(_), DataType::Vector(_)) => false,
+                            (Value::Vector(_), DataType::Vector(_)) => true,
                             (Value::String(_), DataType::Vector(_)) => true, // Always cast strings to vectors
                             (Value::String(_), DataType::Json | DataType::Jsonb) => true, // Always cast strings to JSON
                             (Value::Int4(_), DataType::Int4) => false,
@@ -4925,7 +5602,7 @@ impl EmbeddedDatabase {
                             let tenant_context = self.tenant_manager.get_current_context();
                             let rls_evaluator = tenant::RLSExpressionEvaluator::new(
                                 std::sync::Arc::new(schema.clone()),
-                                tenant_context
+                                tenant_context,
                             );
                             let expr = rls_evaluator.parse(with_check_expr)?;
                             let satisfies_policy = rls_evaluator.evaluate(&expr, &tuple)?;
@@ -4938,15 +5615,21 @@ impl EmbeddedDatabase {
                         }
                     }
 
-                    self.storage.insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)?;
+                    self.storage
+                        .insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)?;
                     count += 1;
                 }
                 Ok(count)
             }
-            sql::LogicalPlan::InsertSelect { table_name, columns, source, returning: _ } => {
+            sql::LogicalPlan::InsertSelect {
+                table_name,
+                columns,
+                source,
+                returning: _,
+            } => {
                 // Execute source SELECT plan to get rows
-                let mut executor = sql::Executor::with_storage(&self.storage)
-                    .with_timeout(self.config.storage.query_timeout_ms);
+                let mut executor =
+                    sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
                 let source_rows = executor.execute(source)?;
 
                 // Check for RLS enforcement
@@ -4959,9 +5642,7 @@ impl EmbeddedDatabase {
 
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
-                let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema {
-                    columns: vec![],
-                }));
+                let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema { columns: vec![] }));
                 let empty_tuple = Tuple::new(vec![]);
 
                 let column_indices: Option<Vec<usize>> = columns.as_ref().map(|cols| {
@@ -4970,11 +5651,13 @@ impl EmbeddedDatabase {
                         .collect()
                 });
 
-                let default_exprs: Vec<Option<sql::LogicalExpr>> = schema.columns.iter()
+                let default_exprs: Vec<Option<sql::LogicalExpr>> = schema
+                    .columns
+                    .iter()
                     .map(|col| {
-                        col.default_expr.as_ref().and_then(|json| {
-                            serde_json::from_str(json).ok()
-                        })
+                        col.default_expr
+                            .as_ref()
+                            .and_then(|json| serde_json::from_str(json).ok())
                     })
                     .collect();
 
@@ -4987,23 +5670,26 @@ impl EmbeddedDatabase {
                             if val_idx >= indices.len() {
                                 return Err(Error::query_execution("More values than columns specified"));
                             }
-                            *indices.get(val_idx).ok_or_else(|| Error::internal("column index out of bounds"))?
+                            *indices
+                                .get(val_idx)
+                                .ok_or_else(|| Error::internal("column index out of bounds"))?
                         } else {
                             val_idx
                         };
 
-                        let target_col = schema.get_column_at(target_col_idx)
-                            .ok_or_else(|| Error::query_execution(format!(
+                        let target_col = schema.get_column_at(target_col_idx).ok_or_else(|| {
+                            Error::query_execution(format!(
                                 "Too many values for INSERT: table has {} columns",
                                 schema.columns.len()
-                            )))?;
+                            ))
+                        })?;
 
                         let target_type = &target_col.data_type;
                         let mut val = value.clone();
 
                         let needs_cast = match (&val, target_type) {
                             (Value::Null, _) => false,
-                            (Value::Vector(_), DataType::Vector(_)) => false,
+                            (Value::Vector(_), DataType::Vector(_)) => true,
                             (Value::String(_), DataType::Vector(_)) => true,
                             (Value::String(_), DataType::Json | DataType::Jsonb) => true,
                             (Value::Int4(_), DataType::Int4) => false,
@@ -5020,7 +5706,8 @@ impl EmbeddedDatabase {
                             val = evaluator.cast_value(val, target_type)?;
                         }
 
-                        let tv = tuple_values.get_mut(target_col_idx)
+                        let tv = tuple_values
+                            .get_mut(target_col_idx)
                             .ok_or_else(|| Error::internal("column index out of bounds"))?;
                         *tv = Some(val);
                     }
@@ -5032,7 +5719,8 @@ impl EmbeddedDatabase {
                             if let Some(val) = opt_val {
                                 Ok(val)
                             } else {
-                                let col = schema.get_column_at(idx)
+                                let col = schema
+                                    .get_column_at(idx)
                                     .ok_or_else(|| Error::internal("column index out of bounds"))?;
                                 if let Some(ref default_expr) = default_exprs.get(idx).and_then(|d| d.as_ref()) {
                                     let mut value = evaluator.evaluate(default_expr, &empty_tuple)?;
@@ -5064,7 +5752,7 @@ impl EmbeddedDatabase {
                             let tenant_context = self.tenant_manager.get_current_context();
                             let rls_evaluator = tenant::RLSExpressionEvaluator::new(
                                 std::sync::Arc::new(schema.clone()),
-                                tenant_context
+                                tenant_context,
                             );
                             let expr = rls_evaluator.parse(with_check_expr)?;
                             let satisfies_policy = rls_evaluator.evaluate(&expr, &tuple)?;
@@ -5076,12 +5764,18 @@ impl EmbeddedDatabase {
                         }
                     }
 
-                    self.storage.insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)?;
+                    self.storage
+                        .insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)?;
                     count += 1;
                 }
                 Ok(count)
             }
-            sql::LogicalPlan::Update { table_name, assignments, selection, returning } => {
+            sql::LogicalPlan::Update {
+                table_name,
+                assignments,
+                selection,
+                returning,
+            } => {
                 // Check for RLS enforcement
                 let rls_enforced = self.tenant_manager.should_apply_rls(table_name, "UPDATE");
                 let rls_condition = if rls_enforced {
@@ -5117,10 +5811,8 @@ impl EmbeddedDatabase {
                     let rls_matches = if let Some((using_expr, _)) = &rls_condition {
                         // Evaluate RLS using expression to check if row can be updated
                         let tenant_context = self.tenant_manager.get_current_context();
-                        let rls_evaluator = tenant::RLSExpressionEvaluator::new(
-                            std::sync::Arc::new(schema.clone()),
-                            tenant_context
-                        );
+                        let rls_evaluator =
+                            tenant::RLSExpressionEvaluator::new(std::sync::Arc::new(schema.clone()), tenant_context);
                         let expr = rls_evaluator.parse(using_expr)?;
                         rls_evaluator.evaluate(&expr, &tuple)?
                     } else {
@@ -5133,31 +5825,33 @@ impl EmbeddedDatabase {
                         // row before handing the expression to the
                         // row-scoped evaluator.
                         for (col_name, value_expr) in assignments {
-                            let bound = self.materialize_scalar_subqueries_for_row(
-                                value_expr, &tuple, &schema, table_name,
-                            )?;
+                            let bound =
+                                self.materialize_scalar_subqueries_for_row(value_expr, &tuple, &schema, table_name)?;
                             let mut new_value = evaluator.evaluate(&bound, &tuple)?;
                             // Find column index
-                            let col_index = evaluator.schema().get_column_index(col_name)
+                            let col_index = evaluator
+                                .schema()
+                                .get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
                             // Auto-cast to target column type (B34).
-                            let target_col = schema.get_column_at(col_index)
+                            let target_col = schema
+                                .get_column_at(col_index)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
                             let target_type = &target_col.data_type;
                             let needs_cast = !matches!(&new_value, Value::Null)
                                 && !matches!(
                                     (&new_value, target_type),
                                     (Value::Vector(_), DataType::Vector(_))
-                                    | (Value::Int2(_), DataType::Int2)
-                                    | (Value::Int4(_), DataType::Int4)
-                                    | (Value::Int8(_), DataType::Int8)
-                                    | (Value::Float4(_), DataType::Float4)
-                                    | (Value::Float8(_), DataType::Float8)
-                                    | (Value::String(_), DataType::Text | DataType::Varchar(_))
-                                    | (Value::Boolean(_), DataType::Boolean)
-                                    | (Value::Json(_), DataType::Json | DataType::Jsonb)
-                                    | (Value::Timestamp(_), DataType::Timestamp | DataType::Timestamptz)
-                                    | (Value::Date(_), DataType::Date)
+                                        | (Value::Int2(_), DataType::Int2)
+                                        | (Value::Int4(_), DataType::Int4)
+                                        | (Value::Int8(_), DataType::Int8)
+                                        | (Value::Float4(_), DataType::Float4)
+                                        | (Value::Float8(_), DataType::Float8)
+                                        | (Value::String(_), DataType::Text | DataType::Varchar(_))
+                                        | (Value::Boolean(_), DataType::Boolean)
+                                        | (Value::Json(_), DataType::Json | DataType::Jsonb)
+                                        | (Value::Timestamp(_), DataType::Timestamp | DataType::Timestamptz)
+                                        | (Value::Date(_), DataType::Date)
                                 );
                             if needs_cast {
                                 new_value = evaluator.cast_value(new_value, target_type)?;
@@ -5189,7 +5883,11 @@ impl EmbeddedDatabase {
                 let update_count = self.storage.update_tuples_branch_aware(table_name, updates)?;
                 Ok(update_count)
             }
-            sql::LogicalPlan::Delete { table_name, selection, returning } => {
+            sql::LogicalPlan::Delete {
+                table_name,
+                selection,
+                returning,
+            } => {
                 // Check for RLS enforcement
                 let rls_enforced = self.tenant_manager.should_apply_rls(table_name, "DELETE");
                 let rls_condition = if rls_enforced {
@@ -5226,10 +5924,8 @@ impl EmbeddedDatabase {
                     let rls_matches = if let Some((using_expr, _)) = &rls_condition {
                         // Evaluate RLS using expression to check if row can be deleted
                         let tenant_context = self.tenant_manager.get_current_context();
-                        let rls_evaluator = tenant::RLSExpressionEvaluator::new(
-                            std::sync::Arc::new(schema.clone()),
-                            tenant_context
-                        );
+                        let rls_evaluator =
+                            tenant::RLSExpressionEvaluator::new(std::sync::Arc::new(schema.clone()), tenant_context);
                         let expr = rls_evaluator.parse(using_expr)?;
                         rls_evaluator.evaluate(&expr, &tuple)?
                     } else {
@@ -5334,10 +6030,11 @@ impl EmbeddedDatabase {
 
                 // Execute BEFORE TRUNCATE triggers
                 let db_ref = self.clone_for_trigger();
-                let mut executor_fn = |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
-                    db_ref.execute_plan_internal(stmt)?;
-                    Ok(())
-                };
+                let mut executor_fn =
+                    |stmt: &sql::LogicalPlan, _ctx: &sql::triggers::TriggerRowContext| -> Result<()> {
+                        db_ref.execute_plan_internal(stmt)?;
+                        Ok(())
+                    };
 
                 let action = self.trigger_registry.execute_triggers(
                     table_name,
@@ -5396,7 +6093,9 @@ impl EmbeddedDatabase {
                 // auto-created "main" branch). Branch data uses separate key
                 // prefixes and does not share the ART index, but as a safety
                 // measure we skip clearing when user branches exist.
-                let has_user_branches = self.storage.list_branches()
+                let has_user_branches = self
+                    .storage
+                    .list_branches()
                     .map(|b| b.iter().any(|br| br.name != "main"))
                     .unwrap_or(false);
                 if !has_user_branches {
@@ -5416,7 +6115,10 @@ impl EmbeddedDatabase {
 
                 // Handle AFTER trigger action
                 if let sql::triggers::TriggerAction::Abort(msg) = action {
-                    return Err(Error::query_execution(format!("TRUNCATE failed in AFTER trigger: {}", msg)));
+                    return Err(Error::query_execution(format!(
+                        "TRUNCATE failed in AFTER trigger: {}",
+                        msg
+                    )));
                 }
 
                 // Log to WAL for replication
@@ -5426,7 +6128,11 @@ impl EmbeddedDatabase {
 
                 Ok(keys_to_delete.len() as u64) // Return number of rows deleted
             }
-            sql::LogicalPlan::AlterColumnStorage { table_name, column_name, storage_mode } => {
+            sql::LogicalPlan::AlterColumnStorage {
+                table_name,
+                column_name,
+                storage_mode,
+            } => {
                 // ALTER TABLE t ALTER COLUMN c SET STORAGE mode
                 // Migrates existing data to the new storage format online
 
@@ -5434,13 +6140,16 @@ impl EmbeddedDatabase {
                 let mut schema = catalog.get_table_schema(table_name)?;
 
                 // Find column index
-                let col_idx = schema.columns.iter()
+                let col_idx = schema
+                    .columns
+                    .iter()
                     .position(|c| c.name == *column_name)
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "Column '{}' not found in table '{}'", column_name, table_name
-                    )))?;
+                    .ok_or_else(|| {
+                        Error::query_execution(format!("Column '{}' not found in table '{}'", column_name, table_name))
+                    })?;
 
-                let col_ref = schema.get_column_at(col_idx)
+                let col_ref = schema
+                    .get_column_at(col_idx)
                     .ok_or_else(|| Error::internal("column index out of bounds"))?;
                 let old_mode = col_ref.storage_mode;
                 if old_mode == *storage_mode {
@@ -5450,33 +6159,41 @@ impl EmbeddedDatabase {
 
                 // Migrate existing data online
                 let column = col_ref.clone();
-                let rows_migrated = self.storage.migrate_column_storage(
-                    table_name,
-                    col_idx,
-                    &column,
-                    old_mode,
-                    *storage_mode,
-                )?;
+                let rows_migrated =
+                    self.storage
+                        .migrate_column_storage(table_name, col_idx, &column, old_mode, *storage_mode)?;
 
                 // Update schema with new storage mode
-                schema.get_column_at_mut(col_idx)
+                schema
+                    .get_column_at_mut(col_idx)
                     .ok_or_else(|| Error::internal("column index out of bounds"))?
                     .storage_mode = *storage_mode;
                 catalog.update_table_schema(table_name, &schema)?;
 
                 // Log to WAL for replication
-                if let Err(e) = self.storage.log_alter_column_storage(table_name, column_name, storage_mode) {
+                if let Err(e) = self
+                    .storage
+                    .log_alter_column_storage(table_name, column_name, storage_mode)
+                {
                     tracing::warn!("Failed to log ALTER COLUMN STORAGE to WAL: {}", e);
                 }
 
                 tracing::info!(
                     "Altered {}.{} storage from {:?} to {:?}, migrated {} rows",
-                    table_name, column_name, old_mode, storage_mode, rows_migrated
+                    table_name,
+                    column_name,
+                    old_mode,
+                    storage_mode,
+                    rows_migrated
                 );
 
                 Ok(rows_migrated as u64)
             }
-            sql::LogicalPlan::AlterTableAddColumn { table_name, column_def, if_not_exists } => {
+            sql::LogicalPlan::AlterTableAddColumn {
+                table_name,
+                column_def,
+                if_not_exists,
+            } => {
                 let catalog = self.storage.catalog();
                 let mut schema = catalog.get_table_schema(table_name)?;
 
@@ -5485,7 +6202,8 @@ impl EmbeddedDatabase {
                         return Ok(0);
                     }
                     return Err(Error::query_execution(format!(
-                        "Column '{}' already exists in table '{}'", column_def.name, table_name
+                        "Column '{}' already exists in table '{}'",
+                        column_def.name, table_name
                     )));
                 }
 
@@ -5507,7 +6225,12 @@ impl EmbeddedDatabase {
                 let rows_updated = self.storage.add_column_to_rows(table_name, &column_def.default)?;
                 Ok(rows_updated as u64)
             }
-            sql::LogicalPlan::AlterTableDropColumn { table_name, column_name, if_exists, cascade } => {
+            sql::LogicalPlan::AlterTableDropColumn {
+                table_name,
+                column_name,
+                if_exists,
+                cascade,
+            } => {
                 let catalog = self.storage.catalog();
                 let mut schema = catalog.get_table_schema(table_name)?;
 
@@ -5517,7 +6240,8 @@ impl EmbeddedDatabase {
                     Some(idx) => {
                         if schema.get_column_at(idx).is_some_and(|c| c.primary_key) && !cascade {
                             return Err(Error::query_execution(format!(
-                                "Cannot drop primary key column '{}' without CASCADE", column_name
+                                "Cannot drop primary key column '{}' without CASCADE",
+                                column_name
                             )));
                         }
 
@@ -5531,40 +6255,56 @@ impl EmbeddedDatabase {
                             Ok(0)
                         } else {
                             Err(Error::query_execution(format!(
-                                "Column '{}' does not exist in table '{}'", column_name, table_name
+                                "Column '{}' does not exist in table '{}'",
+                                column_name, table_name
                             )))
                         }
                     }
                 }
             }
-            sql::LogicalPlan::AlterTableRenameColumn { table_name, old_column_name, new_column_name } => {
+            sql::LogicalPlan::AlterTableRenameColumn {
+                table_name,
+                old_column_name,
+                new_column_name,
+            } => {
                 let catalog = self.storage.catalog();
                 let mut schema = catalog.get_table_schema(table_name)?;
 
                 if schema.columns.iter().any(|c| c.name == *new_column_name) {
                     return Err(Error::query_execution(format!(
-                        "Column '{}' already exists in table '{}'", new_column_name, table_name
+                        "Column '{}' already exists in table '{}'",
+                        new_column_name, table_name
                     )));
                 }
 
-                let col_idx = schema.columns.iter()
+                let col_idx = schema
+                    .columns
+                    .iter()
                     .position(|c| c.name == *old_column_name)
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "Column '{}' does not exist in table '{}'", old_column_name, table_name
-                    )))?;
+                    .ok_or_else(|| {
+                        Error::query_execution(format!(
+                            "Column '{}' does not exist in table '{}'",
+                            old_column_name, table_name
+                        ))
+                    })?;
 
-                schema.get_column_at_mut(col_idx)
+                schema
+                    .get_column_at_mut(col_idx)
                     .ok_or_else(|| Error::internal("column index out of bounds"))?
                     .name = new_column_name.clone();
                 catalog.update_table_schema(table_name, &schema)?;
                 Ok(0)
             }
-            sql::LogicalPlan::AlterTableRename { table_name, new_table_name } => {
+            sql::LogicalPlan::AlterTableRename {
+                table_name,
+                new_table_name,
+            } => {
                 let catalog = self.storage.catalog();
 
                 if catalog.get_table_schema(new_table_name).is_ok() {
                     return Err(Error::query_execution(format!(
-                        "Table '{}' already exists", new_table_name
+                        "Table '{}' already exists",
+                        new_table_name
                     )));
                 }
 
@@ -5579,11 +6319,17 @@ impl EmbeddedDatabase {
                 Ok(total_rows)
             }
             sql::LogicalPlan::Savepoint { ref name } => {
-                let txn = self.current_transaction.lock()
+                let txn = self
+                    .current_transaction
+                    .lock()
                     .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
                 let write_set_snapshot = match txn.as_ref() {
                     Some(t) => t.savepoint_snapshot(),
-                    None => return Err(Error::query_execution("SAVEPOINT can only be used within a transaction")),
+                    None => {
+                        return Err(Error::query_execution(
+                            "SAVEPOINT can only be used within a transaction",
+                        ))
+                    }
                 };
                 drop(txn);
                 let savepoint = SavepointState {
@@ -5605,12 +6351,13 @@ impl EmbeddedDatabase {
             sql::LogicalPlan::RollbackToSavepoint { ref name } => {
                 let savepoints = self.savepoints.read();
                 if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
-                    let snapshot = savepoints.get(pos)
-                        .map(|s| s.write_set_snapshot.clone());
+                    let snapshot = savepoints.get(pos).map(|s| s.write_set_snapshot.clone());
                     drop(savepoints);
 
                     if let Some(snapshot) = snapshot {
-                        let txn = self.current_transaction.lock()
+                        let txn = self
+                            .current_transaction
+                            .lock()
                             .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
                         if let Some(t) = txn.as_ref() {
                             t.rollback_to_savepoint(&snapshot);
@@ -5635,8 +6382,8 @@ impl EmbeddedDatabase {
             }
             _ => {
                 // For query plans, use executor
-                let mut executor = sql::Executor::with_storage(&self.storage)
-                    .with_timeout(self.config.storage.query_timeout_ms);
+                let mut executor =
+                    sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
                 let results = executor.execute(&plan)?;
                 Ok(results.len() as u64)
             }
@@ -5824,8 +6571,9 @@ impl EmbeddedDatabase {
     /// Resolve `EXCLUDED.col` references in an expression for ON CONFLICT DO UPDATE.
     ///
     /// Replaces `LogicalExpr::Column { table: Some("EXCLUDED"|"excluded"), name }` with
-    /// the literal value from the proposed INSERT row.  All other expressions are
-    /// recursively traversed and returned as-is.
+    /// the literal value from the proposed INSERT row. All nested expressions are
+    /// recursively traversed so `CASE`, `COALESCE`, predicates, and tuple forms
+    /// can freely mix existing-row refs with `EXCLUDED.*`.
     fn resolve_excluded_refs(
         expr: &sql::logical_plan::LogicalExpr,
         excluded_map: &std::collections::HashMap<String, Value>,
@@ -5854,18 +6602,120 @@ impl EmbeddedDatabase {
                     expr: Box::new(Self::resolve_excluded_refs(inner, excluded_map)),
                 }
             }
-            sql::logical_plan::LogicalExpr::Cast { expr: inner, data_type } => {
-                sql::logical_plan::LogicalExpr::Cast {
-                    expr: Box::new(Self::resolve_excluded_refs(inner, excluded_map)),
-                    data_type: data_type.clone(),
+            sql::logical_plan::LogicalExpr::AggregateFunction { fun, args, distinct } => {
+                sql::logical_plan::LogicalExpr::AggregateFunction {
+                    fun: fun.clone(),
+                    args: args
+                        .iter()
+                        .map(|a| Self::resolve_excluded_refs(a, excluded_map))
+                        .collect(),
+                    distinct: *distinct,
                 }
             }
+            sql::logical_plan::LogicalExpr::Cast { expr: inner, data_type } => sql::logical_plan::LogicalExpr::Cast {
+                expr: Box::new(Self::resolve_excluded_refs(inner, excluded_map)),
+                data_type: data_type.clone(),
+            },
             sql::logical_plan::LogicalExpr::ScalarFunction { fun, args } => {
                 sql::logical_plan::LogicalExpr::ScalarFunction {
                     fun: fun.clone(),
-                    args: args.iter().map(|a| Self::resolve_excluded_refs(a, excluded_map)).collect(),
+                    args: args
+                        .iter()
+                        .map(|a| Self::resolve_excluded_refs(a, excluded_map))
+                        .collect(),
                 }
             }
+            sql::logical_plan::LogicalExpr::Case {
+                expr,
+                when_then,
+                else_result,
+            } => sql::logical_plan::LogicalExpr::Case {
+                expr: expr
+                    .as_ref()
+                    .map(|e| Box::new(Self::resolve_excluded_refs(e, excluded_map))),
+                when_then: when_then
+                    .iter()
+                    .map(|(when, then)| {
+                        (
+                            Self::resolve_excluded_refs(when, excluded_map),
+                            Self::resolve_excluded_refs(then, excluded_map),
+                        )
+                    })
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| Box::new(Self::resolve_excluded_refs(e, excluded_map))),
+            },
+            sql::logical_plan::LogicalExpr::IsNull { expr: inner, is_null } => sql::logical_plan::LogicalExpr::IsNull {
+                expr: Box::new(Self::resolve_excluded_refs(inner, excluded_map)),
+                is_null: *is_null,
+            },
+            sql::logical_plan::LogicalExpr::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => sql::logical_plan::LogicalExpr::Between {
+                expr: Box::new(Self::resolve_excluded_refs(inner, excluded_map)),
+                low: Box::new(Self::resolve_excluded_refs(low, excluded_map)),
+                high: Box::new(Self::resolve_excluded_refs(high, excluded_map)),
+                negated: *negated,
+            },
+            sql::logical_plan::LogicalExpr::InList {
+                expr: inner,
+                list,
+                negated,
+            } => sql::logical_plan::LogicalExpr::InList {
+                expr: Box::new(Self::resolve_excluded_refs(inner, excluded_map)),
+                list: list
+                    .iter()
+                    .map(|item| Self::resolve_excluded_refs(item, excluded_map))
+                    .collect(),
+                negated: *negated,
+            },
+            sql::logical_plan::LogicalExpr::InSubquery {
+                expr: inner,
+                subquery,
+                negated,
+            } => sql::logical_plan::LogicalExpr::InSubquery {
+                expr: Box::new(Self::resolve_excluded_refs(inner, excluded_map)),
+                subquery: subquery.clone(),
+                negated: *negated,
+            },
+            sql::logical_plan::LogicalExpr::ArraySubscript { array, index } => {
+                sql::logical_plan::LogicalExpr::ArraySubscript {
+                    array: Box::new(Self::resolve_excluded_refs(array, excluded_map)),
+                    index: Box::new(Self::resolve_excluded_refs(index, excluded_map)),
+                }
+            }
+            sql::logical_plan::LogicalExpr::Tuple { items } => sql::logical_plan::LogicalExpr::Tuple {
+                items: items
+                    .iter()
+                    .map(|item| Self::resolve_excluded_refs(item, excluded_map))
+                    .collect(),
+            },
+            sql::logical_plan::LogicalExpr::WindowFunction {
+                fun,
+                args,
+                partition_by,
+                order_by,
+                frame,
+            } => sql::logical_plan::LogicalExpr::WindowFunction {
+                fun: fun.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| Self::resolve_excluded_refs(arg, excluded_map))
+                    .collect(),
+                partition_by: partition_by
+                    .iter()
+                    .map(|arg| Self::resolve_excluded_refs(arg, excluded_map))
+                    .collect(),
+                order_by: order_by
+                    .iter()
+                    .map(|(arg, asc)| (Self::resolve_excluded_refs(arg, excluded_map), *asc))
+                    .collect(),
+                frame: frame.clone(),
+            },
             // For other expression types (literals, plain columns, etc.), return as-is
             other => other.clone(),
         }
@@ -5876,32 +6726,16 @@ impl EmbeddedDatabase {
         table_schema: &Schema,
         returning_items: &[sql::logical_plan::ReturningItem],
     ) -> Schema {
-        let columns = returning_items.iter()
-            .flat_map(|item| {
-                match item {
-                    sql::logical_plan::ReturningItem::Wildcard => {
-                        table_schema.columns.clone()
-                    }
-                    sql::logical_plan::ReturningItem::Column(col_name) => {
-                        if let Some(col) = table_schema.columns.iter().find(|c| &c.name == col_name) {
-                            vec![col.clone()]
-                        } else {
-                            vec![Column {
-                                name: col_name.clone(),
-                                data_type: DataType::Text,
-                                nullable: true,
-                                primary_key: false,
-                                source_table: None,
-                                source_table_name: None,
-                                default_expr: None,
-                                unique: false,
-                                storage_mode: crate::ColumnStorageMode::Default,
-                            }]
-                        }
-                    }
-                    sql::logical_plan::ReturningItem::Expression { alias, .. } => {
+        let columns = returning_items
+            .iter()
+            .flat_map(|item| match item {
+                sql::logical_plan::ReturningItem::Wildcard => table_schema.columns.clone(),
+                sql::logical_plan::ReturningItem::Column(col_name) => {
+                    if let Some(col) = table_schema.columns.iter().find(|c| &c.name == col_name) {
+                        vec![col.clone()]
+                    } else {
                         vec![Column {
-                            name: alias.clone(),
+                            name: col_name.clone(),
                             data_type: DataType::Text,
                             nullable: true,
                             primary_key: false,
@@ -5912,6 +6746,19 @@ impl EmbeddedDatabase {
                             storage_mode: crate::ColumnStorageMode::Default,
                         }]
                     }
+                }
+                sql::logical_plan::ReturningItem::Expression { alias, .. } => {
+                    vec![Column {
+                        name: alias.clone(),
+                        data_type: DataType::Text,
+                        nullable: true,
+                        primary_key: false,
+                        source_table: None,
+                        source_table_name: None,
+                        default_expr: None,
+                        unique: false,
+                        storage_mode: crate::ColumnStorageMode::Default,
+                    }]
                 }
             })
             .collect();
@@ -5957,16 +6804,20 @@ impl EmbeddedDatabase {
             return self.handle_drop_database(name, *if_exists);
         }
         match plan {
-            sql::LogicalPlan::Insert { table_name, columns, values, returning, on_conflict } => {
+            sql::LogicalPlan::Insert {
+                table_name,
+                columns,
+                values,
+                returning,
+                on_conflict,
+            } => {
                 // Get table schema for column types
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
 
                 // Create evaluator with parameters
-                let evaluator = sql::Evaluator::with_parameters(
-                    std::sync::Arc::new(Schema { columns: vec![] }),
-                    params.to_vec(),
-                );
+                let evaluator =
+                    sql::Evaluator::with_parameters(std::sync::Arc::new(Schema { columns: vec![] }), params.to_vec());
                 let empty_tuple = Tuple::new(vec![]);
 
                 let has_returning = returning.is_some();
@@ -5985,9 +6836,11 @@ impl EmbeddedDatabase {
 
                     for (col_idx, expr) in value_row.iter().enumerate() {
                         let target_col_idx = if let Some(ref cols) = columns {
-                            let col_name = cols.get(col_idx)
+                            let col_name = cols
+                                .get(col_idx)
                                 .ok_or_else(|| Error::internal("column index out of bounds"))?;
-                            schema.get_column_index(col_name)
+                            schema
+                                .get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?
                         } else {
                             col_idx
@@ -6001,11 +6854,12 @@ impl EmbeddedDatabase {
                             continue;
                         }
 
-                        let target_col = schema.get_column_at(target_col_idx)
-                            .ok_or_else(|| Error::query_execution(format!(
+                        let target_col = schema.get_column_at(target_col_idx).ok_or_else(|| {
+                            Error::query_execution(format!(
                                 "Too many values for INSERT: table has {} columns",
                                 schema.columns.len()
-                            )))?;
+                            ))
+                        })?;
 
                         let target_type = &target_col.data_type;
                         let mut value = evaluator.evaluate(expr, &empty_tuple)?;
@@ -6013,7 +6867,7 @@ impl EmbeddedDatabase {
                         // Auto-cast if needed
                         let needs_cast = match (&value, target_type) {
                             (Value::Null, _) => false,
-                            (Value::Vector(_), DataType::Vector(_)) => false,
+                            (Value::Vector(_), DataType::Vector(_)) => true,
                             (Value::String(_), DataType::Vector(_)) => true,
                             (Value::String(_), DataType::Json | DataType::Jsonb) => true,
                             (Value::Int4(_), DataType::Int4) => false,
@@ -6043,9 +6897,7 @@ impl EmbeddedDatabase {
                     // runs inside the storage layer — we leave primary
                     // keys NULL here on purpose so the counter picks the
                     // row_id.
-                    Self::apply_defaults_and_check_not_null(
-                        &mut tuple_values, &schema, &user_provided,
-                    )?;
+                    Self::apply_defaults_and_check_not_null(&mut tuple_values, &schema, &user_provided)?;
 
                     let tuple = Tuple::new(tuple_values);
 
@@ -6064,7 +6916,9 @@ impl EmbeddedDatabase {
                         }
                     }
 
-                    let conflict = self.storage.art_indexes()
+                    let conflict = self
+                        .storage
+                        .art_indexes()
                         .check_unique_constraints(table_name, &col_values_map);
 
                     match (conflict, on_conflict) {
@@ -6083,7 +6937,9 @@ impl EmbeddedDatabase {
                             // implicit-tx surface this path serves.
                             self.check_fk_constraints_on_write(table_name, &col_values_map, None)?;
                             let row_id = self.storage.insert_tuple_branch_aware_with_schema(
-                                table_name, tuple.clone(), &schema,
+                                table_name,
+                                tuple.clone(),
+                                &schema,
                             )?;
                             if has_returning {
                                 let mut filled = tuple;
@@ -6144,36 +7000,38 @@ impl EmbeddedDatabase {
                                                     found_row_id = Some(*rid);
                                                 }
                                             }
-                                            if found_row_id.is_some() { break; }
+                                            if found_row_id.is_some() {
+                                                break;
+                                            }
                                         }
                                     }
                                 }
                             }
                             if found_row_id.is_none() {
-                                let pk_values: Vec<Value> = schema.columns.iter().enumerate()
+                                let pk_values: Vec<Value> = schema
+                                    .columns
+                                    .iter()
+                                    .enumerate()
                                     .filter(|(_, c)| c.primary_key)
                                     .filter_map(|(i, _)| tuple.values.get(i).cloned())
                                     .collect();
-                                if !pk_values.is_empty()
-                                    && !pk_values.iter().any(|v| matches!(v, Value::Null))
-                                {
+                                if !pk_values.is_empty() && !pk_values.iter().any(|v| matches!(v, Value::Null)) {
                                     let pk_key = crate::storage::ArtIndexManager::encode_key(&pk_values);
-                                    found_row_id = self.storage.art_indexes()
-                                        .pk_index_lookup(table_name, &pk_key);
+                                    found_row_id = self.storage.art_indexes().pk_index_lookup(table_name, &pk_key);
                                 }
                             }
-                            let existing_row_id = found_row_id.ok_or_else(|| Error::query_execution(
-                                format!("ON CONFLICT DO UPDATE: could not find existing row ({})", e)
-                            ))?;
+                            let existing_row_id = found_row_id.ok_or_else(|| {
+                                Error::query_execution(format!(
+                                    "ON CONFLICT DO UPDATE: could not find existing row ({})",
+                                    e
+                                ))
+                            })?;
 
                             // Read the existing tuple from storage.
-                            let existing_key = self.storage.branch_aware_data_key(
-                                table_name, existing_row_id,
-                            );
-                            let existing_raw = self.storage.get(&existing_key)?
-                                .ok_or_else(|| Error::query_execution(
-                                    "ON CONFLICT DO UPDATE: existing row not found in storage"
-                                ))?;
+                            let existing_key = self.storage.branch_aware_data_key(table_name, existing_row_id);
+                            let existing_raw = self.storage.get(&existing_key)?.ok_or_else(|| {
+                                Error::query_execution("ON CONFLICT DO UPDATE: existing row not found in storage")
+                            })?;
                             let mut updated_tuple: Tuple = bincode::deserialize(&existing_raw)
                                 .map_err(|err| Error::storage(format!("Failed to deserialize tuple: {}", err)))?;
                             updated_tuple.row_id = Some(existing_row_id);
@@ -6194,28 +7052,35 @@ impl EmbeddedDatabase {
                                 }
                             }
                             let update_eval = sql::Evaluator::with_parameters(
-                                std::sync::Arc::new(schema.clone()),
+                                std::sync::Arc::new(schema.clone().with_source_table_name(table_name)),
                                 params.to_vec(),
                             );
                             for (col_name, expr) in assignments {
-                                let target_idx = schema.columns.iter()
+                                let target_idx = schema
+                                    .columns
+                                    .iter()
                                     .position(|c| c.name.eq_ignore_ascii_case(col_name))
-                                    .ok_or_else(|| Error::query_execution(format!(
-                                        "ON CONFLICT DO UPDATE: column '{}' not found", col_name
-                                    )))?;
+                                    .ok_or_else(|| {
+                                        Error::query_execution(format!(
+                                            "ON CONFLICT DO UPDATE: column '{}' not found",
+                                            col_name
+                                        ))
+                                    })?;
                                 let resolved_expr = Self::resolve_excluded_refs(expr, &excluded_map);
                                 let mut new_val = update_eval.evaluate(&resolved_expr, &updated_tuple)?;
-                                let target_type = &schema.columns.get(target_idx)
+                                let target_type = &schema
+                                    .columns
+                                    .get(target_idx)
                                     .ok_or_else(|| Error::internal("column index out of bounds"))?
                                     .data_type;
-                                if new_val.data_type() != *target_type
-                                    && !matches!(new_val, Value::Null)
-                                {
+                                if new_val.data_type() != *target_type && !matches!(new_val, Value::Null) {
                                     new_val = update_eval.cast_value(new_val, target_type)?;
                                 }
                                 if target_idx < updated_tuple.values.len() {
                                     #[allow(clippy::indexing_slicing)]
-                                    { updated_tuple.values[target_idx] = new_val; }
+                                    {
+                                        updated_tuple.values[target_idx] = new_val;
+                                    }
                                 }
                             }
 
@@ -6231,9 +7096,9 @@ impl EmbeddedDatabase {
                             )?;
 
                             if has_returning {
-                                if let Some(projected) = Self::project_returning_columns(
-                                    &updated_tuple, &schema, returning,
-                                ) {
+                                if let Some(projected) =
+                                    Self::project_returning_columns(&updated_tuple, &schema, returning)
+                                {
                                     returned_tuples.push(projected);
                                 }
                             }
@@ -6247,10 +7112,15 @@ impl EmbeddedDatabase {
                 }
                 Ok((count, returned_tuples))
             }
-            sql::LogicalPlan::InsertSelect { table_name, columns, source, returning } => {
+            sql::LogicalPlan::InsertSelect {
+                table_name,
+                columns,
+                source,
+                returning,
+            } => {
                 // Execute source SELECT plan
-                let mut executor = sql::Executor::with_storage(&self.storage)
-                    .with_timeout(self.config.storage.query_timeout_ms);
+                let mut executor =
+                    sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
                 let source_rows = executor.execute(source)?;
 
                 let catalog = self.storage.catalog();
@@ -6272,23 +7142,26 @@ impl EmbeddedDatabase {
 
                     for (val_idx, value) in source_row.values.iter().enumerate() {
                         let target_col_idx = if let Some(ref indices) = column_indices {
-                            *indices.get(val_idx).ok_or_else(|| Error::internal("column index out of bounds"))?
+                            *indices
+                                .get(val_idx)
+                                .ok_or_else(|| Error::internal("column index out of bounds"))?
                         } else {
                             val_idx
                         };
 
-                        let target_col = schema.get_column_at(target_col_idx)
-                            .ok_or_else(|| Error::query_execution(format!(
+                        let target_col = schema.get_column_at(target_col_idx).ok_or_else(|| {
+                            Error::query_execution(format!(
                                 "Too many values for INSERT: table has {} columns",
                                 schema.columns.len()
-                            )))?;
+                            ))
+                        })?;
 
                         let target_type = &target_col.data_type;
                         let mut val = value.clone();
 
                         let needs_cast = match (&val, target_type) {
                             (Value::Null, _) => false,
-                            (Value::Vector(_), DataType::Vector(_)) => false,
+                            (Value::Vector(_), DataType::Vector(_)) => true,
                             (Value::String(_), DataType::Vector(_)) => true,
                             (Value::String(_), DataType::Json | DataType::Jsonb) => true,
                             (Value::Int4(_), DataType::Int4) => false,
@@ -6314,22 +7187,25 @@ impl EmbeddedDatabase {
                             returned_tuples.push(projected);
                         }
                     }
-                    self.storage.insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)?;
+                    self.storage
+                        .insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)?;
                     count += 1;
                 }
                 Ok((count, returned_tuples))
             }
-            sql::LogicalPlan::Update { table_name, assignments, selection, returning } => {
+            sql::LogicalPlan::Update {
+                table_name,
+                assignments,
+                selection,
+                returning,
+            } => {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
                 // Stamp source_table_name on every column so
                 // qualified predicates like `WHERE "t"."col" = $1`
                 // resolve against this evaluator schema (B31).
                 let eval_schema = schema.clone().with_source_table_name(table_name);
-                let evaluator = sql::Evaluator::with_parameters(
-                    std::sync::Arc::new(eval_schema),
-                    params.to_vec(),
-                );
+                let evaluator = sql::Evaluator::with_parameters(std::sync::Arc::new(eval_schema), params.to_vec());
 
                 // Use branch-aware scan to read tuples
                 let tuples = self.storage.scan_table_branch_aware(table_name)?;
@@ -6348,11 +7224,12 @@ impl EmbeddedDatabase {
 
                     if matches {
                         for (col_name, value_expr) in assignments {
-                            let bound = self.materialize_scalar_subqueries_for_row(
-                                value_expr, &tuple, &schema, table_name,
-                            )?;
+                            let bound =
+                                self.materialize_scalar_subqueries_for_row(value_expr, &tuple, &schema, table_name)?;
                             let mut new_value = evaluator.evaluate(&bound, &tuple)?;
-                            let col_index = evaluator.schema().get_column_index(col_name)
+                            let col_index = evaluator
+                                .schema()
+                                .get_column_index(col_name)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
                             // Auto-cast SET values to the target
                             // column type (B34). Drizzle binds
@@ -6361,12 +7238,13 @@ impl EmbeddedDatabase {
                             // explicit cast the storage layer ended
                             // up persisting NULL. INSERT already does
                             // this; UPDATE must match.
-                            let target_col = schema.get_column_at(col_index)
+                            let target_col = schema
+                                .get_column_at(col_index)
                                 .ok_or_else(|| Error::query_execution(format!("Column '{}' not found", col_name)))?;
                             let target_type = &target_col.data_type;
                             let needs_cast = match (&new_value, target_type) {
                                 (Value::Null, _) => false,
-                                (Value::Vector(_), DataType::Vector(_)) => false,
+                                (Value::Vector(_), DataType::Vector(_)) => true,
                                 (Value::String(_), DataType::Vector(_)) => true,
                                 (Value::String(_), DataType::Json | DataType::Jsonb) => true,
                                 (Value::Int2(_), DataType::Int2) => false,
@@ -6411,7 +7289,8 @@ impl EmbeddedDatabase {
 
                 // Project RETURNING clause columns from updated tuples
                 let returned_tuples: Vec<Tuple> = if returning.is_some() {
-                    updates.iter()
+                    updates
+                        .iter()
                         .filter_map(|(_, tuple)| Self::project_returning_columns(tuple, &schema, returning))
                         .collect()
                 } else {
@@ -6422,14 +7301,15 @@ impl EmbeddedDatabase {
                 let count = self.storage.update_tuples_branch_aware(table_name, updates)?;
                 Ok((count, returned_tuples))
             }
-            sql::LogicalPlan::Delete { table_name, selection, returning } => {
+            sql::LogicalPlan::Delete {
+                table_name,
+                selection,
+                returning,
+            } => {
                 let catalog = self.storage.catalog();
                 let schema = catalog.get_table_schema(table_name)?;
                 let eval_schema = schema.clone().with_source_table_name(table_name);
-                let evaluator = sql::Evaluator::with_parameters(
-                    std::sync::Arc::new(eval_schema),
-                    params.to_vec(),
-                );
+                let evaluator = sql::Evaluator::with_parameters(std::sync::Arc::new(eval_schema), params.to_vec());
 
                 // Use branch-aware scan to read tuples
                 let tuples = self.storage.scan_table_branch_aware(table_name)?;
@@ -6497,11 +7377,17 @@ impl EmbeddedDatabase {
             // Savepoint support for nested transactions
             sql::LogicalPlan::Savepoint { name } => {
                 // Check if we're in a transaction and snapshot the write set
-                let txn = self.current_transaction.lock()
+                let txn = self
+                    .current_transaction
+                    .lock()
                     .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
                 let write_set_snapshot = match txn.as_ref() {
                     Some(t) => t.savepoint_snapshot(),
-                    None => return Err(Error::query_execution("SAVEPOINT can only be used within a transaction")),
+                    None => {
+                        return Err(Error::query_execution(
+                            "SAVEPOINT can only be used within a transaction",
+                        ))
+                    }
                 };
                 drop(txn);
 
@@ -6526,13 +7412,14 @@ impl EmbeddedDatabase {
                 let savepoints = self.savepoints.read();
                 // Find the savepoint
                 if let Some(pos) = savepoints.iter().rposition(|s| &s.name == name) {
-                    let snapshot = savepoints.get(pos)
-                        .map(|s| s.write_set_snapshot.clone());
+                    let snapshot = savepoints.get(pos).map(|s| s.write_set_snapshot.clone());
                     drop(savepoints);
 
                     // Rollback the transaction write set to the savepoint state
                     if let Some(snapshot) = snapshot {
-                        let txn = self.current_transaction.lock()
+                        let txn = self
+                            .current_transaction
+                            .lock()
                             .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
                         if let Some(t) = txn.as_ref() {
                             t.rollback_to_savepoint(&snapshot);
@@ -6551,7 +7438,9 @@ impl EmbeddedDatabase {
             // Prepared statement support
             sql::LogicalPlan::Prepare { name, statement, .. } => {
                 // Store the prepared statement
-                self.prepared_statements.write().insert(name.clone(), *statement.clone());
+                self.prepared_statements
+                    .write()
+                    .insert(name.clone(), *statement.clone());
                 Ok((0, Vec::new()))
             }
             sql::LogicalPlan::Execute { name, parameters } => {
@@ -6565,13 +7454,17 @@ impl EmbeddedDatabase {
                     let empty_tuple = Tuple::new(vec![]);
                     let empty_schema = std::sync::Arc::new(Schema { columns: vec![] });
                     let evaluator = sql::Evaluator::new(empty_schema);
-                    let param_values: Result<Vec<Value>> = parameters.iter()
+                    let param_values: Result<Vec<Value>> = parameters
+                        .iter()
                         .map(|expr| evaluator.evaluate(expr, &empty_tuple))
                         .collect();
                     // Execute the prepared statement with parameters
                     self.execute_plan_with_params(&plan, &param_values?)
                 } else {
-                    Err(Error::query_execution(format!("Prepared statement '{}' does not exist", name)))
+                    Err(Error::query_execution(format!(
+                        "Prepared statement '{}' does not exist",
+                        name
+                    )))
                 }
             }
             sql::LogicalPlan::Deallocate { name } => {
@@ -6579,7 +7472,10 @@ impl EmbeddedDatabase {
                     // Remove specific prepared statement
                     let removed = self.prepared_statements.write().remove(stmt_name);
                     if removed.is_none() {
-                        return Err(Error::query_execution(format!("Prepared statement '{}' does not exist", stmt_name)));
+                        return Err(Error::query_execution(format!(
+                            "Prepared statement '{}' does not exist",
+                            stmt_name
+                        )));
                     }
                 } else {
                     // DEALLOCATE ALL - remove all prepared statements
@@ -6648,16 +7544,17 @@ impl EmbeddedDatabase {
         let sql: &str = sql;
         let start = std::time::Instant::now();
 
-        // DML with RETURNING clause: route through execute_returning path
-        // which handles INSERT/UPDATE/DELETE and returns the affected rows
+        // DML belongs on the write executor.  `query()` is commonly used
+        // by client adapters as a generic SQL entry point; without this
+        // guard, INSERT/UPDATE/DELETE without RETURNING fall into the
+        // SELECT-only physical executor and fail as "Operator not yet
+        // implemented".  The RETURNING path still returns rows, while
+        // non-RETURNING DML returns an empty result set.
         {
             let upper = sql.trim().to_uppercase();
-            let is_dml = upper.starts_with("INSERT")
-                || upper.starts_with("UPDATE")
-                || upper.starts_with("DELETE");
-            if is_dml && upper.contains("RETURNING") {
+            let is_dml = upper.starts_with("INSERT") || upper.starts_with("UPDATE") || upper.starts_with("DELETE");
+            if is_dml {
                 let (_count, tuples) = self.execute_returning(sql)?;
-                // Invalidate result cache since DML modified data
                 self.invalidate_result_cache();
                 self.log_slow_query(sql, start.elapsed(), tuples.len() as u64);
                 return Ok(tuples);
@@ -6669,20 +7566,24 @@ impl EmbeddedDatabase {
         {
             use crate::error::LockResultExt;
             let has_active_txn = {
-                let txn_lock = self.current_transaction.lock()
+                let txn_lock = self
+                    .current_transaction
+                    .lock()
                     .map_lock_err("Failed to acquire transaction lock for query")?;
                 txn_lock.is_some()
             };
             if has_active_txn {
-                let txn_lock = self.current_transaction.lock()
+                let txn_lock = self
+                    .current_transaction
+                    .lock()
                     .map_lock_err("Failed to acquire transaction lock for query")?;
-                let txn_ref = txn_lock.as_ref()
+                let txn_ref = txn_lock
+                    .as_ref()
                     .ok_or_else(|| Error::transaction("Transaction lock in invalid state"))?;
                 // Parse and execute through transaction-aware executor
                 let (statement, _) = self.parse_cached(sql)?;
                 let catalog = self.storage.catalog();
-                let planner = sql::Planner::with_catalog(&catalog)
-                    .with_sql(sql.to_string());
+                let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
                 let plan = planner.statement_to_plan(statement)?;
                 let mut executor = sql::Executor::with_storage(&self.storage)
                     .with_timeout(self.config.storage.query_timeout_ms)
@@ -6701,13 +7602,24 @@ impl EmbeddedDatabase {
         // would serve stale rows to the caller.
         let is_non_deterministic = {
             let up = sql.to_ascii_uppercase();
-            ["NEXTVAL", "SETVAL", "CURRVAL", "GEN_RANDOM_UUID",
-             "UUID_GENERATE_V4", "RANDOM(", "NOW(", "CLOCK_TIMESTAMP"]
-                .iter()
-                .any(|m| up.contains(m))
+            [
+                "NEXTVAL",
+                "SETVAL",
+                "CURRVAL",
+                "GEN_RANDOM_UUID",
+                "UUID_GENERATE_V4",
+                "RANDOM(",
+                "NOW(",
+                "CLOCK_TIMESTAMP",
+            ]
+            .iter()
+            .any(|m| up.contains(m))
         };
         if !is_non_deterministic {
-            if let Some(cached_results) = self.result_cache.lock().ok()
+            if let Some(cached_results) = self
+                .result_cache
+                .lock()
+                .ok()
                 .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone))
             {
                 tracing::debug!(phase = "result_cache", "Result cache hit");
@@ -6724,7 +7636,11 @@ impl EmbeddedDatabase {
         }
 
         // Check plan cache (Arc::clone is O(1))
-        let cached_plan = self.plan_cache.lock().ok().and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone));
+        let cached_plan = self
+            .plan_cache
+            .lock()
+            .ok()
+            .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone));
 
         if let Some(arc_plan) = cached_plan {
             tracing::debug!(phase = "parse", duration_us = 0_u64, "SQL parsed (cached)");
@@ -6733,10 +7649,15 @@ impl EmbeddedDatabase {
             // Fast path: no RLS context → execute directly from Arc (no deep clone)
             if self.tenant_manager.get_current_context().is_none() {
                 let exec_start = std::time::Instant::now();
-                let mut executor = sql::Executor::with_storage(&self.storage)
-                    .with_timeout(self.config.storage.query_timeout_ms);
+                let mut executor =
+                    sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
                 let results = executor.execute(&arc_plan)?;
-                tracing::debug!(phase = "execute", duration_us = exec_start.elapsed().as_micros() as u64, rows = results.len() as u64, "Query executed");
+                tracing::debug!(
+                    phase = "execute",
+                    duration_us = exec_start.elapsed().as_micros() as u64,
+                    rows = results.len() as u64,
+                    "Query executed"
+                );
                 self.log_slow_query(sql, start.elapsed(), results.len() as u64);
                 // Cache the results for future identical queries
                 if let Ok(mut cache) = self.result_cache.lock() {
@@ -6748,10 +7669,15 @@ impl EmbeddedDatabase {
             // Slow path: RLS active → need owned plan for mutation
             let plan = self.apply_rls_to_plan((*arc_plan).clone())?;
             let exec_start = std::time::Instant::now();
-            let mut executor = sql::Executor::with_storage(&self.storage)
-                .with_timeout(self.config.storage.query_timeout_ms);
+            let mut executor =
+                sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
             let results = executor.execute(&plan)?;
-            tracing::debug!(phase = "execute", duration_us = exec_start.elapsed().as_micros() as u64, rows = results.len() as u64, "Query executed");
+            tracing::debug!(
+                phase = "execute",
+                duration_us = exec_start.elapsed().as_micros() as u64,
+                rows = results.len() as u64,
+                "Query executed"
+            );
             self.log_slow_query(sql, start.elapsed(), results.len() as u64);
             return Ok(results);
         }
@@ -6760,15 +7686,22 @@ impl EmbeddedDatabase {
         // 1. Parse SQL (with cache)
         let parse_start = std::time::Instant::now();
         let (statement, _parse_cached) = self.parse_cached(sql)?;
-        tracing::debug!(phase = "parse", duration_us = parse_start.elapsed().as_micros() as u64, "SQL parsed");
+        tracing::debug!(
+            phase = "parse",
+            duration_us = parse_start.elapsed().as_micros() as u64,
+            "SQL parsed"
+        );
 
         // 2. Create logical plan
         let plan_start = std::time::Instant::now();
         let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog)
-            .with_sql(sql.to_string());
+        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
         let plan = planner.statement_to_plan(statement)?;
-        tracing::debug!(phase = "plan", duration_us = plan_start.elapsed().as_micros() as u64, "Logical plan created");
+        tracing::debug!(
+            phase = "plan",
+            duration_us = plan_start.elapsed().as_micros() as u64,
+            "Logical plan created"
+        );
 
         // 3. Optimize plan (predicate pushdown, constant folding, projection pruning)
         let plan = {
@@ -6780,13 +7713,13 @@ impl EmbeddedDatabase {
                 Box::new(optimizer::rules::JoinPredicatePushdownRule::new()),
                 Box::new(optimizer::rules::ProjectionPruningRule::new()),
             ];
-            let opt = optimizer::Optimizer::with_rules(
-                stats,
-                rules,
-                optimizer::OptimizerConfig::default(),
-            );
+            let opt = optimizer::Optimizer::with_rules(stats, rules, optimizer::OptimizerConfig::default());
             let optimized = opt.optimize_recursive(plan)?;
-            tracing::debug!(phase = "optimize", duration_us = opt_start.elapsed().as_micros() as u64, "Plan optimized");
+            tracing::debug!(
+                phase = "optimize",
+                duration_us = opt_start.elapsed().as_micros() as u64,
+                "Plan optimized"
+            );
             optimized
         };
 
@@ -6800,10 +7733,15 @@ impl EmbeddedDatabase {
 
         // 6. Execute
         let exec_start = std::time::Instant::now();
-        let mut executor = sql::Executor::with_storage(&self.storage)
-            .with_timeout(self.config.storage.query_timeout_ms);
+        let mut executor =
+            sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
         let results = executor.execute(&plan)?;
-        tracing::debug!(phase = "execute", duration_us = exec_start.elapsed().as_micros() as u64, rows = results.len() as u64, "Query executed");
+        tracing::debug!(
+            phase = "execute",
+            duration_us = exec_start.elapsed().as_micros() as u64,
+            rows = results.len() as u64,
+            "Query executed"
+        );
 
         self.log_slow_query(sql, start.elapsed(), results.len() as u64);
 
@@ -6830,8 +7768,7 @@ impl EmbeddedDatabase {
         } else {
             let (statement, _) = self.parse_cached(sql)?;
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog)
-                .with_sql(sql.to_string());
+            let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
             planner.statement_to_plan(statement)?
         };
 
@@ -6843,16 +7780,12 @@ impl EmbeddedDatabase {
                 Box::new(optimizer::rules::JoinPredicatePushdownRule::new()),
                 Box::new(optimizer::rules::ProjectionPruningRule::new()),
             ];
-            let opt = optimizer::Optimizer::with_rules(
-                stats,
-                rules,
-                optimizer::OptimizerConfig::default(),
-            );
+            let opt = optimizer::Optimizer::with_rules(stats, rules, optimizer::OptimizerConfig::default());
             opt.optimize_recursive(plan)?
         };
 
-        let mut executor = sql::Executor::with_storage(&self.storage)
-            .with_timeout(self.config.storage.query_timeout_ms);
+        let mut executor =
+            sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
         executor.execute_with_columns(&plan)
     }
 
@@ -6927,11 +7860,15 @@ impl EmbeddedDatabase {
     ///
     /// * `path` - File path where the dump will be written
     /// * `compression` - Compression algorithm to use (None, Gzip, Zstd)
-    pub fn dump_full_compressed(&self, path: &std::path::Path, compression: storage::DumpCompressionType) -> Result<storage::DumpMetadata> {
+    pub fn dump_full_compressed(
+        &self,
+        path: &std::path::Path,
+        compression: storage::DumpCompressionType,
+    ) -> Result<storage::DumpMetadata> {
         // Create a temporary manager with the requested compression
         let manager = storage::DumpManager::new(
             path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf(),
-            compression
+            compression,
         );
         manager.create_full_dump(path, self)
     }
@@ -6969,8 +7906,8 @@ impl EmbeddedDatabase {
     /// * `path` - Path to the dump file
     /// * `_tables` - List of table names to restore
     pub fn restore_tables(&mut self, path: &std::path::Path, _tables: Vec<&str>) -> Result<()> {
-         // Stub for test
-         self.restore_from_dump(path)
+        // Stub for test
+        self.restore_from_dump(path)
     }
 
     /// Read dump metadata without restoring
@@ -6985,26 +7922,30 @@ impl EmbeddedDatabase {
         use std::io::{Read, Seek, SeekFrom};
         let file = std::fs::File::open(path).map_err(|e| Error::io(e.to_string()))?;
         let mut reader = std::io::BufReader::new(file);
-        
+
         // Skip magic (8) and version (4)
         reader.seek(SeekFrom::Start(12)).map_err(|e| Error::io(e.to_string()))?;
-        
+
         // Read metadata length (4 bytes)
         let mut len_bytes = [0u8; 4];
-        reader.read_exact(&mut len_bytes).map_err(|e| Error::io(e.to_string()))?;
+        reader
+            .read_exact(&mut len_bytes)
+            .map_err(|e| Error::io(e.to_string()))?;
         let len = u32::from_le_bytes(len_bytes) as usize;
-        
+
         if len == 0 || len > 8192 {
             return Err(Error::io("Invalid metadata length".to_string()));
         }
 
         // Read JSON metadata
         let mut json_bytes = vec![0u8; len];
-        reader.read_exact(&mut json_bytes).map_err(|e| Error::io(e.to_string()))?;
-        
+        reader
+            .read_exact(&mut json_bytes)
+            .map_err(|e| Error::io(e.to_string()))?;
+
         let metadata: storage::DumpMetadata = serde_json::from_slice(&json_bytes)
             .map_err(|e| Error::io(format!("Failed to deserialize metadata: {}", e)))?;
-            
+
         Ok(metadata)
     }
 
@@ -7044,7 +7985,11 @@ impl EmbeddedDatabase {
     /// # Ok(())
     /// # }
     /// ```
-    pub fn create_session(&self, user_name: &str, isolation: crate::session::IsolationLevel) -> Result<crate::session::SessionId> {
+    pub fn create_session(
+        &self,
+        user_name: &str,
+        isolation: crate::session::IsolationLevel,
+    ) -> Result<crate::session::SessionId> {
         let user = crate::session::User::new_passwordless(user_name);
         self.session_manager.create_session(&user, isolation)
     }
@@ -7077,7 +8022,7 @@ impl EmbeddedDatabase {
     pub fn begin_transaction_for_session(&self, session_id: crate::session::SessionId) -> Result<()> {
         let session_lock = self.session_manager.get_session(session_id)?;
         let mut session = session_lock.write();
-        
+
         if session.active_txn.is_some() {
             return Err(Error::transaction("Session already has an active transaction"));
         }
@@ -7096,10 +8041,10 @@ impl EmbeddedDatabase {
         let txn_id = txn.snapshot_id();
         session.active_txn = Some(txn_id);
         session.stats.transactions_started += 1;
-        
+
         // Store transaction in map
         self.session_transactions.insert(session_id, txn);
-        
+
         Ok(())
     }
 
@@ -7118,7 +8063,7 @@ impl EmbeddedDatabase {
     pub fn commit_transaction_for_session(&self, session_id: crate::session::SessionId) -> Result<()> {
         let session_lock = self.session_manager.get_session(session_id)?;
         let mut session = session_lock.write();
-        
+
         if session.active_txn.is_none() {
             return Err(Error::transaction("Session has no active transaction to commit"));
         }
@@ -7153,7 +8098,7 @@ impl EmbeddedDatabase {
     pub fn rollback_transaction_for_session(&self, session_id: crate::session::SessionId) -> Result<()> {
         let session_lock = self.session_manager.get_session(session_id)?;
         let mut session = session_lock.write();
-        
+
         if session.active_txn.is_none() {
             return Err(Error::transaction("Session has no active transaction to rollback"));
         }
@@ -7194,7 +8139,7 @@ impl EmbeddedDatabase {
         let mut session = session_lock.write();
         session.touch();
         session.stats.queries_executed += 1;
-        
+
         // Check if session has an active transaction
         if self.session_transactions.contains_key(&session_id) {
             // For READ COMMITTED, each statement gets a fresh snapshot.
@@ -7207,7 +8152,9 @@ impl EmbeddedDatabase {
 
             // Use a read guard (shared) during execution to avoid blocking
             // other sessions that may hash to the same DashMap shard
-            let txn = self.session_transactions.get(&session_id)
+            let txn = self
+                .session_transactions
+                .get(&session_id)
                 .ok_or_else(|| Error::transaction("Session transaction disappeared during execute"))?;
 
             // Skip fast paths for session transactions — writes must go through
@@ -7227,7 +8174,7 @@ impl EmbeddedDatabase {
             )?;
 
             let result = self.execute_in_transaction_no_fast_path(sql, &txn);
-            
+
             match result {
                 Ok(count) => {
                     txn.commit_with_timestamp(self.storage.next_timestamp())?;
@@ -7257,12 +8204,17 @@ impl EmbeddedDatabase {
     /// # Returns
     ///
     /// Vector of tuples matching the query
-    pub fn query_in_session(&self, session_id: crate::session::SessionId, sql: &str, _params: &[&dyn std::fmt::Display]) -> Result<Vec<Tuple>> {
+    pub fn query_in_session(
+        &self,
+        session_id: crate::session::SessionId,
+        sql: &str,
+        _params: &[&dyn std::fmt::Display],
+    ) -> Result<Vec<Tuple>> {
         let session_lock = self.session_manager.get_session(session_id)?;
         let mut session = session_lock.write();
         session.touch();
         session.stats.queries_executed += 1;
-        
+
         // Check if session has an active transaction
         if self.session_transactions.contains_key(&session_id) {
             // For READ COMMITTED, each statement gets a fresh snapshot.
@@ -7275,7 +8227,9 @@ impl EmbeddedDatabase {
 
             // Use a read guard (shared) during execution to avoid blocking
             // other sessions that may hash to the same DashMap shard
-            let txn = self.session_transactions.get(&session_id)
+            let txn = self
+                .session_transactions
+                .get(&session_id)
                 .ok_or_else(|| Error::transaction("Session transaction disappeared during query"))?;
 
             // Parse SQL with cache
@@ -7283,8 +8237,7 @@ impl EmbeddedDatabase {
 
             // Create logical plan with catalog access and original SQL for time-travel parsing
             let catalog = self.storage.catalog();
-            let planner = sql::Planner::with_catalog(&catalog)
-                .with_sql(sql.to_string());
+            let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
             let plan = planner.statement_to_plan(statement)?;
 
             // Execute plan with transaction context
@@ -7392,23 +8345,47 @@ impl EmbeddedDatabase {
         // 1. Parse SQL (will recognize $N placeholders)
         let parse_start = std::time::Instant::now();
         let (statement, _) = self.parse_cached(sql)?;
-        tracing::debug!(phase = "parse", duration_us = parse_start.elapsed().as_micros() as u64, "SQL parsed");
+        tracing::debug!(
+            phase = "parse",
+            duration_us = parse_start.elapsed().as_micros() as u64,
+            "SQL parsed"
+        );
 
         // 2. Create logical plan with catalog access and original SQL for time-travel parsing
         let plan_start = std::time::Instant::now();
         let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog)
-            .with_sql(sql.to_string());
+        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
         let mut plan = planner.statement_to_plan(statement)?;
-        tracing::debug!(phase = "plan", duration_us = plan_start.elapsed().as_micros() as u64, "Logical plan created");
+        tracing::debug!(
+            phase = "plan",
+            duration_us = plan_start.elapsed().as_micros() as u64,
+            "Logical plan created"
+        );
 
         // 3. Apply RLS policies to SELECT queries
         plan = self.apply_rls_to_plan(plan)?;
 
+        if matches!(
+            &plan,
+            sql::LogicalPlan::Insert { .. }
+                | sql::LogicalPlan::InsertSelect { .. }
+                | sql::LogicalPlan::Update { .. }
+                | sql::LogicalPlan::Delete { .. }
+        ) {
+            let (_count, returned) = self.execute_plan_with_params(&plan, params)?;
+            self.log_slow_query(sql, start.elapsed(), returned.len() as u64);
+            return Ok(returned);
+        }
+
         // 4. Execute plan with parameters and return results
         let exec_start = std::time::Instant::now();
         let results = self.query_plan_with_params(&plan, params)?;
-        tracing::debug!(phase = "execute", duration_us = exec_start.elapsed().as_micros() as u64, rows = results.len() as u64, "Query executed");
+        tracing::debug!(
+            phase = "execute",
+            duration_us = exec_start.elapsed().as_micros() as u64,
+            rows = results.len() as u64,
+            "Query executed"
+        );
 
         self.log_slow_query(sql, start.elapsed(), results.len() as u64);
         Ok(results)
@@ -7435,11 +8412,7 @@ impl EmbeddedDatabase {
     /// `params` substitute positionally for `$1..$n`; an empty slice behaves like
     /// `query_with_columns`. Row-level security policies are applied, as in
     /// `query_params`.
-    pub fn query_params_with_columns(
-        &self,
-        sql: &str,
-        params: &[Value],
-    ) -> Result<(Vec<Tuple>, Vec<String>)> {
+    pub fn query_params_with_columns(&self, sql: &str, params: &[Value]) -> Result<(Vec<Tuple>, Vec<String>)> {
         #[cfg(feature = "code-graph")]
         let (rewritten_owned, _branch_guard) = self.rewrite_and_scope(sql);
         #[cfg(feature = "code-graph")]
@@ -7459,6 +8432,47 @@ impl EmbeddedDatabase {
             self.apply_rls_to_plan(plan)?
         };
 
+        if matches!(
+            &plan,
+            sql::LogicalPlan::Insert { .. }
+                | sql::LogicalPlan::InsertSelect { .. }
+                | sql::LogicalPlan::Update { .. }
+                | sql::LogicalPlan::Delete { .. }
+        ) {
+            let columns = match &plan {
+                sql::LogicalPlan::Insert {
+                    table_name,
+                    returning: Some(items),
+                    ..
+                }
+                | sql::LogicalPlan::InsertSelect {
+                    table_name,
+                    returning: Some(items),
+                    ..
+                }
+                | sql::LogicalPlan::Update {
+                    table_name,
+                    returning: Some(items),
+                    ..
+                }
+                | sql::LogicalPlan::Delete {
+                    table_name,
+                    returning: Some(items),
+                    ..
+                } => {
+                    let schema = self.storage.catalog().get_table_schema(table_name)?;
+                    Self::returning_schema(&schema, items)
+                        .columns
+                        .into_iter()
+                        .map(|c| c.name)
+                        .collect()
+                }
+                _ => Vec::new(),
+            };
+            let (_count, rows) = self.execute_plan_with_params(&plan, params)?;
+            return Ok((rows, columns));
+        }
+
         // Same optimization pipeline as query_with_columns.
         let plan = {
             let stats = optimizer::cost::StatsCatalog::new();
@@ -7468,11 +8482,7 @@ impl EmbeddedDatabase {
                 Box::new(optimizer::rules::JoinPredicatePushdownRule::new()),
                 Box::new(optimizer::rules::ProjectionPruningRule::new()),
             ];
-            let opt = optimizer::Optimizer::with_rules(
-                stats,
-                rules,
-                optimizer::OptimizerConfig::default(),
-            );
+            let opt = optimizer::Optimizer::with_rules(stats, rules, optimizer::OptimizerConfig::default());
             opt.optimize_recursive(plan)?
         };
 
@@ -7592,7 +8602,8 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn in_transaction(&self) -> bool {
-        self.current_transaction.lock()
+        self.current_transaction
+            .lock()
             .map(|txn| txn.is_some())
             .unwrap_or(false)
     }
@@ -7632,17 +8643,12 @@ impl EmbeddedDatabase {
     ///
     /// Returns the allocated `row_id`s in input order.
     #[allow(dead_code)]
-    pub(crate) fn bulk_insert_tuples(
-        &self,
-        table_name: &str,
-        tuples: Vec<Tuple>,
-    ) -> Result<Vec<u64>> {
+    pub(crate) fn bulk_insert_tuples(&self, table_name: &str, tuples: Vec<Tuple>) -> Result<Vec<u64>> {
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
 
         let mut row_ids: Vec<u64> = Vec::with_capacity(tuples.len());
-        let mut art_updates: Vec<(u64, std::collections::HashMap<String, Value>)> =
-            Vec::with_capacity(tuples.len());
+        let mut art_updates: Vec<(u64, std::collections::HashMap<String, Value>)> = Vec::with_capacity(tuples.len());
 
         for mut tuple in tuples {
             let row_id = catalog.next_row_id(table_name)?;
@@ -7655,9 +8661,15 @@ impl EmbeddedDatabase {
                         if matches!(v, Value::Null) && i < tuple.values.len() {
                             #[allow(clippy::indexing_slicing)]
                             match col.data_type {
-                                DataType::Int2 => { tuple.values[i] = Value::Int2(row_id as i16); }
-                                DataType::Int4 => { tuple.values[i] = Value::Int4(row_id as i32); }
-                                _ => { tuple.values[i] = Value::Int8(row_id as i64); }
+                                DataType::Int2 => {
+                                    tuple.values[i] = Value::Int2(row_id as i16);
+                                }
+                                DataType::Int4 => {
+                                    tuple.values[i] = Value::Int4(row_id as i32);
+                                }
+                                _ => {
+                                    tuple.values[i] = Value::Int8(row_id as i64);
+                                }
                             }
                         }
                     }
@@ -7674,7 +8686,9 @@ impl EmbeddedDatabase {
             }
 
             // PK / UNIQUE check before committing the write.
-            if let Err(e) = self.storage.art_indexes()
+            if let Err(e) = self
+                .storage
+                .art_indexes()
                 .check_unique_constraints(table_name, &col_values)
             {
                 return Err(Error::constraint_violation(e.to_string()));
@@ -7683,8 +8697,8 @@ impl EmbeddedDatabase {
             // Direct RocksDB write — bypasses txn.write_set so
             // subsequent SQL statements in the outer txn don't pay
             // O(N) merge_with_write_set cost.
-            let val = bincode::serialize(&tuple)
-                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+            let val =
+                bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
             let key = self.storage.branch_aware_data_key(table_name, row_id);
             self.storage.put(&key, &val)?;
 
@@ -7693,9 +8707,7 @@ impl EmbeddedDatabase {
         }
 
         for (row_id, col_values) in art_updates {
-            if let Err(e) = self.storage.art_indexes()
-                .on_insert(table_name, row_id, &col_values)
-            {
+            if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
                 tracing::debug!("ART on_insert {}: {}", table_name, e);
             }
         }
@@ -7773,69 +8785,108 @@ impl EmbeddedDatabase {
         let vector_mgr = self.storage.vector_indexes();
         let metadata_list = vector_mgr.list_all_metadata();
 
-        Ok(metadata_list.iter().map(|meta| {
-            // Get vector count if possible
-            let (vector_count, metric, index_type) = match vector_mgr.get_index_stats(&meta.name) {
-                Ok(stats) => (
-                    stats.num_vectors as u64,
-                    match &meta.index_type {
-                        storage::VectorIndexType::Standard(cfg) => match cfg.distance_metric {
-                            DistanceMetric::L2 => "l2".to_string(),
-                            DistanceMetric::Cosine => "cosine".to_string(),
-                            DistanceMetric::InnerProduct => "inner_product".to_string(),
+        Ok(metadata_list
+            .iter()
+            .map(|meta| {
+                // Get vector count if possible
+                let (vector_count, metric, index_type) = match vector_mgr.get_index_stats(&meta.name) {
+                    Ok(stats) => (
+                        stats.num_vectors as u64,
+                        match &meta.index_type {
+                            storage::VectorIndexType::Standard(cfg) => match cfg.distance_metric {
+                                DistanceMetric::L2 => "l2".to_string(),
+                                DistanceMetric::Cosine => "cosine".to_string(),
+                                DistanceMetric::InnerProduct => "inner_product".to_string(),
+                            },
+                            storage::VectorIndexType::Quantized(cfg) => match cfg.distance_metric {
+                                DistanceMetric::L2 => "l2".to_string(),
+                                DistanceMetric::Cosine => "cosine".to_string(),
+                                DistanceMetric::InnerProduct => "inner_product".to_string(),
+                            },
+                            storage::VectorIndexType::Persistent(cfg) => match cfg.distance_metric {
+                                DistanceMetric::L2 => "l2".to_string(),
+                                DistanceMetric::Cosine => "cosine".to_string(),
+                                DistanceMetric::InnerProduct => "inner_product".to_string(),
+                            },
                         },
-                        storage::VectorIndexType::Quantized(cfg) => match cfg.distance_metric {
-                            DistanceMetric::L2 => "l2".to_string(),
-                            DistanceMetric::Cosine => "cosine".to_string(),
-                            DistanceMetric::InnerProduct => "inner_product".to_string(),
+                        match &meta.index_type {
+                            storage::VectorIndexType::Standard(_) => "hnsw".to_string(),
+                            storage::VectorIndexType::Quantized(_) => "hnsw_pq".to_string(),
+                            storage::VectorIndexType::Persistent(cfg) => if cfg.pq_enabled {
+                                "persistent_pq_hnsw"
+                            } else {
+                                "persistent_hnsw"
+                            }
+                            .to_string(),
                         },
-                    },
-                    match &meta.index_type {
-                        storage::VectorIndexType::Standard(_) => "hnsw".to_string(),
-                        storage::VectorIndexType::Quantized(_) => "hnsw_pq".to_string(),
-                    },
-                ),
-                Err(_) => (0, "cosine".to_string(), "hnsw".to_string()),
-            };
+                    ),
+                    Err(_) => (0, "cosine".to_string(), "hnsw".to_string()),
+                };
 
-            let dimensions = match &meta.index_type {
-                storage::VectorIndexType::Standard(cfg) => cfg.dimension as u32,
-                storage::VectorIndexType::Quantized(cfg) => cfg.dimension as u32,
-            };
+                let dimensions = meta.dimension() as u32;
 
-            VectorStoreInfo {
-                name: meta.name.clone(),
-                dimensions,
-                vector_count,
-                created_at: "N/A".to_string(),
-                metric,
-                index_type,
-            }
-        }).collect())
+                VectorStoreInfo {
+                    name: meta.name.clone(),
+                    dimensions,
+                    vector_count,
+                    created_at: "N/A".to_string(),
+                    metric,
+                    index_type,
+                }
+            })
+            .collect())
     }
 
     /// Create a new vector store
     pub fn create_vector_store(&self, name: &str, dimensions: u32) -> Result<VectorStoreInfo> {
-        use crate::vector::DistanceMetric;
+        self.create_vector_store_with_options(name, dimensions, "cosine", "hnsw")
+    }
 
+    pub fn create_vector_store_with_options(
+        &self,
+        name: &str,
+        dimensions: u32,
+        metric: &str,
+        index_type: &str,
+    ) -> Result<VectorStoreInfo> {
         let vector_mgr = self.storage.vector_indexes();
+        let distance_metric = parse_vector_metric(metric)?;
+        let normalized_index_type = index_type.to_ascii_lowercase();
 
-        // Create a HNSW index for the vector store
-        vector_mgr.create_index(
-            name.to_string(),
-            name.to_string(),  // table_name
-            "embedding".to_string(),  // column_name
-            dimensions as usize,
-            DistanceMetric::Cosine,  // Default to cosine similarity
-        )?;
+        match normalized_index_type.as_str() {
+            "persistent_hnsw" | "persistent" => vector_mgr.create_persistent_index(
+                name.to_string(),
+                name.to_string(),
+                "embedding".to_string(),
+                dimensions as usize,
+                distance_metric,
+                None,
+                None,
+                &[],
+                self.storage.db(),
+            )?,
+            "hnsw" => vector_mgr.create_index(
+                name.to_string(),
+                name.to_string(),
+                "embedding".to_string(),
+                dimensions as usize,
+                distance_metric,
+            )?,
+            other => {
+                return Err(Error::query_execution(format!(
+                    "Unsupported vector store index_type '{}'; supported values are hnsw and persistent_hnsw",
+                    other
+                )));
+            }
+        }
 
         Ok(VectorStoreInfo {
             name: name.to_string(),
             dimensions,
             vector_count: 0,
             created_at: chrono::Utc::now().to_rfc3339(),
-            metric: "cosine".to_string(),
-            index_type: "hnsw".to_string(),
+            metric: metric.to_string(),
+            index_type: normalized_index_type,
         })
     }
 
@@ -7859,11 +8910,22 @@ impl EmbeddedDatabase {
                 DistanceMetric::Cosine => "cosine".to_string(),
                 DistanceMetric::InnerProduct => "inner_product".to_string(),
             },
+            storage::VectorIndexType::Persistent(cfg) => match cfg.distance_metric {
+                DistanceMetric::L2 => "l2".to_string(),
+                DistanceMetric::Cosine => "cosine".to_string(),
+                DistanceMetric::InnerProduct => "inner_product".to_string(),
+            },
         };
 
         let index_type = match &meta.index_type {
             storage::VectorIndexType::Standard(_) => "hnsw".to_string(),
             storage::VectorIndexType::Quantized(_) => "hnsw_pq".to_string(),
+            storage::VectorIndexType::Persistent(cfg) => if cfg.pq_enabled {
+                "persistent_pq_hnsw"
+            } else {
+                "persistent_hnsw"
+            }
+            .to_string(),
         };
 
         Ok(VectorStoreInfo {
@@ -7886,29 +8948,77 @@ impl EmbeddedDatabase {
     ///
     /// Returns a list of generated vector IDs
     pub fn insert_vectors(&self, store: &str, vectors: Vec<Vec<f32>>) -> Result<Vec<String>> {
+        self.insert_vectors_with_options(store, None, vectors, None, None)
+    }
+
+    pub fn insert_vectors_with_options(
+        &self,
+        store: &str,
+        ids: Option<Vec<String>>,
+        vectors: Vec<Vec<f32>>,
+        metadata: Option<Vec<std::collections::HashMap<String, serde_json::Value>>>,
+        namespace: Option<String>,
+    ) -> Result<Vec<String>> {
         let vector_mgr = self.storage.vector_indexes();
 
         // Verify store exists
         let _ = vector_mgr.get_metadata(store)?;
 
-        let mut ids = Vec::with_capacity(vectors.len());
-
-        for vector in vectors {
-            // Generate a unique ID using timestamp + counter
-            let id = self.storage.next_timestamp();
-            let id_str = format!("vec_{}", id);
-
-            // Insert into HNSW index
-            vector_mgr.insert_vector(store, id, &vector)?;
-
-            ids.push(id_str);
+        if let Some(ref requested_ids) = ids {
+            if requested_ids.len() != vectors.len() {
+                return Err(Error::query_execution(
+                    "Number of vector IDs must match number of vectors".to_string(),
+                ));
+            }
+        }
+        if let Some(ref metadata_items) = metadata {
+            if metadata_items.len() != vectors.len() {
+                return Err(Error::query_execution(
+                    "Number of metadata entries must match number of vectors".to_string(),
+                ));
+            }
         }
 
-        Ok(ids)
+        let mut inserted_ids = Vec::with_capacity(vectors.len());
+
+        for (idx, vector) in vectors.into_iter().enumerate() {
+            let row_id = self.storage.next_timestamp();
+            let id_str = ids
+                .as_ref()
+                .and_then(|requested_ids| requested_ids.get(idx).cloned())
+                .unwrap_or_else(|| format!("vec_{}", row_id));
+            let meta = metadata.as_ref().and_then(|items| items.get(idx).cloned());
+            vector_mgr.insert_vector_record(store, row_id, id_str.clone(), &vector, meta, namespace.clone())?;
+
+            inserted_ids.push(id_str);
+        }
+
+        Ok(inserted_ids)
     }
 
     /// Upsert vectors (insert or update)
     pub fn upsert_vectors(&self, store: &str, vectors: Vec<(String, Vec<f32>)>) -> Result<()> {
+        let ids: Vec<String> = vectors.iter().map(|(id, _)| id.clone()).collect();
+        let values: Vec<Vec<f32>> = vectors.into_iter().map(|(_, vector)| vector).collect();
+        let _ = self.delete_vectors(store, ids.clone());
+        self.insert_vectors_with_options(store, Some(ids), values, None, None)?;
+        Ok(())
+    }
+
+    pub fn upsert_vectors_with_options(
+        &self,
+        store: &str,
+        ids: Vec<String>,
+        vectors: Vec<Vec<f32>>,
+        metadata: Option<Vec<std::collections::HashMap<String, serde_json::Value>>>,
+        namespace: Option<String>,
+    ) -> Result<()> {
+        let _ = self.delete_vectors(store, ids.clone());
+        self.insert_vectors_with_options(store, Some(ids), vectors, metadata, namespace)?;
+        Ok(())
+    }
+
+    fn upsert_vectors_legacy(&self, store: &str, vectors: Vec<(String, Vec<f32>)>) -> Result<()> {
         let vector_mgr = self.storage.vector_indexes();
 
         // Verify store exists
@@ -7916,18 +9026,16 @@ impl EmbeddedDatabase {
 
         for (id_str, vector) in vectors {
             // Parse ID from string (format: vec_123)
-            let id = id_str.strip_prefix("vec_")
+            let id = id_str
+                .strip_prefix("vec_")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or_else(|| {
                     // Generate new ID for non-standard IDs
                     self.storage.next_timestamp()
                 });
 
-            // Try to delete existing vector (ignore errors if not found)
             let _ = vector_mgr.delete_vector(store, id);
-
-            // Insert the vector
-            vector_mgr.insert_vector(store, id, &vector)?;
+            vector_mgr.insert_vector_record(store, id, id_str, &vector, None, None)?;
         }
 
         Ok(())
@@ -7942,50 +9050,80 @@ impl EmbeddedDatabase {
         // Verify store exists
         let _ = vector_mgr.get_metadata(store)?;
 
-        // Search HNSW index
-        let results = vector_mgr.search(store, &query, k)?;
+        let results = vector_mgr.search_with_filters(store, &query, k, None, None)?;
 
         // Convert row_ids to string IDs
-        Ok(results.into_iter()
-            .map(|(row_id, distance)| (format!("vec_{}", row_id), distance))
-            .collect())
+        Ok(results.into_iter().map(|result| (result.id, result.score)).collect())
+    }
+
+    pub fn search_vectors_with_options(
+        &self,
+        store: &str,
+        query: Vec<f32>,
+        k: usize,
+        filter: Option<&std::collections::HashMap<String, serde_json::Value>>,
+        namespace: Option<&str>,
+    ) -> Result<Vec<storage::StoredVectorSearchResult>> {
+        let vector_mgr = self.storage.vector_indexes();
+        let _ = vector_mgr.get_metadata(store)?;
+        vector_mgr.search_with_filters(store, &query, k, filter, namespace)
     }
 
     /// Text search (requires text embedding - stub for now)
     pub fn text_search(&self, _query: &str) -> Result<Vec<String>> {
-        Err(Error::Generic("Text search requires embedding model - not yet implemented".to_string()))
+        Err(Error::Generic(
+            "Text search requires embedding model - not yet implemented".to_string(),
+        ))
     }
 
     /// Store texts for embedding (requires embedding model - stub for now)
     pub fn store_texts(&self, _store: &str, _texts: Vec<String>) -> Result<Vec<String>> {
-        Err(Error::Generic("Text storage requires embedding model - not yet implemented".to_string()))
+        Err(Error::Generic(
+            "Text storage requires embedding model - not yet implemented".to_string(),
+        ))
     }
 
     /// Hybrid search (vector + text) - requires embedding model
     pub fn hybrid_search(&self, _store: &str, _query: &str, _k: usize) -> Result<Vec<(String, f32)>> {
-        Err(Error::Generic("Hybrid search requires embedding model - not yet implemented".to_string()))
+        Err(Error::Generic(
+            "Hybrid search requires embedding model - not yet implemented".to_string(),
+        ))
     }
 
     /// Delete vectors by ID
     pub fn delete_vectors(&self, store: &str, ids: Vec<String>) -> Result<()> {
+        self.delete_vectors_in_namespace(store, ids, None).map(|_| ())
+    }
+
+    /// Delete vectors by ID, optionally scoped to namespace. Returns actual deleted count.
+    pub fn delete_vectors_in_namespace(&self, store: &str, ids: Vec<String>, namespace: Option<&str>) -> Result<usize> {
         let vector_mgr = self.storage.vector_indexes();
 
         // Verify store exists
         let _ = vector_mgr.get_metadata(store)?;
 
-        for id_str in ids {
-            // Parse ID from string
-            if let Some(id) = id_str.strip_prefix("vec_").and_then(|s| s.parse::<u64>().ok()) {
-                vector_mgr.delete_vector(store, id)?;
-            }
-        }
-
-        Ok(())
+        vector_mgr.delete_records_in_namespace(store, &ids, namespace)
     }
 
-    /// Fetch vectors by ID (not yet implemented - requires storing raw vectors)
-    pub fn fetch_vectors(&self, _store: &str, _ids: Vec<String>) -> Result<Vec<(String, Vec<f32>)>> {
-        Err(Error::Generic("Vector fetch not yet implemented - HNSW index doesn't store raw vectors".to_string()))
+    /// Fetch vectors by API id.
+    pub fn fetch_vectors(&self, store: &str, ids: Vec<String>) -> Result<Vec<(String, Vec<f32>)>> {
+        Ok(self
+            .fetch_vector_records(store, ids, None)?
+            .into_iter()
+            .map(|record| (record.id, record.vector))
+            .collect())
+    }
+
+    /// Fetch vectors by API id with metadata and optional namespace filtering.
+    pub fn fetch_vector_records(
+        &self,
+        store: &str,
+        ids: Vec<String>,
+        namespace: Option<&str>,
+    ) -> Result<Vec<storage::StoredVectorRecord>> {
+        let vector_mgr = self.storage.vector_indexes();
+        let _ = vector_mgr.get_metadata(store)?;
+        vector_mgr.fetch_records_in_namespace(store, &ids, namespace)
     }
 
     // Agent session operations
@@ -8037,11 +9175,19 @@ impl EmbeddedDatabase {
 
     /// Get NL to SQL conversion
     pub fn nl_to_sql(&self, _query: &str) -> Result<String> {
-        Err(Error::Generic("Natural language to SQL not yet implemented".to_string()))
+        Err(Error::Generic(
+            "Natural language to SQL not yet implemented".to_string(),
+        ))
     }
 
     /// Store document
-    pub fn store_document(&self, _collection: &str, _id: &str, _content: &str, _metadata: Option<serde_json::Value>) -> Result<()> {
+    pub fn store_document(
+        &self,
+        _collection: &str,
+        _id: &str,
+        _content: &str,
+        _metadata: Option<serde_json::Value>,
+    ) -> Result<()> {
         Err(Error::Generic("Document storage not yet implemented".to_string()))
     }
 
@@ -8056,7 +9202,13 @@ impl EmbeddedDatabase {
     }
 
     /// Update document
-    pub fn update_document(&self, _collection: &str, _id: &str, _content: &str, _metadata: Option<serde_json::Value>) -> Result<()> {
+    pub fn update_document(
+        &self,
+        _collection: &str,
+        _id: &str,
+        _content: &str,
+        _metadata: Option<serde_json::Value>,
+    ) -> Result<()> {
         Err(Error::Generic("Document storage not yet implemented".to_string()))
     }
 
@@ -8087,7 +9239,9 @@ impl EmbeddedDatabase {
 
     /// Batch create documents
     pub fn batch_create_documents(&self, _collection: &str, _docs: Vec<DocumentData>) -> Result<Vec<String>> {
-        Err(Error::Generic("Batch document creation not yet implemented".to_string()))
+        Err(Error::Generic(
+            "Batch document creation not yet implemented".to_string(),
+        ))
     }
 
     /// Batch infer schema
@@ -8097,7 +9251,9 @@ impl EmbeddedDatabase {
 
     /// Chat completion stream
     pub fn chat_completion_stream(&self, _messages: Vec<(String, String)>) -> Result<String> {
-        Err(Error::Generic("Chat completion streaming not yet implemented".to_string()))
+        Err(Error::Generic(
+            "Chat completion streaming not yet implemented".to_string(),
+        ))
     }
 
     /// Compare schemas
@@ -8111,13 +9267,26 @@ impl EmbeddedDatabase {
     }
 
     /// Create document (alias for store_document)
-    pub fn create_document(&self, _collection: &str, _id: &str, _content: &str, _metadata: Option<serde_json::Value>) -> Result<String> {
+    pub fn create_document(
+        &self,
+        _collection: &str,
+        _id: &str,
+        _content: &str,
+        _metadata: Option<serde_json::Value>,
+    ) -> Result<String> {
         Ok("document_id".to_string())
     }
 
     /// Find similar documents
-    pub fn find_similar_documents(&self, _collection: &str, _query: &str, _limit: usize) -> Result<Vec<(DocumentData, f32)>> {
-        Err(Error::Generic("Similar document search not yet implemented".to_string()))
+    pub fn find_similar_documents(
+        &self,
+        _collection: &str,
+        _query: &str,
+        _limit: usize,
+    ) -> Result<Vec<(DocumentData, f32)>> {
+        Err(Error::Generic(
+            "Similar document search not yet implemented".to_string(),
+        ))
     }
 
     /// Fork agent session
@@ -8127,12 +9296,16 @@ impl EmbeddedDatabase {
 
     /// Generate schema from description
     pub fn generate_schema_from_description(&self, _description: &str) -> Result<Schema> {
-        Err(Error::Generic("Schema generation from description not yet implemented".to_string()))
+        Err(Error::Generic(
+            "Schema generation from description not yet implemented".to_string(),
+        ))
     }
 
     /// Get agent context
     pub fn get_agent_context(&self, _session_id: &str) -> Result<serde_json::Value> {
-        Err(Error::Generic("Agent context retrieval not yet implemented".to_string()))
+        Err(Error::Generic(
+            "Agent context retrieval not yet implemented".to_string(),
+        ))
     }
 
     /// Get chat model
@@ -8152,12 +9325,16 @@ impl EmbeddedDatabase {
 
     /// Infer schema from file
     pub fn infer_schema_from_file(&self, _path: &str) -> Result<Schema> {
-        Err(Error::Generic("Schema inference from file not yet implemented".to_string()))
+        Err(Error::Generic(
+            "Schema inference from file not yet implemented".to_string(),
+        ))
     }
 
     /// Instantiate schema template
     pub fn instantiate_schema_template(&self, _template_name: &str, _params: serde_json::Value) -> Result<Schema> {
-        Err(Error::Generic("Schema template instantiation not yet implemented".to_string()))
+        Err(Error::Generic(
+            "Schema template instantiation not yet implemented".to_string(),
+        ))
     }
 
     /// List chat models
@@ -8197,7 +9374,9 @@ impl EmbeddedDatabase {
 
     /// Summarize agent memory
     pub fn summarize_agent_memory(&self, _session_id: &str) -> Result<String> {
-        Err(Error::Generic("Agent memory summarization not yet implemented".to_string()))
+        Err(Error::Generic(
+            "Agent memory summarization not yet implemented".to_string(),
+        ))
     }
 
     // --- Convenience API ---
@@ -8267,18 +9446,16 @@ impl EmbeddedDatabase {
             parse_cache: self.parse_cache.clone(),
             result_cache: self.result_cache.clone(),
             art_undo_log: self.art_undo_log.clone(),
+            fk_validation_mode: self.fk_validation_mode.clone(),
+            fk_validation_source: self.fk_validation_source.clone(),
+            deferred_fk_checks: self.deferred_fk_checks.clone(),
         }
     }
 
     /// Check if a foreign key reference exists in the referenced table
     ///
     /// Used for FK constraint validation during INSERT/UPDATE operations.
-    fn check_foreign_key_exists(
-        &self,
-        table_name: &str,
-        column_names: &[String],
-        values: &[Value],
-    ) -> Result<bool> {
+    fn check_foreign_key_exists(&self, table_name: &str, column_names: &[String], values: &[Value]) -> Result<bool> {
         // Build a query to check if the referenced row exists
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
@@ -8290,13 +9467,15 @@ impl EmbeddedDatabase {
             let mut matches = true;
             for (col_name, expected_value) in column_names.iter().zip(values.iter()) {
                 // Find column index
-                let col_idx = schema.columns.iter()
-                    .position(|c| &c.name == col_name);
+                let col_idx = schema.columns.iter().position(|c| &c.name == col_name);
 
                 if let Some(idx) = col_idx {
                     match tuple.values.get(idx) {
                         Some(actual_value) if actual_value == expected_value => {}
-                        _ => { matches = false; break; }
+                        _ => {
+                            matches = false;
+                            break;
+                        }
                     }
                 } else {
                     matches = false;
@@ -8316,12 +9495,7 @@ impl EmbeddedDatabase {
     ///
     /// Scans the table to check if a row with the same values for the specified
     /// columns already exists.
-    fn check_unique_violation(
-        &self,
-        table_name: &str,
-        column_names: &[String],
-        values: &[Value],
-    ) -> Result<bool> {
+    fn check_unique_violation(&self, table_name: &str, column_names: &[String], values: &[Value]) -> Result<bool> {
         let catalog = self.storage.catalog();
         let schema = catalog.get_table_schema(table_name)?;
 
@@ -8332,13 +9506,15 @@ impl EmbeddedDatabase {
             let mut matches = true;
             for (col_name, expected_value) in column_names.iter().zip(values.iter()) {
                 // Find column index
-                let col_idx = schema.columns.iter()
-                    .position(|c| &c.name == col_name);
+                let col_idx = schema.columns.iter().position(|c| &c.name == col_name);
 
                 if let Some(idx) = col_idx {
                     match tuple.values.get(idx) {
                         Some(actual_value) if actual_value == expected_value => {}
-                        _ => { matches = false; break; }
+                        _ => {
+                            matches = false;
+                            break;
+                        }
                     }
                 } else {
                     matches = false;
@@ -8377,7 +9553,10 @@ impl EmbeddedDatabase {
                 if let Some(idx) = col_idx {
                     match tuple.values.get(idx) {
                         Some(val) if val == parent_val => {}
-                        _ => { matches = false; break; }
+                        _ => {
+                            matches = false;
+                            break;
+                        }
                     }
                 } else {
                     matches = false;
@@ -8429,7 +9608,10 @@ impl EmbeddedDatabase {
                 if let Some(idx) = col_idx {
                     match tuple.values.get(idx) {
                         Some(val) if val == parent_val => {}
-                        _ => { matches = false; break; }
+                        _ => {
+                            matches = false;
+                            break;
+                        }
                     }
                 } else {
                     matches = false;
@@ -8473,23 +9655,19 @@ impl EmbeddedDatabase {
     ///
     /// Parses the CHECK expression and evaluates it against the provided values.
     /// Returns true if the constraint is satisfied, false otherwise.
-    fn evaluate_check_constraint(
-        &self,
-        expression: &str,
-        schema: &Schema,
-        values: &[Value],
-    ) -> Result<bool> {
+    fn evaluate_check_constraint(&self, expression: &str, schema: &Schema, values: &[Value]) -> Result<bool> {
         // Create a tuple from the values for evaluation
         let tuple = Tuple::new(values.to_vec());
 
         // First, try to deserialize as JSON (LogicalExpr was serialized with serde_json)
         let logical_expr = if expression.starts_with('{') || expression.starts_with('[') {
             // Looks like JSON, try to deserialize as LogicalExpr
-            serde_json::from_str::<sql::LogicalExpr>(expression)
-                .map_err(|e| Error::query_execution(format!(
+            serde_json::from_str::<sql::LogicalExpr>(expression).map_err(|e| {
+                Error::query_execution(format!(
                     "Failed to deserialize CHECK constraint expression '{}': {}",
                     expression, e
-                )))?
+                ))
+            })?
         } else {
             // Treat as SQL expression - parse it
             use sqlparser::dialect::PostgreSqlDialect;
@@ -8499,15 +9677,16 @@ impl EmbeddedDatabase {
             let sql = format!("SELECT * FROM dummy WHERE {}", expression);
             let dialect = PostgreSqlDialect {};
 
-            let mut statements = SqlParser::parse_sql(&dialect, &sql)
-                .map_err(|e| Error::query_execution(format!(
+            let mut statements = SqlParser::parse_sql(&dialect, &sql).map_err(|e| {
+                Error::query_execution(format!(
                     "Failed to parse CHECK constraint expression '{}': {}",
                     expression, e
-                )))?;
+                ))
+            })?;
 
             if statements.len() != 1 {
                 return Err(Error::query_execution(
-                    "Invalid CHECK constraint expression: expected single statement"
+                    "Invalid CHECK constraint expression: expected single statement",
                 ));
             }
 
@@ -8524,10 +9703,12 @@ impl EmbeddedDatabase {
                 None
             };
 
-            let selection = selection.ok_or_else(|| Error::query_execution(format!(
-                "Failed to extract expression from CHECK constraint: {}",
-                expression
-            )))?;
+            let selection = selection.ok_or_else(|| {
+                Error::query_execution(format!(
+                    "Failed to extract expression from CHECK constraint: {}",
+                    expression
+                ))
+            })?;
 
             // Use the planner to convert the SQL expression to LogicalExpr
             let catalog = self.storage.catalog();
@@ -8583,7 +9764,15 @@ impl EmbeddedDatabase {
         if constraints.foreign_keys.is_empty() {
             return Ok(());
         }
+        let mode = *self.fk_validation_mode.read();
+        let source = *self.fk_validation_source.read();
+        if mode == FkValidationMode::Off || source == FkValidationSource::Proxy {
+            return Ok(());
+        }
         for fk in &constraints.foreign_keys {
+            if fk.enforcement == sql::ConstraintEnforcement::NotEnforced {
+                continue;
+            }
             // Gather the FK column values from the new tuple.
             let mut parent_values: Vec<Value> = Vec::with_capacity(fk.columns.len());
             let mut any_null = false;
@@ -8605,6 +9794,17 @@ impl EmbeddedDatabase {
             if any_null {
                 continue;
             }
+            let should_defer = active_txn.is_some()
+                && (mode == FkValidationMode::Deferred
+                    || fk.enforcement == sql::ConstraintEnforcement::Deferred
+                    || (fk.deferrable && fk.initially_deferred));
+            if should_defer {
+                self.deferred_fk_checks.lock().push(PendingFkCheck {
+                    fk: fk.clone(),
+                    parent_values,
+                });
+                continue;
+            }
             let parent_exists = self.check_referencing_rows_exist(
                 &fk.references_table,
                 &fk.references_columns,
@@ -8612,9 +9812,11 @@ impl EmbeddedDatabase {
                 active_txn,
             )?;
             if !parent_exists {
-                let parent_repr: Vec<String> = parent_values.iter()
-                    .map(|v| format!("{v}"))
-                    .collect();
+                if mode == FkValidationMode::Audit || fk.enforcement == sql::ConstraintEnforcement::LockFree {
+                    self.record_fk_violation(fk, &parent_values)?;
+                    continue;
+                }
+                let parent_repr: Vec<String> = parent_values.iter().map(|v| format!("{v}")).collect();
                 return Err(Error::constraint_violation(format!(
                     "Foreign key constraint '{}' violated: row references \
                      non-existent {}({}) = ({})",
@@ -8625,6 +9827,90 @@ impl EmbeddedDatabase {
                 )));
             }
         }
+        Ok(())
+    }
+
+    fn validate_deferred_fk_checks(&self, active_txn: Option<&storage::Transaction>) -> Result<()> {
+        let checks = {
+            let checks = self.deferred_fk_checks.lock();
+            if checks.is_empty() {
+                return Ok(());
+            }
+            let mut seen = std::collections::HashSet::with_capacity(checks.len());
+            let mut unique = Vec::with_capacity(checks.len());
+            for check in checks.iter() {
+                let key = (
+                    check.fk.references_table.clone(),
+                    check.fk.references_columns.clone(),
+                    check.parent_values.clone(),
+                );
+                if seen.insert(key) {
+                    unique.push(check.clone());
+                }
+            }
+            unique
+        };
+        if checks.is_empty() {
+            return Ok(());
+        }
+        for check in &checks {
+            let parent_exists = self.check_referencing_rows_exist(
+                &check.fk.references_table,
+                &check.fk.references_columns,
+                &check.parent_values,
+                active_txn,
+            )?;
+            if !parent_exists {
+                if *self.fk_validation_mode.read() == FkValidationMode::Audit {
+                    self.record_fk_violation(&check.fk, &check.parent_values)?;
+                    continue;
+                }
+                let parent_repr: Vec<String> = check.parent_values.iter().map(|v| format!("{v}")).collect();
+                return Err(Error::constraint_violation(format!(
+                    "Deferred foreign key constraint '{}' violated at COMMIT: \
+                     row references non-existent {}({}) = ({})",
+                    check.fk.name,
+                    check.fk.references_table,
+                    check.fk.references_columns.join(", "),
+                    parent_repr.join(", "),
+                )));
+            }
+        }
+        self.deferred_fk_checks.lock().clear();
+        Ok(())
+    }
+
+    fn record_fk_violation(&self, fk: &sql::ForeignKeyConstraint, parent_values: &[Value]) -> Result<()> {
+        let table_name = "pg_log_violations";
+        let catalog = self.storage.catalog();
+        if catalog.get_table_schema(table_name).is_err() {
+            let schema = Schema::new(vec![
+                Column::new("constraint_name", DataType::Text),
+                Column::new("table_name", DataType::Text),
+                Column::new("referenced_table", DataType::Text),
+                Column::new("referenced_columns", DataType::Text),
+                Column::new("referenced_values", DataType::Text),
+                Column::new("validation_mode", DataType::Text),
+            ]);
+            if let Err(e) = catalog.create_table(table_name, schema) {
+                tracing::debug!("Could not create pg_log_violations: {}", e);
+            }
+        }
+        let tuple = Tuple::new(vec![
+            Value::String(fk.name.clone()),
+            Value::String(fk.table_name.clone()),
+            Value::String(fk.references_table.clone()),
+            Value::String(fk.references_columns.join(",")),
+            Value::String(
+                parent_values
+                    .iter()
+                    .map(|v| format!("{v}"))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            Value::String(self.fk_validation_mode.read().as_str().to_string()),
+        ]);
+        let _ = self.storage.insert_tuple(table_name, tuple);
         Ok(())
     }
 
@@ -8701,13 +9987,15 @@ impl EmbeddedDatabase {
         for tuple in tuples {
             let mut matches = true;
             for (col_name, expected_value) in column_names.iter().zip(values.iter()) {
-                let col_idx = schema.columns.iter()
-                    .position(|c| &c.name == col_name);
+                let col_idx = schema.columns.iter().position(|c| &c.name == col_name);
 
                 if let Some(idx) = col_idx {
                     match tuple.values.get(idx) {
                         Some(actual_value) if actual_value == expected_value => {}
-                        _ => { matches = false; break; }
+                        _ => {
+                            matches = false;
+                            break;
+                        }
                     }
                 } else {
                     matches = false;
@@ -8841,9 +10129,7 @@ impl EmbeddedDatabase {
             if if_not_exists {
                 return Ok((0, vec![]));
             }
-            return Err(Error::query_execution(format!(
-                "database \"{trimmed}\" already exists"
-            )));
+            return Err(Error::query_execution(format!("database \"{trimmed}\" already exists")));
         }
         self.tenant_manager.register_tenant_with_plan(
             trimmed.to_string(),
@@ -8873,9 +10159,7 @@ impl EmbeddedDatabase {
             if if_exists {
                 return Ok((0, vec![]));
             }
-            return Err(Error::query_execution(format!(
-                "database \"{trimmed}\" does not exist"
-            )));
+            return Err(Error::query_execution(format!("database \"{trimmed}\" does not exist")));
         };
         self.tenant_manager
             .delete_tenant(tenant.id)
@@ -8989,32 +10273,48 @@ impl EmbeddedDatabase {
         match expr {
             LogicalExpr::ScalarSubquery { subquery } => {
                 // Substitute any outer-table column refs with literals.
-                let bound_plan = Self::bind_outer_refs_in_plan(
-                    subquery.as_ref(),
-                    outer_row,
-                    outer_schema,
-                    outer_table,
-                );
+                let bound_plan = Self::bind_outer_refs_in_plan(subquery.as_ref(), outer_row, outer_schema, outer_table);
                 // Execute the (now-uncorrelated) plan.
-                let mut executor = sql::Executor::with_storage(&self.storage)
-                    .with_timeout(self.config.storage.query_timeout_ms);
+                let mut executor =
+                    sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);
                 let rows = executor.execute(&bound_plan)?;
-                let value = rows.first()
+                let value = rows
+                    .first()
                     .and_then(|t| t.values.first().cloned())
                     .unwrap_or(Value::Null);
                 Ok(LogicalExpr::Literal(value))
             }
             LogicalExpr::BinaryExpr { left, op, right } => Ok(LogicalExpr::BinaryExpr {
-                left: Box::new(self.materialize_scalar_subqueries_for_row(left, outer_row, outer_schema, outer_table)?),
+                left: Box::new(self.materialize_scalar_subqueries_for_row(
+                    left,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                )?),
                 op: *op,
-                right: Box::new(self.materialize_scalar_subqueries_for_row(right, outer_row, outer_schema, outer_table)?),
+                right: Box::new(self.materialize_scalar_subqueries_for_row(
+                    right,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                )?),
             }),
             LogicalExpr::UnaryExpr { op, expr: inner } => Ok(LogicalExpr::UnaryExpr {
                 op: *op,
-                expr: Box::new(self.materialize_scalar_subqueries_for_row(inner, outer_row, outer_schema, outer_table)?),
+                expr: Box::new(self.materialize_scalar_subqueries_for_row(
+                    inner,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                )?),
             }),
             LogicalExpr::Cast { expr: inner, data_type } => Ok(LogicalExpr::Cast {
-                expr: Box::new(self.materialize_scalar_subqueries_for_row(inner, outer_row, outer_schema, outer_table)?),
+                expr: Box::new(self.materialize_scalar_subqueries_for_row(
+                    inner,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                )?),
                 data_type: data_type.clone(),
             }),
             // Everything else passes through unchanged.
@@ -9035,28 +10335,62 @@ impl EmbeddedDatabase {
         use sql::LogicalPlan;
         match plan {
             LogicalPlan::Filter { input, predicate } => LogicalPlan::Filter {
-                input: Box::new(Self::bind_outer_refs_in_plan(input, outer_row, outer_schema, outer_table)),
+                input: Box::new(Self::bind_outer_refs_in_plan(
+                    input,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                )),
                 predicate: Self::bind_outer_refs_in_expr(predicate, outer_row, outer_schema, outer_table),
             },
-            LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => LogicalPlan::Project {
-                input: Box::new(Self::bind_outer_refs_in_plan(input, outer_row, outer_schema, outer_table)),
-                exprs: exprs.iter()
+            LogicalPlan::Project {
+                input,
+                exprs,
+                aliases,
+                distinct,
+                distinct_on,
+            } => LogicalPlan::Project {
+                input: Box::new(Self::bind_outer_refs_in_plan(
+                    input,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                )),
+                exprs: exprs
+                    .iter()
                     .map(|e| Self::bind_outer_refs_in_expr(e, outer_row, outer_schema, outer_table))
                     .collect(),
                 aliases: aliases.clone(),
                 distinct: *distinct,
                 distinct_on: distinct_on.clone(),
             },
-            LogicalPlan::Limit { input, limit, offset, limit_param, offset_param } => LogicalPlan::Limit {
-                input: Box::new(Self::bind_outer_refs_in_plan(input, outer_row, outer_schema, outer_table)),
+            LogicalPlan::Limit {
+                input,
+                limit,
+                offset,
+                limit_param,
+                offset_param,
+            } => LogicalPlan::Limit {
+                input: Box::new(Self::bind_outer_refs_in_plan(
+                    input,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                )),
                 limit: *limit,
                 offset: *offset,
                 limit_param: *limit_param,
                 offset_param: *offset_param,
             },
             LogicalPlan::Sort { input, exprs, asc } => LogicalPlan::Sort {
-                input: Box::new(Self::bind_outer_refs_in_plan(input, outer_row, outer_schema, outer_table)),
-                exprs: exprs.iter()
+                input: Box::new(Self::bind_outer_refs_in_plan(
+                    input,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                )),
+                exprs: exprs
+                    .iter()
                     .map(|e| Self::bind_outer_refs_in_expr(e, outer_row, outer_schema, outer_table))
                     .collect(),
                 asc: asc.clone(),
@@ -9074,7 +10408,11 @@ impl EmbeddedDatabase {
         use sql::LogicalExpr;
         match expr {
             LogicalExpr::Column { table: Some(tbl), name } if tbl.eq_ignore_ascii_case(outer_table) => {
-                if let Some(idx) = outer_schema.columns.iter().position(|c| c.name.eq_ignore_ascii_case(name)) {
+                if let Some(idx) = outer_schema
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(name))
+                {
                     if let Some(v) = outer_row.values.get(idx) {
                         return LogicalExpr::Literal(v.clone());
                     }
@@ -9082,26 +10420,66 @@ impl EmbeddedDatabase {
                 expr.clone()
             }
             LogicalExpr::BinaryExpr { left, op, right } => LogicalExpr::BinaryExpr {
-                left: Box::new(Self::bind_outer_refs_in_expr(left, outer_row, outer_schema, outer_table)),
+                left: Box::new(Self::bind_outer_refs_in_expr(
+                    left,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                )),
                 op: *op,
-                right: Box::new(Self::bind_outer_refs_in_expr(right, outer_row, outer_schema, outer_table)),
+                right: Box::new(Self::bind_outer_refs_in_expr(
+                    right,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                )),
             },
             LogicalExpr::UnaryExpr { op, expr: inner } => LogicalExpr::UnaryExpr {
                 op: *op,
-                expr: Box::new(Self::bind_outer_refs_in_expr(inner, outer_row, outer_schema, outer_table)),
+                expr: Box::new(Self::bind_outer_refs_in_expr(
+                    inner,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                )),
             },
             LogicalExpr::IsNull { expr: inner, is_null } => LogicalExpr::IsNull {
-                expr: Box::new(Self::bind_outer_refs_in_expr(inner, outer_row, outer_schema, outer_table)),
+                expr: Box::new(Self::bind_outer_refs_in_expr(
+                    inner,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                )),
                 is_null: *is_null,
             },
-            LogicalExpr::Between { expr: inner, low, high, negated } => LogicalExpr::Between {
-                expr: Box::new(Self::bind_outer_refs_in_expr(inner, outer_row, outer_schema, outer_table)),
+            LogicalExpr::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => LogicalExpr::Between {
+                expr: Box::new(Self::bind_outer_refs_in_expr(
+                    inner,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                )),
                 low: Box::new(Self::bind_outer_refs_in_expr(low, outer_row, outer_schema, outer_table)),
-                high: Box::new(Self::bind_outer_refs_in_expr(high, outer_row, outer_schema, outer_table)),
+                high: Box::new(Self::bind_outer_refs_in_expr(
+                    high,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                )),
                 negated: *negated,
             },
             LogicalExpr::ScalarSubquery { subquery } => LogicalExpr::ScalarSubquery {
-                subquery: Box::new(Self::bind_outer_refs_in_plan(subquery, outer_row, outer_schema, outer_table)),
+                subquery: Box::new(Self::bind_outer_refs_in_plan(
+                    subquery,
+                    outer_row,
+                    outer_schema,
+                    outer_table,
+                )),
             },
             other => other.clone(),
         }
@@ -9113,12 +10491,19 @@ impl EmbeddedDatabase {
         let predicate = selection?;
         let pk_col = schema.columns.iter().find(|c| c.primary_key)?;
 
-        if let sql::LogicalExpr::BinaryExpr { left, op: sql::BinaryOperator::Eq, right } = predicate {
+        if let sql::LogicalExpr::BinaryExpr {
+            left,
+            op: sql::BinaryOperator::Eq,
+            right,
+        } = predicate
+        {
             match (left.as_ref(), right.as_ref()) {
-                (sql::LogicalExpr::Column { name, .. }, sql::LogicalExpr::Literal(val))
-                    if name == &pk_col.name => Some(val.clone()),
-                (sql::LogicalExpr::Literal(val), sql::LogicalExpr::Column { name, .. })
-                    if name == &pk_col.name => Some(val.clone()),
+                (sql::LogicalExpr::Column { name, .. }, sql::LogicalExpr::Literal(val)) if name == &pk_col.name => {
+                    Some(val.clone())
+                }
+                (sql::LogicalExpr::Literal(val), sql::LogicalExpr::Column { name, .. }) if name == &pk_col.name => {
+                    Some(val.clone())
+                }
                 _ => None,
             }
         } else {
@@ -9138,16 +10523,19 @@ impl EmbeddedDatabase {
     /// Recursively apply RLS to all Scan operators in a plan
     fn apply_rls_to_plan_recursive(&self, plan: sql::LogicalPlan) -> Result<sql::LogicalPlan> {
         match plan {
-            sql::LogicalPlan::Scan { table_name, alias, schema, projection, as_of } => {
+            sql::LogicalPlan::Scan {
+                table_name,
+                alias,
+                schema,
+                projection,
+                as_of,
+            } => {
                 // Check if RLS should be applied to this table
                 if self.tenant_manager.should_apply_rls(&table_name, "SELECT") {
                     if let Some((using_expr, _)) = self.tenant_manager.get_rls_conditions(&table_name, "SELECT") {
                         // Parse the RLS expression
                         let tenant_context = self.tenant_manager.get_current_context();
-                        let rls_evaluator = tenant::RLSExpressionEvaluator::new(
-                            schema.clone(),
-                            tenant_context
-                        );
+                        let rls_evaluator = tenant::RLSExpressionEvaluator::new(schema.clone(), tenant_context);
                         let filter_expr = rls_evaluator.parse(&using_expr)?;
 
                         // Create a Filter plan wrapping the Scan
@@ -9167,74 +10555,95 @@ impl EmbeddedDatabase {
                 }
 
                 // No RLS, return as-is
-                Ok(sql::LogicalPlan::Scan { table_name, alias, schema, projection, as_of })
-            }
-
-            sql::LogicalPlan::Filter { input, predicate } => {
-                Ok(sql::LogicalPlan::Filter {
-                    input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
-                    predicate,
+                Ok(sql::LogicalPlan::Scan {
+                    table_name,
+                    alias,
+                    schema,
+                    projection,
+                    as_of,
                 })
             }
 
-            sql::LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => {
-                Ok(sql::LogicalPlan::Project {
-                    input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
-                    exprs,
-                    aliases,
-                    distinct,
-                    distinct_on,
-                })
-            }
+            sql::LogicalPlan::Filter { input, predicate } => Ok(sql::LogicalPlan::Filter {
+                input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
+                predicate,
+            }),
 
-            sql::LogicalPlan::Aggregate { input, group_by, aggr_exprs, having } => {
-                Ok(sql::LogicalPlan::Aggregate {
-                    input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
-                    group_by,
-                    aggr_exprs,
-                    having,
-                })
-            }
+            sql::LogicalPlan::Project {
+                input,
+                exprs,
+                aliases,
+                distinct,
+                distinct_on,
+            } => Ok(sql::LogicalPlan::Project {
+                input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
+                exprs,
+                aliases,
+                distinct,
+                distinct_on,
+            }),
 
-            sql::LogicalPlan::Join { left, right, join_type, on, lateral } => {
-                Ok(sql::LogicalPlan::Join {
-                    left: Box::new(self.apply_rls_to_plan_recursive(*left)?),
-                    right: Box::new(self.apply_rls_to_plan_recursive(*right)?),
-                    join_type,
-                    on,
-                    lateral,
-                })
-            }
+            sql::LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                having,
+            } => Ok(sql::LogicalPlan::Aggregate {
+                input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
+                group_by,
+                aggr_exprs,
+                having,
+            }),
 
-            sql::LogicalPlan::Sort { input, exprs, asc } => {
-                Ok(sql::LogicalPlan::Sort {
-                    input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
-                    exprs,
-                    asc,
-                })
-            }
+            sql::LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                on,
+                lateral,
+            } => Ok(sql::LogicalPlan::Join {
+                left: Box::new(self.apply_rls_to_plan_recursive(*left)?),
+                right: Box::new(self.apply_rls_to_plan_recursive(*right)?),
+                join_type,
+                on,
+                lateral,
+            }),
 
-            sql::LogicalPlan::Limit { input, limit, offset, limit_param, offset_param } => {
-                Ok(sql::LogicalPlan::Limit {
-                    input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
-                    limit,
-                    offset,
-                    limit_param,
-                    offset_param,
-                })
-            }
+            sql::LogicalPlan::Sort { input, exprs, asc } => Ok(sql::LogicalPlan::Sort {
+                input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
+                exprs,
+                asc,
+            }),
+
+            sql::LogicalPlan::Limit {
+                input,
+                limit,
+                offset,
+                limit_param,
+                offset_param,
+            } => Ok(sql::LogicalPlan::Limit {
+                input: Box::new(self.apply_rls_to_plan_recursive(*input)?),
+                limit,
+                offset,
+                limit_param,
+                offset_param,
+            }),
 
             // Handle FilteredScan - inject RLS filter into the existing predicate
-            sql::LogicalPlan::FilteredScan { table_name, alias, schema, projection, predicate, as_of } => {
+            sql::LogicalPlan::FilteredScan {
+                table_name,
+                alias,
+                schema,
+                projection,
+                predicate,
+                as_of,
+            } => {
                 // Check if RLS should be applied to this table
                 if self.tenant_manager.should_apply_rls(&table_name, "SELECT") {
                     if let Some((using_expr, _)) = self.tenant_manager.get_rls_conditions(&table_name, "SELECT") {
                         // Parse the RLS expression
                         let tenant_context = self.tenant_manager.get_current_context();
-                        let rls_evaluator = tenant::RLSExpressionEvaluator::new(
-                            schema.clone(),
-                            tenant_context
-                        );
+                        let rls_evaluator = tenant::RLSExpressionEvaluator::new(schema.clone(), tenant_context);
                         let rls_predicate = rls_evaluator.parse(&using_expr)?;
 
                         // Combine existing predicate with RLS predicate using AND
@@ -9260,7 +10669,14 @@ impl EmbeddedDatabase {
                 }
 
                 // No RLS, return as-is
-                Ok(sql::LogicalPlan::FilteredScan { table_name, alias, schema, projection, predicate, as_of })
+                Ok(sql::LogicalPlan::FilteredScan {
+                    table_name,
+                    alias,
+                    schema,
+                    projection,
+                    predicate,
+                    as_of,
+                })
             }
 
             // For plans that don't contain Scan operators, return as-is
@@ -9300,10 +10716,7 @@ impl EmbeddedDatabase {
     ///     Ok(())
     /// }
     /// ```
-    pub async fn start_auto_refresh(
-        &self,
-        config: Option<storage::AutoRefreshConfig>,
-    ) -> Result<()> {
+    pub async fn start_auto_refresh(&self, config: Option<storage::AutoRefreshConfig>) -> Result<()> {
         let worker_config = config.unwrap_or_else(|| {
             storage::AutoRefreshConfig::default()
                 .with_enabled(true)
@@ -9345,7 +10758,9 @@ impl EmbeddedDatabase {
 
     /// Check if the auto-refresh worker is currently running
     pub fn is_auto_refresh_running(&self) -> bool {
-        self.auto_refresh_worker.read().as_ref()
+        self.auto_refresh_worker
+            .read()
+            .as_ref()
             .map(|w| w.is_running())
             .unwrap_or(false)
     }
@@ -9478,8 +10893,7 @@ impl Transaction<'_> {
 
         // Create logical plan with catalog access and original SQL for time-travel parsing
         let catalog = self.db.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog)
-            .with_sql(sql.to_string());
+        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
         let plan = planner.statement_to_plan(statement)?;
 
         // Execute plan with transaction context
@@ -9496,12 +10910,7 @@ impl Transaction<'_> {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 // Allow stricter patterns in test code for convenience
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing,
-)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod tests {
     use super::*;
 
@@ -9523,8 +10932,11 @@ mod tests {
 
         db.execute("BEGIN").unwrap();
         let result = db.execute("SAVEPOINT s1");
-        assert!(result.is_ok(),
-            "SAVEPOINT via execute() in BEGIN block should succeed, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "SAVEPOINT via execute() in BEGIN block should succeed, got: {:?}",
+            result.err()
+        );
         db.execute("ROLLBACK").unwrap();
     }
 
@@ -9536,8 +10948,11 @@ mod tests {
         // meaningful effect since the implicit transaction auto-commits.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let result = db.execute("SAVEPOINT s1");
-        assert!(result.is_ok(),
-            "SAVEPOINT in implicit transaction should succeed, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "SAVEPOINT in implicit transaction should succeed, got: {:?}",
+            result.err()
+        );
     }
 
     #[test]
@@ -9554,13 +10969,19 @@ mod tests {
         if result.is_ok() {
             let _ = db.execute_returning("INSERT INTO sp_ret VALUES (1, 'test')");
             let release_result = db.execute_returning("RELEASE SAVEPOINT s1");
-            assert!(release_result.is_ok(), "RELEASE SAVEPOINT should work via returning path");
+            assert!(
+                release_result.is_ok(),
+                "RELEASE SAVEPOINT should work via returning path"
+            );
             let _ = db.execute_returning("COMMIT");
         } else {
             // If this also fails, savepoints are broken on all paths
             let err = result.unwrap_err().to_string();
-            assert!(err.contains("not yet implemented") || err.contains("SAVEPOINT"),
-                "Unexpected error: {}", err);
+            assert!(
+                err.contains("not yet implemented") || err.contains("SAVEPOINT"),
+                "Unexpected error: {}",
+                err
+            );
             let _ = db.execute_returning("ROLLBACK");
         }
     }
@@ -9612,7 +11033,11 @@ mod tests {
         db.execute("COMMIT").unwrap();
 
         let rows = db.query("SELECT * FROM sp_nested_rel", &[]).unwrap();
-        assert_eq!(rows.len(), 2, "Both A and B should be preserved after nested RELEASE + COMMIT");
+        assert_eq!(
+            rows.len(),
+            2,
+            "Both A and B should be preserved after nested RELEASE + COMMIT"
+        );
     }
 
     #[test]
@@ -9639,8 +11064,11 @@ mod tests {
         // ROLLBACK TO SAVEPOINT now correctly undoes INSERTs that go through
         // the transaction write set. The INSERT is removed from the write set
         // before COMMIT applies it, so 0 rows are committed.
-        assert_eq!(rows.len(), 0,
-            "ROLLBACK TO SAVEPOINT should undo INSERTs via transaction write set");
+        assert_eq!(
+            rows.len(),
+            0,
+            "ROLLBACK TO SAVEPOINT should undo INSERTs via transaction write set"
+        );
     }
 
     #[test]
@@ -9666,7 +11094,11 @@ mod tests {
         db.execute("COMMIT").unwrap();
 
         let rows = db.query("SELECT * FROM sp_reuse", &[]).unwrap();
-        assert_eq!(rows.len(), 2, "Both inserts should persist after reuse of savepoint name");
+        assert_eq!(
+            rows.len(),
+            2,
+            "Both inserts should persist after reuse of savepoint name"
+        );
     }
 
     // ========================================================================
@@ -9679,17 +11111,25 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE iso_rc (id INT, val TEXT)").unwrap();
 
-        let s1 = db.create_session("user1", crate::session::IsolationLevel::ReadCommitted).unwrap();
-        let s2 = db.create_session("user2", crate::session::IsolationLevel::ReadCommitted).unwrap();
+        let s1 = db
+            .create_session("user1", crate::session::IsolationLevel::ReadCommitted)
+            .unwrap();
+        let s2 = db
+            .create_session("user2", crate::session::IsolationLevel::ReadCommitted)
+            .unwrap();
 
         // S1 begins and inserts
         db.begin_transaction_for_session(s1).unwrap();
-        db.execute_in_session(s1, "INSERT INTO iso_rc VALUES (1, 'uncommitted')").unwrap();
+        db.execute_in_session(s1, "INSERT INTO iso_rc VALUES (1, 'uncommitted')")
+            .unwrap();
 
         // S2 queries - should NOT see the uncommitted row
         let rows = db.query_in_session(s2, "SELECT * FROM iso_rc", &[]).unwrap();
-        assert_eq!(rows.len(), 0,
-            "Uncommitted writes from S1 should be invisible to S2 (read committed)");
+        assert_eq!(
+            rows.len(),
+            0,
+            "Uncommitted writes from S1 should be invisible to S2 (read committed)"
+        );
 
         // S1 commits
         db.commit_transaction_for_session(s1).unwrap();
@@ -9711,12 +11151,17 @@ mod tests {
         db.execute("CREATE TABLE iso_dirty (id INT, val TEXT)").unwrap();
         db.execute("INSERT INTO iso_dirty VALUES (1, 'visible')").unwrap();
 
-        let s1 = db.create_session("writer", crate::session::IsolationLevel::ReadCommitted).unwrap();
-        let s2 = db.create_session("reader", crate::session::IsolationLevel::ReadCommitted).unwrap();
+        let s1 = db
+            .create_session("writer", crate::session::IsolationLevel::ReadCommitted)
+            .unwrap();
+        let s2 = db
+            .create_session("reader", crate::session::IsolationLevel::ReadCommitted)
+            .unwrap();
 
         // S1 updates the row in a transaction
         db.begin_transaction_for_session(s1).unwrap();
-        db.execute_in_session(s1, "INSERT INTO iso_dirty VALUES (2, 'dirty')").unwrap();
+        db.execute_in_session(s1, "INSERT INTO iso_dirty VALUES (2, 'dirty')")
+            .unwrap();
 
         // S2 should only see the original row
         let rows = db.query_in_session(s2, "SELECT * FROM iso_dirty", &[]).unwrap();
@@ -9734,12 +11179,17 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE iso_rb_vis (id INT, val TEXT)").unwrap();
 
-        let s1 = db.create_session("writer", crate::session::IsolationLevel::ReadCommitted).unwrap();
-        let s2 = db.create_session("reader", crate::session::IsolationLevel::ReadCommitted).unwrap();
+        let s1 = db
+            .create_session("writer", crate::session::IsolationLevel::ReadCommitted)
+            .unwrap();
+        let s2 = db
+            .create_session("reader", crate::session::IsolationLevel::ReadCommitted)
+            .unwrap();
 
         // S1 inserts and rolls back
         db.begin_transaction_for_session(s1).unwrap();
-        db.execute_in_session(s1, "INSERT INTO iso_rb_vis VALUES (1, 'rolled_back')").unwrap();
+        db.execute_in_session(s1, "INSERT INTO iso_rb_vis VALUES (1, 'rolled_back')")
+            .unwrap();
         db.rollback_transaction_for_session(s1).unwrap();
 
         // S2 should see nothing
@@ -9748,7 +11198,11 @@ mod tests {
 
         // Even through the default (non-session) query path
         let rows = db.query("SELECT * FROM iso_rb_vis", &[]).unwrap();
-        assert_eq!(rows.len(), 0, "Rolled-back data should be invisible via default query path too");
+        assert_eq!(
+            rows.len(),
+            0,
+            "Rolled-back data should be invisible via default query path too"
+        );
 
         db.destroy_session(s1).unwrap();
         db.destroy_session(s2).unwrap();
@@ -9775,9 +11229,9 @@ mod tests {
             let handle = std::thread::spawn(move || {
                 for i in 0..rows_per_thread {
                     let id = t * rows_per_thread + i;
-                    db_clone.execute(
-                        &format!("INSERT INTO conc_ins VALUES ({}, {})", id, t)
-                    ).unwrap();
+                    db_clone
+                        .execute(&format!("INSERT INTO conc_ins VALUES ({}, {})", id, t))
+                        .unwrap();
                 }
             });
             handles.push(handle);
@@ -9788,16 +11242,19 @@ mod tests {
         }
 
         let rows = db.query("SELECT * FROM conc_ins", &[]).unwrap();
-        assert_eq!(rows.len(), (num_threads * rows_per_thread) as usize,
-            "All inserts from all threads should be visible");
+        assert_eq!(
+            rows.len(),
+            (num_threads * rows_per_thread) as usize,
+            "All inserts from all threads should be visible"
+        );
     }
 
     #[test]
     fn test_concurrent_reads_during_write() {
         // A writer thread inserts rows while reader threads query concurrently.
         // Verifies no panics or data corruption during concurrent access.
-        use std::sync::Arc;
         use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
 
         let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
         db.execute("CREATE TABLE conc_rw (id INT, val TEXT)").unwrap();
@@ -9809,7 +11266,8 @@ mod tests {
         let done_w = Arc::clone(&done);
         let writer = std::thread::spawn(move || {
             for i in 0..50 {
-                db_w.execute(&format!("INSERT INTO conc_rw VALUES ({}, 'row_{}')", i, i)).unwrap();
+                db_w.execute(&format!("INSERT INTO conc_rw VALUES ({}, 'row_{}')", i, i))
+                    .unwrap();
             }
             done_w.store(true, Ordering::Release);
         });
@@ -9824,9 +11282,7 @@ mod tests {
                 while !done_r.load(Ordering::Acquire) {
                     // Use unique SQL text per query to bypass result cache, which can
                     // return stale results and make row counts appear non-monotonic.
-                    let sql = format!(
-                        "SELECT * FROM conc_rw WHERE 1=1 /* t{}q{} */", t, query_count
-                    );
+                    let sql = format!("SELECT * FROM conc_rw WHERE 1=1 /* t{}q{} */", t, query_count);
                     let rows = db_r.query(&sql, &[]).unwrap();
                     // Just verify we got valid results without panics
                     assert!(rows.len() <= 50, "Should never exceed 50 rows");
@@ -9845,7 +11301,11 @@ mod tests {
 
         // Use unique SQL to bypass cache for the final check
         let final_rows = db.query("SELECT * FROM conc_rw WHERE 1=1 /* final */", &[]).unwrap();
-        assert_eq!(final_rows.len(), 50, "All 50 rows should be visible after writer completes");
+        assert_eq!(
+            final_rows.len(),
+            50,
+            "All 50 rows should be visible after writer completes"
+        );
     }
 
     #[test]
@@ -9868,13 +11328,15 @@ mod tests {
             let handle = std::thread::spawn(move || {
                 for _ in 0..increments_per_thread {
                     // Read current value
-                    let rows = db_clone.query("SELECT cnt FROM conc_counter WHERE id = 1", &[]).unwrap();
+                    let rows = db_clone
+                        .query("SELECT cnt FROM conc_counter WHERE id = 1", &[])
+                        .unwrap();
                     if let Some(row) = rows.first() {
                         if let Some(Value::Int4(current)) = row.get(0) {
                             let new_val = current + 1;
-                            db_clone.execute(
-                                &format!("UPDATE conc_counter SET cnt = {} WHERE id = 1", new_val)
-                            ).unwrap();
+                            db_clone
+                                .execute(&format!("UPDATE conc_counter SET cnt = {} WHERE id = 1", new_val))
+                                .unwrap();
                         }
                     }
                 }
@@ -9894,8 +11356,12 @@ mod tests {
             // work is fully applied) and <= num_threads * increments_per_thread.
             let max_expected = (num_threads * increments_per_thread) as i32;
             assert!(*final_val > 0, "Counter should have been incremented at least once");
-            assert!(*final_val <= max_expected,
-                "Counter {} should not exceed {}", final_val, max_expected);
+            assert!(
+                *final_val <= max_expected,
+                "Counter {} should not exceed {}",
+                final_val,
+                max_expected
+            );
             // Document whether lost updates occurred
             if *final_val < max_expected {
                 // Expected: lost updates due to read-modify-write without locking
@@ -9917,22 +11383,25 @@ mod tests {
 
         // Pre-create tables for each thread
         for t in 0..num_threads {
-            db.execute(&format!("CREATE TABLE conc_tbl_{} (id INT, val TEXT)", t)).unwrap();
+            db.execute(&format!("CREATE TABLE conc_tbl_{} (id INT, val TEXT)", t))
+                .unwrap();
         }
 
         for t in 0..num_threads {
             let db_clone = Arc::clone(&db);
             let handle = std::thread::spawn(move || {
-                let session = db_clone.create_session(
-                    &format!("user{}", t),
-                    crate::session::IsolationLevel::ReadCommitted,
-                ).unwrap();
+                let session = db_clone
+                    .create_session(&format!("user{}", t), crate::session::IsolationLevel::ReadCommitted)
+                    .unwrap();
 
                 db_clone.begin_transaction_for_session(session).unwrap();
                 for i in 0..10 {
-                    db_clone.execute_in_session(session,
-                        &format!("INSERT INTO conc_tbl_{} VALUES ({}, 'val_{}')", t, i, i)
-                    ).unwrap();
+                    db_clone
+                        .execute_in_session(
+                            session,
+                            &format!("INSERT INTO conc_tbl_{} VALUES ({}, 'val_{}')", t, i, i),
+                        )
+                        .unwrap();
                 }
                 db_clone.commit_transaction_for_session(session).unwrap();
                 db_clone.destroy_session(session).unwrap();
@@ -9947,8 +11416,13 @@ mod tests {
         // Verify each table has 10 rows
         for t in 0..num_threads {
             let rows = db.query(&format!("SELECT * FROM conc_tbl_{}", t), &[]).unwrap();
-            assert_eq!(rows.len(), 10,
-                "Table conc_tbl_{} should have 10 rows, got {}", t, rows.len());
+            assert_eq!(
+                rows.len(),
+                10,
+                "Table conc_tbl_{} should have 10 rows, got {}",
+                t,
+                rows.len()
+            );
         }
     }
 
@@ -9979,7 +11453,10 @@ mod tests {
         db.execute("ROLLBACK").unwrap();
 
         let result = db.execute("ROLLBACK");
-        assert!(result.is_err(), "Second ROLLBACK without active transaction should fail");
+        assert!(
+            result.is_err(),
+            "Second ROLLBACK without active transaction should fail"
+        );
     }
 
     #[test]
@@ -9997,7 +11474,8 @@ mod tests {
         assert_eq!(rows.len(), 3, "All auto-committed inserts should be visible");
 
         // Update auto-commits too
-        db.execute("UPDATE autocommit SET val = 'updated' WHERE id = 2").unwrap();
+        db.execute("UPDATE autocommit SET val = 'updated' WHERE id = 2")
+            .unwrap();
         let rows = db.query("SELECT val FROM autocommit WHERE id = 2", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0), Some(&Value::String("updated".to_string())));
@@ -10042,8 +11520,11 @@ mod tests {
         // and the INSERT was in the same auto-commit scope.
         if let Ok(rows) = query_result {
             // Table survived rollback (DDL auto-commit behavior)
-            assert!(rows.is_empty() || rows.len() == 1,
-                "DDL rollback behavior: table exists with {} rows", rows.len());
+            assert!(
+                rows.is_empty() || rows.len() == 1,
+                "DDL rollback behavior: table exists with {} rows",
+                rows.len()
+            );
         }
         // If query_result is Err, table was successfully rolled back (ideal behavior)
     }
@@ -10084,7 +11565,10 @@ mod tests {
         assert!(result.is_err(), "Insert into nonexistent table should fail");
 
         // Transaction should still be active (error in one statement does not abort)
-        assert!(db.in_transaction(), "Transaction should still be active after statement error");
+        assert!(
+            db.in_transaction(),
+            "Transaction should still be active after statement error"
+        );
 
         // Valid SQL should still work
         db.execute("INSERT INTO txn_err VALUES (1, 'after_error')").unwrap();
@@ -10103,8 +11587,10 @@ mod tests {
         db.execute("BEGIN").unwrap();
         let result = db.execute("BEGIN");
         assert!(result.is_err(), "Nested BEGIN should fail");
-        assert!(result.unwrap_err().to_string().contains("already active"),
-            "Error should mention transaction already active");
+        assert!(
+            result.unwrap_err().to_string().contains("already active"),
+            "Error should mention transaction already active"
+        );
 
         db.execute("ROLLBACK").unwrap();
     }
@@ -10147,7 +11633,8 @@ mod tests {
     fn test_insert_rollback_pk_reuse() {
         // INSERT with id=1 -> ROLLBACK -> INSERT with id=1 again should work.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE pk_reuse (id INT PRIMARY KEY, val TEXT)").unwrap();
+        db.execute("CREATE TABLE pk_reuse (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
 
         // Insert and rollback
         db.execute("BEGIN").unwrap();
@@ -10175,8 +11662,11 @@ mod tests {
         let rows = db.query("SELECT val FROM upd_rb WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         let val = rows[0].get(0);
-        assert_eq!(val, Some(&Value::String("original".to_string())),
-            "ROLLBACK should undo the UPDATE");
+        assert_eq!(
+            val,
+            Some(&Value::String("original".to_string())),
+            "ROLLBACK should undo the UPDATE"
+        );
         if true {
             // Correct behavior: rollback undid the update
         }
@@ -10202,10 +11692,12 @@ mod tests {
     fn test_insert_commit_data_integrity() {
         // Verify data types are preserved through transaction commit.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE integrity (id INT, name TEXT, score FLOAT, active BOOLEAN)").unwrap();
+        db.execute("CREATE TABLE integrity (id INT, name TEXT, score FLOAT, active BOOLEAN)")
+            .unwrap();
 
         db.execute("BEGIN").unwrap();
-        db.execute("INSERT INTO integrity VALUES (42, 'test_name', 3.14, true)").unwrap();
+        db.execute("INSERT INTO integrity VALUES (42, 'test_name', 3.14, true)")
+            .unwrap();
         db.execute("COMMIT").unwrap();
 
         let rows = db.query("SELECT * FROM integrity WHERE id = 42", &[]).unwrap();
@@ -10231,7 +11723,8 @@ mod tests {
 
         db.execute("BEGIN").unwrap();
         for i in 1..=10 {
-            db.execute(&format!("INSERT INTO multi_rb VALUES ({}, 'row_{}')", i, i)).unwrap();
+            db.execute(&format!("INSERT INTO multi_rb VALUES ({}, 'row_{}')", i, i))
+                .unwrap();
         }
         db.execute("ROLLBACK").unwrap();
 
@@ -10341,16 +11834,20 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE sess_seq (id INT, val TEXT)").unwrap();
 
-        let s1 = db.create_session("user1", crate::session::IsolationLevel::ReadCommitted).unwrap();
+        let s1 = db
+            .create_session("user1", crate::session::IsolationLevel::ReadCommitted)
+            .unwrap();
 
         // Transaction 1: insert
         db.begin_transaction_for_session(s1).unwrap();
-        db.execute_in_session(s1, "INSERT INTO sess_seq VALUES (1, 'first')").unwrap();
+        db.execute_in_session(s1, "INSERT INTO sess_seq VALUES (1, 'first')")
+            .unwrap();
         db.commit_transaction_for_session(s1).unwrap();
 
         // Transaction 2: insert more
         db.begin_transaction_for_session(s1).unwrap();
-        db.execute_in_session(s1, "INSERT INTO sess_seq VALUES (2, 'second')").unwrap();
+        db.execute_in_session(s1, "INSERT INTO sess_seq VALUES (2, 'second')")
+            .unwrap();
         db.commit_transaction_for_session(s1).unwrap();
 
         let rows = db.query("SELECT * FROM sess_seq", &[]).unwrap();
@@ -10365,16 +11862,20 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE sess_rb_new (id INT, val TEXT)").unwrap();
 
-        let s1 = db.create_session("user1", crate::session::IsolationLevel::ReadCommitted).unwrap();
+        let s1 = db
+            .create_session("user1", crate::session::IsolationLevel::ReadCommitted)
+            .unwrap();
 
         // Transaction 1: rollback
         db.begin_transaction_for_session(s1).unwrap();
-        db.execute_in_session(s1, "INSERT INTO sess_rb_new VALUES (1, 'rolled_back')").unwrap();
+        db.execute_in_session(s1, "INSERT INTO sess_rb_new VALUES (1, 'rolled_back')")
+            .unwrap();
         db.rollback_transaction_for_session(s1).unwrap();
 
         // Transaction 2: commit
         db.begin_transaction_for_session(s1).unwrap();
-        db.execute_in_session(s1, "INSERT INTO sess_rb_new VALUES (2, 'committed')").unwrap();
+        db.execute_in_session(s1, "INSERT INTO sess_rb_new VALUES (2, 'committed')")
+            .unwrap();
         db.commit_transaction_for_session(s1).unwrap();
 
         let rows = db.query("SELECT * FROM sess_rb_new", &[]).unwrap();
@@ -10389,7 +11890,9 @@ mod tests {
         // Starting two transactions on the same session should fail.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let s1 = db.create_session("user1", crate::session::IsolationLevel::ReadCommitted).unwrap();
+        let s1 = db
+            .create_session("user1", crate::session::IsolationLevel::ReadCommitted)
+            .unwrap();
         db.begin_transaction_for_session(s1).unwrap();
 
         let result = db.begin_transaction_for_session(s1);
@@ -10404,7 +11907,9 @@ mod tests {
         // Committing without an active transaction should fail.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let s1 = db.create_session("user1", crate::session::IsolationLevel::ReadCommitted).unwrap();
+        let s1 = db
+            .create_session("user1", crate::session::IsolationLevel::ReadCommitted)
+            .unwrap();
         let result = db.commit_transaction_for_session(s1);
         assert!(result.is_err(), "COMMIT without active transaction should fail");
 
@@ -10416,7 +11921,9 @@ mod tests {
         // Rolling back without an active transaction should fail.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let s1 = db.create_session("user1", crate::session::IsolationLevel::ReadCommitted).unwrap();
+        let s1 = db
+            .create_session("user1", crate::session::IsolationLevel::ReadCommitted)
+            .unwrap();
         let result = db.rollback_transaction_for_session(s1);
         assert!(result.is_err(), "ROLLBACK without active transaction should fail");
 
@@ -10435,7 +11942,11 @@ mod tests {
         db.begin().unwrap();
         db.execute("INSERT INTO t_ryow VALUES (1, 'hello')").unwrap();
         let rows = db.query("SELECT * FROM t_ryow", &[]).unwrap();
-        assert_eq!(rows.len(), 1, "INSERT must be visible to SELECT within the same transaction");
+        assert_eq!(
+            rows.len(),
+            1,
+            "INSERT must be visible to SELECT within the same transaction"
+        );
         db.commit().unwrap();
     }
 
@@ -10450,8 +11961,11 @@ mod tests {
         let rows = db.query("SELECT * FROM t_ryow2 WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         let val = &rows[0].values[1];
-        assert_eq!(val, &Value::String("after".to_string()),
-            "UPDATE must be visible to SELECT within the same transaction");
+        assert_eq!(
+            val,
+            &Value::String("after".to_string()),
+            "UPDATE must be visible to SELECT within the same transaction"
+        );
         db.commit().unwrap();
     }
 
@@ -10464,8 +11978,11 @@ mod tests {
         db.begin().unwrap();
         db.execute("DELETE FROM t_ryow3 WHERE id = 1").unwrap();
         let rows = db.query("SELECT * FROM t_ryow3", &[]).unwrap();
-        assert_eq!(rows.len(), 0,
-            "DELETE must be reflected in SELECT within the same transaction");
+        assert_eq!(
+            rows.len(),
+            0,
+            "DELETE must be reflected in SELECT within the same transaction"
+        );
         db.commit().unwrap();
     }
 
@@ -10479,8 +11996,11 @@ mod tests {
         db.execute("INSERT INTO t_ryow4 VALUES (2, 'b')").unwrap();
         db.execute("INSERT INTO t_ryow4 VALUES (3, 'c')").unwrap();
         let rows = db.query("SELECT * FROM t_ryow4", &[]).unwrap();
-        assert_eq!(rows.len(), 3,
-            "All INSERTs must be visible to SELECT within the same transaction");
+        assert_eq!(
+            rows.len(),
+            3,
+            "All INSERTs must be visible to SELECT within the same transaction"
+        );
         db.commit().unwrap();
     }
 
@@ -10497,8 +12017,7 @@ mod tests {
         db.rollback().unwrap();
         // After rollback, must be gone
         let rows = db.query("SELECT * FROM t_ryow5", &[]).unwrap();
-        assert_eq!(rows.len(), 0,
-            "After ROLLBACK, inserted data must not be visible");
+        assert_eq!(rows.len(), 0, "After ROLLBACK, inserted data must not be visible");
     }
 
     // ===================================================================
@@ -10510,16 +12029,32 @@ mod tests {
     /// Bob and Charlie both earn 110000 (tie scenario).
     fn setup_window_test_db() -> EmbeddedDatabase {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept TEXT, salary INT, age INT)")
+            .unwrap();
         db.execute(
-            "CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept TEXT, salary INT, age INT)",
+            "INSERT INTO employees (id, name, dept, salary, age) VALUES (1, 'Alice',   'Engineering', 120000, 35)",
         )
         .unwrap();
-        db.execute("INSERT INTO employees (id, name, dept, salary, age) VALUES (1, 'Alice',   'Engineering', 120000, 35)").unwrap();
-        db.execute("INSERT INTO employees (id, name, dept, salary, age) VALUES (2, 'Bob',     'Engineering', 110000, 28)").unwrap();
-        db.execute("INSERT INTO employees (id, name, dept, salary, age) VALUES (3, 'Charlie', 'Engineering', 110000, 32)").unwrap();
-        db.execute("INSERT INTO employees (id, name, dept, salary, age) VALUES (4, 'Dave',    'Sales',       90000,  40)").unwrap();
-        db.execute("INSERT INTO employees (id, name, dept, salary, age) VALUES (5, 'Eve',     'Sales',       95000,  25)").unwrap();
-        db.execute("INSERT INTO employees (id, name, dept, salary, age) VALUES (6, 'Frank',   'Marketing',   80000,  45)").unwrap();
+        db.execute(
+            "INSERT INTO employees (id, name, dept, salary, age) VALUES (2, 'Bob',     'Engineering', 110000, 28)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO employees (id, name, dept, salary, age) VALUES (3, 'Charlie', 'Engineering', 110000, 32)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO employees (id, name, dept, salary, age) VALUES (4, 'Dave',    'Sales',       90000,  40)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO employees (id, name, dept, salary, age) VALUES (5, 'Eve',     'Sales',       95000,  25)",
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO employees (id, name, dept, salary, age) VALUES (6, 'Frank',   'Marketing',   80000,  45)",
+        )
+        .unwrap();
         db
     }
 
@@ -10578,14 +12113,10 @@ mod tests {
             .unwrap();
         assert_eq!(results.len(), 6);
         // Collect row numbers per department
-        let mut dept_row_nums: std::collections::HashMap<String, Vec<i64>> =
-            std::collections::HashMap::new();
+        let mut dept_row_nums: std::collections::HashMap<String, Vec<i64>> = std::collections::HashMap::new();
         for row in &results {
             if let (Some(Value::String(dept)), Some(Value::Int8(rn))) = (row.get(1), row.get(2)) {
-                dept_row_nums
-                    .entry(dept.clone())
-                    .or_default()
-                    .push(*rn);
+                dept_row_nums.entry(dept.clone()).or_default().push(*rn);
             }
         }
         // Engineering: 3 employees => row numbers 1,2,3
@@ -10638,16 +12169,14 @@ mod tests {
     #[test]
     fn test_window_rank_with_ties() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE scores (id INT PRIMARY KEY, score INT)").unwrap();
+        db.execute("CREATE TABLE scores (id INT PRIMARY KEY, score INT)")
+            .unwrap();
         db.execute("INSERT INTO scores (id, score) VALUES (1, 100)").unwrap();
         db.execute("INSERT INTO scores (id, score) VALUES (2, 90)").unwrap();
         db.execute("INSERT INTO scores (id, score) VALUES (3, 90)").unwrap();
         db.execute("INSERT INTO scores (id, score) VALUES (4, 80)").unwrap();
         let results = db
-            .query(
-                "SELECT id, score, RANK() OVER (ORDER BY score DESC) FROM scores",
-                &[],
-            )
+            .query("SELECT id, score, RANK() OVER (ORDER BY score DESC) FROM scores", &[])
             .unwrap();
         assert_eq!(results.len(), 4);
         let ranks: Vec<i64> = results
@@ -10671,7 +12200,8 @@ mod tests {
     #[test]
     fn test_window_dense_rank_basic() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE scores (id INT PRIMARY KEY, score INT)").unwrap();
+        db.execute("CREATE TABLE scores (id INT PRIMARY KEY, score INT)")
+            .unwrap();
         db.execute("INSERT INTO scores (id, score) VALUES (1, 100)").unwrap();
         db.execute("INSERT INTO scores (id, score) VALUES (2, 90)").unwrap();
         db.execute("INSERT INTO scores (id, score) VALUES (3, 90)").unwrap();
@@ -10705,10 +12235,7 @@ mod tests {
     fn test_window_ntile_basic() {
         let db = setup_window_test_db();
         let results = db
-            .query(
-                "SELECT name, NTILE(3) OVER (ORDER BY salary) FROM employees",
-                &[],
-            )
+            .query("SELECT name, NTILE(3) OVER (ORDER BY salary) FROM employees", &[])
             .unwrap();
         assert_eq!(results.len(), 6);
         // 6 rows / 3 buckets = 2 rows per bucket
@@ -10734,12 +12261,8 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE nums (id INT PRIMARY KEY, val INT)").unwrap();
         for i in 1..=7 {
-            db.execute(&format!(
-                "INSERT INTO nums (id, val) VALUES ({}, {})",
-                i,
-                i * 10
-            ))
-            .unwrap();
+            db.execute(&format!("INSERT INTO nums (id, val) VALUES ({}, {})", i, i * 10))
+                .unwrap();
         }
         let results = db
             .query("SELECT val, NTILE(3) OVER (ORDER BY val) FROM nums", &[])
@@ -10771,10 +12294,7 @@ mod tests {
         db.execute("INSERT INTO nums (id, val) VALUES (3, 30)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (4, 40)").unwrap();
         let results = db
-            .query(
-                "SELECT val, LAG(val, 1) OVER (ORDER BY val) FROM nums",
-                &[],
-            )
+            .query("SELECT val, LAG(val, 1) OVER (ORDER BY val) FROM nums", &[])
             .unwrap();
         assert_eq!(results.len(), 4);
         // First row: LAG = NULL (no previous row)
@@ -10793,18 +12313,11 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE nums (id INT PRIMARY KEY, val INT)").unwrap();
         for i in 1..=5 {
-            db.execute(&format!(
-                "INSERT INTO nums (id, val) VALUES ({}, {})",
-                i,
-                i * 10
-            ))
-            .unwrap();
+            db.execute(&format!("INSERT INTO nums (id, val) VALUES ({}, {})", i, i * 10))
+                .unwrap();
         }
         let results = db
-            .query(
-                "SELECT val, LAG(val, 2) OVER (ORDER BY val) FROM nums",
-                &[],
-            )
+            .query("SELECT val, LAG(val, 2) OVER (ORDER BY val) FROM nums", &[])
             .unwrap();
         assert_eq!(results.len(), 5);
         assert_eq!(results[0].get(1).unwrap(), &Value::Null);
@@ -10826,10 +12339,7 @@ mod tests {
         db.execute("INSERT INTO nums (id, val) VALUES (2, 200)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (3, 300)").unwrap();
         let results = db
-            .query(
-                "SELECT val, LAG(val) OVER (ORDER BY val) FROM nums",
-                &[],
-            )
+            .query("SELECT val, LAG(val) OVER (ORDER BY val) FROM nums", &[])
             .unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].get(1).unwrap(), &Value::Null);
@@ -10850,10 +12360,7 @@ mod tests {
         db.execute("INSERT INTO nums (id, val) VALUES (3, 30)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (4, 40)").unwrap();
         let results = db
-            .query(
-                "SELECT val, LEAD(val, 1) OVER (ORDER BY val) FROM nums",
-                &[],
-            )
+            .query("SELECT val, LEAD(val, 1) OVER (ORDER BY val) FROM nums", &[])
             .unwrap();
         assert_eq!(results.len(), 4);
         // Last row: LEAD = NULL
@@ -10872,18 +12379,11 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE nums (id INT PRIMARY KEY, val INT)").unwrap();
         for i in 1..=5 {
-            db.execute(&format!(
-                "INSERT INTO nums (id, val) VALUES ({}, {})",
-                i,
-                i * 10
-            ))
-            .unwrap();
+            db.execute(&format!("INSERT INTO nums (id, val) VALUES ({}, {})", i, i * 10))
+                .unwrap();
         }
         let results = db
-            .query(
-                "SELECT val, LEAD(val, 2) OVER (ORDER BY val) FROM nums",
-                &[],
-            )
+            .query("SELECT val, LEAD(val, 2) OVER (ORDER BY val) FROM nums", &[])
             .unwrap();
         assert_eq!(results.len(), 5);
         assert_eq!(results[3].get(1).unwrap(), &Value::Null);
@@ -10904,10 +12404,7 @@ mod tests {
         db.execute("INSERT INTO nums (id, val) VALUES (2, 200)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (3, 300)").unwrap();
         let results = db
-            .query(
-                "SELECT val, LEAD(val) OVER (ORDER BY val) FROM nums",
-                &[],
-            )
+            .query("SELECT val, LEAD(val) OVER (ORDER BY val) FROM nums", &[])
             .unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[2].get(1).unwrap(), &Value::Null);
@@ -10927,10 +12424,7 @@ mod tests {
         db.execute("INSERT INTO nums (id, val) VALUES (2, 20)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (3, 30)").unwrap();
         let results = db
-            .query(
-                "SELECT val, FIRST_VALUE(val) OVER (ORDER BY val) FROM nums",
-                &[],
-            )
+            .query("SELECT val, FIRST_VALUE(val) OVER (ORDER BY val) FROM nums", &[])
             .unwrap();
         assert_eq!(results.len(), 3);
         for row in &results {
@@ -10976,7 +12470,8 @@ mod tests {
     #[test]
     fn test_window_first_value_with_nulls() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE null_first (id INT PRIMARY KEY, val INT)").unwrap();
+        db.execute("CREATE TABLE null_first (id INT PRIMARY KEY, val INT)")
+            .unwrap();
         db.execute("INSERT INTO null_first (id) VALUES (1)").unwrap(); // val = NULL
         db.execute("INSERT INTO null_first (id, val) VALUES (2, 20)").unwrap();
         db.execute("INSERT INTO null_first (id, val) VALUES (3, 30)").unwrap();
@@ -11007,10 +12502,7 @@ mod tests {
         // With ORDER BY and default frame (UNBOUNDED PRECEDING to CURRENT ROW),
         // LAST_VALUE returns the current row's value.
         let results = db
-            .query(
-                "SELECT val, LAST_VALUE(val) OVER (ORDER BY val) FROM nums",
-                &[],
-            )
+            .query("SELECT val, LAST_VALUE(val) OVER (ORDER BY val) FROM nums", &[])
             .unwrap();
         assert_eq!(results.len(), 3);
         for row in &results {
@@ -11032,9 +12524,7 @@ mod tests {
         db.execute("INSERT INTO nums (id, val) VALUES (3, 30)").unwrap();
         // Without ORDER BY, default frame is UNBOUNDED PRECEDING to UNBOUNDED FOLLOWING
         // so LAST_VALUE should be the last value in the partition.
-        let results = db
-            .query("SELECT val, LAST_VALUE(val) OVER () FROM nums", &[])
-            .unwrap();
+        let results = db.query("SELECT val, LAST_VALUE(val) OVER () FROM nums", &[]).unwrap();
         assert_eq!(results.len(), 3);
         let last_vals: Vec<&Value> = results.iter().map(|r| r.get(1).unwrap()).collect();
         assert!(
@@ -11086,10 +12576,7 @@ mod tests {
         db.execute("INSERT INTO nums (id, val) VALUES (3, 30)").unwrap();
         // With ORDER BY, default frame = UNBOUNDED PRECEDING to CURRENT ROW => running sum
         let results = db
-            .query(
-                "SELECT val, SUM(val) OVER (ORDER BY val) FROM nums",
-                &[],
-            )
+            .query("SELECT val, SUM(val) OVER (ORDER BY val) FROM nums", &[])
             .unwrap();
         assert_eq!(results.len(), 3);
         let sums: Vec<f64> = results
@@ -11140,19 +12627,12 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE nums (id INT PRIMARY KEY, val INT)").unwrap();
         for i in 1..=5 {
-            db.execute(&format!(
-                "INSERT INTO nums (id, val) VALUES ({}, {})",
-                i,
-                i * 10
-            ))
-            .unwrap();
+            db.execute(&format!("INSERT INTO nums (id, val) VALUES ({}, {})", i, i * 10))
+                .unwrap();
         }
         // Use COUNT(val) to count non-NULL val values with running window.
         let results = db
-            .query(
-                "SELECT val, COUNT(val) OVER (ORDER BY val) FROM nums",
-                &[],
-            )
+            .query("SELECT val, COUNT(val) OVER (ORDER BY val) FROM nums", &[])
             .unwrap();
         assert_eq!(results.len(), 5);
         let counts: Vec<i64> = results
@@ -11203,10 +12683,7 @@ mod tests {
         db.execute("INSERT INTO nums (id, val) VALUES (2, 20)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (3, 30)").unwrap();
         let results = db
-            .query(
-                "SELECT val, AVG(val) OVER (ORDER BY val) FROM nums",
-                &[],
-            )
+            .query("SELECT val, AVG(val) OVER (ORDER BY val) FROM nums", &[])
             .unwrap();
         assert_eq!(results.len(), 3);
         let avgs: Vec<f64> = results
@@ -11283,12 +12760,10 @@ mod tests {
     #[test]
     fn test_window_empty_result_set() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE empty_t (id INT PRIMARY KEY, val INT)").unwrap();
+        db.execute("CREATE TABLE empty_t (id INT PRIMARY KEY, val INT)")
+            .unwrap();
         let results = db
-            .query(
-                "SELECT val, ROW_NUMBER() OVER (ORDER BY val) FROM empty_t",
-                &[],
-            )
+            .query("SELECT val, ROW_NUMBER() OVER (ORDER BY val) FROM empty_t", &[])
             .unwrap();
         assert_eq!(results.len(), 0, "Window on empty table => 0 rows");
     }
@@ -11308,14 +12783,16 @@ mod tests {
     #[test]
     fn test_window_single_row_partition() {
         let db = setup_window_test_db();
-        let results = db.query(
-            "SELECT name, dept, \
+        let results = db
+            .query(
+                "SELECT name, dept, \
                 ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary), \
                 RANK() OVER (PARTITION BY dept ORDER BY salary), \
                 SUM(salary) OVER (PARTITION BY dept) \
              FROM employees WHERE dept = 'Marketing'",
-            &[],
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].get(2).unwrap(), &Value::Int8(1), "ROW_NUMBER = 1");
         assert_eq!(results[0].get(3).unwrap(), &Value::Int8(1), "RANK = 1");
@@ -11333,10 +12810,7 @@ mod tests {
         db.execute("INSERT INTO null_t (id) VALUES (2)").unwrap();
         db.execute("INSERT INTO null_t (id) VALUES (3)").unwrap();
         let results = db
-            .query(
-                "SELECT id, val, SUM(val) OVER (ORDER BY id) FROM null_t",
-                &[],
-            )
+            .query("SELECT id, val, SUM(val) OVER (ORDER BY id) FROM null_t", &[])
             .unwrap();
         assert_eq!(results.len(), 3);
         // SQL standard: SUM of all NULLs returns NULL
@@ -11353,15 +12827,13 @@ mod tests {
     #[test]
     fn test_window_null_in_windowed_column() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE mixed_nulls (id INT PRIMARY KEY, val INT)").unwrap();
+        db.execute("CREATE TABLE mixed_nulls (id INT PRIMARY KEY, val INT)")
+            .unwrap();
         db.execute("INSERT INTO mixed_nulls (id, val) VALUES (1, 10)").unwrap();
         db.execute("INSERT INTO mixed_nulls (id) VALUES (2)").unwrap(); // val=NULL
         db.execute("INSERT INTO mixed_nulls (id, val) VALUES (3, 30)").unwrap();
         let results = db
-            .query(
-                "SELECT id, val, LAG(val, 1) OVER (ORDER BY id) FROM mixed_nulls",
-                &[],
-            )
+            .query("SELECT id, val, LAG(val, 1) OVER (ORDER BY id) FROM mixed_nulls", &[])
             .unwrap();
         assert_eq!(results.len(), 3);
         assert_eq!(results[0].get(2).unwrap(), &Value::Null, "LAG for first row = NULL");
@@ -11382,17 +12854,18 @@ mod tests {
     fn test_window_multiple_functions_same_select() {
         let db = setup_window_test_db();
         // Use COUNT(salary) instead of COUNT(*) -- see COUNT(*) bug note
-        let results = db.query(
-            "SELECT name, salary, \
+        let results = db
+            .query(
+                "SELECT name, salary, \
                 ROW_NUMBER() OVER (ORDER BY salary DESC), \
                 SUM(salary) OVER (), \
                 COUNT(salary) OVER () \
              FROM employees",
-            &[],
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
         assert_eq!(results.len(), 6);
-        let total: f64 =
-            120_000.0 + 110_000.0 + 110_000.0 + 90_000.0 + 95_000.0 + 80_000.0;
+        let total: f64 = 120_000.0 + 110_000.0 + 110_000.0 + 90_000.0 + 95_000.0 + 80_000.0;
         for row in &results {
             let sum_val = row.get(3).unwrap();
             assert!(
@@ -11422,10 +12895,7 @@ mod tests {
         let db = setup_window_test_db();
         // Use COUNT(salary) -- COUNT(*) returns 0 as a window function (bug).
         let results = db
-            .query(
-                "SELECT name, salary, COUNT(salary) OVER () FROM employees",
-                &[],
-            )
+            .query("SELECT name, salary, COUNT(salary) OVER () FROM employees", &[])
             .unwrap();
         assert_eq!(results.len(), 6);
         for row in &results {
@@ -11436,21 +12906,21 @@ mod tests {
     #[test]
     fn test_window_partition_with_many_groups() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE big_t (id INT PRIMARY KEY, grp INT, val INT)").unwrap();
+        db.execute("CREATE TABLE big_t (id INT PRIMARY KEY, grp INT, val INT)")
+            .unwrap();
         for i in 1..=200 {
             let grp = (i - 1) / 2 + 1; // 100 groups, 2 rows each
             db.execute(&format!(
                 "INSERT INTO big_t (id, grp, val) VALUES ({}, {}, {})",
-                i, grp, i * 10
+                i,
+                grp,
+                i * 10
             ))
             .unwrap();
         }
         // Use COUNT(val) -- COUNT(*) returns 0 as window function (bug)
         let results = db
-            .query(
-                "SELECT grp, COUNT(val) OVER (PARTITION BY grp) FROM big_t",
-                &[],
-            )
+            .query("SELECT grp, COUNT(val) OVER (PARTITION BY grp) FROM big_t", &[])
             .unwrap();
         assert_eq!(results.len(), 200);
         for row in &results {
@@ -11465,14 +12935,17 @@ mod tests {
     #[test]
     fn test_window_identical_values_all_rows() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE same_vals (id INT PRIMARY KEY, val INT)").unwrap();
+        db.execute("CREATE TABLE same_vals (id INT PRIMARY KEY, val INT)")
+            .unwrap();
         db.execute("INSERT INTO same_vals (id, val) VALUES (1, 42)").unwrap();
         db.execute("INSERT INTO same_vals (id, val) VALUES (2, 42)").unwrap();
         db.execute("INSERT INTO same_vals (id, val) VALUES (3, 42)").unwrap();
-        let results = db.query(
-            "SELECT id, val, ROW_NUMBER() OVER (ORDER BY val), SUM(val) OVER () FROM same_vals",
-            &[],
-        ).unwrap();
+        let results = db
+            .query(
+                "SELECT id, val, ROW_NUMBER() OVER (ORDER BY val), SUM(val) OVER () FROM same_vals",
+                &[],
+            )
+            .unwrap();
         assert_eq!(results.len(), 3);
         let row_nums: Vec<i64> = results
             .iter()
@@ -11498,8 +12971,9 @@ mod tests {
         db.execute("CREATE TABLE single (id INT PRIMARY KEY, val INT)").unwrap();
         db.execute("INSERT INTO single (id, val) VALUES (1, 42)").unwrap();
         // Use COUNT(val) instead of COUNT(*) -- COUNT(*) returns 0 (bug)
-        let results = db.query(
-            "SELECT val, \
+        let results = db
+            .query(
+                "SELECT val, \
                 ROW_NUMBER() OVER (ORDER BY val), \
                 RANK() OVER (ORDER BY val), \
                 LAG(val, 1) OVER (ORDER BY val), \
@@ -11507,8 +12981,9 @@ mod tests {
                 SUM(val) OVER (), \
                 COUNT(val) OVER () \
              FROM single",
-            &[],
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
         assert_eq!(results.len(), 1);
         let row = &results[0];
         assert_eq!(row.get(1).unwrap(), &Value::Int8(1), "ROW_NUMBER = 1");
@@ -11534,10 +13009,12 @@ mod tests {
         db.execute("INSERT INTO nums (id, val) VALUES (2, 20)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (3, 30)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (4, 40)").unwrap();
-        let results = db.query(
-            "SELECT val, SUM(val) OVER (ORDER BY val ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM nums",
-            &[],
-        ).unwrap();
+        let results = db
+            .query(
+                "SELECT val, SUM(val) OVER (ORDER BY val ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM nums",
+                &[],
+            )
+            .unwrap();
         assert_eq!(results.len(), 4);
         let sums: Vec<f64> = results
             .iter()
@@ -11560,10 +13037,12 @@ mod tests {
         db.execute("INSERT INTO nums (id, val) VALUES (2, 20)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (3, 30)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (4, 40)").unwrap();
-        let results = db.query(
-            "SELECT val, SUM(val) OVER (ORDER BY val ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM nums",
-            &[],
-        ).unwrap();
+        let results = db
+            .query(
+                "SELECT val, SUM(val) OVER (ORDER BY val ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM nums",
+                &[],
+            )
+            .unwrap();
         assert_eq!(results.len(), 4);
         let sums: Vec<f64> = results
             .iter()
@@ -11608,10 +13087,12 @@ mod tests {
         db.execute("INSERT INTO nums (id, val) VALUES (1, 10)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (2, 20)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (3, 30)").unwrap();
-        let results = db.query(
-            "SELECT val, SUM(val) OVER (ORDER BY val ROWS BETWEEN CURRENT ROW AND CURRENT ROW) FROM nums",
-            &[],
-        ).unwrap();
+        let results = db
+            .query(
+                "SELECT val, SUM(val) OVER (ORDER BY val ROWS BETWEEN CURRENT ROW AND CURRENT ROW) FROM nums",
+                &[],
+            )
+            .unwrap();
         assert_eq!(results.len(), 3);
         for row in &results {
             let val = match row.get(0).unwrap() {
@@ -11623,10 +13104,7 @@ mod tests {
                 Value::Float8(v) => *v,
                 other => panic!("expected Float8, got {:?}", other),
             };
-            assert!(
-                (sum - val).abs() < 0.01,
-                "CURRENT ROW frame SUM should equal own value"
-            );
+            assert!((sum - val).abs() < 0.01, "CURRENT ROW frame SUM should equal own value");
         }
     }
 
@@ -11635,17 +13113,15 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE nums (id INT PRIMARY KEY, val INT)").unwrap();
         for i in 1..=5 {
-            db.execute(&format!(
-                "INSERT INTO nums (id, val) VALUES ({}, {})",
-                i,
-                i * 10
-            ))
-            .unwrap();
+            db.execute(&format!("INSERT INTO nums (id, val) VALUES ({}, {})", i, i * 10))
+                .unwrap();
         }
-        let results = db.query(
-            "SELECT val, SUM(val) OVER (ORDER BY val ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM nums",
-            &[],
-        ).unwrap();
+        let results = db
+            .query(
+                "SELECT val, SUM(val) OVER (ORDER BY val ROWS BETWEEN 2 PRECEDING AND CURRENT ROW) FROM nums",
+                &[],
+            )
+            .unwrap();
         assert_eq!(results.len(), 5);
         let sums: Vec<f64> = results
             .iter()
@@ -11673,9 +13149,7 @@ mod tests {
         db.execute("INSERT INTO nums (id, val) VALUES (1, 10)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (2, 20)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (3, 30)").unwrap();
-        let results = db
-            .query("SELECT val, ROW_NUMBER() OVER () FROM nums", &[])
-            .unwrap();
+        let results = db.query("SELECT val, ROW_NUMBER() OVER () FROM nums", &[]).unwrap();
         assert_eq!(results.len(), 3);
         let row_nums: Vec<i64> = results
             .iter()
@@ -11697,10 +13171,7 @@ mod tests {
         db.execute("INSERT INTO nums (id, val) VALUES (2, 20)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (3, 30)").unwrap();
         let results = db
-            .query(
-                "SELECT val, ROW_NUMBER() OVER (ORDER BY val DESC) FROM nums",
-                &[],
-            )
+            .query("SELECT val, ROW_NUMBER() OVER (ORDER BY val DESC) FROM nums", &[])
             .unwrap();
         assert_eq!(results.len(), 3);
         for row in &results {
@@ -11725,10 +13196,12 @@ mod tests {
     #[test]
     fn test_window_sum_with_where_clause() {
         let db = setup_window_test_db();
-        let results = db.query(
-            "SELECT name, salary, SUM(salary) OVER (ORDER BY salary) FROM employees WHERE dept = 'Engineering'",
-            &[],
-        ).unwrap();
+        let results = db
+            .query(
+                "SELECT name, salary, SUM(salary) OVER (ORDER BY salary) FROM employees WHERE dept = 'Engineering'",
+                &[],
+            )
+            .unwrap();
         assert_eq!(results.len(), 3, "Only Engineering employees");
         let sums: Vec<f64> = results
             .iter()
@@ -11762,9 +13235,7 @@ mod tests {
         db.execute("INSERT INTO t (id, val) VALUES (1, 10)").unwrap();
         db.execute("INSERT INTO t (id) VALUES (2)").unwrap(); // val = NULL
         db.execute("INSERT INTO t (id, val) VALUES (3, 30)").unwrap();
-        let results = db
-            .query("SELECT id, COUNT(*) OVER () FROM t", &[])
-            .unwrap();
+        let results = db.query("SELECT id, COUNT(*) OVER () FROM t", &[]).unwrap();
         assert_eq!(results.len(), 3);
         // COUNT(*) counts all rows including those with NULLs
         for row in &results {
@@ -11784,9 +13255,7 @@ mod tests {
         db.execute("INSERT INTO t (id, val) VALUES (1, 10)").unwrap();
         db.execute("INSERT INTO t (id) VALUES (2)").unwrap(); // val = NULL
         db.execute("INSERT INTO t (id, val) VALUES (3, 30)").unwrap();
-        let results = db
-            .query("SELECT id, COUNT(val) OVER () FROM t", &[])
-            .unwrap();
+        let results = db.query("SELECT id, COUNT(val) OVER () FROM t", &[]).unwrap();
         assert_eq!(results.len(), 3);
         for row in &results {
             // COUNT(val) should return 2 (only non-NULL values)
@@ -11801,14 +13270,16 @@ mod tests {
     #[test]
     fn test_window_multiple_partitions_multiple_functions() {
         let db = setup_window_test_db();
-        let results = db.query(
-            "SELECT name, dept, salary, \
+        let results = db
+            .query(
+                "SELECT name, dept, salary, \
                 ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary DESC), \
                 SUM(salary) OVER (PARTITION BY dept), \
                 AVG(salary) OVER (PARTITION BY dept) \
              FROM employees",
-            &[],
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
         assert_eq!(results.len(), 6);
         for row in &results {
             assert_eq!(row.len(), 6, "3 original + 3 window columns");
@@ -11838,15 +13309,16 @@ mod tests {
     #[test]
     fn test_window_lag_partitioned() {
         let db = setup_window_test_db();
-        let results = db.query(
-            "SELECT name, dept, salary, LAG(salary, 1) OVER (PARTITION BY dept ORDER BY salary) FROM employees",
-            &[],
-        ).unwrap();
+        let results = db
+            .query(
+                "SELECT name, dept, salary, LAG(salary, 1) OVER (PARTITION BY dept ORDER BY salary) FROM employees",
+                &[],
+            )
+            .unwrap();
         assert_eq!(results.len(), 6);
         // Each partition should have exactly one row with LAG = NULL (the first
         // in ORDER BY salary order). Collect by department.
-        let mut dept_null_count: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        let mut dept_null_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for row in &results {
             if let Some(Value::String(dept)) = row.get(1) {
                 if row.get(3).unwrap() == &Value::Null {
@@ -11867,15 +13339,16 @@ mod tests {
     #[test]
     fn test_window_lead_partitioned() {
         let db = setup_window_test_db();
-        let results = db.query(
-            "SELECT name, dept, salary, LEAD(salary, 1) OVER (PARTITION BY dept ORDER BY salary) FROM employees",
-            &[],
-        ).unwrap();
+        let results = db
+            .query(
+                "SELECT name, dept, salary, LEAD(salary, 1) OVER (PARTITION BY dept ORDER BY salary) FROM employees",
+                &[],
+            )
+            .unwrap();
         assert_eq!(results.len(), 6);
         // Each partition should have exactly one row with LEAD = NULL (the last
         // in ORDER BY salary order).
-        let mut dept_null_count: std::collections::HashMap<String, usize> =
-            std::collections::HashMap::new();
+        let mut dept_null_count: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
         for row in &results {
             if let Some(Value::String(dept)) = row.get(1) {
                 if row.get(3).unwrap() == &Value::Null {
@@ -11895,19 +13368,14 @@ mod tests {
     #[test]
     fn test_window_large_dataset_row_number() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE large_t (id INT PRIMARY KEY, val INT)").unwrap();
-        for i in 1..=500 {
-            db.execute(&format!(
-                "INSERT INTO large_t (id, val) VALUES ({}, {})",
-                i, i
-            ))
+        db.execute("CREATE TABLE large_t (id INT PRIMARY KEY, val INT)")
             .unwrap();
+        for i in 1..=500 {
+            db.execute(&format!("INSERT INTO large_t (id, val) VALUES ({}, {})", i, i))
+                .unwrap();
         }
         let results = db
-            .query(
-                "SELECT id, ROW_NUMBER() OVER (ORDER BY val) FROM large_t",
-                &[],
-            )
+            .query("SELECT id, ROW_NUMBER() OVER (ORDER BY val) FROM large_t", &[])
             .unwrap();
         assert_eq!(results.len(), 500);
         let row_nums: std::collections::HashSet<i64> = results
@@ -11925,16 +13393,14 @@ mod tests {
     #[test]
     fn test_window_percent_rank() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE scores (id INT PRIMARY KEY, score INT)").unwrap();
+        db.execute("CREATE TABLE scores (id INT PRIMARY KEY, score INT)")
+            .unwrap();
         db.execute("INSERT INTO scores (id, score) VALUES (1, 100)").unwrap();
         db.execute("INSERT INTO scores (id, score) VALUES (2, 200)").unwrap();
         db.execute("INSERT INTO scores (id, score) VALUES (3, 300)").unwrap();
         db.execute("INSERT INTO scores (id, score) VALUES (4, 400)").unwrap();
         let results = db
-            .query(
-                "SELECT score, PERCENT_RANK() OVER (ORDER BY score) FROM scores",
-                &[],
-            )
+            .query("SELECT score, PERCENT_RANK() OVER (ORDER BY score) FROM scores", &[])
             .unwrap();
         assert_eq!(results.len(), 4);
         let pct_ranks: Vec<f64> = results
@@ -11954,13 +13420,11 @@ mod tests {
     #[test]
     fn test_window_percent_rank_single_row() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE one_row (id INT PRIMARY KEY, val INT)").unwrap();
+        db.execute("CREATE TABLE one_row (id INT PRIMARY KEY, val INT)")
+            .unwrap();
         db.execute("INSERT INTO one_row (id, val) VALUES (1, 42)").unwrap();
         let results = db
-            .query(
-                "SELECT val, PERCENT_RANK() OVER (ORDER BY val) FROM one_row",
-                &[],
-            )
+            .query("SELECT val, PERCENT_RANK() OVER (ORDER BY val) FROM one_row", &[])
             .unwrap();
         assert_eq!(results.len(), 1);
         assert!(
@@ -11977,10 +13441,7 @@ mod tests {
         db.execute("INSERT INTO nums (id, val) VALUES (2, 20)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (3, 30)").unwrap();
         let results = db
-            .query(
-                "SELECT val, NTILE(1) OVER (ORDER BY val) FROM nums",
-                &[],
-            )
+            .query("SELECT val, NTILE(1) OVER (ORDER BY val) FROM nums", &[])
             .unwrap();
         assert_eq!(results.len(), 3);
         for row in &results {
@@ -11995,10 +13456,7 @@ mod tests {
         db.execute("INSERT INTO nums (id, val) VALUES (1, 10)").unwrap();
         db.execute("INSERT INTO nums (id, val) VALUES (2, 20)").unwrap();
         let results = db
-            .query(
-                "SELECT val, NTILE(5) OVER (ORDER BY val) FROM nums",
-                &[],
-            )
+            .query("SELECT val, NTILE(5) OVER (ORDER BY val) FROM nums", &[])
             .unwrap();
         assert_eq!(results.len(), 2);
         let buckets: Vec<i64> = results
@@ -12022,9 +13480,9 @@ mod tests {
     fn test_returning_insert_star() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE ret_test (a INT, b TEXT)").unwrap();
-        let (count, rows) = db.execute_returning(
-            "INSERT INTO ret_test (a, b) VALUES (1, 'hello') RETURNING *"
-        ).unwrap();
+        let (count, rows) = db
+            .execute_returning("INSERT INTO ret_test (a, b) VALUES (1, 'hello') RETURNING *")
+            .unwrap();
         assert_eq!(count, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values.len(), 2);
@@ -12036,9 +13494,9 @@ mod tests {
     fn test_returning_insert_specific_columns() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE ret_cols (a INT, b TEXT)").unwrap();
-        let (count, rows) = db.execute_returning(
-            "INSERT INTO ret_cols (a, b) VALUES (1, 'world') RETURNING a, b"
-        ).unwrap();
+        let (count, rows) = db
+            .execute_returning("INSERT INTO ret_cols (a, b) VALUES (1, 'world') RETURNING a, b")
+            .unwrap();
         assert_eq!(count, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values.len(), 2);
@@ -12050,9 +13508,9 @@ mod tests {
     fn test_returning_insert_single_column() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE ret_single (a INT, b TEXT)").unwrap();
-        let (count, rows) = db.execute_returning(
-            "INSERT INTO ret_single (a, b) VALUES (42, 'test') RETURNING a"
-        ).unwrap();
+        let (count, rows) = db
+            .execute_returning("INSERT INTO ret_single (a, b) VALUES (42, 'test') RETURNING a")
+            .unwrap();
         assert_eq!(count, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values.len(), 1);
@@ -12063,9 +13521,9 @@ mod tests {
     fn test_returning_insert_expression_with_alias() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE ret_expr (a INT, b INT)").unwrap();
-        let (count, rows) = db.execute_returning(
-            "INSERT INTO ret_expr (a, b) VALUES (1, 2) RETURNING a + 1 AS incremented"
-        ).unwrap();
+        let (count, rows) = db
+            .execute_returning("INSERT INTO ret_expr (a, b) VALUES (1, 2) RETURNING a + 1 AS incremented")
+            .unwrap();
         assert_eq!(count, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values.len(), 1);
@@ -12078,9 +13536,9 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE ret_upd (a INT, b INT)").unwrap();
         db.execute("INSERT INTO ret_upd (a, b) VALUES (1, 5)").unwrap();
-        let (count, rows) = db.execute_returning(
-            "UPDATE ret_upd SET b = 10 WHERE a = 1 RETURNING *"
-        ).unwrap();
+        let (count, rows) = db
+            .execute_returning("UPDATE ret_upd SET b = 10 WHERE a = 1 RETURNING *")
+            .unwrap();
         assert_eq!(count, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::Int4(1));
@@ -12093,9 +13551,9 @@ mod tests {
         db.execute("CREATE TABLE ret_upd2 (a INT, b INT)").unwrap();
         db.execute("INSERT INTO ret_upd2 (a, b) VALUES (1, 5)").unwrap();
         db.execute("INSERT INTO ret_upd2 (a, b) VALUES (2, 6)").unwrap();
-        let (count, rows) = db.execute_returning(
-            "UPDATE ret_upd2 SET b = 99 WHERE a = 2 RETURNING b"
-        ).unwrap();
+        let (count, rows) = db
+            .execute_returning("UPDATE ret_upd2 SET b = 99 WHERE a = 2 RETURNING b")
+            .unwrap();
         assert_eq!(count, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values.len(), 1);
@@ -12108,9 +13566,9 @@ mod tests {
         db.execute("CREATE TABLE ret_del (a INT, b TEXT)").unwrap();
         db.execute("INSERT INTO ret_del (a, b) VALUES (1, 'one')").unwrap();
         db.execute("INSERT INTO ret_del (a, b) VALUES (2, 'two')").unwrap();
-        let (count, rows) = db.execute_returning(
-            "DELETE FROM ret_del WHERE a = 1 RETURNING a"
-        ).unwrap();
+        let (count, rows) = db
+            .execute_returning("DELETE FROM ret_del WHERE a = 1 RETURNING a")
+            .unwrap();
         assert_eq!(count, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values.len(), 1);
@@ -12123,9 +13581,9 @@ mod tests {
         db.execute("CREATE TABLE ret_del2 (a INT, b TEXT)").unwrap();
         db.execute("INSERT INTO ret_del2 (a, b) VALUES (1, 'one')").unwrap();
         db.execute("INSERT INTO ret_del2 (a, b) VALUES (2, 'two')").unwrap();
-        let (count, rows) = db.execute_returning(
-            "DELETE FROM ret_del2 WHERE a = 2 RETURNING *"
-        ).unwrap();
+        let (count, rows) = db
+            .execute_returning("DELETE FROM ret_del2 WHERE a = 2 RETURNING *")
+            .unwrap();
         assert_eq!(count, 1);
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values.len(), 2);
@@ -12137,9 +13595,9 @@ mod tests {
     fn test_returning_multi_row_insert() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE ret_multi (a INT, b INT)").unwrap();
-        let (count, rows) = db.execute_returning(
-            "INSERT INTO ret_multi (a, b) VALUES (1, 10), (2, 20), (3, 30) RETURNING *"
-        ).unwrap();
+        let (count, rows) = db
+            .execute_returning("INSERT INTO ret_multi (a, b) VALUES (1, 10), (2, 20), (3, 30) RETURNING *")
+            .unwrap();
         assert_eq!(count, 3);
         assert_eq!(rows.len(), 3);
         assert_eq!(rows[0].values[0], Value::Int4(1));
@@ -12151,9 +13609,9 @@ mod tests {
     fn test_returning_no_matching_rows() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE ret_empty (a INT)").unwrap();
-        let (count, rows) = db.execute_returning(
-            "DELETE FROM ret_empty WHERE a = 999 RETURNING *"
-        ).unwrap();
+        let (count, rows) = db
+            .execute_returning("DELETE FROM ret_empty WHERE a = 999 RETURNING *")
+            .unwrap();
         assert_eq!(count, 0);
         assert_eq!(rows.len(), 0);
     }
@@ -12163,10 +13621,9 @@ mod tests {
         // RETURNING statements should also work via the query() method
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE ret_query (a INT, b TEXT)").unwrap();
-        let rows = db.query(
-            "INSERT INTO ret_query (a, b) VALUES (7, 'seven') RETURNING *",
-            &[]
-        ).unwrap();
+        let rows = db
+            .query("INSERT INTO ret_query (a, b) VALUES (7, 'seven') RETURNING *", &[])
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::Int4(7));
         assert_eq!(rows[0].values[1], Value::String("seven".to_string()));
@@ -12178,9 +13635,7 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE ret_none (a INT)").unwrap();
         db.execute("INSERT INTO ret_none (a) VALUES (1)").unwrap();
-        let (count, rows) = db.execute_returning(
-            "UPDATE ret_none SET a = 2 WHERE a = 1"
-        ).unwrap();
+        let (count, rows) = db.execute_returning("UPDATE ret_none SET a = 2 WHERE a = 1").unwrap();
         assert_eq!(count, 1);
         assert_eq!(rows.len(), 0);
     }
@@ -12210,9 +13665,12 @@ mod tests {
     fn test_json_column_create_insert_select() {
         // Test creating a table with JSONB column, inserting, and selecting back
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE json_basic (id INT PRIMARY KEY, data JSONB)").unwrap();
-        db.execute(r#"INSERT INTO json_basic (id, data) VALUES (1, '{"name":"Alice","age":30}')"#).unwrap();
-        db.execute(r#"INSERT INTO json_basic (id, data) VALUES (2, '{"name":"Bob","age":25}')"#).unwrap();
+        db.execute("CREATE TABLE json_basic (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        db.execute(r#"INSERT INTO json_basic (id, data) VALUES (1, '{"name":"Alice","age":30}')"#)
+            .unwrap();
+        db.execute(r#"INSERT INTO json_basic (id, data) VALUES (2, '{"name":"Bob","age":25}')"#)
+            .unwrap();
 
         let rows = db.query("SELECT id, data FROM json_basic ORDER BY id", &[]).unwrap();
         assert_eq!(rows.len(), 2);
@@ -12226,8 +13684,10 @@ mod tests {
     fn test_json_column_type_json_vs_jsonb() {
         // Both JSON and JSONB column types should accept and store JSON data
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE json_types (id INT PRIMARY KEY, j JSON, jb JSONB)").unwrap();
-        db.execute(r#"INSERT INTO json_types (id, j, jb) VALUES (1, '{"a":1}', '{"b":2}')"#).unwrap();
+        db.execute("CREATE TABLE json_types (id INT PRIMARY KEY, j JSON, jb JSONB)")
+            .unwrap();
+        db.execute(r#"INSERT INTO json_types (id, j, jb) VALUES (1, '{"a":1}', '{"b":2}')"#)
+            .unwrap();
 
         let rows = db.query("SELECT j, jb FROM json_types WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
@@ -12241,8 +13701,10 @@ mod tests {
     fn test_json_null_column() {
         // NULL JSON column should work
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE json_nulls (id INT PRIMARY KEY, data JSONB)").unwrap();
-        db.execute("INSERT INTO json_nulls (id, data) VALUES (1, NULL)").unwrap();
+        db.execute("CREATE TABLE json_nulls (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        db.execute("INSERT INTO json_nulls (id, data) VALUES (1, NULL)")
+            .unwrap();
 
         let rows = db.query("SELECT data FROM json_nulls WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
@@ -12284,9 +13746,9 @@ mod tests {
         // Test -> operator on CAST-produced JSON (guaranteed Value::Json)
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT CAST('{"name":"Alice","age":30}' AS JSONB)->'name'"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(r#"SELECT CAST('{"name":"Alice","age":30}' AS JSONB)->'name'"#, &[])
+            .unwrap();
         assert_eq!(rows.len(), 1);
         match &rows[0].values[0] {
             Value::Json(j) => assert_eq!(j, "\"Alice\""),
@@ -12299,9 +13761,9 @@ mod tests {
         // Test ->> operator returns text on CAST-produced JSON
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT CAST('{"name":"Alice","age":30}' AS JSONB)->>'name'"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(r#"SELECT CAST('{"name":"Alice","age":30}' AS JSONB)->>'name'"#, &[])
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::String("Alice".to_string()));
     }
@@ -12311,9 +13773,7 @@ mod tests {
         // ->> on numeric field returns text
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT CAST('{"age":25}' AS JSONB)->>'age'"#, &[]
-        ).unwrap();
+        let rows = db.query(r#"SELECT CAST('{"age":25}' AS JSONB)->>'age'"#, &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::String("25".to_string()));
     }
@@ -12323,9 +13783,9 @@ mod tests {
         // Test -> with integer index for array element access
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT CAST('["apple","banana","cherry"]' AS JSONB)->1"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(r#"SELECT CAST('["apple","banana","cherry"]' AS JSONB)->1"#, &[])
+            .unwrap();
         assert_eq!(rows.len(), 1);
         match &rows[0].values[0] {
             Value::Json(j) => assert_eq!(j, "\"banana\""),
@@ -12338,9 +13798,9 @@ mod tests {
         // Accessing a non-existent key returns NULL
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT CAST('{"name":"Alice"}' AS JSONB)->'nonexistent'"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(r#"SELECT CAST('{"name":"Alice"}' AS JSONB)->'nonexistent'"#, &[])
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::Null);
     }
@@ -12349,11 +13809,15 @@ mod tests {
     fn test_json_arrow_on_null_column() {
         // -> on a NULL JSON column returns NULL
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE json_null_op (id INT PRIMARY KEY, data JSONB)").unwrap();
-        db.execute("INSERT INTO json_null_op (id, data) VALUES (1, NULL)").unwrap();
+        db.execute("CREATE TABLE json_null_op (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        db.execute("INSERT INTO json_null_op (id, data) VALUES (1, NULL)")
+            .unwrap();
 
         // Use CAST on the column to ensure it is Json type, but NULL stays NULL
-        let rows = db.query("SELECT CAST(data AS JSONB)->'key' FROM json_null_op WHERE id = 1", &[]).unwrap();
+        let rows = db
+            .query("SELECT CAST(data AS JSONB)->'key' FROM json_null_op WHERE id = 1", &[])
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::Null);
     }
@@ -12363,10 +13827,12 @@ mod tests {
         // Chained -> for nested access
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT CAST('{"user":{"address":{"city":"NYC"}}}' AS JSONB)->'user'->'address'->'city'"#,
-            &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT CAST('{"user":{"address":{"city":"NYC"}}}' AS JSONB)->'user'->'address'->'city'"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         match &rows[0].values[0] {
             Value::Json(j) => assert_eq!(j, "\"NYC\""),
@@ -12379,9 +13845,12 @@ mod tests {
         // -> for navigation then ->> at end for text extraction
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT CAST('{"user":{"name":"Alice"}}' AS JSONB)->'user'->>'name'"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT CAST('{"user":{"name":"Alice"}}' AS JSONB)->'user'->>'name'"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::String("Alice".to_string()));
     }
@@ -12391,17 +13860,21 @@ mod tests {
         // @> containment operator
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT CAST('{"name":"Alice","city":"NYC"}' AS JSONB) @> CAST('{"city":"NYC"}' AS JSONB)"#,
-            &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT CAST('{"name":"Alice","city":"NYC"}' AS JSONB) @> CAST('{"city":"NYC"}' AS JSONB)"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::Boolean(true));
 
-        let rows = db.query(
-            r#"SELECT CAST('{"name":"Alice","city":"NYC"}' AS JSONB) @> CAST('{"city":"LA"}' AS JSONB)"#,
-            &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT CAST('{"name":"Alice","city":"NYC"}' AS JSONB) @> CAST('{"city":"LA"}' AS JSONB)"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::Boolean(false));
     }
 
@@ -12410,14 +13883,20 @@ mod tests {
         // <@ operator: left is contained by right
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT CAST('{"a":1}' AS JSONB) <@ CAST('{"a":1,"b":2}' AS JSONB)"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT CAST('{"a":1}' AS JSONB) <@ CAST('{"a":1,"b":2}' AS JSONB)"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::Boolean(true));
 
-        let rows = db.query(
-            r#"SELECT CAST('{"a":1,"c":3}' AS JSONB) <@ CAST('{"a":1,"b":2}' AS JSONB)"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT CAST('{"a":1,"c":3}' AS JSONB) <@ CAST('{"a":1,"b":2}' AS JSONB)"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::Boolean(false));
     }
 
@@ -12444,16 +13923,20 @@ mod tests {
         // @> with arrays
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT CAST('{"tags":["rust","db","json"]}' AS JSONB) @> CAST('{"tags":["rust"]}' AS JSONB)"#,
-            &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT CAST('{"tags":["rust","db","json"]}' AS JSONB) @> CAST('{"tags":["rust"]}' AS JSONB)"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::Boolean(true));
 
-        let rows = db.query(
-            r#"SELECT CAST('{"tags":["rust","db"]}' AS JSONB) @> CAST('{"tags":["python"]}' AS JSONB)"#,
-            &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT CAST('{"tags":["rust","db"]}' AS JSONB) @> CAST('{"tags":["python"]}' AS JSONB)"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::Boolean(false));
     }
 
@@ -12463,24 +13946,24 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let json_str = r#"{"str":"hello","num":42,"flag":true,"arr":[1,2,3],"obj":{"x":1}}"#;
 
-        let rows = db.query(
-            &format!("SELECT CAST('{}' AS JSONB)->>'str'", json_str), &[]
-        ).unwrap();
+        let rows = db
+            .query(&format!("SELECT CAST('{}' AS JSONB)->>'str'", json_str), &[])
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::String("hello".to_string()));
 
-        let rows = db.query(
-            &format!("SELECT CAST('{}' AS JSONB)->>'num'", json_str), &[]
-        ).unwrap();
+        let rows = db
+            .query(&format!("SELECT CAST('{}' AS JSONB)->>'num'", json_str), &[])
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::String("42".to_string()));
 
-        let rows = db.query(
-            &format!("SELECT CAST('{}' AS JSONB)->>'flag'", json_str), &[]
-        ).unwrap();
+        let rows = db
+            .query(&format!("SELECT CAST('{}' AS JSONB)->>'flag'", json_str), &[])
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::String("true".to_string()));
 
-        let rows = db.query(
-            &format!("SELECT CAST('{}' AS JSONB)->'arr'", json_str), &[]
-        ).unwrap();
+        let rows = db
+            .query(&format!("SELECT CAST('{}' AS JSONB)->'arr'", json_str), &[])
+            .unwrap();
         match &rows[0].values[0] {
             Value::Json(j) => {
                 let parsed: serde_json::Value = serde_json::from_str(j).unwrap();
@@ -12495,9 +13978,12 @@ mod tests {
     fn test_json_update_column() {
         // Test updating a JSONB column
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE json_update (id INT PRIMARY KEY, data JSONB)").unwrap();
-        db.execute(r#"INSERT INTO json_update (id, data) VALUES (1, '{"v":1}')"#).unwrap();
-        db.execute(r#"UPDATE json_update SET data = '{"v":2,"extra":"added"}' WHERE id = 1"#).unwrap();
+        db.execute("CREATE TABLE json_update (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        db.execute(r#"INSERT INTO json_update (id, data) VALUES (1, '{"v":1}')"#)
+            .unwrap();
+        db.execute(r#"UPDATE json_update SET data = '{"v":2,"extra":"added"}' WHERE id = 1"#)
+            .unwrap();
 
         let rows = db.query("SELECT data FROM json_update WHERE id = 1", &[]).unwrap();
         let parsed = parse_json_value(&rows[0].values[0]);
@@ -12536,7 +14022,9 @@ mod tests {
         // Test jsonb_array_length
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query("SELECT jsonb_array_length(CAST('[10,20,30,40]' AS JSONB))", &[]).unwrap();
+        let rows = db
+            .query("SELECT jsonb_array_length(CAST('[10,20,30,40]' AS JSONB))", &[])
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::Int4(4));
 
         let rows = db.query("SELECT jsonb_array_length(CAST('[]' AS JSONB))", &[]).unwrap();
@@ -12564,10 +14052,12 @@ mod tests {
         // jsonb_extract_path_text returns text
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_extract_path_text(CAST('{"user":{"name":"Alice"}}' AS JSONB), 'user', 'name')"#,
-            &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_extract_path_text(CAST('{"user":{"name":"Alice"}}' AS JSONB), 'user', 'name')"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::String("Alice".to_string()));
     }
 
@@ -12576,9 +14066,12 @@ mod tests {
         // Non-existent path returns NULL
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_extract_path(CAST('{"a":1}' AS JSONB), 'nonexistent', 'path')"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_extract_path(CAST('{"a":1}' AS JSONB), 'nonexistent', 'path')"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::Null);
     }
 
@@ -12586,15 +14079,25 @@ mod tests {
     fn test_json_func_jsonb_object_keys() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_object_keys(CAST('{"name":"Alice","age":30,"city":"NYC"}' AS JSONB))"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_object_keys(CAST('{"name":"Alice","age":30,"city":"NYC"}' AS JSONB))"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         match &rows[0].values[0] {
             Value::Array(keys) => {
-                let key_strings: Vec<String> = keys.iter().filter_map(|v| {
-                    if let Value::String(s) = v { Some(s.clone()) } else { None }
-                }).collect();
+                let key_strings: Vec<String> = keys
+                    .iter()
+                    .filter_map(|v| {
+                        if let Value::String(s) = v {
+                            Some(s.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect();
                 assert!(key_strings.contains(&"name".to_string()));
                 assert!(key_strings.contains(&"age".to_string()));
                 assert!(key_strings.contains(&"city".to_string()));
@@ -12607,7 +14110,9 @@ mod tests {
     #[test]
     fn test_json_func_jsonb_build_object() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db.query("SELECT jsonb_build_object('name', 'Alice', 'age', 30)", &[]).unwrap();
+        let rows = db
+            .query("SELECT jsonb_build_object('name', 'Alice', 'age', 30)", &[])
+            .unwrap();
         match &rows[0].values[0] {
             Value::Json(j) => {
                 let parsed: serde_json::Value = serde_json::from_str(j).unwrap();
@@ -12640,9 +14145,12 @@ mod tests {
     fn test_json_func_jsonb_strip_nulls() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_strip_nulls(CAST('{"a":1,"b":null,"c":"hello","d":null}' AS JSONB))"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_strip_nulls(CAST('{"a":1,"b":null,"c":"hello","d":null}' AS JSONB))"#,
+                &[],
+            )
+            .unwrap();
         match &rows[0].values[0] {
             Value::Json(j) => {
                 let parsed: serde_json::Value = serde_json::from_str(j).unwrap();
@@ -12659,9 +14167,12 @@ mod tests {
     fn test_json_func_jsonb_strip_nulls_nested() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_strip_nulls(CAST('{"a":1,"b":{"c":null,"d":2},"e":null}' AS JSONB))"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_strip_nulls(CAST('{"a":1,"b":{"c":null,"d":2},"e":null}' AS JSONB))"#,
+                &[],
+            )
+            .unwrap();
         match &rows[0].values[0] {
             Value::Json(j) => {
                 let parsed: serde_json::Value = serde_json::from_str(j).unwrap();
@@ -12678,9 +14189,9 @@ mod tests {
     fn test_json_func_jsonb_pretty() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_pretty(CAST('{"a":1,"b":2}' AS JSONB))"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(r#"SELECT jsonb_pretty(CAST('{"a":1,"b":2}' AS JSONB))"#, &[])
+            .unwrap();
         match &rows[0].values[0] {
             Value::String(s) => {
                 assert!(s.contains('\n'));
@@ -12696,9 +14207,12 @@ mod tests {
     fn test_json_func_jsonb_path_query() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_path_query(CAST('{"user":{"name":"Alice"}}' AS JSONB), 'user.name')"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_path_query(CAST('{"user":{"name":"Alice"}}' AS JSONB), 'user.name')"#,
+                &[],
+            )
+            .unwrap();
         match &rows[0].values[0] {
             Value::Json(j) => assert_eq!(j, "\"Alice\""),
             other => panic!("Expected Json from jsonb_path_query, got {:?}", other),
@@ -12732,14 +14246,20 @@ mod tests {
     fn test_json_func_jsonb_path_exists() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_path_exists(CAST('{"user":{"name":"Alice"}}' AS JSONB), 'user.name')"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_path_exists(CAST('{"user":{"name":"Alice"}}' AS JSONB), 'user.name')"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::Boolean(true));
 
-        let rows = db.query(
-            r#"SELECT jsonb_path_exists(CAST('{"user":{"name":"Alice"}}' AS JSONB), 'user.email')"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_path_exists(CAST('{"user":{"name":"Alice"}}' AS JSONB), 'user.email')"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::Boolean(false));
     }
 
@@ -12747,9 +14267,12 @@ mod tests {
     fn test_json_func_jsonb_path_query_array() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_path_query_array(CAST('{"user":{"name":"Alice"}}' AS JSONB), 'user.name')"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_path_query_array(CAST('{"user":{"name":"Alice"}}' AS JSONB), 'user.name')"#,
+                &[],
+            )
+            .unwrap();
         match &rows[0].values[0] {
             Value::Array(arr) => {
                 assert_eq!(arr.len(), 1);
@@ -12766,9 +14289,12 @@ mod tests {
     fn test_json_func_jsonb_path_query_first() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_path_query_first(CAST('{"x":{"y":42}}' AS JSONB), 'x.y')"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_path_query_first(CAST('{"x":{"y":42}}' AS JSONB), 'x.y')"#,
+                &[],
+            )
+            .unwrap();
         match &rows[0].values[0] {
             Value::Json(j) => assert_eq!(j, "42"),
             other => panic!("Expected Json, got {:?}", other),
@@ -12779,9 +14305,12 @@ mod tests {
     fn test_json_func_jsonb_set() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_set(CAST('{"name":"Alice","age":30}' AS JSONB), ARRAY['age'], '31')"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_set(CAST('{"name":"Alice","age":30}' AS JSONB), ARRAY['age'], '31')"#,
+                &[],
+            )
+            .unwrap();
         match &rows[0].values[0] {
             Value::Json(j) => {
                 let parsed: serde_json::Value = serde_json::from_str(j).unwrap();
@@ -12813,9 +14342,12 @@ mod tests {
     fn test_json_func_jsonb_concat() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_concat(CAST('{"x":1}' AS JSONB), CAST('{"y":2}' AS JSONB))"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_concat(CAST('{"x":1}' AS JSONB), CAST('{"y":2}' AS JSONB))"#,
+                &[],
+            )
+            .unwrap();
         match &rows[0].values[0] {
             Value::Json(j) => {
                 let parsed: serde_json::Value = serde_json::from_str(j).unwrap();
@@ -12831,9 +14363,12 @@ mod tests {
         // Right-side keys overwrite left-side on merge
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_concat(CAST('{"x":1,"y":2}' AS JSONB), CAST('{"y":99,"z":3}' AS JSONB))"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_concat(CAST('{"x":1,"y":2}' AS JSONB), CAST('{"y":99,"z":3}' AS JSONB))"#,
+                &[],
+            )
+            .unwrap();
         match &rows[0].values[0] {
             Value::Json(j) => {
                 let parsed: serde_json::Value = serde_json::from_str(j).unwrap();
@@ -12849,9 +14384,12 @@ mod tests {
     fn test_json_func_jsonb_delete() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_delete(CAST('{"a":1,"b":2,"c":3}' AS JSONB), ARRAY['b'])"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_delete(CAST('{"a":1,"b":2,"c":3}' AS JSONB), ARRAY['b'])"#,
+                &[],
+            )
+            .unwrap();
         match &rows[0].values[0] {
             Value::Json(j) => {
                 let parsed: serde_json::Value = serde_json::from_str(j).unwrap();
@@ -12867,9 +14405,9 @@ mod tests {
     fn test_json_func_jsonb_each() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_each(CAST('{"x":10,"y":20}' AS JSONB))"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(r#"SELECT jsonb_each(CAST('{"x":10,"y":20}' AS JSONB))"#, &[])
+            .unwrap();
         match &rows[0].values[0] {
             Value::Array(pairs) => {
                 assert_eq!(pairs.len(), 4);
@@ -12886,9 +14424,12 @@ mod tests {
     fn test_json_func_jsonb_each_text() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_each_text(CAST('{"name":"Alice","age":30}' AS JSONB))"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_each_text(CAST('{"name":"Alice","age":30}' AS JSONB))"#,
+                &[],
+            )
+            .unwrap();
         match &rows[0].values[0] {
             Value::Array(pairs) => {
                 for v in pairs {
@@ -12904,9 +14445,12 @@ mod tests {
         // MVP: returns first element
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_array_elements(CAST('["first","second","third"]' AS JSONB))"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_array_elements(CAST('["first","second","third"]' AS JSONB))"#,
+                &[],
+            )
+            .unwrap();
         match &rows[0].values[0] {
             Value::Json(j) => assert_eq!(j, "\"first\""),
             other => panic!("Expected Json from jsonb_array_elements, got {:?}", other),
@@ -12917,19 +14461,26 @@ mod tests {
     fn test_json_func_jsonb_array_elements_text() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT jsonb_array_elements_text(CAST('["hello","world"]' AS JSONB))"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT jsonb_array_elements_text(CAST('["hello","world"]' AS JSONB))"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::String("hello".to_string()));
     }
 
     #[test]
     fn test_json_agg_function() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE json_agg_t (id INT PRIMARY KEY, name TEXT)").unwrap();
-        db.execute("INSERT INTO json_agg_t (id, name) VALUES (1, 'Alice')").unwrap();
-        db.execute("INSERT INTO json_agg_t (id, name) VALUES (2, 'Bob')").unwrap();
-        db.execute("INSERT INTO json_agg_t (id, name) VALUES (3, 'Charlie')").unwrap();
+        db.execute("CREATE TABLE json_agg_t (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO json_agg_t (id, name) VALUES (1, 'Alice')")
+            .unwrap();
+        db.execute("INSERT INTO json_agg_t (id, name) VALUES (2, 'Bob')")
+            .unwrap();
+        db.execute("INSERT INTO json_agg_t (id, name) VALUES (3, 'Charlie')")
+            .unwrap();
 
         let rows = db.query("SELECT json_agg(name) FROM json_agg_t", &[]).unwrap();
         match &rows[0].values[0] {
@@ -12984,10 +14535,12 @@ mod tests {
     fn test_json_deeply_nested_via_cast() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT CAST('{"a":{"b":{"c":{"d":{"e":"deep"}}}}}' AS JSONB)->'a'->'b'->'c'->'d'->>'e'"#,
-            &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT CAST('{"a":{"b":{"c":{"d":{"e":"deep"}}}}}' AS JSONB)->'a'->'b'->'c'->'d'->>'e'"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::String("deep".to_string()));
     }
 
@@ -12996,9 +14549,7 @@ mod tests {
         // ->> on JSON null value returns text "null"
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            r#"SELECT CAST('{"a":null}' AS JSONB)->>'a'"#, &[]
-        ).unwrap();
+        let rows = db.query(r#"SELECT CAST('{"a":null}' AS JSONB)->>'a'"#, &[]).unwrap();
         assert_eq!(rows[0].values[0], Value::String("null".to_string()));
     }
 
@@ -13007,15 +14558,21 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
         // Wrong value for existing key
-        let rows = db.query(
-            r#"SELECT CAST('{"a":1,"b":2}' AS JSONB) @> CAST('{"a":99}' AS JSONB)"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT CAST('{"a":1,"b":2}' AS JSONB) @> CAST('{"a":99}' AS JSONB)"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::Boolean(false));
 
         // Non-existent key
-        let rows = db.query(
-            r#"SELECT CAST('{"a":1,"b":2}' AS JSONB) @> CAST('{"z":1}' AS JSONB)"#, &[]
-        ).unwrap();
+        let rows = db
+            .query(
+                r#"SELECT CAST('{"a":1,"b":2}' AS JSONB) @> CAST('{"z":1}' AS JSONB)"#,
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::Boolean(false));
     }
 
@@ -13023,7 +14580,8 @@ mod tests {
     fn test_json_storage_roundtrip_preserves_data() {
         // Verify that JSON data survives INSERT/SELECT round-trip
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE json_rt (id INT PRIMARY KEY, data JSONB)").unwrap();
+        db.execute("CREATE TABLE json_rt (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
 
         let test_cases = vec![
             (1, r#"{"nested":{"a":1,"b":[2,3]}}"#),
@@ -13034,7 +14592,8 @@ mod tests {
         ];
 
         for (id, json) in &test_cases {
-            db.execute(&format!("INSERT INTO json_rt (id, data) VALUES ({}, '{}')", id, json)).unwrap();
+            db.execute(&format!("INSERT INTO json_rt (id, data) VALUES ({}, '{}')", id, json))
+                .unwrap();
         }
 
         let rows = db.query("SELECT id, data FROM json_rt ORDER BY id", &[]).unwrap();
@@ -13051,10 +14610,14 @@ mod tests {
     fn test_json_delete_rows_from_json_table() {
         // DELETE works on tables with JSONB columns
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE json_del (id INT PRIMARY KEY, data JSONB)").unwrap();
-        db.execute(r#"INSERT INTO json_del (id, data) VALUES (1, '{"x":1}')"#).unwrap();
-        db.execute(r#"INSERT INTO json_del (id, data) VALUES (2, '{"x":2}')"#).unwrap();
-        db.execute(r#"INSERT INTO json_del (id, data) VALUES (3, '{"x":3}')"#).unwrap();
+        db.execute("CREATE TABLE json_del (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        db.execute(r#"INSERT INTO json_del (id, data) VALUES (1, '{"x":1}')"#)
+            .unwrap();
+        db.execute(r#"INSERT INTO json_del (id, data) VALUES (2, '{"x":2}')"#)
+            .unwrap();
+        db.execute(r#"INSERT INTO json_del (id, data) VALUES (3, '{"x":3}')"#)
+            .unwrap();
 
         db.execute("DELETE FROM json_del WHERE id = 2").unwrap();
 
@@ -13069,9 +14632,9 @@ mod tests {
         // Chain: build JSON object in-memory, then use -> on it
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT jsonb_build_object('name', 'Alice', 'age', 30)->>'name'", &[]
-        ).unwrap();
+        let rows = db
+            .query("SELECT jsonb_build_object('name', 'Alice', 'age', 30)->>'name'", &[])
+            .unwrap();
         assert_eq!(rows[0].values[0], Value::String("Alice".to_string()));
     }
 
@@ -13098,9 +14661,12 @@ mod tests {
     fn test_json_mixed_with_regular_columns() {
         // JSON alongside regular columns in storage
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE json_mixed (id INT PRIMARY KEY, name TEXT, meta JSONB)").unwrap();
-        db.execute(r#"INSERT INTO json_mixed (id, name, meta) VALUES (1, 'Alice', '{"role":"admin"}')"#).unwrap();
-        db.execute(r#"INSERT INTO json_mixed (id, name, meta) VALUES (2, 'Bob', '{"role":"user"}')"#).unwrap();
+        db.execute("CREATE TABLE json_mixed (id INT PRIMARY KEY, name TEXT, meta JSONB)")
+            .unwrap();
+        db.execute(r#"INSERT INTO json_mixed (id, name, meta) VALUES (1, 'Alice', '{"role":"admin"}')"#)
+            .unwrap();
+        db.execute(r#"INSERT INTO json_mixed (id, name, meta) VALUES (2, 'Bob', '{"role":"user"}')"#)
+            .unwrap();
 
         let rows = db.query("SELECT name, meta FROM json_mixed ORDER BY id", &[]).unwrap();
         assert_eq!(rows.len(), 2);
@@ -13116,14 +14682,16 @@ mod tests {
     fn test_json_large_document() {
         // Test with a 50-key JSON document
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE json_large (id INT PRIMARY KEY, data JSONB)").unwrap();
+        db.execute("CREATE TABLE json_large (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
 
         let mut json_obj = serde_json::Map::new();
         for i in 0..50 {
             json_obj.insert(format!("key_{}", i), serde_json::json!(i));
         }
         let json_str = serde_json::Value::Object(json_obj).to_string();
-        db.execute(&format!("INSERT INTO json_large (id, data) VALUES (1, '{}')", json_str)).unwrap();
+        db.execute(&format!("INSERT INTO json_large (id, data) VALUES (1, '{}')", json_str))
+            .unwrap();
 
         let rows = db.query("SELECT data FROM json_large WHERE id = 1", &[]).unwrap();
         let parsed = parse_json_value(&rows[0].values[0]);
@@ -13135,8 +14703,10 @@ mod tests {
     #[test]
     fn test_json_unicode_content() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE json_uni (id INT PRIMARY KEY, data JSONB)").unwrap();
-        db.execute(r#"INSERT INTO json_uni (id, data) VALUES (1, '{"greeting":"Bonjour"}')"#).unwrap();
+        db.execute("CREATE TABLE json_uni (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        db.execute(r#"INSERT INTO json_uni (id, data) VALUES (1, '{"greeting":"Bonjour"}')"#)
+            .unwrap();
 
         let rows = db.query("SELECT data FROM json_uni WHERE id = 1", &[]).unwrap();
         let parsed = parse_json_value(&rows[0].values[0]);
@@ -13186,13 +14756,22 @@ mod tests {
 
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 10, "Expected 10 rows for counting 1..10, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    10,
+                    "Expected 10 rows for counting 1..10, got {}",
+                    rows.len()
+                );
                 for (i, row) in rows.iter().enumerate() {
                     let val = row.get(0).unwrap();
                     let expected = (i as i32) + 1;
                     assert_eq!(
-                        val, &Value::Int4(expected),
-                        "Row {} should be {}, got {:?}", i, expected, val
+                        val,
+                        &Value::Int4(expected),
+                        "Row {} should be {}, got {:?}",
+                        i,
+                        expected,
+                        val
                     );
                 }
             }
@@ -13212,10 +14791,12 @@ mod tests {
         // Build a tree: CEO -> VP -> Director -> Manager -> Staff
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        db.execute("CREATE TABLE rc_employees (id INT PRIMARY KEY, name TEXT, manager_id INT)").unwrap();
+        db.execute("CREATE TABLE rc_employees (id INT PRIMARY KEY, name TEXT, manager_id INT)")
+            .unwrap();
         db.execute("INSERT INTO rc_employees VALUES (1, 'CEO', NULL)").unwrap();
         db.execute("INSERT INTO rc_employees VALUES (2, 'VP', 1)").unwrap();
-        db.execute("INSERT INTO rc_employees VALUES (3, 'Director', 2)").unwrap();
+        db.execute("INSERT INTO rc_employees VALUES (3, 'Director', 2)")
+            .unwrap();
         db.execute("INSERT INTO rc_employees VALUES (4, 'Manager', 3)").unwrap();
         db.execute("INSERT INTO rc_employees VALUES (5, 'Staff', 4)").unwrap();
 
@@ -13245,13 +14826,14 @@ mod tests {
                 // may have issues with schema resolution or self-referencing.
                 let err_msg = e.to_string();
                 assert!(
-                    err_msg.contains("not found") ||
-                    err_msg.contains("not implemented") ||
-                    err_msg.contains("not yet") ||
-                    err_msg.contains("recursive") ||
-                    err_msg.contains("ambiguous") ||
-                    err_msg.contains("column"),
-                    "Unexpected error in recursive CTE tree traversal: {}", err_msg
+                    err_msg.contains("not found")
+                        || err_msg.contains("not implemented")
+                        || err_msg.contains("not yet")
+                        || err_msg.contains("recursive")
+                        || err_msg.contains("ambiguous")
+                        || err_msg.contains("column"),
+                    "Unexpected error in recursive CTE tree traversal: {}",
+                    err_msg
                 );
             }
         }
@@ -13281,28 +14863,44 @@ mod tests {
                 if rows.len() == expected_deduped.len() {
                     for (i, (row, exp)) in rows.iter().zip(expected_deduped.iter()).enumerate() {
                         let val = row.get(0).unwrap();
-                        assert_eq!(val, &Value::Int4(*exp),
-                            "Fibonacci (deduped) row {} should be {}, got {:?}", i, exp, val);
+                        assert_eq!(
+                            val,
+                            &Value::Int4(*exp),
+                            "Fibonacci (deduped) row {} should be {}, got {:?}",
+                            i,
+                            exp,
+                            val
+                        );
                     }
                 } else if rows.len() == expected_full.len() {
                     for (i, (row, exp)) in rows.iter().zip(expected_full.iter()).enumerate() {
                         let val = row.get(0).unwrap();
-                        assert_eq!(val, &Value::Int4(*exp),
-                            "Fibonacci row {} should be {}, got {:?}", i, exp, val);
+                        assert_eq!(
+                            val,
+                            &Value::Int4(*exp),
+                            "Fibonacci row {} should be {}, got {:?}",
+                            i,
+                            exp,
+                            val
+                        );
                     }
                 } else {
-                    panic!("Expected 11 (deduped) or 12 (full) Fibonacci numbers, got {}", rows.len());
+                    panic!(
+                        "Expected 11 (deduped) or 12 (full) Fibonacci numbers, got {}",
+                        rows.len()
+                    );
                 }
             }
             Err(e) => {
                 let err_msg = e.to_string();
                 assert!(
-                    err_msg.contains("not found") ||
-                    err_msg.contains("not implemented") ||
-                    err_msg.contains("not yet") ||
-                    err_msg.contains("column") ||
-                    err_msg.contains("type"),
-                    "Unexpected error in recursive CTE Fibonacci: {}", err_msg
+                    err_msg.contains("not found")
+                        || err_msg.contains("not implemented")
+                        || err_msg.contains("not yet")
+                        || err_msg.contains("column")
+                        || err_msg.contains("type"),
+                    "Unexpected error in recursive CTE Fibonacci: {}",
+                    err_msg
                 );
             }
         }
@@ -13329,16 +14927,17 @@ mod tests {
                     let val = row.get(0).unwrap();
                     let expected = (i as i32) + 1;
                     assert_eq!(
-                        val, &Value::Int4(expected),
-                        "Row {} should be {}, got {:?}", i, expected, val
+                        val,
+                        &Value::Int4(expected),
+                        "Row {} should be {}, got {:?}",
+                        i,
+                        expected,
+                        val
                     );
                 }
             }
             Err(e) => {
-                panic!(
-                    "Recursive CTE with WHERE depth limit failed: {}",
-                    e
-                );
+                panic!("Recursive CTE with WHERE depth limit failed: {}", e);
             }
         }
     }
@@ -13356,15 +14955,14 @@ mod tests {
                 assert_eq!(rows.len(), 1, "Non-recursive CTE should return 1 row");
                 let val = rows[0].get(0).unwrap();
                 assert_eq!(
-                    val, &Value::Int4(42),
-                    "Non-recursive CTE should return 42, got {:?}", val
+                    val,
+                    &Value::Int4(42),
+                    "Non-recursive CTE should return 42, got {:?}",
+                    val
                 );
             }
             Err(e) => {
-                panic!(
-                    "Non-recursive CTE failed: {}. Basic WITH support should work.",
-                    e
-                );
+                panic!("Non-recursive CTE failed: {}. Basic WITH support should work.", e);
             }
         }
     }
@@ -13374,10 +14972,12 @@ mod tests {
         // Non-recursive CTE that reads from a real table.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        db.execute("CREATE TABLE rc_products (id INT, name TEXT, price INT)").unwrap();
+        db.execute("CREATE TABLE rc_products (id INT, name TEXT, price INT)")
+            .unwrap();
         db.execute("INSERT INTO rc_products VALUES (1, 'Widget', 10)").unwrap();
         db.execute("INSERT INTO rc_products VALUES (2, 'Gadget', 25)").unwrap();
-        db.execute("INSERT INTO rc_products VALUES (3, 'Doohickey', 5)").unwrap();
+        db.execute("INSERT INTO rc_products VALUES (3, 'Doohickey', 5)")
+            .unwrap();
 
         let sql = "\
             WITH expensive AS ( \
@@ -13403,7 +15003,8 @@ mod tests {
         // Generate numbers 1-5 via recursive CTE, then join with a table.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        db.execute("CREATE TABLE rc_items (id INT PRIMARY KEY, label TEXT)").unwrap();
+        db.execute("CREATE TABLE rc_items (id INT PRIMARY KEY, label TEXT)")
+            .unwrap();
         db.execute("INSERT INTO rc_items VALUES (1, 'alpha')").unwrap();
         db.execute("INSERT INTO rc_items VALUES (2, 'beta')").unwrap();
         db.execute("INSERT INTO rc_items VALUES (3, 'gamma')").unwrap();
@@ -13435,13 +15036,14 @@ mod tests {
                 // JOIN with CTE may fail if CTE is not properly registered
                 let err_msg = e.to_string();
                 assert!(
-                    err_msg.contains("not found") ||
-                    err_msg.contains("not implemented") ||
-                    err_msg.contains("ambiguous") ||
-                    err_msg.contains("table") ||
-                    err_msg.contains("column") ||
-                    err_msg.contains("type"),
-                    "Unexpected error in recursive CTE JOIN: {}", err_msg
+                    err_msg.contains("not found")
+                        || err_msg.contains("not implemented")
+                        || err_msg.contains("ambiguous")
+                        || err_msg.contains("table")
+                        || err_msg.contains("column")
+                        || err_msg.contains("type"),
+                    "Unexpected error in recursive CTE JOIN: {}",
+                    err_msg
                 );
             }
         }
@@ -13464,19 +15066,22 @@ mod tests {
         match db.query(sql, &[]) {
             Ok(rows) => {
                 assert_eq!(
-                    rows.len(), 0,
-                    "Empty base case should produce 0 rows, got {}", rows.len()
+                    rows.len(),
+                    0,
+                    "Empty base case should produce 0 rows, got {}",
+                    rows.len()
                 );
             }
             Err(e) => {
                 let err_msg = e.to_string();
                 assert!(
-                    err_msg.contains("not found") ||
-                    err_msg.contains("not implemented") ||
-                    err_msg.contains("column") ||
-                    err_msg.contains("type") ||
-                    err_msg.contains("empty"),
-                    "Unexpected error in empty base case CTE: {}", err_msg
+                    err_msg.contains("not found")
+                        || err_msg.contains("not implemented")
+                        || err_msg.contains("column")
+                        || err_msg.contains("type")
+                        || err_msg.contains("empty"),
+                    "Unexpected error in empty base case CTE: {}",
+                    err_msg
                 );
             }
         }
@@ -13515,21 +15120,28 @@ mod tests {
                 // For this query, both produce the same result (1..5)
                 // since each iteration produces distinct values anyway.
                 assert_eq!(
-                    rows_all.len(), 5,
-                    "UNION ALL counting 1..5 should produce 5 rows, got {}", rows_all.len()
+                    rows_all.len(),
+                    5,
+                    "UNION ALL counting 1..5 should produce 5 rows, got {}",
+                    rows_all.len()
                 );
                 assert!(
                     rows_distinct.len() <= rows_all.len(),
                     "UNION should produce <= rows than UNION ALL ({} vs {})",
-                    rows_distinct.len(), rows_all.len()
+                    rows_distinct.len(),
+                    rows_all.len()
                 );
                 // Values should be 1-5 as Int4
                 for (i, row) in rows_all.iter().enumerate() {
                     let val = row.get(0).unwrap();
                     let expected = (i as i32) + 1;
                     assert_eq!(
-                        val, &Value::Int4(expected),
-                        "UNION ALL row {} should be {}, got {:?}", i, expected, val
+                        val,
+                        &Value::Int4(expected),
+                        "UNION ALL row {} should be {}, got {:?}",
+                        i,
+                        expected,
+                        val
                     );
                 }
             }
@@ -13537,11 +15149,12 @@ mod tests {
                 // UNION ALL works but UNION does not
                 let err_msg = e.to_string();
                 assert!(
-                    err_msg.contains("not implemented") ||
-                    err_msg.contains("not found") ||
-                    err_msg.contains("UNION") ||
-                    err_msg.contains("recursive"),
-                    "Unexpected error in UNION recursive CTE: {}", err_msg
+                    err_msg.contains("not implemented")
+                        || err_msg.contains("not found")
+                        || err_msg.contains("UNION")
+                        || err_msg.contains("recursive"),
+                    "Unexpected error in UNION recursive CTE: {}",
+                    err_msg
                 );
             }
             (Err(e_all), _) => {
@@ -13577,8 +15190,7 @@ mod tests {
                     Value::Int4(v) => assert_eq!(*v, 55, "SUM(1..10) should be 55, got {}", v),
                     Value::Numeric(v) => assert_eq!(v, "55", "SUM(1..10) should be 55, got {}", v),
                     Value::Float8(v) => {
-                        assert!((*v - 55.0).abs() < 0.001,
-                            "SUM(1..10) should be 55.0, got {}", v);
+                        assert!((*v - 55.0).abs() < 0.001, "SUM(1..10) should be 55.0, got {}", v);
                     }
                     other => panic!("SUM returned unexpected type: {:?}", other),
                 }
@@ -13586,11 +15198,12 @@ mod tests {
             Err(e) => {
                 let err_msg = e.to_string();
                 assert!(
-                    err_msg.contains("not found") ||
-                    err_msg.contains("not implemented") ||
-                    err_msg.contains("aggregate") ||
-                    err_msg.contains("column"),
-                    "Unexpected error in recursive CTE with aggregate: {}", err_msg
+                    err_msg.contains("not found")
+                        || err_msg.contains("not implemented")
+                        || err_msg.contains("aggregate")
+                        || err_msg.contains("column"),
+                    "Unexpected error in recursive CTE with aggregate: {}",
+                    err_msg
                 );
             }
         }
@@ -13616,8 +15229,12 @@ mod tests {
             let val = row.get(0).unwrap();
             let expected = (i as i32) + 1;
             assert_eq!(
-                val, &Value::Int4(expected),
-                "LIMIT row {} should be {}, got {:?}", i, expected, val
+                val,
+                &Value::Int4(expected),
+                "LIMIT row {} should be {}, got {:?}",
+                i,
+                expected,
+                val
             );
         }
     }
@@ -13639,13 +15256,12 @@ mod tests {
         match db.query(sql, &[]) {
             Ok(rows) => {
                 assert_eq!(
-                    rows.len(), 1,
-                    "Should produce exactly 1 row (base case only), got {}", rows.len()
+                    rows.len(),
+                    1,
+                    "Should produce exactly 1 row (base case only), got {}",
+                    rows.len()
                 );
-                assert_eq!(
-                    rows[0].get(0).unwrap(), &Value::Int4(100),
-                    "Single row should be 100"
-                );
+                assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(100), "Single row should be 100");
             }
             Err(e) => {
                 panic!("Recursive CTE single-row termination failed: {}", e);
@@ -13658,7 +15274,8 @@ mod tests {
         // Multiple CTEs defined in a single WITH clause.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        db.execute("CREATE TABLE rc_multi (id INT, category TEXT, amount INT)").unwrap();
+        db.execute("CREATE TABLE rc_multi (id INT, category TEXT, amount INT)")
+            .unwrap();
         db.execute("INSERT INTO rc_multi VALUES (1, 'A', 10)").unwrap();
         db.execute("INSERT INTO rc_multi VALUES (2, 'B', 20)").unwrap();
         db.execute("INSERT INTO rc_multi VALUES (3, 'A', 30)").unwrap();
@@ -13680,11 +15297,12 @@ mod tests {
             Err(e) => {
                 let err_msg = e.to_string();
                 assert!(
-                    err_msg.contains("not found") ||
-                    err_msg.contains("not implemented") ||
-                    err_msg.contains("table") ||
-                    err_msg.contains("CTE"),
-                    "Unexpected error in multiple CTEs: {}", err_msg
+                    err_msg.contains("not found")
+                        || err_msg.contains("not implemented")
+                        || err_msg.contains("table")
+                        || err_msg.contains("CTE"),
+                    "Unexpected error in multiple CTEs: {}",
+                    err_msg
                 );
             }
         }
@@ -13714,31 +15332,37 @@ mod tests {
             Ok(rows) => {
                 // Reachable from 1: {1, 2, 3, 4, 5}
                 // The executor deduplicates rows, so we get distinct nodes.
-                let nodes: Vec<i64> = rows.iter().map(|r| {
-                    match r.get(0).unwrap() {
+                let nodes: Vec<i64> = rows
+                    .iter()
+                    .map(|r| match r.get(0).unwrap() {
                         Value::Int8(v) => *v,
                         Value::Int4(v) => i64::from(*v),
                         other => panic!("Unexpected node type: {:?}", other),
-                    }
-                }).collect();
+                    })
+                    .collect();
 
                 assert!(nodes.contains(&1), "Should contain starting node 1");
                 assert!(nodes.contains(&2), "Should contain node 2");
                 assert!(nodes.contains(&3), "Should contain node 3");
                 assert!(nodes.contains(&4), "Should contain node 4");
                 assert!(nodes.contains(&5), "Should contain node 5");
-                assert_eq!(nodes.len(), 5,
-                    "Should have exactly 5 distinct reachable nodes, got {:?}", nodes);
+                assert_eq!(
+                    nodes.len(),
+                    5,
+                    "Should have exactly 5 distinct reachable nodes, got {:?}",
+                    nodes
+                );
             }
             Err(e) => {
                 let err_msg = e.to_string();
                 assert!(
-                    err_msg.contains("not found") ||
-                    err_msg.contains("not implemented") ||
-                    err_msg.contains("ambiguous") ||
-                    err_msg.contains("column") ||
-                    err_msg.contains("table"),
-                    "Unexpected error in recursive CTE graph traversal: {}", err_msg
+                    err_msg.contains("not found")
+                        || err_msg.contains("not implemented")
+                        || err_msg.contains("ambiguous")
+                        || err_msg.contains("column")
+                        || err_msg.contains("table"),
+                    "Unexpected error in recursive CTE graph traversal: {}",
+                    err_msg
                 );
             }
         }
@@ -13763,8 +15387,12 @@ mod tests {
         for (i, row) in rows.iter().enumerate() {
             let s = row.get(0).unwrap();
             assert_eq!(
-                s, &Value::String(expected[i].to_string()),
-                "Row {} should be '{}', got {:?}", i, expected[i], s
+                s,
+                &Value::String(expected[i].to_string()),
+                "Row {} should be '{}', got {:?}",
+                i,
+                expected[i],
+                s
             );
         }
     }
@@ -13786,14 +15414,21 @@ mod tests {
             Ok(rows) => {
                 let expected: Vec<i32> = vec![1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
                 assert_eq!(
-                    rows.len(), expected.len(),
-                    "Expected {} powers of 2, got {}", expected.len(), rows.len()
+                    rows.len(),
+                    expected.len(),
+                    "Expected {} powers of 2, got {}",
+                    expected.len(),
+                    rows.len()
                 );
                 for (i, (row, exp)) in rows.iter().zip(expected.iter()).enumerate() {
                     let val = row.get(0).unwrap();
                     assert_eq!(
-                        val, &Value::Int4(*exp),
-                        "Power of 2 row {} should be {}, got {:?}", i, exp, val
+                        val,
+                        &Value::Int4(*exp),
+                        "Power of 2 row {} should be {}, got {:?}",
+                        i,
+                        exp,
+                        val
                     );
                 }
             }
@@ -13844,11 +15479,12 @@ mod tests {
             Err(e) => {
                 let err_msg = e.to_string();
                 assert!(
-                    err_msg.contains("not found") ||
-                    err_msg.contains("not implemented") ||
-                    err_msg.contains("column") ||
-                    err_msg.contains("alias"),
-                    "Unexpected error in CTE column alias: {}", err_msg
+                    err_msg.contains("not found")
+                        || err_msg.contains("not implemented")
+                        || err_msg.contains("column")
+                        || err_msg.contains("alias"),
+                    "Unexpected error in CTE column alias: {}",
+                    err_msg
                 );
             }
         }
@@ -13874,8 +15510,12 @@ mod tests {
                     let val = row.get(0).unwrap();
                     let expected = 10 - i as i32;
                     assert_eq!(
-                        val, &Value::Int4(expected),
-                        "Countdown row {} should be {}, got {:?}", i, expected, val
+                        val,
+                        &Value::Int4(expected),
+                        "Countdown row {} should be {}, got {:?}",
+                        i,
+                        expected,
+                        val
                     );
                 }
             }
@@ -13898,14 +15538,20 @@ mod tests {
         // UNION ALL keeps all rows from both sides including duplicates.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 1 AS id, 'alice' AS name \
+        let rows = db
+            .query(
+                "SELECT 1 AS id, 'alice' AS name \
              UNION ALL \
              SELECT 2, 'bob'",
-            &[],
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
 
-        assert_eq!(rows.len(), 2, "UNION ALL of two single-row SELECTs should produce 2 rows");
+        assert_eq!(
+            rows.len(),
+            2,
+            "UNION ALL of two single-row SELECTs should produce 2 rows"
+        );
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(1));
         assert_eq!(rows[0].get(1).unwrap(), &Value::String("alice".to_string()));
         assert_eq!(rows[1].get(0).unwrap(), &Value::Int4(2));
@@ -13917,10 +15563,9 @@ mod tests {
         // UNION ALL must keep duplicate rows from both sides.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 1 AS v UNION ALL SELECT 1 UNION ALL SELECT 1",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT 1 AS v UNION ALL SELECT 1 UNION ALL SELECT 1", &[])
+            .unwrap();
 
         assert_eq!(rows.len(), 3, "UNION ALL of three identical rows should produce 3 rows");
         for row in &rows {
@@ -13933,13 +15578,11 @@ mod tests {
         // UNION (without ALL) removes duplicate rows.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 1 AS v UNION SELECT 1 UNION SELECT 2",
-            &[],
-        ).unwrap();
+        let rows = db.query("SELECT 1 AS v UNION SELECT 1 UNION SELECT 2", &[]).unwrap();
 
         assert_eq!(rows.len(), 2, "UNION of (1, 1, 2) should produce 2 distinct rows");
-        let mut vals: Vec<i32> = rows.iter()
+        let mut vals: Vec<i32> = rows
+            .iter()
             .map(|r| match r.get(0).unwrap() {
                 Value::Int4(n) => *n,
                 other => panic!("Expected Int4, got {:?}", other),
@@ -13955,16 +15598,17 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
         // UNION ALL: should return 4 rows (2 duplicates of value 1)
-        let rows_all = db.query(
-            "SELECT 1 AS v UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 2",
-            &[],
-        ).unwrap();
+        let rows_all = db
+            .query(
+                "SELECT 1 AS v UNION ALL SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 2",
+                &[],
+            )
+            .unwrap();
 
         // UNION: should return 2 rows (deduped)
-        let rows_distinct = db.query(
-            "SELECT 1 AS v UNION SELECT 1 UNION SELECT 2 UNION SELECT 2",
-            &[],
-        ).unwrap();
+        let rows_distinct = db
+            .query("SELECT 1 AS v UNION SELECT 1 UNION SELECT 2 UNION SELECT 2", &[])
+            .unwrap();
 
         assert_eq!(rows_all.len(), 4, "UNION ALL should produce 4 rows");
         assert_eq!(rows_distinct.len(), 2, "UNION (distinct) should produce 2 rows");
@@ -13975,10 +15619,7 @@ mod tests {
         // INTERSECT returns only rows present in both sides.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 1 AS v INTERSECT SELECT 1",
-            &[],
-        ).unwrap();
+        let rows = db.query("SELECT 1 AS v INTERSECT SELECT 1", &[]).unwrap();
 
         assert_eq!(rows.len(), 1, "INTERSECT of (1) and (1) should produce 1 row");
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(1));
@@ -13989,10 +15630,7 @@ mod tests {
         // INTERSECT with no common rows should return empty result.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 1 AS v INTERSECT SELECT 2",
-            &[],
-        ).unwrap();
+        let rows = db.query("SELECT 1 AS v INTERSECT SELECT 2", &[]).unwrap();
 
         assert_eq!(rows.len(), 0, "INTERSECT of (1) and (2) should produce 0 rows");
     }
@@ -14011,7 +15649,8 @@ mod tests {
         match db.query(sql, &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 2, "INTERSECT of (1,2,3) and (2,3,4) should produce 2 rows");
-                let mut vals: Vec<i32> = rows.iter()
+                let mut vals: Vec<i32> = rows
+                    .iter()
                     .map(|r| match r.get(0).unwrap() {
                         Value::Int4(n) => *n,
                         other => panic!("Expected Int4, got {:?}", other),
@@ -14029,13 +15668,13 @@ mod tests {
                 db.execute("CREATE TABLE int_right (v INT)").unwrap();
                 db.execute("INSERT INTO int_right VALUES (2), (3), (4)").unwrap();
 
-                let rows = db.query(
-                    "SELECT v FROM int_left INTERSECT SELECT v FROM int_right",
-                    &[],
-                ).unwrap();
+                let rows = db
+                    .query("SELECT v FROM int_left INTERSECT SELECT v FROM int_right", &[])
+                    .unwrap();
 
                 assert_eq!(rows.len(), 2, "INTERSECT of (1,2,3) and (2,3,4) should produce 2 rows");
-                let mut vals: Vec<i32> = rows.iter()
+                let mut vals: Vec<i32> = rows
+                    .iter()
                     .map(|r| match r.get(0).unwrap() {
                         Value::Int4(n) => *n,
                         other => panic!("Expected Int4, got {:?}", other),
@@ -14058,10 +15697,9 @@ mod tests {
         db.execute("CREATE TABLE exc_right (v INT)").unwrap();
         db.execute("INSERT INTO exc_right VALUES (2), (3)").unwrap();
 
-        let rows = db.query(
-            "SELECT v FROM exc_left EXCEPT SELECT v FROM exc_right",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT v FROM exc_left EXCEPT SELECT v FROM exc_right", &[])
+            .unwrap();
 
         assert_eq!(rows.len(), 1, "EXCEPT of (1,2,3) minus (2,3) should produce 1 row");
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(1));
@@ -14072,10 +15710,7 @@ mod tests {
         // EXCEPT where right contains all rows from left yields empty result.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 1 AS v EXCEPT SELECT 1",
-            &[],
-        ).unwrap();
+        let rows = db.query("SELECT 1 AS v EXCEPT SELECT 1", &[]).unwrap();
 
         assert_eq!(rows.len(), 0, "EXCEPT of (1) minus (1) should produce 0 rows");
     }
@@ -14085,10 +15720,7 @@ mod tests {
         // EXCEPT where there is no overlap returns all left rows.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 1 AS v EXCEPT SELECT 2",
-            &[],
-        ).unwrap();
+        let rows = db.query("SELECT 1 AS v EXCEPT SELECT 2", &[]).unwrap();
 
         assert_eq!(rows.len(), 1, "EXCEPT of (1) minus (2) should produce 1 row");
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(1));
@@ -14105,14 +15737,12 @@ mod tests {
         db.execute("CREATE TABLE ea_right (v INT)").unwrap();
         db.execute("INSERT INTO ea_right VALUES (1)").unwrap();
 
-        match db.query(
-            "SELECT v FROM ea_left EXCEPT ALL SELECT v FROM ea_right",
-            &[],
-        ) {
+        match db.query("SELECT v FROM ea_left EXCEPT ALL SELECT v FROM ea_right", &[]) {
             Ok(rows) => {
                 // EXCEPT ALL: left has 3x1, right has 1x1 => 2x1 remain + 1x2 = 3 rows
                 assert_eq!(rows.len(), 3, "EXCEPT ALL should produce 3 rows (two 1s and one 2)");
-                let mut vals: Vec<i32> = rows.iter()
+                let mut vals: Vec<i32> = rows
+                    .iter()
                     .map(|r| match r.get(0).unwrap() {
                         Value::Int4(n) => *n,
                         other => panic!("Expected Int4, got {:?}", other),
@@ -14138,15 +15768,15 @@ mod tests {
         db.execute("CREATE TABLE ia_right (v INT)").unwrap();
         db.execute("INSERT INTO ia_right VALUES (1), (1)").unwrap();
 
-        match db.query(
-            "SELECT v FROM ia_left INTERSECT ALL SELECT v FROM ia_right",
-            &[],
-        ) {
+        match db.query("SELECT v FROM ia_left INTERSECT ALL SELECT v FROM ia_right", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 2, "INTERSECT ALL should produce 2 rows (min of 3,2 = 2)");
                 for row in &rows {
-                    assert_eq!(row.get(0).unwrap(), &Value::Int4(1),
-                        "All INTERSECT ALL results should be 1");
+                    assert_eq!(
+                        row.get(0).unwrap(),
+                        &Value::Int4(1),
+                        "All INTERSECT ALL results should be 1"
+                    );
                 }
             }
             Err(e) => {
@@ -14160,13 +15790,15 @@ mod tests {
         // Three-way UNION chaining: SELECT ... UNION SELECT ... UNION SELECT ...
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 1 AS v UNION SELECT 2 UNION SELECT 3",
-            &[],
-        ).unwrap();
+        let rows = db.query("SELECT 1 AS v UNION SELECT 2 UNION SELECT 3", &[]).unwrap();
 
-        assert_eq!(rows.len(), 3, "Three-way UNION of distinct values should produce 3 rows");
-        let mut vals: Vec<i32> = rows.iter()
+        assert_eq!(
+            rows.len(),
+            3,
+            "Three-way UNION of distinct values should produce 3 rows"
+        );
+        let mut vals: Vec<i32> = rows
+            .iter()
             .map(|r| match r.get(0).unwrap() {
                 Value::Int4(n) => *n,
                 other => panic!("Expected Int4, got {:?}", other),
@@ -14181,13 +15813,16 @@ mod tests {
         // Three-way UNION ALL chaining.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 10 AS v UNION ALL SELECT 20 UNION ALL SELECT 30 UNION ALL SELECT 10",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query(
+                "SELECT 10 AS v UNION ALL SELECT 20 UNION ALL SELECT 30 UNION ALL SELECT 10",
+                &[],
+            )
+            .unwrap();
 
         assert_eq!(rows.len(), 4, "Four-way UNION ALL should produce 4 rows");
-        let vals: Vec<i32> = rows.iter()
+        let vals: Vec<i32> = rows
+            .iter()
             .map(|r| match r.get(0).unwrap() {
                 Value::Int4(n) => *n,
                 other => panic!("Expected Int4, got {:?}", other),
@@ -14203,10 +15838,9 @@ mod tests {
 
         // First SELECT has column named 'first_col', second has 'second_col'.
         // Result schema should use 'first_col' from the left side.
-        let rows = db.query(
-            "SELECT 1 AS first_col UNION ALL SELECT 2 AS second_col",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT 1 AS first_col UNION ALL SELECT 2 AS second_col", &[])
+            .unwrap();
 
         assert_eq!(rows.len(), 2);
         // Verify the values are correct regardless of column naming
@@ -14219,13 +15853,13 @@ mod tests {
         // ORDER BY applies to the entire UNION result.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 3 AS v UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY v",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT 3 AS v UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY v", &[])
+            .unwrap();
 
         assert_eq!(rows.len(), 3, "UNION ALL with ORDER BY should produce 3 rows");
-        let vals: Vec<i32> = rows.iter()
+        let vals: Vec<i32> = rows
+            .iter()
             .map(|r| match r.get(0).unwrap() {
                 Value::Int4(n) => *n,
                 other => panic!("Expected Int4, got {:?}", other),
@@ -14239,13 +15873,16 @@ mod tests {
         // ORDER BY DESC on UNION result.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 3 AS v UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY v DESC",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query(
+                "SELECT 3 AS v UNION ALL SELECT 1 UNION ALL SELECT 2 ORDER BY v DESC",
+                &[],
+            )
+            .unwrap();
 
         assert_eq!(rows.len(), 3);
-        let vals: Vec<i32> = rows.iter()
+        let vals: Vec<i32> = rows
+            .iter()
             .map(|r| match r.get(0).unwrap() {
                 Value::Int4(n) => *n,
                 other => panic!("Expected Int4, got {:?}", other),
@@ -14259,10 +15896,9 @@ mod tests {
         // LIMIT applied to UNION result.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 1 AS v UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT 2",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT 1 AS v UNION ALL SELECT 2 UNION ALL SELECT 3 LIMIT 2", &[])
+            .unwrap();
 
         assert_eq!(rows.len(), 2, "UNION ALL with LIMIT 2 should produce 2 rows");
     }
@@ -14272,15 +15908,18 @@ mod tests {
         // ORDER BY + LIMIT on UNION result.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 5 AS v UNION ALL SELECT 3 UNION ALL SELECT 1 \
+        let rows = db
+            .query(
+                "SELECT 5 AS v UNION ALL SELECT 3 UNION ALL SELECT 1 \
              UNION ALL SELECT 4 UNION ALL SELECT 2 \
              ORDER BY v LIMIT 3",
-            &[],
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
 
         assert_eq!(rows.len(), 3, "UNION ALL with ORDER BY + LIMIT 3 should produce 3 rows");
-        let vals: Vec<i32> = rows.iter()
+        let vals: Vec<i32> = rows
+            .iter()
             .map(|r| match r.get(0).unwrap() {
                 Value::Int4(n) => *n,
                 other => panic!("Expected Int4, got {:?}", other),
@@ -14299,10 +15938,9 @@ mod tests {
         db.execute("CREATE TABLE ie_right (v INT)").unwrap();
         db.execute("INSERT INTO ie_right VALUES (3), (4)").unwrap();
 
-        let rows = db.query(
-            "SELECT v FROM ie_left INTERSECT SELECT v FROM ie_right",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT v FROM ie_left INTERSECT SELECT v FROM ie_right", &[])
+            .unwrap();
 
         assert_eq!(rows.len(), 0, "INTERSECT with no common rows should produce 0 rows");
     }
@@ -14313,21 +15951,18 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
         // UNION ALL: should keep both NULLs
-        let rows_all = db.query(
-            "SELECT NULL AS v UNION ALL SELECT NULL",
-            &[],
-        ).unwrap();
+        let rows_all = db.query("SELECT NULL AS v UNION ALL SELECT NULL", &[]).unwrap();
         assert_eq!(rows_all.len(), 2, "UNION ALL of (NULL, NULL) should produce 2 rows");
         assert_eq!(rows_all[0].get(0).unwrap(), &Value::Null);
         assert_eq!(rows_all[1].get(0).unwrap(), &Value::Null);
 
         // UNION (distinct): should dedup NULLs into one row
-        let rows_distinct = db.query(
-            "SELECT NULL AS v UNION SELECT NULL",
-            &[],
-        ).unwrap();
-        assert_eq!(rows_distinct.len(), 1,
-            "UNION of (NULL, NULL) should dedup to 1 row (SQL standard: NULL = NULL for UNION)");
+        let rows_distinct = db.query("SELECT NULL AS v UNION SELECT NULL", &[]).unwrap();
+        assert_eq!(
+            rows_distinct.len(),
+            1,
+            "UNION of (NULL, NULL) should dedup to 1 row (SQL standard: NULL = NULL for UNION)"
+        );
         assert_eq!(rows_distinct[0].get(0).unwrap(), &Value::Null);
     }
 
@@ -14336,13 +15971,9 @@ mod tests {
         // INTERSECT treats NULL = NULL per SQL standard.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT NULL AS v INTERSECT SELECT NULL",
-            &[],
-        ).unwrap();
+        let rows = db.query("SELECT NULL AS v INTERSECT SELECT NULL", &[]).unwrap();
 
-        assert_eq!(rows.len(), 1,
-            "INTERSECT of (NULL) and (NULL) should produce 1 row");
+        assert_eq!(rows.len(), 1, "INTERSECT of (NULL) and (NULL) should produce 1 row");
         assert_eq!(rows[0].get(0).unwrap(), &Value::Null);
     }
 
@@ -14351,13 +15982,9 @@ mod tests {
         // EXCEPT treats NULL = NULL per SQL standard: NULL EXCEPT NULL = empty.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT NULL AS v EXCEPT SELECT NULL",
-            &[],
-        ).unwrap();
+        let rows = db.query("SELECT NULL AS v EXCEPT SELECT NULL", &[]).unwrap();
 
-        assert_eq!(rows.len(), 0,
-            "EXCEPT of (NULL) minus (NULL) should produce 0 rows");
+        assert_eq!(rows.len(), 0, "EXCEPT of (NULL) minus (NULL) should produce 0 rows");
     }
 
     #[test]
@@ -14365,22 +15992,29 @@ mod tests {
         // UNION ALL with real table data from INSERT statements.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        db.execute("CREATE TABLE employees (id INT, name TEXT, dept TEXT)").unwrap();
+        db.execute("CREATE TABLE employees (id INT, name TEXT, dept TEXT)")
+            .unwrap();
         db.execute("INSERT INTO employees VALUES (1, 'Alice', 'Eng')").unwrap();
         db.execute("INSERT INTO employees VALUES (2, 'Bob', 'Eng')").unwrap();
 
-        db.execute("CREATE TABLE contractors (id INT, name TEXT, dept TEXT)").unwrap();
-        db.execute("INSERT INTO contractors VALUES (3, 'Charlie', 'Eng')").unwrap();
-        db.execute("INSERT INTO contractors VALUES (4, 'Diana', 'Sales')").unwrap();
+        db.execute("CREATE TABLE contractors (id INT, name TEXT, dept TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO contractors VALUES (3, 'Charlie', 'Eng')")
+            .unwrap();
+        db.execute("INSERT INTO contractors VALUES (4, 'Diana', 'Sales')")
+            .unwrap();
 
-        let rows = db.query(
-            "SELECT id, name FROM employees UNION ALL SELECT id, name FROM contractors",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query(
+                "SELECT id, name FROM employees UNION ALL SELECT id, name FROM contractors",
+                &[],
+            )
+            .unwrap();
 
         assert_eq!(rows.len(), 4, "UNION ALL of 2+2 rows should produce 4 rows");
 
-        let names: Vec<String> = rows.iter()
+        let names: Vec<String> = rows
+            .iter()
             .map(|r| match r.get(1).unwrap() {
                 Value::String(s) => s.clone(),
                 other => panic!("Expected String, got {:?}", other),
@@ -14398,21 +16032,26 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
         db.execute("CREATE TABLE colors_a (name TEXT)").unwrap();
-        db.execute("INSERT INTO colors_a VALUES ('red'), ('green'), ('blue')").unwrap();
+        db.execute("INSERT INTO colors_a VALUES ('red'), ('green'), ('blue')")
+            .unwrap();
 
         db.execute("CREATE TABLE colors_b (name TEXT)").unwrap();
-        db.execute("INSERT INTO colors_b VALUES ('blue'), ('green'), ('yellow')").unwrap();
+        db.execute("INSERT INTO colors_b VALUES ('blue'), ('green'), ('yellow')")
+            .unwrap();
 
-        let rows = db.query(
-            "SELECT name FROM colors_a UNION SELECT name FROM colors_b",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT name FROM colors_a UNION SELECT name FROM colors_b", &[])
+            .unwrap();
 
         // red, green, blue, yellow (4 unique)
-        assert_eq!(rows.len(), 4,
-            "UNION of (red,green,blue) and (blue,green,yellow) should produce 4 unique rows");
+        assert_eq!(
+            rows.len(),
+            4,
+            "UNION of (red,green,blue) and (blue,green,yellow) should produce 4 unique rows"
+        );
 
-        let mut names: Vec<String> = rows.iter()
+        let mut names: Vec<String> = rows
+            .iter()
             .map(|r| match r.get(0).unwrap() {
                 Value::String(s) => s.clone(),
                 other => panic!("Expected String, got {:?}", other),
@@ -14428,20 +16067,25 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
         db.execute("CREATE TABLE skills_a (skill TEXT)").unwrap();
-        db.execute("INSERT INTO skills_a VALUES ('rust'), ('python'), ('go')").unwrap();
+        db.execute("INSERT INTO skills_a VALUES ('rust'), ('python'), ('go')")
+            .unwrap();
 
         db.execute("CREATE TABLE skills_b (skill TEXT)").unwrap();
-        db.execute("INSERT INTO skills_b VALUES ('python'), ('go'), ('java')").unwrap();
+        db.execute("INSERT INTO skills_b VALUES ('python'), ('go'), ('java')")
+            .unwrap();
 
-        let rows = db.query(
-            "SELECT skill FROM skills_a INTERSECT SELECT skill FROM skills_b",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT skill FROM skills_a INTERSECT SELECT skill FROM skills_b", &[])
+            .unwrap();
 
-        assert_eq!(rows.len(), 2,
-            "INTERSECT of (rust,python,go) and (python,go,java) should produce 2 rows");
+        assert_eq!(
+            rows.len(),
+            2,
+            "INTERSECT of (rust,python,go) and (python,go,java) should produce 2 rows"
+        );
 
-        let mut names: Vec<String> = rows.iter()
+        let mut names: Vec<String> = rows
+            .iter()
             .map(|r| match r.get(0).unwrap() {
                 Value::String(s) => s.clone(),
                 other => panic!("Expected String, got {:?}", other),
@@ -14457,20 +16101,20 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
         db.execute("CREATE TABLE all_items (item TEXT)").unwrap();
-        db.execute("INSERT INTO all_items VALUES ('a'), ('b'), ('c'), ('d')").unwrap();
+        db.execute("INSERT INTO all_items VALUES ('a'), ('b'), ('c'), ('d')")
+            .unwrap();
 
         db.execute("CREATE TABLE sold_items (item TEXT)").unwrap();
         db.execute("INSERT INTO sold_items VALUES ('b'), ('d')").unwrap();
 
-        let rows = db.query(
-            "SELECT item FROM all_items EXCEPT SELECT item FROM sold_items",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT item FROM all_items EXCEPT SELECT item FROM sold_items", &[])
+            .unwrap();
 
-        assert_eq!(rows.len(), 2,
-            "EXCEPT of (a,b,c,d) minus (b,d) should produce 2 rows");
+        assert_eq!(rows.len(), 2, "EXCEPT of (a,b,c,d) minus (b,d) should produce 2 rows");
 
-        let mut names: Vec<String> = rows.iter()
+        let mut names: Vec<String> = rows
+            .iter()
             .map(|r| match r.get(0).unwrap() {
                 Value::String(s) => s.clone(),
                 other => panic!("Expected String, got {:?}", other),
@@ -14485,10 +16129,9 @@ mod tests {
         // UNION with multiple columns verifies all columns match.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 1 AS a, 'x' AS b UNION ALL SELECT 2, 'y'",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT 1 AS a, 'x' AS b UNION ALL SELECT 2, 'y'", &[])
+            .unwrap();
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(1));
@@ -14503,15 +16146,16 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
         // (1, 'a') appears twice, but (1, 'b') is different from (1, 'a')
-        let rows = db.query(
-            "SELECT 1 AS a, 'a' AS b \
+        let rows = db
+            .query(
+                "SELECT 1 AS a, 'a' AS b \
              UNION SELECT 1, 'a' \
              UNION SELECT 1, 'b'",
-            &[],
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
 
-        assert_eq!(rows.len(), 2,
-            "UNION should dedup (1,'a') but keep (1,'b') as distinct");
+        assert_eq!(rows.len(), 2, "UNION should dedup (1,'a') but keep (1,'b') as distinct");
     }
 
     #[test]
@@ -14523,10 +16167,9 @@ mod tests {
         db.execute("CREATE TABLE full_tbl (v INT)").unwrap();
         db.execute("INSERT INTO full_tbl VALUES (1), (2)").unwrap();
 
-        let rows = db.query(
-            "SELECT v FROM empty_tbl UNION ALL SELECT v FROM full_tbl",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT v FROM empty_tbl UNION ALL SELECT v FROM full_tbl", &[])
+            .unwrap();
 
         assert_eq!(rows.len(), 2, "UNION ALL of empty + 2 rows should produce 2 rows");
     }
@@ -14540,10 +16183,9 @@ mod tests {
         db.execute("INSERT INTO full_tbl2 VALUES (1), (2)").unwrap();
         db.execute("CREATE TABLE empty_tbl2 (v INT)").unwrap();
 
-        let rows = db.query(
-            "SELECT v FROM full_tbl2 UNION ALL SELECT v FROM empty_tbl2",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT v FROM full_tbl2 UNION ALL SELECT v FROM empty_tbl2", &[])
+            .unwrap();
 
         assert_eq!(rows.len(), 2, "UNION ALL of 2 rows + empty should produce 2 rows");
     }
@@ -14556,10 +16198,9 @@ mod tests {
         db.execute("CREATE TABLE empty_a (v INT)").unwrap();
         db.execute("CREATE TABLE empty_b (v INT)").unwrap();
 
-        let rows = db.query(
-            "SELECT v FROM empty_a UNION ALL SELECT v FROM empty_b",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT v FROM empty_a UNION ALL SELECT v FROM empty_b", &[])
+            .unwrap();
 
         assert_eq!(rows.len(), 0, "UNION ALL of two empty tables should produce 0 rows");
     }
@@ -14573,13 +16214,11 @@ mod tests {
         db.execute("INSERT INTO exc_full VALUES (10), (20), (30)").unwrap();
         db.execute("CREATE TABLE exc_empty (v INT)").unwrap();
 
-        let rows = db.query(
-            "SELECT v FROM exc_full EXCEPT SELECT v FROM exc_empty",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT v FROM exc_full EXCEPT SELECT v FROM exc_empty", &[])
+            .unwrap();
 
-        assert_eq!(rows.len(), 3,
-            "EXCEPT with empty right should return all 3 left rows");
+        assert_eq!(rows.len(), 3, "EXCEPT with empty right should return all 3 left rows");
     }
 
     #[test]
@@ -14591,13 +16230,11 @@ mod tests {
         db.execute("INSERT INTO isec_full VALUES (10), (20)").unwrap();
         db.execute("CREATE TABLE isec_empty (v INT)").unwrap();
 
-        let rows = db.query(
-            "SELECT v FROM isec_full INTERSECT SELECT v FROM isec_empty",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT v FROM isec_full INTERSECT SELECT v FROM isec_empty", &[])
+            .unwrap();
 
-        assert_eq!(rows.len(), 0,
-            "INTERSECT with empty right should produce 0 rows");
+        assert_eq!(rows.len(), 0, "INTERSECT with empty right should produce 0 rows");
     }
 
     #[test]
@@ -14608,13 +16245,16 @@ mod tests {
         db.execute("CREATE TABLE nums (v INT)").unwrap();
         db.execute("INSERT INTO nums VALUES (1), (2), (3), (4), (5)").unwrap();
 
-        let rows = db.query(
-            "SELECT v FROM nums WHERE v <= 2 UNION ALL SELECT v FROM nums WHERE v >= 4",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query(
+                "SELECT v FROM nums WHERE v <= 2 UNION ALL SELECT v FROM nums WHERE v >= 4",
+                &[],
+            )
+            .unwrap();
 
         assert_eq!(rows.len(), 4, "UNION ALL of (1,2) and (4,5) should produce 4 rows");
-        let mut vals: Vec<i32> = rows.iter()
+        let mut vals: Vec<i32> = rows
+            .iter()
             .map(|r| match r.get(0).unwrap() {
                 Value::Int4(n) => *n,
                 other => panic!("Expected Int4, got {:?}", other),
@@ -14629,14 +16269,16 @@ mod tests {
         // UNION with mix of NULL and non-NULL values.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 1 AS v UNION SELECT NULL UNION SELECT 2 UNION SELECT NULL",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT 1 AS v UNION SELECT NULL UNION SELECT 2 UNION SELECT NULL", &[])
+            .unwrap();
 
         // Should have 3 distinct entries: 1, 2, NULL (two NULLs deduped)
-        assert_eq!(rows.len(), 3,
-            "UNION of (1, NULL, 2, NULL) should produce 3 rows (dedup NULLs)");
+        assert_eq!(
+            rows.len(),
+            3,
+            "UNION of (1, NULL, 2, NULL) should produce 3 rows (dedup NULLs)"
+        );
     }
 
     #[test]
@@ -14648,20 +16290,20 @@ mod tests {
         db.execute("CREATE TABLE big_b (id INT, val TEXT)").unwrap();
 
         for i in 0..50 {
-            db.execute(&format!("INSERT INTO big_a VALUES ({}, 'a{}')", i, i)).unwrap();
+            db.execute(&format!("INSERT INTO big_a VALUES ({}, 'a{}')", i, i))
+                .unwrap();
         }
         for i in 25..75 {
-            db.execute(&format!("INSERT INTO big_b VALUES ({}, 'b{}')", i, i)).unwrap();
+            db.execute(&format!("INSERT INTO big_b VALUES ({}, 'b{}')", i, i))
+                .unwrap();
         }
 
-        let rows = db.query(
-            "SELECT id, val FROM big_a UNION ALL SELECT id, val FROM big_b",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT id, val FROM big_a UNION ALL SELECT id, val FROM big_b", &[])
+            .unwrap();
 
         // 50 from a + 50 from b = 100 total
-        assert_eq!(rows.len(), 100,
-            "UNION ALL of 50+50 rows should produce 100 rows");
+        assert_eq!(rows.len(), 100, "UNION ALL of 50+50 rows should produce 100 rows");
     }
 
     #[test]
@@ -14669,10 +16311,7 @@ mod tests {
         // INTERSECT with exactly one common row.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 1 AS v INTERSECT SELECT 1",
-            &[],
-        ).unwrap();
+        let rows = db.query("SELECT 1 AS v INTERSECT SELECT 1", &[]).unwrap();
 
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(1));
@@ -14688,23 +16327,23 @@ mod tests {
         db.execute("CREATE TABLE set_b (v INT)").unwrap();
         db.execute("INSERT INTO set_b VALUES (2), (3), (4)").unwrap();
 
-        let a_except_b = db.query(
-            "SELECT v FROM set_a EXCEPT SELECT v FROM set_b",
-            &[],
-        ).unwrap();
+        let a_except_b = db.query("SELECT v FROM set_a EXCEPT SELECT v FROM set_b", &[]).unwrap();
 
-        let b_except_a = db.query(
-            "SELECT v FROM set_b EXCEPT SELECT v FROM set_a",
-            &[],
-        ).unwrap();
+        let b_except_a = db.query("SELECT v FROM set_b EXCEPT SELECT v FROM set_a", &[]).unwrap();
 
         // A - B = {1}, B - A = {4}
         assert_eq!(a_except_b.len(), 1);
         assert_eq!(b_except_a.len(), 1);
-        assert_eq!(a_except_b[0].get(0).unwrap(), &Value::Int4(1),
-            "A EXCEPT B should yield 1");
-        assert_eq!(b_except_a[0].get(0).unwrap(), &Value::Int4(4),
-            "B EXCEPT A should yield 4");
+        assert_eq!(
+            a_except_b[0].get(0).unwrap(),
+            &Value::Int4(1),
+            "A EXCEPT B should yield 1"
+        );
+        assert_eq!(
+            b_except_a[0].get(0).unwrap(),
+            &Value::Int4(4),
+            "B EXCEPT A should yield 4"
+        );
     }
 
     #[test]
@@ -14712,10 +16351,9 @@ mod tests {
         // UNION with text/string values.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 'hello' AS greeting UNION ALL SELECT 'world'",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT 'hello' AS greeting UNION ALL SELECT 'world'", &[])
+            .unwrap();
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("hello".to_string()));
@@ -14727,13 +16365,13 @@ mod tests {
         // UNION (distinct) correctly deduplicates string values.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 'same' AS v UNION SELECT 'same' UNION SELECT 'different'",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT 'same' AS v UNION SELECT 'same' UNION SELECT 'different'", &[])
+            .unwrap();
 
         assert_eq!(rows.len(), 2, "UNION should dedup 'same' into one row");
-        let mut vals: Vec<String> = rows.iter()
+        let mut vals: Vec<String> = rows
+            .iter()
             .map(|r| match r.get(0).unwrap() {
                 Value::String(s) => s.clone(),
                 other => panic!("Expected String, got {:?}", other),
@@ -14748,10 +16386,9 @@ mod tests {
         // UNION with boolean values.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT TRUE AS flag UNION SELECT FALSE UNION SELECT TRUE",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT TRUE AS flag UNION SELECT FALSE UNION SELECT TRUE", &[])
+            .unwrap();
 
         assert_eq!(rows.len(), 2, "UNION of (TRUE, FALSE, TRUE) should produce 2 rows");
     }
@@ -14761,10 +16398,7 @@ mod tests {
         // UNION ALL without ORDER BY should return left rows first, then right rows.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 100 AS v UNION ALL SELECT 200",
-            &[],
-        ).unwrap();
+        let rows = db.query("SELECT 100 AS v UNION ALL SELECT 200", &[]).unwrap();
 
         assert_eq!(rows.len(), 2);
         // Left side (100) should appear before right side (200)
@@ -14780,10 +16414,9 @@ mod tests {
         db.execute("CREATE TABLE self_exc (v INT)").unwrap();
         db.execute("INSERT INTO self_exc VALUES (1), (2), (3)").unwrap();
 
-        let rows = db.query(
-            "SELECT v FROM self_exc EXCEPT SELECT v FROM self_exc",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT v FROM self_exc EXCEPT SELECT v FROM self_exc", &[])
+            .unwrap();
 
         assert_eq!(rows.len(), 0, "Table EXCEPT itself should produce 0 rows");
     }
@@ -14796,13 +16429,13 @@ mod tests {
         db.execute("CREATE TABLE self_int (v INT)").unwrap();
         db.execute("INSERT INTO self_int VALUES (1), (2), (3)").unwrap();
 
-        let rows = db.query(
-            "SELECT v FROM self_int INTERSECT SELECT v FROM self_int",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT v FROM self_int INTERSECT SELECT v FROM self_int", &[])
+            .unwrap();
 
         assert_eq!(rows.len(), 3, "Table INTERSECT itself should return all 3 unique rows");
-        let mut vals: Vec<i32> = rows.iter()
+        let mut vals: Vec<i32> = rows
+            .iter()
             .map(|r| match r.get(0).unwrap() {
                 Value::Int4(n) => *n,
                 other => panic!("Expected Int4, got {:?}", other),
@@ -14817,10 +16450,7 @@ mod tests {
         // UNION with computed expressions.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        let rows = db.query(
-            "SELECT 1 + 1 AS result UNION ALL SELECT 2 * 3",
-            &[],
-        ).unwrap();
+        let rows = db.query("SELECT 1 + 1 AS result UNION ALL SELECT 2 * 3", &[]).unwrap();
 
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(2));
@@ -14863,15 +16493,22 @@ mod tests {
     fn setup_subquery_tables() -> EmbeddedDatabase {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        db.execute("CREATE TABLE customers (id INT, name TEXT, category TEXT)").unwrap();
-        db.execute("CREATE TABLE orders (id INT, customer_id INT, amount INT, product_id INT)").unwrap();
-        db.execute("CREATE TABLE products (id INT, name TEXT, price INT)").unwrap();
+        db.execute("CREATE TABLE customers (id INT, name TEXT, category TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE orders (id INT, customer_id INT, amount INT, product_id INT)")
+            .unwrap();
+        db.execute("CREATE TABLE products (id INT, name TEXT, price INT)")
+            .unwrap();
 
         // Customers
-        db.execute("INSERT INTO customers VALUES (1, 'Alice', 'premium')").unwrap();
-        db.execute("INSERT INTO customers VALUES (2, 'Bob', 'standard')").unwrap();
-        db.execute("INSERT INTO customers VALUES (3, 'Charlie', 'premium')").unwrap();
-        db.execute("INSERT INTO customers VALUES (4, 'Diana', 'standard')").unwrap();
+        db.execute("INSERT INTO customers VALUES (1, 'Alice', 'premium')")
+            .unwrap();
+        db.execute("INSERT INTO customers VALUES (2, 'Bob', 'standard')")
+            .unwrap();
+        db.execute("INSERT INTO customers VALUES (3, 'Charlie', 'premium')")
+            .unwrap();
+        db.execute("INSERT INTO customers VALUES (4, 'Diana', 'standard')")
+            .unwrap();
 
         // Orders: customer 4 (Diana) has no orders
         db.execute("INSERT INTO orders VALUES (10, 1, 100, 1)").unwrap();
@@ -15020,7 +16657,12 @@ mod tests {
         let sql = "SELECT id, name FROM customers WHERE EXISTS (SELECT 1 FROM orders) ORDER BY id";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 4, "EXISTS(non-empty) should return all 4 customers, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    4,
+                    "EXISTS(non-empty) should return all 4 customers, got {}",
+                    rows.len()
+                );
                 assert_eq!(rows[0].get(1), Some(&Value::String("Alice".to_string())));
                 assert_eq!(rows[3].get(1), Some(&Value::String("Diana".to_string())));
             }
@@ -15039,7 +16681,12 @@ mod tests {
         let sql = "SELECT id, name FROM customers WHERE EXISTS (SELECT 1 FROM orders WHERE amount > 9999)";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 0, "EXISTS on empty subquery should return 0 rows, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    0,
+                    "EXISTS on empty subquery should return 0 rows, got {}",
+                    rows.len()
+                );
             }
             Err(e) => {
                 println!("EXISTS with empty subquery not supported: {}", e);
@@ -15056,7 +16703,12 @@ mod tests {
         let sql = "SELECT id, name FROM customers WHERE NOT EXISTS (SELECT 1 FROM orders)";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 0, "NOT EXISTS(non-empty) should return 0 rows, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    0,
+                    "NOT EXISTS(non-empty) should return 0 rows, got {}",
+                    rows.len()
+                );
             }
             Err(e) => {
                 println!("NOT EXISTS uncorrelated not supported: {}", e);
@@ -15070,10 +16722,16 @@ mod tests {
         // No orders with amount > 9999, so NOT EXISTS is true for every customer
         let db = setup_subquery_tables();
 
-        let sql = "SELECT id, name FROM customers WHERE NOT EXISTS (SELECT 1 FROM orders WHERE amount > 9999) ORDER BY id";
+        let sql =
+            "SELECT id, name FROM customers WHERE NOT EXISTS (SELECT 1 FROM orders WHERE amount > 9999) ORDER BY id";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 4, "NOT EXISTS(empty) should return all 4 customers, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    4,
+                    "NOT EXISTS(empty) should return all 4 customers, got {}",
+                    rows.len()
+                );
             }
             Err(e) => {
                 println!("NOT EXISTS with empty subquery not supported: {}", e);
@@ -15091,7 +16749,12 @@ mod tests {
         match db.query(sql, &[]) {
             Ok(rows) => {
                 // Orders with amount >= 200: (11, 200) and (13, 300), so EXISTS is true
-                assert_eq!(rows.len(), 4, "EXISTS with matching filter should return all customers, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    4,
+                    "EXISTS with matching filter should return all customers, got {}",
+                    rows.len()
+                );
             }
             Err(e) => {
                 println!("EXISTS with filter not supported: {}", e);
@@ -15157,17 +16820,15 @@ mod tests {
 
         let sql = "SELECT id, name FROM customers WHERE EXISTS (SELECT 1 FROM orders WHERE orders.customer_id = customers.id) ORDER BY id";
         match db.query(sql, &[]) {
-            Ok(rows) => {
-                match rows.len() {
-                    0 => println!("Correlated EXISTS returns 0 rows (v3.31.1 fallback)"),
-                    3 => {
-                        assert_eq!(rows[0].get(0), Some(&Value::Int4(1)));
-                        assert_eq!(rows[1].get(0), Some(&Value::Int4(2)));
-                        assert_eq!(rows[2].get(0), Some(&Value::Int4(3)));
-                    }
-                    n => panic!("Correlated EXISTS: unexpected {} rows", n),
+            Ok(rows) => match rows.len() {
+                0 => println!("Correlated EXISTS returns 0 rows (v3.31.1 fallback)"),
+                3 => {
+                    assert_eq!(rows[0].get(0), Some(&Value::Int4(1)));
+                    assert_eq!(rows[1].get(0), Some(&Value::Int4(2)));
+                    assert_eq!(rows[2].get(0), Some(&Value::Int4(3)));
                 }
-            }
+                n => panic!("Correlated EXISTS: unexpected {} rows", n),
+            },
             Err(e) => {
                 println!("Correlated EXISTS not supported: {}", e);
             }
@@ -15184,16 +16845,14 @@ mod tests {
 
         let sql = "SELECT id, name FROM customers WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.customer_id = customers.id) ORDER BY id";
         match db.query(sql, &[]) {
-            Ok(rows) => {
-                match rows.len() {
-                    4 => println!("Correlated NOT EXISTS returns all 4 rows (v3.31.1 fallback)"),
-                    1 => {
-                        assert_eq!(rows[0].get(0), Some(&Value::Int4(4)));
-                        assert_eq!(rows[0].get(1), Some(&Value::String("Diana".to_string())));
-                    }
-                    n => panic!("Correlated NOT EXISTS: unexpected {} rows", n),
+            Ok(rows) => match rows.len() {
+                4 => println!("Correlated NOT EXISTS returns all 4 rows (v3.31.1 fallback)"),
+                1 => {
+                    assert_eq!(rows[0].get(0), Some(&Value::Int4(4)));
+                    assert_eq!(rows[0].get(1), Some(&Value::String("Diana".to_string())));
                 }
-            }
+                n => panic!("Correlated NOT EXISTS: unexpected {} rows", n),
+            },
             Err(e) => {
                 println!("Correlated NOT EXISTS not supported: {}", e);
             }
@@ -15214,8 +16873,11 @@ mod tests {
                 // Alice: 2 orders, Bob: 1, Charlie: 1, Diana: 0
                 assert_eq!(rows.len(), 4, "Should return all 4 customers");
                 // Check order counts if scalar subquery is supported
-                println!("Scalar subquery returned {} rows - values: {:?}", rows.len(),
-                    rows.iter().map(|r| (r.get(0), r.get(1))).collect::<Vec<_>>());
+                println!(
+                    "Scalar subquery returned {} rows - values: {:?}",
+                    rows.len(),
+                    rows.iter().map(|r| (r.get(0), r.get(1))).collect::<Vec<_>>()
+                );
             }
             Err(e) => {
                 // Scalar subqueries (Expr::Subquery) are not handled in expr_to_logical;
@@ -15280,8 +16942,10 @@ mod tests {
             Ok(rows) => {
                 // customer_id=1: 100+200=300, customer_id=2: 50, customer_id=3: 300
                 assert_eq!(rows.len(), 3, "3 customers have orders, got {}", rows.len());
-                println!("FROM subquery with aggregation returned: {:?}",
-                    rows.iter().map(|r| (r.get(0), r.get(1))).collect::<Vec<_>>());
+                println!(
+                    "FROM subquery with aggregation returned: {:?}",
+                    rows.iter().map(|r| (r.get(0), r.get(1))).collect::<Vec<_>>()
+                );
             }
             Err(e) => {
                 println!("Subquery in FROM with aggregation not supported: {}", e);
@@ -15321,7 +16985,12 @@ mod tests {
                    (SELECT id FROM products WHERE price > 20)) ORDER BY id";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 2, "2 customers ordered expensive products, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "2 customers ordered expensive products, got {}",
+                    rows.len()
+                );
                 assert_eq!(rows[0].get(0), Some(&Value::Int4(1)));
                 assert_eq!(rows[0].get(1), Some(&Value::String("Alice".to_string())));
                 assert_eq!(rows[1].get(0), Some(&Value::Int4(3)));
@@ -15349,7 +17018,12 @@ mod tests {
                    (SELECT id FROM customers WHERE category = 'premium')) ORDER BY id";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 3, "3 products ordered by premium customers, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    3,
+                    "3 products ordered by premium customers, got {}",
+                    rows.len()
+                );
                 assert_eq!(rows[0].get(1), Some(&Value::String("Widget".to_string())));
                 assert_eq!(rows[1].get(1), Some(&Value::String("Gadget".to_string())));
                 assert_eq!(rows[2].get(1), Some(&Value::String("Gizmo".to_string())));
@@ -15376,7 +17050,12 @@ mod tests {
                    ORDER BY id";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 2, "2 premium customers when orders exist, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "2 premium customers when orders exist, got {}",
+                    rows.len()
+                );
                 assert_eq!(rows[0].get(1), Some(&Value::String("Alice".to_string())));
                 assert_eq!(rows[1].get(1), Some(&Value::String("Charlie".to_string())));
             }
@@ -15416,7 +17095,12 @@ mod tests {
         let sql = "SELECT id, name FROM customers WHERE id + 0 IN (SELECT customer_id FROM orders) ORDER BY id";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 3, "3 customers with orders (via expression), got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    3,
+                    "3 customers with orders (via expression), got {}",
+                    rows.len()
+                );
                 assert_eq!(rows[0].get(0), Some(&Value::Int4(1)));
                 assert_eq!(rows[1].get(0), Some(&Value::Int4(2)));
                 assert_eq!(rows[2].get(0), Some(&Value::Int4(3)));
@@ -15436,7 +17120,12 @@ mod tests {
         let sql = "SELECT id, name FROM customers WHERE id IN (SELECT customer_id FROM orders WHERE amount = 300)";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 1, "Only 1 customer has the 300-amount order, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "Only 1 customer has the 300-amount order, got {}",
+                    rows.len()
+                );
                 assert_eq!(rows[0].get(0), Some(&Value::Int4(3)));
                 assert_eq!(rows[0].get(1), Some(&Value::String("Charlie".to_string())));
             }
@@ -15455,7 +17144,12 @@ mod tests {
         match db.query(sql, &[]) {
             Ok(rows) => {
                 // Orders with amount > 100: (11, 200) and (13, 300), so EXISTS is true
-                assert_eq!(rows.len(), 4, "EXISTS(SELECT *) with matches returns all outer rows, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    4,
+                    "EXISTS(SELECT *) with matches returns all outer rows, got {}",
+                    rows.len()
+                );
             }
             Err(e) => {
                 println!("EXISTS with SELECT * not supported: {}", e);
@@ -15468,11 +17162,17 @@ mod tests {
         // Derived table in FROM, then apply outer WHERE filter
         let db = setup_subquery_tables();
 
-        let sql = "SELECT * FROM (SELECT id, name, category FROM customers) AS sub WHERE category = 'standard' ORDER BY id";
+        let sql =
+            "SELECT * FROM (SELECT id, name, category FROM customers) AS sub WHERE category = 'standard' ORDER BY id";
         match db.query(sql, &[]) {
             Ok(rows) => {
                 // Standard customers: Bob(2), Diana(4)
-                assert_eq!(rows.len(), 2, "2 standard customers via derived table, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "2 standard customers via derived table, got {}",
+                    rows.len()
+                );
                 assert_eq!(rows[0].get(1), Some(&Value::String("Bob".to_string())));
                 assert_eq!(rows[1].get(1), Some(&Value::String("Diana".to_string())));
             }
@@ -15537,7 +17237,11 @@ mod tests {
         let sql = "SELECT id FROM checker WHERE EXISTS (SELECT 1 FROM singleton) ORDER BY id";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 2, "EXISTS on single-row table should return all checker rows");
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "EXISTS on single-row table should return all checker rows"
+                );
                 assert_eq!(rows[0].get(0), Some(&Value::Int4(1)));
                 assert_eq!(rows[1].get(0), Some(&Value::Int4(2)));
             }
@@ -15558,7 +17262,12 @@ mod tests {
                 // Customer names: Alice, Bob, Charlie, Diana
                 // Product names: Widget, Gadget, Gizmo, Doohickey
                 // No overlap, so no rows returned
-                assert_eq!(rows.len(), 0, "No customer names match product names, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    0,
+                    "No customer names match product names, got {}",
+                    rows.len()
+                );
             }
             Err(e) => {
                 println!("IN subquery with string column not supported: {}", e);
@@ -15574,7 +17283,12 @@ mod tests {
         let sql = "SELECT id, name FROM customers WHERE name NOT IN (SELECT name FROM products) ORDER BY id";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 4, "All 4 customers have non-product names, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    4,
+                    "All 4 customers have non-product names, got {}",
+                    rows.len()
+                );
             }
             Err(e) => {
                 println!("NOT IN subquery with string column not supported: {}", e);
@@ -15619,7 +17333,12 @@ mod tests {
             Ok(rows) => {
                 // No orders > 9999, so EXISTS is false
                 // Only premium: Alice(1), Charlie(3)
-                assert_eq!(rows.len(), 2, "Only premium customers when EXISTS is false, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "Only premium customers when EXISTS is false, got {}",
+                    rows.len()
+                );
                 assert_eq!(rows[0].get(1), Some(&Value::String("Alice".to_string())));
                 assert_eq!(rows[1].get(1), Some(&Value::String("Charlie".to_string())));
             }
@@ -15643,7 +17362,12 @@ mod tests {
             Ok(rows) => {
                 // No orders > 9999, so NOT EXISTS is true
                 // Standard customers: Bob(2), Diana(4)
-                assert_eq!(rows.len(), 2, "Standard customers when NOT EXISTS is true, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "Standard customers when NOT EXISTS is true, got {}",
+                    rows.len()
+                );
                 assert_eq!(rows[0].get(1), Some(&Value::String("Bob".to_string())));
                 assert_eq!(rows[1].get(1), Some(&Value::String("Diana".to_string())));
             }
@@ -15669,23 +17393,27 @@ mod tests {
         // Customers table
         db.execute("CREATE TABLE jt_customers (id INT PRIMARY KEY, name TEXT, city TEXT)")
             .unwrap();
-        db.execute("INSERT INTO jt_customers VALUES (1, 'Alice', 'NYC')").unwrap();
+        db.execute("INSERT INTO jt_customers VALUES (1, 'Alice', 'NYC')")
+            .unwrap();
         db.execute("INSERT INTO jt_customers VALUES (2, 'Bob', 'LA')").unwrap();
-        db.execute("INSERT INTO jt_customers VALUES (3, 'Carol', 'NYC')").unwrap();
-        db.execute("INSERT INTO jt_customers VALUES (4, 'Diana', 'Chicago')").unwrap();
+        db.execute("INSERT INTO jt_customers VALUES (3, 'Carol', 'NYC')")
+            .unwrap();
+        db.execute("INSERT INTO jt_customers VALUES (4, 'Diana', 'Chicago')")
+            .unwrap();
 
         // Products table
         db.execute("CREATE TABLE jt_products (id INT PRIMARY KEY, name TEXT, price INT)")
             .unwrap();
-        db.execute("INSERT INTO jt_products VALUES (10, 'Widget', 100)").unwrap();
-        db.execute("INSERT INTO jt_products VALUES (20, 'Gadget', 250)").unwrap();
-        db.execute("INSERT INTO jt_products VALUES (30, 'Doohickey', 50)").unwrap();
+        db.execute("INSERT INTO jt_products VALUES (10, 'Widget', 100)")
+            .unwrap();
+        db.execute("INSERT INTO jt_products VALUES (20, 'Gadget', 250)")
+            .unwrap();
+        db.execute("INSERT INTO jt_products VALUES (30, 'Doohickey', 50)")
+            .unwrap();
 
         // Orders table (references customers)
-        db.execute(
-            "CREATE TABLE jt_orders (id INT PRIMARY KEY, customer_id INT, product_id INT, qty INT)",
-        )
-        .unwrap();
+        db.execute("CREATE TABLE jt_orders (id INT PRIMARY KEY, customer_id INT, product_id INT, qty INT)")
+            .unwrap();
         db.execute("INSERT INTO jt_orders VALUES (100, 1, 10, 2)").unwrap(); // Alice buys 2 Widgets
         db.execute("INSERT INTO jt_orders VALUES (101, 1, 20, 1)").unwrap(); // Alice buys 1 Gadget
         db.execute("INSERT INTO jt_orders VALUES (102, 2, 10, 5)").unwrap(); // Bob buys 5 Widgets
@@ -15739,26 +17467,26 @@ mod tests {
         // 4-table JOIN chain: orders -> customers -> addresses -> cities
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        db.execute("CREATE TABLE jt4_cities (id INT PRIMARY KEY, city_name TEXT)").unwrap();
+        db.execute("CREATE TABLE jt4_cities (id INT PRIMARY KEY, city_name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO jt4_cities VALUES (1, 'New York')").unwrap();
         db.execute("INSERT INTO jt4_cities VALUES (2, 'Los Angeles')").unwrap();
 
         db.execute("CREATE TABLE jt4_addresses (id INT PRIMARY KEY, street TEXT, city_id INT)")
             .unwrap();
-        db.execute("INSERT INTO jt4_addresses VALUES (10, '123 Main St', 1)").unwrap();
-        db.execute("INSERT INTO jt4_addresses VALUES (20, '456 Oak Ave', 2)").unwrap();
+        db.execute("INSERT INTO jt4_addresses VALUES (10, '123 Main St', 1)")
+            .unwrap();
+        db.execute("INSERT INTO jt4_addresses VALUES (20, '456 Oak Ave', 2)")
+            .unwrap();
 
-        db.execute(
-            "CREATE TABLE jt4_customers (id INT PRIMARY KEY, name TEXT, address_id INT)",
-        )
-        .unwrap();
-        db.execute("INSERT INTO jt4_customers VALUES (100, 'Alice', 10)").unwrap();
+        db.execute("CREATE TABLE jt4_customers (id INT PRIMARY KEY, name TEXT, address_id INT)")
+            .unwrap();
+        db.execute("INSERT INTO jt4_customers VALUES (100, 'Alice', 10)")
+            .unwrap();
         db.execute("INSERT INTO jt4_customers VALUES (200, 'Bob', 20)").unwrap();
 
-        db.execute(
-            "CREATE TABLE jt4_orders (id INT PRIMARY KEY, customer_id INT, amount INT)",
-        )
-        .unwrap();
+        db.execute("CREATE TABLE jt4_orders (id INT PRIMARY KEY, customer_id INT, amount INT)")
+            .unwrap();
         db.execute("INSERT INTO jt4_orders VALUES (1000, 100, 500)").unwrap();
         db.execute("INSERT INTO jt4_orders VALUES (1001, 200, 300)").unwrap();
 
@@ -15794,20 +17522,24 @@ mod tests {
     fn setup_employee_db() -> EmbeddedDatabase {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        db.execute(
-            "CREATE TABLE jt_employees (id INT PRIMARY KEY, name TEXT, manager_id INT, dept TEXT)",
-        )
-        .unwrap();
+        db.execute("CREATE TABLE jt_employees (id INT PRIMARY KEY, name TEXT, manager_id INT, dept TEXT)")
+            .unwrap();
         // CEO has no manager (NULL manager_id)
-        db.execute("INSERT INTO jt_employees VALUES (1, 'Eve', NULL, 'Exec')").unwrap();
+        db.execute("INSERT INTO jt_employees VALUES (1, 'Eve', NULL, 'Exec')")
+            .unwrap();
         // Directors report to CEO
-        db.execute("INSERT INTO jt_employees VALUES (2, 'Frank', 1, 'Engineering')").unwrap();
-        db.execute("INSERT INTO jt_employees VALUES (3, 'Grace', 1, 'Sales')").unwrap();
+        db.execute("INSERT INTO jt_employees VALUES (2, 'Frank', 1, 'Engineering')")
+            .unwrap();
+        db.execute("INSERT INTO jt_employees VALUES (3, 'Grace', 1, 'Sales')")
+            .unwrap();
         // Engineers report to Frank
-        db.execute("INSERT INTO jt_employees VALUES (4, 'Hank', 2, 'Engineering')").unwrap();
-        db.execute("INSERT INTO jt_employees VALUES (5, 'Iris', 2, 'Engineering')").unwrap();
+        db.execute("INSERT INTO jt_employees VALUES (4, 'Hank', 2, 'Engineering')")
+            .unwrap();
+        db.execute("INSERT INTO jt_employees VALUES (5, 'Iris', 2, 'Engineering')")
+            .unwrap();
         // Sales person reports to Grace
-        db.execute("INSERT INTO jt_employees VALUES (6, 'Jack', 3, 'Sales')").unwrap();
+        db.execute("INSERT INTO jt_employees VALUES (6, 'Jack', 3, 'Sales')")
+            .unwrap();
 
         db
     }
@@ -15914,7 +17646,8 @@ mod tests {
         let db = setup_multi_table_join_db();
 
         // Add a product that nobody ordered
-        db.execute("INSERT INTO jt_products VALUES (40, 'Thingamajig', 75)").unwrap();
+        db.execute("INSERT INTO jt_products VALUES (40, 'Thingamajig', 75)")
+            .unwrap();
 
         let sql = "\
             SELECT jt_orders.id, jt_products.name \
@@ -15945,11 +17678,13 @@ mod tests {
         // CROSS JOIN: cartesian product of two small tables
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        db.execute("CREATE TABLE jt_colors (id INT PRIMARY KEY, color TEXT)").unwrap();
+        db.execute("CREATE TABLE jt_colors (id INT PRIMARY KEY, color TEXT)")
+            .unwrap();
         db.execute("INSERT INTO jt_colors VALUES (1, 'Red')").unwrap();
         db.execute("INSERT INTO jt_colors VALUES (2, 'Blue')").unwrap();
 
-        db.execute("CREATE TABLE jt_sizes (id INT PRIMARY KEY, size TEXT)").unwrap();
+        db.execute("CREATE TABLE jt_sizes (id INT PRIMARY KEY, size TEXT)")
+            .unwrap();
         db.execute("INSERT INTO jt_sizes VALUES (1, 'Small')").unwrap();
         db.execute("INSERT INTO jt_sizes VALUES (2, 'Medium')").unwrap();
         db.execute("INSERT INTO jt_sizes VALUES (3, 'Large')").unwrap();
@@ -16001,7 +17736,12 @@ mod tests {
         match db.query(sql, &[]) {
             Ok(rows) => {
                 // Only (1,10) and (1,20) match on both columns
-                assert_eq!(rows.len(), 2, "Expected 2 rows matching both conditions, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "Expected 2 rows matching both conditions, got {}",
+                    rows.len()
+                );
                 assert_eq!(rows[0].get(0).unwrap(), &Value::String("x".to_string()));
                 assert_eq!(rows[0].get(1).unwrap(), &Value::String("match1".to_string()));
                 assert_eq!(rows[1].get(0).unwrap(), &Value::String("y".to_string()));
@@ -16075,11 +17815,13 @@ mod tests {
         // JOIN producing empty result: no matching rows
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        db.execute("CREATE TABLE jt_empty_a (id INT PRIMARY KEY, val TEXT)").unwrap();
+        db.execute("CREATE TABLE jt_empty_a (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
         db.execute("INSERT INTO jt_empty_a VALUES (1, 'one')").unwrap();
         db.execute("INSERT INTO jt_empty_a VALUES (2, 'two')").unwrap();
 
-        db.execute("CREATE TABLE jt_empty_b (id INT PRIMARY KEY, ref_id INT, info TEXT)").unwrap();
+        db.execute("CREATE TABLE jt_empty_b (id INT PRIMARY KEY, ref_id INT, info TEXT)")
+            .unwrap();
         db.execute("INSERT INTO jt_empty_b VALUES (10, 99, 'orphan1')").unwrap();
         db.execute("INSERT INTO jt_empty_b VALUES (20, 98, 'orphan2')").unwrap();
 
@@ -16104,11 +17846,13 @@ mod tests {
         // LEFT JOIN where FK is NULL: some rows have NULL foreign keys
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        db.execute("CREATE TABLE jt_depts (id INT PRIMARY KEY, dept_name TEXT)").unwrap();
+        db.execute("CREATE TABLE jt_depts (id INT PRIMARY KEY, dept_name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO jt_depts VALUES (1, 'Engineering')").unwrap();
         db.execute("INSERT INTO jt_depts VALUES (2, 'Marketing')").unwrap();
 
-        db.execute("CREATE TABLE jt_staff (id INT PRIMARY KEY, name TEXT, dept_id INT)").unwrap();
+        db.execute("CREATE TABLE jt_staff (id INT PRIMARY KEY, name TEXT, dept_id INT)")
+            .unwrap();
         db.execute("INSERT INTO jt_staff VALUES (1, 'Alice', 1)").unwrap();
         db.execute("INSERT INTO jt_staff VALUES (2, 'Bob', NULL)").unwrap(); // No department
         db.execute("INSERT INTO jt_staff VALUES (3, 'Carol', 2)").unwrap();
@@ -16256,7 +18000,8 @@ mod tests {
         db.execute("INSERT INTO jt_t1 VALUES (1, 'a')").unwrap();
         db.execute("INSERT INTO jt_t1 VALUES (2, 'b')").unwrap();
 
-        db.execute("CREATE TABLE jt_t2 (id INT PRIMARY KEY, t1_id INT, info TEXT)").unwrap();
+        db.execute("CREATE TABLE jt_t2 (id INT PRIMARY KEY, t1_id INT, info TEXT)")
+            .unwrap();
         db.execute("INSERT INTO jt_t2 VALUES (10, 1, 'info1')").unwrap();
         db.execute("INSERT INTO jt_t2 VALUES (20, 2, 'info2')").unwrap();
         db.execute("INSERT INTO jt_t2 VALUES (30, 1, 'info3')").unwrap();
@@ -16358,19 +18103,20 @@ mod tests {
         // customers INNER JOIN orders LEFT JOIN (optional) product_reviews
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        db.execute("CREATE TABLE jt_mix_cust (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE jt_mix_cust (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO jt_mix_cust VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO jt_mix_cust VALUES (2, 'Bob')").unwrap();
 
         db.execute("CREATE TABLE jt_mix_orders (id INT PRIMARY KEY, cust_id INT, product TEXT)")
             .unwrap();
-        db.execute("INSERT INTO jt_mix_orders VALUES (10, 1, 'Widget')").unwrap();
-        db.execute("INSERT INTO jt_mix_orders VALUES (20, 2, 'Gadget')").unwrap();
+        db.execute("INSERT INTO jt_mix_orders VALUES (10, 1, 'Widget')")
+            .unwrap();
+        db.execute("INSERT INTO jt_mix_orders VALUES (20, 2, 'Gadget')")
+            .unwrap();
 
-        db.execute(
-            "CREATE TABLE jt_mix_reviews (id INT PRIMARY KEY, order_id INT, rating INT)",
-        )
-        .unwrap();
+        db.execute("CREATE TABLE jt_mix_reviews (id INT PRIMARY KEY, order_id INT, rating INT)")
+            .unwrap();
         // Only order 10 has a review
         db.execute("INSERT INTO jt_mix_reviews VALUES (100, 10, 5)").unwrap();
 
@@ -16453,11 +18199,13 @@ mod tests {
         // JOIN with one empty table: should produce 0 results
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        db.execute("CREATE TABLE jt_full (id INT PRIMARY KEY, val TEXT)").unwrap();
+        db.execute("CREATE TABLE jt_full (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
         db.execute("INSERT INTO jt_full VALUES (1, 'one')").unwrap();
         db.execute("INSERT INTO jt_full VALUES (2, 'two')").unwrap();
 
-        db.execute("CREATE TABLE jt_empty (id INT PRIMARY KEY, ref_id INT)").unwrap();
+        db.execute("CREATE TABLE jt_empty (id INT PRIMARY KEY, ref_id INT)")
+            .unwrap();
         // No data inserted into jt_empty
 
         let sql = "\
@@ -16467,7 +18215,12 @@ mod tests {
 
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 0, "JOIN with empty table should produce 0 rows, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    0,
+                    "JOIN with empty table should produce 0 rows, got {}",
+                    rows.len()
+                );
             }
             Err(e) => {
                 panic!("JOIN with empty table failed: {}", e);
@@ -16480,7 +18233,8 @@ mod tests {
         // LEFT JOIN with empty right table: all left rows with NULL right columns
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        db.execute("CREATE TABLE jt_main (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE jt_main (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO jt_main VALUES (1, 'alpha')").unwrap();
         db.execute("INSERT INTO jt_main VALUES (2, 'beta')").unwrap();
 
@@ -16541,7 +18295,8 @@ mod tests {
         // JOIN where multiple rows match the same join key (one-to-many)
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        db.execute("CREATE TABLE jt_parent (id INT PRIMARY KEY, label TEXT)").unwrap();
+        db.execute("CREATE TABLE jt_parent (id INT PRIMARY KEY, label TEXT)")
+            .unwrap();
         db.execute("INSERT INTO jt_parent VALUES (1, 'group_a')").unwrap();
 
         db.execute("CREATE TABLE jt_child (id INT PRIMARY KEY, parent_id INT, name TEXT)")
@@ -16578,19 +18333,24 @@ mod tests {
         // 5-table chain: a -> b -> c -> d -> e
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-        db.execute("CREATE TABLE jt5_a (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE jt5_a (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO jt5_a VALUES (1, 'a1')").unwrap();
 
-        db.execute("CREATE TABLE jt5_b (id INT PRIMARY KEY, a_id INT, name TEXT)").unwrap();
+        db.execute("CREATE TABLE jt5_b (id INT PRIMARY KEY, a_id INT, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO jt5_b VALUES (10, 1, 'b1')").unwrap();
 
-        db.execute("CREATE TABLE jt5_c (id INT PRIMARY KEY, b_id INT, name TEXT)").unwrap();
+        db.execute("CREATE TABLE jt5_c (id INT PRIMARY KEY, b_id INT, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO jt5_c VALUES (100, 10, 'c1')").unwrap();
 
-        db.execute("CREATE TABLE jt5_d (id INT PRIMARY KEY, c_id INT, name TEXT)").unwrap();
+        db.execute("CREATE TABLE jt5_d (id INT PRIMARY KEY, c_id INT, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO jt5_d VALUES (1000, 100, 'd1')").unwrap();
 
-        db.execute("CREATE TABLE jt5_e (id INT PRIMARY KEY, d_id INT, name TEXT)").unwrap();
+        db.execute("CREATE TABLE jt5_e (id INT PRIMARY KEY, d_id INT, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO jt5_e VALUES (10000, 1000, 'e1')").unwrap();
 
         let sql = "\
@@ -16658,70 +18418,87 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
         // Simulate WordPress wp_term_taxonomy and wp_terms tables
-        db.execute("CREATE TABLE wp_term_taxonomy (term_taxonomy_id INT PRIMARY KEY, term_id INT, taxonomy TEXT)").unwrap();
-        db.execute("CREATE TABLE wp_terms (term_id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE wp_term_taxonomy (term_taxonomy_id INT PRIMARY KEY, term_id INT, taxonomy TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE wp_terms (term_id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO wp_terms VALUES (1, 'Uncategorized')").unwrap();
         db.execute("INSERT INTO wp_terms VALUES (2, 'News')").unwrap();
-        db.execute("INSERT INTO wp_term_taxonomy VALUES (1, 1, 'category')").unwrap();
-        db.execute("INSERT INTO wp_term_taxonomy VALUES (2, 2, 'category')").unwrap();
-        db.execute("INSERT INTO wp_term_taxonomy VALUES (3, 2, 'post_tag')").unwrap();
+        db.execute("INSERT INTO wp_term_taxonomy VALUES (1, 1, 'category')")
+            .unwrap();
+        db.execute("INSERT INTO wp_term_taxonomy VALUES (2, 2, 'category')")
+            .unwrap();
+        db.execute("INSERT INTO wp_term_taxonomy VALUES (3, 2, 'post_tag')")
+            .unwrap();
 
         // WordPress exact query pattern: alias.column in SELECT + WHERE + ON
-        let rows = db.query(
-            "SELECT tt.term_taxonomy_id FROM wp_term_taxonomy AS tt \
+        let rows = db
+            .query(
+                "SELECT tt.term_taxonomy_id FROM wp_term_taxonomy AS tt \
              INNER JOIN wp_terms AS t ON t.term_id = tt.term_id \
              WHERE tt.taxonomy = 'category'",
-            &[],
-        ).expect("WordPress-style JOIN with aliased WHERE column should work");
+                &[],
+            )
+            .expect("WordPress-style JOIN with aliased WHERE column should work");
         assert_eq!(rows.len(), 2, "Should find 2 category rows");
 
         // Also test alias.column in SELECT with multiple columns from both tables
-        let rows = db.query(
-            "SELECT t.name, tt.taxonomy FROM wp_term_taxonomy AS tt \
+        let rows = db
+            .query(
+                "SELECT t.name, tt.taxonomy FROM wp_term_taxonomy AS tt \
              INNER JOIN wp_terms AS t ON t.term_id = tt.term_id \
              WHERE tt.taxonomy = 'category' ORDER BY t.name",
-            &[],
-        ).expect("Multi-column aliased JOIN should work");
+                &[],
+            )
+            .expect("Multi-column aliased JOIN should work");
         assert_eq!(rows.len(), 2);
 
         // Simple two-table JOIN with aliases in WHERE
         db.execute("CREATE TABLE t1 (id INT PRIMARY KEY, name TEXT)").unwrap();
-        db.execute("CREATE TABLE t2 (id INT PRIMARY KEY, t1_id INT, value TEXT)").unwrap();
+        db.execute("CREATE TABLE t2 (id INT PRIMARY KEY, t1_id INT, value TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t1 VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO t2 VALUES (1, 1, 'hello')").unwrap();
 
-        let rows = db.query(
-            "SELECT a.name, b.value FROM t1 AS a INNER JOIN t2 AS b ON a.id = b.t1_id WHERE a.name = 'Alice'",
-            &[],
-        ).expect("JOIN with aliased WHERE column should work");
+        let rows = db
+            .query(
+                "SELECT a.name, b.value FROM t1 AS a INNER JOIN t2 AS b ON a.id = b.t1_id WHERE a.name = 'Alice'",
+                &[],
+            )
+            .expect("JOIN with aliased WHERE column should work");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("Alice".to_string()));
         assert_eq!(rows[0].get(1).unwrap(), &Value::String("hello".to_string()));
 
         // Three-table JOIN with aliases (WordPress pattern: wp_term_relationships)
-        db.execute("CREATE TABLE wp_term_relationships (object_id INT, term_taxonomy_id INT)").unwrap();
+        db.execute("CREATE TABLE wp_term_relationships (object_id INT, term_taxonomy_id INT)")
+            .unwrap();
         db.execute("INSERT INTO wp_term_relationships VALUES (10, 1)").unwrap();
         db.execute("INSERT INTO wp_term_relationships VALUES (20, 2)").unwrap();
         db.execute("INSERT INTO wp_term_relationships VALUES (30, 3)").unwrap();
 
-        let rows = db.query(
-            "SELECT tr.object_id, tt.taxonomy, t.name \
+        let rows = db
+            .query(
+                "SELECT tr.object_id, tt.taxonomy, t.name \
              FROM wp_term_relationships AS tr \
              INNER JOIN wp_term_taxonomy AS tt ON tr.term_taxonomy_id = tt.term_taxonomy_id \
              INNER JOIN wp_terms AS t ON t.term_id = tt.term_id \
              WHERE tt.taxonomy = 'category'",
-            &[],
-        ).expect("Three-table WordPress-style JOIN should work");
+                &[],
+            )
+            .expect("Three-table WordPress-style JOIN should work");
         assert_eq!(rows.len(), 2, "Should find 2 relationships with category taxonomy");
 
         // Test ON condition with swapped column order (right alias on left side of equality)
         // This was the exact trigger: ON t.term_id = tt.term_id where t is the right table
-        let rows = db.query(
-            "SELECT tt.term_taxonomy_id FROM wp_term_taxonomy AS tt \
+        let rows = db
+            .query(
+                "SELECT tt.term_taxonomy_id FROM wp_term_taxonomy AS tt \
              INNER JOIN wp_terms AS t ON tt.term_id = t.term_id \
              WHERE tt.taxonomy = 'category'",
-            &[],
-        ).expect("JOIN with swapped ON column order should work");
+                &[],
+            )
+            .expect("JOIN with swapped ON column order should work");
         assert_eq!(rows.len(), 2, "Should still find 2 category rows with swapped ON order");
     }
 
@@ -16733,7 +18510,8 @@ mod tests {
     fn test_truncate_basic() {
         // TRUNCATE removes all rows from a table
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE trunc_basic (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE trunc_basic (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO trunc_basic VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO trunc_basic VALUES (2, 'Bob')").unwrap();
         db.execute("INSERT INTO trunc_basic VALUES (3, 'Charlie')").unwrap();
@@ -16751,13 +18529,16 @@ mod tests {
     fn test_truncate_preserves_schema() {
         // Table structure (columns, types) should be intact after TRUNCATE
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE trunc_schema (id INT PRIMARY KEY, name TEXT, score FLOAT)").unwrap();
-        db.execute("INSERT INTO trunc_schema VALUES (1, 'Alice', 95.5)").unwrap();
+        db.execute("CREATE TABLE trunc_schema (id INT PRIMARY KEY, name TEXT, score FLOAT)")
+            .unwrap();
+        db.execute("INSERT INTO trunc_schema VALUES (1, 'Alice', 95.5)")
+            .unwrap();
 
         db.execute("TRUNCATE TABLE trunc_schema").unwrap();
 
         // The table still exists and accepts inserts with the same schema
-        db.execute("INSERT INTO trunc_schema VALUES (10, 'David', 88.0)").unwrap();
+        db.execute("INSERT INTO trunc_schema VALUES (10, 'David', 88.0)")
+            .unwrap();
         let rows = db.query("SELECT id, name, score FROM trunc_schema", &[]).unwrap();
         assert_eq!(rows.len(), 1, "Should have 1 row after re-insert");
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(10));
@@ -16768,11 +18549,16 @@ mod tests {
     fn test_truncate_empty_table() {
         // TRUNCATE on an already-empty table should succeed without error
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE trunc_empty (id INT PRIMARY KEY, val TEXT)").unwrap();
+        db.execute("CREATE TABLE trunc_empty (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
 
         // Table has no rows
         let result = db.execute("TRUNCATE TABLE trunc_empty");
-        assert!(result.is_ok(), "TRUNCATE on empty table should succeed, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "TRUNCATE on empty table should succeed, got: {:?}",
+            result.err()
+        );
 
         let rows = db.query("SELECT * FROM trunc_empty", &[]).unwrap();
         assert_eq!(rows.len(), 0, "Empty table should remain empty after TRUNCATE");
@@ -16782,14 +18568,16 @@ mod tests {
     fn test_truncate_reinsert_after() {
         // After TRUNCATE, new rows can be inserted and queried
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE trunc_reinsert (id INT PRIMARY KEY, label TEXT)").unwrap();
+        db.execute("CREATE TABLE trunc_reinsert (id INT PRIMARY KEY, label TEXT)")
+            .unwrap();
         db.execute("INSERT INTO trunc_reinsert VALUES (1, 'first')").unwrap();
         db.execute("INSERT INTO trunc_reinsert VALUES (2, 'second')").unwrap();
 
         db.execute("TRUNCATE TABLE trunc_reinsert").unwrap();
 
         // Re-insert with potentially same or different PKs
-        db.execute("INSERT INTO trunc_reinsert VALUES (1, 'new_first')").unwrap();
+        db.execute("INSERT INTO trunc_reinsert VALUES (1, 'new_first')")
+            .unwrap();
         db.execute("INSERT INTO trunc_reinsert VALUES (3, 'third')").unwrap();
 
         let rows = db.query("SELECT * FROM trunc_reinsert ORDER BY id", &[]).unwrap();
@@ -16802,8 +18590,10 @@ mod tests {
     fn test_truncate_multiple_tables() {
         // TRUNCATE two tables independently; each should only affect its own data
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE trunc_a (id INT PRIMARY KEY, val TEXT)").unwrap();
-        db.execute("CREATE TABLE trunc_b (id INT PRIMARY KEY, val TEXT)").unwrap();
+        db.execute("CREATE TABLE trunc_a (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE trunc_b (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
 
         db.execute("INSERT INTO trunc_a VALUES (1, 'a1')").unwrap();
         db.execute("INSERT INTO trunc_a VALUES (2, 'a2')").unwrap();
@@ -16829,10 +18619,12 @@ mod tests {
     fn test_truncate_with_many_rows() {
         // TRUNCATE a table with 100+ rows
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE trunc_many (id INT PRIMARY KEY, val INT)").unwrap();
+        db.execute("CREATE TABLE trunc_many (id INT PRIMARY KEY, val INT)")
+            .unwrap();
 
         for i in 1..=150 {
-            db.execute(&format!("INSERT INTO trunc_many VALUES ({}, {})", i, i * 10)).unwrap();
+            db.execute(&format!("INSERT INTO trunc_many VALUES ({}, {})", i, i * 10))
+                .unwrap();
         }
 
         let rows = db.query("SELECT COUNT(*) FROM trunc_many", &[]).unwrap();
@@ -16855,7 +18647,8 @@ mod tests {
     fn test_truncate_preserves_indexes() {
         // After TRUNCATE, indexes should still work (re-inserted data should be queryable)
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE trunc_idx (id INT PRIMARY KEY, name TEXT, score INT)").unwrap();
+        db.execute("CREATE TABLE trunc_idx (id INT PRIMARY KEY, name TEXT, score INT)")
+            .unwrap();
         db.execute("INSERT INTO trunc_idx VALUES (1, 'Alice', 90)").unwrap();
         db.execute("INSERT INTO trunc_idx VALUES (2, 'Bob', 85)").unwrap();
 
@@ -16886,7 +18679,9 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         // The error should mention the table name or "not exist"
         assert!(
-            err_msg.to_lowercase().contains("no_such_table") || err_msg.to_lowercase().contains("not exist") || err_msg.to_lowercase().contains("not found"),
+            err_msg.to_lowercase().contains("no_such_table")
+                || err_msg.to_lowercase().contains("not exist")
+                || err_msg.to_lowercase().contains("not found"),
             "Error should mention missing table, got: {}",
             err_msg
         );
@@ -16916,9 +18711,11 @@ mod tests {
     fn test_truncate_then_count() {
         // Verify COUNT(*) returns 0 after TRUNCATE and correct count after re-inserts
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE trunc_cnt (id INT PRIMARY KEY, x INT)").unwrap();
+        db.execute("CREATE TABLE trunc_cnt (id INT PRIMARY KEY, x INT)")
+            .unwrap();
         for i in 1..=5 {
-            db.execute(&format!("INSERT INTO trunc_cnt VALUES ({}, {})", i, i)).unwrap();
+            db.execute(&format!("INSERT INTO trunc_cnt VALUES ({}, {})", i, i))
+                .unwrap();
         }
 
         db.execute("TRUNCATE TABLE trunc_cnt").unwrap();
@@ -16948,34 +18745,45 @@ mod tests {
     fn test_fk_basic_creation() {
         // CREATE TABLE with REFERENCES clause should succeed
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fk_parent (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE fk_parent (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
 
         let result = db.execute(
             "CREATE TABLE fk_child (
                 id INT PRIMARY KEY,
                 parent_id INT,
                 FOREIGN KEY (parent_id) REFERENCES fk_parent(id)
-            )"
+            )",
         );
-        assert!(result.is_ok(), "Creating table with FK constraint should succeed, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Creating table with FK constraint should succeed, got: {:?}",
+            result.err()
+        );
     }
 
     #[test]
     fn test_fk_insert_valid() {
         // Insert with a valid FK reference should succeed
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fk_iv_parent (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE fk_iv_parent (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute(
             "CREATE TABLE fk_iv_child (
                 id INT PRIMARY KEY,
                 parent_id INT,
                 FOREIGN KEY (parent_id) REFERENCES fk_iv_parent(id)
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         db.execute("INSERT INTO fk_iv_parent VALUES (1, 'Alice')").unwrap();
         let result = db.execute("INSERT INTO fk_iv_child VALUES (100, 1)");
-        assert!(result.is_ok(), "Insert with valid FK reference should succeed, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Insert with valid FK reference should succeed, got: {:?}",
+            result.err()
+        );
 
         let rows = db.query("SELECT * FROM fk_iv_child WHERE parent_id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1, "Child row should be inserted");
@@ -16985,14 +18793,16 @@ mod tests {
     fn test_fk_insert_invalid() {
         // Insert with a non-existent FK value should error (FK constraint violation)
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fk_ii_parent (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE fk_ii_parent (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute(
             "CREATE TABLE fk_ii_child (
                 id INT PRIMARY KEY,
                 parent_id INT,
                 FOREIGN KEY (parent_id) REFERENCES fk_ii_parent(id)
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         // Parent table has no rows, so parent_id=999 does not exist
         let result = db.execute("INSERT INTO fk_ii_child VALUES (1, 999)");
@@ -17009,18 +18819,24 @@ mod tests {
     fn test_fk_insert_null_fk_value() {
         // Insert with NULL FK value should succeed (NULL is allowed unless NOT NULL)
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fk_null_parent (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE fk_null_parent (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute(
             "CREATE TABLE fk_null_child (
                 id INT PRIMARY KEY,
                 parent_id INT,
                 FOREIGN KEY (parent_id) REFERENCES fk_null_parent(id)
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         // Insert child with NULL parent_id - should be allowed (NULL bypasses FK check)
         let result = db.execute("INSERT INTO fk_null_child VALUES (1, NULL)");
-        assert!(result.is_ok(), "Insert with NULL FK value should succeed, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Insert with NULL FK value should succeed, got: {:?}",
+            result.err()
+        );
 
         let rows = db.query("SELECT * FROM fk_null_child", &[]).unwrap();
         assert_eq!(rows.len(), 1);
@@ -17031,24 +18847,31 @@ mod tests {
     fn test_fk_delete_parent_default_action() {
         // Default FK action (NO ACTION) should prevent deleting parent when children exist
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fk_dp_parent (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE fk_dp_parent (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute(
             "CREATE TABLE fk_dp_child (
                 id INT PRIMARY KEY,
                 parent_id INT,
                 FOREIGN KEY (parent_id) REFERENCES fk_dp_parent(id)
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         db.execute("INSERT INTO fk_dp_parent VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO fk_dp_child VALUES (100, 1)").unwrap();
 
         // Deleting parent when child references it should fail (default is NO ACTION / RESTRICT)
         let result = db.execute("DELETE FROM fk_dp_parent WHERE id = 1");
-        assert!(result.is_err(), "Deleting parent with referencing children should fail with default action");
+        assert!(
+            result.is_err(),
+            "Deleting parent with referencing children should fail with default action"
+        );
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.to_lowercase().contains("foreign key") || err_msg.to_lowercase().contains("constraint") || err_msg.to_lowercase().contains("referenced"),
+            err_msg.to_lowercase().contains("foreign key")
+                || err_msg.to_lowercase().contains("constraint")
+                || err_msg.to_lowercase().contains("referenced"),
             "Error should mention FK constraint, got: {}",
             err_msg
         );
@@ -17064,14 +18887,16 @@ mod tests {
     fn test_fk_cascade_delete() {
         // ON DELETE CASCADE should remove child rows when parent is deleted
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fk_cd_parent (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE fk_cd_parent (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute(
             "CREATE TABLE fk_cd_child (
                 id INT PRIMARY KEY,
                 parent_id INT,
                 FOREIGN KEY (parent_id) REFERENCES fk_cd_parent(id) ON DELETE CASCADE
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         db.execute("INSERT INTO fk_cd_parent VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO fk_cd_parent VALUES (2, 'Bob')").unwrap();
@@ -17087,7 +18912,11 @@ mod tests {
         assert_eq!(parent_rows[0].get(0).unwrap(), &Value::Int4(2));
 
         let child_rows = db.query("SELECT * FROM fk_cd_child", &[]).unwrap();
-        assert_eq!(child_rows.len(), 1, "Only child 102 (referencing parent 2) should remain");
+        assert_eq!(
+            child_rows.len(),
+            1,
+            "Only child 102 (referencing parent 2) should remain"
+        );
         assert_eq!(child_rows[0].get(0).unwrap(), &Value::Int4(102));
     }
 
@@ -17095,14 +18924,16 @@ mod tests {
     fn test_fk_set_null_delete() {
         // ON DELETE SET NULL should set FK column to NULL when parent is deleted
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fk_sn_parent (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE fk_sn_parent (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute(
             "CREATE TABLE fk_sn_child (
                 id INT PRIMARY KEY,
                 parent_id INT,
                 FOREIGN KEY (parent_id) REFERENCES fk_sn_parent(id) ON DELETE SET NULL
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         db.execute("INSERT INTO fk_sn_parent VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO fk_sn_child VALUES (100, 1)").unwrap();
@@ -17111,25 +18942,37 @@ mod tests {
         // Delete parent — child FK columns should become NULL
         db.execute("DELETE FROM fk_sn_parent WHERE id = 1").unwrap();
 
-        let child_rows = db.query("SELECT id, parent_id FROM fk_sn_child ORDER BY id", &[]).unwrap();
+        let child_rows = db
+            .query("SELECT id, parent_id FROM fk_sn_child ORDER BY id", &[])
+            .unwrap();
         assert_eq!(child_rows.len(), 2, "Child rows should still exist");
         // FK column should be NULL after parent deletion
-        assert_eq!(child_rows[0].get(1).unwrap(), &Value::Null, "parent_id should be NULL after SET NULL");
-        assert_eq!(child_rows[1].get(1).unwrap(), &Value::Null, "parent_id should be NULL after SET NULL");
+        assert_eq!(
+            child_rows[0].get(1).unwrap(),
+            &Value::Null,
+            "parent_id should be NULL after SET NULL"
+        );
+        assert_eq!(
+            child_rows[1].get(1).unwrap(),
+            &Value::Null,
+            "parent_id should be NULL after SET NULL"
+        );
     }
 
     #[test]
     fn test_fk_restrict_delete() {
         // ON DELETE RESTRICT should prevent parent deletion when children exist
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fk_rd_parent (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE fk_rd_parent (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute(
             "CREATE TABLE fk_rd_child (
                 id INT PRIMARY KEY,
                 parent_id INT,
                 FOREIGN KEY (parent_id) REFERENCES fk_rd_parent(id) ON DELETE RESTRICT
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         db.execute("INSERT INTO fk_rd_parent VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO fk_rd_child VALUES (100, 1)").unwrap();
@@ -17154,14 +18997,16 @@ mod tests {
     fn test_fk_restrict_allows_delete_when_no_children() {
         // RESTRICT should allow deletion when there are no referencing children
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fk_ra_parent (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE fk_ra_parent (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute(
             "CREATE TABLE fk_ra_child (
                 id INT PRIMARY KEY,
                 parent_id INT,
                 FOREIGN KEY (parent_id) REFERENCES fk_ra_parent(id) ON DELETE RESTRICT
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         db.execute("INSERT INTO fk_ra_parent VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO fk_ra_parent VALUES (2, 'Bob')").unwrap();
@@ -17170,7 +19015,11 @@ mod tests {
 
         // Deleting parent 2 (no children reference it) should succeed
         let result = db.execute("DELETE FROM fk_ra_parent WHERE id = 2");
-        assert!(result.is_ok(), "Should allow deletion of unreferenced parent, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should allow deletion of unreferenced parent, got: {:?}",
+            result.err()
+        );
 
         let parent_rows = db.query("SELECT * FROM fk_ra_parent", &[]).unwrap();
         assert_eq!(parent_rows.len(), 1, "Only parent 1 should remain");
@@ -17180,20 +19029,25 @@ mod tests {
     fn test_fk_no_action_delete() {
         // NO ACTION is the default — same behavior as RESTRICT in immediate mode
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fk_na_parent (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE fk_na_parent (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute(
             "CREATE TABLE fk_na_child (
                 id INT PRIMARY KEY,
                 parent_id INT,
                 FOREIGN KEY (parent_id) REFERENCES fk_na_parent(id) ON DELETE NO ACTION
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         db.execute("INSERT INTO fk_na_parent VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO fk_na_child VALUES (100, 1)").unwrap();
 
         let result = db.execute("DELETE FROM fk_na_parent WHERE id = 1");
-        assert!(result.is_err(), "NO ACTION should prevent parent deletion when children exist");
+        assert!(
+            result.is_err(),
+            "NO ACTION should prevent parent deletion when children exist"
+        );
     }
 
     #[test]
@@ -17206,8 +19060,9 @@ mod tests {
                 name TEXT,
                 manager_id INT,
                 FOREIGN KEY (manager_id) REFERENCES fk_self_emp(id)
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         // Insert root employee (manager_id is NULL — no parent reference)
         db.execute("INSERT INTO fk_self_emp VALUES (1, 'CEO', NULL)").unwrap();
@@ -17227,8 +19082,10 @@ mod tests {
     fn test_fk_multiple_fks_on_one_table() {
         // Table with multiple FK constraints pointing to different parent tables
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fk_m_departments (id INT PRIMARY KEY, name TEXT)").unwrap();
-        db.execute("CREATE TABLE fk_m_managers (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE fk_m_departments (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE fk_m_managers (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute(
             "CREATE TABLE fk_m_employees (
                 id INT PRIMARY KEY,
@@ -17237,15 +19094,21 @@ mod tests {
                 manager_id INT,
                 FOREIGN KEY (dept_id) REFERENCES fk_m_departments(id),
                 FOREIGN KEY (manager_id) REFERENCES fk_m_managers(id)
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
-        db.execute("INSERT INTO fk_m_departments VALUES (1, 'Engineering')").unwrap();
+        db.execute("INSERT INTO fk_m_departments VALUES (1, 'Engineering')")
+            .unwrap();
         db.execute("INSERT INTO fk_m_managers VALUES (10, 'Alice')").unwrap();
 
         // Valid insert referencing both parents
         let result = db.execute("INSERT INTO fk_m_employees VALUES (100, 'Bob', 1, 10)");
-        assert!(result.is_ok(), "Insert with valid references to both FK parents should succeed, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Insert with valid references to both FK parents should succeed, got: {:?}",
+            result.err()
+        );
 
         // Invalid dept_id
         let result = db.execute("INSERT INTO fk_m_employees VALUES (101, 'Carol', 999, 10)");
@@ -17260,19 +19123,22 @@ mod tests {
     fn test_fk_cascade_delete_multiple_children() {
         // CASCADE should delete all matching children, not just the first one
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fk_cm_parent (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE fk_cm_parent (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute(
             "CREATE TABLE fk_cm_child (
                 id INT PRIMARY KEY,
                 parent_id INT,
                 label TEXT,
                 FOREIGN KEY (parent_id) REFERENCES fk_cm_parent(id) ON DELETE CASCADE
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         db.execute("INSERT INTO fk_cm_parent VALUES (1, 'Alpha')").unwrap();
         for i in 1..=5 {
-            db.execute(&format!("INSERT INTO fk_cm_child VALUES ({}, 1, 'child_{}')", i, i)).unwrap();
+            db.execute(&format!("INSERT INTO fk_cm_child VALUES ({}, 1, 'child_{}')", i, i))
+                .unwrap();
         }
 
         let child_count = db.query("SELECT COUNT(*) FROM fk_cm_child", &[]).unwrap();
@@ -17297,14 +19163,16 @@ mod tests {
         // Documents actual behavior: HeliosDB currently allows dropping referenced tables
         // (PostgreSQL would disallow without CASCADE)
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fk_drop_parent (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE fk_drop_parent (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute(
             "CREATE TABLE fk_drop_child (
                 id INT PRIMARY KEY,
                 parent_id INT,
                 FOREIGN KEY (parent_id) REFERENCES fk_drop_parent(id)
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         db.execute("INSERT INTO fk_drop_parent VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO fk_drop_child VALUES (100, 1)").unwrap();
@@ -17315,13 +19183,19 @@ mod tests {
                 // HeliosDB allows dropping referenced tables (no FK dependency check on DROP)
                 // Document this behavior: child table still exists but FK is now dangling
                 let child_rows = db.query("SELECT * FROM fk_drop_child", &[]).unwrap();
-                assert_eq!(child_rows.len(), 1, "Child table data should still exist after parent drop");
+                assert_eq!(
+                    child_rows.len(),
+                    1,
+                    "Child table data should still exist after parent drop"
+                );
             }
             Err(e) => {
                 // If HeliosDB blocks the drop, verify the error message
                 let err_msg = e.to_string();
                 assert!(
-                    err_msg.to_lowercase().contains("foreign key") || err_msg.to_lowercase().contains("referenced") || err_msg.to_lowercase().contains("depends"),
+                    err_msg.to_lowercase().contains("foreign key")
+                        || err_msg.to_lowercase().contains("referenced")
+                        || err_msg.to_lowercase().contains("depends"),
                     "Error should mention FK dependency, got: {}",
                     err_msg
                 );
@@ -17338,14 +19212,16 @@ mod tests {
         // Note: HeliosDB may not enforce ON UPDATE actions during UPDATE statements.
         // This test documents actual behavior.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fk_cu_parent (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE fk_cu_parent (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute(
             "CREATE TABLE fk_cu_child (
                 id INT PRIMARY KEY,
                 parent_id INT,
                 FOREIGN KEY (parent_id) REFERENCES fk_cu_parent(id) ON UPDATE CASCADE
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         db.execute("INSERT INTO fk_cu_parent VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO fk_cu_child VALUES (100, 1)").unwrap();
@@ -17354,7 +19230,9 @@ mod tests {
         match db.execute("UPDATE fk_cu_parent SET id = 10 WHERE id = 1") {
             Ok(_) => {
                 // Check if cascade happened (child parent_id updated to 10)
-                let child_rows = db.query("SELECT parent_id FROM fk_cu_child WHERE id = 100", &[]).unwrap();
+                let child_rows = db
+                    .query("SELECT parent_id FROM fk_cu_child WHERE id = 100", &[])
+                    .unwrap();
                 assert_eq!(child_rows.len(), 1, "Child should still exist");
                 match child_rows[0].get(0).unwrap() {
                     Value::Int4(v) => {
@@ -17380,14 +19258,16 @@ mod tests {
     fn test_fk_insert_then_delete_child_then_delete_parent() {
         // Insert parent + child, delete child first, then parent should succeed
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE fk_idc_parent (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE fk_idc_parent (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute(
             "CREATE TABLE fk_idc_child (
                 id INT PRIMARY KEY,
                 parent_id INT,
                 FOREIGN KEY (parent_id) REFERENCES fk_idc_parent(id)
-            )"
-        ).unwrap();
+            )",
+        )
+        .unwrap();
 
         db.execute("INSERT INTO fk_idc_parent VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO fk_idc_child VALUES (100, 1)").unwrap();
@@ -17397,7 +19277,11 @@ mod tests {
 
         // Now parent can be deleted since no children reference it
         let result = db.execute("DELETE FROM fk_idc_parent WHERE id = 1");
-        assert!(result.is_ok(), "Should be able to delete parent after all children removed, got: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Should be able to delete parent after all children removed, got: {:?}",
+            result.err()
+        );
 
         let parent_rows = db.query("SELECT * FROM fk_idc_parent", &[]).unwrap();
         assert_eq!(parent_rows.len(), 0, "Parent should be deleted");
@@ -17412,13 +19296,19 @@ mod tests {
     /// Helper: create a database with a sales table for GROUP BY / HAVING tests.
     fn setup_group_by_db() -> EmbeddedDatabase {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE gb_sales (id INT, department TEXT, amount INT, rating FLOAT8)").unwrap();
-        db.execute("INSERT INTO gb_sales VALUES (1, 'Engineering', 100, 4.5)").unwrap();
-        db.execute("INSERT INTO gb_sales VALUES (2, 'Engineering', 200, 3.8)").unwrap();
-        db.execute("INSERT INTO gb_sales VALUES (3, 'Engineering', 150, 4.2)").unwrap();
+        db.execute("CREATE TABLE gb_sales (id INT, department TEXT, amount INT, rating FLOAT8)")
+            .unwrap();
+        db.execute("INSERT INTO gb_sales VALUES (1, 'Engineering', 100, 4.5)")
+            .unwrap();
+        db.execute("INSERT INTO gb_sales VALUES (2, 'Engineering', 200, 3.8)")
+            .unwrap();
+        db.execute("INSERT INTO gb_sales VALUES (3, 'Engineering', 150, 4.2)")
+            .unwrap();
         db.execute("INSERT INTO gb_sales VALUES (4, 'Sales', 80, 3.0)").unwrap();
-        db.execute("INSERT INTO gb_sales VALUES (5, 'Sales', 120, 4.1)").unwrap();
-        db.execute("INSERT INTO gb_sales VALUES (6, 'Marketing', 90, 3.5)").unwrap();
+        db.execute("INSERT INTO gb_sales VALUES (5, 'Sales', 120, 4.1)")
+            .unwrap();
+        db.execute("INSERT INTO gb_sales VALUES (6, 'Marketing', 90, 3.5)")
+            .unwrap();
         db.execute("INSERT INTO gb_sales VALUES (7, 'HR', 60, 2.8)").unwrap();
         db
     }
@@ -17432,7 +19322,12 @@ mod tests {
             &[],
         ).unwrap();
         // Engineering has 3 rows, Sales has 2 rows => both match
-        assert_eq!(rows.len(), 2, "Expected 2 departments with count > 1, got {}", rows.len());
+        assert_eq!(
+            rows.len(),
+            2,
+            "Expected 2 departments with count > 1, got {}",
+            rows.len()
+        );
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("Engineering".to_string()));
         assert_eq!(rows[0].get(1).unwrap(), &Value::Int8(3));
         assert_eq!(rows[1].get(0).unwrap(), &Value::String("Sales".to_string()));
@@ -17449,7 +19344,12 @@ mod tests {
         ).unwrap();
         // Engineering: 100+200+150=450, Sales: 80+120=200 => both > 100
         // Marketing: 90, HR: 60 => excluded
-        assert_eq!(rows.len(), 2, "Expected 2 departments with sum > 100, got {}", rows.len());
+        assert_eq!(
+            rows.len(),
+            2,
+            "Expected 2 departments with sum > 100, got {}",
+            rows.len()
+        );
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("Engineering".to_string()));
         assert_eq!(rows[0].get(1).unwrap(), &Value::Int8(450));
         assert_eq!(rows[1].get(0).unwrap(), &Value::String("Sales".to_string()));
@@ -17466,12 +19366,21 @@ mod tests {
         ).unwrap();
         // Engineering: avg(4.5, 3.8, 4.2) = 4.166..., Sales: avg(3.0, 4.1) = 3.55
         // Marketing: avg(3.5) = 3.5 (not > 3.5), HR: avg(2.8) = 2.8 => excluded
-        assert_eq!(rows.len(), 2, "Expected 2 departments with avg > 3.5, got {}", rows.len());
+        assert_eq!(
+            rows.len(),
+            2,
+            "Expected 2 departments with avg > 3.5, got {}",
+            rows.len()
+        );
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("Engineering".to_string()));
         assert_eq!(rows[1].get(0).unwrap(), &Value::String("Sales".to_string()));
         // Verify AVG returns Float8
         if let Value::Float8(avg) = rows[0].get(1).unwrap() {
-            assert!((avg - 4.1666).abs() < 0.01, "Engineering avg should be ~4.167, got {}", avg);
+            assert!(
+                (avg - 4.1666).abs() < 0.01,
+                "Engineering avg should be ~4.167, got {}",
+                avg
+            );
         } else {
             panic!("AVG should return Float8, got {:?}", rows[0].get(1));
         }
@@ -17489,7 +19398,12 @@ mod tests {
         // Sales: count=2, sum=200 => matches both
         // Marketing: count=1 => fails count check
         // HR: count=1 => fails count check
-        assert_eq!(rows.len(), 2, "Expected 2 departments matching both conditions, got {}", rows.len());
+        assert_eq!(
+            rows.len(),
+            2,
+            "Expected 2 departments matching both conditions, got {}",
+            rows.len()
+        );
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("Engineering".to_string()));
         assert_eq!(rows[1].get(0).unwrap(), &Value::String("Sales".to_string()));
     }
@@ -17498,10 +19412,12 @@ mod tests {
     fn test_group_by_having_no_match() {
         // HAVING condition that excludes all groups
         let db = setup_group_by_db();
-        let rows = db.query(
-            "SELECT department, COUNT(*) FROM gb_sales GROUP BY department HAVING COUNT(*) > 100",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query(
+                "SELECT department, COUNT(*) FROM gb_sales GROUP BY department HAVING COUNT(*) > 100",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 0, "No group should have count > 100");
     }
 
@@ -17513,14 +19429,20 @@ mod tests {
             "SELECT department, COUNT(*) FROM gb_sales GROUP BY department HAVING COUNT(*) >= 1 ORDER BY department",
             &[],
         ).unwrap();
-        assert_eq!(rows.len(), 4, "All 4 departments should match count >= 1, got {}", rows.len());
+        assert_eq!(
+            rows.len(),
+            4,
+            "All 4 departments should match count >= 1, got {}",
+            rows.len()
+        );
     }
 
     #[test]
     fn test_group_by_multiple_columns() {
         // GROUP BY col1, col2
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE gb_multi (region TEXT, category TEXT, amount INT)").unwrap();
+        db.execute("CREATE TABLE gb_multi (region TEXT, category TEXT, amount INT)")
+            .unwrap();
         db.execute("INSERT INTO gb_multi VALUES ('East', 'A', 10)").unwrap();
         db.execute("INSERT INTO gb_multi VALUES ('East', 'A', 20)").unwrap();
         db.execute("INSERT INTO gb_multi VALUES ('East', 'B', 30)").unwrap();
@@ -17532,7 +19454,12 @@ mod tests {
             &[],
         ).unwrap();
         // East/A: 30, East/B: 30, West/A: 40, West/B: 50
-        assert_eq!(rows.len(), 4, "Expected 4 groups from 2-column GROUP BY, got {}", rows.len());
+        assert_eq!(
+            rows.len(),
+            4,
+            "Expected 4 groups from 2-column GROUP BY, got {}",
+            rows.len()
+        );
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("East".to_string()));
         assert_eq!(rows[0].get(1).unwrap(), &Value::String("A".to_string()));
         assert_eq!(rows[0].get(2).unwrap(), &Value::Int8(30));
@@ -17551,10 +19478,12 @@ mod tests {
     fn test_group_by_with_order_by() {
         // GROUP BY + ORDER BY alias ASC to sort groups by aggregate result
         let db = setup_group_by_db();
-        let rows = db.query(
-            "SELECT department, SUM(amount) AS total FROM gb_sales GROUP BY department ORDER BY total ASC",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query(
+                "SELECT department, SUM(amount) AS total FROM gb_sales GROUP BY department ORDER BY total ASC",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 4, "Expected 4 departments, got {}", rows.len());
         // Ascending by total: HR: 60, Marketing: 90, Sales: 200, Engineering: 450
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("HR".to_string()));
@@ -17577,15 +19506,19 @@ mod tests {
         db.execute("INSERT INTO gb_nulls VALUES (NULL, 30)").unwrap();
         db.execute("INSERT INTO gb_nulls VALUES (NULL, 40)").unwrap();
 
-        let rows = db.query(
-            "SELECT category, SUM(val) FROM gb_nulls GROUP BY category ORDER BY category",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query(
+                "SELECT category, SUM(val) FROM gb_nulls GROUP BY category ORDER BY category",
+                &[],
+            )
+            .unwrap();
         // Should have 2 groups: NULL group and 'A' group
         assert_eq!(rows.len(), 2, "Expected 2 groups (A and NULL), got {}", rows.len());
 
         // Find the 'A' group and the NULL group regardless of order
-        let a_group = rows.iter().find(|r| r.get(0).unwrap() == &Value::String("A".to_string()));
+        let a_group = rows
+            .iter()
+            .find(|r| r.get(0).unwrap() == &Value::String("A".to_string()));
         let null_group = rows.iter().find(|r| r.get(0).unwrap() == &Value::Null);
 
         assert!(a_group.is_some(), "Should have an 'A' group");
@@ -17625,8 +19558,12 @@ mod tests {
                 // COUNT(DISTINCT) may not be supported at the SQL level
                 let err_msg = e.to_string();
                 assert!(
-                    err_msg.contains("DISTINCT") || err_msg.contains("distinct") || err_msg.contains("not") || err_msg.contains("syntax"),
-                    "COUNT(DISTINCT) unsupported or syntax error: {}", err_msg
+                    err_msg.contains("DISTINCT")
+                        || err_msg.contains("distinct")
+                        || err_msg.contains("not")
+                        || err_msg.contains("syntax"),
+                    "COUNT(DISTINCT) unsupported or syntax error: {}",
+                    err_msg
                 );
             }
         }
@@ -17672,7 +19609,8 @@ mod tests {
         let val = rows[0].get(0).unwrap();
         assert!(
             val == &Value::Int4(3) || val == &Value::Int4(4),
-            "CAST(3.7 AS INT) should truncate to 3 (or possibly round to 4), got {:?}", val
+            "CAST(3.7 AS INT) should truncate to 3 (or possibly round to 4), got {:?}",
+            val
         );
     }
 
@@ -17718,7 +19656,8 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("Cannot cast") || err_msg.contains("cast") || err_msg.contains("invalid"),
-            "Error should mention cast failure, got: {}", err_msg
+            "Error should mention cast failure, got: {}",
+            err_msg
         );
     }
 
@@ -17739,10 +19678,12 @@ mod tests {
         db.execute("INSERT INTO cast_where VALUES (2, 99)").unwrap();
         db.execute("INSERT INTO cast_where VALUES (3, 42)").unwrap();
 
-        let rows = db.query(
-            "SELECT id FROM cast_where WHERE CAST(code AS TEXT) = '42' ORDER BY id",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query(
+                "SELECT id FROM cast_where WHERE CAST(code AS TEXT) = '42' ORDER BY id",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2, "Expected 2 rows with code=42, got {}", rows.len());
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(1));
         assert_eq!(rows[1].get(0).unwrap(), &Value::Int4(3));
@@ -17775,8 +19716,11 @@ mod tests {
         assert_eq!(rows.len(), 1, "Should still have 1 row");
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(1));
         assert_eq!(rows[0].get(1).unwrap(), &Value::String("Alice".to_string()));
-        assert_eq!(rows[0].get(2).unwrap(), &Value::Null,
-            "New column should be NULL for existing rows");
+        assert_eq!(
+            rows[0].get(2).unwrap(),
+            &Value::Null,
+            "New column should be NULL for existing rows"
+        );
     }
 
     #[test]
@@ -17787,10 +19731,13 @@ mod tests {
         db.execute("INSERT INTO alt_add_def VALUES (1, 'Alice')").unwrap();
         db.execute("INSERT INTO alt_add_def VALUES (2, 'Bob')").unwrap();
 
-        db.execute("ALTER TABLE alt_add_def ADD COLUMN status TEXT DEFAULT 'active'").unwrap();
+        db.execute("ALTER TABLE alt_add_def ADD COLUMN status TEXT DEFAULT 'active'")
+            .unwrap();
 
         // Query the new column for existing rows
-        let rows = db.query("SELECT id, name, status FROM alt_add_def ORDER BY id", &[]).unwrap();
+        let rows = db
+            .query("SELECT id, name, status FROM alt_add_def ORDER BY id", &[])
+            .unwrap();
         assert_eq!(rows.len(), 2, "Should still have 2 rows");
 
         // The default may or may not be applied to existing rows depending on
@@ -17799,13 +19746,16 @@ mod tests {
         let status_1 = rows[1].get(2).unwrap();
 
         // Both rows should have the same behavior for the new column
-        assert_eq!(status_0, status_1,
-            "Both existing rows should get same value for new column with DEFAULT");
+        assert_eq!(
+            status_0, status_1,
+            "Both existing rows should get same value for new column with DEFAULT"
+        );
 
         // Accept either NULL (default not backfilled) or the default value
         assert!(
             *status_0 == Value::Null || *status_0 == Value::String("active".to_string()),
-            "New column should be NULL or 'active', got: {:?}", status_0
+            "New column should be NULL or 'active', got: {:?}",
+            status_0
         );
     }
 
@@ -17824,8 +19774,7 @@ mod tests {
         assert_eq!(rows.len(), 3, "Should still have 3 rows");
 
         for (i, row) in rows.iter().enumerate() {
-            assert_eq!(row.get(1).unwrap(), &Value::Null,
-                "Row {} new column should be NULL", i);
+            assert_eq!(row.get(1).unwrap(), &Value::Null, "Row {} new column should be NULL", i);
         }
     }
 
@@ -17836,10 +19785,12 @@ mod tests {
         db.execute("CREATE TABLE alt_add_text (id INT)").unwrap();
         db.execute("INSERT INTO alt_add_text VALUES (1)").unwrap();
 
-        db.execute("ALTER TABLE alt_add_text ADD COLUMN description TEXT").unwrap();
+        db.execute("ALTER TABLE alt_add_text ADD COLUMN description TEXT")
+            .unwrap();
 
         // Now update the new column with text data
-        db.execute("UPDATE alt_add_text SET description = 'hello world' WHERE id = 1").unwrap();
+        db.execute("UPDATE alt_add_text SET description = 'hello world' WHERE id = 1")
+            .unwrap();
 
         let rows = db.query("SELECT id, description FROM alt_add_text", &[]).unwrap();
         assert_eq!(rows.len(), 1);
@@ -17859,7 +19810,9 @@ mod tests {
         // Insert a row with the new column
         db.execute("INSERT INTO alt_add_ins VALUES (2, 'Bob', 95)").unwrap();
 
-        let rows = db.query("SELECT id, name, score FROM alt_add_ins ORDER BY id", &[]).unwrap();
+        let rows = db
+            .query("SELECT id, name, score FROM alt_add_ins ORDER BY id", &[])
+            .unwrap();
         assert_eq!(rows.len(), 2, "Should have 2 rows total");
 
         // First row (pre-ALTER): new column should be NULL
@@ -17878,11 +19831,13 @@ mod tests {
         db.execute("CREATE TABLE alt_add_dup (id INT, name TEXT)").unwrap();
 
         let result = db.execute("ALTER TABLE alt_add_dup ADD COLUMN name TEXT");
-        assert!(result.is_err(),
-            "Adding a duplicate column should fail");
+        assert!(result.is_err(), "Adding a duplicate column should fail");
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("already exists"),
-            "Error should mention 'already exists', got: {}", err_msg);
+        assert!(
+            err_msg.contains("already exists"),
+            "Error should mention 'already exists', got: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -17893,9 +19848,11 @@ mod tests {
 
         // Should succeed without error even though 'name' already exists
         let result = db.execute("ALTER TABLE alt_add_ine ADD COLUMN IF NOT EXISTS name TEXT");
-        assert!(result.is_ok(),
+        assert!(
+            result.is_ok(),
             "ADD COLUMN IF NOT EXISTS for existing column should succeed silently, got: {:?}",
-            result.err());
+            result.err()
+        );
     }
 
     // --- DROP COLUMN tests ---
@@ -17904,15 +19861,16 @@ mod tests {
     fn test_alter_drop_column_basic() {
         // Drop a column and verify it no longer appears in schema.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE alt_drop_basic (id INT, name TEXT, age INT)").unwrap();
-        db.execute("INSERT INTO alt_drop_basic VALUES (1, 'Alice', 30)").unwrap();
+        db.execute("CREATE TABLE alt_drop_basic (id INT, name TEXT, age INT)")
+            .unwrap();
+        db.execute("INSERT INTO alt_drop_basic VALUES (1, 'Alice', 30)")
+            .unwrap();
 
         db.execute("ALTER TABLE alt_drop_basic DROP COLUMN age").unwrap();
 
         // Querying the dropped column should fail
         let result = db.query("SELECT age FROM alt_drop_basic", &[]);
-        assert!(result.is_err(),
-            "Selecting a dropped column should fail");
+        assert!(result.is_err(), "Selecting a dropped column should fail");
 
         // Querying remaining columns should work
         let rows = db.query("SELECT id, name FROM alt_drop_basic", &[]).unwrap();
@@ -17925,15 +19883,21 @@ mod tests {
     fn test_alter_drop_column_with_data() {
         // Drop a column from a table with multiple rows; verify other data is preserved.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE alt_drop_data (id INT, name TEXT, score INT, grade TEXT)").unwrap();
-        db.execute("INSERT INTO alt_drop_data VALUES (1, 'Alice', 90, 'A')").unwrap();
-        db.execute("INSERT INTO alt_drop_data VALUES (2, 'Bob', 80, 'B')").unwrap();
-        db.execute("INSERT INTO alt_drop_data VALUES (3, 'Carol', 70, 'C')").unwrap();
+        db.execute("CREATE TABLE alt_drop_data (id INT, name TEXT, score INT, grade TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO alt_drop_data VALUES (1, 'Alice', 90, 'A')")
+            .unwrap();
+        db.execute("INSERT INTO alt_drop_data VALUES (2, 'Bob', 80, 'B')")
+            .unwrap();
+        db.execute("INSERT INTO alt_drop_data VALUES (3, 'Carol', 70, 'C')")
+            .unwrap();
 
         db.execute("ALTER TABLE alt_drop_data DROP COLUMN score").unwrap();
 
         // Remaining columns should still have correct data
-        let rows = db.query("SELECT id, name, grade FROM alt_drop_data ORDER BY id", &[]).unwrap();
+        let rows = db
+            .query("SELECT id, name, grade FROM alt_drop_data ORDER BY id", &[])
+            .unwrap();
         assert_eq!(rows.len(), 3, "All rows should still exist");
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(1));
         assert_eq!(rows[0].get(1).unwrap(), &Value::String("Alice".to_string()));
@@ -17953,11 +19917,13 @@ mod tests {
         db.execute("CREATE TABLE alt_drop_ne (id INT, name TEXT)").unwrap();
 
         let result = db.execute("ALTER TABLE alt_drop_ne DROP COLUMN nonexistent");
-        assert!(result.is_err(),
-            "Dropping a nonexistent column should fail");
+        assert!(result.is_err(), "Dropping a nonexistent column should fail");
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("does not exist"),
-            "Error should mention 'does not exist', got: {}", err_msg);
+        assert!(
+            err_msg.contains("does not exist"),
+            "Error should mention 'does not exist', got: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -17967,9 +19933,11 @@ mod tests {
         db.execute("CREATE TABLE alt_drop_ie (id INT, name TEXT)").unwrap();
 
         let result = db.execute("ALTER TABLE alt_drop_ie DROP COLUMN IF EXISTS nonexistent");
-        assert!(result.is_ok(),
+        assert!(
+            result.is_ok(),
             "DROP COLUMN IF EXISTS for nonexistent column should succeed silently, got: {:?}",
-            result.err());
+            result.err()
+        );
     }
 
     #[test]
@@ -17989,8 +19957,10 @@ mod tests {
             match query_result {
                 Ok(rows) => {
                     // Table is queryable; rows may be empty or have zero-width tuples
-                    assert!(rows.is_empty() || rows[0].values.is_empty(),
-                        "After dropping last column, rows should be empty or have no values");
+                    assert!(
+                        rows.is_empty() || rows[0].values.is_empty(),
+                        "After dropping last column, rows should be empty or have no values"
+                    );
                 }
                 Err(_) => {
                     // Querying a zero-column table fails -- acceptable behavior
@@ -18004,15 +19974,21 @@ mod tests {
     fn test_alter_drop_primary_key_column_without_cascade() {
         // Dropping a primary key column without CASCADE should fail.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE alt_drop_pk (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE alt_drop_pk (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO alt_drop_pk VALUES (1, 'Alice')").unwrap();
 
         let result = db.execute("ALTER TABLE alt_drop_pk DROP COLUMN id");
-        assert!(result.is_err(),
-            "Dropping a primary key column without CASCADE should fail");
+        assert!(
+            result.is_err(),
+            "Dropping a primary key column without CASCADE should fail"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("CASCADE") || err_msg.contains("primary key"),
-            "Error should mention CASCADE or primary key, got: {}", err_msg);
+        assert!(
+            err_msg.contains("CASCADE") || err_msg.contains("primary key"),
+            "Error should mention CASCADE or primary key, got: {}",
+            err_msg
+        );
     }
 
     // --- RENAME COLUMN tests ---
@@ -18024,7 +20000,8 @@ mod tests {
         db.execute("CREATE TABLE alt_ren_col (id INT, old_name TEXT)").unwrap();
         db.execute("INSERT INTO alt_ren_col VALUES (1, 'Alice')").unwrap();
 
-        db.execute("ALTER TABLE alt_ren_col RENAME COLUMN old_name TO new_name").unwrap();
+        db.execute("ALTER TABLE alt_ren_col RENAME COLUMN old_name TO new_name")
+            .unwrap();
 
         // Query with new column name should work
         let rows = db.query("SELECT id, new_name FROM alt_ren_col", &[]).unwrap();
@@ -18042,7 +20019,8 @@ mod tests {
         db.execute("INSERT INTO alt_ren_data VALUES (2, 'two')").unwrap();
         db.execute("INSERT INTO alt_ren_data VALUES (3, 'three')").unwrap();
 
-        db.execute("ALTER TABLE alt_ren_data RENAME COLUMN val TO value").unwrap();
+        db.execute("ALTER TABLE alt_ren_data RENAME COLUMN val TO value")
+            .unwrap();
 
         let rows = db.query("SELECT id, value FROM alt_ren_data ORDER BY id", &[]).unwrap();
         assert_eq!(rows.len(), 3, "All rows should still exist after rename");
@@ -18052,8 +20030,10 @@ mod tests {
 
         // The old name should no longer work
         let result = db.query("SELECT val FROM alt_ren_data", &[]);
-        assert!(result.is_err(),
-            "Old column name should no longer be valid after rename");
+        assert!(
+            result.is_err(),
+            "Old column name should no longer be valid after rename"
+        );
     }
 
     #[test]
@@ -18063,11 +20043,13 @@ mod tests {
         db.execute("CREATE TABLE alt_ren_ne (id INT, name TEXT)").unwrap();
 
         let result = db.execute("ALTER TABLE alt_ren_ne RENAME COLUMN ghost TO phantom");
-        assert!(result.is_err(),
-            "Renaming a nonexistent column should fail");
+        assert!(result.is_err(), "Renaming a nonexistent column should fail");
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("does not exist"),
-            "Error should mention 'does not exist', got: {}", err_msg);
+        assert!(
+            err_msg.contains("does not exist"),
+            "Error should mention 'does not exist', got: {}",
+            err_msg
+        );
     }
 
     #[test]
@@ -18077,11 +20059,16 @@ mod tests {
         db.execute("CREATE TABLE alt_ren_dup (id INT, name TEXT)").unwrap();
 
         let result = db.execute("ALTER TABLE alt_ren_dup RENAME COLUMN id TO name");
-        assert!(result.is_err(),
-            "Renaming to an already-existing column name should fail");
+        assert!(
+            result.is_err(),
+            "Renaming to an already-existing column name should fail"
+        );
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("already exists"),
-            "Error should mention 'already exists', got: {}", err_msg);
+        assert!(
+            err_msg.contains("already exists"),
+            "Error should mention 'already exists', got: {}",
+            err_msg
+        );
     }
 
     // --- RENAME TABLE tests ---
@@ -18111,8 +20098,7 @@ mod tests {
         db.execute("ALTER TABLE alt_orig RENAME TO alt_renamed").unwrap();
 
         let result = db.query("SELECT * FROM alt_orig", &[]);
-        assert!(result.is_err(),
-            "Querying the old table name after rename should fail");
+        assert!(result.is_err(), "Querying the old table name after rename should fail");
     }
 
     #[test]
@@ -18123,11 +20109,13 @@ mod tests {
         db.execute("CREATE TABLE alt_dst (id INT)").unwrap();
 
         let result = db.execute("ALTER TABLE alt_src RENAME TO alt_dst");
-        assert!(result.is_err(),
-            "Renaming to an existing table name should fail");
+        assert!(result.is_err(), "Renaming to an existing table name should fail");
         let err_msg = result.unwrap_err().to_string();
-        assert!(err_msg.contains("already exists"),
-            "Error should mention 'already exists', got: {}", err_msg);
+        assert!(
+            err_msg.contains("already exists"),
+            "Error should mention 'already exists', got: {}",
+            err_msg
+        );
     }
 
     // --- Combined / integration ALTER TABLE tests ---
@@ -18172,9 +20160,12 @@ mod tests {
         db.execute("ALTER TABLE alt_seq ADD COLUMN c TEXT").unwrap();
 
         // Insert a new row using the current schema
-        db.execute("INSERT INTO alt_seq VALUES (2, 'new', 42, 'hello')").unwrap();
+        db.execute("INSERT INTO alt_seq VALUES (2, 'new', 42, 'hello')")
+            .unwrap();
 
-        let rows = db.query("SELECT id, alpha, b, c FROM alt_seq ORDER BY id", &[]).unwrap();
+        let rows = db
+            .query("SELECT id, alpha, b, c FROM alt_seq ORDER BY id", &[])
+            .unwrap();
         assert_eq!(rows.len(), 2, "Should have 2 rows");
 
         // Row 1: pre-existing, new columns are NULL
@@ -18196,8 +20187,7 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
 
         let result = db.execute("ALTER TABLE no_such_table ADD COLUMN x INT");
-        assert!(result.is_err(),
-            "ALTER TABLE on nonexistent table should fail");
+        assert!(result.is_err(), "ALTER TABLE on nonexistent table should fail");
     }
 
     // ========================================================================
@@ -18212,20 +20202,29 @@ mod tests {
     /// Rows: id 1..=10, name "Product_01".."Product_10", price varies, category cycling.
     fn setup_pagination_db() -> EmbeddedDatabase {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute(
-            "CREATE TABLE pg_products (id INT, name TEXT, price INT, category TEXT)"
-        ).unwrap();
+        db.execute("CREATE TABLE pg_products (id INT, name TEXT, price INT, category TEXT)")
+            .unwrap();
         // Insert 10 rows with varying prices and 3 categories
-        db.execute("INSERT INTO pg_products VALUES (1,  'Product_01', 50,  'Electronics')").unwrap();
-        db.execute("INSERT INTO pg_products VALUES (2,  'Product_02', 30,  'Books')").unwrap();
-        db.execute("INSERT INTO pg_products VALUES (3,  'Product_03', 75,  'Electronics')").unwrap();
-        db.execute("INSERT INTO pg_products VALUES (4,  'Product_04', 20,  'Clothing')").unwrap();
-        db.execute("INSERT INTO pg_products VALUES (5,  'Product_05', 90,  'Electronics')").unwrap();
-        db.execute("INSERT INTO pg_products VALUES (6,  'Product_06', 15,  'Books')").unwrap();
-        db.execute("INSERT INTO pg_products VALUES (7,  'Product_07', 60,  'Clothing')").unwrap();
-        db.execute("INSERT INTO pg_products VALUES (8,  'Product_08', 45,  'Books')").unwrap();
-        db.execute("INSERT INTO pg_products VALUES (9,  'Product_09', 80,  'Clothing')").unwrap();
-        db.execute("INSERT INTO pg_products VALUES (10, 'Product_10', 35,  'Electronics')").unwrap();
+        db.execute("INSERT INTO pg_products VALUES (1,  'Product_01', 50,  'Electronics')")
+            .unwrap();
+        db.execute("INSERT INTO pg_products VALUES (2,  'Product_02', 30,  'Books')")
+            .unwrap();
+        db.execute("INSERT INTO pg_products VALUES (3,  'Product_03', 75,  'Electronics')")
+            .unwrap();
+        db.execute("INSERT INTO pg_products VALUES (4,  'Product_04', 20,  'Clothing')")
+            .unwrap();
+        db.execute("INSERT INTO pg_products VALUES (5,  'Product_05', 90,  'Electronics')")
+            .unwrap();
+        db.execute("INSERT INTO pg_products VALUES (6,  'Product_06', 15,  'Books')")
+            .unwrap();
+        db.execute("INSERT INTO pg_products VALUES (7,  'Product_07', 60,  'Clothing')")
+            .unwrap();
+        db.execute("INSERT INTO pg_products VALUES (8,  'Product_08', 45,  'Books')")
+            .unwrap();
+        db.execute("INSERT INTO pg_products VALUES (9,  'Product_09', 80,  'Clothing')")
+            .unwrap();
+        db.execute("INSERT INTO pg_products VALUES (10, 'Product_10', 35,  'Electronics')")
+            .unwrap();
         db
     }
 
@@ -18235,10 +20234,7 @@ mod tests {
     fn test_limit_basic() {
         // LIMIT 3 should return exactly 3 rows from the 10-row table.
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT id FROM pg_products ORDER BY id LIMIT 3",
-            &[],
-        ).unwrap();
+        let rows = db.query("SELECT id FROM pg_products ORDER BY id LIMIT 3", &[]).unwrap();
         assert_eq!(rows.len(), 3, "LIMIT 3 should return 3 rows, got {}", rows.len());
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(1));
         assert_eq!(rows[1].get(0).unwrap(), &Value::Int4(2));
@@ -18249,10 +20245,7 @@ mod tests {
     fn test_limit_zero() {
         // LIMIT 0 should return no rows.
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT id FROM pg_products LIMIT 0",
-            &[],
-        ).unwrap();
+        let rows = db.query("SELECT id FROM pg_products LIMIT 0", &[]).unwrap();
         assert_eq!(rows.len(), 0, "LIMIT 0 should return 0 rows, got {}", rows.len());
     }
 
@@ -18260,21 +20253,22 @@ mod tests {
     fn test_limit_exceeds_rows() {
         // LIMIT 100 on a 10-row table should return all 10 rows.
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT id FROM pg_products ORDER BY id LIMIT 100",
-            &[],
-        ).unwrap();
-        assert_eq!(rows.len(), 10, "LIMIT 100 on 10 rows should return 10, got {}", rows.len());
+        let rows = db
+            .query("SELECT id FROM pg_products ORDER BY id LIMIT 100", &[])
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            10,
+            "LIMIT 100 on 10 rows should return 10, got {}",
+            rows.len()
+        );
     }
 
     #[test]
     fn test_limit_one() {
         // LIMIT 1 should return exactly 1 row.
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT id FROM pg_products ORDER BY id LIMIT 1",
-            &[],
-        ).unwrap();
+        let rows = db.query("SELECT id FROM pg_products ORDER BY id LIMIT 1", &[]).unwrap();
         assert_eq!(rows.len(), 1, "LIMIT 1 should return 1 row, got {}", rows.len());
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(1));
     }
@@ -18284,16 +20278,27 @@ mod tests {
         // LIMIT 3 combined with ORDER BY price DESC should return the 3 most expensive.
         // Prices: 90 (id=5), 80 (id=9), 75 (id=3), 60, 50, 45, 35, 30, 20, 15
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT id, price FROM pg_products ORDER BY price DESC LIMIT 3",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT id, price FROM pg_products ORDER BY price DESC LIMIT 3", &[])
+            .unwrap();
         assert_eq!(rows.len(), 3, "Top 3 by price DESC should return 3 rows");
-        assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(5),  "Most expensive is id=5 (price 90)");
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &Value::Int4(5),
+            "Most expensive is id=5 (price 90)"
+        );
         assert_eq!(rows[0].get(1).unwrap(), &Value::Int4(90));
-        assert_eq!(rows[1].get(0).unwrap(), &Value::Int4(9),  "Second most expensive is id=9 (price 80)");
+        assert_eq!(
+            rows[1].get(0).unwrap(),
+            &Value::Int4(9),
+            "Second most expensive is id=9 (price 80)"
+        );
         assert_eq!(rows[1].get(1).unwrap(), &Value::Int4(80));
-        assert_eq!(rows[2].get(0).unwrap(), &Value::Int4(3),  "Third most expensive is id=3 (price 75)");
+        assert_eq!(
+            rows[2].get(0).unwrap(),
+            &Value::Int4(3),
+            "Third most expensive is id=3 (price 75)"
+        );
         assert_eq!(rows[2].get(1).unwrap(), &Value::Int4(75));
     }
 
@@ -18303,10 +20308,9 @@ mod tests {
     fn test_offset_basic() {
         // OFFSET 2 should skip the first 2 rows and return the remaining 8.
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT id FROM pg_products ORDER BY id OFFSET 2",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT id FROM pg_products ORDER BY id OFFSET 2", &[])
+            .unwrap();
         assert_eq!(rows.len(), 8, "OFFSET 2 on 10 rows should return 8, got {}", rows.len());
         // First returned row should be id=3 (after skipping id=1 and id=2)
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(3));
@@ -18319,21 +20323,24 @@ mod tests {
         // Note: using LIMIT 100 to avoid an overflow bug in the LIMIT pushdown path
         // where usize::MAX + offset overflows when no explicit LIMIT is provided.
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT id FROM pg_products ORDER BY id LIMIT 100 OFFSET 20",
-            &[],
-        ).unwrap();
-        assert_eq!(rows.len(), 0, "OFFSET beyond row count should return 0 rows, got {}", rows.len());
+        let rows = db
+            .query("SELECT id FROM pg_products ORDER BY id LIMIT 100 OFFSET 20", &[])
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            0,
+            "OFFSET beyond row count should return 0 rows, got {}",
+            rows.len()
+        );
     }
 
     #[test]
     fn test_offset_zero() {
         // OFFSET 0 should return all rows (no rows skipped).
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT id FROM pg_products ORDER BY id OFFSET 0",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT id FROM pg_products ORDER BY id OFFSET 0", &[])
+            .unwrap();
         assert_eq!(rows.len(), 10, "OFFSET 0 should return all 10 rows, got {}", rows.len());
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(1));
     }
@@ -18342,11 +20349,15 @@ mod tests {
     fn test_limit_offset_combined() {
         // LIMIT 3 OFFSET 2: skip first 2, take next 3 => ids 3, 4, 5
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT id FROM pg_products ORDER BY id LIMIT 3 OFFSET 2",
-            &[],
-        ).unwrap();
-        assert_eq!(rows.len(), 3, "LIMIT 3 OFFSET 2 should return 3 rows, got {}", rows.len());
+        let rows = db
+            .query("SELECT id FROM pg_products ORDER BY id LIMIT 3 OFFSET 2", &[])
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "LIMIT 3 OFFSET 2 should return 3 rows, got {}",
+            rows.len()
+        );
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(3));
         assert_eq!(rows[1].get(0).unwrap(), &Value::Int4(4));
         assert_eq!(rows[2].get(0).unwrap(), &Value::Int4(5));
@@ -18356,11 +20367,15 @@ mod tests {
     fn test_limit_offset_page_2() {
         // Page 2 with page_size=3: OFFSET 3, LIMIT 3 => ids 4, 5, 6
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT id FROM pg_products ORDER BY id LIMIT 3 OFFSET 3",
-            &[],
-        ).unwrap();
-        assert_eq!(rows.len(), 3, "Page 2 (LIMIT 3 OFFSET 3) should return 3 rows, got {}", rows.len());
+        let rows = db
+            .query("SELECT id FROM pg_products ORDER BY id LIMIT 3 OFFSET 3", &[])
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            3,
+            "Page 2 (LIMIT 3 OFFSET 3) should return 3 rows, got {}",
+            rows.len()
+        );
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(4));
         assert_eq!(rows[1].get(0).unwrap(), &Value::Int4(5));
         assert_eq!(rows[2].get(0).unwrap(), &Value::Int4(6));
@@ -18371,11 +20386,15 @@ mod tests {
         // Last page: page_size=3, page 4 => OFFSET 9, LIMIT 3
         // Only 1 row left (id=10), so should return just 1.
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT id FROM pg_products ORDER BY id LIMIT 3 OFFSET 9",
-            &[],
-        ).unwrap();
-        assert_eq!(rows.len(), 1, "Last page should return 1 remaining row, got {}", rows.len());
+        let rows = db
+            .query("SELECT id FROM pg_products ORDER BY id LIMIT 3 OFFSET 9", &[])
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            1,
+            "Last page should return 1 remaining row, got {}",
+            rows.len()
+        );
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(10));
     }
 
@@ -18386,18 +20405,30 @@ mod tests {
         // ORDER BY price ASC should sort from cheapest to most expensive.
         // Prices in ASC order: 15, 20, 30, 35, 45, 50, 60, 75, 80, 90
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT id, price FROM pg_products ORDER BY price ASC",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT id, price FROM pg_products ORDER BY price ASC", &[])
+            .unwrap();
         assert_eq!(rows.len(), 10);
         assert_eq!(rows[0].get(1).unwrap(), &Value::Int4(15), "Cheapest should be 15");
         assert_eq!(rows[9].get(1).unwrap(), &Value::Int4(90), "Most expensive should be 90");
         // Verify full ordering: each price <= next price
         for i in 0..9 {
-            let cur = match rows[i].get(1).unwrap() { Value::Int4(v) => *v, _ => panic!("expected Int4") };
-            let nxt = match rows[i + 1].get(1).unwrap() { Value::Int4(v) => *v, _ => panic!("expected Int4") };
-            assert!(cur <= nxt, "Row {} price {} should be <= row {} price {}", i, cur, i + 1, nxt);
+            let cur = match rows[i].get(1).unwrap() {
+                Value::Int4(v) => *v,
+                _ => panic!("expected Int4"),
+            };
+            let nxt = match rows[i + 1].get(1).unwrap() {
+                Value::Int4(v) => *v,
+                _ => panic!("expected Int4"),
+            };
+            assert!(
+                cur <= nxt,
+                "Row {} price {} should be <= row {} price {}",
+                i,
+                cur,
+                i + 1,
+                nxt
+            );
         }
     }
 
@@ -18405,18 +20436,34 @@ mod tests {
     fn test_order_by_desc() {
         // ORDER BY price DESC should sort from most expensive to cheapest.
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT id, price FROM pg_products ORDER BY price DESC",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT id, price FROM pg_products ORDER BY price DESC", &[])
+            .unwrap();
         assert_eq!(rows.len(), 10);
-        assert_eq!(rows[0].get(1).unwrap(), &Value::Int4(90), "Most expensive should be first");
+        assert_eq!(
+            rows[0].get(1).unwrap(),
+            &Value::Int4(90),
+            "Most expensive should be first"
+        );
         assert_eq!(rows[9].get(1).unwrap(), &Value::Int4(15), "Cheapest should be last");
         // Verify full ordering: each price >= next price
         for i in 0..9 {
-            let cur = match rows[i].get(1).unwrap() { Value::Int4(v) => *v, _ => panic!("expected Int4") };
-            let nxt = match rows[i + 1].get(1).unwrap() { Value::Int4(v) => *v, _ => panic!("expected Int4") };
-            assert!(cur >= nxt, "Row {} price {} should be >= row {} price {}", i, cur, i + 1, nxt);
+            let cur = match rows[i].get(1).unwrap() {
+                Value::Int4(v) => *v,
+                _ => panic!("expected Int4"),
+            };
+            let nxt = match rows[i + 1].get(1).unwrap() {
+                Value::Int4(v) => *v,
+                _ => panic!("expected Int4"),
+            };
+            assert!(
+                cur >= nxt,
+                "Row {} price {} should be >= row {} price {}",
+                i,
+                cur,
+                i + 1,
+                nxt
+            );
         }
     }
 
@@ -18425,10 +20472,12 @@ mod tests {
         // ORDER BY category, price: sort by category first (alpha), then by price within each category.
         // Categories: Books (3 rows), Clothing (3 rows), Electronics (4 rows)
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT id, category, price FROM pg_products ORDER BY category, price",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query(
+                "SELECT id, category, price FROM pg_products ORDER BY category, price",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 10);
         // Books group first (alpha order): prices 15, 30, 45
         assert_eq!(rows[0].get(1).unwrap(), &Value::String("Books".to_string()));
@@ -18453,10 +20502,12 @@ mod tests {
     fn test_order_by_mixed_directions() {
         // ORDER BY category ASC, price DESC: alphabetical category, then most expensive first.
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT id, category, price FROM pg_products ORDER BY category ASC, price DESC",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query(
+                "SELECT id, category, price FROM pg_products ORDER BY category ASC, price DESC",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 10);
         // Books group (ASC): prices DESC => 45, 30, 15
         assert_eq!(rows[0].get(1).unwrap(), &Value::String("Books".to_string()));
@@ -18493,10 +20544,9 @@ mod tests {
         db.execute("INSERT INTO pg_nullsort VALUES (5, 70)").unwrap();
 
         // ASC: NULLs come first, then 30, 50, 70
-        let rows = db.query(
-            "SELECT id, score FROM pg_nullsort ORDER BY score ASC, id ASC",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT id, score FROM pg_nullsort ORDER BY score ASC, id ASC", &[])
+            .unwrap();
         assert_eq!(rows.len(), 5);
         // First two rows should be NULLs (ids 2 and 4, ordered by id)
         assert_eq!(rows[0].get(1).unwrap(), &Value::Null);
@@ -18507,10 +20557,9 @@ mod tests {
         assert_eq!(rows[4].get(1).unwrap(), &Value::Int4(70));
 
         // DESC: non-nulls descending, then NULLs last
-        let rows_desc = db.query(
-            "SELECT id, score FROM pg_nullsort ORDER BY score DESC, id ASC",
-            &[],
-        ).unwrap();
+        let rows_desc = db
+            .query("SELECT id, score FROM pg_nullsort ORDER BY score DESC, id ASC", &[])
+            .unwrap();
         assert_eq!(rows_desc.len(), 5);
         assert_eq!(rows_desc[0].get(1).unwrap(), &Value::Int4(70));
         assert_eq!(rows_desc[1].get(1).unwrap(), &Value::Int4(50));
@@ -18552,8 +20601,11 @@ mod tests {
         }
 
         // Verify all 10 IDs collected in order
-        assert_eq!(all_ids, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
-            "Full pagination should yield all IDs 1..=10 in order");
+        assert_eq!(
+            all_ids,
+            vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+            "Full pagination should yield all IDs 1..=10 in order"
+        );
     }
 
     #[test]
@@ -18562,14 +20614,29 @@ mod tests {
         // Electronics products: ids 1 (50), 3 (75), 5 (90), 10 (35) => 4 rows
         // ORDER BY price DESC, LIMIT 2 => top 2 most expensive electronics
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT id, price FROM pg_products WHERE category = 'Electronics' ORDER BY price DESC LIMIT 2",
-            &[],
-        ).unwrap();
-        assert_eq!(rows.len(), 2, "LIMIT 2 on 4 Electronics rows should return 2, got {}", rows.len());
-        assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(5),  "Most expensive electronics is id=5 (90)");
+        let rows = db
+            .query(
+                "SELECT id, price FROM pg_products WHERE category = 'Electronics' ORDER BY price DESC LIMIT 2",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            2,
+            "LIMIT 2 on 4 Electronics rows should return 2, got {}",
+            rows.len()
+        );
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &Value::Int4(5),
+            "Most expensive electronics is id=5 (90)"
+        );
         assert_eq!(rows[0].get(1).unwrap(), &Value::Int4(90));
-        assert_eq!(rows[1].get(0).unwrap(), &Value::Int4(3),  "Second most expensive is id=3 (75)");
+        assert_eq!(
+            rows[1].get(0).unwrap(),
+            &Value::Int4(3),
+            "Second most expensive is id=3 (75)"
+        );
         assert_eq!(rows[1].get(1).unwrap(), &Value::Int4(75));
     }
 
@@ -18579,10 +20646,12 @@ mod tests {
         // 3 categories: Books, Clothing, Electronics
         // COUNT(*) per category, ORDER BY category, LIMIT 2 => first 2 alphabetically
         let db = setup_pagination_db();
-        let rows = db.query(
-            "SELECT category, COUNT(*) AS cnt FROM pg_products GROUP BY category ORDER BY category LIMIT 2",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query(
+                "SELECT category, COUNT(*) AS cnt FROM pg_products GROUP BY category ORDER BY category LIMIT 2",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2, "LIMIT 2 on 3 groups should return 2, got {}", rows.len());
         // Books (3 rows), Clothing (3 rows) alphabetically first
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("Books".to_string()));
@@ -18603,7 +20672,11 @@ mod tests {
         let val = rows[0].get(0).unwrap();
         match val {
             Value::String(s) => {
-                assert!(s.contains("PostgreSQL"), "version() should mention PostgreSQL, got: {}", s);
+                assert!(
+                    s.contains("PostgreSQL"),
+                    "version() should mention PostgreSQL, got: {}",
+                    s
+                );
                 assert!(s.contains("HeliosDB"), "version() should mention HeliosDB, got: {}", s);
             }
             other => panic!("Expected String, got: {:?}", other),
@@ -18618,7 +20691,10 @@ mod tests {
         let val = rows[0].get(0).unwrap();
         match val {
             Value::String(s) => {
-                assert!(s.contains("PostgreSQL"), "pg_catalog.version() should mention PostgreSQL");
+                assert!(
+                    s.contains("PostgreSQL"),
+                    "pg_catalog.version() should mention PostgreSQL"
+                );
             }
             other => panic!("Expected String, got: {:?}", other),
         }
@@ -18649,7 +20725,8 @@ mod tests {
         // Bug 1: WHERE ID = 1 returns 0 rows but WHERE ID IN (1) works
         // Root cause: Int4 literal vs Int8 PK type mismatch in ART index lookup
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE wp_posts (ID BIGSERIAL PRIMARY KEY, title TEXT)").unwrap();
+        db.execute("CREATE TABLE wp_posts (ID BIGSERIAL PRIMARY KEY, title TEXT)")
+            .unwrap();
         db.execute("INSERT INTO wp_posts (title) VALUES ('hello')").unwrap();
 
         // IN works (goes through evaluator with cross-type comparison)
@@ -18661,15 +20738,22 @@ mod tests {
         assert_eq!(rows_eq.len(), 1, "fast-path WHERE ID = 1 should find the row");
 
         // Force executor path: add ORDER BY to bypass try_fast_select
-        let rows_order = db.query("SELECT * FROM wp_posts WHERE ID = 1 ORDER BY ID", &[]).unwrap();
-        assert_eq!(rows_order.len(), 1, "executor-path WHERE ID = 1 ORDER BY should find the row");
+        let rows_order = db
+            .query("SELECT * FROM wp_posts WHERE ID = 1 ORDER BY ID", &[])
+            .unwrap();
+        assert_eq!(
+            rows_order.len(),
+            1,
+            "executor-path WHERE ID = 1 ORDER BY should find the row"
+        );
 
         // SELECT with column list (not SELECT *) to test yet another path
         let rows_col = db.query("SELECT ID, title FROM wp_posts WHERE ID = 1", &[]).unwrap();
         assert_eq!(rows_col.len(), 1, "SELECT cols WHERE ID = 1 should find the row");
 
         // Int2 PK with Int4 literal
-        db.execute("CREATE TABLE t_small (id SMALLSERIAL PRIMARY KEY, val TEXT)").unwrap();
+        db.execute("CREATE TABLE t_small (id SMALLSERIAL PRIMARY KEY, val TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t_small (val) VALUES ('x')").unwrap();
         let rows_small = db.query("SELECT * FROM t_small WHERE id = 1", &[]).unwrap();
         assert_eq!(rows_small.len(), 1, "SMALLSERIAL PK with int4 literal should work");
@@ -18679,7 +20763,8 @@ mod tests {
     fn test_wp_last_insert_id_serial() {
         // Bug 2: SERIAL auto-fill must produce a non-zero ID
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE t_serial (id BIGSERIAL PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE t_serial (id BIGSERIAL PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t_serial (name) VALUES ('hello')").unwrap();
         let rows = db.query("SELECT MAX(id) FROM t_serial", &[]).unwrap();
         let max_id = rows[0].get(0).unwrap();
@@ -18695,7 +20780,8 @@ mod tests {
         // Bug 3: duplicate PK must produce an error containing keywords the handler matches.
         // The fast-path insert was silently swallowing the ART duplicate error.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE t_dup (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE t_dup (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t_dup VALUES (1, 'a')").unwrap();
         let result = db.execute("INSERT INTO t_dup VALUES (1, 'b')");
         assert!(result.is_err(), "Duplicate PK insert must fail, but got Ok");
@@ -18704,7 +20790,8 @@ mod tests {
         let lower = msg.to_lowercase();
         assert!(
             lower.contains("duplicate") || lower.contains("unique") || lower.contains("primary key"),
-            "Duplicate PK error should contain recognizable keywords, got: {}", msg
+            "Duplicate PK error should contain recognizable keywords, got: {}",
+            msg
         );
     }
 
@@ -18712,20 +20799,25 @@ mod tests {
     fn test_wp_duplicate_pk_no_data_corruption() {
         // Verify that after a failed duplicate insert, only the original row exists
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE t_dup2 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE t_dup2 (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t_dup2 VALUES (1, 'original')").unwrap();
         let _ = db.execute("INSERT INTO t_dup2 VALUES (1, 'duplicate')");
         let rows = db.query("SELECT * FROM t_dup2", &[]).unwrap();
         assert_eq!(rows.len(), 1, "Only one row should exist after rejected duplicate");
-        assert_eq!(rows[0].get(1).unwrap(), &Value::String("original".to_string()),
-            "Original row must be preserved");
+        assert_eq!(
+            rows[0].get(1).unwrap(),
+            &Value::String("original".to_string()),
+            "Original row must be preserved"
+        );
     }
 
     #[test]
     fn test_wp_duplicate_unique_constraint() {
         // Also test UNIQUE constraint enforcement through fast path
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE t_uq (id INT PRIMARY KEY, email TEXT UNIQUE)").unwrap();
+        db.execute("CREATE TABLE t_uq (id INT PRIMARY KEY, email TEXT UNIQUE)")
+            .unwrap();
         db.execute("INSERT INTO t_uq VALUES (1, 'a@b.com')").unwrap();
         let result = db.execute("INSERT INTO t_uq VALUES (2, 'a@b.com')");
         assert!(result.is_err(), "Duplicate UNIQUE insert must fail");
@@ -18738,10 +20830,12 @@ mod tests {
     #[test]
     fn test_on_conflict_do_nothing() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE t_oc1 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE t_oc1 (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t_oc1 VALUES (1, 'a')").unwrap();
         // Should silently skip the conflicting row
-        db.execute("INSERT INTO t_oc1 VALUES (1, 'b') ON CONFLICT DO NOTHING").unwrap();
+        db.execute("INSERT INTO t_oc1 VALUES (1, 'b') ON CONFLICT DO NOTHING")
+            .unwrap();
         let rows = db.query("SELECT name FROM t_oc1 WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::String("a".to_string()));
@@ -18750,10 +20844,12 @@ mod tests {
     #[test]
     fn test_on_conflict_do_update() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE t_oc2 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE t_oc2 (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t_oc2 VALUES (1, 'a')").unwrap();
         // Should update the existing row with the proposed insert value
-        db.execute("INSERT INTO t_oc2 VALUES (1, 'b') ON CONFLICT DO UPDATE SET name = EXCLUDED.name").unwrap();
+        db.execute("INSERT INTO t_oc2 VALUES (1, 'b') ON CONFLICT DO UPDATE SET name = EXCLUDED.name")
+            .unwrap();
         let rows = db.query("SELECT name FROM t_oc2 WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::String("b".to_string()));
@@ -18762,7 +20858,8 @@ mod tests {
     #[test]
     fn test_on_conflict_do_update_multiple_columns() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE t_oc3 (id INT PRIMARY KEY, name TEXT, score INT)").unwrap();
+        db.execute("CREATE TABLE t_oc3 (id INT PRIMARY KEY, name TEXT, score INT)")
+            .unwrap();
         db.execute("INSERT INTO t_oc3 VALUES (1, 'alice', 10)").unwrap();
         db.execute("INSERT INTO t_oc3 VALUES (1, 'bob', 20) ON CONFLICT DO UPDATE SET name = EXCLUDED.name, score = EXCLUDED.score").unwrap();
         let rows = db.query("SELECT name, score FROM t_oc3 WHERE id = 1", &[]).unwrap();
@@ -18775,8 +20872,10 @@ mod tests {
     fn test_on_conflict_do_nothing_no_conflict() {
         // When there is no conflict, the insert should proceed normally
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE t_oc4 (id INT PRIMARY KEY, name TEXT)").unwrap();
-        db.execute("INSERT INTO t_oc4 VALUES (1, 'a') ON CONFLICT DO NOTHING").unwrap();
+        db.execute("CREATE TABLE t_oc4 (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t_oc4 VALUES (1, 'a') ON CONFLICT DO NOTHING")
+            .unwrap();
         let rows = db.query("SELECT name FROM t_oc4 WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::String("a".to_string()));
@@ -18786,8 +20885,10 @@ mod tests {
     fn test_on_conflict_do_update_no_conflict() {
         // When there is no conflict, the insert should proceed normally
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE t_oc5 (id INT PRIMARY KEY, name TEXT)").unwrap();
-        db.execute("INSERT INTO t_oc5 VALUES (1, 'a') ON CONFLICT DO UPDATE SET name = EXCLUDED.name").unwrap();
+        db.execute("CREATE TABLE t_oc5 (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO t_oc5 VALUES (1, 'a') ON CONFLICT DO UPDATE SET name = EXCLUDED.name")
+            .unwrap();
         let rows = db.query("SELECT name FROM t_oc5 WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::String("a".to_string()));
@@ -18797,9 +20898,12 @@ mod tests {
     fn test_on_conflict_do_nothing_returns_zero() {
         // When a row is skipped, it should not count as affected
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE t_oc6 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE t_oc6 (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t_oc6 VALUES (1, 'a')").unwrap();
-        let affected = db.execute("INSERT INTO t_oc6 VALUES (1, 'b') ON CONFLICT DO NOTHING").unwrap();
+        let affected = db
+            .execute("INSERT INTO t_oc6 VALUES (1, 'b') ON CONFLICT DO NOTHING")
+            .unwrap();
         assert_eq!(affected, 0, "DO NOTHING should report 0 affected rows");
     }
 
@@ -18807,9 +20911,12 @@ mod tests {
     fn test_on_conflict_do_update_returns_one() {
         // When a row is updated via upsert, it should count as 1 affected
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE t_oc7 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE t_oc7 (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t_oc7 VALUES (1, 'a')").unwrap();
-        let affected = db.execute("INSERT INTO t_oc7 VALUES (1, 'b') ON CONFLICT DO UPDATE SET name = EXCLUDED.name").unwrap();
+        let affected = db
+            .execute("INSERT INTO t_oc7 VALUES (1, 'b') ON CONFLICT DO UPDATE SET name = EXCLUDED.name")
+            .unwrap();
         assert_eq!(affected, 1, "DO UPDATE should report 1 affected row");
     }
 
@@ -18817,8 +20924,10 @@ mod tests {
     fn test_on_conflict_with_column_list() {
         // INSERT with explicit column list + ON CONFLICT
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE t_oc8 (id INT PRIMARY KEY, name TEXT, val INT)").unwrap();
-        db.execute("INSERT INTO t_oc8 (id, name, val) VALUES (1, 'a', 10)").unwrap();
+        db.execute("CREATE TABLE t_oc8 (id INT PRIMARY KEY, name TEXT, val INT)")
+            .unwrap();
+        db.execute("INSERT INTO t_oc8 (id, name, val) VALUES (1, 'a', 10)")
+            .unwrap();
         db.execute("INSERT INTO t_oc8 (id, name, val) VALUES (1, 'b', 20) ON CONFLICT DO UPDATE SET name = EXCLUDED.name, val = EXCLUDED.val").unwrap();
         let rows = db.query("SELECT name, val FROM t_oc8 WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
@@ -18830,13 +20939,19 @@ mod tests {
     fn test_on_conflict_do_update_partial() {
         // Only update some columns, leave others unchanged
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE t_oc9 (id INT PRIMARY KEY, name TEXT, val INT)").unwrap();
+        db.execute("CREATE TABLE t_oc9 (id INT PRIMARY KEY, name TEXT, val INT)")
+            .unwrap();
         db.execute("INSERT INTO t_oc9 VALUES (1, 'alice', 10)").unwrap();
         // Only update 'val', leave 'name' unchanged
-        db.execute("INSERT INTO t_oc9 VALUES (1, 'bob', 99) ON CONFLICT DO UPDATE SET val = EXCLUDED.val").unwrap();
+        db.execute("INSERT INTO t_oc9 VALUES (1, 'bob', 99) ON CONFLICT DO UPDATE SET val = EXCLUDED.val")
+            .unwrap();
         let rows = db.query("SELECT name, val FROM t_oc9 WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].values[0], Value::String("alice".to_string()), "name should be unchanged");
+        assert_eq!(
+            rows[0].values[0],
+            Value::String("alice".to_string()),
+            "name should be unchanged"
+        );
         assert_eq!(rows[0].values[1], Value::Int4(99), "val should be updated");
     }
 
@@ -18844,9 +20959,11 @@ mod tests {
     fn test_on_conflict_do_update_with_literal() {
         // SET col = literal_value (not EXCLUDED reference)
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE t_oc10 (id INT PRIMARY KEY, name TEXT)").unwrap();
+        db.execute("CREATE TABLE t_oc10 (id INT PRIMARY KEY, name TEXT)")
+            .unwrap();
         db.execute("INSERT INTO t_oc10 VALUES (1, 'a')").unwrap();
-        db.execute("INSERT INTO t_oc10 VALUES (1, 'b') ON CONFLICT DO UPDATE SET name = 'replaced'").unwrap();
+        db.execute("INSERT INTO t_oc10 VALUES (1, 'b') ON CONFLICT DO UPDATE SET name = 'replaced'")
+            .unwrap();
         let rows = db.query("SELECT name FROM t_oc10 WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].values[0], Value::String("replaced".to_string()));

@@ -51,10 +51,7 @@ fn initialize_handshake_carries_required_fields() {
     assert!(r["serverInfo"]["name"].is_string());
     assert!(r["serverInfo"]["version"].is_string());
     let caps = &r["capabilities"];
-    assert!(
-        caps["tools"].is_object(),
-        "server must advertise tools capability"
-    );
+    assert!(caps["tools"].is_object(), "server must advertise tools capability");
     assert!(
         caps["resources"].is_object(),
         "server must advertise resources capability"
@@ -63,8 +60,7 @@ fn initialize_handshake_carries_required_fields() {
 
 #[test]
 fn tools_list_response_shape() {
-    let resp =
-        serde_json::to_value(handle_rpc(req(2, "tools/list", json!({})))).unwrap();
+    let resp = serde_json::to_value(handle_rpc(req(2, "tools/list", json!({})))).unwrap();
     assert_jsonrpc_envelope(&resp);
     let tools = resp["result"]["tools"].as_array().expect("tools array");
     assert!(!tools.is_empty(), "server must advertise at least one tool");
@@ -113,12 +109,9 @@ fn tools_call_response_shape() {
 
 #[test]
 fn resources_list_response_shape() {
-    let resp =
-        serde_json::to_value(handle_rpc(req(4, "resources/list", json!({})))).unwrap();
+    let resp = serde_json::to_value(handle_rpc(req(4, "resources/list", json!({})))).unwrap();
     assert_jsonrpc_envelope(&resp);
-    let resources = resp["result"]["resources"]
-        .as_array()
-        .expect("resources array");
+    let resources = resp["result"]["resources"].as_array().expect("resources array");
     for r in resources {
         assert!(r["uri"].is_string(), "resource missing uri: {r}");
         assert!(r["name"].is_string(), "resource missing name: {r}");
@@ -156,8 +149,7 @@ fn ping_returns_empty_object() {
 
 #[test]
 fn unknown_method_returns_method_not_found() {
-    let resp = serde_json::to_value(handle_rpc(req(7, "this/does/not/exist", json!({}))))
-        .unwrap();
+    let resp = serde_json::to_value(handle_rpc(req(7, "this/does/not/exist", json!({})))).unwrap();
     let err = &resp["error"];
     assert!(err.is_object(), "unknown method must produce an error envelope");
     assert_eq!(err["code"].as_i64(), Some(-32601));

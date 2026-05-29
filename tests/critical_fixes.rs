@@ -15,8 +15,7 @@ fn test_jsonb_type_support() {
         .expect("INSERT with JSONB should succeed");
 
     // Query to verify data was inserted
-    let results = db.query("SELECT * FROM products", &[])
-        .expect("SELECT should succeed");
+    let results = db.query("SELECT * FROM products", &[]).expect("SELECT should succeed");
 
     assert_eq!(results.len(), 1, "Should have 1 row");
     println!("✓ JSONB type support works!");
@@ -37,7 +36,8 @@ fn test_vector_string_autocast() {
 
     // This query would fail with "Vector distance operators require vector operands, got String"
     // if the auto-casting didn't work
-    let results = db.query("SELECT * FROM embeddings WHERE vec <-> '[1.0, 0.0, 0.0]' < 5", &[])
+    let results = db
+        .query("SELECT * FROM embeddings WHERE vec <-> '[1.0, 0.0, 0.0]' < 5", &[])
         .expect("Vector distance query should succeed");
 
     assert_eq!(results.len(), 1, "Should find the inserted vector");
@@ -56,8 +56,7 @@ fn test_vector_with_explicit_cast() {
     db.execute("INSERT INTO vecs VALUES (1, CAST('[1.0, 2.0]' AS VECTOR(2)))")
         .expect("INSERT with explicit CAST should succeed");
 
-    let results = db.query("SELECT * FROM vecs", &[])
-        .expect("SELECT should succeed");
+    let results = db.query("SELECT * FROM vecs", &[]).expect("SELECT should succeed");
 
     assert_eq!(results.len(), 1);
     println!("✓ Explicit CAST to VECTOR works!");
@@ -75,8 +74,7 @@ fn test_auto_cast_type_mismatches() {
     db.execute("INSERT INTO mixed VALUES (1, '42', 'hello')")
         .expect("INSERT with auto-cast should succeed");
 
-    let results = db.query("SELECT * FROM mixed", &[])
-        .expect("SELECT should succeed");
+    let results = db.query("SELECT * FROM mixed", &[]).expect("SELECT should succeed");
 
     assert_eq!(results.len(), 1);
     println!("✓ General auto-casting works!");

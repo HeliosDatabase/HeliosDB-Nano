@@ -38,9 +38,7 @@
 pub mod distance;
 pub mod quantization;
 
-pub use distance::{
-    l2_distance, cosine_distance, dot_product, l2_distance_squared,
-};
+pub use distance::{cosine_distance, dot_product, l2_distance, l2_distance_squared};
 
 /// CPU feature detection results
 #[derive(Debug, Clone, Copy)]

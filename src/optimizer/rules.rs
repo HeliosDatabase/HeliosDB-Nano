@@ -5,9 +5,9 @@
 
 #![allow(unreachable_patterns)]
 
-use crate::sql::logical_plan::{LogicalPlan, LogicalExpr, BinaryOperator};
+use super::cost::{ColumnStats, CostEstimator};
+use crate::sql::logical_plan::{BinaryOperator, LogicalExpr, LogicalPlan};
 use crate::Result;
-use super::cost::{CostEstimator, ColumnStats};
 use std::collections::HashSet;
 
 /// Trait for optimization rules
@@ -49,7 +49,14 @@ impl SelectionPushdownRule {
         project: Box<LogicalPlan>,
         filter_pred: LogicalExpr,
     ) -> Result<Option<LogicalPlan>> {
-        if let LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } = *project {
+        if let LogicalPlan::Project {
+            input,
+            exprs,
+            aliases,
+            distinct,
+            distinct_on,
+        } = *project
+        {
             // Rewrite the filter predicate: replace column references that use
             // projection aliases with the underlying projection expressions.
             // This ensures the predicate is valid against the input schema
@@ -96,68 +103,70 @@ impl SelectionPushdownRule {
                 }
                 pred.clone()
             }
-            LogicalExpr::BinaryExpr { left, op, right } => {
-                LogicalExpr::BinaryExpr {
-                    left: Box::new(Self::rewrite_predicate_for_pushdown(left, proj_exprs, proj_aliases)),
-                    op: op.clone(),
-                    right: Box::new(Self::rewrite_predicate_for_pushdown(right, proj_exprs, proj_aliases)),
-                }
-            }
-            LogicalExpr::UnaryExpr { op, expr } => {
-                LogicalExpr::UnaryExpr {
-                    op: *op,
-                    expr: Box::new(Self::rewrite_predicate_for_pushdown(expr, proj_exprs, proj_aliases)),
-                }
-            }
-            LogicalExpr::IsNull { expr, is_null } => {
-                LogicalExpr::IsNull {
-                    expr: Box::new(Self::rewrite_predicate_for_pushdown(expr, proj_exprs, proj_aliases)),
-                    is_null: *is_null,
-                }
-            }
-            LogicalExpr::Between { expr, low, high, negated } => {
-                LogicalExpr::Between {
-                    expr: Box::new(Self::rewrite_predicate_for_pushdown(expr, proj_exprs, proj_aliases)),
-                    low: Box::new(Self::rewrite_predicate_for_pushdown(low, proj_exprs, proj_aliases)),
-                    high: Box::new(Self::rewrite_predicate_for_pushdown(high, proj_exprs, proj_aliases)),
-                    negated: *negated,
-                }
-            }
-            LogicalExpr::InList { expr, list, negated } => {
-                LogicalExpr::InList {
-                    expr: Box::new(Self::rewrite_predicate_for_pushdown(expr, proj_exprs, proj_aliases)),
-                    list: list.iter()
-                        .map(|e| Self::rewrite_predicate_for_pushdown(e, proj_exprs, proj_aliases))
-                        .collect(),
-                    negated: *negated,
-                }
-            }
-            LogicalExpr::Case { expr: case_expr, when_then, else_result } => {
-                LogicalExpr::Case {
-                    expr: case_expr.as_ref().map(|o| Box::new(Self::rewrite_predicate_for_pushdown(o, proj_exprs, proj_aliases))),
-                    when_then: when_then.iter()
-                        .map(|(w, t)| (
+            LogicalExpr::BinaryExpr { left, op, right } => LogicalExpr::BinaryExpr {
+                left: Box::new(Self::rewrite_predicate_for_pushdown(left, proj_exprs, proj_aliases)),
+                op: op.clone(),
+                right: Box::new(Self::rewrite_predicate_for_pushdown(right, proj_exprs, proj_aliases)),
+            },
+            LogicalExpr::UnaryExpr { op, expr } => LogicalExpr::UnaryExpr {
+                op: *op,
+                expr: Box::new(Self::rewrite_predicate_for_pushdown(expr, proj_exprs, proj_aliases)),
+            },
+            LogicalExpr::IsNull { expr, is_null } => LogicalExpr::IsNull {
+                expr: Box::new(Self::rewrite_predicate_for_pushdown(expr, proj_exprs, proj_aliases)),
+                is_null: *is_null,
+            },
+            LogicalExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => LogicalExpr::Between {
+                expr: Box::new(Self::rewrite_predicate_for_pushdown(expr, proj_exprs, proj_aliases)),
+                low: Box::new(Self::rewrite_predicate_for_pushdown(low, proj_exprs, proj_aliases)),
+                high: Box::new(Self::rewrite_predicate_for_pushdown(high, proj_exprs, proj_aliases)),
+                negated: *negated,
+            },
+            LogicalExpr::InList { expr, list, negated } => LogicalExpr::InList {
+                expr: Box::new(Self::rewrite_predicate_for_pushdown(expr, proj_exprs, proj_aliases)),
+                list: list
+                    .iter()
+                    .map(|e| Self::rewrite_predicate_for_pushdown(e, proj_exprs, proj_aliases))
+                    .collect(),
+                negated: *negated,
+            },
+            LogicalExpr::Case {
+                expr: case_expr,
+                when_then,
+                else_result,
+            } => LogicalExpr::Case {
+                expr: case_expr
+                    .as_ref()
+                    .map(|o| Box::new(Self::rewrite_predicate_for_pushdown(o, proj_exprs, proj_aliases))),
+                when_then: when_then
+                    .iter()
+                    .map(|(w, t)| {
+                        (
                             Self::rewrite_predicate_for_pushdown(w, proj_exprs, proj_aliases),
                             Self::rewrite_predicate_for_pushdown(t, proj_exprs, proj_aliases),
-                        ))
-                        .collect(),
-                    else_result: else_result.as_ref().map(|e| Box::new(Self::rewrite_predicate_for_pushdown(e, proj_exprs, proj_aliases))),
-                }
-            }
-            LogicalExpr::ScalarFunction { fun, args } => {
-                LogicalExpr::ScalarFunction {
-                    fun: fun.clone(),
-                    args: args.iter()
-                        .map(|a| Self::rewrite_predicate_for_pushdown(a, proj_exprs, proj_aliases))
-                        .collect(),
-                }
-            }
-            LogicalExpr::Cast { expr, data_type } => {
-                LogicalExpr::Cast {
-                    expr: Box::new(Self::rewrite_predicate_for_pushdown(expr, proj_exprs, proj_aliases)),
-                    data_type: data_type.clone(),
-                }
-            }
+                        )
+                    })
+                    .collect(),
+                else_result: else_result
+                    .as_ref()
+                    .map(|e| Box::new(Self::rewrite_predicate_for_pushdown(e, proj_exprs, proj_aliases))),
+            },
+            LogicalExpr::ScalarFunction { fun, args } => LogicalExpr::ScalarFunction {
+                fun: fun.clone(),
+                args: args
+                    .iter()
+                    .map(|a| Self::rewrite_predicate_for_pushdown(a, proj_exprs, proj_aliases))
+                    .collect(),
+            },
+            LogicalExpr::Cast { expr, data_type } => LogicalExpr::Cast {
+                expr: Box::new(Self::rewrite_predicate_for_pushdown(expr, proj_exprs, proj_aliases)),
+                data_type: data_type.clone(),
+            },
             // For all other expression types (literals, wildcards, subqueries,
             // table-qualified columns, etc.), return as-is
             _ => pred.clone(),
@@ -165,12 +174,12 @@ impl SelectionPushdownRule {
     }
 
     /// Merge consecutive filters using AND
-    fn merge_filters(
-        &self,
-        inner_filter: Box<LogicalPlan>,
-        outer_pred: LogicalExpr,
-    ) -> Result<Option<LogicalPlan>> {
-        if let LogicalPlan::Filter { input, predicate: inner_pred } = *inner_filter {
+    fn merge_filters(&self, inner_filter: Box<LogicalPlan>, outer_pred: LogicalExpr) -> Result<Option<LogicalPlan>> {
+        if let LogicalPlan::Filter {
+            input,
+            predicate: inner_pred,
+        } = *inner_filter
+        {
             // Combine predicates with AND
             let combined = LogicalExpr::BinaryExpr {
                 left: Box::new(outer_pred),
@@ -188,11 +197,7 @@ impl SelectionPushdownRule {
     }
 
     /// Split AND predicates and push each part down separately
-    fn split_and_push_conjuncts(
-        &self,
-        input: Box<LogicalPlan>,
-        predicate: LogicalExpr,
-    ) -> Result<Option<LogicalPlan>> {
+    fn split_and_push_conjuncts(&self, input: Box<LogicalPlan>, predicate: LogicalExpr) -> Result<Option<LogicalPlan>> {
         let conjuncts = Self::extract_conjuncts(&predicate);
 
         if conjuncts.len() <= 1 {
@@ -217,12 +222,15 @@ impl SelectionPushdownRule {
     /// references. Predicates that only touch the left side push below as
     /// Filter(left), those touching only the right side push below as
     /// Filter(right), and cross-table predicates remain above the join.
-    fn push_through_join(
-        &self,
-        join_node: Box<LogicalPlan>,
-        predicate: LogicalExpr,
-    ) -> Result<Option<LogicalPlan>> {
-        if let LogicalPlan::Join { left, right, join_type, on, lateral } = *join_node {
+    fn push_through_join(&self, join_node: Box<LogicalPlan>, predicate: LogicalExpr) -> Result<Option<LogicalPlan>> {
+        if let LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            on,
+            lateral,
+        } = *join_node
+        {
             // Collect table names/aliases reachable from each side
             let left_tables = Self::collect_table_refs(&left);
             let right_tables = Self::collect_table_refs(&right);
@@ -372,7 +380,11 @@ impl SelectionPushdownRule {
                 Self::extract_column_table_refs_inner(low, refs);
                 Self::extract_column_table_refs_inner(high, refs);
             }
-            LogicalExpr::Case { expr, when_then, else_result } => {
+            LogicalExpr::Case {
+                expr,
+                when_then,
+                else_result,
+            } => {
                 if let Some(op) = expr {
                     Self::extract_column_table_refs_inner(op, refs);
                 }
@@ -413,7 +425,11 @@ impl SelectionPushdownRule {
     /// Extract AND conjuncts from a predicate
     pub(crate) fn extract_conjuncts(expr: &LogicalExpr) -> Vec<LogicalExpr> {
         match expr {
-            LogicalExpr::BinaryExpr { left, op: BinaryOperator::And, right } => {
+            LogicalExpr::BinaryExpr {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
                 let mut result = Self::extract_conjuncts(left);
                 result.extend(Self::extract_conjuncts(right));
                 result
@@ -496,13 +512,16 @@ impl ProjectionPruningRule {
             LogicalExpr::UnaryExpr { expr, .. } => {
                 Self::collect_used_columns(expr, columns);
             }
-            LogicalExpr::AggregateFunction { args, .. } |
-            LogicalExpr::ScalarFunction { args, .. } => {
+            LogicalExpr::AggregateFunction { args, .. } | LogicalExpr::ScalarFunction { args, .. } => {
                 for arg in args {
                     Self::collect_used_columns(arg, columns);
                 }
             }
-            LogicalExpr::Case { expr, when_then, else_result } => {
+            LogicalExpr::Case {
+                expr,
+                when_then,
+                else_result,
+            } => {
                 if let Some(e) = expr {
                     Self::collect_used_columns(e, columns);
                 }
@@ -558,7 +577,12 @@ impl ProjectionPruningRule {
                 Self::collect_used_columns(array, columns);
                 Self::collect_used_columns(index, columns);
             }
-            LogicalExpr::WindowFunction { args, partition_by, order_by, .. } => {
+            LogicalExpr::WindowFunction {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
                 for arg in args {
                     Self::collect_used_columns(arg, columns);
                 }
@@ -574,9 +598,7 @@ impl ProjectionPruningRule {
                     Self::collect_used_columns(item, columns);
                 }
             }
-            LogicalExpr::Literal(_) |
-            LogicalExpr::Wildcard |
-            LogicalExpr::Parameter { .. } => {}
+            LogicalExpr::Literal(_) | LogicalExpr::Wildcard | LogicalExpr::Parameter { .. } => {}
         }
     }
 
@@ -594,7 +616,14 @@ impl ProjectionPruningRule {
         }
 
         // If input is a scan, add projection to it
-        if let LogicalPlan::Scan { table_name, alias, schema, projection, as_of } = *input {
+        if let LogicalPlan::Scan {
+            table_name,
+            alias,
+            schema,
+            projection,
+            as_of,
+        } = *input
+        {
             if projection.is_some() {
                 // Already has projection, can't optimize further
                 return Ok(None);
@@ -643,9 +672,13 @@ impl OptimizationRule for ProjectionPruningRule {
 
     fn apply(&self, plan: LogicalPlan, _cost_estimator: &CostEstimator) -> Result<Option<LogicalPlan>> {
         match plan {
-            LogicalPlan::Project { input, exprs, aliases, distinct: false, distinct_on: None } => {
-                self.prune_projection(input, exprs, aliases)
-            }
+            LogicalPlan::Project {
+                input,
+                exprs,
+                aliases,
+                distinct: false,
+                distinct_on: None,
+            } => self.prune_projection(input, exprs, aliases),
             _ => Ok(None),
         }
     }
@@ -689,7 +722,13 @@ impl OptimizationRule for JoinReorderingRule {
 
     fn apply(&self, plan: LogicalPlan, cost_estimator: &CostEstimator) -> Result<Option<LogicalPlan>> {
         match plan {
-            LogicalPlan::Join { left, right, join_type, on, lateral } => {
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                on,
+                lateral,
+            } => {
                 // Only reorder inner joins (outer joins are order-dependent)
                 // Also don't reorder LATERAL joins (right depends on left)
                 if !matches!(join_type, crate::sql::logical_plan::JoinType::Inner) || lateral {
@@ -755,21 +794,26 @@ impl IndexSelectionRule {
                 if let LogicalExpr::Column { name, .. } = left.as_ref() {
                     if name == column_name {
                         // Check if operator is index-compatible
-                        return matches!(op,
-                            BinaryOperator::Eq |
-                            BinaryOperator::Lt |
-                            BinaryOperator::LtEq |
-                            BinaryOperator::Gt |
-                            BinaryOperator::GtEq |
-                            BinaryOperator::VectorL2Distance |
-                            BinaryOperator::VectorCosineDistance |
-                            BinaryOperator::VectorInnerProduct
+                        return matches!(
+                            op,
+                            BinaryOperator::Eq
+                                | BinaryOperator::Lt
+                                | BinaryOperator::LtEq
+                                | BinaryOperator::Gt
+                                | BinaryOperator::GtEq
+                                | BinaryOperator::VectorL2Distance
+                                | BinaryOperator::VectorCosineDistance
+                                | BinaryOperator::VectorInnerProduct
                         );
                     }
                 }
                 false
             }
-            LogicalExpr::BinaryExpr { op: BinaryOperator::And, left, right } => {
+            LogicalExpr::BinaryExpr {
+                op: BinaryOperator::And,
+                left,
+                right,
+            } => {
                 // Check both sides of AND
                 Self::can_use_index(left, column_name) || Self::can_use_index(right, column_name)
             }
@@ -778,11 +822,7 @@ impl IndexSelectionRule {
     }
 
     /// Score index usefulness (higher is better)
-    fn score_index(
-        _index_type: &str,
-        _predicate: &LogicalExpr,
-        col_stats: &ColumnStats,
-    ) -> f64 {
+    fn score_index(_index_type: &str, _predicate: &LogicalExpr, col_stats: &ColumnStats) -> f64 {
         // If index exists and has good selectivity, it's useful
         if col_stats.has_index {
             // Estimate selectivity improvement
@@ -813,7 +853,14 @@ impl OptimizationRule for IndexSelectionRule {
     fn apply(&self, plan: LogicalPlan, cost_estimator: &CostEstimator) -> Result<Option<LogicalPlan>> {
         match plan {
             LogicalPlan::Filter { input, predicate } => {
-                if let LogicalPlan::Scan { table_name, alias, schema, projection, as_of } = *input {
+                if let LogicalPlan::Scan {
+                    table_name,
+                    alias,
+                    schema,
+                    projection,
+                    as_of,
+                } = *input
+                {
                     // Get table statistics
                     let stats = match cost_estimator.stats().get_table_stats(&table_name) {
                         Some(s) => s,
@@ -998,10 +1045,14 @@ impl ConstantFoldingRule {
                     predicate: folded_predicate,
                 })
             }
-            LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => {
-                let folded_exprs: Result<Vec<_>> = exprs.into_iter()
-                    .map(|e| Self::fold_expr(e))
-                    .collect();
+            LogicalPlan::Project {
+                input,
+                exprs,
+                aliases,
+                distinct,
+                distinct_on,
+            } => {
+                let folded_exprs: Result<Vec<_>> = exprs.into_iter().map(|e| Self::fold_expr(e)).collect();
                 Ok(LogicalPlan::Project {
                     input,
                     exprs: folded_exprs?,
@@ -1021,10 +1072,7 @@ impl OptimizationRule for ConstantFoldingRule {
     }
 
     fn is_applicable(&self, plan: &LogicalPlan) -> bool {
-        matches!(plan,
-            LogicalPlan::Filter { .. } |
-            LogicalPlan::Project { .. }
-        )
+        matches!(plan, LogicalPlan::Filter { .. } | LogicalPlan::Project { .. })
     }
 
     fn apply(&self, plan: LogicalPlan, _cost_estimator: &CostEstimator) -> Result<Option<LogicalPlan>> {
@@ -1087,28 +1135,24 @@ impl StorageFilterPushdownRule {
             LogicalExpr::BinaryExpr { left, op, right } => {
                 match op {
                     // Equality and comparison operators
-                    BinaryOperator::Eq |
-                    BinaryOperator::NotEq |
-                    BinaryOperator::Lt |
-                    BinaryOperator::LtEq |
-                    BinaryOperator::Gt |
-                    BinaryOperator::GtEq => {
+                    BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq => {
                         // Check if it's column vs literal
                         let is_column_literal = matches!(
                             (left.as_ref(), right.as_ref()),
-                            (LogicalExpr::Column { .. }, LogicalExpr::Literal(_)) |
-                            (LogicalExpr::Literal(_), LogicalExpr::Column { .. })
+                            (LogicalExpr::Column { .. }, LogicalExpr::Literal(_))
+                                | (LogicalExpr::Literal(_), LogicalExpr::Column { .. })
                         );
                         is_column_literal
                     }
                     // AND predicates can be pushed if all parts can be pushed
-                    BinaryOperator::And => {
-                        Self::can_push_predicate(left) && Self::can_push_predicate(right)
-                    }
+                    BinaryOperator::And => Self::can_push_predicate(left) && Self::can_push_predicate(right),
                     // OR predicates are more complex but can still be pushed
-                    BinaryOperator::Or => {
-                        Self::can_push_predicate(left) && Self::can_push_predicate(right)
-                    }
+                    BinaryOperator::Or => Self::can_push_predicate(left) && Self::can_push_predicate(right),
                     // LIKE can be pushed for prefix patterns
                     BinaryOperator::Like => {
                         matches!(
@@ -1125,14 +1169,14 @@ impl StorageFilterPushdownRule {
             }
             // BETWEEN can be pushed
             LogicalExpr::Between { expr, low, high, .. } => {
-                matches!(expr.as_ref(), LogicalExpr::Column { .. }) &&
-                matches!(low.as_ref(), LogicalExpr::Literal(_)) &&
-                matches!(high.as_ref(), LogicalExpr::Literal(_))
+                matches!(expr.as_ref(), LogicalExpr::Column { .. })
+                    && matches!(low.as_ref(), LogicalExpr::Literal(_))
+                    && matches!(high.as_ref(), LogicalExpr::Literal(_))
             }
             // IN lists can be pushed
             LogicalExpr::InList { expr, list, .. } => {
-                matches!(expr.as_ref(), LogicalExpr::Column { .. }) &&
-                list.iter().all(|e| matches!(e, LogicalExpr::Literal(_)))
+                matches!(expr.as_ref(), LogicalExpr::Column { .. })
+                    && list.iter().all(|e| matches!(e, LogicalExpr::Literal(_)))
             }
             _ => false,
         }
@@ -1153,8 +1197,7 @@ impl StorageFilterPushdownRule {
                         0.1 // Default equality selectivity
                     }
                     BinaryOperator::NotEq => 0.9,
-                    BinaryOperator::Lt | BinaryOperator::LtEq |
-                    BinaryOperator::Gt | BinaryOperator::GtEq => 0.33,
+                    BinaryOperator::Lt | BinaryOperator::LtEq | BinaryOperator::Gt | BinaryOperator::GtEq => 0.33,
                     BinaryOperator::And => {
                         let left_sel = self.estimate_selectivity(left, cost_estimator);
                         let right_sel = self.estimate_selectivity(right, cost_estimator);
@@ -1203,7 +1246,12 @@ impl StorageFilterPushdownRule {
     where
         F: FnMut(&LogicalExpr),
     {
-        if let LogicalExpr::BinaryExpr { left, op: BinaryOperator::And, right } = expr {
+        if let LogicalExpr::BinaryExpr {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } = expr
+        {
             Self::collect_conjuncts(left, collector);
             Self::collect_conjuncts(right, collector);
         } else {
@@ -1243,7 +1291,14 @@ impl OptimizationRule for StorageFilterPushdownRule {
 
     fn apply(&self, plan: LogicalPlan, cost_estimator: &CostEstimator) -> Result<Option<LogicalPlan>> {
         if let LogicalPlan::Filter { input, predicate } = plan {
-            if let LogicalPlan::Scan { table_name, alias, schema, projection, as_of } = *input {
+            if let LogicalPlan::Scan {
+                table_name,
+                alias,
+                schema,
+                projection,
+                as_of,
+            } = *input
+            {
                 // Check if predicate can be pushed down
                 if !Self::can_push_predicate(&predicate) {
                     // Cannot push - return original
@@ -1345,19 +1400,37 @@ impl JoinPredicatePushdownRule {
     /// ON conjuncts into Filter wrappers above the inputs.
     fn rewrite(plan: LogicalPlan) -> LogicalPlan {
         match plan {
-            LogicalPlan::Join { left, right, join_type, on, lateral } => {
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                on,
+                lateral,
+            } => {
                 // Recurse into both sides first.
                 let left = Box::new(Self::rewrite(*left));
                 let right = Box::new(Self::rewrite(*right));
 
                 // LATERAL joins: don't try to push.
                 if lateral {
-                    return LogicalPlan::Join { left, right, join_type, on, lateral };
+                    return LogicalPlan::Join {
+                        left,
+                        right,
+                        join_type,
+                        on,
+                        lateral,
+                    };
                 }
 
                 // Cross join (no ON): nothing to push.
                 let Some(on_expr) = on else {
-                    return LogicalPlan::Join { left, right, join_type, on: None, lateral };
+                    return LogicalPlan::Join {
+                        left,
+                        right,
+                        join_type,
+                        on: None,
+                        lateral,
+                    };
                 };
 
                 let conjuncts = SelectionPushdownRule::extract_conjuncts(&on_expr);
@@ -1412,7 +1485,13 @@ impl JoinPredicatePushdownRule {
                     } else {
                         Some(SelectionPushdownRule::combine_conjuncts(keep_on))
                     };
-                    return LogicalPlan::Join { left, right, join_type, on: new_on, lateral };
+                    return LogicalPlan::Join {
+                        left,
+                        right,
+                        join_type,
+                        on: new_on,
+                        lateral,
+                    };
                 }
 
                 let new_left = if left_preds.is_empty() {
@@ -1437,7 +1516,13 @@ impl JoinPredicatePushdownRule {
                     Some(SelectionPushdownRule::combine_conjuncts(keep_on))
                 };
 
-                LogicalPlan::Join { left: new_left, right: new_right, join_type, on: new_on, lateral }
+                LogicalPlan::Join {
+                    left: new_left,
+                    right: new_right,
+                    join_type,
+                    on: new_on,
+                    lateral,
+                }
             }
 
             // Pass-through recursion for plans that wrap a single child.
@@ -1445,37 +1530,48 @@ impl JoinPredicatePushdownRule {
                 input: Box::new(Self::rewrite(*input)),
                 predicate,
             },
-            LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => {
-                LogicalPlan::Project {
-                    input: Box::new(Self::rewrite(*input)),
-                    exprs,
-                    aliases,
-                    distinct,
-                    distinct_on,
-                }
-            }
+            LogicalPlan::Project {
+                input,
+                exprs,
+                aliases,
+                distinct,
+                distinct_on,
+            } => LogicalPlan::Project {
+                input: Box::new(Self::rewrite(*input)),
+                exprs,
+                aliases,
+                distinct,
+                distinct_on,
+            },
             LogicalPlan::Sort { input, exprs, asc } => LogicalPlan::Sort {
                 input: Box::new(Self::rewrite(*input)),
                 exprs,
                 asc,
             },
-            LogicalPlan::Limit { input, limit, offset, limit_param, offset_param } => {
-                LogicalPlan::Limit {
-                    input: Box::new(Self::rewrite(*input)),
-                    limit,
-                    offset,
-                    limit_param,
-                    offset_param,
-                }
-            }
-            LogicalPlan::Aggregate { input, group_by, aggr_exprs, having } => {
-                LogicalPlan::Aggregate {
-                    input: Box::new(Self::rewrite(*input)),
-                    group_by,
-                    aggr_exprs,
-                    having,
-                }
-            }
+            LogicalPlan::Limit {
+                input,
+                limit,
+                offset,
+                limit_param,
+                offset_param,
+            } => LogicalPlan::Limit {
+                input: Box::new(Self::rewrite(*input)),
+                limit,
+                offset,
+                limit_param,
+                offset_param,
+            },
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                having,
+            } => LogicalPlan::Aggregate {
+                input: Box::new(Self::rewrite(*input)),
+                group_by,
+                aggr_exprs,
+                having,
+            },
             LogicalPlan::Union { left, right, all } => LogicalPlan::Union {
                 left: Box::new(Self::rewrite(*left)),
                 right: Box::new(Self::rewrite(*right)),
@@ -1499,14 +1595,17 @@ impl JoinPredicatePushdownRule {
                 query: Box::new(Self::rewrite(*query)),
                 recursive,
             },
-            LogicalPlan::InsertSelect { table_name, columns, source, returning } => {
-                LogicalPlan::InsertSelect {
-                    table_name,
-                    columns,
-                    source: Box::new(Self::rewrite(*source)),
-                    returning,
-                }
-            }
+            LogicalPlan::InsertSelect {
+                table_name,
+                columns,
+                source,
+                returning,
+            } => LogicalPlan::InsertSelect {
+                table_name,
+                columns,
+                source: Box::new(Self::rewrite(*source)),
+                returning,
+            },
 
             // Leaves and other variants (Scan / FilteredScan / DDL / DML /
             // misc.): no nested Join to rewrite.
@@ -1525,10 +1624,12 @@ impl OptimizationRule for JoinPredicatePushdownRule {
     fn is_applicable(&self, plan: &LogicalPlan) -> bool {
         fn contains_join_with_on(plan: &LogicalPlan) -> bool {
             match plan {
-                LogicalPlan::Join { on: Some(_), lateral: false, .. } => true,
-                LogicalPlan::Join { left, right, .. } => {
-                    contains_join_with_on(left) || contains_join_with_on(right)
-                }
+                LogicalPlan::Join {
+                    on: Some(_),
+                    lateral: false,
+                    ..
+                } => true,
+                LogicalPlan::Join { left, right, .. } => contains_join_with_on(left) || contains_join_with_on(right),
                 LogicalPlan::Filter { input, .. }
                 | LogicalPlan::Project { input, .. }
                 | LogicalPlan::Sort { input, .. }
@@ -1540,8 +1641,7 @@ impl OptimizationRule for JoinPredicatePushdownRule {
                     contains_join_with_on(left) || contains_join_with_on(right)
                 }
                 LogicalPlan::With { ctes, query, .. } => {
-                    contains_join_with_on(query)
-                        || ctes.iter().any(|(_, p, _)| contains_join_with_on(p))
+                    contains_join_with_on(query) || ctes.iter().any(|(_, p, _)| contains_join_with_on(p))
                 }
                 LogicalPlan::InsertSelect { source, .. } => contains_join_with_on(source),
                 _ => false,
@@ -1572,22 +1672,22 @@ impl Default for JoinPredicatePushdownRule {
 /// Create all standard optimization rules
 pub fn create_default_rules() -> Vec<Box<dyn OptimizationRule>> {
     vec![
-        Box::new(ConstantFoldingRule::new()),         // Apply first - simplifies expressions
-        Box::new(SelectionPushdownRule::new()),       // Push filters above joins/projections down
-        Box::new(JoinPredicatePushdownRule::new()),   // Push one-sided ON conjuncts into inputs
-        Box::new(ProjectionPruningRule::new()),       // Reduce columns early
-        Box::new(IndexSelectionRule::new()),          // Choose indexes
-        Box::new(JoinReorderingRule::new()),          // Optimize join order
-        Box::new(StorageFilterPushdownRule::new()),   // Storage-level filtering (last - converts Filter+Scan to FilteredScan)
+        Box::new(ConstantFoldingRule::new()),       // Apply first - simplifies expressions
+        Box::new(SelectionPushdownRule::new()),     // Push filters above joins/projections down
+        Box::new(JoinPredicatePushdownRule::new()), // Push one-sided ON conjuncts into inputs
+        Box::new(ProjectionPruningRule::new()),     // Reduce columns early
+        Box::new(IndexSelectionRule::new()),        // Choose indexes
+        Box::new(JoinReorderingRule::new()),        // Optimize join order
+        Box::new(StorageFilterPushdownRule::new()), // Storage-level filtering (last - converts Filter+Scan to FilteredScan)
     ]
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql::logical_plan::*;
-    use crate::{Schema, Column, DataType, Value};
     use crate::optimizer::cost::{StatsCatalog, TableStats};
+    use crate::sql::logical_plan::*;
+    use crate::{Column, DataType, Schema, Value};
     use std::sync::Arc;
 
     fn create_test_schema() -> Arc<Schema> {
@@ -1600,9 +1700,9 @@ mod tests {
                     primary_key: true,
                     source_table: None,
                     source_table_name: None,
-                default_expr: None,
-                unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
                 Column {
                     name: "name".to_string(),
@@ -1611,9 +1711,9 @@ mod tests {
                     primary_key: false,
                     source_table: None,
                     source_table_name: None,
-                default_expr: None,
-                unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
             ],
         })
@@ -1669,7 +1769,10 @@ mod tests {
         let inner_filter = LogicalPlan::Filter {
             input: Box::new(scan),
             predicate: LogicalExpr::BinaryExpr {
-                left: Box::new(LogicalExpr::Column { table: None, name: "id".to_string()  }),
+                left: Box::new(LogicalExpr::Column {
+                    table: None,
+                    name: "id".to_string(),
+                }),
                 op: BinaryOperator::Gt,
                 right: Box::new(LogicalExpr::Literal(Value::Int4(0))),
             },
@@ -1678,7 +1781,10 @@ mod tests {
         let outer_filter = LogicalPlan::Filter {
             input: Box::new(inner_filter),
             predicate: LogicalExpr::BinaryExpr {
-                left: Box::new(LogicalExpr::Column { table: None, name: "id".to_string()  }),
+                left: Box::new(LogicalExpr::Column {
+                    table: None,
+                    name: "id".to_string(),
+                }),
                 op: BinaryOperator::Lt,
                 right: Box::new(LogicalExpr::Literal(Value::Int4(100))),
             },
@@ -1694,7 +1800,10 @@ mod tests {
 
         let mut used = HashSet::new();
         let expr = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "id".to_string()  }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            }),
             op: BinaryOperator::Eq,
             right: Box::new(LogicalExpr::Literal(Value::Int4(1))),
         };
@@ -1713,14 +1822,14 @@ mod tests {
         stats_catalog.add_table_stats(
             TableStats::new("small".to_string())
                 .with_row_count(100)
-                .with_avg_row_size(100)
+                .with_avg_row_size(100),
         );
 
         // Large table (10000 rows)
         stats_catalog.add_table_stats(
             TableStats::new("large".to_string())
                 .with_row_count(10000)
-                .with_avg_row_size(100)
+                .with_avg_row_size(100),
         );
 
         let estimator = CostEstimator::new(stats_catalog);
@@ -1780,7 +1889,10 @@ mod tests {
     }
 
     fn col(table: &str, name: &str) -> LogicalExpr {
-        LogicalExpr::Column { table: Some(table.to_string()), name: name.to_string() }
+        LogicalExpr::Column {
+            table: Some(table.to_string()),
+            name: name.to_string(),
+        }
     }
 
     fn lit_int(v: i32) -> LogicalExpr {
@@ -1792,7 +1904,11 @@ mod tests {
     }
 
     fn binary(left: LogicalExpr, op: BinaryOperator, right: LogicalExpr) -> LogicalExpr {
-        LogicalExpr::BinaryExpr { left: Box::new(left), op, right: Box::new(right) }
+        LogicalExpr::BinaryExpr {
+            left: Box::new(left),
+            op,
+            right: Box::new(right),
+        }
     }
 
     fn make_join(left: LogicalPlan, right: LogicalPlan, on: Option<LogicalExpr>, jt: JoinType) -> LogicalPlan {
@@ -1853,15 +1969,14 @@ mod tests {
         let rule = JoinPredicatePushdownRule::new();
         let estimator = CostEstimator::new(StatsCatalog::new());
         let on = binary(col("l", "id"), BinaryOperator::Eq, col("r", "id"));
-        let plan = make_join(
-            make_scan("l"),
-            make_scan("r"),
-            Some(on),
-            JoinType::Inner,
-        );
+        let plan = make_join(make_scan("l"), make_scan("r"), Some(on), JoinType::Inner);
         let result = rule.apply(plan, &estimator).unwrap();
         // No conjunct is pushable, so the rule should return None.
-        assert!(result.is_none(), "cross-side ON should NOT be rewritten, got {:?}", result);
+        assert!(
+            result.is_none(),
+            "cross-side ON should NOT be rewritten, got {:?}",
+            result
+        );
     }
 
     /// Mixed: equi-join key AND right-only constant → split, push the constant.

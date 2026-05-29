@@ -13,30 +13,21 @@
 //! - **Sort**: ORDER BY with in-memory sorting
 //! - **Limit**: LIMIT/OFFSET row restriction
 
-pub mod executor;
 pub mod aggregation;
 pub mod cancellation;
+pub mod executor;
 
 // Re-export executor types (Tuple is re-exported from crate::types)
 pub use executor::{
-    Executor,
-    ScanExecutor, FilterExecutor, ProjectExecutor,
-    NestedLoopJoinExecutor, HashJoinExecutor,
-    AggregateExecutor, SortExecutor, LimitExecutor,
-    PredicateFn, ProjectFn, JoinConditionFn, KeyExtractorFn, GroupKeyFn,
+    AggregateExecutor, Executor, FilterExecutor, GroupKeyFn, HashJoinExecutor, JoinConditionFn, KeyExtractorFn,
+    LimitExecutor, NestedLoopJoinExecutor, PredicateFn, ProjectExecutor, ProjectFn, ScanExecutor, SortExecutor,
 };
 
 // Re-export aggregation types
 pub use aggregation::{
-    AggregateFunction, AggregateState,
-    CountFunction, SumFunction, AvgFunction,
-    MinFunction, MaxFunction, StddevFunction, VarianceFunction,
-    create_aggregate,
+    create_aggregate, AggregateFunction, AggregateState, AvgFunction, CountFunction, MaxFunction, MinFunction,
+    StddevFunction, SumFunction, VarianceFunction,
 };
 
 // Re-export cancellation types
-pub use cancellation::{
-    CancellationToken, QueryRegistry, QueryGuard,
-    RunningQuery, QueryState,
-    start_timeout_checker,
-};
+pub use cancellation::{start_timeout_checker, CancellationToken, QueryGuard, QueryRegistry, QueryState, RunningQuery};

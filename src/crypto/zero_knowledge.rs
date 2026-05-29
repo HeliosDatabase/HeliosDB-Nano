@@ -51,9 +51,9 @@
 //! # Ok::<(), heliosdb_nano::Error>(())
 //! ```
 
-use crate::crypto::{derive_key_from_password, encrypt, decrypt, EncryptionKey};
+use crate::crypto::{decrypt, derive_key_from_password, encrypt, EncryptionKey};
 use crate::{Error, Result};
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -303,8 +303,8 @@ impl ZeroKnowledgeSession {
 
     /// Validate hex-encoded hash
     pub fn validate_key_hash_hex(&self, expected_hash_hex: &str) -> Result<bool> {
-        let expected = hex::decode(expected_hash_hex)
-            .map_err(|e| Error::encryption(format!("Invalid hash hex: {}", e)))?;
+        let expected =
+            hex::decode(expected_hash_hex).map_err(|e| Error::encryption(format!("Invalid hash hex: {}", e)))?;
 
         if expected.len() != 32 {
             return Err(Error::encryption("Hash must be 32 bytes"));
@@ -334,9 +334,10 @@ impl ZeroKnowledgeSession {
 
         let mut key = [0u8; 32];
         for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
-            let hex_byte = std::str::from_utf8(chunk)
-                .map_err(|_| Error::encryption("Invalid hex string"))?;
-            let dest = key.get_mut(i).ok_or_else(|| Error::encryption("Key index out of bounds"))?;
+            let hex_byte = std::str::from_utf8(chunk).map_err(|_| Error::encryption("Invalid hex string"))?;
+            let dest = key
+                .get_mut(i)
+                .ok_or_else(|| Error::encryption("Key index out of bounds"))?;
             *dest = u8::from_str_radix(hex_byte, 16)
                 .map_err(|_| Error::encryption(format!("Invalid hex byte: {}", hex_byte)))?;
         }
@@ -425,11 +426,7 @@ impl NonceTracker {
     }
 
     /// Force cleanup when at capacity
-    fn force_cleanup(
-        &self,
-        nonces: &mut HashSet<[u8; 16]>,
-        expiry: &mut Vec<(Instant, [u8; 16])>,
-    ) {
+    fn force_cleanup(&self, nonces: &mut HashSet<[u8; 16]>, expiry: &mut Vec<(Instant, [u8; 16])>) {
         // Remove oldest 10%
         let remove_count = self.max_nonces / 10;
         for _ in 0..remove_count {
@@ -512,11 +509,7 @@ pub struct ZkeRequestContext {
 
 impl ZkeRequestContext {
     /// Create new request context
-    pub fn new(
-        session: ZeroKnowledgeSession,
-        nonce_tracker: Arc<NonceTracker>,
-        config: ZkeConfig,
-    ) -> Self {
+    pub fn new(session: ZeroKnowledgeSession, nonce_tracker: Arc<NonceTracker>, config: ZkeConfig) -> Self {
         Self {
             session,
             nonce_tracker,
@@ -587,8 +580,7 @@ mod tests {
 
     #[test]
     fn test_derive_keys() {
-        let keys = ZkeKeyDerivation::derive_keys("password123", "user@example.com")
-            .expect("Key derivation failed");
+        let keys = ZkeKeyDerivation::derive_keys("password123", "user@example.com").expect("Key derivation failed");
 
         assert_eq!(keys.auth_key.len(), 32);
         assert_eq!(keys.encryption_key.len(), 32);
@@ -706,9 +698,7 @@ mod tests {
     #[test]
     fn test_session_with_nonce() {
         let key: EncryptionKey = rand::random();
-        let session = ZeroKnowledgeSession::new(key)
-            .unwrap()
-            .with_random_nonce();
+        let session = ZeroKnowledgeSession::new(key).unwrap().with_random_nonce();
 
         assert!(session.nonce().is_some());
         assert!(session.nonce_hex().is_some());

@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use futures::Stream;
 
 use super::{
-    ChatMessage, LlmProvider, LlmProviderConfig, LlmRequest, LlmResponse,
-    MessageRole, ModelInfo, ProviderError, ProviderResult, StreamChunk, TokenUsage,
+    ChatMessage, LlmProvider, LlmProviderConfig, LlmRequest, LlmResponse, MessageRole, ModelInfo, ProviderError,
+    ProviderResult, StreamChunk, TokenUsage,
 };
 
 /// Anthropic provider
@@ -18,14 +18,20 @@ pub struct AnthropicProvider {
 impl AnthropicProvider {
     /// Create new Anthropic provider
     pub fn new(config: &LlmProviderConfig) -> ProviderResult<Self> {
-        let api_key = config.api_key.clone()
+        let api_key = config
+            .api_key
+            .clone()
             .or_else(|| std::env::var("ANTHROPIC_API_KEY").ok())
             .ok_or_else(|| ProviderError::Config("Anthropic API key required".into()))?;
 
-        let endpoint = config.endpoint.clone()
+        let endpoint = config
+            .endpoint
+            .clone()
             .unwrap_or_else(|| "https://api.anthropic.com/v1".into());
 
-        let default_model = config.model.clone()
+        let default_model = config
+            .model
+            .clone()
             .unwrap_or_else(|| "claude-3-5-sonnet-20241022".into());
 
         Ok(Self {
@@ -170,13 +176,16 @@ impl LlmProvider for AnthropicProvider {
         }
         if let Some(ref tools) = request.tools {
             // Convert OpenAI-style tools to Anthropic format
-            let anthropic_tools: Vec<serde_json::Value> = tools.iter().map(|t| {
-                serde_json::json!({
-                    "name": t.function.name,
-                    "description": t.function.description,
-                    "input_schema": t.function.parameters,
+            let anthropic_tools: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.function.name,
+                        "description": t.function.description,
+                        "input_schema": t.function.parameters,
+                    })
                 })
-            }).collect();
+                .collect();
             body["tools"] = serde_json::json!(anthropic_tools);
         }
 
@@ -201,8 +210,7 @@ impl LlmProvider for AnthropicProvider {
             return Err(ProviderError::Api(error_text));
         }
 
-        let result: serde_json::Value = response.json().await
-            .map_err(|e| ProviderError::Api(e.to_string()))?;
+        let result: serde_json::Value = response.json().await.map_err(|e| ProviderError::Api(e.to_string()))?;
 
         // Parse response
         let content = &result["content"][0];
@@ -234,8 +242,7 @@ impl LlmProvider for AnthropicProvider {
         let usage = result.get("usage").map(|u| TokenUsage {
             prompt_tokens: u["input_tokens"].as_u64().unwrap_or(0) as usize,
             completion_tokens: u["output_tokens"].as_u64().unwrap_or(0) as usize,
-            total_tokens: (u["input_tokens"].as_u64().unwrap_or(0) +
-                          u["output_tokens"].as_u64().unwrap_or(0)) as usize,
+            total_tokens: (u["input_tokens"].as_u64().unwrap_or(0) + u["output_tokens"].as_u64().unwrap_or(0)) as usize,
         });
 
         Ok(LlmResponse {
@@ -278,13 +285,16 @@ impl LlmProvider for AnthropicProvider {
             body["stop_sequences"] = serde_json::json!(stop);
         }
         if let Some(ref tools) = request.tools {
-            let anthropic_tools: Vec<serde_json::Value> = tools.iter().map(|t| {
-                serde_json::json!({
-                    "name": t.function.name,
-                    "description": t.function.description,
-                    "input_schema": t.function.parameters,
+            let anthropic_tools: Vec<serde_json::Value> = tools
+                .iter()
+                .map(|t| {
+                    serde_json::json!({
+                        "name": t.function.name,
+                        "description": t.function.description,
+                        "input_schema": t.function.parameters,
+                    })
                 })
-            }).collect();
+                .collect();
             body["tools"] = serde_json::json!(anthropic_tools);
         }
 
