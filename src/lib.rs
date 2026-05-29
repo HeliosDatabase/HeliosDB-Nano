@@ -2401,10 +2401,18 @@ impl EmbeddedDatabase {
                         new_col_values,
                     });
 
-                    // Log to WAL for crash recovery (skip in explicit transactions —
-                    // WAL entries should only reflect committed changes)
+                    // P0#2: still append the logical WAL entry (so crash-recovery
+                    // replay and logical replication stay consistent), but WITHOUT a
+                    // per-statement fsync by default — durability matches the RocksDB
+                    // WriteBatch at commit. The legacy fsync-per-statement behavior
+                    // (which capped durable UPDATE throughput at the device fsync rate)
+                    // is opt-in via storage.logical_wal_per_statement.
                     if !skip_fast_paths && self.storage.is_wal_enabled() {
-                        self.storage.log_data_update(table_name, &key, &value)?;
+                        if self.storage.logical_wal_per_statement() {
+                            self.storage.log_data_update(table_name, &key, &value)?;
+                        } else {
+                            self.storage.log_data_update_nosync(table_name, &key, &value)?;
+                        }
                     }
 
                     // Invalidate row cache (stale after update)
@@ -2694,10 +2702,17 @@ impl EmbeddedDatabase {
                         let key = format!("data:{}:{}", table_name, row_id).into_bytes();
                         txn.delete(key.clone())?;
 
-                        // Log to WAL for crash recovery (skip in explicit transactions —
-                        // WAL entries should only reflect committed changes)
+                        // P0#2: append the logical WAL entry without a per-statement
+                        // fsync by default (recovery replay + replication stay
+                        // consistent; durability matches the RocksDB WriteBatch at
+                        // commit). Legacy fsync-per-DELETE is opt-in via
+                        // storage.logical_wal_per_statement.
                         if !skip_fast_paths && self.storage.is_wal_enabled() {
-                            self.storage.log_data_delete(table_name, &key)?;
+                            if self.storage.logical_wal_per_statement() {
+                                self.storage.log_data_delete(table_name, &key)?;
+                            } else {
+                                self.storage.log_data_delete_nosync(table_name, &key)?;
+                            }
                         }
 
                         // Invalidate row cache (row deleted)

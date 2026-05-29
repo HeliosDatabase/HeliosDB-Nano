@@ -244,6 +244,17 @@ pub struct StorageConfig {
     /// Default: Some(1000) (1 second)
     #[serde(default = "default_slow_query_threshold")]
     pub slow_query_threshold_ms: Option<u64>,
+    /// Append a per-statement logical WAL entry (with fsync in Sync mode) for
+    /// autocommit UPDATE/DELETE.
+    ///
+    /// Default: false. Durability and logical replication then rely on the
+    /// RocksDB WriteBatch written at commit — uniform with the INSERT fast path
+    /// and with explicit transactions (which already never emit per-statement
+    /// logical-WAL entries). Setting this true restores the legacy behavior of
+    /// an extra fsync'd `wal:entries` append per autocommit UPDATE/DELETE, which
+    /// caps durable throughput at the device fsync rate (~tens–hundreds/s).
+    #[serde(default)]
+    pub logical_wal_per_statement: bool,
 }
 
 fn default_slow_query_threshold() -> Option<u64> {
@@ -268,6 +279,7 @@ impl Default for StorageConfig {
             statement_timeout_ms: None, // Unlimited by default
             transaction_isolation: TransactionIsolation::ReadCommitted, // PostgreSQL default
             slow_query_threshold_ms: Some(1000), // 1 second default
+            logical_wal_per_statement: false,    // rely on RocksDB WAL at commit (see field docs)
         }
     }
 }

@@ -96,6 +96,9 @@ fn make_db(mode: &str, dir: &std::path::Path) -> Result<EmbeddedDatabase> {
             c.storage.memory_only = false;
             c.storage.wal_enabled = true;
             c.storage.wal_sync_mode = WalSyncModeConfig::Sync;
+            // P0#2 A/B: HELIOS_LOGICAL_WAL=1 restores the legacy per-statement
+            // fsync'd logical-WAL append for autocommit UPDATE/DELETE.
+            c.storage.logical_wal_per_statement = std::env::var("HELIOS_LOGICAL_WAL").is_ok();
             EmbeddedDatabase::with_config(c)
         }
         "disk_group" => {
