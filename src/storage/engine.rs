@@ -1845,6 +1845,29 @@ impl StorageEngine {
         Ok(count)
     }
 
+    /// Count rows matching a single-column integer primary-key range using the
+    /// in-memory ART index only. Returns `Ok(None)` when the table shape cannot
+    /// use this path.
+    pub fn count_table_pk_int_range_with_schema(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        lower: Option<(i64, bool)>,
+        upper: Option<(i64, bool)>,
+    ) -> Result<Option<usize>> {
+        if self.get_current_branch_id().is_some() {
+            return Ok(None);
+        }
+        let mut pk_cols = schema.columns.iter().filter(|col| col.primary_key);
+        let pk_col = match (pk_cols.next(), pk_cols.next()) {
+            (Some(col), None) => col,
+            _ => return Ok(None),
+        };
+        Ok(self
+            .art_index_manager
+            .pk_index_count_int_range(table_name, &pk_col.data_type, lower, upper))
+    }
+
     /// Scan table with an offset and a row limit (for LIMIT+OFFSET pushdown).
     ///
     /// Skips `offset` rows *without* deserialising them (raw RocksDB

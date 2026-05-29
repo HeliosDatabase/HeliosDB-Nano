@@ -13,7 +13,7 @@
 
 use super::art_index::{AdaptiveRadixTree, ArtIndexError, ArtIndexStats, ArtIndexType, ArtResult};
 use super::art_node::RowId;
-use crate::{Schema, Tuple, Value};
+use crate::{DataType, Schema, Tuple, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -78,6 +78,17 @@ pub struct ArtIndexManager {
 impl Default for ArtIndexManager {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn decode_int_key(key: &[u8], width: usize) -> Option<i64> {
+    match width {
+        2 if key.len() == 2 => Some(i64::from(i16::from_be_bytes([key[0], key[1]]))),
+        4 if key.len() == 4 => Some(i64::from(i32::from_be_bytes([key[0], key[1], key[2], key[3]]))),
+        8 if key.len() == 8 => Some(i64::from_be_bytes([
+            key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7],
+        ])),
+        _ => None,
     }
 }
 
@@ -556,6 +567,55 @@ impl ArtIndexManager {
         })
     }
 
+    /// Count rows in a single-column integer PK index that satisfy an optional
+    /// numeric range. Iterates the in-memory ART only; it does not fetch or
+    /// deserialize table rows.
+    pub fn pk_index_count_int_range(
+        &self,
+        table: &str,
+        pk_type: &DataType,
+        lower: Option<(i64, bool)>,
+        upper: Option<(i64, bool)>,
+    ) -> Option<usize> {
+        let key_width = match pk_type {
+            DataType::Int2 => 2,
+            DataType::Int4 => 4,
+            DataType::Int8 => 8,
+            _ => return None,
+        };
+        let pk_name = {
+            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
+            pk_indexes.get(table).cloned()
+        }?;
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let index = indexes.get(&pk_name)?;
+        if index.columns().len() != 1 {
+            return None;
+        }
+
+        Some(
+            index
+                .iter()
+                .filter_map(|(key, _)| decode_int_key(&key, key_width))
+                .filter(|value| {
+                    lower.map_or(true, |(bound, inclusive)| {
+                        if inclusive {
+                            *value >= bound
+                        } else {
+                            *value > bound
+                        }
+                    }) && upper.map_or(true, |(bound, inclusive)| {
+                        if inclusive {
+                            *value <= bound
+                        } else {
+                            *value < bound
+                        }
+                    })
+                })
+                .count(),
+        )
+    }
+
     /// List indexes for a specific table
     pub fn list_table_indexes(&self, table: &str) -> Vec<(String, ArtIndexType, Vec<String>)> {
         let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
@@ -1029,6 +1089,31 @@ mod tests {
         // Different key should succeed
         let result = manager.check_pk_constraint("users", &[Value::Int8(2)]);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_pk_int_range_count_handles_negative_keys() {
+        let manager = ArtIndexManager::new();
+        manager.create_pk_index("events", &["id".to_string()]).unwrap();
+
+        for (row_id, id) in [(-3_i64), -1, 0, 1, 4].into_iter().enumerate() {
+            let mut values = HashMap::new();
+            values.insert("id".to_string(), Value::Int8(id));
+            manager.on_insert("events", row_id as u64 + 1, &values).unwrap();
+        }
+
+        assert_eq!(
+            manager.pk_index_count_int_range("events", &DataType::Int8, Some((0, true)), None),
+            Some(3)
+        );
+        assert_eq!(
+            manager.pk_index_count_int_range("events", &DataType::Int8, None, Some((0, false))),
+            Some(2)
+        );
+        assert_eq!(
+            manager.pk_index_count_int_range("events", &DataType::Int8, Some((-1, true)), Some((1, true))),
+            Some(3)
+        );
     }
 
     #[test]

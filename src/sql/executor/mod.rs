@@ -1001,6 +1001,157 @@ impl<'a> Executor<'a> {
         )))
     }
 
+    fn count_star_schema_operator(count: i64) -> Box<dyn PhysicalOperator> {
+        Box::new(MaterializedOperator::new(
+            vec![crate::Tuple::new(vec![crate::Value::Int8(count)])],
+            count_star_schema(),
+        ))
+    }
+
+    fn try_count_star_pk_range(&self, input: &LogicalPlan) -> Result<Option<Box<dyn PhysicalOperator>>> {
+        let storage = match self.storage {
+            Some(s) => s,
+            None => return Ok(None),
+        };
+        if self.transaction.is_some() {
+            return Ok(None);
+        }
+
+        let (table_name, schema, predicate, as_of) = match input {
+            LogicalPlan::Filter { input, predicate } => {
+                if let LogicalPlan::Scan {
+                    table_name,
+                    schema,
+                    as_of,
+                    ..
+                } = input.as_ref()
+                {
+                    (table_name, schema, predicate, as_of)
+                } else {
+                    return Ok(None);
+                }
+            }
+            LogicalPlan::FilteredScan {
+                table_name,
+                schema,
+                predicate: Some(predicate),
+                as_of,
+                ..
+            } => (table_name, schema, predicate, as_of),
+            _ => return Ok(None),
+        };
+        if as_of.is_some() || self.get_cte(table_name).is_some() {
+            return Ok(None);
+        }
+
+        let mut pk_cols = schema.columns.iter().filter(|col| col.primary_key);
+        let pk_col = match (pk_cols.next(), pk_cols.next()) {
+            (Some(col), None) => col,
+            _ => return Ok(None),
+        };
+        let Some((lower, upper)) = self.pk_int_range_from_predicate(predicate, &pk_col.name, &pk_col.data_type) else {
+            return Ok(None);
+        };
+        let Some(count) = storage.count_table_pk_int_range_with_schema(table_name, schema, lower, upper)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self::count_star_schema_operator(count as i64)))
+    }
+
+    fn pk_int_range_from_predicate(
+        &self,
+        predicate: &crate::sql::LogicalExpr,
+        pk_name: &str,
+        pk_type: &crate::DataType,
+    ) -> Option<(Option<(i64, bool)>, Option<(i64, bool)>)> {
+        use crate::sql::LogicalExpr;
+
+        let LogicalExpr::BinaryExpr { left, op, right } = predicate else {
+            return None;
+        };
+
+        let left_col = Self::expr_matches_column(left, pk_name);
+        let right_col = Self::expr_matches_column(right, pk_name);
+        match (left_col, right_col) {
+            (true, false) => {
+                let bound = self.bound_expr_to_i64(right, pk_type)?;
+                Self::range_for_column_op(*op, bound)
+            }
+            (false, true) => {
+                let bound = self.bound_expr_to_i64(left, pk_type)?;
+                Self::range_for_value_op(*op, bound)
+            }
+            _ => None,
+        }
+    }
+
+    fn expr_matches_column(expr: &crate::sql::LogicalExpr, col_name: &str) -> bool {
+        match expr {
+            crate::sql::LogicalExpr::Column { name, .. } => {
+                name.rsplit('.').next().unwrap_or(name).eq_ignore_ascii_case(col_name)
+            }
+            _ => false,
+        }
+    }
+
+    fn bound_expr_to_i64(&self, expr: &crate::sql::LogicalExpr, pk_type: &crate::DataType) -> Option<i64> {
+        match expr {
+            crate::sql::LogicalExpr::Literal(v) => Self::value_to_i64_for_pk_range(v, pk_type),
+            crate::sql::LogicalExpr::Parameter { index } => self
+                .parameters
+                .get(index.saturating_sub(1))
+                .and_then(|v| Self::value_to_i64_for_pk_range(v, pk_type)),
+            _ => None,
+        }
+    }
+
+    fn value_to_i64_for_pk_range(value: &crate::Value, pk_type: &crate::DataType) -> Option<i64> {
+        use crate::{DataType, Value};
+        let raw = match value {
+            Value::Int2(v) => i64::from(*v),
+            Value::Int4(v) => i64::from(*v),
+            Value::Int8(v) => *v,
+            Value::String(s) => s.parse::<i64>().ok()?,
+            _ => return None,
+        };
+        match pk_type {
+            DataType::Int2 if i16::try_from(raw).is_ok() => Some(raw),
+            DataType::Int4 if i32::try_from(raw).is_ok() => Some(raw),
+            DataType::Int8 => Some(raw),
+            _ => None,
+        }
+    }
+
+    fn range_for_column_op(
+        op: crate::sql::BinaryOperator,
+        bound: i64,
+    ) -> Option<(Option<(i64, bool)>, Option<(i64, bool)>)> {
+        use crate::sql::BinaryOperator;
+        match op {
+            BinaryOperator::Eq => Some((Some((bound, true)), Some((bound, true)))),
+            BinaryOperator::Gt => Some((Some((bound, false)), None)),
+            BinaryOperator::GtEq => Some((Some((bound, true)), None)),
+            BinaryOperator::Lt => Some((None, Some((bound, false)))),
+            BinaryOperator::LtEq => Some((None, Some((bound, true)))),
+            _ => None,
+        }
+    }
+
+    fn range_for_value_op(
+        op: crate::sql::BinaryOperator,
+        bound: i64,
+    ) -> Option<(Option<(i64, bool)>, Option<(i64, bool)>)> {
+        use crate::sql::BinaryOperator;
+        match op {
+            BinaryOperator::Eq => Some((Some((bound, true)), Some((bound, true)))),
+            BinaryOperator::Lt => Some((Some((bound, false)), None)),
+            BinaryOperator::LtEq => Some((Some((bound, true)), None)),
+            BinaryOperator::Gt => Some((None, Some((bound, false)))),
+            BinaryOperator::GtEq => Some((None, Some((bound, true)))),
+            _ => None,
+        }
+    }
+
     /// Convert a logical plan to a physical operator
     pub(crate) fn plan_to_operator(&mut self, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
         match plan {
@@ -1420,11 +1571,10 @@ impl<'a> Executor<'a> {
                                     while let Some(_tuple) = point_op.next()? {
                                         count += 1;
                                     }
-                                    let result_tuple = crate::Tuple::new(vec![crate::Value::Int8(count)]);
-                                    return Ok(Box::new(MaterializedOperator::new(
-                                        vec![result_tuple],
-                                        count_star_schema(),
-                                    )));
+                                    return Ok(Self::count_star_schema_operator(count));
+                                }
+                                if let Some(range_count) = self.try_count_star_pk_range(input.as_ref())? {
+                                    return Ok(range_count);
                                 }
 
                                 let scan_table_filtered = match filter_input.as_ref() {
@@ -1489,11 +1639,10 @@ impl<'a> Executor<'a> {
                                     while let Some(_tuple) = point_op.next()? {
                                         count += 1;
                                     }
-                                    let result_tuple = crate::Tuple::new(vec![crate::Value::Int8(count)]);
-                                    return Ok(Box::new(MaterializedOperator::new(
-                                        vec![result_tuple],
-                                        count_star_schema(),
-                                    )));
+                                    return Ok(Self::count_star_schema_operator(count));
+                                }
+                                if let Some(range_count) = self.try_count_star_pk_range(input.as_ref())? {
+                                    return Ok(range_count);
                                 }
                             }
                         } // end if is_count_star

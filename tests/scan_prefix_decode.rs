@@ -57,3 +57,22 @@ fn prefix_decode_preserves_results() {
     assert_eq!(r[0].values.len(), 4);
     assert_eq!(r[0].values[3], Value::String("note-100".into()));
 }
+
+#[test]
+fn count_star_pk_range_handles_negative_keys() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE n (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    for id in [-3, -1, 0, 1, 4] {
+        db.execute(&format!("INSERT INTO n VALUES ({id}, 'v{id}')"))
+            .unwrap();
+    }
+
+    let rows = db.query("SELECT COUNT(*) FROM n WHERE id >= 0", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 3);
+
+    let rows = db.query("SELECT COUNT(*) FROM n WHERE id < 0", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 2);
+
+    let rows = db.query("SELECT COUNT(*) FROM n WHERE 0 <= id", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 3);
+}
