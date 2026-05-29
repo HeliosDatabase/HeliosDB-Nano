@@ -364,20 +364,22 @@ impl DeltaTracker {
 
             let mut delta_set = DeltaSet::new(table_name.clone());
 
-            // Iterate over deltas for this table
-            let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+            // Seek straight to the `delta:{table}:` prefix instead of iterating
+            // from the start of the keyspace (which walked every `data:` row key
+            // before reaching the deltas). total_order_seek is needed because the
+            // DB uses a fixed 5-byte prefix extractor.
+            let mut read_opts = rocksdb::ReadOptions::default();
+            read_opts.set_total_order_seek(true);
+            let iter = self.db.iterator_opt(
+                rocksdb::IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
+                read_opts,
+            );
             for item in iter {
                 let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
-                // Check if key matches our prefix
+                // Stop at the first key past this prefix.
                 if !key.starts_with(prefix_bytes) {
-                    // Optimization: break if we've passed the prefix
-                    if let (Some(&k), Some(&p)) = (key.first(), prefix_bytes.first()) {
-                        if k > p {
-                            break;
-                        }
-                    }
-                    continue;
+                    break;
                 }
 
                 // Deserialize delta
@@ -407,17 +409,17 @@ impl DeltaTracker {
             let prefix = format!("delta:{}:", table_name);
             let prefix_bytes = prefix.as_bytes();
 
-            let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+            let mut read_opts = rocksdb::ReadOptions::default();
+            read_opts.set_total_order_seek(true);
+            let iter = self.db.iterator_opt(
+                rocksdb::IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
+                read_opts,
+            );
             for item in iter {
                 let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
                 if !key.starts_with(prefix_bytes) {
-                    if let (Some(&k), Some(&p)) = (key.first(), prefix_bytes.first()) {
-                        if k > p {
-                            break;
-                        }
-                    }
-                    continue;
+                    break;
                 }
 
                 // Deserialize delta to check timestamp
@@ -439,20 +441,20 @@ impl DeltaTracker {
         let mut purged_count = 0;
         let mut keys_to_delete = Vec::new();
 
-        // Scan all deltas
+        // Seek to the `delta:` prefix rather than scanning the whole keyspace.
         let prefix = b"delta:";
-        let iter = self.db.iterator(rocksdb::IteratorMode::Start);
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix.as_slice(), rocksdb::Direction::Forward),
+            read_opts,
+        );
 
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(prefix) {
-                if let (Some(&k), Some(&p)) = (key.first(), prefix.first()) {
-                    if k > p {
-                        break;
-                    }
-                }
-                continue;
+                break;
             }
 
             // Deserialize delta to check timestamp

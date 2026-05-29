@@ -489,22 +489,25 @@ impl<'a> Catalog<'a> {
         let old_prefix_bytes = old_data_prefix.as_bytes();
         let new_data_prefix = format!("data:{}:", new_name);
 
-        // Collect all old keys and their values
+        // Collect all old keys and their values. Seek to the table's data
+        // prefix instead of scanning from the start of the keyspace.
         let mut rows_to_move = Vec::new();
-        let iter = self.storage.db.iterator(rocksdb::IteratorMode::Start);
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(old_prefix_bytes, rocksdb::Direction::Forward),
+            read_opts,
+        );
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
-            if key.starts_with(old_prefix_bytes) {
-                // Extract row_id from old key: data:{old_name}:{row_id}
-                let key_str = String::from_utf8_lossy(&key);
-                if let Some(row_id_str) = key_str.strip_prefix(&old_data_prefix) {
-                    rows_to_move.push((row_id_str.to_string(), value.to_vec()));
-                }
-            } else if let (Some(&k0), Some(&p0)) = (key.first(), old_prefix_bytes.first()) {
-                if k0 > p0 {
-                    break;
-                }
+            if !key.starts_with(old_prefix_bytes) {
+                break;
+            }
+            // Extract row_id from old key: data:{old_name}:{row_id}
+            let key_str = String::from_utf8_lossy(&key);
+            if let Some(row_id_str) = key_str.strip_prefix(&old_data_prefix) {
+                rows_to_move.push((row_id_str.to_string(), value.to_vec()));
             }
         }
 
@@ -826,17 +829,18 @@ impl<'a> Catalog<'a> {
         let prefix = b"trigger:";
         let mut triggers = Vec::new();
 
-        let iter = self.storage.db.iterator(rocksdb::IteratorMode::Start);
+        // Seek to the `trigger:` prefix instead of scanning from keyspace start.
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix.as_slice(), rocksdb::Direction::Forward),
+            read_opts,
+        );
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(prefix) {
-                if let (Some(&k0), Some(&p0)) = (key.first(), prefix.first()) {
-                    if k0 > p0 {
-                        break;
-                    }
-                }
-                continue;
+                break;
             }
 
             // Deserialize trigger definition
@@ -854,17 +858,20 @@ impl<'a> Catalog<'a> {
         let prefix_bytes = prefix.as_bytes();
         let mut keys_to_delete = Vec::new();
 
-        let iter = self.storage.db.iterator(rocksdb::IteratorMode::Start);
+        // Seek to the `trigger:{table}:` prefix instead of scanning from start.
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward),
+            read_opts,
+        );
         for item in iter {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
-            if key.starts_with(prefix_bytes) {
-                keys_to_delete.push(key.to_vec());
-            } else if let (Some(&k0), Some(&p0)) = (key.first(), prefix_bytes.first()) {
-                if k0 > p0 {
-                    break;
-                }
+            if !key.starts_with(prefix_bytes) {
+                break;
             }
+            keys_to_delete.push(key.to_vec());
         }
 
         let count = keys_to_delete.len();

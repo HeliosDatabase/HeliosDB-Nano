@@ -236,17 +236,18 @@ impl<'a> MaterializedViewCatalog<'a> {
         let prefix = b"meta:mv:";
         let mut views = Vec::new();
 
-        let iter = self.storage.db.iterator(rocksdb::IteratorMode::Start);
+        // Seek to the `meta:mv:` prefix instead of scanning from keyspace start.
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix.as_slice(), rocksdb::Direction::Forward),
+            read_opts,
+        );
         for item in iter {
             let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(prefix) {
-                if let (Some(&k), Some(&p)) = (key.first(), prefix.first()) {
-                    if k > p {
-                        break;
-                    }
-                }
-                continue;
+                break;
             }
 
             // Extract view name from key
