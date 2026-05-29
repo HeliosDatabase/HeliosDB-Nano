@@ -627,6 +627,263 @@ impl<'a> Executor<'a> {
         }
     }
 
+    // ============================ Correlated subqueries ============================
+    // `materialize_subqueries` runs once at plan-build time with no outer row, so a
+    // CORRELATED subquery (one referencing an outer column) errors and is swallowed
+    // to false/NULL. The helpers below evaluate correlated subqueries per outer row:
+    // each subquery's inner plan has its FREE (outer-referencing) column refs bound
+    // to the current outer row's values, then it is executed. See the Filter arm.
+
+    /// Base-table schema of a (single-table) subquery plan, used to decide whether a
+    /// column reference is satisfied by the subquery's own table (inner) or is FREE
+    /// (a correlated outer reference).
+    fn base_scan_schema(plan: &LogicalPlan) -> Option<std::sync::Arc<Schema>> {
+        match plan {
+            LogicalPlan::Scan { schema, .. } | LogicalPlan::FilteredScan { schema, .. } => Some(schema.clone()),
+            LogicalPlan::Filter { input, .. }
+            | LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => Self::base_scan_schema(input),
+            _ => None,
+        }
+    }
+
+    /// A column ref is a FREE outer reference if the subquery's own base table does
+    /// not provide it but `outer` does.
+    fn col_is_free_outer(table: &Option<String>, name: &str, inner: Option<&Schema>, outer: &Schema) -> bool {
+        let in_inner = inner.is_some_and(|s| s.get_qualified_column_index(table.as_deref(), name).is_some());
+        !in_inner && outer.get_qualified_column_index(table.as_deref(), name).is_some()
+    }
+
+    fn expr_has_free_outer_ref(expr: &crate::sql::LogicalExpr, inner: Option<&Schema>, outer: &Schema) -> bool {
+        use crate::sql::LogicalExpr as E;
+        match expr {
+            E::Column { table, name } => Self::col_is_free_outer(table, name, inner, outer),
+            E::BinaryExpr { left, right, .. } => {
+                Self::expr_has_free_outer_ref(left, inner, outer) || Self::expr_has_free_outer_ref(right, inner, outer)
+            }
+            E::UnaryExpr { expr, .. } | E::IsNull { expr, .. } => Self::expr_has_free_outer_ref(expr, inner, outer),
+            E::Between { expr, low, high, .. } => {
+                Self::expr_has_free_outer_ref(expr, inner, outer)
+                    || Self::expr_has_free_outer_ref(low, inner, outer)
+                    || Self::expr_has_free_outer_ref(high, inner, outer)
+            }
+            E::InList { expr, list, .. } => {
+                Self::expr_has_free_outer_ref(expr, inner, outer) || list.iter().any(|e| Self::expr_has_free_outer_ref(e, inner, outer))
+            }
+            E::Case { expr, when_then, else_result } => {
+                expr.as_ref().is_some_and(|e| Self::expr_has_free_outer_ref(e, inner, outer))
+                    || when_then.iter().any(|(w, t)| Self::expr_has_free_outer_ref(w, inner, outer) || Self::expr_has_free_outer_ref(t, inner, outer))
+                    || else_result.as_ref().is_some_and(|e| Self::expr_has_free_outer_ref(e, inner, outer))
+            }
+            _ => false,
+        }
+    }
+
+    fn plan_has_free_outer_ref(plan: &LogicalPlan, outer: &Schema) -> bool {
+        match plan {
+            LogicalPlan::FilteredScan { schema, predicate: Some(p), .. } => Self::expr_has_free_outer_ref(p, Some(schema), outer),
+            LogicalPlan::Filter { input, predicate } => {
+                let inner = Self::base_scan_schema(input);
+                Self::expr_has_free_outer_ref(predicate, inner.as_deref(), outer) || Self::plan_has_free_outer_ref(input, outer)
+            }
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => Self::plan_has_free_outer_ref(input, outer),
+            _ => false,
+        }
+    }
+
+    /// True if `expr` contains a correlated subquery (vs the predicate's `outer` schema).
+    fn expr_has_correlated_subquery(&self, expr: &crate::sql::LogicalExpr, outer: &Schema) -> bool {
+        use crate::sql::LogicalExpr as E;
+        match expr {
+            E::Exists { subquery, .. } | E::ScalarSubquery { subquery } | E::InSubquery { subquery, .. } => {
+                Self::plan_has_free_outer_ref(subquery, outer)
+            }
+            E::BinaryExpr { left, right, .. } => {
+                self.expr_has_correlated_subquery(left, outer) || self.expr_has_correlated_subquery(right, outer)
+            }
+            E::UnaryExpr { expr, .. } | E::IsNull { expr, .. } => self.expr_has_correlated_subquery(expr, outer),
+            E::Between { expr, low, high, .. } => {
+                self.expr_has_correlated_subquery(expr, outer)
+                    || self.expr_has_correlated_subquery(low, outer)
+                    || self.expr_has_correlated_subquery(high, outer)
+            }
+            E::InList { expr, list, .. } => {
+                self.expr_has_correlated_subquery(expr, outer) || list.iter().any(|e| self.expr_has_correlated_subquery(e, outer))
+            }
+            E::Case { expr, when_then, else_result } => {
+                expr.as_ref().is_some_and(|e| self.expr_has_correlated_subquery(e, outer))
+                    || when_then.iter().any(|(w, t)| self.expr_has_correlated_subquery(w, outer) || self.expr_has_correlated_subquery(t, outer))
+                    || else_result.as_ref().is_some_and(|e| self.expr_has_correlated_subquery(e, outer))
+            }
+            _ => false,
+        }
+    }
+
+    /// Bind a subquery's FREE outer column refs to the outer row's values (in place).
+    fn bind_expr_to_outer(expr: &mut crate::sql::LogicalExpr, inner: Option<&Schema>, outer: &Schema, row: &Tuple) {
+        use crate::sql::LogicalExpr as E;
+        match expr {
+            E::Column { table, name } => {
+                if inner.is_some_and(|s| s.get_qualified_column_index(table.as_deref(), name).is_some()) {
+                    return; // inner column — leave for the subquery to resolve
+                }
+                if let Some(idx) = outer.get_qualified_column_index(table.as_deref(), name) {
+                    if let Some(v) = row.values.get(idx) {
+                        *expr = E::Literal(v.clone());
+                    }
+                }
+            }
+            E::BinaryExpr { left, right, .. } => {
+                Self::bind_expr_to_outer(left, inner, outer, row);
+                Self::bind_expr_to_outer(right, inner, outer, row);
+            }
+            E::UnaryExpr { expr, .. } | E::IsNull { expr, .. } => Self::bind_expr_to_outer(expr, inner, outer, row),
+            E::Between { expr, low, high, .. } => {
+                Self::bind_expr_to_outer(expr, inner, outer, row);
+                Self::bind_expr_to_outer(low, inner, outer, row);
+                Self::bind_expr_to_outer(high, inner, outer, row);
+            }
+            E::InList { expr, list, .. } => {
+                Self::bind_expr_to_outer(expr, inner, outer, row);
+                for e in list {
+                    Self::bind_expr_to_outer(e, inner, outer, row);
+                }
+            }
+            E::Case { expr, when_then, else_result } => {
+                if let Some(e) = expr {
+                    Self::bind_expr_to_outer(e, inner, outer, row);
+                }
+                for (w, t) in when_then {
+                    Self::bind_expr_to_outer(w, inner, outer, row);
+                    Self::bind_expr_to_outer(t, inner, outer, row);
+                }
+                if let Some(e) = else_result {
+                    Self::bind_expr_to_outer(e, inner, outer, row);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Return a clone of `plan` with its predicates' free outer column refs bound to
+    /// the outer row (so a correlated subquery executes for that specific row).
+    fn bind_plan_to_outer(plan: &LogicalPlan, outer: &Schema, row: &Tuple) -> LogicalPlan {
+        let mut p = plan.clone();
+        Self::bind_plan_mut(&mut p, outer, row);
+        p
+    }
+
+    fn bind_plan_mut(plan: &mut LogicalPlan, outer: &Schema, row: &Tuple) {
+        match plan {
+            LogicalPlan::FilteredScan { schema, predicate, .. } => {
+                let inner = schema.clone();
+                if let Some(p) = predicate {
+                    Self::bind_expr_to_outer(p, Some(&inner), outer, row);
+                }
+            }
+            LogicalPlan::Filter { input, predicate } => {
+                let inner = Self::base_scan_schema(input);
+                Self::bind_expr_to_outer(predicate, inner.as_deref(), outer, row);
+                Self::bind_plan_mut(input, outer, row);
+            }
+            LogicalPlan::Project { input, .. }
+            | LogicalPlan::Aggregate { input, .. }
+            | LogicalPlan::Sort { input, .. }
+            | LogicalPlan::Limit { input, .. } => Self::bind_plan_mut(input, outer, row),
+            _ => {}
+        }
+    }
+
+    /// Like `materialize_subqueries`, but evaluates each subquery for a specific
+    /// OUTER row (binding free outer refs first), so correlated subqueries are
+    /// correct. On execution failure it falls back to the same false/NULL the
+    /// uncorrelated path uses (preserves drizzle / info_schema introspection).
+    fn materialize_subqueries_with_outer(
+        &self,
+        expr: &crate::sql::LogicalExpr,
+        outer: &Schema,
+        row: &Tuple,
+    ) -> Result<crate::sql::LogicalExpr> {
+        use crate::sql::LogicalExpr as E;
+        let run = |plan: &LogicalPlan| -> Vec<Tuple> {
+            let bound = Self::bind_plan_to_outer(plan, outer, row);
+            let mut ex = if let Some(s) = self.storage {
+                Executor::with_storage(s)
+            } else {
+                Executor::new()
+            }
+            .with_parameters(self.parameters.clone());
+            // Carry materialized CTEs so a correlated subquery can reference a
+            // WITH relation defined in the outer query (e.g. EXISTS over a CTE).
+            ex.cte_context = self.cte_context.clone();
+            ex.execute(&bound).unwrap_or_default()
+        };
+        match expr {
+            E::InSubquery { expr: inner_expr, subquery, negated } => {
+                let results = run(subquery);
+                let materialized_inner = self.materialize_subqueries_with_outer(inner_expr, outer, row)?;
+                let list: Vec<E> = results
+                    .iter()
+                    .filter_map(|t| t.values.first().map(|v| E::Literal(v.clone())))
+                    .collect();
+                Ok(E::InList { expr: Box::new(materialized_inner), list, negated: *negated })
+            }
+            E::ScalarSubquery { subquery } => {
+                let results = run(subquery);
+                let value = results.first().and_then(|t| t.values.first().cloned()).unwrap_or(crate::Value::Null);
+                Ok(E::Literal(value))
+            }
+            E::Exists { subquery, negated } => {
+                let exists = !run(subquery).is_empty();
+                Ok(E::Literal(crate::Value::Boolean(if *negated { !exists } else { exists })))
+            }
+            E::BinaryExpr { left, op, right } => Ok(E::BinaryExpr {
+                left: Box::new(self.materialize_subqueries_with_outer(left, outer, row)?),
+                op: *op,
+                right: Box::new(self.materialize_subqueries_with_outer(right, outer, row)?),
+            }),
+            E::UnaryExpr { op, expr: inner } => Ok(E::UnaryExpr {
+                op: *op,
+                expr: Box::new(self.materialize_subqueries_with_outer(inner, outer, row)?),
+            }),
+            E::IsNull { expr: inner, is_null } => Ok(E::IsNull {
+                expr: Box::new(self.materialize_subqueries_with_outer(inner, outer, row)?),
+                is_null: *is_null,
+            }),
+            E::Between { expr: inner, low, high, negated } => Ok(E::Between {
+                expr: Box::new(self.materialize_subqueries_with_outer(inner, outer, row)?),
+                low: Box::new(self.materialize_subqueries_with_outer(low, outer, row)?),
+                high: Box::new(self.materialize_subqueries_with_outer(high, outer, row)?),
+                negated: *negated,
+            }),
+            E::InList { expr: inner, list, negated } => {
+                let ml: Result<Vec<E>> = list.iter().map(|e| self.materialize_subqueries_with_outer(e, outer, row)).collect();
+                Ok(E::InList { expr: Box::new(self.materialize_subqueries_with_outer(inner, outer, row)?), list: ml?, negated: *negated })
+            }
+            E::Case { expr: operand, when_then, else_result } => {
+                let mo = match operand {
+                    Some(op) => Some(Box::new(self.materialize_subqueries_with_outer(op, outer, row)?)),
+                    None => None,
+                };
+                let mwt: Result<Vec<(E, E)>> = when_then
+                    .iter()
+                    .map(|(w, t)| Ok((self.materialize_subqueries_with_outer(w, outer, row)?, self.materialize_subqueries_with_outer(t, outer, row)?)))
+                    .collect();
+                let me = match else_result {
+                    Some(e) => Some(Box::new(self.materialize_subqueries_with_outer(e, outer, row)?)),
+                    None => None,
+                };
+                Ok(E::Case { expr: mo, when_then: mwt?, else_result: me })
+            }
+            _ => Ok(expr.clone()),
+        }
+    }
+
     /// Try to use PK ART index for a point lookup when we have Filter(Scan) with `pk_col = literal`.
     /// Returns Some(operator) if successful, None if not applicable.
     fn try_index_point_lookup(
@@ -755,8 +1012,28 @@ impl<'a> Executor<'a> {
                 if let Some(result) = self.try_index_point_lookup(input, predicate)? {
                     return Ok(result);
                 }
-                let input_op = self.plan_to_operator(input)?;
-                // Materialize any IN subqueries before creating the filter
+                let mut input_op = self.plan_to_operator(input)?;
+                let input_schema = input_op.schema();
+                // Correlated subquery in the predicate: evaluate per outer row (the
+                // once-at-plan-build materialize_subqueries can't, since it has no
+                // outer row). Drain the input, bind each subquery's free outer refs
+                // to the row, execute it, and keep matching rows.
+                if self.expr_has_correlated_subquery(predicate, &input_schema) {
+                    let evaluator =
+                        crate::sql::Evaluator::with_parameters(input_schema.clone(), self.parameters.clone());
+                    let mut matched: Vec<Tuple> = Vec::new();
+                    while let Some(row) = input_op.next()? {
+                        if let Some(ref ctx) = self.timeout_ctx {
+                            ctx.check_timeout()?;
+                        }
+                        let bound = self.materialize_subqueries_with_outer(predicate, &input_schema, &row)?;
+                        if let crate::Value::Boolean(true) = evaluator.evaluate(&bound, &row)? {
+                            matched.push(row);
+                        }
+                    }
+                    return Ok(Box::new(scan::MaterializedOperator::new(matched, input_schema)));
+                }
+                // Uncorrelated / no subquery: materialize once, stream through Filter.
                 let materialized_predicate = self.materialize_subqueries(predicate)?;
                 Ok(Box::new(
                     FilterOperator::new(input_op, materialized_predicate, self.parameters.clone())
@@ -844,6 +1121,50 @@ impl<'a> Executor<'a> {
                     ))
                 } else {
                     let input_op = self.plan_to_operator(input)?;
+                    let input_schema = input_op.schema();
+                    // Correlated scalar subquery in a projection (e.g.
+                    // `SELECT id, (SELECT COUNT(*) FROM p WHERE p.fk = t.id) FROM t`):
+                    // evaluate per outer row, binding the subquery's free outer refs.
+                    if !*distinct
+                        && distinct_on.is_none()
+                        && exprs.iter().any(|e| self.expr_has_correlated_subquery(e, &input_schema))
+                    {
+                        use crate::sql::TypeInference;
+                        let columns = aliases
+                            .iter()
+                            .zip(exprs.iter())
+                            .map(|(alias, expr)| crate::Column {
+                                name: alias.clone(),
+                                data_type: expr.infer_type(&input_schema).unwrap_or(crate::DataType::Text),
+                                nullable: true,
+                                primary_key: false,
+                                source_table: None,
+                                source_table_name: None,
+                                default_expr: None,
+                                unique: false,
+                                storage_mode: crate::ColumnStorageMode::Default,
+                            })
+                            .collect();
+                        let output_schema = Arc::new(Schema { columns });
+                        let evaluator =
+                            crate::sql::Evaluator::with_parameters(input_schema.clone(), self.parameters.clone());
+                        let mut input_op = input_op;
+                        let mut out: Vec<Tuple> = Vec::new();
+                        while let Some(row) = input_op.next()? {
+                            if let Some(ref ctx) = self.timeout_ctx {
+                                ctx.check_timeout()?;
+                            }
+                            let mut values = Vec::with_capacity(exprs.len());
+                            for e in exprs.iter() {
+                                let bound = self.materialize_subqueries_with_outer(e, &input_schema, &row)?;
+                                values.push(evaluator.evaluate(&bound, &row)?);
+                            }
+                            let mut t = Tuple::new(values);
+                            t.row_id = row.row_id;
+                            out.push(t);
+                        }
+                        return Ok(Box::new(scan::MaterializedOperator::new(out, output_schema)));
+                    }
                     // Materialize any subqueries in project expressions
                     let materialized_exprs: Vec<LogicalExpr> = exprs
                         .iter()
