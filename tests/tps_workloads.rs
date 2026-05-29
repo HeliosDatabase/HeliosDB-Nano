@@ -14,6 +14,64 @@ use heliosdb_nano::config::WalSyncModeConfig;
 use heliosdb_nano::{Config, EmbeddedDatabase, Result};
 use std::time::Instant;
 
+/// Analytics scan benchmark over a large table (P1#6 parallel-decode).
+/// Set HELIOS_SCAN_SERIAL=1 to force the serial decode path for A/B comparison.
+///   HELIOS_SCAN=1 HELIOS_SCAN_N=300000 cargo test --profile perf --test tps_workloads run_scan_bench -- --nocapture --test-threads=1
+#[test]
+fn run_scan_bench() {
+    if std::env::var("HELIOS_SCAN").is_err() {
+        eprintln!("skipping run_scan_bench (set HELIOS_SCAN=1)");
+        return;
+    }
+    let n: usize = std::env::var("HELIOS_SCAN_N").ok().and_then(|s| s.parse().ok()).unwrap_or(300_000);
+    let serial = std::env::var("HELIOS_SCAN_SERIAL").is_ok();
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE wide (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, d INTEGER, e INTEGER)")
+        .unwrap();
+    db.execute("BEGIN").unwrap();
+    for i in 0..n {
+        db.execute(&format!(
+            "INSERT INTO wide (id,a,b,c,d,e) VALUES ({i},{},{},'row{}',{},{})",
+            i % 1000,
+            (i * 7) % 100000,
+            i,
+            (i * 13) % 100000,
+            i % 8
+        ))
+        .unwrap();
+    }
+    db.execute("COMMIT").unwrap();
+
+    println!(
+        "\n=== scan bench: N={n} decode={} ===",
+        if serial { "SERIAL" } else { "PARALLEL" }
+    );
+    let runs = 5usize;
+    // Vary the predicate each run (`b >= r`, b is non-indexed and >= 0 so it
+    // still matches ~all rows) so the SQL text differs → result cache MISSES →
+    // we measure real scan+decode every iteration, not an Arc cache clone.
+    let bench = |label: &str, mk: &dyn Fn(usize) -> String| {
+        let t = Instant::now();
+        let mut rows = 0;
+        for r in 0..runs {
+            rows = db.query(&mk(r), &[]).unwrap().len();
+        }
+        let us = t.elapsed().as_secs_f64() * 1e6 / runs as f64;
+        println!("{label:<26} {us:>10.1} us/query   ({rows} rows out)");
+    };
+    bench("full_scan(SELECT *)", &|r| format!("SELECT * FROM wide WHERE b >= {r}"));
+    bench("filter_scan(d>50000)", &|r| {
+        format!("SELECT id, a FROM wide WHERE d > 50000 AND b >= {r}")
+    });
+    bench("agg_sum_avg", &|r| {
+        format!("SELECT SUM(a), AVG(d), MAX(b) FROM wide WHERE b >= {r}")
+    });
+    bench("group_by_e", &|r| {
+        format!("SELECT e, COUNT(*), SUM(a) FROM wide WHERE b >= {r} GROUP BY e")
+    });
+    println!();
+}
+
 fn bench<F: FnMut() -> Result<()>>(label: &str, ops: usize, mut f: F) {
     let start = Instant::now();
     f().expect("workload failed");

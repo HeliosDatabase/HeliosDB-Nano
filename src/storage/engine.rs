@@ -1528,20 +1528,27 @@ impl StorageEngine {
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
 
-        let mut tuples = Vec::new();
-
-        // Iterate over all keys with the prefix
-        // Use total_order_seek to bypass prefix bloom filter for full table scans
+        // Phase 1: collect raw (key,value) byte pairs (cheap memcpy from RocksDB).
         let mut read_opts = ReadOptions::default();
         read_opts.set_total_order_seek(true);
         let iter = self
             .db
             .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+        let mut raw_rows: Vec<(Box<[u8]>, Box<[u8]>)> = Vec::new();
         for item in iter {
             let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break; // past the prefix range
+            }
+            raw_rows.push((key, raw_value));
+        }
 
-            // Check if key starts with our prefix (break when past it)
-            if key.starts_with(prefix_bytes) {
+        // Phase 2: decode each row. The per-row decode (decrypt + bincode +
+        // column-storage resolution) is the CPU cost; we parallelize it across
+        // cores for large scans (P1#6 intra-query parallelism). `par_iter`
+        // preserves input order, so the result order matches the serial path.
+        let decode = |key: &[u8], raw_value: &[u8]| -> Result<Tuple> {
+            {
                 // Deserialize tuple (decrypt first if encryption is enabled). With a
                 // prefix_len, decode only the leading columns and stop — the trailing
                 // (often large) column bytes are never parsed.
@@ -1616,12 +1623,28 @@ impl StorageEngine {
                     }
                 }
 
-                tuples.push(tuple);
-            } else {
-                // Past the prefix range — stop iterating
-                break;
+                Ok(tuple)
             }
-        }
+        };
+
+        // Parallelize decode for large scans; stay serial for small ones to
+        // avoid thread-pool dispatch overhead. par_iter preserves order.
+        // HELIOS_SCAN_SERIAL=1 forces the serial path (A/B benchmarking + kill switch).
+        static SCAN_SERIAL: once_cell::sync::Lazy<bool> =
+            once_cell::sync::Lazy::new(|| std::env::var("HELIOS_SCAN_SERIAL").is_ok());
+        const PAR_DECODE_THRESHOLD: usize = 4096;
+        let tuples: Vec<Tuple> = if !*SCAN_SERIAL && raw_rows.len() >= PAR_DECODE_THRESHOLD {
+            use rayon::prelude::*;
+            raw_rows
+                .par_iter()
+                .map(|kv| decode(&kv.0, &kv.1))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            raw_rows
+                .iter()
+                .map(|kv| decode(&kv.0, &kv.1))
+                .collect::<Result<Vec<_>>>()?
+        };
 
         tracing::debug!(
             phase = "storage_scan",
