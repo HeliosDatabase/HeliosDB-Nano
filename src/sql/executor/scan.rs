@@ -200,6 +200,11 @@ fn collect_expr_columns(expr: &LogicalExpr, cols: &mut HashSet<String>, bail: &m
             collect_expr_columns(right, cols, bail);
         }
         LogicalExpr::UnaryExpr { expr, .. } => collect_expr_columns(expr, cols, bail),
+        LogicalExpr::AggregateFunction {
+            fun: crate::sql::logical_plan::AggregateFunction::Count,
+            args,
+            ..
+        } if args.iter().all(|arg| matches!(arg, LogicalExpr::Wildcard)) => {}
         LogicalExpr::AggregateFunction { args, .. } | LogicalExpr::ScalarFunction { args, .. } => {
             for a in args {
                 collect_expr_columns(a, cols, bail);
@@ -1252,6 +1257,14 @@ mod tests {
         }
     }
 
+    fn count_star() -> LogicalExpr {
+        LogicalExpr::AggregateFunction {
+            fun: crate::sql::logical_plan::AggregateFunction::Count,
+            args: vec![LogicalExpr::Wildcard],
+            distinct: false,
+        }
+    }
+
     #[test]
     fn test_scan_operator_empty() {
         let schema = Arc::new(Schema {
@@ -1363,5 +1376,46 @@ mod tests {
         };
 
         assert_eq!(compute_scan_prefix_hint(&plan), Some(("w".to_string(), 2)));
+    }
+
+    #[test]
+    fn count_star_without_filter_needs_no_columns() {
+        let schema = test_schema();
+        let plan = LogicalPlan::Aggregate {
+            input: Box::new(LogicalPlan::Scan {
+                table_name: "w".to_string(),
+                alias: None,
+                schema,
+                projection: None,
+                as_of: None,
+            }),
+            group_by: vec![],
+            aggr_exprs: vec![count_star()],
+            having: None,
+        };
+
+        assert_eq!(compute_scan_prefix_hint(&plan), Some(("w".to_string(), 0)));
+    }
+
+    #[test]
+    fn count_star_filter_uses_predicate_columns_only() {
+        let schema = test_schema();
+        let plan = LogicalPlan::Aggregate {
+            input: Box::new(LogicalPlan::Filter {
+                input: Box::new(LogicalPlan::Scan {
+                    table_name: "w".to_string(),
+                    alias: None,
+                    schema,
+                    projection: None,
+                    as_of: None,
+                }),
+                predicate: id_eq_seven(),
+            }),
+            group_by: vec![],
+            aggr_exprs: vec![count_star()],
+            having: None,
+        };
+
+        assert_eq!(compute_scan_prefix_hint(&plan), Some(("w".to_string(), 1)));
     }
 }
