@@ -74,37 +74,48 @@ impl PgCatalog {
         //   ('pg_catalog','information_schema');
         let has_information_schema_ref =
             query_lower.contains("information_schema.") || query_lower.contains(" information_schema ");
+        // KanttBan #22/#23 (v3.31.x) migrated several information_schema
+        // views to the planner-backed SystemViewRegistry by returning
+        // Ok(None) here. That delegation is required for drizzle-kit,
+        // which JOINs `table_constraints ⨝ key_column_usage ⨝
+        // constraint_column_usage` (and `columns`) in one statement —
+        // the substring router can only serve a single view, so a JOIN
+        // must fall through to the planner. But a *single-view* SELECT
+        // (no JOIN) is still served directly here so the legacy
+        // interception contract (and the direct `handle_query` callers /
+        // tests) keeps working. Detect a catalog JOIN and only then
+        // defer to the planner.
+        // Defer to the planner for JOINs and aggregates/GROUP BY — the
+        // substring router can only serve a single view and can't run
+        // the planner's aggregate operator. Plain single-view SELECTs
+        // are still intercepted here (legacy contract + direct callers).
+        let needs_planner = query_lower.contains(" join ")
+            || query_lower.contains("count(")
+            || query_lower.contains(" group by ");
         let result = if has_information_schema_ref {
-            if query_lower.contains("information_schema.columns") {
-                // KanttBan #23 (v3.31.1 phase 2): migrated to the
-                // SystemViewRegistry with the full identity-column
-                // shape. Falling through to the planner so drizzle's
-                // getColumnsInfoQuery (which JOINs against this view
-                // and reads is_identity / identity_generation / etc.)
-                // gets the rich row data instead of the legacy
-                // 6-col substring-routed shape.
-                return Ok(None);
-            } else if query_lower.contains("information_schema.tables") {
-                // KanttBan #22 (v3.31.0 slice 4): migrated to the
-                // SystemViewRegistry. Returning None falls through to
-                // the planner; the registry's
-                // `execute_information_schema_tables` handles WHERE /
-                // alias / JOIN natively. The legacy
-                // `query_information_schema_tables` helper still
-                // exists for tests that hit it directly.
-                return Ok(None);
-            } else if query_lower.contains("information_schema.key_column_usage")
-                || query_lower.contains("information_schema.table_constraints")
-                || query_lower.contains("information_schema.referential_constraints")
-                || query_lower.contains("information_schema.constraint_column_usage")
+            if needs_planner
+                && (query_lower.contains("information_schema.columns")
+                    || query_lower.contains("information_schema.tables")
+                    || query_lower.contains("information_schema.key_column_usage")
+                    || query_lower.contains("information_schema.table_constraints")
+                    || query_lower.contains("information_schema.referential_constraints")
+                    || query_lower.contains("information_schema.constraint_column_usage"))
             {
-                // KanttBan #23 phase 2.8+2.9: migrated to the
-                // SystemViewRegistry. Falling through lets the
-                // planner JOIN these views together — critical
-                // for drizzle-kit, which queries
-                // table_constraints ⨝ key_column_usage ⨝
-                // constraint_column_usage in a single statement.
+                // JOIN / aggregate across registry-backed views: defer to the planner.
                 return Ok(None);
+            } else if query_lower.contains("information_schema.columns") {
+                Some(self.query_information_schema_columns(&query_lower)?)
+            } else if query_lower.contains("information_schema.tables") {
+                Some(self.query_information_schema_tables(&query_lower)?)
+            } else if query_lower.contains("information_schema.key_column_usage") {
+                Some(self.query_information_schema_key_column_usage()?)
+            } else if query_lower.contains("information_schema.table_constraints") {
+                Some(self.query_information_schema_table_constraints()?)
+            } else if query_lower.contains("information_schema.referential_constraints") {
+                Some(self.query_information_schema_referential_constraints()?)
+            } else if query_lower.contains("information_schema.constraint_column_usage") {
+                // Empty placeholder shape (Nano doesn't surface this view's rows).
+                Self::known_empty_information_schema_view("constraint_column_usage")
             } else if query_lower.contains("information_schema.routines") {
                 Some(Self::query_information_schema_routines())
             } else if query_lower.contains("information_schema.check_constraints") {
@@ -2261,17 +2272,18 @@ mod tests {
 
     #[test]
     fn test_handle_query_information_schema_tables() {
-        // v3.31.0 slice 4: information_schema.tables migrated to the
-        // SystemViewRegistry. The catalog handler now returns None
-        // (falls through to the planner) instead of doing its own
-        // limited projection / WHERE filtering.
+        // A plain single-view SELECT against information_schema.tables is
+        // intercepted directly so the legacy contract (and the direct
+        // `handle_query` callers / introspection tests) keeps working.
+        // JOINs and aggregates still fall through to the planner — see
+        // `group_by_information_schema_tables_falls_through_to_planner`.
         let catalog = PgCatalog::new();
         let result = catalog
             .handle_query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
             .unwrap();
         assert!(
-            result.is_none(),
-            "information_schema.tables falls through; got {result:?}"
+            result.is_some(),
+            "plain information_schema.tables SELECT is intercepted; got {result:?}"
         );
     }
 
