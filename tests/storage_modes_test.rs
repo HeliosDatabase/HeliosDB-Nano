@@ -2,13 +2,50 @@
 //!
 //! Tests dictionary encoding, content-addressed storage, and columnar storage.
 
-use heliosdb_nano::{Config, EmbeddedDatabase, Value};
+use heliosdb_nano::{
+    storage::{WalEntry, WalOperation},
+    Config, EmbeddedDatabase, Tuple, Value,
+};
 
 fn test_db() -> EmbeddedDatabase {
     let mut config = Config::default();
     config.storage.memory_only = true;
     config.storage.wal_enabled = false; // Faster tests
     EmbeddedDatabase::with_config(config).expect("Failed to create database")
+}
+
+fn wal_test_db(time_travel_enabled: bool) -> EmbeddedDatabase {
+    let mut config = Config::default();
+    config.storage.memory_only = true;
+    config.storage.wal_enabled = true;
+    config.storage.logical_wal_per_statement = true;
+    config.storage.time_travel_enabled = time_travel_enabled;
+    EmbeddedDatabase::with_config(config).expect("Failed to create database")
+}
+
+fn find_insert_wal_tuple(db: &EmbeddedDatabase, table_name: &str) -> Tuple {
+    let last_lsn_key = b"wal:last_lsn".to_vec();
+    let last_lsn_bytes = db
+        .storage
+        .get(&last_lsn_key)
+        .unwrap()
+        .expect("wal:last_lsn should exist");
+    let last_lsn = u64::from_le_bytes(last_lsn_bytes.try_into().unwrap());
+
+    for lsn in 1..=last_lsn {
+        let key = format!("wal:entries:{:020}", lsn).into_bytes();
+        let Some(raw) = db.storage.get(&key).unwrap() else {
+            continue;
+        };
+        let entry = WalEntry::deserialize(&raw).unwrap();
+        if let WalOperation::Insert { table, tuple, .. } = entry.operation {
+            if table == table_name {
+                return bincode::deserialize(&tuple).unwrap();
+            }
+        }
+    }
+
+    panic!("missing INSERT WAL entry for table {table_name}");
 }
 
 #[test]
@@ -111,6 +148,13 @@ fn test_columnar_storage() {
         .execute("ALTER TABLE metrics ALTER COLUMN value SET STORAGE COLUMNAR")
         .unwrap();
     assert_eq!(migrated, 3);
+    assert_eq!(
+        db.storage
+            .columnar_column_stats("metrics", "value")
+            .unwrap()
+            .non_null_values,
+        3
+    );
 
     // Verify data
     let results = db.query("SELECT * FROM metrics ORDER BY id", &[]).unwrap();
@@ -125,6 +169,63 @@ fn test_columnar_storage() {
     let results = db.query("SELECT * FROM metrics WHERE id = 4", &[]).unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].values[2], Value::Float8(4.5));
+    assert_eq!(
+        db.storage
+            .columnar_column_stats("metrics", "value")
+            .unwrap()
+            .non_null_values,
+        4
+    );
+}
+
+#[test]
+fn test_columnar_storage_fast_insert_side_data() {
+    let db = test_db();
+
+    db.execute("CREATE TABLE metrics (id INT PRIMARY KEY, value FLOAT8)")
+        .unwrap();
+    db.execute("ALTER TABLE metrics ALTER COLUMN value SET STORAGE COLUMNAR")
+        .unwrap();
+
+    // Simple literal INSERT uses the autocommit fast path. It must still
+    // populate the physical columnar side store, otherwise a future columnar
+    // scan would miss the row even though row scans read the inline value.
+    db.execute("INSERT INTO metrics (id, value) VALUES (1, 10.5)").unwrap();
+
+    let stats = db.storage.columnar_column_stats("metrics", "value").unwrap();
+    assert_eq!(stats.non_null_values, 1);
+    let rows = db.query("SELECT value FROM metrics WHERE id = 1", &[]).unwrap();
+    assert_eq!(rows[0].values[0], Value::Float8(10.5));
+}
+
+#[test]
+fn test_columnar_fast_insert_wal_logs_logical_tuple() {
+    let db = wal_test_db(true);
+
+    db.execute("CREATE TABLE metrics (id INT PRIMARY KEY, value FLOAT8)")
+        .unwrap();
+    db.execute("ALTER TABLE metrics ALTER COLUMN value SET STORAGE COLUMNAR")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, value) VALUES (1, 10.5)").unwrap();
+
+    let wal_tuple = find_insert_wal_tuple(&db, "metrics");
+    assert_eq!(wal_tuple.values[1], Value::Float8(10.5));
+}
+
+#[test]
+fn test_columnar_direct_insert_tt_off_wal_logs_logical_tuple() {
+    let db = wal_test_db(false);
+
+    db.execute("CREATE TABLE metrics (id INT PRIMARY KEY, value FLOAT8)")
+        .unwrap();
+    db.execute("ALTER TABLE metrics ALTER COLUMN value SET STORAGE COLUMNAR")
+        .unwrap();
+    db.storage
+        .insert_tuple("metrics", Tuple::new(vec![Value::Int4(1), Value::Float8(10.5)]))
+        .unwrap();
+
+    let wal_tuple = find_insert_wal_tuple(&db, "metrics");
+    assert_eq!(wal_tuple.values[1], Value::Float8(10.5));
 }
 
 #[test]
