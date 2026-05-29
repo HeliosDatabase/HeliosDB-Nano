@@ -118,6 +118,29 @@ fn test_insert_with_parameters() {
 }
 
 #[test]
+fn test_parameterized_insert_cache_invalidated_by_schema_change() {
+    let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
+    db.execute("CREATE TABLE param_cache_schema (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+
+    let sql = "INSERT INTO param_cache_schema (id, name) VALUES ($1, $2)";
+    db.execute_params(sql, &[Value::Int4(1), Value::String("before".to_string())])
+        .unwrap();
+
+    db.execute("ALTER TABLE param_cache_schema ADD COLUMN score INT DEFAULT 7")
+        .unwrap();
+
+    db.execute_params(sql, &[Value::Int4(2), Value::String("after".to_string())])
+        .unwrap();
+
+    let rows = db
+        .query("SELECT id, name, score FROM param_cache_schema WHERE id = 2", &[])
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get(2).unwrap(), &Value::Int4(7));
+}
+
+#[test]
 fn test_parameterized_insert_in_explicit_transaction_commit_and_rollback() {
     let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
     db.execute("CREATE TABLE txn_params (id INT PRIMARY KEY, name TEXT)")
