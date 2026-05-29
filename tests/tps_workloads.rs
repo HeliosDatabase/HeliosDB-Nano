@@ -12,7 +12,7 @@
 //! HELIOS_TPS_TIME_TRAVEL=0 disables MVCC version-key maintenance for write-path diagnosis.
 
 use heliosdb_nano::config::WalSyncModeConfig;
-use heliosdb_nano::{Config, EmbeddedDatabase, Result};
+use heliosdb_nano::{Config, EmbeddedDatabase, Result, Value};
 use std::time::Instant;
 
 /// Concurrent point-lookup benchmark (P0#4 row-cache read-lock).
@@ -497,6 +497,109 @@ fn run_tps_suite() {
     bench("order_by_limit10", scan_iters, || {
         for _ in 0..scan_iters {
             let _ = db.query("SELECT id, balance FROM users ORDER BY balance DESC LIMIT 10", &[])?;
+        }
+        Ok(())
+    });
+
+    println!("{}", "-".repeat(80));
+    println!("done.\n");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+/// Parameterized DML TPS harness. This mirrors the write-heavy part of
+/// `run_tps_suite`, but uses `execute_params` / `query_params`, which is the
+/// path used by PG-wire extended protocol clients and sqlite-style bindings.
+#[test]
+fn run_param_tps_suite() {
+    if std::env::var("HELIOS_TPS_PARAMS").is_err() {
+        eprintln!("skipping run_param_tps_suite (set HELIOS_TPS_PARAMS=1 to run)");
+        return;
+    }
+    let mode = std::env::var("HELIOS_TPS_MODE").unwrap_or_else(|_| "mem".into());
+    let n: usize = std::env::var("HELIOS_TPS_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50_000);
+    let m: usize = std::env::var("HELIOS_TPS_M")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or((n / 5).max(2_000));
+
+    let tmp = std::env::temp_dir().join(format!("helios_param_tps_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&tmp);
+    std::fs::create_dir_all(&tmp).unwrap();
+
+    println!("\n============= HeliosDB-Nano parameterized TPS =============");
+    println!(
+        "mode={mode}  N={n}  M={m}  time_travel={}  dir={}",
+        env_bool_enabled("HELIOS_TPS_TIME_TRAVEL", true),
+        tmp.display()
+    );
+    println!("{}", "-".repeat(80));
+
+    let db = make_db(&mode, &tmp).expect("db open");
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT, age INTEGER, balance INTEGER)")
+        .unwrap();
+
+    bench("param_bulk_insert(txn)", n, || {
+        db.execute("BEGIN")?;
+        for i in 0..n {
+            db.execute_params(
+                "INSERT INTO users (id, name, email, age, balance) VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    Value::Int8(i as i64),
+                    Value::String(format!("User{i}")),
+                    Value::String(format!("u{i}@ex.com")),
+                    Value::Int4(18 + (i % 60) as i32),
+                    Value::Int8(((i * 7) % 100000) as i64),
+                ],
+            )?;
+        }
+        db.execute("COMMIT")?;
+        Ok(())
+    });
+
+    bench("param_autocommit_insert", m, || {
+        for i in 0..m {
+            let id = n + i;
+            db.execute_params(
+                "INSERT INTO users (id, name, email, age, balance) VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    Value::Int8(id as i64),
+                    Value::String(format!("AC{id}")),
+                    Value::String(format!("ac{id}@ex.com")),
+                    Value::Int4(33),
+                    Value::Int8(500),
+                ],
+            )?;
+        }
+        Ok(())
+    });
+
+    bench("param_point_lookup_pk", m, || {
+        for i in 0..m {
+            let id = (i * 2654435761usize) % n;
+            let rows = db.query_params("SELECT * FROM users WHERE id = $1", &[Value::Int8(id as i64)])?;
+            assert!(!rows.is_empty());
+        }
+        Ok(())
+    });
+
+    bench("param_update_by_pk", m, || {
+        for i in 0..m {
+            let id = (i * 40503usize) % n;
+            db.execute_params(
+                "UPDATE users SET balance = balance + 1 WHERE id = $1",
+                &[Value::Int8(id as i64)],
+            )?;
+        }
+        Ok(())
+    });
+
+    bench("param_delete_by_pk", m, || {
+        for i in 0..m {
+            let id = n + i;
+            db.execute_params("DELETE FROM users WHERE id = $1", &[Value::Int8(id as i64)])?;
         }
         Ok(())
     });

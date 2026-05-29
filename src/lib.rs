@@ -4382,6 +4382,515 @@ impl EmbeddedDatabase {
         Some(result)
     }
 
+    /// Execute eligible parameterized autocommit INSERTs through the same
+    /// direct storage path used by literal INSERTs. This keeps PG-wire
+    /// extended-protocol inserts from falling back to the slower
+    /// versioned/logical-plan path on every row.
+    fn try_autocommit_fast_insert_params(&self, plan: &sql::LogicalPlan, params: &[Value]) -> Option<Result<u64>> {
+        if self.in_transaction()
+            || !self.savepoints.read().is_empty()
+            || !self.session_transactions.is_empty()
+            || self.tenant_manager.get_current_context().is_some()
+            || self.storage.get_current_branch_id().is_some()
+        {
+            return None;
+        }
+
+        let sql::LogicalPlan::Insert {
+            table_name,
+            columns,
+            values,
+            returning,
+            on_conflict,
+        } = plan
+        else {
+            return None;
+        };
+
+        if returning.is_some() || on_conflict.is_some() || values.len() != 1 {
+            return None;
+        }
+        if self.tenant_manager.should_apply_rls(table_name, "INSERT") {
+            return None;
+        }
+        if self.trigger_registry.has_triggers_for_table(table_name) {
+            return None;
+        }
+
+        let catalog = self.storage.catalog();
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(schema) => schema,
+            Err(_) => return None,
+        };
+        if let Ok(tc) = catalog.load_table_constraints(table_name) {
+            if !tc.foreign_keys.is_empty() || !tc.check_constraints.is_empty() {
+                return None;
+            }
+        }
+
+        let column_names: Vec<&str> = columns.as_ref().map_or_else(
+            || schema.columns.iter().map(|c| c.name.as_str()).collect(),
+            |cols| cols.iter().map(String::as_str).collect(),
+        );
+        let value_row = values.first()?;
+        if column_names.len() != value_row.len() {
+            return None;
+        }
+
+        let evaluator =
+            sql::Evaluator::with_parameters(std::sync::Arc::new(Schema { columns: vec![] }), params.to_vec());
+        let empty_tuple = Tuple::new(vec![]);
+        let mut tuple_values = vec![Value::Null; schema.columns.len()];
+        let mut user_provided = vec![false; schema.columns.len()];
+
+        for (col_name, expr) in column_names.iter().zip(value_row) {
+            let col_idx = match schema.get_column_index(col_name) {
+                Some(idx) => idx,
+                None => return None,
+            };
+            let target_col = match schema.get_column_at(col_idx) {
+                Some(col) => col,
+                None => return None,
+            };
+
+            if matches!(expr, sql::LogicalExpr::DefaultValue) {
+                continue;
+            }
+            if !Self::fast_param_insert_expr_supported(expr) {
+                return None;
+            }
+
+            let mut value = match evaluator.evaluate(expr, &empty_tuple) {
+                Ok(value) => value,
+                Err(e) => return Some(Err(e)),
+            };
+            if Self::insert_value_needs_cast(&value, &target_col.data_type) {
+                value = match evaluator.cast_value(value, &target_col.data_type) {
+                    Ok(value) => value,
+                    Err(e) => return Some(Err(e)),
+                };
+            }
+
+            if let Some(slot) = tuple_values.get_mut(col_idx) {
+                *slot = value;
+            }
+            if let Some(flag) = user_provided.get_mut(col_idx) {
+                *flag = true;
+            }
+        }
+
+        if let Err(e) = Self::apply_defaults_and_check_not_null(&mut tuple_values, &schema, &user_provided) {
+            return Some(Err(e));
+        }
+
+        let result = self
+            .storage
+            .insert_tuple_fast(table_name, Tuple::new(tuple_values), &schema)
+            .map(|_| 1);
+        if result.is_ok() {
+            self.storage.increment_lsn();
+        }
+        Some(result)
+    }
+
+    fn try_transaction_fast_insert_params(&self, plan: &sql::LogicalPlan, params: &[Value]) -> Option<Result<u64>> {
+        if !self.in_transaction()
+            || !self.savepoints.read().is_empty()
+            || !self.session_transactions.is_empty()
+            || self.tenant_manager.get_current_context().is_some()
+        {
+            return None;
+        }
+
+        let sql::LogicalPlan::Insert {
+            table_name,
+            columns,
+            values,
+            returning,
+            on_conflict,
+        } = plan
+        else {
+            return None;
+        };
+
+        if returning.is_some() || on_conflict.is_some() || values.len() != 1 {
+            return None;
+        }
+        if self.tenant_manager.should_apply_rls(table_name, "INSERT") {
+            return None;
+        }
+        if self.trigger_registry.has_triggers_for_table(table_name) {
+            return None;
+        }
+
+        let catalog = self.storage.catalog();
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(schema) => schema,
+            Err(_) => return None,
+        };
+        if let Ok(tc) = catalog.load_table_constraints(table_name) {
+            if !tc.foreign_keys.is_empty() || !tc.check_constraints.is_empty() {
+                return None;
+            }
+        }
+
+        let column_names: Vec<&str> = columns.as_ref().map_or_else(
+            || schema.columns.iter().map(|c| c.name.as_str()).collect(),
+            |cols| cols.iter().map(String::as_str).collect(),
+        );
+        let value_row = values.first()?;
+        if column_names.len() != value_row.len() {
+            return None;
+        }
+
+        let evaluator =
+            sql::Evaluator::with_parameters(std::sync::Arc::new(Schema { columns: vec![] }), params.to_vec());
+        let empty_tuple = Tuple::new(vec![]);
+        let mut tuple_values = vec![Value::Null; schema.columns.len()];
+        let mut user_provided = vec![false; schema.columns.len()];
+
+        for (col_name, expr) in column_names.iter().zip(value_row) {
+            let col_idx = match schema.get_column_index(col_name) {
+                Some(idx) => idx,
+                None => return None,
+            };
+            let target_col = match schema.get_column_at(col_idx) {
+                Some(col) => col,
+                None => return None,
+            };
+
+            if matches!(expr, sql::LogicalExpr::DefaultValue) {
+                continue;
+            }
+            if !Self::fast_param_insert_expr_supported(expr) {
+                return None;
+            }
+
+            let mut value = match evaluator.evaluate(expr, &empty_tuple) {
+                Ok(value) => value,
+                Err(e) => return Some(Err(e)),
+            };
+            if Self::insert_value_needs_cast(&value, &target_col.data_type) {
+                value = match evaluator.cast_value(value, &target_col.data_type) {
+                    Ok(value) => value,
+                    Err(e) => return Some(Err(e)),
+                };
+            }
+
+            if let Some(slot) = tuple_values.get_mut(col_idx) {
+                *slot = value;
+            }
+            if let Some(flag) = user_provided.get_mut(col_idx) {
+                *flag = true;
+            }
+        }
+
+        if let Err(e) = Self::apply_defaults_and_check_not_null(&mut tuple_values, &schema, &user_provided) {
+            return Some(Err(e));
+        }
+
+        let txn_guard = match self.current_transaction.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let txn = txn_guard.as_ref()?;
+        Some(self.insert_validated_tuples_in_transaction(table_name, vec![Tuple::new(tuple_values)], &schema, txn))
+    }
+
+    fn fast_param_insert_expr_supported(expr: &sql::LogicalExpr) -> bool {
+        match expr {
+            sql::LogicalExpr::Literal(_) | sql::LogicalExpr::Parameter { .. } | sql::LogicalExpr::DefaultValue => true,
+            sql::LogicalExpr::Cast { expr, .. } => Self::fast_param_insert_expr_supported(expr),
+            _ => false,
+        }
+    }
+
+    fn insert_value_needs_cast(value: &Value, target_type: &DataType) -> bool {
+        match (value, target_type) {
+            (Value::Null, _) => false,
+            (Value::Vector(_), DataType::Vector(_)) => true,
+            (Value::String(_), DataType::Vector(_)) => true,
+            (Value::String(_), DataType::Json | DataType::Jsonb) => true,
+            (Value::Int4(_), DataType::Int4) => false,
+            (Value::Int8(_), DataType::Int8) => false,
+            (Value::Float4(_), DataType::Float4) => false,
+            (Value::Float8(_), DataType::Float8) => false,
+            (Value::String(_), DataType::Text | DataType::Varchar(_)) => false,
+            (Value::Boolean(_), DataType::Boolean) => false,
+            (Value::Json(_), DataType::Json | DataType::Jsonb) => false,
+            _ => true,
+        }
+    }
+
+    fn try_autocommit_fast_update_delete_params(
+        &self,
+        plan: &sql::LogicalPlan,
+        params: &[Value],
+    ) -> Option<Result<u64>> {
+        if self.in_transaction()
+            || !self.savepoints.read().is_empty()
+            || !self.session_transactions.is_empty()
+            || self.tenant_manager.get_current_context().is_some()
+            || self.storage.get_current_branch_id().is_some()
+        {
+            return None;
+        }
+
+        match plan {
+            sql::LogicalPlan::Update {
+                table_name,
+                assignments,
+                selection,
+                returning,
+            } => self.try_fast_update_params(table_name, assignments, selection, returning, params),
+            sql::LogicalPlan::Delete {
+                table_name,
+                selection,
+                returning,
+            } => self.try_fast_delete_params(table_name, selection, returning, params),
+            _ => None,
+        }
+    }
+
+    fn try_fast_update_params(
+        &self,
+        table_name: &str,
+        assignments: &[(String, sql::LogicalExpr)],
+        selection: &Option<sql::LogicalExpr>,
+        returning: &Option<Vec<sql::logical_plan::ReturningItem>>,
+        params: &[Value],
+    ) -> Option<Result<u64>> {
+        if returning.is_some()
+            || assignments.is_empty()
+            || self.tenant_manager.should_apply_rls(table_name, "UPDATE")
+            || self.trigger_registry.has_triggers_for_table(table_name)
+        {
+            return None;
+        }
+
+        let catalog = self.storage.catalog();
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(schema) => schema,
+            Err(_) => return None,
+        };
+        if let Ok(constraints) = catalog.load_table_constraints(table_name) {
+            if !constraints.foreign_keys.is_empty() || !constraints.check_constraints.is_empty() {
+                return None;
+            }
+        }
+
+        let pk_value = match self.fast_pk_value_from_selection(selection, &schema, params) {
+            Some(Ok(value)) => value,
+            Some(Err(e)) => return Some(Err(e)),
+            None => return None,
+        };
+
+        let existing_row = match self.storage.get_row_by_pk_with_schema(table_name, &pk_value, &schema) {
+            Ok(Some(row)) => row,
+            Ok(None) => return Some(Ok(0)),
+            Err(e) => return Some(Err(e)),
+        };
+        let row_id = existing_row.row_id.unwrap_or(0);
+        if row_id == 0 {
+            return None;
+        }
+
+        let evaluator = sql::Evaluator::with_parameters(std::sync::Arc::new(schema.clone()), params.to_vec());
+        let mut new_values = existing_row.values.clone();
+        for (col_name, expr) in assignments {
+            let col_idx = match schema.get_column_index(col_name) {
+                Some(idx) => idx,
+                None => return None,
+            };
+            let column = match schema.get_column_at(col_idx) {
+                Some(column) => column,
+                None => return None,
+            };
+            if column.primary_key || column.unique {
+                return None;
+            }
+            if !Self::fast_update_expr_supported(expr) {
+                return None;
+            }
+
+            let mut value = match evaluator.evaluate(expr, &existing_row) {
+                Ok(value) => value,
+                Err(e) => return Some(Err(e)),
+            };
+            if Self::insert_value_needs_cast(&value, &column.data_type) {
+                value = match evaluator.cast_value(value, &column.data_type) {
+                    Ok(value) => value,
+                    Err(e) => return Some(Err(e)),
+                };
+            }
+            if !column.nullable && matches!(value, Value::Null) {
+                return Some(Err(Error::constraint_violation(format!(
+                    "Column '{}' cannot be null",
+                    col_name
+                ))));
+            }
+            if let Some(slot) = new_values.get_mut(col_idx) {
+                *slot = value;
+            } else {
+                return None;
+            }
+        }
+
+        let new_tuple = Tuple::new(new_values);
+        let key = self.storage.branch_aware_data_key(table_name, row_id);
+        let value = match bincode::serialize(&new_tuple) {
+            Ok(value) => value,
+            Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
+        };
+        if self.storage.is_wal_enabled() {
+            let wal_result = if self.storage.logical_wal_per_statement() {
+                self.storage.log_data_update(table_name, &key, &value)
+            } else {
+                self.storage.log_data_update_nosync(table_name, &key, &value)
+            };
+            if let Err(e) = wal_result {
+                return Some(Err(e));
+            }
+        }
+
+        let result = self
+            .storage
+            .update_tuple_fast(table_name, row_id, new_tuple, &existing_row, &schema);
+        if result.is_ok() {
+            self.storage.increment_lsn();
+        }
+        Some(result)
+    }
+
+    fn try_fast_delete_params(
+        &self,
+        table_name: &str,
+        selection: &Option<sql::LogicalExpr>,
+        returning: &Option<Vec<sql::logical_plan::ReturningItem>>,
+        params: &[Value],
+    ) -> Option<Result<u64>> {
+        if returning.is_some()
+            || self.tenant_manager.should_apply_rls(table_name, "DELETE")
+            || self.trigger_registry.has_triggers_for_table(table_name)
+        {
+            return None;
+        }
+
+        let catalog = self.storage.catalog();
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(schema) => schema,
+            Err(_) => return None,
+        };
+        if let Ok(constraints) = catalog.load_table_constraints(table_name) {
+            if !constraints.foreign_keys.is_empty() {
+                return None;
+            }
+        }
+        if *self.fk_validation_mode.read() != FkValidationMode::Off
+            && *self.fk_validation_source.read() != FkValidationSource::Proxy
+        {
+            match catalog.get_referencing_fks(table_name) {
+                Ok(referencing_fks) if referencing_fks.is_empty() => {}
+                Ok(_) => return None,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        let pk_value = match self.fast_pk_value_from_selection(selection, &schema, params) {
+            Some(Ok(value)) => value,
+            Some(Err(e)) => return Some(Err(e)),
+            None => return None,
+        };
+
+        let existing_row = match self.storage.get_row_by_pk_with_schema(table_name, &pk_value, &schema) {
+            Ok(Some(row)) => row,
+            Ok(None) => return Some(Ok(0)),
+            Err(e) => return Some(Err(e)),
+        };
+        let row_id = existing_row.row_id.unwrap_or(0);
+        if row_id == 0 {
+            return None;
+        }
+
+        let key = self.storage.branch_aware_data_key(table_name, row_id);
+        let result = (|| {
+            if self.storage.is_wal_enabled() {
+                if self.storage.logical_wal_per_statement() {
+                    self.storage.log_data_delete(table_name, &key)?;
+                } else {
+                    self.storage.log_data_delete_nosync(table_name, &key)?;
+                }
+            }
+            self.storage
+                .delete_tuple_fast(table_name, row_id, &existing_row, &schema)
+        })();
+        if result.is_ok() {
+            self.storage.increment_lsn();
+        }
+        Some(result)
+    }
+
+    fn fast_pk_value_from_selection(
+        &self,
+        selection: &Option<sql::LogicalExpr>,
+        schema: &Schema,
+        params: &[Value],
+    ) -> Option<Result<Value>> {
+        let sql::LogicalExpr::BinaryExpr { left, op, right } = selection.as_ref()? else {
+            return None;
+        };
+        if !matches!(op, sql::BinaryOperator::Eq) {
+            return None;
+        }
+
+        let (column_name, value_expr) = match (left.as_ref(), right.as_ref()) {
+            (sql::LogicalExpr::Column { name, .. }, value_expr) => (name, value_expr),
+            (value_expr, sql::LogicalExpr::Column { name, .. }) => (name, value_expr),
+            _ => return None,
+        };
+        let col_idx = schema.get_column_index(column_name)?;
+        let column = schema.get_column_at(col_idx)?;
+        if !column.primary_key || !Self::fast_param_insert_expr_supported(value_expr) {
+            return None;
+        }
+
+        let evaluator =
+            sql::Evaluator::with_parameters(std::sync::Arc::new(Schema { columns: vec![] }), params.to_vec());
+        let empty_tuple = Tuple::new(vec![]);
+        let mut value = match evaluator.evaluate(value_expr, &empty_tuple) {
+            Ok(value) => value,
+            Err(e) => return Some(Err(e)),
+        };
+        if Self::insert_value_needs_cast(&value, &column.data_type) {
+            value = match evaluator.cast_value(value, &column.data_type) {
+                Ok(value) => value,
+                Err(e) => return Some(Err(e)),
+            };
+        }
+        Some(Ok(value))
+    }
+
+    fn fast_update_expr_supported(expr: &sql::LogicalExpr) -> bool {
+        match expr {
+            sql::LogicalExpr::Literal(_) | sql::LogicalExpr::Parameter { .. } | sql::LogicalExpr::Column { .. } => true,
+            sql::LogicalExpr::Cast { expr, .. } | sql::LogicalExpr::UnaryExpr { expr, .. } => {
+                Self::fast_update_expr_supported(expr)
+            }
+            sql::LogicalExpr::BinaryExpr { left, op, right } => {
+                matches!(
+                    op,
+                    sql::BinaryOperator::Plus
+                        | sql::BinaryOperator::Minus
+                        | sql::BinaryOperator::Multiply
+                        | sql::BinaryOperator::Divide
+                        | sql::BinaryOperator::Modulo
+                ) && Self::fast_update_expr_supported(left)
+                    && Self::fast_update_expr_supported(right)
+            }
+            _ => false,
+        }
+    }
+
     /// Execute eligible autocommit UPDATE/DELETE fast paths without creating an
     /// otherwise-empty transaction wrapper.
     fn try_autocommit_fast_update_delete(&self, sql: &str) -> Option<Result<u64>> {
@@ -5529,6 +6038,10 @@ impl EmbeddedDatabase {
     /// Fast path for SELECT: `SELECT * FROM table WHERE pk_col = literal`
     /// Bypasses full SQL parsing, planning, and optimization for simple PK lookups.
     fn try_fast_select(&self, sql: &str) -> Option<Result<Vec<Tuple>>> {
+        if self.in_transaction() {
+            return None;
+        }
+
         let trimmed = sql.trim();
 
         // Quick prefix check
@@ -5612,6 +6125,126 @@ impl EmbeddedDatabase {
             Ok(None) => Some(Ok(vec![])),
             Err(e) => Some(Err(e)),
         }
+    }
+
+    fn try_fast_select_params(&self, sql: &str, params: &[Value]) -> Option<Result<Vec<Tuple>>> {
+        if self.in_transaction() {
+            return None;
+        }
+
+        let trimmed = sql.trim();
+        if trimmed.len() < 20 || !trimmed.as_bytes().get(..6)?.eq_ignore_ascii_case(b"SELECT") {
+            return None;
+        }
+
+        let after_select = trimmed.get(6..)?.trim_start();
+        if !after_select.starts_with('*') {
+            return None;
+        }
+        let after_star = after_select.get(1..)?.trim_start();
+        if after_star.len() < 4 || !after_star.as_bytes().get(..4)?.eq_ignore_ascii_case(b"FROM") {
+            return None;
+        }
+        let after_from = after_star.get(4..)?.trim_start();
+        let table_end = after_from.find(|c: char| c.is_whitespace())?;
+        let table_name = after_from.get(..table_end)?.trim().trim_matches('"');
+        if table_name.is_empty() {
+            return None;
+        }
+
+        let rest = after_from.get(table_end..)?.trim_start();
+        if rest.len() < 5 || !rest.as_bytes().get(..5)?.eq_ignore_ascii_case(b"WHERE") {
+            return None;
+        }
+        let where_clause = rest.get(5..)?.trim_start();
+        if Self::contains_ascii_case_insensitive(where_clause, b"AND")
+            || Self::contains_ascii_case_insensitive(where_clause, b"OR")
+            || Self::contains_ascii_case_insensitive(where_clause, b"JOIN")
+            || Self::contains_ascii_case_insensitive(where_clause, b"ORDER")
+            || Self::contains_ascii_case_insensitive(where_clause, b"GROUP")
+            || Self::contains_ascii_case_insensitive(where_clause, b"LIMIT")
+        {
+            return None;
+        }
+
+        let where_clause = where_clause.strip_suffix(';').unwrap_or(where_clause).trim();
+        let eq_pos = where_clause.find('=')?;
+        let pk_col = where_clause.get(..eq_pos)?.trim().trim_matches('"');
+        let pk_val_str = where_clause.get(eq_pos + 1..)?.trim();
+        if pk_col.is_empty() || pk_val_str.is_empty() {
+            return None;
+        }
+        if self.tenant_manager.should_apply_rls(table_name, "SELECT") {
+            return None;
+        }
+
+        let catalog = self.storage.catalog();
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(schema) => schema,
+            Err(_) => return None,
+        };
+        let pk_col_idx = schema.get_column_index(pk_col)?;
+        let pk_column = schema.get_column_at(pk_col_idx)?;
+        if !pk_column.primary_key {
+            return None;
+        }
+
+        let pk_value = match Self::fast_param_or_literal_value(pk_val_str, params, &pk_column.data_type) {
+            Some(Ok(value)) => value,
+            Some(Err(e)) => return Some(Err(e)),
+            None => return None,
+        };
+
+        match self.storage.get_row_by_pk_with_schema(table_name, &pk_value, &schema) {
+            Ok(Some(row)) => Some(Ok(vec![row])),
+            Ok(None) => Some(Ok(vec![])),
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    fn fast_param_or_literal_value(token: &str, params: &[Value], target_type: &DataType) -> Option<Result<Value>> {
+        let token = token.trim();
+        if let Some(index_str) = token.strip_prefix('$') {
+            if !index_str.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            let index = match index_str.parse::<usize>() {
+                Ok(index) if index > 0 => index,
+                Ok(_) => {
+                    return Some(Err(Error::query_execution(
+                        "Parameter indices must be 1-based (e.g., $1, $2)",
+                    )))
+                }
+                Err(_) => {
+                    return Some(Err(Error::query_execution(format!(
+                        "Invalid parameter placeholder: {token}. Expected format: $1, $2, etc."
+                    ))))
+                }
+            };
+            let mut value = match params.get(index - 1) {
+                Some(value) => value.clone(),
+                None => {
+                    return Some(Err(Error::query_execution(format!(
+                        "Parameter ${} not provided. Expected {} parameters, got {}",
+                        index,
+                        index,
+                        params.len()
+                    ))))
+                }
+            };
+            if Self::insert_value_needs_cast(&value, target_type) {
+                let evaluator =
+                    sql::Evaluator::with_parameters(std::sync::Arc::new(Schema { columns: vec![] }), params.to_vec());
+                value = match evaluator.cast_value(value, target_type) {
+                    Ok(value) => value,
+                    Err(e) => return Some(Err(e)),
+                };
+            }
+            return Some(Ok(value));
+        }
+
+        let (value, _) = Self::fast_parse_one_value(token, target_type)?;
+        Some(Ok(value))
     }
 
     /// Evaluate simple expressions like `col + 0.01`, `col - 5`, `col * 2`, `col || 'suffix'`
@@ -6014,6 +6647,26 @@ impl EmbeddedDatabase {
             cache.put(sql.to_string(), statement.clone());
         }
         Ok((statement, false))
+    }
+
+    /// Parse and plan a parameterized statement with a cache key that cannot
+    /// collide with the non-parameterized `query()` plan cache entries.
+    fn parameterized_plan_cached(&self, sql: &str) -> Result<std::sync::Arc<sql::LogicalPlan>> {
+        let cache_key = format!("\0params\0{sql}");
+        if let Ok(mut cache) = self.plan_cache.lock() {
+            if let Some(plan) = cache.get(&cache_key) {
+                return Ok(std::sync::Arc::clone(plan));
+            }
+        }
+
+        let (statement, _) = self.parse_cached(sql)?;
+        let catalog = self.storage.catalog();
+        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
+        let plan = std::sync::Arc::new(planner.statement_to_plan(statement)?);
+        if let Ok(mut cache) = self.plan_cache.lock() {
+            cache.put(cache_key, std::sync::Arc::clone(&plan));
+        }
+        Ok(plan)
     }
 
     /// Internal execute method without transaction management
@@ -7052,15 +7705,24 @@ impl EmbeddedDatabase {
     /// This method prevents SQL injection by treating parameters as data, not code.
     /// Even malicious input like `"'; DROP TABLE users; --"` is safely handled.
     pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<u64> {
-        // 1. Parse SQL with cache (will recognize $N placeholders)
-        let (statement, _) = self.parse_cached(sql)?;
+        let plan = self.parameterized_plan_cached(sql)?;
 
-        // 2. Create logical plan with catalog access
-        let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog);
-        let plan = planner.statement_to_plan(statement)?;
+        if let Some(result) = self.try_transaction_fast_insert_params(&plan, params) {
+            let count = result?;
+            self.invalidate_result_cache();
+            return Ok(count);
+        }
+        if let Some(result) = self.try_autocommit_fast_insert_params(&plan, params) {
+            let count = result?;
+            self.invalidate_result_cache();
+            return Ok(count);
+        }
+        if let Some(result) = self.try_autocommit_fast_update_delete_params(&plan, params) {
+            let count = result?;
+            self.invalidate_result_cache();
+            return Ok(count);
+        }
 
-        // 3. Execute plan with parameters and extract count
         let (count, _tuples) = self.execute_plan_with_params(&plan, params)?;
         Ok(count)
     }
@@ -7100,15 +7762,8 @@ impl EmbeddedDatabase {
     /// # }
     /// ```
     pub fn execute_params_returning(&self, sql: &str, params: &[Value]) -> Result<(u64, Vec<Tuple>)> {
-        // 1. Parse SQL with cache (will recognize $N placeholders)
-        let (statement, _) = self.parse_cached(sql)?;
+        let plan = self.parameterized_plan_cached(sql)?;
 
-        // 2. Create logical plan with catalog access
-        let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog);
-        let plan = planner.statement_to_plan(statement)?;
-
-        // 3. Execute plan with parameters
         let out = self.execute_plan_with_params(&plan, params);
 
         // 4. Code-graph auto_reparse hook — same logic as `execute()`
@@ -8955,27 +9610,20 @@ impl EmbeddedDatabase {
         let sql: &str = sql;
         let start = std::time::Instant::now();
 
-        // 1. Parse SQL (will recognize $N placeholders)
-        let parse_start = std::time::Instant::now();
-        let (statement, _) = self.parse_cached(sql)?;
-        tracing::debug!(
-            phase = "parse",
-            duration_us = parse_start.elapsed().as_micros() as u64,
-            "SQL parsed"
-        );
+        if let Some(result) = self.try_fast_select_params(sql, params) {
+            let rows = result?;
+            self.log_slow_query(sql, start.elapsed(), rows.len() as u64);
+            return Ok(rows);
+        }
 
-        // 2. Create logical plan with catalog access and original SQL for time-travel parsing
         let plan_start = std::time::Instant::now();
-        let catalog = self.storage.catalog();
-        let planner = sql::Planner::with_catalog(&catalog).with_sql(sql.to_string());
-        let mut plan = planner.statement_to_plan(statement)?;
+        let mut plan = (*self.parameterized_plan_cached(sql)?).clone();
         tracing::debug!(
             phase = "plan",
             duration_us = plan_start.elapsed().as_micros() as u64,
-            "Logical plan created"
+            "Parameterized logical plan ready"
         );
 
-        // 3. Apply RLS policies to SELECT queries
         plan = self.apply_rls_to_plan(plan)?;
 
         if matches!(
@@ -9006,10 +9654,19 @@ impl EmbeddedDatabase {
 
     /// Internal method to execute a query plan with parameters
     fn query_plan_with_params(&self, plan: &sql::LogicalPlan, params: &[Value]) -> Result<Vec<Tuple>> {
-        // Create an executor with parameter support
+        // Keep parameterized SELECT consistent with `query()`: explicit
+        // transactions must see rows staged in the transaction write set.
+        let txn_lock = self
+            .current_transaction
+            .lock()
+            .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
+
         let mut executor = sql::Executor::with_storage(&self.storage)
             .with_timeout(self.config.storage.query_timeout_ms)
             .with_parameters(params.to_vec());
+        if let Some(txn_ref) = txn_lock.as_ref() {
+            executor = executor.with_transaction(txn_ref);
+        }
 
         executor.execute(plan)
     }
@@ -9099,9 +9756,16 @@ impl EmbeddedDatabase {
             opt.optimize_recursive(plan)?
         };
 
+        let txn_lock = self
+            .current_transaction
+            .lock()
+            .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
         let mut executor = sql::Executor::with_storage(&self.storage)
             .with_timeout(self.config.storage.query_timeout_ms)
             .with_parameters(params.to_vec());
+        if let Some(txn_ref) = txn_lock.as_ref() {
+            executor = executor.with_transaction(txn_ref);
+        }
         executor.execute_with_columns(&plan)
     }
 

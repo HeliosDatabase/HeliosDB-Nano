@@ -118,6 +118,52 @@ fn test_insert_with_parameters() {
 }
 
 #[test]
+fn test_parameterized_insert_in_explicit_transaction_commit_and_rollback() {
+    let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
+    db.execute("CREATE TABLE txn_params (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+
+    db.execute("BEGIN").unwrap();
+    db.execute_params(
+        "INSERT INTO txn_params (id, name) VALUES ($1, $2)",
+        &[Value::Int4(1), Value::String("committed".to_string())],
+    )
+    .unwrap();
+    let in_txn = db
+        .query_params("SELECT * FROM txn_params WHERE id = $1", &[Value::Int4(1)])
+        .unwrap();
+    assert_eq!(in_txn.len(), 1);
+    let (in_txn_with_columns, columns) = db
+        .query_params_with_columns("SELECT * FROM txn_params WHERE id = $1", &[Value::Int4(1)])
+        .unwrap();
+    assert_eq!(columns, vec!["id".to_string(), "name".to_string()]);
+    assert_eq!(in_txn_with_columns.len(), 1);
+    db.execute("COMMIT").unwrap();
+
+    let committed = db
+        .query_params("SELECT * FROM txn_params WHERE id = $1", &[Value::Int4(1)])
+        .unwrap();
+    assert_eq!(committed.len(), 1);
+
+    db.execute("BEGIN").unwrap();
+    db.execute_params(
+        "INSERT INTO txn_params (id, name) VALUES ($1, $2)",
+        &[Value::Int4(2), Value::String("rolled_back".to_string())],
+    )
+    .unwrap();
+    let in_txn = db
+        .query_params("SELECT * FROM txn_params WHERE id = $1", &[Value::Int4(2)])
+        .unwrap();
+    assert_eq!(in_txn.len(), 1);
+    db.execute("ROLLBACK").unwrap();
+
+    let rolled_back = db
+        .query_params("SELECT * FROM txn_params WHERE id = $1", &[Value::Int4(2)])
+        .unwrap();
+    assert_eq!(rolled_back.len(), 0);
+}
+
+#[test]
 fn test_update_with_parameters() {
     let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
 
