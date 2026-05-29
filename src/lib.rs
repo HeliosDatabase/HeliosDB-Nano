@@ -254,6 +254,7 @@ pub mod network;
 pub mod optimizer;
 pub mod protocol;
 pub mod protocols; // Protocol integration layer (adapters)
+pub mod query_trace;
 pub mod repl;
 pub mod runtime; // Per-request runtime helpers (bump arena, ...)
 pub mod search;
@@ -397,6 +398,8 @@ pub struct EmbeddedDatabase {
     /// Repeated parameterized INSERT metadata cache. Invalidated with the plan cache on DDL.
     fast_param_insert_cache:
         std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamInsertSpec>>>>,
+    /// Lightweight SQL-visible query profiler, disabled by default.
+    query_profiler: std::sync::Arc<query_trace::QueryProfiler>,
     /// ART index undo log for transaction rollback: (table, row_id, col_values)
     /// Cleared on commit, replayed as on_delete on rollback
     art_undo_log: std::sync::Arc<parking_lot::RwLock<Vec<ArtUndoOp>>>,
@@ -561,6 +564,13 @@ impl FkValidationSource {
 struct PendingFkCheck {
     fk: sql::ForeignKeyConstraint,
     parent_values: Vec<Value>,
+}
+
+enum TraceControl {
+    SetEnabled(bool),
+    ShowEnabled,
+    Report,
+    Reset,
 }
 
 fn parse_vector_metric(metric: &str) -> Result<vector::DistanceMetric> {
@@ -797,6 +807,96 @@ impl EmbeddedDatabase {
         } else {
             Ok(None)
         }
+    }
+
+    fn try_handle_trace_execute(&self, sql: &str) -> Result<Option<u64>> {
+        match self.try_handle_trace_control(sql)? {
+            Some(TraceControl::SetEnabled(_)) | Some(TraceControl::Reset) => Ok(Some(0)),
+            Some(TraceControl::Report) | Some(TraceControl::ShowEnabled) => Ok(Some(0)),
+            None => Ok(None),
+        }
+    }
+
+    fn try_handle_trace_query(&self, sql: &str) -> Result<Option<Vec<Tuple>>> {
+        let Some(control) = self.try_handle_trace_control(sql)? else {
+            return Ok(None);
+        };
+        let value = match control {
+            TraceControl::SetEnabled(enabled) => {
+                if enabled {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                }
+            }
+            TraceControl::ShowEnabled => {
+                if self.query_profiler.enabled() {
+                    "on".to_string()
+                } else {
+                    "off".to_string()
+                }
+            }
+            TraceControl::Report => self.query_profiler.report(),
+            TraceControl::Reset => {
+                self.query_profiler.reset();
+                "Trace data reset".to_string()
+            }
+        };
+        Ok(Some(vec![Tuple::new(vec![Value::String(value)])]))
+    }
+
+    fn try_handle_trace_control(&self, sql: &str) -> Result<Option<TraceControl>> {
+        let trimmed = sql.trim().trim_end_matches(';').trim();
+        let upper = trimmed.to_ascii_uppercase();
+        if upper.starts_with("SET ") {
+            let mut body = trimmed[4..].trim();
+            if body.to_ascii_uppercase().starts_with("LOCAL ") {
+                body = body[6..].trim();
+            }
+            let Some(eq_pos) = body.find('=') else {
+                return Ok(None);
+            };
+            let name = body[..eq_pos].trim().to_ascii_lowercase();
+            if name != "helios.trace_queries" {
+                return Ok(None);
+            }
+            let value = body[eq_pos + 1..]
+                .trim()
+                .trim_matches('\'')
+                .trim_matches('"')
+                .to_ascii_lowercase();
+            let enabled = match value.as_str() {
+                "1" | "true" | "on" | "yes" => true,
+                "0" | "false" | "off" | "no" => false,
+                _ => {
+                    return Err(Error::query_execution(
+                        "helios.trace_queries accepts 0/1, on/off, or true/false".to_string(),
+                    ));
+                }
+            };
+            self.query_profiler.set_enabled(enabled);
+            return Ok(Some(TraceControl::SetEnabled(enabled)));
+        }
+
+        if upper.starts_with("SHOW ") {
+            let name = trimmed[5..].trim().to_ascii_lowercase();
+            return match name.as_str() {
+                "helios.trace_queries" => Ok(Some(TraceControl::ShowEnabled)),
+                "helios.trace_report" => Ok(Some(TraceControl::Report)),
+                "helios.trace_reset" => Ok(Some(TraceControl::Reset)),
+                _ => Ok(None),
+            };
+        }
+
+        if upper.starts_with("RESET ") {
+            let name = trimmed[6..].trim().to_ascii_lowercase();
+            if name == "helios.trace_queries" {
+                self.query_profiler.set_enabled(false);
+                return Ok(Some(TraceControl::SetEnabled(false)));
+            }
+        }
+
+        Ok(None)
     }
 
     fn try_parse_alter_constraint_enforcement(sql: &str) -> Result<Option<sql::LogicalPlan>> {
@@ -3468,6 +3568,7 @@ impl EmbeddedDatabase {
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
             ))),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
+            query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
@@ -3533,6 +3634,7 @@ impl EmbeddedDatabase {
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
             ))),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
+            query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
@@ -3621,6 +3723,7 @@ impl EmbeddedDatabase {
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
             ))),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
+            query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
@@ -3692,6 +3795,8 @@ impl EmbeddedDatabase {
 
     /// Log slow queries at WARN level if they exceed the configured threshold
     fn log_slow_query(&self, sql: &str, elapsed: std::time::Duration, rows: u64) {
+        self.query_profiler
+            .record(query_trace::QueryTrace::new(sql, elapsed, rows));
         if let Some(threshold) = self.config.storage.slow_query_threshold_ms {
             let elapsed_ms = elapsed.as_millis() as u64;
             if elapsed_ms >= threshold {
@@ -4321,6 +4426,10 @@ impl EmbeddedDatabase {
         let sql: &str = sql;
 
         let start = std::time::Instant::now();
+
+        if let Some(count) = self.try_handle_trace_execute(sql)? {
+            return Ok(count);
+        }
 
         if let Some(count) = self.try_handle_fk_setting(sql)? {
             return Ok(count);
@@ -8894,6 +9003,10 @@ impl EmbeddedDatabase {
         let sql: &str = sql;
         let start = std::time::Instant::now();
 
+        if let Some(rows) = self.try_handle_trace_query(sql)? {
+            return Ok(rows);
+        }
+
         // DML belongs on the write executor.  `query()` is commonly used
         // by client adapters as a generic SQL entry point; without this
         // guard, INSERT/UPDATE/DELETE without RETURNING fall into the
@@ -10814,6 +10927,7 @@ impl EmbeddedDatabase {
             parse_cache: self.parse_cache.clone(),
             result_cache: self.result_cache.clone(),
             fast_param_insert_cache: self.fast_param_insert_cache.clone(),
+            query_profiler: self.query_profiler.clone(),
             art_undo_log: self.art_undo_log.clone(),
             fk_validation_mode: self.fk_validation_mode.clone(),
             fk_validation_source: self.fk_validation_source.clone(),
