@@ -54,10 +54,22 @@ impl AggregateOperator {
         let input_schema = input.schema();
         let evaluator = crate::sql::Evaluator::with_parameters(input_schema.clone(), parameters);
 
-        // Streaming fast path: no GROUP BY and all aggregates are streamable
-        let mut output_tuples = if group_by.is_empty() && Self::all_streamable(&aggr_exprs) {
-            let result = Self::streaming_aggregate(&mut input, &aggr_exprs, &evaluator, &input_schema, &timeout_ctx)?;
-            vec![Tuple::new(result)]
+        // Streaming fast path: no DISTINCT and all aggregates are streamable.
+        let mut output_tuples = if Self::all_streamable(&aggr_exprs) {
+            if group_by.is_empty() {
+                let result =
+                    Self::streaming_aggregate(&mut input, &aggr_exprs, &evaluator, &input_schema, &timeout_ctx)?;
+                vec![Tuple::new(result)]
+            } else {
+                Self::streaming_grouped_aggregate(
+                    &mut input,
+                    &group_by,
+                    &aggr_exprs,
+                    &evaluator,
+                    &input_schema,
+                    &timeout_ctx,
+                )?
+            }
         } else {
             // Standard materialization path
             Self::materialized_aggregate(&mut input, &group_by, &aggr_exprs, &evaluator, &timeout_ctx)?
@@ -415,16 +427,84 @@ impl AggregateOperator {
         input_schema: &Schema,
         timeout_ctx: &Option<TimeoutContext>,
     ) -> Result<Vec<crate::Value>> {
-        use crate::sql::{AggregateFunction, LogicalExpr};
-        use crate::Value;
-
         let arg_accessors: Vec<AggregateArgAccessor> = aggr_exprs
             .iter()
             .map(|expr| AggregateArgAccessor::for_aggregate(expr, input_schema))
             .collect::<Result<Vec<_>>>()?;
 
         // Initialize accumulators for each aggregate expression
-        let mut accumulators: Vec<StreamingAccumulator> = aggr_exprs
+        let mut accumulators = Self::new_streaming_accumulators(aggr_exprs);
+
+        // Process input tuples one at a time
+        while let Some(tuple) = input.next()? {
+            if let Some(ref ctx) = timeout_ctx {
+                ctx.check_timeout()?;
+            }
+
+            // Update each accumulator
+            for (i, accessor) in arg_accessors.iter().enumerate() {
+                if let Some(acc) = accumulators.get_mut(i) {
+                    Self::update_streaming_accumulator(acc, accessor, &tuple, evaluator)?;
+                }
+            }
+        }
+
+        // Finalize accumulators into result values
+        accumulators.into_iter().map(|acc| acc.finalize()).collect()
+    }
+
+    /// Compute GROUP BY aggregates in one pass for non-DISTINCT streamable
+    /// aggregates. Avoids storing every tuple inside each group.
+    fn streaming_grouped_aggregate(
+        input: &mut Box<dyn PhysicalOperator>,
+        group_by: &[crate::sql::LogicalExpr],
+        aggr_exprs: &[crate::sql::LogicalExpr],
+        evaluator: &crate::sql::Evaluator,
+        input_schema: &Schema,
+        timeout_ctx: &Option<TimeoutContext>,
+    ) -> Result<Vec<Tuple>> {
+        use crate::Value;
+        use std::collections::BTreeMap;
+
+        let arg_accessors: Vec<AggregateArgAccessor> = aggr_exprs
+            .iter()
+            .map(|expr| AggregateArgAccessor::for_aggregate(expr, input_schema))
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut groups: BTreeMap<GroupKey, Vec<StreamingAccumulator>> = BTreeMap::new();
+        while let Some(tuple) = input.next()? {
+            if let Some(ref ctx) = timeout_ctx {
+                ctx.check_timeout()?;
+            }
+
+            let key_values: Result<Vec<Value>> = group_by.iter().map(|expr| evaluator.evaluate(expr, &tuple)).collect();
+            let accumulators = groups
+                .entry(GroupKey(key_values?))
+                .or_insert_with(|| Self::new_streaming_accumulators(aggr_exprs));
+
+            for (acc, accessor) in accumulators.iter_mut().zip(&arg_accessors) {
+                Self::update_streaming_accumulator(acc, accessor, &tuple, evaluator)?;
+            }
+        }
+
+        let mut output_tuples = Vec::with_capacity(groups.len());
+        for (group_key, accumulators) in groups {
+            if let Some(ref ctx) = timeout_ctx {
+                ctx.check_timeout()?;
+            }
+            let mut output_values = group_key.0;
+            let aggr_values: Result<Vec<Value>> =
+                accumulators.into_iter().map(StreamingAccumulator::finalize).collect();
+            output_values.append(&mut aggr_values?);
+            output_tuples.push(Tuple::new(output_values));
+        }
+        Ok(output_tuples)
+    }
+
+    fn new_streaming_accumulators(aggr_exprs: &[crate::sql::LogicalExpr]) -> Vec<StreamingAccumulator> {
+        use crate::sql::{AggregateFunction, LogicalExpr};
+
+        aggr_exprs
             .iter()
             .map(|expr| {
                 if let LogicalExpr::AggregateFunction { fun, .. } = expr {
@@ -440,42 +520,33 @@ impl AggregateOperator {
                     StreamingAccumulator::Count(0) // unreachable
                 }
             })
-            .collect();
+            .collect()
+    }
 
-        // Process input tuples one at a time
-        while let Some(tuple) = input.next()? {
-            if let Some(ref ctx) = timeout_ctx {
-                ctx.check_timeout()?;
+    fn update_streaming_accumulator(
+        acc: &mut StreamingAccumulator,
+        accessor: &AggregateArgAccessor,
+        tuple: &Tuple,
+        evaluator: &crate::sql::Evaluator,
+    ) -> Result<()> {
+        use crate::Value;
+
+        match accessor {
+            AggregateArgAccessor::Wildcard => {
+                let val = Value::Null; // sentinel — COUNT(*) counts all rows
+                acc.update(&val, true)
             }
-
-            // Update each accumulator
-            for (i, accessor) in arg_accessors.iter().enumerate() {
-                if let Some(acc) = accumulators.get_mut(i) {
-                    match accessor {
-                        AggregateArgAccessor::Wildcard => {
-                            let val = Value::Null; // sentinel — COUNT(*) counts all rows
-                            acc.update(&val, true)?;
-                        }
-                        AggregateArgAccessor::Column(index) => {
-                            let val = tuple.get(*index).ok_or_else(|| {
-                                Error::query_execution(format!(
-                                    "Column index {} out of bounds in aggregate input tuple",
-                                    index
-                                ))
-                            })?;
-                            acc.update(val, false)?;
-                        }
-                        AggregateArgAccessor::Expr(expr) => {
-                            let val = evaluator.evaluate(expr, &tuple)?;
-                            acc.update(&val, false)?;
-                        }
-                    }
-                }
+            AggregateArgAccessor::Column(index) => {
+                let val = tuple.get(*index).ok_or_else(|| {
+                    Error::query_execution(format!("Column index {} out of bounds in aggregate input tuple", index))
+                })?;
+                acc.update(val, false)
+            }
+            AggregateArgAccessor::Expr(expr) => {
+                let val = evaluator.evaluate(expr, tuple)?;
+                acc.update(&val, false)
             }
         }
-
-        // Finalize accumulators into result values
-        accumulators.into_iter().map(|acc| acc.finalize()).collect()
     }
 
     /// Standard materialization path for GROUP BY queries
