@@ -19,7 +19,7 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/dimensigon/HDB-HeliosDB-Nano"
+Repository = "https://github.com/HeliosDatabase/HeliosDB-Nano"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]

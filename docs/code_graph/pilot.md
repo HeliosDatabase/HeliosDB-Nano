@@ -24,7 +24,7 @@ Or from a remote checkout (read the script first if you don't
 trust the source):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Dimensigon/HDB-HeliosDB-Nano/main/scripts/install-nano-pilot.sh | sh
+curl -fsSL https://raw.githubusercontent.com/HeliosDatabase/HeliosDB-Nano/main/scripts/install-nano-pilot.sh | sh
 ```
 
 After the installer runs you have:
@@ -70,7 +70,7 @@ git diff --cached --name-only --diff-filter=ACMR | \
 CLI subcommand on purpose (the engine stays generic). The MCP
 server runs as a tiny stdio / HTTP shim that consumes the engine
 as a library: the
-[`heliosdb-codekb-mcp`](https://github.com/dimensigon/heliosdb-codekb-mcp)
+[`heliosdb-codekb-mcp`](https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP)
 plugin binary.
 
 Drop this snippet into `~/.config/claude/claude.json` (or the

@@ -332,7 +332,7 @@ Apache-2.0 License - See LICENSE file for details
 ## Support
 
 - **Documentation**: [HELIOSDB_SQLITE_CHECKER_GUIDE.md](HELIOSDB_SQLITE_CHECKER_GUIDE.md)
-- **Issues**: https://github.com/heliosdb/heliosdb-nano/issues
+- **Issues**: https://github.com/HeliosDatabase/HeliosDB-Nano/issues
 - **Email**: support@heliosdb.com
 - **Discord**: https://discord.gg/heliosdb
 

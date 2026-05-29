@@ -224,7 +224,7 @@ async fn redoc_ui() -> Html<String> {
         <div class="links">
             <a href="/v1/docs">Swagger UI</a>
             <a href="/v1/openapi.yaml">OpenAPI Spec</a>
-            <a href="https://github.com/heliosdb/heliosdb-lite">GitHub</a>
+            <a href="https://github.com/HeliosDatabase/HeliosDB-Lite">GitHub</a>
         </div>
     </div>
     <redoc spec-url="/v1/openapi.json"
