@@ -232,14 +232,33 @@ impl RowCache {
             return None;
         }
 
-        let cache = self.cache.read();
+        {
+            let cache = self.cache.read();
+            match cache.peek(&key) {
+                Some(entry) if !entry.is_expired() => {
+                    let tuple = entry.tuple.clone();
+                    self.hot_hits.fetch_add(1, Ordering::Relaxed);
+                    return Some(tuple);
+                }
+                Some(_) => {} // expired — fall through to evict under the write lock
+                None => {
+                    self.hot_misses.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+            }
+        }
+        // Expired entry: take the exclusive lock, re-check, and pop exactly once
+        // (so `expirations` is counted once — not once per read — and the slot is
+        // reclaimed rather than occupying capacity until the next put). The hot,
+        // non-expired path above stays fully shared + lock-free.
+        let mut cache = self.cache.write();
         if let Some(entry) = cache.peek(&key) {
             if entry.is_expired() {
-                // Expired: count it but leave it in place (reaped on next put/
-                // eviction) — popping would require an exclusive lock.
+                cache.pop(&key);
                 self.hot_expirations.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
+            // Refreshed by a concurrent writer between the read and write lock.
             let tuple = entry.tuple.clone();
             self.hot_hits.fetch_add(1, Ordering::Relaxed);
             return Some(tuple);

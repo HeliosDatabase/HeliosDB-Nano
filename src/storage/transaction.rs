@@ -269,6 +269,17 @@ impl Transaction {
             }
         };
 
+        // P0#1 read-side gate: when versioning is disabled, version history is
+        // not maintained, so stale pre-existing v_idx: must not be consulted —
+        // read the current committed `data:` value directly (mirrors the commit
+        // write-gate and the engine's scan_table_at_snapshot gate).
+        if !self.versioning_enabled {
+            return self
+                .db
+                .get(key)
+                .map_err(|e| Error::storage(format!("Transaction get failed: {}", e)));
+        }
+
         // Use snapshot manager to read the versioned value
         // This implements the core MVCC logic: find the latest version <= snapshot_ts
         self.snapshot_manager.read_at_snapshot(table_name, row_id, snapshot_ts)

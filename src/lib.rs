@@ -8028,7 +8028,7 @@ impl EmbeddedDatabase {
         }
 
         // Create a real storage transaction with a FRESH snapshot
-        let txn = storage::Transaction::new_with_session(
+        let mut txn = storage::Transaction::new_with_session(
             self.storage.db.clone(),
             self.storage.next_timestamp(),
             self.storage.snapshot_manager_arc(),
@@ -8037,6 +8037,9 @@ impl EmbeddedDatabase {
             self.lock_manager.clone(),
             self.dirty_tracker.clone(),
         )?;
+        // P0#1: session transactions must honor time_travel_enabled too
+        // (new_with_session defaults versioning on).
+        txn.set_versioning_enabled(self.storage.time_travel_enabled());
 
         let txn_id = txn.snapshot_id();
         session.active_txn = Some(txn_id);
@@ -8163,7 +8166,7 @@ impl EmbeddedDatabase {
         } else {
             // Implicit transaction — skip fast paths since session-based execution
             // requires MVCC versioning for proper isolation across sessions
-            let txn = storage::Transaction::new_with_session(
+            let mut txn = storage::Transaction::new_with_session(
                 self.storage.db.clone(),
                 self.storage.next_timestamp(),
                 self.storage.snapshot_manager_arc(),
@@ -8172,6 +8175,8 @@ impl EmbeddedDatabase {
                 self.lock_manager.clone(),
                 self.dirty_tracker.clone(),
             )?;
+            // P0#1: session transactions must honor time_travel_enabled too.
+            txn.set_versioning_enabled(self.storage.time_travel_enabled());
 
             let result = self.execute_in_transaction_no_fast_path(sql, &txn);
 

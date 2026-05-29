@@ -547,6 +547,15 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
                         // Merge with write set from transaction for read-your-own-writes
                         txn.merge_with_write_set(&actual_table_name, base_tuples)?
                     } else if let Some(as_of_clause) = as_of {
+                        // P0#1: AS OF / historical queries require version history.
+                        // With time_travel_enabled=false the commit path writes no
+                        // versions, so honoring AS OF would silently return current
+                        // state. Error clearly instead of returning a wrong answer.
+                        if !storage.time_travel_enabled() {
+                            return Err(crate::Error::query_execution(
+                                "AS OF / time-travel queries require time_travel_enabled = true",
+                            ));
+                        }
                         tracing::debug!(
                             "Time-travel query on table '{}' (actual: '{}') with AS OF clause: {:?}",
                             table_name,
@@ -790,6 +799,12 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                     None,
                 )
             } else if let Some(as_of_clause) = as_of {
+                // P0#1: AS OF requires version history (see above).
+                if !storage.time_travel_enabled() {
+                    return Err(crate::Error::query_execution(
+                        "AS OF / time-travel queries require time_travel_enabled = true",
+                    ));
+                }
                 tracing::debug!(
                     "Time-travel FilteredScan on table '{}' with AS OF clause: {:?}",
                     table_name,

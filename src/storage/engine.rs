@@ -3276,6 +3276,13 @@ impl StorageEngine {
         self.config.storage.logical_wal_per_statement
     }
 
+    /// Whether MVCC version history / time-travel is enabled. When false,
+    /// commit skips version-key emission and reads return current state, so
+    /// AS OF / historical queries cannot be answered.
+    pub fn time_travel_enabled(&self) -> bool {
+        self.config.storage.time_travel_enabled
+    }
+
     /// Get current WAL LSN (Log Sequence Number)
     pub fn wal_lsn(&self) -> Option<u64> {
         self.wal.as_ref().map(|wal| wal.read().current_lsn())
@@ -4566,6 +4573,13 @@ impl StorageEngine {
     /// Performance: O(n) where n is the number of rows in the table.
     /// Uses snapshot manager's efficient version resolution.
     pub fn scan_table_at_snapshot(&self, table_name: &str, snapshot_ts: u64) -> Result<Vec<Tuple>> {
+        // P0#1 read-side gate: when versioning is disabled (time_travel_enabled=false),
+        // the commit path stops writing v:/v_idx:, so any pre-existing version
+        // history is stale (older than the advanced `data:` value). Mirror the
+        // write-gate and return the current committed state instead of stale versions.
+        if !self.config.storage.time_travel_enabled {
+            return self.scan_table_branch_aware(table_name);
+        }
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
 
