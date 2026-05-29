@@ -3,7 +3,7 @@
 //! so the read path must NOT consult stale pre-existing `v_idx:` history, and
 //! `AS OF` queries must error rather than silently return current state.
 
-use heliosdb_nano::{Config, EmbeddedDatabase, Value};
+use heliosdb_nano::{Config, EmbeddedDatabase, Tuple, Value};
 
 /// #3: a row that has version history from when TT was on, then UPDATEd under
 /// TT-off, must read back the LATEST value inside a transaction (snapshot read),
@@ -80,4 +80,30 @@ fn tt_on_as_of_still_works() {
     // A future timestamp resolves to the latest snapshot; query must succeed.
     let res = db.query("SELECT v FROM t AS OF TIMESTAMP '2999-01-01 00:00:00' WHERE id = 1", &[]);
     assert!(res.is_ok(), "AS OF with TT-on must succeed, got: {:?}", res.err());
+}
+
+#[test]
+fn tt_off_main_branch_context_does_not_force_versioned_insert() {
+    let mut c = Config::in_memory();
+    c.storage.time_travel_enabled = false;
+    let db = EmbeddedDatabase::with_config(c).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+
+    db.storage.set_current_branch(Some("main".to_string()));
+    assert_eq!(
+        db.storage.get_current_branch(),
+        None,
+        "main branch context should normalize to no branch isolation"
+    );
+
+    let snapshots_before = db.storage.snapshot_manager().snapshot_count();
+    db.storage
+        .insert_tuple("t", Tuple::new(vec![Value::Int4(1), Value::Int4(10)]))
+        .unwrap();
+
+    assert_eq!(
+        db.storage.snapshot_manager().snapshot_count(),
+        snapshots_before,
+        "TT-off insert on main must not route through versioned branch-aware insert"
+    );
 }

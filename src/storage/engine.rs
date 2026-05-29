@@ -5527,7 +5527,7 @@ impl StorageEngine {
     ///
     /// All subsequent queries will execute on this branch instead of main
     pub fn set_current_branch(&self, branch_name: Option<String>) {
-        *self.current_branch.lock() = branch_name;
+        *self.current_branch.lock() = branch_name.filter(|name| name != "main");
     }
 
     /// Clear the current branch context (revert to main)
@@ -5537,7 +5537,10 @@ impl StorageEngine {
 
     /// Check if a non-main branch is currently active
     pub fn is_branch_active(&self) -> bool {
-        self.current_branch.lock().is_some()
+        self.current_branch
+            .lock()
+            .as_deref()
+            .is_some_and(|name| name != "main")
     }
 
     /// Get current branch ID if a non-main branch is active
