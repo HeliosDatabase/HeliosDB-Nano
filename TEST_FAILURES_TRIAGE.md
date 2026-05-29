@@ -105,7 +105,7 @@ hangs and was skipped during the full-suite run — same class.)
 
 | group | count | nature | priority |
 |---|---|---|---|
-| A (real engine bugs) | 14 | correlated subquery/EXISTS (8+1), info-schema views (3), TRUNCATE count, txn RYOW, HNSW tombstone | triage & fix |
+| A (real engine bugs) | 14 | correlated subquery/EXISTS (8+1) **[FIXED]**, info-schema views (3) **[FIXED]**, TRUNCATE count, txn RYOW **[FIXED]**, HNSW tombstone | triage & fix |
 | B (stale test) | 1 | default-value test asserts old behavior | update test |
 | C (flaky/env) | 2 (+SSL) | auth timing, PQ training data, HA/SSL network | CI hygiene |
 
@@ -135,23 +135,29 @@ subqueries) is the most impactful functional gap.
   **C2** (PQ training-data sample count). Codex confirmed ownership; lands on
   codex-fk and merges.
 
+**Fixed + committed on `fix/correlated-subqueries` (2026-05-29):**
+- **A1/Defect-1 — correlated subqueries/EXISTS (8 tests)** and **A3 — CTE with EXISTS
+  (1 test)** are now **implemented and passing** (all 9). Approach: a *materializing
+  correlated path* in `sql/executor/mod.rs`. `plan_to_operator`'s Filter and (non-
+  DISTINCT) Project arms now detect a correlated subquery in the predicate / a
+  projection expr — `expr_has_correlated_subquery` walks the inner plan and flags any
+  column ref that the subquery's own base table does **not** provide but the outer
+  schema does (`base_scan_schema` + `get_qualified_column_index`). When correlated,
+  the input is drained and, **per outer row**, the subquery's free outer refs are
+  bound to that row's literals (`bind_plan_to_outer` → `bind_expr_to_outer`) and the
+  bound inner plan is executed via a child `Executor` (which inherits the parent's
+  `cte_context`, so EXISTS-over-a-CTE resolves — that's A3). Results collect into a
+  `MaterializedOperator`. The **uncorrelated fast path is untouched** and execution
+  failures still fall back to `false`/`NULL`, so drizzle-kit / info_schema
+  introspection does **not** regress. Verified: `subquery_hardening` 34/34,
+  `cte_hardening` 39/39, plus `drizzle_compat`, `information_schema_completion`,
+  `join_hardening`, `lateral_join`, `aggregate_hardening`, `insert_select`,
+  `extended_query_param_select` all green; lib `1772 passed` (only A6 still fails).
+  (The previous in-code "deferred" notes at `sql/executor/mod.rs` are superseded for
+  the single-table-subquery case; nested-loop join for multi-table correlation
+  remains future work but no failing test requires it.)
+
 **Scoped follow-ups (NOT fixed — require dedicated, reviewed effort):**
-- **A1/Defect-1 — correlated subqueries/EXISTS (8 tests).** This is the high-impact
-  functional gap, but it is **deliberately deferred by the codebase**: see the
-  in-code notes at `sql/executor/mod.rs:532-544` and `:500-516` ("true
-  correlated-subquery support needs nested-loop join or dependent-rewrite
-  (significant planner work, deferred)"). `materialize_subqueries` evaluates a
-  subquery **once at plan-build time with no outer-row binding**; a correlated inner
-  SELECT references an outer column, errors, and the error is **intentionally
-  swallowed** to `false`/`NULL` — a fallback **drizzle-kit / info_schema
-  introspection relies on** (pg_class correlated EXISTS). **Fix plan** (from the
-  root-cause workflow): detect correlation (outer-column refs in the inner plan);
-  leave correlated subqueries un-materialized; give `FilterOperator` (and the
-  Project path for scalar-subquery-in-SELECT) the storage handle + outer schema so it
-  can, per outer row, bind outer columns to literals and execute the inner plan;
-  **keep** the uncorrelated fast path and **keep** the swallow only for
-  genuinely-unresolvable system-catalog cases (so drizzle doesn't regress). Medium
-  size, **moderate regression risk** → must not be rushed.
 - **A6 — HNSW `len()` semantics (1 test).** Not an engine bug to fix blindly:
   `vector_index.rs:676/685/700` use `len()` as the **live** `num_vectors`, so the
   current `len()` = live count (2 after deleting 1 of 3) is correct for real callers;
