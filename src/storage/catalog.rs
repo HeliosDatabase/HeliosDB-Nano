@@ -940,17 +940,24 @@ impl<'a> Catalog<'a> {
         let mut result = Vec::new();
         let prefix = b"table_constraints:";
 
-        let iter = self.storage.db.iterator(rocksdb::IteratorMode::Start);
+        // Seek directly to the `table_constraints:` prefix instead of iterating
+        // from the start of the keyspace. With `IteratorMode::Start` this walked
+        // every `data:` row key (which sort before `table_constraints:`), making
+        // every reverse-FK lookup -- and therefore every DELETE -- O(table rows).
+        // `total_order_seek` is required because the DB uses a 5-byte prefix extractor.
+        let mut read_opts = rocksdb::ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self.storage.db.iterator_opt(
+            rocksdb::IteratorMode::From(prefix, rocksdb::Direction::Forward),
+            read_opts,
+        );
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(prefix) {
-                if let (Some(&k0), Some(&p0)) = (key.first(), prefix.first()) {
-                    if k0 > p0 {
-                        break;
-                    }
-                }
-                continue;
+                // We seeked to `table_constraints:`; the first key that no longer
+                // shares the prefix means the whole group has been read.
+                break;
             }
 
             let constraints: crate::sql::TableConstraints = bincode::deserialize(&value)
