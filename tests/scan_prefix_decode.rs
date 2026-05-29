@@ -97,3 +97,26 @@ fn count_star_pk_range_handles_negative_keys() {
     let rows = db.query("SELECT COUNT(*) FROM n WHERE id > 1 AND id < 1", &[]).unwrap();
     assert_eq!(int(&rows[0].values[0]), 0);
 }
+
+#[test]
+fn count_star_uses_live_pk_index_size_after_mutations() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE n (id INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    for id in 1..=5 {
+        db.execute(&format!("INSERT INTO n VALUES ({id}, 'v{id}')")).unwrap();
+    }
+
+    assert_eq!(db.storage.art_indexes().pk_index_len("n"), Some(5));
+    let rows = db.query("SELECT COUNT(*) FROM n", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 5);
+
+    db.execute("DELETE FROM n WHERE id = 3").unwrap();
+    assert_eq!(db.storage.art_indexes().pk_index_len("n"), Some(4));
+    let rows = db.query("SELECT COUNT(*) FROM n", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 4);
+
+    db.execute("TRUNCATE TABLE n").unwrap();
+    assert_eq!(db.storage.art_indexes().pk_index_len("n"), Some(0));
+    let rows = db.query("SELECT COUNT(*) FROM n", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 0);
+}
