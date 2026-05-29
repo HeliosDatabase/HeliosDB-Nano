@@ -494,24 +494,27 @@ fn test_dml_visibility_within_transaction_after_savepoint() {
 }
 
 #[test]
-fn test_query_within_explicit_transaction_no_ryow() {
-    // Document that read-your-own-writes is NOT supported in explicit transactions.
-    // SELECT within the transaction does not see inserts made in the same transaction.
+fn test_query_within_explicit_transaction_reads_own_writes() {
+    // Read-your-own-writes IS supported in explicit transactions: a SELECT within
+    // the transaction sees inserts made earlier in the same transaction (the
+    // previously-documented "limitation" has been fixed).
     let db = setup();
 
     db.execute("BEGIN").unwrap();
-    db.execute("INSERT INTO sp_test VALUES (1, 'invisible_within_txn')")
+    db.execute("INSERT INTO sp_test VALUES (1, 'visible_within_txn')")
         .unwrap();
 
-    // Query within the transaction sees 0 rows (no RYOW)
+    // Query within the transaction sees its own uncommitted insert (RYOW).
     let rows = db.query("SELECT * FROM sp_test", &[]).unwrap();
     assert_eq!(
         rows.len(),
-        0,
-        "KNOWN LIMITATION: read-your-own-writes not supported in explicit transactions"
+        1,
+        "read-your-own-writes: a SELECT in an explicit txn must see the txn's own insert"
     );
 
     db.execute("ROLLBACK").unwrap();
+    // After rollback the uncommitted insert is gone.
+    assert_eq!(count_rows(&db), 0, "rolled-back insert must not persist");
 }
 
 #[test]

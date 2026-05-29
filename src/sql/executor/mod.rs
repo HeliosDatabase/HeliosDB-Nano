@@ -1139,11 +1139,19 @@ impl<'a> Executor<'a> {
                     }
                 }
                 let input_op = self.plan_to_operator(input)?;
+                // Materialize any subqueries in the HAVING expression — the Filter
+                // and Project paths already do this, but HAVING was passed raw, so a
+                // (sub)query in HAVING reached the evaluator as an opaque node, erred,
+                // and silently dropped every group (bug A1/Defect-2).
+                let having = having
+                    .as_ref()
+                    .map(|h| self.materialize_subqueries(h))
+                    .transpose()?;
                 Ok(Box::new(AggregateOperator::new(
                     input_op,
                     group_by.clone(),
                     aggr_exprs.clone(),
-                    having.clone(),
+                    having,
                     self.parameters.clone(),
                     self.timeout_ctx.clone(),
                 )?))
