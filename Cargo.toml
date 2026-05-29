@@ -382,3 +382,9 @@ required-features = ["code-graph"]
 
 [profile.bench]
 inherits = "release"
+
+[profile.perf]
+inherits = "release"
+lto = false
+codegen-units = 16
+debug = 1
