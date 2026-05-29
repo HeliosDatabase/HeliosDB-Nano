@@ -1,6 +1,6 @@
 # heliosdb-nano (Python)
 
-In-process Python binding for [HeliosDB-Nano](https://github.com/dimensigon/HDB-HeliosDB-Nano)'s
+In-process Python binding for [HeliosDB-Nano](https://github.com/HeliosDatabase/HeliosDB-Nano)'s
 embedded database. Calls the Rust `EmbeddedDatabase` API directly — **no subprocess,
 no wire protocol, no serialization hop** — so Python sees the same path behind the
 "embedded beats SQLite" numbers.

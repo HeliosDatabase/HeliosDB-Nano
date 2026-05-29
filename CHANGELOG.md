@@ -1352,7 +1352,7 @@ source comments still showed CLI examples like
 "unrecognized subcommand". The engine deliberately has no
 `mcp-server` CLI subcommand — MCP is a library integration
 consumed by the out-of-tree
-[`heliosdb-codekb-mcp`](https://github.com/dimensigon/heliosdb-codekb-mcp)
+[`heliosdb-codekb-mcp`](https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP)
 plugin, which exposes `serve --source X [--http <addr>]`. Doc
 content updated to redirect users at the plugin.
 

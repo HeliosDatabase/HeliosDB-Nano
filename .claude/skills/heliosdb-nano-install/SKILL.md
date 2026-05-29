@@ -86,7 +86,7 @@ heliosdb-nano start --data-dir ./data --replication-role primary --sync-mode sem
 
 ### Recipe 6: Build from source (development)
 ```bash
-git clone https://github.com/dimensigon/HDB-HeliosDB-Nano.git
+git clone https://github.com/HeliosDatabase/HeliosDB-Nano.git
 cd HDB-HeliosDB-Nano
 cargo build --release --features code-graph,mcp-endpoint
 ./target/release/heliosdb-nano --version

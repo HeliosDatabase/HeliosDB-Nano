@@ -616,7 +616,7 @@ async fn start_server(
     println!();
     println!("    Compatibility notes:");
     println!("      FTS:         docs/compatibility/fts.md");
-    println!("      ORM matrix:  https://github.com/Dimensigon/HDB-HeliosDB-Nano/blob/main/docs/compatibility/orm.md");
+    println!("      ORM matrix:  https://github.com/HeliosDatabase/HeliosDB-Nano/blob/main/docs/compatibility/orm.md");
     println!("      Known gaps:  SELECT heliosdb_capability_report();");
     if mysql_enabled {
         println!();

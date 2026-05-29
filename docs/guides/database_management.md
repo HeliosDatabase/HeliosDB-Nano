@@ -51,7 +51,7 @@ migration scripts and Docker entrypoints.
 
 For most multi-tenant workloads we recommend the row-level-security
 tenant model documented in
-[`docs/guides/tenancy_skill.md`](https://github.com/Dimensigon/HDB-HeliosDB-Nano)
+[`docs/guides/tenancy_skill.md`](https://github.com/HeliosDatabase/HeliosDB-Nano)
 (see the `heliosdb-nano-tenant` skill). It is one to two orders of
 magnitude cheaper per-tenant than `CREATE DATABASE`, scales to
 thousands of tenants on a single binary, and supports tiered plans
