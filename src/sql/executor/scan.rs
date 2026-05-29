@@ -11,6 +11,12 @@ use crate::{Error, Result, Schema, Tuple};
 use std::collections::HashSet;
 use std::sync::Arc;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ScanDecodeHint {
+    Prefix(usize),
+    Columns(Vec<usize>),
+}
+
 /// Compute a conservative single-table prefix-decode hint for a read plan (issue #1
 /// follow-up). `Some((table, prefix_len))` means every column the plan references in
 /// `table` lives at an index `< prefix_len`, so a scan of `table` only needs to decode
@@ -20,6 +26,31 @@ use std::sync::Arc;
 /// exhaustive so a newly added expression variant is a compile error here (forcing a
 /// correctness review) rather than a silent miss.
 pub(super) fn compute_scan_prefix_hint(plan: &LogicalPlan) -> Option<(String, usize)> {
+    let (table_name, indices, _total_cols) = collect_single_table_column_indices(plan)?;
+    let prefix_len = indices.last().map(|idx| idx + 1).unwrap_or(0);
+    Some((table_name, prefix_len))
+}
+
+/// Compute the row-decode strategy for a single-table read plan. Prefix decode is
+/// fastest when all required columns are early. Selected-column decode handles the
+/// common analytics shape where a query needs a few later columns but should still
+/// skip unrelated leading/middle/tail values.
+pub(super) fn compute_scan_decode_hint(plan: &LogicalPlan) -> Option<(String, ScanDecodeHint)> {
+    let (table_name, indices, total_cols) = collect_single_table_column_indices(plan)?;
+    let prefix_len = indices.last().map(|idx| idx + 1).unwrap_or(0);
+
+    if is_prefix_contiguous(&indices) && should_use_prefix_decode(prefix_len, total_cols) {
+        return Some((table_name, ScanDecodeHint::Prefix(prefix_len)));
+    }
+
+    if should_use_selected_decode(&indices, total_cols) {
+        return Some((table_name, ScanDecodeHint::Columns(indices)));
+    }
+
+    None
+}
+
+fn collect_single_table_column_indices(plan: &LogicalPlan) -> Option<(String, Vec<usize>, usize)> {
     let mut cols: HashSet<String> = HashSet::new();
     let mut tables: Vec<(String, Arc<Schema>)> = Vec::new();
     let mut bail = false;
@@ -35,7 +66,7 @@ pub(super) fn compute_scan_prefix_hint(plan: &LogicalPlan) -> Option<(String, us
         return None;
     }
     let (table_name, schema) = &tables[0];
-    let mut max_idx: isize = -1;
+    let mut indices = Vec::new();
     for c in &cols {
         // A name that doesn't resolve to a base column is a *derived* column — an
         // aggregate output (`agg_0`) or a projection alias referenced by a node above
@@ -43,11 +74,12 @@ pub(super) fn compute_scan_prefix_hint(plan: &LogicalPlan) -> Option<(String, us
         // at the producing node's expression, so skipping it here is safe (and never
         // under-counts the prefix). Only base columns widen the prefix.
         if let Some(idx) = resolve_col_index(schema, c) {
-            max_idx = max_idx.max(idx as isize);
+            indices.push(idx);
         }
     }
-    // No referenced base columns (e.g. COUNT(*)) → prefix 0 → decode nothing.
-    Some((table_name.clone(), (max_idx + 1) as usize))
+    indices.sort_unstable();
+    indices.dedup();
+    Some((table_name.clone(), indices, schema.columns.len()))
 }
 
 fn resolve_col_index(schema: &Schema, name: &str) -> Option<usize> {
@@ -62,6 +94,28 @@ fn should_use_prefix_decode(prefix_len: usize, total_columns: usize) -> bool {
     // COUNT(*) and early-column plans, but measured slower when it only skips a
     // narrow suffix. Keep it conservative until column-width stats can guide this.
     prefix_len < total_columns && prefix_len.saturating_mul(2) <= total_columns
+}
+
+fn is_prefix_contiguous(indices: &[usize]) -> bool {
+    indices
+        .iter()
+        .copied()
+        .enumerate()
+        .all(|(expected, idx)| idx == expected)
+}
+
+fn should_use_selected_decode(indices: &[usize], total_columns: usize) -> bool {
+    if total_columns == 0 || indices.len() >= total_columns {
+        return false;
+    }
+    if indices.is_empty() {
+        return true;
+    }
+
+    let skips_leading = indices.first().copied().unwrap_or(0) > 0;
+    let sparse = indices.len().saturating_mul(2) <= total_columns;
+
+    skips_leading || sparse
 }
 
 fn collect_plan_columns(
@@ -697,12 +751,12 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
                 // Issue #1 follow-up: when the executor's needed-column analysis is
                 // certain (single regular table, no wildcard/subquery), decode only the
                 // leading columns and skip the costly tail.
-                match executor.scan_prefix_hint_for(table_name) {
-                    Some(prefix_len)
-                        if actual_table_name == *table_name
-                            && should_use_prefix_decode(prefix_len, schema.columns.len()) =>
-                    {
-                        storage.scan_table_branch_aware_with_schema_prefix(&actual_table_name, &schema, prefix_len)?
+                match executor.scan_decode_hint_for(table_name) {
+                    Some(ScanDecodeHint::Prefix(prefix_len)) if actual_table_name == *table_name => {
+                        storage.scan_table_branch_aware_with_schema_prefix(&actual_table_name, &schema, *prefix_len)?
+                    }
+                    Some(ScanDecodeHint::Columns(columns)) if actual_table_name == *table_name => {
+                        storage.scan_table_branch_aware_with_schema_columns(&actual_table_name, &schema, columns)?
                     }
                     _ => storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?,
                 }
@@ -887,12 +941,12 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                 )
             } else {
                 // Normal filtered scan (current data) with branch isolation
-                let base_tuples = match executor.scan_prefix_hint_for(table_name) {
-                    Some(prefix_len)
-                        if actual_table_name == *table_name
-                            && should_use_prefix_decode(prefix_len, schema.columns.len()) =>
-                    {
-                        storage.scan_table_branch_aware_with_schema_prefix(&actual_table_name, &schema, prefix_len)?
+                let base_tuples = match executor.scan_decode_hint_for(table_name) {
+                    Some(ScanDecodeHint::Prefix(prefix_len)) if actual_table_name == *table_name => {
+                        storage.scan_table_branch_aware_with_schema_prefix(&actual_table_name, &schema, *prefix_len)?
+                    }
+                    Some(ScanDecodeHint::Columns(columns)) if actual_table_name == *table_name => {
+                        storage.scan_table_branch_aware_with_schema_columns(&actual_table_name, &schema, columns)?
                     }
                     _ => storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?,
                 };
@@ -1335,6 +1389,38 @@ mod tests {
         assert!(should_use_prefix_decode(2, 4));
         assert!(!should_use_prefix_decode(4, 5));
         assert!(!should_use_prefix_decode(5, 5));
+    }
+
+    #[test]
+    fn selected_decode_hint_handles_sparse_later_columns() {
+        let schema = test_schema();
+        let plan = LogicalPlan::Aggregate {
+            input: Box::new(LogicalPlan::Scan {
+                table_name: "w".to_string(),
+                alias: None,
+                schema,
+                projection: None,
+                as_of: None,
+            }),
+            group_by: vec![LogicalExpr::Column {
+                table: None,
+                name: "note".to_string(),
+            }],
+            aggr_exprs: vec![LogicalExpr::AggregateFunction {
+                fun: crate::sql::logical_plan::AggregateFunction::Sum,
+                args: vec![LogicalExpr::Column {
+                    table: None,
+                    name: "payload".to_string(),
+                }],
+                distinct: false,
+            }],
+            having: None,
+        };
+
+        assert_eq!(
+            compute_scan_decode_hint(&plan),
+            Some(("w".to_string(), ScanDecodeHint::Columns(vec![2, 3])))
+        );
     }
 
     #[test]
