@@ -652,6 +652,34 @@ impl EmbeddedDatabase {
         )))
     }
 
+    fn plan_invalidates_sql_caches(plan: &sql::LogicalPlan) -> bool {
+        matches!(
+            plan,
+            sql::LogicalPlan::CreateTable { .. }
+                | sql::LogicalPlan::DropTable { .. }
+                | sql::LogicalPlan::AlterColumnStorage { .. }
+                | sql::LogicalPlan::AlterTableAddColumn { .. }
+                | sql::LogicalPlan::AlterTableDropColumn { .. }
+                | sql::LogicalPlan::AlterTableRename { .. }
+                | sql::LogicalPlan::AlterTableRenameColumn { .. }
+                | sql::LogicalPlan::AlterTableAddForeignKey { .. }
+                | sql::LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
+                | sql::LogicalPlan::AlterTableMulti { .. }
+                | sql::LogicalPlan::CreateIndex { .. }
+                | sql::LogicalPlan::CreateTrigger { .. }
+                | sql::LogicalPlan::DropTrigger { .. }
+                | sql::LogicalPlan::Truncate { .. }
+                | sql::LogicalPlan::CreateMaterializedView { .. }
+                | sql::LogicalPlan::DropMaterializedView { .. }
+        )
+    }
+
+    fn serialize_default_expr(default: &Option<sql::LogicalExpr>) -> Option<String> {
+        default
+            .as_ref()
+            .map(|expr| serde_json::to_string(expr).unwrap_or_default())
+    }
+
     /// Check if a SQL statement is a transaction control statement (zero-allocation)
     fn is_transaction_control(sql: &str) -> bool {
         let trimmed = sql.trim().trim_end_matches(';').trim();
@@ -1117,15 +1145,9 @@ impl EmbeddedDatabase {
             planner.statement_to_plan(statement)?
         };
 
-        // Invalidate plan cache on DDL operations that affect schema (including MV operations)
-        if matches!(
-            &plan,
-            sql::LogicalPlan::CreateTable { .. }
-                | sql::LogicalPlan::DropTable { .. }
-                | sql::LogicalPlan::CreateMaterializedView { .. }
-                | sql::LogicalPlan::DropMaterializedView { .. }
-                | sql::LogicalPlan::Truncate { .. }
-        ) {
+        // Invalidate SQL metadata caches on DDL operations that can alter schemas,
+        // constraints, indexes, triggers, or materialized-view shape.
+        if Self::plan_invalidates_sql_caches(&plan) {
             self.invalidate_plan_cache();
         }
 
@@ -1147,10 +1169,7 @@ impl EmbeddedDatabase {
                     .iter()
                     .map(|col_def| {
                         // Serialize default expression to JSON for storage
-                        let default_expr = col_def
-                            .default
-                            .as_ref()
-                            .map(|expr| serde_json::to_string(expr).unwrap_or_default());
+                        let default_expr = Self::serialize_default_expr(&col_def.default);
 
                         Column {
                             name: col_def.name.clone(),
@@ -3081,7 +3100,7 @@ impl EmbeddedDatabase {
                     primary_key: column_def.primary_key,
                     source_table: None,
                     source_table_name: Some(table_name.clone()),
-                    default_expr: column_def.default.as_ref().map(|e| format!("{:?}", e)),
+                    default_expr: Self::serialize_default_expr(&column_def.default),
                     unique: column_def.unique,
                     storage_mode: column_def.storage_mode,
                 };
@@ -5146,7 +5165,7 @@ impl EmbeddedDatabase {
                     primary_key: column_def.primary_key,
                     source_table: None,
                     source_table_name: Some(table_name.clone()),
-                    default_expr: column_def.default.as_ref().map(|e| format!("{:?}", e)),
+                    default_expr: Self::serialize_default_expr(&column_def.default),
                     unique: column_def.unique,
                     storage_mode: column_def.storage_mode,
                 };
@@ -6792,23 +6811,9 @@ impl EmbeddedDatabase {
             "Logical plan created"
         );
 
-        // Invalidate plan cache on DDL operations (schema changes)
-        if matches!(
-            &plan,
-            sql::LogicalPlan::CreateTable { .. }
-                | sql::LogicalPlan::DropTable { .. }
-                | sql::LogicalPlan::AlterTableAddColumn { .. }
-                | sql::LogicalPlan::AlterTableDropColumn { .. }
-                | sql::LogicalPlan::AlterTableRename { .. }
-                | sql::LogicalPlan::AlterTableRenameColumn { .. }
-                | sql::LogicalPlan::AlterTableAddForeignKey { .. }
-                | sql::LogicalPlan::AlterTableAlterConstraintEnforcement { .. }
-                | sql::LogicalPlan::AlterTableMulti { .. }
-                | sql::LogicalPlan::CreateIndex { .. }
-                | sql::LogicalPlan::Truncate { .. }
-                | sql::LogicalPlan::CreateMaterializedView { .. }
-                | sql::LogicalPlan::DropMaterializedView { .. }
-        ) {
+        // Invalidate SQL metadata caches on DDL operations that can alter schemas,
+        // constraints, indexes, triggers, or materialized-view shape.
+        if Self::plan_invalidates_sql_caches(&plan) {
             self.invalidate_plan_cache();
         }
 
@@ -7557,7 +7562,7 @@ impl EmbeddedDatabase {
                     primary_key: column_def.primary_key,
                     source_table: None,
                     source_table_name: Some(table_name.clone()),
-                    default_expr: column_def.default.as_ref().map(|e| format!("{:?}", e)),
+                    default_expr: Self::serialize_default_expr(&column_def.default),
                     unique: column_def.unique,
                     storage_mode: column_def.storage_mode,
                 };
@@ -12282,6 +12287,32 @@ mod tests {
     fn test_embedded_database_creation() {
         let db = EmbeddedDatabase::new_in_memory();
         assert!(db.is_ok());
+    }
+
+    #[test]
+    fn test_trigger_ddl_invalidates_sql_caches() {
+        let create_trigger = sql::LogicalPlan::CreateTrigger {
+            name: "trg_cache".to_string(),
+            table_name: "cache_target".to_string(),
+            timing: sql::logical_plan::TriggerTiming::After,
+            events: vec![sql::logical_plan::TriggerEvent::Insert],
+            for_each: sql::logical_plan::TriggerFor::Row,
+            when_condition: None,
+            body: vec![],
+            if_not_exists: false,
+            referencing: vec![],
+            characteristics: sql::logical_plan::TriggerCharacteristics::default(),
+            trigger_type: sql::logical_plan::TriggerType::default(),
+            from_constraint: None,
+        };
+        assert!(EmbeddedDatabase::plan_invalidates_sql_caches(&create_trigger));
+
+        let drop_trigger = sql::LogicalPlan::DropTrigger {
+            name: "trg_cache".to_string(),
+            table_name: Some("cache_target".to_string()),
+            if_exists: false,
+        };
+        assert!(EmbeddedDatabase::plan_invalidates_sql_caches(&drop_trigger));
     }
 
     // ========================================================================
