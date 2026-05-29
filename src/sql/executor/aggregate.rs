@@ -56,7 +56,7 @@ impl AggregateOperator {
 
         // Streaming fast path: no GROUP BY and all aggregates are streamable
         let mut output_tuples = if group_by.is_empty() && Self::all_streamable(&aggr_exprs) {
-            let result = Self::streaming_aggregate(&mut input, &aggr_exprs, &evaluator, &timeout_ctx)?;
+            let result = Self::streaming_aggregate(&mut input, &aggr_exprs, &evaluator, &input_schema, &timeout_ctx)?;
             vec![Tuple::new(result)]
         } else {
             // Standard materialization path
@@ -412,10 +412,16 @@ impl AggregateOperator {
         input: &mut Box<dyn PhysicalOperator>,
         aggr_exprs: &[crate::sql::LogicalExpr],
         evaluator: &crate::sql::Evaluator,
+        input_schema: &Schema,
         timeout_ctx: &Option<TimeoutContext>,
     ) -> Result<Vec<crate::Value>> {
         use crate::sql::{AggregateFunction, LogicalExpr};
         use crate::Value;
+
+        let arg_accessors: Vec<AggregateArgAccessor> = aggr_exprs
+            .iter()
+            .map(|expr| AggregateArgAccessor::for_aggregate(expr, input_schema))
+            .collect::<Result<Vec<_>>>()?;
 
         // Initialize accumulators for each aggregate expression
         let mut accumulators: Vec<StreamingAccumulator> = aggr_exprs
@@ -443,21 +449,26 @@ impl AggregateOperator {
             }
 
             // Update each accumulator
-            for (i, expr) in aggr_exprs.iter().enumerate() {
-                if let LogicalExpr::AggregateFunction { args, .. } = expr {
-                    let arg_expr = args
-                        .first()
-                        .ok_or_else(|| Error::query_execution("Aggregate function has no arguments"))?;
-
-                    // COUNT(*) doesn't need to evaluate the arg
-                    let val = if matches!(arg_expr, LogicalExpr::Wildcard) {
-                        Value::Null // sentinel — COUNT(*) counts all rows
-                    } else {
-                        evaluator.evaluate(arg_expr, &tuple)?
-                    };
-
-                    if let Some(acc) = accumulators.get_mut(i) {
-                        acc.update(&val, matches!(arg_expr, LogicalExpr::Wildcard))?;
+            for (i, accessor) in arg_accessors.iter().enumerate() {
+                if let Some(acc) = accumulators.get_mut(i) {
+                    match accessor {
+                        AggregateArgAccessor::Wildcard => {
+                            let val = Value::Null; // sentinel — COUNT(*) counts all rows
+                            acc.update(&val, true)?;
+                        }
+                        AggregateArgAccessor::Column(index) => {
+                            let val = tuple.get(*index).ok_or_else(|| {
+                                Error::query_execution(format!(
+                                    "Column index {} out of bounds in aggregate input tuple",
+                                    index
+                                ))
+                            })?;
+                            acc.update(val, false)?;
+                        }
+                        AggregateArgAccessor::Expr(expr) => {
+                            let val = evaluator.evaluate(expr, &tuple)?;
+                            acc.update(&val, false)?;
+                        }
                     }
                 }
             }
@@ -517,6 +528,45 @@ impl AggregateOperator {
         }
 
         Ok(output_tuples)
+    }
+}
+
+enum AggregateArgAccessor {
+    Wildcard,
+    Column(usize),
+    Expr(crate::sql::LogicalExpr),
+}
+
+impl AggregateArgAccessor {
+    fn for_aggregate(expr: &crate::sql::LogicalExpr, schema: &Schema) -> Result<Self> {
+        use crate::sql::LogicalExpr;
+
+        let LogicalExpr::AggregateFunction { args, .. } = expr else {
+            return Err(Error::query_execution("Expected aggregate function expression"));
+        };
+        let arg_expr = args
+            .first()
+            .ok_or_else(|| Error::query_execution("Aggregate function has no arguments"))?;
+
+        match arg_expr {
+            LogicalExpr::Wildcard => Ok(Self::Wildcard),
+            LogicalExpr::Column { table, name } => {
+                let index = schema
+                    .get_qualified_column_index(table.as_deref(), name)
+                    .ok_or_else(|| {
+                        Error::query_execution(format!(
+                            "Column '{}' not found in aggregate input schema",
+                            if let Some(t) = table {
+                                format!("{}.{}", t, name)
+                            } else {
+                                name.clone()
+                            }
+                        ))
+                    })?;
+                Ok(Self::Column(index))
+            }
+            _ => Ok(Self::Expr(arg_expr.clone())),
+        }
     }
 }
 
