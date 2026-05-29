@@ -46,6 +46,13 @@ enum RowDecodeHint<'a> {
     Columns(&'a [usize]),
 }
 
+fn schema_uses_column_storage(schema: &crate::Schema) -> bool {
+    schema
+        .columns
+        .iter()
+        .any(|column| column.storage_mode != ColumnStorageMode::Default)
+}
+
 /// Storage engine
 pub struct StorageEngine {
     /// RocksDB instance
@@ -1503,65 +1510,16 @@ impl StorageEngine {
             // Check bulk load mode early - skip some operations if enabled
             let bulk_mode = self.is_bulk_load_mode();
 
-            // Apply per-column storage transformations
-            let mut transformed_tuple = tuple.clone();
-            for (idx, column) in schema.columns.iter().enumerate() {
-                if idx >= transformed_tuple.values.len() {
-                    break;
-                }
-                match column.storage_mode {
-                    ColumnStorageMode::Dictionary => {
-                        // Dictionary encode string values
-                        if let Some(crate::Value::String(s)) = transformed_tuple.values.get(idx) {
-                            let s = s.clone();
-                            let dict_id = self.dict_manager.encode(&self.db, table_name, &column.name, &s)?;
-                            if let Some(val) = transformed_tuple.values.get_mut(idx) {
-                                *val = crate::Value::DictRef { dict_id };
-                            }
-                        }
-                    }
-                    ColumnStorageMode::ContentAddressed => {
-                        // Use content-addressed storage for large values
-                        let cur_val = transformed_tuple
-                            .values
-                            .get(idx)
-                            .ok_or_else(|| Error::internal("index out of bounds in content-addressed transform"))?;
-                        let new_val = ContentAddressedStore::maybe_store(&self.db, cur_val)?;
-                        if let Some(val) = transformed_tuple.values.get_mut(idx) {
-                            *val = new_val;
-                        }
-                    }
-                    ColumnStorageMode::Columnar => {
-                        // Store in columnar format separately
-                        let cur_val = transformed_tuple
-                            .values
-                            .get(idx)
-                            .ok_or_else(|| Error::internal("index out of bounds in columnar transform"))?
-                            .clone();
-                        ColumnarStore::store(&self.db, table_name, &column.name, row_id, cur_val)?;
-                        // Mark as columnar reference in row tuple
-                        if let Some(val) = transformed_tuple.values.get_mut(idx) {
-                            *val = crate::Value::ColumnarRef;
-                        }
-                    }
-                    ColumnStorageMode::Default => {
-                        // No transformation needed
-                    }
-                }
-            }
-
-            // Flush dictionary changes if any
-            if schema
-                .columns
-                .iter()
-                .any(|c| c.storage_mode == ColumnStorageMode::Dictionary)
-            {
-                self.dict_manager.flush(&self.db)?;
-            }
+            let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &tuple, &schema)?;
 
             // Serialize transformed tuple (RocksDB LZ4 handles compression at block level)
-            let value = bincode::serialize(&transformed_tuple)
+            let value = bincode::serialize(&stored_tuple)
                 .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+            let logical_value = if schema_uses_column_storage(&schema) {
+                bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
+            } else {
+                value.clone()
+            };
 
             // Build key: data:{table_name}:{row_id} (using thread-local buffer)
             let key = Self::build_data_key(table_name, row_id);
@@ -1570,7 +1528,7 @@ impl StorageEngine {
             self.put(&key, &value)?;
 
             // Log to WAL for durability/replication
-            self.log_data_insert(table_name, &key, &value)?;
+            self.log_data_insert(table_name, &key, &logical_value)?;
 
             // Update ART index for PK/unique constraint indexes
             {
@@ -3047,6 +3005,11 @@ impl StorageEngine {
         None
     }
 
+    /// Return physical columnar-storage stats for a single table column.
+    pub fn columnar_column_stats(&self, table_name: &str, column_name: &str) -> Result<super::ColumnarStats> {
+        ColumnarStore::stats(&self.db, table_name, column_name)
+    }
+
     /// Close the storage engine
     pub fn close(self) -> Result<()> {
         // RocksDB will be dropped and closed automatically
@@ -4516,6 +4479,8 @@ impl StorageEngine {
             }
         }
 
+        let logical_tuple = tuple.clone();
+
         // PK / UNIQUE check before committing the write.  Mirror of the
         // check in `insert_tuple_fast` (the SQL fast-path entry); without
         // this, parameterised INSERTs (`db.execute_params`) and other
@@ -4537,9 +4502,16 @@ impl StorageEngine {
         // Check bulk load mode early - skip some operations if enabled
         let bulk_mode = self.is_bulk_load_mode();
 
-        // Serialize tuple directly (RocksDB LZ4 handles compression at block level)
-        let value =
-            bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+        let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &tuple, schema)?;
+        // Serialize transformed tuple directly (RocksDB LZ4 handles compression at block level)
+        let value = bincode::serialize(&stored_tuple)
+            .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+        let logical_value = if schema_uses_column_storage(schema) {
+            bincode::serialize(&logical_tuple)
+                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
+        } else {
+            value.clone()
+        };
 
         // Get current timestamp for MVCC
         let timestamp = self.next_timestamp();
@@ -4549,7 +4521,7 @@ impl StorageEngine {
         self.put(&key, &value)?;
 
         // Log to WAL for durability/replication
-        self.log_data_insert(table_name, &key, &value)?;
+        self.log_data_insert(table_name, &key, &logical_value)?;
 
         // Update ART index for PK/unique constraint indexes
         {
@@ -4566,7 +4538,7 @@ impl StorageEngine {
 
         // Write versioned copy (for time-travel queries)
         self.snapshot_manager
-            .write_version(table_name, row_id, timestamp, &value)?;
+            .write_version(table_name, row_id, timestamp, &logical_value)?;
 
         // Register snapshot with WAL LSN for AS OF TRANSACTION queries
         // This ensures the transaction ID matches what users see in the REPL
@@ -4661,17 +4633,25 @@ impl StorageEngine {
             return Err(Error::constraint_violation(e.to_string()));
         }
 
-        let value =
-            bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+        let logical_tuple = tuple.clone();
+        let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &tuple, schema)?;
+        let value = bincode::serialize(&stored_tuple)
+            .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+        let logical_value = if schema_uses_column_storage(schema) {
+            bincode::serialize(&logical_tuple)
+                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
+        } else {
+            value.clone()
+        };
 
         let key = Self::build_data_key(table_name, row_id);
         self.put(&key, &value)?;
 
         if self.fast_insert_requires_logical_wal() {
             if self.config.storage.logical_wal_per_statement {
-                self.log_data_insert(table_name, &key, &value)?;
+                self.log_data_insert(table_name, &key, &logical_value)?;
             } else {
-                self.log_data_insert_nosync(table_name, &key, &value)?;
+                self.log_data_insert_nosync(table_name, &key, &logical_value)?;
             }
         }
 
@@ -4686,6 +4666,64 @@ impl StorageEngine {
         }
 
         Ok(row_id)
+    }
+
+    fn transform_tuple_for_column_storage(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        tuple: &Tuple,
+        schema: &crate::Schema,
+    ) -> Result<Tuple> {
+        if !schema_uses_column_storage(schema) {
+            return Ok(tuple.clone());
+        }
+
+        let mut transformed = tuple.clone();
+        let mut used_dictionary = false;
+        for (idx, column) in schema.columns.iter().enumerate() {
+            if idx >= transformed.values.len() {
+                break;
+            }
+            match column.storage_mode {
+                ColumnStorageMode::Dictionary => {
+                    if let Some(crate::Value::String(s)) = transformed.values.get(idx) {
+                        let dict_id = self.dict_manager.encode(&self.db, table_name, &column.name, s)?;
+                        if let Some(val) = transformed.values.get_mut(idx) {
+                            *val = crate::Value::DictRef { dict_id };
+                        }
+                        used_dictionary = true;
+                    }
+                }
+                ColumnStorageMode::ContentAddressed => {
+                    let cur_val = transformed
+                        .values
+                        .get(idx)
+                        .ok_or_else(|| Error::internal("index out of bounds in content-addressed transform"))?;
+                    let new_val = ContentAddressedStore::maybe_store(&self.db, cur_val)?;
+                    if let Some(val) = transformed.values.get_mut(idx) {
+                        *val = new_val;
+                    }
+                }
+                ColumnStorageMode::Columnar => {
+                    let cur_val = transformed
+                        .values
+                        .get(idx)
+                        .ok_or_else(|| Error::internal("index out of bounds in columnar transform"))?
+                        .clone();
+                    ColumnarStore::store(&self.db, table_name, &column.name, row_id, cur_val)?;
+                    if let Some(val) = transformed.values.get_mut(idx) {
+                        *val = crate::Value::ColumnarRef;
+                    }
+                }
+                ColumnStorageMode::Default => {}
+            }
+        }
+
+        if used_dictionary {
+            self.dict_manager.flush(&self.db)?;
+        }
+        Ok(transformed)
     }
 
     /// Fast UPDATE: overwrites a row in-place, updates ART indexes, invalidates row cache.

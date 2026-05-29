@@ -219,6 +219,7 @@ impl ColumnarStore {
             }
         }
 
+        results.sort_by_key(|(row_id, _)| *row_id);
         Ok(results)
     }
 
@@ -382,6 +383,23 @@ mod tests {
         let stats = ColumnarStore::stats(&db, "test", "col").unwrap();
         assert_eq!(stats.batch_count, 3);
         assert_eq!(stats.non_null_values, 4);
+    }
+
+    #[test]
+    fn test_columnar_scan_orders_decimal_batch_keys_by_row_id() {
+        let (_dir, db) = test_db();
+
+        ColumnarStore::store(&db, "test", "col", 10 * BATCH_SIZE as u64, Value::Int4(10)).unwrap();
+        ColumnarStore::store(&db, "test", "col", 2 * BATCH_SIZE as u64, Value::Int4(2)).unwrap();
+
+        let results = ColumnarStore::scan_column(&db, "test", "col").unwrap();
+        assert_eq!(
+            results,
+            vec![
+                (2 * BATCH_SIZE as u64, Value::Int4(2)),
+                (10 * BATCH_SIZE as u64, Value::Int4(10)),
+            ]
+        );
     }
 
     #[test]

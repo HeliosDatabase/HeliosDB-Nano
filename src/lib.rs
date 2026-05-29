@@ -5459,19 +5459,21 @@ impl EmbeddedDatabase {
         }
         let rest = after_into.get(table_end..)?.trim_start();
 
-        // Extract column list: (<col1>, <col2>, ...)
-        if !rest.starts_with('(') {
-            return None;
-        }
-        let col_end = rest.find(')')?;
-        let col_list_str = rest.get(1..col_end)?;
-        let columns: Vec<&str> = col_list_str.split(',').map(|s| s.trim()).collect();
-        if columns.is_empty() || columns.iter().any(|c| c.is_empty()) {
-            return None;
-        }
+        // Extract optional column list: (<col1>, <col2>, ...). If omitted,
+        // VALUES map to the full schema order.
+        let (columns, after_cols): (Option<Vec<&str>>, &str) = if rest.starts_with('(') {
+            let col_end = rest.find(')')?;
+            let col_list_str = rest.get(1..col_end)?;
+            let columns: Vec<&str> = col_list_str.split(',').map(|s| s.trim()).collect();
+            if columns.is_empty() || columns.iter().any(|c| c.is_empty()) {
+                return None;
+            }
+            (Some(columns), rest.get(col_end + 1..)?.trim_start())
+        } else {
+            (None, rest)
+        };
 
         // Find VALUES keyword
-        let after_cols = rest.get(col_end + 1..)?.trim_start();
         if after_cols.len() < 6 || !after_cols.as_bytes().get(..6)?.eq_ignore_ascii_case(b"VALUES") {
             return None;
         }
@@ -5522,22 +5524,31 @@ impl EmbeddedDatabase {
         }
 
         // Resolve column indices and target types
-        if columns.len() != Self::fast_parse_value_count(values_str) {
+        let value_count = Self::fast_parse_value_count(values_str);
+        let expected_count = columns.as_ref().map_or(schema.columns.len(), Vec::len);
+        if expected_count != value_count {
             return None; // Column/value count mismatch
         }
 
-        let mut target_types = Vec::with_capacity(columns.len());
-        let mut col_indices = Vec::with_capacity(columns.len());
-        for col_name in &columns {
-            match schema.get_column_index(col_name) {
-                Some(idx) => {
-                    col_indices.push(idx);
-                    match schema.get_column_at(idx) {
-                        Some(col) => target_types.push(col.data_type.clone()),
-                        None => return None,
+        let mut target_types = Vec::with_capacity(expected_count);
+        let mut col_indices = Vec::with_capacity(expected_count);
+        if let Some(columns) = &columns {
+            for col_name in columns {
+                match schema.get_column_index(col_name) {
+                    Some(idx) => {
+                        col_indices.push(idx);
+                        match schema.get_column_at(idx) {
+                            Some(col) => target_types.push(col.data_type.clone()),
+                            None => return None,
+                        }
                     }
+                    None => return None, // Unknown column — let normal path handle error
                 }
-                None => return None, // Unknown column — let normal path handle error
+            }
+        } else {
+            for (idx, col) in schema.columns.iter().enumerate() {
+                col_indices.push(idx);
+                target_types.push(col.data_type.clone());
             }
         }
 
