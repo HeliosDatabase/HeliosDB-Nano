@@ -944,7 +944,7 @@ impl EmbeddedDatabase {
         self.execute_in_transaction_inner(sql, txn, false)
     }
 
-    /// Execute within transaction context, skipping fast paths.
+    /// Execute within transaction context, skipping direct storage fast paths.
     /// Used by `Transaction::execute()` and session transactions to ensure
     /// writes go through the transaction write set (not directly to storage).
     fn execute_in_transaction_no_fast_path(&self, sql: &str, txn: &storage::Transaction) -> Result<u64> {
@@ -972,6 +972,16 @@ impl EmbeddedDatabase {
         let has_savepoints = !self.savepoints.read().is_empty();
         let has_session_txns = !self.session_transactions.is_empty();
         let use_fast_paths = !skip_fast_paths && !has_savepoints && !has_session_txns;
+
+        // Explicit transactions can still use transaction-aware INSERT fast
+        // paths. These buffer rows in the transaction write set, so
+        // COMMIT/ROLLBACK semantics are preserved while avoiding full
+        // parser/planner and per-row counter persistence overhead.
+        if skip_fast_paths && !has_savepoints && !has_session_txns {
+            if let Some(result) = self.try_fast_insert_literal_in_transaction(sql, txn) {
+                return result;
+            }
+        }
 
         // Fast path: simple INSERT with literal values (skips full SQL parsing)
         if use_fast_paths {
@@ -4294,6 +4304,8 @@ impl EmbeddedDatabase {
                 .as_ref()
                 .ok_or_else(|| Error::transaction("Transaction lock in invalid state"))?;
             self.execute_in_transaction_no_fast_path(sql, txn_ref)
+        } else if let Some(result) = self.try_autocommit_fast_insert(sql) {
+            result
         } else if let Some(result) = self.try_autocommit_fast_update_delete(sql) {
             result
         } else {
@@ -4351,6 +4363,23 @@ impl EmbeddedDatabase {
     /// ```
     pub fn execute_returning(&self, sql: &str) -> Result<(u64, Vec<Tuple>)> {
         self.execute_params_returning(sql, &[])
+    }
+
+    /// Execute eligible autocommit INSERTs without creating an empty implicit
+    /// transaction around a direct fast-path storage write.
+    fn try_autocommit_fast_insert(&self, sql: &str) -> Option<Result<u64>> {
+        if !self.savepoints.read().is_empty()
+            || !self.session_transactions.is_empty()
+            || self.tenant_manager.get_current_context().is_some()
+        {
+            return None;
+        }
+
+        let result = self.try_fast_insert(sql)?;
+        if result.is_ok() {
+            self.storage.increment_lsn();
+        }
+        Some(result)
     }
 
     /// Execute eligible autocommit UPDATE/DELETE fast paths without creating an
@@ -4822,6 +4851,283 @@ impl EmbeddedDatabase {
                     .map(|_| 1),
             )
         }
+    }
+
+    /// Transaction-aware fast path for simple literal INSERT statements.
+    ///
+    /// Handles `INSERT INTO t (a, b) VALUES (...)` and `INSERT INTO t VALUES
+    /// (...)`, including multi-row VALUES, while buffering rows in the active
+    /// transaction write set.
+    #[allow(clippy::indexing_slicing)] // validated indices
+    fn try_fast_insert_literal_in_transaction(&self, sql: &str, txn: &storage::Transaction) -> Option<Result<u64>> {
+        let trimmed = sql.trim();
+
+        if trimmed.len() < 20 || !trimmed.as_bytes().get(..6)?.eq_ignore_ascii_case(b"INSERT") {
+            return None;
+        }
+        if self.tenant_manager.get_current_context().is_some() {
+            return None;
+        }
+
+        let after_insert = trimmed.get(6..)?.trim_start();
+        if !after_insert.as_bytes().get(..4)?.eq_ignore_ascii_case(b"INTO") {
+            return None;
+        }
+        let after_into = after_insert.get(4..)?.trim_start();
+
+        let table_end = after_into.find(|c: char| c == '(' || c.is_whitespace())?;
+        let table_name = after_into.get(..table_end)?.trim().trim_matches('"');
+        if table_name.is_empty() {
+            return None;
+        }
+        let rest = after_into.get(table_end..)?.trim_start();
+
+        let (explicit_columns, after_cols) = if rest.starts_with('(') {
+            let col_end = rest.find(')')?;
+            let col_list_str = rest.get(1..col_end)?;
+            let columns: Vec<&str> = col_list_str.split(',').map(|s| s.trim().trim_matches('"')).collect();
+            if columns.is_empty() || columns.iter().any(|c| c.is_empty()) {
+                return None;
+            }
+            (Some(columns), rest.get(col_end + 1..)?.trim_start())
+        } else {
+            (None, rest)
+        };
+
+        if after_cols.len() < 6 || !after_cols.as_bytes().get(..6)?.eq_ignore_ascii_case(b"VALUES") {
+            return None;
+        }
+        let values_rest = after_cols.get(6..)?.trim_start();
+        let value_groups = Self::fast_parse_value_groups(values_rest)?;
+
+        if self.tenant_manager.should_apply_rls(table_name, "INSERT") {
+            return None;
+        }
+        if self.trigger_registry.has_triggers_for_table(table_name) {
+            return None;
+        }
+
+        let catalog = self.storage.catalog();
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(schema) => schema,
+            Err(_) => return None,
+        };
+        if let Ok(tc) = catalog.load_table_constraints(table_name) {
+            if !tc.foreign_keys.is_empty() || !tc.check_constraints.is_empty() {
+                return None;
+            }
+        }
+
+        let columns = explicit_columns.unwrap_or_else(|| schema.columns.iter().map(|c| c.name.as_str()).collect());
+
+        let mut target_types = Vec::with_capacity(columns.len());
+        let mut col_indices = Vec::with_capacity(columns.len());
+        for col_name in &columns {
+            match schema.get_column_index(col_name) {
+                Some(idx) => {
+                    col_indices.push(idx);
+                    match schema.get_column_at(idx) {
+                        Some(col) => target_types.push(col.data_type.clone()),
+                        None => return None,
+                    }
+                }
+                None => return None,
+            }
+        }
+
+        let mut tuples = Vec::with_capacity(value_groups.len());
+        for values_str in value_groups {
+            if columns.len() != Self::fast_parse_value_count(values_str) {
+                return None;
+            }
+
+            let values = Self::fast_parse_values(values_str, &target_types)?;
+            let mut tuple_values = vec![Value::Null; schema.columns.len()];
+            let mut user_provided = vec![false; schema.columns.len()];
+            for (i, &col_idx) in col_indices.iter().enumerate() {
+                if let Some(value) = values.get(i) {
+                    if col_idx < tuple_values.len() {
+                        tuple_values[col_idx] = value.clone();
+                        user_provided[col_idx] = true;
+                    }
+                }
+            }
+
+            if let Err(e) = Self::apply_defaults_and_check_not_null(&mut tuple_values, &schema, &user_provided) {
+                return Some(Err(e));
+            }
+            tuples.push(Tuple::new(tuple_values));
+        }
+
+        Some(self.insert_validated_tuples_in_transaction(table_name, tuples, &schema, txn))
+    }
+
+    fn tuple_column_values(schema: &Schema, tuple: &Tuple) -> std::collections::HashMap<String, Value> {
+        let mut col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+        for (i, col) in schema.columns.iter().enumerate() {
+            if let Some(value) = tuple.values.get(i) {
+                col_values.insert(col.name.clone(), value.clone());
+            }
+        }
+        col_values
+    }
+
+    fn validate_fast_insert_batch(&self, table_name: &str, schema: &Schema, tuples: &[Tuple]) -> Result<()> {
+        let mut unique_specs: Vec<Vec<usize>> = schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, col)| {
+                if col.primary_key || col.unique {
+                    Some(vec![idx])
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if let Ok(tc) = self.storage.catalog().load_table_constraints(table_name) {
+            for unique in tc.unique_constraints {
+                let mut indexes = Vec::with_capacity(unique.columns.len());
+                for col_name in &unique.columns {
+                    match schema.get_column_index(col_name) {
+                        Some(idx) => indexes.push(idx),
+                        None => {
+                            return Err(Error::constraint_violation(format!(
+                                "UNIQUE constraint '{}' references unknown column '{}'",
+                                unique.name, col_name
+                            )))
+                        }
+                    }
+                }
+                if !indexes.is_empty() {
+                    unique_specs.push(indexes);
+                }
+            }
+        }
+        unique_specs.sort();
+        unique_specs.dedup();
+
+        let mut seen = std::collections::HashSet::new();
+        for tuple in tuples {
+            let col_values = Self::tuple_column_values(schema, tuple);
+            if let Err(e) = self
+                .storage
+                .art_indexes()
+                .check_unique_constraints(table_name, &col_values)
+            {
+                return Err(Error::constraint_violation(e.to_string()));
+            }
+
+            for spec in &unique_specs {
+                let mut parts = Vec::with_capacity(spec.len());
+                let mut has_null = false;
+                for &idx in spec {
+                    match tuple.values.get(idx) {
+                        Some(Value::Null) | None => {
+                            has_null = true;
+                            break;
+                        }
+                        Some(value) => parts.push(format!("{:?}", value)),
+                    }
+                }
+                if has_null {
+                    continue;
+                }
+
+                let key = format!("{:?}:{:?}", spec, parts);
+                if !seen.insert(key) {
+                    return Err(Error::constraint_violation(
+                        "Duplicate key value violates UNIQUE constraint".to_string(),
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn insert_validated_tuples_in_transaction(
+        &self,
+        table_name: &str,
+        tuples: Vec<Tuple>,
+        schema: &Schema,
+        txn: &storage::Transaction,
+    ) -> Result<u64> {
+        let mut prepared = Vec::with_capacity(tuples.len());
+        let mut generated_tuples = Vec::with_capacity(tuples.len());
+        for tuple in tuples {
+            let (row_id, tuple) = self.prepare_tuple_for_transaction_insert(table_name, tuple, schema);
+            generated_tuples.push(tuple.clone());
+            prepared.push((row_id, tuple));
+        }
+
+        self.validate_fast_insert_batch(table_name, schema, &generated_tuples)?;
+
+        let mut inserted = 0_u64;
+        let mut final_row_id = None;
+        for (row_id, tuple) in prepared {
+            self.insert_prepared_tuple_in_transaction(table_name, row_id, tuple, schema, txn)?;
+            final_row_id = Some(row_id);
+            inserted += 1;
+        }
+
+        if let Some(row_id) = final_row_id {
+            self.storage.stage_row_counter_in_transaction(table_name, row_id, txn)?;
+        }
+        Ok(inserted)
+    }
+
+    fn prepare_tuple_for_transaction_insert(
+        &self,
+        table_name: &str,
+        mut tuple: Tuple,
+        schema: &Schema,
+    ) -> (u64, Tuple) {
+        let row_id = self.storage.next_row_id_volatile(table_name);
+
+        for (i, col) in schema.columns.iter().enumerate() {
+            if col.primary_key {
+                if let Some(value) = tuple.values.get(i) {
+                    if matches!(value, Value::Null) && i < tuple.values.len() {
+                        match col.data_type {
+                            DataType::Int2 => tuple.values[i] = Value::Int2(row_id as i16),
+                            DataType::Int4 => tuple.values[i] = Value::Int4(row_id as i32),
+                            _ => tuple.values[i] = Value::Int8(row_id as i64),
+                        }
+                    }
+                }
+            }
+        }
+
+        (row_id, tuple)
+    }
+
+    fn insert_prepared_tuple_in_transaction(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        tuple: Tuple,
+        schema: &Schema,
+        txn: &storage::Transaction,
+    ) -> Result<()> {
+        let col_values = Self::tuple_column_values(schema, &tuple);
+        self.check_fk_constraints_on_write(table_name, &col_values, Some(txn))?;
+
+        let val = bincode::serialize(&tuple).map_err(|e| Error::storage(e.to_string()))?;
+        let key = self.storage.branch_aware_data_key(table_name, row_id);
+        txn.put(key, val)?;
+
+        if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
+            tracing::debug!("ART index insert for '{}': {}", table_name, e);
+        }
+        self.art_undo_log.write().push(ArtUndoOp::RemoveInserted {
+            table_name: table_name.to_string(),
+            row_id,
+            col_values,
+        });
+
+        Ok(())
     }
 
     /// Fast path for simple UPDATE: `UPDATE table SET col = literal WHERE pk_col = literal`
@@ -5466,6 +5772,49 @@ impl EmbeddedDatabase {
                 .as_bytes()
                 .windows(needle.len())
                 .any(|window| window.eq_ignore_ascii_case(needle))
+    }
+
+    /// Parse one or more VALUES groups from a simple INSERT statement.
+    ///
+    /// Returns the contents inside each parenthesized group. Anything after the
+    /// groups other than an optional semicolon causes the caller to fall back to
+    /// the normal parser.
+    #[allow(clippy::indexing_slicing)] // validated by get()/prefix checks
+    fn fast_parse_value_groups(mut remaining: &str) -> Option<Vec<&str>> {
+        let mut groups = Vec::new();
+
+        loop {
+            remaining = remaining.trim_start();
+            if remaining.is_empty() {
+                break;
+            }
+            if remaining == ";" {
+                break;
+            }
+            if !remaining.starts_with('(') {
+                return None;
+            }
+
+            let inner = remaining.get(1..)?;
+            let close_idx = Self::find_closing_paren(inner)?;
+            groups.push(inner.get(..close_idx)?);
+            remaining = inner.get(close_idx + 1..)?.trim_start();
+
+            if remaining.is_empty() || remaining == ";" {
+                break;
+            }
+            if remaining.starts_with(',') {
+                remaining = remaining.get(1..)?;
+                continue;
+            }
+            return None;
+        }
+
+        if groups.is_empty() {
+            None
+        } else {
+            Some(groups)
+        }
     }
 
     /// Parse comma-separated literal values with type hints.

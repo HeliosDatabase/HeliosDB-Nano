@@ -4772,6 +4772,23 @@ impl StorageEngine {
         counter.fetch_add(1, Ordering::SeqCst) + 1
     }
 
+    /// Stage a row counter update in an active transaction.
+    ///
+    /// This pairs with `next_row_id_volatile` for transactional bulk inserts:
+    /// many row IDs can be allocated without forcing a metadata write per row,
+    /// while the final counter value is still persisted with the transaction.
+    pub fn stage_row_counter_in_transaction(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        txn: &crate::storage::Transaction,
+    ) -> Result<()> {
+        let key = format!("counter:{}", table_name).into_bytes();
+        let value =
+            bincode::serialize(&row_id).map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
+        txn.put(key, value)
+    }
+
     /// Persist the current row counter value for a table.
     ///
     /// Called after a batch of volatile row ID allocations to ensure
