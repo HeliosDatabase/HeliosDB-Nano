@@ -3,7 +3,7 @@
 //! Tests dictionary encoding, content-addressed storage, and columnar storage.
 
 use heliosdb_nano::{
-    storage::{WalEntry, WalOperation},
+    storage::{ColumnarStore, WalEntry, WalOperation},
     Config, EmbeddedDatabase, Tuple, Value,
 };
 
@@ -226,6 +226,53 @@ fn test_columnar_direct_insert_tt_off_wal_logs_logical_tuple() {
 
     let wal_tuple = find_insert_wal_tuple(&db, "metrics");
     assert_eq!(wal_tuple.values[1], Value::Float8(10.5));
+}
+
+#[test]
+fn test_columnar_fast_update_refreshes_side_data() {
+    let db = test_db();
+
+    db.execute("CREATE TABLE metrics (id INT PRIMARY KEY, value FLOAT8)")
+        .unwrap();
+    db.execute("ALTER TABLE metrics ALTER COLUMN value SET STORAGE COLUMNAR")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, value) VALUES (1, 10.5)").unwrap();
+
+    db.execute("UPDATE metrics SET value = 20.5 WHERE id = 1").unwrap();
+
+    let rocks = db.storage.db();
+    assert_eq!(
+        ColumnarStore::get(rocks.as_ref(), "metrics", "value", 1).unwrap(),
+        Some(Value::Float8(20.5))
+    );
+    let rows = db.query("SELECT value FROM metrics WHERE id = 1", &[]).unwrap();
+    assert_eq!(rows[0].values[0], Value::Float8(20.5));
+}
+
+#[test]
+fn test_columnar_fast_delete_clears_side_data() {
+    let db = test_db();
+
+    db.execute("CREATE TABLE metrics (id INT PRIMARY KEY, value FLOAT8)")
+        .unwrap();
+    db.execute("ALTER TABLE metrics ALTER COLUMN value SET STORAGE COLUMNAR")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, value) VALUES (1, 10.5)").unwrap();
+
+    db.execute("DELETE FROM metrics WHERE id = 1").unwrap();
+
+    let rocks = db.storage.db();
+    assert_eq!(
+        ColumnarStore::get(rocks.as_ref(), "metrics", "value", 1).unwrap(),
+        Some(Value::Null)
+    );
+    assert_eq!(
+        db.storage
+            .columnar_column_stats("metrics", "value")
+            .unwrap()
+            .non_null_values,
+        0
+    );
 }
 
 #[test]
