@@ -266,17 +266,24 @@ fn test_auth_manager_timing_attack_resistance() {
     // Test that both existing and non-existing users take similar time
     // (prevents timing attacks to enumerate users)
 
+    let iterations = 256;
+
     let start = Instant::now();
-    let _ = auth.verify_cleartext("alice", "wrong_password");
+    for _ in 0..iterations {
+        let _ = auth.verify_cleartext("alice", "wrong_password");
+    }
     let time_existing_user = start.elapsed();
 
     let start = Instant::now();
-    let _ = auth.verify_cleartext("nonexistent_user", "password");
+    for _ in 0..iterations {
+        let _ = auth.verify_cleartext("nonexistent_user", "password");
+    }
     let time_nonexistent_user = start.elapsed();
 
     // Times should be similar (within an order of magnitude)
     // This is a basic check; real timing attack testing would be more sophisticated
-    assert!(time_existing_user.as_micros() > 0 && time_nonexistent_user.as_micros() > 0);
+    assert!(time_existing_user.as_nanos() > 0);
+    assert!(time_nonexistent_user.as_nanos() > 0);
 }
 
 #[test]

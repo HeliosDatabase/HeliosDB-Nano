@@ -13,7 +13,7 @@
 
 use super::art_index::{AdaptiveRadixTree, ArtIndexError, ArtIndexStats, ArtIndexType, ArtResult};
 use super::art_node::RowId;
-use crate::Value;
+use crate::{Schema, Tuple, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -617,6 +617,15 @@ impl ArtIndexManager {
         key
     }
 
+    fn index_values_from_tuple(columns: &[String], schema: &Schema, tuple: &Tuple) -> Option<Vec<Value>> {
+        let mut values = Vec::with_capacity(columns.len());
+        for column in columns {
+            let idx = schema.get_column_index(column)?;
+            values.push(tuple.values.get(idx)?.clone());
+        }
+        Some(values)
+    }
+
     /// Check primary key constraint before INSERT
     pub fn check_pk_constraint(&self, table: &str, key_values: &[Value]) -> ArtResult<()> {
         // Check for NULL values
@@ -857,6 +866,31 @@ impl ArtIndexManager {
                     }
                     ArtIndexType::ForeignKey | ArtIndexType::Manual => {
                         // Non-unique indexes: remove only the specific row_id
+                        let _ = index.remove_value(&key, row_id);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Update indexes after DELETE using the already-materialized tuple.
+    pub fn on_delete_tuple(&self, table: &str, row_id: RowId, schema: &Schema, tuple: &Tuple) -> ArtResult<()> {
+        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+
+        for index in indexes.values_mut() {
+            if index.table() != table {
+                continue;
+            }
+
+            if let Some(values) = Self::index_values_from_tuple(index.columns(), schema, tuple) {
+                let key = Self::encode_key(&values);
+                match index.index_type() {
+                    ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
+                        let _ = index.remove(&key);
+                    }
+                    ArtIndexType::ForeignKey | ArtIndexType::Manual => {
                         let _ = index.remove_value(&key, row_id);
                     }
                 }
