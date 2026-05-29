@@ -27,10 +27,7 @@ fn test_create_branch_sql() {
     let branches = db.query("SELECT * FROM pg_database_branches()").unwrap();
     assert!(branches.len() >= 2); // main + dev
 
-    let branch_names: Vec<String> = branches
-        .iter()
-        .map(|row| row.get_string(0).unwrap())
-        .collect();
+    let branch_names: Vec<String> = branches.iter().map(|row| row.get_string(0).unwrap()).collect();
     assert!(branch_names.contains(&"main".to_string()));
     assert!(branch_names.contains(&"dev".to_string()));
 }
@@ -41,13 +38,17 @@ fn test_create_branch_with_parent() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
 
     // Create staging from main
-    db.execute("CREATE DATABASE BRANCH staging FROM main AS OF NOW").unwrap();
+    db.execute("CREATE DATABASE BRANCH staging FROM main AS OF NOW")
+        .unwrap();
 
     // Create feature from staging
-    db.execute("CREATE DATABASE BRANCH feature FROM staging AS OF NOW").unwrap();
+    db.execute("CREATE DATABASE BRANCH feature FROM staging AS OF NOW")
+        .unwrap();
 
     // Verify hierarchy
-    let branches = db.query("SELECT branch_name, parent_id FROM pg_database_branches()").unwrap();
+    let branches = db
+        .query("SELECT branch_name, parent_id FROM pg_database_branches()")
+        .unwrap();
     assert_eq!(branches.len(), 3); // main, staging, feature
 }
 
@@ -79,10 +80,7 @@ fn test_drop_branch_sql() {
 
     // Verify branch no longer exists
     let branches = db.query("SELECT branch_name FROM pg_database_branches()").unwrap();
-    let branch_names: Vec<String> = branches
-        .iter()
-        .map(|row| row.get_string(0).unwrap())
-        .collect();
+    let branch_names: Vec<String> = branches.iter().map(|row| row.get_string(0).unwrap()).collect();
     assert!(!branch_names.contains(&"temp".to_string()));
 }
 
@@ -106,7 +104,8 @@ fn test_merge_branch_sql() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
 
     // Setup: create table and insert data
-    db.execute("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)").unwrap();
+    db.execute("CREATE TABLE users (id SERIAL PRIMARY KEY, name TEXT)")
+        .unwrap();
     db.execute("INSERT INTO users (name) VALUES ('Alice')").unwrap();
 
     // Create dev branch
@@ -120,7 +119,9 @@ fn test_merge_branch_sql() {
     assert!(result.is_ok());
 
     // Verify dev branch is marked as merged
-    let branches = db.query("SELECT branch_name, status FROM pg_database_branches()").unwrap();
+    let branches = db
+        .query("SELECT branch_name, status FROM pg_database_branches()")
+        .unwrap();
     let dev_status = branches
         .iter()
         .find(|row| row.get_string(0).unwrap() == "dev")
@@ -135,11 +136,14 @@ fn test_merge_with_conflict_resolution() {
 
     // Create branches
     db.execute("CREATE DATABASE BRANCH dev FROM main AS OF NOW").unwrap();
-    db.execute("CREATE DATABASE BRANCH staging FROM main AS OF NOW").unwrap();
+    db.execute("CREATE DATABASE BRANCH staging FROM main AS OF NOW")
+        .unwrap();
 
     // Test different merge strategies
-    db.execute("MERGE DATABASE BRANCH dev INTO main WITH (conflict_resolution = 'branch_wins')").unwrap();
-    db.execute("MERGE DATABASE BRANCH staging INTO main WITH (conflict_resolution = 'target_wins')").unwrap();
+    db.execute("MERGE DATABASE BRANCH dev INTO main WITH (conflict_resolution = 'branch_wins')")
+        .unwrap();
+    db.execute("MERGE DATABASE BRANCH staging INTO main WITH (conflict_resolution = 'target_wins')")
+        .unwrap();
 }
 
 #[test]
@@ -148,8 +152,10 @@ fn test_create_branch_as_of_timestamp() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
 
     // Create table and insert data
-    db.execute("CREATE TABLE logs (id SERIAL PRIMARY KEY, message TEXT, ts TIMESTAMP)").unwrap();
-    db.execute("INSERT INTO logs (message, ts) VALUES ('Event 1', CURRENT_TIMESTAMP)").unwrap();
+    db.execute("CREATE TABLE logs (id SERIAL PRIMARY KEY, message TEXT, ts TIMESTAMP)")
+        .unwrap();
+    db.execute("INSERT INTO logs (message, ts) VALUES ('Event 1', CURRENT_TIMESTAMP)")
+        .unwrap();
 
     // Create branch at current time
     let result = db.execute("CREATE DATABASE BRANCH snapshot1 FROM main AS OF NOW");
@@ -166,7 +172,8 @@ fn test_system_view_pg_database_branches() {
 
     // Create multiple branches
     db.execute("CREATE DATABASE BRANCH dev FROM main AS OF NOW").unwrap();
-    db.execute("CREATE DATABASE BRANCH staging FROM main AS OF NOW").unwrap();
+    db.execute("CREATE DATABASE BRANCH staging FROM main AS OF NOW")
+        .unwrap();
     db.execute("CREATE DATABASE BRANCH feature FROM dev AS OF NOW").unwrap();
 
     // Query system view
@@ -181,7 +188,8 @@ fn test_system_view_pg_database_branches() {
         .iter()
         .find(|row| row.get_string(0).unwrap() == "main")
         .unwrap();
-    assert!(main_branch.get_i64(2).is_err() || main_branch.get_i64(2).unwrap() == 0); // parent_id null or 0
+    assert!(main_branch.get_i64(2).is_err() || main_branch.get_i64(2).unwrap() == 0);
+    // parent_id null or 0
 }
 
 #[test]
@@ -191,7 +199,8 @@ fn test_system_view_pg_branch_stats() {
 
     // Create branches
     db.execute("CREATE DATABASE BRANCH dev FROM main AS OF NOW").unwrap();
-    db.execute("CREATE DATABASE BRANCH staging FROM main AS OF NOW").unwrap();
+    db.execute("CREATE DATABASE BRANCH staging FROM main AS OF NOW")
+        .unwrap();
 
     // Query branch statistics
     let stats = db.query("SELECT * FROM pg_branch_stats()").unwrap();
@@ -201,10 +210,7 @@ fn test_system_view_pg_branch_stats() {
     assert_eq!(stats[0].values.len(), 6);
 
     // Verify columns: branch_name, modified_keys, storage_bytes, commit_count, last_modified, compression_ratio
-    let main_stats = stats
-        .iter()
-        .find(|row| row.get_string(0).unwrap() == "main")
-        .unwrap();
+    let main_stats = stats.iter().find(|row| row.get_string(0).unwrap() == "main").unwrap();
 
     assert!(main_stats.get_i64(1).is_ok()); // modified_keys
     assert!(main_stats.get_i64(2).is_ok()); // storage_bytes
@@ -217,11 +223,14 @@ fn test_branch_lifecycle_complete() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
 
     // 1. Create table and insert initial data
-    db.execute("CREATE TABLE products (id SERIAL PRIMARY KEY, name TEXT, price REAL)").unwrap();
-    db.execute("INSERT INTO products (name, price) VALUES ('Widget', 9.99)").unwrap();
+    db.execute("CREATE TABLE products (id SERIAL PRIMARY KEY, name TEXT, price REAL)")
+        .unwrap();
+    db.execute("INSERT INTO products (name, price) VALUES ('Widget', 9.99)")
+        .unwrap();
 
     // 2. Create development branch
-    db.execute("CREATE DATABASE BRANCH development FROM main AS OF NOW").unwrap();
+    db.execute("CREATE DATABASE BRANCH development FROM main AS OF NOW")
+        .unwrap();
 
     // 3. Verify branch creation
     let branches = db.query("SELECT branch_name FROM pg_database_branches()").unwrap();
@@ -248,21 +257,20 @@ fn test_branch_with_transactions() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
 
     // Create table
-    db.execute("CREATE TABLE accounts (id SERIAL PRIMARY KEY, balance REAL)").unwrap();
+    db.execute("CREATE TABLE accounts (id SERIAL PRIMARY KEY, balance REAL)")
+        .unwrap();
     db.execute("INSERT INTO accounts (balance) VALUES (1000.0)").unwrap();
 
     // Create branch
-    db.execute("CREATE DATABASE BRANCH test_txn FROM main AS OF NOW").unwrap();
+    db.execute("CREATE DATABASE BRANCH test_txn FROM main AS OF NOW")
+        .unwrap();
 
     // Note: Full transaction support within branches would require
     // SET BRANCH context switching, which is a future enhancement
 
     // Verify branch exists
     let branches = db.query("SELECT branch_name FROM pg_database_branches()").unwrap();
-    let branch_names: Vec<String> = branches
-        .iter()
-        .map(|row| row.get_string(0).unwrap())
-        .collect();
+    let branch_names: Vec<String> = branches.iter().map(|row| row.get_string(0).unwrap()).collect();
     assert!(branch_names.contains(&"test_txn".to_string()));
 }
 
@@ -303,17 +311,16 @@ fn test_merge_with_delete_after() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
 
     // Create temporary branch
-    db.execute("CREATE DATABASE BRANCH temp_feature FROM main AS OF NOW").unwrap();
+    db.execute("CREATE DATABASE BRANCH temp_feature FROM main AS OF NOW")
+        .unwrap();
 
     // Merge and delete in one operation
-    db.execute("MERGE DATABASE BRANCH temp_feature INTO main WITH (delete_branch_after = true)").unwrap();
+    db.execute("MERGE DATABASE BRANCH temp_feature INTO main WITH (delete_branch_after = true)")
+        .unwrap();
 
     // Verify branch no longer exists
     let branches = db.query("SELECT branch_name FROM pg_database_branches()").unwrap();
-    let branch_names: Vec<String> = branches
-        .iter()
-        .map(|row| row.get_string(0).unwrap())
-        .collect();
+    let branch_names: Vec<String> = branches.iter().map(|row| row.get_string(0).unwrap()).collect();
     assert!(!branch_names.contains(&"temp_feature".to_string()));
 }
 
@@ -352,7 +359,8 @@ fn test_cannot_drop_branch_with_children() {
 
     // Create parent and child
     db.execute("CREATE DATABASE BRANCH parent FROM main AS OF NOW").unwrap();
-    db.execute("CREATE DATABASE BRANCH child FROM parent AS OF NOW").unwrap();
+    db.execute("CREATE DATABASE BRANCH child FROM parent AS OF NOW")
+        .unwrap();
 
     // Try to drop parent (should fail)
     let result = db.execute("DROP DATABASE BRANCH parent");
@@ -372,11 +380,14 @@ fn test_branch_isolation_with_tables() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
 
     // Create table in main
-    db.execute("CREATE TABLE test_table (id SERIAL PRIMARY KEY, value TEXT)").unwrap();
-    db.execute("INSERT INTO test_table (value) VALUES ('main_data')").unwrap();
+    db.execute("CREATE TABLE test_table (id SERIAL PRIMARY KEY, value TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO test_table (value) VALUES ('main_data')")
+        .unwrap();
 
     // Create branch
-    db.execute("CREATE DATABASE BRANCH isolated FROM main AS OF NOW").unwrap();
+    db.execute("CREATE DATABASE BRANCH isolated FROM main AS OF NOW")
+        .unwrap();
 
     // Note: Full branch context switching would be needed to verify
     // complete isolation. This test verifies branch creation succeeds.
@@ -401,7 +412,9 @@ fn test_multiple_sequential_merges() {
     }
 
     // Verify all branches marked as merged (still in metadata)
-    let branches = db.query("SELECT branch_name, status FROM pg_database_branches()").unwrap();
+    let branches = db
+        .query("SELECT branch_name, status FROM pg_database_branches()")
+        .unwrap();
 
     // Filter for iteration branches
     let merged_count = branches
@@ -421,12 +434,15 @@ fn test_pg_branch_stats_accuracy() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
 
     // Create branch
-    db.execute("CREATE DATABASE BRANCH stats_test FROM main AS OF NOW").unwrap();
+    db.execute("CREATE DATABASE BRANCH stats_test FROM main AS OF NOW")
+        .unwrap();
 
     // Query initial stats
-    let stats = db.query(
-        "SELECT modified_keys, storage_bytes, commit_count FROM pg_branch_stats() WHERE branch_name = 'stats_test'"
-    ).unwrap();
+    let stats = db
+        .query(
+            "SELECT modified_keys, storage_bytes, commit_count FROM pg_branch_stats() WHERE branch_name = 'stats_test'",
+        )
+        .unwrap();
 
     assert_eq!(stats.len(), 1);
 

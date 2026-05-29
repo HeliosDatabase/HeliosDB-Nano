@@ -30,28 +30,25 @@
 
 #![allow(unused_variables)]
 
-pub mod config;
-pub mod link_manager;
 pub mod commit_tracker;
+pub mod config;
 pub mod ddl_versioning;
 pub mod diff;
 pub mod hooks;
+pub mod link_manager;
 pub mod webhooks;
 
-use crate::storage::{
-    BranchId, BranchManager, SnapshotId,
-    GIT_CONFIG_KEY,
-};
+use crate::storage::{BranchId, BranchManager, SnapshotId, GIT_CONFIG_KEY};
 use crate::{Error, Result};
+use parking_lot::RwLock;
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::Arc;
-use parking_lot::RwLock;
 
+pub use commit_tracker::{CommitState, CommitTracker};
 pub use config::GitConfig;
 pub use link_manager::LinkManager;
-pub use commit_tracker::{CommitTracker, CommitState};
 
 /// Git repository configuration stored in the database
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -222,11 +219,7 @@ pub struct GitIntegrationManager {
 
 impl GitIntegrationManager {
     /// Create a new Git integration manager
-    pub fn new(
-        db: Arc<DB>,
-        branch_manager: Arc<BranchManager>,
-        timestamp: Arc<RwLock<u64>>,
-    ) -> Result<Self> {
+    pub fn new(db: Arc<DB>, branch_manager: Arc<BranchManager>, timestamp: Arc<RwLock<u64>>) -> Result<Self> {
         // Load existing config if any
         let config = Self::load_config(&db)?;
 
@@ -258,9 +251,10 @@ impl GitIntegrationManager {
 
     /// Save Git config to storage
     fn save_config(&self, config: &GitRepoConfig) -> Result<()> {
-        let data = bincode::serialize(config)
-            .map_err(|e| Error::storage(format!("Failed to serialize Git config: {}", e)))?;
-        self.db.put(GIT_CONFIG_KEY, &data)
+        let data =
+            bincode::serialize(config).map_err(|e| Error::storage(format!("Failed to serialize Git config: {}", e)))?;
+        self.db
+            .put(GIT_CONFIG_KEY, &data)
             .map_err(|e| Error::storage(format!("Failed to save Git config: {}", e)))
     }
 
@@ -295,12 +289,7 @@ impl GitIntegrationManager {
     }
 
     /// Link a Git branch to a database branch
-    pub fn link_branch(
-        &self,
-        git_branch: &str,
-        db_branch_name: &str,
-        auto_sync: bool,
-    ) -> Result<()> {
+    pub fn link_branch(&self, git_branch: &str, db_branch_name: &str, auto_sync: bool) -> Result<()> {
         // Get database branch metadata
         let db_branch = self.branch_manager.get_branch_by_name(db_branch_name)?;
 

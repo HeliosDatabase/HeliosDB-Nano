@@ -34,10 +34,7 @@ fn lists_all_static_languages() {
             Some(heliosdb_nano::Value::String(s)) => s.clone(),
             other => panic!("unexpected source: {other:?}"),
         };
-        assert!(
-            source == "static" || source == "runtime",
-            "unexpected source: {source}"
-        );
+        assert!(source == "static" || source == "runtime", "unexpected source: {source}");
     }
 }
 
@@ -76,10 +73,7 @@ fn runtime_grammar_overriding_static_shows_runtime_source() {
     // shadowing surfaces as `runtime` in the view.
     db.register_grammar("python", tree_sitter_python::LANGUAGE.into());
     let rows = db
-        .query(
-            "SELECT source FROM hdb_code_languages WHERE name = 'python'",
-            &[],
-        )
+        .query("SELECT source FROM hdb_code_languages WHERE name = 'python'", &[])
         .unwrap();
     assert_eq!(rows.len(), 1);
     let source = match rows[0].values.first() {

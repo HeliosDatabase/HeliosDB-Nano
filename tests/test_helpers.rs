@@ -5,7 +5,7 @@
 //! - Common test fixtures
 //! - Test utilities and assertions
 
-use heliosdb_nano::{EmbeddedDatabase, Result, Value, Tuple};
+use heliosdb_nano::{EmbeddedDatabase, Result, Tuple, Value};
 use rand::Rng;
 
 /// Test data generator
@@ -59,9 +59,7 @@ impl TestDataGenerator {
 
     /// Generate batch of users
     pub fn generate_users(&mut self, count: usize) -> Vec<(i32, String, String, i32)> {
-        (1..=count as i32)
-            .map(|id| self.generate_user(id))
-            .collect()
+        (1..=count as i32).map(|id| self.generate_user(id)).collect()
     }
 }
 

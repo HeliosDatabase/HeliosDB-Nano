@@ -28,7 +28,7 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 
-use super::types::{Session, SessionId, IsolationLevel, User, UserId};
+use super::types::{IsolationLevel, Session, SessionId, User, UserId};
 use crate::{Error, Result};
 use dashmap::DashMap;
 use std::sync::{Arc, Mutex};
@@ -116,30 +116,31 @@ impl SessionManager {
         let session_id = session.id;
 
         // Register session
-        self.sessions.insert(session_id, Arc::new(parking_lot::RwLock::new(session)));
+        self.sessions
+            .insert(session_id, Arc::new(parking_lot::RwLock::new(session)));
 
         Ok(session_id)
     }
 
     /// Destroy a session
     pub fn destroy_session(&self, session_id: SessionId) -> Result<()> {
-        self.sessions.remove(&session_id)
+        self.sessions
+            .remove(&session_id)
             .ok_or_else(|| Error::Generic(format!("Session {:?} not found", session_id)))?;
         Ok(())
     }
 
     /// Get a session by ID
     pub fn get_session(&self, session_id: SessionId) -> Result<Arc<parking_lot::RwLock<Session>>> {
-        self.sessions.get(&session_id)
+        self.sessions
+            .get(&session_id)
             .map(|entry| Arc::clone(entry.value()))
             .ok_or_else(|| Error::Generic(format!("Session {:?} not found", session_id)))
     }
 
     /// List all active sessions
     pub fn list_active_sessions(&self) -> Vec<SessionId> {
-        self.sessions.iter()
-            .map(|entry| *entry.key())
-            .collect()
+        self.sessions.iter().map(|entry| *entry.key()).collect()
     }
 
     /// Delete a session by ID
@@ -154,7 +155,8 @@ impl SessionManager {
 
     /// Get all sessions for a specific user
     pub fn get_user_sessions(&self, user_id: &UserId) -> Vec<SessionId> {
-        self.sessions.iter()
+        self.sessions
+            .iter()
             .filter(|entry| {
                 let session = entry.value().read();
                 session.user_id == *user_id
@@ -185,7 +187,8 @@ impl SessionManager {
             .unwrap_or_default()
             .as_secs();
 
-        let expired: Vec<SessionId> = self.sessions
+        let expired: Vec<SessionId> = self
+            .sessions
             .iter()
             .filter_map(|entry| {
                 let session = entry.value().read();
@@ -221,7 +224,8 @@ impl SessionManager {
     /// * `Err(Error)` - If quota would be exceeded
     pub fn enforce_quota(&self, user_id: &UserId, quota: &ResourceQuota) -> Result<()> {
         // Count user's active sessions
-        let user_session_count = self.sessions
+        let user_session_count = self
+            .sessions
             .iter()
             .filter(|entry| {
                 let session = entry.value().read();
@@ -260,7 +264,8 @@ mod tests {
         let manager = SessionManager::new();
         let user = User::new("alice", "password123");
 
-        let session_id = manager.create_session(&user, IsolationLevel::ReadCommitted)
+        let session_id = manager
+            .create_session(&user, IsolationLevel::ReadCommitted)
             .expect("Failed to create session");
 
         assert!(manager.sessions.contains_key(&session_id));
@@ -271,7 +276,8 @@ mod tests {
         let manager = SessionManager::with_quota(1); // Max 1 session
         let user = User::new("bob", "password456");
 
-        let _session1 = manager.create_session(&user, IsolationLevel::ReadCommitted)
+        let _session1 = manager
+            .create_session(&user, IsolationLevel::ReadCommitted)
             .expect("First session should succeed");
 
         let result = manager.create_session(&user, IsolationLevel::ReadCommitted);
@@ -284,9 +290,11 @@ mod tests {
         let user1 = User::new("user1", "pass1");
         let user2 = User::new("user2", "pass2");
 
-        let session1 = manager.create_session(&user1, IsolationLevel::ReadCommitted)
+        let session1 = manager
+            .create_session(&user1, IsolationLevel::ReadCommitted)
             .expect("Failed to create session1");
-        let session2 = manager.create_session(&user2, IsolationLevel::ReadCommitted)
+        let session2 = manager
+            .create_session(&user2, IsolationLevel::ReadCommitted)
             .expect("Failed to create session2");
 
         // Both sessions should be independent
@@ -423,7 +431,8 @@ mod tests {
         manager.create_session(&user1, IsolationLevel::ReadCommitted).unwrap();
 
         // Bob can still create a session (quota is per-user)
-        manager.create_session(&user2, IsolationLevel::RepeatableRead)
+        manager
+            .create_session(&user2, IsolationLevel::RepeatableRead)
             .expect("Bob's session should succeed");
 
         // Alice's second session should fail

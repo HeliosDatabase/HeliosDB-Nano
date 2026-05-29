@@ -7,9 +7,9 @@
 //! - Large dataset operations
 //! - Memory usage
 
+use heliosdb_nano::crypto::{decrypt, derive_key_from_password, encrypt, EncryptionKey};
 use heliosdb_nano::{EmbeddedDatabase, Result};
-use heliosdb_nano::crypto::{encrypt, decrypt, derive_key_from_password, EncryptionKey};
-use std::time::{Instant, Duration};
+use std::time::{Duration, Instant};
 
 mod test_helpers;
 use test_helpers::*;
@@ -19,7 +19,7 @@ use test_helpers::*;
 struct BenchmarkResult {
     operation: String,
     duration: Duration,
-    throughput: Option<f64>, // operations per second
+    throughput: Option<f64>,    // operations per second
     memory_used: Option<usize>, // bytes
 }
 
@@ -55,8 +55,7 @@ fn bench_baseline_insert_performance() -> Result<()> {
     }
 
     let duration = start.elapsed();
-    let result = BenchmarkResult::new("Baseline Insert".to_string(), duration)
-        .with_throughput(iterations);
+    let result = BenchmarkResult::new("Baseline Insert".to_string(), duration).with_throughput(iterations);
 
     println!("\n=== Baseline Insert Performance ===");
     println!("Total time: {:?}", result.duration);
@@ -86,8 +85,7 @@ fn bench_baseline_query_performance() -> Result<()> {
     }
 
     let duration = start.elapsed();
-    let result = BenchmarkResult::new("Baseline Query".to_string(), duration)
-        .with_throughput(iterations);
+    let result = BenchmarkResult::new("Baseline Query".to_string(), duration).with_throughput(iterations);
 
     println!("\n=== Baseline Query Performance ===");
     println!("Total time: {:?}", result.duration);
@@ -118,7 +116,10 @@ fn bench_encryption_overhead() -> Result<()> {
     ];
 
     println!("\n=== Encryption Overhead Benchmark ===");
-    println!("{:<10} {:<15} {:<15} {:<15}", "Size", "Encrypt (ms)", "Decrypt (ms)", "Throughput (MB/s)");
+    println!(
+        "{:<10} {:<15} {:<15} {:<15}",
+        "Size", "Encrypt (ms)", "Decrypt (ms)", "Throughput (MB/s)"
+    );
     println!("{:-<60}", "");
 
     for (label, data) in test_sizes {
@@ -300,14 +301,17 @@ fn bench_transaction_overhead() -> Result<()> {
     for i in 0..iterations {
         tx.execute(&format!(
             "INSERT INTO users (id, name, email, age) VALUES ({}, 'User{}', 'user{}@example.com', 25)",
-            i + 1000, i, i
+            i + 1000,
+            i,
+            i
         ))?;
     }
     tx.commit()?;
     let with_tx_duration = start.elapsed();
 
     let overhead_percent = ((with_tx_duration.as_millis() as f64 - without_tx_duration.as_millis() as f64)
-        / without_tx_duration.as_millis() as f64) * 100.0;
+        / without_tx_duration.as_millis() as f64)
+        * 100.0;
 
     println!("\n=== Transaction Overhead ===");
     println!("Without transaction: {:?}", without_tx_duration);
@@ -354,11 +358,7 @@ fn bench_aggregation_performance() -> Result<()> {
 
         // Aggregations should complete in reasonable time (raised for CI/VM environments
         // and parallel test execution with resource contention)
-        assert!(
-            avg_ms < 10000.0,
-            "Aggregation too slow: {:.2} ms",
-            avg_ms
-        );
+        assert!(avg_ms < 10000.0, "Aggregation too slow: {:.2} ms", avg_ms);
     }
 
     Ok(())
@@ -415,7 +415,10 @@ fn bench_update_performance() -> Result<()> {
     println!("\n=== Update Performance ===");
     println!("Single row updates ({} ops): {:?}", iterations, single_duration);
     println!("Bulk update (1000 rows): {:?}", bulk_duration);
-    println!("Single update avg: {:.2} ms", single_duration.as_millis() as f64 / iterations as f64);
+    println!(
+        "Single update avg: {:.2} ms",
+        single_duration.as_millis() as f64 / iterations as f64
+    );
 
     Ok(())
 }
@@ -444,7 +447,10 @@ fn bench_delete_performance() -> Result<()> {
     println!("\n=== Delete Performance ===");
     println!("Single row deletes ({} ops): {:?}", iterations, single_duration);
     println!("Bulk delete: {:?}", bulk_duration);
-    println!("Single delete avg: {:.2} ms", single_duration.as_millis() as f64 / iterations as f64);
+    println!(
+        "Single delete avg: {:.2} ms",
+        single_duration.as_millis() as f64 / iterations as f64
+    );
 
     Ok(())
 }
@@ -469,7 +475,10 @@ fn bench_memory_usage_estimate() -> Result<()> {
         for i in 0..size {
             db.execute(&format!(
                 "INSERT INTO users (id, name, email, age) VALUES ({}, 'User{}', 'user{}@example.com', {})",
-                i, i, i, 25 + (i % 50)
+                i,
+                i,
+                i,
+                25 + (i % 50)
             ))?;
         }
 

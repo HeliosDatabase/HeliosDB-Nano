@@ -93,9 +93,7 @@ fn setup_tracing() -> Arc<Mutex<Vec<CapturedEvent>>> {
     let for_global = Arc::clone(&events);
 
     TRACING_INIT.call_once(move || {
-        let collector = EventCollector {
-            events: for_collector,
-        };
+        let collector = EventCollector { events: for_collector };
         let subscriber = tracing_subscriber::registry()
             .with(tracing_subscriber::EnvFilter::new("heliosdb_nano=trace"))
             .with(collector);
@@ -108,9 +106,7 @@ fn setup_tracing() -> Arc<Mutex<Vec<CapturedEvent>>> {
 
     // If already initialized by a previous call, return the global reference
     // Safety: GLOBAL_EVENTS is only written once in call_once above
-    unsafe {
-        GLOBAL_EVENTS.as_ref().map_or(events, Arc::clone)
-    }
+    unsafe { GLOBAL_EVENTS.as_ref().map_or(events, Arc::clone) }
 }
 
 // ─── Metrics Collection ─────────────────────────────────────────────────────
@@ -156,7 +152,10 @@ impl PipelineMetrics {
             (self.txn_commit_us, "txn_commit"),
             (self.overhead_us(), "overhead"),
         ];
-        phases.iter().max_by_key(|(us, _)| *us).map_or("unknown", |(_, name)| name)
+        phases
+            .iter()
+            .max_by_key(|(us, _)| *us)
+            .map_or("unknown", |(_, name)| name)
     }
 }
 
@@ -369,34 +368,30 @@ fn setup_test_data(db: &EmbeddedDatabase) {
 
 // ─── Benchmark Suite ────────────────────────────────────────────────────────
 
-fn run_benchmark_suite(
-    db: &EmbeddedDatabase,
-    events: &Arc<Mutex<Vec<CapturedEvent>>>,
-) -> Vec<PipelineMetrics> {
+fn run_benchmark_suite(db: &EmbeddedDatabase, events: &Arc<Mutex<Vec<CapturedEvent>>>) -> Vec<PipelineMetrics> {
     let mut results = Vec::new();
 
     // ── DDL ──
     results.push(benchmark_execute(
-        db, events,
+        db,
+        events,
         "CREATE TABLE bench_temp (id INT PRIMARY KEY, val TEXT, num INT)",
         "CREATE TABLE",
     ));
 
     results.push(benchmark_execute(
-        db, events,
+        db,
+        events,
         "ALTER TABLE bench_temp ADD COLUMN extra TEXT",
         "ALTER TABLE ADD COL",
     ));
 
-    results.push(benchmark_execute(
-        db, events,
-        "DROP TABLE bench_temp",
-        "DROP TABLE",
-    ));
+    results.push(benchmark_execute(db, events, "DROP TABLE bench_temp", "DROP TABLE"));
 
     // ── INSERT ──
     results.push(benchmark_execute(
-        db, events,
+        db,
+        events,
         "INSERT INTO bench_ddl_target VALUES (9999, 'single_insert')",
         "INSERT (single)",
     ));
@@ -404,127 +399,136 @@ fn run_benchmark_suite(
     let bulk_inserts: Vec<String> = (10000..10100)
         .map(|i| format!("INSERT INTO bench_ddl_target VALUES ({}, 'bulk_{}')", i, i))
         .collect();
-    results.push(benchmark_execute_bulk(
-        db, events,
-        &bulk_inserts,
-        "INSERT (bulk 100)",
-    ));
+    results.push(benchmark_execute_bulk(db, events, &bulk_inserts, "INSERT (bulk 100)"));
 
     // Batch insert (single transaction)
     let batch_strs: Vec<String> = (20000..20100)
         .map(|i| format!("INSERT INTO bench_ddl_target VALUES ({}, 'batch_{}')", i, i))
         .collect();
     let batch_refs: Vec<&str> = batch_strs.iter().map(|s| s.as_str()).collect();
-    results.push(benchmark_execute_batch(
-        db, events,
-        &batch_refs,
-        "INSERT (batch 100)",
-    ));
+    results.push(benchmark_execute_batch(db, events, &batch_refs, "INSERT (batch 100)"));
 
     // ── UPDATE ──
     results.push(benchmark_execute(
-        db, events,
+        db,
+        events,
         "UPDATE bench_main SET name = 'updated' WHERE id = 500",
         "UPDATE (single)",
     ));
 
     results.push(benchmark_execute(
-        db, events,
+        db,
+        events,
         "UPDATE bench_main SET score = score + 1.0 WHERE age > 60",
         "UPDATE (bulk WHERE)",
     ));
 
     // ── DELETE ──
     results.push(benchmark_execute(
-        db, events,
+        db,
+        events,
         "DELETE FROM bench_ddl_target WHERE id = 9999",
         "DELETE (single)",
     ));
 
     results.push(benchmark_execute(
-        db, events,
+        db,
+        events,
         "DELETE FROM bench_ddl_target WHERE id >= 10050",
         "DELETE (bulk WHERE)",
     ));
 
     // ── SELECT (Simple) ──
     results.push(benchmark_query(
-        db, events,
+        db,
+        events,
         "SELECT * FROM bench_main",
         "SELECT * (full scan)",
     ));
 
     results.push(benchmark_query(
-        db, events,
+        db,
+        events,
         "SELECT * FROM bench_main WHERE age > 60",
         "SELECT WHERE",
     ));
 
     results.push(benchmark_query(
-        db, events,
+        db,
+        events,
         "SELECT * FROM bench_main WHERE id = 42",
         "SELECT WHERE id=",
     ));
 
     results.push(benchmark_query(
-        db, events,
+        db,
+        events,
         "SELECT * FROM bench_main LIMIT 10",
         "SELECT LIMIT 10",
     ));
 
     results.push(benchmark_query(
-        db, events,
+        db,
+        events,
         "SELECT name, age FROM bench_main WHERE active = true",
         "SELECT projection+filter",
     ));
 
     // ── Aggregations ──
     results.push(benchmark_query(
-        db, events,
+        db,
+        events,
         "SELECT COUNT(*) FROM bench_main",
         "COUNT(*)",
     ));
 
     results.push(benchmark_query(
-        db, events,
+        db,
+        events,
         "SELECT AVG(score), SUM(age), MIN(id), MAX(id) FROM bench_main",
         "AVG/SUM/MIN/MAX",
     ));
 
     results.push(benchmark_query(
-        db, events,
+        db,
+        events,
         "SELECT age, COUNT(*), AVG(score) FROM bench_main GROUP BY age",
         "GROUP BY",
     ));
 
     results.push(benchmark_query(
-        db, events,
+        db,
+        events,
         "SELECT age, COUNT(*) as cnt FROM bench_main GROUP BY age HAVING COUNT(*) > 15",
         "GROUP BY + HAVING",
     ));
 
     // ── Sorting ──
     results.push(benchmark_query(
-        db, events,
+        db,
+        events,
         "SELECT * FROM bench_main ORDER BY score DESC",
         "ORDER BY DESC",
     ));
 
     results.push(benchmark_query(
-        db, events,
+        db,
+        events,
         "SELECT * FROM bench_main ORDER BY age, name",
         "ORDER BY (multi-col)",
     ));
 
     // ── JOINs ──
     results.push(benchmark_query(
-        db, events,
+        db,
+        events,
         "SELECT m.name, o.amount FROM bench_main m INNER JOIN bench_orders o ON m.id = o.user_id WHERE m.id < 50",
         "INNER JOIN",
     ));
 
     results.push(benchmark_query(
-        db, events,
+        db,
+        events,
         "SELECT m.name, o.amount FROM bench_main m LEFT JOIN bench_orders o ON m.id = o.user_id WHERE m.id < 50",
         "LEFT JOIN",
     ));
@@ -537,39 +541,45 @@ fn run_benchmark_suite(
     ));
 
     results.push(benchmark_query(
-        db, events,
+        db,
+        events,
         "SELECT name, age, ROW_NUMBER() OVER (ORDER BY score DESC) as rank FROM bench_main WHERE id < 100",
         "Window (ROW_NUMBER)",
     ));
 
     results.push(benchmark_query(
-        db, events,
+        db,
+        events,
         "SELECT name FROM bench_main WHERE id < 500 UNION ALL SELECT name FROM bench_main WHERE id >= 500",
         "UNION ALL",
     ));
 
     // ── Subqueries ──
     results.push(benchmark_query(
-        db, events,
+        db,
+        events,
         "SELECT * FROM bench_main WHERE id IN (SELECT user_id FROM bench_orders WHERE amount > 100)",
         "IN (subquery)",
     ));
 
     // ── Cached Queries (plan cache warm) ──
     results.push(benchmark_query_cached(
-        db, events,
+        db,
+        events,
         "SELECT * FROM bench_main WHERE age > 60",
         "SELECT WHERE",
     ));
 
     results.push(benchmark_query_cached(
-        db, events,
+        db,
+        events,
         "SELECT age, COUNT(*), AVG(score) FROM bench_main GROUP BY age",
         "GROUP BY",
     ));
 
     results.push(benchmark_query_cached(
-        db, events,
+        db,
+        events,
         "SELECT m.name, o.amount FROM bench_main m INNER JOIN bench_orders o ON m.id = o.user_id WHERE m.id < 50",
         "INNER JOIN",
     ));
@@ -721,11 +731,31 @@ fn print_analysis(in_mem: &[PipelineMetrics], persistent: &[PipelineMetrics]) {
     let total_overhead: u64 = in_mem.iter().map(|m| m.overhead_us()).sum();
 
     if total_wall > 0 {
-        println!("  Parse:   {:>7} ({:.1}%)", format_us(total_parse), (total_parse as f64 / total_wall as f64) * 100.0);
-        println!("  Plan:    {:>7} ({:.1}%)", format_us(total_plan), (total_plan as f64 / total_wall as f64) * 100.0);
-        println!("  Execute: {:>7} ({:.1}%)", format_us(total_execute), (total_execute as f64 / total_wall as f64) * 100.0);
-        println!("  Commit:  {:>7} ({:.1}%)", format_us(total_commit), (total_commit as f64 / total_wall as f64) * 100.0);
-        println!("  Other:   {:>7} ({:.1}%)", format_us(total_overhead), (total_overhead as f64 / total_wall as f64) * 100.0);
+        println!(
+            "  Parse:   {:>7} ({:.1}%)",
+            format_us(total_parse),
+            (total_parse as f64 / total_wall as f64) * 100.0
+        );
+        println!(
+            "  Plan:    {:>7} ({:.1}%)",
+            format_us(total_plan),
+            (total_plan as f64 / total_wall as f64) * 100.0
+        );
+        println!(
+            "  Execute: {:>7} ({:.1}%)",
+            format_us(total_execute),
+            (total_execute as f64 / total_wall as f64) * 100.0
+        );
+        println!(
+            "  Commit:  {:>7} ({:.1}%)",
+            format_us(total_commit),
+            (total_commit as f64 / total_wall as f64) * 100.0
+        );
+        println!(
+            "  Other:   {:>7} ({:.1}%)",
+            format_us(total_overhead),
+            (total_overhead as f64 / total_wall as f64) * 100.0
+        );
     }
 
     println!();
@@ -738,11 +768,31 @@ fn print_analysis(in_mem: &[PipelineMetrics], persistent: &[PipelineMetrics]) {
     let p_total_overhead: u64 = persistent.iter().map(|m| m.overhead_us()).sum();
 
     if p_total_wall > 0 {
-        println!("  Parse:   {:>7} ({:.1}%)", format_us(p_total_parse), (p_total_parse as f64 / p_total_wall as f64) * 100.0);
-        println!("  Plan:    {:>7} ({:.1}%)", format_us(p_total_plan), (p_total_plan as f64 / p_total_wall as f64) * 100.0);
-        println!("  Execute: {:>7} ({:.1}%)", format_us(p_total_execute), (p_total_execute as f64 / p_total_wall as f64) * 100.0);
-        println!("  Commit:  {:>7} ({:.1}%)", format_us(p_total_commit), (p_total_commit as f64 / p_total_wall as f64) * 100.0);
-        println!("  Other:   {:>7} ({:.1}%)", format_us(p_total_overhead), (p_total_overhead as f64 / p_total_wall as f64) * 100.0);
+        println!(
+            "  Parse:   {:>7} ({:.1}%)",
+            format_us(p_total_parse),
+            (p_total_parse as f64 / p_total_wall as f64) * 100.0
+        );
+        println!(
+            "  Plan:    {:>7} ({:.1}%)",
+            format_us(p_total_plan),
+            (p_total_plan as f64 / p_total_wall as f64) * 100.0
+        );
+        println!(
+            "  Execute: {:>7} ({:.1}%)",
+            format_us(p_total_execute),
+            (p_total_execute as f64 / p_total_wall as f64) * 100.0
+        );
+        println!(
+            "  Commit:  {:>7} ({:.1}%)",
+            format_us(p_total_commit),
+            (p_total_commit as f64 / p_total_wall as f64) * 100.0
+        );
+        println!(
+            "  Other:   {:>7} ({:.1}%)",
+            format_us(p_total_overhead),
+            (p_total_overhead as f64 / p_total_wall as f64) * 100.0
+        );
     }
 
     // ── Bottleneck Identification ──
@@ -764,7 +814,9 @@ fn print_analysis(in_mem: &[PipelineMetrics], persistent: &[PipelineMetrics]) {
         if m.wall_time_us > 0 && m.phase_pct(m.plan_us) > 30.0 {
             println!(
                 "  PLAN-HEAVY: '{}' — planning takes {:.0}% of wall time ({}). Complex logical plan construction.",
-                m.label, m.phase_pct(m.plan_us), format_us(m.plan_us)
+                m.label,
+                m.phase_pct(m.plan_us),
+                format_us(m.plan_us)
             );
         }
     }
@@ -774,7 +826,10 @@ fn print_analysis(in_mem: &[PipelineMetrics], persistent: &[PipelineMetrics]) {
         if m.wall_time_us > 0 && m.phase_pct(m.execute_us) > 70.0 {
             println!(
                 "  EXEC-HEAVY: '{}' — execution takes {:.0}% of wall time ({}, {} rows).",
-                m.label, m.phase_pct(m.execute_us), format_us(m.execute_us), m.rows
+                m.label,
+                m.phase_pct(m.execute_us),
+                format_us(m.execute_us),
+                m.rows
             );
         }
     }
@@ -784,7 +839,9 @@ fn print_analysis(in_mem: &[PipelineMetrics], persistent: &[PipelineMetrics]) {
         if m.wall_time_us > 0 && m.phase_pct(m.txn_commit_us) > 30.0 {
             println!(
                 "  COMMIT-HEAVY (persistent): '{}' — commit takes {:.0}% of wall time ({}).",
-                m.label, m.phase_pct(m.txn_commit_us), format_us(m.txn_commit_us)
+                m.label,
+                m.phase_pct(m.txn_commit_us),
+                format_us(m.txn_commit_us)
             );
         }
     }
@@ -817,8 +874,14 @@ fn print_analysis(in_mem: &[PipelineMetrics], persistent: &[PipelineMetrics]) {
     println!("--- Improvement Suggestions ---");
 
     // Parse phase analysis
-    let avg_parse = if in_mem.is_empty() { 0 } else { total_parse / in_mem.len() as u64 };
-    println!("  1. PARSING: Average parse time = {}. {}", format_us(avg_parse),
+    let avg_parse = if in_mem.is_empty() {
+        0
+    } else {
+        total_parse / in_mem.len() as u64
+    };
+    println!(
+        "  1. PARSING: Average parse time = {}. {}",
+        format_us(avg_parse),
         if avg_parse < 100 {
             "SQL parsing is efficient. No action needed."
         } else if avg_parse < 500 {
@@ -829,8 +892,14 @@ fn print_analysis(in_mem: &[PipelineMetrics], persistent: &[PipelineMetrics]) {
     );
 
     // Plan phase analysis
-    let avg_plan = if in_mem.is_empty() { 0 } else { total_plan / in_mem.len() as u64 };
-    println!("  2. PLANNING: Average plan time = {}. {}", format_us(avg_plan),
+    let avg_plan = if in_mem.is_empty() {
+        0
+    } else {
+        total_plan / in_mem.len() as u64
+    };
+    println!(
+        "  2. PLANNING: Average plan time = {}. {}",
+        format_us(avg_plan),
         if avg_plan < 100 {
             "Logical planning is fast. No action needed."
         } else if avg_plan < 500 {
@@ -843,7 +912,9 @@ fn print_analysis(in_mem: &[PipelineMetrics], persistent: &[PipelineMetrics]) {
     // Execute phase analysis
     if total_execute > 0 {
         let exec_pct = (total_execute as f64 / total_wall as f64) * 100.0;
-        println!("  3. EXECUTION: {:.0}% of total time. {}", exec_pct,
+        println!(
+            "  3. EXECUTION: {:.0}% of total time. {}",
+            exec_pct,
             if exec_pct > 70.0 {
                 "Execution dominates — optimize hot-path operators (scans, joins)."
             } else if exec_pct > 40.0 {
@@ -857,7 +928,9 @@ fn print_analysis(in_mem: &[PipelineMetrics], persistent: &[PipelineMetrics]) {
     // Commit phase analysis (persistent)
     if p_total_commit > 0 && p_total_wall > 0 {
         let commit_pct = (p_total_commit as f64 / p_total_wall as f64) * 100.0;
-        println!("  4. COMMIT (persistent): {:.0}% of total time. {}", commit_pct,
+        println!(
+            "  4. COMMIT (persistent): {:.0}% of total time. {}",
+            commit_pct,
             if commit_pct > 30.0 {
                 "Heavy commit overhead. Consider group commit or WAL batching for bulk operations."
             } else if commit_pct > 15.0 {
@@ -871,7 +944,9 @@ fn print_analysis(in_mem: &[PipelineMetrics], persistent: &[PipelineMetrics]) {
     // Overhead analysis
     if total_overhead > 0 && total_wall > 0 {
         let overhead_pct = (total_overhead as f64 / total_wall as f64) * 100.0;
-        println!("  5. UNTRACED OVERHEAD: {:.0}% of total time. {}", overhead_pct,
+        println!(
+            "  5. UNTRACED OVERHEAD: {:.0}% of total time. {}",
+            overhead_pct,
             if overhead_pct > 40.0 {
                 "Large untraced gap — DML dispatch (INSERT/UPDATE/DELETE) path lacks tracing. Add phase instrumentation to execute_in_transaction()."
             } else if overhead_pct > 20.0 {
@@ -885,7 +960,9 @@ fn print_analysis(in_mem: &[PipelineMetrics], persistent: &[PipelineMetrics]) {
     // Persistent vs in-memory summary
     if total_wall > 0 && p_total_wall > 0 {
         let overall_ratio = p_total_wall as f64 / total_wall as f64;
-        println!("  6. STORAGE OVERHEAD: Persistent mode is {:.1}x slower overall. {}", overall_ratio,
+        println!(
+            "  6. STORAGE OVERHEAD: Persistent mode is {:.1}x slower overall. {}",
+            overall_ratio,
             if overall_ratio > 5.0 {
                 "Very high disk penalty. Consider memory-mapped mode or SSD optimization."
             } else if overall_ratio > 2.0 {
@@ -900,8 +977,10 @@ fn print_analysis(in_mem: &[PipelineMetrics], persistent: &[PipelineMetrics]) {
     let total_op_build: u64 = in_mem.iter().map(|m| m.operator_build_us).sum();
     let total_op_exec: u64 = in_mem.iter().map(|m| m.operator_exec_us).sum();
     if total_op_build + total_op_exec > 0 {
-        println!("  7. OPERATOR BREAKDOWN: Build={}, Exec={}. {}",
-            format_us(total_op_build), format_us(total_op_exec),
+        println!(
+            "  7. OPERATOR BREAKDOWN: Build={}, Exec={}. {}",
+            format_us(total_op_build),
+            format_us(total_op_exec),
             if total_op_build > total_op_exec {
                 "Operator tree construction is slow — consider caching physical plans."
             } else {
@@ -963,7 +1042,10 @@ fn test_pipeline_performance_report() {
 
     // ── Assertions ──
     // Verify we actually captured tracing events
-    let traced_count = in_mem_results.iter().filter(|m| m.parse_us > 0 || m.execute_us > 0).count();
+    let traced_count = in_mem_results
+        .iter()
+        .filter(|m| m.parse_us > 0 || m.execute_us > 0)
+        .count();
     assert!(
         traced_count > 0,
         "Expected at least some statements to have traced phases, got 0"

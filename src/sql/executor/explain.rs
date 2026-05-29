@@ -21,13 +21,13 @@
 
 #![allow(elided_lifetimes_in_paths)]
 
-use crate::{Result, Schema, Tuple, Value, Column, DataType};
-use crate::sql::LogicalPlan;
-use crate::sql::explain_options::{ExplainOptions, ExplainFormatOption};
-use crate::sql::explain::{ExplainPlanner, ExplainOutput};
-use crate::sql::explain_storage::format_storage_features_text;
-use super::{PhysicalOperator, Executor};
 use super::scan::MaterializedOperator;
+use super::{Executor, PhysicalOperator};
+use crate::sql::explain::{ExplainOutput, ExplainPlanner};
+use crate::sql::explain_options::{ExplainFormatOption, ExplainOptions};
+use crate::sql::explain_storage::format_storage_features_text;
+use crate::sql::LogicalPlan;
+use crate::{Column, DataType, Result, Schema, Tuple, Value};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -47,19 +47,17 @@ pub(super) fn handle_explain(
 ) -> Result<Box<dyn PhysicalOperator>> {
     // Create schema for EXPLAIN output (single text column called "QUERY PLAN")
     let schema = Arc::new(Schema {
-        columns: vec![
-            Column {
-                name: "QUERY PLAN".to_string(),
-                data_type: DataType::Text,
-                nullable: false,
-                primary_key: false,
-                source_table: None,
-                source_table_name: None,
-                default_expr: None,
-                unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
-            },
-        ],
+        columns: vec![Column {
+            name: "QUERY PLAN".to_string(),
+            data_type: DataType::Text,
+            nullable: false,
+            primary_key: false,
+            source_table: None,
+            source_table_name: None,
+            default_expr: None,
+            unique: false,
+            storage_mode: crate::ColumnStorageMode::Default,
+        }],
     });
 
     // Create ExplainPlanner with appropriate mode and format
@@ -97,12 +95,8 @@ pub(super) fn handle_explain(
 
     // Format the output based on the requested format
     let formatted_output = match options.format {
-        ExplainFormatOption::Json => {
-            format_json_output(&output, &storage_features, options)
-        }
-        ExplainFormatOption::Yaml => {
-            format_yaml_output(&output, &storage_features, options)
-        }
+        ExplainFormatOption::Json => format_json_output(&output, &storage_features, options),
+        ExplainFormatOption::Yaml => format_yaml_output(&output, &storage_features, options),
         ExplainFormatOption::Tree | ExplainFormatOption::Text => {
             format_text_output(&output, &storage_features, options, &explain_planner)
         }
@@ -118,10 +112,7 @@ pub(super) fn handle_explain(
 }
 
 /// Execute the query for EXPLAIN ANALYZE
-fn execute_for_analyze(
-    executor: &Executor,
-    plan: &LogicalPlan,
-) -> (Option<usize>, Option<f64>, Option<String>) {
+fn execute_for_analyze(executor: &Executor, plan: &LogicalPlan) -> (Option<usize>, Option<f64>, Option<String>) {
     let start_time = Instant::now();
 
     if let Some(storage) = executor.storage() {
@@ -323,8 +314,10 @@ fn format_summary(output: &ExplainOutput, options: &ExplainOptions) -> String {
             };
 
             result.push_str(&format!("  Estimate Accuracy:\n"));
-            result.push_str(&format!("    Rows: {} actual vs {} estimated ({:.1}%)\n",
-                actual_rows, output.total_rows, row_accuracy));
+            result.push_str(&format!(
+                "    Rows: {} actual vs {} estimated ({:.1}%)\n",
+                actual_rows, output.total_rows, row_accuracy
+            ));
             result.push_str(&format!("    Time: {:.3} ms\n", actual_time));
         }
     }
@@ -359,7 +352,12 @@ fn format_plan(lines: &mut Vec<String>, plan: &LogicalPlan, depth: usize, verbos
     let arrow = if depth > 0 { "-> " } else { "" };
 
     match plan {
-        LogicalPlan::Scan { table_name, projection, as_of, .. } => {
+        LogicalPlan::Scan {
+            table_name,
+            projection,
+            as_of,
+            ..
+        } => {
             let proj_str = if let Some(proj) = projection {
                 format!(" (projection: {:?})", proj)
             } else {
@@ -370,12 +368,21 @@ fn format_plan(lines: &mut Vec<String>, plan: &LogicalPlan, depth: usize, verbos
             } else {
                 String::new()
             };
-            lines.push(format!("{}{}Seq Scan on {}{}{}", indent, arrow, table_name, proj_str, as_of_str));
+            lines.push(format!(
+                "{}{}Seq Scan on {}{}{}",
+                indent, arrow, table_name, proj_str, as_of_str
+            ));
             if verbose {
                 lines.push(format!("{}  Output: all columns", indent));
             }
         }
-        LogicalPlan::FilteredScan { table_name, predicate, projection, as_of, .. } => {
+        LogicalPlan::FilteredScan {
+            table_name,
+            predicate,
+            projection,
+            as_of,
+            ..
+        } => {
             let pred_str = if let Some(pred) = predicate {
                 format!(" (filter: {:?})", pred)
             } else {
@@ -391,18 +398,38 @@ fn format_plan(lines: &mut Vec<String>, plan: &LogicalPlan, depth: usize, verbos
             } else {
                 String::new()
             };
-            lines.push(format!("{}{}Filtered Scan on {}{}{}{}", indent, arrow, table_name, pred_str, proj_str, as_of_str));
+            lines.push(format!(
+                "{}{}Filtered Scan on {}{}{}{}",
+                indent, arrow, table_name, pred_str, proj_str, as_of_str
+            ));
         }
         LogicalPlan::Filter { input, predicate } => {
             lines.push(format!("{}{}Filter: {:?}", indent, arrow, predicate));
             format_plan(lines, input, depth + 1, verbose);
         }
-        LogicalPlan::Project { input, aliases, distinct, .. } => {
+        LogicalPlan::Project {
+            input,
+            aliases,
+            distinct,
+            ..
+        } => {
             let distinct_str = if *distinct { " DISTINCT" } else { "" };
-            lines.push(format!("{}{}Project{}: [{}]", indent, arrow, distinct_str, aliases.join(", ")));
+            lines.push(format!(
+                "{}{}Project{}: [{}]",
+                indent,
+                arrow,
+                distinct_str,
+                aliases.join(", ")
+            ));
             format_plan(lines, input, depth + 1, verbose);
         }
-        LogicalPlan::Aggregate { input, group_by, aggr_exprs, having, .. } => {
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            having,
+            ..
+        } => {
             let group_str = if group_by.is_empty() {
                 String::new()
             } else {
@@ -413,28 +440,44 @@ fn format_plan(lines: &mut Vec<String>, plan: &LogicalPlan, depth: usize, verbos
             } else {
                 String::new()
             };
-            lines.push(format!("{}{}Aggregate: {:?}{}{}", indent, arrow, aggr_exprs, group_str, having_str));
+            lines.push(format!(
+                "{}{}Aggregate: {:?}{}{}",
+                indent, arrow, aggr_exprs, group_str, having_str
+            ));
             format_plan(lines, input, depth + 1, verbose);
         }
-        LogicalPlan::Join { left, right, join_type, on, lateral } => {
+        LogicalPlan::Join {
+            left,
+            right,
+            join_type,
+            on,
+            lateral,
+        } => {
             let on_str = if let Some(cond) = on {
                 format!(" ON {:?}", cond)
             } else {
                 String::new()
             };
             let lateral_str = if *lateral { "LATERAL " } else { "" };
-            lines.push(format!("{}{}{}Nested Loop {:?} Join{}", indent, arrow, lateral_str, join_type, on_str));
+            lines.push(format!(
+                "{}{}{}Nested Loop {:?} Join{}",
+                indent, arrow, lateral_str, join_type, on_str
+            ));
             format_plan(lines, left, depth + 1, verbose);
             format_plan(lines, right, depth + 1, verbose);
         }
         LogicalPlan::Sort { input, exprs, asc } => {
-            let sort_info: Vec<String> = exprs.iter().zip(asc.iter())
+            let sort_info: Vec<String> = exprs
+                .iter()
+                .zip(asc.iter())
                 .map(|(e, a)| format!("{:?} {}", e, if *a { "ASC" } else { "DESC" }))
                 .collect();
             lines.push(format!("{}{}Sort: [{}]", indent, arrow, sort_info.join(", ")));
             format_plan(lines, input, depth + 1, verbose);
         }
-        LogicalPlan::Limit { input, limit, offset, .. } => {
+        LogicalPlan::Limit {
+            input, limit, offset, ..
+        } => {
             let offset_str = if *offset > 0 {
                 format!(" OFFSET {}", offset)
             } else {
@@ -445,9 +488,15 @@ fn format_plan(lines: &mut Vec<String>, plan: &LogicalPlan, depth: usize, verbos
         }
         LogicalPlan::Explain { input, options } => {
             let mut opts_parts = Vec::new();
-            if options.analyze { opts_parts.push("ANALYZE"); }
-            if options.verbose { opts_parts.push("VERBOSE"); }
-            if options.storage { opts_parts.push("STORAGE"); }
+            if options.analyze {
+                opts_parts.push("ANALYZE");
+            }
+            if options.verbose {
+                opts_parts.push("VERBOSE");
+            }
+            if options.storage {
+                opts_parts.push("STORAGE");
+            }
             let opts_str = if opts_parts.is_empty() {
                 String::new()
             } else {

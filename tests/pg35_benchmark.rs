@@ -43,11 +43,8 @@ struct PgClient {
 
 impl PgClient {
     fn connect(connstr: &str) -> std::result::Result<Self, Box<dyn std::error::Error>> {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let (client, connection) =
-            rt.block_on(tokio_postgres::connect(connstr, tokio_postgres::NoTls))?;
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+        let (client, connection) = rt.block_on(tokio_postgres::connect(connstr, tokio_postgres::NoTls))?;
         let handle = rt.spawn(async move {
             if let Err(e) = connection.await {
                 eprintln!("PG connection error: {}", e);
@@ -95,12 +92,7 @@ where
     }
 }
 
-fn bench_helios_safe<F>(
-    db: &EmbeddedDatabase,
-    name: &str,
-    iters: usize,
-    f: F,
-) -> Option<CategoryResult>
+fn bench_helios_safe<F>(db: &EmbeddedDatabase, name: &str, iters: usize, f: F) -> Option<CategoryResult>
 where
     F: Fn(&EmbeddedDatabase, usize) -> std::result::Result<(), String>,
 {
@@ -331,10 +323,7 @@ fn populate_pg(pg: &PgClient) {
                 i, i, i, age, region, tier, i
             ));
         }
-        let _ = pg.execute(&format!(
-            "INSERT INTO customers VALUES {}",
-            values.join(",")
-        ));
+        let _ = pg.execute(&format!("INSERT INTO customers VALUES {}", values.join(",")));
     }
 
     let cats = ["Electronics", "Books", "Clothing", "Food", "Sports"];
@@ -351,10 +340,7 @@ fn populate_pg(pg: &PgClient) {
                 i
             ));
         }
-        let _ = pg.execute(&format!(
-            "INSERT INTO products VALUES {}",
-            values.join(",")
-        ));
+        let _ = pg.execute(&format!("INSERT INTO products VALUES {}", values.join(",")));
     }
 
     for batch in 0..5 {
@@ -373,10 +359,7 @@ fn populate_pg(pg: &PgClient) {
                 50 + (i % 950)
             ));
         }
-        let _ = pg.execute(&format!(
-            "INSERT INTO orders VALUES {}",
-            values.join(",")
-        ));
+        let _ = pg.execute(&format!("INSERT INTO orders VALUES {}", values.join(",")));
     }
 
     for batch in 0..2 {
@@ -394,10 +377,7 @@ fn populate_pg(pg: &PgClient) {
                 5 + (i % 100)
             ));
         }
-        let _ = pg.execute(&format!(
-            "INSERT INTO order_items VALUES {}",
-            values.join(",")
-        ));
+        let _ = pg.execute(&format!("INSERT INTO order_items VALUES {}", values.join(",")));
     }
 
     let cat_names = [
@@ -440,11 +420,7 @@ fn populate_pg(pg: &PgClient) {
 
 // --- 35 benchmark categories ---
 
-fn run_all_categories(
-    db: &EmbeddedDatabase,
-    pg: &PgClient,
-    iters: usize,
-) -> Vec<ComparisonRow> {
+fn run_all_categories(db: &EmbeddedDatabase, pg: &PgClient, iters: usize) -> Vec<ComparisonRow> {
     let mut results = Vec::new();
 
     // Helper tables for DDL benchmarks
@@ -502,21 +478,15 @@ fn run_all_categories(
     // 3. ALTER TABLE
     {
         let h = bench_helios_safe(db, "ALTER TABLE", iters, |db, i| {
-            db.execute(&format!(
-                "ALTER TABLE bench_alt ADD COLUMN col_{} TEXT",
-                i
-            ))
-            .map(|_| ())
-            .map_err(|e| e.to_string())?;
+            db.execute(&format!("ALTER TABLE bench_alt ADD COLUMN col_{} TEXT", i))
+                .map(|_| ())
+                .map_err(|e| e.to_string())?;
             db.execute(&format!("ALTER TABLE bench_alt DROP COLUMN col_{}", i))
                 .map(|_| ())
                 .map_err(|e| e.to_string())
         });
         let p = bench_pg(pg, "ALTER TABLE", iters, |pg, i| {
-            let _ = pg.execute(&format!(
-                "ALTER TABLE bench_alt ADD COLUMN col_{} TEXT",
-                i
-            ));
+            let _ = pg.execute(&format!("ALTER TABLE bench_alt ADD COLUMN col_{} TEXT", i));
             let _ = pg.execute(&format!("ALTER TABLE bench_alt DROP COLUMN col_{}", i));
         });
         results.push(compare_safe("ALTER TABLE", h.as_ref(), &p));
@@ -525,14 +495,8 @@ fn run_all_categories(
     // 4. DROP TABLE
     {
         for i in 0..(iters + 2) {
-            let _ = db.execute(&format!(
-                "CREATE TABLE IF NOT EXISTS bench_drop_{} (id INT)",
-                i
-            ));
-            let _ = pg.execute(&format!(
-                "CREATE TABLE IF NOT EXISTS bench_drop_{} (id INT)",
-                i
-            ));
+            let _ = db.execute(&format!("CREATE TABLE IF NOT EXISTS bench_drop_{} (id INT)", i));
+            let _ = pg.execute(&format!("CREATE TABLE IF NOT EXISTS bench_drop_{} (id INT)", i));
         }
         let h = bench_helios_safe(db, "DROP TABLE", iters, |db, i| {
             db.execute(&format!("DROP TABLE IF EXISTS bench_drop_{}", i))
@@ -574,7 +538,9 @@ fn run_all_categories(
             .execute("CREATE MATERIALIZED VIEW IF NOT EXISTS bench_mv AS SELECT region, COUNT(*) as cnt FROM customers GROUP BY region")
             .is_ok();
         let _ = pg.execute("DROP MATERIALIZED VIEW IF EXISTS bench_mv");
-        let _ = pg.execute("CREATE MATERIALIZED VIEW bench_mv AS SELECT region, COUNT(*) as cnt FROM customers GROUP BY region");
+        let _ = pg.execute(
+            "CREATE MATERIALIZED VIEW bench_mv AS SELECT region, COUNT(*) as cnt FROM customers GROUP BY region",
+        );
 
         let h = if mv_ok {
             bench_helios_safe(db, "REFRESH MATVIEW", iters, |db, _| {
@@ -593,8 +559,7 @@ fn run_all_categories(
 
     // 7. TRUNCATE
     {
-        let _ =
-            db.execute("CREATE TABLE IF NOT EXISTS bench_trunc (id INT, val TEXT)");
+        let _ = db.execute("CREATE TABLE IF NOT EXISTS bench_trunc (id INT, val TEXT)");
         let _ = pg.execute("CREATE TABLE IF NOT EXISTS bench_trunc (id INT, val TEXT)");
 
         let h = bench_helios_safe(db, "TRUNCATE", iters, |db, _| {
@@ -624,18 +589,10 @@ fn run_all_categories(
         let _ = pg.execute("CREATE TABLE bench_ins (id INT PRIMARY KEY, val TEXT)");
 
         let h = bench_helios(db, "INSERT single", iters, |db, i| {
-            let _ = db.execute(&format!(
-                "INSERT INTO bench_ins VALUES ({}, 'v{}')",
-                10000 + i,
-                i
-            ));
+            let _ = db.execute(&format!("INSERT INTO bench_ins VALUES ({}, 'v{}')", 10000 + i, i));
         });
         let p = bench_pg(pg, "INSERT single", iters, |pg, i| {
-            let _ = pg.execute(&format!(
-                "INSERT INTO bench_ins VALUES ({}, 'v{}')",
-                10000 + i,
-                i
-            ));
+            let _ = pg.execute(&format!("INSERT INTO bench_ins VALUES ({}, 'v{}')", 10000 + i, i));
         });
         results.push(compare_result("INSERT single", &h, &p));
     }
@@ -648,23 +605,13 @@ fn run_all_categories(
 
         let h = bench_helios(db, "INSERT multi-row", iters, |db, i| {
             let base = 20000 + i * 10;
-            let vals: Vec<String> = (0..10)
-                .map(|j| format!("({}, 'b{}')", base + j, j))
-                .collect();
-            let _ = db.execute(&format!(
-                "INSERT INTO bench_ins_m VALUES {}",
-                vals.join(",")
-            ));
+            let vals: Vec<String> = (0..10).map(|j| format!("({}, 'b{}')", base + j, j)).collect();
+            let _ = db.execute(&format!("INSERT INTO bench_ins_m VALUES {}", vals.join(",")));
         });
         let p = bench_pg(pg, "INSERT multi-row", iters, |pg, i| {
             let base = 20000 + i * 10;
-            let vals: Vec<String> = (0..10)
-                .map(|j| format!("({}, 'b{}')", base + j, j))
-                .collect();
-            let _ = pg.execute(&format!(
-                "INSERT INTO bench_ins_m VALUES {}",
-                vals.join(",")
-            ));
+            let vals: Vec<String> = (0..10).map(|j| format!("({}, 'b{}')", base + j, j)).collect();
+            let _ = pg.execute(&format!("INSERT INTO bench_ins_m VALUES {}", vals.join(",")));
         });
         results.push(compare_result("INSERT multi-row", &h, &p));
     }
@@ -698,17 +645,11 @@ fn run_all_categories(
     {
         let h = bench_helios(db, "UPDATE point", iters, |db, i| {
             let id = (i % 200) + 1;
-            let _ = db.execute(&format!(
-                "UPDATE customers SET age = age + 0 WHERE id = {}",
-                id
-            ));
+            let _ = db.execute(&format!("UPDATE customers SET age = age + 0 WHERE id = {}", id));
         });
         let p = bench_pg(pg, "UPDATE point", iters, |pg, i| {
             let id = (i % 200) + 1;
-            let _ = pg.execute(&format!(
-                "UPDATE customers SET age = age + 0 WHERE id = {}",
-                id
-            ));
+            let _ = pg.execute(&format!("UPDATE customers SET age = age + 0 WHERE id = {}", id));
         });
         results.push(compare_result("UPDATE point", &h, &p));
     }
@@ -734,9 +675,7 @@ fn run_all_categories(
 
     // 13. UPSERT
     {
-        let _ = db.execute(
-            "CREATE TABLE IF NOT EXISTS bench_ups (id INT PRIMARY KEY, val TEXT, counter INT)",
-        );
+        let _ = db.execute("CREATE TABLE IF NOT EXISTS bench_ups (id INT PRIMARY KEY, val TEXT, counter INT)");
         let _ = pg.execute("DROP TABLE IF EXISTS bench_ups");
         let _ = pg.execute("CREATE TABLE bench_ups (id INT PRIMARY KEY, val TEXT, counter INT)");
         for i in 0..30 {
@@ -790,10 +729,7 @@ fn run_all_categories(
     {
         let h = bench_helios(db, "Point lookup", iters, |db, i| {
             let id = (i % 200) + 1;
-            let _ = db.query(
-                &format!("SELECT * FROM customers WHERE id = {}", id),
-                &[],
-            );
+            let _ = db.query(&format!("SELECT * FROM customers WHERE id = {}", id), &[]);
         });
         let p = bench_pg(pg, "Point lookup", iters, |pg, i| {
             let id = (i % 200) + 1;
@@ -1140,18 +1076,14 @@ fn run_all_categories(
     {
         let h = bench_helios_safe(db, "Transaction ctl", iters, |db, _| {
             db.execute("BEGIN").map(|_| ()).map_err(|e| e.to_string())?;
-            db.execute("SAVEPOINT sp1")
-                .map(|_| ())
-                .map_err(|e| e.to_string())?;
+            db.execute("SAVEPOINT sp1").map(|_| ()).map_err(|e| e.to_string())?;
             db.execute("INSERT INTO bench_ins VALUES (99999, 'txn')")
                 .map(|_| ())
                 .map_err(|e| e.to_string())?;
             db.execute("ROLLBACK TO SAVEPOINT sp1")
                 .map(|_| ())
                 .map_err(|e| e.to_string())?;
-            db.execute("COMMIT")
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            db.execute("COMMIT").map(|_| ()).map_err(|e| e.to_string())
         });
         let p = bench_pg(pg, "Transaction ctl", iters, |pg, _| {
             let _ = pg.execute("BEGIN");
@@ -1168,10 +1100,7 @@ fn run_all_categories(
         let h = bench_helios_safe(db, "Prepared stmts", iters, |db, i| {
             let name = format!("bench_s_{}", i);
             db.query(
-                &format!(
-                    "PREPARE {} AS SELECT * FROM customers WHERE id = $1",
-                    name
-                ),
+                &format!("PREPARE {} AS SELECT * FROM customers WHERE id = $1", name),
                 &[],
             )
             .map(|_| ())
@@ -1201,12 +1130,8 @@ fn run_all_categories(
             db.query("SET work_mem = '8192'", &[])
                 .map(|_| ())
                 .map_err(|e| e.to_string())?;
-            db.query("SHOW work_mem", &[])
-                .map(|_| ())
-                .map_err(|e| e.to_string())?;
-            db.query("RESET work_mem", &[])
-                .map(|_| ())
-                .map_err(|e| e.to_string())
+            db.query("SHOW work_mem", &[]).map(|_| ()).map_err(|e| e.to_string())?;
+            db.query("RESET work_mem", &[]).map(|_| ()).map_err(|e| e.to_string())
         });
         let p = bench_pg(pg, "SET/SHOW/RESET", iters, |pg, _| {
             let _ = pg.execute("SET work_mem = '8MB'");
@@ -1259,12 +1184,8 @@ fn compare_safe(name: &str, h: Option<&CategoryResult>, p: &CategoryResult) -> C
 
 fn print_comparison_table(results: &[ComparisonRow]) {
     println!("\n{}", "=".repeat(105));
-    println!(
-        "  HELIOSDB-NANO vs POSTGRESQL 16 -- HEAD-TO-HEAD COMPARISON"
-    );
-    println!(
-        "  Dataset: 200 customers, 50 products, 500 orders, 1000 items, 20 categories"
-    );
+    println!("  HELIOSDB-NANO vs POSTGRESQL 16 -- HEAD-TO-HEAD COMPARISON");
+    println!("  Dataset: 200 customers, 50 products, 500 orders, 1000 items, 20 categories");
     println!("{}\n", "=".repeat(105));
 
     println!(
@@ -1339,15 +1260,8 @@ fn print_trace_breakdown(results: &[ComparisonRow]) {
     println!("  TOP OPTIMIZATION TARGETS (where PG wins by largest margin)");
     println!("{}\n", "=".repeat(80));
 
-    let mut sorted: Vec<&ComparisonRow> = results
-        .iter()
-        .filter(|r| !r.helios_na && r.ratio > 1.05)
-        .collect();
-    sorted.sort_by(|a, b| {
-        b.ratio
-            .partial_cmp(&a.ratio)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    let mut sorted: Vec<&ComparisonRow> = results.iter().filter(|r| !r.helios_na && r.ratio > 1.05).collect();
+    sorted.sort_by(|a, b| b.ratio.partial_cmp(&a.ratio).unwrap_or(std::cmp::Ordering::Equal));
 
     for (i, r) in sorted.iter().take(10).enumerate() {
         println!(
@@ -1369,11 +1283,7 @@ fn print_trace_breakdown(results: &[ComparisonRow]) {
         .iter()
         .filter(|r| !r.helios_na && r.ratio < 0.95 && r.ratio > 0.0)
         .collect();
-    helios_better.sort_by(|a, b| {
-        a.ratio
-            .partial_cmp(&b.ratio)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    helios_better.sort_by(|a, b| a.ratio.partial_cmp(&b.ratio).unwrap_or(std::cmp::Ordering::Equal));
 
     if !helios_better.is_empty() {
         println!("\n  NANO ADVANTAGES (faster than PG):");
@@ -1398,42 +1308,18 @@ fn print_analysis(results: &[ComparisonRow]) {
     let active: Vec<&ComparisonRow> = results.iter().filter(|r| !r.helios_na).collect();
 
     let critical: Vec<&&ComparisonRow> = active.iter().filter(|r| r.ratio > 5.0).collect();
-    let significant: Vec<&&ComparisonRow> = active
-        .iter()
-        .filter(|r| r.ratio > 2.0 && r.ratio <= 5.0)
-        .collect();
-    let moderate: Vec<&&ComparisonRow> = active
-        .iter()
-        .filter(|r| r.ratio > 1.05 && r.ratio <= 2.0)
-        .collect();
-    let competitive: Vec<&&ComparisonRow> = active
-        .iter()
-        .filter(|r| r.ratio >= 0.95 && r.ratio <= 1.05)
-        .collect();
-    let helios_faster: Vec<&&ComparisonRow> = active
-        .iter()
-        .filter(|r| r.ratio > 0.0 && r.ratio < 0.95)
-        .collect();
+    let significant: Vec<&&ComparisonRow> = active.iter().filter(|r| r.ratio > 2.0 && r.ratio <= 5.0).collect();
+    let moderate: Vec<&&ComparisonRow> = active.iter().filter(|r| r.ratio > 1.05 && r.ratio <= 2.0).collect();
+    let competitive: Vec<&&ComparisonRow> = active.iter().filter(|r| r.ratio >= 0.95 && r.ratio <= 1.05).collect();
+    let helios_faster: Vec<&&ComparisonRow> = active.iter().filter(|r| r.ratio > 0.0 && r.ratio < 0.95).collect();
     let na_list: Vec<&ComparisonRow> = results.iter().filter(|r| r.helios_na).collect();
 
     println!("    Critical (>5x slower):    {} categories", critical.len());
-    println!(
-        "    Significant (2-5x):       {} categories",
-        significant.len()
-    );
+    println!("    Significant (2-5x):       {} categories", significant.len());
     println!("    Moderate (1.05-2x):       {} categories", moderate.len());
-    println!(
-        "    Competitive (~1x):        {} categories",
-        competitive.len()
-    );
-    println!(
-        "    Nano faster (<0.95x):     {} categories",
-        helios_faster.len()
-    );
-    println!(
-        "    Not supported (N/A):      {} categories",
-        na_list.len()
-    );
+    println!("    Competitive (~1x):        {} categories", competitive.len());
+    println!("    Nano faster (<0.95x):     {} categories", helios_faster.len());
+    println!("    Not supported (N/A):      {} categories", na_list.len());
 
     if !na_list.is_empty() {
         println!("\n  N/A CATEGORIES (not supported in Nano):");
@@ -1449,18 +1335,12 @@ fn print_analysis(results: &[ComparisonRow]) {
 #[ignore] // Requires Docker PostgreSQL on port 25433
 fn pg35_benchmark() {
     println!("\n{}", "=".repeat(105));
-    println!(
-        "  HELIOSDB-NANO vs POSTGRESQL 16 -- COMPREHENSIVE 35-CATEGORY BENCHMARK"
-    );
-    println!(
-        "  HeliosDB-Nano v3.7.0 (Embedded/In-Memory) vs PostgreSQL 16 (Docker/25433)"
-    );
+    println!("  HELIOSDB-NANO vs POSTGRESQL 16 -- COMPREHENSIVE 35-CATEGORY BENCHMARK");
+    println!("  HeliosDB-Nano v3.7.0 (Embedded/In-Memory) vs PostgreSQL 16 (Docker/25433)");
     println!("{}\n", "=".repeat(105));
 
     // Connect to PostgreSQL
-    let pg = match PgClient::connect(
-        "host=127.0.0.1 port=25433 user=bench password=benchpass dbname=benchdb",
-    ) {
+    let pg = match PgClient::connect("host=127.0.0.1 port=25433 user=bench password=benchpass dbname=benchdb") {
         Ok(pg) => {
             println!("  [OK] Connected to PostgreSQL 16 on port 25433");
             pg
@@ -1503,10 +1383,7 @@ fn pg35_benchmark() {
 
     // Run benchmarks
     let iters = 20;
-    println!(
-        "\n  Running 35 categories x {} iterations each x 2 engines...\n",
-        iters
-    );
+    println!("\n  Running 35 categories x {} iterations each x 2 engines...\n", iters);
 
     let start = Instant::now();
     let results = run_all_categories(&db, &pg, iters);

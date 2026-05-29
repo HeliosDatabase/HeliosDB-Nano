@@ -26,15 +26,24 @@ fn is_distinct_from_has_postgres_null_safe_semantics() -> Result<()> {
         Value::Boolean(false),
     );
     assert_eq!(
-        db.query("SELECT NULL IS DISTINCT FROM 'a'", &[])?.get(0).unwrap().values[0],
+        db.query("SELECT NULL IS DISTINCT FROM 'a'", &[])?
+            .get(0)
+            .unwrap()
+            .values[0],
         Value::Boolean(true),
     );
     assert_eq!(
-        db.query("SELECT NULL IS DISTINCT FROM NULL", &[])?.get(0).unwrap().values[0],
+        db.query("SELECT NULL IS DISTINCT FROM NULL", &[])?
+            .get(0)
+            .unwrap()
+            .values[0],
         Value::Boolean(false),
     );
     assert_eq!(
-        db.query("SELECT NULL IS NOT DISTINCT FROM NULL", &[])?.get(0).unwrap().values[0],
+        db.query("SELECT NULL IS NOT DISTINCT FROM NULL", &[])?
+            .get(0)
+            .unwrap()
+            .values[0],
         Value::Boolean(true),
     );
     Ok(())

@@ -13,9 +13,9 @@
 
 #![cfg(test)]
 
-use heliosdb_nano::{EmbeddedDatabase, Result, Error};
-use heliosdb_nano::session::IsolationLevel;
 use crate::test_helpers::*;
+use heliosdb_nano::session::IsolationLevel;
+use heliosdb_nano::{EmbeddedDatabase, Error, Result};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -78,23 +78,35 @@ fn test_10_concurrent_users_5_transactions_each() -> Result<()> {
                     // Deduct from source (lower ID)
                     db_clone.execute_in_session(
                         session,
-                        &format!("UPDATE bank_accounts SET balance = balance - {} WHERE id = {}", amount, from_account)
+                        &format!(
+                            "UPDATE bank_accounts SET balance = balance - {} WHERE id = {}",
+                            amount, from_account
+                        ),
                     )?;
                     // Add to destination (higher ID)
                     db_clone.execute_in_session(
                         session,
-                        &format!("UPDATE bank_accounts SET balance = balance + {} WHERE id = {}", amount, to_account)
+                        &format!(
+                            "UPDATE bank_accounts SET balance = balance + {} WHERE id = {}",
+                            amount, to_account
+                        ),
                     )?;
                 } else {
                     // Add to destination (lower ID)
                     db_clone.execute_in_session(
                         session,
-                        &format!("UPDATE bank_accounts SET balance = balance + {} WHERE id = {}", amount, to_account)
+                        &format!(
+                            "UPDATE bank_accounts SET balance = balance + {} WHERE id = {}",
+                            amount, to_account
+                        ),
                     )?;
                     // Deduct from source (higher ID)
                     db_clone.execute_in_session(
                         session,
-                        &format!("UPDATE bank_accounts SET balance = balance - {} WHERE id = {}", amount, from_account)
+                        &format!(
+                            "UPDATE bank_accounts SET balance = balance - {} WHERE id = {}",
+                            amount, from_account
+                        ),
                     )?;
                 }
 
@@ -163,7 +175,7 @@ fn test_concurrent_users_mixed_read_write() -> Result<()> {
                     let product_id = (i % 100) + 1;
                     db_clone.execute_in_session(
                         session,
-                        &format!("UPDATE products SET stock = stock - 1 WHERE id = {}", product_id)
+                        &format!("UPDATE products SET stock = stock - 1 WHERE id = {}", product_id),
                     )?;
                     db_clone.commit_transaction_for_session(session)?;
                     thread::sleep(Duration::from_millis(1));
@@ -268,7 +280,7 @@ fn test_dump_during_active_transactions() -> Result<()> {
             db_writer.begin_transaction_for_session(session)?;
             db_writer.execute_in_session(
                 session,
-                &format!("INSERT INTO orders VALUES ({}, {})", i, i as f64 * 10.5)
+                &format!("INSERT INTO orders VALUES ({}, {})", i, i as f64 * 10.5),
             )?;
             db_writer.commit_transaction_for_session(session)?;
             thread::sleep(Duration::from_millis(1));
@@ -302,9 +314,7 @@ fn test_dump_snapshot_consistency() -> Result<()> {
     // Start dump
     let db_clone = Arc::clone(&db);
     let dump_path_clone = dump_path.clone();
-    let dump_handle = thread::spawn(move || {
-        db_clone.dump_full(&dump_path_clone)
-    });
+    let dump_handle = thread::spawn(move || db_clone.dump_full(&dump_path_clone));
 
     // Modify data during dump
     thread::sleep(Duration::from_millis(10));
@@ -343,7 +353,7 @@ fn test_session_timeout_during_transaction() -> Result<()> {
 
     // Simulate session loss/timeout by not committing
     // In a real system, background cleanup would rollback.
-    
+
     // Manual rollback for now since timeout background task is not yet fully integrated in tests
     db.rollback_transaction_for_session(session)?;
 
@@ -373,11 +383,11 @@ fn test_session_cleanup_releases_locks() -> Result<()> {
     // Session 2 should be able to acquire lock immediately
     let session2 = db.create_session("bob", IsolationLevel::ReadCommitted)?;
     db.begin_transaction_for_session(session2)?;
-    
+
     let start = Instant::now();
     db.execute_in_session(session2, "UPDATE accounts SET balance = 2000 WHERE id = 1")?;
     let elapsed = start.elapsed();
-    
+
     // Should not block
     assert!(elapsed < Duration::from_millis(100));
 
@@ -443,7 +453,7 @@ fn test_transaction_rollback_on_deadlock() -> Result<()> {
     db.begin_transaction_for_session(session)?;
     db.execute_in_session(session, "UPDATE accounts SET balance = 1500 WHERE id = 1")?;
     db.rollback_transaction_for_session(session)?;
-    
+
     let results = db.query("SELECT balance FROM accounts WHERE id = 1", &[])?;
     assert_eq!(get_int_value(&results[0], 0), Some(1000));
 
@@ -484,7 +494,9 @@ fn test_e2e_banking_workload() -> Result<()> {
 
     // Setup banking schema
     db.execute("CREATE TABLE accounts (id INT PRIMARY KEY, owner TEXT, balance INT)")?;
-    db.execute("CREATE TABLE transactions (id INT PRIMARY KEY, from_account INT, to_account INT, amount INT, timestamp INT)")?;
+    db.execute(
+        "CREATE TABLE transactions (id INT PRIMARY KEY, from_account INT, to_account INT, amount INT, timestamp INT)",
+    )?;
 
     // Create 100 accounts
     for i in 1..=100 {
@@ -506,29 +518,31 @@ fn test_e2e_banking_workload() -> Result<()> {
 
                 let mut from = (user_id * 5 + 1) % 100 + 1;
                 let mut to = (user_id * 5 + 2) % 100 + 1;
-                if from == to { to = (to % 100) + 1; }
-                
+                if from == to {
+                    to = (to % 100) + 1;
+                }
+
                 // Sort IDs to avoid deadlocks
                 let (first, second) = if from < to { (from, to) } else { (to, from) };
-                
+
                 let amount = 100;
 
                 // Debit from source
                 db_clone.execute_in_session(
                     session,
-                    &format!("UPDATE accounts SET balance = balance - {} WHERE id = {}", amount, from)
+                    &format!("UPDATE accounts SET balance = balance - {} WHERE id = {}", amount, from),
                 )?;
 
                 // Credit to destination
                 db_clone.execute_in_session(
                     session,
-                    &format!("UPDATE accounts SET balance = balance + {} WHERE id = {}", amount, to)
+                    &format!("UPDATE accounts SET balance = balance + {} WHERE id = {}", amount, to),
                 )?;
 
                 db_clone.commit_transaction_for_session(session)?;
                 thread::sleep(Duration::from_millis(5));
             }
-            
+
             db_clone.destroy_session(session)?;
             Ok(())
         });
@@ -582,7 +596,7 @@ fn test_e2e_inventory_management_workload() -> Result<()> {
                     let product_id = (i % 50) + 1;
                     db_clone.execute_in_session(
                         session,
-                        &format!("UPDATE products SET stock = stock - 10 WHERE id = {}", product_id)
+                        &format!("UPDATE products SET stock = stock - 10 WHERE id = {}", product_id),
                     )?;
                     db_clone.commit_transaction_for_session(session)?;
                     thread::sleep(Duration::from_millis(10));
@@ -594,7 +608,7 @@ fn test_e2e_inventory_management_workload() -> Result<()> {
                     let product_id = (i % 50) + 1;
                     db_clone.execute_in_session(
                         session,
-                        &format!("UPDATE products SET stock = stock + 100 WHERE id = {}", product_id)
+                        &format!("UPDATE products SET stock = stock + 100 WHERE id = {}", product_id),
                     )?;
                     db_clone.commit_transaction_for_session(session)?;
                     thread::sleep(Duration::from_millis(15));

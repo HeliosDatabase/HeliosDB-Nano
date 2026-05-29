@@ -32,10 +32,7 @@ pub struct LinkerStats {
 /// `qualified` name appears as a whole word in the text.  Matching
 /// kinds are `DocChunk`, `Email`, `Issue`, `InvestorQuestion`,
 /// `Answer`; extend this list by passing `extra_kinds`.
-pub fn link_exact_qualified(
-    db: &EmbeddedDatabase,
-    extra_kinds: &[&str],
-) -> Result<LinkerStats> {
+pub fn link_exact_qualified(db: &EmbeddedDatabase, extra_kinds: &[&str]) -> Result<LinkerStats> {
     ensure_tables(db)?;
     let mut stats = LinkerStats::default();
 
@@ -66,10 +63,7 @@ pub fn link_exact_qualified(
 
     // Map code_symbol node_id → _hdb_graph_nodes.node_id.
     let mut code_to_graph: HashMap<i64, i64> = HashMap::new();
-    for row in db.query(
-        "SELECT source_ref, node_id FROM _hdb_graph_nodes",
-        &[],
-    )? {
+    for row in db.query("SELECT source_ref, node_id FROM _hdb_graph_nodes", &[])? {
         let Some(Value::String(sref)) = row.values.first() else {
             continue;
         };
@@ -98,13 +92,17 @@ pub fn link_exact_qualified(
         }
     }
 
-    let mut kinds: Vec<&str> = vec!["DocChunk", "DocSection", "Email", "Issue", "Comment", "InvestorQuestion", "Answer"];
+    let mut kinds: Vec<&str> = vec![
+        "DocChunk",
+        "DocSection",
+        "Email",
+        "Issue",
+        "Comment",
+        "InvestorQuestion",
+        "Answer",
+    ];
     kinds.extend_from_slice(extra_kinds);
-    let kind_list = kinds
-        .iter()
-        .map(|k| format!("'{k}'"))
-        .collect::<Vec<_>>()
-        .join(",");
+    let kind_list = kinds.iter().map(|k| format!("'{k}'")).collect::<Vec<_>>().join(",");
 
     let text_rows = db.query(
         &format!(
@@ -156,23 +154,10 @@ fn contains_whole_word(haystack: &str, needle: &str) -> bool {
     let mut start = 0usize;
     while let Some(pos) = haystack[start..].find(needle) {
         let abs = start + pos;
-        let before_ok = abs == 0
-            || !is_ident_char(
-                haystack
-                    .as_bytes()
-                    .get(abs - 1)
-                    .copied()
-                    .unwrap_or(b' '),
-            );
+        let before_ok = abs == 0 || !is_ident_char(haystack.as_bytes().get(abs - 1).copied().unwrap_or(b' '));
         let after_idx = abs + needle.len();
-        let after_ok = after_idx == haystack.len()
-            || !is_ident_char(
-                haystack
-                    .as_bytes()
-                    .get(after_idx)
-                    .copied()
-                    .unwrap_or(b' '),
-            );
+        let after_ok =
+            after_idx == haystack.len() || !is_ident_char(haystack.as_bytes().get(after_idx).copied().unwrap_or(b' '));
         if before_ok && after_ok {
             return true;
         }

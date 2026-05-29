@@ -5,8 +5,8 @@ use async_trait::async_trait;
 use futures::Stream;
 
 use super::{
-    ChatMessage, LlmProvider, LlmProviderConfig, LlmRequest, LlmResponse,
-    ModelInfo, ProviderError, ProviderResult, StreamChunk, TokenUsage,
+    ChatMessage, LlmProvider, LlmProviderConfig, LlmRequest, LlmResponse, ModelInfo, ProviderError, ProviderResult,
+    StreamChunk, TokenUsage,
 };
 
 /// OpenAI provider
@@ -20,15 +20,18 @@ pub struct OpenAiProvider {
 impl OpenAiProvider {
     /// Create new OpenAI provider
     pub fn new(config: &LlmProviderConfig) -> ProviderResult<Self> {
-        let api_key = config.api_key.clone()
+        let api_key = config
+            .api_key
+            .clone()
             .or_else(|| std::env::var("OPENAI_API_KEY").ok())
             .ok_or_else(|| ProviderError::Config("OpenAI API key required".into()))?;
 
-        let endpoint = config.endpoint.clone()
+        let endpoint = config
+            .endpoint
+            .clone()
             .unwrap_or_else(|| "https://api.openai.com/v1".into());
 
-        let default_model = config.model.clone()
-            .unwrap_or_else(|| "gpt-4-turbo-preview".into());
+        let default_model = config.model.clone().unwrap_or_else(|| "gpt-4-turbo-preview".into());
 
         Ok(Self {
             api_key,
@@ -168,8 +171,7 @@ impl LlmProvider for OpenAiProvider {
             return Err(ProviderError::Api(error_text));
         }
 
-        let result: serde_json::Value = response.json().await
-            .map_err(|e| ProviderError::Api(e.to_string()))?;
+        let result: serde_json::Value = response.json().await.map_err(|e| ProviderError::Api(e.to_string()))?;
 
         // Parse response
         let choice = result["choices"][0].clone();
@@ -179,12 +181,12 @@ impl LlmProvider for OpenAiProvider {
             role: super::MessageRole::Assistant,
             content: message_data["content"].as_str().unwrap_or("").to_string(),
             name: None,
-            function_call: message_data.get("function_call").and_then(|fc| {
-                serde_json::from_value(fc.clone()).ok()
-            }),
-            tool_calls: message_data.get("tool_calls").and_then(|tc| {
-                serde_json::from_value(tc.clone()).ok()
-            }),
+            function_call: message_data
+                .get("function_call")
+                .and_then(|fc| serde_json::from_value(fc.clone()).ok()),
+            tool_calls: message_data
+                .get("tool_calls")
+                .and_then(|tc| serde_json::from_value(tc.clone()).ok()),
             tool_call_id: None,
         };
 

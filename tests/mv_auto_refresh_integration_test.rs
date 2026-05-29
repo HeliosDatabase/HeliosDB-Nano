@@ -13,14 +13,12 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_nano::{Config, Column, DataType, Schema, Tuple, Value};
-use heliosdb_nano::storage::{
-    StorageEngine, MaterializedViewCatalog, MaterializedViewMetadata,
-    AutoRefreshWorker, AutoRefreshConfig, AutoRefreshPolicy,
-    MVScheduler, SchedulerConfig, Priority,
-    MvSystemViews,
-};
 use heliosdb_nano::sql::LogicalPlan;
+use heliosdb_nano::storage::{
+    AutoRefreshConfig, AutoRefreshPolicy, AutoRefreshWorker, MVScheduler, MaterializedViewCatalog,
+    MaterializedViewMetadata, MvSystemViews, Priority, SchedulerConfig, StorageEngine,
+};
+use heliosdb_nano::{Column, Config, DataType, Schema, Tuple, Value};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -126,9 +124,7 @@ fn test_system_views_status() {
 
     // Create MV catalog and add a test view
     let mv_catalog = MaterializedViewCatalog::new(&storage);
-    let schema = Schema::new(vec![
-        Column::new("count", DataType::Int8),
-    ]);
+    let schema = Schema::new(vec![Column::new("count", DataType::Int8)]);
 
     let query_plan = LogicalPlan::Scan {
         table_name: "test".to_string(),

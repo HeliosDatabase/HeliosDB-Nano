@@ -207,10 +207,7 @@ pub enum AuditFilter {
     /// Filter by session ID
     Session(String),
     /// Filter by time range
-    TimeRange {
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    },
+    TimeRange { start: DateTime<Utc>, end: DateTime<Utc> },
     /// Filter by success status
     Success(bool),
 }
@@ -301,10 +298,7 @@ mod tests {
 
     #[test]
     fn test_parse_operation_type() {
-        assert_eq!(
-            parse_operation_type("CREATE_TABLE"),
-            OperationType::CreateTable
-        );
+        assert_eq!(parse_operation_type("CREATE_TABLE"), OperationType::CreateTable);
         assert_eq!(parse_operation_type("INSERT"), OperationType::Insert);
     }
 

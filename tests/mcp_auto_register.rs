@@ -40,11 +40,7 @@ fn lsp_definition_via_mcp_resolves_indexed_function() {
     .unwrap();
     db.code_index(CodeIndexOptions::for_table("src")).unwrap();
 
-    let r = call_tool(
-        Some(&db),
-        "helios_lsp_definition",
-        json!({ "name": "greet" }),
-    );
+    let r = call_tool(Some(&db), "helios_lsp_definition", json!({ "name": "greet" }));
     assert!(!r.is_error, "got {r:?}");
     let rows = r.payload["rows"].as_array().expect("rows");
     assert!(!rows.is_empty(), "no rows for 'greet': {:?}", r.payload);
@@ -56,10 +52,7 @@ fn lsp_definition_via_mcp_resolves_indexed_function() {
 fn lsp_definition_without_db_errors_cleanly() {
     let r = call_tool(None, "helios_lsp_definition", json!({ "name": "x" }));
     assert!(r.is_error);
-    assert!(r.payload["error"]
-        .as_str()
-        .unwrap()
-        .contains("requires a database"));
+    assert!(r.payload["error"].as_str().unwrap().contains("requires a database"));
 }
 
 #[test]

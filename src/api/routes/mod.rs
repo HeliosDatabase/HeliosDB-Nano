@@ -1,20 +1,20 @@
 //! Route definitions for REST API
 
-pub mod branches;
-pub mod query;
-pub mod data;
-pub mod vectors;
 pub mod agents;
-pub mod documents;
-pub mod chat;
-pub mod schema;
+pub mod branches;
 pub mod cancellation;
-pub mod webhooks;
+pub mod chat;
+pub mod data;
+pub mod documents;
+pub mod query;
 pub mod rest;
+pub mod schema;
+pub mod vectors;
+pub mod webhooks;
 
-use axum::Router;
-use crate::api::server::AppState;
 use crate::api::openapi;
+use crate::api::server::AppState;
+use axum::Router;
 
 /// Create v1 API routes
 pub fn v1_routes() -> Router<AppState> {

@@ -216,9 +216,7 @@ impl MessageHeader {
 
     pub fn decode(buf: &mut impl Buf) -> Result<Self> {
         if buf.remaining() < HEADER_SIZE {
-            return Err(ReplicationError::Transport(
-                "Incomplete header".to_string(),
-            ));
+            return Err(ReplicationError::Transport("Incomplete header".to_string()));
         }
 
         let magic = buf.get_u32();
@@ -283,23 +281,26 @@ impl Message {
     pub async fn read_from<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Self> {
         // Read header
         let mut header_buf = [0u8; HEADER_SIZE];
-        reader.read_exact(&mut header_buf).await.map_err(|e| {
-            ReplicationError::Transport(format!("Failed to read header: {}", e))
-        })?;
+        reader
+            .read_exact(&mut header_buf)
+            .await
+            .map_err(|e| ReplicationError::Transport(format!("Failed to read header: {}", e)))?;
 
         let header = MessageHeader::decode(&mut &header_buf[..])?;
 
         // Read payload
         let mut payload = vec![0u8; header.length as usize];
-        reader.read_exact(&mut payload).await.map_err(|e| {
-            ReplicationError::Transport(format!("Failed to read payload: {}", e))
-        })?;
+        reader
+            .read_exact(&mut payload)
+            .await
+            .map_err(|e| ReplicationError::Transport(format!("Failed to read payload: {}", e)))?;
 
         // Read checksum
         let mut checksum_buf = [0u8; 4];
-        reader.read_exact(&mut checksum_buf).await.map_err(|e| {
-            ReplicationError::Transport(format!("Failed to read checksum: {}", e))
-        })?;
+        reader
+            .read_exact(&mut checksum_buf)
+            .await
+            .map_err(|e| ReplicationError::Transport(format!("Failed to read checksum: {}", e)))?;
         let checksum = u32::from_be_bytes(checksum_buf);
 
         // Verify checksum
@@ -320,9 +321,10 @@ impl Message {
 
     pub async fn write_to<W: AsyncWrite + Unpin>(&self, writer: &mut W) -> Result<()> {
         let buf = self.encode();
-        writer.write_all(&buf).await.map_err(|e| {
-            ReplicationError::Transport(format!("Failed to write message: {}", e))
-        })?;
+        writer
+            .write_all(&buf)
+            .await
+            .map_err(|e| ReplicationError::Transport(format!("Failed to write message: {}", e)))?;
         Ok(())
     }
 }
@@ -743,10 +745,7 @@ pub enum ConnectionState {
 
 impl ReplicationConnection {
     /// Create a new connection (client side)
-    pub async fn connect(
-        addr: SocketAddr,
-        timeout: Duration,
-    ) -> Result<Self> {
+    pub async fn connect(addr: SocketAddr, timeout: Duration) -> Result<Self> {
         let stream = tokio::time::timeout(timeout, TcpStream::connect(addr))
             .await
             .map_err(|_| ReplicationError::Transport("Connection timeout".to_string()))?
@@ -771,7 +770,7 @@ impl ReplicationConnection {
 
         Self {
             stream,
-            remote_addr: remote_addr,
+            remote_addr,
             state: ConnectionState::Connecting,
             sequence: AtomicU64::new(0),
             handshake: None,
@@ -793,9 +792,7 @@ impl ReplicationConnection {
 
         let response = Message::read_from(&mut self.stream).await?;
         if response.header.msg_type != MessageType::HandshakeResponse {
-            return Err(ReplicationError::Transport(
-                "Expected HandshakeResponse".to_string(),
-            ));
+            return Err(ReplicationError::Transport("Expected HandshakeResponse".to_string()));
         }
 
         let handshake: HandshakeResponse = bincode::deserialize(&response.payload)
@@ -855,8 +852,8 @@ impl ReplicationConnection {
 
     /// Send acknowledgment
     pub async fn send_ack(&mut self, ack: AckPayload) -> Result<()> {
-        let payload = bincode::serialize(&ack)
-            .map_err(|e| ReplicationError::Transport(format!("Serialize failed: {}", e)))?;
+        let payload =
+            bincode::serialize(&ack).map_err(|e| ReplicationError::Transport(format!("Serialize failed: {}", e)))?;
 
         self.send(MessageType::Ack, Bytes::from(payload)).await?;
         Ok(())
@@ -1000,30 +997,19 @@ impl ReplicationServer {
     }
 
     /// Handle a client connection
-    async fn handle_connection(
-        stream: TcpStream,
-        addr: SocketAddr,
-        state: Arc<RwLock<ServerState>>,
-    ) -> Result<()> {
+    async fn handle_connection(stream: TcpStream, addr: SocketAddr, state: Arc<RwLock<ServerState>>) -> Result<()> {
         let mut conn = ReplicationConnection::from_stream(stream, addr);
 
         // Wait for handshake
         let msg = conn.recv().await?;
         if msg.header.msg_type != MessageType::HandshakeRequest {
-            return Err(ReplicationError::Transport(
-                "Expected HandshakeRequest".to_string(),
-            ));
+            return Err(ReplicationError::Transport("Expected HandshakeRequest".to_string()));
         }
 
         let request: HandshakeRequest = bincode::deserialize(&msg.payload)
             .map_err(|e| ReplicationError::Transport(format!("Deserialize failed: {}", e)))?;
 
-        tracing::info!(
-            "Handshake from {:?} node {} at {}",
-            request.role,
-            request.node_id,
-            addr
-        );
+        tracing::info!("Handshake from {:?} node {} at {}", request.role, request.node_id, addr);
 
         // Build response
         let state_guard = state.read().await;
@@ -1069,7 +1055,7 @@ impl ReplicationServer {
                     last_ack_lsn: request.current_lsn.unwrap_or(0),
                     last_ack_time: Instant::now(),
                     connection_tx: msg_tx,
-                }
+                },
             );
         }
 
@@ -1096,19 +1082,12 @@ impl ReplicationServer {
                                     standby.last_ack_lsn = ack.lsn;
                                     standby.last_ack_time = Instant::now();
                                 }
-                                tracing::trace!(
-                                    "Received ACK from {} for LSN {}",
-                                    request.node_id,
-                                    ack.lsn
-                                );
+                                tracing::trace!("Received ACK from {} for LSN {}", request.node_id, ack.lsn);
                             }
                         }
                         MessageType::Nack => {
                             // Handle negative acknowledgment
-                            tracing::warn!(
-                                "Received NACK from {}",
-                                request.node_id
-                            );
+                            tracing::warn!("Received NACK from {}", request.node_id);
                         }
                         _ => {
                             tracing::debug!(

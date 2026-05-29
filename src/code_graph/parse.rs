@@ -110,10 +110,7 @@ fn registry() -> &'static RwLock<HashMap<String, tree_sitter::Language>> {
 ///
 /// Idempotent: re-registering the same tag overwrites the previous
 /// entry. Returns the previous registration if any.
-pub fn register_grammar(
-    name: impl Into<String>,
-    grammar: tree_sitter::Language,
-) -> Option<tree_sitter::Language> {
+pub fn register_grammar(name: impl Into<String>, grammar: tree_sitter::Language) -> Option<tree_sitter::Language> {
     let mut m = registry().write();
     m.insert(name.into(), grammar)
 }
@@ -171,11 +168,7 @@ pub fn parse_by_name(lang_name: &str, source: &str) -> Result<tree_sitter::Tree>
 // has no eviction — at most ~10 entries per thread (one per supported
 // language plus any registered runtime grammars).  Parser is not Send,
 // which is exactly why we hold it in a thread-local.
-fn parse_with_cached(
-    cache_key: &str,
-    ts_lang: &tree_sitter::Language,
-    source: &str,
-) -> Result<tree_sitter::Tree> {
+fn parse_with_cached(cache_key: &str, ts_lang: &tree_sitter::Language, source: &str) -> Result<tree_sitter::Tree> {
     use std::cell::RefCell;
     use std::collections::HashMap;
     thread_local! {
@@ -185,9 +178,8 @@ fn parse_with_cached(
         let mut map = cell.borrow_mut();
         if !map.contains_key(cache_key) {
             let mut p = tree_sitter::Parser::new();
-            p.set_language(ts_lang).map_err(|e| {
-                Error::query_execution(format!("tree-sitter set_language failed: {e}"))
-            })?;
+            p.set_language(ts_lang)
+                .map_err(|e| Error::query_execution(format!("tree-sitter set_language failed: {e}")))?;
             map.insert(cache_key.to_string(), p);
         }
         let parser = map
@@ -203,9 +195,7 @@ fn grammar_for(lang: Language) -> tree_sitter::Language {
     match lang {
         Language::Rust => tree_sitter_rust::LANGUAGE.into(),
         Language::Python => tree_sitter_python::LANGUAGE.into(),
-        Language::TypeScript | Language::JavaScript => {
-            tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into()
-        }
+        Language::TypeScript | Language::JavaScript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
         Language::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
         Language::Go => tree_sitter_go::LANGUAGE.into(),
         Language::Markdown => tree_sitter_md::LANGUAGE.into(),

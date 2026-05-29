@@ -13,10 +13,10 @@
 //! - `performance` - Performance benchmarks
 //! - `cli_commands` - CLI integration
 
-mod session_management;
-mod lock_management;
-mod transaction_isolation;
+mod cli_commands;
 mod dump_restore;
+mod lock_management;
 mod multi_user_scenarios;
 mod performance;
-mod cli_commands;
+mod session_management;
+mod transaction_isolation;

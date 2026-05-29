@@ -1,8 +1,8 @@
 // Standalone test for trigger parsing
 // Compile with: rustc --edition 2021 test_trigger_manual.rs -L target/debug/deps --extern heliosdb_nano=target/debug/libheliosdb_nano.rlib
 
+use heliosdb_nano::sql::logical_plan::{LogicalPlan, TriggerEvent, TriggerFor, TriggerTiming};
 use heliosdb_nano::sql::{Parser, Planner};
-use heliosdb_nano::sql::logical_plan::{LogicalPlan, TriggerTiming, TriggerEvent, TriggerFor};
 
 fn main() {
     println!("=== HeliosDB Trigger Parser Manual Test ===\n");
@@ -14,12 +14,14 @@ fn main() {
 
     // Test 2: BEFORE UPDATE trigger
     println!("\nTest 2: BEFORE UPDATE trigger");
-    let sql = "CREATE TRIGGER update_timestamp BEFORE UPDATE ON products FOR EACH ROW EXECUTE FUNCTION update_modified_at()";
+    let sql =
+        "CREATE TRIGGER update_timestamp BEFORE UPDATE ON products FOR EACH ROW EXECUTE FUNCTION update_modified_at()";
     test_trigger(sql);
 
     // Test 3: INSTEAD OF DELETE trigger
     println!("\nTest 3: INSTEAD OF DELETE trigger");
-    let sql = "CREATE TRIGGER prevent_delete INSTEAD OF DELETE ON users FOR EACH ROW EXECUTE FUNCTION log_delete_attempt()";
+    let sql =
+        "CREATE TRIGGER prevent_delete INSTEAD OF DELETE ON users FOR EACH ROW EXECUTE FUNCTION log_delete_attempt()";
     test_trigger(sql);
 
     // Test 4: UPDATE OF specific columns
@@ -29,7 +31,8 @@ fn main() {
 
     // Test 5: FOR EACH STATEMENT
     println!("\nTest 5: FOR EACH STATEMENT trigger");
-    let sql = "CREATE TRIGGER bulk_audit AFTER INSERT ON orders FOR EACH STATEMENT EXECUTE FUNCTION audit_bulk_insert()";
+    let sql =
+        "CREATE TRIGGER bulk_audit AFTER INSERT ON orders FOR EACH STATEMENT EXECUTE FUNCTION audit_bulk_insert()";
     test_trigger(sql);
 
     // Test 6: OR REPLACE
@@ -73,7 +76,17 @@ fn test_trigger(sql: &str) {
                 Ok(plan) => {
                     println!("✓ Converted to logical plan successfully");
                     match plan {
-                        LogicalPlan::CreateTrigger { name, table_name, timing, events, for_each, when_condition, body, if_not_exists, .. } => {
+                        LogicalPlan::CreateTrigger {
+                            name,
+                            table_name,
+                            timing,
+                            events,
+                            for_each,
+                            when_condition,
+                            body,
+                            if_not_exists,
+                            ..
+                        } => {
                             println!("  Type: CREATE TRIGGER");
                             println!("  Name: {}", name);
                             println!("  Table: {}", table_name);
@@ -84,7 +97,11 @@ fn test_trigger(sql: &str) {
                             println!("  Body statements: {}", body.len());
                             println!("  OR REPLACE: {}", if_not_exists);
                         }
-                        LogicalPlan::DropTrigger { name, table_name, if_exists } => {
+                        LogicalPlan::DropTrigger {
+                            name,
+                            table_name,
+                            if_exists,
+                        } => {
                             println!("  Type: DROP TRIGGER");
                             println!("  Name: {}", name);
                             println!("  Table: {:?}", table_name);

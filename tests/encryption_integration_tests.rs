@@ -8,7 +8,7 @@
 //! - Performance overhead
 //! - Concurrent encryption operations
 
-use heliosdb_nano::crypto::{encrypt, decrypt, derive_key_from_password, EncryptionKey};
+use heliosdb_nano::crypto::{decrypt, derive_key_from_password, encrypt, EncryptionKey};
 use std::time::Instant;
 
 #[test]
@@ -115,8 +115,7 @@ fn test_key_derivation_from_password() {
     let password = "supersecretpassword123";
     let salt = b"unique_salt_1234";
 
-    let key = derive_key_from_password(password, salt)
-        .expect("Key derivation failed");
+    let key = derive_key_from_password(password, salt).expect("Key derivation failed");
 
     assert_eq!(key.len(), 32, "Key should be 256 bits (32 bytes)");
 }
@@ -126,10 +125,8 @@ fn test_key_derivation_deterministic() {
     let password = "mypassword";
     let salt = b"consistent_salt_";
 
-    let key1 = derive_key_from_password(password, salt)
-        .expect("Key derivation failed");
-    let key2 = derive_key_from_password(password, salt)
-        .expect("Key derivation failed");
+    let key1 = derive_key_from_password(password, salt).expect("Key derivation failed");
+    let key2 = derive_key_from_password(password, salt).expect("Key derivation failed");
 
     assert_eq!(key1, key2, "Same password and salt should produce same key");
 }
@@ -140,10 +137,8 @@ fn test_key_derivation_different_salts() {
     let salt1 = b"salt_version_001";
     let salt2 = b"salt_version_002";
 
-    let key1 = derive_key_from_password(password, salt1)
-        .expect("Key derivation failed");
-    let key2 = derive_key_from_password(password, salt2)
-        .expect("Key derivation failed");
+    let key1 = derive_key_from_password(password, salt1).expect("Key derivation failed");
+    let key2 = derive_key_from_password(password, salt2).expect("Key derivation failed");
 
     assert_ne!(key1, key2, "Different salts should produce different keys");
 }
@@ -154,10 +149,8 @@ fn test_key_derivation_different_passwords() {
     let password1 = "password123";
     let password2 = "password456";
 
-    let key1 = derive_key_from_password(password1, salt)
-        .expect("Key derivation failed");
-    let key2 = derive_key_from_password(password2, salt)
-        .expect("Key derivation failed");
+    let key1 = derive_key_from_password(password1, salt).expect("Key derivation failed");
+    let key2 = derive_key_from_password(password2, salt).expect("Key derivation failed");
 
     assert_ne!(key1, key2, "Different passwords should produce different keys");
 }
@@ -169,8 +162,7 @@ fn test_key_derivation_performance() {
 
     // Argon2 should take 50-500ms (intentionally slow for security)
     let start = Instant::now();
-    let _key = derive_key_from_password(password, salt)
-        .expect("Key derivation failed");
+    let _key = derive_key_from_password(password, salt).expect("Key derivation failed");
     let duration = start.elapsed();
 
     println!("Key derivation took: {:?}", duration);
@@ -189,8 +181,7 @@ fn test_encrypt_decrypt_with_derived_key() {
     let password = "user_password_123";
     let salt = b"user_salt_value_";
 
-    let key = derive_key_from_password(password, salt)
-        .expect("Key derivation failed");
+    let key = derive_key_from_password(password, salt).expect("Key derivation failed");
 
     let plaintext = b"User data to be encrypted";
     let ciphertext = encrypt(&key, plaintext).expect("Encryption failed");
@@ -235,22 +226,13 @@ fn test_encryption_various_data_sizes() {
     for size in test_sizes {
         let plaintext = vec![0x5A; size];
 
-        let ciphertext = encrypt(&key, &plaintext)
-            .expect(&format!("Encryption failed for {} bytes", size));
-        let decrypted = decrypt(&key, &ciphertext)
-            .expect(&format!("Decryption failed for {} bytes", size));
+        let ciphertext = encrypt(&key, &plaintext).expect(&format!("Encryption failed for {} bytes", size));
+        let decrypted = decrypt(&key, &ciphertext).expect(&format!("Decryption failed for {} bytes", size));
 
-        assert_eq!(
-            decrypted, plaintext,
-            "Encryption/decryption failed for {} bytes",
-            size
-        );
+        assert_eq!(decrypted, plaintext, "Encryption/decryption failed for {} bytes", size);
 
         // Ciphertext should be larger (nonce + auth tag)
-        assert!(
-            ciphertext.len() > size,
-            "Ciphertext should include overhead"
-        );
+        assert!(ciphertext.len() > size, "Ciphertext should include overhead");
     }
 }
 
@@ -267,10 +249,8 @@ fn test_concurrent_encryption() {
         let key_clone = Arc::clone(&key);
         let handle = thread::spawn(move || {
             let plaintext = format!("Message from thread {}", i);
-            let ciphertext = encrypt(&key_clone, plaintext.as_bytes())
-                .expect("Encryption failed");
-            let decrypted = decrypt(&key_clone, &ciphertext)
-                .expect("Decryption failed");
+            let ciphertext = encrypt(&key_clone, plaintext.as_bytes()).expect("Encryption failed");
+            let decrypted = decrypt(&key_clone, &ciphertext).expect("Decryption failed");
 
             assert_eq!(decrypted, plaintext.as_bytes());
         });
@@ -294,10 +274,7 @@ fn test_encryption_special_characters() {
     let decrypted = decrypt(&key, &ciphertext).expect("Decryption failed");
 
     assert_eq!(&decrypted[..], plaintext);
-    assert_eq!(
-        String::from_utf8(decrypted).unwrap(),
-        special_data
-    );
+    assert_eq!(String::from_utf8(decrypted).unwrap(), special_data);
 }
 
 #[test]
@@ -350,8 +327,7 @@ fn test_key_derivation_weak_password() {
     let weak_password = "123";
     let salt = b"salt____________";
 
-    let key = derive_key_from_password(weak_password, salt)
-        .expect("Key derivation failed");
+    let key = derive_key_from_password(weak_password, salt).expect("Key derivation failed");
 
     assert_eq!(key.len(), 32);
 

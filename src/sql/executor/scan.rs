@@ -4,10 +4,10 @@
 
 #![allow(elided_lifetimes_in_paths)]
 
-use crate::{Result, Error, Tuple, Schema};
-use crate::sql::LogicalPlan;
-use super::{PhysicalOperator, TimeoutContext, Executor};
+use super::{Executor, PhysicalOperator, TimeoutContext};
 use crate::sql::logical_plan::LogicalExpr;
+use crate::sql::LogicalPlan;
+use crate::{Error, Result, Schema, Tuple};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -70,7 +70,12 @@ fn collect_plan_columns(
         LogicalPlan::Scan { table_name, schema, .. } => {
             tables.push((table_name.clone(), schema.clone()));
         }
-        LogicalPlan::FilteredScan { table_name, schema, predicate, .. } => {
+        LogicalPlan::FilteredScan {
+            table_name,
+            schema,
+            predicate,
+            ..
+        } => {
             tables.push((table_name.clone(), schema.clone()));
             if let Some(p) = predicate {
                 collect_expr_columns(p, cols, bail);
@@ -80,7 +85,12 @@ fn collect_plan_columns(
             collect_expr_columns(predicate, cols, bail);
             collect_plan_columns(input, cols, tables, bail);
         }
-        LogicalPlan::Project { input, exprs, distinct_on, .. } => {
+        LogicalPlan::Project {
+            input,
+            exprs,
+            distinct_on,
+            ..
+        } => {
             for e in exprs {
                 collect_expr_columns(e, cols, bail);
             }
@@ -91,7 +101,12 @@ fn collect_plan_columns(
             }
             collect_plan_columns(input, cols, tables, bail);
         }
-        LogicalPlan::Aggregate { input, group_by, aggr_exprs, having } => {
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            having,
+        } => {
             for e in group_by {
                 collect_expr_columns(e, cols, bail);
             }
@@ -141,7 +156,11 @@ fn collect_expr_columns(expr: &LogicalExpr, cols: &mut HashSet<String>, bail: &m
                 collect_expr_columns(a, cols, bail);
             }
         }
-        LogicalExpr::Case { expr, when_then, else_result } => {
+        LogicalExpr::Case {
+            expr,
+            when_then,
+            else_result,
+        } => {
             if let Some(e) = expr {
                 collect_expr_columns(e, cols, bail);
             }
@@ -171,7 +190,12 @@ fn collect_expr_columns(expr: &LogicalExpr, cols: &mut HashSet<String>, bail: &m
             collect_expr_columns(array, cols, bail);
             collect_expr_columns(index, cols, bail);
         }
-        LogicalExpr::WindowFunction { args, partition_by, order_by, .. } => {
+        LogicalExpr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
             for a in args {
                 collect_expr_columns(a, cols, bail);
             }
@@ -242,16 +266,15 @@ impl PhysicalOperator for ScanOperator {
         }
 
         let tuple = std::mem::take(
-            self.tuples.get_mut(self.current_index)
-                .ok_or_else(|| Error::query_execution("Scan index out of bounds"))?
+            self.tuples
+                .get_mut(self.current_index)
+                .ok_or_else(|| Error::query_execution("Scan index out of bounds"))?,
         );
         self.current_index += 1;
 
         // Apply projection if specified
         if let Some(indices) = &self.projection {
-            let projected_values: Vec<_> = indices.iter()
-                .filter_map(|&i| tuple.get(i).cloned())
-                .collect();
+            let projected_values: Vec<_> = indices.iter().filter_map(|&i| tuple.get(i).cloned()).collect();
             let mut projected_tuple = Tuple::new(projected_values);
             // Preserve row_id through projection for DML operations
             projected_tuple.row_id = tuple.row_id;
@@ -263,7 +286,8 @@ impl PhysicalOperator for ScanOperator {
 
     fn schema(&self) -> Arc<Schema> {
         if let Some(indices) = &self.projection {
-            let columns: Vec<_> = indices.iter()
+            let columns: Vec<_> = indices
+                .iter()
                 .filter_map(|&i| self.schema.columns.get(i).cloned())
                 .collect();
             Arc::new(Schema { columns })
@@ -304,12 +328,7 @@ pub struct VectorScanOperator {
 
 impl VectorScanOperator {
     /// Create a new vector scan operator.  No pre-filter.
-    pub fn new(
-        table_name: String,
-        schema: Arc<Schema>,
-        results: Vec<(u64, f32)>,
-        tuples: Vec<Tuple>,
-    ) -> Self {
+    pub fn new(table_name: String, schema: Arc<Schema>, results: Vec<(u64, f32)>, tuples: Vec<Tuple>) -> Self {
         Self {
             table_name,
             schema,
@@ -353,17 +372,14 @@ impl PhysicalOperator for VectorScanOperator {
                 .tuples
                 .get(self.current_index)
                 .cloned()
-                .ok_or_else(|| {
-                    Error::query_execution("Vector scan index out of bounds")
-                })?;
+                .ok_or_else(|| Error::query_execution("Vector scan index out of bounds"))?;
             self.current_index += 1;
             // Fast path: no pre-filter.
             let Some(pred) = &self.prefilter else {
                 return Ok(Some(tuple));
             };
             if self.evaluator.is_none() {
-                self.evaluator =
-                    Some(crate::sql::Evaluator::new(self.schema.clone()));
+                self.evaluator = Some(crate::sql::Evaluator::new(self.schema.clone()));
             }
             let pass = match self.evaluator.as_ref() {
                 Some(ev) => match ev.evaluate(pred, &tuple) {
@@ -412,7 +428,10 @@ impl PhysicalOperator for MaterializedOperator {
             return Ok(None);
         }
 
-        let tuple = self.tuples.get(self.current_index).cloned()
+        let tuple = self
+            .tuples
+            .get(self.current_index)
+            .cloned()
             .ok_or_else(|| Error::query_execution("Materialized index out of bounds"))?;
         self.current_index += 1;
 
@@ -425,11 +444,15 @@ impl PhysicalOperator for MaterializedOperator {
 }
 
 /// Handle Scan logical plan node
-pub(super) fn handle_scan(
-    executor: &Executor,
-    plan: &LogicalPlan,
-) -> Result<Box<dyn PhysicalOperator>> {
-    if let LogicalPlan::Scan { table_name, alias, schema: _plan_schema, projection, as_of } = plan {
+pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
+    if let LogicalPlan::Scan {
+        table_name,
+        alias,
+        schema: _plan_schema,
+        projection,
+        as_of,
+    } = plan
+    {
         // Use alias for column source_table (for JOIN disambiguation), fallback to table_name
         let source_name = alias.as_ref().unwrap_or(table_name);
 
@@ -442,13 +465,16 @@ pub(super) fn handle_scan(
                 col.source_table_name = Some(table_name.clone());
             }
 
-            return Ok(Box::new(ScanOperator::new(
-                table_name.clone(),
-                Arc::new(schema_with_source),
-                projection.clone(),
-                cte_data.tuples.clone(),
-                executor.parameters().to_vec(),
-            ).with_timeout(executor.timeout_ctx())));
+            return Ok(Box::new(
+                ScanOperator::new(
+                    table_name.clone(),
+                    Arc::new(schema_with_source),
+                    projection.clone(),
+                    cte_data.tuples.clone(),
+                    executor.parameters().to_vec(),
+                )
+                .with_timeout(executor.timeout_ctx()),
+            ));
         }
 
         // KanttBan #22 (v3.31.0): system-view source (pg_namespace,
@@ -459,11 +485,9 @@ pub(super) fn handle_scan(
         use crate::sql::phase3::SystemViewRegistry;
         let registry = SystemViewRegistry::new();
         if registry.is_system_view(table_name) {
-            let storage = executor.storage().ok_or_else(|| {
-                Error::query_execution(
-                    "system view requires storage context".to_string(),
-                )
-            })?;
+            let storage = executor
+                .storage()
+                .ok_or_else(|| Error::query_execution("system view requires storage context".to_string()))?;
             let mut schema = registry
                 .get_schema(table_name)
                 .cloned()
@@ -473,174 +497,178 @@ pub(super) fn handle_scan(
                 col.source_table_name = Some(table_name.clone());
             }
             let tuples = registry.execute(table_name, storage)?;
-            return Ok(Box::new(ScanOperator::new(
-                table_name.clone(),
-                Arc::new(schema),
-                projection.clone(),
-                tuples,
-                executor.parameters().to_vec(),
-            ).with_timeout(executor.timeout_ctx())));
+            return Ok(Box::new(
+                ScanOperator::new(
+                    table_name.clone(),
+                    Arc::new(schema),
+                    projection.clone(),
+                    tuples,
+                    executor.parameters().to_vec(),
+                )
+                .with_timeout(executor.timeout_ctx()),
+            ));
         }
 
         // Fetch actual schema from storage and scan table
-        let (actual_schema, tuples) = if let Some(storage) = executor.storage() {
-            let catalog = storage.catalog();
-            let mv_catalog = storage.mv_catalog();
+        let (actual_schema, tuples) =
+            if let Some(storage) = executor.storage() {
+                let catalog = storage.catalog();
+                let mv_catalog = storage.mv_catalog();
 
-            // First check if it's a materialized view
-            // We need to do this first because MVs are stored in __mv_<name> tables
-            let (schema, actual_table_name) = if mv_catalog.view_exists(table_name)? {
-                let mv_metadata = mv_catalog.get_view(table_name)?;
-                let mv_data_table = crate::storage::MaterializedViewCatalog::mv_data_table_name(table_name);
+                // First check if it's a materialized view
+                // We need to do this first because MVs are stored in __mv_<name> tables
+                let (schema, actual_table_name) = if mv_catalog.view_exists(table_name)? {
+                    let mv_metadata = mv_catalog.get_view(table_name)?;
+                    let mv_data_table = crate::storage::MaterializedViewCatalog::mv_data_table_name(table_name);
 
-                // Check if MV data table exists (view has been refreshed)
-                if !catalog.table_exists(&mv_data_table)? {
-                    return Err(Error::query_execution(format!(
+                    // Check if MV data table exists (view has been refreshed)
+                    if !catalog.table_exists(&mv_data_table)? {
+                        return Err(Error::query_execution(format!(
                         "Materialized view '{}' exists but has never been refreshed. Run: REFRESH MATERIALIZED VIEW {}",
                         table_name, table_name
                     )));
-                }
+                    }
 
-                (mv_metadata.schema, mv_data_table)
-            } else {
-                // Not an MV, try regular table
-                match catalog.get_table_schema(table_name) {
-                    Ok(schema) => (schema, table_name.clone()),
-                    Err(e) => return Err(e),
-                }
-            };
+                    (mv_metadata.schema, mv_data_table)
+                } else {
+                    // Not an MV, try regular table
+                    match catalog.get_table_schema(table_name) {
+                        Ok(schema) => (schema, table_name.clone()),
+                        Err(e) => return Err(e),
+                    }
+                };
 
-            // Handle time-travel or transactional queries
-            let tuples = if let Some(txn) = executor.transaction() {
-                // Transactional scan: read at transaction's snapshot
-                let base_tuples = storage.scan_table_at_snapshot(&actual_table_name, txn.snapshot_id())?;
-                
-                // Merge with write set from transaction for read-your-own-writes
-                txn.merge_with_write_set(&actual_table_name, base_tuples)?
-            } else if let Some(as_of_clause) = as_of {
-                tracing::debug!(
-                    "Time-travel query on table '{}' (actual: '{}') with AS OF clause: {:?}",
-                    table_name,
-                    actual_table_name,
-                    as_of_clause
-                );
+                // Handle time-travel or transactional queries
+                let tuples =
+                    if let Some(txn) = executor.transaction() {
+                        // Transactional scan: read at transaction's snapshot
+                        let base_tuples = storage.scan_table_at_snapshot(&actual_table_name, txn.snapshot_id())?;
 
-                let snapshot_mgr = storage.snapshot_manager();
+                        // Merge with write set from transaction for read-your-own-writes
+                        txn.merge_with_write_set(&actual_table_name, base_tuples)?
+                    } else if let Some(as_of_clause) = as_of {
+                        tracing::debug!(
+                            "Time-travel query on table '{}' (actual: '{}') with AS OF clause: {:?}",
+                            table_name,
+                            actual_table_name,
+                            as_of_clause
+                        );
 
-                // Handle VERSIONS BETWEEN separately - returns all versions in range
-                if let crate::sql::logical_plan::AsOfClause::VersionsBetween { start, end } = as_of_clause {
-                    tracing::debug!(
-                        "VERSIONS BETWEEN query: start={:?}, end={:?}",
-                        start, end
-                    );
+                        let snapshot_mgr = storage.snapshot_manager();
 
-                    // Resolve start and end to internal LSN timestamps for version lookup
-                    let start_ts = snapshot_mgr.resolve_timestamp_for_range(start, true)?;
-                    let end_ts = snapshot_mgr.resolve_timestamp_for_range(end, false)?;
+                        // Handle VERSIONS BETWEEN separately - returns all versions in range
+                        if let crate::sql::logical_plan::AsOfClause::VersionsBetween { start, end } = as_of_clause {
+                            tracing::debug!("VERSIONS BETWEEN query: start={:?}, end={:?}", start, end);
 
-                    tracing::debug!(
-                        "Resolved VERSIONS BETWEEN timestamps: {} to {}",
-                        start_ts, end_ts
-                    );
+                            // Resolve start and end to internal LSN timestamps for version lookup
+                            let start_ts = snapshot_mgr.resolve_timestamp_for_range(start, true)?;
+                            let end_ts = snapshot_mgr.resolve_timestamp_for_range(end, false)?;
 
-                    // Scan all versions in range
-                    let versions = snapshot_mgr.scan_versions_between(&actual_table_name, start_ts, end_ts)?;
+                            tracing::debug!("Resolved VERSIONS BETWEEN timestamps: {} to {}", start_ts, end_ts);
 
-                    tracing::debug!(
-                        "VERSIONS BETWEEN scan returned {} versions from table '{}'",
-                        versions.len(),
-                        table_name
-                    );
+                            // Scan all versions in range
+                            let versions = snapshot_mgr.scan_versions_between(&actual_table_name, start_ts, end_ts)?;
 
-                    // Convert raw version bytes to tuples (RocksDB handles decompression at block level)
-                    let mut tuples = Vec::with_capacity(versions.len());
-                    for (row_id, timestamp, value_bytes) in versions {
-                        // Deserialize tuple directly (RocksDB LZ4 handles decompression)
-                        match bincode::deserialize::<crate::Tuple>(&value_bytes) {
-                            Ok(mut tuple) => {
-                                tuple.row_id = Some(row_id);
-                                tuples.push(tuple);
-                            }
-                            Err(e) => {
-                                tracing::warn!(
+                            tracing::debug!(
+                                "VERSIONS BETWEEN scan returned {} versions from table '{}'",
+                                versions.len(),
+                                table_name
+                            );
+
+                            // Convert raw version bytes to tuples (RocksDB handles decompression at block level)
+                            let mut tuples = Vec::with_capacity(versions.len());
+                            for (row_id, timestamp, value_bytes) in versions {
+                                // Deserialize tuple directly (RocksDB LZ4 handles decompression)
+                                match bincode::deserialize::<crate::Tuple>(&value_bytes) {
+                                    Ok(mut tuple) => {
+                                        tuple.row_id = Some(row_id);
+                                        tuples.push(tuple);
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
                                     "Failed to deserialize version at row_id={}, timestamp={}: {} (data len={})",
                                     row_id, timestamp, e, value_bytes.len()
                                 );
+                                    }
+                                }
                             }
-                        }
-                    }
 
-                    tuples
-                } else {
-                    // Regular AS OF query - single point in time
-                    // Resolve AS OF clause to snapshot timestamp
-                    // Supports: AS OF TIMESTAMP '...', AS OF TRANSACTION <id>, AS OF SCN <id>
-                    let snapshot_ts = snapshot_mgr.resolve_as_of(as_of_clause)
-                        .map_err(|e| {
-                            tracing::error!(
-                                "Failed to resolve AS OF clause {:?} for table '{}': {}",
-                                as_of_clause,
-                                table_name,
+                            tuples
+                        } else {
+                            // Regular AS OF query - single point in time
+                            // Resolve AS OF clause to snapshot timestamp
+                            // Supports: AS OF TIMESTAMP '...', AS OF TRANSACTION <id>, AS OF SCN <id>
+                            let snapshot_ts = snapshot_mgr.resolve_as_of(as_of_clause).map_err(|e| {
+                                tracing::error!(
+                                    "Failed to resolve AS OF clause {:?} for table '{}': {}",
+                                    as_of_clause,
+                                    table_name,
+                                    e
+                                );
                                 e
+                            })?;
+
+                            tracing::debug!(
+                                "Resolved AS OF clause to snapshot timestamp {} for table '{}'",
+                                snapshot_ts,
+                                table_name
                             );
-                            e
-                        })?;
 
-                    tracing::debug!(
-                        "Resolved AS OF clause to snapshot timestamp {} for table '{}'",
-                        snapshot_ts,
-                        table_name
-                    );
+                            // Scan at historical snapshot (use actual_table_name for MV support)
+                            let result = storage.scan_table_at_snapshot(&actual_table_name, snapshot_ts)?;
 
-                    // Scan at historical snapshot (use actual_table_name for MV support)
-                    let result = storage.scan_table_at_snapshot(&actual_table_name, snapshot_ts)?;
+                            tracing::debug!(
+                                "Time-travel scan returned {} tuples from table '{}' at snapshot {}",
+                                result.len(),
+                                table_name,
+                                snapshot_ts
+                            );
 
-                    tracing::debug!(
-                        "Time-travel scan returned {} tuples from table '{}' at snapshot {}",
-                        result.len(),
-                        table_name,
-                        snapshot_ts
-                    );
+                            result
+                        }
+                    } else {
+                        // Normal scan (current data) with branch isolation.
+                        // Use actual_table_name to support materialized views.
+                        // Pass pre-fetched schema to avoid duplicate lookup inside scan_table.
+                        // Issue #1 follow-up: when the executor's needed-column analysis is
+                        // certain (single regular table, no wildcard/subquery), decode only the
+                        // leading columns and skip the costly tail.
+                        match executor.scan_prefix_hint_for(table_name) {
+                            Some(prefix_len) if actual_table_name == *table_name => storage
+                                .scan_table_branch_aware_with_schema_prefix(&actual_table_name, &schema, prefix_len)?,
+                            _ => storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?,
+                        }
+                    };
 
-                    result
-                }
+                // Set source_table (alias) and source_table_name (actual) on each column for JOIN disambiguation
+                // This allows both `e.name` (alias) and `employees.name` (full name) syntax in queries
+                let schema_with_source = Schema {
+                    columns: schema
+                        .columns
+                        .into_iter()
+                        .map(|mut col| {
+                            col.source_table = Some(source_name.clone());
+                            col.source_table_name = Some(table_name.clone());
+                            col
+                        })
+                        .collect(),
+                };
+                (Arc::new(schema_with_source), tuples)
             } else {
-                // Normal scan (current data) with branch isolation.
-                // Use actual_table_name to support materialized views.
-                // Pass pre-fetched schema to avoid duplicate lookup inside scan_table.
-                // Issue #1 follow-up: when the executor's needed-column analysis is
-                // certain (single regular table, no wildcard/subquery), decode only the
-                // leading columns and skip the costly tail.
-                match executor.scan_prefix_hint_for(table_name) {
-                    Some(prefix_len) if actual_table_name == *table_name => {
-                        storage.scan_table_branch_aware_with_schema_prefix(&actual_table_name, &schema, prefix_len)?
-                    }
-                    _ => storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?,
-                }
+                // No storage, use placeholder schema from plan
+                (_plan_schema.clone(), Vec::new())
             };
 
-            // Set source_table (alias) and source_table_name (actual) on each column for JOIN disambiguation
-            // This allows both `e.name` (alias) and `employees.name` (full name) syntax in queries
-            let schema_with_source = Schema {
-                columns: schema.columns.into_iter().map(|mut col| {
-                    col.source_table = Some(source_name.clone());
-                    col.source_table_name = Some(table_name.clone());
-                    col
-                }).collect(),
-            };
-            (Arc::new(schema_with_source), tuples)
-        } else {
-            // No storage, use placeholder schema from plan
-            (_plan_schema.clone(), Vec::new())
-        };
-
-        Ok(Box::new(ScanOperator::new(
-            table_name.clone(),
-            actual_schema,
-            projection.clone(),
-            tuples,
-            executor.parameters().to_vec(),
-        ).with_timeout(executor.timeout_ctx())))
+        Ok(Box::new(
+            ScanOperator::new(
+                table_name.clone(),
+                actual_schema,
+                projection.clone(),
+                tuples,
+                executor.parameters().to_vec(),
+            )
+            .with_timeout(executor.timeout_ctx()),
+        ))
     } else {
         Err(Error::query_execution("Expected Scan plan node"))
     }
@@ -650,11 +678,16 @@ pub(super) fn handle_scan(
 ///
 /// This handles scans with storage-level predicate pushdown, using bloom filters,
 /// zone maps, and SIMD-accelerated filtering for improved performance.
-pub(super) fn handle_filtered_scan(
-    executor: &Executor,
-    plan: &LogicalPlan,
-) -> Result<Box<dyn PhysicalOperator>> {
-    if let LogicalPlan::FilteredScan { table_name, alias, schema: _plan_schema, projection, predicate, as_of } = plan {
+pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
+    if let LogicalPlan::FilteredScan {
+        table_name,
+        alias,
+        schema: _plan_schema,
+        projection,
+        predicate,
+        as_of,
+    } = plan
+    {
         // Use alias for column source_table (for JOIN disambiguation), fallback to table_name
         let source_name = alias.as_ref().unwrap_or(table_name);
 
@@ -668,13 +701,16 @@ pub(super) fn handle_filtered_scan(
             }
 
             let schema_arc = Arc::new(schema_with_source);
-            let scan_op = Box::new(ScanOperator::new(
-                table_name.clone(),
-                schema_arc.clone(),
-                projection.clone(),
-                cte_data.tuples.clone(),
-                executor.parameters().to_vec(),
-            ).with_timeout(executor.timeout_ctx()));
+            let scan_op = Box::new(
+                ScanOperator::new(
+                    table_name.clone(),
+                    schema_arc.clone(),
+                    projection.clone(),
+                    cte_data.tuples.clone(),
+                    executor.parameters().to_vec(),
+                )
+                .with_timeout(executor.timeout_ctx()),
+            );
 
             // Apply filter if predicate exists
             if let Some(pred) = predicate {
@@ -741,10 +777,10 @@ pub(super) fn handle_filtered_scan(
             let tuples = if let Some(txn) = executor.transaction() {
                 // Transactional scan: read at transaction's snapshot
                 let base_tuples = storage.scan_table_at_snapshot(&actual_table_name, txn.snapshot_id())?;
-                
+
                 // Merge with write set
                 let merged_tuples = txn.merge_with_write_set(&actual_table_name, base_tuples)?;
-                
+
                 // Apply storage-level filtering (on the merged set)
                 storage.predicate_pushdown().scan_with_pushdown(
                     &actual_table_name,
@@ -789,19 +825,20 @@ pub(super) fn handle_filtered_scan(
                 )
             };
 
-            tracing::debug!(
-                "FilteredScan returned {} tuples after predicate pushdown",
-                tuples.len()
-            );
+            tracing::debug!("FilteredScan returned {} tuples after predicate pushdown", tuples.len());
 
             // Set source_table (alias) and source_table_name (actual) on each column for JOIN disambiguation
             // This allows both `e.name` (alias) and `employees.name` (full name) syntax in queries
             let schema_with_source = Schema {
-                columns: schema.columns.into_iter().map(|mut col| {
-                    col.source_table = Some(source_name.clone());
-                    col.source_table_name = Some(table_name.clone());
-                    col
-                }).collect(),
+                columns: schema
+                    .columns
+                    .into_iter()
+                    .map(|mut col| {
+                        col.source_table = Some(source_name.clone());
+                        col.source_table_name = Some(table_name.clone());
+                        col
+                    })
+                    .collect(),
             };
             (Arc::new(schema_with_source), tuples)
         } else {
@@ -809,13 +846,16 @@ pub(super) fn handle_filtered_scan(
             (_plan_schema.clone(), Vec::new())
         };
 
-        Ok(Box::new(ScanOperator::new(
-            table_name.clone(),
-            actual_schema,
-            projection.clone(),
-            tuples,
-            executor.parameters().to_vec(),
-        ).with_timeout(executor.timeout_ctx())))
+        Ok(Box::new(
+            ScanOperator::new(
+                table_name.clone(),
+                actual_schema,
+                projection.clone(),
+                tuples,
+                executor.parameters().to_vec(),
+            )
+            .with_timeout(executor.timeout_ctx()),
+        ))
     } else {
         Err(Error::query_execution("Expected FilteredScan plan node"))
     }
@@ -919,7 +959,10 @@ impl PhysicalOperator for UnnestOperator {
             return Ok(None);
         }
 
-        let value = self.values.get(self.current_index).cloned()
+        let value = self
+            .values
+            .get(self.current_index)
+            .cloned()
             .ok_or_else(|| Error::query_execution("Unnest index out of bounds"))?;
         self.current_index += 1;
 
@@ -958,15 +1001,16 @@ fn eval_table_function_arg(expr: &crate::sql::LogicalExpr, params: &[crate::Valu
         LogicalExpr::Literal(crate::Value::Int2(v)) => Ok(i64::from(*v)),
         LogicalExpr::Literal(crate::Value::Float4(v)) => Ok(*v as i64),
         LogicalExpr::Literal(crate::Value::Float8(v)) => Ok(*v as i64),
-        LogicalExpr::UnaryExpr { op: crate::sql::UnaryOperator::Minus, expr: inner } => {
+        LogicalExpr::UnaryExpr {
+            op: crate::sql::UnaryOperator::Minus,
+            expr: inner,
+        } => {
             let val = eval_table_function_arg(inner, params)?;
             Ok(-val)
         }
         LogicalExpr::Parameter { index } => {
             if *index == 0 || *index > params.len() {
-                return Err(Error::query_execution(format!(
-                    "Parameter ${} out of range", index
-                )));
+                return Err(Error::query_execution(format!("Parameter ${} out of range", index)));
             }
             // Safety: index validated in range 1..=params.len() above
             #[allow(clippy::indexing_slicing)]
@@ -975,42 +1019,48 @@ fn eval_table_function_arg(expr: &crate::sql::LogicalExpr, params: &[crate::Valu
                 crate::Value::Int8(v) => Ok(*v),
                 crate::Value::Int2(v) => Ok(i64::from(*v)),
                 other => Err(Error::query_execution(format!(
-                    "Expected integer parameter for table function, got {:?}", other
+                    "Expected integer parameter for table function, got {:?}",
+                    other
                 ))),
             }
         }
-        other => {
-            Err(Error::query_execution(format!(
-                "Table function argument must be a literal integer, got {:?}", other
-            )))
-        }
+        other => Err(Error::query_execution(format!(
+            "Table function argument must be a literal integer, got {:?}",
+            other
+        ))),
     }
 }
 
 /// Handle TableFunction logical plan node
-pub(super) fn handle_table_function(
-    executor: &Executor,
-    plan: &LogicalPlan,
-) -> Result<Box<dyn PhysicalOperator>> {
-    if let LogicalPlan::TableFunction { function_name, args, alias } = plan {
+pub(super) fn handle_table_function(executor: &Executor, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
+    if let LogicalPlan::TableFunction {
+        function_name,
+        args,
+        alias,
+    } = plan
+    {
         match function_name.as_str() {
             "generate_series" => {
                 if args.len() < 2 || args.len() > 3 {
                     return Err(Error::query_execution(
-                        "generate_series requires 2 or 3 arguments: generate_series(start, stop[, step])"
+                        "generate_series requires 2 or 3 arguments: generate_series(start, stop[, step])",
                     ));
                 }
                 let params = executor.parameters();
-                let start = eval_table_function_arg(args.first()
-                    .ok_or_else(|| Error::query_execution("Missing start argument"))?, params)?;
-                let stop = eval_table_function_arg(args.get(1)
-                    .ok_or_else(|| Error::query_execution("Missing stop argument"))?, params)?;
+                let start = eval_table_function_arg(
+                    args.first()
+                        .ok_or_else(|| Error::query_execution("Missing start argument"))?,
+                    params,
+                )?;
+                let stop = eval_table_function_arg(
+                    args.get(1)
+                        .ok_or_else(|| Error::query_execution("Missing stop argument"))?,
+                    params,
+                )?;
                 let step = if let Some(step_expr) = args.get(2) {
                     let s = eval_table_function_arg(step_expr, params)?;
                     if s == 0 {
-                        return Err(Error::query_execution(
-                            "generate_series step cannot be zero"
-                        ));
+                        return Err(Error::query_execution("generate_series step cannot be zero"));
                     }
                     s
                 } else {
@@ -1022,9 +1072,7 @@ pub(super) fn handle_table_function(
             }
             "unnest" => {
                 if args.is_empty() {
-                    return Err(Error::query_execution(
-                        "unnest requires at least one argument"
-                    ));
+                    return Err(Error::query_execution("unnest requires at least one argument"));
                 }
                 // For unnest, we expect array literal expressions
                 // Arrays are parsed as Literal(Value::Array(...)) by the planner
@@ -1039,9 +1087,7 @@ pub(super) fn handle_table_function(
                             values.push(v.clone());
                         }
                         _ => {
-                            return Err(Error::query_execution(
-                                "UNNEST argument must be an array expression"
-                            ));
+                            return Err(Error::query_execution("UNNEST argument must be an array expression"));
                         }
                     }
                 }
@@ -1050,7 +1096,8 @@ pub(super) fn handle_table_function(
                 Ok(Box::new(UnnestOperator::new(values, schema)))
             }
             _ => Err(Error::query_execution(format!(
-                "Unknown table function: {}", function_name
+                "Unknown table function: {}",
+                function_name
             ))),
         }
     } else {
@@ -1075,9 +1122,9 @@ mod tests {
                 primary_key: true,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             }],
         });
 

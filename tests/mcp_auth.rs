@@ -20,11 +20,7 @@ use serde_json::{json, Value};
 fn make_token(secret: &[u8], scopes: &[&str]) -> String {
     let mgr = JwtManager::new(secret);
     let raw = mgr
-        .generate_token(
-            "u".into(),
-            "t".into(),
-            uuid::Uuid::new_v4(),
-        )
+        .generate_token("u".into(), "t".into(), uuid::Uuid::new_v4())
         .unwrap();
     let mut claims = mgr.validate_token(&raw).unwrap();
     claims.scopes = scopes.iter().map(|s| (*s).to_string()).collect();

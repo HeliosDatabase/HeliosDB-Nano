@@ -2,24 +2,19 @@
 //!
 //! Tests SSL/TLS encryption for PostgreSQL wire protocol connections.
 
+use heliosdb_nano::protocol::postgres::{AuthMethod, CertificateManager, PgServerBuilder, SslConfig, SslMode};
 use heliosdb_nano::{EmbeddedDatabase, Result};
-use heliosdb_nano::protocol::postgres::{
-    PgServerBuilder, SslConfig, SslMode, CertificateManager, AuthMethod
-};
-use std::sync::Arc;
 use std::net::SocketAddr;
-use tokio::net::TcpStream;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 
 /// SSL request message code
 const SSL_REQUEST_CODE: i32 = 80877103;
 
 /// Create test server with SSL
-async fn create_ssl_server(
-    ssl_mode: SslMode,
-    port: u16,
-) -> Result<(Arc<EmbeddedDatabase>, SocketAddr)> {
+async fn create_ssl_server(ssl_mode: SslMode, port: u16) -> Result<(Arc<EmbeddedDatabase>, SocketAddr)> {
     // Setup test certificates
     CertificateManager::setup_test_certs()?;
 
@@ -27,14 +22,11 @@ async fn create_ssl_server(
     let db = Arc::new(EmbeddedDatabase::new_in_memory()?);
 
     // Configure SSL
-    let ssl_config = SslConfig::new(
-        ssl_mode,
-        "certs/server.crt",
-        "certs/server.key",
-    );
+    let ssl_config = SslConfig::new(ssl_mode, "certs/server.crt", "certs/server.key");
 
     // Build server
-    let addr: SocketAddr = format!("127.0.0.1:{}", port).parse()
+    let addr: SocketAddr = format!("127.0.0.1:{}", port)
+        .parse()
         .map_err(|e| heliosdb_nano::Error::config(format!("Invalid address: {}", e)))?;
 
     let server = PgServerBuilder::new()
@@ -61,19 +53,27 @@ async fn create_ssl_server(
 async fn send_ssl_request(stream: &mut TcpStream) -> Result<bool> {
     // Send SSL request message
     // Length (8 bytes total)
-    stream.write_i32(8).await
+    stream
+        .write_i32(8)
+        .await
         .map_err(|e| heliosdb_nano::Error::network(format!("Write failed: {}", e)))?;
 
     // SSL request code
-    stream.write_i32(SSL_REQUEST_CODE).await
+    stream
+        .write_i32(SSL_REQUEST_CODE)
+        .await
         .map_err(|e| heliosdb_nano::Error::network(format!("Write failed: {}", e)))?;
 
-    stream.flush().await
+    stream
+        .flush()
+        .await
         .map_err(|e| heliosdb_nano::Error::network(format!("Flush failed: {}", e)))?;
 
     // Read response (should be 'S' or 'N')
     let mut response = [0u8; 1];
-    stream.read_exact(&mut response).await
+    stream
+        .read_exact(&mut response)
+        .await
         .map_err(|e| heliosdb_nano::Error::network(format!("Read failed: {}", e)))?;
 
     Ok(response[0] == b'S')
@@ -85,7 +85,8 @@ async fn test_ssl_mode_allow_accepts_ssl_request() -> Result<()> {
     let (_db, addr) = create_ssl_server(SslMode::Allow, 15432).await?;
 
     // Connect to server
-    let mut stream = TcpStream::connect(addr).await
+    let mut stream = TcpStream::connect(addr)
+        .await
         .map_err(|e| heliosdb_nano::Error::network(format!("Connection failed: {}", e)))?;
 
     // Send SSL request
@@ -105,13 +106,10 @@ async fn test_ssl_mode_disable_rejects_ssl_request() -> Result<()> {
     let db = Arc::new(EmbeddedDatabase::new_in_memory()?);
 
     // Configure SSL as disabled
-    let ssl_config = SslConfig::new(
-        SslMode::Disable,
-        "certs/server.crt",
-        "certs/server.key",
-    );
+    let ssl_config = SslConfig::new(SslMode::Disable, "certs/server.crt", "certs/server.key");
 
-    let addr: SocketAddr = "127.0.0.1:15433".parse()
+    let addr: SocketAddr = "127.0.0.1:15433"
+        .parse()
         .map_err(|e| heliosdb_nano::Error::config(format!("Invalid address: {}", e)))?;
 
     let server = PgServerBuilder::new()
@@ -132,7 +130,8 @@ async fn test_ssl_mode_disable_rejects_ssl_request() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // Connect to server
-    let mut stream = TcpStream::connect(server_addr).await
+    let mut stream = TcpStream::connect(server_addr)
+        .await
         .map_err(|e| heliosdb_nano::Error::network(format!("Connection failed: {}", e)))?;
 
     // Send SSL request
@@ -150,7 +149,8 @@ async fn test_ssl_mode_require() -> Result<()> {
     let (_db, addr) = create_ssl_server(SslMode::Require, 15434).await?;
 
     // Connect to server
-    let mut stream = TcpStream::connect(addr).await
+    let mut stream = TcpStream::connect(addr)
+        .await
         .map_err(|e| heliosdb_nano::Error::network(format!("Connection failed: {}", e)))?;
 
     // Send SSL request
@@ -168,20 +168,12 @@ async fn test_ssl_mode_require() -> Result<()> {
 #[tokio::test]
 async fn test_ssl_config_validation() {
     // Valid configuration
-    let valid_config = SslConfig::new(
-        SslMode::Disable,
-        "certs/server.crt",
-        "certs/server.key",
-    );
+    let valid_config = SslConfig::new(SslMode::Disable, "certs/server.crt", "certs/server.key");
     // Validation should pass for disabled mode even if files don't exist
     assert!(valid_config.validate().is_ok());
 
     // Invalid certificate path (for enabled modes)
-    let invalid_config = SslConfig::new(
-        SslMode::Require,
-        "nonexistent/cert.pem",
-        "certs/server.key",
-    );
+    let invalid_config = SslConfig::new(SslMode::Require, "nonexistent/cert.pem", "certs/server.key");
     assert!(invalid_config.validate().is_err());
 }
 
@@ -189,8 +181,7 @@ async fn test_ssl_config_validation() {
 async fn test_certificate_generation() -> Result<()> {
     use tempfile::TempDir;
 
-    let temp_dir = TempDir::new()
-        .map_err(|e| heliosdb_nano::Error::io(format!("Temp dir creation failed: {}", e)))?;
+    let temp_dir = TempDir::new().map_err(|e| heliosdb_nano::Error::io(format!("Temp dir creation failed: {}", e)))?;
 
     let cert_path = temp_dir.path().join("test.crt");
     let key_path = temp_dir.path().join("test.key");
@@ -234,7 +225,8 @@ async fn test_ssl_negotiation_protocol() -> Result<()> {
     let (_db, addr) = create_ssl_server(SslMode::Allow, 15435).await?;
 
     // Connect to server
-    let mut stream = TcpStream::connect(addr).await
+    let mut stream = TcpStream::connect(addr)
+        .await
         .map_err(|e| heliosdb_nano::Error::network(format!("Connection failed: {}", e)))?;
 
     // Manually construct SSL request message
@@ -243,14 +235,20 @@ async fn test_ssl_negotiation_protocol() -> Result<()> {
     request.extend_from_slice(&SSL_REQUEST_CODE.to_be_bytes()); // SSL request code
 
     // Send request
-    stream.write_all(&request).await
+    stream
+        .write_all(&request)
+        .await
         .map_err(|e| heliosdb_nano::Error::network(format!("Write failed: {}", e)))?;
-    stream.flush().await
+    stream
+        .flush()
+        .await
         .map_err(|e| heliosdb_nano::Error::network(format!("Flush failed: {}", e)))?;
 
     // Read response
     let mut response = [0u8; 1];
-    stream.read_exact(&mut response).await
+    stream
+        .read_exact(&mut response)
+        .await
         .map_err(|e| heliosdb_nano::Error::network(format!("Read failed: {}", e)))?;
 
     // Verify response is 'S' (SSL accepted)
@@ -265,19 +263,13 @@ async fn test_server_builder_with_ssl() -> Result<()> {
     CertificateManager::setup_test_certs()?;
 
     let db = Arc::new(EmbeddedDatabase::new_in_memory()?);
-    let addr: SocketAddr = "127.0.0.1:15436".parse()
+    let addr: SocketAddr = "127.0.0.1:15436"
+        .parse()
         .map_err(|e| heliosdb_nano::Error::config(format!("Invalid address: {}", e)))?;
 
-    let ssl_config = SslConfig::new(
-        SslMode::Prefer,
-        "certs/server.crt",
-        "certs/server.key",
-    );
+    let ssl_config = SslConfig::new(SslMode::Prefer, "certs/server.crt", "certs/server.key");
 
-    let server = PgServerBuilder::new()
-        .address(addr)
-        .ssl_config(ssl_config)
-        .build(db)?;
+    let server = PgServerBuilder::new().address(addr).ssl_config(ssl_config).build(db)?;
 
     assert!(server.config().ssl_config.is_some());
     assert_eq!(server.config().ssl_config.as_ref().unwrap().mode, SslMode::Prefer);
@@ -291,13 +283,11 @@ async fn test_ssl_test_builder_method() -> Result<()> {
     CertificateManager::setup_test_certs()?;
 
     let db = Arc::new(EmbeddedDatabase::new_in_memory()?);
-    let addr: SocketAddr = "127.0.0.1:15437".parse()
+    let addr: SocketAddr = "127.0.0.1:15437"
+        .parse()
         .map_err(|e| heliosdb_nano::Error::config(format!("Invalid address: {}", e)))?;
 
-    let server = PgServerBuilder::new()
-        .address(addr)
-        .ssl_test()
-        .build(db)?;
+    let server = PgServerBuilder::new().address(addr).ssl_test().build(db)?;
 
     assert!(server.config().ssl_config.is_some());
     assert_eq!(server.config().ssl_config.as_ref().unwrap().mode, SslMode::Allow);

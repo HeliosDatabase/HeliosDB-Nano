@@ -13,26 +13,40 @@ mod cte_hardening {
 
         db.execute("CREATE TABLE cte_employees (id INT, name TEXT, manager_id INT, dept TEXT, salary INT)")
             .unwrap();
-        db.execute("INSERT INTO cte_employees VALUES (1, 'Alice', NULL, 'Engineering', 120000)").unwrap();
-        db.execute("INSERT INTO cte_employees VALUES (2, 'Bob', 1, 'Engineering', 90000)").unwrap();
-        db.execute("INSERT INTO cte_employees VALUES (3, 'Charlie', 1, 'Engineering', 85000)").unwrap();
-        db.execute("INSERT INTO cte_employees VALUES (4, 'Diana', 2, 'Sales', 70000)").unwrap();
-        db.execute("INSERT INTO cte_employees VALUES (5, 'Eve', 2, 'Sales', 75000)").unwrap();
-        db.execute("INSERT INTO cte_employees VALUES (6, 'Frank', 3, 'HR', 65000)").unwrap();
+        db.execute("INSERT INTO cte_employees VALUES (1, 'Alice', NULL, 'Engineering', 120000)")
+            .unwrap();
+        db.execute("INSERT INTO cte_employees VALUES (2, 'Bob', 1, 'Engineering', 90000)")
+            .unwrap();
+        db.execute("INSERT INTO cte_employees VALUES (3, 'Charlie', 1, 'Engineering', 85000)")
+            .unwrap();
+        db.execute("INSERT INTO cte_employees VALUES (4, 'Diana', 2, 'Sales', 70000)")
+            .unwrap();
+        db.execute("INSERT INTO cte_employees VALUES (5, 'Eve', 2, 'Sales', 75000)")
+            .unwrap();
+        db.execute("INSERT INTO cte_employees VALUES (6, 'Frank', 3, 'HR', 65000)")
+            .unwrap();
 
         db.execute("CREATE TABLE cte_departments (id INT, name TEXT, budget INT)")
             .unwrap();
-        db.execute("INSERT INTO cte_departments VALUES (1, 'Engineering', 500000)").unwrap();
-        db.execute("INSERT INTO cte_departments VALUES (2, 'Sales', 300000)").unwrap();
-        db.execute("INSERT INTO cte_departments VALUES (3, 'HR', 200000)").unwrap();
+        db.execute("INSERT INTO cte_departments VALUES (1, 'Engineering', 500000)")
+            .unwrap();
+        db.execute("INSERT INTO cte_departments VALUES (2, 'Sales', 300000)")
+            .unwrap();
+        db.execute("INSERT INTO cte_departments VALUES (3, 'HR', 200000)")
+            .unwrap();
 
         db.execute("CREATE TABLE cte_products (id INT, name TEXT, price INT, category TEXT)")
             .unwrap();
-        db.execute("INSERT INTO cte_products VALUES (1, 'Widget', 10, 'A')").unwrap();
-        db.execute("INSERT INTO cte_products VALUES (2, 'Gadget', 25, 'A')").unwrap();
-        db.execute("INSERT INTO cte_products VALUES (3, 'Doohickey', 50, 'B')").unwrap();
-        db.execute("INSERT INTO cte_products VALUES (4, 'Thingamajig', 100, 'B')").unwrap();
-        db.execute("INSERT INTO cte_products VALUES (5, 'Whatchamacallit', 5, 'C')").unwrap();
+        db.execute("INSERT INTO cte_products VALUES (1, 'Widget', 10, 'A')")
+            .unwrap();
+        db.execute("INSERT INTO cte_products VALUES (2, 'Gadget', 25, 'A')")
+            .unwrap();
+        db.execute("INSERT INTO cte_products VALUES (3, 'Doohickey', 50, 'B')")
+            .unwrap();
+        db.execute("INSERT INTO cte_products VALUES (4, 'Thingamajig', 100, 'B')")
+            .unwrap();
+        db.execute("INSERT INTO cte_products VALUES (5, 'Whatchamacallit', 5, 'C')")
+            .unwrap();
 
         db
     }
@@ -65,7 +79,10 @@ mod cte_hardening {
     #[test]
     fn test_basic_cte_simple_select() {
         let db = setup_db();
-        let rows = q(&db, "WITH eng AS (SELECT id, name FROM cte_employees WHERE dept = 'Engineering') SELECT * FROM eng");
+        let rows = q(
+            &db,
+            "WITH eng AS (SELECT id, name FROM cte_employees WHERE dept = 'Engineering') SELECT * FROM eng",
+        );
         assert_eq!(rows.len(), 3);
     }
 
@@ -157,8 +174,7 @@ mod cte_hardening {
                 assert_eq!(rows.len(), 3);
                 for row in &rows {
                     let v = &row.values[1];
-                    let ok = matches!(v, Value::Int4(b) if *b > 350_000)
-                        || matches!(v, Value::Int8(b) if *b > 350_000);
+                    let ok = matches!(v, Value::Int4(b) if *b > 350_000) || matches!(v, Value::Int8(b) if *b > 350_000);
                     assert!(ok, "expected budget > 350000, got {v:?}");
                 }
             }
@@ -319,7 +335,10 @@ mod cte_hardening {
     #[test]
     fn test_cte_with_distinct() {
         let db = setup_db();
-        let rows = q(&db, "WITH depts AS (SELECT dept FROM cte_employees) SELECT DISTINCT dept FROM depts ORDER BY dept");
+        let rows = q(
+            &db,
+            "WITH depts AS (SELECT dept FROM cte_employees) SELECT DISTINCT dept FROM depts ORDER BY dept",
+        );
         assert_eq!(rows.len(), 3);
     }
 
@@ -351,14 +370,20 @@ mod cte_hardening {
     #[test]
     fn test_cte_same_column_names_as_outer() {
         let db = setup_db();
-        let rows = q(&db, "WITH cte AS (SELECT id, name FROM cte_employees WHERE id <= 2) SELECT cte.id, cte.name FROM cte");
+        let rows = q(
+            &db,
+            "WITH cte AS (SELECT id, name FROM cte_employees WHERE id <= 2) SELECT cte.id, cte.name FROM cte",
+        );
         assert_eq!(rows.len(), 2);
     }
 
     #[test]
     fn test_cte_returning_empty_result() {
         let db = setup_db();
-        let rows = q(&db, "WITH empty AS (SELECT id, name FROM cte_employees WHERE salary > 999999) SELECT * FROM empty");
+        let rows = q(
+            &db,
+            "WITH empty AS (SELECT id, name FROM cte_employees WHERE salary > 999999) SELECT * FROM empty",
+        );
         assert_eq!(rows.len(), 0);
     }
 
@@ -468,7 +493,10 @@ mod cte_hardening {
     #[test]
     fn test_cte_with_like() {
         let db = setup_db();
-        let rows = q(&db, "WITH names AS (SELECT name FROM cte_employees WHERE name LIKE 'A%') SELECT * FROM names");
+        let rows = q(
+            &db,
+            "WITH names AS (SELECT name FROM cte_employees WHERE name LIKE 'A%') SELECT * FROM names",
+        );
         assert_eq!(rows.len(), 1);
         assert_str(&rows[0].values[0], "Alice");
     }

@@ -16,7 +16,8 @@ fn int(v: &Value) -> i64 {
 #[test]
 fn prefix_decode_preserves_results() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
-    db.execute("CREATE TABLE w (id INT, k TEXT, payload TEXT, note TEXT)").unwrap();
+    db.execute("CREATE TABLE w (id INT, k TEXT, payload TEXT, note TEXT)")
+        .unwrap();
     for n in 0..300 {
         db.execute(&format!(
             "INSERT INTO w VALUES ({n}, 'k{}', 'payload-{n}-xxxxxxxxxxxxxxxx', 'note-{n}')",

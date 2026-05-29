@@ -47,10 +47,7 @@ impl Centrality {
     }
 
     pub fn get(&self, node_id: i64) -> f32 {
-        self.weights
-            .get(&node_id)
-            .copied()
-            .unwrap_or(self.fallback_weight)
+        self.weights.get(&node_id).copied().unwrap_or(self.fallback_weight)
     }
 
     pub fn len(&self) -> usize {
@@ -65,10 +62,7 @@ impl Centrality {
     /// then min-max normalise into `[0, 1]`. Optional
     /// `edge_kinds` narrows to relevant edges (e.g. `["CALLS"]` for
     /// the FR's call-frequency heuristic).
-    pub fn from_edges(
-        db: &EmbeddedDatabase,
-        edge_kinds: &[&str],
-    ) -> Result<Self> {
+    pub fn from_edges(db: &EmbeddedDatabase, edge_kinds: &[&str]) -> Result<Self> {
         let sql = if edge_kinds.is_empty() {
             "SELECT to_node, SUM(weight) FROM _hdb_graph_edges \
              GROUP BY to_node"
@@ -177,10 +171,7 @@ mod tests {
     fn rerank_is_stable_without_centrality() {
         let hits = vec![mk_hit(1, 0), mk_hit(2, 0), mk_hit(3, 0)];
         let out = centrality_rerank(hits.clone(), &Centrality::new(), 0.0);
-        assert_eq!(
-            out.iter().map(|h| h.node_id).collect::<Vec<_>>(),
-            vec![1, 2, 3]
-        );
+        assert_eq!(out.iter().map(|h| h.node_id).collect::<Vec<_>>(), vec![1, 2, 3]);
     }
 
     #[test]

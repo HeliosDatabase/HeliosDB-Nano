@@ -2,7 +2,7 @@
 //!
 //! Tests dictionary encoding, content-addressed storage, and columnar storage.
 
-use heliosdb_nano::{EmbeddedDatabase, Config, Value};
+use heliosdb_nano::{Config, EmbeddedDatabase, Value};
 
 fn test_db() -> EmbeddedDatabase {
     let mut config = Config::default();
@@ -16,7 +16,8 @@ fn test_dictionary_encoding() {
     let db = test_db();
 
     // Create table with default storage
-    db.execute("CREATE TABLE orders (id INT PRIMARY KEY, status TEXT)").unwrap();
+    db.execute("CREATE TABLE orders (id INT PRIMARY KEY, status TEXT)")
+        .unwrap();
 
     // Insert data with repetitive values
     db.execute("INSERT INTO orders VALUES (1, 'pending')").unwrap();
@@ -30,7 +31,9 @@ fn test_dictionary_encoding() {
     assert_eq!(results.len(), 5);
 
     // Migrate to dictionary encoding
-    let migrated = db.execute("ALTER TABLE orders ALTER COLUMN status SET STORAGE DICTIONARY").unwrap();
+    let migrated = db
+        .execute("ALTER TABLE orders ALTER COLUMN status SET STORAGE DICTIONARY")
+        .unwrap();
     assert_eq!(migrated, 5); // 5 rows migrated
 
     // Verify data after migration
@@ -55,18 +58,23 @@ fn test_content_addressed_storage() {
     let db = test_db();
 
     // Create table
-    db.execute("CREATE TABLE documents (id INT PRIMARY KEY, content TEXT)").unwrap();
+    db.execute("CREATE TABLE documents (id INT PRIMARY KEY, content TEXT)")
+        .unwrap();
 
     // Create large duplicate content (> 1KB)
     let large_content = "x".repeat(2000);
 
     // Insert duplicate content
-    db.execute(&format!("INSERT INTO documents VALUES (1, '{}')", large_content)).unwrap();
-    db.execute(&format!("INSERT INTO documents VALUES (2, '{}')", large_content)).unwrap();
+    db.execute(&format!("INSERT INTO documents VALUES (1, '{}')", large_content))
+        .unwrap();
+    db.execute(&format!("INSERT INTO documents VALUES (2, '{}')", large_content))
+        .unwrap();
     db.execute("INSERT INTO documents VALUES (3, 'small')").unwrap();
 
     // Migrate to content-addressed storage
-    let migrated = db.execute("ALTER TABLE documents ALTER COLUMN content SET STORAGE CONTENT_ADDRESSED").unwrap();
+    let migrated = db
+        .execute("ALTER TABLE documents ALTER COLUMN content SET STORAGE CONTENT_ADDRESSED")
+        .unwrap();
     assert_eq!(migrated, 3);
 
     // Verify data is correctly retrieved
@@ -90,7 +98,8 @@ fn test_columnar_storage() {
     let db = test_db();
 
     // Create table
-    db.execute("CREATE TABLE metrics (id INT PRIMARY KEY, timestamp INT8, value FLOAT8)").unwrap();
+    db.execute("CREATE TABLE metrics (id INT PRIMARY KEY, timestamp INT8, value FLOAT8)")
+        .unwrap();
 
     // Insert data
     db.execute("INSERT INTO metrics VALUES (1, 1000, 1.5)").unwrap();
@@ -98,7 +107,9 @@ fn test_columnar_storage() {
     db.execute("INSERT INTO metrics VALUES (3, 3000, 3.5)").unwrap();
 
     // Migrate value column to columnar storage
-    let migrated = db.execute("ALTER TABLE metrics ALTER COLUMN value SET STORAGE COLUMNAR").unwrap();
+    let migrated = db
+        .execute("ALTER TABLE metrics ALTER COLUMN value SET STORAGE COLUMNAR")
+        .unwrap();
     assert_eq!(migrated, 3);
 
     // Verify data
@@ -124,10 +135,13 @@ fn test_migrate_back_to_default() {
     db.execute("CREATE TABLE test (id INT PRIMARY KEY, val TEXT)").unwrap();
     db.execute("INSERT INTO test VALUES (1, 'foo'), (2, 'bar')").unwrap();
 
-    db.execute("ALTER TABLE test ALTER COLUMN val SET STORAGE DICTIONARY").unwrap();
+    db.execute("ALTER TABLE test ALTER COLUMN val SET STORAGE DICTIONARY")
+        .unwrap();
 
     // Migrate back to default
-    let migrated = db.execute("ALTER TABLE test ALTER COLUMN val SET STORAGE DEFAULT").unwrap();
+    let migrated = db
+        .execute("ALTER TABLE test ALTER COLUMN val SET STORAGE DEFAULT")
+        .unwrap();
     assert_eq!(migrated, 2);
 
     // Verify data
@@ -142,23 +156,32 @@ fn test_multiple_storage_modes_same_table() {
     let db = test_db();
 
     // Create table with multiple columns
-    db.execute("CREATE TABLE combined (
+    db.execute(
+        "CREATE TABLE combined (
         id INT PRIMARY KEY,
         status TEXT,
         description TEXT,
         score FLOAT8
-    )").unwrap();
+    )",
+    )
+    .unwrap();
 
     // Insert data
     let desc = "x".repeat(2000); // Large content
-    db.execute(&format!("INSERT INTO combined VALUES (1, 'active', '{}', 95.5)", desc)).unwrap();
-    db.execute(&format!("INSERT INTO combined VALUES (2, 'active', '{}', 87.3)", desc)).unwrap();
-    db.execute("INSERT INTO combined VALUES (3, 'inactive', 'small', 75.0)").unwrap();
+    db.execute(&format!("INSERT INTO combined VALUES (1, 'active', '{}', 95.5)", desc))
+        .unwrap();
+    db.execute(&format!("INSERT INTO combined VALUES (2, 'active', '{}', 87.3)", desc))
+        .unwrap();
+    db.execute("INSERT INTO combined VALUES (3, 'inactive', 'small', 75.0)")
+        .unwrap();
 
     // Set different storage modes for different columns
-    db.execute("ALTER TABLE combined ALTER COLUMN status SET STORAGE DICTIONARY").unwrap();
-    db.execute("ALTER TABLE combined ALTER COLUMN description SET STORAGE CONTENT_ADDRESSED").unwrap();
-    db.execute("ALTER TABLE combined ALTER COLUMN score SET STORAGE COLUMNAR").unwrap();
+    db.execute("ALTER TABLE combined ALTER COLUMN status SET STORAGE DICTIONARY")
+        .unwrap();
+    db.execute("ALTER TABLE combined ALTER COLUMN description SET STORAGE CONTENT_ADDRESSED")
+        .unwrap();
+    db.execute("ALTER TABLE combined ALTER COLUMN score SET STORAGE COLUMNAR")
+        .unwrap();
 
     // Verify all data is correctly retrieved
     let results = db.query("SELECT * FROM combined ORDER BY id", &[]).unwrap();
@@ -190,7 +213,9 @@ fn test_no_change_when_same_mode() {
     db.execute("INSERT INTO test VALUES (1, 'test')").unwrap();
 
     // Setting same mode should return 0 (no rows migrated)
-    let result = db.execute("ALTER TABLE test ALTER COLUMN val SET STORAGE DEFAULT").unwrap();
+    let result = db
+        .execute("ALTER TABLE test ALTER COLUMN val SET STORAGE DEFAULT")
+        .unwrap();
     assert_eq!(result, 0);
 }
 

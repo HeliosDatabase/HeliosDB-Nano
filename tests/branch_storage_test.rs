@@ -2,7 +2,10 @@
 //!
 //! Tests the copy-on-write branch storage backend.
 
-use heliosdb_nano::{Config, storage::{StorageEngine, BranchOptions}};
+use heliosdb_nano::{
+    storage::{BranchOptions, StorageEngine},
+    Config,
+};
 
 #[test]
 fn test_create_and_list_branches() {
@@ -10,11 +13,9 @@ fn test_create_and_list_branches() {
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
     // Create a branch
-    let branch_id = engine.create_branch(
-        "dev",
-        Some("main"),
-        BranchOptions::default(),
-    ).unwrap();
+    let branch_id = engine
+        .create_branch("dev", Some("main"), BranchOptions::default())
+        .unwrap();
 
     assert!(branch_id > 1); // main is 1
 
@@ -36,7 +37,9 @@ fn test_branch_isolation() {
     engine.put(&b"key1".to_vec(), b"value_main").unwrap();
 
     // Create branch
-    engine.create_branch("dev", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("dev", Some("main"), BranchOptions::default())
+        .unwrap();
 
     // Read from dev (should see main's value)
     let mut tx = engine.begin_branch_transaction("dev").unwrap();
@@ -69,10 +72,16 @@ fn test_copy_on_write() {
 
     // Create branch (should be instant)
     let start = std::time::Instant::now();
-    engine.create_branch("feature", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("feature", Some("main"), BranchOptions::default())
+        .unwrap();
     let elapsed = start.elapsed();
 
-    assert!(elapsed.as_millis() < 100, "Branch creation took too long: {:?}", elapsed);
+    assert!(
+        elapsed.as_millis() < 100,
+        "Branch creation took too long: {:?}",
+        elapsed
+    );
 
     // Read all keys from branch (should see main's values)
     let mut tx = engine.begin_branch_transaction("feature").unwrap();
@@ -112,7 +121,9 @@ fn test_drop_branch() {
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
     // Create and drop branch
-    engine.create_branch("temp", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("temp", Some("main"), BranchOptions::default())
+        .unwrap();
     engine.drop_branch("temp", false).unwrap();
 
     // Verify branch no longer appears in list
@@ -136,8 +147,12 @@ fn test_cannot_drop_with_children() {
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
     // Create parent and child
-    engine.create_branch("parent", Some("main"), BranchOptions::default()).unwrap();
-    engine.create_branch("child", Some("parent"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("parent", Some("main"), BranchOptions::default())
+        .unwrap();
+    engine
+        .create_branch("child", Some("parent"), BranchOptions::default())
+        .unwrap();
 
     // Try to drop parent
     let result = engine.drop_branch("parent", false);
@@ -153,8 +168,12 @@ fn test_branch_hierarchy() {
     engine.put(&b"key".to_vec(), b"main_value").unwrap();
 
     // Create hierarchy: main -> level1 -> level2
-    engine.create_branch("level1", Some("main"), BranchOptions::default()).unwrap();
-    engine.create_branch("level2", Some("level1"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("level1", Some("main"), BranchOptions::default())
+        .unwrap();
+    engine
+        .create_branch("level2", Some("level1"), BranchOptions::default())
+        .unwrap();
 
     // Read from level2 (should traverse to main)
     let tx = engine.begin_branch_transaction("level2").unwrap();
@@ -193,8 +212,12 @@ fn test_concurrent_branch_writes() {
     let engine = Arc::new(StorageEngine::open_in_memory(&config).unwrap());
 
     // Create two branches
-    engine.create_branch("branch_a", Some("main"), BranchOptions::default()).unwrap();
-    engine.create_branch("branch_b", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("branch_a", Some("main"), BranchOptions::default())
+        .unwrap();
+    engine
+        .create_branch("branch_b", Some("main"), BranchOptions::default())
+        .unwrap();
 
     let engine_a = Arc::clone(&engine);
     let engine_b = Arc::clone(&engine);

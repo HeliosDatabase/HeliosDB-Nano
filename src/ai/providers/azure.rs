@@ -4,8 +4,8 @@ use async_trait::async_trait;
 use futures::Stream;
 
 use super::{
-    ChatMessage, LlmProvider, LlmProviderConfig, LlmRequest, LlmResponse,
-    ModelInfo, ProviderError, ProviderResult, StreamChunk, TokenUsage,
+    ChatMessage, LlmProvider, LlmProviderConfig, LlmRequest, LlmResponse, ModelInfo, ProviderError, ProviderResult,
+    StreamChunk, TokenUsage,
 };
 
 /// Azure OpenAI provider
@@ -19,19 +19,27 @@ pub struct AzureOpenAiProvider {
 impl AzureOpenAiProvider {
     /// Create new Azure OpenAI provider
     pub fn new(config: &LlmProviderConfig) -> ProviderResult<Self> {
-        let api_key = config.api_key.clone()
+        let api_key = config
+            .api_key
+            .clone()
             .or_else(|| std::env::var("AZURE_OPENAI_API_KEY").ok())
             .ok_or_else(|| ProviderError::Config("Azure OpenAI API key required".into()))?;
 
-        let endpoint = config.endpoint.clone()
+        let endpoint = config
+            .endpoint
+            .clone()
             .or_else(|| std::env::var("AZURE_OPENAI_ENDPOINT").ok())
             .ok_or_else(|| ProviderError::Config("Azure OpenAI endpoint required".into()))?;
 
-        let deployment = config.deployment.clone()
+        let deployment = config
+            .deployment
+            .clone()
             .or_else(|| std::env::var("AZURE_OPENAI_DEPLOYMENT").ok())
             .ok_or_else(|| ProviderError::Config("Azure deployment name required".into()))?;
 
-        let api_version = config.api_version.clone()
+        let api_version = config
+            .api_version
+            .clone()
             .unwrap_or_else(|| "2024-08-01-preview".into());
 
         Ok(Self {
@@ -122,8 +130,7 @@ impl LlmProvider for AzureOpenAiProvider {
             return Err(ProviderError::Api(error_text));
         }
 
-        let result: serde_json::Value = response.json().await
-            .map_err(|e| ProviderError::Api(e.to_string()))?;
+        let result: serde_json::Value = response.json().await.map_err(|e| ProviderError::Api(e.to_string()))?;
 
         // Parse response (same as OpenAI)
         let choice = result["choices"][0].clone();
@@ -133,12 +140,12 @@ impl LlmProvider for AzureOpenAiProvider {
             role: super::MessageRole::Assistant,
             content: message_data["content"].as_str().unwrap_or("").to_string(),
             name: None,
-            function_call: message_data.get("function_call").and_then(|fc| {
-                serde_json::from_value(fc.clone()).ok()
-            }),
-            tool_calls: message_data.get("tool_calls").and_then(|tc| {
-                serde_json::from_value(tc.clone()).ok()
-            }),
+            function_call: message_data
+                .get("function_call")
+                .and_then(|fc| serde_json::from_value(fc.clone()).ok()),
+            tool_calls: message_data
+                .get("tool_calls")
+                .and_then(|tc| serde_json::from_value(tc.clone()).ok()),
             tool_call_id: None,
         };
 

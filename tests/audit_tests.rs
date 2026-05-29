@@ -1,6 +1,9 @@
 //! Audit logging integration tests
 
-use heliosdb_nano::{EmbeddedDatabase, Config, audit::{AuditLogger, AuditConfig, AuditQuery, OperationType}};
+use heliosdb_nano::{
+    audit::{AuditConfig, AuditLogger, AuditQuery, OperationType},
+    Config, EmbeddedDatabase,
+};
 use std::sync::Arc;
 
 #[tokio::test]
@@ -9,31 +12,33 @@ async fn test_audit_logger_basic() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
 
     // Get storage reference
-    let storage = Arc::new(
-        heliosdb_nano::storage::StorageEngine::open_in_memory(&config).unwrap()
-    );
+    let storage = Arc::new(heliosdb_nano::storage::StorageEngine::open_in_memory(&config).unwrap());
 
     let audit_config = AuditConfig::default();
     let logger = AuditLogger::new(storage.clone(), audit_config).unwrap();
 
     // Log DDL operation
-    logger.log_ddl(
-        "CREATE TABLE",
-        "users",
-        "CREATE TABLE users (id INT, name TEXT)",
-        true,
-        None,
-    ).unwrap();
+    logger
+        .log_ddl(
+            "CREATE TABLE",
+            "users",
+            "CREATE TABLE users (id INT, name TEXT)",
+            true,
+            None,
+        )
+        .unwrap();
 
     // Log DML operation
-    logger.log_dml(
-        "INSERT",
-        "users",
-        "INSERT INTO users VALUES (1, 'Alice')",
-        1,
-        true,
-        None,
-    ).unwrap();
+    logger
+        .log_dml(
+            "INSERT",
+            "users",
+            "INSERT INTO users VALUES (1, 'Alice')",
+            1,
+            true,
+            None,
+        )
+        .unwrap();
 
     // Force async flush for testing (allows tokio runtime to process background task)
     logger.flush_async().await.unwrap();
@@ -47,25 +52,27 @@ async fn test_audit_logger_basic() {
 #[tokio::test]
 async fn test_audit_query_builder() {
     let config = Config::in_memory();
-    let storage = Arc::new(
-        heliosdb_nano::storage::StorageEngine::open_in_memory(&config).unwrap()
-    );
+    let storage = Arc::new(heliosdb_nano::storage::StorageEngine::open_in_memory(&config).unwrap());
 
     let audit_config = AuditConfig::default();
     let logger = AuditLogger::new(storage.clone(), audit_config).unwrap();
 
     // Log multiple operations
-    logger.log_ddl("CREATE TABLE", "users", "CREATE TABLE users (id INT)", true, None).unwrap();
-    logger.log_dml("INSERT", "users", "INSERT INTO users VALUES (1)", 1, true, None).unwrap();
-    logger.log_dml("UPDATE", "users", "UPDATE users SET name='Bob'", 1, true, None).unwrap();
+    logger
+        .log_ddl("CREATE TABLE", "users", "CREATE TABLE users (id INT)", true, None)
+        .unwrap();
+    logger
+        .log_dml("INSERT", "users", "INSERT INTO users VALUES (1)", 1, true, None)
+        .unwrap();
+    logger
+        .log_dml("UPDATE", "users", "UPDATE users SET name='Bob'", 1, true, None)
+        .unwrap();
 
     // Force synchronous flush for testing
     logger.flush_async().await.unwrap();
 
     // Build query
-    let query = AuditQuery::new()
-        .with_operation(OperationType::Insert)
-        .limit(10);
+    let query = AuditQuery::new().with_operation(OperationType::Insert).limit(10);
 
     let sql = query.build_sql();
     assert!(sql.contains("operation = 'INSERT'"));
@@ -75,9 +82,7 @@ async fn test_audit_query_builder() {
 #[tokio::test]
 async fn test_audit_config_filtering() {
     let config = Config::in_memory();
-    let storage = Arc::new(
-        heliosdb_nano::storage::StorageEngine::open_in_memory(&config).unwrap()
-    );
+    let storage = Arc::new(heliosdb_nano::storage::StorageEngine::open_in_memory(&config).unwrap());
 
     // Config that only logs DDL
     let audit_config = AuditConfig {
@@ -90,10 +95,14 @@ async fn test_audit_config_filtering() {
     let logger = AuditLogger::new(storage.clone(), audit_config).unwrap();
 
     // Log DDL (should be logged)
-    logger.log_ddl("CREATE TABLE", "users", "CREATE TABLE users (id INT)", true, None).unwrap();
+    logger
+        .log_ddl("CREATE TABLE", "users", "CREATE TABLE users (id INT)", true, None)
+        .unwrap();
 
     // Log DML (should NOT be logged)
-    logger.log_dml("INSERT", "users", "INSERT INTO users VALUES (1)", 1, true, None).unwrap();
+    logger
+        .log_dml("INSERT", "users", "INSERT INTO users VALUES (1)", 1, true, None)
+        .unwrap();
 
     // Force synchronous flush for testing
     logger.flush_async().await.unwrap();
@@ -166,22 +175,22 @@ async fn test_query_truncation() {
 #[tokio::test]
 async fn test_error_logging() {
     let config = Config::in_memory();
-    let storage = Arc::new(
-        heliosdb_nano::storage::StorageEngine::open_in_memory(&config).unwrap()
-    );
+    let storage = Arc::new(heliosdb_nano::storage::StorageEngine::open_in_memory(&config).unwrap());
 
     let audit_config = AuditConfig::default();
     let logger = AuditLogger::new(storage.clone(), audit_config).unwrap();
 
     // Log failed operation
-    logger.log_dml(
-        "INSERT",
-        "nonexistent_table",
-        "INSERT INTO nonexistent_table VALUES (1)",
-        0,
-        false,
-        Some("Table does not exist"),
-    ).unwrap();
+    logger
+        .log_dml(
+            "INSERT",
+            "nonexistent_table",
+            "INSERT INTO nonexistent_table VALUES (1)",
+            0,
+            false,
+            Some("Table does not exist"),
+        )
+        .unwrap();
 
     // Force synchronous flush for testing
     logger.flush_async().await.unwrap();

@@ -2,8 +2,8 @@
 //!
 //! Measures the performance overhead of transparent data encryption.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
-use heliosdb_nano::{Config, Column, DataType, Schema, Tuple, Value};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use heliosdb_nano::{Column, Config, DataType, Schema, Tuple, Value};
 
 fn setup_encrypted_storage() -> heliosdb_nano::storage::StorageEngine {
     let hex_key = generate_random_hex_key();
@@ -11,17 +11,14 @@ fn setup_encrypted_storage() -> heliosdb_nano::storage::StorageEngine {
 
     let mut config = Config::in_memory();
     config.encryption.enabled = true;
-    config.encryption.key_source =
-        heliosdb_nano::config::KeySource::Environment("BENCH_ENCRYPTION_KEY".to_string());
+    config.encryption.key_source = heliosdb_nano::config::KeySource::Environment("BENCH_ENCRYPTION_KEY".to_string());
 
-    heliosdb_nano::storage::StorageEngine::open_in_memory(&config)
-        .expect("Failed to open encrypted storage")
+    heliosdb_nano::storage::StorageEngine::open_in_memory(&config).expect("Failed to open encrypted storage")
 }
 
 fn setup_unencrypted_storage() -> heliosdb_nano::storage::StorageEngine {
     let config = Config::in_memory();
-    heliosdb_nano::storage::StorageEngine::open_in_memory(&config)
-        .expect("Failed to open unencrypted storage")
+    heliosdb_nano::storage::StorageEngine::open_in_memory(&config).expect("Failed to open unencrypted storage")
 }
 
 fn generate_random_hex_key() -> String {
@@ -41,34 +38,26 @@ fn benchmark_put_get(c: &mut Criterion) {
         group.throughput(Throughput::Bytes(*size as u64));
 
         // Encrypted storage
-        group.bench_with_input(
-            BenchmarkId::new("encrypted", size),
-            size,
-            |b, _| {
-                let storage = setup_encrypted_storage();
-                let key = b"benchmark_key".to_vec();
+        group.bench_with_input(BenchmarkId::new("encrypted", size), size, |b, _| {
+            let storage = setup_encrypted_storage();
+            let key = b"benchmark_key".to_vec();
 
-                b.iter(|| {
-                    storage.put(&key, black_box(&payload)).unwrap();
-                    let _result = storage.get(&key).unwrap();
-                });
-            },
-        );
+            b.iter(|| {
+                storage.put(&key, black_box(&payload)).unwrap();
+                let _result = storage.get(&key).unwrap();
+            });
+        });
 
         // Unencrypted storage
-        group.bench_with_input(
-            BenchmarkId::new("unencrypted", size),
-            size,
-            |b, _| {
-                let storage = setup_unencrypted_storage();
-                let key = b"benchmark_key".to_vec();
+        group.bench_with_input(BenchmarkId::new("unencrypted", size), size, |b, _| {
+            let storage = setup_unencrypted_storage();
+            let key = b"benchmark_key".to_vec();
 
-                b.iter(|| {
-                    storage.put(&key, black_box(&payload)).unwrap();
-                    let _result = storage.get(&key).unwrap();
-                });
-            },
-        );
+            b.iter(|| {
+                storage.put(&key, black_box(&payload)).unwrap();
+                let _result = storage.get(&key).unwrap();
+            });
+        });
     }
 
     group.finish();
@@ -89,7 +78,8 @@ fn benchmark_insert_tuple(c: &mut Criterion) {
             Column::new("age", DataType::Int4),
         ]);
 
-        catalog.create_table("bench_users", schema)
+        catalog
+            .create_table("bench_users", schema)
             .expect("Failed to create table");
 
         let mut counter = 0i32;
@@ -119,7 +109,8 @@ fn benchmark_insert_tuple(c: &mut Criterion) {
             Column::new("age", DataType::Int4),
         ]);
 
-        catalog.create_table("bench_users", schema)
+        catalog
+            .create_table("bench_users", schema)
             .expect("Failed to create table");
 
         let mut counter = 0i32;
@@ -156,16 +147,15 @@ fn benchmark_scan_table(c: &mut Criterion) {
             Column::new("data", DataType::Text),
         ]);
 
-        catalog.create_table("scan_bench", schema)
+        catalog
+            .create_table("scan_bench", schema)
             .expect("Failed to create table");
 
         // Insert test data
         for i in 0..num_tuples {
-            let tuple = Tuple::new(vec![
-                Value::Int4(i),
-                Value::String(format!("data_value_{}", i)),
-            ]);
-            storage.insert_tuple("scan_bench", tuple)
+            let tuple = Tuple::new(vec![Value::Int4(i), Value::String(format!("data_value_{}", i))]);
+            storage
+                .insert_tuple("scan_bench", tuple)
                 .expect("Failed to insert tuple");
         }
 
@@ -185,16 +175,15 @@ fn benchmark_scan_table(c: &mut Criterion) {
             Column::new("data", DataType::Text),
         ]);
 
-        catalog.create_table("scan_bench", schema)
+        catalog
+            .create_table("scan_bench", schema)
             .expect("Failed to create table");
 
         // Insert test data
         for i in 0..num_tuples {
-            let tuple = Tuple::new(vec![
-                Value::Int4(i),
-                Value::String(format!("data_value_{}", i)),
-            ]);
-            storage.insert_tuple("scan_bench", tuple)
+            let tuple = Tuple::new(vec![Value::Int4(i), Value::String(format!("data_value_{}", i))]);
+            storage
+                .insert_tuple("scan_bench", tuple)
                 .expect("Failed to insert tuple");
         }
 
@@ -260,28 +249,16 @@ fn benchmark_crypto_primitives(c: &mut Criterion) {
 
         group.throughput(Throughput::Bytes(*size as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("encrypt", size),
-            size,
-            |b, _| {
-                b.iter(|| {
-                    heliosdb_nano::crypto::encrypt(&key, black_box(&plaintext)).unwrap()
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("encrypt", size), size, |b, _| {
+            b.iter(|| heliosdb_nano::crypto::encrypt(&key, black_box(&plaintext)).unwrap());
+        });
 
         // Pre-encrypt for decrypt benchmark
         let ciphertext = heliosdb_nano::crypto::encrypt(&key, &plaintext).unwrap();
 
-        group.bench_with_input(
-            BenchmarkId::new("decrypt", size),
-            size,
-            |b, _| {
-                b.iter(|| {
-                    heliosdb_nano::crypto::decrypt(&key, black_box(&ciphertext)).unwrap()
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("decrypt", size), size, |b, _| {
+            b.iter(|| heliosdb_nano::crypto::decrypt(&key, black_box(&ciphertext)).unwrap());
+        });
     }
 
     group.finish();

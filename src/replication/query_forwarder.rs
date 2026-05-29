@@ -28,10 +28,7 @@ pub enum ForwardedResult {
         rows: Vec<Vec<Option<String>>>,
     },
     /// Command completed (INSERT, UPDATE, DELETE, etc.)
-    Command {
-        tag: String,
-        rows_affected: u64,
-    },
+    Command { tag: String, rows_affected: u64 },
     /// Error from primary
     Error {
         severity: String,
@@ -135,10 +132,10 @@ impl QueryForwarder {
         }
         let mut buf = [0u8; 1];
         let result = match conn.peek(&mut buf) {
-            Ok(0) => false, // Connection closed
-            Ok(_) => true,  // Data available
+            Ok(0) => false,                                              // Connection closed
+            Ok(_) => true,                                               // Data available
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => true, // No data, but alive
-            Err(_) => false, // Error
+            Err(_) => false,                                             // Error
         };
         let _ = conn.set_nonblocking(false);
         result
@@ -174,7 +171,6 @@ impl QueryForwarder {
 
     /// Perform PostgreSQL startup handshake
     fn perform_startup(&self, conn: &mut TcpStream) -> Result<(), ForwarderError> {
-
         // Build startup message
         // Protocol version 3.0 (196608 = 3 << 16)
         let mut params: Vec<u8> = Vec::new();
@@ -355,8 +351,9 @@ impl QueryForwarder {
                 _ => {
                     // Skip unknown message
                     let mut buf = vec![0u8; msg_len];
-                    conn.read_exact(&mut buf)
-                        .map_err(|e| ForwarderError::Protocol(format!("Failed to skip message type {}: {}", msg_type as char, e)))?;
+                    conn.read_exact(&mut buf).map_err(|e| {
+                        ForwarderError::Protocol(format!("Failed to skip message type {}: {}", msg_type as char, e))
+                    })?;
                 }
             }
         }
@@ -386,7 +383,12 @@ impl QueryForwarder {
     }
 
     /// Parse DataRow message
-    fn parse_data_row(&self, conn: &mut TcpStream, _msg_len: usize, num_columns: usize) -> Result<Vec<Option<String>>, ForwarderError> {
+    fn parse_data_row(
+        &self,
+        conn: &mut TcpStream,
+        _msg_len: usize,
+        num_columns: usize,
+    ) -> Result<Vec<Option<String>>, ForwarderError> {
         let num_values = self.read_i16(conn)? as usize;
         let mut row = Vec::with_capacity(num_columns.max(num_values));
 

@@ -69,10 +69,7 @@ fn test_sql_injection_union() -> Result<()> {
 
     // Either fails to parse or returns no results
     if let Ok(results) = result {
-        assert!(
-            results.len() <= 1,
-            "UNION injection should not leak all data"
-        );
+        assert!(results.len() <= 1, "UNION injection should not leak all data");
     }
 
     Ok(())
@@ -142,7 +139,10 @@ fn test_null_byte_injection() -> Result<()> {
 
     // Try null byte injection
     let malicious = "test\0admin";
-    let query = format!("INSERT INTO users (id, name, email, age) VALUES (1, '{}', 'test@example.com', 25)", malicious);
+    let query = format!(
+        "INSERT INTO users (id, name, email, age) VALUES (1, '{}', 'test@example.com', 25)",
+        malicious
+    );
 
     // Should handle null bytes properly
     let result = db.execute(&query);
@@ -401,7 +401,8 @@ fn test_data_type_enforcement() -> Result<()> {
     setup_users_table(&db)?;
 
     // Try to insert wrong data type
-    let result = db.execute("INSERT INTO users (id, name, email, age) VALUES ('not_a_number', 'Test', 'test@example.com', 25)");
+    let result =
+        db.execute("INSERT INTO users (id, name, email, age) VALUES ('not_a_number', 'Test', 'test@example.com', 25)");
 
     // Should reject type mismatch
     assert!(result.is_err(), "Should reject invalid data types");

@@ -67,14 +67,10 @@ pub enum WalRecord {
     },
 
     /// 2PC Phase 2: Commit prepared transaction
-    CommitPrepared {
-        txn_id: u64,
-    },
+    CommitPrepared { txn_id: u64 },
 
     /// 2PC: Rollback prepared transaction
-    RollbackPrepared {
-        txn_id: u64,
-    },
+    RollbackPrepared { txn_id: u64 },
 
     /// Checkpoint marker (for recovery)
     Checkpoint {
@@ -86,20 +82,9 @@ pub enum WalRecord {
 /// Individual WAL operation
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WalOp {
-    Insert {
-        table: String,
-        row_id: u64,
-        data: Vec<u8>,
-    },
-    Update {
-        table: String,
-        row_id: u64,
-        data: Vec<u8>,
-    },
-    Delete {
-        table: String,
-        row_id: u64,
-    },
+    Insert { table: String, row_id: u64, data: Vec<u8> },
+    Update { table: String, row_id: u64, data: Vec<u8> },
+    Delete { table: String, row_id: u64 },
 }
 
 impl From<&WriteOp> for WalOp {
@@ -143,10 +128,7 @@ impl WalPartition {
     /// Open or create a WAL partition
     pub fn open(path: impl AsRef<Path>, id: u16) -> std::io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)?;
+        let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         let lsn = Self::recover_lsn(&path)?;
 
@@ -176,8 +158,7 @@ impl WalPartition {
 
     /// Append a record to the WAL
     pub fn append(&self, record: &WalRecord) -> std::io::Result<u64> {
-        let serialized = bincode::serialize(record)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let serialized = bincode::serialize(record).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
 
         let record_len = serialized.len() as u32;
         let mut writer = self.writer.lock();
@@ -187,7 +168,8 @@ impl WalPartition {
         writer.write_all(&serialized)?;
 
         let lsn = self.lsn.fetch_add(1, Ordering::SeqCst) + 1;
-        self.unflushed_bytes.fetch_add(serialized.len() as u64 + 4, Ordering::Relaxed);
+        self.unflushed_bytes
+            .fetch_add(serialized.len() as u64 + 4, Ordering::Relaxed);
         self.unflushed_records.fetch_add(1, Ordering::Relaxed);
 
         Ok(lsn)
@@ -291,8 +273,8 @@ impl PartitionedWalManager {
             return 0;
         }
         // Simple hash combining table name and row_id
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
         let mut hasher = DefaultHasher::new();
         table.hash(&mut hasher);
         row_id.hash(&mut hasher);
@@ -306,12 +288,7 @@ impl PartitionedWalManager {
     }
 
     /// Commit a single-partition transaction (fast path)
-    pub fn commit_single(
-        &self,
-        txn_id: u64,
-        operations: &[WriteOp],
-        sync: bool,
-    ) -> std::io::Result<u64> {
+    pub fn commit_single(&self, txn_id: u64, operations: &[WriteOp], sync: bool) -> std::io::Result<u64> {
         if !self.is_enabled() || self.partitions.is_empty() {
             return Ok(self.next_timestamp());
         }
@@ -332,8 +309,12 @@ impl PartitionedWalManager {
             operations: wal_ops,
         };
 
-        let partition = self.partitions.get(partition_id as usize)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid partition ID: {}", partition_id)))?;
+        let partition = self.partitions.get(partition_id as usize).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Invalid partition ID: {}", partition_id),
+            )
+        })?;
         partition.append(&record)?;
 
         if sync {
@@ -344,12 +325,7 @@ impl PartitionedWalManager {
     }
 
     /// Write a commit record with pre-converted WalOps
-    pub fn write_commit(
-        &self,
-        txn_id: u64,
-        timestamp: u64,
-        operations: Vec<WalOp>,
-    ) -> std::io::Result<()> {
+    pub fn write_commit(&self, txn_id: u64, timestamp: u64, operations: Vec<WalOp>) -> std::io::Result<()> {
         if !self.is_enabled() || self.partitions.is_empty() {
             return Ok(());
         }
@@ -372,19 +348,19 @@ impl PartitionedWalManager {
             operations,
         };
 
-        let partition = self.partitions.get(partition_id as usize)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid partition ID: {}", partition_id)))?;
+        let partition = self.partitions.get(partition_id as usize).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("Invalid partition ID: {}", partition_id),
+            )
+        })?;
         partition.append(&record)?;
 
         Ok(())
     }
 
     /// Start 2PC for cross-partition transaction
-    pub fn prepare_2pc(
-        &self,
-        txn_id: u64,
-        operations: &[WriteOp],
-    ) -> std::io::Result<()> {
+    pub fn prepare_2pc(&self, txn_id: u64, operations: &[WriteOp]) -> std::io::Result<()> {
         if !self.is_enabled() || self.partitions.is_empty() {
             return Ok(());
         }
@@ -415,8 +391,12 @@ impl PartitionedWalManager {
                 partition: partition_id,
                 operations: ops,
             };
-            let partition = self.partitions.get(partition_id as usize)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid partition ID: {}", partition_id)))?;
+            let partition = self.partitions.get(partition_id as usize).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Invalid partition ID: {}", partition_id),
+                )
+            })?;
             partition.append(&record)?;
             partition.sync()?; // Must sync prepare
 
@@ -448,8 +428,12 @@ impl PartitionedWalManager {
             // Phase 2: Commit on all partitions
             let record = WalRecord::CommitPrepared { txn_id };
             for partition_id in partitions {
-                let partition = self.partitions.get(partition_id as usize)
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid partition ID: {}", partition_id)))?;
+                let partition = self.partitions.get(partition_id as usize).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Invalid partition ID: {}", partition_id),
+                    )
+                })?;
                 partition.append(&record)?;
             }
 
@@ -478,8 +462,12 @@ impl PartitionedWalManager {
         if let Some(partitions) = partitions {
             let record = WalRecord::RollbackPrepared { txn_id };
             for partition_id in partitions {
-                let partition = self.partitions.get(partition_id as usize)
-                    .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid partition ID: {}", partition_id)))?;
+                let partition = self.partitions.get(partition_id as usize).ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Invalid partition ID: {}", partition_id),
+                    )
+                })?;
                 partition.append(&record)?;
             }
         }
@@ -489,11 +477,7 @@ impl PartitionedWalManager {
     }
 
     /// Commit batch of transactions (for batched mode)
-    pub fn commit_batch(
-        &self,
-        requests: &[CommitRequest],
-        sync: bool,
-    ) -> std::io::Result<u64> {
+    pub fn commit_batch(&self, requests: &[CommitRequest], sync: bool) -> std::io::Result<u64> {
         if !self.is_enabled() || self.partitions.is_empty() {
             return Ok(self.next_timestamp());
         }
@@ -564,8 +548,12 @@ impl PartitionedWalManager {
 
         // Write records to each partition
         for (partition_id, records) in partition_records {
-            let partition = self.partitions.get(partition_id as usize)
-                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::Other, format!("Invalid partition ID: {}", partition_id)))?;
+            let partition = self.partitions.get(partition_id as usize).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Invalid partition ID: {}", partition_id),
+                )
+            })?;
             for record in records {
                 partition.append(&record)?;
             }
@@ -611,10 +599,7 @@ impl PartitionedWalManager {
 
     /// Get total unflushed bytes across all partitions
     pub fn unflushed_bytes(&self) -> u64 {
-        self.partitions
-            .iter()
-            .map(|p| p.unflushed_stats().0)
-            .sum()
+        self.partitions.iter().map(|p| p.unflushed_stats().0).sum()
     }
 }
 
@@ -647,11 +632,7 @@ impl WalRecovery {
         Ok(row_ids)
     }
 
-    fn scan_wal_file(
-        &self,
-        path: &Path,
-        row_ids: &mut HashMap<String, u64>,
-    ) -> std::io::Result<()> {
+    fn scan_wal_file(&self, path: &Path, row_ids: &mut HashMap<String, u64>) -> std::io::Result<()> {
         use std::io::Read;
 
         let mut file = File::open(path)?;
@@ -689,11 +670,7 @@ impl WalRecovery {
         Ok(())
     }
 
-    fn process_record_for_recovery(
-        &self,
-        record: WalRecord,
-        row_ids: &mut HashMap<String, u64>,
-    ) {
+    fn process_record_for_recovery(&self, record: WalRecord, row_ids: &mut HashMap<String, u64>) {
         match record {
             WalRecord::Commit { operations, .. } => {
                 for op in operations {
@@ -789,23 +766,20 @@ impl WalRecovery {
             }
 
             if let Some(record_slice) = buffer.get(pos..pos + len) {
-            if let Ok(record) = bincode::deserialize::<WalRecord>(record_slice) {
-                match record {
-                    WalRecord::Prepare { txn_id, partition, .. } => {
-                        prepared
-                            .entry(txn_id)
-                            .or_insert_with(HashSet::new)
-                            .insert(partition);
+                if let Ok(record) = bincode::deserialize::<WalRecord>(record_slice) {
+                    match record {
+                        WalRecord::Prepare { txn_id, partition, .. } => {
+                            prepared.entry(txn_id).or_insert_with(HashSet::new).insert(partition);
+                        }
+                        WalRecord::CommitPrepared { txn_id } => {
+                            committed.insert(txn_id);
+                        }
+                        WalRecord::RollbackPrepared { txn_id } => {
+                            rolled_back.insert(txn_id);
+                        }
+                        _ => {}
                     }
-                    WalRecord::CommitPrepared { txn_id } => {
-                        committed.insert(txn_id);
-                    }
-                    WalRecord::RollbackPrepared { txn_id } => {
-                        rolled_back.insert(txn_id);
-                    }
-                    _ => {}
                 }
-            }
             }
 
             pos += len;
@@ -823,19 +797,13 @@ mod tests {
     #[test]
     fn test_single_partition_commit() {
         let dir = tempdir().unwrap();
-        let manager = PartitionedWalManager::new(
-            dir.path(),
-            1,
-            IngestionSafetyLevel::Full,
-        ).unwrap();
+        let manager = PartitionedWalManager::new(dir.path(), 1, IngestionSafetyLevel::Full).unwrap();
 
-        let ops = vec![
-            WriteOp::Insert {
-                table: "test".to_string(),
-                row_id: 1,
-                data: vec![1, 2, 3],
-            },
-        ];
+        let ops = vec![WriteOp::Insert {
+            table: "test".to_string(),
+            row_id: 1,
+            data: vec![1, 2, 3],
+        }];
 
         let ts = manager.commit_single(1, &ops, true).unwrap();
         assert!(ts > 0);
@@ -851,7 +819,8 @@ mod tests {
                 disable_wal: true,
                 checkpoint_interval_secs: 0,
             },
-        ).unwrap();
+        )
+        .unwrap();
 
         assert!(!manager.is_enabled());
     }

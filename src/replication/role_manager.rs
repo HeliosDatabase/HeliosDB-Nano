@@ -3,12 +3,12 @@
 //! Manages transitions between Primary, Standby, and transitional states
 //! for controlled switchover and failover operations.
 
-use std::sync::atomic::{AtomicU8, Ordering};
 use parking_lot::RwLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::{Result, Error};
+use crate::{Error, Result};
 
 /// Node role in the HA cluster
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -237,8 +237,7 @@ impl RoleManager {
 
     /// Get current role (lock-free)
     pub fn role(&self) -> NodeRole {
-        NodeRole::from_u8(self.role.load(Ordering::SeqCst))
-            .unwrap_or(NodeRole::Offline)
+        NodeRole::from_u8(self.role.load(Ordering::SeqCst)).unwrap_or(NodeRole::Offline)
     }
 
     /// Check if this node is the primary
@@ -365,10 +364,7 @@ impl RoleManager {
         if valid {
             Ok(())
         } else {
-            Err(Error::ha(format!(
-                "Invalid role transition: {} -> {}",
-                from, to
-            )))
+            Err(Error::ha(format!("Invalid role transition: {} -> {}", from, to)))
         }
     }
 
@@ -463,11 +459,11 @@ impl RoleManager {
         let current = self.role();
 
         // Must be in appropriate transitional state
-        if !matches!(current, NodeRole::CatchingUp | NodeRole::TransitioningToPrimary | NodeRole::Standby) {
-            return Err(Error::ha(format!(
-                "Cannot promote from role: {}",
-                current
-            )));
+        if !matches!(
+            current,
+            NodeRole::CatchingUp | NodeRole::TransitioningToPrimary | NodeRole::Standby
+        ) {
+            return Err(Error::ha(format!("Cannot promote from role: {}", current)));
         }
 
         self.change_role(NodeRole::Primary, reason)
@@ -478,11 +474,11 @@ impl RoleManager {
         let current = self.role();
 
         // Must be in appropriate transitional state
-        if !matches!(current, NodeRole::Draining | NodeRole::TransitioningToStandby | NodeRole::Primary) {
-            return Err(Error::ha(format!(
-                "Cannot demote from role: {}",
-                current
-            )));
+        if !matches!(
+            current,
+            NodeRole::Draining | NodeRole::TransitioningToStandby | NodeRole::Primary
+        ) {
+            return Err(Error::ha(format!("Cannot demote from role: {}", current)));
         }
 
         self.change_role(NodeRole::Standby, reason)
@@ -514,14 +510,20 @@ mod tests {
         assert!(manager.is_standby());
 
         // Valid transition: Standby -> CatchingUp
-        manager.change_role(NodeRole::CatchingUp, RoleChangeReason::Switchover).unwrap();
+        manager
+            .change_role(NodeRole::CatchingUp, RoleChangeReason::Switchover)
+            .unwrap();
         assert_eq!(manager.role(), NodeRole::CatchingUp);
 
         // Valid transition: CatchingUp -> TransitioningToPrimary
-        manager.change_role(NodeRole::TransitioningToPrimary, RoleChangeReason::Switchover).unwrap();
+        manager
+            .change_role(NodeRole::TransitioningToPrimary, RoleChangeReason::Switchover)
+            .unwrap();
 
         // Valid transition: TransitioningToPrimary -> Primary
-        manager.change_role(NodeRole::Primary, RoleChangeReason::Switchover).unwrap();
+        manager
+            .change_role(NodeRole::Primary, RoleChangeReason::Switchover)
+            .unwrap();
         assert!(manager.is_primary());
         assert_eq!(manager.current_primary(), Some(node_id));
     }
@@ -548,9 +550,13 @@ mod tests {
         assert!(manager.is_switchover_in_progress());
 
         // Advance through phases
-        manager.advance_switchover_phase(SwitchoverPhase::Synchronization).unwrap();
+        manager
+            .advance_switchover_phase(SwitchoverPhase::Synchronization)
+            .unwrap();
         manager.advance_switchover_phase(SwitchoverPhase::RoleChange).unwrap();
-        manager.advance_switchover_phase(SwitchoverPhase::Reconfiguration).unwrap();
+        manager
+            .advance_switchover_phase(SwitchoverPhase::Reconfiguration)
+            .unwrap();
         manager.advance_switchover_phase(SwitchoverPhase::Resumption).unwrap();
         manager.advance_switchover_phase(SwitchoverPhase::Completed).unwrap();
 

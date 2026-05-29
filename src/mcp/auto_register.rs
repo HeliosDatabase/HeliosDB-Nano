@@ -53,11 +53,7 @@ pub fn registered() -> impl Iterator<Item = &'static McpExtensionTool> {
 /// Dispatch an inventory-registered tool by name. Returns `None` if
 /// the name isn't in the inventory so the caller can fall through to
 /// the hand-rolled catalogue.
-pub fn try_call(
-    db: Option<&EmbeddedDatabase>,
-    name: &str,
-    args: JsonValue,
-) -> Option<ToolOutcome> {
+pub fn try_call(db: Option<&EmbeddedDatabase>, name: &str, args: JsonValue) -> Option<ToolOutcome> {
     for entry in registered() {
         if entry.name == name {
             return Some((entry.handler)(db, args));

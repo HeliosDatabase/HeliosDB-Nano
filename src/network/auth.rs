@@ -2,13 +2,13 @@
 //!
 //! Supports SCRAM-SHA-256 authentication mechanism
 
-use sha2::{Sha256, Digest};
+use crate::Error;
 #[cfg(feature = "ring-crypto")]
 use ring::hmac;
 #[cfg(feature = "ring-crypto")]
 use ring::pbkdf2;
+use sha2::{Digest, Sha256};
 use std::num::NonZeroU32;
-use crate::Error;
 
 /// SCRAM-SHA-256 authentication state machine
 pub struct ScramAuth {
@@ -88,10 +88,7 @@ impl ScramAuth {
         let combined_nonce = format!("{}{}", self.client_nonce, self.server_nonce);
         let salt_base64 = base64::encode(&self.salt);
 
-        self.server_first_message = format!(
-            "r={},s={},i={}",
-            combined_nonce, salt_base64, self.iteration_count
-        );
+        self.server_first_message = format!("r={},s={},i={}", combined_nonce, salt_base64, self.iteration_count);
 
         self.state = ScramState::SentChallenge;
 
@@ -128,8 +125,8 @@ impl ScramAuth {
         let client_proof_b64 = attrs
             .get("p")
             .ok_or_else(|| Error::protocol("Missing proof in SCRAM final message"))?;
-        let client_proof = base64::decode(client_proof_b64)
-            .map_err(|_| Error::protocol("Invalid base64 in client proof"))?;
+        let client_proof =
+            base64::decode(client_proof_b64).map_err(|_| Error::protocol("Invalid base64 in client proof"))?;
 
         // Compute auth message
         let auth_message = format!(
@@ -159,7 +156,8 @@ impl ScramAuth {
         let client_signature = hmac::sign(&client_key, auth_message.as_bytes());
 
         // Compute client key from proof
-        let computed_client_key: Vec<u8> = client_proof.iter()
+        let computed_client_key: Vec<u8> = client_proof
+            .iter()
             .zip(client_signature.as_ref().iter())
             .map(|(a, b)| a ^ b)
             .collect();
@@ -188,7 +186,7 @@ impl ScramAuth {
     fn derive_keys(password: &str, salt: &[u8], iterations: u32) -> (Vec<u8>, Vec<u8>) {
         // Compute salted password using PBKDF2
         let mut salted_password = vec![0u8; 32]; // SHA-256 output size
-        // Use minimum of 4096 iterations as per SCRAM-SHA-256 recommendation if iterations is 0
+                                                 // Use minimum of 4096 iterations as per SCRAM-SHA-256 recommendation if iterations is 0
         const MIN_ITERATIONS: NonZeroU32 = match NonZeroU32::new(4096) {
             Some(n) => n,
             None => unreachable!(), // 4096 is non-zero
@@ -300,8 +298,7 @@ mod base64 {
 
             #[allow(clippy::indexing_slicing)] // SAFETY: chunk length is checked by match arms (1/2/3), CHARS indexed by 6-bit values (0-63) into [u8; 64]
             fn encode_chunk(&mut self, chunk: &[u8]) -> io::Result<()> {
-                const CHARS: &[u8; 64] =
-                    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+                const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
                 match chunk.len() {
                     3 => {
@@ -309,21 +306,18 @@ mod base64 {
                         let b2 = (((chunk[0] & 0x03) << 4) | (chunk[1] >> 4)) as usize;
                         let b3 = (((chunk[1] & 0x0F) << 2) | (chunk[2] >> 6)) as usize;
                         let b4 = (chunk[2] & 0x3F) as usize;
-                        self.writer
-                            .write_all(&[CHARS[b1], CHARS[b2], CHARS[b3], CHARS[b4]])?;
+                        self.writer.write_all(&[CHARS[b1], CHARS[b2], CHARS[b3], CHARS[b4]])?;
                     }
                     2 => {
                         let b1 = (chunk[0] >> 2) as usize;
                         let b2 = (((chunk[0] & 0x03) << 4) | (chunk[1] >> 4)) as usize;
                         let b3 = ((chunk[1] & 0x0F) << 2) as usize;
-                        self.writer
-                            .write_all(&[CHARS[b1], CHARS[b2], CHARS[b3], b'='])?;
+                        self.writer.write_all(&[CHARS[b1], CHARS[b2], CHARS[b3], b'='])?;
                     }
                     1 => {
                         let b1 = (chunk[0] >> 2) as usize;
                         let b2 = ((chunk[0] & 0x03) << 4) as usize;
-                        self.writer
-                            .write_all(&[CHARS[b1], CHARS[b2], b'=', b'='])?;
+                        self.writer.write_all(&[CHARS[b1], CHARS[b2], b'=', b'='])?;
                     }
                     _ => {}
                 }
@@ -403,10 +397,7 @@ mod base64 {
                     return Ok(());
                 }
 
-                let values: Vec<u8> = chunk
-                    .iter()
-                    .filter_map(|&c| Self::char_to_value(c))
-                    .collect();
+                let values: Vec<u8> = chunk.iter().filter_map(|&c| Self::char_to_value(c)).collect();
 
                 if values.len() < 2 {
                     return Ok(());
@@ -454,7 +445,8 @@ mod base64 {
 
                 let available = self.buffer.len().saturating_sub(self.pos);
                 let to_copy = available.min(buf.len());
-                if let (Some(dst), Some(src)) = (buf.get_mut(..to_copy), self.buffer.get(self.pos..self.pos + to_copy)) {
+                if let (Some(dst), Some(src)) = (buf.get_mut(..to_copy), self.buffer.get(self.pos..self.pos + to_copy))
+                {
                     dst.copy_from_slice(src);
                 }
                 self.pos += to_copy;

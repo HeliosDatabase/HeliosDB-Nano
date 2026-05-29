@@ -4,11 +4,11 @@
 //! It provides functionality for storing view definitions, tracking staleness, and managing
 //! the lifecycle of materialized views.
 
-use crate::{Result, Error, Schema, Tuple};
-use crate::sql::LogicalPlan;
 use super::StorageEngine;
+use crate::sql::LogicalPlan;
+use crate::{Error, Result, Schema, Tuple};
 use chrono::{DateTime, Utc};
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Metadata for a materialized view
@@ -179,10 +179,8 @@ impl<'a> MaterializedViewCatalog<'a> {
 
         let key = Self::mv_metadata_key(view_name);
         match self.storage.get(&key)? {
-            Some(data) => {
-                bincode::deserialize(&data)
-                    .map_err(|e| Error::storage(format!("Failed to deserialize MV metadata: {}", e)))
-            }
+            Some(data) => bincode::deserialize(&data)
+                .map_err(|e| Error::storage(format!("Failed to deserialize MV metadata: {}", e))),
             None => Err(Error::query_execution(format!(
                 "Materialized view '{}' does not exist",
                 view_name
@@ -266,7 +264,11 @@ impl<'a> MaterializedViewCatalog<'a> {
     /// Stores the query results in a regular table format for easy querying.
     /// The table name is prefixed with "__mv_" to distinguish it from user tables.
     pub fn store_view_data(&self, view_name: &str, tuples: Vec<Tuple>, schema: &Schema) -> Result<u64> {
-        tracing::info!("Storing data for materialized view '{}' ({} rows)", view_name, tuples.len());
+        tracing::info!(
+            "Storing data for materialized view '{}' ({} rows)",
+            view_name,
+            tuples.len()
+        );
 
         let data_table = Self::mv_data_table_name(view_name);
         let catalog = self.storage.catalog();
@@ -289,7 +291,11 @@ impl<'a> MaterializedViewCatalog<'a> {
             self.storage.insert_tuple(&data_table, tuple)?;
         }
 
-        tracing::info!("Successfully stored {} rows for materialized view '{}'", row_count, view_name);
+        tracing::info!(
+            "Successfully stored {} rows for materialized view '{}'",
+            row_count,
+            view_name
+        );
         Ok(row_count)
     }
 
@@ -314,7 +320,8 @@ impl<'a> MaterializedViewCatalog<'a> {
 
         tracing::info!(
             "Storing data for materialized view '{}' CONCURRENTLY ({} rows)",
-            view_name, tuples.len()
+            view_name,
+            tuples.len()
         );
 
         let data_table = Self::mv_data_table_name(view_name);
@@ -325,10 +332,7 @@ impl<'a> MaterializedViewCatalog<'a> {
         let temp_table = format!("{}__temp_{}", data_table, timestamp);
         let backup_table = format!("{}__old_{}", data_table, timestamp);
 
-        tracing::debug!(
-            "Using temporary table '{}' for concurrent refresh",
-            temp_table
-        );
+        tracing::debug!("Using temporary table '{}' for concurrent refresh", temp_table);
 
         // Step 1: Create temporary table with the new data
         if let Err(e) = catalog.create_table(&temp_table, schema.clone()) {
@@ -342,14 +346,17 @@ impl<'a> MaterializedViewCatalog<'a> {
             if let Err(e) = self.storage.insert_tuple(&temp_table, tuple) {
                 tracing::error!(
                     "Failed to insert tuple {} into temporary table '{}': {}",
-                    idx, temp_table, e
+                    idx,
+                    temp_table,
+                    e
                 );
 
                 // Cleanup: drop temporary table
                 if let Err(cleanup_err) = catalog.drop_table(&temp_table) {
                     tracing::warn!(
                         "Failed to cleanup temporary table '{}' after insert error: {}",
-                        temp_table, cleanup_err
+                        temp_table,
+                        cleanup_err
                     );
                 }
 
@@ -357,10 +364,7 @@ impl<'a> MaterializedViewCatalog<'a> {
             }
         }
 
-        tracing::debug!(
-            "Populated temporary table '{}' with {} rows",
-            temp_table, row_count
-        );
+        tracing::debug!("Populated temporary table '{}' with {} rows", temp_table, row_count);
 
         // Step 3: Atomic swap using rename operations
         // This is the critical section where we swap the tables
@@ -373,10 +377,7 @@ impl<'a> MaterializedViewCatalog<'a> {
 
                 // Cleanup temporary table
                 if let Err(cleanup_err) = catalog.drop_table(&temp_table) {
-                    tracing::warn!(
-                        "Failed to cleanup temporary table '{}': {}",
-                        temp_table, cleanup_err
-                    );
+                    tracing::warn!("Failed to cleanup temporary table '{}': {}", temp_table, cleanup_err);
                 }
 
                 return Err(e);
@@ -386,17 +387,11 @@ impl<'a> MaterializedViewCatalog<'a> {
         if table_exists {
             // Rename: old table -> backup table
             if let Err(e) = catalog.rename_table(&data_table, &backup_table) {
-                tracing::error!(
-                    "Failed to rename '{}' to '{}': {}",
-                    data_table, backup_table, e
-                );
+                tracing::error!("Failed to rename '{}' to '{}': {}", data_table, backup_table, e);
 
                 // Cleanup temporary table
                 if let Err(cleanup_err) = catalog.drop_table(&temp_table) {
-                    tracing::warn!(
-                        "Failed to cleanup temporary table '{}': {}",
-                        temp_table, cleanup_err
-                    );
+                    tracing::warn!("Failed to cleanup temporary table '{}': {}", temp_table, cleanup_err);
                 }
 
                 return Err(e);
@@ -406,20 +401,21 @@ impl<'a> MaterializedViewCatalog<'a> {
 
         // Rename: temp table -> main table
         if let Err(e) = catalog.rename_table(&temp_table, &data_table) {
-            tracing::error!(
-                "CRITICAL: Failed to rename '{}' to '{}': {}",
-                temp_table, data_table, e
-            );
+            tracing::error!("CRITICAL: Failed to rename '{}' to '{}': {}", temp_table, data_table, e);
 
             // Attempt to restore original state if old table was renamed
             if table_exists {
-                tracing::info!("Attempting to restore original table by renaming '{}' back to '{}'",
-                    backup_table, data_table);
+                tracing::info!(
+                    "Attempting to restore original table by renaming '{}' back to '{}'",
+                    backup_table,
+                    data_table
+                );
 
                 if let Err(restore_err) = catalog.rename_table(&backup_table, &data_table) {
                     tracing::error!(
                         "CRITICAL: Failed to restore original table '{}': {}. Manual intervention may be required.",
-                        data_table, restore_err
+                        data_table,
+                        restore_err
                     );
                 } else {
                     tracing::info!("Successfully restored original table '{}'", data_table);
@@ -429,10 +425,7 @@ impl<'a> MaterializedViewCatalog<'a> {
             // Try to cleanup temporary table if it still exists
             if catalog.table_exists(&temp_table).unwrap_or(false) {
                 if let Err(cleanup_err) = catalog.drop_table(&temp_table) {
-                    tracing::warn!(
-                        "Failed to cleanup temporary table '{}': {}",
-                        temp_table, cleanup_err
-                    );
+                    tracing::warn!("Failed to cleanup temporary table '{}': {}", temp_table, cleanup_err);
                 }
             }
 
@@ -446,7 +439,8 @@ impl<'a> MaterializedViewCatalog<'a> {
                 // Log but don't fail - the refresh succeeded, cleanup is just housekeeping
                 tracing::warn!(
                     "Warning: Failed to drop backup table '{}': {}. This may be cleaned up manually.",
-                    backup_table, e
+                    backup_table,
+                    e
                 );
             } else {
                 tracing::debug!("Dropped backup table '{}'", backup_table);
@@ -455,7 +449,8 @@ impl<'a> MaterializedViewCatalog<'a> {
 
         tracing::info!(
             "Successfully stored {} rows for materialized view '{}' (CONCURRENT mode)",
-            row_count, view_name
+            row_count,
+            view_name
         );
 
         Ok(row_count)
@@ -493,13 +488,12 @@ impl<'a> MaterializedViewCatalog<'a> {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::{Config, Column, DataType, Value};
+    use crate::{Column, Config, DataType, Value};
 
     #[test]
     fn test_create_and_get_view() {
         let config = Config::in_memory();
-        let storage = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open storage");
+        let storage = StorageEngine::open_in_memory(&config).expect("Failed to open storage");
         let mv_catalog = MaterializedViewCatalog::new(&storage);
 
         let schema = Schema::new(vec![
@@ -525,15 +519,16 @@ mod tests {
             schema.clone(),
         );
 
-        mv_catalog.create_view(metadata.clone())
-            .expect("Failed to create view");
+        mv_catalog.create_view(metadata.clone()).expect("Failed to create view");
 
         // Verify view exists
-        assert!(mv_catalog.view_exists("user_summary")
+        assert!(mv_catalog
+            .view_exists("user_summary")
             .expect("Failed to check if view exists"));
 
         // Verify metadata
-        let retrieved = mv_catalog.get_view("user_summary")
+        let retrieved = mv_catalog
+            .get_view("user_summary")
             .expect("Failed to get view metadata");
         assert_eq!(retrieved.view_name, "user_summary");
         assert_eq!(retrieved.query_text, metadata.query_text);
@@ -543,13 +538,10 @@ mod tests {
     #[test]
     fn test_drop_view() {
         let config = Config::in_memory();
-        let storage = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open storage");
+        let storage = StorageEngine::open_in_memory(&config).expect("Failed to open storage");
         let mv_catalog = MaterializedViewCatalog::new(&storage);
 
-        let schema = Schema::new(vec![
-            Column::new("id", DataType::Int4),
-        ]);
+        let schema = Schema::new(vec![Column::new("id", DataType::Int4)]);
 
         // Create a dummy plan for testing
         let query_plan = LogicalPlan::Scan {
@@ -569,24 +561,23 @@ mod tests {
             schema,
         );
 
-        mv_catalog.create_view(metadata)
-            .expect("Failed to create view");
+        mv_catalog.create_view(metadata).expect("Failed to create view");
 
-        assert!(mv_catalog.view_exists("temp_view")
+        assert!(mv_catalog
+            .view_exists("temp_view")
             .expect("Failed to check if view exists"));
 
-        mv_catalog.drop_view("temp_view")
-            .expect("Failed to drop view");
+        mv_catalog.drop_view("temp_view").expect("Failed to drop view");
 
-        assert!(!mv_catalog.view_exists("temp_view")
+        assert!(!mv_catalog
+            .view_exists("temp_view")
             .expect("Failed to check if view exists after drop"));
     }
 
     #[test]
     fn test_store_and_read_view_data() {
         let config = Config::in_memory();
-        let storage = StorageEngine::open_in_memory(&config)
-            .expect("Failed to open storage");
+        let storage = StorageEngine::open_in_memory(&config).expect("Failed to open storage");
         let mv_catalog = MaterializedViewCatalog::new(&storage);
 
         let schema = Schema::new(vec![
@@ -612,36 +603,29 @@ mod tests {
             schema.clone(),
         );
 
-        mv_catalog.create_view(metadata)
-            .expect("Failed to create view");
+        mv_catalog.create_view(metadata).expect("Failed to create view");
 
         // Store test data
         let tuples = vec![
-            Tuple::new(vec![
-                Value::String("Alice".to_string()),
-                Value::Int4(30),
-            ]),
-            Tuple::new(vec![
-                Value::String("Bob".to_string()),
-                Value::Int4(25),
-            ]),
+            Tuple::new(vec![Value::String("Alice".to_string()), Value::Int4(30)]),
+            Tuple::new(vec![Value::String("Bob".to_string()), Value::Int4(25)]),
         ];
 
-        let row_count = mv_catalog.store_view_data("test_view", tuples.clone(), &schema)
+        let row_count = mv_catalog
+            .store_view_data("test_view", tuples.clone(), &schema)
             .expect("Failed to store view data");
         assert_eq!(row_count, 2);
 
         // Read back data
-        let retrieved = mv_catalog.read_view_data("test_view")
+        let retrieved = mv_catalog
+            .read_view_data("test_view")
             .expect("Failed to read view data");
         assert_eq!(retrieved.len(), 2);
     }
 
     #[test]
     fn test_staleness_tracking() {
-        let schema = Schema::new(vec![
-            Column::new("id", DataType::Int4),
-        ]);
+        let schema = Schema::new(vec![Column::new("id", DataType::Int4)]);
 
         // Create a dummy plan for testing
         let query_plan = LogicalPlan::Scan {

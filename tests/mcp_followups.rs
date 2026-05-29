@@ -19,9 +19,7 @@ fn indexed_db() -> EmbeddedDatabase {
         "INSERT INTO src VALUES ($1, 'rust', $2)",
         &[
             Value::String("a.rs".to_string()),
-            Value::String(
-                "pub fn alpha() {}\npub fn beta() { alpha(); }\n".to_string(),
-            ),
+            Value::String("pub fn alpha() {}\npub fn beta() { alpha(); }\n".to_string()),
         ],
     )
     .unwrap();
@@ -47,11 +45,7 @@ fn all_followup_tools_are_listed() {
 #[test]
 fn document_symbols_returns_file_outline() {
     let db = indexed_db();
-    let r = call_tool(
-        Some(&db),
-        "helios_lsp_document_symbols",
-        json!({ "path": "a.rs" }),
-    );
+    let r = call_tool(Some(&db), "helios_lsp_document_symbols", json!({ "path": "a.rs" }));
     assert!(!r.is_error, "{r:?}");
     let symbols = r.payload["symbols"].as_array().expect("symbols");
     let names: Vec<_> = symbols
@@ -145,11 +139,7 @@ fn graphrag_search_matches_indexed_symbol() {
 #[test]
 fn graphrag_search_empty_seed_errors() {
     let db = indexed_db();
-    let r = call_tool(
-        Some(&db),
-        "helios_graphrag_search",
-        json!({ "seed_text": "" }),
-    );
+    let r = call_tool(Some(&db), "helios_graphrag_search", json!({ "seed_text": "" }));
     assert!(r.is_error);
 }
 

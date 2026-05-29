@@ -1,7 +1,7 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use heliosdb_nano::sync::{
-    ConflictChangeEntry as ChangeEntry, ConflictChangeOperation as ChangeOperation,
-    ConflictDetector, ConflictResolutionV2 as ConflictResolution, VectorClock,
+    ConflictChangeEntry as ChangeEntry, ConflictChangeOperation as ChangeOperation, ConflictDetector,
+    ConflictResolutionV2 as ConflictResolution, VectorClock,
 };
 use uuid::Uuid;
 
@@ -53,8 +53,7 @@ fn conflict_resolution_benchmark(c: &mut Criterion) {
 
     let now = chrono::Utc::now();
     let local = create_test_entry(node1, now, ChangeOperation::Update);
-    let remote =
-        create_test_entry(node2, now + chrono::Duration::seconds(1), ChangeOperation::Update);
+    let remote = create_test_entry(node2, now + chrono::Duration::seconds(1), ChangeOperation::Update);
 
     let mut local_concurrent = local.clone();
     let mut remote_concurrent = remote.clone();

@@ -23,9 +23,7 @@ fn bench_l2_distance(c: &mut Criterion) {
         group.throughput(Throughput::Elements(size as u64));
 
         group.bench_with_input(BenchmarkId::new("simd", size), &size, |bench, _| {
-            bench.iter(|| {
-                simd::l2_distance(black_box(&a), black_box(&b))
-            });
+            bench.iter(|| simd::l2_distance(black_box(&a), black_box(&b)));
         });
     }
 
@@ -43,9 +41,7 @@ fn bench_l2_distance_squared(c: &mut Criterion) {
         group.throughput(Throughput::Elements(size as u64));
 
         group.bench_with_input(BenchmarkId::new("simd", size), &size, |bench, _| {
-            bench.iter(|| {
-                simd::l2_distance_squared(black_box(&a), black_box(&b))
-            });
+            bench.iter(|| simd::l2_distance_squared(black_box(&a), black_box(&b)));
         });
     }
 
@@ -63,9 +59,7 @@ fn bench_cosine_distance(c: &mut Criterion) {
         group.throughput(Throughput::Elements(size as u64));
 
         group.bench_with_input(BenchmarkId::new("simd", size), &size, |bench, _| {
-            bench.iter(|| {
-                simd::cosine_distance(black_box(&a), black_box(&b))
-            });
+            bench.iter(|| simd::cosine_distance(black_box(&a), black_box(&b)));
         });
     }
 
@@ -83,9 +77,7 @@ fn bench_dot_product(c: &mut Criterion) {
         group.throughput(Throughput::Elements(size as u64));
 
         group.bench_with_input(BenchmarkId::new("simd", size), &size, |bench, _| {
-            bench.iter(|| {
-                simd::dot_product(black_box(&a), black_box(&b))
-            });
+            bench.iter(|| simd::dot_product(black_box(&a), black_box(&b)));
         });
     }
 
@@ -110,21 +102,15 @@ fn bench_openai_embeddings(c: &mut Criterion) {
         group.throughput(Throughput::Elements(dim as u64));
 
         group.bench_with_input(BenchmarkId::new("l2", name), &dim, |bench, _| {
-            bench.iter(|| {
-                simd::l2_distance(black_box(&a), black_box(&b))
-            });
+            bench.iter(|| simd::l2_distance(black_box(&a), black_box(&b)));
         });
 
         group.bench_with_input(BenchmarkId::new("cosine", name), &dim, |bench, _| {
-            bench.iter(|| {
-                simd::cosine_distance(black_box(&a), black_box(&b))
-            });
+            bench.iter(|| simd::cosine_distance(black_box(&a), black_box(&b)));
         });
 
         group.bench_with_input(BenchmarkId::new("dot", name), &dim, |bench, _| {
-            bench.iter(|| {
-                simd::dot_product(black_box(&a), black_box(&b))
-            });
+            bench.iter(|| simd::dot_product(black_box(&a), black_box(&b)));
         });
     }
 

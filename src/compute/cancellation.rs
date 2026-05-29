@@ -3,13 +3,13 @@
 //! Provides cooperative query cancellation using tokens that can be
 //! checked at various points during query execution.
 
+use chrono::{DateTime, Utc};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
-use chrono::{DateTime, Utc};
 
-use crate::{Result, Error};
+use crate::{Error, Result};
 
 // =============================================================================
 // CancellationToken - Thread-safe cancellation signal
@@ -69,7 +69,8 @@ impl CancellationToken {
     /// Check if cancelled and return an error if so
     pub fn check(&self) -> Result<()> {
         if self.is_cancelled() {
-            let reason = self.cancellation_reason()
+            let reason = self
+                .cancellation_reason()
                 .unwrap_or_else(|| "Query cancelled".to_string());
             Err(Error::QueryCancelled(reason))
         } else {
@@ -153,9 +154,7 @@ impl RunningQuery {
     /// Update elapsed time
     pub fn update_elapsed(&mut self) {
         let now = Utc::now();
-        self.elapsed = (now - self.started_at)
-            .to_std()
-            .unwrap_or(Duration::ZERO);
+        self.elapsed = (now - self.started_at).to_std().unwrap_or(Duration::ZERO);
     }
 }
 
@@ -247,10 +246,12 @@ impl QueryRegistry {
             if queries.len() >= self.max_tracked {
                 let completed: Vec<u64> = queries
                     .iter()
-                    .filter(|(_, q)| matches!(
-                        q.state,
-                        QueryState::Completed | QueryState::Failed | QueryState::Cancelled
-                    ))
+                    .filter(|(_, q)| {
+                        matches!(
+                            q.state,
+                            QueryState::Completed | QueryState::Failed | QueryState::Cancelled
+                        )
+                    })
                     .map(|(id, _)| *id)
                     .collect();
 
@@ -305,10 +306,7 @@ impl QueryRegistry {
         if let Ok(mut queries) = self.queries.write() {
             if let Some(query) = queries.get_mut(&query_id) {
                 if !query.cancellable {
-                    return Err(Error::Generic(format!(
-                        "Query {} cannot be cancelled",
-                        query_id
-                    )));
+                    return Err(Error::Generic(format!("Query {} cannot be cancelled", query_id)));
                 }
 
                 query.cancel_token.cancel_with_reason("Cancelled by user request");
@@ -324,10 +322,7 @@ impl QueryRegistry {
         if let Ok(mut queries) = self.queries.write() {
             if let Some(query) = queries.get_mut(&query_id) {
                 if !query.cancellable {
-                    return Err(Error::Generic(format!(
-                        "Query {} cannot be cancelled",
-                        query_id
-                    )));
+                    return Err(Error::Generic(format!("Query {} cannot be cancelled", query_id)));
                 }
 
                 query.cancel_token.cancel_with_reason(reason);
@@ -360,15 +355,12 @@ impl QueryRegistry {
         let mut cancelled = 0;
         if let Ok(mut queries) = self.queries.write() {
             for query in queries.values_mut() {
-                if query.cancellable
-                    && matches!(query.state, QueryState::Planning | QueryState::Executing)
-                {
+                if query.cancellable && matches!(query.state, QueryState::Planning | QueryState::Executing) {
                     query.update_elapsed();
                     if query.elapsed > timeout {
-                        query.cancel_token.cancel_with_reason(format!(
-                            "Query timeout exceeded ({:.1}s)",
-                            timeout.as_secs_f64()
-                        ));
+                        query
+                            .cancel_token
+                            .cancel_with_reason(format!("Query timeout exceeded ({:.1}s)", timeout.as_secs_f64()));
                         query.state = QueryState::Cancelling;
                         cancelled += 1;
                     }
@@ -388,7 +380,12 @@ impl QueryRegistry {
         if let Ok(queries) = self.queries.read() {
             queries
                 .values()
-                .filter(|q| matches!(q.state, QueryState::Planning | QueryState::Executing | QueryState::Cancelling))
+                .filter(|q| {
+                    matches!(
+                        q.state,
+                        QueryState::Planning | QueryState::Executing | QueryState::Cancelling
+                    )
+                })
                 .cloned()
                 .collect()
         } else {
@@ -422,10 +419,7 @@ impl QueryRegistry {
         if let Ok(queries) = self.queries.read() {
             queries
                 .values()
-                .filter(|q| {
-                    q.user_name == user_name
-                        && matches!(q.state, QueryState::Planning | QueryState::Executing)
-                })
+                .filter(|q| q.user_name == user_name && matches!(q.state, QueryState::Planning | QueryState::Executing))
                 .count()
         } else {
             0
@@ -438,7 +432,10 @@ impl QueryRegistry {
             let cutoff = Utc::now() - chrono::Duration::from_std(max_age).unwrap_or(chrono::Duration::hours(1));
             queries.retain(|_, q| {
                 // Keep running queries
-                if matches!(q.state, QueryState::Planning | QueryState::Executing | QueryState::Cancelling) {
+                if matches!(
+                    q.state,
+                    QueryState::Planning | QueryState::Executing | QueryState::Cancelling
+                ) {
                     return true;
                 }
                 // Keep recent completed queries

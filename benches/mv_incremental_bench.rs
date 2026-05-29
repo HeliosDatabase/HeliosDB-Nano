@@ -2,14 +2,10 @@
 //!
 //! Compares performance between full recomputation and incremental refresh.
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId};
-use heliosdb_nano::{
-    Config, StorageEngine, Schema, Column, DataType, Tuple, Value,
-};
-use heliosdb_nano::storage::{
-    IncrementalRefresher, DeltaTracker, MaterializedViewMetadata,
-};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use heliosdb_nano::sql::LogicalPlan;
+use heliosdb_nano::storage::{DeltaTracker, IncrementalRefresher, MaterializedViewMetadata};
+use heliosdb_nano::{Column, Config, DataType, Schema, StorageEngine, Tuple, Value};
 use std::sync::Arc;
 
 fn setup_test_data(storage: &StorageEngine, num_rows: usize) {
@@ -38,21 +34,17 @@ fn benchmark_full_refresh(c: &mut Criterion) {
     let mut group = c.benchmark_group("materialized_view_refresh");
 
     for size in [100, 1000, 10_000].iter() {
-        group.bench_with_input(
-            BenchmarkId::new("full_refresh", size),
-            size,
-            |b, &size| {
-                b.iter(|| {
-                    let config = Config::in_memory();
-                    let storage = StorageEngine::open_in_memory(&config).unwrap();
-                    setup_test_data(&storage, size);
+        group.bench_with_input(BenchmarkId::new("full_refresh", size), size, |b, &size| {
+            b.iter(|| {
+                let config = Config::in_memory();
+                let storage = StorageEngine::open_in_memory(&config).unwrap();
+                setup_test_data(&storage, size);
 
-                    // Simulate full table scan
-                    let tuples = storage.scan_table("test_table").unwrap();
-                    black_box(tuples.len());
-                });
-            },
-        );
+                // Simulate full table scan
+                let tuples = storage.scan_table("test_table").unwrap();
+                black_box(tuples.len());
+            });
+        });
     }
 
     group.finish();
@@ -62,36 +54,32 @@ fn benchmark_incremental_refresh(c: &mut Criterion) {
     let mut group = c.benchmark_group("materialized_view_refresh");
 
     for size in [100, 1000, 10_000].iter() {
-        group.bench_with_input(
-            BenchmarkId::new("incremental_refresh", size),
-            size,
-            |b, &size| {
-                b.iter(|| {
-                    let config = Config::in_memory();
-                    let storage = Arc::new(StorageEngine::open_in_memory(&config).unwrap());
-                    let tracker = Arc::new(DeltaTracker::new(Arc::clone(&storage)));
+        group.bench_with_input(BenchmarkId::new("incremental_refresh", size), size, |b, &size| {
+            b.iter(|| {
+                let config = Config::in_memory();
+                let storage = Arc::new(StorageEngine::open_in_memory(&config).unwrap());
+                let tracker = Arc::new(DeltaTracker::new(Arc::clone(&storage)));
 
-                    setup_test_data(&storage, size);
+                setup_test_data(&storage, size);
 
-                    // Simulate small number of changes (1% of dataset)
-                    let num_changes = (size / 100).max(1);
-                    for i in 0..num_changes {
-                        let tuple = Tuple {
-                            values: vec![
-                                Value::Int4(i as i32),
-                                Value::Int8(i as i64 * 200),
-                                Value::String("updated".to_string()),
-                            ],
-                        };
-                        tracker.record_insert("test_table", tuple, 1000 + i as u64);
-                    }
+                // Simulate small number of changes (1% of dataset)
+                let num_changes = (size / 100).max(1);
+                for i in 0..num_changes {
+                    let tuple = Tuple {
+                        values: vec![
+                            Value::Int4(i as i32),
+                            Value::Int8(i as i64 * 200),
+                            Value::String("updated".to_string()),
+                        ],
+                    };
+                    tracker.record_insert("test_table", tuple, 1000 + i as u64);
+                }
 
-                    // Get deltas and process them
-                    let deltas = tracker.get_deltas_since("test_table", 500);
-                    black_box(deltas.len());
-                });
-            },
-        );
+                // Get deltas and process them
+                let deltas = tracker.get_deltas_since("test_table", 500);
+                black_box(deltas.len());
+            });
+        });
     }
 
     group.finish();

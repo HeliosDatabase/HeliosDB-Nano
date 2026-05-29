@@ -131,7 +131,7 @@ impl LockGuard {
             lock_manager: Some(lock_manager),
         }
     }
-    
+
     /// Create a dummy lock guard (for tests or internal use)
     pub fn dummy(lock_id: String, transaction_id: u64) -> Self {
         Self {
@@ -341,12 +341,7 @@ impl LockManager {
     }
 
     /// DFS helper for cycle detection
-    fn has_cycle(
-        &self,
-        node: u64,
-        visited: &mut HashSet<u64>,
-        rec_stack: &mut HashSet<u64>,
-    ) -> Result<bool> {
+    fn has_cycle(&self, node: u64, visited: &mut HashSet<u64>, rec_stack: &mut HashSet<u64>) -> Result<bool> {
         // Mark current node as visited and in recursion stack
         visited.insert(node);
         rec_stack.insert(node);
@@ -542,7 +537,8 @@ mod tests {
         let manager = Arc::new(LockManager::new(5000));
 
         // Acquire read lock
-        let guard = manager.acquire_lock("resource1", 1, LockType::Read)
+        let guard = manager
+            .acquire_lock("resource1", 1, LockType::Read)
             .expect("Failed to acquire read lock");
 
         assert!(manager.is_locked("resource1"));
@@ -558,9 +554,11 @@ mod tests {
         let manager = Arc::new(LockManager::new(5000));
 
         // Multiple transactions can hold read locks simultaneously
-        let guard1 = manager.acquire_lock("resource1", 1, LockType::Read)
+        let guard1 = manager
+            .acquire_lock("resource1", 1, LockType::Read)
             .expect("Failed to acquire read lock for tx 1");
-        let guard2 = manager.acquire_lock("resource1", 2, LockType::Read)
+        let guard2 = manager
+            .acquire_lock("resource1", 2, LockType::Read)
             .expect("Failed to acquire read lock for tx 2");
 
         let holders = manager.get_lock_holders("resource1");
@@ -577,14 +575,13 @@ mod tests {
         let manager = Arc::new(LockManager::new(1000));
 
         // First transaction acquires write lock
-        let guard1 = manager.acquire_lock("resource1", 1, LockType::Write)
+        let guard1 = manager
+            .acquire_lock("resource1", 1, LockType::Write)
             .expect("Failed to acquire write lock");
 
         // Second transaction tries to acquire read lock (should timeout)
         let manager_clone = Arc::clone(&manager);
-        let handle = thread::spawn(move || {
-            manager_clone.acquire_lock("resource1", 2, LockType::Read)
-        });
+        let handle = thread::spawn(move || manager_clone.acquire_lock("resource1", 2, LockType::Read));
 
         // Wait a bit to ensure second thread starts
         thread::sleep(Duration::from_millis(100));
@@ -602,18 +599,18 @@ mod tests {
         let manager = Arc::new(LockManager::new(5000));
 
         // Transaction 1 holds lock on resource A
-        let guard1 = manager.acquire_lock("resourceA", 1, LockType::Write)
+        let guard1 = manager
+            .acquire_lock("resourceA", 1, LockType::Write)
             .expect("Failed to acquire lock A for tx 1");
 
         // Transaction 2 holds lock on resource B
-        let guard2 = manager.acquire_lock("resourceB", 2, LockType::Write)
+        let guard2 = manager
+            .acquire_lock("resourceB", 2, LockType::Write)
             .expect("Failed to acquire lock B for tx 2");
 
         // Transaction 1 tries to acquire lock on resource B (will wait)
         let manager1 = Arc::clone(&manager);
-        let handle1 = thread::spawn(move || {
-            manager1.acquire_lock("resourceB", 1, LockType::Write)
-        });
+        let handle1 = thread::spawn(move || manager1.acquire_lock("resourceB", 1, LockType::Write));
 
         // Give tx1 time to start waiting
         thread::sleep(Duration::from_millis(50));
@@ -623,7 +620,7 @@ mod tests {
 
         // Should detect deadlock
         assert!(result.is_err());
-        
+
         // Clean up
         drop(guard1);
         drop(guard2);

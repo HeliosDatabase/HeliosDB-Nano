@@ -7,8 +7,8 @@
 //! - Application lifecycle integration
 //! - Resource cleanup
 
-use std::sync::Arc;
 use std::path::Path;
+use std::sync::Arc;
 
 // Run with: cargo test --test embedded_mode_integration_test --lib
 

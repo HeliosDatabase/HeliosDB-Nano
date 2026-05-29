@@ -309,27 +309,33 @@ pub async fn create_chat_completion(
     // Get RAG context if configured
     let rag_context = if let Some(ref rag_config) = req.rag {
         // Extract user query from last user message
-        let user_query = req.messages.iter()
+        let user_query = req
+            .messages
+            .iter()
             .rev()
             .find(|m| m.role == "user")
             .and_then(|m| m.content.clone())
             .unwrap_or_default();
 
-        let raw_sources = state.db.rag_search(
-            &rag_config.vector_stores.first().unwrap_or(&"default".to_string()),
-            &user_query,
-            rag_config.top_k,
-        ).map_err(|e| ApiError::internal(format!("RAG search failed: {}", e)))?;
+        let raw_sources = state
+            .db
+            .rag_search(
+                &rag_config.vector_stores.first().unwrap_or(&"default".to_string()),
+                &user_query,
+                rag_config.top_k,
+            )
+            .map_err(|e| ApiError::internal(format!("RAG search failed: {}", e)))?;
 
-        let sources: Vec<_> = raw_sources.into_iter().map(|(doc, score, context)| {
-            crate::api::models::RagSource {
+        let sources: Vec<_> = raw_sources
+            .into_iter()
+            .map(|(doc, score, context)| crate::api::models::RagSource {
                 id: doc.id.clone(),
                 content: doc.content,
                 score,
                 metadata: doc.metadata,
                 context: Some(context),
-            }
-        }).collect();
+            })
+            .collect();
 
         Some(sources)
     } else {
@@ -340,7 +346,8 @@ pub async fn create_chat_completion(
     let mut messages = req.messages.clone();
     if let Some(ref sources) = rag_context {
         // Insert context as system message
-        let context = sources.iter()
+        let context = sources
+            .iter()
             .map(|s| format!("Source [{}]: {}", s.id, s.content))
             .collect::<Vec<_>>()
             .join("\n\n");
@@ -359,53 +366,57 @@ pub async fn create_chat_completion(
         };
 
         // Insert after existing system messages
-        let system_end = messages.iter()
-            .position(|m| m.role != "system")
-            .unwrap_or(0);
+        let system_end = messages.iter().position(|m| m.role != "system").unwrap_or(0);
         messages.insert(system_end, system_msg);
     }
 
     // Load memory context if session provided
     if let Some(ref session_id) = req.session_id {
-        let memory_messages = state.db.get_agent_messages(
-            session_id,
-        ).map_err(|e| ApiError::internal(format!("Memory load failed: {}", e)))?;
+        let memory_messages = state
+            .db
+            .get_agent_messages(session_id)
+            .map_err(|e| ApiError::internal(format!("Memory load failed: {}", e)))?;
 
         // Prepend memory (after system messages)
-        let system_end = messages.iter()
-            .position(|m| m.role != "system")
-            .unwrap_or(0);
+        let system_end = messages.iter().position(|m| m.role != "system").unwrap_or(0);
 
         for (i, m) in memory_messages.into_iter().enumerate() {
             // Parse function_call JSON string if present
-            let function_call = m.function_call.as_ref().and_then(|fc_str| {
-                serde_json::from_str::<FunctionCall>(fc_str).ok()
-            });
+            let function_call = m
+                .function_call
+                .as_ref()
+                .and_then(|fc_str| serde_json::from_str::<FunctionCall>(fc_str).ok());
 
             // Parse tool_calls if present - it's stored as Option<serde_json::Value>
-            let tool_calls = m.tool_calls.as_ref().and_then(|tc_val| {
-                serde_json::from_value::<Vec<ToolCall>>(tc_val.clone()).ok()
-            });
+            let tool_calls = m
+                .tool_calls
+                .as_ref()
+                .and_then(|tc_val| serde_json::from_value::<Vec<ToolCall>>(tc_val.clone()).ok());
 
-            messages.insert(system_end + i, ChatMessage {
-                role: m.role,
-                content: Some(m.content),
-                name: if m.name.is_empty() { None } else { Some(m.name) },
-                function_call,
-                tool_calls,
-                tool_call_id: None,
-            });
+            messages.insert(
+                system_end + i,
+                ChatMessage {
+                    role: m.role,
+                    content: Some(m.content),
+                    name: if m.name.is_empty() { None } else { Some(m.name) },
+                    function_call,
+                    tool_calls,
+                    tool_call_id: None,
+                },
+            );
         }
     }
 
     // Generate completion
-    let messages_for_api: Vec<(String, String)> = messages.iter().map(|m| {
-        (m.role.clone(), m.content.clone().unwrap_or_default())
-    }).collect();
+    let messages_for_api: Vec<(String, String)> = messages
+        .iter()
+        .map(|m| (m.role.clone(), m.content.clone().unwrap_or_default()))
+        .collect();
 
-    let completion_text = state.db.chat_completion(
-        messages_for_api,
-    ).map_err(|e| ApiError::internal(format!("Chat completion failed: {}", e)))?;
+    let completion_text = state
+        .db
+        .chat_completion(messages_for_api)
+        .map_err(|e| ApiError::internal(format!("Chat completion failed: {}", e)))?;
 
     let result = crate::api::models::ChatCompletionResult {
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
@@ -429,20 +440,16 @@ pub async fn create_chat_completion(
     if let Some(ref session_id) = req.session_id {
         // Save user message
         if let Some(user_msg) = req.messages.iter().rev().find(|m| m.role == "user") {
-            let _ = state.db.add_agent_message(
-                session_id,
-                "user",
-                user_msg.content.as_deref().unwrap_or(""),
-            );
+            let _ = state
+                .db
+                .add_agent_message(session_id, "user", user_msg.content.as_deref().unwrap_or(""));
         }
 
         // Save assistant response
         if let Some(choice) = result.choices.first() {
-            let _ = state.db.add_agent_message(
-                session_id,
-                "assistant",
-                &choice.message.content,
-            );
+            let _ = state
+                .db
+                .add_agent_message(session_id, "assistant", &choice.message.content);
         }
     }
 
@@ -452,38 +459,46 @@ pub async fn create_chat_completion(
         object: "chat.completion".to_string(),
         created: result.created,
         model: result.model,
-        choices: result.choices.into_iter().map(|c| {
-            // Parse function_call from serde_json::Value if present
-            let function_call = c.message.function_call.as_ref().and_then(|fc_val| {
-                serde_json::from_value::<FunctionCall>(fc_val.clone()).ok()
-            });
+        choices: result
+            .choices
+            .into_iter()
+            .map(|c| {
+                // Parse function_call from serde_json::Value if present
+                let function_call = c
+                    .message
+                    .function_call
+                    .as_ref()
+                    .and_then(|fc_val| serde_json::from_value::<FunctionCall>(fc_val.clone()).ok());
 
-            // Parse tool_calls from Option<Vec<serde_json::Value>> if present
-            let tool_calls = c.message.tool_calls.as_ref().and_then(|tc_list| {
-                tc_list.iter()
-                    .map(|tc_val| serde_json::from_value::<ToolCall>(tc_val.clone()).ok())
-                    .collect::<Option<Vec<ToolCall>>>()
-            });
+                // Parse tool_calls from Option<Vec<serde_json::Value>> if present
+                let tool_calls = c.message.tool_calls.as_ref().and_then(|tc_list| {
+                    tc_list
+                        .iter()
+                        .map(|tc_val| serde_json::from_value::<ToolCall>(tc_val.clone()).ok())
+                        .collect::<Option<Vec<ToolCall>>>()
+                });
 
-            ChatChoice {
-                index: c.index as usize,
-                message: ChatMessage {
-                    role: c.message.role,
-                    content: Some(c.message.content),
-                    name: c.message.name,
-                    function_call,
-                    tool_calls,
-                    tool_call_id: None,
-                },
-                finish_reason: c.finish_reason,
-            }
-        }).collect(),
+                ChatChoice {
+                    index: c.index as usize,
+                    message: ChatMessage {
+                        role: c.message.role,
+                        content: Some(c.message.content),
+                        name: c.message.name,
+                        function_call,
+                        tool_calls,
+                        tool_call_id: None,
+                    },
+                    finish_reason: c.finish_reason,
+                }
+            })
+            .collect(),
         usage: {
             // Parse usage from serde_json::Value
             if let Ok(usage_obj) = serde_json::from_value::<serde_json::Map<String, serde_json::Value>>(result.usage) {
                 Some(Usage {
                     prompt_tokens: usage_obj.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
-                    completion_tokens: usage_obj.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                    completion_tokens: usage_obj.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0)
+                        as usize,
                     total_tokens: usage_obj.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
                 })
             } else {
@@ -492,20 +507,23 @@ pub async fn create_chat_completion(
         },
         sources: if req.rag.as_ref().map(|r| r.include_sources).unwrap_or(false) {
             rag_context.map(|sources| {
-                sources.into_iter().map(|s| {
-                    // Convert metadata from Option<serde_json::Value> to HashMap
-                    let metadata = match s.metadata {
-                        Some(serde_json::Value::Object(map)) => map.into_iter().collect(),
-                        _ => HashMap::new(),
-                    };
+                sources
+                    .into_iter()
+                    .map(|s| {
+                        // Convert metadata from Option<serde_json::Value> to HashMap
+                        let metadata = match s.metadata {
+                            Some(serde_json::Value::Object(map)) => map.into_iter().collect(),
+                            _ => HashMap::new(),
+                        };
 
-                    RagSource {
-                        id: s.id,
-                        content: s.content,
-                        score: s.score,
-                        metadata,
-                    }
-                }).collect()
+                        RagSource {
+                            id: s.id,
+                            content: s.content,
+                            score: s.score,
+                            metadata,
+                        }
+                    })
+                    .collect()
             })
         } else {
             None
@@ -547,9 +565,11 @@ pub async fn create_chat_completion_stream(
     State(state): State<AppState>,
     Json(req): Json<ChatCompletionRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, ApiError> {
-    let messages_for_api: Vec<(String, String)> = req.messages.iter().map(|m| {
-        (m.role.clone(), m.content.clone().unwrap_or_default())
-    }).collect();
+    let messages_for_api: Vec<(String, String)> = req
+        .messages
+        .iter()
+        .map(|m| (m.role.clone(), m.content.clone().unwrap_or_default()))
+        .collect();
 
     let model = req.model.clone().unwrap_or_else(|| "heliosdb-default".to_string());
     let chunk_id = format!("chatcmpl-{}", &uuid::Uuid::new_v4().to_string().replace("-", "")[..24]);
@@ -664,10 +684,10 @@ pub async fn create_chat_completion_stream(
 }
 
 /// List available models
-pub async fn list_models(
-    State(state): State<AppState>,
-) -> Result<Json<ModelsResponse>, ApiError> {
-    let models = state.db.list_chat_models()
+pub async fn list_models(State(state): State<AppState>) -> Result<Json<ModelsResponse>, ApiError> {
+    let models = state
+        .db
+        .list_chat_models()
         .map_err(|e| ApiError::internal(format!("Failed to list models: {}", e)))?;
 
     let model_infos: Vec<ModelInfo> = models
@@ -676,15 +696,11 @@ pub async fn list_models(
             // Parse serde_json::Value to extract fields
             if let serde_json::Value::Object(map) = m {
                 Some(ModelInfo {
-                    id: map.get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("unknown")
-                        .to_string(),
+                    id: map.get("id").and_then(|v| v.as_str()).unwrap_or("unknown").to_string(),
                     object: "model".to_string(),
-                    created: map.get("created")
-                        .and_then(|v| v.as_i64())
-                        .unwrap_or(0),
-                    owned_by: map.get("owned_by")
+                    created: map.get("created").and_then(|v| v.as_i64()).unwrap_or(0),
+                    owned_by: map
+                        .get("owned_by")
                         .and_then(|v| v.as_str())
                         .unwrap_or("unknown")
                         .to_string(),
@@ -706,21 +722,19 @@ pub async fn get_model(
     State(state): State<AppState>,
     Path(model_id): Path<String>,
 ) -> Result<Json<ModelInfo>, ApiError> {
-    let model_val = state.db.get_chat_model(&model_id)
+    let model_val = state
+        .db
+        .get_chat_model(&model_id)
         .map_err(|e| ApiError::not_found(format!("Model not found: {}", e)))?;
 
     // Parse serde_json::Value to extract fields
     if let serde_json::Value::Object(map) = model_val {
         Ok(Json(ModelInfo {
-            id: map.get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or(&model_id)
-                .to_string(),
+            id: map.get("id").and_then(|v| v.as_str()).unwrap_or(&model_id).to_string(),
             object: "model".to_string(),
-            created: map.get("created")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0),
-            owned_by: map.get("owned_by")
+            created: map.get("created").and_then(|v| v.as_i64()).unwrap_or(0),
+            owned_by: map
+                .get("owned_by")
                 .and_then(|v| v.as_str())
                 .unwrap_or("unknown")
                 .to_string(),
@@ -740,9 +754,10 @@ pub async fn create_embeddings(
         EmbeddingInput::Multiple(v) => v,
     };
 
-    let embeddings_vec = state.db.create_embeddings(
-        inputs.clone(),
-    ).map_err(|e| ApiError::internal(format!("Embedding failed: {}", e)))?;
+    let embeddings_vec = state
+        .db
+        .create_embeddings(inputs.clone())
+        .map_err(|e| ApiError::internal(format!("Embedding failed: {}", e)))?;
 
     let prompt_tokens: usize = inputs.iter().map(|s| s.split_whitespace().count()).sum();
     let total_tokens = prompt_tokens;

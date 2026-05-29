@@ -25,9 +25,7 @@ fn random_key(len: usize) -> Vec<u8> {
 
 /// Generate sequential numeric keys (big-endian for correct ordering)
 fn sequential_keys(count: usize) -> Vec<Vec<u8>> {
-    (0..count as u64)
-        .map(|i| i.to_be_bytes().to_vec())
-        .collect()
+    (0..count as u64).map(|i| i.to_be_bytes().to_vec()).collect()
 }
 
 /// Generate random string keys of given count and length
@@ -292,36 +290,25 @@ fn bench_key_encoding(c: &mut Criterion) {
     // Single integer
     let int_values = vec![Value::Int4(42)];
     group.bench_function("encode_int4", |bench| {
-        bench.iter(|| {
-            black_box(ArtIndexManager::encode_key(&int_values))
-        });
+        bench.iter(|| black_box(ArtIndexManager::encode_key(&int_values)));
     });
 
     // Single bigint
     let bigint_values = vec![Value::Int8(9223372036854775807i64)];
     group.bench_function("encode_int8", |bench| {
-        bench.iter(|| {
-            black_box(ArtIndexManager::encode_key(&bigint_values))
-        });
+        bench.iter(|| black_box(ArtIndexManager::encode_key(&bigint_values)));
     });
 
     // Single string
     let text_values = vec![Value::String("hello world".to_string())];
     group.bench_function("encode_text", |bench| {
-        bench.iter(|| {
-            black_box(ArtIndexManager::encode_key(&text_values))
-        });
+        bench.iter(|| black_box(ArtIndexManager::encode_key(&text_values)));
     });
 
     // Composite key (int, text)
-    let composite_values = vec![
-        Value::Int4(123),
-        Value::String("user@example.com".to_string()),
-    ];
+    let composite_values = vec![Value::Int4(123), Value::String("user@example.com".to_string())];
     group.bench_function("encode_composite", |bench| {
-        bench.iter(|| {
-            black_box(ArtIndexManager::encode_key(&composite_values))
-        });
+        bench.iter(|| black_box(ArtIndexManager::encode_key(&composite_values)));
     });
 
     group.finish();

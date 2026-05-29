@@ -13,17 +13,17 @@ pub mod quantization;
 pub mod quantized_hnsw;
 pub mod simd;
 
+pub use biased_descent::{apply_bias, BiasOptions, CentralityMap};
+pub use hnsw_index::{HnswConfig, HnswIndex, MultiMetricHnswIndex};
+pub use in_descent::{search as in_descent_search, Adjacency, InDescentOptions, Positions};
 #[cfg(feature = "vector-persist")]
 pub use persistent::{PersistentVectorIndex, PqHnswConfig, VectorPrecision};
-pub use biased_descent::{apply_bias, BiasOptions, CentralityMap};
-pub use in_descent::{search as in_descent_search, Adjacency, InDescentOptions, Positions};
-pub use hnsw_index::{HnswIndex, HnswConfig, MultiMetricHnswIndex};
 pub use quantization::{
-    ProductQuantizer, ProductQuantizerConfig, Codebook, QuantizedVector,
-    Encoder, Decoder, DistanceComputer, PqError, PqResult,
+    Codebook, Decoder, DistanceComputer, Encoder, PqError, PqResult, ProductQuantizer, ProductQuantizerConfig,
+    QuantizedVector,
 };
-pub use quantized_hnsw::{QuantizedHnswIndex, QuantizedHnswConfig, MemoryStats};
-use serde::{Serialize, Deserialize};
+pub use quantized_hnsw::{MemoryStats, QuantizedHnswConfig, QuantizedHnswIndex};
+use serde::{Deserialize, Serialize};
 
 /// Vector dimension
 pub type Dimension = usize;

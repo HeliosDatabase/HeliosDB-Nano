@@ -165,8 +165,8 @@ impl Config {
     /// Load configuration from file
     pub fn from_file(path: impl AsRef<std::path::Path>) -> crate::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)
-            .map_err(|e| crate::Error::config(format!("Failed to parse config: {}", e)))?;
+        let config: Config =
+            toml::from_str(&content).map_err(|e| crate::Error::config(format!("Failed to parse config: {}", e)))?;
         Ok(config)
     }
 
@@ -261,10 +261,10 @@ impl Default for StorageConfig {
             memory_only: false,
             wal_enabled: true,
             wal_sync_mode: WalSyncModeConfig::Sync, // Safest default for single-user workloads
-            cache_size: 512 * 1024 * 1024, // 512 MB
+            cache_size: 512 * 1024 * 1024,          // 512 MB
             compression: CompressionType::Zstd,
-            time_travel_enabled: true, // Enable by default for zero-config transparency
-            query_timeout_ms: None, // Unlimited by default
+            time_travel_enabled: true,  // Enable by default for zero-config transparency
+            query_timeout_ms: None,     // Unlimited by default
             statement_timeout_ms: None, // Unlimited by default
             transaction_isolation: TransactionIsolation::ReadCommitted, // PostgreSQL default
             slow_query_threshold_ms: Some(1000), // 1 second default
@@ -533,9 +533,7 @@ impl Default for PerformanceConfig {
 // For now use a simple fallback
 mod num_cpus {
     pub fn get() -> usize {
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4)
+        std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
     }
 }
 
@@ -693,10 +691,10 @@ impl Default for MaterializedViewConfig {
             default_max_cpu_percent: 15,
             refresh_check_interval_secs: 60,
             max_concurrent_refreshes: 2,
-            enable_incremental: false,  // Disabled by default, opt-in
-            enable_delta_tracking: false,  // Disabled by default
-            enable_scheduler: false,  // Disabled by default
-            delta_retention_hours: 168,  // 7 days
+            enable_incremental: false,    // Disabled by default, opt-in
+            enable_delta_tracking: false, // Disabled by default
+            enable_scheduler: false,      // Disabled by default
+            delta_retention_hours: 168,   // 7 days
         }
     }
 }
@@ -801,14 +799,10 @@ impl SessionConfig {
     /// Validate configuration values
     pub fn validate(&self) -> crate::Result<()> {
         if self.timeout_secs < 1 {
-            return Err(crate::Error::config(
-                "session.timeout_secs must be at least 1 second",
-            ));
+            return Err(crate::Error::config("session.timeout_secs must be at least 1 second"));
         }
         if self.max_sessions_per_user < 1 {
-            return Err(crate::Error::config(
-                "session.max_sessions_per_user must be at least 1",
-            ));
+            return Err(crate::Error::config("session.max_sessions_per_user must be at least 1"));
         }
         if self.cleanup_interval_secs < 1 {
             return Err(crate::Error::config(
@@ -855,9 +849,7 @@ impl LockConfig {
             ));
         }
         if self.max_lock_holders < 1 {
-            return Err(crate::Error::config(
-                "locks.max_lock_holders must be at least 1",
-            ));
+            return Err(crate::Error::config("locks.max_lock_holders must be at least 1"));
         }
         Ok(())
     }
@@ -910,9 +902,7 @@ impl DumpConfig {
 
         // Validate max dump size
         if self.max_dump_size_mb < 1 {
-            return Err(crate::Error::config(
-                "dump.max_dump_size_mb must be at least 1 MB",
-            ));
+            return Err(crate::Error::config("dump.max_dump_size_mb must be at least 1 MB"));
         }
 
         // Validate cron schedule if auto_dump_enabled
@@ -1338,8 +1328,8 @@ mod tests {
 
         // Invalid cron schedules
         assert!(DumpConfig::validate_cron_schedule("invalid").is_err());
-        assert!(DumpConfig::validate_cron_schedule("0 * * *").is_err());  // Only 4 fields
-        assert!(DumpConfig::validate_cron_schedule("0 * * * * *").is_err());  // 6 fields
-        assert!(DumpConfig::validate_cron_schedule("").is_err());  // Empty
+        assert!(DumpConfig::validate_cron_schedule("0 * * *").is_err()); // Only 4 fields
+        assert!(DumpConfig::validate_cron_schedule("0 * * * * *").is_err()); // 6 fields
+        assert!(DumpConfig::validate_cron_schedule("").is_err()); // Empty
     }
 }

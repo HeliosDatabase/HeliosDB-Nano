@@ -48,7 +48,8 @@ mod cross_process_rebuild {
         // Session 1 — create + populate.
         {
             let db = EmbeddedDatabase::new(&dir).unwrap();
-            db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)").unwrap();
+            db.execute("CREATE TABLE users (id INT PRIMARY KEY, name TEXT)")
+                .unwrap();
             db.execute("INSERT INTO users (id, name) VALUES (1, 'alice')").unwrap();
             db.execute("INSERT INTO users (id, name) VALUES (2, 'bob')").unwrap();
         }
@@ -75,12 +76,10 @@ mod cross_process_rebuild {
         // Session 1 — insert original row.
         {
             let db = EmbeddedDatabase::new(&dir).unwrap();
-            db.execute(
-                "CREATE TABLE files (path TEXT PRIMARY KEY, mtime REAL, size INTEGER)",
-            ).unwrap();
-            db.execute(
-                "INSERT INTO files (path, mtime, size) VALUES ('/x', 1.0, 100)",
-            ).unwrap();
+            db.execute("CREATE TABLE files (path TEXT PRIMARY KEY, mtime REAL, size INTEGER)")
+                .unwrap();
+            db.execute("INSERT INTO files (path, mtime, size) VALUES ('/x', 1.0, 100)")
+                .unwrap();
         }
 
         // Session 2 — INSERT OR REPLACE the same PK. Without ART rebuild
@@ -88,9 +87,8 @@ mod cross_process_rebuild {
         // path='/x'. With rebuild, the existing row is updated in place.
         {
             let db = EmbeddedDatabase::new(&dir).unwrap();
-            db.execute(
-                "INSERT OR REPLACE INTO files (path, mtime, size) VALUES ('/x', 2.0, 200)",
-            ).unwrap();
+            db.execute("INSERT OR REPLACE INTO files (path, mtime, size) VALUES ('/x', 2.0, 200)")
+                .unwrap();
 
             let rows = db.query("SELECT path, size FROM files", &[]).unwrap();
             assert_eq!(rows.len(), 1, "expected one row, got {}", rows.len());
@@ -137,20 +135,16 @@ mod cross_process_rebuild {
 
         {
             let db = EmbeddedDatabase::new(&dir).unwrap();
-            db.execute(
-                "CREATE TABLE accounts (id INT PRIMARY KEY, email TEXT UNIQUE)",
-            ).unwrap();
-            db.execute(
-                "INSERT INTO accounts (id, email) VALUES (1, 'a@b.com')",
-            ).unwrap();
+            db.execute("CREATE TABLE accounts (id INT PRIMARY KEY, email TEXT UNIQUE)")
+                .unwrap();
+            db.execute("INSERT INTO accounts (id, email) VALUES (1, 'a@b.com')")
+                .unwrap();
         }
 
         // Same email, different PK — must trip the UNIQUE index after reopen.
         {
             let db = EmbeddedDatabase::new(&dir).unwrap();
-            let res = db.execute(
-                "INSERT INTO accounts (id, email) VALUES (2, 'a@b.com')",
-            );
+            let res = db.execute("INSERT INTO accounts (id, email) VALUES (2, 'a@b.com')");
             assert!(
                 res.is_err(),
                 "expected unique-violation on duplicate email after reopen"
@@ -184,14 +178,14 @@ mod cross_process_rebuild {
         // Process 1.
         {
             let db = EmbeddedDatabase::new(&dir).unwrap();
-            db.execute(
-                "CREATE TABLE src (path TEXT PRIMARY KEY, content TEXT)",
-            ).unwrap();
+            db.execute("CREATE TABLE src (path TEXT PRIMARY KEY, content TEXT)")
+                .unwrap();
             db.execute_params(
                 "INSERT INTO src (path, content) VALUES ($1, $2) \
                  ON CONFLICT(path) DO UPDATE SET content = excluded.content",
                 &[Value::String("a.rs".into()), Value::String("v1".into())],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // Process 2: re-attach, run the same upsert. Expected: 1 row,
@@ -202,11 +196,13 @@ mod cross_process_rebuild {
                 "INSERT INTO src (path, content) VALUES ($1, $2) \
                  ON CONFLICT(path) DO UPDATE SET content = excluded.content",
                 &[Value::String("a.rs".into()), Value::String("v2".into())],
-            ).unwrap();
+            )
+            .unwrap();
 
             let rows = db.query("SELECT path, content FROM src", &[]).unwrap();
             assert_eq!(
-                rows.len(), 1,
+                rows.len(),
+                1,
                 "named-column ON CONFLICT failed to detect prior-process row — {} rows present",
                 rows.len()
             );

@@ -11,8 +11,7 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use heliosdb_nano::sync::{
     ChangeLogImpl, ChangeType, ConflictChangeEntry, ConflictChangeOperation, ConflictDetector,
-    ConflictResolutionV2 as ConflictResolution, RowDelta, SyncClient, SyncConfig, SyncServer,
-    VectorClock,
+    ConflictResolutionV2 as ConflictResolution, RowDelta, SyncClient, SyncConfig, SyncServer, VectorClock,
 };
 use rocksdb::{Options, DB};
 use std::sync::Arc;
@@ -96,28 +95,24 @@ fn bench_change_log_append_batched(c: &mut Criterion) {
 
     for batch_size in [10, 100, 1000].iter() {
         group.throughput(Throughput::Elements(*batch_size as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(batch_size),
-            batch_size,
-            |b, &size| {
-                let (db, _temp_dir) = create_test_db();
-                let change_log = ChangeLogImpl::new(db).expect("Failed to create change log");
+        group.bench_with_input(BenchmarkId::from_parameter(batch_size), batch_size, |b, &size| {
+            let (db, _temp_dir) = create_test_db();
+            let change_log = ChangeLogImpl::new(db).expect("Failed to create change log");
 
-                b.iter(|| {
-                    for i in 0..size {
-                        let change = ChangeType::Insert {
-                            table: "users".to_string(),
-                            row_id: i as u64,
-                            data: vec![0u8; 100],
-                        };
+            b.iter(|| {
+                for i in 0..size {
+                    let change = ChangeType::Insert {
+                        table: "users".to_string(),
+                        row_id: i as u64,
+                        data: vec![0u8; 100],
+                    };
 
-                        change_log
-                            .append(i as u64, change, VectorClock::new())
-                            .expect("Append failed");
-                    }
-                });
-            },
-        );
+                    change_log
+                        .append(i as u64, change, VectorClock::new())
+                        .expect("Append failed");
+                }
+            });
+        });
     }
     group.finish();
 }
@@ -134,9 +129,7 @@ fn bench_change_log_query(c: &mut Criterion) {
             data: vec![0u8; 100],
         };
 
-        change_log
-            .append(i, change, VectorClock::new())
-            .expect("Append failed");
+        change_log.append(i, change, VectorClock::new()).expect("Append failed");
     }
 
     c.bench_function("change_log_query_since_lsn", |b| {
@@ -159,40 +152,35 @@ fn bench_change_log_compaction(c: &mut Criterion) {
 
     for entry_count in [100, 1000, 10000].iter() {
         group.throughput(Throughput::Elements(*entry_count as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(entry_count),
-            entry_count,
-            |b, &count| {
-                b.iter_batched(
-                    || {
-                        // Setup: Create change log with entries
-                        let (db, _temp_dir) = create_test_db();
-                        let change_log =
-                            ChangeLogImpl::new(db).expect("Failed to create change log");
+        group.bench_with_input(BenchmarkId::from_parameter(entry_count), entry_count, |b, &count| {
+            b.iter_batched(
+                || {
+                    // Setup: Create change log with entries
+                    let (db, _temp_dir) = create_test_db();
+                    let change_log = ChangeLogImpl::new(db).expect("Failed to create change log");
 
-                        for i in 0..count {
-                            let change = ChangeType::Insert {
-                                table: "users".to_string(),
-                                row_id: i as u64,
-                                data: vec![0u8; 100],
-                            };
+                    for i in 0..count {
+                        let change = ChangeType::Insert {
+                            table: "users".to_string(),
+                            row_id: i as u64,
+                            data: vec![0u8; 100],
+                        };
 
-                            change_log
-                                .append(i as u64, change, VectorClock::new())
-                                .expect("Append failed");
-                        }
+                        change_log
+                            .append(i as u64, change, VectorClock::new())
+                            .expect("Append failed");
+                    }
 
-                        (change_log, _temp_dir)
-                    },
-                    |(change_log, _temp_dir)| {
-                        // Benchmark: Compact half the entries
-                        let watermark = count / 2;
-                        change_log.compact(watermark as u64).expect("Compact failed")
-                    },
-                    criterion::BatchSize::SmallInput,
-                );
-            },
-        );
+                    (change_log, _temp_dir)
+                },
+                |(change_log, _temp_dir)| {
+                    // Benchmark: Compact half the entries
+                    let watermark = count / 2;
+                    change_log.compact(watermark as u64).expect("Compact failed")
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
     }
     group.finish();
 }
@@ -207,8 +195,7 @@ fn bench_conflict_detection(c: &mut Criterion) {
     let node2 = Uuid::new_v4();
 
     let mut local = create_change_entry(node1, chrono::Utc::now(), ConflictChangeOperation::Update);
-    let mut remote =
-        create_change_entry(node2, chrono::Utc::now(), ConflictChangeOperation::Update);
+    let mut remote = create_change_entry(node2, chrono::Utc::now(), ConflictChangeOperation::Update);
 
     // Make them concurrent
     local.vector_clock.increment(node1);
@@ -292,8 +279,7 @@ fn bench_conflict_resolution(c: &mut Criterion) {
 
     // Vector Clock Causal
     {
-        let detector =
-            ConflictDetector::new(ConflictResolution::VectorClockCausal, Uuid::new_v4());
+        let detector = ConflictDetector::new(ConflictResolution::VectorClockCausal, Uuid::new_v4());
         let node1 = Uuid::new_v4();
         let node2 = Uuid::new_v4();
 
@@ -304,9 +290,7 @@ fn bench_conflict_resolution(c: &mut Criterion) {
         local.vector_clock.increment(node1);
         remote.vector_clock.increment(node2);
 
-        let conflict = detector
-            .detect("users", &vec![1], &local, &remote)
-            .unwrap();
+        let conflict = detector.detect("users", &vec![1], &local, &remote).unwrap();
 
         group.bench_function("resolve_vector_clock", |b| {
             b.iter(|| detector.resolve(black_box(conflict.clone())));
@@ -325,16 +309,12 @@ fn bench_delta_creation(c: &mut Criterion) {
 
     for data_size in [100, 1024, 10240].iter() {
         group.throughput(Throughput::Bytes(*data_size as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(data_size),
-            data_size,
-            |b, &size| {
-                b.iter(|| {
-                    let delta = create_row_delta(black_box("users"), black_box(1), black_box(size));
-                    black_box(delta)
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(data_size), data_size, |b, &size| {
+            b.iter(|| {
+                let delta = create_row_delta(black_box("users"), black_box(1), black_box(size));
+                black_box(delta)
+            });
+        });
     }
     group.finish();
 }
@@ -344,18 +324,14 @@ fn bench_delta_checksum(c: &mut Criterion) {
 
     for data_size in [100, 1024, 10240].iter() {
         group.throughput(Throughput::Bytes(*data_size as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(data_size),
-            data_size,
-            |b, &size| {
-                let delta = create_row_delta("users", 1, size);
+        group.bench_with_input(BenchmarkId::from_parameter(data_size), data_size, |b, &size| {
+            let delta = create_row_delta("users", 1, size);
 
-                b.iter(|| {
-                    let checksum = delta.calculate_checksum();
-                    black_box(checksum)
-                });
-            },
-        );
+            b.iter(|| {
+                let checksum = delta.calculate_checksum();
+                black_box(checksum)
+            });
+        });
     }
     group.finish();
 }
@@ -446,36 +422,32 @@ fn bench_client_enqueue(c: &mut Criterion) {
 
     for batch_size in [10, 100, 1000].iter() {
         group.throughput(Throughput::Elements(*batch_size as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(batch_size),
-            batch_size,
-            |b, &size| {
-                b.iter_batched(
-                    || {
-                        // Setup: Create client
-                        let config = SyncConfig {
-                            server_url: "http://localhost:8080".to_string(),
-                            client_id: Uuid::new_v4(),
-                            sync_interval: Duration::from_secs(30),
-                            retry_interval: Duration::from_secs(5),
-                            max_batch_size: 1000,
-                            enable_compression: true,
-                            enable_e2e_encryption: false,
-                        };
+        group.bench_with_input(BenchmarkId::from_parameter(batch_size), batch_size, |b, &size| {
+            b.iter_batched(
+                || {
+                    // Setup: Create client
+                    let config = SyncConfig {
+                        server_url: "http://localhost:8080".to_string(),
+                        client_id: Uuid::new_v4(),
+                        sync_interval: Duration::from_secs(30),
+                        retry_interval: Duration::from_secs(5),
+                        max_batch_size: 1000,
+                        enable_compression: true,
+                        enable_e2e_encryption: false,
+                    };
 
-                        SyncClient::new(config).expect("Failed to create client")
-                    },
-                    |mut client| {
-                        // Benchmark: Enqueue changes
-                        for i in 0..size {
-                            let delta = create_row_delta("users", i as u64, 100);
-                            client.enqueue_change(delta).expect("Enqueue failed");
-                        }
-                    },
-                    criterion::BatchSize::SmallInput,
-                );
-            },
-        );
+                    SyncClient::new(config).expect("Failed to create client")
+                },
+                |mut client| {
+                    // Benchmark: Enqueue changes
+                    for i in 0..size {
+                        let delta = create_row_delta("users", i as u64, 100);
+                        client.enqueue_change(delta).expect("Enqueue failed");
+                    }
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
     }
     group.finish();
 }
@@ -490,40 +462,35 @@ fn bench_large_dataset_operations(c: &mut Criterion) {
 
     for dataset_size in [1000, 5000, 10000].iter() {
         group.throughput(Throughput::Elements(*dataset_size as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(dataset_size),
-            dataset_size,
-            |b, &size| {
-                b.iter_batched(
-                    || {
-                        // Setup: Create change log and populate
-                        let (db, _temp_dir) = create_test_db();
-                        let change_log =
-                            ChangeLogImpl::new(db).expect("Failed to create change log");
+        group.bench_with_input(BenchmarkId::from_parameter(dataset_size), dataset_size, |b, &size| {
+            b.iter_batched(
+                || {
+                    // Setup: Create change log and populate
+                    let (db, _temp_dir) = create_test_db();
+                    let change_log = ChangeLogImpl::new(db).expect("Failed to create change log");
 
-                        for i in 0..size {
-                            let change = ChangeType::Insert {
-                                table: "users".to_string(),
-                                row_id: i as u64,
-                                data: vec![0u8; 100],
-                            };
+                    for i in 0..size {
+                        let change = ChangeType::Insert {
+                            table: "users".to_string(),
+                            row_id: i as u64,
+                            data: vec![0u8; 100],
+                        };
 
-                            change_log
-                                .append(i as u64, change, VectorClock::new())
-                                .expect("Append failed");
-                        }
+                        change_log
+                            .append(i as u64, change, VectorClock::new())
+                            .expect("Append failed");
+                    }
 
-                        (change_log, _temp_dir)
-                    },
-                    |(change_log, _temp_dir)| {
-                        // Benchmark: Query all entries
-                        let entries = change_log.query_since_lsn(0).expect("Query failed");
-                        black_box(entries)
-                    },
-                    criterion::BatchSize::SmallInput,
-                );
-            },
-        );
+                    (change_log, _temp_dir)
+                },
+                |(change_log, _temp_dir)| {
+                    // Benchmark: Query all entries
+                    let entries = change_log.query_since_lsn(0).expect("Query failed");
+                    black_box(entries)
+                },
+                criterion::BatchSize::SmallInput,
+            );
+        });
     }
     group.finish();
 }
@@ -541,12 +508,7 @@ fn bench_serialization(c: &mut Criterion) {
         data: vec![0u8; 1024],
     };
 
-    let change_log_entry = heliosdb_nano::sync::ChangeEntry::new(
-        100,
-        1,
-        change.clone(),
-        VectorClock::new(),
-    );
+    let change_log_entry = heliosdb_nano::sync::ChangeEntry::new(100, 1, change.clone(), VectorClock::new());
 
     // Serialize
     group.bench_function("serialize_change_entry", |b| {
@@ -594,25 +556,13 @@ criterion_group!(
     bench_delta_verification
 );
 
-criterion_group!(
-    vector_clock_benches,
-    bench_vector_clock_operations
-);
+criterion_group!(vector_clock_benches, bench_vector_clock_operations);
 
-criterion_group!(
-    client_benches,
-    bench_client_enqueue
-);
+criterion_group!(client_benches, bench_client_enqueue);
 
-criterion_group!(
-    large_dataset_benches,
-    bench_large_dataset_operations
-);
+criterion_group!(large_dataset_benches, bench_large_dataset_operations);
 
-criterion_group!(
-    serialization_benches,
-    bench_serialization
-);
+criterion_group!(serialization_benches, bench_serialization);
 
 criterion_main!(
     change_log_benches,

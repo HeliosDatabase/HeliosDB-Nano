@@ -538,7 +538,8 @@ impl BlockBloomFilter {
 
     /// Add a column filter
     pub fn add_column_filter(&mut self, column_name: String, expected_distinct: usize) {
-        self.column_filters.push(ColumnBloomFilter::new(column_name, expected_distinct));
+        self.column_filters
+            .push(ColumnBloomFilter::new(column_name, expected_distinct));
     }
 
     /// Add a row ID
@@ -589,7 +590,8 @@ impl TableBloomFilters {
 
     /// Add a column to track
     pub fn add_column(&mut self, column_name: String, expected_distinct: usize) {
-        self.column_filters.push(ColumnBloomFilter::new(column_name, expected_distinct));
+        self.column_filters
+            .push(ColumnBloomFilter::new(column_name, expected_distinct));
     }
 
     /// Index a row
@@ -643,7 +645,9 @@ impl TableBloomFilters {
 
         // Index each tuple
         for (row_id, tuple) in tuples.iter().enumerate() {
-            let values: Vec<(String, Value)> = schema.columns.iter()
+            let values: Vec<(String, Value)> = schema
+                .columns
+                .iter()
                 .zip(tuple.values.iter())
                 .map(|(col, val)| (col.name.clone(), val.clone()))
                 .collect();
@@ -731,10 +735,13 @@ mod tests {
         tbf.add_column("status".to_string(), 5);
         tbf.add_column("name".to_string(), 500);
 
-        tbf.index_row(1, &[
-            ("status".to_string(), Value::String("active".to_string())),
-            ("name".to_string(), Value::String("Alice".to_string())),
-        ]);
+        tbf.index_row(
+            1,
+            &[
+                ("status".to_string(), Value::String("active".to_string())),
+                ("name".to_string(), Value::String("Alice".to_string())),
+            ],
+        );
 
         assert!(tbf.might_contain_value("status", &Value::String("active".to_string())));
         assert!(tbf.might_contain_value("name", &Value::String("Alice".to_string())));

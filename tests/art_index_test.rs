@@ -9,8 +9,8 @@
 
 #![allow(clippy::unwrap_used)]
 
+use heliosdb_nano::storage::{ArtIndexType, StorageEngine};
 use heliosdb_nano::{Config, Value};
-use heliosdb_nano::storage::{StorageEngine, ArtIndexType};
 
 /// Test automatic PK index creation
 #[test]
@@ -91,7 +91,7 @@ fn test_unique_index_auto_creation() {
                 source_table: None,
                 source_table_name: None,
                 default_expr: None,
-                unique: true,  // UNIQUE constraint
+                unique: true, // UNIQUE constraint
                 storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
         ],
@@ -117,19 +117,17 @@ fn test_index_drop_on_table_drop() {
 
     // Create table with PK
     let schema = heliosdb_nano::Schema {
-        columns: vec![
-            heliosdb_nano::Column {
-                name: "id".to_string(),
-                data_type: heliosdb_nano::DataType::Int4,
-                nullable: false,
-                primary_key: true,
-                source_table: None,
-                source_table_name: None,
-                default_expr: None,
-                unique: false,
-                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
-            },
-        ],
+        columns: vec![heliosdb_nano::Column {
+            name: "id".to_string(),
+            data_type: heliosdb_nano::DataType::Int4,
+            nullable: false,
+            primary_key: true,
+            source_table: None,
+            source_table_name: None,
+            default_expr: None,
+            unique: false,
+            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
+        }],
     };
 
     catalog.create_table("test_drop", schema).unwrap();
@@ -142,7 +140,10 @@ fn test_index_drop_on_table_drop() {
     catalog.drop_table("test_drop").unwrap();
 
     // Verify index was dropped
-    assert!(!art_manager.has_pk("test_drop"), "PK index should be dropped with table");
+    assert!(
+        !art_manager.has_pk("test_drop"),
+        "PK index should be dropped with table"
+    );
 }
 
 /// Test heliosdb_art_indexes system view
@@ -190,13 +191,15 @@ fn test_art_indexes_system_view() {
     assert!(indexes.len() >= 2, "Should have at least PK and UNIQUE indexes");
 
     // Check PK index
-    let pk_indexes: Vec<_> = indexes.iter()
+    let pk_indexes: Vec<_> = indexes
+        .iter()
         .filter(|(_, _, t, _)| *t == ArtIndexType::PrimaryKey)
         .collect();
     assert!(!pk_indexes.is_empty(), "Should have PK index");
 
     // Check UNIQUE index
-    let unique_indexes: Vec<_> = indexes.iter()
+    let unique_indexes: Vec<_> = indexes
+        .iter()
         .filter(|(_, _, t, _)| *t == ArtIndexType::Unique)
         .collect();
     assert!(!unique_indexes.is_empty(), "Should have UNIQUE index");
@@ -254,12 +257,7 @@ fn test_art_node_basic_operations() {
     use heliosdb_nano::storage::art_index::AdaptiveRadixTree;
 
     // Create a manual ART index
-    let mut art = AdaptiveRadixTree::new(
-        "test_idx",
-        "test_table",
-        vec!["col".to_string()],
-        ArtIndexType::Manual,
-    );
+    let mut art = AdaptiveRadixTree::new("test_idx", "test_table", vec!["col".to_string()], ArtIndexType::Manual);
 
     // Insert some keys
     art.insert(b"apple", 1).unwrap();
@@ -317,12 +315,7 @@ fn test_art_numeric_keys() {
 fn test_art_iteration() {
     use heliosdb_nano::storage::art_index::AdaptiveRadixTree;
 
-    let mut art = AdaptiveRadixTree::new(
-        "test_idx",
-        "test_table",
-        vec!["name".to_string()],
-        ArtIndexType::Manual,
-    );
+    let mut art = AdaptiveRadixTree::new("test_idx", "test_table", vec!["name".to_string()], ArtIndexType::Manual);
 
     art.insert(b"alice", 1).unwrap();
     art.insert(b"bob", 2).unwrap();
@@ -345,12 +338,7 @@ fn test_art_iteration() {
 fn test_art_range_scan() {
     use heliosdb_nano::storage::art_index::AdaptiveRadixTree;
 
-    let mut art = AdaptiveRadixTree::new(
-        "test_idx",
-        "test_table",
-        vec!["name".to_string()],
-        ArtIndexType::Manual,
-    );
+    let mut art = AdaptiveRadixTree::new("test_idx", "test_table", vec!["name".to_string()], ArtIndexType::Manual);
 
     art.insert(b"a", 1).unwrap();
     art.insert(b"b", 2).unwrap();
@@ -370,12 +358,7 @@ fn test_art_range_scan() {
 fn test_art_prefix_scan() {
     use heliosdb_nano::storage::art_index::AdaptiveRadixTree;
 
-    let mut art = AdaptiveRadixTree::new(
-        "test_idx",
-        "test_table",
-        vec!["path".to_string()],
-        ArtIndexType::Manual,
-    );
+    let mut art = AdaptiveRadixTree::new("test_idx", "test_table", vec!["path".to_string()], ArtIndexType::Manual);
 
     art.insert(b"/users/alice", 1).unwrap();
     art.insert(b"/users/bob", 2).unwrap();
@@ -398,12 +381,7 @@ fn test_art_prefix_scan() {
 fn test_art_node_growth() {
     use heliosdb_nano::storage::art_index::AdaptiveRadixTree;
 
-    let mut art = AdaptiveRadixTree::new(
-        "test_idx",
-        "test_table",
-        vec!["key".to_string()],
-        ArtIndexType::Manual,
-    );
+    let mut art = AdaptiveRadixTree::new("test_idx", "test_table", vec!["key".to_string()], ArtIndexType::Manual);
 
     // Insert 300 unique keys to force node growth
     for i in 0u16..300 {

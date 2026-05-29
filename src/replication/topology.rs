@@ -3,15 +3,15 @@
 //! Tracks cluster membership, node states, and topology changes.
 //! Used by HeliosProxy and switchover coordinator to route traffic.
 
+use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use parking_lot::RwLock;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::Result;
 use super::role_manager::NodeRole;
+use crate::Result;
 
 /// Global topology manager instance
 static TOPOLOGY_MANAGER: once_cell::sync::Lazy<TopologyManager> =
@@ -56,12 +56,7 @@ pub struct NodeInfo {
 }
 
 impl NodeInfo {
-    pub fn new(
-        node_id: Uuid,
-        role: NodeRole,
-        client_addr: String,
-        replication_addr: String,
-    ) -> Self {
+    pub fn new(node_id: Uuid, role: NodeRole, client_addr: String, replication_addr: String) -> Self {
         Self {
             node_id,
             alias: None,
@@ -142,10 +137,7 @@ pub enum TopologyEvent {
         new_alias: Option<String>,
     },
     /// Node health changed
-    HealthChanged {
-        node_id: Uuid,
-        is_healthy: bool,
-    },
+    HealthChanged { node_id: Uuid, is_healthy: bool },
     /// Primary changed
     PrimaryChanged {
         old_primary: Option<Uuid>,
@@ -413,12 +405,7 @@ impl TopologyManager {
 
     /// Get nodes that can handle reads
     pub fn get_read_nodes(&self) -> Vec<NodeInfo> {
-        self.nodes
-            .read()
-            .values()
-            .filter(|n| n.can_read())
-            .cloned()
-            .collect()
+        self.nodes.read().values().filter(|n| n.can_read()).cloned().collect()
     }
 
     /// Get the best standby for promotion (lowest priority value, then lowest lag)
@@ -592,8 +579,9 @@ impl TopologyManager {
         let nodes_map = self.nodes.read();
         let primary_id = *self.primary_node.read();
 
-        let mut nodes: Vec<NodeStatus> = nodes_map.values().map(|n| {
-            NodeStatus {
+        let mut nodes: Vec<NodeStatus> = nodes_map
+            .values()
+            .map(|n| NodeStatus {
                 node_id: n.node_id,
                 alias: n.alias.clone(),
                 display_name: n.display_name(),
@@ -609,21 +597,23 @@ impl TopologyManager {
                 priority: n.priority,
                 weight: n.weight,
                 tags: n.tags.clone(),
-            }
-        }).collect();
+            })
+            .collect();
 
         // Sort: primary first, then by priority, then by alias/name
         nodes.sort_by(|a, b| {
             let a_is_primary = Some(a.node_id) == primary_id;
             let b_is_primary = Some(b.node_id) == primary_id;
-            b_is_primary.cmp(&a_is_primary)
+            b_is_primary
+                .cmp(&a_is_primary)
                 .then(a.priority.cmp(&b.priority))
                 .then(a.display_name.cmp(&b.display_name))
         });
 
         let total_nodes = nodes.len();
         let healthy_nodes = nodes.iter().filter(|n| n.is_healthy).count();
-        let max_lag_ms = nodes.iter()
+        let max_lag_ms = nodes
+            .iter()
             .filter(|n| n.role == "Standby")
             .map(|n| n.lag_ms)
             .max()
@@ -635,20 +625,24 @@ impl TopologyManager {
         let cluster_healthy = primary_count == 1 && healthy_nodes > 1;
 
         let health_summary = if cluster_healthy {
-            format!("Healthy: 1 primary, {} standbys, {} nodes total", standby_count, total_nodes)
+            format!(
+                "Healthy: 1 primary, {} standbys, {} nodes total",
+                standby_count, total_nodes
+            )
         } else if primary_count == 0 {
             "CRITICAL: No primary node".to_string()
         } else if primary_count > 1 {
             format!("CRITICAL: Multiple primaries detected ({})", primary_count)
         } else if healthy_nodes <= 1 {
-            format!("WARNING: Insufficient healthy nodes ({}/{})", healthy_nodes, total_nodes)
+            format!(
+                "WARNING: Insufficient healthy nodes ({}/{})",
+                healthy_nodes, total_nodes
+            )
         } else {
             format!("WARNING: {} healthy nodes out of {}", healthy_nodes, total_nodes)
         };
 
-        let primary_name = primary_id.and_then(|id| {
-            nodes_map.get(&id).map(|n| n.display_name())
-        });
+        let primary_name = primary_id.and_then(|id| nodes_map.get(&id).map(|n| n.display_name()));
 
         TopologyDescription {
             nodes,
@@ -862,8 +856,7 @@ mod tests {
 
     #[test]
     fn test_health_timeout() {
-        let manager = TopologyManager::new(None)
-            .with_health_timeout(Duration::from_millis(10));
+        let manager = TopologyManager::new(None).with_health_timeout(Duration::from_millis(10));
 
         let node = NodeInfo::new(
             Uuid::new_v4(),

@@ -8,9 +8,7 @@ use std::time::Duration;
 
 /// Get the number of available CPU cores
 fn get_cpu_count() -> usize {
-    std::thread::available_parallelism()
-        .map(|p| p.get())
-        .unwrap_or(1)
+    std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1)
 }
 
 /// Ingestion safety level controlling ACID guarantees vs performance
@@ -104,9 +102,7 @@ impl IngestionSafetyLevel {
 
     /// Create an async safety level with sensible defaults
     pub fn async_default() -> Self {
-        Self::Async {
-            sync_interval_ms: 1000,
-        }
+        Self::Async { sync_interval_ms: 1000 }
     }
 
     /// Create unsafe mode for bulk loading
@@ -141,9 +137,10 @@ impl IngestionSafetyLevel {
     /// Get batch parameters if batched mode
     pub fn batch_params(&self) -> Option<(usize, Duration)> {
         match self {
-            Self::Batched { batch_size, batch_timeout_ms } => {
-                Some((*batch_size, Duration::from_millis(*batch_timeout_ms)))
-            }
+            Self::Batched {
+                batch_size,
+                batch_timeout_ms,
+            } => Some((*batch_size, Duration::from_millis(*batch_timeout_ms))),
             _ => None,
         }
     }
@@ -151,9 +148,7 @@ impl IngestionSafetyLevel {
     /// Get async sync interval if async mode
     pub fn async_sync_interval(&self) -> Option<Duration> {
         match self {
-            Self::Async { sync_interval_ms } => {
-                Some(Duration::from_millis(*sync_interval_ms))
-            }
+            Self::Async { sync_interval_ms } => Some(Duration::from_millis(*sync_interval_ms)),
             _ => None,
         }
     }
@@ -161,9 +156,10 @@ impl IngestionSafetyLevel {
     /// Get checkpoint interval for unsafe mode
     pub fn checkpoint_interval(&self) -> Option<Duration> {
         match self {
-            Self::Unsafe { checkpoint_interval_secs, .. } if *checkpoint_interval_secs > 0 => {
-                Some(Duration::from_secs(*checkpoint_interval_secs))
-            }
+            Self::Unsafe {
+                checkpoint_interval_secs,
+                ..
+            } if *checkpoint_interval_secs > 0 => Some(Duration::from_secs(*checkpoint_interval_secs)),
             _ => None,
         }
     }

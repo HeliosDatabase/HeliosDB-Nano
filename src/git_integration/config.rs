@@ -67,8 +67,8 @@ impl GitConfig {
     /// Get current Git branch name
     fn get_current_branch(repo_path: &Path) -> Result<String> {
         let head_path = repo_path.join(".git/HEAD");
-        let content = std::fs::read_to_string(&head_path)
-            .map_err(|e| Error::io(format!("Failed to read .git/HEAD: {}", e)))?;
+        let content =
+            std::fs::read_to_string(&head_path).map_err(|e| Error::io(format!("Failed to read .git/HEAD: {}", e)))?;
 
         // Parse "ref: refs/heads/branch-name"
         if let Some(stripped) = content.strip_prefix("ref: refs/heads/") {
@@ -82,14 +82,14 @@ impl GitConfig {
     /// Get current Git commit SHA
     fn get_current_commit(repo_path: &Path) -> Result<String> {
         let head_path = repo_path.join(".git/HEAD");
-        let content = std::fs::read_to_string(&head_path)
-            .map_err(|e| Error::io(format!("Failed to read .git/HEAD: {}", e)))?;
+        let content =
+            std::fs::read_to_string(&head_path).map_err(|e| Error::io(format!("Failed to read .git/HEAD: {}", e)))?;
 
         if let Some(ref_path) = content.strip_prefix("ref: ") {
             // Read the ref file
             let ref_file = repo_path.join(".git").join(ref_path.trim());
-            let commit = std::fs::read_to_string(&ref_file)
-                .map_err(|e| Error::io(format!("Failed to read ref file: {}", e)))?;
+            let commit =
+                std::fs::read_to_string(&ref_file).map_err(|e| Error::io(format!("Failed to read ref file: {}", e)))?;
             Ok(commit.trim().to_string())
         } else {
             // Already a commit SHA

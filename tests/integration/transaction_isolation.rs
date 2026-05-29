@@ -4,9 +4,9 @@
 
 #![cfg(test)]
 
-use heliosdb_nano::{EmbeddedDatabase, Result};
-use heliosdb_nano::session::IsolationLevel;
 use crate::test_helpers::*;
+use heliosdb_nano::session::IsolationLevel;
+use heliosdb_nano::{EmbeddedDatabase, Result};
 use std::sync::Arc;
 
 #[test]
@@ -48,7 +48,7 @@ fn test_repeatable_read_isolation() -> Result<()> {
     let session2 = db.create_session("user2", IsolationLevel::RepeatableRead)?;
 
     db.begin_transaction_for_session(session2)?;
-    
+
     // Session 1 updates and commits
     db.execute_in_session(session1, "UPDATE test SET val = 'updated' WHERE id = 1")?;
 

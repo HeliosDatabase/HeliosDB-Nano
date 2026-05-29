@@ -45,7 +45,11 @@ pub struct ProgressEvent {
 
 impl ProgressEvent {
     pub fn new(progress: f64) -> Self {
-        Self { progress, total: None, message: None }
+        Self {
+            progress,
+            total: None,
+            message: None,
+        }
     }
 
     pub fn with_total(mut self, total: f64) -> Self {

@@ -10,8 +10,8 @@
 //! whitelist of SQL-standard view names that legitimately return empty for
 //! Nano's surface; anything outside the whitelist now returns an error.
 
+use heliosdb_nano::{protocol::postgres::catalog::PgCatalog, EmbeddedDatabase, Value};
 use std::sync::Arc;
-use heliosdb_nano::{EmbeddedDatabase, Value, protocol::postgres::catalog::PgCatalog};
 
 fn s(v: &Value) -> String {
     match v {
@@ -85,10 +85,12 @@ fn referential_constraints_view_returns_zero_rows_for_no_fks() {
 #[test]
 fn referential_constraints_view_exposes_real_fk_metadata() {
     let (cat, db) = catalog_with_db();
-    db.execute("CREATE TABLE parents (id INT PRIMARY KEY)").expect("parents");
+    db.execute("CREATE TABLE parents (id INT PRIMARY KEY)")
+        .expect("parents");
     db.execute(
-        "CREATE TABLE kids (id INT PRIMARY KEY, p INT REFERENCES parents(id) ON DELETE CASCADE ON UPDATE NO ACTION)"
-    ).expect("kids");
+        "CREATE TABLE kids (id INT PRIMARY KEY, p INT REFERENCES parents(id) ON DELETE CASCADE ON UPDATE NO ACTION)",
+    )
+    .expect("kids");
 
     let (schema, rows) = cat
         .handle_query("SELECT * FROM information_schema.referential_constraints WHERE constraint_schema = 'public'")
@@ -98,7 +100,13 @@ fn referential_constraints_view_exposes_real_fk_metadata() {
     assert_eq!(rows.len(), 1, "expected exactly one FK row, got {}", rows.len());
 
     // Find indices.
-    let idx = |name: &str| schema.columns.iter().position(|c| c.name == name).unwrap_or_else(|| panic!("column {name} missing"));
+    let idx = |name: &str| {
+        schema
+            .columns
+            .iter()
+            .position(|c| c.name == name)
+            .unwrap_or_else(|| panic!("column {name} missing"))
+    };
     let i_name = idx("constraint_name");
     let i_uname = idx("unique_constraint_name");
     let i_upd = idx("update_rule");
@@ -107,9 +115,15 @@ fn referential_constraints_view_exposes_real_fk_metadata() {
 
     let row = &rows[0];
     let name = s(&row.values[i_name]);
-    assert!(name.contains("kids") && name.contains("parents"), "constraint name should reference kids+parents, got {name}");
+    assert!(
+        name.contains("kids") && name.contains("parents"),
+        "constraint name should reference kids+parents, got {name}"
+    );
     let uname = s(&row.values[i_uname]);
-    assert!(uname.contains("parents"), "unique_constraint_name should reference parents, got {uname}");
+    assert!(
+        uname.contains("parents"),
+        "unique_constraint_name should reference parents, got {uname}"
+    );
     assert_eq!(s(&row.values[i_upd]), "NO ACTION");
     assert_eq!(s(&row.values[i_del]), "CASCADE");
     assert_eq!(s(&row.values[i_match]), "NONE");
@@ -125,7 +139,12 @@ fn check_constraints_view_returns_zero_rows() {
         .expect("intercepted");
     // SQL-standard columns:
     let names: Vec<_> = schema.columns.iter().map(|c| c.name.as_str()).collect();
-    for required in &["constraint_catalog", "constraint_schema", "constraint_name", "check_clause"] {
+    for required in &[
+        "constraint_catalog",
+        "constraint_schema",
+        "constraint_name",
+        "check_clause",
+    ] {
         assert!(names.contains(required), "missing {required}");
     }
     // We don't yet expose check constraints through this view; empty is OK.
@@ -162,7 +181,10 @@ fn whitelist_views_return_empty_without_error() {
         let q = format!("SELECT * FROM information_schema.{view}");
         let result = cat.handle_query(&q);
         assert!(result.is_ok(), "{view}: should not error, got {result:?}");
-        assert!(result.unwrap().is_some(), "{view}: should be recognised and intercepted");
+        assert!(
+            result.unwrap().is_some(),
+            "{view}: should be recognised and intercepted"
+        );
     }
 }
 
@@ -171,16 +193,19 @@ fn truly_unknown_information_schema_view_errors_loudly() {
     // An unknown view name (typo / made-up) should now error rather than
     // silently return an empty result — the v3.24.0 behaviour change.
     let (cat, _db) = catalog_with_db();
-    let result = cat.handle_query(
-        "SELECT * FROM information_schema.completely_made_up_view_name_xyz_42"
-    );
+    let result = cat.handle_query("SELECT * FROM information_schema.completely_made_up_view_name_xyz_42");
     assert!(
         result.is_err(),
         "expected error for unknown information_schema view; got Ok: {result:?}"
     );
     let msg = result.unwrap_err().to_string().to_lowercase();
     assert!(
-        msg.contains("information_schema") && (msg.contains("unknown") || msg.contains("not supported") || msg.contains("does not exist") || msg.contains("not a recognised") || msg.contains("not a recognized")),
+        msg.contains("information_schema")
+            && (msg.contains("unknown")
+                || msg.contains("not supported")
+                || msg.contains("does not exist")
+                || msg.contains("not a recognised")
+                || msg.contains("not a recognized")),
         "error should mention information_schema and unknown/not-supported/does-not-exist/not-a-recognised; got {msg}"
     );
 }
@@ -190,7 +215,8 @@ fn existing_views_still_work() {
     // Regression check — make sure adding the new views didn't break the four
     // pre-existing handlers.
     let (cat, db) = catalog_with_db();
-    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)").expect("create");
+    db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)")
+        .expect("create");
 
     for q in &[
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",

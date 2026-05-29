@@ -2,17 +2,15 @@
 //!
 //! Comprehensive tests for SCRAM-SHA-256 authentication implementation
 
-use heliosdb_nano::{EmbeddedDatabase, Result};
-use heliosdb_nano::protocol::postgres::{
-    AuthManager, AuthMethod, ScramAuthState,
-    InMemoryPasswordStore, SharedPasswordStore, PasswordStore,
-    password_store::ScramCredentials,
-};
 use heliosdb_nano::protocol::postgres::auth::{
-    scram_hi, scram_hmac_sha256, scram_h,
-    scram_salted_password, scram_client_key, scram_stored_key, scram_server_key,
-    prepare_scram_credentials,
+    prepare_scram_credentials, scram_client_key, scram_h, scram_hi, scram_hmac_sha256, scram_salted_password,
+    scram_server_key, scram_stored_key,
 };
+use heliosdb_nano::protocol::postgres::{
+    password_store::ScramCredentials, AuthManager, AuthMethod, InMemoryPasswordStore, PasswordStore, ScramAuthState,
+    SharedPasswordStore,
+};
+use heliosdb_nano::{EmbeddedDatabase, Result};
 
 #[test]
 fn test_scram_hi_function_rfc_example() {
@@ -278,10 +276,7 @@ fn test_auth_manager_timing_attack_resistance() {
 
     // Times should be similar (within an order of magnitude)
     // This is a basic check; real timing attack testing would be more sophisticated
-    assert!(
-        time_existing_user.as_micros() > 0 &&
-        time_nonexistent_user.as_micros() > 0
-    );
+    assert!(time_existing_user.as_micros() > 0 && time_nonexistent_user.as_micros() > 0);
 }
 
 #[test]

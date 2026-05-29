@@ -40,10 +40,17 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_inner_a (id INT, name TEXT)").unwrap();
         d.execute("CREATE TABLE j_inner_b (aid INT, score INT)").unwrap();
-        d.execute("INSERT INTO j_inner_a VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')").unwrap();
-        d.execute("INSERT INTO j_inner_b VALUES (1, 90), (2, 80), (4, 70)").unwrap();
+        d.execute("INSERT INTO j_inner_a VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')")
+            .unwrap();
+        d.execute("INSERT INTO j_inner_b VALUES (1, 90), (2, 80), (4, 70)")
+            .unwrap();
 
-        let rows = d.query("SELECT a.id, a.name, b.score FROM j_inner_a a INNER JOIN j_inner_b b ON a.id = b.aid", &[]).unwrap();
+        let rows = d
+            .query(
+                "SELECT a.id, a.name, b.score FROM j_inner_a a INNER JOIN j_inner_b b ON a.id = b.aid",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2);
         let ids: Vec<i64> = rows.iter().map(|r| to_i64(r.get(0).unwrap())).collect();
         assert!(ids.contains(&1));
@@ -56,9 +63,15 @@ mod join_hardening {
         d.execute("CREATE TABLE j_inner_t1 (code TEXT, val INT)").unwrap();
         d.execute("CREATE TABLE j_inner_t2 (code TEXT, label TEXT)").unwrap();
         d.execute("INSERT INTO j_inner_t1 VALUES ('X', 10), ('Y', 20)").unwrap();
-        d.execute("INSERT INTO j_inner_t2 VALUES ('X', 'ex'), ('Z', 'zee')").unwrap();
+        d.execute("INSERT INTO j_inner_t2 VALUES ('X', 'ex'), ('Z', 'zee')")
+            .unwrap();
 
-        let rows = d.query("SELECT t1.code, t1.val, t2.label FROM j_inner_t1 t1 INNER JOIN j_inner_t2 t2 ON t1.code = t2.code", &[]).unwrap();
+        let rows = d
+            .query(
+                "SELECT t1.code, t1.val, t2.label FROM j_inner_t1 t1 INNER JOIN j_inner_t2 t2 ON t1.code = t2.code",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(to_str(rows[0].get(0).unwrap()), "X");
         assert_eq!(to_str(rows[0].get(2).unwrap()), "ex");
@@ -69,10 +82,17 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_inner_w1 (id INT, v INT)").unwrap();
         d.execute("CREATE TABLE j_inner_w2 (fk INT, w INT)").unwrap();
-        d.execute("INSERT INTO j_inner_w1 VALUES (1, 10), (2, 20), (3, 30)").unwrap();
-        d.execute("INSERT INTO j_inner_w2 VALUES (1, 100), (2, 200), (3, 300)").unwrap();
+        d.execute("INSERT INTO j_inner_w1 VALUES (1, 10), (2, 20), (3, 30)")
+            .unwrap();
+        d.execute("INSERT INTO j_inner_w2 VALUES (1, 100), (2, 200), (3, 300)")
+            .unwrap();
 
-        let rows = d.query("SELECT a.id, b.w FROM j_inner_w1 a INNER JOIN j_inner_w2 b ON a.id = b.fk WHERE b.w > 150", &[]).unwrap();
+        let rows = d
+            .query(
+                "SELECT a.id, b.w FROM j_inner_w1 a INNER JOIN j_inner_w2 b ON a.id = b.fk WHERE b.w > 150",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2);
         for r in &rows {
             assert!(to_i64(r.get(1).unwrap()) > 150);
@@ -84,10 +104,17 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_inner_mc1 (a INT, b INT, val TEXT)").unwrap();
         d.execute("CREATE TABLE j_inner_mc2 (x INT, y INT, info TEXT)").unwrap();
-        d.execute("INSERT INTO j_inner_mc1 VALUES (1, 10, 'one'), (2, 20, 'two'), (1, 20, 'three')").unwrap();
-        d.execute("INSERT INTO j_inner_mc2 VALUES (1, 10, 'alpha'), (1, 20, 'beta'), (2, 30, 'gamma')").unwrap();
+        d.execute("INSERT INTO j_inner_mc1 VALUES (1, 10, 'one'), (2, 20, 'two'), (1, 20, 'three')")
+            .unwrap();
+        d.execute("INSERT INTO j_inner_mc2 VALUES (1, 10, 'alpha'), (1, 20, 'beta'), (2, 30, 'gamma')")
+            .unwrap();
 
-        let rows = d.query("SELECT m1.val, m2.info FROM j_inner_mc1 m1 INNER JOIN j_inner_mc2 m2 ON m1.a = m2.x AND m1.b = m2.y", &[]).unwrap();
+        let rows = d
+            .query(
+                "SELECT m1.val, m2.info FROM j_inner_mc1 m1 INNER JOIN j_inner_mc2 m2 ON m1.a = m2.x AND m1.b = m2.y",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2);
         let vals: Vec<String> = rows.iter().map(|r| to_str(r.get(0).unwrap())).collect();
         assert!(vals.contains(&"one".to_string()));
@@ -97,13 +124,17 @@ mod join_hardening {
     #[test]
     fn test_inner_join_self_join() {
         let d = db();
-        d.execute("CREATE TABLE j_inner_emp (id INT, name TEXT, manager_id INT)").unwrap();
-        d.execute("INSERT INTO j_inner_emp VALUES (1, 'Boss', NULL), (2, 'Alice', 1), (3, 'Bob', 1), (4, 'Eve', 2)").unwrap();
+        d.execute("CREATE TABLE j_inner_emp (id INT, name TEXT, manager_id INT)")
+            .unwrap();
+        d.execute("INSERT INTO j_inner_emp VALUES (1, 'Boss', NULL), (2, 'Alice', 1), (3, 'Bob', 1), (4, 'Eve', 2)")
+            .unwrap();
 
-        let rows = d.query(
-            "SELECT e.name, m.name FROM j_inner_emp e INNER JOIN j_inner_emp m ON e.manager_id = m.id",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT e.name, m.name FROM j_inner_emp e INNER JOIN j_inner_emp m ON e.manager_id = m.id",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 3);
         let names: Vec<String> = rows.iter().map(|r| to_str(r.get(0).unwrap())).collect();
         assert!(names.contains(&"Alice".to_string()));
@@ -119,7 +150,12 @@ mod join_hardening {
         d.execute("INSERT INTO j_inner_nm1 VALUES (1), (2)").unwrap();
         d.execute("INSERT INTO j_inner_nm2 VALUES (3), (4)").unwrap();
 
-        let rows = d.query("SELECT a.id, b.id FROM j_inner_nm1 a INNER JOIN j_inner_nm2 b ON a.id = b.id", &[]).unwrap();
+        let rows = d
+            .query(
+                "SELECT a.id, b.id FROM j_inner_nm1 a INNER JOIN j_inner_nm2 b ON a.id = b.id",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 0);
     }
 
@@ -128,10 +164,17 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_inner_nk1 (id INT, v TEXT)").unwrap();
         d.execute("CREATE TABLE j_inner_nk2 (id INT, w TEXT)").unwrap();
-        d.execute("INSERT INTO j_inner_nk1 VALUES (NULL, 'a'), (1, 'b')").unwrap();
-        d.execute("INSERT INTO j_inner_nk2 VALUES (NULL, 'x'), (1, 'y')").unwrap();
+        d.execute("INSERT INTO j_inner_nk1 VALUES (NULL, 'a'), (1, 'b')")
+            .unwrap();
+        d.execute("INSERT INTO j_inner_nk2 VALUES (NULL, 'x'), (1, 'y')")
+            .unwrap();
 
-        let rows = d.query("SELECT t1.v, t2.w FROM j_inner_nk1 t1 INNER JOIN j_inner_nk2 t2 ON t1.id = t2.id", &[]).unwrap();
+        let rows = d
+            .query(
+                "SELECT t1.v, t2.w FROM j_inner_nk1 t1 INNER JOIN j_inner_nk2 t2 ON t1.id = t2.id",
+                &[],
+            )
+            .unwrap();
         // NULL = NULL is false in SQL, so only id=1 matches
         assert_eq!(rows.len(), 1);
         assert_eq!(to_str(rows[0].get(0).unwrap()), "b");
@@ -141,10 +184,14 @@ mod join_hardening {
     #[test]
     fn test_inner_join_multi_column_composite() {
         let d = db();
-        d.execute("CREATE TABLE j_inner_comp1 (a INT, b TEXT, val INT)").unwrap();
-        d.execute("CREATE TABLE j_inner_comp2 (x INT, y TEXT, data TEXT)").unwrap();
-        d.execute("INSERT INTO j_inner_comp1 VALUES (1, 'a', 10), (1, 'b', 20), (2, 'a', 30)").unwrap();
-        d.execute("INSERT INTO j_inner_comp2 VALUES (1, 'a', 'match1'), (2, 'b', 'no'), (2, 'a', 'match2')").unwrap();
+        d.execute("CREATE TABLE j_inner_comp1 (a INT, b TEXT, val INT)")
+            .unwrap();
+        d.execute("CREATE TABLE j_inner_comp2 (x INT, y TEXT, data TEXT)")
+            .unwrap();
+        d.execute("INSERT INTO j_inner_comp1 VALUES (1, 'a', 10), (1, 'b', 20), (2, 'a', 30)")
+            .unwrap();
+        d.execute("INSERT INTO j_inner_comp2 VALUES (1, 'a', 'match1'), (2, 'b', 'no'), (2, 'a', 'match2')")
+            .unwrap();
 
         let rows = d.query(
             "SELECT c1.val, c2.data FROM j_inner_comp1 c1 INNER JOIN j_inner_comp2 c2 ON c1.a = c2.x AND c1.b = c2.y",
@@ -165,10 +212,16 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_left_a (id INT, name TEXT)").unwrap();
         d.execute("CREATE TABLE j_left_b (aid INT, score INT)").unwrap();
-        d.execute("INSERT INTO j_left_a VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')").unwrap();
+        d.execute("INSERT INTO j_left_a VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')")
+            .unwrap();
         d.execute("INSERT INTO j_left_b VALUES (1, 90), (3, 70)").unwrap();
 
-        let rows = d.query("SELECT a.id, a.name, b.score FROM j_left_a a LEFT JOIN j_left_b b ON a.id = b.aid ORDER BY a.id", &[]).unwrap();
+        let rows = d
+            .query(
+                "SELECT a.id, a.name, b.score FROM j_left_a a LEFT JOIN j_left_b b ON a.id = b.aid ORDER BY a.id",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 3);
         // Bob (id=2) has no match, score should be NULL
         let bob_row = rows.iter().find(|r| to_i64(r.get(0).unwrap()) == 2).unwrap();
@@ -186,7 +239,12 @@ mod join_hardening {
         d.execute("INSERT INTO j_left_nm1 VALUES (1, 'a'), (2, 'b')").unwrap();
         d.execute("INSERT INTO j_left_nm2 VALUES (99, 'z')").unwrap();
 
-        let rows = d.query("SELECT t1.id, t2.w FROM j_left_nm1 t1 LEFT JOIN j_left_nm2 t2 ON t1.id = t2.fk ORDER BY t1.id", &[]).unwrap();
+        let rows = d
+            .query(
+                "SELECT t1.id, t2.w FROM j_left_nm1 t1 LEFT JOIN j_left_nm2 t2 ON t1.id = t2.fk ORDER BY t1.id",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2);
         assert!(is_null(rows[0].get(1).unwrap()));
         assert!(is_null(rows[1].get(1).unwrap()));
@@ -201,7 +259,12 @@ mod join_hardening {
         d.execute("INSERT INTO j_left_wf2 VALUES (1, 10)").unwrap();
 
         // WHERE on right table column filters out non-matching left rows
-        let rows = d.query("SELECT a.id, b.v FROM j_left_wf1 a LEFT JOIN j_left_wf2 b ON a.id = b.fk WHERE b.v IS NOT NULL", &[]).unwrap();
+        let rows = d
+            .query(
+                "SELECT a.id, b.v FROM j_left_wf1 a LEFT JOIN j_left_wf2 b ON a.id = b.fk WHERE b.v IS NOT NULL",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(to_i64(rows[0].get(0).unwrap()), 1);
     }
@@ -211,11 +274,17 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_left_aj1 (id INT, name TEXT)").unwrap();
         d.execute("CREATE TABLE j_left_aj2 (fk INT)").unwrap();
-        d.execute("INSERT INTO j_left_aj1 VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')").unwrap();
+        d.execute("INSERT INTO j_left_aj1 VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie')")
+            .unwrap();
         d.execute("INSERT INTO j_left_aj2 VALUES (1), (3)").unwrap();
 
         // Anti-join: find rows in left that have no match in right
-        let rows = d.query("SELECT a.id, a.name FROM j_left_aj1 a LEFT JOIN j_left_aj2 b ON a.id = b.fk WHERE b.fk IS NULL", &[]).unwrap();
+        let rows = d
+            .query(
+                "SELECT a.id, a.name FROM j_left_aj1 a LEFT JOIN j_left_aj2 b ON a.id = b.fk WHERE b.fk IS NULL",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(to_str(rows[0].get(1).unwrap()), "Bob");
     }
@@ -225,8 +294,10 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_left_agg1 (id INT, name TEXT)").unwrap();
         d.execute("CREATE TABLE j_left_agg2 (cid INT, item TEXT)").unwrap();
-        d.execute("INSERT INTO j_left_agg1 VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
-        d.execute("INSERT INTO j_left_agg2 VALUES (1, 'x'), (1, 'y'), (1, 'z')").unwrap();
+        d.execute("INSERT INTO j_left_agg1 VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        d.execute("INSERT INTO j_left_agg2 VALUES (1, 'x'), (1, 'y'), (1, 'z')")
+            .unwrap();
 
         let rows = d.query(
             "SELECT a.name, COUNT(b.item) FROM j_left_agg1 a LEFT JOIN j_left_agg2 b ON a.id = b.cid GROUP BY a.name ORDER BY a.name",
@@ -270,7 +341,12 @@ mod join_hardening {
         d.execute("INSERT INTO j_left_dup1 VALUES (1, 'A')").unwrap();
         d.execute("INSERT INTO j_left_dup2 VALUES (1, 'x'), (1, 'y')").unwrap();
 
-        let rows = d.query("SELECT a.name, b.tag FROM j_left_dup1 a LEFT JOIN j_left_dup2 b ON a.id = b.fk", &[]).unwrap();
+        let rows = d
+            .query(
+                "SELECT a.name, b.tag FROM j_left_dup1 a LEFT JOIN j_left_dup2 b ON a.id = b.fk",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2, "One-to-many left join should produce 2 rows");
     }
 
@@ -281,7 +357,12 @@ mod join_hardening {
         d.execute("CREATE TABLE j_left_er2 (fk INT, v INT)").unwrap();
         d.execute("INSERT INTO j_left_er1 VALUES (1), (2)").unwrap();
 
-        let rows = d.query("SELECT a.id, b.v FROM j_left_er1 a LEFT JOIN j_left_er2 b ON a.id = b.fk", &[]).unwrap();
+        let rows = d
+            .query(
+                "SELECT a.id, b.v FROM j_left_er1 a LEFT JOIN j_left_er2 b ON a.id = b.fk",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2);
         assert!(is_null(rows[0].get(1).unwrap()));
         assert!(is_null(rows[1].get(1).unwrap()));
@@ -296,15 +377,22 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_right_a (id INT, name TEXT)").unwrap();
         d.execute("CREATE TABLE j_right_b (fk INT, score INT)").unwrap();
-        d.execute("INSERT INTO j_right_a VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
+        d.execute("INSERT INTO j_right_a VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
         d.execute("INSERT INTO j_right_b VALUES (2, 80), (3, 70)").unwrap();
 
-        match d.query("SELECT a.name, b.fk, b.score FROM j_right_a a RIGHT JOIN j_right_b b ON a.id = b.fk ORDER BY b.fk", &[]) {
+        match d.query(
+            "SELECT a.name, b.fk, b.score FROM j_right_a a RIGHT JOIN j_right_b b ON a.id = b.fk ORDER BY b.fk",
+            &[],
+        ) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 2);
                 // fk=2 has match, fk=3 does not
                 let r3 = rows.iter().find(|r| to_i64(r.get(1).unwrap()) == 3).unwrap();
-                assert!(is_null(r3.get(0).unwrap()), "Unmatched right row should have NULL left columns");
+                assert!(
+                    is_null(r3.get(0).unwrap()),
+                    "Unmatched right row should have NULL left columns"
+                );
             }
             Err(e) => {
                 eprintln!("RIGHT JOIN not supported: {e}");
@@ -320,7 +408,10 @@ mod join_hardening {
         d.execute("INSERT INTO j_right_nl1 VALUES (99)").unwrap();
         d.execute("INSERT INTO j_right_nl2 VALUES (1, 'a'), (2, 'b')").unwrap();
 
-        match d.query("SELECT a.id, b.v FROM j_right_nl1 a RIGHT JOIN j_right_nl2 b ON a.id = b.fk ORDER BY b.fk", &[]) {
+        match d.query(
+            "SELECT a.id, b.v FROM j_right_nl1 a RIGHT JOIN j_right_nl2 b ON a.id = b.fk ORDER BY b.fk",
+            &[],
+        ) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 2);
                 assert!(is_null(rows[0].get(0).unwrap()));
@@ -346,7 +437,11 @@ mod join_hardening {
             &[],
         ) {
             Ok(right_rows) => {
-                assert_eq!(right_rows.len(), 2, "RIGHT JOIN should produce 2 rows (one match + one right-only)");
+                assert_eq!(
+                    right_rows.len(),
+                    2,
+                    "RIGHT JOIN should produce 2 rows (one match + one right-only)"
+                );
             }
             Err(e) => {
                 eprintln!("RIGHT JOIN not supported: {e}");
@@ -362,7 +457,10 @@ mod join_hardening {
         d.execute("INSERT INTO j_right_wh1 VALUES (1, 10), (2, 20)").unwrap();
         d.execute("INSERT INTO j_right_wh2 VALUES (1, 100), (3, 300)").unwrap();
 
-        match d.query("SELECT a.x, b.y FROM j_right_wh1 a RIGHT JOIN j_right_wh2 b ON a.id = b.fk WHERE b.y > 200", &[]) {
+        match d.query(
+            "SELECT a.x, b.y FROM j_right_wh1 a RIGHT JOIN j_right_wh2 b ON a.id = b.fk WHERE b.y > 200",
+            &[],
+        ) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
                 assert_eq!(to_i64(rows[0].get(1).unwrap()), 300);
@@ -382,7 +480,8 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_full_a (id INT, name TEXT)").unwrap();
         d.execute("CREATE TABLE j_full_b (fk INT, val INT)").unwrap();
-        d.execute("INSERT INTO j_full_a VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
+        d.execute("INSERT INTO j_full_a VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
         d.execute("INSERT INTO j_full_b VALUES (2, 20), (3, 30)").unwrap();
 
         match d.query("SELECT a.id, a.name, b.fk, b.val FROM j_full_a a FULL OUTER JOIN j_full_b b ON a.id = b.fk ORDER BY COALESCE(a.id, b.fk)", &[]) {
@@ -409,7 +508,10 @@ mod join_hardening {
         d.execute("INSERT INTO j_full_no1 VALUES (1), (2)").unwrap();
         d.execute("INSERT INTO j_full_no2 VALUES (3), (4)").unwrap();
 
-        match d.query("SELECT a.id, b.id FROM j_full_no1 a FULL OUTER JOIN j_full_no2 b ON a.id = b.id", &[]) {
+        match d.query(
+            "SELECT a.id, b.id FROM j_full_no1 a FULL OUTER JOIN j_full_no2 b ON a.id = b.id",
+            &[],
+        ) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 4);
                 // Each row has one NULL side
@@ -433,7 +535,10 @@ mod join_hardening {
         d.execute("INSERT INTO j_full_co1 VALUES (1, 'a'), (2, 'b')").unwrap();
         d.execute("INSERT INTO j_full_co2 VALUES (1, 'x'), (2, 'y')").unwrap();
 
-        match d.query("SELECT t1.v, t2.w FROM j_full_co1 t1 FULL OUTER JOIN j_full_co2 t2 ON t1.id = t2.id", &[]) {
+        match d.query(
+            "SELECT t1.v, t2.w FROM j_full_co1 t1 FULL OUTER JOIN j_full_co2 t2 ON t1.id = t2.id",
+            &[],
+        ) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 2);
                 // No NULLs since all rows match
@@ -453,15 +558,23 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_full_nk1 (id INT, v TEXT)").unwrap();
         d.execute("CREATE TABLE j_full_nk2 (id INT, w TEXT)").unwrap();
-        d.execute("INSERT INTO j_full_nk1 VALUES (NULL, 'a'), (1, 'b')").unwrap();
-        d.execute("INSERT INTO j_full_nk2 VALUES (NULL, 'x'), (1, 'y')").unwrap();
+        d.execute("INSERT INTO j_full_nk1 VALUES (NULL, 'a'), (1, 'b')")
+            .unwrap();
+        d.execute("INSERT INTO j_full_nk2 VALUES (NULL, 'x'), (1, 'y')")
+            .unwrap();
 
-        match d.query("SELECT t1.v, t2.w FROM j_full_nk1 t1 FULL OUTER JOIN j_full_nk2 t2 ON t1.id = t2.id", &[]) {
+        match d.query(
+            "SELECT t1.v, t2.w FROM j_full_nk1 t1 FULL OUTER JOIN j_full_nk2 t2 ON t1.id = t2.id",
+            &[],
+        ) {
             Ok(rows) => {
                 // Standard SQL: NULL != NULL, so expect 3 rows.
                 // Engine currently treats NULL=NULL as true in FULL JOIN, yielding 2 rows.
-                assert!(rows.len() == 2 || rows.len() == 3,
-                    "Expected 2 (engine behavior) or 3 (strict SQL), got {}", rows.len());
+                assert!(
+                    rows.len() == 2 || rows.len() == 3,
+                    "Expected 2 (engine behavior) or 3 (strict SQL), got {}",
+                    rows.len()
+                );
             }
             Err(e) => {
                 eprintln!("FULL OUTER JOIN not supported: {e}");
@@ -481,7 +594,9 @@ mod join_hardening {
         d.execute("INSERT INTO j_cross_a VALUES (1), (2)").unwrap();
         d.execute("INSERT INTO j_cross_b VALUES (10), (20), (30)").unwrap();
 
-        let rows = d.query("SELECT a.id, b.id FROM j_cross_a a CROSS JOIN j_cross_b b", &[]).unwrap();
+        let rows = d
+            .query("SELECT a.id, b.id FROM j_cross_a a CROSS JOIN j_cross_b b", &[])
+            .unwrap();
         assert_eq!(rows.len(), 6, "2 x 3 = 6 cartesian product rows");
     }
 
@@ -493,7 +608,12 @@ mod join_hardening {
         d.execute("INSERT INTO j_cross_w1 VALUES (1, 'a'), (2, 'b')").unwrap();
         d.execute("INSERT INTO j_cross_w2 VALUES (1, 'x'), (3, 'y')").unwrap();
 
-        let rows = d.query("SELECT t1.v, t2.w FROM j_cross_w1 t1 CROSS JOIN j_cross_w2 t2 WHERE t1.id = t2.id", &[]).unwrap();
+        let rows = d
+            .query(
+                "SELECT t1.v, t2.w FROM j_cross_w1 t1 CROSS JOIN j_cross_w2 t2 WHERE t1.id = t2.id",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(to_str(rows[0].get(0).unwrap()), "a");
     }
@@ -505,7 +625,9 @@ mod join_hardening {
         d.execute("CREATE TABLE j_cross_e2 (id INT)").unwrap();
         d.execute("INSERT INTO j_cross_e1 VALUES (1), (2)").unwrap();
 
-        let rows = d.query("SELECT a.id, b.id FROM j_cross_e1 a CROSS JOIN j_cross_e2 b", &[]).unwrap();
+        let rows = d
+            .query("SELECT a.id, b.id FROM j_cross_e1 a CROSS JOIN j_cross_e2 b", &[])
+            .unwrap();
         assert_eq!(rows.len(), 0, "Cross join with empty table yields 0 rows");
     }
 
@@ -519,9 +641,12 @@ mod join_hardening {
         d.execute("CREATE TABLE j_mt_cust (id INT, name TEXT)").unwrap();
         d.execute("CREATE TABLE j_mt_ord (id INT, cid INT, total INT)").unwrap();
         d.execute("CREATE TABLE j_mt_item (oid INT, product TEXT)").unwrap();
-        d.execute("INSERT INTO j_mt_cust VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
-        d.execute("INSERT INTO j_mt_ord VALUES (10, 1, 100), (11, 1, 200), (12, 2, 50)").unwrap();
-        d.execute("INSERT INTO j_mt_item VALUES (10, 'Widget'), (10, 'Gadget'), (12, 'Doohickey')").unwrap();
+        d.execute("INSERT INTO j_mt_cust VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        d.execute("INSERT INTO j_mt_ord VALUES (10, 1, 100), (11, 1, 200), (12, 2, 50)")
+            .unwrap();
+        d.execute("INSERT INTO j_mt_item VALUES (10, 'Widget'), (10, 'Gadget'), (12, 'Doohickey')")
+            .unwrap();
 
         let rows = d.query(
             "SELECT c.name, o.total, i.product FROM j_mt_cust c INNER JOIN j_mt_ord o ON c.id = o.cid INNER JOIN j_mt_item i ON o.id = i.oid",
@@ -536,7 +661,8 @@ mod join_hardening {
         d.execute("CREATE TABLE j_mix_a (id INT, name TEXT)").unwrap();
         d.execute("CREATE TABLE j_mix_b (aid INT, score INT)").unwrap();
         d.execute("CREATE TABLE j_mix_c (aid INT, tag TEXT)").unwrap();
-        d.execute("INSERT INTO j_mix_a VALUES (1, 'X'), (2, 'Y'), (3, 'Z')").unwrap();
+        d.execute("INSERT INTO j_mix_a VALUES (1, 'X'), (2, 'Y'), (3, 'Z')")
+            .unwrap();
         d.execute("INSERT INTO j_mix_b VALUES (1, 90), (2, 80)").unwrap();
         d.execute("INSERT INTO j_mix_c VALUES (1, 'hi')").unwrap();
 
@@ -556,7 +682,8 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_sub_a (id INT, v INT)").unwrap();
         d.execute("CREATE TABLE j_sub_b (id INT, w INT)").unwrap();
-        d.execute("INSERT INTO j_sub_a VALUES (1, 10), (2, 20), (3, 30)").unwrap();
+        d.execute("INSERT INTO j_sub_a VALUES (1, 10), (2, 20), (3, 30)")
+            .unwrap();
         d.execute("INSERT INTO j_sub_b VALUES (1, 100), (2, 200)").unwrap();
 
         match d.query(
@@ -579,8 +706,10 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_grp_dept (id INT, name TEXT)").unwrap();
         d.execute("CREATE TABLE j_grp_emp (did INT, salary INT)").unwrap();
-        d.execute("INSERT INTO j_grp_dept VALUES (1, 'Eng'), (2, 'Sales'), (3, 'HR')").unwrap();
-        d.execute("INSERT INTO j_grp_emp VALUES (1, 100), (1, 120), (2, 80)").unwrap();
+        d.execute("INSERT INTO j_grp_dept VALUES (1, 'Eng'), (2, 'Sales'), (3, 'HR')")
+            .unwrap();
+        d.execute("INSERT INTO j_grp_emp VALUES (1, 100), (1, 120), (2, 80)")
+            .unwrap();
 
         let rows = d.query(
             "SELECT d.name, SUM(e.salary) FROM j_grp_dept d INNER JOIN j_grp_emp e ON d.id = e.did GROUP BY d.name ORDER BY d.name",
@@ -600,13 +729,17 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_bool_a (id INT, active BOOLEAN)").unwrap();
         d.execute("CREATE TABLE j_bool_b (active BOOLEAN, label TEXT)").unwrap();
-        d.execute("INSERT INTO j_bool_a VALUES (1, true), (2, false), (3, true)").unwrap();
-        d.execute("INSERT INTO j_bool_b VALUES (true, 'on'), (false, 'off')").unwrap();
+        d.execute("INSERT INTO j_bool_a VALUES (1, true), (2, false), (3, true)")
+            .unwrap();
+        d.execute("INSERT INTO j_bool_b VALUES (true, 'on'), (false, 'off')")
+            .unwrap();
 
-        let rows = d.query(
-            "SELECT a.id, b.label FROM j_bool_a a INNER JOIN j_bool_b b ON a.active = b.active ORDER BY a.id",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT a.id, b.label FROM j_bool_a a INNER JOIN j_bool_b b ON a.active = b.active ORDER BY a.id",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 3);
         assert_eq!(to_str(rows[0].get(1).unwrap()), "on");
         assert_eq!(to_str(rows[1].get(1).unwrap()), "off");
@@ -617,13 +750,17 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_dist_a (id INT, cat TEXT)").unwrap();
         d.execute("CREATE TABLE j_dist_b (fk INT, tag TEXT)").unwrap();
-        d.execute("INSERT INTO j_dist_a VALUES (1, 'A'), (2, 'A'), (3, 'B')").unwrap();
-        d.execute("INSERT INTO j_dist_b VALUES (1, 'x'), (2, 'x'), (3, 'y')").unwrap();
+        d.execute("INSERT INTO j_dist_a VALUES (1, 'A'), (2, 'A'), (3, 'B')")
+            .unwrap();
+        d.execute("INSERT INTO j_dist_b VALUES (1, 'x'), (2, 'x'), (3, 'y')")
+            .unwrap();
 
-        let rows = d.query(
-            "SELECT DISTINCT a.cat, b.tag FROM j_dist_a a INNER JOIN j_dist_b b ON a.id = b.fk",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT DISTINCT a.cat, b.tag FROM j_dist_a a INNER JOIN j_dist_b b ON a.id = b.fk",
+                &[],
+            )
+            .unwrap();
         // cat A -> tag x (twice but DISTINCT), cat B -> tag y => 2 distinct rows
         assert_eq!(rows.len(), 2);
     }
@@ -633,8 +770,10 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_ord_a (id INT, name TEXT)").unwrap();
         d.execute("CREATE TABLE j_ord_b (aid INT, score INT)").unwrap();
-        d.execute("INSERT INTO j_ord_a VALUES (1, 'C'), (2, 'A'), (3, 'B')").unwrap();
-        d.execute("INSERT INTO j_ord_b VALUES (1, 30), (2, 10), (3, 20)").unwrap();
+        d.execute("INSERT INTO j_ord_a VALUES (1, 'C'), (2, 'A'), (3, 'B')")
+            .unwrap();
+        d.execute("INSERT INTO j_ord_b VALUES (1, 30), (2, 10), (3, 20)")
+            .unwrap();
 
         match d.query(
             "SELECT a.name, b.score FROM j_ord_a a INNER JOIN j_ord_b b ON a.id = b.aid ORDER BY b.score",
@@ -659,12 +798,15 @@ mod join_hardening {
         d.execute("CREATE TABLE j_lim_a (id INT)").unwrap();
         d.execute("CREATE TABLE j_lim_b (fk INT, v INT)").unwrap();
         d.execute("INSERT INTO j_lim_a VALUES (1), (2), (3), (4), (5)").unwrap();
-        d.execute("INSERT INTO j_lim_b VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)").unwrap();
+        d.execute("INSERT INTO j_lim_b VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)")
+            .unwrap();
 
-        let rows = d.query(
-            "SELECT a.id, b.v FROM j_lim_a a INNER JOIN j_lim_b b ON a.id = b.fk ORDER BY a.id LIMIT 3",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT a.id, b.v FROM j_lim_a a INNER JOIN j_lim_b b ON a.id = b.fk ORDER BY a.id LIMIT 3",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 3);
     }
 
@@ -672,13 +814,16 @@ mod join_hardening {
     fn test_join_with_table_aliases() {
         let d = db();
         d.execute("CREATE TABLE j_alias_tbl (id INT, data TEXT)").unwrap();
-        d.execute("INSERT INTO j_alias_tbl VALUES (1, 'hello'), (2, 'world')").unwrap();
+        d.execute("INSERT INTO j_alias_tbl VALUES (1, 'hello'), (2, 'world')")
+            .unwrap();
 
         // Self-join using aliases
-        let rows = d.query(
-            "SELECT x.data, y.data FROM j_alias_tbl x INNER JOIN j_alias_tbl y ON x.id < y.id",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT x.data, y.data FROM j_alias_tbl x INNER JOIN j_alias_tbl y ON x.id < y.id",
+                &[],
+            )
+            .unwrap();
         // id pairs: (1,2) => 1 row
         assert_eq!(rows.len(), 1);
     }
@@ -729,9 +874,12 @@ mod join_hardening {
         d.execute("CREATE TABLE j_m2m_students (id INT, name TEXT)").unwrap();
         d.execute("CREATE TABLE j_m2m_courses (id INT, title TEXT)").unwrap();
         d.execute("CREATE TABLE j_m2m_enroll (sid INT, cid INT)").unwrap();
-        d.execute("INSERT INTO j_m2m_students VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
-        d.execute("INSERT INTO j_m2m_courses VALUES (10, 'Math'), (20, 'Science')").unwrap();
-        d.execute("INSERT INTO j_m2m_enroll VALUES (1, 10), (1, 20), (2, 10)").unwrap();
+        d.execute("INSERT INTO j_m2m_students VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        d.execute("INSERT INTO j_m2m_courses VALUES (10, 'Math'), (20, 'Science')")
+            .unwrap();
+        d.execute("INSERT INTO j_m2m_enroll VALUES (1, 10), (1, 20), (2, 10)")
+            .unwrap();
 
         let rows = d.query(
             "SELECT s.name, c.title FROM j_m2m_students s INNER JOIN j_m2m_enroll e ON s.id = e.sid INNER JOIN j_m2m_courses c ON e.cid = c.id ORDER BY s.name, c.title",
@@ -747,8 +895,10 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_la_parent (id INT, name TEXT)").unwrap();
         d.execute("CREATE TABLE j_la_child (pid INT, val INT)").unwrap();
-        d.execute("INSERT INTO j_la_parent VALUES (1, 'A'), (2, 'B'), (3, 'C')").unwrap();
-        d.execute("INSERT INTO j_la_child VALUES (1, 10), (1, 20), (3, NULL)").unwrap();
+        d.execute("INSERT INTO j_la_parent VALUES (1, 'A'), (2, 'B'), (3, 'C')")
+            .unwrap();
+        d.execute("INSERT INTO j_la_child VALUES (1, 10), (1, 20), (3, NULL)")
+            .unwrap();
 
         let rows = d.query(
             "SELECT p.name, SUM(c.val) FROM j_la_parent p LEFT JOIN j_la_child c ON p.id = c.pid GROUP BY p.name ORDER BY p.name",
@@ -760,8 +910,11 @@ mod join_hardening {
         let b = rows.iter().find(|r| to_str(r.get(0).unwrap()) == "B").unwrap();
         // SUM with no matching rows: strict SQL returns NULL, engine may return 0
         let b_sum = b.get(1).unwrap();
-        assert!(is_null(b_sum) || to_i64(b_sum) == 0,
-            "SUM of no rows should be NULL or 0, got {:?}", b_sum);
+        assert!(
+            is_null(b_sum) || to_i64(b_sum) == 0,
+            "SUM of no rows should be NULL or 0, got {:?}",
+            b_sum
+        );
     }
 
     #[test]
@@ -769,7 +922,8 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_coal_a (id INT, name TEXT)").unwrap();
         d.execute("CREATE TABLE j_coal_b (fk INT, nickname TEXT)").unwrap();
-        d.execute("INSERT INTO j_coal_a VALUES (1, 'Alice'), (2, 'Bob')").unwrap();
+        d.execute("INSERT INTO j_coal_a VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
         d.execute("INSERT INTO j_coal_b VALUES (1, 'Ali')").unwrap();
 
         let rows = d.query(
@@ -786,13 +940,17 @@ mod join_hardening {
         let d = db();
         d.execute("CREATE TABLE j_oto_user (id INT, username TEXT)").unwrap();
         d.execute("CREATE TABLE j_oto_profile (uid INT, bio TEXT)").unwrap();
-        d.execute("INSERT INTO j_oto_user VALUES (1, 'alice'), (2, 'bob')").unwrap();
-        d.execute("INSERT INTO j_oto_profile VALUES (1, 'Hello!'), (2, 'Hi there')").unwrap();
+        d.execute("INSERT INTO j_oto_user VALUES (1, 'alice'), (2, 'bob')")
+            .unwrap();
+        d.execute("INSERT INTO j_oto_profile VALUES (1, 'Hello!'), (2, 'Hi there')")
+            .unwrap();
 
-        let rows = d.query(
-            "SELECT u.username, p.bio FROM j_oto_user u INNER JOIN j_oto_profile p ON u.id = p.uid ORDER BY u.id",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT u.username, p.bio FROM j_oto_user u INNER JOIN j_oto_profile p ON u.id = p.uid ORDER BY u.id",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(to_str(rows[0].get(0).unwrap()), "alice");
         assert_eq!(to_str(rows[0].get(1).unwrap()), "Hello!");
@@ -808,10 +966,12 @@ mod join_hardening {
             d.execute(&format!("INSERT INTO j_lgc_b VALUES ({i})")).unwrap();
         }
 
-        let rows = d.query(
-            "SELECT a.id, b.id FROM j_lgc_a a INNER JOIN j_lgc_b b ON a.id = b.id",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT a.id, b.id FROM j_lgc_a a INNER JOIN j_lgc_b b ON a.id = b.id",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 20);
     }
 }

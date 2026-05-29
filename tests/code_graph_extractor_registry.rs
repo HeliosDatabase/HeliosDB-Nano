@@ -4,9 +4,7 @@
 
 use std::sync::Arc;
 
-use heliosdb_nano::code_graph::{
-    CodeIndexOptions, StaticLanguageExtractor, SymbolExtractor,
-};
+use heliosdb_nano::code_graph::{CodeIndexOptions, StaticLanguageExtractor, SymbolExtractor};
 use heliosdb_nano::{EmbeddedDatabase, Value};
 
 #[test]
@@ -42,9 +40,14 @@ fn registered_grammar_plus_extractor_yields_symbols() {
     let extractor = Arc::new(StaticLanguageExtractor {
         language: heliosdb_nano::code_graph::parse::Language::Rust,
     });
-    let prior = db.register_extractor("rust_alias_for_extractor", extractor.clone() as Arc<dyn SymbolExtractor>);
+    let prior = db.register_extractor(
+        "rust_alias_for_extractor",
+        extractor.clone() as Arc<dyn SymbolExtractor>,
+    );
     assert!(prior.is_none());
-    assert!(db.registered_extractors().contains(&"rust_alias_for_extractor".to_string()));
+    assert!(db
+        .registered_extractors()
+        .contains(&"rust_alias_for_extractor".to_string()));
 
     db.execute_params_returning(
         "INSERT INTO src VALUES ($1, 'rust_alias_for_extractor', $2)",
@@ -73,10 +76,7 @@ fn registered_grammar_without_extractor_is_skipped() {
     db.register_grammar("rust_alias_no_extractor", tree_sitter_rust::LANGUAGE.into());
     db.execute_params_returning(
         "INSERT INTO src VALUES ($1, 'rust_alias_no_extractor', $2)",
-        &[
-            Value::String("a.rs".into()),
-            Value::String("pub fn x() {}\n".into()),
-        ],
+        &[Value::String("a.rs".into()), Value::String("pub fn x() {}\n".into())],
     )
     .unwrap();
     let stats = db.code_index(CodeIndexOptions::for_table("src")).unwrap();

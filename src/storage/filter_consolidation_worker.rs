@@ -3,20 +3,20 @@
 //! CPU-aware background worker that consolidates filter index deltas into base structures.
 //! Inspired by the AutoRefreshWorker pattern for materialized views.
 
+use chrono::{DateTime, Utc};
+use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use parking_lot::{Mutex, RwLock};
-use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc};
-use tracing::{info, debug, error};
+use tracing::{debug, error, info};
 
-use crate::{Result, Error};
-use super::filter_index_delta::FilterIndexDeltaTracker;
 use super::bloom_filter::TableBloomFilters;
-use super::zone_map::{TableZoneMap, BlockZoneMap, ColumnZoneMap};
+use super::filter_index_delta::FilterIndexDeltaTracker;
 use super::mv_scheduler::CpuMonitor;
+use super::zone_map::{BlockZoneMap, ColumnZoneMap, TableZoneMap};
+use crate::{Error, Result};
 
 /// Configuration for filter consolidation worker
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -200,8 +200,7 @@ impl FilterConsolidationWorker {
 
                                 // Running average
                                 let total = s.successful_consolidations as f64;
-                                s.avg_consolidation_ms =
-                                    (s.avg_consolidation_ms * (total - 1.0) + duration_ms) / total;
+                                s.avg_consolidation_ms = (s.avg_consolidation_ms * (total - 1.0) + duration_ms) / total;
 
                                 let entry = ConsolidationHistoryEntry {
                                     table_name: table.clone(),
@@ -306,7 +305,8 @@ impl FilterConsolidationWorker {
         parallel: bool,
     ) -> Result<(u64, usize, usize)> {
         // Get deltas for this table
-        let deltas = delta_tracker.get_table_deltas(table)
+        let deltas = delta_tracker
+            .get_table_deltas(table)
             .ok_or_else(|| Error::storage("No deltas found for table"))?;
 
         let delta_count = deltas.delta_count;
@@ -323,15 +323,15 @@ impl FilterConsolidationWorker {
             if parallel {
                 // Parallel bloom filter updates
                 use rayon::prelude::*;
-                let updates: Vec<_> = deltas.bloom_deltas.par_iter()
+                let updates: Vec<_> = deltas
+                    .bloom_deltas
+                    .par_iter()
                     .map(|(col, delta)| (col.clone(), delta.clone()))
                     .collect();
 
                 for (col, delta) in updates {
                     // Find or create filter for this column
-                    if let Some(cf) = table_filters.column_filters.iter_mut()
-                        .find(|cf| cf.column_name == col)
-                    {
+                    if let Some(cf) = table_filters.column_filters.iter_mut().find(|cf| cf.column_name == col) {
                         delta.apply_to(&mut cf.filter);
                     } else {
                         table_filters.add_column(col.clone(), 10000);
@@ -344,7 +344,9 @@ impl FilterConsolidationWorker {
             } else {
                 for (col, delta) in &deltas.bloom_deltas {
                     // Find or create filter for this column
-                    if let Some(cf) = table_filters.column_filters.iter_mut()
+                    if let Some(cf) = table_filters
+                        .column_filters
+                        .iter_mut()
                         .find(|cf| cf.column_name == *col)
                     {
                         delta.apply_to(&mut cf.filter);
@@ -362,9 +364,9 @@ impl FilterConsolidationWorker {
         // Update zone maps
         if !deltas.zone_deltas.is_empty() {
             let mut maps = zone_maps.write();
-            let table_map = maps.entry(table.to_string()).or_insert_with(|| {
-                TableZoneMap::new(table.to_string(), 1000)
-            });
+            let table_map = maps
+                .entry(table.to_string())
+                .or_insert_with(|| TableZoneMap::new(table.to_string(), 1000));
 
             for (block_id, zone_delta) in &deltas.zone_deltas {
                 let block_idx = *block_id as usize;
@@ -385,7 +387,9 @@ impl FilterConsolidationWorker {
                         continue;
                     }
 
-                    let col_map = block_map.columns.entry(update.column_name.clone())
+                    let col_map = block_map
+                        .columns
+                        .entry(update.column_name.clone())
                         .or_insert_with(|| ColumnZoneMap::new(update.column_name.clone()));
 
                     // Expand range if needed

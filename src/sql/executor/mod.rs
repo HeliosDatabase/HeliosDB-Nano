@@ -8,34 +8,34 @@
 //!
 //! Operators are composed into a tree that processes data one tuple at a time.
 
-use crate::{Result, Error, Tuple, Schema};
 use crate::sql::LogicalPlan;
 use crate::storage::StorageEngine;
+use crate::{Error, Result, Schema, Tuple};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 // Re-export submodules
-pub mod scan;
-pub mod filter;
-pub mod project;
-pub mod join;
 pub mod aggregate;
 pub mod ddl;
-pub mod phase3;
 pub mod explain;
-pub mod window;
+pub mod filter;
+pub mod join;
+pub mod phase3;
+pub mod project;
+pub mod scan;
 pub mod set_ops;
 pub mod topk;
+pub mod window;
 
 // Re-export operators for public API
-pub use scan::{ScanOperator, VectorScanOperator, MaterializedOperator, GenerateSeriesOperator, UnnestOperator};
-pub use filter::FilterOperator;
-pub use project::{ProjectOperator, LimitOperator};
-pub use join::{NestedLoopJoinOperator, HashJoinOperator};
 pub use aggregate::{AggregateOperator, SortOperator};
-pub use window::WindowOperator;
-pub use set_ops::{UnionOperator, IntersectOperator, ExceptOperator};
+pub use filter::FilterOperator;
+pub use join::{HashJoinOperator, NestedLoopJoinOperator};
+pub use project::{LimitOperator, ProjectOperator};
+pub use scan::{GenerateSeriesOperator, MaterializedOperator, ScanOperator, UnnestOperator, VectorScanOperator};
+pub use set_ops::{ExceptOperator, IntersectOperator, UnionOperator};
 pub use topk::TopKOperator;
+pub use window::WindowOperator;
 
 /// Create a schema for COUNT(*) fast path results (single Int8 column).
 fn count_star_schema() -> Arc<Schema> {
@@ -101,10 +101,7 @@ impl PhysicalOperator for DualScanOperator {
 /// and the ART index lookup encodes types byte-exactly.  Without
 /// this coercion `WHERE id = '<uuid>'` against a UUID PK misses
 /// every row.
-pub(crate) fn coerce_literal_to_column_type(
-    v: crate::Value,
-    col_type: &crate::DataType,
-) -> crate::Value {
+pub(crate) fn coerce_literal_to_column_type(v: crate::Value, col_type: &crate::DataType) -> crate::Value {
     use crate::{DataType, Value};
     match (&v, col_type) {
         (Value::String(s), DataType::Uuid) => match uuid::Uuid::parse_str(s) {
@@ -115,12 +112,10 @@ pub(crate) fn coerce_literal_to_column_type(
             Ok(d) => Value::Date(d),
             Err(_) => v,
         },
-        (Value::String(s), DataType::Timestamp) => {
-            match chrono::DateTime::parse_from_rfc3339(s) {
-                Ok(t) => Value::Timestamp(t.to_utc()),
-                Err(_) => v,
-            }
-        }
+        (Value::String(s), DataType::Timestamp) => match chrono::DateTime::parse_from_rfc3339(s) {
+            Ok(t) => Value::Timestamp(t.to_utc()),
+            Err(_) => v,
+        },
         _ => v,
     }
 }
@@ -137,7 +132,10 @@ pub struct StatusMessageOperator {
 impl StatusMessageOperator {
     /// Create a new StatusMessage operator
     pub fn new(message: String) -> Self {
-        Self { message, exhausted: false }
+        Self {
+            message,
+            exhausted: false,
+        }
     }
 }
 
@@ -208,8 +206,7 @@ impl TimeoutContext {
         // Only check time every 1000 rows to minimize overhead
         // This amortizes the cost of Instant::now() across many rows
         const CHECK_INTERVAL: usize = 1000;
-        let count = self.rows_since_check
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let count = self.rows_since_check.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
         if count % CHECK_INTERVAL != 0 {
             return Ok(());
@@ -395,14 +392,33 @@ impl<'a> Executor<'a> {
         Vec<crate::sql::LogicalExpr>,
         Vec<bool>,
         &LogicalPlan,
-        Option<(Vec<crate::sql::LogicalExpr>, Vec<String>, bool, Option<Vec<crate::sql::LogicalExpr>>)>,
+        Option<(
+            Vec<crate::sql::LogicalExpr>,
+            Vec<String>,
+            bool,
+            Option<Vec<crate::sql::LogicalExpr>>,
+        )>,
     )> {
         match input {
-            LogicalPlan::Sort { input: inner, exprs, asc } => {
-                Some((exprs.clone(), asc.clone(), inner.as_ref(), None))
-            }
-            LogicalPlan::Project { input: inner, exprs: p_exprs, aliases, distinct, distinct_on, .. } => {
-                if let LogicalPlan::Sort { input: inner2, exprs, asc } = inner.as_ref() {
+            LogicalPlan::Sort {
+                input: inner,
+                exprs,
+                asc,
+            } => Some((exprs.clone(), asc.clone(), inner.as_ref(), None)),
+            LogicalPlan::Project {
+                input: inner,
+                exprs: p_exprs,
+                aliases,
+                distinct,
+                distinct_on,
+                ..
+            } => {
+                if let LogicalPlan::Sort {
+                    input: inner2,
+                    exprs,
+                    asc,
+                } = inner.as_ref()
+                {
                     Some((
                         exprs.clone(),
                         asc.clone(),
@@ -425,13 +441,18 @@ impl<'a> Executor<'a> {
         use crate::sql::LogicalExpr;
 
         match expr {
-            LogicalExpr::InSubquery { expr: inner_expr, subquery, negated } => {
+            LogicalExpr::InSubquery {
+                expr: inner_expr,
+                subquery,
+                negated,
+            } => {
                 // Execute the subquery to get the list of values
                 let mut subquery_executor = if let Some(storage) = self.storage {
                     Executor::with_storage(storage)
                 } else {
                     Executor::new()
-                }.with_parameters(self.parameters.clone());
+                }
+                .with_parameters(self.parameters.clone());
 
                 let results = subquery_executor.execute(subquery)?;
 
@@ -440,7 +461,8 @@ impl<'a> Executor<'a> {
 
                 // Use HashSet for large IN lists (O(1) lookup instead of O(N) linear scan)
                 if results.len() > 16 {
-                    let value_set: std::collections::HashSet<crate::Value> = results.iter()
+                    let value_set: std::collections::HashSet<crate::Value> = results
+                        .iter()
                         .filter_map(|tuple| tuple.values.first().cloned())
                         .collect();
                     Ok(LogicalExpr::InSet {
@@ -449,10 +471,9 @@ impl<'a> Executor<'a> {
                         negated: *negated,
                     })
                 } else {
-                    let list: Vec<LogicalExpr> = results.iter()
-                        .filter_map(|tuple| {
-                            tuple.values.first().map(|v| LogicalExpr::Literal(v.clone()))
-                        })
+                    let list: Vec<LogicalExpr> = results
+                        .iter()
+                        .filter_map(|tuple| tuple.values.first().map(|v| LogicalExpr::Literal(v.clone())))
                         .collect();
                     Ok(LogicalExpr::InList {
                         expr: Box::new(materialized_inner),
@@ -473,7 +494,8 @@ impl<'a> Executor<'a> {
                     Executor::with_storage(storage)
                 } else {
                     Executor::new()
-                }.with_parameters(self.parameters.clone());
+                }
+                .with_parameters(self.parameters.clone());
 
                 // KanttBan #23 phase 2.10: same fallback as
                 // correlated EXISTS (phase 2.5b) — when the inner
@@ -488,13 +510,12 @@ impl<'a> Executor<'a> {
                 let results = match subquery_executor.execute(subquery) {
                     Ok(r) => r,
                     Err(e) => {
-                        tracing::debug!(
-                            "Correlated scalar subquery failed ({e}); falling back to NULL"
-                        );
+                        tracing::debug!("Correlated scalar subquery failed ({e}); falling back to NULL");
                         Vec::new()
                     }
                 };
-                let value = results.first()
+                let value = results
+                    .first()
                     .and_then(|tuple| tuple.values.first().cloned())
                     .unwrap_or(crate::Value::Null);
                 Ok(LogicalExpr::Literal(value))
@@ -505,7 +526,8 @@ impl<'a> Executor<'a> {
                     Executor::with_storage(storage)
                 } else {
                     Executor::new()
-                }.with_parameters(self.parameters.clone());
+                }
+                .with_parameters(self.parameters.clone());
 
                 // KanttBan #23 phase 2.5: correlated EXISTS
                 // (inner WHERE references outer columns) fails here
@@ -538,50 +560,55 @@ impl<'a> Executor<'a> {
                 Ok(LogicalExpr::Literal(crate::Value::Boolean(result)))
             }
             // Recursively process compound expressions
-            LogicalExpr::BinaryExpr { left, op, right } => {
-                Ok(LogicalExpr::BinaryExpr {
-                    left: Box::new(self.materialize_subqueries(left)?),
-                    op: *op,
-                    right: Box::new(self.materialize_subqueries(right)?),
-                })
-            }
-            LogicalExpr::UnaryExpr { op, expr: inner } => {
-                Ok(LogicalExpr::UnaryExpr {
-                    op: *op,
-                    expr: Box::new(self.materialize_subqueries(inner)?),
-                })
-            }
-            LogicalExpr::IsNull { expr: inner, is_null } => {
-                Ok(LogicalExpr::IsNull {
-                    expr: Box::new(self.materialize_subqueries(inner)?),
-                    is_null: *is_null,
-                })
-            }
-            LogicalExpr::Between { expr: inner, low, high, negated } => {
-                Ok(LogicalExpr::Between {
-                    expr: Box::new(self.materialize_subqueries(inner)?),
-                    low: Box::new(self.materialize_subqueries(low)?),
-                    high: Box::new(self.materialize_subqueries(high)?),
-                    negated: *negated,
-                })
-            }
-            LogicalExpr::InList { expr: inner, list, negated } => {
-                let materialized_list: Result<Vec<LogicalExpr>> = list.iter()
-                    .map(|e| self.materialize_subqueries(e))
-                    .collect();
+            LogicalExpr::BinaryExpr { left, op, right } => Ok(LogicalExpr::BinaryExpr {
+                left: Box::new(self.materialize_subqueries(left)?),
+                op: *op,
+                right: Box::new(self.materialize_subqueries(right)?),
+            }),
+            LogicalExpr::UnaryExpr { op, expr: inner } => Ok(LogicalExpr::UnaryExpr {
+                op: *op,
+                expr: Box::new(self.materialize_subqueries(inner)?),
+            }),
+            LogicalExpr::IsNull { expr: inner, is_null } => Ok(LogicalExpr::IsNull {
+                expr: Box::new(self.materialize_subqueries(inner)?),
+                is_null: *is_null,
+            }),
+            LogicalExpr::Between {
+                expr: inner,
+                low,
+                high,
+                negated,
+            } => Ok(LogicalExpr::Between {
+                expr: Box::new(self.materialize_subqueries(inner)?),
+                low: Box::new(self.materialize_subqueries(low)?),
+                high: Box::new(self.materialize_subqueries(high)?),
+                negated: *negated,
+            }),
+            LogicalExpr::InList {
+                expr: inner,
+                list,
+                negated,
+            } => {
+                let materialized_list: Result<Vec<LogicalExpr>> =
+                    list.iter().map(|e| self.materialize_subqueries(e)).collect();
                 Ok(LogicalExpr::InList {
                     expr: Box::new(self.materialize_subqueries(inner)?),
                     list: materialized_list?,
                     negated: *negated,
                 })
             }
-            LogicalExpr::Case { expr: operand, when_then, else_result } => {
+            LogicalExpr::Case {
+                expr: operand,
+                when_then,
+                else_result,
+            } => {
                 let materialized_operand = if let Some(op) = operand {
                     Some(Box::new(self.materialize_subqueries(op)?))
                 } else {
                     None
                 };
-                let materialized_when_then: Result<Vec<(LogicalExpr, LogicalExpr)>> = when_then.iter()
+                let materialized_when_then: Result<Vec<(LogicalExpr, LogicalExpr)>> = when_then
+                    .iter()
                     .map(|(w, t)| Ok((self.materialize_subqueries(w)?, self.materialize_subqueries(t)?)))
                     .collect();
                 let materialized_else = if let Some(e) = else_result {
@@ -607,8 +634,8 @@ impl<'a> Executor<'a> {
         input: &LogicalPlan,
         predicate: &crate::sql::LogicalExpr,
     ) -> Result<Option<Box<dyn PhysicalOperator>>> {
-        use crate::sql::LogicalExpr;
         use crate::sql::BinaryOperator;
+        use crate::sql::LogicalExpr;
 
         // Only works with a Scan input and storage available
         let storage = match self.storage {
@@ -617,9 +644,13 @@ impl<'a> Executor<'a> {
         };
 
         let (table_name, alias, schema, projection, as_of) = match input {
-            LogicalPlan::Scan { table_name, alias, schema, projection, as_of } => {
-                (table_name, alias, schema, projection, as_of)
-            }
+            LogicalPlan::Scan {
+                table_name,
+                alias,
+                schema,
+                projection,
+                as_of,
+            } => (table_name, alias, schema, projection, as_of),
             _ => return Ok(None),
         };
 
@@ -643,15 +674,20 @@ impl<'a> Executor<'a> {
 
         // Check if predicate is `pk_col = literal` or `literal = pk_col`
         let pk_value = match predicate {
-            LogicalExpr::BinaryExpr { left, op: BinaryOperator::Eq, right } => {
+            LogicalExpr::BinaryExpr {
+                left,
+                op: BinaryOperator::Eq,
+                right,
+            } => {
                 match (left.as_ref(), right.as_ref()) {
-                    (LogicalExpr::Column { name, .. }, LogicalExpr::Literal(val))
-                        if name == &pk_col.name => Some(val.clone()),
-                    (LogicalExpr::Literal(val), LogicalExpr::Column { name, .. })
-                        if name == &pk_col.name => Some(val.clone()),
+                    (LogicalExpr::Column { name, .. }, LogicalExpr::Literal(val)) if name == &pk_col.name => {
+                        Some(val.clone())
+                    }
+                    (LogicalExpr::Literal(val), LogicalExpr::Column { name, .. }) if name == &pk_col.name => {
+                        Some(val.clone())
+                    }
                     // Handle parameterized query: pk_col = $1
-                    (LogicalExpr::Column { name, .. }, LogicalExpr::Parameter { index })
-                        if name == &pk_col.name => {
+                    (LogicalExpr::Column { name, .. }, LogicalExpr::Parameter { index }) if name == &pk_col.name => {
                         self.parameters.get(index.saturating_sub(1)).cloned()
                     }
                     _ => None,
@@ -679,12 +715,16 @@ impl<'a> Executor<'a> {
 
         // Build schema with source_table set for JOIN disambiguation
         let source_alias = alias.as_deref().unwrap_or(table_name);
-        let schema_cols: Vec<_> = schema.columns.iter().map(|col| {
-            let mut c = col.clone();
-            c.source_table = Some(source_alias.to_string());
-            c.source_table_name = Some(table_name.clone());
-            c
-        }).collect();
+        let schema_cols: Vec<_> = schema
+            .columns
+            .iter()
+            .map(|col| {
+                let mut c = col.clone();
+                c.source_table = Some(source_alias.to_string());
+                c.source_table_name = Some(table_name.clone());
+                c
+            })
+            .collect();
         let actual_schema = Arc::new(Schema { columns: schema_cols });
 
         let tuples = match tuple {
@@ -692,27 +732,24 @@ impl<'a> Executor<'a> {
             None => vec![],
         };
 
-        Ok(Some(Box::new(scan::ScanOperator::new(
-            table_name.clone(),
-            actual_schema,
-            projection.clone(),
-            tuples,
-            self.parameters.clone(),
-        ).with_timeout(self.timeout_ctx()))))
+        Ok(Some(Box::new(
+            scan::ScanOperator::new(
+                table_name.clone(),
+                actual_schema,
+                projection.clone(),
+                tuples,
+                self.parameters.clone(),
+            )
+            .with_timeout(self.timeout_ctx()),
+        )))
     }
 
     /// Convert a logical plan to a physical operator
     pub(crate) fn plan_to_operator(&mut self, plan: &LogicalPlan) -> Result<Box<dyn PhysicalOperator>> {
         match plan {
-            LogicalPlan::Scan { .. } => {
-                scan::handle_scan(self, plan)
-            }
-            LogicalPlan::FilteredScan { .. } => {
-                scan::handle_filtered_scan(self, plan)
-            }
-            LogicalPlan::TableFunction { .. } => {
-                scan::handle_table_function(self, plan)
-            }
+            LogicalPlan::Scan { .. } => scan::handle_scan(self, plan),
+            LogicalPlan::FilteredScan { .. } => scan::handle_filtered_scan(self, plan),
+            LogicalPlan::TableFunction { .. } => scan::handle_table_function(self, plan),
             LogicalPlan::Filter { input, predicate } => {
                 // Try PK index-based point lookup for Filter(Scan) with equality predicate
                 if let Some(result) = self.try_index_point_lookup(input, predicate)? {
@@ -721,13 +758,18 @@ impl<'a> Executor<'a> {
                 let input_op = self.plan_to_operator(input)?;
                 // Materialize any IN subqueries before creating the filter
                 let materialized_predicate = self.materialize_subqueries(predicate)?;
-                Ok(Box::new(FilterOperator::new(
-                    input_op,
-                    materialized_predicate,
-                    self.parameters.clone(),
-                ).with_timeout(self.timeout_ctx.clone())))
+                Ok(Box::new(
+                    FilterOperator::new(input_op, materialized_predicate, self.parameters.clone())
+                        .with_timeout(self.timeout_ctx.clone()),
+                ))
             }
-            LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => {
+            LogicalPlan::Project {
+                input,
+                exprs,
+                aliases,
+                distinct,
+                distinct_on,
+            } => {
                 use crate::sql::LogicalExpr;
 
                 // Check if any expressions are window functions
@@ -764,7 +806,9 @@ impl<'a> Executor<'a> {
                             storage_mode: crate::ColumnStorageMode::Default,
                         });
                     }
-                    let window_schema = Arc::new(Schema { columns: window_schema_cols });
+                    let window_schema = Arc::new(Schema {
+                        columns: window_schema_cols,
+                    });
 
                     // Create window operator
                     let window_op = WindowOperator::new(input_op, window_exprs, window_schema);
@@ -787,14 +831,17 @@ impl<'a> Executor<'a> {
                         })
                         .collect();
 
-                    Ok(Box::new(ProjectOperator::new_with_distinct_on(
-                        Box::new(window_op),
-                        modified_exprs,
-                        aliases.clone(),
-                        *distinct,
-                        distinct_on.clone(),
-                        self.parameters.clone(),
-                    ).with_timeout(self.timeout_ctx.clone())))
+                    Ok(Box::new(
+                        ProjectOperator::new_with_distinct_on(
+                            Box::new(window_op),
+                            modified_exprs,
+                            aliases.clone(),
+                            *distinct,
+                            distinct_on.clone(),
+                            self.parameters.clone(),
+                        )
+                        .with_timeout(self.timeout_ctx.clone()),
+                    ))
                 } else {
                     let input_op = self.plan_to_operator(input)?;
                     // Materialize any subqueries in project expressions
@@ -802,17 +849,26 @@ impl<'a> Executor<'a> {
                         .iter()
                         .map(|e| self.materialize_subqueries(e))
                         .collect::<Result<Vec<_>>>()?;
-                    Ok(Box::new(ProjectOperator::new_with_distinct_on(
-                        input_op,
-                        materialized_exprs,
-                        aliases.clone(),
-                        *distinct,
-                        distinct_on.clone(),
-                        self.parameters.clone(),
-                    ).with_timeout(self.timeout_ctx.clone())))
+                    Ok(Box::new(
+                        ProjectOperator::new_with_distinct_on(
+                            input_op,
+                            materialized_exprs,
+                            aliases.clone(),
+                            *distinct,
+                            distinct_on.clone(),
+                            self.parameters.clone(),
+                        )
+                        .with_timeout(self.timeout_ctx.clone()),
+                    ))
                 }
             }
-            LogicalPlan::Limit { input, limit, offset, limit_param, offset_param } => {
+            LogicalPlan::Limit {
+                input,
+                limit,
+                offset,
+                limit_param,
+                offset_param,
+            } => {
                 // Resolve `LIMIT $N` / `OFFSET $N` from the bound
                 // parameter list if the planner left a placeholder
                 // sentinel in place. Accepts integer, integer-castable
@@ -821,11 +877,13 @@ impl<'a> Executor<'a> {
                     match param_idx {
                         None => Ok(sentinel),
                         Some(idx) => {
-                            let value = self.parameters.get(idx.saturating_sub(1))
-                                .ok_or_else(|| Error::query_execution(format!(
+                            let value = self.parameters.get(idx.saturating_sub(1)).ok_or_else(|| {
+                                Error::query_execution(format!(
                                     "LIMIT/OFFSET parameter ${} not provided (have {} parameters)",
-                                    idx, self.parameters.len(),
-                                )))?;
+                                    idx,
+                                    self.parameters.len(),
+                                ))
+                            })?;
                             match value {
                                 crate::Value::Int2(n) => Ok((*n).max(0) as usize),
                                 crate::Value::Int4(n) => Ok((*n).max(0) as usize),
@@ -851,11 +909,20 @@ impl<'a> Executor<'a> {
                 let offset = &offset;
                 // LIMIT pushdown: detect Scan or Project(Scan) with no filter/sort
                 let scan_info = match input.as_ref() {
-                    LogicalPlan::Scan { table_name, schema, projection, .. } => {
-                        Some((table_name, schema, projection))
-                    }
+                    LogicalPlan::Scan {
+                        table_name,
+                        schema,
+                        projection,
+                        ..
+                    } => Some((table_name, schema, projection)),
                     LogicalPlan::Project { input: inner, .. } => {
-                        if let LogicalPlan::Scan { table_name, schema, projection, .. } = inner.as_ref() {
+                        if let LogicalPlan::Scan {
+                            table_name,
+                            schema,
+                            projection,
+                            ..
+                        } = inner.as_ref()
+                        {
                             Some((table_name, schema, projection))
                         } else {
                             None
@@ -865,42 +932,55 @@ impl<'a> Executor<'a> {
                 };
                 if let Some((table_name, schema, projection)) = scan_info {
                     if let Some(storage) = self.storage {
-                    if self.get_cte(table_name).is_none() {
-                        // Storage-level OFFSET pushdown: skip the first
-                        // `offset` rows without deserialising them, then
-                        // fetch the next `limit` fully. Cheaper than the
-                        // old "fetch limit+offset, discard offset" path.
-                        let tuples = storage.scan_table_with_offset_limit(
-                            table_name, *offset, *limit,
-                        )?;
-                        let scan_op = Box::new(ScanOperator::new(
-                            table_name.clone(), schema.clone(), projection.clone(), tuples, self.parameters.clone(),
-                        ).with_timeout(self.timeout_ctx.clone()));
-                        // If original input was Project(Scan), wrap with ProjectOperator
-                        let final_input: Box<dyn PhysicalOperator> = if let LogicalPlan::Project { exprs, aliases, distinct, distinct_on, .. } = input.as_ref() {
-                            let materialized_exprs: Vec<crate::sql::LogicalExpr> = exprs
-                                .iter()
-                                .map(|e| self.materialize_subqueries(e))
-                                .collect::<Result<Vec<_>>>()?;
-                            Box::new(ProjectOperator::new_with_distinct_on(
-                                scan_op,
-                                materialized_exprs,
-                                aliases.clone(),
-                                *distinct,
-                                distinct_on.clone(),
-                                self.parameters.clone(),
-                            ).with_timeout(self.timeout_ctx.clone()))
-                        } else {
-                            scan_op
-                        };
-                        // Storage already applied the offset, so the outer
-                        // LimitOperator gets offset=0 and just caps at `limit`.
-                        return Ok(Box::new(LimitOperator::new(
-                            final_input,
-                            *limit,
-                            0,
-                        ).with_timeout(self.timeout_ctx.clone())));
-                    }
+                        if self.get_cte(table_name).is_none() {
+                            // Storage-level OFFSET pushdown: skip the first
+                            // `offset` rows without deserialising them, then
+                            // fetch the next `limit` fully. Cheaper than the
+                            // old "fetch limit+offset, discard offset" path.
+                            let tuples = storage.scan_table_with_offset_limit(table_name, *offset, *limit)?;
+                            let scan_op = Box::new(
+                                ScanOperator::new(
+                                    table_name.clone(),
+                                    schema.clone(),
+                                    projection.clone(),
+                                    tuples,
+                                    self.parameters.clone(),
+                                )
+                                .with_timeout(self.timeout_ctx.clone()),
+                            );
+                            // If original input was Project(Scan), wrap with ProjectOperator
+                            let final_input: Box<dyn PhysicalOperator> = if let LogicalPlan::Project {
+                                exprs,
+                                aliases,
+                                distinct,
+                                distinct_on,
+                                ..
+                            } = input.as_ref()
+                            {
+                                let materialized_exprs: Vec<crate::sql::LogicalExpr> = exprs
+                                    .iter()
+                                    .map(|e| self.materialize_subqueries(e))
+                                    .collect::<Result<Vec<_>>>()?;
+                                Box::new(
+                                    ProjectOperator::new_with_distinct_on(
+                                        scan_op,
+                                        materialized_exprs,
+                                        aliases.clone(),
+                                        *distinct,
+                                        distinct_on.clone(),
+                                        self.parameters.clone(),
+                                    )
+                                    .with_timeout(self.timeout_ctx.clone()),
+                                )
+                            } else {
+                                scan_op
+                            };
+                            // Storage already applied the offset, so the outer
+                            // LimitOperator gets offset=0 and just caps at `limit`.
+                            return Ok(Box::new(
+                                LimitOperator::new(final_input, *limit, 0).with_timeout(self.timeout_ctx.clone()),
+                            ));
+                        }
                     }
                 }
                 // Top-K fast path: Limit over Sort (optionally under Project)
@@ -913,19 +993,15 @@ impl<'a> Executor<'a> {
                 let k = limit.saturating_add(*offset);
                 let real_bound = *limit != usize::MAX;
                 if real_bound {
-                    if let Some((sort_exprs, sort_asc, sort_input, project_wrap)) =
-                        Self::extract_sort_for_topk(input)
-                    {
+                    if let Some((sort_exprs, sort_asc, sort_input, project_wrap)) = Self::extract_sort_for_topk(input) {
                         let sort_input_op = self.plan_to_operator(sort_input)?;
-                        let topk: Box<dyn PhysicalOperator> = Box::new(
-                            TopKOperator::new(
-                                sort_input_op,
-                                sort_exprs,
-                                sort_asc,
-                                k,
-                                self.timeout_ctx.clone(),
-                            )?,
-                        );
+                        let topk: Box<dyn PhysicalOperator> = Box::new(TopKOperator::new(
+                            sort_input_op,
+                            sort_exprs,
+                            sort_asc,
+                            k,
+                            self.timeout_ctx.clone(),
+                        )?);
                         // Re-wrap with the Project on top, if we stripped one.
                         let after_project: Box<dyn PhysicalOperator> = match project_wrap {
                             Some((exprs, aliases, distinct, distinct_on)) => {
@@ -933,30 +1009,29 @@ impl<'a> Executor<'a> {
                                     .iter()
                                     .map(|e| self.materialize_subqueries(e))
                                     .collect::<Result<Vec<_>>>()?;
-                                Box::new(ProjectOperator::new_with_distinct_on(
-                                    topk,
-                                    materialised,
-                                    aliases,
-                                    distinct,
-                                    distinct_on,
-                                    self.parameters.clone(),
-                                ).with_timeout(self.timeout_ctx.clone()))
+                                Box::new(
+                                    ProjectOperator::new_with_distinct_on(
+                                        topk,
+                                        materialised,
+                                        aliases,
+                                        distinct,
+                                        distinct_on,
+                                        self.parameters.clone(),
+                                    )
+                                    .with_timeout(self.timeout_ctx.clone()),
+                                )
                             }
                             None => topk,
                         };
-                        return Ok(Box::new(LimitOperator::new(
-                            after_project,
-                            *limit,
-                            *offset,
-                        ).with_timeout(self.timeout_ctx.clone())));
+                        return Ok(Box::new(
+                            LimitOperator::new(after_project, *limit, *offset).with_timeout(self.timeout_ctx.clone()),
+                        ));
                     }
                 }
                 let input_op = self.plan_to_operator(input)?;
-                Ok(Box::new(LimitOperator::new(
-                    input_op,
-                    *limit,
-                    *offset,
-                ).with_timeout(self.timeout_ctx.clone())))
+                Ok(Box::new(
+                    LimitOperator::new(input_op, *limit, *offset).with_timeout(self.timeout_ctx.clone()),
+                ))
             }
             LogicalPlan::Sort { input, exprs, asc } => {
                 let input_op = self.plan_to_operator(input)?;
@@ -967,7 +1042,12 @@ impl<'a> Executor<'a> {
                     self.timeout_ctx.clone(),
                 )?))
             }
-            LogicalPlan::Aggregate { input, group_by, aggr_exprs, having } => {
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                having,
+            } => {
                 // Fast path: COUNT(*) with no GROUP BY, no HAVING, plain Scan input
                 #[allow(clippy::indexing_slicing)] // Safety: aggr_exprs.len() == 1 checked in condition
                 if group_by.is_empty() && having.is_none() && aggr_exprs.len() == 1 {
@@ -976,67 +1056,30 @@ impl<'a> Executor<'a> {
                         distinct: false,
                         args,
                         ..
-                    } = &aggr_exprs[0] {
-                    // Only use fast path for COUNT(*), not COUNT(col)
-                    // COUNT(col) needs to evaluate per-row to skip NULLs
-                    let is_count_star = args.first().is_some_and(|a| matches!(a, crate::sql::LogicalExpr::Wildcard));
-                    if is_count_star {
-                        let scan_table = match input.as_ref() {
-                            LogicalPlan::Scan { table_name, .. } => Some(table_name.as_str()),
-                            LogicalPlan::Project { input: inner, .. } => {
-                                if let LogicalPlan::Scan { table_name, .. } = inner.as_ref() {
-                                    Some(table_name.as_str())
-                                } else {
-                                    None
-                                }
-                            }
-                            _ => None,
-                        };
-                        if let Some(table_name) = scan_table {
-                            if self.get_cte(table_name).is_none() {
-                                if let Some(storage) = self.storage {
-                                    let count = storage.count_table_rows(table_name)?;
-                                    let result_tuple = crate::Tuple::new(vec![crate::Value::Int8(count as i64)]);
-                                    return Ok(Box::new(MaterializedOperator::new(
-                                        vec![result_tuple],
-                                        count_star_schema(),
-                                    )));
-                                }
-                            }
-                        }
-
-                        // Fast path: COUNT(*) with Filter(Scan) — scan + filter + count without materializing
-                        if let LogicalPlan::Filter { input: filter_input, predicate } = input.as_ref() {
-                            let scan_table_filtered = match filter_input.as_ref() {
-                                LogicalPlan::Scan { table_name, .. } => Some((table_name.as_str(), filter_input.as_ref())),
+                    } = &aggr_exprs[0]
+                    {
+                        // Only use fast path for COUNT(*), not COUNT(col)
+                        // COUNT(col) needs to evaluate per-row to skip NULLs
+                        let is_count_star = args
+                            .first()
+                            .is_some_and(|a| matches!(a, crate::sql::LogicalExpr::Wildcard));
+                        if is_count_star {
+                            let scan_table = match input.as_ref() {
+                                LogicalPlan::Scan { table_name, .. } => Some(table_name.as_str()),
                                 LogicalPlan::Project { input: inner, .. } => {
                                     if let LogicalPlan::Scan { table_name, .. } = inner.as_ref() {
-                                        Some((table_name.as_str(), filter_input.as_ref()))
+                                        Some(table_name.as_str())
                                     } else {
                                         None
                                     }
                                 }
                                 _ => None,
                             };
-                            if let Some((table_name, scan_plan)) = scan_table_filtered {
+                            if let Some(table_name) = scan_table {
                                 if self.get_cte(table_name).is_none() {
-                                    if let Some(_storage) = self.storage {
-                                        // Build scan operator to get schema, then iterate + filter + count
-                                        let mut scan_op = self.plan_to_operator(&Box::new(scan_plan.clone()))?;
-                                        let schema = scan_op.schema();
-                                        let evaluator = crate::sql::Evaluator::with_parameters(schema, self.parameters.clone());
-                                        let _ = table_name; // used for debug context
-                                        let mut count: i64 = 0;
-                                        while let Some(tuple) = scan_op.next()? {
-                                            if let Some(ref ctx) = self.timeout_ctx {
-                                                ctx.check_timeout()?;
-                                            }
-                                            let result = evaluator.evaluate(predicate, &tuple)?;
-                                            if matches!(result, crate::Value::Boolean(true)) {
-                                                count += 1;
-                                            }
-                                        }
-                                        let result_tuple = crate::Tuple::new(vec![crate::Value::Int8(count)]);
+                                    if let Some(storage) = self.storage {
+                                        let count = storage.count_table_rows(table_name)?;
+                                        let result_tuple = crate::Tuple::new(vec![crate::Value::Int8(count as i64)]);
                                         return Ok(Box::new(MaterializedOperator::new(
                                             vec![result_tuple],
                                             count_star_schema(),
@@ -1044,8 +1087,55 @@ impl<'a> Executor<'a> {
                                     }
                                 }
                             }
-                        }
-                    } // end if is_count_star
+
+                            // Fast path: COUNT(*) with Filter(Scan) — scan + filter + count without materializing
+                            if let LogicalPlan::Filter {
+                                input: filter_input,
+                                predicate,
+                            } = input.as_ref()
+                            {
+                                let scan_table_filtered = match filter_input.as_ref() {
+                                    LogicalPlan::Scan { table_name, .. } => {
+                                        Some((table_name.as_str(), filter_input.as_ref()))
+                                    }
+                                    LogicalPlan::Project { input: inner, .. } => {
+                                        if let LogicalPlan::Scan { table_name, .. } = inner.as_ref() {
+                                            Some((table_name.as_str(), filter_input.as_ref()))
+                                        } else {
+                                            None
+                                        }
+                                    }
+                                    _ => None,
+                                };
+                                if let Some((table_name, scan_plan)) = scan_table_filtered {
+                                    if self.get_cte(table_name).is_none() {
+                                        if let Some(_storage) = self.storage {
+                                            // Build scan operator to get schema, then iterate + filter + count
+                                            let mut scan_op = self.plan_to_operator(&Box::new(scan_plan.clone()))?;
+                                            let schema = scan_op.schema();
+                                            let evaluator =
+                                                crate::sql::Evaluator::with_parameters(schema, self.parameters.clone());
+                                            let _ = table_name; // used for debug context
+                                            let mut count: i64 = 0;
+                                            while let Some(tuple) = scan_op.next()? {
+                                                if let Some(ref ctx) = self.timeout_ctx {
+                                                    ctx.check_timeout()?;
+                                                }
+                                                let result = evaluator.evaluate(predicate, &tuple)?;
+                                                if matches!(result, crate::Value::Boolean(true)) {
+                                                    count += 1;
+                                                }
+                                            }
+                                            let result_tuple = crate::Tuple::new(vec![crate::Value::Int8(count)]);
+                                            return Ok(Box::new(MaterializedOperator::new(
+                                                vec![result_tuple],
+                                                count_star_schema(),
+                                            )));
+                                        }
+                                    }
+                                }
+                            }
+                        } // end if is_count_star
                     }
                 }
                 let input_op = self.plan_to_operator(input)?;
@@ -1058,9 +1148,13 @@ impl<'a> Executor<'a> {
                     self.timeout_ctx.clone(),
                 )?))
             }
-            LogicalPlan::Join { left, right, join_type, on, lateral } => {
-                join::handle_join(self, left, right, join_type, on, *lateral)
-            }
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                on,
+                lateral,
+            } => join::handle_join(self, left, right, join_type, on, *lateral),
             LogicalPlan::Union { left, right, all } => {
                 let left_op = self.plan_to_operator(left)?;
                 let right_op = self.plan_to_operator(right)?;
@@ -1076,20 +1170,21 @@ impl<'a> Executor<'a> {
                 let right_op = self.plan_to_operator(right)?;
                 Ok(Box::new(ExceptOperator::new(left_op, right_op, *all)?))
             }
-            LogicalPlan::CreateIndex { .. } => {
-                ddl::handle_create_index(self, plan)
-            }
+            LogicalPlan::CreateIndex { .. } => ddl::handle_create_index(self, plan),
             LogicalPlan::CreateSequence { name, if_not_exists } => {
                 // In-memory sequence registration. Returns empty result
                 // set (DDL semantics).
                 crate::sql::sequences::create_sequence(name, *if_not_exists);
-                Ok(Box::new(ScanOperator::new(
-                    String::new(),
-                    Arc::new(crate::Schema { columns: vec![] }),
-                    None,
-                    vec![],
-                    vec![],
-                ).with_timeout(self.timeout_ctx())))
+                Ok(Box::new(
+                    ScanOperator::new(
+                        String::new(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(self.timeout_ctx()),
+                ))
             }
             LogicalPlan::CreateEnumType { name, labels } => {
                 // KanttBan #20 (v3.31.0). Persist the enum labels in
@@ -1101,51 +1196,56 @@ impl<'a> Executor<'a> {
                 // duplicate names silently overwrite for now —
                 // matches PG behaviour close enough for the
                 // idempotent migration pattern.
-                let storage = self.storage.ok_or_else(|| {
-                    Error::query_execution("CREATE TYPE requires storage context".to_string())
-                })?;
+                let storage = self
+                    .storage
+                    .ok_or_else(|| Error::query_execution("CREATE TYPE requires storage context".to_string()))?;
                 storage.catalog().register_enum_type(name, labels)?;
-                Ok(Box::new(ScanOperator::new(
-                    String::new(),
-                    Arc::new(crate::Schema { columns: vec![] }),
-                    None,
-                    vec![],
-                    vec![],
-                ).with_timeout(self.timeout_ctx())))
+                Ok(Box::new(
+                    ScanOperator::new(
+                        String::new(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(self.timeout_ctx()),
+                ))
             }
             LogicalPlan::DropEnumType { name, if_exists } => {
-                let storage = self.storage.ok_or_else(|| {
-                    Error::query_execution("DROP TYPE requires storage context".to_string())
-                })?;
+                let storage = self
+                    .storage
+                    .ok_or_else(|| Error::query_execution("DROP TYPE requires storage context".to_string()))?;
                 let catalog = storage.catalog();
                 if !*if_exists && !catalog.enum_type_exists(name)? {
-                    return Err(Error::query_execution(format!(
-                        "type \"{name}\" does not exist"
-                    )));
+                    return Err(Error::query_execution(format!("type \"{name}\" does not exist")));
                 }
                 catalog.drop_enum_type(name)?;
-                Ok(Box::new(ScanOperator::new(
-                    String::new(),
-                    Arc::new(crate::Schema { columns: vec![] }),
-                    None,
-                    vec![],
-                    vec![],
-                ).with_timeout(self.timeout_ctx())))
+                Ok(Box::new(
+                    ScanOperator::new(
+                        String::new(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(self.timeout_ctx()),
+                ))
             }
-            LogicalPlan::CreateExtension { name, if_not_exists } => {
-                handle_create_extension(self, name, *if_not_exists)
-            }
+            LogicalPlan::CreateExtension { name, if_not_exists } => handle_create_extension(self, name, *if_not_exists),
             LogicalPlan::DropExtension { .. } => {
                 // Not reachable from SQL today (sqlparser 0.53 doesn't
                 // expose DROP EXTENSION); kept as a no-op DDL node for
                 // forward compatibility.
-                Ok(Box::new(ScanOperator::new(
-                    String::new(),
-                    Arc::new(crate::Schema { columns: vec![] }),
-                    None,
-                    vec![],
-                    vec![],
-                ).with_timeout(self.timeout_ctx())))
+                Ok(Box::new(
+                    ScanOperator::new(
+                        String::new(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(self.timeout_ctx()),
+                ))
             }
             LogicalPlan::CreateDatabase { .. } | LogicalPlan::DropDatabase { .. } => {
                 // Handled at the EmbeddedDatabase layer (which has the
@@ -1153,20 +1253,19 @@ impl<'a> Executor<'a> {
                 // because `execute_plan_with_params_inner` intercepts
                 // them before invoking the executor; this arm exists
                 // only for exhaustiveness.
-                Ok(Box::new(ScanOperator::new(
-                    String::new(),
-                    Arc::new(crate::Schema { columns: vec![] }),
-                    None,
-                    vec![],
-                    vec![],
-                ).with_timeout(self.timeout_ctx())))
+                Ok(Box::new(
+                    ScanOperator::new(
+                        String::new(),
+                        Arc::new(crate::Schema { columns: vec![] }),
+                        None,
+                        vec![],
+                        vec![],
+                    )
+                    .with_timeout(self.timeout_ctx()),
+                ))
             }
-            LogicalPlan::DropTable { name, if_exists } => {
-                ddl::handle_drop_table(self, name, *if_exists)
-            }
-            LogicalPlan::Truncate { table_name } => {
-                ddl::handle_truncate(self, table_name)
-            }
+            LogicalPlan::DropTable { name, if_exists } => ddl::handle_drop_table(self, name, *if_exists),
+            LogicalPlan::Truncate { table_name } => ddl::handle_truncate(self, table_name),
             LogicalPlan::CreateBranch { .. }
             | LogicalPlan::DropBranch { .. }
             | LogicalPlan::MergeBranch { .. }
@@ -1178,9 +1277,7 @@ impl<'a> Executor<'a> {
             | LogicalPlan::AlterMaterializedView { .. }
             | LogicalPlan::CreateView { .. }
             | LogicalPlan::DropView { .. }
-            | LogicalPlan::SystemView { .. } => {
-                phase3::handle_phase3_operation(self, plan)
-            }
+            | LogicalPlan::SystemView { .. } => phase3::handle_phase3_operation(self, plan),
             LogicalPlan::With { ctes, query, recursive } => {
                 // Materialize each CTE before executing the main query
                 // CTEs are stored in cte_context and looked up during table scans
@@ -1191,14 +1288,16 @@ impl<'a> Executor<'a> {
                         if aliases.len() == original_schema.columns.len() {
                             // Rename columns using the aliases
                             Arc::new(Schema::new(
-                                original_schema.columns.iter()
+                                original_schema
+                                    .columns
+                                    .iter()
                                     .zip(aliases.iter())
                                     .map(|(col, alias)| {
                                         let mut new_col = col.clone();
                                         new_col.name = alias.clone();
                                         new_col
                                     })
-                                    .collect()
+                                    .collect(),
                             ))
                         } else {
                             original_schema
@@ -1263,7 +1362,11 @@ impl<'a> Executor<'a> {
                         }
 
                         if iteration >= MAX_RECURSION_DEPTH {
-                            tracing::warn!("Recursive CTE '{}' reached maximum recursion depth {}", cte_name, MAX_RECURSION_DEPTH);
+                            tracing::warn!(
+                                "Recursive CTE '{}' reached maximum recursion depth {}",
+                                cte_name,
+                                MAX_RECURSION_DEPTH
+                            );
                         }
 
                         // Store final results
@@ -1292,9 +1395,7 @@ impl<'a> Executor<'a> {
                 // Now execute the main query with CTEs available in context
                 self.plan_to_operator(query)
             }
-            LogicalPlan::Explain { input, options } => {
-                explain::handle_explain(self, input, options)
-            }
+            LogicalPlan::Explain { input, options } => explain::handle_explain(self, input, options),
             LogicalPlan::DualScan => {
                 // DualScan returns a single row with no columns
                 // Used as input for SELECT without FROM (e.g., SELECT 1+1)
@@ -1334,25 +1435,15 @@ impl<'a> Executor<'a> {
 
             // HA Operations (ha-tier1 feature)
             #[cfg(feature = "ha-tier1")]
-            LogicalPlan::Switchover { target_node } => {
-                ddl::handle_switchover(self, target_node)
-            }
+            LogicalPlan::Switchover { target_node } => ddl::handle_switchover(self, target_node),
             #[cfg(feature = "ha-tier1")]
-            LogicalPlan::SwitchoverCheck { target_node } => {
-                ddl::handle_switchover_check(self, target_node)
-            }
+            LogicalPlan::SwitchoverCheck { target_node } => ddl::handle_switchover_check(self, target_node),
             #[cfg(feature = "ha-tier1")]
-            LogicalPlan::ClusterStatus => {
-                ddl::handle_cluster_status(self)
-            }
+            LogicalPlan::ClusterStatus => ddl::handle_cluster_status(self),
             #[cfg(feature = "ha-tier1")]
-            LogicalPlan::SetNodeAlias { node_id, alias } => {
-                ddl::handle_set_node_alias(self, node_id, alias)
-            }
+            LogicalPlan::SetNodeAlias { node_id, alias } => ddl::handle_set_node_alias(self, node_id, alias),
             #[cfg(feature = "ha-tier1")]
-            LogicalPlan::ShowTopology => {
-                ddl::handle_show_topology(self)
-            }
+            LogicalPlan::ShowTopology => ddl::handle_show_topology(self),
 
             _ => Err(Error::query_execution(format!(
                 "Operator not yet implemented: {:?}",
@@ -1404,12 +1495,8 @@ pub(crate) fn compare_values(a: &crate::Value, b: &crate::Value) -> std::cmp::Or
         (Value::Int4(a), Value::Int4(b)) => a.cmp(b),
         (Value::Int8(a), Value::Int8(b)) => a.cmp(b),
 
-        (Value::Float4(a), Value::Float4(b)) => {
-            a.partial_cmp(b).unwrap_or(Ordering::Equal)
-        }
-        (Value::Float8(a), Value::Float8(b)) => {
-            a.partial_cmp(b).unwrap_or(Ordering::Equal)
-        }
+        (Value::Float4(a), Value::Float4(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
+        (Value::Float8(a), Value::Float8(b)) => a.partial_cmp(b).unwrap_or(Ordering::Equal),
 
         (Value::String(a), Value::String(b)) => a.cmp(b),
         (Value::Bytes(a), Value::Bytes(b)) => a.cmp(b),
@@ -1428,9 +1515,7 @@ pub(crate) fn compare_values(a: &crate::Value, b: &crate::Value) -> std::cmp::Or
         // GROUP BY / ORDER BY correct.
         (Value::Numeric(a), Value::Numeric(b)) => a.cmp(b),
         // For JSON and complex types, compare as strings
-        (Value::Json(a), Value::Json(b)) => {
-            a.to_string().cmp(&b.to_string())
-        }
+        (Value::Json(a), Value::Json(b)) => a.to_string().cmp(&b.to_string()),
         (Value::Array(a), Value::Array(b)) => {
             // Lexicographic array comparison
             a.len().cmp(&b.len()).then_with(|| {

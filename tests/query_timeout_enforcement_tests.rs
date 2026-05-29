@@ -2,7 +2,7 @@
 //!
 //! Comprehensive tests to verify timeout enforcement across all operators.
 
-use heliosdb_nano::{EmbeddedDatabase, Config};
+use heliosdb_nano::{Config, EmbeddedDatabase};
 use std::time::{Duration, Instant};
 
 #[test]
@@ -28,8 +28,11 @@ fn test_scan_timeout() {
     if elapsed > Duration::from_millis(100) {
         assert!(result.is_err(), "Query should have timed out but succeeded");
         let err_msg = format!("{}", result.unwrap_err());
-        assert!(err_msg.contains("timeout") || err_msg.contains("exceeded"),
-            "Error should mention timeout: {}", err_msg);
+        assert!(
+            err_msg.contains("timeout") || err_msg.contains("exceeded"),
+            "Error should mention timeout: {}",
+            err_msg
+        );
     }
 }
 
@@ -48,11 +51,15 @@ fn test_aggregate_timeout() {
             "INSERT INTO sales VALUES ({}, {})",
             i % 100, // 100 groups
             i * 10
-        )).unwrap();
+        ))
+        .unwrap();
     }
 
     let start = Instant::now();
-    let result = db.query("SELECT product_id, SUM(amount), AVG(amount) FROM sales GROUP BY product_id", &[]);
+    let result = db.query(
+        "SELECT product_id, SUM(amount), AVG(amount) FROM sales GROUP BY product_id",
+        &[],
+    );
     let elapsed = start.elapsed();
 
     if elapsed > Duration::from_millis(50) {
@@ -69,7 +76,8 @@ fn test_sort_timeout() {
     config.storage.query_timeout_ms = Some(100);
 
     let db = EmbeddedDatabase::with_config(config).unwrap();
-    db.execute("CREATE TABLE items (id INT, priority INT, name TEXT)").unwrap();
+    db.execute("CREATE TABLE items (id INT, priority INT, name TEXT)")
+        .unwrap();
 
     // Insert many rows
     for i in 0..10000 {
@@ -78,7 +86,8 @@ fn test_sort_timeout() {
             i,
             10000 - i, // Reverse order
             i
-        )).unwrap();
+        ))
+        .unwrap();
     }
 
     let start = Instant::now();
@@ -153,7 +162,11 @@ fn test_timeout_configuration() {
 
         // Small query should succeed even with short timeout
         let result = db.query("SELECT * FROM test LIMIT 10", &[]);
-        assert!(result.is_ok(), "Small query should succeed with timeout={}ms", timeout_ms);
+        assert!(
+            result.is_ok(),
+            "Small query should succeed with timeout={}ms",
+            timeout_ms
+        );
     }
 }
 
@@ -167,18 +180,22 @@ fn test_timeout_propagates_through_operator_tree() {
     db.execute("CREATE TABLE test (id INT, value INT)").unwrap();
 
     for i in 0..5000 {
-        db.execute(&format!("INSERT INTO test VALUES ({}, {})", i, i * 2)).unwrap();
+        db.execute(&format!("INSERT INTO test VALUES ({}, {})", i, i * 2))
+            .unwrap();
     }
 
     let start = Instant::now();
     // Complex query with multiple operators: Scan -> Filter -> Project -> Aggregate -> Sort
-    let result = db.query("
+    let result = db.query(
+        "
         SELECT value / 2 as half_value, COUNT(*) as cnt
         FROM test
         WHERE id > 100
         GROUP BY value / 2
         ORDER BY cnt DESC
-    ", &[]);
+    ",
+        &[],
+    );
     let elapsed = start.elapsed();
 
     // Timeout should propagate through the entire operator tree
@@ -200,9 +217,10 @@ fn test_project_with_distinct_timeout() {
     for i in 0..10000 {
         db.execute(&format!(
             "INSERT INTO test VALUES ('cat{}', 'item{}')",
-            i % 50, // 50 categories
-            i % 100 // 100 items
-        )).unwrap();
+            i % 50,  // 50 categories
+            i % 100  // 100 items
+        ))
+        .unwrap();
     }
 
     let start = Instant::now();
@@ -234,7 +252,8 @@ fn test_timeout_error_message() {
         // Error message should be helpful
         assert!(
             err_msg.contains("timeout") || err_msg.contains("exceeded") || err_msg.contains("limit"),
-            "Error message should explain timeout: '{}'", err_msg
+            "Error message should explain timeout: '{}'",
+            err_msg
         );
     }
 }
@@ -249,21 +268,20 @@ fn test_timeout_with_materialized_views() {
     db.execute("CREATE TABLE events (event_type TEXT, count INT)").unwrap();
 
     for i in 0..5000 {
-        db.execute(&format!(
-            "INSERT INTO events VALUES ('type{}', {})",
-            i % 10,
-            i
-        )).unwrap();
+        db.execute(&format!("INSERT INTO events VALUES ('type{}', {})", i % 10, i))
+            .unwrap();
     }
 
     let start = Instant::now();
     // Creating MV involves executing the query
-    let result = db.execute("
+    let result = db.execute(
+        "
         CREATE MATERIALIZED VIEW event_summary AS
         SELECT event_type, SUM(count) as total
         FROM events
         GROUP BY event_type
-    ");
+    ",
+    );
     let elapsed = start.elapsed();
 
     // MV creation should respect timeout during initial population

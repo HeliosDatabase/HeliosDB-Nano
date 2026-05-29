@@ -5,6 +5,7 @@
 //! - Swagger UI at /v1/docs
 //! - ReDoc documentation at /v1/redoc
 
+use crate::api::server::AppState;
 use axum::{
     body::Body,
     http::{header, StatusCode},
@@ -12,7 +13,6 @@ use axum::{
     routing::get,
     Router,
 };
-use crate::api::server::AppState;
 
 /// Create a minimal error response that cannot fail
 ///

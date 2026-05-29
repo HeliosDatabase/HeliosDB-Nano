@@ -3,8 +3,8 @@
 //! This module provides a trait-based adapter that bridges HeliosDB Full's
 //! LsmStorageEngine interface to HeliosDB Lite's RocksDB-based StorageEngine.
 
-use crate::{Error, Result, StorageEngine};
 use crate::storage::Transaction;
+use crate::{Error, Result, StorageEngine};
 use std::sync::Arc;
 
 /// Storage adapter trait
@@ -129,7 +129,10 @@ impl StorageAdapter for LiteStorageAdapter {
         use rocksdb::IteratorMode;
 
         let mut results = Vec::new();
-        let iter = self.engine.db.iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward));
+        let iter = self
+            .engine
+            .db
+            .iterator(IteratorMode::From(prefix, rocksdb::Direction::Forward));
 
         for item in iter {
             let (key, value) = item.map_err(|e| Error::storage(format!("Scan error: {}", e)))?;
@@ -170,31 +173,38 @@ struct LiteTransactionAdapter {
 
 impl TransactionAdapter for LiteTransactionAdapter {
     fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
-        self.txn.as_ref()
+        self.txn
+            .as_ref()
             .ok_or_else(|| Error::transaction("Transaction already consumed"))?
             .get(&key.to_vec())
     }
 
     fn put(&mut self, key: &[u8], value: &[u8]) -> Result<()> {
-        self.txn.as_mut()
+        self.txn
+            .as_mut()
             .ok_or_else(|| Error::transaction("Transaction already consumed"))?
             .put(key.to_vec(), value.to_vec())
     }
 
     fn delete(&mut self, key: &[u8]) -> Result<()> {
-        self.txn.as_mut()
+        self.txn
+            .as_mut()
             .ok_or_else(|| Error::transaction("Transaction already consumed"))?
             .delete(key.to_vec())
     }
 
     fn commit(mut self: Box<Self>) -> Result<()> {
-        let txn = self.txn.take()
+        let txn = self
+            .txn
+            .take()
             .ok_or_else(|| Error::transaction("Transaction already consumed"))?;
         txn.commit()
     }
 
     fn rollback(mut self: Box<Self>) -> Result<()> {
-        let txn = self.txn.take()
+        let txn = self
+            .txn
+            .take()
             .ok_or_else(|| Error::transaction("Transaction already consumed"))?;
         txn.rollback()
     }

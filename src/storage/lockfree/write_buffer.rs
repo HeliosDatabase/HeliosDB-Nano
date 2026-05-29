@@ -45,22 +45,11 @@ use super::config::IngestionSafetyLevel;
 #[derive(Debug, Clone)]
 pub enum WriteOp {
     /// Insert a new row
-    Insert {
-        table: String,
-        row_id: u64,
-        data: Vec<u8>,
-    },
+    Insert { table: String, row_id: u64, data: Vec<u8> },
     /// Update an existing row
-    Update {
-        table: String,
-        row_id: u64,
-        data: Vec<u8>,
-    },
+    Update { table: String, row_id: u64, data: Vec<u8> },
     /// Delete a row
-    Delete {
-        table: String,
-        row_id: u64,
-    },
+    Delete { table: String, row_id: u64 },
 }
 
 impl WriteOp {
@@ -309,12 +298,8 @@ impl WriteCoordinator {
 
         match self.commit_sender.try_send(request) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(_)) => {
-                Err("Commit queue full - backpressure".to_string())
-            }
-            Err(TrySendError::Disconnected(_)) => {
-                Err("Write coordinator shut down".to_string())
-            }
+            Err(TrySendError::Full(_)) => Err("Commit queue full - backpressure".to_string()),
+            Err(TrySendError::Disconnected(_)) => Err("Write coordinator shut down".to_string()),
         }
     }
 
@@ -439,7 +424,10 @@ impl BatchedCommitWorker {
         match &self.safety_level {
             IngestionSafetyLevel::Full => true, // Always flush immediately
 
-            IngestionSafetyLevel::Batched { batch_size, batch_timeout_ms } => {
+            IngestionSafetyLevel::Batched {
+                batch_size,
+                batch_timeout_ms,
+            } => {
                 self.pending.len() >= *batch_size
                     || self.last_flush.elapsed() >= Duration::from_millis(*batch_timeout_ms)
             }
@@ -463,12 +451,8 @@ impl BatchedCommitWorker {
         // Receive new commits (with timeout for batching)
         let timeout = match &self.safety_level {
             IngestionSafetyLevel::Full => Duration::from_millis(0),
-            IngestionSafetyLevel::Batched { batch_timeout_ms, .. } => {
-                Duration::from_millis(*batch_timeout_ms)
-            }
-            IngestionSafetyLevel::Async { sync_interval_ms } => {
-                Duration::from_millis(*sync_interval_ms)
-            }
+            IngestionSafetyLevel::Batched { batch_timeout_ms, .. } => Duration::from_millis(*batch_timeout_ms),
+            IngestionSafetyLevel::Async { sync_interval_ms } => Duration::from_millis(*sync_interval_ms),
             IngestionSafetyLevel::Unsafe { .. } => Duration::from_millis(100),
         };
 

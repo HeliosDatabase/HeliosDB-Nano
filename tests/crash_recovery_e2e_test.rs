@@ -87,13 +87,21 @@ fn test_crash_recovery_multiple_tables() {
     {
         let db = open_db(&db_path);
         db.execute("CREATE TABLE users (id INT, name TEXT)").unwrap();
-        db.execute("CREATE TABLE orders (id INT, user_id INT, amount INT)").unwrap();
+        db.execute("CREATE TABLE orders (id INT, user_id INT, amount INT)")
+            .unwrap();
 
         for i in 1..=10 {
-            db.execute(&format!("INSERT INTO users VALUES ({}, 'user_{}')", i, i)).unwrap();
+            db.execute(&format!("INSERT INTO users VALUES ({}, 'user_{}')", i, i))
+                .unwrap();
         }
         for i in 1..=20 {
-            db.execute(&format!("INSERT INTO orders VALUES ({}, {}, {})", i, (i % 10) + 1, i * 100)).unwrap();
+            db.execute(&format!(
+                "INSERT INTO orders VALUES ({}, {}, {})",
+                i,
+                (i % 10) + 1,
+                i * 100
+            ))
+            .unwrap();
         }
 
         drop(db);
@@ -124,7 +132,8 @@ fn test_crash_recovery_update_delete() {
         db.execute("INSERT INTO crud_test VALUES (2, 'to_delete')").unwrap();
         db.execute("INSERT INTO crud_test VALUES (3, 'unchanged')").unwrap();
 
-        db.execute("UPDATE crud_test SET status = 'updated' WHERE id = 1").unwrap();
+        db.execute("UPDATE crud_test SET status = 'updated' WHERE id = 1")
+            .unwrap();
         db.execute("DELETE FROM crud_test WHERE id = 2").unwrap();
 
         drop(db);

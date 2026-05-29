@@ -57,17 +57,33 @@ fn quirk_j_mv_aggregates_against_real_data() {
 
     // MV: COUNT(DISTINCT) — the headline repro (was 4). This name also has an orphaned
     // `__mv_td_distinct` data row in the delivered dir, so it exercises the purge too.
-    mk(&db, "td_distinct", "SELECT COUNT(DISTINCT session_id) AS n FROM dashboard.messages");
-    assert_eq!(scalar(&db, "SELECT * FROM td_distinct"), d_distinct, "MV COUNT(DISTINCT)");
+    mk(
+        &db,
+        "td_distinct",
+        "SELECT COUNT(DISTINCT session_id) AS n FROM dashboard.messages",
+    );
+    assert_eq!(
+        scalar(&db, "SELECT * FROM td_distinct"),
+        d_distinct,
+        "MV COUNT(DISTINCT)"
+    );
 
     // MV: COUNT(*) + SUM (was 407 / 353).
-    mk(&db, "td_two", "SELECT COUNT(*) AS n, SUM(input_tokens) AS s FROM dashboard.messages");
+    mk(
+        &db,
+        "td_two",
+        "SELECT COUNT(*) AS n, SUM(input_tokens) AS s FROM dashboard.messages",
+    );
     let (two, _) = db.query_with_columns("SELECT * FROM td_two").unwrap();
     assert_eq!(as_i64(&two[0].values[0]), d_count, "MV COUNT(*) in multi-agg");
     assert_eq!(as_i64(&two[0].values[1]), d_sum, "MV SUM");
 
     // MV: GROUP BY (was 4 groups / a partial total).
-    mk(&db, "td_group", "SELECT type, COUNT(*) AS n FROM dashboard.messages GROUP BY type");
+    mk(
+        &db,
+        "td_group",
+        "SELECT type, COUNT(*) AS n FROM dashboard.messages GROUP BY type",
+    );
     let (grp, _) = db.query_with_columns("SELECT * FROM td_group").unwrap();
     let grp_total: i64 = grp.iter().map(|r| as_i64(r.values.last().unwrap())).sum();
     assert_eq!(grp.len(), d_grp.len(), "MV GROUP BY group count");

@@ -4,15 +4,15 @@
 //! Uses RocksDB's WriteBatch for atomic operations and built-in WAL support.
 
 use crate::{Error, Result};
-use rocksdb::{DB, WriteBatch, WriteOptions};
+use parking_lot::Mutex;
+use rocksdb::{WriteBatch, WriteOptions, DB};
 use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::collections::{HashMap, VecDeque};
-use std::time::{SystemTime, UNIX_EPOCH, Duration};
 use std::thread::{self, JoinHandle};
-use tracing::{debug, info, warn, error};
-use parking_lot::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tracing::{debug, error, info, warn};
 
 // Import HA state for replication broadcast (when ha-tier1 is enabled)
 #[cfg(feature = "ha-tier1")]
@@ -22,7 +22,6 @@ use crate::replication::ha_state::ha_state;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum WalOperation {
     // === DML Operations ===
-
     /// Insert a tuple into a table
     Insert {
         table: String,
@@ -36,26 +35,15 @@ pub enum WalOperation {
         tuple: Vec<u8>,
     },
     /// Delete a tuple from a table
-    Delete {
-        table: String,
-        key: Vec<u8>,
-    },
+    Delete { table: String, key: Vec<u8> },
     /// Truncate all rows from a table
-    Truncate {
-        table: String,
-    },
+    Truncate { table: String },
 
     // === Table DDL ===
-
     /// Create a new table
-    CreateTable {
-        table: String,
-        schema: Vec<u8>,
-    },
+    CreateTable { table: String, schema: Vec<u8> },
     /// Drop a table
-    DropTable {
-        table: String,
-    },
+    DropTable { table: String },
     /// Alter table column storage mode
     AlterColumnStorage {
         table: String,
@@ -65,7 +53,6 @@ pub enum WalOperation {
     },
 
     // === Index Operations ===
-
     /// Create an index
     CreateIndex {
         name: String,
@@ -76,12 +63,9 @@ pub enum WalOperation {
         options: Vec<u8>,
     },
     /// Drop an index
-    DropIndex {
-        name: String,
-    },
+    DropIndex { name: String },
 
     // === Trigger Operations ===
-
     /// Create a trigger
     CreateTrigger {
         name: String,
@@ -90,13 +74,9 @@ pub enum WalOperation {
         definition: Vec<u8>,
     },
     /// Drop a trigger
-    DropTrigger {
-        name: String,
-        table: Option<String>,
-    },
+    DropTrigger { name: String, table: Option<String> },
 
     // === Function/Procedure Operations ===
-
     /// Create a function
     CreateFunction {
         name: String,
@@ -104,9 +84,7 @@ pub enum WalOperation {
         definition: Vec<u8>,
     },
     /// Drop a function
-    DropFunction {
-        name: String,
-    },
+    DropFunction { name: String },
     /// Create a procedure
     CreateProcedure {
         name: String,
@@ -114,12 +92,9 @@ pub enum WalOperation {
         definition: Vec<u8>,
     },
     /// Drop a procedure
-    DropProcedure {
-        name: String,
-    },
+    DropProcedure { name: String },
 
     // === Materialized View Operations ===
-
     /// Create a materialized view
     CreateMaterializedView {
         name: String,
@@ -127,9 +102,7 @@ pub enum WalOperation {
         definition: Vec<u8>,
     },
     /// Drop a materialized view
-    DropMaterializedView {
-        name: String,
-    },
+    DropMaterializedView { name: String },
     /// Refresh a materialized view
     RefreshMaterializedView {
         name: String,
@@ -138,7 +111,6 @@ pub enum WalOperation {
     },
 
     // === Constraint Operations ===
-
     /// Add a constraint to a table
     AddConstraint {
         table: String,
@@ -146,34 +118,20 @@ pub enum WalOperation {
         constraint: Vec<u8>,
     },
     /// Drop a constraint from a table
-    DropConstraint {
-        table: String,
-        constraint_name: String,
-    },
+    DropConstraint { table: String, constraint_name: String },
 
     // === Transaction Control ===
-
     /// Transaction begin
-    Begin {
-        tx_id: u64,
-    },
+    Begin { tx_id: u64 },
     /// Transaction commit
-    Commit {
-        tx_id: u64,
-    },
+    Commit { tx_id: u64 },
     /// Transaction abort
-    Abort {
-        tx_id: u64,
-    },
+    Abort { tx_id: u64 },
 
     // === HA Replication Operations ===
-
     /// Update a sequence counter (for HA replication)
     /// Ensures auto-increment values are preserved across failover
-    UpdateCounter {
-        table_name: String,
-        new_value: u64,
-    },
+    UpdateCounter { table_name: String, new_value: u64 },
 }
 
 /// WAL entry with metadata
@@ -211,14 +169,12 @@ impl WalEntry {
 
     /// Serialize entry to bytes
     pub fn serialize(&self) -> Result<Vec<u8>> {
-        bincode::serialize(self)
-            .map_err(|e| Error::storage(format!("Failed to serialize WAL entry: {}", e)))
+        bincode::serialize(self).map_err(|e| Error::storage(format!("Failed to serialize WAL entry: {}", e)))
     }
 
     /// Deserialize entry from bytes
     pub fn deserialize(data: &[u8]) -> Result<Self> {
-        bincode::deserialize(data)
-            .map_err(|e| Error::storage(format!("Failed to deserialize WAL entry: {}", e)))
+        bincode::deserialize(data).map_err(|e| Error::storage(format!("Failed to deserialize WAL entry: {}", e)))
     }
 }
 
@@ -597,10 +553,7 @@ impl WriteAheadLog {
 
         // Queue the write
         if let Some(queue) = &self.commit_queue {
-            let pending = PendingWrite {
-                entry,
-                result_tx: tx,
-            };
+            let pending = PendingWrite { entry, result_tx: tx };
             queue.lock().push_back(pending);
         } else {
             return Err(Error::storage("Group commit queue not initialized"));
@@ -650,8 +603,7 @@ impl WriteAheadLog {
         // Iterate over all WAL entries
         let iter = self.db.prefix_iterator(prefix);
         for item in iter {
-            let (key, value) = item
-                .map_err(|e| Error::storage(format!("WAL replay iterator error: {}", e)))?;
+            let (key, value) = item.map_err(|e| Error::storage(format!("WAL replay iterator error: {}", e)))?;
 
             // Skip if not a WAL entry
             if !key.starts_with(prefix) {
@@ -682,8 +634,7 @@ impl WriteAheadLog {
         let mut deleted_count = 0;
 
         for item in iter {
-            let (key, value) = item
-                .map_err(|e| Error::storage(format!("WAL truncate iterator error: {}", e)))?;
+            let (key, value) = item.map_err(|e| Error::storage(format!("WAL truncate iterator error: {}", e)))?;
 
             if !key.starts_with(prefix) {
                 break;
@@ -731,9 +682,7 @@ impl WriteAheadLog {
     /// Changing to/from GroupCommit mode is not supported after initialization.
     pub fn set_sync_mode(&mut self, mode: WalSyncMode) {
         // Warn if trying to change to/from GroupCommit mode
-        if (self.sync_mode == WalSyncMode::GroupCommit || mode == WalSyncMode::GroupCommit)
-            && self.sync_mode != mode
-        {
+        if (self.sync_mode == WalSyncMode::GroupCommit || mode == WalSyncMode::GroupCommit) && self.sync_mode != mode {
             warn!("Cannot dynamically change to/from GroupCommit mode. This change may not take full effect.");
         }
 

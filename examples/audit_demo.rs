@@ -4,8 +4,8 @@
 //!
 //! Run with: cargo run --example audit_demo
 
-use heliosdb_nano::{EmbeddedDatabase, Config};
-use heliosdb_nano::audit::{AuditLogger, AuditConfig, AuditQuery, OperationType};
+use heliosdb_nano::audit::{AuditConfig, AuditLogger, AuditQuery, OperationType};
+use heliosdb_nano::{Config, EmbeddedDatabase};
 use std::sync::Arc;
 
 #[tokio::main]
@@ -16,18 +16,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("1. Creating database...");
     let config = Config::in_memory();
     let db = EmbeddedDatabase::new_in_memory()?;
-    let storage = Arc::new(
-        heliosdb_nano::storage::StorageEngine::open_in_memory(&config)?
-    );
+    let storage = Arc::new(heliosdb_nano::storage::StorageEngine::open_in_memory(&config)?);
     println!("   Database created\n");
 
     // 2. Initialize audit logger with default configuration
     println!("2. Initializing audit logger...");
     let audit_config = AuditConfig::default();
-    println!("   Config: log_ddl={}, log_dml={}, log_select={}",
-        audit_config.log_ddl,
-        audit_config.log_dml,
-        audit_config.log_select
+    println!(
+        "   Config: log_ddl={}, log_dml={}, log_select={}",
+        audit_config.log_ddl, audit_config.log_dml, audit_config.log_select
     );
     let mut logger = AuditLogger::new(storage.clone(), audit_config)?;
     logger.set_user("demo_user".to_string());
@@ -120,14 +117,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 8. Query with filter
     println!("8. Querying INSERT operations only...");
-    let query = AuditQuery::new()
-        .with_operation(OperationType::Insert)
-        .limit(10);
+    let query = AuditQuery::new().with_operation(OperationType::Insert).limit(10);
     let sql = query.build_sql();
     println!("   SQL: {}", sql);
-    let tuples = logger.query_audit_log(&format!(
-        "operation = 'INSERT'"
-    ))?;
+    let tuples = logger.query_audit_log(&format!("operation = 'INSERT'"))?;
     let insert_events = AuditQuery::parse_events(tuples)?;
     println!("   Found {} INSERT events\n", insert_events.len());
 
@@ -135,16 +128,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("9. Configuration examples:");
 
     let minimal = AuditConfig::minimal();
-    println!("   Minimal: log_ddl={}, log_dml={}, retention={}d",
-        minimal.log_ddl, minimal.log_dml, minimal.retention_days);
+    println!(
+        "   Minimal: log_ddl={}, log_dml={}, retention={}d",
+        minimal.log_ddl, minimal.log_dml, minimal.retention_days
+    );
 
     let verbose = AuditConfig::verbose();
-    println!("   Verbose: log_ddl={}, log_dml={}, log_select={}, retention={}d",
-        verbose.log_ddl, verbose.log_dml, verbose.log_select, verbose.retention_days);
+    println!(
+        "   Verbose: log_ddl={}, log_dml={}, log_select={}, retention={}d",
+        verbose.log_ddl, verbose.log_dml, verbose.log_select, verbose.retention_days
+    );
 
     let compliance = AuditConfig::compliance();
-    println!("   Compliance: log_ddl={}, log_dml={}, retention={}d, checksums={}",
-        compliance.log_ddl, compliance.log_dml, compliance.retention_days, compliance.enable_checksums);
+    println!(
+        "   Compliance: log_ddl={}, log_dml={}, retention={}d, checksums={}",
+        compliance.log_ddl, compliance.log_dml, compliance.retention_days, compliance.enable_checksums
+    );
 
     println!("\n=== Demo Complete ===");
 

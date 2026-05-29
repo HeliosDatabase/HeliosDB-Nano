@@ -58,22 +58,22 @@
 //! - `ErrorResponse` (E): Error message
 //! - `ParameterStatus` (S): Server parameter value
 
-pub mod messages;
 pub mod auth;
+pub mod catalog;
+pub mod certs;
 pub mod handler;
 mod handler_extended;
-pub mod server;
-pub mod catalog;
-pub mod prepared;
-pub mod ssl;
-pub mod certs;
+pub mod messages;
 pub mod password_store;
+pub mod prepared;
+pub mod server;
+pub mod ssl;
 
 // Re-exports
 pub use auth::{AuthManager, AuthMethod, ScramAuthState};
-pub use server::{PgServer, PgServerBuilder, PgServerConfig};
-pub use messages::{FrontendMessage, BackendMessage, TransactionStatus};
-pub use prepared::{PreparedStatementManager, PreparedStatement, Portal, PortalState};
-pub use ssl::{SslConfig, SslMode, SslNegotiator, SecureConnection};
 pub use certs::CertificateManager;
-pub use password_store::{PasswordStore, InMemoryPasswordStore, SharedPasswordStore, ScramCredentials};
+pub use messages::{BackendMessage, FrontendMessage, TransactionStatus};
+pub use password_store::{InMemoryPasswordStore, PasswordStore, ScramCredentials, SharedPasswordStore};
+pub use prepared::{Portal, PortalState, PreparedStatement, PreparedStatementManager};
+pub use server::{PgServer, PgServerBuilder, PgServerConfig};
+pub use ssl::{SecureConnection, SslConfig, SslMode, SslNegotiator};

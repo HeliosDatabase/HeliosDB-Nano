@@ -10,12 +10,7 @@
 //!   so it returns the current row value rather than the partition's last value.
 //! - LAG/LEAD with a literal default value (3rd argument) is supported.
 
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod window_functions_hardening {
     use heliosdb_nano::{EmbeddedDatabase, Value};
 
@@ -61,12 +56,18 @@ mod window_functions_hardening {
     fn setup_employees(d: &EmbeddedDatabase) {
         d.execute("CREATE TABLE employees (id INT PRIMARY KEY, name TEXT, dept TEXT, salary INT)")
             .unwrap();
-        d.execute("INSERT INTO employees VALUES (1, 'Alice',   'Engineering', 120000)").unwrap();
-        d.execute("INSERT INTO employees VALUES (2, 'Bob',     'Engineering', 110000)").unwrap();
-        d.execute("INSERT INTO employees VALUES (3, 'Charlie', 'Engineering', 110000)").unwrap();
-        d.execute("INSERT INTO employees VALUES (4, 'Dave',    'Sales',        90000)").unwrap();
-        d.execute("INSERT INTO employees VALUES (5, 'Eve',     'Sales',        95000)").unwrap();
-        d.execute("INSERT INTO employees VALUES (6, 'Frank',   'Marketing',    80000)").unwrap();
+        d.execute("INSERT INTO employees VALUES (1, 'Alice',   'Engineering', 120000)")
+            .unwrap();
+        d.execute("INSERT INTO employees VALUES (2, 'Bob',     'Engineering', 110000)")
+            .unwrap();
+        d.execute("INSERT INTO employees VALUES (3, 'Charlie', 'Engineering', 110000)")
+            .unwrap();
+        d.execute("INSERT INTO employees VALUES (4, 'Dave',    'Sales',        90000)")
+            .unwrap();
+        d.execute("INSERT INTO employees VALUES (5, 'Eve',     'Sales',        95000)")
+            .unwrap();
+        d.execute("INSERT INTO employees VALUES (6, 'Frank',   'Marketing',    80000)")
+            .unwrap();
     }
 
     // ========================================================================
@@ -82,7 +83,9 @@ mod window_functions_hardening {
             d.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10)).unwrap();
         }
 
-        let rows = d.query("SELECT val, ROW_NUMBER() OVER (ORDER BY val) FROM t", &[]).unwrap();
+        let rows = d
+            .query("SELECT val, ROW_NUMBER() OVER (ORDER BY val) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 5);
         // The lowest val (10) should get ROW_NUMBER=1
         for row in &rows {
@@ -99,10 +102,12 @@ mod window_functions_hardening {
         let d = db();
         setup_employees(&d);
 
-        let rows = d.query(
-            "SELECT name, dept, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary) FROM employees",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT name, dept, ROW_NUMBER() OVER (PARTITION BY dept ORDER BY salary) FROM employees",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 6);
 
         // Collect ROW_NUMBERs per department
@@ -134,15 +139,17 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (2, 100)").unwrap();
         d.execute("INSERT INTO t VALUES (3, 100)").unwrap();
 
-        let rows = d.query(
-            "SELECT id, ROW_NUMBER() OVER (ORDER BY score) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT id, ROW_NUMBER() OVER (ORDER BY score) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 3);
         let mut rns: Vec<i64> = rows.iter().map(|r| to_i64(r.get(1).unwrap())).collect();
         rns.sort();
-        assert_eq!(rns, vec![1, 2, 3],
-            "ROW_NUMBER must produce distinct 1,2,3 even with tied score values");
+        assert_eq!(
+            rns,
+            vec![1, 2, 3],
+            "ROW_NUMBER must produce distinct 1,2,3 even with tied score values"
+        );
     }
 
     #[test]
@@ -151,10 +158,9 @@ mod window_functions_hardening {
         let d = db();
         d.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
 
-        let rows = d.query(
-            "SELECT val, ROW_NUMBER() OVER (ORDER BY val) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT val, ROW_NUMBER() OVER (ORDER BY val) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 0, "Empty table produces no rows with window functions");
     }
 
@@ -172,15 +178,13 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (3, 90)").unwrap();
         d.execute("INSERT INTO t VALUES (4, 80)").unwrap();
 
-        let rows = d.query(
-            "SELECT id, score, RANK() OVER (ORDER BY score DESC) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT id, score, RANK() OVER (ORDER BY score DESC) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 4);
         let mut ranks: Vec<i64> = rows.iter().map(|r| to_i64(r.get(2).unwrap())).collect();
         ranks.sort();
-        assert_eq!(ranks, vec![1, 2, 2, 4],
-            "RANK should skip: 1,2,2,4 per SQL standard");
+        assert_eq!(ranks, vec![1, 2, 2, 4], "RANK should skip: 1,2,2,4 per SQL standard");
     }
 
     #[test]
@@ -193,15 +197,17 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (3, 90)").unwrap();
         d.execute("INSERT INTO t VALUES (4, 80)").unwrap();
 
-        let rows = d.query(
-            "SELECT id, score, DENSE_RANK() OVER (ORDER BY score DESC) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT id, score, DENSE_RANK() OVER (ORDER BY score DESC) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 4);
         let mut ranks: Vec<i64> = rows.iter().map(|r| to_i64(r.get(2).unwrap())).collect();
         ranks.sort();
-        assert_eq!(ranks, vec![1, 2, 2, 3],
-            "DENSE_RANK should not skip: 1,2,2,3 per SQL standard");
+        assert_eq!(
+            ranks,
+            vec![1, 2, 2, 3],
+            "DENSE_RANK should not skip: 1,2,2,3 per SQL standard"
+        );
     }
 
     #[test]
@@ -215,10 +221,12 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (4, 80)").unwrap();
         d.execute("INSERT INTO t VALUES (5, 70)").unwrap();
 
-        let rows = d.query(
-            "SELECT score, RANK() OVER (ORDER BY score DESC), DENSE_RANK() OVER (ORDER BY score DESC) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT score, RANK() OVER (ORDER BY score DESC), DENSE_RANK() OVER (ORDER BY score DESC) FROM t",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 5);
 
         for row in &rows {
@@ -226,14 +234,20 @@ mod window_functions_hardening {
             let rank = to_i64(row.get(1).unwrap());
             let dense_rank = to_i64(row.get(2).unwrap());
             match score {
-                100 => { assert_eq!(rank, 1); assert_eq!(dense_rank, 1); }
-                90  => { assert_eq!(rank, 2); assert_eq!(dense_rank, 2); }
-                80  => {
+                100 => {
+                    assert_eq!(rank, 1);
+                    assert_eq!(dense_rank, 1);
+                }
+                90 => {
+                    assert_eq!(rank, 2);
+                    assert_eq!(dense_rank, 2);
+                }
+                80 => {
                     // After tie of 2 at rank 2: RANK=4, DENSE_RANK=3
                     assert_eq!(rank, 4, "RANK for score=80 should be 4 (gap after tie)");
                     assert_eq!(dense_rank, 3, "DENSE_RANK for score=80 should be 3 (no gap)");
                 }
-                70  => {
+                70 => {
                     assert_eq!(rank, 5, "RANK for score=70");
                     assert_eq!(dense_rank, 4, "DENSE_RANK for score=70");
                 }
@@ -248,10 +262,12 @@ mod window_functions_hardening {
         let d = db();
         setup_employees(&d);
 
-        let rows = d.query(
-            "SELECT name, dept, salary, RANK() OVER (PARTITION BY dept ORDER BY salary DESC) FROM employees",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT name, dept, salary, RANK() OVER (PARTITION BY dept ORDER BY salary DESC) FROM employees",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 6);
 
         // Engineering: Alice=120000 rank 1, Bob=Charlie=110000 rank 2 (tied).
@@ -282,10 +298,9 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t (id) VALUES (3)").unwrap(); // val = NULL
         d.execute("INSERT INTO t VALUES (4, 20)").unwrap();
 
-        let rows = d.query(
-            "SELECT id, val, RANK() OVER (ORDER BY val) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT id, val, RANK() OVER (ORDER BY val) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 4);
         // All ranks should be valid positive integers
         let ranks: Vec<i64> = rows.iter().map(|r| to_i64(r.get(2).unwrap())).collect();
@@ -300,10 +315,12 @@ mod window_functions_hardening {
         d.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
         d.execute("INSERT INTO t VALUES (1, 42)").unwrap();
 
-        let rows = d.query(
-            "SELECT val, RANK() OVER (ORDER BY val), DENSE_RANK() OVER (ORDER BY val) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT val, RANK() OVER (ORDER BY val), DENSE_RANK() OVER (ORDER BY val) FROM t",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(to_i64(rows[0].get(1).unwrap()), 1, "RANK of single row = 1");
         assert_eq!(to_i64(rows[0].get(2).unwrap()), 1, "DENSE_RANK of single row = 1");
@@ -322,10 +339,9 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (2, 20)").unwrap();
         d.execute("INSERT INTO t VALUES (3, 30)").unwrap();
 
-        let rows = d.query(
-            "SELECT val, LAG(val, 1) OVER (ORDER BY val) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT val, LAG(val, 1) OVER (ORDER BY val) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 3);
         // First row: LAG is NULL (no predecessor)
         assert_eq!(rows[0].get(1).unwrap(), &Value::Null, "LAG of first row = NULL");
@@ -344,10 +360,9 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (2, 20)").unwrap();
         d.execute("INSERT INTO t VALUES (3, 30)").unwrap();
 
-        let rows = d.query(
-            "SELECT val, LEAD(val, 1) OVER (ORDER BY val) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT val, LEAD(val, 1) OVER (ORDER BY val) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 3);
         // First row: LEAD = 20
         assert!(is_int(rows[0].get(1).unwrap(), 20), "LEAD of first row = 20");
@@ -365,10 +380,7 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (1, 100)").unwrap();
         d.execute("INSERT INTO t VALUES (2, 200)").unwrap();
 
-        let result = d.query(
-            "SELECT val, LAG(val, 1, 0) OVER (ORDER BY val) FROM t",
-            &[],
-        );
+        let result = d.query("SELECT val, LAG(val, 1, 0) OVER (ORDER BY val) FROM t", &[]);
         match result {
             Ok(rows) => {
                 assert_eq!(rows.len(), 2);
@@ -380,8 +392,10 @@ mod window_functions_hardening {
                     lag0
                 );
                 // Second row: LAG = 100
-                assert!(is_int(rows[1].get(1).unwrap(), 100),
-                    "LAG with default: second row should be 100");
+                assert!(
+                    is_int(rows[1].get(1).unwrap(), 100),
+                    "LAG with default: second row should be 100"
+                );
             }
             Err(e) => {
                 // LAG with default value may not be supported yet; document it.
@@ -399,16 +413,22 @@ mod window_functions_hardening {
             d.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10)).unwrap();
         }
 
-        let rows = d.query(
-            "SELECT val, LAG(val, 3) OVER (ORDER BY val), LEAD(val, 3) OVER (ORDER BY val) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT val, LAG(val, 3) OVER (ORDER BY val), LEAD(val, 3) OVER (ORDER BY val) FROM t",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 6);
 
         // First 3 rows: LAG(3) = NULL
         for i in 0..3 {
-            assert_eq!(rows[i].get(1).unwrap(), &Value::Null,
-                "LAG(3) for row {} should be NULL", i);
+            assert_eq!(
+                rows[i].get(1).unwrap(),
+                &Value::Null,
+                "LAG(3) for row {} should be NULL",
+                i
+            );
         }
         // Row 3 (val=40): LAG(3) = 10
         assert!(is_int(rows[3].get(1).unwrap(), 10), "LAG(3) for row 3 should be 10");
@@ -417,8 +437,12 @@ mod window_functions_hardening {
 
         // Last 3 rows: LEAD(3) = NULL
         for i in 3..6 {
-            assert_eq!(rows[i].get(2).unwrap(), &Value::Null,
-                "LEAD(3) for row {} should be NULL", i);
+            assert_eq!(
+                rows[i].get(2).unwrap(),
+                &Value::Null,
+                "LEAD(3) for row {} should be NULL",
+                i
+            );
         }
         // Row 0 (val=10): LEAD(3) = 40
         assert!(is_int(rows[0].get(2).unwrap(), 40), "LEAD(3) for row 0 should be 40");
@@ -433,13 +457,13 @@ mod window_functions_hardening {
         d.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
         d.execute("INSERT INTO t VALUES (1, 999)").unwrap();
 
-        let rows = d.query(
-            "SELECT val, LAG(val) OVER (ORDER BY val) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d.query("SELECT val, LAG(val) OVER (ORDER BY val) FROM t", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(1).unwrap(), &Value::Null,
-            "LAG of only row (no default) must be NULL");
+        assert_eq!(
+            rows[0].get(1).unwrap(),
+            &Value::Null,
+            "LAG of only row (no default) must be NULL"
+        );
     }
 
     #[test]
@@ -449,13 +473,15 @@ mod window_functions_hardening {
         d.execute("CREATE TABLE t (id INT PRIMARY KEY, val INT)").unwrap();
         d.execute("INSERT INTO t VALUES (1, 999)").unwrap();
 
-        let rows = d.query(
-            "SELECT val, LEAD(val) OVER (ORDER BY val) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT val, LEAD(val) OVER (ORDER BY val) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(1).unwrap(), &Value::Null,
-            "LEAD of only row (no default) must be NULL");
+        assert_eq!(
+            rows[0].get(1).unwrap(),
+            &Value::Null,
+            "LEAD of only row (no default) must be NULL"
+        );
     }
 
     // ========================================================================
@@ -471,10 +497,7 @@ mod window_functions_hardening {
             d.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10)).unwrap();
         }
 
-        let rows = d.query(
-            "SELECT val, NTILE(4) OVER (ORDER BY val) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d.query("SELECT val, NTILE(4) OVER (ORDER BY val) FROM t", &[]).unwrap();
         assert_eq!(rows.len(), 8);
         let buckets: Vec<i64> = rows.iter().map(|r| to_i64(r.get(1).unwrap())).collect();
         // Should have exactly 4 distinct buckets 1..=4
@@ -499,10 +522,9 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (2, 20)").unwrap();
         d.execute("INSERT INTO t VALUES (3, 30)").unwrap();
 
-        let rows = d.query(
-            "SELECT val, NTILE(10) OVER (ORDER BY val) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT val, NTILE(10) OVER (ORDER BY val) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 3);
         let buckets: Vec<i64> = rows.iter().map(|r| to_i64(r.get(1).unwrap())).collect();
         // With more buckets than rows, each row gets its own bucket.
@@ -524,14 +546,14 @@ mod window_functions_hardening {
             d.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i)).unwrap();
         }
 
-        let rows = d.query(
-            "SELECT val, NTILE(1) OVER (ORDER BY val) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d.query("SELECT val, NTILE(1) OVER (ORDER BY val) FROM t", &[]).unwrap();
         assert_eq!(rows.len(), 5);
         for row in &rows {
-            assert_eq!(to_i64(row.get(1).unwrap()), 1,
-                "NTILE(1) should put all rows in bucket 1");
+            assert_eq!(
+                to_i64(row.get(1).unwrap()),
+                1,
+                "NTILE(1) should put all rows in bucket 1"
+            );
         }
     }
 
@@ -548,15 +570,16 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (2, 10)").unwrap();
         d.execute("INSERT INTO t VALUES (3, 20)").unwrap();
 
-        let rows = d.query(
-            "SELECT val, FIRST_VALUE(val) OVER (ORDER BY val) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT val, FIRST_VALUE(val) OVER (ORDER BY val) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 3);
         for row in &rows {
-            assert!(is_int(row.get(1).unwrap(), 10),
+            assert!(
+                is_int(row.get(1).unwrap(), 10),
                 "FIRST_VALUE with ORDER BY val should always be 10 (min), got {:?}",
-                row.get(1).unwrap());
+                row.get(1).unwrap()
+            );
         }
     }
 
@@ -572,17 +595,18 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (2, 20)").unwrap();
         d.execute("INSERT INTO t VALUES (3, 30)").unwrap();
 
-        let rows = d.query(
-            "SELECT val, LAST_VALUE(val) OVER (ORDER BY val) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT val, LAST_VALUE(val) OVER (ORDER BY val) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 3);
         // Each row's LAST_VALUE should equal its own val (current row)
         for row in &rows {
             let val = row.get(0).unwrap();
             let lv = row.get(1).unwrap();
-            assert_eq!(val, lv,
-                "LAST_VALUE with default frame (ORDER BY) should equal current row value");
+            assert_eq!(
+                val, lv,
+                "LAST_VALUE with default frame (ORDER BY) should equal current row value"
+            );
         }
     }
 
@@ -607,8 +631,11 @@ mod window_functions_hardening {
                     "Marketing" => 80000,
                     _ => panic!("unexpected dept {}", dept),
                 };
-                assert_eq!(fv, expected_min,
-                    "FIRST_VALUE(salary) for {} should be {} (ORDER BY salary ASC)", dept, expected_min);
+                assert_eq!(
+                    fv, expected_min,
+                    "FIRST_VALUE(salary) for {} should be {} (ORDER BY salary ASC)",
+                    dept, expected_min
+                );
             }
         }
     }
@@ -627,10 +654,12 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (3, 15)").unwrap();
         d.execute("INSERT INTO t VALUES (4, 20)").unwrap();
 
-        let rows = d.query(
-            "SELECT val, SUM(val) OVER (ORDER BY val ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT val, SUM(val) OVER (ORDER BY val ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM t",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 4);
         let sums: Vec<f64> = rows.iter().map(|r| to_f64(r.get(1).unwrap())).collect();
         // Running sums: 5, 15, 30, 50
@@ -649,10 +678,12 @@ mod window_functions_hardening {
             d.execute(&format!("INSERT INTO t VALUES ({}, {})", i, i * 10)).unwrap();
         }
 
-        let rows = d.query(
-            "SELECT val, SUM(val) OVER (ORDER BY val ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT val, SUM(val) OVER (ORDER BY val ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 5);
         let sums: Vec<f64> = rows.iter().map(|r| to_f64(r.get(1).unwrap())).collect();
         // Row 0 (val=10): [10,20] = 30
@@ -679,10 +710,7 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (4, 4)").unwrap();
         d.execute("INSERT INTO t VALUES (5, 5)").unwrap();
 
-        let rows = d.query(
-            "SELECT val, SUM(val) OVER (ORDER BY val) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d.query("SELECT val, SUM(val) OVER (ORDER BY val) FROM t", &[]).unwrap();
         assert_eq!(rows.len(), 5);
         let sums: Vec<f64> = rows.iter().map(|r| to_f64(r.get(1).unwrap())).collect();
         // 1, 3, 6, 10, 15
@@ -704,10 +732,12 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (4, 40)").unwrap();
         d.execute("INSERT INTO t VALUES (5, 50)").unwrap();
 
-        let rows = d.query(
-            "SELECT val, AVG(val) OVER (ORDER BY val ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query(
+                "SELECT val, AVG(val) OVER (ORDER BY val ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM t",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 5);
         let avgs: Vec<f64> = rows.iter().map(|r| to_f64(r.get(1).unwrap())).collect();
         // Row 0: avg(10,20) = 15
@@ -738,17 +768,16 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t (id) VALUES (2)").unwrap(); // val = NULL
         d.execute("INSERT INTO t VALUES (3, 30)").unwrap();
 
-        let rows = d.query(
-            "SELECT id, COUNT(*) OVER () FROM t",
-            &[],
-        ).unwrap();
+        let rows = d.query("SELECT id, COUNT(*) OVER () FROM t", &[]).unwrap();
         assert_eq!(rows.len(), 3);
 
         // COUNT(*) should count all rows (including NULLs): expect 3.
         for row in &rows {
             let count = to_i64(row.get(1).unwrap());
-            assert_eq!(count, 3,
-                "COUNT(*) OVER() should count all rows including those with NULL columns");
+            assert_eq!(
+                count, 3,
+                "COUNT(*) OVER() should count all rows including those with NULL columns"
+            );
         }
     }
 
@@ -757,7 +786,8 @@ mod window_functions_hardening {
         // COUNT(col) OVER (PARTITION BY ...) should count only non-NULL values
         // in each partition per SQL standard.
         let d = db();
-        d.execute("CREATE TABLE t (id INT PRIMARY KEY, grp TEXT, val INT)").unwrap();
+        d.execute("CREATE TABLE t (id INT PRIMARY KEY, grp TEXT, val INT)")
+            .unwrap();
         d.execute("INSERT INTO t VALUES (1, 'A', 10)").unwrap();
         d.execute("INSERT INTO t VALUES (2, 'A', NULL)").unwrap();
         d.execute("INSERT INTO t VALUES (3, 'A', 30)").unwrap();
@@ -765,10 +795,9 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (5, 'B', NULL)").unwrap();
         d.execute("INSERT INTO t VALUES (6, 'B', 60)").unwrap();
 
-        let rows = d.query(
-            "SELECT grp, COUNT(val) OVER (PARTITION BY grp) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT grp, COUNT(val) OVER (PARTITION BY grp) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 6);
 
         for row in &rows {
@@ -792,10 +821,9 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t (id) VALUES (2)").unwrap(); // val=NULL
         d.execute("INSERT INTO t VALUES (3, 30)").unwrap();
 
-        let rows = d.query(
-            "SELECT id, val, SUM(val) OVER (ORDER BY id) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT id, val, SUM(val) OVER (ORDER BY id) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 3);
         let sums: Vec<f64> = rows.iter().map(|r| to_f64(r.get(2).unwrap())).collect();
         // Running sum: 10, 10 (NULL skipped), 40
@@ -813,15 +841,17 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (2, 20)").unwrap();
         d.execute("INSERT INTO t VALUES (3, 30)").unwrap();
 
-        let rows = d.query(
-            "SELECT val, \
+        let rows = d
+            .query(
+                "SELECT val, \
                  ROW_NUMBER() OVER (ORDER BY val), \
                  SUM(val) OVER (), \
                  MIN(val) OVER (), \
                  MAX(val) OVER () \
              FROM t",
-            &[],
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 3);
 
         // ROW_NUMBER should be 1,2,3
@@ -859,8 +889,11 @@ mod window_functions_hardening {
         // ROW_NUMBER should be 1,2,3 (not 1..6 from full table)
         let mut rns: Vec<i64> = rows.iter().map(|r| to_i64(r.get(2).unwrap())).collect();
         rns.sort();
-        assert_eq!(rns, vec![1, 2, 3],
-            "ROW_NUMBER should be relative to filtered set, not full table");
+        assert_eq!(
+            rns,
+            vec![1, 2, 3],
+            "ROW_NUMBER should be relative to filtered set, not full table"
+        );
     }
 
     // ========================================================================
@@ -878,10 +911,9 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (4, 40)").unwrap();
         d.execute("INSERT INTO t VALUES (5, 50)").unwrap();
 
-        let rows = d.query(
-            "SELECT val, PERCENT_RANK() OVER (ORDER BY val) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT val, PERCENT_RANK() OVER (ORDER BY val) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 5);
         let pct_ranks: Vec<f64> = rows.iter().map(|r| to_f64(r.get(1).unwrap())).collect();
         // (rank-1)/(5-1): 0.0, 0.25, 0.5, 0.75, 1.0
@@ -903,17 +935,32 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (3, 30)").unwrap();
         d.execute("INSERT INTO t VALUES (4, 40)").unwrap();
 
-        let rows = d.query(
-            "SELECT val, CUME_DIST() OVER (ORDER BY val) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT val, CUME_DIST() OVER (ORDER BY val) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 4);
         let cds: Vec<f64> = rows.iter().map(|r| to_f64(r.get(1).unwrap())).collect();
         // SQL-standard CUME_DIST: (count of rows <= current) / total_rows
-        assert!((cds[0] - 0.25).abs() < 0.01, "CUME_DIST row 0 should be 0.25, got {}", cds[0]);
-        assert!((cds[1] - 0.50).abs() < 0.01, "CUME_DIST row 1 should be 0.50, got {}", cds[1]);
-        assert!((cds[2] - 0.75).abs() < 0.01, "CUME_DIST row 2 should be 0.75, got {}", cds[2]);
-        assert!((cds[3] - 1.00).abs() < 0.01, "CUME_DIST row 3 should be 1.00, got {}", cds[3]);
+        assert!(
+            (cds[0] - 0.25).abs() < 0.01,
+            "CUME_DIST row 0 should be 0.25, got {}",
+            cds[0]
+        );
+        assert!(
+            (cds[1] - 0.50).abs() < 0.01,
+            "CUME_DIST row 1 should be 0.50, got {}",
+            cds[1]
+        );
+        assert!(
+            (cds[2] - 0.75).abs() < 0.01,
+            "CUME_DIST row 2 should be 0.75, got {}",
+            cds[2]
+        );
+        assert!(
+            (cds[3] - 1.00).abs() < 0.01,
+            "CUME_DIST row 3 should be 1.00, got {}",
+            cds[3]
+        );
     }
 
     #[test]
@@ -925,10 +972,7 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (2, 20)").unwrap();
         d.execute("INSERT INTO t VALUES (3, 30)").unwrap();
 
-        let result = d.query(
-            "SELECT val, NTH_VALUE(val, 2) OVER (ORDER BY val) FROM t",
-            &[],
-        );
+        let result = d.query("SELECT val, NTH_VALUE(val, 2) OVER (ORDER BY val) FROM t", &[]);
         match result {
             Ok(rows) => {
                 assert_eq!(rows.len(), 3);
@@ -937,8 +981,11 @@ mod window_functions_hardening {
                 // Row 1 (frame=[10,20]): NTH_VALUE(2) = 20
                 // Row 2 (frame=[10,20,30]): NTH_VALUE(2) = 20
                 let v0 = rows[0].get(1).unwrap();
-                assert_eq!(v0, &Value::Null,
-                    "NTH_VALUE(2) for first row should be NULL (frame too small)");
+                assert_eq!(
+                    v0,
+                    &Value::Null,
+                    "NTH_VALUE(2) for first row should be NULL (frame too small)"
+                );
                 let v1 = rows[1].get(1).unwrap();
                 assert!(is_int(v1, 20), "NTH_VALUE(2) for second row = 20, got {:?}", v1);
                 let v2 = rows[2].get(1).unwrap();
@@ -960,10 +1007,7 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t (id) VALUES (2)").unwrap();
         d.execute("INSERT INTO t (id) VALUES (3)").unwrap();
 
-        let rows = d.query(
-            "SELECT id, SUM(val) OVER () FROM t",
-            &[],
-        ).unwrap();
+        let rows = d.query("SELECT id, SUM(val) OVER () FROM t", &[]).unwrap();
         assert_eq!(rows.len(), 3);
         // SQL standard: SUM of all NULLs returns NULL.
         for row in &rows {
@@ -980,15 +1024,15 @@ mod window_functions_hardening {
     fn test_window_with_text_ordering() {
         // Window functions should work with TEXT ORDER BY columns.
         let d = db();
-        d.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score INT)").unwrap();
+        d.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT, score INT)")
+            .unwrap();
         d.execute("INSERT INTO t VALUES (1, 'Charlie', 80)").unwrap();
         d.execute("INSERT INTO t VALUES (2, 'Alice', 90)").unwrap();
         d.execute("INSERT INTO t VALUES (3, 'Bob', 85)").unwrap();
 
-        let rows = d.query(
-            "SELECT name, score, ROW_NUMBER() OVER (ORDER BY name) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT name, score, ROW_NUMBER() OVER (ORDER BY name) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 3);
         // Alphabetical order: Alice=1, Bob=2, Charlie=3
         for row in &rows {
@@ -1008,7 +1052,8 @@ mod window_functions_hardening {
     fn test_window_mixed_partitions_different_sizes() {
         // Partitions of unequal size: verify correct independent computation.
         let d = db();
-        d.execute("CREATE TABLE t (id INT PRIMARY KEY, grp TEXT, val INT)").unwrap();
+        d.execute("CREATE TABLE t (id INT PRIMARY KEY, grp TEXT, val INT)")
+            .unwrap();
         d.execute("INSERT INTO t VALUES (1, 'X', 100)").unwrap();
         d.execute("INSERT INTO t VALUES (2, 'Y', 200)").unwrap();
         d.execute("INSERT INTO t VALUES (3, 'Y', 300)").unwrap();
@@ -1016,10 +1061,9 @@ mod window_functions_hardening {
         d.execute("INSERT INTO t VALUES (5, 'Z', 500)").unwrap();
         d.execute("INSERT INTO t VALUES (6, 'Z', 600)").unwrap();
 
-        let rows = d.query(
-            "SELECT grp, val, SUM(val) OVER (PARTITION BY grp) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT grp, val, SUM(val) OVER (PARTITION BY grp) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 6);
 
         for row in &rows {
@@ -1031,8 +1075,13 @@ mod window_functions_hardening {
                     "Z" => 1500.0,
                     _ => panic!("unexpected group"),
                 };
-                assert!((sum_val - expected).abs() < 0.01,
-                    "SUM for group {} should be {}, got {}", grp, expected, sum_val);
+                assert!(
+                    (sum_val - expected).abs() < 0.01,
+                    "SUM for group {} should be {}, got {}",
+                    grp,
+                    expected,
+                    sum_val
+                );
             }
         }
     }
@@ -1041,15 +1090,15 @@ mod window_functions_hardening {
     fn test_window_count_star_over_with_partition() {
         // COUNT(*) OVER (PARTITION BY ...) should count all rows per partition.
         let d = db();
-        d.execute("CREATE TABLE t (id INT PRIMARY KEY, grp TEXT, val INT)").unwrap();
+        d.execute("CREATE TABLE t (id INT PRIMARY KEY, grp TEXT, val INT)")
+            .unwrap();
         d.execute("INSERT INTO t VALUES (1, 'A', 10)").unwrap();
         d.execute("INSERT INTO t VALUES (2, 'A', NULL)").unwrap();
         d.execute("INSERT INTO t VALUES (3, 'B', 30)").unwrap();
 
-        let rows = d.query(
-            "SELECT grp, COUNT(*) OVER (PARTITION BY grp) FROM t",
-            &[],
-        ).unwrap();
+        let rows = d
+            .query("SELECT grp, COUNT(*) OVER (PARTITION BY grp) FROM t", &[])
+            .unwrap();
         assert_eq!(rows.len(), 3);
 
         for row in &rows {

@@ -41,11 +41,11 @@
 //! - `VerifyCA`: Require SSL and verify client certificate against CA
 //! - `VerifyFull`: Require SSL and verify client certificate with hostname
 
-use heliosdb_nano::{EmbeddedDatabase, Result};
 use heliosdb_nano::protocol::postgres::{
-    PgServerBuilder, SslConfig, SslMode, CertificateManager,
-    AuthMethod, AuthManager, InMemoryPasswordStore, SharedPasswordStore, PasswordStore
+    AuthManager, AuthMethod, CertificateManager, InMemoryPasswordStore, PasswordStore, PgServerBuilder,
+    SharedPasswordStore, SslConfig, SslMode,
 };
+use heliosdb_nano::{EmbeddedDatabase, Result};
 use std::sync::Arc;
 use tracing_subscriber;
 
@@ -77,25 +77,21 @@ async fn main() -> Result<()> {
             id INTEGER PRIMARY KEY,
             username TEXT NOT NULL,
             email TEXT NOT NULL
-        )"
+        )",
     )?;
 
     db.execute(
         "INSERT INTO users (id, username, email) VALUES
         (1, 'alice', 'alice@example.com'),
         (2, 'bob', 'bob@example.com'),
-        (3, 'charlie', 'charlie@example.com')"
+        (3, 'charlie', 'charlie@example.com')",
     )?;
     println!("Sample data created\n");
 
     // Configure SSL modes (choose one)
 
     // Option 1: Allow mode (accepts both SSL and non-SSL)
-    let ssl_config = SslConfig::new(
-        SslMode::Allow,
-        &cert_path,
-        &key_path,
-    );
+    let ssl_config = SslConfig::new(SslMode::Allow, &cert_path, &key_path);
     println!("SSL Mode: Allow (accepts both SSL and non-SSL connections)");
 
     // Option 2: Require mode (SSL required)
@@ -133,7 +129,8 @@ async fn main() -> Result<()> {
     println!("  Users configured: postgres, admin, alice");
 
     // Build server with SSL and SCRAM authentication
-    let addr: std::net::SocketAddr = "127.0.0.1:5432".parse()
+    let addr: std::net::SocketAddr = "127.0.0.1:5432"
+        .parse()
         .map_err(|e| heliosdb_nano::Error::config(format!("Invalid address: {}", e)))?;
     let server = PgServerBuilder::new()
         .address(addr)

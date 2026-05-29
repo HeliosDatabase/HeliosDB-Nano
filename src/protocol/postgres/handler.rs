@@ -1332,8 +1332,7 @@ where
         }
         self.suppress_ready_for_query = false;
         let code = Self::sqlstate_for_error(error);
-        self.send_error("ERROR", code, &error.to_string(), None, None)
-            .await
+        self.send_error("ERROR", code, &error.to_string(), None, None).await
     }
 
     fn sqlstate_for_error(error: &Error) -> &'static str {

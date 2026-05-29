@@ -5,10 +5,10 @@
 
 use crate::storage::{BranchId, SnapshotId, GIT_COMMIT_PREFIX};
 use crate::{Error, Result};
+use parking_lot::RwLock;
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 /// Commit state - database state at a specific Git commit
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -93,7 +93,8 @@ impl CommitTracker {
         let value = bincode::serialize(&state)
             .map_err(|e| Error::storage(format!("Failed to serialize commit state: {}", e)))?;
 
-        self.db.put(&key, &value)
+        self.db
+            .put(&key, &value)
             .map_err(|e| Error::storage(format!("Failed to save commit state: {}", e)))?;
 
         // Update cache
@@ -101,7 +102,9 @@ impl CommitTracker {
 
         tracing::info!(
             "Recorded state for commit {} -> branch {}, snapshot {}",
-            commit_sha, db_branch_id, snapshot_id
+            commit_sha,
+            db_branch_id,
+            snapshot_id
         );
 
         Ok(state)
@@ -135,7 +138,8 @@ impl CommitTracker {
         let value = bincode::serialize(&state)
             .map_err(|e| Error::storage(format!("Failed to serialize commit state: {}", e)))?;
 
-        self.db.put(&key, &value)
+        self.db
+            .put(&key, &value)
             .map_err(|e| Error::storage(format!("Failed to save commit state: {}", e)))?;
 
         self.cache.write().insert(commit_sha.to_string(), state.clone());
@@ -192,8 +196,7 @@ impl CommitTracker {
         let mut matches = Vec::new();
 
         for item in iter {
-            let (key, _value) = item
-                .map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            let (key, _value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(GIT_COMMIT_PREFIX) {
                 break;
@@ -213,7 +216,8 @@ impl CommitTracker {
             1 => Ok(Some(matches.into_iter().next().unwrap_or_default())),
             _ => Err(Error::storage(format!(
                 "Ambiguous commit SHA '{}': {} matches",
-                abbreviated, matches.len()
+                abbreviated,
+                matches.len()
             ))),
         }
     }
@@ -243,15 +247,14 @@ impl CommitTracker {
         let iter = self.db.prefix_iterator(GIT_COMMIT_PREFIX);
 
         for item in iter {
-            let (key, value) = item
-                .map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(GIT_COMMIT_PREFIX) {
                 break;
             }
 
-            let state: CommitState = bincode::deserialize(&value)
-                .map_err(|e| Error::storage(format!("Failed to deserialize: {}", e)))?;
+            let state: CommitState =
+                bincode::deserialize(&value).map_err(|e| Error::storage(format!("Failed to deserialize: {}", e)))?;
 
             states.push(state);
 
@@ -271,7 +274,8 @@ impl CommitTracker {
     pub fn delete_state(&self, commit_sha: &str) -> Result<()> {
         let key = Self::encode_key(commit_sha);
 
-        self.db.delete(&key)
+        self.db
+            .delete(&key)
             .map_err(|e| Error::storage(format!("Failed to delete commit state: {}", e)))?;
 
         self.cache.write().remove(commit_sha);
@@ -283,21 +287,19 @@ impl CommitTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Config;
     use crate::storage::StorageEngine;
+    use crate::Config;
 
     #[test]
     fn test_commit_tracker_basic() {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).expect("Failed to open engine");
 
-        let tracker = CommitTracker::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        );
+        let tracker = CommitTracker::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp));
 
         // Record state
-        let state = tracker.record_state("abc123def456", 1, 100)
+        let state = tracker
+            .record_state("abc123def456", 1, 100)
             .expect("Failed to record state");
 
         assert_eq!(state.commit_sha, "abc123def456");
@@ -305,7 +307,8 @@ mod tests {
         assert_eq!(state.snapshot_id, 100);
 
         // Get state
-        let retrieved = tracker.get_state("abc123def456")
+        let retrieved = tracker
+            .get_state("abc123def456")
             .expect("Failed to get state")
             .expect("State should exist");
 
@@ -313,8 +316,7 @@ mod tests {
         assert_eq!(retrieved.db_branch_id, 1);
 
         // Get by abbreviated SHA
-        let by_abbrev = tracker.get_state("abc123")
-            .expect("Failed to get by abbreviated SHA");
+        let by_abbrev = tracker.get_state("abc123").expect("Failed to get by abbreviated SHA");
         assert!(by_abbrev.is_some());
     }
 
@@ -323,14 +325,12 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).expect("Failed to open engine");
 
-        let tracker = CommitTracker::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        );
+        let tracker = CommitTracker::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp));
 
         tracker.record_state("commit123", 2, 500).expect("Failed to record");
 
-        let snapshot = tracker.get_snapshot_for_commit("commit123")
+        let snapshot = tracker
+            .get_snapshot_for_commit("commit123")
             .expect("Failed to get snapshot")
             .expect("Snapshot should exist");
 

@@ -96,13 +96,12 @@ impl TnsHeader {
         let flags = cursor.get_u8();
         let header_checksum = cursor.get_u16();
 
-        let packet_type = TnsPacketType::from_u8(packet_type_byte)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Invalid TNS packet type: {}", packet_type_byte),
-                )
-            })?;
+        let packet_type = TnsPacketType::from_u8(packet_type_byte).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Invalid TNS packet type: {}", packet_type_byte),
+            )
+        })?;
 
         Ok(Self {
             length,
@@ -330,10 +329,7 @@ pub struct TnsData {
 impl TnsData {
     /// Create a new TNS Data packet
     pub fn new(data: Vec<u8>) -> Self {
-        Self {
-            flags: 0x0000,
-            data,
-        }
+        Self { flags: 0x0000, data }
     }
 
     /// Parse TNS Data packet
@@ -349,10 +345,7 @@ impl TnsData {
         let flags = cursor.get_u16();
         let payload = data.get(2..).unwrap_or(&[]).to_vec();
 
-        Ok(Self {
-            flags,
-            data: payload,
-        })
+        Ok(Self { flags, data: payload })
     }
 
     /// Encode TNS Data packet to bytes
@@ -403,11 +396,9 @@ impl TnsPacket {
             ));
         }
 
-        let payload = data.get(TnsHeader::SIZE..header.length as usize)
-            .ok_or_else(|| io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "TNS packet payload out of bounds",
-            ))?
+        let payload = data
+            .get(TnsHeader::SIZE..header.length as usize)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "TNS packet payload out of bounds"))?
             .to_vec();
 
         Ok(Self { header, payload })
@@ -450,8 +441,8 @@ mod tests {
         let data = vec![
             0x00, 0x20, // length = 32
             0x00, 0x00, // checksum = 0
-            0x01,       // packet type = Connect
-            0x00,       // flags = 0
+            0x01, // packet type = Connect
+            0x00, // flags = 0
             0x00, 0x00, // header checksum = 0
         ];
 

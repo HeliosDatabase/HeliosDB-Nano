@@ -118,7 +118,8 @@ fn version_string_matches_cargo() -> Result<()> {
     assert!(
         v.contains(cargo_ver),
         "version() = {:?}; expected to contain {:?}",
-        v, cargo_ver
+        v,
+        cargo_ver
     );
     Ok(())
 }
@@ -127,10 +128,7 @@ fn version_string_matches_cargo() -> Result<()> {
 fn fts_null_propagation() -> Result<()> {
     // NULL tsvector or tsquery should propagate NULL through @@ and ts_rank_cd.
     let db = EmbeddedDatabase::new_in_memory()?;
-    let rows = db.query(
-        "SELECT ts_rank_cd(NULL, to_tsquery('x'))",
-        &[],
-    )?;
+    let rows = db.query("SELECT ts_rank_cd(NULL, to_tsquery('x'))", &[])?;
     assert!(matches!(rows[0].values[0], Value::Null));
     Ok(())
 }

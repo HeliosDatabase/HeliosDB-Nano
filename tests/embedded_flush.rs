@@ -20,7 +20,8 @@ fn flush_then_reads_span_sst_and_memtable() {
     db.execute("CREATE TABLE t (id INT, k TEXT)").expect("create");
 
     // Batch 1 → flushed to SST.
-    db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'a')").expect("insert b1");
+    db.execute("INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'a')")
+        .expect("insert b1");
     db.flush().expect("flush");
     assert_eq!(count(&db, "SELECT COUNT(*) FROM t"), 3, "rows visible after flush");
 

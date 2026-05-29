@@ -15,16 +15,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{info, error};
+use tracing::{error, info};
 
+use crate::ai::nl_query::{
+    ColumnSchema, ConversationContext, NlQueryConfig, NlQueryEngine, NlQueryRequest, QueryHistoryEntry, SchemaContext,
+    SqlDialect, TableSchema,
+};
 use crate::api::models::ApiError;
 use crate::api::server::AppState;
 use crate::storage::dump::DatabaseInterface;
-use crate::ai::nl_query::{
-    NlQueryEngine, NlQueryRequest, NlQueryConfig,
-    SchemaContext, TableSchema, ColumnSchema, ConversationContext,
-    QueryHistoryEntry, SqlDialect,
-};
 
 // ============================================================================
 // Request/Response Types
@@ -301,17 +300,18 @@ pub async fn nl_to_sql(
     let schema_context = build_schema_context(&state, &request).await?;
 
     // Build conversation context
-    let conversation_context = request.context.map(|entries| {
-        ConversationContext {
-            history: entries.into_iter().map(|e| QueryHistoryEntry {
+    let conversation_context = request.context.map(|entries| ConversationContext {
+        history: entries
+            .into_iter()
+            .map(|e| QueryHistoryEntry {
                 question: e.question,
                 sql: e.sql,
                 success: e.success,
                 timestamp: None,
-            }).collect(),
-            entities: None,
-            session_id: request.session_id.clone(),
-        }
+            })
+            .collect(),
+        entities: None,
+        session_id: request.session_id.clone(),
     });
 
     // Build config
@@ -323,7 +323,7 @@ pub async fn nl_to_sql(
         schema: Some(schema_context),
         context: conversation_context,
         config: Some(config),
-        user_id: None, // Would come from auth
+        user_id: None,   // Would come from auth
         tenant_id: None, // Would come from tenant context
         metadata: None,
     };
@@ -332,7 +332,9 @@ pub async fn nl_to_sql(
     let engine = get_nl_engine(&state)?;
 
     // Translate
-    let response = engine.translate(nl_request).await
+    let response = engine
+        .translate(nl_request)
+        .await
         .map_err(|e| ApiError::internal(format!("NL translation failed: {}", e)))?;
 
     // Build API response
@@ -343,12 +345,14 @@ pub async fn nl_to_sql(
         intent: format!("{:?}", response.analysis.intent).to_lowercase(),
         tables: response.analysis.tables,
         valid: response.validation.as_ref().map(|v| v.allowed).unwrap_or(true),
-        validation_errors: response.validation
+        validation_errors: response
+            .validation
             .as_ref()
             .map(|v| v.errors.iter().map(|e| e.message.clone()).collect())
             .unwrap_or_default(),
         warnings: response.warnings,
-        suggestions: response.suggestions
+        suggestions: response
+            .suggestions
             .unwrap_or_default()
             .into_iter()
             .map(|s| SuggestionResponse {
@@ -363,8 +367,7 @@ pub async fn nl_to_sql(
 
     info!(
         "NL Query completed in {}ms, confidence: {:.2}",
-        api_response.processing_time_ms,
-        api_response.confidence
+        api_response.processing_time_ms, api_response.confidence
     );
 
     Ok(Json(api_response))
@@ -384,17 +387,18 @@ pub async fn nl_execute(
     let nl_start = Instant::now();
 
     let schema_context = build_schema_context_from_execute(&state, &request).await?;
-    let conversation_context = request.context.map(|entries| {
-        ConversationContext {
-            history: entries.into_iter().map(|e| QueryHistoryEntry {
+    let conversation_context = request.context.map(|entries| ConversationContext {
+        history: entries
+            .into_iter()
+            .map(|e| QueryHistoryEntry {
                 question: e.question,
                 sql: e.sql,
                 success: e.success,
                 timestamp: None,
-            }).collect(),
-            entities: None,
-            session_id: request.session_id.clone(),
-        }
+            })
+            .collect(),
+        entities: None,
+        session_id: request.session_id.clone(),
     });
 
     let config = build_config(request.config);
@@ -410,7 +414,9 @@ pub async fn nl_execute(
     };
 
     let engine = get_nl_engine(&state)?;
-    let nl_response = engine.translate(nl_request).await
+    let nl_response = engine
+        .translate(nl_request)
+        .await
         .map_err(|e| ApiError::internal(format!("NL translation failed: {}", e)))?;
 
     let nl_processing_time = nl_start.elapsed().as_millis() as u64;
@@ -420,7 +426,11 @@ pub async fn nl_execute(
         if !v.allowed {
             return Err(ApiError::bad_request(format!(
                 "Generated SQL is not valid: {}",
-                v.errors.iter().map(|e| e.message.as_str()).collect::<Vec<_>>().join(", ")
+                v.errors
+                    .iter()
+                    .map(|e| e.message.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )));
         }
     }
@@ -437,11 +447,10 @@ pub async fn nl_execute(
     };
 
     // Execute query
-    let tuples = state.db.query(&sql, &[])
-        .map_err(|e| {
-            error!("SQL execution failed: {}", e);
-            ApiError::from(e)
-        })?;
+    let tuples = state.db.query(&sql, &[]).map_err(|e| {
+        error!("SQL execution failed: {}", e);
+        ApiError::from(e)
+    })?;
 
     let sql_execution_time = sql_start.elapsed().as_millis() as u64;
 
@@ -449,21 +458,24 @@ pub async fn nl_execute(
     let (columns, column_types, rows) = if tuples.is_empty() {
         (vec![], vec![], vec![])
     } else if let Some(first) = tuples.first() {
-        let cols: Vec<String> = (0..first.values.len())
-            .map(|i| format!("column_{}", i))
-            .collect();
-        let types: Vec<String> = first.values.iter()
+        let cols: Vec<String> = (0..first.values.len()).map(|i| format!("column_{}", i)).collect();
+        let types: Vec<String> = first
+            .values
+            .iter()
             .map(|v| format!("{:?}", v).split('(').next().unwrap_or("unknown").to_lowercase())
             .collect();
 
-        let rows: Vec<HashMap<String, serde_json::Value>> = tuples.iter().map(|t| {
-            let mut row = HashMap::new();
-            for (i, v) in t.values.iter().enumerate() {
-                let json_val: serde_json::Value = v.into();
-                row.insert(cols.get(i).cloned().unwrap_or_default(), json_val);
-            }
-            row
-        }).collect();
+        let rows: Vec<HashMap<String, serde_json::Value>> = tuples
+            .iter()
+            .map(|t| {
+                let mut row = HashMap::new();
+                for (i, v) in t.values.iter().enumerate() {
+                    let json_val: serde_json::Value = v.into();
+                    row.insert(cols.get(i).cloned().unwrap_or_default(), json_val);
+                }
+                row
+            })
+            .collect();
 
         (cols, types, rows)
     } else {
@@ -488,10 +500,7 @@ pub async fn nl_execute(
 
     info!(
         "NL Execute completed: {} rows in {}ms (NL: {}ms, SQL: {}ms)",
-        response.row_count,
-        total_time,
-        nl_processing_time,
-        sql_execution_time
+        response.row_count, total_time, nl_processing_time, sql_execution_time
     );
 
     Ok(Json(response))
@@ -555,23 +564,20 @@ pub async fn nl_explain(
     }
 
     if !conditions.is_empty() {
-        explanation_parts.push(format!(
-            "It filters results where {}.",
-            conditions.join(" and ")
-        ));
+        explanation_parts.push(format!("It filters results where {}.", conditions.join(" and ")));
     }
 
     if !joins.is_empty() {
-        explanation_parts.push(format!(
-            "It combines data using {} join(s).",
-            joins.len()
-        ));
+        explanation_parts.push(format!("It combines data using {} join(s).", joins.len()));
     }
 
     // Extract limit
     let limit = if let Some(pos) = sql_upper.find("LIMIT") {
         let after = &request.sql[pos + 5..];
-        after.trim().split_whitespace().next()
+        after
+            .trim()
+            .split_whitespace()
+            .next()
             .and_then(|s| s.parse::<usize>().ok())
     } else {
         None
@@ -618,10 +624,13 @@ pub async fn get_schema_context(
     info!("Getting schema context for NL queries");
 
     // Get tables from catalog
-    let tables_result = state.db.list_tables()
+    let tables_result = state
+        .db
+        .list_tables()
         .map_err(|e| ApiError::internal(format!("Failed to list tables: {}", e)))?;
 
-    let filter_tables: Option<Vec<String>> = params.tables
+    let filter_tables: Option<Vec<String>> = params
+        .tables
         .map(|t| t.split(',').map(|s| s.trim().to_string()).collect());
 
     let mut tables = Vec::new();
@@ -635,17 +644,21 @@ pub async fn get_schema_context(
 
         // Get table schema
         if let Ok(schema) = state.db.get_table_schema(&table_name) {
-            let columns: Vec<ColumnSchemaResponse> = schema.columns.iter().map(|c| {
-                ColumnSchemaResponse {
+            let columns: Vec<ColumnSchemaResponse> = schema
+                .columns
+                .iter()
+                .map(|c| ColumnSchemaResponse {
                     name: c.name.clone(),
                     data_type: format!("{:?}", c.data_type),
                     nullable: c.nullable,
                     description: None,
                     is_primary_key: c.primary_key,
-                }
-            }).collect();
+                })
+                .collect();
 
-            let primary_key: Vec<String> = schema.columns.iter()
+            let primary_key: Vec<String> = schema
+                .columns
+                .iter()
                 .filter(|c| c.primary_key)
                 .map(|c| c.name.clone())
                 .collect();
@@ -654,9 +667,13 @@ pub async fn get_schema_context(
                 name: table_name,
                 description: None,
                 columns,
-                primary_key: if primary_key.is_empty() { None } else { Some(primary_key) },
+                primary_key: if primary_key.is_empty() {
+                    None
+                } else {
+                    Some(primary_key)
+                },
                 foreign_keys: None, // Would need FK introspection
-                row_count: None, // Would need count query
+                row_count: None,    // Would need count query
             });
         }
     }
@@ -713,7 +730,11 @@ pub async fn nl_suggest(
         }
     }
 
-    if partial_lower.contains("average") || partial_lower.contains("avg") || partial_lower.contains("total") || partial_lower.contains("sum") {
+    if partial_lower.contains("average")
+        || partial_lower.contains("avg")
+        || partial_lower.contains("total")
+        || partial_lower.contains("sum")
+    {
         suggestions.push(QuerySuggestionResponse {
             question: "What is the average value?".to_string(),
             category: "aggregate".to_string(),
@@ -759,22 +780,23 @@ pub async fn nl_suggest(
 // ============================================================================
 
 /// Build schema context from API request
-async fn build_schema_context(
-    state: &AppState,
-    request: &NlQueryApiRequest,
-) -> Result<SchemaContext, ApiError> {
+async fn build_schema_context(state: &AppState, request: &NlQueryApiRequest) -> Result<SchemaContext, ApiError> {
     let tables_list = if let Some(ref tables) = request.tables {
         tables.clone()
     } else {
-        state.db.list_tables()
+        state
+            .db
+            .list_tables()
             .map_err(|e| ApiError::internal(format!("Failed to list tables: {}", e)))?
     };
 
     let mut tables = Vec::new();
     for table_name in tables_list {
         if let Ok(schema) = state.db.get_table_schema(&table_name) {
-            let columns: Vec<ColumnSchema> = schema.columns.iter().map(|c| {
-                ColumnSchema {
+            let columns: Vec<ColumnSchema> = schema
+                .columns
+                .iter()
+                .map(|c| ColumnSchema {
                     name: c.name.clone(),
                     data_type: format!("{:?}", c.data_type),
                     nullable: c.nullable,
@@ -783,10 +805,12 @@ async fn build_schema_context(
                     is_primary_key: c.primary_key,
                     is_unique: false,
                     enum_values: None,
-                }
-            }).collect();
+                })
+                .collect();
 
-            let primary_key: Vec<String> = schema.columns.iter()
+            let primary_key: Vec<String> = schema
+                .columns
+                .iter()
                 .filter(|c| c.primary_key)
                 .map(|c| c.name.clone())
                 .collect();
@@ -795,7 +819,11 @@ async fn build_schema_context(
                 name: table_name,
                 description: None,
                 columns,
-                primary_key: if primary_key.is_empty() { None } else { Some(primary_key) },
+                primary_key: if primary_key.is_empty() {
+                    None
+                } else {
+                    Some(primary_key)
+                },
                 foreign_keys: None,
                 indexes: None,
                 sample_values: None,
@@ -820,15 +848,19 @@ async fn build_schema_context_from_execute(
     let tables_list = if let Some(ref tables) = request.tables {
         tables.clone()
     } else {
-        state.db.list_tables()
+        state
+            .db
+            .list_tables()
             .map_err(|e| ApiError::internal(format!("Failed to list tables: {}", e)))?
     };
 
     let mut tables = Vec::new();
     for table_name in tables_list {
         if let Ok(schema) = state.db.get_table_schema(&table_name) {
-            let columns: Vec<ColumnSchema> = schema.columns.iter().map(|c| {
-                ColumnSchema {
+            let columns: Vec<ColumnSchema> = schema
+                .columns
+                .iter()
+                .map(|c| ColumnSchema {
                     name: c.name.clone(),
                     data_type: format!("{:?}", c.data_type),
                     nullable: c.nullable,
@@ -837,10 +869,12 @@ async fn build_schema_context_from_execute(
                     is_primary_key: c.primary_key,
                     is_unique: false,
                     enum_values: None,
-                }
-            }).collect();
+                })
+                .collect();
 
-            let primary_key: Vec<String> = schema.columns.iter()
+            let primary_key: Vec<String> = schema
+                .columns
+                .iter()
                 .filter(|c| c.primary_key)
                 .map(|c| c.name.clone())
                 .collect();
@@ -849,7 +883,11 @@ async fn build_schema_context_from_execute(
                 name: table_name,
                 description: None,
                 columns,
-                primary_key: if primary_key.is_empty() { None } else { Some(primary_key) },
+                primary_key: if primary_key.is_empty() {
+                    None
+                } else {
+                    Some(primary_key)
+                },
                 foreign_keys: None,
                 indexes: None,
                 sample_values: None,
@@ -954,7 +992,8 @@ fn extract_conditions_from_sql(sql: &str) -> Vec<String> {
     if let Some(where_pos) = sql.to_uppercase().find("WHERE") {
         let after = &sql[where_pos + 5..];
         // Find end (ORDER BY, GROUP BY, LIMIT, or end)
-        let end = after.to_uppercase()
+        let end = after
+            .to_uppercase()
             .find("ORDER BY")
             .or_else(|| after.to_uppercase().find("GROUP BY"))
             .or_else(|| after.to_uppercase().find("LIMIT"))
@@ -995,7 +1034,8 @@ fn extract_columns_from_sql(sql: &str) -> Vec<String> {
     if let Some(select_pos) = upper.find("SELECT") {
         if let Some(from_pos) = upper.find("FROM") {
             let columns_part = &sql[select_pos + 6..from_pos];
-            return columns_part.split(',')
+            return columns_part
+                .split(',')
                 .map(|c| c.trim().to_string())
                 .filter(|c| !c.is_empty())
                 .collect();
@@ -1025,9 +1065,7 @@ fn extract_order_by_from_sql(sql: &str) -> Option<String> {
     let upper = sql.to_uppercase();
     if let Some(pos) = upper.find("ORDER BY") {
         let after = &sql[pos + 8..];
-        let end = after.to_uppercase()
-            .find("LIMIT")
-            .unwrap_or(after.len());
+        let end = after.to_uppercase().find("LIMIT").unwrap_or(after.len());
         return Some(after[..end].trim().to_string());
     }
     None

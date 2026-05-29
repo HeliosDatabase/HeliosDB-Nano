@@ -4,8 +4,8 @@
 //! enabling the query executor to determine correct column types at compile time
 //! rather than defaulting everything to Text.
 
-use crate::{DataType, Schema, Column, Error, Result};
-use super::{LogicalExpr, BinaryOperator, UnaryOperator, AggregateFunction};
+use super::{AggregateFunction, BinaryOperator, LogicalExpr, UnaryOperator};
+use crate::{Column, DataType, Error, Result, Schema};
 
 /// Type inference trait for logical expressions
 pub trait TypeInference {
@@ -52,16 +52,13 @@ impl TypeInference for LogicalExpr {
     fn infer_type(&self, schema: &Schema) -> Result<DataType> {
         match self {
             // Column reference: look up in schema
-            LogicalExpr::Column { name, .. } => {
-                schema.get_column(name)
-                    .map(|col| col.data_type.clone())
-                    .ok_or_else(|| Error::type_conversion(format!("Column '{}' not found in schema", name)))
-            }
+            LogicalExpr::Column { name, .. } => schema
+                .get_column(name)
+                .map(|col| col.data_type.clone())
+                .ok_or_else(|| Error::type_conversion(format!("Column '{}' not found in schema", name))),
 
             // Literal: get type from value
-            LogicalExpr::Literal(value) => {
-                Ok(value.data_type())
-            }
+            LogicalExpr::Literal(value) => Ok(value.data_type()),
 
             // Binary expression: apply type coercion rules
             LogicalExpr::BinaryExpr { left, op, right } => {
@@ -96,7 +93,10 @@ impl TypeInference for LogicalExpr {
                     }
                     AggregateFunction::Min | AggregateFunction::Max => {
                         if args.is_empty() {
-                            return Err(Error::type_conversion(format!("{:?} requires at least one argument", fun)));
+                            return Err(Error::type_conversion(format!(
+                                "{:?} requires at least one argument",
+                                fun
+                            )));
                         }
                         // Preserve input type for MIN/MAX
                         args[0].infer_type(schema)
@@ -162,7 +162,9 @@ impl TypeInference for LogicalExpr {
             }
 
             // CASE expression: infer from THEN/ELSE branches
-            LogicalExpr::Case { when_then, else_result, .. } => {
+            LogicalExpr::Case {
+                when_then, else_result, ..
+            } => {
                 // Try to infer from first THEN branch
                 if let Some((_, then_expr)) = when_then.first() {
                     return then_expr.infer_type(schema);
@@ -176,76 +178,58 @@ impl TypeInference for LogicalExpr {
             }
 
             // CAST expression: use target type
-            LogicalExpr::Cast { data_type, .. } => {
-                Ok(data_type.clone())
-            }
+            LogicalExpr::Cast { data_type, .. } => Ok(data_type.clone()),
 
             // IS NULL / IS NOT NULL: always boolean
-            LogicalExpr::IsNull { .. } => {
-                Ok(DataType::Boolean)
-            }
+            LogicalExpr::IsNull { .. } => Ok(DataType::Boolean),
 
             // BETWEEN: always boolean
-            LogicalExpr::Between { .. } => {
-                Ok(DataType::Boolean)
-            }
+            LogicalExpr::Between { .. } => Ok(DataType::Boolean),
 
             // IN list: always boolean
-            LogicalExpr::InList { .. } => {
-                Ok(DataType::Boolean)
-            }
+            LogicalExpr::InList { .. } => Ok(DataType::Boolean),
 
             // IN set (HashSet-based): always boolean
-            LogicalExpr::InSet { .. } => {
-                Ok(DataType::Boolean)
-            }
+            LogicalExpr::InSet { .. } => Ok(DataType::Boolean),
 
             // IN subquery: always returns boolean
-            LogicalExpr::InSubquery { .. } => {
-                Ok(DataType::Boolean)
-            }
+            LogicalExpr::InSubquery { .. } => Ok(DataType::Boolean),
 
             // Scalar subquery: type is the first column of the subplan
-            LogicalExpr::ScalarSubquery { subquery } => {
-                subquery.schema().columns.first()
-                    .map(|c| c.data_type.clone())
-                    .ok_or_else(|| Error::type_conversion(
-                        "Scalar subquery returned no columns".to_string()
-                    ))
-            }
+            LogicalExpr::ScalarSubquery { subquery } => subquery
+                .schema()
+                .columns
+                .first()
+                .map(|c| c.data_type.clone())
+                .ok_or_else(|| Error::type_conversion("Scalar subquery returned no columns".to_string())),
 
             // DEFAULT marker — the real type is the target column's,
             // resolved by the INSERT executor at execute time.
             LogicalExpr::DefaultValue => Ok(DataType::Text),
 
             // EXISTS subquery: always returns boolean
-            LogicalExpr::Exists { .. } => {
-                Ok(DataType::Boolean)
-            }
+            LogicalExpr::Exists { .. } => Ok(DataType::Boolean),
 
             // Wildcard: cannot infer type
-            LogicalExpr::Wildcard => {
-                Err(Error::type_conversion("Cannot infer type for wildcard expression"))
-            }
+            LogicalExpr::Wildcard => Err(Error::type_conversion("Cannot infer type for wildcard expression")),
 
             // Parameter: cannot infer without parameter values
-            LogicalExpr::Parameter { index } => {
-                Err(Error::type_conversion(format!("Cannot infer type for parameter ${}", index)))
-            }
+            LogicalExpr::Parameter { index } => Err(Error::type_conversion(format!(
+                "Cannot infer type for parameter ${}",
+                index
+            ))),
 
             // NEW row: look up in schema (same as column reference)
-            LogicalExpr::NewRow { column } => {
-                schema.get_column(column)
-                    .map(|col| col.data_type.clone())
-                    .ok_or_else(|| Error::type_conversion(format!("Column '{}' not found in NEW row", column)))
-            }
+            LogicalExpr::NewRow { column } => schema
+                .get_column(column)
+                .map(|col| col.data_type.clone())
+                .ok_or_else(|| Error::type_conversion(format!("Column '{}' not found in NEW row", column))),
 
             // OLD row: look up in schema (same as column reference)
-            LogicalExpr::OldRow { column } => {
-                schema.get_column(column)
-                    .map(|col| col.data_type.clone())
-                    .ok_or_else(|| Error::type_conversion(format!("Column '{}' not found in OLD row", column)))
-            }
+            LogicalExpr::OldRow { column } => schema
+                .get_column(column)
+                .map(|col| col.data_type.clone())
+                .ok_or_else(|| Error::type_conversion(format!("Column '{}' not found in OLD row", column))),
 
             // Array subscript: arr[n] returns element type
             LogicalExpr::ArraySubscript { array, .. } => {
@@ -253,7 +237,7 @@ impl TypeInference for LogicalExpr {
                 match array_type {
                     DataType::Array(elem_type) => Ok(*elem_type),
                     _ => Err(Error::type_conversion(
-                        "Array subscript requires an array type".to_string()
+                        "Array subscript requires an array type".to_string(),
                     )),
                 }
             }
@@ -268,17 +252,16 @@ impl TypeInference for LogicalExpr {
             LogicalExpr::WindowFunction { fun, args, .. } => {
                 use super::logical_plan::WindowFunctionType;
                 match fun {
-                    WindowFunctionType::RowNumber |
-                    WindowFunctionType::Rank |
-                    WindowFunctionType::DenseRank |
-                    WindowFunctionType::Ntile => Ok(DataType::Int8),
-                    WindowFunctionType::PercentRank |
-                    WindowFunctionType::CumeDist => Ok(DataType::Float8),
-                    WindowFunctionType::Lag |
-                    WindowFunctionType::Lead |
-                    WindowFunctionType::FirstValue |
-                    WindowFunctionType::LastValue |
-                    WindowFunctionType::NthValue => {
+                    WindowFunctionType::RowNumber
+                    | WindowFunctionType::Rank
+                    | WindowFunctionType::DenseRank
+                    | WindowFunctionType::Ntile => Ok(DataType::Int8),
+                    WindowFunctionType::PercentRank | WindowFunctionType::CumeDist => Ok(DataType::Float8),
+                    WindowFunctionType::Lag
+                    | WindowFunctionType::Lead
+                    | WindowFunctionType::FirstValue
+                    | WindowFunctionType::LastValue
+                    | WindowFunctionType::NthValue => {
                         // Return type matches the argument type
                         if args.is_empty() {
                             Ok(DataType::Text) // Fallback
@@ -298,8 +281,7 @@ impl TypeInference for LogicalExpr {
                                 }
                             }
                             crate::sql::AggregateFunction::Avg => Ok(DataType::Float8),
-                            crate::sql::AggregateFunction::Min |
-                            crate::sql::AggregateFunction::Max => {
+                            crate::sql::AggregateFunction::Min | crate::sql::AggregateFunction::Max => {
                                 if args.is_empty() {
                                     Ok(DataType::Float8)
                                 } else {
@@ -327,9 +309,7 @@ impl TypeInference for LogicalExpr {
         match self {
             // Column: check schema for nullability
             LogicalExpr::Column { name, .. } => {
-                schema.get_column(name)
-                    .map(|col| col.nullable)
-                    .unwrap_or(true) // Default to nullable if not found
+                schema.get_column(name).map(|col| col.nullable).unwrap_or(true) // Default to nullable if not found
             }
 
             // Literal: only NULL is nullable
@@ -338,14 +318,10 @@ impl TypeInference for LogicalExpr {
             }
 
             // Binary expressions: nullable if either operand is nullable
-            LogicalExpr::BinaryExpr { left, right, .. } => {
-                left.infer_nullable(schema) || right.infer_nullable(schema)
-            }
+            LogicalExpr::BinaryExpr { left, right, .. } => left.infer_nullable(schema) || right.infer_nullable(schema),
 
             // Unary expressions: preserve operand nullability
-            LogicalExpr::UnaryExpr { expr, .. } => {
-                expr.infer_nullable(schema)
-            }
+            LogicalExpr::UnaryExpr { expr, .. } => expr.infer_nullable(schema),
 
             // Aggregate functions: generally nullable except COUNT(*)
             LogicalExpr::AggregateFunction { fun, args, .. } => {
@@ -359,27 +335,29 @@ impl TypeInference for LogicalExpr {
                         }
                     }
                     // Other aggregates can return NULL if no rows match
-                    AggregateFunction::Sum | AggregateFunction::Avg |
-                    AggregateFunction::Min | AggregateFunction::Max |
-                    AggregateFunction::JsonAgg |
-                    AggregateFunction::ArrayAgg |
-                    AggregateFunction::StringAgg { .. } => true,
+                    AggregateFunction::Sum
+                    | AggregateFunction::Avg
+                    | AggregateFunction::Min
+                    | AggregateFunction::Max
+                    | AggregateFunction::JsonAgg
+                    | AggregateFunction::ArrayAgg
+                    | AggregateFunction::StringAgg { .. } => true,
                 }
             }
 
             // Scalar functions: generally nullable if any arg is nullable
-            LogicalExpr::ScalarFunction { args, .. } => {
-                args.iter().any(|arg| arg.infer_nullable(schema))
-            }
+            LogicalExpr::ScalarFunction { args, .. } => args.iter().any(|arg| arg.infer_nullable(schema)),
 
             // CASE: nullable if any branch is nullable
-            LogicalExpr::Case { when_then, else_result, .. } => {
+            LogicalExpr::Case {
+                when_then, else_result, ..
+            } => {
                 // Check all THEN branches
-                let any_then_nullable = when_then.iter()
-                    .any(|(_, then_expr)| then_expr.infer_nullable(schema));
+                let any_then_nullable = when_then.iter().any(|(_, then_expr)| then_expr.infer_nullable(schema));
 
                 // Check ELSE branch
-                let else_nullable = else_result.as_ref()
+                let else_nullable = else_result
+                    .as_ref()
                     .map(|expr| expr.infer_nullable(schema))
                     .unwrap_or(true); // No ELSE means implicit NULL
 
@@ -387,9 +365,7 @@ impl TypeInference for LogicalExpr {
             }
 
             // CAST: preserve source nullability
-            LogicalExpr::Cast { expr, .. } => {
-                expr.infer_nullable(schema)
-            }
+            LogicalExpr::Cast { expr, .. } => expr.infer_nullable(schema),
 
             // IS NULL/IS NOT NULL: never nullable (always returns boolean)
             LogicalExpr::IsNull { .. } => false,
@@ -423,16 +399,14 @@ impl TypeInference for LogicalExpr {
 
             // NEW row: check schema for nullability (same as column)
             LogicalExpr::NewRow { column } => {
-                schema.get_column(column)
-                    .map(|col| col.nullable)
-                    .unwrap_or(true) // Default to nullable if not found
+                schema.get_column(column).map(|col| col.nullable).unwrap_or(true)
+                // Default to nullable if not found
             }
 
             // OLD row: check schema for nullability (same as column)
             LogicalExpr::OldRow { column } => {
-                schema.get_column(column)
-                    .map(|col| col.nullable)
-                    .unwrap_or(true) // Default to nullable if not found
+                schema.get_column(column).map(|col| col.nullable).unwrap_or(true)
+                // Default to nullable if not found
             }
 
             // Array subscript: arr[n] is nullable (could be out of bounds or null input)
@@ -447,13 +421,12 @@ impl TypeInference for LogicalExpr {
                 use super::logical_plan::WindowFunctionType;
                 match fun {
                     // Ranking functions are never null
-                    WindowFunctionType::RowNumber |
-                    WindowFunctionType::Rank |
-                    WindowFunctionType::DenseRank |
-                    WindowFunctionType::Ntile => false,
+                    WindowFunctionType::RowNumber
+                    | WindowFunctionType::Rank
+                    | WindowFunctionType::DenseRank
+                    | WindowFunctionType::Ntile => false,
                     // Statistical functions are never null
-                    WindowFunctionType::PercentRank |
-                    WindowFunctionType::CumeDist => false,
+                    WindowFunctionType::PercentRank | WindowFunctionType::CumeDist => false,
                     // Offset and value functions can return null
                     _ => true,
                 }
@@ -462,8 +435,7 @@ impl TypeInference for LogicalExpr {
     }
 
     fn to_column(&self, name: String, schema: &Schema) -> Column {
-        let data_type = self.infer_type(schema)
-            .unwrap_or(DataType::Text); // Fallback to Text if inference fails
+        let data_type = self.infer_type(schema).unwrap_or(DataType::Text); // Fallback to Text if inference fails
         let nullable = self.infer_nullable(schema);
 
         Column {
@@ -633,17 +605,18 @@ fn coerce_numeric_types(left: DataType, right: DataType) -> Result<DataType> {
         (Text, n) | (n, Text) if is_numeric(&n) => Ok(n),
 
         // Non-numeric types in arithmetic
-        (l, r) => Err(Error::type_conversion(
-            format!("Cannot perform arithmetic on types {:?} and {:?}", l, r)
-        ))
+        (l, r) => Err(Error::type_conversion(format!(
+            "Cannot perform arithmetic on types {:?} and {:?}",
+            l, r
+        ))),
     }
 }
 
 /// Check if a type is numeric
 fn is_numeric(data_type: &DataType) -> bool {
-    matches!(data_type,
-        DataType::Int2 | DataType::Int4 | DataType::Int8 |
-        DataType::Float4 | DataType::Float8 | DataType::Numeric
+    matches!(
+        data_type,
+        DataType::Int2 | DataType::Int4 | DataType::Int8 | DataType::Float4 | DataType::Float8 | DataType::Numeric
     )
 }
 
@@ -667,7 +640,10 @@ mod tests {
     #[test]
     fn test_column_type_inference() {
         let schema = test_schema();
-        let expr = LogicalExpr::Column { table: None, name: "price".to_string()  };
+        let expr = LogicalExpr::Column {
+            table: None,
+            name: "price".to_string(),
+        };
         assert_eq!(expr.infer_type(&schema).unwrap(), DataType::Float8);
     }
 
@@ -683,7 +659,10 @@ mod tests {
         let schema = test_schema();
         let expr = LogicalExpr::AggregateFunction {
             fun: AggregateFunction::Count,
-            args: vec![LogicalExpr::Column { table: None, name: "id".to_string()  }],
+            args: vec![LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            }],
             distinct: false,
         };
         assert_eq!(expr.infer_type(&schema).unwrap(), DataType::Int8);
@@ -694,7 +673,10 @@ mod tests {
         let schema = test_schema();
         let expr = LogicalExpr::AggregateFunction {
             fun: AggregateFunction::Sum,
-            args: vec![LogicalExpr::Column { table: None, name: "price".to_string()  }],
+            args: vec![LogicalExpr::Column {
+                table: None,
+                name: "price".to_string(),
+            }],
             distinct: false,
         };
         assert_eq!(expr.infer_type(&schema).unwrap(), DataType::Float8);
@@ -705,7 +687,10 @@ mod tests {
         let schema = test_schema();
         let expr = LogicalExpr::AggregateFunction {
             fun: AggregateFunction::Avg,
-            args: vec![LogicalExpr::Column { table: None, name: "quantity".to_string()  }],
+            args: vec![LogicalExpr::Column {
+                table: None,
+                name: "quantity".to_string(),
+            }],
             distinct: false,
         };
         assert_eq!(expr.infer_type(&schema).unwrap(), DataType::Float8);
@@ -716,9 +701,15 @@ mod tests {
         let schema = test_schema();
         // Int4 + Float8 = Float8
         let expr = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "id".to_string()  }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            }),
             op: BinaryOperator::Plus,
-            right: Box::new(LogicalExpr::Column { table: None, name: "price".to_string()  }),
+            right: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "price".to_string(),
+            }),
         };
         assert_eq!(expr.infer_type(&schema).unwrap(), DataType::Float8);
     }
@@ -727,7 +718,10 @@ mod tests {
     fn test_comparison_returns_boolean() {
         let schema = test_schema();
         let expr = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "price".to_string()  }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "price".to_string(),
+            }),
             op: BinaryOperator::Gt,
             right: Box::new(LogicalExpr::Literal(Value::Float8(100.0))),
         };
@@ -738,7 +732,10 @@ mod tests {
     fn test_cast_expression() {
         let schema = test_schema();
         let expr = LogicalExpr::Cast {
-            expr: Box::new(LogicalExpr::Column { table: None, name: "id".to_string()  }),
+            expr: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            }),
             data_type: DataType::Text,
         };
         assert_eq!(expr.infer_type(&schema).unwrap(), DataType::Text);
@@ -748,7 +745,10 @@ mod tests {
     fn test_is_null_returns_boolean() {
         let schema = test_schema();
         let expr = LogicalExpr::IsNull {
-            expr: Box::new(LogicalExpr::Column { table: None, name: "name".to_string()  }),
+            expr: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "name".to_string(),
+            }),
             is_null: true,
         };
         assert_eq!(expr.infer_type(&schema).unwrap(), DataType::Boolean);
@@ -758,9 +758,15 @@ mod tests {
     fn test_vector_distance_returns_float() {
         let schema = test_schema();
         let expr = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "embedding".to_string()  }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "embedding".to_string(),
+            }),
             op: BinaryOperator::VectorL2Distance,
-            right: Box::new(LogicalExpr::Column { table: None, name: "embedding".to_string()  }),
+            right: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "embedding".to_string(),
+            }),
         };
         assert_eq!(expr.infer_type(&schema).unwrap(), DataType::Float8);
     }
@@ -768,7 +774,10 @@ mod tests {
     #[test]
     fn test_unknown_column_error() {
         let schema = test_schema();
-        let expr = LogicalExpr::Column { table: None, name: "nonexistent".to_string()  };
+        let expr = LogicalExpr::Column {
+            table: None,
+            name: "nonexistent".to_string(),
+        };
         assert!(expr.infer_type(&schema).is_err());
     }
 
@@ -777,7 +786,10 @@ mod tests {
     #[test]
     fn test_nullable_column() {
         let schema = test_schema();
-        let expr = LogicalExpr::Column { table: None, name: "name".to_string()  };
+        let expr = LogicalExpr::Column {
+            table: None,
+            name: "name".to_string(),
+        };
         assert!(expr.infer_nullable(&schema)); // name is nullable
     }
 
@@ -800,7 +812,10 @@ mod tests {
         let schema = test_schema();
         // nullable + non-nullable = nullable
         let expr = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "name".to_string()  }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "name".to_string(),
+            }),
             op: BinaryOperator::Plus,
             right: Box::new(LogicalExpr::Literal(Value::Int4(1))),
         };
@@ -825,7 +840,10 @@ mod tests {
         // COUNT(col) can return NULL if no rows
         let expr = LogicalExpr::AggregateFunction {
             fun: AggregateFunction::Count,
-            args: vec![LogicalExpr::Column { table: None, name: "id".to_string()  }],
+            args: vec![LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            }],
             distinct: false,
         };
         assert!(expr.infer_nullable(&schema));
@@ -836,7 +854,10 @@ mod tests {
         let schema = test_schema();
         let expr = LogicalExpr::AggregateFunction {
             fun: AggregateFunction::Sum,
-            args: vec![LogicalExpr::Column { table: None, name: "price".to_string()  }],
+            args: vec![LogicalExpr::Column {
+                table: None,
+                name: "price".to_string(),
+            }],
             distinct: false,
         };
         assert!(expr.infer_nullable(&schema)); // SUM returns NULL for empty set
@@ -846,7 +867,10 @@ mod tests {
     fn test_is_null_not_nullable() {
         let schema = test_schema();
         let expr = LogicalExpr::IsNull {
-            expr: Box::new(LogicalExpr::Column { table: None, name: "name".to_string()  }),
+            expr: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "name".to_string(),
+            }),
             is_null: true,
         };
         assert!(!expr.infer_nullable(&schema)); // IS NULL always returns boolean
@@ -884,7 +908,10 @@ mod tests {
     fn test_cast_preserves_nullability() {
         let schema = test_schema();
         let expr = LogicalExpr::Cast {
-            expr: Box::new(LogicalExpr::Column { table: None, name: "name".to_string()  }),
+            expr: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "name".to_string(),
+            }),
             data_type: DataType::Int4,
         };
         assert!(expr.infer_nullable(&schema)); // Cast preserves nullability
@@ -907,7 +934,10 @@ mod tests {
     #[test]
     fn test_to_column_from_nullable_column() {
         let schema = test_schema();
-        let expr = LogicalExpr::Column { table: None, name: "name".to_string()  };
+        let expr = LogicalExpr::Column {
+            table: None,
+            name: "name".to_string(),
+        };
         let col = expr.to_column("result".to_string(), &schema);
 
         assert_eq!(col.name, "result");
@@ -920,7 +950,10 @@ mod tests {
         let schema = test_schema();
         let expr = LogicalExpr::AggregateFunction {
             fun: AggregateFunction::Avg,
-            args: vec![LogicalExpr::Column { table: None, name: "price".to_string()  }],
+            args: vec![LogicalExpr::Column {
+                table: None,
+                name: "price".to_string(),
+            }],
             distinct: false,
         };
         let col = expr.to_column("avg_price".to_string(), &schema);
@@ -935,9 +968,15 @@ mod tests {
         let schema = test_schema();
         // price * quantity (Float8 * Int8 = Float8)
         let expr = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "price".to_string()  }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "price".to_string(),
+            }),
             op: BinaryOperator::Multiply,
-            right: Box::new(LogicalExpr::Column { table: None, name: "quantity".to_string()  }),
+            right: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "quantity".to_string(),
+            }),
         };
         let col = expr.to_column("total".to_string(), &schema);
 
@@ -953,10 +992,16 @@ mod tests {
         let schema = test_schema();
         // id + (price * 2.0) -> Int4 + Float8 = Float8
         let expr = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "id".to_string()  }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            }),
             op: BinaryOperator::Plus,
             right: Box::new(LogicalExpr::BinaryExpr {
-                left: Box::new(LogicalExpr::Column { table: None, name: "price".to_string()  }),
+                left: Box::new(LogicalExpr::Column {
+                    table: None,
+                    name: "price".to_string(),
+                }),
                 op: BinaryOperator::Multiply,
                 right: Box::new(LogicalExpr::Literal(Value::Float8(2.0))),
             }),
@@ -969,7 +1014,10 @@ mod tests {
         let schema = test_schema();
         let expr = LogicalExpr::ScalarFunction {
             fun: "length".to_string(),
-            args: vec![LogicalExpr::Column { table: None, name: "name".to_string()  }],
+            args: vec![LogicalExpr::Column {
+                table: None,
+                name: "name".to_string(),
+            }],
         };
         assert_eq!(expr.infer_type(&schema).unwrap(), DataType::Int8);
         assert!(expr.infer_nullable(&schema)); // Function arg is nullable
@@ -981,7 +1029,10 @@ mod tests {
         let expr = LogicalExpr::ScalarFunction {
             fun: "concat".to_string(),
             args: vec![
-                LogicalExpr::Column { table: None, name: "name".to_string()  },
+                LogicalExpr::Column {
+                    table: None,
+                    name: "name".to_string(),
+                },
                 LogicalExpr::Literal(Value::String(" suffix".to_string())),
             ],
         };
@@ -1004,7 +1055,10 @@ mod tests {
         // SUM(quantity)
         let sum_expr = LogicalExpr::AggregateFunction {
             fun: AggregateFunction::Sum,
-            args: vec![LogicalExpr::Column { table: None, name: "quantity".to_string()  }],
+            args: vec![LogicalExpr::Column {
+                table: None,
+                name: "quantity".to_string(),
+            }],
             distinct: false,
         };
         assert_eq!(sum_expr.infer_type(&schema).unwrap(), DataType::Int8);
@@ -1013,7 +1067,10 @@ mod tests {
         // AVG(price)
         let avg_expr = LogicalExpr::AggregateFunction {
             fun: AggregateFunction::Avg,
-            args: vec![LogicalExpr::Column { table: None, name: "price".to_string()  }],
+            args: vec![LogicalExpr::Column {
+                table: None,
+                name: "price".to_string(),
+            }],
             distinct: false,
         };
         assert_eq!(avg_expr.infer_type(&schema).unwrap(), DataType::Float8);
@@ -1028,7 +1085,10 @@ mod tests {
 
         // -> returns JSONB
         let json_get = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "metadata".to_string()  }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "metadata".to_string(),
+            }),
             op: BinaryOperator::JsonGet,
             right: Box::new(LogicalExpr::Literal(Value::String("key".to_string()))),
         };
@@ -1036,7 +1096,10 @@ mod tests {
 
         // ->> returns TEXT
         let json_get_text = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "metadata".to_string()  }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "metadata".to_string(),
+            }),
             op: BinaryOperator::JsonGetText,
             right: Box::new(LogicalExpr::Literal(Value::String("key".to_string()))),
         };
@@ -1044,7 +1107,10 @@ mod tests {
 
         // @> returns BOOLEAN
         let json_contains = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "metadata".to_string()  }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "metadata".to_string(),
+            }),
             op: BinaryOperator::JsonContains,
             right: Box::new(LogicalExpr::Literal(Value::Json("{}".to_string()))),
         };

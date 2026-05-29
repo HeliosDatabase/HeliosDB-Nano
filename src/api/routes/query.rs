@@ -2,15 +2,9 @@
 //!
 //! Provides REST endpoints for executing SQL queries and statements.
 
-use axum::{
-    Router,
-    routing::post,
-};
+use axum::{routing::post, Router};
 
-use crate::api::{
-    handlers::query_handler,
-    server::AppState,
-};
+use crate::api::{handlers::query_handler, server::AppState};
 
 /// Create query execution routes
 ///
@@ -91,7 +85,13 @@ mod tests {
     fn test_routes_creation() {
         let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
         let query_registry = Arc::new(crate::compute::QueryRegistry::new());
-        let state = AppState { db, query_registry, auth_bridge: None, oauth_registry: None, change_notifier: None };
+        let state = AppState {
+            db,
+            query_registry,
+            auth_bridge: None,
+            oauth_registry: None,
+            change_notifier: None,
+        };
         let router: axum::Router<()> = routes().with_state(state);
         // Router created successfully
         drop(router);

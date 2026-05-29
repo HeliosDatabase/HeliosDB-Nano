@@ -4,8 +4,8 @@
 
 #![allow(elided_lifetimes_in_paths)]
 
-use crate::{Result, Error, Tuple, Schema};
-use super::{PhysicalOperator, TimeoutContext, Executor};
+use super::{Executor, PhysicalOperator, TimeoutContext};
+use crate::{Error, Result, Schema, Tuple};
 use std::sync::Arc;
 
 /// Nested loop join operator
@@ -26,10 +26,10 @@ pub struct NestedLoopJoinOperator {
     // Outer join state
     left_column_count: usize,
     right_column_count: usize,
-    left_matched: bool,  // Did current left tuple match any right tuple?
-    right_matched: Vec<bool>,  // Which right tuples have been matched?
-    emitting_unmatched_right: bool,  // Are we emitting unmatched right tuples?
-    unmatched_right_index: usize,  // Index into right_tuples for unmatched emission
+    left_matched: bool,             // Did current left tuple match any right tuple?
+    right_matched: Vec<bool>,       // Which right tuples have been matched?
+    emitting_unmatched_right: bool, // Are we emitting unmatched right tuples?
+    unmatched_right_index: usize,   // Index into right_tuples for unmatched emission
 }
 
 impl NestedLoopJoinOperator {
@@ -129,12 +129,16 @@ impl PhysicalOperator for NestedLoopJoinOperator {
             // Try to find a matching right tuple
             while self.right_index < self.right_tuples.len() {
                 let right_idx = self.right_index;
-                let right_tuple = self.right_tuples.get(right_idx)
+                let right_tuple = self
+                    .right_tuples
+                    .get(right_idx)
                     .ok_or_else(|| Error::query_execution("Right tuple index out of bounds"))?;
                 self.right_index += 1;
 
                 // Combine left and right tuples
-                let left_tuple = self.left_tuple.as_ref()
+                let left_tuple = self
+                    .left_tuple
+                    .as_ref()
                     .ok_or_else(|| Error::query_execution("Left tuple unexpectedly None"))?;
                 let mut combined_values = left_tuple.values.clone();
                 combined_values.extend(right_tuple.values.clone());
@@ -167,7 +171,9 @@ impl PhysicalOperator for NestedLoopJoinOperator {
             // No more right tuples for this left tuple
             // For LEFT/FULL joins, emit unmatched left tuple with NULLs
             if !self.left_matched && matches!(self.join_type, JoinType::Left | JoinType::Full) {
-                let left_tuple = self.left_tuple.as_ref()
+                let left_tuple = self
+                    .left_tuple
+                    .as_ref()
                     .ok_or_else(|| Error::query_execution("Left tuple unexpectedly None"))?;
                 let result = self.join_with_nulls_right(left_tuple);
                 self.left_tuple = None;
@@ -192,7 +198,9 @@ impl NestedLoopJoinOperator {
             self.unmatched_right_index += 1;
 
             if !self.right_matched.get(idx).copied().unwrap_or(false) {
-                let right_tuple = self.right_tuples.get(idx)
+                let right_tuple = self
+                    .right_tuples
+                    .get(idx)
                     .ok_or_else(|| Error::query_execution("Right tuple index out of bounds"))?;
                 return Ok(Some(self.join_with_nulls_left(right_tuple)));
             }
@@ -282,7 +290,10 @@ impl PartialEq for JoinKey {
         if self.0.len() != other.0.len() {
             return false;
         }
-        self.0.iter().zip(other.0.iter()).all(|(a, b)| values_equal_for_join(a, b))
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .all(|(a, b)| values_equal_for_join(a, b))
     }
 }
 impl Eq for JoinKey {}
@@ -348,13 +359,20 @@ impl HashJoinOperator {
         on_condition: Option<crate::sql::LogicalExpr>,
         timeout_ctx: Option<TimeoutContext>,
     ) -> Result<Self> {
-        Self::with_memory_limit(left, right, join_type, on_condition, Self::DEFAULT_MEMORY_LIMIT, timeout_ctx)
+        Self::with_memory_limit(
+            left,
+            right,
+            join_type,
+            on_condition,
+            Self::DEFAULT_MEMORY_LIMIT,
+            timeout_ctx,
+        )
     }
 
     /// Create a new hash join operator with custom memory limit
     fn with_memory_limit(
         left: Box<dyn PhysicalOperator>,
-        mut right: Box<dyn PhysicalOperator>,  // Must be mutable to consume in build_phase
+        mut right: Box<dyn PhysicalOperator>, // Must be mutable to consume in build_phase
         join_type: crate::sql::JoinType,
         on_condition: Option<crate::sql::LogicalExpr>,
         memory_limit: usize,
@@ -450,19 +468,14 @@ impl HashJoinOperator {
 
             // Check memory limit
             if self.memory_used + additional_memory > self.memory_limit {
-                return Err(Error::query_execution(
-                    format!(
-                        "Hash join exceeds memory limit ({} bytes). Consider using nested loop join or increasing limit.",
-                        self.memory_limit
-                    )
-                ));
+                return Err(Error::query_execution(format!(
+                    "Hash join exceeds memory limit ({} bytes). Consider using nested loop join or increasing limit.",
+                    self.memory_limit
+                )));
             }
 
             // Insert into hash table (with overflow chaining)
-            self.hash_table
-                .entry(key)
-                .or_insert_with(Vec::new)
-                .push(tuple);
+            self.hash_table.entry(key).or_insert_with(Vec::new).push(tuple);
 
             self.memory_used += additional_memory;
         }
@@ -501,10 +514,14 @@ impl HashJoinOperator {
         tuple: &Tuple,
         is_right_side: bool,
     ) -> Result<Vec<crate::Value>> {
-        use crate::sql::{LogicalExpr, BinaryOperator};
+        use crate::sql::{BinaryOperator, LogicalExpr};
 
         // Use the appropriate evaluator based on which side's tuple we're evaluating
-        let evaluator = if is_right_side { &self.right_evaluator } else { &self.left_evaluator };
+        let evaluator = if is_right_side {
+            &self.right_evaluator
+        } else {
+            &self.left_evaluator
+        };
 
         match condition {
             LogicalExpr::BinaryExpr { left, op, right } => {
@@ -553,11 +570,15 @@ impl HashJoinOperator {
 
             // If we have pending matches for current left tuple, emit them
             if self.match_index < self.current_matches.len() {
-                let right_tuple = self.current_matches.get(self.match_index)
+                let right_tuple = self
+                    .current_matches
+                    .get(self.match_index)
                     .ok_or_else(|| Error::query_execution("Match index out of bounds"))?;
                 self.match_index += 1;
 
-                let left_tuple = self.current_left_tuple.as_ref()
+                let left_tuple = self
+                    .current_left_tuple
+                    .as_ref()
                     .ok_or_else(|| Error::query_execution("Missing left tuple"))?;
 
                 return Ok(Some(Self::join_tuples(left_tuple, right_tuple)));
@@ -581,7 +602,8 @@ impl HashJoinOperator {
                     let key_opt = self.extract_join_key(&left_tuple, false)?;
                     tracing::debug!(
                         "HashJoin probe: left_tuple = {:?}, extracted key = {:?}",
-                        left_tuple.values, key_opt
+                        left_tuple.values,
+                        key_opt
                     );
 
                     // If join key contains NULL, this tuple will never match
@@ -605,10 +627,10 @@ impl HashJoinOperator {
                         let filtered_matches: Vec<Tuple> = if is_equi {
                             matches.clone()
                         } else {
-                            matches.iter()
+                            matches
+                                .iter()
                                 .filter(|right_tuple| {
-                                    self.evaluate_join_condition(&left_tuple, right_tuple)
-                                        .unwrap_or(false)
+                                    self.evaluate_join_condition(&left_tuple, right_tuple).unwrap_or(false)
                                 })
                                 .cloned()
                                 .collect()
@@ -682,7 +704,8 @@ impl HashJoinOperator {
         // Initialize iterator if not already done
         if self.unmatched_right_iter.is_none() {
             // Collect unmatched right tuples
-            let unmatched: Vec<_> = self.hash_table
+            let unmatched: Vec<_> = self
+                .hash_table
                 .iter()
                 .filter(|(key, _)| !self.matched_right_keys.contains(key))
                 .map(|(key, tuples)| (key.clone(), tuples.clone()))
@@ -738,9 +761,7 @@ impl HashJoinOperator {
     /// Estimate memory size of a tuple
     fn estimate_tuple_size(tuple: &Tuple) -> usize {
         let base = 24; // Vec overhead
-        let values_size: usize = tuple.values.iter()
-            .map(|v| Self::estimate_value_size(v))
-            .sum();
+        let values_size: usize = tuple.values.iter().map(|v| Self::estimate_value_size(v)).sum();
         base + values_size
     }
 
@@ -858,11 +879,7 @@ pub(super) fn handle_join(
 
                 // Apply residual filter on top if present
                 if let Some(residual) = residual_part {
-                    join_op = Box::new(super::filter::FilterOperator::new(
-                        join_op,
-                        residual,
-                        vec![],
-                    ));
+                    join_op = Box::new(super::filter::FilterOperator::new(join_op, residual, vec![]));
                 }
 
                 Ok(join_op)
@@ -949,13 +966,16 @@ fn try_index_nested_loop_join(
     // Build output schema (left + right)
     let mut output_columns = left_schema.columns.clone();
     output_columns.extend(right_schema.columns.clone());
-    let output_schema = Arc::new(Schema { columns: output_columns });
+    let output_schema = Arc::new(Schema {
+        columns: output_columns,
+    });
 
     let right_col_count = right_schema.columns.len();
     let is_left_join = matches!(join_type, crate::sql::JoinType::Left);
 
     // Phase 3: Execute INLJ (immutable borrow of executor/storage again)
-    let storage = executor.storage()
+    let storage = executor
+        .storage()
         .ok_or_else(|| Error::query_execution("Storage unavailable for INLJ"))?;
 
     let mut result_tuples = Vec::new();
@@ -968,7 +988,11 @@ fn try_index_nested_loop_join(
                 if is_left_join {
                     let mut combined_values = left_tuple.values.clone();
                     combined_values.resize(combined_values.len() + right_col_count, crate::Value::Null);
-                    result_tuples.push(Tuple { values: combined_values, row_id: None, branch_id: None });
+                    result_tuples.push(Tuple {
+                        values: combined_values,
+                        row_id: None,
+                        branch_id: None,
+                    });
                 }
                 continue;
             }
@@ -984,7 +1008,11 @@ fn try_index_nested_loop_join(
             if is_left_join {
                 let mut combined_values = left_tuple.values.clone();
                 combined_values.resize(combined_values.len() + right_col_count, crate::Value::Null);
-                result_tuples.push(Tuple { values: combined_values, row_id: None, branch_id: None });
+                result_tuples.push(Tuple {
+                    values: combined_values,
+                    row_id: None,
+                    branch_id: None,
+                });
             }
             continue;
         }
@@ -995,20 +1023,30 @@ fn try_index_nested_loop_join(
                 let mut combined_values = Vec::with_capacity(left_tuple.values.len() + right_tuple.values.len());
                 combined_values.extend_from_slice(&left_tuple.values);
                 combined_values.extend_from_slice(&right_tuple.values);
-                result_tuples.push(Tuple { values: combined_values, row_id: None, branch_id: None });
+                result_tuples.push(Tuple {
+                    values: combined_values,
+                    row_id: None,
+                    branch_id: None,
+                });
             }
         }
     }
 
-    Ok(Some(Box::new(super::MaterializedOperator::new(result_tuples, output_schema))))
+    Ok(Some(Box::new(super::MaterializedOperator::new(
+        result_tuples,
+        output_schema,
+    ))))
 }
 
 /// Extract table name, alias, and schema from a Scan or Filter(Scan) plan node
 fn extract_scan_info(plan: &crate::sql::LogicalPlan) -> Option<(String, Option<String>, Arc<Schema>)> {
     match plan {
-        crate::sql::LogicalPlan::Scan { table_name, alias, schema, .. } => {
-            Some((table_name.clone(), alias.clone(), schema.clone()))
-        }
+        crate::sql::LogicalPlan::Scan {
+            table_name,
+            alias,
+            schema,
+            ..
+        } => Some((table_name.clone(), alias.clone(), schema.clone())),
         crate::sql::LogicalPlan::Filter { input, .. } => extract_scan_info(input),
         crate::sql::LogicalPlan::Project { input, .. } => extract_scan_info(input),
         _ => None,
@@ -1017,22 +1055,28 @@ fn extract_scan_info(plan: &crate::sql::LogicalPlan) -> Option<(String, Option<S
 
 /// Extract column pair from a simple equi-join condition: col1 = col2
 /// Returns (table_option, column_name) for each side
-fn extract_equi_columns(condition: &crate::sql::LogicalExpr) -> Option<((Option<String>, String), (Option<String>, String))> {
-    use crate::sql::{LogicalExpr, BinaryOperator};
+fn extract_equi_columns(
+    condition: &crate::sql::LogicalExpr,
+) -> Option<((Option<String>, String), (Option<String>, String))> {
+    use crate::sql::{BinaryOperator, LogicalExpr};
 
     match condition {
-        LogicalExpr::BinaryExpr { left, op: BinaryOperator::Eq, right } => {
-            match (left.as_ref(), right.as_ref()) {
-                (LogicalExpr::Column { table: lt, name: ln }, LogicalExpr::Column { table: rt, name: rn }) => {
-                    Some(((lt.clone(), ln.clone()), (rt.clone(), rn.clone())))
-                }
-                _ => None,
+        LogicalExpr::BinaryExpr {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => match (left.as_ref(), right.as_ref()) {
+            (LogicalExpr::Column { table: lt, name: ln }, LogicalExpr::Column { table: rt, name: rn }) => {
+                Some(((lt.clone(), ln.clone()), (rt.clone(), rn.clone())))
             }
-        }
+            _ => None,
+        },
         // For compound AND conditions, try the first equality
-        LogicalExpr::BinaryExpr { left, op: BinaryOperator::And, .. } => {
-            extract_equi_columns(left)
-        }
+        LogicalExpr::BinaryExpr {
+            left,
+            op: BinaryOperator::And,
+            ..
+        } => extract_equi_columns(left),
         _ => None,
     }
 }
@@ -1087,14 +1131,18 @@ fn split_join_condition(
 /// Check if a join condition is purely equi-join (only equality + AND).
 /// Used internally by HashJoinOperator to skip redundant condition re-evaluation.
 fn is_pure_equi_join(condition: &Option<crate::sql::LogicalExpr>) -> bool {
-    use crate::sql::{LogicalExpr, BinaryOperator};
+    use crate::sql::{BinaryOperator, LogicalExpr};
 
     fn check(expr: &LogicalExpr) -> bool {
         match expr {
-            LogicalExpr::BinaryExpr { op: BinaryOperator::Eq, .. } => true,
-            LogicalExpr::BinaryExpr { left, op: BinaryOperator::And, right } => {
-                check(left) && check(right)
-            }
+            LogicalExpr::BinaryExpr {
+                op: BinaryOperator::Eq, ..
+            } => true,
+            LogicalExpr::BinaryExpr {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => check(left) && check(right),
             _ => false,
         }
     }
@@ -1111,14 +1159,20 @@ fn collect_and_terms(
     equi: &mut Vec<crate::sql::LogicalExpr>,
     residual: &mut Vec<crate::sql::LogicalExpr>,
 ) {
-    use crate::sql::{LogicalExpr, BinaryOperator};
+    use crate::sql::{BinaryOperator, LogicalExpr};
 
     match expr {
-        LogicalExpr::BinaryExpr { left, op: BinaryOperator::And, right } => {
+        LogicalExpr::BinaryExpr {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
             collect_and_terms(left, equi, residual);
             collect_and_terms(right, equi, residual);
         }
-        LogicalExpr::BinaryExpr { op: BinaryOperator::Eq, .. } => {
+        LogicalExpr::BinaryExpr {
+            op: BinaryOperator::Eq, ..
+        } => {
             equi.push(expr.clone());
         }
         _ => {
@@ -1129,13 +1183,11 @@ fn collect_and_terms(
 
 /// Combine a list of predicates with AND
 fn combine_with_and(parts: Vec<crate::sql::LogicalExpr>) -> Option<crate::sql::LogicalExpr> {
-    use crate::sql::{LogicalExpr, BinaryOperator};
+    use crate::sql::{BinaryOperator, LogicalExpr};
 
-    parts.into_iter().reduce(|left, right| {
-        LogicalExpr::BinaryExpr {
-            left: Box::new(left),
-            op: BinaryOperator::And,
-            right: Box::new(right),
-        }
+    parts.into_iter().reduce(|left, right| LogicalExpr::BinaryExpr {
+        left: Box::new(left),
+        op: BinaryOperator::And,
+        right: Box::new(right),
     })
 }

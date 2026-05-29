@@ -85,11 +85,7 @@ fn translate_backslash_escapes(sql: &str) -> String {
 
 /// Process the interior of a string literal (single or double-quoted).
 /// Handles backslash escapes and outputs content between the open/close quotes.
-fn process_string_interior(
-    out: &mut String,
-    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
-    quote_char: char,
-) {
+fn process_string_interior(out: &mut String, chars: &mut std::iter::Peekable<std::str::Chars<'_>>, quote_char: char) {
     loop {
         match chars.next() {
             Some('\\') => {
@@ -217,7 +213,7 @@ fn translate_backticks(sql: &str) -> String {
             // Double-quoted identifiers cause "table not found" because the PG parser
             // treats them as case-sensitive quoted identifiers that don't match the
             // stored (unquoted) table names.
-            '`' => {},
+            '`' => {}
             _ => out.push(ch),
         }
     }
@@ -285,8 +281,7 @@ fn translate_types(sql: &str) -> String {
 
     // Strip display width from INT/BIGINT/INTEGER/SMALLINT: INT(11) → INT
     static INT_WIDTH_RE: OnceLock<Regex> = OnceLock::new();
-    let re = INT_WIDTH_RE
-        .get_or_init(|| init_regex(r"(?i)\b(INT|BIGINT|INTEGER|SMALLINT)\s*\(\s*\d+\s*\)"));
+    let re = INT_WIDTH_RE.get_or_init(|| init_regex(r"(?i)\b(INT|BIGINT|INTEGER|SMALLINT)\s*\(\s*\d+\s*\)"));
     s = re.replace_all(&s, "$1").to_string();
 
     // INT UNSIGNED → BIGINT  (promote to avoid overflow)
@@ -308,8 +303,7 @@ fn translate_types(sql: &str) -> String {
     s = re.replace_all(&s, "DOUBLE PRECISION").to_string();
 
     static DOUBLE_FIX_RE: OnceLock<Regex> = OnceLock::new();
-    let re = DOUBLE_FIX_RE
-        .get_or_init(|| init_regex(r"(?i)\bDOUBLE\s+PRECISION\s+PRECISION\b"));
+    let re = DOUBLE_FIX_RE.get_or_init(|| init_regex(r"(?i)\bDOUBLE\s+PRECISION\s+PRECISION\b"));
     s = re.replace_all(&s, "DOUBLE PRECISION").to_string();
 
     // FLOAT(N) → REAL
@@ -332,16 +326,12 @@ fn translate_types(sql: &str) -> String {
 fn translate_auto_increment(sql: &str) -> String {
     // BIGINT ... AUTO_INCREMENT  →  BIGSERIAL  (remove AUTO_INCREMENT, swap type)
     static BIGINT_AI_RE: OnceLock<Regex> = OnceLock::new();
-    let re = BIGINT_AI_RE.get_or_init(|| {
-        init_regex(r"(?i)\bBIGINT\b([^,)]*?)\s+AUTO_INCREMENT\b")
-    });
+    let re = BIGINT_AI_RE.get_or_init(|| init_regex(r"(?i)\bBIGINT\b([^,)]*?)\s+AUTO_INCREMENT\b"));
     let mut s = re.replace_all(sql, "BIGSERIAL$1").to_string();
 
     // INT/INTEGER ... AUTO_INCREMENT  →  SERIAL
     static INT_AI_RE: OnceLock<Regex> = OnceLock::new();
-    let re = INT_AI_RE.get_or_init(|| {
-        init_regex(r"(?i)\b(?:INT|INTEGER)\b([^,)]*?)\s+AUTO_INCREMENT\b")
-    });
+    let re = INT_AI_RE.get_or_init(|| init_regex(r"(?i)\b(?:INT|INTEGER)\b([^,)]*?)\s+AUTO_INCREMENT\b"));
     s = re.replace_all(&s, "SERIAL$1").to_string();
 
     // Catch any remaining standalone AUTO_INCREMENT (safety net)
@@ -361,14 +351,12 @@ fn translate_charset_collation(sql: &str) -> String {
 
     // DEFAULT CHARACTER SET <name> (must be matched BEFORE bare CHARACTER SET)
     static DEFAULT_CHARSET_LONG_RE: OnceLock<Regex> = OnceLock::new();
-    let re = DEFAULT_CHARSET_LONG_RE
-        .get_or_init(|| init_regex(r"(?i)\s*DEFAULT\s+CHARACTER\s+SET\s*=?\s*\w+"));
+    let re = DEFAULT_CHARSET_LONG_RE.get_or_init(|| init_regex(r"(?i)\s*DEFAULT\s+CHARACTER\s+SET\s*=?\s*\w+"));
     s = re.replace_all(&s, "").to_string();
 
     // DEFAULT CHARSET=<name>
     static DEFAULT_CHARSET_RE: OnceLock<Regex> = OnceLock::new();
-    let re =
-        DEFAULT_CHARSET_RE.get_or_init(|| init_regex(r"(?i)\s*DEFAULT\s+CHARSET\s*=?\s*\w+"));
+    let re = DEFAULT_CHARSET_RE.get_or_init(|| init_regex(r"(?i)\s*DEFAULT\s+CHARSET\s*=?\s*\w+"));
     s = re.replace_all(&s, "").to_string();
 
     // CHARACTER SET <name> (bare, without DEFAULT prefix)
@@ -400,9 +388,7 @@ fn translate_charset_collation(sql: &str) -> String {
 
 fn translate_on_duplicate_key(sql: &str) -> String {
     static ODK_RE: OnceLock<Regex> = OnceLock::new();
-    let re = ODK_RE.get_or_init(|| {
-        init_regex(r"(?i)\s+ON\s+DUPLICATE\s+KEY\s+UPDATE\s+(.+)$")
-    });
+    let re = ODK_RE.get_or_init(|| init_regex(r"(?i)\s+ON\s+DUPLICATE\s+KEY\s+UPDATE\s+(.+)$"));
 
     // Translate ON DUPLICATE KEY UPDATE to ON CONFLICT DO UPDATE SET.
     // The planner now supports ON CONFLICT natively, so we convert
@@ -470,8 +456,7 @@ fn translate_functions(sql: &str) -> String {
 
     // GROUP_CONCAT(col SEPARATOR 'sep') → STRING_AGG(col, 'sep')
     static GC_SEP_RE: OnceLock<Regex> = OnceLock::new();
-    let re = GC_SEP_RE
-        .get_or_init(|| init_regex(r"(?i)\bGROUP_CONCAT\s*\((.+?)\s+SEPARATOR\s+'([^']*)'\)"));
+    let re = GC_SEP_RE.get_or_init(|| init_regex(r"(?i)\bGROUP_CONCAT\s*\((.+?)\s+SEPARATOR\s+'([^']*)'\)"));
     s = re.replace_all(&s, "STRING_AGG($1, '$2')").to_string();
 
     // GROUP_CONCAT(col) → STRING_AGG(col, ',')
@@ -645,16 +630,15 @@ fn translate_multi_table_delete(sql: &str) -> String {
         let where_clause = &caps[8];
 
         // Strip the "WHERE " prefix from the WHERE clause
-        let where_body = where_clause.trim()
+        let where_body = where_clause
+            .trim()
             .strip_prefix("WHERE ")
             .or_else(|| where_clause.trim().strip_prefix("where "))
             .unwrap_or(where_clause.trim());
 
         // Build a common subquery FROM clause that uses the original aliases.
         // This lets the ON and WHERE clauses use their original alias references.
-        let subquery_from = format!(
-            "{table1} AS {alias1} INNER JOIN {table2} AS {alias2} ON {on_condition}"
-        );
+        let subquery_from = format!("{table1} AS {alias1} INNER JOIN {table2} AS {alias2} ON {on_condition}");
         let subquery_where = where_body;
 
         // Find a join column from the ON condition for each table.
@@ -692,7 +676,10 @@ fn translate_multi_table_delete(sql: &str) -> String {
         let table2 = &caps[5];
         let alias2 = &caps[6];
         let where_clause = caps[7].trim();
-        let where_body = where_clause.strip_prefix("WHERE ").or_else(|| where_clause.strip_prefix("where ")).unwrap_or(where_clause);
+        let where_body = where_clause
+            .strip_prefix("WHERE ")
+            .or_else(|| where_clause.strip_prefix("where "))
+            .unwrap_or(where_clause);
 
         // Find PK column from schema (default to "option_id" for wp_options pattern)
         let pk_col = "option_id"; // WordPress transient cleanup always uses wp_options
@@ -770,22 +757,20 @@ fn translate_key_indexes(sql: &str) -> String {
     // Captures: the comma prefix, the column list (with optional prefix lengths).
     // Group 1 = column parenthesised list (may contain nested parens for prefix lengths).
     static UNIQUE_KEY_RE: OnceLock<Regex> = OnceLock::new();
-    let re = UNIQUE_KEY_RE.get_or_init(|| {
-        init_regex(r"(?im),\s*UNIQUE\s+KEY\s+\w+\s*\(((?:[^()]*\([^)]*\))*[^)]*)\)")
-    });
+    let re = UNIQUE_KEY_RE.get_or_init(|| init_regex(r"(?im),\s*UNIQUE\s+KEY\s+\w+\s*\(((?:[^()]*\([^)]*\))*[^)]*)\)"));
 
-    let mut s = re.replace_all(sql, |caps: &regex::Captures<'_>| {
-        let col_list = &caps[1];
-        // Strip prefix lengths: col_name(191) → col_name
-        let clean_cols = strip_prefix_lengths(col_list);
-        format!(", UNIQUE({})", clean_cols)
-    }).to_string();
+    let mut s = re
+        .replace_all(sql, |caps: &regex::Captures<'_>| {
+            let col_list = &caps[1];
+            // Strip prefix lengths: col_name(191) → col_name
+            let clean_cols = strip_prefix_lengths(col_list);
+            format!(", UNIQUE({})", clean_cols)
+        })
+        .to_string();
 
     // Step 2: Remove plain (non-unique) KEY definitions.
     static KEY_LINE_RE: OnceLock<Regex> = OnceLock::new();
-    let re = KEY_LINE_RE.get_or_init(|| {
-        init_regex(r"(?im),\s*KEY\s+\w+\s*\((?:[^()]*\([^)]*\))*[^)]*\)")
-    });
+    let re = KEY_LINE_RE.get_or_init(|| init_regex(r"(?im),\s*KEY\s+\w+\s*\((?:[^()]*\([^)]*\))*[^)]*\)"));
 
     s = re.replace_all(&s, "").to_string();
 
@@ -820,9 +805,8 @@ fn translate_alter_table_keys(sql: &str) -> String {
     }
     // Match: ALTER TABLE t ADD [UNIQUE] KEY|INDEX name (cols)
     static ALTER_KEY_RE: OnceLock<Regex> = OnceLock::new();
-    let re = ALTER_KEY_RE.get_or_init(|| {
-        init_regex(r"(?i)\bADD\s+(?:UNIQUE\s+)?(?:KEY|INDEX)\s+\w+\s*\((?:[^()]*\([^)]*\))*[^)]*\)")
-    });
+    let re = ALTER_KEY_RE
+        .get_or_init(|| init_regex(r"(?i)\bADD\s+(?:UNIQUE\s+)?(?:KEY|INDEX)\s+\w+\s*\((?:[^()]*\([^)]*\))*[^)]*\)"));
     if re.is_match(sql) {
         // Convert to no-op (silently succeed)
         return String::new();
@@ -854,8 +838,7 @@ fn translate_misc(sql: &str) -> String {
 
     // Strip HIGH_PRIORITY / LOW_PRIORITY / DELAYED
     static PRIORITY_RE: OnceLock<Regex> = OnceLock::new();
-    let re =
-        PRIORITY_RE.get_or_init(|| init_regex(r"(?i)\b(?:HIGH_PRIORITY|LOW_PRIORITY|DELAYED)\b"));
+    let re = PRIORITY_RE.get_or_init(|| init_regex(r"(?i)\b(?:HIGH_PRIORITY|LOW_PRIORITY|DELAYED)\b"));
     s = re.replace_all(&s, "").to_string();
 
     // Strip BINARY keyword before string comparisons
@@ -867,9 +850,8 @@ fn translate_misc(sql: &str) -> String {
     // and DATE_ADD(NOW(), INTERVAL N UNIT) → DATE_ADD(NOW(), 'N UNIT')
     // sqlparser chokes on INTERVAL keyword inside function args; wrap as string
     static DATE_INTERVAL_RE: OnceLock<Regex> = OnceLock::new();
-    let re = DATE_INTERVAL_RE.get_or_init(|| {
-        init_regex(r"(?i)\b(DATE_(?:ADD|SUB))\s*\(\s*([^,]+)\s*,\s*INTERVAL\s+(\d+)\s+(\w+)\s*\)")
-    });
+    let re = DATE_INTERVAL_RE
+        .get_or_init(|| init_regex(r"(?i)\b(DATE_(?:ADD|SUB))\s*\(\s*([^,]+)\s*,\s*INTERVAL\s+(\d+)\s+(\w+)\s*\)"));
     s = re.replace_all(&s, "$1($2, '$3 $4')").to_string();
 
     // Strip WHERE 1=1 tautology (WordPress adds to every query for chaining AND clauses)
@@ -895,13 +877,9 @@ mod tests {
 
     #[test]
     fn test_auto_increment() {
-        let sql =
-            "CREATE TABLE wp_posts (ID bigint(20) NOT NULL AUTO_INCREMENT, PRIMARY KEY (ID))";
+        let sql = "CREATE TABLE wp_posts (ID bigint(20) NOT NULL AUTO_INCREMENT, PRIMARY KEY (ID))";
         let result = translate(sql);
-        assert!(
-            result.contains("BIGSERIAL"),
-            "Should convert to BIGSERIAL: {result}"
-        );
+        assert!(result.contains("BIGSERIAL"), "Should convert to BIGSERIAL: {result}");
         assert!(
             !result.contains("AUTO_INCREMENT"),
             "Should remove AUTO_INCREMENT: {result}"
@@ -955,10 +933,7 @@ mod tests {
         assert!(result.contains("id"), "Identifier should remain");
         assert!(result.contains("wp_posts"), "Table name should remain");
         // String 'publish' should NOT be affected
-        assert!(
-            result.contains("'publish'"),
-            "String literals should be preserved"
-        );
+        assert!(result.contains("'publish'"), "String literals should be preserved");
     }
 
     #[test]
@@ -986,10 +961,7 @@ mod tests {
     fn test_limit_single_arg_unchanged() {
         let sql = "SELECT * FROM t LIMIT 10";
         let result = translate(sql);
-        assert!(
-            result.contains("LIMIT 10"),
-            "Single LIMIT should be unchanged"
-        );
+        assert!(result.contains("LIMIT 10"), "Single LIMIT should be unchanged");
     }
 
     #[test]
@@ -1000,10 +972,7 @@ mod tests {
             result.starts_with("INSERT INTO"),
             "REPLACE INTO -> INSERT INTO: {result}"
         );
-        assert!(
-            !result.contains("REPLACE"),
-            "REPLACE should be removed: {result}"
-        );
+        assert!(!result.contains("REPLACE"), "REPLACE should be removed: {result}");
     }
 
     #[test]
@@ -1090,14 +1059,8 @@ mod tests {
     fn test_int_unsigned_promotion() {
         let sql = "CREATE TABLE t (id INT UNSIGNED)";
         let result = translate(sql);
-        assert!(
-            result.contains("BIGINT"),
-            "INT UNSIGNED -> BIGINT: {result}"
-        );
-        assert!(
-            !result.contains("UNSIGNED"),
-            "UNSIGNED should be stripped: {result}"
-        );
+        assert!(result.contains("BIGINT"), "INT UNSIGNED -> BIGINT: {result}");
+        assert!(!result.contains("UNSIGNED"), "UNSIGNED should be stripped: {result}");
     }
 
     #[test]
@@ -1122,20 +1085,14 @@ mod tests {
         let sql = "CREATE TABLE t (status ENUM('active','inactive'))";
         let result = translate(sql);
         assert!(result.contains("TEXT"), "ENUM -> TEXT: {result}");
-        assert!(
-            !result.contains("ENUM"),
-            "ENUM should be removed: {result}"
-        );
+        assert!(!result.contains("ENUM"), "ENUM should be removed: {result}");
     }
 
     #[test]
     fn test_serial_auto_increment() {
         let sql = "CREATE TABLE t (id INT NOT NULL AUTO_INCREMENT)";
         let result = translate(sql);
-        assert!(
-            result.contains("SERIAL"),
-            "INT AUTO_INCREMENT -> SERIAL: {result}"
-        );
+        assert!(result.contains("SERIAL"), "INT AUTO_INCREMENT -> SERIAL: {result}");
         assert!(
             !result.contains("AUTO_INCREMENT"),
             "AUTO_INCREMENT should be removed: {result}"
@@ -1146,10 +1103,7 @@ mod tests {
     fn test_year_to_smallint() {
         let sql = "CREATE TABLE t (yr YEAR)";
         let result = translate(sql);
-        assert!(
-            result.contains("SMALLINT"),
-            "YEAR -> SMALLINT: {result}"
-        );
+        assert!(result.contains("SMALLINT"), "YEAR -> SMALLINT: {result}");
     }
 
     #[test]
@@ -1207,24 +1161,15 @@ mod tests {
         let sql = "CREATE TABLE t (a longtext, b datetime, c tinyint(1))";
         let result = translate(sql);
         assert!(result.contains("TEXT"), "lowercase LONGTEXT -> TEXT");
-        assert!(
-            result.contains("TIMESTAMP"),
-            "lowercase DATETIME -> TIMESTAMP"
-        );
-        assert!(
-            result.contains("BOOLEAN"),
-            "lowercase TINYINT(1) -> BOOLEAN"
-        );
+        assert!(result.contains("TIMESTAMP"), "lowercase DATETIME -> TIMESTAMP");
+        assert!(result.contains("BOOLEAN"), "lowercase TINYINT(1) -> BOOLEAN");
     }
 
     #[test]
     fn test_backtick_preserves_string_contents() {
         let sql = "SELECT `col` FROM t WHERE val = 'it`s a test'";
         let result = translate(sql);
-        assert!(
-            result.contains("col"),
-            "Backtick identifier stripped: {result}"
-        );
+        assert!(result.contains("col"), "Backtick identifier stripped: {result}");
         // Identifier backticks are stripped; the one inside the string literal
         // is preserved (it lives inside single quotes, not an identifier).
         assert!(
@@ -1254,10 +1199,7 @@ mod tests {
     fn test_mediumint() {
         let sql = "CREATE TABLE t (id MEDIUMINT)";
         let result = translate(sql);
-        assert!(
-            result.contains("INTEGER"),
-            "MEDIUMINT -> INTEGER: {result}"
-        );
+        assert!(result.contains("INTEGER"), "MEDIUMINT -> INTEGER: {result}");
     }
 
     #[test]
@@ -1274,10 +1216,7 @@ mod tests {
         let result = translate(sql);
         // Should produce two semicolon-separated DELETE statements with IN subqueries
         let parts: Vec<&str> = result.split(';').collect();
-        assert!(
-            parts.len() >= 2,
-            "Should produce two DELETE statements: {result}"
-        );
+        assert!(parts.len() >= 2, "Should produce two DELETE statements: {result}");
         assert!(
             parts[0].contains("DELETE FROM wp_terms WHERE term_id IN"),
             "First DELETE should target wp_terms with IN subquery: {result}"
@@ -1287,10 +1226,7 @@ mod tests {
             "Second DELETE should target wp_term_taxonomy with IN subquery: {result}"
         );
         // Subqueries should use original aliases, not resolved table names
-        assert!(
-            result.contains("INNER JOIN"),
-            "Subquery should contain JOIN: {result}"
-        );
+        assert!(result.contains("INNER JOIN"), "Subquery should contain JOIN: {result}");
     }
 
     #[test]
@@ -1298,10 +1234,7 @@ mod tests {
         let sql = "DELETE a, b FROM wp_terms a JOIN wp_term_taxonomy b ON a.term_id = b.term_id WHERE b.count = 0";
         let result = translate(sql);
         let parts: Vec<&str> = result.split(';').collect();
-        assert!(
-            parts.len() >= 2,
-            "Should handle JOIN without AS keyword: {result}"
-        );
+        assert!(parts.len() >= 2, "Should handle JOIN without AS keyword: {result}");
         assert!(
             parts[0].contains("DELETE FROM wp_terms"),
             "First DELETE should target wp_terms: {result}"

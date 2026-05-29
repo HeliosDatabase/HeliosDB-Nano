@@ -58,10 +58,7 @@ fn main() {
     }
     let mean = total / QUERIES as u128;
     println!("==> mean: {mean} ms, max: {max} ms, target: {TARGET_MS} ms");
-    assert!(
-        mean <= TARGET_MS,
-        "mean {mean}ms exceeded target {TARGET_MS}ms"
-    );
+    assert!(mean <= TARGET_MS, "mean {mean}ms exceeded target {TARGET_MS}ms");
 }
 
 fn setup_graph(db: &EmbeddedDatabase) {
@@ -89,10 +86,7 @@ fn setup_graph(db: &EmbeddedDatabase) {
         db.execute_params_returning(
             "INSERT INTO _hdb_graph_nodes (node_kind, source_ref, title) \
              VALUES ('Function', $1, $2)",
-            &[
-                Value::String(format!("code_symbol:{i}")),
-                Value::String(title),
-            ],
+            &[Value::String(format!("code_symbol:{i}")), Value::String(title)],
         )
         .unwrap();
     }

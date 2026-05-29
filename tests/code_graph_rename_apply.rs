@@ -6,17 +6,11 @@ use heliosdb_nano::code_graph::{CodeIndexOptions, RenameApplyOptions};
 use heliosdb_nano::{EmbeddedDatabase, Value};
 
 fn upsert(db: &EmbeddedDatabase, path: &str, body: &str) {
-    db.execute_params_returning(
-        "DELETE FROM src WHERE path = $1",
-        &[Value::String(path.into())],
-    )
-    .unwrap();
+    db.execute_params_returning("DELETE FROM src WHERE path = $1", &[Value::String(path.into())])
+        .unwrap();
     db.execute_params_returning(
         "INSERT INTO src (path, lang, content) VALUES ($1, 'rust', $2)",
-        &[
-            Value::String(path.into()),
-            Value::String(body.into()),
-        ],
+        &[Value::String(path.into()), Value::String(body.into())],
     )
     .unwrap();
 }
@@ -103,9 +97,7 @@ fn word_boundary_prevents_substring_match() {
     db.code_index(CodeIndexOptions::for_table("src")).unwrap();
     let id = symbol_id_of(&db, "foo");
 
-    let _ = db
-        .lsp_rename_apply(id, "qux", &RenameApplyOptions::apply())
-        .unwrap();
+    let _ = db.lsp_rename_apply(id, "qux", &RenameApplyOptions::apply()).unwrap();
     let row = db
         .query_params(
             "SELECT content FROM src WHERE path = $1",

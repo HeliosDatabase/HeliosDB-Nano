@@ -1,6 +1,6 @@
 // Phase 3 Feature Benchmarks
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, BenchmarkId, Throughput};
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use rand::Rng;
 
 // ==================== Product Quantization Benchmarks ====================
@@ -165,33 +165,26 @@ fn bench_pq_search(c: &mut Criterion) {
 
         // Generate database vectors and encode them
         let database_vectors = generate_random_vectors(*num_vectors, dim);
-        let encoded_database: Vec<Vec<u8>> = database_vectors
-            .iter()
-            .map(|v| pq.encode(v))
-            .collect();
+        let encoded_database: Vec<Vec<u8>> = database_vectors.iter().map(|v| pq.encode(v)).collect();
 
         let query = generate_random_vector(dim);
         pq.precompute_distance_table(&query);
 
         group.throughput(Throughput::Elements(*num_vectors as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(num_vectors),
-            num_vectors,
-            |b, _| {
-                b.iter(|| {
-                    // Find top-10 nearest neighbors
-                    let mut distances: Vec<(usize, f32)> = encoded_database
-                        .iter()
-                        .enumerate()
-                        .map(|(i, codes)| (i, pq.compute_distance_with_table(codes)))
-                        .collect();
+        group.bench_with_input(BenchmarkId::from_parameter(num_vectors), num_vectors, |b, _| {
+            b.iter(|| {
+                // Find top-10 nearest neighbors
+                let mut distances: Vec<(usize, f32)> = encoded_database
+                    .iter()
+                    .enumerate()
+                    .map(|(i, codes)| (i, pq.compute_distance_with_table(codes)))
+                    .collect();
 
-                    distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-                    let top10 = &distances[..10.min(distances.len())];
-                    black_box(top10);
-                });
-            },
-        );
+                distances.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+                let top10 = &distances[..10.min(distances.len())];
+                black_box(top10);
+            });
+        });
     }
 
     group.finish();
@@ -215,19 +208,15 @@ fn bench_pq_batch_distance(c: &mut Criterion) {
         let codes_batch: Vec<Vec<u8>> = vectors.iter().map(|v| pq.encode(v)).collect();
 
         group.throughput(Throughput::Elements(*batch_size as u64));
-        group.bench_with_input(
-            BenchmarkId::from_parameter(batch_size),
-            batch_size,
-            |b, _| {
-                b.iter(|| {
-                    let distances: Vec<f32> = codes_batch
-                        .iter()
-                        .map(|codes| pq.compute_distance_with_table(codes))
-                        .collect();
-                    black_box(distances);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(batch_size), batch_size, |b, _| {
+            b.iter(|| {
+                let distances: Vec<f32> = codes_batch
+                    .iter()
+                    .map(|codes| pq.compute_distance_with_table(codes))
+                    .collect();
+                black_box(distances);
+            });
+        });
     }
 
     group.finish();
@@ -256,29 +245,21 @@ fn bench_fsst_compression(c: &mut Criterion) {
 
         group.throughput(Throughput::Bytes(size_bytes as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("compress", size_kb),
-            &size_kb,
-            |b, _| {
-                b.iter(|| {
-                    let compressed = fsst_compress_simulation(black_box(&data));
-                    black_box(compressed);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("compress", size_kb), &size_kb, |b, _| {
+            b.iter(|| {
+                let compressed = fsst_compress_simulation(black_box(&data));
+                black_box(compressed);
+            });
+        });
 
         let compressed = fsst_compress_simulation(&data);
 
-        group.bench_with_input(
-            BenchmarkId::new("decompress", size_kb),
-            &size_kb,
-            |b, _| {
-                b.iter(|| {
-                    let decompressed = fsst_decompress_simulation(black_box(&compressed));
-                    black_box(decompressed);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("decompress", size_kb), &size_kb, |b, _| {
+            b.iter(|| {
+                let decompressed = fsst_decompress_simulation(black_box(&compressed));
+                black_box(decompressed);
+            });
+        });
     }
 
     group.finish();
@@ -290,31 +271,22 @@ fn bench_alp_compression(c: &mut Criterion) {
     // Simulate ALP compression for floats
     fn alp_compress_simulation(floats: &[f64]) -> Vec<u8> {
         // Simplified: convert to bytes and compress
-        let bytes: Vec<u8> = floats
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let bytes: Vec<u8> = floats.iter().flat_map(|f| f.to_le_bytes()).collect();
         zstd::encode_all(&bytes[..], 3).unwrap()
     }
 
     for num_floats in [1000, 10000, 100000].iter() {
-        let floats: Vec<f64> = (0..*num_floats)
-            .map(|i| 100.0 + (i as f64) * 0.1)
-            .collect();
+        let floats: Vec<f64> = (0..*num_floats).map(|i| 100.0 + (i as f64) * 0.1).collect();
 
         let size_bytes = num_floats * 8;
         group.throughput(Throughput::Bytes(size_bytes as u64));
 
-        group.bench_with_input(
-            BenchmarkId::from_parameter(num_floats),
-            num_floats,
-            |b, _| {
-                b.iter(|| {
-                    let compressed = alp_compress_simulation(black_box(&floats));
-                    black_box(compressed);
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::from_parameter(num_floats), num_floats, |b, _| {
+            b.iter(|| {
+                let compressed = alp_compress_simulation(black_box(&floats));
+                black_box(compressed);
+            });
+        });
     }
 
     group.finish();

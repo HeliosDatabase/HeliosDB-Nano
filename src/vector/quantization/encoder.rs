@@ -1,6 +1,6 @@
 //! Vector encoding to quantized representation
 
-use super::{Codebook, QuantizedVector, PqError, PqResult};
+use super::{Codebook, PqError, PqResult, QuantizedVector};
 use crate::vector::Vector;
 use std::sync::Arc;
 
@@ -120,10 +120,7 @@ mod tests {
         let codebook = Arc::new(create_test_codebook());
         let encoder = Encoder::new(codebook);
 
-        let vectors = vec![
-            vec![0.1, 0.1, 2.1, 2.1],
-            vec![0.9, 0.9, 3.1, 3.1],
-        ];
+        let vectors = vec![vec![0.1, 0.1, 2.1, 2.1], vec![0.9, 0.9, 3.1, 3.1]];
 
         let quantized = encoder.encode_batch(&vectors).unwrap();
         assert_eq!(quantized.len(), 2);

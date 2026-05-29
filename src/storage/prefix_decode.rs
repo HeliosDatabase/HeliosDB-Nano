@@ -78,11 +78,7 @@ fn row_blob_opts() -> impl Options {
 /// Decode a row blob into a full-width `Tuple`, materializing only the first
 /// `prefix_len` values (the rest are `Value::Null`). `row_id` is left `None`; the scan
 /// recovers it from the row key.
-pub(crate) fn decode_tuple_prefix(
-    bytes: &[u8],
-    prefix_len: usize,
-    total_cols: usize,
-) -> bincode::Result<Tuple> {
+pub(crate) fn decode_tuple_prefix(bytes: &[u8], prefix_len: usize, total_cols: usize) -> bincode::Result<Tuple> {
     let values = row_blob_opts().deserialize_seed(PrefixValues { prefix_len, total_cols }, bytes)?;
     Ok(Tuple {
         values,

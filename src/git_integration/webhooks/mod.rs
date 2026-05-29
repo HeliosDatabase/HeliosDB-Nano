@@ -251,15 +251,15 @@ impl WebhookHandler {
 
                 let event_type = match pr_payload.action.as_str() {
                     "opened" | "reopened" => WebhookEventType::PrOpened,
-                    "closed" if pr_payload.pull_request.merged == Some(true) => {
-                        WebhookEventType::PrMerged
-                    }
+                    "closed" if pr_payload.pull_request.merged == Some(true) => WebhookEventType::PrMerged,
                     "closed" => WebhookEventType::PrClosed,
                     "synchronize" => WebhookEventType::PrUpdated,
-                    _ => return Err(Error::sql_parse(format!(
-                        "Unsupported GitHub PR action: {}",
-                        pr_payload.action
-                    ))),
+                    _ => {
+                        return Err(Error::sql_parse(format!(
+                            "Unsupported GitHub PR action: {}",
+                            pr_payload.action
+                        )))
+                    }
                 };
 
                 Ok(WebhookEvent {
@@ -274,17 +274,14 @@ impl WebhookHandler {
                     raw_payload: Some(payload.to_string()),
                 })
             }
-            _ => Err(Error::sql_parse(format!(
-                "Unsupported GitHub event: {}",
-                event_header
-            ))),
+            _ => Err(Error::sql_parse(format!("Unsupported GitHub event: {}", event_header))),
         }
     }
 
     /// Parse GitLab webhook payload
     pub fn parse_gitlab(&self, payload: &str) -> Result<WebhookEvent> {
-        let mr_payload: GitLabMrPayload = serde_json::from_str(payload)
-            .map_err(|e| Error::sql_parse(format!("Invalid GitLab MR payload: {}", e)))?;
+        let mr_payload: GitLabMrPayload =
+            serde_json::from_str(payload).map_err(|e| Error::sql_parse(format!("Invalid GitLab MR payload: {}", e)))?;
 
         let event_type = match mr_payload.object_attributes.action.as_deref() {
             Some("open") | Some("reopen") => WebhookEventType::PrOpened,
@@ -295,10 +292,12 @@ impl WebhookHandler {
                 "opened" => WebhookEventType::PrOpened,
                 "merged" => WebhookEventType::PrMerged,
                 "closed" => WebhookEventType::PrClosed,
-                _ => return Err(Error::sql_parse(format!(
-                    "Unsupported GitLab MR state: {}",
-                    mr_payload.object_attributes.state
-                ))),
+                _ => {
+                    return Err(Error::sql_parse(format!(
+                        "Unsupported GitLab MR state: {}",
+                        mr_payload.object_attributes.state
+                    )))
+                }
             },
         };
 
@@ -317,8 +316,7 @@ impl WebhookHandler {
 
     /// Parse generic webhook payload
     pub fn parse_generic(&self, payload: &str) -> Result<WebhookEvent> {
-        serde_json::from_str(payload)
-            .map_err(|e| Error::sql_parse(format!("Invalid generic webhook payload: {}", e)))
+        serde_json::from_str(payload).map_err(|e| Error::sql_parse(format!("Invalid generic webhook payload: {}", e)))
     }
 
     /// Validate GitHub webhook signature (HMAC-SHA256)
@@ -445,11 +443,10 @@ impl WebhookHandler {
             event.target_branch.as_deref().unwrap_or("main")
         );
 
-        Ok(WebhookResult::success(format!(
-            "Created preview branch '{}' for PR #{}",
-            branch_name, pr_num
-        ))
-        .with_action("create_preview_branch"))
+        Ok(
+            WebhookResult::success(format!("Created preview branch '{}' for PR #{}", branch_name, pr_num))
+                .with_action("create_preview_branch"),
+        )
     }
 
     /// Handle PR updated event (basic handler - no storage integration)
@@ -463,8 +460,7 @@ impl WebhookHandler {
 
         tracing::info!("PR #{} updated with new commits", pr_num);
 
-        Ok(WebhookResult::success(format!("Synced PR #{} preview branch", pr_num))
-            .with_action("sync_preview_branch"))
+        Ok(WebhookResult::success(format!("Synced PR #{} preview branch", pr_num)).with_action("sync_preview_branch"))
     }
 
     /// Handle PR merged event (basic handler - no storage integration)
@@ -482,11 +478,10 @@ impl WebhookHandler {
             event.target_branch.as_deref().unwrap_or("main")
         );
 
-        Ok(WebhookResult::success(format!(
-            "Merged and cleaned up PR #{} preview branch",
-            pr_num
-        ))
-        .with_action("merge_preview_branch"))
+        Ok(
+            WebhookResult::success(format!("Merged and cleaned up PR #{} preview branch", pr_num))
+                .with_action("merge_preview_branch"),
+        )
     }
 
     /// Handle PR closed event (basic handler - no storage integration)
@@ -499,11 +494,7 @@ impl WebhookHandler {
 
         tracing::info!("PR #{} closed without merge, dropping preview", pr_num);
 
-        Ok(WebhookResult::success(format!(
-            "Dropped PR #{} preview branch",
-            pr_num
-        ))
-        .with_action("drop_preview_branch"))
+        Ok(WebhookResult::success(format!("Dropped PR #{} preview branch", pr_num)).with_action("drop_preview_branch"))
     }
 
     /// Handle push event - syncs linked branch on push
@@ -546,10 +537,7 @@ pub struct StorageWebhookHandler<'a> {
 
 impl<'a> StorageWebhookHandler<'a> {
     /// Create a new storage-aware webhook handler
-    pub fn new(
-        config: WebhookConfig,
-        branch_manager: &'a crate::storage::BranchManager,
-    ) -> Self {
+    pub fn new(config: WebhookConfig, branch_manager: &'a crate::storage::BranchManager) -> Self {
         Self {
             config,
             branch_manager,
@@ -589,7 +577,9 @@ impl<'a> StorageWebhookHandler<'a> {
         );
 
         // Get the base branch ID
-        let base_branch = self.branch_manager.get_branch_by_name(target_branch)
+        let base_branch = self
+            .branch_manager
+            .get_branch_by_name(target_branch)
             .map_err(|e| Error::execution(format!("Base branch '{}' not found: {}", target_branch, e)))?;
 
         // Get current timestamp for snapshot
@@ -608,12 +598,9 @@ impl<'a> StorageWebhookHandler<'a> {
         });
 
         // Create the preview branch
-        let branch_id = self.branch_manager.create_branch(
-            &preview_branch_name,
-            Some(target_branch),
-            snapshot_ts,
-            options,
-        )?;
+        let branch_id =
+            self.branch_manager
+                .create_branch(&preview_branch_name, Some(target_branch), snapshot_ts, options)?;
 
         tracing::info!(
             "Preview branch '{}' created with ID {} for PR #{}",
@@ -702,11 +689,10 @@ impl<'a> StorageWebhookHandler<'a> {
                     tracing::warn!("Failed to drop PR #{} branch after merge: {}", pr_num, e);
                 }
 
-                Ok(WebhookResult::success(format!(
-                    "Merged and cleaned up PR #{} preview branch",
-                    pr_num
-                ))
-                .with_action("merge_preview_branch"))
+                Ok(
+                    WebhookResult::success(format!("Merged and cleaned up PR #{} preview branch", pr_num))
+                        .with_action("merge_preview_branch"),
+                )
             }
             Err(_) => {
                 // Branch doesn't exist - nothing to merge
@@ -723,32 +709,33 @@ impl<'a> StorageWebhookHandler<'a> {
         let pr_num = event.pr_number.unwrap_or(0);
         let preview_branch_name = format!("pr-{}", pr_num);
 
-        tracing::info!("Dropping PR #{} preview branch '{}' (closed without merge)", pr_num, preview_branch_name);
+        tracing::info!(
+            "Dropping PR #{} preview branch '{}' (closed without merge)",
+            pr_num,
+            preview_branch_name
+        );
 
         // Check if the preview branch exists and drop it
         match self.branch_manager.get_branch_by_name(&preview_branch_name) {
             Ok(branch) => {
                 self.branch_manager.drop_branch(&preview_branch_name, false)?;
 
-                Ok(WebhookResult::success(format!(
-                    "Dropped PR #{} preview branch",
-                    pr_num
-                ))
-                .with_branch(branch.branch_id)
-                .with_action("drop_preview_branch"))
+                Ok(WebhookResult::success(format!("Dropped PR #{} preview branch", pr_num))
+                    .with_branch(branch.branch_id)
+                    .with_action("drop_preview_branch"))
             }
-            Err(_) => {
-                Ok(WebhookResult::success(format!(
-                    "PR #{} preview branch does not exist",
-                    pr_num
-                ))
-                .with_action("no_action"))
-            }
+            Err(_) => Ok(
+                WebhookResult::success(format!("PR #{} preview branch does not exist", pr_num))
+                    .with_action("no_action"),
+            ),
         }
     }
 
     fn handle_push(&self, event: &WebhookEvent) -> Result<WebhookResult> {
-        tracing::info!("Push to branch '{}' - checking for linked DB branch", event.source_branch);
+        tracing::info!(
+            "Push to branch '{}' - checking for linked DB branch",
+            event.source_branch
+        );
 
         // Check if there's a DB branch linked to this Git branch
         match self.branch_manager.get_branch_by_name(&event.source_branch) {
@@ -762,18 +749,15 @@ impl<'a> StorageWebhookHandler<'a> {
                     );
                     // Here we could trigger migration application or other sync operations
                 }
-                Ok(WebhookResult::success(format!(
-                    "Synced branch '{}'",
-                    event.source_branch
-                ))
-                .with_branch(branch.branch_id))
+                Ok(
+                    WebhookResult::success(format!("Synced branch '{}'", event.source_branch))
+                        .with_branch(branch.branch_id),
+                )
             }
-            Err(_) => {
-                Ok(WebhookResult::success(format!(
-                    "No linked DB branch for Git branch '{}'",
-                    event.source_branch
-                )))
-            }
+            Err(_) => Ok(WebhookResult::success(format!(
+                "No linked DB branch for Git branch '{}'",
+                event.source_branch
+            ))),
         }
     }
 
@@ -796,10 +780,7 @@ impl<'a> StorageWebhookHandler<'a> {
             Ok(branch) => {
                 if let Some(git_link) = &branch.options.git_link {
                     if git_link.git_branch == event.source_branch {
-                        tracing::info!(
-                            "Found linked DB branch '{}' for deleted Git branch",
-                            branch.name
-                        );
+                        tracing::info!("Found linked DB branch '{}' for deleted Git branch", branch.name);
                         // Optionally drop the DB branch (configurable behavior)
                         // For safety, we don't auto-drop by default
                     }
@@ -809,12 +790,10 @@ impl<'a> StorageWebhookHandler<'a> {
                     event.source_branch
                 )))
             }
-            Err(_) => {
-                Ok(WebhookResult::success(format!(
-                    "Noted Git branch '{}' deletion",
-                    event.source_branch
-                )))
-            }
+            Err(_) => Ok(WebhookResult::success(format!(
+                "Noted Git branch '{}' deletion",
+                event.source_branch
+            ))),
         }
     }
 }
@@ -878,9 +857,7 @@ mod tests {
 
     #[test]
     fn test_webhook_result() {
-        let result = WebhookResult::success("Test")
-            .with_branch(1)
-            .with_action("test_action");
+        let result = WebhookResult::success("Test").with_branch(1).with_action("test_action");
 
         assert!(result.success);
         assert_eq!(result.branch_id, Some(1));

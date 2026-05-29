@@ -11,13 +11,12 @@
 //! **CRITICAL**: These tests verify that no tenant can access another tenant's data.
 //! Any failure in RLS tests indicates a SECURITY VULNERABILITY.
 
-use heliosdb_nano::{EmbeddedDatabase, Result};
 use heliosdb_nano::tenant::{
-    TenantManager, IsolationMode, RLSCommand, ChangeType,
-    ResourceLimits, TenantContext, MigrationState
+    ChangeType, IsolationMode, MigrationState, RLSCommand, ResourceLimits, TenantContext, TenantManager,
 };
-use uuid::Uuid;
+use heliosdb_nano::{EmbeddedDatabase, Result};
 use std::sync::Arc;
+use uuid::Uuid;
 
 mod test_helpers;
 use test_helpers::*;
@@ -31,18 +30,9 @@ fn create_test_tenant_manager() -> TenantManager {
     let manager = TenantManager::new();
 
     // Create test tenants with different isolation modes
-    let _tenant1 = manager.register_tenant(
-        "TenantA".to_string(),
-        IsolationMode::SharedSchema
-    );
-    let _tenant2 = manager.register_tenant(
-        "TenantB".to_string(),
-        IsolationMode::SharedSchema
-    );
-    let _tenant3 = manager.register_tenant(
-        "TenantC".to_string(),
-        IsolationMode::DatabasePerTenant
-    );
+    let _tenant1 = manager.register_tenant("TenantA".to_string(), IsolationMode::SharedSchema);
+    let _tenant2 = manager.register_tenant("TenantB".to_string(), IsolationMode::SharedSchema);
+    let _tenant3 = manager.register_tenant("TenantC".to_string(), IsolationMode::DatabasePerTenant);
 
     manager
 }
@@ -57,17 +47,13 @@ fn setup_multi_tenant_table(db: &EmbeddedDatabase) -> Result<()> {
             customer_name TEXT,
             amount DECIMAL(10,2),
             status TEXT
-        )"
+        )",
     )?;
     Ok(())
 }
 
 /// Populate test data for multiple tenants
-fn populate_multi_tenant_data(
-    db: &EmbeddedDatabase,
-    tenant_a_id: &str,
-    tenant_b_id: &str
-) -> Result<()> {
+fn populate_multi_tenant_data(db: &EmbeddedDatabase, tenant_a_id: &str, tenant_b_id: &str) -> Result<()> {
     // Tenant A data
     db.execute(&format!(
         "INSERT INTO orders VALUES (1, '{}', 'Alice', 100.50, 'pending')",
@@ -141,8 +127,10 @@ fn test_rls_prevents_cross_tenant_select() -> Result<()> {
     assert!(conditions.is_some(), "Should have RLS conditions");
 
     let (using_expr, _) = conditions.unwrap();
-    assert!(using_expr.contains(&tenant_a.id.to_string()),
-            "Using expression should contain tenant ID");
+    assert!(
+        using_expr.contains(&tenant_a.id.to_string()),
+        "Using expression should contain tenant ID"
+    );
 
     println!("✓ RLS policy correctly restricts SELECT to tenant_id = {}", tenant_a.id);
 
@@ -176,7 +164,10 @@ fn test_rls_prevents_cross_tenant_update() -> Result<()> {
     });
 
     // Verify RLS applies to UPDATE
-    assert!(manager.should_apply_rls("orders", "UPDATE"), "RLS should apply to UPDATE");
+    assert!(
+        manager.should_apply_rls("orders", "UPDATE"),
+        "RLS should apply to UPDATE"
+    );
 
     let conditions = manager.get_rls_conditions("orders", "UPDATE");
     assert!(conditions.is_some(), "Should have RLS conditions for UPDATE");
@@ -217,7 +208,10 @@ fn test_rls_prevents_cross_tenant_delete() -> Result<()> {
     });
 
     // Verify RLS applies to DELETE
-    assert!(manager.should_apply_rls("orders", "DELETE"), "RLS should apply to DELETE");
+    assert!(
+        manager.should_apply_rls("orders", "DELETE"),
+        "RLS should apply to DELETE"
+    );
 
     let conditions = manager.get_rls_conditions("orders", "DELETE");
     assert!(conditions.is_some(), "Should have RLS conditions for DELETE");
@@ -253,7 +247,10 @@ fn test_rls_with_check_insert() -> Result<()> {
     });
 
     // Verify RLS applies to INSERT
-    assert!(manager.should_apply_rls("orders", "INSERT"), "RLS should apply to INSERT");
+    assert!(
+        manager.should_apply_rls("orders", "INSERT"),
+        "RLS should apply to INSERT"
+    );
 
     let conditions = manager.get_rls_conditions("orders", "INSERT");
     assert!(conditions.is_some(), "Should have RLS conditions for INSERT");
@@ -366,19 +363,30 @@ fn test_connection_limit_enforced() -> Result<()> {
     let tenant_a = &tenants[0];
 
     // Set low connection limit
-    manager.update_resource_limits(
-        tenant_a.id,
-        ResourceLimits {
-            max_storage_bytes: 100 * 1024 * 1024,
-            max_connections: 3,
-            max_qps: 1000,
-        }
-    ).expect("Failed to update resource limits");
+    manager
+        .update_resource_limits(
+            tenant_a.id,
+            ResourceLimits {
+                max_storage_bytes: 100 * 1024 * 1024,
+                max_connections: 3,
+                max_qps: 1000,
+            },
+        )
+        .expect("Failed to update resource limits");
 
     // Add connections up to limit
-    assert!(manager.add_connection(tenant_a.id).is_ok(), "Connection 1 should succeed");
-    assert!(manager.add_connection(tenant_a.id).is_ok(), "Connection 2 should succeed");
-    assert!(manager.add_connection(tenant_a.id).is_ok(), "Connection 3 should succeed");
+    assert!(
+        manager.add_connection(tenant_a.id).is_ok(),
+        "Connection 1 should succeed"
+    );
+    assert!(
+        manager.add_connection(tenant_a.id).is_ok(),
+        "Connection 2 should succeed"
+    );
+    assert!(
+        manager.add_connection(tenant_a.id).is_ok(),
+        "Connection 3 should succeed"
+    );
 
     // Next connection should fail
     let result = manager.add_connection(tenant_a.id);
@@ -386,10 +394,15 @@ fn test_connection_limit_enforced() -> Result<()> {
     assert!(result.unwrap_err().contains("limit exceeded"));
 
     // Remove a connection
-    manager.remove_connection(tenant_a.id).expect("Failed to remove connection");
+    manager
+        .remove_connection(tenant_a.id)
+        .expect("Failed to remove connection");
 
     // Now should be able to add again
-    assert!(manager.add_connection(tenant_a.id).is_ok(), "Connection should succeed after removal");
+    assert!(
+        manager.add_connection(tenant_a.id).is_ok(),
+        "Connection should succeed after removal"
+    );
 
     println!("✓ Connection limit correctly enforced");
 
@@ -403,14 +416,16 @@ fn test_storage_limit_enforced() -> Result<()> {
     let tenant_a = &tenants[0];
 
     // Set low storage limit (10 MB)
-    manager.update_resource_limits(
-        tenant_a.id,
-        ResourceLimits {
-            max_storage_bytes: 10 * 1024 * 1024,
-            max_connections: 50,
-            max_qps: 1000,
-        }
-    ).expect("Failed to update resource limits");
+    manager
+        .update_resource_limits(
+            tenant_a.id,
+            ResourceLimits {
+                max_storage_bytes: 10 * 1024 * 1024,
+                max_connections: 50,
+                max_qps: 1000,
+            },
+        )
+        .expect("Failed to update resource limits");
 
     // Try to set storage within limit
     let result = manager.update_storage_usage(tenant_a.id, 5 * 1024 * 1024);
@@ -433,14 +448,16 @@ fn test_qps_limit_enforced() -> Result<()> {
     let tenant_a = &tenants[0];
 
     // Set low QPS limit
-    manager.update_resource_limits(
-        tenant_a.id,
-        ResourceLimits {
-            max_storage_bytes: 100 * 1024 * 1024,
-            max_connections: 50,
-            max_qps: 5,
-        }
-    ).expect("Failed to update resource limits");
+    manager
+        .update_resource_limits(
+            tenant_a.id,
+            ResourceLimits {
+                max_storage_bytes: 100 * 1024 * 1024,
+                max_connections: 50,
+                max_qps: 5,
+            },
+        )
+        .expect("Failed to update resource limits");
 
     // Execute queries up to limit
     for i in 1..=5 {
@@ -465,14 +482,16 @@ fn test_quota_window_reset() -> Result<()> {
     let tenant_a = &tenants[0];
 
     // Set low QPS limit
-    manager.update_resource_limits(
-        tenant_a.id,
-        ResourceLimits {
-            max_storage_bytes: 100 * 1024 * 1024,
-            max_connections: 50,
-            max_qps: 3,
-        }
-    ).expect("Failed to update resource limits");
+    manager
+        .update_resource_limits(
+            tenant_a.id,
+            ResourceLimits {
+                max_storage_bytes: 100 * 1024 * 1024,
+                max_connections: 50,
+                max_qps: 3,
+            },
+        )
+        .expect("Failed to update resource limits");
 
     // Execute queries to limit
     manager.record_query(tenant_a.id).expect("Query 1 failed");
@@ -486,7 +505,10 @@ fn test_quota_window_reset() -> Result<()> {
     manager.reset_qps_window(tenant_a.id).expect("Reset failed");
 
     // Should succeed now
-    assert!(manager.record_query(tenant_a.id).is_ok(), "Query should succeed after window reset");
+    assert!(
+        manager.record_query(tenant_a.id).is_ok(),
+        "Query should succeed after window reset"
+    );
 
     // Verify tracking updated
     let tracking = manager.get_quota_tracking(tenant_a.id);
@@ -505,17 +527,21 @@ fn test_storage_rollback_on_quota_exceeded() -> Result<()> {
     let tenant_a = &tenants[0];
 
     // Set storage limit
-    manager.update_resource_limits(
-        tenant_a.id,
-        ResourceLimits {
-            max_storage_bytes: 10 * 1024 * 1024,
-            max_connections: 50,
-            max_qps: 1000,
-        }
-    ).expect("Failed to update resource limits");
+    manager
+        .update_resource_limits(
+            tenant_a.id,
+            ResourceLimits {
+                max_storage_bytes: 10 * 1024 * 1024,
+                max_connections: 50,
+                max_qps: 1000,
+            },
+        )
+        .expect("Failed to update resource limits");
 
     // Set initial storage
-    manager.update_storage_usage(tenant_a.id, 5 * 1024 * 1024).expect("Failed to set initial storage");
+    manager
+        .update_storage_usage(tenant_a.id, 5 * 1024 * 1024)
+        .expect("Failed to set initial storage");
 
     let initial_tracking = manager.get_quota_tracking(tenant_a.id).unwrap();
     assert_eq!(initial_tracking.storage_bytes_used, 5 * 1024 * 1024);
@@ -526,8 +552,11 @@ fn test_storage_rollback_on_quota_exceeded() -> Result<()> {
 
     // Verify storage wasn't updated
     let tracking = manager.get_quota_tracking(tenant_a.id).unwrap();
-    assert_eq!(tracking.storage_bytes_used, 5 * 1024 * 1024,
-               "Storage should remain at previous value");
+    assert_eq!(
+        tracking.storage_bytes_used,
+        5 * 1024 * 1024,
+        "Storage should remain at previous value"
+    );
 
     println!("✓ Storage quota enforcement prevents updates");
 
@@ -702,10 +731,7 @@ fn test_tenant_registration() -> Result<()> {
     let manager = TenantManager::new();
 
     // Register new tenant
-    let tenant = manager.register_tenant(
-        "TestTenant".to_string(),
-        IsolationMode::SharedSchema,
-    );
+    let tenant = manager.register_tenant("TestTenant".to_string(), IsolationMode::SharedSchema);
 
     assert_eq!(tenant.name, "TestTenant");
     assert_eq!(tenant.isolation_mode, IsolationMode::SharedSchema);
@@ -768,24 +794,15 @@ fn test_isolation_modes() -> Result<()> {
     let manager = TenantManager::new();
 
     // Test each isolation mode
-    let shared_schema = manager.register_tenant(
-        "SharedSchemaTenant".to_string(),
-        IsolationMode::SharedSchema,
-    );
+    let shared_schema = manager.register_tenant("SharedSchemaTenant".to_string(), IsolationMode::SharedSchema);
     assert_eq!(shared_schema.isolation_mode, IsolationMode::SharedSchema);
     assert!(shared_schema.rls_enabled);
 
-    let db_per_tenant = manager.register_tenant(
-        "DbPerTenant".to_string(),
-        IsolationMode::DatabasePerTenant,
-    );
+    let db_per_tenant = manager.register_tenant("DbPerTenant".to_string(), IsolationMode::DatabasePerTenant);
     assert_eq!(db_per_tenant.isolation_mode, IsolationMode::DatabasePerTenant);
     assert!(!db_per_tenant.rls_enabled);
 
-    let schema_per_tenant = manager.register_tenant(
-        "SchemaPerTenant".to_string(),
-        IsolationMode::SchemaPerTenant,
-    );
+    let schema_per_tenant = manager.register_tenant("SchemaPerTenant".to_string(), IsolationMode::SchemaPerTenant);
     assert_eq!(schema_per_tenant.isolation_mode, IsolationMode::SchemaPerTenant);
     assert!(!schema_per_tenant.rls_enabled);
 
@@ -830,25 +847,33 @@ fn test_tenant_migration_lifecycle() -> Result<()> {
     let target = &tenants[1];
 
     // Start migration
-    manager.start_migration(source.id, target.id).expect("Failed to start migration");
+    manager
+        .start_migration(source.id, target.id)
+        .expect("Failed to start migration");
 
     let status = manager.get_migration_status(source.id, target.id);
     assert!(status.is_some());
     assert_eq!(status.as_ref().unwrap().migration_state, MigrationState::Pending);
 
     // Update to Snapshotting
-    manager.update_migration_state(source.id, target.id, MigrationState::Snapshotting).expect("Failed to update state");
+    manager
+        .update_migration_state(source.id, target.id, MigrationState::Snapshotting)
+        .expect("Failed to update state");
     let status = manager.get_migration_status(source.id, target.id).unwrap();
     assert_eq!(status.migration_state, MigrationState::Snapshotting);
 
     // Record progress
-    manager.record_replication_progress(source.id, target.id, 50, 100).expect("Failed to record progress");
+    manager
+        .record_replication_progress(source.id, target.id, 50, 100)
+        .expect("Failed to record progress");
     let status = manager.get_migration_status(source.id, target.id).unwrap();
     assert_eq!(status.changes_replicated, 50);
     assert_eq!(status.total_changes, 100);
 
     // Complete migration
-    manager.update_migration_state(source.id, target.id, MigrationState::Completed).expect("Failed to complete migration");
+    manager
+        .update_migration_state(source.id, target.id, MigrationState::Completed)
+        .expect("Failed to complete migration");
     let status = manager.get_migration_status(source.id, target.id).unwrap();
     assert_eq!(status.migration_state, MigrationState::Completed);
     assert!(status.completed_at.is_some());
@@ -866,28 +891,28 @@ fn test_migration_consistency_verification() -> Result<()> {
     let source = &tenants[0];
     let target = &tenants[1];
 
-    manager.start_migration(source.id, target.id).expect("Failed to start migration");
+    manager
+        .start_migration(source.id, target.id)
+        .expect("Failed to start migration");
 
     // Set matching checksums
-    manager.set_migration_checksums(
-        source.id,
-        target.id,
-        "abc123".to_string(),
-        "abc123".to_string(),
-    ).expect("Failed to set matching checksums");
+    manager
+        .set_migration_checksums(source.id, target.id, "abc123".to_string(), "abc123".to_string())
+        .expect("Failed to set matching checksums");
 
-    let consistent = manager.verify_migration_consistency(source.id, target.id).expect("Failed to verify consistency");
+    let consistent = manager
+        .verify_migration_consistency(source.id, target.id)
+        .expect("Failed to verify consistency");
     assert!(consistent, "Checksums should match");
 
     // Set non-matching checksums
-    manager.set_migration_checksums(
-        source.id,
-        target.id,
-        "abc123".to_string(),
-        "xyz789".to_string(),
-    ).expect("Failed to set non-matching checksums");
+    manager
+        .set_migration_checksums(source.id, target.id, "abc123".to_string(), "xyz789".to_string())
+        .expect("Failed to set non-matching checksums");
 
-    let consistent = manager.verify_migration_consistency(source.id, target.id).expect("Failed to verify consistency");
+    let consistent = manager
+        .verify_migration_consistency(source.id, target.id)
+        .expect("Failed to verify consistency");
     assert!(!consistent, "Checksums should not match");
 
     println!("✓ Migration consistency verification works");
@@ -903,16 +928,24 @@ fn test_migration_pause_resume() -> Result<()> {
     let source = &tenants[0];
     let target = &tenants[1];
 
-    manager.start_migration(source.id, target.id).expect("Failed to start migration");
-    manager.update_migration_state(source.id, target.id, MigrationState::Replicating).expect("Failed to update state");
+    manager
+        .start_migration(source.id, target.id)
+        .expect("Failed to start migration");
+    manager
+        .update_migration_state(source.id, target.id, MigrationState::Replicating)
+        .expect("Failed to update state");
 
     // Pause
-    manager.pause_migration(source.id, target.id).expect("Failed to pause migration");
+    manager
+        .pause_migration(source.id, target.id)
+        .expect("Failed to pause migration");
     let status = manager.get_migration_status(source.id, target.id).unwrap();
     assert_eq!(status.migration_state, MigrationState::Paused);
 
     // Resume
-    manager.resume_migration(source.id, target.id).expect("Failed to resume migration");
+    manager
+        .resume_migration(source.id, target.id)
+        .expect("Failed to resume migration");
     let status = manager.get_migration_status(source.id, target.id).unwrap();
     assert_eq!(status.migration_state, MigrationState::Replicating);
 
@@ -929,10 +962,14 @@ fn test_migration_rollback() -> Result<()> {
     let source = &tenants[0];
     let target = &tenants[1];
 
-    manager.start_migration(source.id, target.id).expect("Failed to start migration");
+    manager
+        .start_migration(source.id, target.id)
+        .expect("Failed to start migration");
 
     // Rollback
-    manager.rollback_migration(source.id, target.id).expect("Failed to rollback migration");
+    manager
+        .rollback_migration(source.id, target.id)
+        .expect("Failed to rollback migration");
 
     let status = manager.get_migration_status(source.id, target.id).unwrap();
     match status.migration_state {
@@ -963,7 +1000,9 @@ fn test_quota_metrics_accuracy() -> Result<()> {
     manager.add_connection(tenant.id).expect("Failed to add connection 2");
 
     // Update storage
-    manager.update_storage_usage(tenant.id, 50 * 1024 * 1024).expect("Failed to update storage");
+    manager
+        .update_storage_usage(tenant.id, 50 * 1024 * 1024)
+        .expect("Failed to update storage");
 
     // Record queries
     manager.record_query(tenant.id).expect("Query 1 failed");
@@ -1065,7 +1104,9 @@ fn test_resource_limit_customization() -> Result<()> {
         max_qps: 5000,
     };
 
-    manager.update_resource_limits(tenant.id, custom_limits.clone()).expect("Failed to update limits");
+    manager
+        .update_resource_limits(tenant.id, custom_limits.clone())
+        .expect("Failed to update limits");
 
     // Verify limits updated
     let updated_tenant = manager.get_tenant(tenant.id).unwrap();

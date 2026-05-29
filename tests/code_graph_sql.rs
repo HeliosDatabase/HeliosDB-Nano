@@ -3,9 +3,7 @@
 
 #![cfg(feature = "code-graph")]
 
-use heliosdb_nano::{
-    code_graph::CodeIndexOptions, EmbeddedDatabase, Result, Value,
-};
+use heliosdb_nano::{code_graph::CodeIndexOptions, EmbeddedDatabase, Result, Value};
 
 fn setup() -> Result<EmbeddedDatabase> {
     let db = EmbeddedDatabase::new_in_memory()?;
@@ -28,12 +26,7 @@ fn insert(db: &EmbeddedDatabase, path: &str, lang: &str, content: &str) -> Resul
 #[test]
 fn lsp_definition_via_sql() -> Result<()> {
     let db = setup()?;
-    insert(
-        &db,
-        "m.rs",
-        "rust",
-        "pub fn answer() -> i32 { 42 }\n",
-    )?;
+    insert(&db, "m.rs", "rust", "pub fn answer() -> i32 { 42 }\n")?;
     db.code_index(CodeIndexOptions::for_table("src"))?;
 
     let rows = db.query("SELECT * FROM lsp_definition('answer')", &[])?;
@@ -53,10 +46,7 @@ fn lsp_definition_with_path_hint_via_sql() -> Result<()> {
     insert(&db, "b.rs", "rust", "pub fn shared() {}\n")?;
     db.code_index(CodeIndexOptions::for_table("src"))?;
 
-    let rows = db.query(
-        "SELECT * FROM lsp_definition('shared', 'b.rs')",
-        &[],
-    )?;
+    let rows = db.query("SELECT * FROM lsp_definition('shared', 'b.rs')", &[])?;
     assert_eq!(rows.len(), 1);
     match &rows[0].values[1] {
         Value::String(s) => assert_eq!(s, "b.rs"),
@@ -83,10 +73,7 @@ fn lsp_references_via_sql() -> Result<()> {
         v => panic!("expected id, got {v:?}"),
     };
 
-    let refs = db.query_params(
-        "SELECT * FROM lsp_references($1)",
-        &[Value::Int8(helper_id)],
-    )?;
+    let refs = db.query_params("SELECT * FROM lsp_references($1)", &[Value::Int8(helper_id)])?;
     assert_eq!(refs.len(), 2);
     Ok(())
 }
@@ -102,10 +89,7 @@ fn lsp_hover_via_sql() -> Result<()> {
         Value::Int8(n) => *n,
         v => panic!("expected id, got {v:?}"),
     };
-    let rows = db.query_params(
-        "SELECT * FROM lsp_hover($1)",
-        &[Value::Int8(id)],
-    )?;
+    let rows = db.query_params("SELECT * FROM lsp_hover($1)", &[Value::Int8(id)])?;
     assert_eq!(rows.len(), 1);
     match &rows[0].values[0] {
         Value::String(s) => assert!(s.contains("hoverable")),

@@ -13,11 +13,15 @@ use heliosdb_nano::{EmbeddedDatabase, Result, Value};
 fn b1_serial_auto_increments() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
     db.execute(r#"CREATE TABLE "users" ("id" SERIAL PRIMARY KEY, "email" VARCHAR(255) NOT NULL UNIQUE)"#)?;
-    let (n, rows) = db.execute_returning(r#"INSERT INTO "users" ("email") VALUES ('alice@example.com') RETURNING id"#)?;
+    let (n, rows) =
+        db.execute_returning(r#"INSERT INTO "users" ("email") VALUES ('alice@example.com') RETURNING id"#)?;
     assert_eq!(n, 1);
     assert_eq!(rows.len(), 1);
-    assert!(matches!(rows[0].values[0], Value::Int4(1) | Value::Int8(1)),
-        "expected id=1, got {:?}", rows[0].values[0]);
+    assert!(
+        matches!(rows[0].values[0], Value::Int4(1) | Value::Int8(1)),
+        "expected id=1, got {:?}",
+        rows[0].values[0]
+    );
     Ok(())
 }
 
@@ -30,7 +34,10 @@ fn b2_identity_auto_increments() -> Result<()> {
     db.execute("CREATE TABLE t_ident (id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v TEXT)")?;
     let (_, rows) = db.execute_returning("INSERT INTO t_ident (v) VALUES ('a') RETURNING id")?;
     assert_eq!(rows.len(), 1);
-    assert!(matches!(rows[0].values[0], Value::Int4(1) | Value::Int8(1) | Value::Int2(1)));
+    assert!(matches!(
+        rows[0].values[0],
+        Value::Int4(1) | Value::Int8(1) | Value::Int2(1)
+    ));
     Ok(())
 }
 
@@ -44,8 +51,11 @@ fn b3_default_keyword_triggers_autofill() -> Result<()> {
     let (_, rows) = db.execute_returning("INSERT INTO t_def (id, n) VALUES (DEFAULT, 'alice') RETURNING *")?;
     assert_eq!(rows.len(), 1);
     // id (position 0) must be auto-filled, not NULL
-    assert!(!matches!(rows[0].values[0], Value::Null),
-        "DEFAULT should have triggered SERIAL auto-fill, got {:?}", rows[0].values);
+    assert!(
+        !matches!(rows[0].values[0], Value::Null),
+        "DEFAULT should have triggered SERIAL auto-fill, got {:?}",
+        rows[0].values
+    );
     Ok(())
 }
 
@@ -72,16 +82,15 @@ fn b4_returning_star_omitted_columns() -> Result<()> {
 #[test]
 fn b5_extract_epoch_from_timestamp_literal() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
-    let rows = db.query(
-        "SELECT EXTRACT(EPOCH FROM TIMESTAMP '2026-01-01 00:00:00')",
-        &[],
-    )?;
+    let rows = db.query("SELECT EXTRACT(EPOCH FROM TIMESTAMP '2026-01-01 00:00:00')", &[])?;
     let secs = match &rows[0].values[0] {
         Value::Float8(f) => *f,
         other => panic!("expected Float8, got {:?}", other),
     };
-    assert!(secs > 1_700_000_000.0 && secs < 2_000_000_000.0,
-        "expected Unix-epoch seconds near 2026, got {secs}");
+    assert!(
+        secs > 1_700_000_000.0 && secs < 2_000_000_000.0,
+        "expected Unix-epoch seconds near 2026, got {secs}"
+    );
     Ok(())
 }
 
@@ -221,8 +230,7 @@ fn b16_version_returns_current_nano_version() -> Result<()> {
         Value::String(s) => s.clone(),
         _ => panic!("expected String"),
     };
-    assert!(v.contains(env!("CARGO_PKG_VERSION")),
-        "version() = {v:?}");
+    assert!(v.contains(env!("CARGO_PKG_VERSION")), "version() = {v:?}");
     Ok(())
 }
 
@@ -259,10 +267,14 @@ fn b23_update_set_correlated_scalar_subquery() -> Result<()> {
     assert_eq!(rows.len(), 2);
     if let Value::String(s) = &rows[0].values[1] {
         assert_eq!(s, "a@b.c");
-    } else { panic!("expected String, got {:?}", rows[0].values); }
+    } else {
+        panic!("expected String, got {:?}", rows[0].values);
+    }
     if let Value::String(s) = &rows[1].values[1] {
         assert_eq!(s, "c@d.e");
-    } else { panic!("expected String"); }
+    } else {
+        panic!("expected String");
+    }
     Ok(())
 }
 
@@ -296,8 +308,11 @@ fn b23_scalar_subquery_returning_null() -> Result<()> {
     // t2 is empty — subquery returns 0 rows → NULL.
     db.execute("UPDATE t1 SET n = (SELECT n FROM t2 WHERE t2.id = t1.id)")?;
     let rows = db.query("SELECT n FROM t1", &[])?;
-    assert!(matches!(rows[0].values[0], Value::Null),
-        "expected NULL from empty scalar subquery, got {:?}", rows[0].values);
+    assert!(
+        matches!(rows[0].values[0], Value::Null),
+        "expected NULL from empty scalar subquery, got {:?}",
+        rows[0].values
+    );
     Ok(())
 }
 
@@ -314,8 +329,11 @@ fn b24_default_expr_applied_when_column_omitted() -> Result<()> {
     db.execute("INSERT INTO t (name) VALUES ('alice')")?;
     let rows = db.query("SELECT name, created_at FROM t", &[])?;
     assert_eq!(rows.len(), 1);
-    assert!(!matches!(rows[0].values[1], Value::Null),
-        "created_at must be populated from DEFAULT now(), got {:?}", rows[0].values[1]);
+    assert!(
+        !matches!(rows[0].values[1], Value::Null),
+        "created_at must be populated from DEFAULT now(), got {:?}",
+        rows[0].values[1]
+    );
     Ok(())
 }
 
@@ -365,8 +383,10 @@ fn b26_not_null_explicit_null_rejected() -> Result<()> {
     let result = db.execute("INSERT INTO t (id, must_be_set) VALUES (1, NULL)");
     assert!(result.is_err(), "explicit NULL into NOT NULL column should error");
     let msg = format!("{}", result.unwrap_err());
-    assert!(msg.contains("NOT NULL") || msg.contains("not null"),
-        "error should mention NOT NULL, got: {msg}");
+    assert!(
+        msg.contains("NOT NULL") || msg.contains("not null"),
+        "error should mention NOT NULL, got: {msg}"
+    );
     Ok(())
 }
 
@@ -409,9 +429,11 @@ fn b27_default_in_values_resolves_column_default() -> Result<()> {
     let rows = db.query("SELECT id, name, created_at FROM t", &[])?;
     assert_eq!(rows.len(), 1);
     // created_at must be a real Timestamp, not Null.
-    assert!(!matches!(rows[0].values[2], Value::Null),
+    assert!(
+        !matches!(rows[0].values[2], Value::Null),
         "DEFAULT in VALUES should resolve to the column's default expression, got {:?}",
-        rows[0].values[2]);
+        rows[0].values[2]
+    );
     Ok(())
 }
 
@@ -546,10 +568,7 @@ fn b29_qualified_predicate_matches_scan_row() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
     db.execute("CREATE TABLE t (id INT, name TEXT)")?;
     db.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')")?;
-    let rows = db.query(
-        "SELECT id, name FROM t WHERE t.name = 'b'",
-        &[],
-    )?;
+    let rows = db.query("SELECT id, name FROM t WHERE t.name = 'b'", &[])?;
     assert_eq!(rows.len(), 1);
     match &rows[0].values[0] {
         Value::Int4(1 | 2 | 3) => {}
@@ -557,7 +576,6 @@ fn b29_qualified_predicate_matches_scan_row() -> Result<()> {
     }
     Ok(())
 }
-
 
 // ---------------------------------------------------------------------
 // B31 — UPDATE / DELETE with table-qualified WHERE column
@@ -575,9 +593,8 @@ fn b31_update_with_qualified_where_column() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
     db.execute(r#"CREATE TABLE "time_entries" ("id" SERIAL PRIMARY KEY, "notes" TEXT)"#)?;
     db.execute(r#"INSERT INTO "time_entries" ("notes") VALUES ('old')"#)?;
-    let (n, rows) = db.execute_returning(
-        r#"UPDATE "time_entries" SET "notes"='new' WHERE "time_entries"."id"=1 RETURNING *"#,
-    )?;
+    let (n, rows) =
+        db.execute_returning(r#"UPDATE "time_entries" SET "notes"='new' WHERE "time_entries"."id"=1 RETURNING *"#)?;
     assert_eq!(n, 1);
     assert_eq!(rows.len(), 1);
     Ok(())
@@ -612,15 +629,9 @@ fn b32_timestamp_vs_iso_string_comparison() -> Result<()> {
     db.execute(r#"CREATE TABLE "t" ("id" INT, "ts" TIMESTAMP)"#)?;
     db.execute(r#"INSERT INTO "t" VALUES (1, '2026-04-22 15:02:34')"#)?;
     db.execute(r#"INSERT INTO "t" VALUES (2, '2026-04-24 10:00:00')"#)?;
-    let gte = db.query(
-        r#"SELECT "id" FROM "t" WHERE "ts" >= '2026-04-23T00:00:00.000Z'"#,
-        &[],
-    )?;
+    let gte = db.query(r#"SELECT "id" FROM "t" WHERE "ts" >= '2026-04-23T00:00:00.000Z'"#, &[])?;
     assert_eq!(gte.len(), 1);
-    let lt = db.query(
-        r#"SELECT "id" FROM "t" WHERE "ts" < '2026-04-23T00:00:00.000Z'"#,
-        &[],
-    )?;
+    let lt = db.query(r#"SELECT "id" FROM "t" WHERE "ts" < '2026-04-23T00:00:00.000Z'"#, &[])?;
     assert_eq!(lt.len(), 1);
     Ok(())
 }
@@ -658,10 +669,7 @@ fn b33_parameterized_limit() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
     db.execute(r#"CREATE TABLE "t" ("id" INT)"#)?;
     db.execute(r#"INSERT INTO "t" VALUES (1),(2),(3),(4),(5)"#)?;
-    let rows = db.query_params(
-        r#"SELECT "id" FROM "t" ORDER BY "id" LIMIT $1"#,
-        &[Value::Int4(3)],
-    )?;
+    let rows = db.query_params(r#"SELECT "id" FROM "t" ORDER BY "id" LIMIT $1"#, &[Value::Int4(3)])?;
     assert_eq!(rows.len(), 3);
     Ok(())
 }
@@ -746,7 +754,8 @@ fn b34_update_set_literal_iso_string() -> Result<()> {
     let rows = db.query(r#"SELECT "ts" FROM "t""#, &[])?;
     assert!(
         matches!(rows[0].values[0], Value::Timestamp(_)),
-        "expected Timestamp, got {:?}", rows[0].values[0],
+        "expected Timestamp, got {:?}",
+        rows[0].values[0],
     );
     Ok(())
 }
@@ -784,9 +793,7 @@ fn b34_update_set_literal_iso_string() -> Result<()> {
 #[test]
 fn b35_mixed_qualifier_group_by() -> Result<()> {
     let db = EmbeddedDatabase::new_in_memory()?;
-    db.execute(
-        r#"CREATE TABLE "time_entries" ("id" INT, "check_in" TIMESTAMP, "workspace_id" INT)"#,
-    )?;
+    db.execute(r#"CREATE TABLE "time_entries" ("id" INT, "check_in" TIMESTAMP, "workspace_id" INT)"#)?;
     db.execute(
         r#"INSERT INTO "time_entries" VALUES
             (1, '2026-04-22 10:00:00', 1),
@@ -915,9 +922,7 @@ fn b36_fk_insert_with_quoted_references() -> Result<()> {
              "owner_id" INTEGER REFERENCES "users"("id")
            )"#,
     )?;
-    let (_, rows) = db.execute_returning(
-        r#"INSERT INTO "users" ("email") VALUES ('a') RETURNING "id""#,
-    )?;
+    let (_, rows) = db.execute_returning(r#"INSERT INTO "users" ("email") VALUES ('a') RETURNING "id""#)?;
     let parent_id = match rows[0].values[0] {
         Value::Int4(n) => n as i64,
         Value::Int8(n) => n,
@@ -943,9 +948,7 @@ fn b36_fk_violation_fires_on_unquoted_insert() -> Result<()> {
              owner_id INTEGER REFERENCES users(id)
            )"#,
     )?;
-    let err = db.execute(
-        r#"INSERT INTO workspaces (name, owner_id) VALUES ('w', 999)"#,
-    );
+    let err = db.execute(r#"INSERT INTO workspaces (name, owner_id) VALUES ('w', 999)"#);
     assert!(err.is_err(), "FK violation expected, got Ok");
     Ok(())
 }
@@ -961,9 +964,7 @@ fn b36_fk_violation_fires_on_quoted_insert() -> Result<()> {
              "owner_id" INTEGER REFERENCES "users"("id")
            )"#,
     )?;
-    let err = db.execute(
-        r#"INSERT INTO "workspaces" ("name", "owner_id") VALUES ('w', 999)"#,
-    );
+    let err = db.execute(r#"INSERT INTO "workspaces" ("name", "owner_id") VALUES ('w', 999)"#);
     assert!(err.is_err(), "FK violation expected, got Ok");
     Ok(())
 }

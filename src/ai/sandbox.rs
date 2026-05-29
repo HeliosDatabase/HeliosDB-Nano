@@ -20,39 +20,30 @@ use std::collections::HashSet;
 
 // Query normalization patterns
 #[allow(clippy::expect_used)]
-static RE_LINE_COMMENTS: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"--[^\n]*").expect("Invalid LINE_COMMENTS regex pattern")
-});
+static RE_LINE_COMMENTS: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"--[^\n]*").expect("Invalid LINE_COMMENTS regex pattern"));
 #[allow(clippy::expect_used)]
-static RE_BLOCK_COMMENTS: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"/\*[\s\S]*?\*/").expect("Invalid BLOCK_COMMENTS regex pattern")
-});
+static RE_BLOCK_COMMENTS: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"/\*[\s\S]*?\*/").expect("Invalid BLOCK_COMMENTS regex pattern"));
 #[allow(clippy::expect_used)]
-static RE_WHITESPACE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"\s+").expect("Invalid WHITESPACE regex pattern")
-});
+static RE_WHITESPACE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\s+").expect("Invalid WHITESPACE regex pattern"));
 
 // Table detection patterns
 #[allow(clippy::expect_used)]
-static RE_FROM_TABLE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)").expect("Invalid FROM_TABLE regex pattern")
-});
+static RE_FROM_TABLE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]*)").expect("Invalid FROM_TABLE regex pattern"));
 #[allow(clippy::expect_used)]
-static RE_JOIN_TABLE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\bJOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)").expect("Invalid JOIN_TABLE regex pattern")
-});
+static RE_JOIN_TABLE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bJOIN\s+([a-zA-Z_][a-zA-Z0-9_]*)").expect("Invalid JOIN_TABLE regex pattern"));
 #[allow(clippy::expect_used)]
-static RE_INTO_TABLE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\bINTO\s+([a-zA-Z_][a-zA-Z0-9_]*)").expect("Invalid INTO_TABLE regex pattern")
-});
+static RE_INTO_TABLE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bINTO\s+([a-zA-Z_][a-zA-Z0-9_]*)").expect("Invalid INTO_TABLE regex pattern"));
 #[allow(clippy::expect_used)]
-static RE_UPDATE_TABLE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\bUPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)").expect("Invalid UPDATE_TABLE regex pattern")
-});
+static RE_UPDATE_TABLE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bUPDATE\s+([a-zA-Z_][a-zA-Z0-9_]*)").expect("Invalid UPDATE_TABLE regex pattern"));
 #[allow(clippy::expect_used)]
-static RE_TABLE_KEYWORD: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)\bTABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)").expect("Invalid TABLE_KEYWORD regex pattern")
-});
+static RE_TABLE_KEYWORD: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)\bTABLE\s+([a-zA-Z_][a-zA-Z0-9_]*)").expect("Invalid TABLE_KEYWORD regex pattern"));
 
 // SQL injection detection patterns
 #[allow(clippy::expect_used)]
@@ -61,50 +52,38 @@ static RE_INJECTION_MULTI_STMT: Lazy<Regex> = Lazy::new(|| {
         .expect("Invalid INJECTION_MULTI_STMT regex pattern")
 });
 #[allow(clippy::expect_used)]
-static RE_INJECTION_OR_EQUALS: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)'\s*OR\s+'?\d*'?\s*=\s*'?\d*'?")
-        .expect("Invalid INJECTION_OR_EQUALS regex pattern")
-});
+static RE_INJECTION_OR_EQUALS: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)'\s*OR\s+'?\d*'?\s*=\s*'?\d*'?").expect("Invalid INJECTION_OR_EQUALS regex pattern"));
 #[allow(clippy::expect_used)]
-static RE_INJECTION_COMMENT: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)'\s*;\s*--").expect("Invalid INJECTION_COMMENT regex pattern")
-});
+static RE_INJECTION_COMMENT: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)'\s*;\s*--").expect("Invalid INJECTION_COMMENT regex pattern"));
 #[allow(clippy::expect_used)]
-static RE_INJECTION_UNION: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)UNION\s+(ALL\s+)?SELECT").expect("Invalid INJECTION_UNION regex pattern")
-});
+static RE_INJECTION_UNION: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)UNION\s+(ALL\s+)?SELECT").expect("Invalid INJECTION_UNION regex pattern"));
 #[allow(clippy::expect_used)]
-static RE_INJECTION_OUTFILE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)INTO\s+OUTFILE").expect("Invalid INJECTION_OUTFILE regex pattern")
-});
+static RE_INJECTION_OUTFILE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)INTO\s+OUTFILE").expect("Invalid INJECTION_OUTFILE regex pattern"));
 #[allow(clippy::expect_used)]
-static RE_INJECTION_LOAD_FILE: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)LOAD_FILE\s*\(").expect("Invalid INJECTION_LOAD_FILE regex pattern")
-});
+static RE_INJECTION_LOAD_FILE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)LOAD_FILE\s*\(").expect("Invalid INJECTION_LOAD_FILE regex pattern"));
 #[allow(clippy::expect_used)]
-static RE_INJECTION_SLEEP: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)SLEEP\s*\(").expect("Invalid INJECTION_SLEEP regex pattern")
-});
+static RE_INJECTION_SLEEP: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)SLEEP\s*\(").expect("Invalid INJECTION_SLEEP regex pattern"));
 #[allow(clippy::expect_used)]
-static RE_INJECTION_BENCHMARK: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)BENCHMARK\s*\(").expect("Invalid INJECTION_BENCHMARK regex pattern")
-});
+static RE_INJECTION_BENCHMARK: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)BENCHMARK\s*\(").expect("Invalid INJECTION_BENCHMARK regex pattern"));
 #[allow(clippy::expect_used)]
-static RE_INJECTION_EXEC: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)EXEC\s*\(").expect("Invalid INJECTION_EXEC regex pattern")
-});
+static RE_INJECTION_EXEC: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)EXEC\s*\(").expect("Invalid INJECTION_EXEC regex pattern"));
 #[allow(clippy::expect_used)]
-static RE_INJECTION_HEX: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"0x[0-9a-fA-F]{10,}").expect("Invalid INJECTION_HEX regex pattern")
-});
+static RE_INJECTION_HEX: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"0x[0-9a-fA-F]{10,}").expect("Invalid INJECTION_HEX regex pattern"));
 #[allow(clippy::expect_used)]
-static RE_INJECTION_CHAR: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)CHAR\s*\(\s*\d+\s*\)").expect("Invalid INJECTION_CHAR regex pattern")
-});
+static RE_INJECTION_CHAR: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)CHAR\s*\(\s*\d+\s*\)").expect("Invalid INJECTION_CHAR regex pattern"));
 #[allow(clippy::expect_used)]
-static RE_INJECTION_CONCAT: Lazy<Regex> = Lazy::new(|| {
-    Regex::new(r"(?i)CONCAT\s*\([^)]*'[^)]*\)").expect("Invalid INJECTION_CONCAT regex pattern")
-});
+static RE_INJECTION_CONCAT: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"(?i)CONCAT\s*\([^)]*'[^)]*\)").expect("Invalid INJECTION_CONCAT regex pattern"));
 
 /// Sandbox configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -345,8 +324,7 @@ impl QuerySandbox {
                 });
             }
 
-            if !self.config.allowed_operations.is_empty() &&
-               !self.config.allowed_operations.contains(op) {
+            if !self.config.allowed_operations.is_empty() && !self.config.allowed_operations.contains(op) {
                 errors.push(ValidationError {
                     code: "OPERATION_NOT_ALLOWED".to_string(),
                     message: format!("{:?} operation is not in allowed list", op),
@@ -371,7 +349,10 @@ impl QuerySandbox {
             }
 
             if !self.config.allowed_tables.is_empty() {
-                let allowed = self.config.allowed_tables.iter()
+                let allowed = self
+                    .config
+                    .allowed_tables
+                    .iter()
                     .any(|t| t.eq_ignore_ascii_case(&table_lower));
                 if !allowed {
                     errors.push(ValidationError {
@@ -482,11 +463,7 @@ impl QuerySandbox {
         }
 
         let allowed = errors.is_empty();
-        let sanitized_query = if allowed {
-            Some(normalized)
-        } else {
-            None
-        };
+        let sanitized_query = if allowed { Some(normalized) } else { None };
 
         SandboxResult {
             allowed,

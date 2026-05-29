@@ -31,13 +31,13 @@
 
 #![allow(deprecated)]
 
-use crate::{Result, Error, Tuple};
-use rocksdb::DB;
-use std::sync::Arc;
-use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
-use serde::{Serialize, Deserialize};
+use crate::{Error, Result, Tuple};
 use chrono::{DateTime, Utc};
+use rocksdb::DB;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Delta operation types for materialized view tracking
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -159,9 +159,7 @@ impl Delta {
         Self {
             table_name,
             row_id,
-            operation: DeltaOperation::Insert {
-                tuple: tuple.clone(),
-            },
+            operation: DeltaOperation::Insert { tuple: tuple.clone() },
             timestamp: SystemTime::now(),
             transaction_id: delta_id,
             delta_id,
@@ -173,13 +171,7 @@ impl Delta {
 
     /// Create a new update delta (legacy API)
     #[allow(deprecated)]
-    pub fn update(
-        delta_id: u64,
-        table_name: String,
-        row_id: u64,
-        old_tuple: Tuple,
-        new_tuple: Tuple,
-    ) -> Self {
+    pub fn update(delta_id: u64, table_name: String, row_id: u64, old_tuple: Tuple, new_tuple: Tuple) -> Self {
         Self {
             table_name,
             row_id,
@@ -202,9 +194,7 @@ impl Delta {
         Self {
             table_name,
             row_id,
-            operation: DeltaOperation::Delete {
-                tuple: tuple.clone(),
-            },
+            operation: DeltaOperation::Delete { tuple: tuple.clone() },
             timestamp: SystemTime::now(),
             transaction_id: delta_id,
             delta_id,
@@ -227,10 +217,7 @@ impl Delta {
         // Key format: mv_delta:{table}:{timestamp_micros}:{row_id}
         // This enables efficient range scans by table and time
         let timestamp_micros = self.timestamp_micros()?;
-        let key = format!(
-            "mv_delta:{}:{:020}:{}",
-            self.table_name, timestamp_micros, self.row_id
-        );
+        let key = format!("mv_delta:{}:{:020}:{}", self.table_name, timestamp_micros, self.row_id);
         Ok(key.into_bytes())
     }
 }
@@ -296,13 +283,16 @@ impl DeltaTracker {
     /// Load the last delta ID from storage
     fn load_last_delta_id(db: &DB) -> Result<u64> {
         let key = b"meta:delta:last_id";
-        match db.get(key)
+        match db
+            .get(key)
             .map_err(|e| Error::storage(format!("Failed to read last delta ID: {}", e)))?
         {
             Some(bytes) => {
                 let id = u64::from_le_bytes(
-                    bytes.as_slice().try_into()
-                        .map_err(|_| Error::storage("Invalid delta ID format"))?
+                    bytes
+                        .as_slice()
+                        .try_into()
+                        .map_err(|_| Error::storage("Invalid delta ID format"))?,
                 );
                 Ok(id)
             }
@@ -314,7 +304,8 @@ impl DeltaTracker {
     fn save_last_delta_id(&self, id: u64) -> Result<()> {
         let key = b"meta:delta:last_id";
         let value = id.to_le_bytes();
-        self.db.put(key, value)
+        self.db
+            .put(key, value)
             .map_err(|e| Error::storage(format!("Failed to save last delta ID: {}", e)))
     }
 
@@ -329,10 +320,11 @@ impl DeltaTracker {
     pub fn record_delta(&self, delta: Delta) -> Result<()> {
         // Store delta in RocksDB
         let key = format!("delta:{}:{:020}", delta.table_name, delta.delta_id);
-        let value = bincode::serialize(&delta)
-            .map_err(|e| Error::storage(format!("Failed to serialize delta: {}", e)))?;
+        let value =
+            bincode::serialize(&delta).map_err(|e| Error::storage(format!("Failed to serialize delta: {}", e)))?;
 
-        self.db.put(key.as_bytes(), &value)
+        self.db
+            .put(key.as_bytes(), &value)
             .map_err(|e| Error::storage(format!("Failed to store delta: {}", e)))?;
 
         // Update last delta ID
@@ -375,8 +367,7 @@ impl DeltaTracker {
             // Iterate over deltas for this table
             let iter = self.db.iterator(rocksdb::IteratorMode::Start);
             for item in iter {
-                let (key, value) = item
-                    .map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
                 // Check if key matches our prefix
                 if !key.starts_with(prefix_bytes) {
@@ -418,8 +409,7 @@ impl DeltaTracker {
 
             let iter = self.db.iterator(rocksdb::IteratorMode::Start);
             for item in iter {
-                let (key, value) = item
-                    .map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
                 if !key.starts_with(prefix_bytes) {
                     if let (Some(&k), Some(&p)) = (key.first(), prefix_bytes.first()) {
@@ -454,8 +444,7 @@ impl DeltaTracker {
         let iter = self.db.iterator(rocksdb::IteratorMode::Start);
 
         for item in iter {
-            let (key, value) = item
-                .map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(prefix) {
                 if let (Some(&k), Some(&p)) = (key.first(), prefix.first()) {
@@ -478,7 +467,8 @@ impl DeltaTracker {
 
         // Delete old deltas
         for key in &keys_to_delete {
-            self.db.delete(key)
+            self.db
+                .delete(key)
                 .map_err(|e| Error::storage(format!("Failed to delete delta: {}", e)))?;
             purged_count += 1;
         }
@@ -495,8 +485,8 @@ impl DeltaTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Config, Value, Column, DataType, Schema};
     use crate::storage::StorageEngine;
+    use crate::{Column, Config, DataType, Schema, Value};
 
     #[test]
     fn test_delta_creation() {
@@ -519,7 +509,9 @@ mod tests {
 
         let tuple = Tuple::new(vec![Value::Int4(1), Value::String("test".to_string())]);
 
-        tracker.record_insert("users", 1, tuple.clone()).expect("Failed to record insert");
+        tracker
+            .record_insert("users", 1, tuple.clone())
+            .expect("Failed to record insert");
 
         assert_eq!(tracker.current_delta_id(), 1);
     }
@@ -531,12 +523,15 @@ mod tests {
         let tracker = DeltaTracker::new(Arc::clone(&engine.db)).expect("Failed to create tracker");
 
         let tuple = Tuple::new(vec![Value::Int4(1)]);
-        tracker.record_insert("users", 1, tuple.clone()).expect("Failed to record");
+        tracker
+            .record_insert("users", 1, tuple.clone())
+            .expect("Failed to record");
 
         let now = Utc::now();
         let before = now - chrono::Duration::seconds(60);
 
-        let deltas = tracker.get_deltas_since(&["users".to_string()], before)
+        let deltas = tracker
+            .get_deltas_since(&["users".to_string()], before)
             .expect("Failed to get deltas");
 
         assert!(deltas.contains_key("users"));
@@ -550,12 +545,19 @@ mod tests {
         let tracker = DeltaTracker::new(Arc::clone(&engine.db)).expect("Failed to create tracker");
 
         let tuple = Tuple::new(vec![Value::Int4(1)]);
-        tracker.record_insert("users", 1, tuple.clone()).expect("Failed to record 1");
-        tracker.record_insert("users", 2, tuple.clone()).expect("Failed to record 2");
-        tracker.record_insert("products", 1, tuple.clone()).expect("Failed to record 3");
+        tracker
+            .record_insert("users", 1, tuple.clone())
+            .expect("Failed to record 1");
+        tracker
+            .record_insert("users", 2, tuple.clone())
+            .expect("Failed to record 2");
+        tracker
+            .record_insert("products", 1, tuple.clone())
+            .expect("Failed to record 3");
 
         let before = Utc::now() - chrono::Duration::seconds(60);
-        let count = tracker.count_deltas_since(&["users".to_string()], before)
+        let count = tracker
+            .count_deltas_since(&["users".to_string()], before)
             .expect("Failed to count");
 
         assert_eq!(count, 2);

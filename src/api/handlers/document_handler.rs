@@ -263,9 +263,10 @@ pub async fn list_documents(
     State(state): State<AppState>,
     Query(query): Query<ListDocumentsQuery>,
 ) -> Result<Json<ApiResponse<Vec<Document>>>, ApiError> {
-    let docs = state.db.list_documents(
-        "default",
-    ).map_err(|e| ApiError::internal(format!("Failed to list documents: {}", e)))?;
+    let docs = state
+        .db
+        .list_documents("default")
+        .map_err(|e| ApiError::internal(format!("Failed to list documents: {}", e)))?;
 
     let documents: Vec<Document> = docs
         .into_iter()
@@ -302,18 +303,14 @@ pub async fn create_document(
         None
     } else {
         Some(serde_json::Value::Object(
-            req.metadata.iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect()
+            req.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
         ))
     };
 
-    let _doc_id = state.db.create_document(
-        "default",
-        &id,
-        &req.content,
-        metadata_value,
-    ).map_err(|e| ApiError::internal(format!("Failed to create document: {}", e)))?;
+    let _doc_id = state
+        .db
+        .create_document("default", &id, &req.content, metadata_value)
+        .map_err(|e| ApiError::internal(format!("Failed to create document: {}", e)))?;
 
     let document = Document {
         id: id.clone(),
@@ -332,37 +329,42 @@ pub async fn batch_create_documents(
     State(state): State<AppState>,
     Json(req): Json<BatchCreateRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<serde_json::Value>>), ApiError> {
-    let docs_data: Vec<crate::types::DocumentData> = req.documents.iter().map(|d| {
-        // Convert HashMap to serde_json::Value
-        let metadata = if d.metadata.is_empty() {
-            None
-        } else {
-            Some(serde_json::Value::Object(
-                d.metadata.iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect()
-            ))
-        };
+    let docs_data: Vec<crate::types::DocumentData> = req
+        .documents
+        .iter()
+        .map(|d| {
+            // Convert HashMap to serde_json::Value
+            let metadata = if d.metadata.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Object(
+                    d.metadata.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                ))
+            };
 
-        crate::types::DocumentData {
-            id: d.id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            content: d.content.clone(),
-            metadata,
-            created_at: chrono::Utc::now().to_rfc3339(),
-            updated_at: chrono::Utc::now().to_rfc3339(),
-            chunks: vec![],
-        }
-    }).collect();
+            crate::types::DocumentData {
+                id: d.id.clone().unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+                content: d.content.clone(),
+                metadata,
+                created_at: chrono::Utc::now().to_rfc3339(),
+                updated_at: chrono::Utc::now().to_rfc3339(),
+                chunks: vec![],
+            }
+        })
+        .collect();
 
-    let ids = state.db.batch_create_documents(
-        "default",
-        docs_data,
-    ).map_err(|e| ApiError::internal(format!("Failed to batch create: {}", e)))?;
+    let ids = state
+        .db
+        .batch_create_documents("default", docs_data)
+        .map_err(|e| ApiError::internal(format!("Failed to batch create: {}", e)))?;
     let count = ids.len();
 
-    Ok((StatusCode::CREATED, Json(ApiResponse::success(serde_json::json!({
-        "created_count": count,
-    })))))
+    Ok((
+        StatusCode::CREATED,
+        Json(ApiResponse::success(serde_json::json!({
+            "created_count": count,
+        }))),
+    ))
 }
 
 /// Get document by ID
@@ -371,11 +373,11 @@ pub async fn get_document(
     Path(doc_id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<ApiResponse<Document>>, ApiError> {
-    let include_chunks = params.get("include_chunks")
-        .map(|s| s == "true")
-        .unwrap_or(false);
+    let include_chunks = params.get("include_chunks").map(|s| s == "true").unwrap_or(false);
 
-    let doc = state.db.get_document("default", &doc_id)
+    let doc = state
+        .db
+        .get_document("default", &doc_id)
         .map_err(|e| ApiError::not_found(format!("Document not found: {}", e)))?;
 
     // Convert Option<serde_json::Value> to HashMap
@@ -409,18 +411,15 @@ pub async fn update_document(
     Json(req): Json<UpdateDocumentRequest>,
 ) -> Result<Json<ApiResponse<Document>>, ApiError> {
     // Convert HashMap to Option<serde_json::Value> for DB
-    let metadata_value = req.metadata.clone().map(|map| {
-        serde_json::Value::Object(
-            map.into_iter().collect()
-        )
-    });
+    let metadata_value = req
+        .metadata
+        .clone()
+        .map(|map| serde_json::Value::Object(map.into_iter().collect()));
 
-    state.db.update_document(
-        "default",
-        &doc_id,
-        req.content.as_deref().unwrap_or(""),
-        metadata_value,
-    ).map_err(|e| ApiError::internal(format!("Failed to update document: {}", e)))?;
+    state
+        .db
+        .update_document("default", &doc_id, req.content.as_deref().unwrap_or(""), metadata_value)
+        .map_err(|e| ApiError::internal(format!("Failed to update document: {}", e)))?;
 
     let document = Document {
         id: doc_id.clone(),
@@ -439,7 +438,9 @@ pub async fn delete_document(
     State(state): State<AppState>,
     Path(doc_id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
-    state.db.delete_document("default", &doc_id)
+    state
+        .db
+        .delete_document("default", &doc_id)
         .map_err(|e| ApiError::internal(format!("Failed to delete document: {}", e)))?;
 
     Ok(StatusCode::NO_CONTENT)
@@ -452,10 +453,10 @@ pub async fn search_documents(
 ) -> Result<Json<ApiResponse<SearchResponse>>, ApiError> {
     let start = std::time::Instant::now();
 
-    let raw_results = state.db.search_documents(
-        "default",
-        &req.query,
-    ).map_err(|e| ApiError::internal(format!("Search failed: {}", e)))?;
+    let raw_results = state
+        .db
+        .search_documents("default", &req.query)
+        .map_err(|e| ApiError::internal(format!("Search failed: {}", e)))?;
 
     let total = raw_results.len();
 
@@ -491,7 +492,9 @@ pub async fn get_chunks(
     State(state): State<AppState>,
     Path(doc_id): Path<String>,
 ) -> Result<Json<ApiResponse<Vec<DocumentChunk>>>, ApiError> {
-    let chunks = state.db.get_document_chunks("default", &doc_id)
+    let chunks = state
+        .db
+        .get_document_chunks("default", &doc_id)
         .map_err(|e| ApiError::internal(format!("Failed to get chunks: {}", e)))?;
 
     // Convert (String, f32) tuples to DocumentChunk
@@ -517,11 +520,10 @@ pub async fn chunk_document(
     Path(doc_id): Path<String>,
     Json(req): Json<ChunkDocumentRequest>,
 ) -> Result<Json<ApiResponse<Vec<DocumentChunk>>>, ApiError> {
-    let chunk_ids = state.db.rechunk_document(
-        "default",
-        &doc_id,
-        512,
-    ).map_err(|e| ApiError::internal(format!("Failed to chunk document: {}", e)))?;
+    let chunk_ids = state
+        .db
+        .rechunk_document("default", &doc_id, 512)
+        .map_err(|e| ApiError::internal(format!("Failed to chunk document: {}", e)))?;
 
     // Convert chunk IDs to DocumentChunk structs
     // Note: This is a placeholder until full chunk metadata is available
@@ -547,11 +549,10 @@ pub async fn similar_documents(
     Path(doc_id): Path<String>,
     Json(req): Json<SimilarDocumentsRequest>,
 ) -> Result<Json<ApiResponse<Vec<DocumentSearchResult>>>, ApiError> {
-    let results = state.db.find_similar_documents(
-        "default",
-        &doc_id,
-        req.limit,
-    ).map_err(|e| ApiError::internal(format!("Failed to find similar: {}", e)))?;
+    let results = state
+        .db
+        .find_similar_documents("default", &doc_id, req.limit)
+        .map_err(|e| ApiError::internal(format!("Failed to find similar: {}", e)))?;
 
     let search_results: Vec<DocumentSearchResult> = results
         .into_iter()

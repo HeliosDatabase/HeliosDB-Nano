@@ -2,10 +2,10 @@
 //!
 //! This module extends the PgConnectionHandler with full extended query protocol support.
 
-use crate::{Result, Error, Value};
 use super::handler::PgConnectionHandler;
-use super::prepared::{PreparedStatement, Portal, PortalState, decode_parameter, substitute_parameters};
 use super::messages::{BackendMessage, FieldDescription};
+use super::prepared::{decode_parameter, substitute_parameters, Portal, PortalState, PreparedStatement};
+use crate::{Error, Result, Value};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
@@ -55,7 +55,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         // catalog emulator so Describe returns the right
         // RowDescription. Otherwise fall through to plan-based
         // derivation + the AST-based fallback.
-        let catalog_schema = self.catalog
+        let catalog_schema = self
+            .catalog
             .handle_query(&query)
             .ok()
             .flatten()
@@ -110,14 +111,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         tracing::debug!("Bind portal '{}' to statement '{}'", portal_name, statement_name);
 
         // Get prepared statement
-        let statement = self.prepared_statements.get_statement(&statement_name)?
-            .ok_or_else(|| Error::query_execution(format!(
-                "Prepared statement '{}' not found", statement_name
-            )))?;
+        let statement = self
+            .prepared_statements
+            .get_statement(&statement_name)?
+            .ok_or_else(|| Error::query_execution(format!("Prepared statement '{}' not found", statement_name)))?;
 
         // Validate parameter count
-        if !params.is_empty() && !statement.param_types.is_empty()
-            && params.len() != statement.param_types.len() {
+        if !params.is_empty() && !statement.param_types.is_empty() && params.len() != statement.param_types.len() {
             return Err(Error::query_execution(format!(
                 "Parameter count mismatch: expected {}, got {}",
                 statement.param_types.len(),
@@ -148,31 +148,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
     /// Handle Execute message (extended protocol) with full implementation
     // SAFETY: param_formats[i] and param_types[i] are guarded by i < len checks.
     #[allow(clippy::indexing_slicing)]
-    pub async fn handle_execute_extended(
-        &mut self,
-        portal_name: String,
-        max_rows: i32,
-    ) -> Result<()> {
+    pub async fn handle_execute_extended(&mut self, portal_name: String, max_rows: i32) -> Result<()> {
         tracing::debug!("Execute portal '{}' (max_rows: {})", portal_name, max_rows);
 
         // Get portal
-        let portal = self.prepared_statements.get_portal(&portal_name)?
-            .ok_or_else(|| Error::query_execution(format!(
-                "Portal '{}' not found", portal_name
-            )))?;
+        let portal = self
+            .prepared_statements
+            .get_portal(&portal_name)?
+            .ok_or_else(|| Error::query_execution(format!("Portal '{}' not found", portal_name)))?;
 
         // Check portal state
         if portal.state == PortalState::Complete {
             return Err(Error::query_execution(format!(
-                "Portal '{}' already complete", portal_name
+                "Portal '{}' already complete",
+                portal_name
             )));
         }
 
         // Get statement
-        let statement = self.prepared_statements.get_statement(&portal.statement_name)?
-            .ok_or_else(|| Error::query_execution(format!(
-                "Statement '{}' not found", portal.statement_name
-            )))?;
+        let statement = self
+            .prepared_statements
+            .get_statement(&portal.statement_name)?
+            .ok_or_else(|| Error::query_execution(format!("Statement '{}' not found", portal.statement_name)))?;
 
         // Convert parameters from wire format to Value
         let mut param_values = Vec::new();
@@ -214,11 +211,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             substitute_parameters(&statement.query, &param_values)?
         };
 
-        tracing::debug!(
-            "Executing query: {} (params: {})",
-            statement.query,
-            param_values.len()
-        );
+        tracing::debug!("Executing query: {} (params: {})", statement.query, param_values.len());
 
         // Execute query
         let is_select = {
@@ -238,10 +231,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             if let Some(catalog_result) = self.catalog.handle_query(&substituted_for_catalog)? {
                 // Mark the portal complete and emit DataRows + CommandComplete
                 // directly against the catalog-emulated result.
-                self.prepared_statements.update_portal_state(
-                    &portal_name,
-                    PortalState::Complete,
-                )?;
+                self.prepared_statements
+                    .update_portal_state(&portal_name, PortalState::Complete)?;
                 for row in &catalog_result.1 {
                     let values = super::handler::tuple_to_pg_values(row);
                     self.send_message(BackendMessage::DataRow { values }).await?;
@@ -271,17 +262,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     )?;
                     to_send.to_vec()
                 } else {
-                    self.prepared_statements.update_portal_state(
-                        &portal_name,
-                        PortalState::Complete,
-                    )?;
+                    self.prepared_statements
+                        .update_portal_state(&portal_name, PortalState::Complete)?;
                     results
                 }
             } else {
-                self.prepared_statements.update_portal_state(
-                    &portal_name,
-                    PortalState::Complete,
-                )?;
+                self.prepared_statements
+                    .update_portal_state(&portal_name, PortalState::Complete)?;
                 results
             };
 
@@ -311,8 +298,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             let is_delete = super::handler::starts_with_icase(trimmed, "DELETE");
             let is_dml_returning = upper.contains("RETURNING") && (is_insert || is_update || is_delete);
             if is_dml_returning {
-                let (affected, tuples) = self.database.execute_params_returning(&statement.query, &param_values)?;
-                self.prepared_statements.update_portal_state(&portal_name, PortalState::Complete)?;
+                let (affected, tuples) = self
+                    .database
+                    .execute_params_returning(&statement.query, &param_values)?;
+                self.prepared_statements
+                    .update_portal_state(&portal_name, PortalState::Complete)?;
                 // RowDescription was already sent during Describe; Execute
                 // only emits DataRows + CommandComplete.
                 for row in &tuples {
@@ -336,10 +326,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             self.send_command_complete(&tag).await?;
 
             // Mark portal complete
-            self.prepared_statements.update_portal_state(
-                &portal_name,
-                PortalState::Complete,
-            )?;
+            self.prepared_statements
+                .update_portal_state(&portal_name, PortalState::Complete)?;
         }
 
         Ok(())
@@ -358,26 +346,28 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         match target {
             DescribeTarget::Statement => {
                 // Describe a prepared statement
-                let statement = self.prepared_statements.get_statement(&name)?
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "Statement '{}' not found", name
-                    )))?;
+                let statement = self
+                    .prepared_statements
+                    .get_statement(&name)?
+                    .ok_or_else(|| Error::query_execution(format!("Statement '{}' not found", name)))?;
 
                 // Send ParameterDescription
                 if !statement.param_types.is_empty() {
                     self.send_message(BackendMessage::ParameterDescription {
                         param_types: statement.param_types.clone(),
-                    }).await?;
+                    })
+                    .await?;
                 } else {
-                    self.send_message(BackendMessage::ParameterDescription {
-                        param_types: vec![],
-                    }).await?;
+                    self.send_message(BackendMessage::ParameterDescription { param_types: vec![] })
+                        .await?;
                 }
 
                 // Send RowDescription or NoData based on derived schema
                 if let Some(schema) = &statement.result_schema {
-                    let fields: Vec<FieldDescription> = schema.columns.iter().map(|col| {
-                        FieldDescription {
+                    let fields: Vec<FieldDescription> = schema
+                        .columns
+                        .iter()
+                        .map(|col| FieldDescription {
                             name: col.name.clone(),
                             table_oid: 0,
                             column_attr_num: 0,
@@ -385,8 +375,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                             data_type_size: super::handler::datatype_to_size(&col.data_type),
                             type_modifier: -1,
                             format_code: 0,
-                        }
-                    }).collect();
+                        })
+                        .collect();
                     self.send_message(BackendMessage::RowDescription { fields }).await?;
                 } else {
                     // Statement doesn't return results (INSERT, UPDATE, DELETE, DDL)
@@ -395,20 +385,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
             }
             DescribeTarget::Portal => {
                 // Describe a portal
-                let portal = self.prepared_statements.get_portal(&name)?
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "Portal '{}' not found", name
-                    )))?;
+                let portal = self
+                    .prepared_statements
+                    .get_portal(&name)?
+                    .ok_or_else(|| Error::query_execution(format!("Portal '{}' not found", name)))?;
 
-                let statement = self.prepared_statements.get_statement(&portal.statement_name)?
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "Statement '{}' not found", portal.statement_name
-                    )))?;
+                let statement = self
+                    .prepared_statements
+                    .get_statement(&portal.statement_name)?
+                    .ok_or_else(|| {
+                        Error::query_execution(format!("Statement '{}' not found", portal.statement_name))
+                    })?;
 
                 // Send RowDescription or NoData
                 if let Some(schema) = &statement.result_schema {
-                    let fields: Vec<FieldDescription> = schema.columns.iter().map(|col| {
-                        FieldDescription {
+                    let fields: Vec<FieldDescription> = schema
+                        .columns
+                        .iter()
+                        .map(|col| FieldDescription {
                             name: col.name.clone(),
                             table_oid: 0,
                             column_attr_num: 0,
@@ -416,8 +410,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                             data_type_size: super::handler::datatype_to_size(&col.data_type),
                             type_modifier: -1,
                             format_code: 0,
-                        }
-                    }).collect();
+                        })
+                        .collect();
                     self.send_message(BackendMessage::RowDescription { fields }).await?;
                 } else {
                     self.send_message(BackendMessage::NoData).await?;
@@ -429,11 +423,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
     }
 
     /// Handle Close message (close statement or portal)
-    pub async fn handle_close(
-        &mut self,
-        target: super::messages::DescribeTarget,
-        name: String,
-    ) -> Result<()> {
+    pub async fn handle_close(&mut self, target: super::messages::DescribeTarget, name: String) -> Result<()> {
         tracing::debug!("Close {:?} '{}'", target, name);
 
         use super::messages::DescribeTarget;
@@ -492,8 +482,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     let catalog = self.database.storage.catalog();
                     let planner = crate::sql::planner::Planner::with_catalog(&catalog);
                     let plan = planner.statement_to_plan(statement.clone())?;
-                    if let crate::sql::LogicalPlan::Insert { table_name, returning: Some(ref items), .. }
-                        | crate::sql::LogicalPlan::InsertSelect { table_name, returning: Some(ref items), .. } = plan {
+                    if let crate::sql::LogicalPlan::Insert {
+                        table_name,
+                        returning: Some(ref items),
+                        ..
+                    }
+                    | crate::sql::LogicalPlan::InsertSelect {
+                        table_name,
+                        returning: Some(ref items),
+                        ..
+                    } = plan
+                    {
                         let table_schema = catalog.get_table_schema(&table_name)?;
                         Ok(Some(crate::EmbeddedDatabase::returning_schema(&table_schema, items)))
                     } else {
@@ -508,7 +507,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     let catalog = self.database.storage.catalog();
                     let planner = crate::sql::planner::Planner::with_catalog(&catalog);
                     let plan = planner.statement_to_plan(statement.clone())?;
-                    if let crate::sql::LogicalPlan::Update { table_name, returning: Some(ref items), .. } = plan {
+                    if let crate::sql::LogicalPlan::Update {
+                        table_name,
+                        returning: Some(ref items),
+                        ..
+                    } = plan
+                    {
                         let table_schema = catalog.get_table_schema(&table_name)?;
                         Ok(Some(crate::EmbeddedDatabase::returning_schema(&table_schema, items)))
                     } else {
@@ -523,7 +527,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                     let catalog = self.database.storage.catalog();
                     let planner = crate::sql::planner::Planner::with_catalog(&catalog);
                     let plan = planner.statement_to_plan(statement.clone())?;
-                    if let crate::sql::LogicalPlan::Delete { table_name, returning: Some(ref items), .. } = plan {
+                    if let crate::sql::LogicalPlan::Delete {
+                        table_name,
+                        returning: Some(ref items),
+                        ..
+                    } = plan
+                    {
                         let table_schema = catalog.get_table_schema(&table_name)?;
                         Ok(Some(crate::EmbeddedDatabase::returning_schema(&table_schema, items)))
                     } else {
@@ -534,13 +543,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
                 }
             }
             // DDL statements (CREATE, DROP, ALTER) don't return results
-            Statement::CreateTable(_) |
-            Statement::Drop { .. } |
-            Statement::CreateIndex(_) |
-            Statement::AlterTable { .. } |
-            Statement::Truncate { .. } => {
-                Ok(None)
-            }
+            Statement::CreateTable(_)
+            | Statement::Drop { .. }
+            | Statement::CreateIndex(_)
+            | Statement::AlterTable { .. }
+            | Statement::Truncate { .. } => Ok(None),
             // For any other statement types, assume no result schema
             _ => Ok(None),
         }
@@ -557,21 +564,40 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
     /// degrading to `NoData` for a SELECT, which breaks SQLAlchemy's
     /// `_row_as_tuple_getter`.
     fn synthesise_schema_from_ast(statement: &sqlparser::ast::Statement) -> Option<crate::Schema> {
-        use sqlparser::ast::{Statement, SetExpr, SelectItem};
+        use sqlparser::ast::{SelectItem, SetExpr, Statement};
 
-        let query = if let Statement::Query(q) = statement { q } else { return None; };
-        let select = if let SetExpr::Select(s) = &*query.body { s } else { return None; };
+        let query = if let Statement::Query(q) = statement {
+            q
+        } else {
+            return None;
+        };
+        let select = if let SetExpr::Select(s) = &*query.body {
+            s
+        } else {
+            return None;
+        };
 
-        let columns: Vec<crate::Column> = select.projection.iter().enumerate().map(|(i, item)| {
-            let name = match item {
-                SelectItem::UnnamedExpr(expr) => Self::expr_column_label(expr).unwrap_or_else(|| format!("column{}", i + 1)),
-                SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
-                SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => format!("column{}", i + 1),
-            };
-            crate::Column::new(name, crate::DataType::Text)
-        }).collect();
+        let columns: Vec<crate::Column> = select
+            .projection
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let name = match item {
+                    SelectItem::UnnamedExpr(expr) => {
+                        Self::expr_column_label(expr).unwrap_or_else(|| format!("column{}", i + 1))
+                    }
+                    SelectItem::ExprWithAlias { alias, .. } => alias.value.clone(),
+                    SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(_, _) => format!("column{}", i + 1),
+                };
+                crate::Column::new(name, crate::DataType::Text)
+            })
+            .collect();
 
-        if columns.is_empty() { None } else { Some(crate::Schema::new(columns)) }
+        if columns.is_empty() {
+            None
+        } else {
+            Some(crate::Schema::new(columns))
+        }
     }
 
     /// Pick a reasonable label for an unaliased SELECT expression — column
@@ -616,4 +642,3 @@ impl<S: AsyncRead + AsyncWrite + Unpin> PgConnectionHandler<S> {
         max_param
     }
 }
-

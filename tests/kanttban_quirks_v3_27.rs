@@ -29,12 +29,17 @@ fn identity_with_parenthesized_sequence_options_parses() {
             ),
             "title" text NOT NULL
         )"#,
-    ).expect("create with IDENTITY (options) must parse");
+    )
+    .expect("create with IDENTITY (options) must parse");
 
     // Auto-increment must still work.
-    db.execute("INSERT INTO tasks (title) VALUES ('first')").expect("insert 1");
-    db.execute("INSERT INTO tasks (title) VALUES ('second')").expect("insert 2");
-    let rows = db.query("SELECT id, title FROM tasks ORDER BY id", &[]).expect("select");
+    db.execute("INSERT INTO tasks (title) VALUES ('first')")
+        .expect("insert 1");
+    db.execute("INSERT INTO tasks (title) VALUES ('second')")
+        .expect("insert 2");
+    let rows = db
+        .query("SELECT id, title FROM tasks ORDER BY id", &[])
+        .expect("select");
     assert_eq!(rows.len(), 2);
 }
 
@@ -53,7 +58,8 @@ fn identity_bare_form_still_works() {
 #[test]
 fn alter_table_add_constraint_foreign_key() {
     let db = EmbeddedDatabase::new_in_memory().expect("db");
-    db.execute("CREATE TABLE parents (id integer PRIMARY KEY, name text)").expect("create parents");
+    db.execute("CREATE TABLE parents (id integer PRIMARY KEY, name text)")
+        .expect("create parents");
     db.execute("CREATE TABLE children (id integer PRIMARY KEY, parent_id integer)")
         .expect("create children");
 
@@ -61,11 +67,14 @@ fn alter_table_add_constraint_foreign_key() {
     db.execute(
         r#"ALTER TABLE children ADD CONSTRAINT fk_children_parent
            FOREIGN KEY (parent_id) REFERENCES parents(id)"#,
-    ).expect("ADD CONSTRAINT FOREIGN KEY must succeed");
+    )
+    .expect("ADD CONSTRAINT FOREIGN KEY must succeed");
 
     // Wire it up: insert a parent, an orphan attempt should now fail.
-    db.execute("INSERT INTO parents (id, name) VALUES (1, 'root')").expect("insert parent");
-    db.execute("INSERT INTO children (id, parent_id) VALUES (1, 1)").expect("valid child");
+    db.execute("INSERT INTO parents (id, name) VALUES (1, 'root')")
+        .expect("insert parent");
+    db.execute("INSERT INTO children (id, parent_id) VALUES (1, 1)")
+        .expect("valid child");
     let orphan = db.execute("INSERT INTO children (id, parent_id) VALUES (2, 999)");
     assert!(orphan.is_err(), "FK added by ALTER must reject orphan; got {orphan:?}");
 }
@@ -75,11 +84,12 @@ fn alter_table_add_constraint_foreign_key() {
 #[test]
 fn fk_enforced_on_insert() {
     let db = EmbeddedDatabase::new_in_memory().expect("db");
-    db.execute("CREATE TABLE p (id integer PRIMARY KEY, name text)").expect("create p");
-    db.execute(
-        "CREATE TABLE c (id integer PRIMARY KEY, parent_id integer REFERENCES p(id), name text)",
-    ).expect("create c with inline FK");
-    db.execute("INSERT INTO p (id, name) VALUES (1, 'p1')").expect("insert parent");
+    db.execute("CREATE TABLE p (id integer PRIMARY KEY, name text)")
+        .expect("create p");
+    db.execute("CREATE TABLE c (id integer PRIMARY KEY, parent_id integer REFERENCES p(id), name text)")
+        .expect("create c with inline FK");
+    db.execute("INSERT INTO p (id, name) VALUES (1, 'p1')")
+        .expect("insert parent");
 
     // Valid: parent_id=1 exists.
     db.execute("INSERT INTO c (id, parent_id, name) VALUES (10, 1, 'ok')")
@@ -93,16 +103,20 @@ fn fk_enforced_on_insert() {
 #[test]
 fn fk_enforced_on_update() {
     let db = EmbeddedDatabase::new_in_memory().expect("db");
-    db.execute("CREATE TABLE p (id integer PRIMARY KEY, name text)").expect("create p");
-    db.execute(
-        "CREATE TABLE c (id integer PRIMARY KEY, parent_id integer REFERENCES p(id), name text)",
-    ).expect("create c");
-    db.execute("INSERT INTO p (id, name) VALUES (1, 'p1')").expect("insert parent");
-    db.execute("INSERT INTO p (id, name) VALUES (2, 'p2')").expect("insert parent2");
-    db.execute("INSERT INTO c (id, parent_id, name) VALUES (10, 1, 'a')").expect("ok child");
+    db.execute("CREATE TABLE p (id integer PRIMARY KEY, name text)")
+        .expect("create p");
+    db.execute("CREATE TABLE c (id integer PRIMARY KEY, parent_id integer REFERENCES p(id), name text)")
+        .expect("create c");
+    db.execute("INSERT INTO p (id, name) VALUES (1, 'p1')")
+        .expect("insert parent");
+    db.execute("INSERT INTO p (id, name) VALUES (2, 'p2')")
+        .expect("insert parent2");
+    db.execute("INSERT INTO c (id, parent_id, name) VALUES (10, 1, 'a')")
+        .expect("ok child");
 
     // Valid: change to existing parent.
-    db.execute("UPDATE c SET parent_id = 2 WHERE id = 10").expect("valid UPDATE");
+    db.execute("UPDATE c SET parent_id = 2 WHERE id = 10")
+        .expect("valid UPDATE");
 
     // Invalid: change to non-existent parent.
     let bad = db.execute("UPDATE c SET parent_id = 999 WHERE id = 10");
@@ -126,7 +140,9 @@ fn fk_null_short_circuits() {
 #[test]
 fn current_setting_known_param() {
     let db = EmbeddedDatabase::new_in_memory().expect("db");
-    let rows = db.query("SELECT current_setting('server_version')", &[]).expect("query");
+    let rows = db
+        .query("SELECT current_setting('server_version')", &[])
+        .expect("query");
     assert_eq!(rows.len(), 1);
     let v = match rows[0].values.first() {
         Some(Value::String(s)) => s.clone(),
@@ -139,7 +155,8 @@ fn current_setting_known_param() {
 fn current_setting_unknown_with_missing_ok_returns_empty() {
     let db = EmbeddedDatabase::new_in_memory().expect("db");
     // Two-arg form: missing_ok=true → empty string for unknown setting.
-    let rows = db.query("SELECT current_setting('does_not_exist', true)", &[])
+    let rows = db
+        .query("SELECT current_setting('does_not_exist', true)", &[])
         .expect("query");
     let v = match rows[0].values.first() {
         Some(Value::String(s)) => s.clone(),

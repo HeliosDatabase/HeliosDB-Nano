@@ -13,8 +13,8 @@
 #![cfg(feature = "internal-tests")]
 
 use heliosdb_nano::{
+    storage::{BranchOptions, MergeStrategy, StorageEngine},
     Config,
-    storage::{StorageEngine, BranchOptions, MergeStrategy},
 };
 
 #[test]
@@ -26,7 +26,9 @@ fn test_merge_no_conflicts() {
     engine.put(b"key1", b"value1_main").unwrap();
 
     // Create dev branch
-    engine.create_branch("dev", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("dev", Some("main"), BranchOptions::default())
+        .unwrap();
 
     // Add key2 in dev
     let mut tx = engine.begin_branch_transaction("dev").unwrap();
@@ -54,7 +56,9 @@ fn test_merge_with_conflict_auto_strategy() {
     engine.put(b"key1", b"original").unwrap();
 
     // Create dev branch
-    engine.create_branch("dev", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("dev", Some("main"), BranchOptions::default())
+        .unwrap();
 
     // Modify key1 in dev
     let mut tx_dev = engine.begin_branch_transaction("dev").unwrap();
@@ -82,7 +86,9 @@ fn test_merge_with_conflict_manual_strategy() {
     // Setup: both branches modify same key
     engine.put(b"key1", b"original").unwrap();
 
-    engine.create_branch("dev", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("dev", Some("main"), BranchOptions::default())
+        .unwrap();
 
     // Modify key1 in dev
     let mut tx_dev = engine.begin_branch_transaction("dev").unwrap();
@@ -110,7 +116,9 @@ fn test_merge_with_conflict_theirs_strategy() {
     // Setup: both branches modify same key
     engine.put(b"key1", b"original").unwrap();
 
-    engine.create_branch("dev", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("dev", Some("main"), BranchOptions::default())
+        .unwrap();
 
     // Modify key1 in dev
     let mut tx_dev = engine.begin_branch_transaction("dev").unwrap();
@@ -138,7 +146,9 @@ fn test_merge_with_conflict_ours_strategy() {
     // Setup: both branches modify same key
     engine.put(b"key1", b"original").unwrap();
 
-    engine.create_branch("dev", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("dev", Some("main"), BranchOptions::default())
+        .unwrap();
 
     // Modify key1 in dev
     let mut tx_dev = engine.begin_branch_transaction("dev").unwrap();
@@ -168,7 +178,9 @@ fn test_merge_multiple_conflicts() {
         engine.put(&key, b"original").unwrap();
     }
 
-    engine.create_branch("dev", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("dev", Some("main"), BranchOptions::default())
+        .unwrap();
 
     // Modify all keys in dev
     let mut tx_dev = engine.begin_branch_transaction("dev").unwrap();
@@ -206,7 +218,9 @@ fn test_merge_with_deletions() {
     engine.put(b"key1", b"value1").unwrap();
     engine.put(b"key2", b"value2").unwrap();
 
-    engine.create_branch("dev", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("dev", Some("main"), BranchOptions::default())
+        .unwrap();
 
     // Delete key1 in dev
     let mut tx_dev = engine.begin_branch_transaction("dev").unwrap();
@@ -228,7 +242,9 @@ fn test_merge_branch_state_update() {
     let config = Config::in_memory();
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
-    engine.create_branch("dev", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("dev", Some("main"), BranchOptions::default())
+        .unwrap();
 
     // Verify dev is Active
     let dev_before = engine.get_branch("dev").unwrap();
@@ -251,7 +267,9 @@ fn test_cannot_merge_inactive_branch() {
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
     // Create and drop a branch
-    engine.create_branch("temp", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("temp", Some("main"), BranchOptions::default())
+        .unwrap();
     engine.drop_branch("temp", false).unwrap();
 
     // Try to merge dropped branch
@@ -268,7 +286,9 @@ fn test_merge_preserves_non_conflicting_changes() {
     // Setup: shared key and branch-specific keys
     engine.put(b"shared", b"original").unwrap();
 
-    engine.create_branch("dev", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("dev", Some("main"), BranchOptions::default())
+        .unwrap();
 
     // Dev: modify shared + add dev_key
     let mut tx_dev = engine.begin_branch_transaction("dev").unwrap();
@@ -299,7 +319,9 @@ fn test_merge_same_change_no_conflict() {
     // Setup
     engine.put(b"key1", b"original").unwrap();
 
-    engine.create_branch("dev", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("dev", Some("main"), BranchOptions::default())
+        .unwrap();
 
     // Both branches make same change
     let mut tx_dev = engine.begin_branch_transaction("dev").unwrap();
@@ -323,7 +345,9 @@ fn test_merge_conflict_metadata() {
     // Setup conflict
     engine.put(b"key1", b"base").unwrap();
 
-    engine.create_branch("dev", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("dev", Some("main"), BranchOptions::default())
+        .unwrap();
 
     let mut tx_dev = engine.begin_branch_transaction("dev").unwrap();
     tx_dev.put(b"key1".to_vec(), b"dev_value".to_vec()).unwrap();
@@ -356,7 +380,9 @@ fn test_merge_large_dataset() {
         engine.put(&key, &value).unwrap();
     }
 
-    engine.create_branch("dev", Some("main"), BranchOptions::default()).unwrap();
+    engine
+        .create_branch("dev", Some("main"), BranchOptions::default())
+        .unwrap();
 
     // Modify 100 keys in dev, add 100 new keys
     let mut tx_dev = engine.begin_branch_transaction("dev").unwrap();

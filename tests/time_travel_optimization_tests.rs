@@ -93,7 +93,9 @@ fn test_indexed_vs_linear_consistency() {
     for i in 1..=100 {
         let timestamp = i * 1000;
         let value = format!("value_{}", i);
-        manager.write_version(table, row_id, timestamp, value.as_bytes()).unwrap();
+        manager
+            .write_version(table, row_id, timestamp, value.as_bytes())
+            .unwrap();
     }
 
     // Verify both methods return the same results at various points
@@ -103,7 +105,8 @@ fn test_indexed_vs_linear_consistency() {
         let linear_result = manager.read_at_snapshot_linear(table, row_id, query_ts).unwrap();
 
         assert_eq!(
-            indexed_result, linear_result,
+            indexed_result,
+            linear_result,
             "Mismatch at timestamp {}. Indexed: {:?}, Linear: {:?}",
             query_ts,
             indexed_result.as_ref().map(|v| String::from_utf8_lossy(v)),
@@ -199,14 +202,8 @@ fn test_multiple_tables() {
     );
 
     // Non-existent table/row combinations
-    assert_eq!(
-        manager.read_at_snapshot("users", 1, 500).unwrap(),
-        None
-    );
-    assert_eq!(
-        manager.read_at_snapshot("orders", 2, 1000).unwrap(),
-        None
-    );
+    assert_eq!(manager.read_at_snapshot("users", 1, 500).unwrap(), None);
+    assert_eq!(manager.read_at_snapshot("orders", 2, 1000).unwrap(), None);
 }
 
 #[test]
@@ -222,26 +219,25 @@ fn test_large_number_of_versions() {
     for i in 1..=num_versions {
         let timestamp = i * 100;
         let value = format!("version_{}", i);
-        manager.write_version(table, row_id, timestamp, value.as_bytes()).unwrap();
+        manager
+            .write_version(table, row_id, timestamp, value.as_bytes())
+            .unwrap();
     }
 
     // Verify we can query efficiently at various points
     let test_points = [
-        (50, None),                        // Before first
-        (100, Some("version_1")),          // First
-        (500000, Some("version_5000")),    // Middle
-        (1000000, Some("version_10000")),  // Last
-        (2000000, Some("version_10000")),  // After last
+        (50, None),                       // Before first
+        (100, Some("version_1")),         // First
+        (500000, Some("version_5000")),   // Middle
+        (1000000, Some("version_10000")), // Last
+        (2000000, Some("version_10000")), // After last
     ];
 
     for (ts, expected) in test_points {
         let result = manager.read_at_snapshot(table, row_id, ts).unwrap();
         let result_str = result.as_ref().map(|v| String::from_utf8_lossy(v).to_string());
         let expected_str = expected.map(String::from);
-        assert_eq!(
-            result_str, expected_str,
-            "Mismatch at timestamp {}", ts
-        );
+        assert_eq!(result_str, expected_str, "Mismatch at timestamp {}", ts);
     }
 }
 
@@ -305,14 +301,8 @@ fn test_index_persistence() {
         let manager = SnapshotManager::new(db);
 
         // Queries should still work using the persisted index
-        assert_eq!(
-            manager.read_at_snapshot("test", 1, 1500).unwrap(),
-            Some(b"v1".to_vec())
-        );
-        assert_eq!(
-            manager.read_at_snapshot("test", 1, 2500).unwrap(),
-            Some(b"v2".to_vec())
-        );
+        assert_eq!(manager.read_at_snapshot("test", 1, 1500).unwrap(), Some(b"v1".to_vec()));
+        assert_eq!(manager.read_at_snapshot("test", 1, 2500).unwrap(), Some(b"v2".to_vec()));
     }
 }
 
@@ -328,7 +318,9 @@ fn test_concurrent_queries() {
 
     // Write versions
     for i in 1..=100 {
-        manager.write_version(table, row_id, i * 1000, format!("v{}", i).as_bytes()).unwrap();
+        manager
+            .write_version(table, row_id, i * 1000, format!("v{}", i).as_bytes())
+            .unwrap();
     }
 
     // Spawn multiple threads doing concurrent queries

@@ -180,11 +180,7 @@ pub fn ingest_image(db: &EmbeddedDatabase, opts: &DoclingIngestOptions) -> Resul
     ingest_with_kind(db, opts, "Image")
 }
 
-fn ingest_with_kind(
-    db: &EmbeddedDatabase,
-    opts: &DoclingIngestOptions,
-    default_kind: &str,
-) -> Result<IngestStats> {
+fn ingest_with_kind(db: &EmbeddedDatabase, opts: &DoclingIngestOptions, default_kind: &str) -> Result<IngestStats> {
     ensure_tables(db)?;
     let kind = if opts.corpus_kind == "Document" {
         default_kind.to_string()
@@ -234,10 +230,7 @@ fn build_source(opts: &DoclingIngestOptions) -> Result<Source> {
         return Ok(Source::Http { url: url.clone() });
     }
     if let Some(bytes) = &opts.source_bytes {
-        let filename = opts
-            .filename
-            .clone()
-            .unwrap_or_else(|| "document.bin".into());
+        let filename = opts.filename.clone().unwrap_or_else(|| "document.bin".into());
         use base64::{engine::general_purpose::STANDARD as B64, Engine};
         return Ok(Source::File {
             filename,
@@ -245,8 +238,7 @@ fn build_source(opts: &DoclingIngestOptions) -> Result<Source> {
         });
     }
     if let Some(path) = &opts.source_path {
-        let bytes = std::fs::read(path)
-            .map_err(|e| Error::query_execution(format!("read {}: {e}", path.display())))?;
+        let bytes = std::fs::read(path).map_err(|e| Error::query_execution(format!("read {}: {e}", path.display())))?;
         let filename = opts.filename.clone().unwrap_or_else(|| {
             path.file_name()
                 .and_then(|s| s.to_str())
@@ -270,19 +262,9 @@ fn project_document(
     converted: &ConvertedDocument,
     stats: &mut IngestStats,
 ) -> Result<()> {
-    let name = converted
-        .name
-        .as_deref()
-        .unwrap_or("converted-document");
+    let name = converted.name.as_deref().unwrap_or("converted-document");
     let root_ref = format!("docling:document:{name}");
-    let root_id = upsert_node(
-        db,
-        kind,
-        &root_ref,
-        Some(name),
-        None,
-        None,
-    )?;
+    let root_id = upsert_node(db, kind, &root_ref, Some(name), None, None)?;
     stats.nodes_added = stats.nodes_added.saturating_add(1);
     stats.rows_seen = stats.rows_seen.saturating_add(1);
 
@@ -293,10 +275,7 @@ fn project_document(
         if text_body.trim().is_empty() {
             continue;
         }
-        let self_ref = t
-            .self_ref
-            .clone()
-            .unwrap_or_else(|| format!("docling:text:{i}"));
+        let self_ref = t.self_ref.clone().unwrap_or_else(|| format!("docling:text:{i}"));
         let extra = serde_json::json!({
             "page_no": t.prov.first().and_then(|p| p.page_no),
             "level": t.level,
@@ -334,10 +313,7 @@ fn project_document(
     // Tables: opaque structured payloads; project as DocTable with
     // page_no metadata.  Caller can post-process via SQL.
     for (i, table) in converted.json_content.tables.iter().enumerate() {
-        let self_ref = table
-            .self_ref
-            .clone()
-            .unwrap_or_else(|| format!("docling:table:{i}"));
+        let self_ref = table.self_ref.clone().unwrap_or_else(|| format!("docling:table:{i}"));
         let extra = serde_json::json!({
             "page_no": table.prov.first().and_then(|p| p.page_no),
         })
@@ -380,15 +356,9 @@ fn upsert_node(
             });
         }
     }
-    let title_v = title
-        .map(|s| Value::String(s.to_string()))
-        .unwrap_or(Value::Null);
-    let text_v = text
-        .map(|s| Value::String(s.to_string()))
-        .unwrap_or(Value::Null);
-    let extra_v = extra
-        .map(|s| Value::String(s.to_string()))
-        .unwrap_or(Value::Null);
+    let title_v = title.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null);
+    let text_v = text.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null);
+    let extra_v = extra.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null);
     let (_, rows) = db.execute_params_returning(
         "INSERT INTO _hdb_graph_nodes (node_kind, source_ref, title, text, extra) \
          VALUES ($1, $2, $3, $4, $5) RETURNING node_id",
@@ -411,13 +381,7 @@ fn upsert_node(
         .unwrap_or(0))
 }
 
-fn insert_edge(
-    db: &EmbeddedDatabase,
-    from: i64,
-    to: i64,
-    kind: &str,
-    weight: f32,
-) -> Result<()> {
+fn insert_edge(db: &EmbeddedDatabase, from: i64, to: i64, kind: &str, weight: f32) -> Result<()> {
     db.execute(&format!(
         "INSERT INTO _hdb_graph_edges (from_node, to_node, edge_kind, weight) \
          VALUES ({from}, {to}, '{kind}', {weight})"

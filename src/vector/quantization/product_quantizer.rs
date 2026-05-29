@@ -2,9 +2,9 @@
 
 #![allow(unused_variables)]
 
-use super::{Codebook, Encoder, Decoder, DistanceComputer, QuantizedVector, PqError, PqResult};
+use super::{Codebook, Decoder, DistanceComputer, Encoder, PqError, PqResult, QuantizedVector};
 use crate::vector::Vector;
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
 /// Product Quantizer configuration
@@ -98,15 +98,11 @@ impl ProductQuantizerConfig {
         }
 
         if self.num_subquantizers == 0 {
-            return Err(PqError::InvalidConfig(
-                "num_subquantizers must be > 0".to_string()
-            ));
+            return Err(PqError::InvalidConfig("num_subquantizers must be > 0".to_string()));
         }
 
         if self.training_iterations == 0 {
-            return Err(PqError::InvalidConfig(
-                "training_iterations must be > 0".to_string()
-            ));
+            return Err(PqError::InvalidConfig("training_iterations must be > 0".to_string()));
         }
 
         Ok(())
@@ -155,10 +151,10 @@ impl ProductQuantizerConfig {
                 if dimension % nsq == 0 {
                     return Ok(Self {
                         num_subquantizers: nsq,
-                        num_centroids: 32,  // Reduced from 256 for faster test training
+                        num_centroids: 32, // Reduced from 256 for faster test training
                         dimension,
-                        training_iterations: 5,  // Reduced from 25 for faster tests
-                        min_training_samples: 100,  // Reduced from 10000 for test datasets
+                        training_iterations: 5,    // Reduced from 25 for faster tests
+                        min_training_samples: 100, // Reduced from 10000 for test datasets
                     });
                 }
             }
@@ -172,10 +168,10 @@ impl ProductQuantizerConfig {
 
         Ok(Self {
             num_subquantizers,
-            num_centroids: 32,  // Reduced from 256 for faster test training
+            num_centroids: 32, // Reduced from 256 for faster test training
             dimension,
-            training_iterations: 5,  // Reduced from 25 for faster tests
-            min_training_samples: 100,  // Reduced from 10000 for test datasets
+            training_iterations: 5,    // Reduced from 25 for faster tests
+            min_training_samples: 100, // Reduced from 10000 for test datasets
         })
     }
 }
@@ -243,10 +239,7 @@ impl ProductQuantizer {
     ///
     /// # Returns
     /// A trained Product Quantizer ready for encoding/decoding
-    pub fn train(
-        config: ProductQuantizerConfig,
-        training_vectors: &[Vector],
-    ) -> PqResult<Self> {
+    pub fn train(config: ProductQuantizerConfig, training_vectors: &[Vector]) -> PqResult<Self> {
         config.validate()?;
 
         // Calculate minimum required samples: need enough points to train k-means
@@ -322,11 +315,7 @@ impl ProductQuantizer {
     ///
     /// # Returns
     /// Approximate L2 distance
-    pub fn compute_distance(
-        &self,
-        query: &Vector,
-        quantized: &QuantizedVector,
-    ) -> PqResult<f32> {
+    pub fn compute_distance(&self, query: &Vector, quantized: &QuantizedVector) -> PqResult<f32> {
         self.distance_computer.compute_distance(query, quantized)
     }
 
