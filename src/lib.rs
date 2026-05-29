@@ -9303,6 +9303,7 @@ impl EmbeddedDatabase {
         // P0#1: session transactions must honor time_travel_enabled too
         // (new_with_session defaults versioning on).
         txn.set_versioning_enabled(self.storage.time_travel_enabled());
+        txn.set_rocksdb_wal_enabled(!self.storage.config().storage.memory_only);
 
         let txn_id = txn.snapshot_id();
         session.active_txn = Some(txn_id);
@@ -9440,6 +9441,7 @@ impl EmbeddedDatabase {
             )?;
             // P0#1: session transactions must honor time_travel_enabled too.
             txn.set_versioning_enabled(self.storage.time_travel_enabled());
+            txn.set_rocksdb_wal_enabled(!self.storage.config().storage.memory_only);
 
             let result = self.execute_in_transaction_no_fast_path(sql, &txn);
 

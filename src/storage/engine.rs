@@ -26,7 +26,7 @@ use crate::crypto::{self, KeyManager};
 use crate::ColumnStorageMode;
 use crate::{Config, Error, Result, Tuple};
 use parking_lot::RwLock;
-use rocksdb::{BlockBasedOptions, Cache, IteratorMode, Options, ReadOptions, WriteBatch, DB};
+use rocksdb::{BlockBasedOptions, Cache, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions, DB};
 use std::cell::RefCell;
 use std::io::Write;
 use std::path::Path;
@@ -114,6 +114,9 @@ pub struct StorageEngine {
     write_counter: Arc<AtomicU64>,
     /// Database path for disk space checks (None for in-memory)
     db_path: Option<std::path::PathBuf>,
+    /// Write options for non-durable memory-only data. Disk-backed modes keep
+    /// RocksDB's WAL enabled for crash recovery.
+    memory_write_options: Option<WriteOptions>,
     /// In-memory schema cache (avoids repeated RocksDB get + bincode deserialize)
     schema_cache: Arc<parking_lot::Mutex<std::collections::HashMap<String, crate::Schema>>>,
     /// In-memory table-constraints cache (avoids repeated metadata gets on DML)
@@ -127,6 +130,13 @@ pub struct StorageEngine {
 const MIN_DISK_SPACE_BYTES: u64 = 100 * 1024 * 1024;
 
 impl StorageEngine {
+    fn memory_only_write_options() -> WriteOptions {
+        let mut opts = WriteOptions::default();
+        opts.set_sync(false);
+        opts.disable_wal(true);
+        opts
+    }
+
     /// Check available disk space and return error if below threshold.
     /// Uses /proc/mounts + statvfs syscall via std to avoid libc dependency.
     fn check_disk_space(path: &std::path::Path) -> Result<()> {
@@ -430,6 +440,7 @@ impl StorageEngine {
             memory_limit_bytes: 0, // Unlimited for disk-backed mode
             write_counter: Arc::new(AtomicU64::new(0)),
             db_path: Some(db_path),
+            memory_write_options: None,
             schema_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -464,9 +475,18 @@ impl StorageEngine {
 
     /// Open in-memory storage engine
     pub fn open_in_memory(config: &Config) -> Result<Self> {
-        // RocksDB doesn't support true in-memory mode with DB::open
-        // We'll use a temporary directory that gets cleaned up
-        let temp_dir = tempfile::tempdir().map_err(|e| Error::storage(format!("Failed to create temp dir: {}", e)))?;
+        // RocksDB doesn't support true in-memory mode with DB::open. Prefer
+        // Linux tmpfs so `Config::in_memory()` does not silently benchmark or
+        // run against disk-backed `/tmp`; fall back to the platform default.
+        let temp_dir = if cfg!(target_os = "linux") && std::path::Path::new("/dev/shm").is_dir() {
+            tempfile::Builder::new()
+                .prefix("heliosdb-nano-")
+                .tempdir_in("/dev/shm")
+                .or_else(|_| tempfile::Builder::new().prefix("heliosdb-nano-").tempdir())
+        } else {
+            tempfile::Builder::new().prefix("heliosdb-nano-").tempdir()
+        }
+        .map_err(|e| Error::storage(format!("Failed to create temp dir: {}", e)))?;
 
         let mut opts = Options::default();
         opts.create_if_missing(true);
@@ -618,6 +638,7 @@ impl StorageEngine {
             memory_limit_bytes: config.resource_quotas.memory_limit_per_user_mb * 1024 * 1024,
             write_counter: Arc::new(AtomicU64::new(0)),
             db_path: None, // No disk space check for in-memory mode
+            memory_write_options: Some(Self::memory_only_write_options()),
             schema_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
             referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
@@ -1196,8 +1217,18 @@ impl StorageEngine {
         // Encrypt if encryption is enabled, otherwise write directly (no copy)
         if let Some(km) = &self.key_manager {
             let data = crypto::encrypt(km.key(), value)?;
+            if let Some(opts) = &self.memory_write_options {
+                self.db
+                    .put_opt(key, data, opts)
+                    .map_err(|e| Error::storage(format!("Put failed: {}", e)))
+            } else {
+                self.db
+                    .put(key, data)
+                    .map_err(|e| Error::storage(format!("Put failed: {}", e)))
+            }
+        } else if let Some(opts) = &self.memory_write_options {
             self.db
-                .put(key, data)
+                .put_opt(key, value, opts)
                 .map_err(|e| Error::storage(format!("Put failed: {}", e)))
         } else {
             self.db
@@ -1228,9 +1259,15 @@ impl StorageEngine {
         }
 
         // Then delete from main database
-        self.db
-            .delete(key)
-            .map_err(|e| Error::storage(format!("Delete failed: {}", e)))
+        if let Some(opts) = &self.memory_write_options {
+            self.db
+                .delete_opt(key, opts)
+                .map_err(|e| Error::storage(format!("Delete failed: {}", e)))
+        } else {
+            self.db
+                .delete(key)
+                .map_err(|e| Error::storage(format!("Delete failed: {}", e)))
+        }
     }
 
     /// Log a data INSERT operation to WAL for replication
@@ -1339,9 +1376,15 @@ impl StorageEngine {
         } else {
             value.to_vec()
         };
-        self.db
-            .put(key, data)
-            .map_err(|e| Error::storage(format!("Internal put failed: {}", e)))
+        if let Some(opts) = &self.memory_write_options {
+            self.db
+                .put_opt(key, data, opts)
+                .map_err(|e| Error::storage(format!("Internal put failed: {}", e)))
+        } else {
+            self.db
+                .put(key, data)
+                .map_err(|e| Error::storage(format!("Internal put failed: {}", e)))
+        }
     }
 
     /// Internal get: fetch and decrypt without WAL involvement
@@ -1377,6 +1420,7 @@ impl StorageEngine {
         let mut txn = Transaction::new(Arc::clone(&self.db), snapshot_id, Arc::clone(&self.snapshot_manager))?;
         // P0#1: emit MVCC version-history at commit only when time-travel is on.
         txn.set_versioning_enabled(self.config.storage.time_travel_enabled);
+        txn.set_rocksdb_wal_enabled(!self.config.storage.memory_only);
         Ok(txn)
     }
 
@@ -4601,9 +4645,15 @@ impl StorageEngine {
         schema: &crate::Schema,
     ) -> Result<u64> {
         let key = Self::build_data_key(table_name, row_id);
-        self.db
-            .delete(&key)
-            .map_err(|e| Error::storage(format!("Fast delete failed: {}", e)))?;
+        if let Some(opts) = &self.memory_write_options {
+            self.db
+                .delete_opt(&key, opts)
+                .map_err(|e| Error::storage(format!("Fast delete failed: {}", e)))?;
+        } else {
+            self.db
+                .delete(&key)
+                .map_err(|e| Error::storage(format!("Fast delete failed: {}", e)))?;
+        }
 
         if let Err(e) = self
             .art_index_manager

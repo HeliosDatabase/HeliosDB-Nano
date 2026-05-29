@@ -13,7 +13,7 @@ use crate::session::{IsolationLevel, SessionId};
 use crate::{Error, Result, Tuple};
 use dashmap::DashMap;
 use parking_lot::RwLock;
-use rocksdb::DB;
+use rocksdb::{WriteOptions, DB};
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
@@ -93,6 +93,10 @@ pub struct Transaction {
     /// serialization) — for read-committed workloads that don't need
     /// AS OF / snapshot-history reads.
     versioning_enabled: bool,
+    /// Whether RocksDB's own WAL should be used for the final WriteBatch.
+    /// Disabled only for `memory_only` databases, where durability is not a
+    /// contract and the temporary RocksDB directory is discarded on close.
+    rocksdb_wal_enabled: bool,
 }
 
 impl Transaction {
@@ -121,6 +125,7 @@ impl Transaction {
             acquired_locks: Arc::new(RwLock::new(Vec::new())),
             dirty_tracker: None,
             versioning_enabled: true,
+            rocksdb_wal_enabled: true,
         })
     }
 
@@ -128,6 +133,10 @@ impl Transaction {
     /// Set by the engine from `StorageConfig::time_travel_enabled`.
     pub fn set_versioning_enabled(&mut self, enabled: bool) {
         self.versioning_enabled = enabled;
+    }
+
+    pub fn set_rocksdb_wal_enabled(&mut self, enabled: bool) {
+        self.rocksdb_wal_enabled = enabled;
     }
 
     /// Create a new transaction with session and lock manager support
@@ -165,6 +174,7 @@ impl Transaction {
             acquired_locks: Arc::new(RwLock::new(Vec::new())),
             dirty_tracker: Some(dirty_tracker),
             versioning_enabled: true,
+            rocksdb_wal_enabled: true,
         })
     }
 
@@ -483,7 +493,14 @@ impl Transaction {
             }
         }
 
-        let result = self.db.write(batch);
+        let result = if self.rocksdb_wal_enabled {
+            self.db.write(batch)
+        } else {
+            let mut write_opts = WriteOptions::default();
+            write_opts.set_sync(false);
+            write_opts.disable_wal(true);
+            self.db.write_opt(batch, &write_opts)
+        };
 
         // Release all acquired locks
         self.acquired_locks.write().clear();
