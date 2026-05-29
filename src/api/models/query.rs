@@ -2,7 +2,7 @@
 //!
 //! Request and response models for SQL query execution.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -149,16 +149,12 @@ impl From<&crate::Value> for serde_json::Value {
             crate::Value::Int2(v) => serde_json::Value::Number((*v).into()),
             crate::Value::Int4(v) => serde_json::Value::Number((*v).into()),
             crate::Value::Int8(v) => serde_json::Value::Number((*v).into()),
-            crate::Value::Float4(v) => {
-                serde_json::Number::from_f64(*v as f64)
-                    .map(serde_json::Value::Number)
-                    .unwrap_or(serde_json::Value::Null)
-            }
-            crate::Value::Float8(v) => {
-                serde_json::Number::from_f64(*v)
-                    .map(serde_json::Value::Number)
-                    .unwrap_or(serde_json::Value::Null)
-            }
+            crate::Value::Float4(v) => serde_json::Number::from_f64(*v as f64)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
+            crate::Value::Float8(v) => serde_json::Number::from_f64(*v)
+                .map(serde_json::Value::Number)
+                .unwrap_or(serde_json::Value::Null),
             crate::Value::Numeric(v) => {
                 // Try to parse as a JSON number, preserving precision
                 v.parse::<serde_json::Number>()
@@ -179,26 +175,20 @@ impl From<&crate::Value> for serde_json::Value {
                 serde_json::from_str(v).unwrap_or(serde_json::Value::Null)
             }
             crate::Value::Array(v) => {
-                serde_json::Value::Array(
-                    v.iter().map(|val| serde_json::Value::from(val)).collect()
-                )
+                serde_json::Value::Array(v.iter().map(|val| serde_json::Value::from(val)).collect())
             }
-            crate::Value::Vector(v) => {
-                serde_json::Value::Array(
-                    v.iter().map(|f| {
+            crate::Value::Vector(v) => serde_json::Value::Array(
+                v.iter()
+                    .map(|f| {
                         serde_json::Number::from_f64(*f as f64)
                             .map(serde_json::Value::Number)
                             .unwrap_or(serde_json::Value::Null)
-                    }).collect()
-                )
-            }
+                    })
+                    .collect(),
+            ),
             // Storage references (should be resolved before API response)
-            crate::Value::DictRef { dict_id } => {
-                serde_json::Value::String(format!("dict:{}", dict_id))
-            }
-            crate::Value::CasRef { hash } => {
-                serde_json::Value::String(format!("cas:{}", hex::encode(hash)))
-            }
+            crate::Value::DictRef { dict_id } => serde_json::Value::String(format!("dict:{}", dict_id)),
+            crate::Value::CasRef { hash } => serde_json::Value::String(format!("cas:{}", hex::encode(hash))),
             crate::Value::ColumnarRef => serde_json::Value::Null,
             crate::Value::Interval(microseconds) => {
                 // Return interval as microseconds number

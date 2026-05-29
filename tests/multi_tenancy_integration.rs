@@ -8,8 +8,8 @@
 //! - Context switching
 //! - Cross-tenant data isolation
 
+use heliosdb_nano::tenant::{ChangeType, IsolationMode, RLSCommand, ResourceLimits, TenantContext};
 use heliosdb_nano::{EmbeddedDatabase, Result};
-use heliosdb_nano::tenant::{IsolationMode, TenantContext, RLSCommand, ChangeType, ResourceLimits};
 
 // ============================================================================
 // Test Utilities
@@ -20,12 +20,15 @@ fn setup_test_db() -> Result<EmbeddedDatabase> {
 }
 
 fn create_test_table(db: &EmbeddedDatabase) -> Result<()> {
-    db.execute("CREATE TABLE sales (
+    db.execute(
+        "CREATE TABLE sales (
         id INT PRIMARY KEY,
         tenant_id TEXT NOT NULL,
         product TEXT NOT NULL,
         amount INT NOT NULL
-    )").map(|_| ())
+    )",
+    )
+    .map(|_| ())
 }
 
 // ============================================================================
@@ -39,15 +42,13 @@ fn test_01_tenant_registration() {
     let db = setup_test_db().unwrap();
 
     // Register multiple tenants
-    let tenant_a = db.tenant_manager.register_tenant(
-        "acme-corp".to_string(),
-        IsolationMode::SharedSchema
-    );
+    let tenant_a = db
+        .tenant_manager
+        .register_tenant("acme-corp".to_string(), IsolationMode::SharedSchema);
 
-    let tenant_b = db.tenant_manager.register_tenant(
-        "globex-inc".to_string(),
-        IsolationMode::SharedSchema
-    );
+    let tenant_b = db
+        .tenant_manager
+        .register_tenant("globex-inc".to_string(), IsolationMode::SharedSchema);
 
     println!("✓ Registered Tenant A: {} ({})", tenant_a.name, tenant_a.id);
     println!("✓ Registered Tenant B: {} ({})", tenant_b.name, tenant_b.id);
@@ -74,15 +75,13 @@ fn test_02_tenant_context_switching() {
 
     let db = setup_test_db().unwrap();
 
-    let tenant_a = db.tenant_manager.register_tenant(
-        "tenant-a".to_string(),
-        IsolationMode::SharedSchema
-    );
+    let tenant_a = db
+        .tenant_manager
+        .register_tenant("tenant-a".to_string(), IsolationMode::SharedSchema);
 
-    let tenant_b = db.tenant_manager.register_tenant(
-        "tenant-b".to_string(),
-        IsolationMode::SharedSchema
-    );
+    let tenant_b = db
+        .tenant_manager
+        .register_tenant("tenant-b".to_string(), IsolationMode::SharedSchema);
 
     // Set context to Tenant A
     db.tenant_manager.set_current_context(TenantContext {
@@ -120,10 +119,9 @@ fn test_03_tenant_deletion() {
 
     let db = setup_test_db().unwrap();
 
-    let tenant = db.tenant_manager.register_tenant(
-        "temporary-tenant".to_string(),
-        IsolationMode::SharedSchema
-    );
+    let tenant = db
+        .tenant_manager
+        .register_tenant("temporary-tenant".to_string(), IsolationMode::SharedSchema);
 
     println!("✓ Created temporary tenant: {}", tenant.id);
 
@@ -150,10 +148,9 @@ fn test_04_rls_insert_isolation() {
     let db = setup_test_db().unwrap();
     create_test_table(&db).unwrap();
 
-    let tenant_a = db.tenant_manager.register_tenant(
-        "tenant-a".to_string(),
-        IsolationMode::SharedSchema
-    );
+    let tenant_a = db
+        .tenant_manager
+        .register_tenant("tenant-a".to_string(), IsolationMode::SharedSchema);
 
     // Create RLS policy
     db.tenant_manager.create_rls_policy(
@@ -201,19 +198,25 @@ fn test_05_rls_select_isolation() {
     let db = setup_test_db().unwrap();
     create_test_table(&db).unwrap();
 
-    let tenant_a = db.tenant_manager.register_tenant("tenant-a".to_string(), IsolationMode::SharedSchema);
-    let tenant_b = db.tenant_manager.register_tenant("tenant-b".to_string(), IsolationMode::SharedSchema);
+    let tenant_a = db
+        .tenant_manager
+        .register_tenant("tenant-a".to_string(), IsolationMode::SharedSchema);
+    let tenant_b = db
+        .tenant_manager
+        .register_tenant("tenant-b".to_string(), IsolationMode::SharedSchema);
 
     // Insert data for both tenants (without RLS temporarily)
     db.execute(&format!(
         "INSERT INTO sales VALUES (1, '{}', 'Laptop', 1200)",
         tenant_a.id
-    )).unwrap();
+    ))
+    .unwrap();
 
     db.execute(&format!(
         "INSERT INTO sales VALUES (2, '{}', 'Desktop', 1500)",
         tenant_b.id
-    )).unwrap();
+    ))
+    .unwrap();
 
     println!("✓ Inserted data for both tenants");
 
@@ -254,19 +257,25 @@ fn test_06_rls_update_isolation() {
     let db = setup_test_db().unwrap();
     create_test_table(&db).unwrap();
 
-    let tenant_a = db.tenant_manager.register_tenant("tenant-a".to_string(), IsolationMode::SharedSchema);
-    let tenant_b = db.tenant_manager.register_tenant("tenant-b".to_string(), IsolationMode::SharedSchema);
+    let tenant_a = db
+        .tenant_manager
+        .register_tenant("tenant-a".to_string(), IsolationMode::SharedSchema);
+    let tenant_b = db
+        .tenant_manager
+        .register_tenant("tenant-b".to_string(), IsolationMode::SharedSchema);
 
     // Insert data for both tenants
     db.execute(&format!(
         "INSERT INTO sales VALUES (1, '{}', 'Laptop', 1200)",
         tenant_a.id
-    )).unwrap();
+    ))
+    .unwrap();
 
     db.execute(&format!(
         "INSERT INTO sales VALUES (2, '{}', 'Desktop', 1500)",
         tenant_b.id
-    )).unwrap();
+    ))
+    .unwrap();
 
     // Create RLS policy
     db.tenant_manager.create_rls_policy(
@@ -303,19 +312,25 @@ fn test_07_rls_delete_isolation() {
     let db = setup_test_db().unwrap();
     create_test_table(&db).unwrap();
 
-    let tenant_a = db.tenant_manager.register_tenant("tenant-a".to_string(), IsolationMode::SharedSchema);
-    let tenant_b = db.tenant_manager.register_tenant("tenant-b".to_string(), IsolationMode::SharedSchema);
+    let tenant_a = db
+        .tenant_manager
+        .register_tenant("tenant-a".to_string(), IsolationMode::SharedSchema);
+    let tenant_b = db
+        .tenant_manager
+        .register_tenant("tenant-b".to_string(), IsolationMode::SharedSchema);
 
     // Insert data for both tenants
     db.execute(&format!(
         "INSERT INTO sales VALUES (1, '{}', 'Laptop', 1200)",
         tenant_a.id
-    )).unwrap();
+    ))
+    .unwrap();
 
     db.execute(&format!(
         "INSERT INTO sales VALUES (2, '{}', 'Desktop', 1500)",
         tenant_b.id
-    )).unwrap();
+    ))
+    .unwrap();
 
     // Create RLS policy
     db.tenant_manager.create_rls_policy(
@@ -355,20 +370,21 @@ fn test_08_connection_quota_enforcement() {
 
     let db = setup_test_db().unwrap();
 
-    let tenant = db.tenant_manager.register_tenant(
-        "limited-tenant".to_string(),
-        IsolationMode::SharedSchema
-    );
+    let tenant = db
+        .tenant_manager
+        .register_tenant("limited-tenant".to_string(), IsolationMode::SharedSchema);
 
     // Set strict connection limit
-    db.tenant_manager.update_resource_limits(
-        tenant.id,
-        ResourceLimits {
-            max_storage_bytes: 100_000_000,
-            max_connections: 3,
-            max_qps: 1000,
-        }
-    ).unwrap();
+    db.tenant_manager
+        .update_resource_limits(
+            tenant.id,
+            ResourceLimits {
+                max_storage_bytes: 100_000_000,
+                max_connections: 3,
+                max_qps: 1000,
+            },
+        )
+        .unwrap();
 
     println!("✓ Set connection limit to 3");
 
@@ -402,20 +418,21 @@ fn test_09_storage_quota_enforcement() {
 
     let db = setup_test_db().unwrap();
 
-    let tenant = db.tenant_manager.register_tenant(
-        "storage-limited".to_string(),
-        IsolationMode::SharedSchema
-    );
+    let tenant = db
+        .tenant_manager
+        .register_tenant("storage-limited".to_string(), IsolationMode::SharedSchema);
 
     // Set strict storage limit (10KB)
-    db.tenant_manager.update_resource_limits(
-        tenant.id,
-        ResourceLimits {
-            max_storage_bytes: 10_000,
-            max_connections: 50,
-            max_qps: 1000,
-        }
-    ).unwrap();
+    db.tenant_manager
+        .update_resource_limits(
+            tenant.id,
+            ResourceLimits {
+                max_storage_bytes: 10_000,
+                max_connections: 50,
+                max_qps: 1000,
+            },
+        )
+        .unwrap();
 
     println!("✓ Set storage limit to 10KB");
 
@@ -444,20 +461,21 @@ fn test_10_qps_quota_enforcement() {
 
     let db = setup_test_db().unwrap();
 
-    let tenant = db.tenant_manager.register_tenant(
-        "qps-limited".to_string(),
-        IsolationMode::SharedSchema
-    );
+    let tenant = db
+        .tenant_manager
+        .register_tenant("qps-limited".to_string(), IsolationMode::SharedSchema);
 
     // Set strict QPS limit
-    db.tenant_manager.update_resource_limits(
-        tenant.id,
-        ResourceLimits {
-            max_storage_bytes: 100_000_000,
-            max_connections: 50,
-            max_qps: 5,
-        }
-    ).unwrap();
+    db.tenant_manager
+        .update_resource_limits(
+            tenant.id,
+            ResourceLimits {
+                max_storage_bytes: 100_000_000,
+                max_connections: 50,
+                max_qps: 5,
+            },
+        )
+        .unwrap();
 
     println!("✓ Set QPS limit to 5 queries/window");
 
@@ -493,10 +511,9 @@ fn test_11_cdc_insert_tracking() {
 
     let db = setup_test_db().unwrap();
 
-    let tenant = db.tenant_manager.register_tenant(
-        "cdc-tenant".to_string(),
-        IsolationMode::SharedSchema
-    );
+    let tenant = db
+        .tenant_manager
+        .register_tenant("cdc-tenant".to_string(), IsolationMode::SharedSchema);
 
     // Record INSERT event
     let event_id = db.tenant_manager.record_change_event(
@@ -529,10 +546,9 @@ fn test_12_cdc_update_tracking() {
 
     let db = setup_test_db().unwrap();
 
-    let tenant = db.tenant_manager.register_tenant(
-        "cdc-tenant".to_string(),
-        IsolationMode::SharedSchema
-    );
+    let tenant = db
+        .tenant_manager
+        .register_tenant("cdc-tenant".to_string(), IsolationMode::SharedSchema);
 
     // Record UPDATE event
     db.tenant_manager.record_change_event(
@@ -563,10 +579,9 @@ fn test_13_cdc_delete_tracking() {
 
     let db = setup_test_db().unwrap();
 
-    let tenant = db.tenant_manager.register_tenant(
-        "cdc-tenant".to_string(),
-        IsolationMode::SharedSchema
-    );
+    let tenant = db
+        .tenant_manager
+        .register_tenant("cdc-tenant".to_string(), IsolationMode::SharedSchema);
 
     // Record DELETE event
     db.tenant_manager.record_change_event(
@@ -596,8 +611,12 @@ fn test_14_cdc_multi_tenant_isolation() {
 
     let db = setup_test_db().unwrap();
 
-    let tenant_a = db.tenant_manager.register_tenant("tenant-a".to_string(), IsolationMode::SharedSchema);
-    let tenant_b = db.tenant_manager.register_tenant("tenant-b".to_string(), IsolationMode::SharedSchema);
+    let tenant_a = db
+        .tenant_manager
+        .register_tenant("tenant-a".to_string(), IsolationMode::SharedSchema);
+    let tenant_b = db
+        .tenant_manager
+        .register_tenant("tenant-b".to_string(), IsolationMode::SharedSchema);
 
     // Record events for Tenant A
     db.tenant_manager.record_change_event(
@@ -646,19 +665,25 @@ fn test_15_complete_multitenant_workflow() {
     create_test_table(&db).unwrap();
 
     // 1. Register tenants
-    let tenant_a = db.tenant_manager.register_tenant("acme-corp".to_string(), IsolationMode::SharedSchema);
-    let tenant_b = db.tenant_manager.register_tenant("globex-inc".to_string(), IsolationMode::SharedSchema);
+    let tenant_a = db
+        .tenant_manager
+        .register_tenant("acme-corp".to_string(), IsolationMode::SharedSchema);
+    let tenant_b = db
+        .tenant_manager
+        .register_tenant("globex-inc".to_string(), IsolationMode::SharedSchema);
     println!("✓ Step 1: Registered 2 tenants");
 
     // 2. Configure resource limits
-    db.tenant_manager.update_resource_limits(
-        tenant_a.id,
-        ResourceLimits {
-            max_storage_bytes: 50_000_000,
-            max_connections: 10,
-            max_qps: 100,
-        }
-    ).unwrap();
+    db.tenant_manager
+        .update_resource_limits(
+            tenant_a.id,
+            ResourceLimits {
+                max_storage_bytes: 50_000_000,
+                max_connections: 10,
+                max_qps: 100,
+            },
+        )
+        .unwrap();
     println!("✓ Step 2: Configured resource limits");
 
     // 3. Create RLS policies
@@ -692,7 +717,8 @@ fn test_15_complete_multitenant_workflow() {
     db.execute(&format!(
         "INSERT INTO sales VALUES (1, '{}', 'Laptop', 1200)",
         tenant_a.id
-    )).unwrap();
+    ))
+    .unwrap();
     println!("✓ Step 4: Inserted data as Tenant A");
 
     // 5. Switch to Tenant B and insert data
@@ -706,7 +732,8 @@ fn test_15_complete_multitenant_workflow() {
     db.execute(&format!(
         "INSERT INTO sales VALUES (2, '{}', 'Desktop', 1500)",
         tenant_b.id
-    )).unwrap();
+    ))
+    .unwrap();
     println!("✓ Step 5: Inserted data as Tenant B");
 
     // 6. Verify RLS isolation (Tenant B shouldn't see Tenant A's data)
@@ -719,7 +746,10 @@ fn test_15_complete_multitenant_workflow() {
     }
     let tracking = db.tenant_manager.get_quota_tracking(tenant_b.id).unwrap();
     assert!(tracking.queries_this_window > 0);
-    println!("✓ Step 7: Quota tracking working ({} queries)", tracking.queries_this_window);
+    println!(
+        "✓ Step 7: Quota tracking working ({} queries)",
+        tracking.queries_this_window
+    );
 
     // 8. Verify CDC tracking
     let changes = db.tenant_manager.get_recent_changes(tenant_b.id, 10);
@@ -740,10 +770,8 @@ fn test_16_high_volume_tenant_registration() {
 
     let count = 100;
     for i in 0..count {
-        db.tenant_manager.register_tenant(
-            format!("tenant-{}", i),
-            IsolationMode::SharedSchema
-        );
+        db.tenant_manager
+            .register_tenant(format!("tenant-{}", i), IsolationMode::SharedSchema);
     }
 
     let tenants = db.tenant_manager.list_tenants();
@@ -760,10 +788,8 @@ fn test_17_concurrent_context_switching() {
 
     let tenants: Vec<_> = (0..10)
         .map(|i| {
-            db.tenant_manager.register_tenant(
-                format!("tenant-{}", i),
-                IsolationMode::SharedSchema
-            )
+            db.tenant_manager
+                .register_tenant(format!("tenant-{}", i), IsolationMode::SharedSchema)
         })
         .collect();
 

@@ -163,8 +163,7 @@ impl RowCache {
     /// Create a row cache with custom configuration
     pub fn with_config(config: RowCacheConfig) -> Self {
         // SAFETY: 1 is always non-zero
-        let cache_size = NonZeroUsize::new(config.max_entries.max(1))
-            .unwrap_or(NonZeroUsize::MIN);
+        let cache_size = NonZeroUsize::new(config.max_entries.max(1)).unwrap_or(NonZeroUsize::MIN);
 
         Self {
             cache: RwLock::new(LruCache::new(cache_size)),
@@ -399,10 +398,7 @@ mod tests {
     use crate::Value;
 
     fn make_tuple(id: i32, name: &str) -> Tuple {
-        Tuple::new(vec![
-            Value::Int4(id),
-            Value::String(name.to_string()),
-        ])
+        Tuple::new(vec![Value::Int4(id), Value::String(name.to_string())])
     }
 
     #[test]

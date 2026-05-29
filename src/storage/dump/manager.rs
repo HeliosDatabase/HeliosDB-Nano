@@ -12,16 +12,16 @@
 //! - Dirty state tracking for incremental dumps
 
 use super::format::{CompressionType, DUMP_MAGIC_NUMBER, DUMP_VERSION};
-use crate::{Result, Error, Tuple, Schema};
-use std::path::{Path, PathBuf};
-use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, BufReader, Write, Read, Seek, SeekFrom};
-use std::sync::Arc;
-use std::time::{SystemTime, Instant};
+use crate::{Error, Result, Schema, Tuple};
+use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use parking_lot::{RwLock, Mutex};
-use serde::{Serialize, Deserialize};
-use tracing::{info, debug, warn};
+use std::fs::{File, OpenOptions};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Instant, SystemTime};
+use tracing::{debug, info, warn};
 
 /// Dump type identifier
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,15 +220,11 @@ impl DumpManager {
 
         // Dispatch based on format
         let metadata = match opts.format {
-            DumpOutputFormat::Binary => {
-                match opts.mode {
-                    DumpMode::Full => self.create_full_dump(&opts.output_path, db)?,
-                    DumpMode::Incremental => self.create_incremental_dump(&opts.output_path, db, opts.append)?,
-                }
-            }
-            DumpOutputFormat::Sql => {
-                self.create_sql_dump(&opts.output_path, db)?
-            }
+            DumpOutputFormat::Binary => match opts.mode {
+                DumpMode::Full => self.create_full_dump(&opts.output_path, db)?,
+                DumpMode::Incremental => self.create_incremental_dump(&opts.output_path, db, opts.append)?,
+            },
+            DumpOutputFormat::Sql => self.create_sql_dump(&opts.output_path, db)?,
         };
 
         let duration_ms = start_time.elapsed().as_millis() as u64;
@@ -250,87 +246,87 @@ impl DumpManager {
     }
 
     /// Create a SQL dump of the database (compatible with SQLite/PostgreSQL)
-    pub fn create_sql_dump<D: DatabaseInterface>(
-        &self,
-        output_path: &Path,
-        db: &D,
-    ) -> Result<DumpMetadata> {
+    pub fn create_sql_dump<D: DatabaseInterface>(&self, output_path: &Path, db: &D) -> Result<DumpMetadata> {
         let start_time = Instant::now();
         let dump_id = self.get_next_dump_id();
         let mut metadata = DumpMetadata::new(dump_id, DumpType::Full);
-        
+
         info!("Starting SQL dump {} to {}", dump_id, output_path.display());
 
-        let file = File::create(output_path)
-            .map_err(|e| Error::storage(format!("Failed to create SQL dump file: {}", e)))?;
+        let file =
+            File::create(output_path).map_err(|e| Error::storage(format!("Failed to create SQL dump file: {}", e)))?;
         let mut writer = BufWriter::new(file);
 
         // Write header
         writeln!(writer, "-- HeliosDB Nano Database Dump")
             .map_err(|e| Error::storage(format!("Failed to write header: {}", e)))?;
-        writeln!(writer, "-- Generated: {}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"))
-            .map_err(|e| Error::storage(format!("Failed to write header: {}", e)))?;
+        writeln!(
+            writer,
+            "-- Generated: {}",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S")
+        )
+        .map_err(|e| Error::storage(format!("Failed to write header: {}", e)))?;
         writeln!(writer, "-- Database: heliosdb-nano\n")
             .map_err(|e| Error::storage(format!("Failed to write header: {}", e)))?;
 
         let tables = db.list_tables()?;
         metadata.table_count = tables.len() as u32;
-        
+
         let mut total_rows = 0;
 
         for table in tables {
             // Write table schema
             let schema = db.get_table_schema(&table)?;
-            
+
             writeln!(writer, "-- Table: {}", table)
                 .map_err(|e| Error::storage(format!("Failed to write comment: {}", e)))?;
             writeln!(writer, "CREATE TABLE IF NOT EXISTS {} (", table)
                 .map_err(|e| Error::storage(format!("Failed to write create table: {}", e)))?;
-            
+
             for (i, col) in schema.columns.iter().enumerate() {
                 let suffix = if i < schema.columns.len() - 1 { "," } else { "" };
                 let type_str = col.data_type.to_string();
                 let pk_str = if col.primary_key { " PRIMARY KEY" } else { "" };
                 let null_str = if !col.nullable { " NOT NULL" } else { "" };
-                
+
                 writeln!(writer, "  {} {}{}{}{}", col.name, type_str, pk_str, null_str, suffix)
                     .map_err(|e| Error::storage(format!("Failed to write column: {}", e)))?;
             }
-            writeln!(writer, ");\n")
-                .map_err(|e| Error::storage(format!("Failed to write end table: {}", e)))?;
+            writeln!(writer, ");\n").map_err(|e| Error::storage(format!("Failed to write end table: {}", e)))?;
 
             // Write data
             let rows = db.scan_table(&table)?;
             total_rows += rows.len() as u64;
-            
+
             if !rows.is_empty() {
                 writeln!(writer, "INSERT INTO {} VALUES", table)
                     .map_err(|e| Error::storage(format!("Failed to write insert header: {}", e)))?;
-                
+
                 for (i, row) in rows.iter().enumerate() {
                     let suffix = if i < rows.len() - 1 { "," } else { ";" };
                     let values: Vec<String> = row.values.iter().map(Self::format_value_for_sql).collect();
                     writeln!(writer, "  ({}){}", values.join(", "), suffix)
                         .map_err(|e| Error::storage(format!("Failed to write row: {}", e)))?;
                 }
-                writeln!(writer, "\n")
-                    .map_err(|e| Error::storage(format!("Failed to write end insert: {}", e)))?;
+                writeln!(writer, "\n").map_err(|e| Error::storage(format!("Failed to write end insert: {}", e)))?;
             }
         }
 
-        writer.flush().map_err(|e| Error::storage(format!("Failed to flush writer: {}", e)))?;
-        
+        writer
+            .flush()
+            .map_err(|e| Error::storage(format!("Failed to flush writer: {}", e)))?;
+
         let file_size = std::fs::metadata(output_path)
             .map_err(|e| Error::storage(format!("Failed to get file metadata: {}", e)))?
             .len();
-            
+
         metadata.total_rows = total_rows;
         metadata.compressed_size = file_size;
         metadata.uncompressed_size = file_size; // SQL is uncompressed text
-        
+
         // Add to history
         self.dump_history.write().push(metadata.clone());
-        
+
         Ok(metadata)
     }
 
@@ -338,7 +334,13 @@ impl DumpManager {
     fn format_value_for_sql(value: &crate::Value) -> String {
         match value {
             crate::Value::Null => "NULL".to_string(),
-            crate::Value::Boolean(b) => if *b { "TRUE".to_string() } else { "FALSE".to_string() },
+            crate::Value::Boolean(b) => {
+                if *b {
+                    "TRUE".to_string()
+                } else {
+                    "FALSE".to_string()
+                }
+            }
             crate::Value::Int2(i) => i.to_string(),
             crate::Value::Int4(i) => i.to_string(),
             crate::Value::Int8(i) => i.to_string(),
@@ -364,8 +366,8 @@ impl DumpManager {
 
         // Note: In a full implementation, we'd track these stats during restore
         Ok(RestoreReport {
-            tables_restored: 0,  // Would be populated during restore
-            rows_restored: 0,    // Would be populated during restore
+            tables_restored: 0, // Would be populated during restore
+            rows_restored: 0,   // Would be populated during restore
             duration_ms,
         })
     }
@@ -380,11 +382,7 @@ impl DumpManager {
     ///
     /// # Returns
     /// Metadata about the created dump including size and checksum
-    pub fn create_full_dump<D: DatabaseInterface>(
-        &self,
-        output_path: &Path,
-        db: &D,
-    ) -> Result<DumpMetadata> {
+    pub fn create_full_dump<D: DatabaseInterface>(&self, output_path: &Path, db: &D) -> Result<DumpMetadata> {
         let start_time = Instant::now();
         let dump_id = self.get_next_dump_id();
         let mut metadata = DumpMetadata::new(dump_id, DumpType::Full);
@@ -392,21 +390,25 @@ impl DumpManager {
         info!("Starting full dump {} to {}", dump_id, output_path.display());
 
         // Open dump file
-        let file = File::create(output_path)
-            .map_err(|e| Error::storage(format!("Failed to create dump file: {}", e)))?;
+        let file =
+            File::create(output_path).map_err(|e| Error::storage(format!("Failed to create dump file: {}", e)))?;
         let mut writer = BufWriter::with_capacity(256 * 1024, file); // 256KB buffer
 
         // Write magic bytes and version
-        writer.write_all(DUMP_MAGIC_NUMBER)
+        writer
+            .write_all(DUMP_MAGIC_NUMBER)
             .map_err(|e| Error::storage(format!("Failed to write magic bytes: {}", e)))?;
-        writer.write_all(&DUMP_VERSION.to_le_bytes())
+        writer
+            .write_all(&DUMP_VERSION.to_le_bytes())
             .map_err(|e| Error::storage(format!("Failed to write version: {}", e)))?;
 
         // Reserve space for metadata header (we'll write it later)
-        let metadata_pos = writer.stream_position()
+        let metadata_pos = writer
+            .stream_position()
             .map_err(|e| Error::storage(format!("Failed to get position: {}", e)))?;
         let metadata_placeholder = vec![0u8; 8192]; // 8KB placeholder
-        writer.write_all(&metadata_placeholder)
+        writer
+            .write_all(&metadata_placeholder)
             .map_err(|e| Error::storage(format!("Failed to write placeholder: {}", e)))?;
 
         // Get all tables
@@ -421,23 +423,28 @@ impl DumpManager {
             debug!("Dumping table {}/{}: {}", idx + 1, tables.len(), table);
 
             // Write table marker
-            writer.write_all(b"TABL")
+            writer
+                .write_all(b"TABL")
                 .map_err(|e| Error::storage(format!("Failed to write table marker: {}", e)))?;
 
             // Write table name
             let table_bytes = table.as_bytes();
-            writer.write_all(&(table_bytes.len() as u32).to_le_bytes())
+            writer
+                .write_all(&(table_bytes.len() as u32).to_le_bytes())
                 .map_err(|e| Error::storage(format!("Failed to write table name length: {}", e)))?;
-            writer.write_all(table_bytes)
+            writer
+                .write_all(table_bytes)
                 .map_err(|e| Error::storage(format!("Failed to write table name: {}", e)))?;
 
             // Get and write schema
             let schema = db.get_table_schema(table)?;
             let schema_bytes = bincode::serialize(&schema)
                 .map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
-            writer.write_all(&(schema_bytes.len() as u32).to_le_bytes())
+            writer
+                .write_all(&(schema_bytes.len() as u32).to_le_bytes())
                 .map_err(|e| Error::storage(format!("Failed to write schema length: {}", e)))?;
-            writer.write_all(&schema_bytes)
+            writer
+                .write_all(&schema_bytes)
                 .map_err(|e| Error::storage(format!("Failed to write schema: {}", e)))?;
 
             uncompressed_bytes += schema_bytes.len() as u64;
@@ -446,9 +453,11 @@ impl DumpManager {
             let indexes = db.get_table_indexes(table).unwrap_or_default();
             let indexes_bytes = bincode::serialize(&indexes)
                 .map_err(|e| Error::storage(format!("Failed to serialize indexes: {}", e)))?;
-            writer.write_all(&(indexes_bytes.len() as u32).to_le_bytes())
+            writer
+                .write_all(&(indexes_bytes.len() as u32).to_le_bytes())
                 .map_err(|e| Error::storage(format!("Failed to write indexes length: {}", e)))?;
-            writer.write_all(&indexes_bytes)
+            writer
+                .write_all(&indexes_bytes)
                 .map_err(|e| Error::storage(format!("Failed to write indexes: {}", e)))?;
 
             uncompressed_bytes += indexes_bytes.len() as u64;
@@ -458,7 +467,8 @@ impl DumpManager {
             let row_count = rows.len() as u64;
             total_rows += row_count;
 
-            writer.write_all(&row_count.to_le_bytes())
+            writer
+                .write_all(&row_count.to_le_bytes())
                 .map_err(|e| Error::storage(format!("Failed to write row count: {}", e)))?;
 
             // Write rows in batches for better compression
@@ -472,14 +482,17 @@ impl DumpManager {
                 // Compress batch
                 let compressed = self.compress_data(&batch_bytes)?;
 
-                writer.write_all(&(compressed.len() as u32).to_le_bytes())
+                writer
+                    .write_all(&(compressed.len() as u32).to_le_bytes())
                     .map_err(|e| Error::storage(format!("Failed to write batch length: {}", e)))?;
-                writer.write_all(&compressed)
+                writer
+                    .write_all(&compressed)
                     .map_err(|e| Error::storage(format!("Failed to write batch: {}", e)))?;
             }
 
             // Write end-of-table marker
-            writer.write_all(&0u32.to_le_bytes())
+            writer
+                .write_all(&0u32.to_le_bytes())
                 .map_err(|e| Error::storage(format!("Failed to write EOT marker: {}", e)))?;
         }
 
@@ -487,11 +500,13 @@ impl DumpManager {
         metadata.uncompressed_size = uncompressed_bytes;
 
         // Write end-of-dump marker
-        writer.write_all(b"ENDD")
+        writer
+            .write_all(b"ENDD")
             .map_err(|e| Error::storage(format!("Failed to write end marker: {}", e)))?;
 
         // Flush and calculate checksum
-        writer.flush()
+        writer
+            .flush()
             .map_err(|e| Error::storage(format!("Failed to flush writer: {}", e)))?;
         drop(writer);
 
@@ -563,27 +578,30 @@ impl DumpManager {
                 .open(output_path)
                 .map_err(|e| Error::storage(format!("Failed to open dump file: {}", e)))?
         } else {
-            File::create(output_path)
-                .map_err(|e| Error::storage(format!("Failed to create dump file: {}", e)))?
+            File::create(output_path).map_err(|e| Error::storage(format!("Failed to create dump file: {}", e)))?
         };
 
         let mut writer = BufWriter::with_capacity(256 * 1024, file);
 
         if !append || !output_path.exists() {
             // Write file header for new file
-            writer.write_all(DUMP_MAGIC_NUMBER)
+            writer
+                .write_all(DUMP_MAGIC_NUMBER)
                 .map_err(|e| Error::storage(format!("Failed to write magic bytes: {}", e)))?;
-            writer.write_all(&DUMP_VERSION.to_le_bytes())
+            writer
+                .write_all(&DUMP_VERSION.to_le_bytes())
                 .map_err(|e| Error::storage(format!("Failed to write version: {}", e)))?;
 
             // Reserve metadata space
             let metadata_placeholder = vec![0u8; 8192];
-            writer.write_all(&metadata_placeholder)
+            writer
+                .write_all(&metadata_placeholder)
                 .map_err(|e| Error::storage(format!("Failed to write placeholder: {}", e)))?;
         }
 
         // Write incremental marker
-        writer.write_all(b"INCR")
+        writer
+            .write_all(b"INCR")
             .map_err(|e| Error::storage(format!("Failed to write incremental marker: {}", e)))?;
 
         metadata.table_count = dirty_tables.len() as u32;
@@ -596,21 +614,26 @@ impl DumpManager {
             debug!("Dumping dirty table: {}", table);
 
             // Write table marker
-            writer.write_all(b"TABL")
+            writer
+                .write_all(b"TABL")
                 .map_err(|e| Error::storage(format!("Failed to write table marker: {}", e)))?;
 
             let table_bytes = table.as_bytes();
-            writer.write_all(&(table_bytes.len() as u32).to_le_bytes())
+            writer
+                .write_all(&(table_bytes.len() as u32).to_le_bytes())
                 .map_err(|e| Error::storage(format!("Failed to write table name length: {}", e)))?;
-            writer.write_all(table_bytes)
+            writer
+                .write_all(table_bytes)
                 .map_err(|e| Error::storage(format!("Failed to write table name: {}", e)))?;
 
             let schema = db.get_table_schema(table)?;
             let schema_bytes = bincode::serialize(&schema)
                 .map_err(|e| Error::storage(format!("Failed to serialize schema: {}", e)))?;
-            writer.write_all(&(schema_bytes.len() as u32).to_le_bytes())
+            writer
+                .write_all(&(schema_bytes.len() as u32).to_le_bytes())
                 .map_err(|e| Error::storage(format!("Failed to write schema length: {}", e)))?;
-            writer.write_all(&schema_bytes)
+            writer
+                .write_all(&schema_bytes)
                 .map_err(|e| Error::storage(format!("Failed to write schema: {}", e)))?;
 
             uncompressed_bytes += schema_bytes.len() as u64;
@@ -618,9 +641,11 @@ impl DumpManager {
             let indexes = db.get_table_indexes(table).unwrap_or_default();
             let indexes_bytes = bincode::serialize(&indexes)
                 .map_err(|e| Error::storage(format!("Failed to serialize indexes: {}", e)))?;
-            writer.write_all(&(indexes_bytes.len() as u32).to_le_bytes())
+            writer
+                .write_all(&(indexes_bytes.len() as u32).to_le_bytes())
                 .map_err(|e| Error::storage(format!("Failed to write indexes length: {}", e)))?;
-            writer.write_all(&indexes_bytes)
+            writer
+                .write_all(&indexes_bytes)
                 .map_err(|e| Error::storage(format!("Failed to write indexes: {}", e)))?;
 
             uncompressed_bytes += indexes_bytes.len() as u64;
@@ -629,7 +654,8 @@ impl DumpManager {
             let row_count = rows.len() as u64;
             total_rows += row_count;
 
-            writer.write_all(&row_count.to_le_bytes())
+            writer
+                .write_all(&row_count.to_le_bytes())
                 .map_err(|e| Error::storage(format!("Failed to write row count: {}", e)))?;
 
             for batch in rows.chunks(1000) {
@@ -639,13 +665,16 @@ impl DumpManager {
                 uncompressed_bytes += batch_bytes.len() as u64;
                 let compressed = self.compress_data(&batch_bytes)?;
 
-                writer.write_all(&(compressed.len() as u32).to_le_bytes())
+                writer
+                    .write_all(&(compressed.len() as u32).to_le_bytes())
                     .map_err(|e| Error::storage(format!("Failed to write batch length: {}", e)))?;
-                writer.write_all(&compressed)
+                writer
+                    .write_all(&compressed)
                     .map_err(|e| Error::storage(format!("Failed to write batch: {}", e)))?;
             }
 
-            writer.write_all(&0u32.to_le_bytes())
+            writer
+                .write_all(&0u32.to_le_bytes())
                 .map_err(|e| Error::storage(format!("Failed to write EOT marker: {}", e)))?;
         }
 
@@ -653,7 +682,8 @@ impl DumpManager {
         metadata.uncompressed_size = uncompressed_bytes;
         metadata.append_count = if append { 1 } else { 0 };
 
-        writer.flush()
+        writer
+            .flush()
             .map_err(|e| Error::storage(format!("Failed to flush writer: {}", e)))?;
         drop(writer);
 
@@ -688,24 +718,20 @@ impl DumpManager {
     ///
     /// # Returns
     /// Ok(()) on success
-    pub fn restore_from_dump<D: DatabaseRestoreInterface>(
-        &self,
-        input_path: &Path,
-        db: &mut D,
-    ) -> Result<()> {
+    pub fn restore_from_dump<D: DatabaseRestoreInterface>(&self, input_path: &Path, db: &mut D) -> Result<()> {
         info!("Starting restore from {}", input_path.display());
 
         // Validate dump first
         self.validate_dump(input_path)?;
 
         // Open dump file
-        let file = File::open(input_path)
-            .map_err(|e| Error::storage(format!("Failed to open dump file: {}", e)))?;
+        let file = File::open(input_path).map_err(|e| Error::storage(format!("Failed to open dump file: {}", e)))?;
         let mut reader = BufReader::with_capacity(256 * 1024, file);
 
         // Read and verify magic bytes
         let mut magic = [0u8; 8];
-        reader.read_exact(&mut magic)
+        reader
+            .read_exact(&mut magic)
             .map_err(|e| Error::storage(format!("Failed to read magic bytes: {}", e)))?;
         if &magic != DUMP_MAGIC_NUMBER {
             return Err(Error::storage("Invalid dump file: bad magic bytes"));
@@ -713,7 +739,8 @@ impl DumpManager {
 
         // Read version
         let mut version_bytes = [0u8; 4];
-        reader.read_exact(&mut version_bytes)
+        reader
+            .read_exact(&mut version_bytes)
             .map_err(|e| Error::storage(format!("Failed to read version: {}", e)))?;
         let version = u32::from_le_bytes(version_bytes);
         if version != DUMP_VERSION {
@@ -721,7 +748,8 @@ impl DumpManager {
         }
 
         // Skip metadata header
-        reader.seek(SeekFrom::Current(8192))
+        reader
+            .seek(SeekFrom::Current(8192))
             .map_err(|e| Error::storage(format!("Failed to seek past metadata: {}", e)))?;
 
         let mut total_tables = 0;
@@ -754,38 +782,44 @@ impl DumpManager {
 
             // Read table name
             let mut len_bytes = [0u8; 4];
-            reader.read_exact(&mut len_bytes)
+            reader
+                .read_exact(&mut len_bytes)
                 .map_err(|e| Error::storage(format!("Failed to read table name length: {}", e)))?;
             let table_name_len = u32::from_le_bytes(len_bytes);
 
             let mut table_bytes = vec![0u8; table_name_len as usize];
-            reader.read_exact(&mut table_bytes)
+            reader
+                .read_exact(&mut table_bytes)
                 .map_err(|e| Error::storage(format!("Failed to read table name: {}", e)))?;
-            let table = String::from_utf8(table_bytes)
-                .map_err(|e| Error::storage(format!("Invalid table name: {}", e)))?;
+            let table =
+                String::from_utf8(table_bytes).map_err(|e| Error::storage(format!("Invalid table name: {}", e)))?;
 
             debug!("Restoring table: {}", table);
 
             // Read schema
             let mut schema_len_bytes = [0u8; 4];
-            reader.read_exact(&mut schema_len_bytes)
+            reader
+                .read_exact(&mut schema_len_bytes)
                 .map_err(|e| Error::storage(format!("Failed to read schema length: {}", e)))?;
             let schema_len = u32::from_le_bytes(schema_len_bytes);
 
             let mut schema_bytes = vec![0u8; schema_len as usize];
-            reader.read_exact(&mut schema_bytes)
+            reader
+                .read_exact(&mut schema_bytes)
                 .map_err(|e| Error::storage(format!("Failed to read schema: {}", e)))?;
             let schema: Schema = bincode::deserialize(&schema_bytes)
                 .map_err(|e| Error::storage(format!("Failed to deserialize schema: {}", e)))?;
 
             // Read indexes
             let mut indexes_len_bytes = [0u8; 4];
-            reader.read_exact(&mut indexes_len_bytes)
+            reader
+                .read_exact(&mut indexes_len_bytes)
                 .map_err(|e| Error::storage(format!("Failed to read indexes length: {}", e)))?;
             let indexes_len = u32::from_le_bytes(indexes_len_bytes);
 
             let mut indexes_bytes = vec![0u8; indexes_len as usize];
-            reader.read_exact(&mut indexes_bytes)
+            reader
+                .read_exact(&mut indexes_bytes)
                 .map_err(|e| Error::storage(format!("Failed to read indexes: {}", e)))?;
             let indexes: Vec<IndexMetadata> = bincode::deserialize(&indexes_bytes)
                 .map_err(|e| Error::storage(format!("Failed to deserialize indexes: {}", e)))?;
@@ -800,7 +834,8 @@ impl DumpManager {
 
             // Read row count
             let mut row_count_bytes = [0u8; 8];
-            reader.read_exact(&mut row_count_bytes)
+            reader
+                .read_exact(&mut row_count_bytes)
                 .map_err(|e| Error::storage(format!("Failed to read row count: {}", e)))?;
             let row_count = u64::from_le_bytes(row_count_bytes);
 
@@ -808,7 +843,8 @@ impl DumpManager {
             let mut rows_read = 0u64;
             loop {
                 let mut batch_len_bytes = [0u8; 4];
-                reader.read_exact(&mut batch_len_bytes)
+                reader
+                    .read_exact(&mut batch_len_bytes)
                     .map_err(|e| Error::storage(format!("Failed to read batch length: {}", e)))?;
                 let batch_len = u32::from_le_bytes(batch_len_bytes);
 
@@ -818,7 +854,8 @@ impl DumpManager {
                 }
 
                 let mut batch_bytes = vec![0u8; batch_len as usize];
-                reader.read_exact(&mut batch_bytes)
+                reader
+                    .read_exact(&mut batch_bytes)
                     .map_err(|e| Error::storage(format!("Failed to read batch: {}", e)))?;
 
                 // Decompress batch
@@ -837,7 +874,10 @@ impl DumpManager {
             }
 
             if rows_read != row_count {
-                warn!("Row count mismatch for table {}: expected {}, got {}", table, row_count, rows_read);
+                warn!(
+                    "Row count mismatch for table {}: expected {}, got {}",
+                    table, row_count, rows_read
+                );
             }
 
             total_tables += 1;
@@ -860,13 +900,13 @@ impl DumpManager {
             return Err(Error::storage("Dump file does not exist"));
         }
 
-        let file = File::open(path)
-            .map_err(|e| Error::storage(format!("Failed to open dump file: {}", e)))?;
+        let file = File::open(path).map_err(|e| Error::storage(format!("Failed to open dump file: {}", e)))?;
         let mut reader = BufReader::new(file);
 
         // Verify magic bytes
         let mut magic = [0u8; 8];
-        reader.read_exact(&mut magic)
+        reader
+            .read_exact(&mut magic)
             .map_err(|e| Error::storage(format!("Failed to read magic bytes: {}", e)))?;
         if &magic != DUMP_MAGIC_NUMBER {
             return Err(Error::storage("Invalid dump file: bad magic bytes"));
@@ -874,7 +914,8 @@ impl DumpManager {
 
         // Verify version
         let mut version_bytes = [0u8; 4];
-        reader.read_exact(&mut version_bytes)
+        reader
+            .read_exact(&mut version_bytes)
             .map_err(|e| Error::storage(format!("Failed to read version: {}", e)))?;
         let version = u32::from_le_bytes(version_bytes);
         if version > DUMP_VERSION {
@@ -931,13 +972,11 @@ impl DumpManager {
         match self.compression {
             CompressionType::None => Ok(data.to_vec()),
             CompressionType::Zstd => {
-                zstd::bulk::compress(data, 3)
-                    .map_err(|e| Error::compression(format!("Zstd compression failed: {}", e)))
+                zstd::bulk::compress(data, 3).map_err(|e| Error::compression(format!("Zstd compression failed: {}", e)))
             }
             CompressionType::Gzip | CompressionType::Brotli => {
                 // For now, use zstd as fallback for unsupported types
-                zstd::bulk::compress(data, 3)
-                    .map_err(|e| Error::compression(format!("Compression failed: {}", e)))
+                zstd::bulk::compress(data, 3).map_err(|e| Error::compression(format!("Compression failed: {}", e)))
             }
         }
     }
@@ -960,14 +999,14 @@ impl DumpManager {
 
     /// Calculate CRC32 checksum of file
     fn calculate_checksum(&self, path: &Path) -> Result<String> {
-        let file = File::open(path)
-            .map_err(|e| Error::storage(format!("Failed to open file for checksum: {}", e)))?;
+        let file = File::open(path).map_err(|e| Error::storage(format!("Failed to open file for checksum: {}", e)))?;
         let mut reader = BufReader::new(file);
         let mut buffer = vec![0u8; 8192];
         let mut hasher = crc32fast::Hasher::new();
 
         loop {
-            let bytes_read = reader.read(&mut buffer)
+            let bytes_read = reader
+                .read(&mut buffer)
                 .map_err(|e| Error::storage(format!("Failed to read file: {}", e)))?;
             if bytes_read == 0 {
                 break;
@@ -981,31 +1020,30 @@ impl DumpManager {
     }
 
     /// Write metadata to file header
-    fn write_metadata_header(
-        &self,
-        path: &Path,
-        position: u64,
-        metadata: &DumpMetadata,
-    ) -> Result<()> {
+    fn write_metadata_header(&self, path: &Path, position: u64, metadata: &DumpMetadata) -> Result<()> {
         let file = OpenOptions::new()
             .write(true)
             .open(path)
             .map_err(|e| Error::storage(format!("Failed to open dump file: {}", e)))?;
         let mut writer = BufWriter::new(file);
 
-        writer.seek(SeekFrom::Start(position))
+        writer
+            .seek(SeekFrom::Start(position))
             .map_err(|e| Error::storage(format!("Failed to seek to metadata position: {}", e)))?;
 
-        let metadata_bytes = serde_json::to_vec(metadata)
-            .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
+        let metadata_bytes =
+            serde_json::to_vec(metadata).map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
 
         // Write actual metadata length
-        writer.write_all(&(metadata_bytes.len() as u32).to_le_bytes())
+        writer
+            .write_all(&(metadata_bytes.len() as u32).to_le_bytes())
             .map_err(|e| Error::storage(format!("Failed to write metadata length: {}", e)))?;
-        writer.write_all(&metadata_bytes)
+        writer
+            .write_all(&metadata_bytes)
             .map_err(|e| Error::storage(format!("Failed to write metadata: {}", e)))?;
 
-        writer.flush()
+        writer
+            .flush()
             .map_err(|e| Error::storage(format!("Failed to flush writer: {}", e)))?;
 
         Ok(())
@@ -1099,8 +1137,8 @@ pub struct RestoreReport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use crate::{Column, DataType, Value};
+    use std::collections::HashMap;
 
     /// Mock database for testing
     struct MockDatabase {
@@ -1121,7 +1159,8 @@ mod tests {
         }
 
         fn add_index(&mut self, table: &str, index: IndexMetadata) {
-            self.indexes.entry(table.to_string())
+            self.indexes
+                .entry(table.to_string())
                 .or_insert_with(Vec::new)
                 .push(index);
         }
@@ -1380,12 +1419,15 @@ mod tests {
         ]);
 
         db.add_table("users", schema, vec![]);
-        db.add_index("users", IndexMetadata {
-            name: "idx_email".to_string(),
-            index_type: "btree".to_string(),
-            columns: vec!["email".to_string()],
-            is_unique: true,
-        });
+        db.add_index(
+            "users",
+            IndexMetadata {
+                name: "idx_email".to_string(),
+                index_type: "btree".to_string(),
+                columns: vec!["email".to_string()],
+                is_unique: true,
+            },
+        );
 
         let dump_path = temp_dir.path().join("with_indexes.dump");
         manager.create_full_dump(&dump_path, &db)?;

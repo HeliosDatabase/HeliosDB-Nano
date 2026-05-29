@@ -29,10 +29,7 @@ pub async fn ws_upgrade(
     Query(params): Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     // Optional: validate JWT from query params before upgrading.
-    let token = params
-        .get("apikey")
-        .or_else(|| params.get("token"))
-        .cloned();
+    let token = params.get("apikey").or_else(|| params.get("token")).cloned();
 
     if let Some(ref _t) = token {
         // If an auth bridge is configured we could validate here;
@@ -148,7 +145,10 @@ async fn handle_ws(mut socket: WebSocket, state: AppState) {
     for table in &subscribed_tables {
         notifier.remove_table_subscription(table);
     }
-    info!("WS client fully disconnected, {} subscriptions removed", subscribed_tables.len());
+    info!(
+        "WS client fully disconnected, {} subscriptions removed",
+        subscribed_tables.len()
+    );
 }
 
 // ── Client message handling ──────────────────────────────────────────────────
@@ -280,11 +280,7 @@ fn extract_table_from_join(msg: &serde_json::Value, topic: &str) -> String {
 /// - `users`                  -> `users`
 /// - `realtime:*`             -> `*`
 fn extract_table_from_topic(topic: &str) -> String {
-    topic
-        .rsplit(':')
-        .next()
-        .unwrap_or(topic)
-        .to_string()
+    topic.rsplit(':').next().unwrap_or(topic).to_string()
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

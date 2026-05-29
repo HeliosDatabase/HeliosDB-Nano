@@ -104,12 +104,12 @@ impl From<Error> for ApiError {
             }
             Error::SqlParse(msg) => ApiError::bad_request(msg),
             Error::QueryExecution(msg) => ApiError::unprocessable_entity(msg),
-            Error::QueryTimeout(msg) => {
-                ApiError::new(StatusCode::REQUEST_TIMEOUT, "QueryTimeout", msg)
-            }
-            Error::QueryCancelled(msg) => {
-                ApiError::new(StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST), "QueryCancelled", msg)
-            }
+            Error::QueryTimeout(msg) => ApiError::new(StatusCode::REQUEST_TIMEOUT, "QueryTimeout", msg),
+            Error::QueryCancelled(msg) => ApiError::new(
+                StatusCode::from_u16(499).unwrap_or(StatusCode::BAD_REQUEST),
+                "QueryCancelled",
+                msg,
+            ),
             Error::Transaction(msg) => ApiError::unprocessable_entity(msg),
             Error::TypeConversion(msg) => ApiError::bad_request(msg),
             Error::Config(msg) => ApiError::bad_request(msg),
@@ -117,11 +117,13 @@ impl From<Error> for ApiError {
             Error::BranchMerge(msg) => ApiError::unprocessable_entity(msg),
             Error::MergeConflict(msg) => ApiError::conflict(msg),
             Error::ConstraintViolation(msg) => ApiError::conflict(msg),
-            Error::Encryption(_) | Error::VectorIndex(_) | Error::MultiTenant(_)
-            | Error::Audit(_) | Error::Compression(_) | Error::LockPoisoned(_)
-            | Error::Generic(_) => {
-                ApiError::internal_server_error(format!("{}", err))
-            }
+            Error::Encryption(_)
+            | Error::VectorIndex(_)
+            | Error::MultiTenant(_)
+            | Error::Audit(_)
+            | Error::Compression(_)
+            | Error::LockPoisoned(_)
+            | Error::Generic(_) => ApiError::internal_server_error(format!("{}", err)),
             Error::Io(e) => ApiError::internal_server_error(format!("I/O error: {}", e)),
         }
     }

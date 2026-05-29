@@ -9,8 +9,8 @@
 
 #![allow(unused_variables)]
 
-use crate::Result;
 use super::explain::ExplainOutput;
+use crate::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -85,9 +85,14 @@ impl PrometheusMetrics {
             let count = self.explain_duration_ms.iter().filter(|&&d| d <= bucket).count();
             output.push_str(&format!("explain_duration_ms_bucket{{le=\"{}\"}} {}\n", bucket, count));
         }
-        output.push_str(&format!("explain_duration_ms_count {}\n", self.explain_duration_ms.len()));
-        output.push_str(&format!("explain_duration_ms_sum {}\n\n",
-            self.explain_duration_ms.iter().sum::<f64>()));
+        output.push_str(&format!(
+            "explain_duration_ms_count {}\n",
+            self.explain_duration_ms.len()
+        ));
+        output.push_str(&format!(
+            "explain_duration_ms_sum {}\n\n",
+            self.explain_duration_ms.iter().sum::<f64>()
+        ));
 
         // Cache metrics
         output.push_str("# HELP explain_cache_size Current number of cached EXPLAIN results\n");
@@ -96,11 +101,17 @@ impl PrometheusMetrics {
 
         output.push_str("# HELP explain_cache_hits_total Total cache hits\n");
         output.push_str("# TYPE explain_cache_hits_total counter\n");
-        output.push_str(&format!("explain_cache_hits_total {}\n\n", self.explain_cache_hits_total));
+        output.push_str(&format!(
+            "explain_cache_hits_total {}\n\n",
+            self.explain_cache_hits_total
+        ));
 
         output.push_str("# HELP explain_cache_misses_total Total cache misses\n");
         output.push_str("# TYPE explain_cache_misses_total counter\n");
-        output.push_str(&format!("explain_cache_misses_total {}\n\n", self.explain_cache_misses_total));
+        output.push_str(&format!(
+            "explain_cache_misses_total {}\n\n",
+            self.explain_cache_misses_total
+        ));
 
         // Plan complexity
         output.push_str("# HELP explain_plan_nodes Number of nodes in query plan\n");
@@ -248,7 +259,9 @@ impl DatadogIntegration {
                 ("explain.cost".to_string(), output.total_cost.to_string()),
                 ("explain.rows".to_string(), output.total_rows.to_string()),
                 ("explain.features".to_string(), output.features.len().to_string()),
-            ].into_iter().collect(),
+            ]
+            .into_iter()
+            .collect(),
         };
 
         // Would send via HTTP to Datadog API
@@ -343,15 +356,13 @@ impl CIIntegration {
         if regression {
             details.push(format!(
                 "Query cost increased by {:.1}% (threshold: {:.1}%)",
-                cost_change,
-                threshold_percent
+                cost_change, threshold_percent
             ));
 
             if current.total_rows != baseline.total_rows {
                 details.push(format!(
                     "Row estimate changed: {} -> {}",
-                    baseline.total_rows,
-                    current.total_rows
+                    baseline.total_rows, current.total_rows
                 ));
             }
 
@@ -470,10 +481,16 @@ impl AlertRule {
 
             let expr = match rule.condition {
                 AlertCondition::HighLatencyP95 => {
-                    format!("histogram_quantile(0.95, rate(explain_duration_ms_bucket[5m])) > {}", rule.threshold)
+                    format!(
+                        "histogram_quantile(0.95, rate(explain_duration_ms_bucket[5m])) > {}",
+                        rule.threshold
+                    )
                 }
                 AlertCondition::HighErrorRate => {
-                    format!("rate(explain_errors_total[5m]) / rate(explain_requests_total[5m]) * 100 > {}", rule.threshold)
+                    format!(
+                        "rate(explain_errors_total[5m]) / rate(explain_requests_total[5m]) * 100 > {}",
+                        rule.threshold
+                    )
                 }
                 AlertCondition::LowCacheHitRate => {
                     format!("rate(explain_cache_hits_total[5m]) / (rate(explain_cache_hits_total[5m]) + rate(explain_cache_misses_total[5m])) * 100 < {}", rule.threshold)
@@ -503,7 +520,7 @@ impl AlertRule {
 mod tests {
     use super::*;
     use crate::sql::logical_plan::LogicalPlan;
-    use crate::{Schema, Column, DataType};
+    use crate::{Column, DataType, Schema};
     use std::sync::Arc;
 
     #[test]
@@ -531,24 +548,22 @@ mod tests {
 
     #[test]
     fn test_ci_regression_detection() {
-        use crate::{Schema, Column, DataType};
-        use std::sync::Arc;
         use super::super::explain::*;
+        use crate::{Column, DataType, Schema};
+        use std::sync::Arc;
 
         let schema = Arc::new(Schema {
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: true,
-                    source_table: None,
-                    source_table_name: None,
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+                source_table: None,
+                source_table_name: None,
                 default_expr: None,
                 unique: false,
                 storage_mode: crate::ColumnStorageMode::Default,
-                },
-            ],
+            }],
         });
 
         let plan = LogicalPlan::Scan {
@@ -576,7 +591,9 @@ mod tests {
         let rules = AlertRule::create_defaults();
 
         assert!(!rules.is_empty());
-        assert!(rules.iter().any(|r| matches!(r.condition, AlertCondition::HighLatencyP95)));
+        assert!(rules
+            .iter()
+            .any(|r| matches!(r.condition, AlertCondition::HighLatencyP95)));
 
         let prometheus_alerts = AlertRule::export_prometheus_alerts(&rules);
         assert!(prometheus_alerts.contains("alert:"));

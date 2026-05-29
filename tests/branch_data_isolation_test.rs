@@ -3,7 +3,10 @@
 //! Tests branch data isolation across both persistent and in-memory storage modes.
 //! Ensures metadata properties and data isolation work correctly regardless of storage mode.
 
-use heliosdb_nano::{Config, storage::{StorageEngine, BranchOptions}};
+use heliosdb_nano::{
+    storage::{BranchOptions, StorageEngine},
+    Config,
+};
 use std::path::PathBuf;
 use tempfile::TempDir;
 
@@ -36,14 +39,14 @@ fn test_persistent_branch_metadata_persistence() {
         let engine = StorageEngine::open(&db_path, &config).expect("Failed to open engine");
 
         // Insert data in main
-        engine.put(&b"key1".to_vec(), b"main_value").expect("Failed to put in main");
+        engine
+            .put(&b"key1".to_vec(), b"main_value")
+            .expect("Failed to put in main");
 
         // Create branch
-        let branch_id = engine.create_branch(
-            "dev",
-            Some("main"),
-            BranchOptions::default(),
-        ).expect("Failed to create branch");
+        let branch_id = engine
+            .create_branch("dev", Some("main"), BranchOptions::default())
+            .expect("Failed to create branch");
 
         assert!(branch_id > 1, "Branch ID should be > 1");
 
@@ -57,8 +60,11 @@ fn test_persistent_branch_metadata_persistence() {
         assert!(names.contains(&"dev"), "Should contain dev branch");
 
         // Write data in the dev branch
-        let mut tx = engine.begin_branch_transaction("dev").expect("Failed to start transaction");
-        tx.put(b"key1".to_vec(), b"dev_value".to_vec()).expect("Failed to put in dev");
+        let mut tx = engine
+            .begin_branch_transaction("dev")
+            .expect("Failed to start transaction");
+        tx.put(b"key1".to_vec(), b"dev_value".to_vec())
+            .expect("Failed to put in dev");
         tx.commit().expect("Failed to commit transaction");
     }
 
@@ -76,9 +82,15 @@ fn test_persistent_branch_metadata_persistence() {
 
         // Verify data isolation persists
         let main_value = engine.get(&b"key1".to_vec()).expect("Failed to get from main");
-        assert_eq!(main_value, Some(b"main_value".to_vec()), "Main branch data should be unchanged");
+        assert_eq!(
+            main_value,
+            Some(b"main_value".to_vec()),
+            "Main branch data should be unchanged"
+        );
 
-        let tx = engine.begin_branch_transaction("dev").expect("Failed to start transaction");
+        let tx = engine
+            .begin_branch_transaction("dev")
+            .expect("Failed to start transaction");
         let dev_value = tx.get(&b"key1".to_vec()).expect("Failed to get from dev");
         assert_eq!(dev_value, Some(b"dev_value".to_vec()), "Dev branch data should persist");
     }
@@ -94,24 +106,32 @@ fn test_persistent_complex_branch_hierarchy() {
         let engine = StorageEngine::open(&db_path, &config).expect("Failed to open engine");
 
         // Create hierarchy: main -> feature -> feature-sub
-        engine.put(&b"data".to_vec(), b"main_data").expect("Failed to put in main");
+        engine
+            .put(&b"data".to_vec(), b"main_data")
+            .expect("Failed to put in main");
 
-        engine.create_branch("feature", Some("main"), BranchOptions::default())
+        engine
+            .create_branch("feature", Some("main"), BranchOptions::default())
             .expect("Failed to create feature branch");
 
-        engine.create_branch("feature-sub", Some("feature"), BranchOptions::default())
+        engine
+            .create_branch("feature-sub", Some("feature"), BranchOptions::default())
             .expect("Failed to create feature-sub branch");
 
         // Modify at each level
-        let mut tx_feature = engine.begin_branch_transaction("feature")
+        let mut tx_feature = engine
+            .begin_branch_transaction("feature")
             .expect("Failed to start feature transaction");
-        tx_feature.put(b"data".to_vec(), b"feature_data".to_vec())
+        tx_feature
+            .put(b"data".to_vec(), b"feature_data".to_vec())
             .expect("Failed to put in feature");
         tx_feature.commit().expect("Failed to commit feature transaction");
 
-        let mut tx_sub = engine.begin_branch_transaction("feature-sub")
+        let mut tx_sub = engine
+            .begin_branch_transaction("feature-sub")
             .expect("Failed to start sub transaction");
-        tx_sub.put(b"data".to_vec(), b"sub_data".to_vec())
+        tx_sub
+            .put(b"data".to_vec(), b"sub_data".to_vec())
             .expect("Failed to put in sub");
         tx_sub.commit().expect("Failed to commit sub transaction");
     }
@@ -128,12 +148,18 @@ fn test_persistent_complex_branch_hierarchy() {
         let main_val = engine.get(&b"data".to_vec()).expect("Failed to get main");
         assert_eq!(main_val, Some(b"main_data".to_vec()), "Main data should persist");
 
-        let tx_feature = engine.begin_branch_transaction("feature")
+        let tx_feature = engine
+            .begin_branch_transaction("feature")
             .expect("Failed to start feature transaction");
         let feature_val = tx_feature.get(&b"data".to_vec()).expect("Failed to get feature");
-        assert_eq!(feature_val, Some(b"feature_data".to_vec()), "Feature data should persist");
+        assert_eq!(
+            feature_val,
+            Some(b"feature_data".to_vec()),
+            "Feature data should persist"
+        );
 
-        let tx_sub = engine.begin_branch_transaction("feature-sub")
+        let tx_sub = engine
+            .begin_branch_transaction("feature-sub")
             .expect("Failed to start sub transaction");
         let sub_val = tx_sub.get(&b"data".to_vec()).expect("Failed to get sub");
         assert_eq!(sub_val, Some(b"sub_data".to_vec()), "Sub data should persist");
@@ -150,13 +176,16 @@ fn test_in_memory_branch_metadata_isolation() {
     let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory engine");
 
     // Insert data in main
-    engine.put(&b"key1".to_vec(), b"main_value").expect("Failed to put in main");
+    engine
+        .put(&b"key1".to_vec(), b"main_value")
+        .expect("Failed to put in main");
 
     // Create multiple branches
     let branch_ids: Vec<_> = (0..5)
         .map(|i| {
             let branch_name = format!("branch_{}", i);
-            engine.create_branch(&branch_name, Some("main"), BranchOptions::default())
+            engine
+                .create_branch(&branch_name, Some("main"), BranchOptions::default())
                 .expect(&format!("Failed to create {}", branch_name))
         })
         .collect();
@@ -170,7 +199,8 @@ fn test_in_memory_branch_metadata_isolation() {
     // Write different values to each branch
     for i in 0..5 {
         let branch_name = format!("branch_{}", i);
-        let mut tx = engine.begin_branch_transaction(&branch_name)
+        let mut tx = engine
+            .begin_branch_transaction(&branch_name)
             .expect(&format!("Failed to start transaction for {}", branch_name));
         let value = format!("branch_{}_value", i);
         tx.put(b"key1".to_vec(), value.into_bytes())
@@ -180,17 +210,27 @@ fn test_in_memory_branch_metadata_isolation() {
 
     // Verify isolation
     let main_val = engine.get(&b"key1".to_vec()).expect("Failed to get from main");
-    assert_eq!(main_val, Some(b"main_value".to_vec()), "Main branch should be unchanged");
+    assert_eq!(
+        main_val,
+        Some(b"main_value".to_vec()),
+        "Main branch should be unchanged"
+    );
 
     for i in 0..5 {
         let branch_name = format!("branch_{}", i);
-        let tx = engine.begin_branch_transaction(&branch_name)
+        let tx = engine
+            .begin_branch_transaction(&branch_name)
             .expect(&format!("Failed to start transaction for {}", branch_name));
-        let value = tx.get(&b"key1".to_vec())
+        let value = tx
+            .get(&b"key1".to_vec())
             .expect(&format!("Failed to get from {}", branch_name));
         let expected = format!("branch_{}_value", i);
-        assert_eq!(value, Some(expected.into_bytes()),
-                   "Branch {} should have isolated value", i);
+        assert_eq!(
+            value,
+            Some(expected.into_bytes()),
+            "Branch {} should have isolated value",
+            i
+        );
     }
 }
 
@@ -201,12 +241,14 @@ fn test_in_memory_branch_metadata_properties() {
 
     // Create a branch with options
     let options = BranchOptions::default();
-    let branch_id = engine.create_branch("test_branch", Some("main"), options)
+    let branch_id = engine
+        .create_branch("test_branch", Some("main"), options)
         .expect("Failed to create branch");
 
     // Verify branch metadata is retrievable
     let branches = engine.list_branches().expect("Failed to list branches");
-    let branch = branches.iter()
+    let branch = branches
+        .iter()
         .find(|b| b.name == "test_branch")
         .expect("Branch should exist in list");
 
@@ -222,12 +264,12 @@ fn test_in_memory_concurrent_branch_isolation() {
     use std::thread;
 
     let config = Config::in_memory();
-    let engine = Arc::new(StorageEngine::open_in_memory(&config)
-        .expect("Failed to open in-memory engine"));
+    let engine = Arc::new(StorageEngine::open_in_memory(&config).expect("Failed to open in-memory engine"));
 
     // Create branches for each thread
     for i in 0..3 {
-        engine.create_branch(&format!("branch_{}", i), Some("main"), BranchOptions::default())
+        engine
+            .create_branch(&format!("branch_{}", i), Some("main"), BranchOptions::default())
             .expect(&format!("Failed to create branch_{}", i));
     }
 
@@ -241,7 +283,8 @@ fn test_in_memory_concurrent_branch_isolation() {
 
             // Write multiple times to ensure metadata consistency
             for j in 0..50 {
-                let mut tx = engine_clone.begin_branch_transaction(&branch_name)
+                let mut tx = engine_clone
+                    .begin_branch_transaction(&branch_name)
                     .expect(&format!("Failed to start transaction"));
                 let key = format!("key{}", j).into_bytes();
                 let value = format!("thread{}_value{}", i, j).into_bytes();
@@ -260,15 +303,21 @@ fn test_in_memory_concurrent_branch_isolation() {
     // Verify data isolation
     for i in 0..3 {
         let branch_name = format!("branch_{}", i);
-        let tx = engine.begin_branch_transaction(&branch_name)
+        let tx = engine
+            .begin_branch_transaction(&branch_name)
             .expect(&format!("Failed to start transaction"));
 
         for j in 0..50 {
             let key = format!("key{}", j).into_bytes();
             let expected = format!("thread{}_value{}", i, j).into_bytes();
             let value = tx.get(&key).expect(&format!("Failed to get key"));
-            assert_eq!(value, Some(expected),
-                       "Branch {} key {} should have correct isolated value", i, j);
+            assert_eq!(
+                value,
+                Some(expected),
+                "Branch {} key {} should have correct isolated value",
+                i,
+                j
+            );
         }
     }
 }
@@ -287,12 +336,14 @@ fn test_in_memory_large_dataset_isolation() {
     }
 
     // Create branch with large dataset
-    engine.create_branch("feature", Some("main"), BranchOptions::default())
+    engine
+        .create_branch("feature", Some("main"), BranchOptions::default())
         .expect("Failed to create branch");
 
     // Modify a subset of keys in branch
     {
-        let mut tx = engine.begin_branch_transaction("feature")
+        let mut tx = engine
+            .begin_branch_transaction("feature")
             .expect("Failed to start transaction");
 
         for i in 0..100 {
@@ -305,7 +356,8 @@ fn test_in_memory_large_dataset_isolation() {
     }
 
     // Verify isolation at scale
-    let tx = engine.begin_branch_transaction("feature")
+    let tx = engine
+        .begin_branch_transaction("feature")
         .expect("Failed to start read transaction");
 
     // Modified keys should have branch values
@@ -338,13 +390,17 @@ fn test_branch_isolation_behavior_consistency() {
         let config = persistent_config(&db_path);
         let engine = StorageEngine::open(&db_path, &config).expect("Failed to open persistent engine");
 
-        engine.put(&b"test_key".to_vec(), b"persistent_value").expect("Failed to put");
+        engine
+            .put(&b"test_key".to_vec(), b"persistent_value")
+            .expect("Failed to put");
 
-        engine.create_branch("test", Some("main"), BranchOptions::default())
+        engine
+            .create_branch("test", Some("main"), BranchOptions::default())
             .expect("Failed to create branch");
 
         let mut tx = engine.begin_branch_transaction("test").expect("Failed to start tx");
-        tx.put(b"test_key".to_vec(), b"branch_value".to_vec()).expect("Failed to put in branch");
+        tx.put(b"test_key".to_vec(), b"branch_value".to_vec())
+            .expect("Failed to put in branch");
         tx.commit().expect("Failed to commit");
     }
 
@@ -353,22 +409,34 @@ fn test_branch_isolation_behavior_consistency() {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory engine");
 
-        engine.put(&b"test_key".to_vec(), b"memory_value").expect("Failed to put");
+        engine
+            .put(&b"test_key".to_vec(), b"memory_value")
+            .expect("Failed to put");
 
-        engine.create_branch("test", Some("main"), BranchOptions::default())
+        engine
+            .create_branch("test", Some("main"), BranchOptions::default())
             .expect("Failed to create branch");
 
         let mut tx = engine.begin_branch_transaction("test").expect("Failed to start tx");
-        tx.put(b"test_key".to_vec(), b"branch_value".to_vec()).expect("Failed to put in branch");
+        tx.put(b"test_key".to_vec(), b"branch_value".to_vec())
+            .expect("Failed to put in branch");
         tx.commit().expect("Failed to commit");
 
         // Both modes should show same branch isolation behavior
         let main_val = engine.get(&b"test_key".to_vec()).expect("Failed to get");
-        assert_eq!(main_val, Some(b"memory_value".to_vec()), "Main branch isolation should match");
+        assert_eq!(
+            main_val,
+            Some(b"memory_value".to_vec()),
+            "Main branch isolation should match"
+        );
 
         let tx = engine.begin_branch_transaction("test").expect("Failed to start tx");
         let branch_val = tx.get(&b"test_key".to_vec()).expect("Failed to get");
-        assert_eq!(branch_val, Some(b"branch_value".to_vec()), "Branch isolation should match");
+        assert_eq!(
+            branch_val,
+            Some(b"branch_value".to_vec()),
+            "Branch isolation should match"
+        );
     }
 }
 
@@ -381,16 +449,19 @@ fn test_multiple_sequential_operations_in_memory() {
     for iteration in 0..10 {
         let branch_name = format!("branch_{}", iteration);
 
-        engine.create_branch(&branch_name, Some("main"), BranchOptions::default())
+        engine
+            .create_branch(&branch_name, Some("main"), BranchOptions::default())
             .expect(&format!("Failed to create {}", branch_name));
 
-        let mut tx = engine.begin_branch_transaction(&branch_name)
+        let mut tx = engine
+            .begin_branch_transaction(&branch_name)
             .expect(&format!("Failed to start tx for {}", branch_name));
 
         tx.put(
             format!("iter_{}", iteration).into_bytes(),
-            format!("value_{}", iteration).into_bytes()
-        ).expect(&format!("Failed to put in {}", branch_name));
+            format!("value_{}", iteration).into_bytes(),
+        )
+        .expect(&format!("Failed to put in {}", branch_name));
 
         tx.commit().expect(&format!("Failed to commit {}", branch_name));
     }
@@ -401,16 +472,19 @@ fn test_multiple_sequential_operations_in_memory() {
 
     for iteration in 0..10 {
         let branch_name = format!("branch_{}", iteration);
-        let tx = engine.begin_branch_transaction(&branch_name)
+        let tx = engine
+            .begin_branch_transaction(&branch_name)
             .expect(&format!("Failed to start read tx for {}", branch_name));
 
-        let value = tx.get(&format!("iter_{}", iteration).into_bytes())
+        let value = tx
+            .get(&format!("iter_{}", iteration).into_bytes())
             .expect(&format!("Failed to get from {}", branch_name));
 
         assert_eq!(
             value,
             Some(format!("value_{}", iteration).into_bytes()),
-            "Iteration {} should have correct value", iteration
+            "Iteration {} should have correct value",
+            iteration
         );
     }
 }
@@ -421,15 +495,19 @@ fn test_branch_write_does_not_leak_to_main_in_memory() {
     let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory engine");
 
     // Write to main
-    engine.put(&b"shared_key".to_vec(), b"main_value").expect("Failed to write to main");
+    engine
+        .put(&b"shared_key".to_vec(), b"main_value")
+        .expect("Failed to write to main");
 
     // Create a branch
-    engine.create_branch("test_branch", Some("main"), BranchOptions::default())
+    engine
+        .create_branch("test_branch", Some("main"), BranchOptions::default())
         .expect("Failed to create branch");
 
     // Write to the branch using BranchTransaction
     {
-        let mut tx = engine.begin_branch_transaction("test_branch")
+        let mut tx = engine
+            .begin_branch_transaction("test_branch")
             .expect("Failed to start branch transaction");
 
         tx.put(b"shared_key".to_vec(), b"branch_value".to_vec())
@@ -439,8 +517,7 @@ fn test_branch_write_does_not_leak_to_main_in_memory() {
     }
 
     // CRITICAL TEST: Verify main branch data is NOT changed
-    let main_value = engine.get(&b"shared_key".to_vec())
-        .expect("Failed to read from main");
+    let main_value = engine.get(&b"shared_key".to_vec()).expect("Failed to read from main");
     assert_eq!(
         main_value,
         Some(b"main_value".to_vec()),
@@ -449,10 +526,10 @@ fn test_branch_write_does_not_leak_to_main_in_memory() {
 
     // Verify branch has the new value
     {
-        let tx = engine.begin_branch_transaction("test_branch")
+        let tx = engine
+            .begin_branch_transaction("test_branch")
             .expect("Failed to start read transaction");
-        let branch_value = tx.get(&b"shared_key".to_vec())
-            .expect("Failed to read from branch");
+        let branch_value = tx.get(&b"shared_key".to_vec()).expect("Failed to read from branch");
         assert_eq!(
             branch_value,
             Some(b"branch_value".to_vec()),
@@ -467,14 +544,17 @@ fn test_multiple_branches_no_cross_contamination_in_memory() {
     let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory engine");
 
     // Create two branches
-    engine.create_branch("branch_a", Some("main"), BranchOptions::default())
+    engine
+        .create_branch("branch_a", Some("main"), BranchOptions::default())
         .expect("Failed to create branch_a");
-    engine.create_branch("branch_b", Some("main"), BranchOptions::default())
+    engine
+        .create_branch("branch_b", Some("main"), BranchOptions::default())
         .expect("Failed to create branch_b");
 
     // Write different values to each branch for the same key
     {
-        let mut tx_a = engine.begin_branch_transaction("branch_a")
+        let mut tx_a = engine
+            .begin_branch_transaction("branch_a")
             .expect("Failed to start transaction for branch_a");
         tx_a.put(b"test_key".to_vec(), b"value_from_a".to_vec())
             .expect("Failed to write to branch_a");
@@ -482,7 +562,8 @@ fn test_multiple_branches_no_cross_contamination_in_memory() {
     }
 
     {
-        let mut tx_b = engine.begin_branch_transaction("branch_b")
+        let mut tx_b = engine
+            .begin_branch_transaction("branch_b")
             .expect("Failed to start transaction for branch_b");
         tx_b.put(b"test_key".to_vec(), b"value_from_b".to_vec())
             .expect("Failed to write to branch_b");
@@ -491,9 +572,11 @@ fn test_multiple_branches_no_cross_contamination_in_memory() {
 
     // Verify each branch has its own isolated value
     {
-        let tx_a = engine.begin_branch_transaction("branch_a")
+        let tx_a = engine
+            .begin_branch_transaction("branch_a")
             .expect("Failed to read from branch_a");
-        let value_a = tx_a.get(&b"test_key".to_vec())
+        let value_a = tx_a
+            .get(&b"test_key".to_vec())
             .expect("Failed to get test_key from branch_a");
         assert_eq!(
             value_a,
@@ -503,9 +586,11 @@ fn test_multiple_branches_no_cross_contamination_in_memory() {
     }
 
     {
-        let tx_b = engine.begin_branch_transaction("branch_b")
+        let tx_b = engine
+            .begin_branch_transaction("branch_b")
             .expect("Failed to read from branch_b");
-        let value_b = tx_b.get(&b"test_key".to_vec())
+        let value_b = tx_b
+            .get(&b"test_key".to_vec())
             .expect("Failed to get test_key from branch_b");
         assert_eq!(
             value_b,
@@ -515,11 +600,9 @@ fn test_multiple_branches_no_cross_contamination_in_memory() {
     }
 
     // Verify main is unchanged
-    let main_value = engine.get(&b"test_key".to_vec())
-        .expect("Failed to read from main");
+    let main_value = engine.get(&b"test_key".to_vec()).expect("Failed to read from main");
     assert_eq!(
-        main_value,
-        None,
+        main_value, None,
         "main should not have test_key (it was never written to main)"
     );
 }

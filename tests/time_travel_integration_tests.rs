@@ -8,17 +8,16 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_nano::{Config, StorageEngine, Tuple, Value, Schema, Column, DataType};
-use heliosdb_nano::sql::LogicalPlan;
 use heliosdb_nano::sql::logical_plan::AsOfClause;
 use heliosdb_nano::sql::Executor;
+use heliosdb_nano::sql::LogicalPlan;
+use heliosdb_nano::{Column, Config, DataType, Schema, StorageEngine, Tuple, Value};
 use std::sync::Arc;
 
 /// Helper to create a test storage engine with sample data
 fn create_test_engine_with_history() -> StorageEngine {
     let config = Config::in_memory();
-    let engine = StorageEngine::open_in_memory(&config)
-        .expect("Failed to create storage engine");
+    let engine = StorageEngine::open_in_memory(&config).expect("Failed to create storage engine");
 
     // Create a simple orders table
     let schema = Schema {
@@ -46,29 +45,24 @@ fn create_test_engine_with_history() -> StorageEngine {
 
     // Create table
     let catalog = engine.catalog();
-    catalog.create_table("orders", schema.clone())
+    catalog
+        .create_table("orders", schema.clone())
         .expect("Failed to create table");
 
     // Insert version 1 - Initial data
     let tuple1 = Tuple {
-        values: vec![
-            Value::Int4(1),
-            Value::String("Alice".to_string()),
-            Value::Float8(100.0),
-        ],
+        values: vec![Value::Int4(1), Value::String("Alice".to_string()), Value::Float8(100.0)],
     };
-    engine.insert_tuple_versioned("orders", tuple1)
+    engine
+        .insert_tuple_versioned("orders", tuple1)
         .expect("Failed to insert tuple 1");
 
     // Insert version 2 - Add another order
     let tuple2 = Tuple {
-        values: vec![
-            Value::Int4(2),
-            Value::String("Bob".to_string()),
-            Value::Float8(200.0),
-        ],
+        values: vec![Value::Int4(2), Value::String("Bob".to_string()), Value::Float8(200.0)],
     };
-    engine.insert_tuple_versioned("orders", tuple2)
+    engine
+        .insert_tuple_versioned("orders", tuple2)
         .expect("Failed to insert tuple 2");
 
     // Insert version 3 - Add third order
@@ -79,7 +73,8 @@ fn create_test_engine_with_history() -> StorageEngine {
             Value::Float8(300.0),
         ],
     };
-    engine.insert_tuple_versioned("orders", tuple3)
+    engine
+        .insert_tuple_versioned("orders", tuple3)
         .expect("Failed to insert tuple 3");
 
     engine
@@ -98,8 +93,7 @@ fn test_current_snapshot_query() {
     };
 
     let mut executor = Executor::with_storage(&engine);
-    let results = executor.execute(&plan)
-        .expect("Failed to execute query");
+    let results = executor.execute(&plan).expect("Failed to execute query");
 
     // Should see all 3 orders
     assert_eq!(results.len(), 3);
@@ -123,14 +117,16 @@ fn test_as_of_transaction() {
     };
 
     let mut executor = Executor::with_storage(&engine);
-    let results = executor.execute(&plan)
+    let results = executor
+        .execute(&plan)
         .expect("Failed to execute AS OF TRANSACTION query");
 
     // Should see only first 2 orders (transaction 1 and 2)
     assert_eq!(results.len(), 2);
 
     // Verify we can see the correct data
-    let customer_names: Vec<String> = results.iter()
+    let customer_names: Vec<String> = results
+        .iter()
         .filter_map(|t| {
             if let Value::String(name) = &t.values[1] {
                 Some(name.clone())
@@ -162,8 +158,7 @@ fn test_as_of_scn() {
     };
 
     let mut executor = Executor::with_storage(&engine);
-    let results = executor.execute(&plan)
-        .expect("Failed to execute AS OF SCN query");
+    let results = executor.execute(&plan).expect("Failed to execute AS OF SCN query");
 
     // Should see only first order (SCN 1)
     assert_eq!(results.len(), 1);
@@ -182,9 +177,7 @@ fn test_as_of_timestamp() {
     let snapshot_mgr = engine.snapshot_manager();
 
     // Get metadata for second snapshot
-    let snapshots: Vec<_> = (1..=10).filter_map(|i| {
-        snapshot_mgr.get_snapshot_metadata(i)
-    }).collect();
+    let snapshots: Vec<_> = (1..=10).filter_map(|i| snapshot_mgr.get_snapshot_metadata(i)).collect();
 
     assert!(snapshots.len() >= 2, "Need at least 2 snapshots for this test");
 
@@ -200,7 +193,8 @@ fn test_as_of_timestamp() {
     };
 
     let mut executor = Executor::with_storage(&engine);
-    let results = executor.execute(&plan)
+    let results = executor
+        .execute(&plan)
         .expect("Failed to execute AS OF TIMESTAMP query");
 
     // Should see first 2 orders
@@ -220,8 +214,7 @@ fn test_as_of_now() {
     };
 
     let mut executor = Executor::with_storage(&engine);
-    let results = executor.execute(&plan)
-        .expect("Failed to execute AS OF NOW query");
+    let results = executor.execute(&plan).expect("Failed to execute AS OF NOW query");
 
     // Should see all 3 orders (same as current)
     assert_eq!(results.len(), 3);
@@ -271,26 +264,22 @@ fn test_snapshot_isolation() {
     let mut executor = Executor::with_storage(&engine);
 
     // Execute both queries
-    let results1 = executor.execute(&plan1)
-        .expect("Failed to execute first query");
-    let results3 = executor.execute(&plan3)
-        .expect("Failed to execute second query");
+    let results1 = executor.execute(&plan1).expect("Failed to execute first query");
+    let results3 = executor.execute(&plan3).expect("Failed to execute second query");
 
     // Verify isolation - results should be different
     assert_eq!(results1.len(), 1);
     assert_eq!(results3.len(), 3);
 
     // Both queries should return consistent results if executed again
-    let results1_again = executor.execute(&plan1)
-        .expect("Failed to execute first query again");
+    let results1_again = executor.execute(&plan1).expect("Failed to execute first query again");
     assert_eq!(results1.len(), results1_again.len());
 }
 
 #[test]
 fn test_multiple_tables_time_travel() {
     let config = Config::in_memory();
-    let engine = StorageEngine::open_in_memory(&config)
-        .expect("Failed to create storage engine");
+    let engine = StorageEngine::open_in_memory(&config).expect("Failed to create storage engine");
 
     // Create two tables
     let schema = Schema {
@@ -311,19 +300,31 @@ fn test_multiple_tables_time_travel() {
     };
 
     let catalog = engine.catalog();
-    catalog.create_table("users", schema.clone())
+    catalog
+        .create_table("users", schema.clone())
         .expect("Failed to create users table");
-    catalog.create_table("products", schema.clone())
+    catalog
+        .create_table("products", schema.clone())
         .expect("Failed to create products table");
 
     // Insert data into both tables
-    engine.insert_tuple_versioned("users", Tuple {
-        values: vec![Value::Int4(1), Value::String("Alice".to_string())],
-    }).expect("Failed to insert user");
+    engine
+        .insert_tuple_versioned(
+            "users",
+            Tuple {
+                values: vec![Value::Int4(1), Value::String("Alice".to_string())],
+            },
+        )
+        .expect("Failed to insert user");
 
-    engine.insert_tuple_versioned("products", Tuple {
-        values: vec![Value::Int4(1), Value::String("Widget".to_string())],
-    }).expect("Failed to insert product");
+    engine
+        .insert_tuple_versioned(
+            "products",
+            Tuple {
+                values: vec![Value::Int4(1), Value::String("Widget".to_string())],
+            },
+        )
+        .expect("Failed to insert product");
 
     // Query both tables at same snapshot
     let plan_users = LogicalPlan::Scan {
@@ -342,10 +343,8 @@ fn test_multiple_tables_time_travel() {
 
     let mut executor = Executor::with_storage(&engine);
 
-    let users = executor.execute(&plan_users)
-        .expect("Failed to query users");
-    let products = executor.execute(&plan_products)
-        .expect("Failed to query products");
+    let users = executor.execute(&plan_users).expect("Failed to query users");
+    let products = executor.execute(&plan_products).expect("Failed to query products");
 
     // Both should have data at transaction 1
     assert_eq!(users.len(), 1);
@@ -354,25 +353,24 @@ fn test_multiple_tables_time_travel() {
 
 #[test]
 fn test_snapshot_gc() {
-    use heliosdb_nano::storage::{SnapshotManager, GcConfig};
+    use heliosdb_nano::storage::{GcConfig, SnapshotManager};
 
     let config = Config::in_memory();
-    let engine = StorageEngine::open_in_memory(&config)
-        .expect("Failed to create storage engine");
+    let engine = StorageEngine::open_in_memory(&config).expect("Failed to create storage engine");
 
     let snapshot_mgr = engine.snapshot_manager();
 
     // Create many snapshots
     for i in 1..=20 {
-        snapshot_mgr.register_snapshot(i * 100)
+        snapshot_mgr
+            .register_snapshot(i * 100)
             .expect("Failed to register snapshot");
     }
 
     assert_eq!(snapshot_mgr.snapshot_count(), 20);
 
     // Run GC
-    let removed = snapshot_mgr.gc_old_snapshots()
-        .expect("Failed to run GC");
+    let removed = snapshot_mgr.gc_old_snapshots().expect("Failed to run GC");
 
     // Should have removed some snapshots (exact count depends on GC config)
     assert!(removed > 0);
@@ -389,27 +387,28 @@ fn test_snapshot_recovery() {
     // Create engine, insert data, and close
     {
         let config = Config::default();
-        let engine = StorageEngine::open(db_path, &config)
-            .expect("Failed to create storage engine");
+        let engine = StorageEngine::open(db_path, &config).expect("Failed to create storage engine");
 
         let schema = Schema {
-            columns: vec![
-                Column {
-                    name: "id".to_string(),
-                    data_type: DataType::Int4,
-                    nullable: false,
-                    primary_key: true,
-                },
-            ],
+            columns: vec![Column {
+                name: "id".to_string(),
+                data_type: DataType::Int4,
+                nullable: false,
+                primary_key: true,
+            }],
         };
 
         let catalog = engine.catalog();
-        catalog.create_table("test", schema)
-            .expect("Failed to create table");
+        catalog.create_table("test", schema).expect("Failed to create table");
 
-        engine.insert_tuple_versioned("test", Tuple {
-            values: vec![Value::Int4(1)],
-        }).expect("Failed to insert");
+        engine
+            .insert_tuple_versioned(
+                "test",
+                Tuple {
+                    values: vec![Value::Int4(1)],
+                },
+            )
+            .expect("Failed to insert");
 
         // Snapshots should be registered
         assert!(engine.snapshot_manager().snapshot_count() > 0);
@@ -418,8 +417,7 @@ fn test_snapshot_recovery() {
     // Reopen and verify snapshots were recovered
     {
         let config = Config::default();
-        let engine = StorageEngine::open(db_path, &config)
-            .expect("Failed to reopen storage engine");
+        let engine = StorageEngine::open(db_path, &config).expect("Failed to reopen storage engine");
 
         // Snapshots should be recovered
         assert!(engine.snapshot_manager().snapshot_count() > 0);

@@ -12,16 +12,16 @@
 
 #![allow(unused_variables)]
 
-use crate::{Result, Error, Schema, Column, DataType, Value, Tuple};
-use crate::storage::StorageEngine;
-use crate::storage::GlobalStatsCollector;
 use crate::sql::SessionRegistry;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use crate::storage::GlobalStatsCollector;
+use crate::storage::StorageEngine;
+use crate::{Column, DataType, Error, Result, Schema, Tuple, Value};
 use chrono::{DateTime, Utc};
 use lru::LruCache;
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 /// System view definition
 #[derive(Debug, Clone)]
@@ -151,8 +151,8 @@ impl SystemViewRegistry {
     ///
     /// Returns an error if cache_size is zero.
     pub fn with_cache_config(cache_size: usize, ttl_seconds: u64) -> Result<Self> {
-        let cache_size_nz = NonZeroUsize::new(cache_size)
-            .ok_or_else(|| Error::config("Cache size must be non-zero"))?;
+        let cache_size_nz =
+            NonZeroUsize::new(cache_size).ok_or_else(|| Error::config("Cache size must be non-zero"))?;
         let mut registry = Self {
             views: HashMap::new(),
             session_registry: None,
@@ -906,9 +906,10 @@ impl SystemViewRegistry {
     /// Invalidate cache for a specific view
     pub fn invalidate_view(&self, view_name: &str) -> Result<()> {
         let cache_key = CacheKey::new(view_name);
-        let mut cache_guard = self.cache.lock().map_err(|e| {
-            Error::query_execution(format!("Cache lock error: {}", e))
-        })?;
+        let mut cache_guard = self
+            .cache
+            .lock()
+            .map_err(|e| Error::query_execution(format!("Cache lock error: {}", e)))?;
 
         cache_guard.pop(&cache_key);
         tracing::debug!("Invalidated system view cache for '{}'", view_name);
@@ -917,9 +918,10 @@ impl SystemViewRegistry {
 
     /// Invalidate entire cache (e.g., after DDL operations)
     pub fn invalidate_all(&self) -> Result<()> {
-        let mut cache_guard = self.cache.lock().map_err(|e| {
-            Error::query_execution(format!("Cache lock error: {}", e))
-        })?;
+        let mut cache_guard = self
+            .cache
+            .lock()
+            .map_err(|e| Error::query_execution(format!("Cache lock error: {}", e)))?;
 
         cache_guard.clear();
         tracing::info!("Invalidated entire system view cache");
@@ -928,7 +930,8 @@ impl SystemViewRegistry {
 
     /// Invalidate cache for views in a specific category
     pub fn invalidate_category(&self, category: ViewCategory) -> Result<()> {
-        let view_names: Vec<String> = self.views
+        let view_names: Vec<String> = self
+            .views
             .values()
             .filter(|v| v.category == category)
             .map(|v| v.name.clone())
@@ -944,9 +947,10 @@ impl SystemViewRegistry {
 
     /// Get cache statistics
     pub fn cache_stats(&self) -> Result<(usize, usize)> {
-        let cache_guard = self.cache.lock().map_err(|e| {
-            Error::query_execution(format!("Cache lock error: {}", e))
-        })?;
+        let cache_guard = self
+            .cache
+            .lock()
+            .map_err(|e| Error::query_execution(format!("Cache lock error: {}", e)))?;
 
         Ok((cache_guard.len(), cache_guard.cap().get()))
     }
@@ -954,10 +958,7 @@ impl SystemViewRegistry {
     /// Execute a system view query with caching
     pub fn execute(&self, view_name: &str, storage: &StorageEngine) -> Result<Vec<Tuple>> {
         if !self.is_system_view(view_name) {
-            return Err(Error::query_execution(format!(
-                "Unknown system view: {}",
-                view_name
-            )));
+            return Err(Error::query_execution(format!("Unknown system view: {}", view_name)));
         }
 
         // Create cache key
@@ -965,9 +966,10 @@ impl SystemViewRegistry {
 
         // Try to get from cache first
         {
-            let cache_guard = self.cache.lock().map_err(|e| {
-                Error::query_execution(format!("Cache lock error: {}", e))
-            })?;
+            let cache_guard = self
+                .cache
+                .lock()
+                .map_err(|e| Error::query_execution(format!("Cache lock error: {}", e)))?;
 
             if let Some(cached) = cache_guard.peek(&cache_key) {
                 if cached.is_valid() {
@@ -996,9 +998,10 @@ impl SystemViewRegistry {
 
         // Store in cache
         {
-            let mut cache_guard = self.cache.lock().map_err(|e| {
-                Error::query_execution(format!("Cache lock error: {}", e))
-            })?;
+            let mut cache_guard = self
+                .cache
+                .lock()
+                .map_err(|e| Error::query_execution(format!("Cache lock error: {}", e)))?;
 
             let cached_result = CachedResult::new(tuples.clone(), self.default_ttl);
             cache_guard.put(cache_key, cached_result);
@@ -1106,7 +1109,7 @@ impl SystemViewRegistry {
                 Value::String(schema),
                 Value::String(bare),
                 Value::String("heliosdb".to_string()),
-                Value::Null, // tablespace
+                Value::Null,           // tablespace
                 Value::Boolean(false), // hasindexes (simplified)
                 Value::Boolean(false), // hasrules
                 Value::Boolean(false), // hastriggers
@@ -1158,13 +1161,13 @@ impl SystemViewRegistry {
             let schema = catalog.get_table_schema(table_name)?;
             for (col_idx, column) in schema.columns.iter().enumerate() {
                 let tuple = Tuple::new(vec![
-                    Value::Int4(table_idx as i32), // attrelid
-                    Value::String(column.name.clone()), // attname
+                    Value::Int4(table_idx as i32),                          // attrelid
+                    Value::String(column.name.clone()),                     // attname
                     Value::Int4(Self::data_type_to_oid(&column.data_type)), // atttypid
-                    Value::Int2(col_idx as i16), // attnum
-                    Value::Int2(-1), // attlen (variable)
-                    Value::Boolean(!column.nullable), // attnotnull
-                    Value::Boolean(false), // atthasdef
+                    Value::Int2(col_idx as i16),                            // attnum
+                    Value::Int2(-1),                                        // attlen (variable)
+                    Value::Boolean(!column.nullable),                       // attnotnull
+                    Value::Boolean(false),                                  // atthasdef
                 ]);
                 results.push(tuple);
             }
@@ -1182,7 +1185,7 @@ impl SystemViewRegistry {
             Value::String("en_US.UTF-8".to_string()),
             Value::String("en_US.UTF-8".to_string()),
             Value::Boolean(false), // datistemplate
-            Value::Boolean(true), // datallowconn
+            Value::Boolean(true),  // datallowconn
         ]);
 
         Ok(vec![tuple])
@@ -1215,9 +1218,9 @@ impl SystemViewRegistry {
                 Value::String(table_name.clone()),
                 Value::Int4(1), // relnamespace (public)
                 Value::String(relkind.to_string()),
-                Value::Int4(1), // relowner
-                Value::Int4(0), // relam
-                Value::Int4(0), // relpages
+                Value::Int4(1),     // relowner
+                Value::Int4(0),     // relam
+                Value::Int4(0),     // relpages
                 Value::Float4(0.0), // reltuples
             ]);
             results.push(tuple);
@@ -1276,8 +1279,8 @@ impl SystemViewRegistry {
         for (name, oid, typtype, typcategory) in types {
             let tuple = Tuple::new(vec![
                 Value::String(name.to_string()),
-                Value::Int4(1), // typnamespace
-                Value::Int4(1), // typowner
+                Value::Int4(1),  // typnamespace
+                Value::Int4(1),  // typowner
                 Value::Int2(-1), // typlen
                 Value::String(typtype.to_string()),
                 Value::String(typcategory.to_string()),
@@ -1302,7 +1305,7 @@ impl SystemViewRegistry {
                 Value::Int4(1), // datid
                 Value::String("heliosdb".to_string()),
                 Value::Int4(session.session_id as i32), // pid
-                Value::Int4(1), // usesysid
+                Value::Int4(1),                         // usesysid
                 Value::String(session.username.clone()),
                 Value::String(session.protocol.as_str().to_string()),
                 Value::String(session.client_address.clone()),
@@ -1377,7 +1380,10 @@ impl SystemViewRegistry {
         // Query timeout
         results.push(Self::setting_tuple(
             "query_timeout_ms",
-            &config.storage.query_timeout_ms.map_or("unlimited".to_string(), |v| v.to_string()),
+            &config
+                .storage
+                .query_timeout_ms
+                .map_or("unlimited".to_string(), |v| v.to_string()),
             "ms",
             "Query Execution",
             "Maximum query execution time in milliseconds",
@@ -1388,7 +1394,10 @@ impl SystemViewRegistry {
         // Slow query threshold
         results.push(Self::setting_tuple(
             "slow_query_threshold_ms",
-            &config.storage.slow_query_threshold_ms.map_or("disabled".to_string(), |v| v.to_string()),
+            &config
+                .storage
+                .slow_query_threshold_ms
+                .map_or("disabled".to_string(), |v| v.to_string()),
             "ms",
             "Query Execution",
             "Queries exceeding this threshold are logged at WARN level",
@@ -1582,12 +1591,12 @@ impl SystemViewRegistry {
             let tuple = Tuple::new(vec![
                 Value::Int4(session.session_id as i32),
                 Value::Boolean(false), // ssl
-                Value::Null, // version
-                Value::Null, // cipher
-                Value::Null, // bits
-                Value::Null, // client_dn
-                Value::Null, // client_serial
-                Value::Null, // issuer_dn
+                Value::Null,           // version
+                Value::Null,           // cipher
+                Value::Null,           // bits
+                Value::Null,           // client_dn
+                Value::Null,           // client_serial
+                Value::Null,           // issuer_dn
             ]);
             results.push(tuple);
         }
@@ -1604,8 +1613,8 @@ impl SystemViewRegistry {
             Value::Boolean(true), // rolcreaterole
             Value::Boolean(true), // rolcreatedb
             Value::Boolean(true), // rolcanlogin
-            Value::Int4(-1), // rolconnlimit (unlimited)
-            Value::Null, // rolvaliduntil
+            Value::Int4(-1),      // rolconnlimit (unlimited)
+            Value::Null,          // rolvaliduntil
         ]);
 
         Ok(vec![tuple])
@@ -1622,15 +1631,15 @@ impl SystemViewRegistry {
                 // Create a tuple for the table with aggregate statistics
                 let tuple = Tuple::new(vec![
                     Value::String(format!("table:{}", table_name)), // query_hash
-                    Value::String("SeqScan".to_string()), // plan_type
-                    Value::Int8(stats.row_count as i64), // execution_count (using row_count as proxy)
-                    Value::Float8(0.0), // total_time_ms (not tracked yet)
-                    Value::Float8(0.0), // avg_time_ms
-                    Value::Float8(0.0), // min_time_ms
-                    Value::Float8(0.0), // max_time_ms
-                    Value::Int8(stats.row_count as i64), // rows_estimate
-                    Value::Int8(stats.row_count as i64), // rows_actual
-                    Value::Timestamp(stats.last_analyzed), // last_execution
+                    Value::String("SeqScan".to_string()),           // plan_type
+                    Value::Int8(stats.row_count as i64),            // execution_count (using row_count as proxy)
+                    Value::Float8(0.0),                             // total_time_ms (not tracked yet)
+                    Value::Float8(0.0),                             // avg_time_ms
+                    Value::Float8(0.0),                             // min_time_ms
+                    Value::Float8(0.0),                             // max_time_ms
+                    Value::Int8(stats.row_count as i64),            // rows_estimate
+                    Value::Int8(stats.row_count as i64),            // rows_actual
+                    Value::Timestamp(stats.last_analyzed),          // last_execution
                 ]);
                 results.push(tuple);
 
@@ -1638,15 +1647,15 @@ impl SystemViewRegistry {
                 for (col_name, col_stats) in &stats.columns {
                     let col_tuple = Tuple::new(vec![
                         Value::String(format!("{}:{}", table_name, col_name)), // query_hash
-                        Value::String("ColumnScan".to_string()), // plan_type
-                        Value::Int8(stats.row_count as i64), // execution_count
-                        Value::Float8(0.0), // total_time_ms
-                        Value::Float8(0.0), // avg_time_ms
-                        Value::Float8(0.0), // min_time_ms
-                        Value::Float8(0.0), // max_time_ms
-                        Value::Int8(col_stats.n_distinct as i64), // rows_estimate (distinct values)
-                        Value::Int8(col_stats.n_distinct as i64), // rows_actual
-                        Value::Timestamp(stats.last_analyzed), // last_execution
+                        Value::String("ColumnScan".to_string()),               // plan_type
+                        Value::Int8(stats.row_count as i64),                   // execution_count
+                        Value::Float8(0.0),                                    // total_time_ms
+                        Value::Float8(0.0),                                    // avg_time_ms
+                        Value::Float8(0.0),                                    // min_time_ms
+                        Value::Float8(0.0),                                    // max_time_ms
+                        Value::Int8(col_stats.n_distinct as i64),              // rows_estimate (distinct values)
+                        Value::Int8(col_stats.n_distinct as i64),              // rows_actual
+                        Value::Timestamp(stats.last_analyzed),                 // last_execution
                     ]);
                     results.push(col_tuple);
                 }
@@ -1715,7 +1724,11 @@ impl SystemViewRegistry {
                     // usename
                     Value::String("replicator".to_string()),
                     // application_name
-                    replica.application_name.clone().map(Value::String).unwrap_or(Value::Null),
+                    replica
+                        .application_name
+                        .clone()
+                        .map(Value::String)
+                        .unwrap_or(Value::Null),
                     // client_addr
                     Value::String(replica.host.clone()),
                     // client_hostname
@@ -1776,16 +1789,16 @@ impl SystemViewRegistry {
 
             // Node summary tuple
             let tuple = Tuple::new(vec![
-                Value::String("local".to_string()), // node_id
-                Value::String("default".to_string()), // node_name
-                Value::Boolean(summary.role == crate::storage::ReplicationRole::Primary), // is_primary
-                Value::Int4(summary.replica_count as i32), // connected_replicas
-                Value::Int8(summary.bytes_sent as i64), // total_changes_sent
-                Value::Int8(summary.bytes_received as i64), // total_changes_received
-                Value::Timestamp(Utc::now()), // last_sync_time
-                Value::Float8(0.0), // avg_sync_latency_ms
-                Value::Float8(summary.max_replica_lag_ms as f64), // max_sync_latency_ms
-                Value::Int8(0), // sync_errors
+                Value::String("local".to_string()),                                          // node_id
+                Value::String("default".to_string()),                                        // node_name
+                Value::Boolean(summary.role == crate::storage::ReplicationRole::Primary),    // is_primary
+                Value::Int4(summary.replica_count as i32),                                   // connected_replicas
+                Value::Int8(summary.bytes_sent as i64),                                      // total_changes_sent
+                Value::Int8(summary.bytes_received as i64),                                  // total_changes_received
+                Value::Timestamp(Utc::now()),                                                // last_sync_time
+                Value::Float8(0.0),                                                          // avg_sync_latency_ms
+                Value::Float8(summary.max_replica_lag_ms as f64),                            // max_sync_latency_ms
+                Value::Int8(0),                                                              // sync_errors
                 Value::Int8(replicas.iter().map(|r| r.bytes_lag).max().unwrap_or(0) as i64), // replication_lag_bytes
             ]);
             results.push(tuple);
@@ -1793,34 +1806,34 @@ impl SystemViewRegistry {
             // Per-replica status
             for replica in replicas {
                 let tuple = Tuple::new(vec![
-                    Value::String(replica.replica_id.clone()), // node_id
+                    Value::String(replica.replica_id.clone()),                // node_id
                     Value::String(format!("replica-{}", replica.replica_id)), // node_name
-                    Value::Boolean(false), // is_primary
-                    Value::Int4(0), // connected_replicas
-                    Value::Int8(0), // total_changes_sent
-                    Value::Int8(replica.bytes_lag as i64), // total_changes_received (bytes behind)
-                    Value::Timestamp(replica.last_msg_time), // last_sync_time
-                    Value::Float8(replica.time_lag_ms as f64), // avg_sync_latency_ms
-                    Value::Float8(replica.time_lag_ms as f64), // max_sync_latency_ms
-                    Value::Int8(0), // sync_errors
-                    Value::Int8(replica.bytes_lag as i64), // replication_lag_bytes
+                    Value::Boolean(false),                                    // is_primary
+                    Value::Int4(0),                                           // connected_replicas
+                    Value::Int8(0),                                           // total_changes_sent
+                    Value::Int8(replica.bytes_lag as i64),                    // total_changes_received (bytes behind)
+                    Value::Timestamp(replica.last_msg_time),                  // last_sync_time
+                    Value::Float8(replica.time_lag_ms as f64),                // avg_sync_latency_ms
+                    Value::Float8(replica.time_lag_ms as f64),                // max_sync_latency_ms
+                    Value::Int8(0),                                           // sync_errors
+                    Value::Int8(replica.bytes_lag as i64),                    // replication_lag_bytes
                 ]);
                 results.push(tuple);
             }
         } else {
             // Default standalone node tuple
             let tuple = Tuple::new(vec![
-                Value::String("local".to_string()), // node_id
+                Value::String("local".to_string()),   // node_id
                 Value::String("default".to_string()), // node_name
-                Value::Boolean(true), // is_primary
-                Value::Int4(0), // connected_replicas
-                Value::Int8(0), // total_changes_sent
-                Value::Int8(0), // total_changes_received
+                Value::Boolean(true),                 // is_primary
+                Value::Int4(0),                       // connected_replicas
+                Value::Int8(0),                       // total_changes_sent
+                Value::Int8(0),                       // total_changes_received
                 Value::Timestamp(Utc::now()),
                 Value::Float8(0.0), // avg_sync_latency_ms
                 Value::Float8(0.0), // max_sync_latency_ms
-                Value::Int8(0), // sync_errors
-                Value::Int8(0), // replication_lag_bytes
+                Value::Int8(0),     // sync_errors
+                Value::Int8(0),     // replication_lag_bytes
             ]);
             results.push(tuple);
         }
@@ -1899,8 +1912,8 @@ impl SystemViewRegistry {
                     Value::String(entry.query_text.clone()),
                     Value::String(entry.query_type.clone()),
                     Value::Timestamp(entry.start_time),
-                    Value::Null, // end_time not set for running queries
-                    Value::Null, // duration_ms not set for running queries
+                    Value::Null,    // end_time not set for running queries
+                    Value::Null,    // duration_ms not set for running queries
                     Value::Int8(0), // rows_returned
                     Value::Int8(0), // rows_examined
                     Value::String("running".to_string()),
@@ -1910,8 +1923,8 @@ impl SystemViewRegistry {
                     entry.client_addr.clone().map(Value::String).unwrap_or(Value::Null),
                     entry.application_name.clone().map(Value::String).unwrap_or(Value::Null),
                     Value::Boolean(entry.is_prepared),
-                    Value::Null, // plan_time_ms
-                    Value::Null, // exec_time_ms
+                    Value::Null,    // plan_time_ms
+                    Value::Null,    // exec_time_ms
                     Value::Int8(0), // shared_blks_hit
                     Value::Int8(0), // shared_blks_read
                     Value::Int8(0), // shared_blks_written
@@ -1946,14 +1959,14 @@ impl SystemViewRegistry {
 
             let tuple = Tuple::new(vec![
                 Value::String("public".to_string()), // schemaname
-                Value::String(table_name.clone()), // tablename
-                Value::Int8(heap_size), // heap_size_bytes
-                Value::Int8(0), // cache_size_bytes (not tracked)
-                Value::Int8(0), // index_size_bytes
-                Value::Int8(heap_size), // total_size_bytes
-                Value::Float8(0.0), // cache_hit_ratio
-                Value::Int8(0), // cache_accesses
-                Value::Int8(0), // cache_hits
+                Value::String(table_name.clone()),   // tablename
+                Value::Int8(heap_size),              // heap_size_bytes
+                Value::Int8(0),                      // cache_size_bytes (not tracked)
+                Value::Int8(0),                      // index_size_bytes
+                Value::Int8(heap_size),              // total_size_bytes
+                Value::Float8(0.0),                  // cache_hit_ratio
+                Value::Int8(0),                      // cache_accesses
+                Value::Int8(0),                      // cache_hits
                 Value::Timestamp(Utc::now()),
             ]);
             results.push(tuple);
@@ -2017,7 +2030,10 @@ impl SystemViewRegistry {
                 // replication_role
                 Value::String(repl_summary.role.to_string()),
                 // replication_state
-                repl_summary.state.map(|s| Value::String(s.to_string())).unwrap_or(Value::Null),
+                repl_summary
+                    .state
+                    .map(|s| Value::String(s.to_string()))
+                    .unwrap_or(Value::Null),
             ]);
             results.push(tuple);
 
@@ -2078,7 +2094,7 @@ impl SystemViewRegistry {
         let mut results = Vec::new();
 
         // Aggregate stats by codec
-        let mut alp_stats = (0i64, 0i64, 0i64, 0.0f64);  // (uses, bytes_in, bytes_out, total_ratio)
+        let mut alp_stats = (0i64, 0i64, 0i64, 0.0f64); // (uses, bytes_in, bytes_out, total_ratio)
         let mut fsst_stats = (0i64, 0i64, 0i64, 0.0f64);
         let mut none_stats = (0i64, 0i64, 0i64, 0.0f64);
 
@@ -2114,7 +2130,11 @@ impl SystemViewRegistry {
             results.push(Tuple::new(vec![
                 Value::String("ALP".to_string()),
                 Value::Int8(alp_stats.0),
-                Value::Float8(if alp_stats.2 > 0 { alp_stats.1 as f64 / alp_stats.2 as f64 } else { 1.0 }),
+                Value::Float8(if alp_stats.2 > 0 {
+                    alp_stats.1 as f64 / alp_stats.2 as f64
+                } else {
+                    1.0
+                }),
                 Value::Float8(0.0), // avg_compress_us (not tracked yet)
                 Value::Float8(0.0), // avg_decompress_us
                 Value::Int8(alp_stats.1),
@@ -2127,7 +2147,11 @@ impl SystemViewRegistry {
             results.push(Tuple::new(vec![
                 Value::String("FSST".to_string()),
                 Value::Int8(fsst_stats.0),
-                Value::Float8(if fsst_stats.2 > 0 { fsst_stats.1 as f64 / fsst_stats.2 as f64 } else { 1.0 }),
+                Value::Float8(if fsst_stats.2 > 0 {
+                    fsst_stats.1 as f64 / fsst_stats.2 as f64
+                } else {
+                    1.0
+                }),
                 Value::Float8(0.0),
                 Value::Float8(0.0),
                 Value::Int8(fsst_stats.1),
@@ -2265,7 +2289,15 @@ impl SystemViewRegistry {
 
     // === Helper Functions ===
 
-    fn setting_tuple(name: &str, value: &str, unit: &str, category: &str, desc: &str, context: &str, vartype: &str) -> Tuple {
+    fn setting_tuple(
+        name: &str,
+        value: &str,
+        unit: &str,
+        category: &str,
+        desc: &str,
+        context: &str,
+        vartype: &str,
+    ) -> Tuple {
         Tuple::new(vec![
             Value::String(name.to_string()),
             Value::String(value.to_string()),
@@ -2295,7 +2327,8 @@ impl SystemViewRegistry {
 
             // Helper to get alias for a node
             let get_alias = |node_id: uuid::Uuid| -> Value {
-                topology.get_node(node_id)
+                topology
+                    .get_node(node_id)
                     .and_then(|n| n.alias.clone())
                     .map(Value::String)
                     .unwrap_or(Value::Null)
@@ -2303,7 +2336,8 @@ impl SystemViewRegistry {
 
             // Helper to get node info from topology
             let get_topology_info = |node_id: uuid::Uuid| -> (u32, u32, Option<String>) {
-                topology.get_node(node_id)
+                topology
+                    .get_node(node_id)
                     .map(|n| (n.priority, n.weight, n.health_message.clone()))
                     .unwrap_or((100, 100, None))
             };
@@ -2400,9 +2434,7 @@ impl SystemViewRegistry {
                     "Unknown"
                 };
 
-                let healthy = topology.get_node(node_id)
-                    .map(|n| n.is_healthy)
-                    .unwrap_or(false);
+                let healthy = topology.get_node(node_id).map(|n| n.is_healthy).unwrap_or(false);
 
                 results.push(Tuple::new(vec![
                     Value::String(alias),
@@ -2440,7 +2472,13 @@ impl SystemViewRegistry {
             let max_lag = standbys.iter().map(|s| s.lag_ms).max().unwrap_or(0);
 
             let cluster_state = match ha_registry.get_role() {
-                HARole::Primary => if standby_count > 0 { "healthy" } else { "standalone" },
+                HARole::Primary => {
+                    if standby_count > 0 {
+                        "healthy"
+                    } else {
+                        "standalone"
+                    }
+                }
                 HARole::Standby => "standby",
                 HARole::Standalone => "standalone",
                 HARole::Observer => "observer",
@@ -2448,9 +2486,11 @@ impl SystemViewRegistry {
 
             let (primary_node, primary_alias) = if let Some(config) = ha_registry.get_config() {
                 if ha_registry.get_role() == HARole::Primary {
-                    let alias = topology.get_node(config.node_id)
-                        .and_then(|n| n.alias.clone());
-                    (Value::String(config.node_id.to_string()), alias.map(Value::String).unwrap_or(Value::Null))
+                    let alias = topology.get_node(config.node_id).and_then(|n| n.alias.clone());
+                    (
+                        Value::String(config.node_id.to_string()),
+                        alias.map(Value::String).unwrap_or(Value::Null),
+                    )
                 } else {
                     (Value::Null, Value::Null)
                 }
@@ -2458,7 +2498,8 @@ impl SystemViewRegistry {
                 (Value::Null, Value::Null)
             };
 
-            let sync_mode = ha_registry.get_config()
+            let sync_mode = ha_registry
+                .get_config()
                 .map(|c| match c.sync_mode {
                     SyncMode::Async => "async",
                     SyncMode::Sync => "sync",
@@ -2686,9 +2727,7 @@ mod tests {
 
         // Create test tables
         use crate::Schema;
-        let schema = Schema::new(vec![
-            crate::Column::new("id", DataType::Int4),
-        ]);
+        let schema = Schema::new(vec![crate::Column::new("id", DataType::Int4)]);
         storage.catalog().create_table("test_table", schema).unwrap();
 
         let registry = SystemViewRegistry::new();

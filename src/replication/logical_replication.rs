@@ -208,11 +208,7 @@ pub struct ColumnMapping {
 
 impl ColumnMapping {
     /// Create a rename mapping
-    pub fn rename(
-        table: impl Into<String>,
-        source: impl Into<String>,
-        target: impl Into<String>,
-    ) -> Self {
+    pub fn rename(table: impl Into<String>, source: impl Into<String>, target: impl Into<String>) -> Self {
         Self {
             table: table.into(),
             source_column: source.into(),
@@ -232,11 +228,7 @@ impl ColumnMapping {
     }
 
     /// Create a type cast mapping
-    pub fn cast(
-        table: impl Into<String>,
-        column: impl Into<String>,
-        target_type: DataType,
-    ) -> Self {
+    pub fn cast(table: impl Into<String>, column: impl Into<String>, target_type: DataType) -> Self {
         Self {
             table: table.into(),
             source_column: column.into(),
@@ -685,12 +677,8 @@ impl LogicalReplicationPipeline {
             (FieldValue::Integer(i), DataType::String) => FieldValue::String(i.to_string()),
             (FieldValue::Float(f), DataType::Integer) => FieldValue::Integer(*f as i64),
             (FieldValue::Float(f), DataType::String) => FieldValue::String(f.to_string()),
-            (FieldValue::String(s), DataType::Integer) => {
-                FieldValue::Integer(s.parse().unwrap_or(0))
-            }
-            (FieldValue::String(s), DataType::Float) => {
-                FieldValue::Float(s.parse().unwrap_or(0.0))
-            }
+            (FieldValue::String(s), DataType::Integer) => FieldValue::Integer(s.parse().unwrap_or(0)),
+            (FieldValue::String(s), DataType::Float) => FieldValue::Float(s.parse().unwrap_or(0.0)),
             (FieldValue::Boolean(b), DataType::Integer) => FieldValue::Integer(if *b { 1 } else { 0 }),
             (FieldValue::Boolean(b), DataType::String) => FieldValue::String(b.to_string()),
             _ => value.clone(), // No conversion needed or not supported
@@ -766,13 +754,11 @@ impl LogicalReplicationPipeline {
                     }
                     return Ok(FieldValue::Integer(0));
                 }
-                "ABS" => {
-                    match value {
-                        FieldValue::Integer(i) => return Ok(FieldValue::Integer(i.abs())),
-                        FieldValue::Float(f) => return Ok(FieldValue::Float(f.abs())),
-                        _ => return Ok(value.clone()),
-                    }
-                }
+                "ABS" => match value {
+                    FieldValue::Integer(i) => return Ok(FieldValue::Integer(i.abs())),
+                    FieldValue::Float(f) => return Ok(FieldValue::Float(f.abs())),
+                    _ => return Ok(value.clone()),
+                },
                 "COALESCE" => {
                     // COALESCE returns the value if not null, otherwise a default
                     if matches!(value, FieldValue::Null) {
@@ -1012,8 +998,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_pipeline_row_filtering() {
-        let config = LogicalReplicationConfig::new()
-            .add_row_filter(RowFilter::new("users", "status != 'deleted'"));
+        let config = LogicalReplicationConfig::new().add_row_filter(RowFilter::new("users", "status != 'deleted'"));
 
         let pipeline = LogicalReplicationPipeline::new(config);
 

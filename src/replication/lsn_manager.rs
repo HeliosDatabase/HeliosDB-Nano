@@ -176,11 +176,7 @@ impl LsnManager {
     /// Used to determine safe WAL retention point.
     pub async fn min_confirmed_flush(&self) -> Lsn {
         let remotes = self.remote_lsns.read().await;
-        remotes
-            .values()
-            .map(|e| e.flush_lsn)
-            .min()
-            .unwrap_or(0)
+        remotes.values().map(|e| e.flush_lsn).min().unwrap_or(0)
     }
 
     /// Create a replication slot
@@ -188,10 +184,7 @@ impl LsnManager {
         let mut slots = self.slots.write().await;
 
         if slots.contains_key(&name) {
-            return Err(ReplicationError::LsnTracking(format!(
-                "Slot '{}' already exists",
-                name
-            )));
+            return Err(ReplicationError::LsnTracking(format!("Slot '{}' already exists", name)));
         }
 
         let local = self.local_lsn.read().await;
@@ -211,18 +204,18 @@ impl LsnManager {
     /// Drop a replication slot
     pub async fn drop_slot(&self, name: &str) -> Result<()> {
         let mut slots = self.slots.write().await;
-        slots.remove(name).ok_or_else(|| {
-            ReplicationError::LsnTracking(format!("Slot '{}' not found", name))
-        })?;
+        slots
+            .remove(name)
+            .ok_or_else(|| ReplicationError::LsnTracking(format!("Slot '{}' not found", name)))?;
         Ok(())
     }
 
     /// Activate a replication slot
     pub async fn activate_slot(&self, name: &str) -> Result<()> {
         let mut slots = self.slots.write().await;
-        let slot = slots.get_mut(name).ok_or_else(|| {
-            ReplicationError::LsnTracking(format!("Slot '{}' not found", name))
-        })?;
+        let slot = slots
+            .get_mut(name)
+            .ok_or_else(|| ReplicationError::LsnTracking(format!("Slot '{}' not found", name)))?;
         slot.active = true;
         Ok(())
     }
@@ -230,9 +223,9 @@ impl LsnManager {
     /// Deactivate a replication slot
     pub async fn deactivate_slot(&self, name: &str) -> Result<()> {
         let mut slots = self.slots.write().await;
-        let slot = slots.get_mut(name).ok_or_else(|| {
-            ReplicationError::LsnTracking(format!("Slot '{}' not found", name))
-        })?;
+        let slot = slots
+            .get_mut(name)
+            .ok_or_else(|| ReplicationError::LsnTracking(format!("Slot '{}' not found", name)))?;
         slot.active = false;
         Ok(())
     }
@@ -240,9 +233,9 @@ impl LsnManager {
     /// Update slot's confirmed flush LSN
     pub async fn update_slot_flush(&self, name: &str, lsn: Lsn) -> Result<()> {
         let mut slots = self.slots.write().await;
-        let slot = slots.get_mut(name).ok_or_else(|| {
-            ReplicationError::LsnTracking(format!("Slot '{}' not found", name))
-        })?;
+        let slot = slots
+            .get_mut(name)
+            .ok_or_else(|| ReplicationError::LsnTracking(format!("Slot '{}' not found", name)))?;
         slot.confirmed_flush_lsn = lsn;
         Ok(())
     }
@@ -348,7 +341,10 @@ mod tests {
         assert!(slot.active);
 
         // Update flush
-        manager.update_slot_flush("standby_slot", 100).await.expect("update failed");
+        manager
+            .update_slot_flush("standby_slot", 100)
+            .await
+            .expect("update failed");
         let slot = manager.get_slot("standby_slot").await.expect("get failed");
         assert_eq!(slot.confirmed_flush_lsn, 100);
 

@@ -7,19 +7,16 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::api::{
     models::{
-        ApiError,
         data::{
-            TableListResponse, TableInfoResponse,
-            DataQueryParams, DataQueryResponse, ColumnInfo, PaginationInfo, QueryMetadata,
-            InsertDataRequest, InsertDataResponse,
-            UpdateDataRequest, UpdateDataResponse,
-            DeleteDataRequest, DeleteDataResponse,
-            tuple_to_map, json_to_value,
+            json_to_value, tuple_to_map, ColumnInfo, DataQueryParams, DataQueryResponse, DeleteDataRequest,
+            DeleteDataResponse, InsertDataRequest, InsertDataResponse, PaginationInfo, QueryMetadata,
+            TableInfoResponse, TableListResponse, UpdateDataRequest, UpdateDataResponse,
         },
+        ApiError,
     },
     server::AppState,
 };
@@ -47,13 +44,11 @@ fn validate_branch(state: &AppState, branch_name: &str) -> Result<(), ApiError> 
                 );
                 Ok(())
             }
-            Err(_) => {
-                Err(ApiError::new(
-                    StatusCode::NOT_FOUND,
-                    "branch_not_found",
-                    format!("Branch '{}' not found", branch_name),
-                ))
-            }
+            Err(_) => Err(ApiError::new(
+                StatusCode::NOT_FOUND,
+                "branch_not_found",
+                format!("Branch '{}' not found", branch_name),
+            )),
         }
     } else {
         // Branching not enabled - only main branch available
@@ -93,17 +88,18 @@ pub async fn list_tables(
     validate_branch(&state, &branch_name)?;
 
     let catalog = state.db.storage.catalog();
-    let table_names = catalog.list_tables()
-        .map_err(|e| {
-            error!("Failed to list tables: {}", e);
-            ApiError::from(e)
-        })?;
+    let table_names = catalog.list_tables().map_err(|e| {
+        error!("Failed to list tables: {}", e);
+        ApiError::from(e)
+    })?;
 
-    let tables: Vec<TableInfoResponse> = table_names.iter()
+    let tables: Vec<TableInfoResponse> = table_names
+        .iter()
         .map(|name| {
             let schema = catalog.get_table_schema(name).ok();
             // Get row count from table statistics if available
-            let row_count = catalog.get_table_statistics(name)
+            let row_count = catalog
+                .get_table_statistics(name)
                 .ok()
                 .flatten()
                 .map(|stats| stats.row_count as u64);
@@ -172,16 +168,13 @@ pub async fn query_data(
 
     // Get table schema
     let catalog = state.db.storage.catalog();
-    let schema = catalog.get_table_schema(&table_name)
-        .map_err(|e| {
-            warn!("Table '{}' not found: {}", table_name, e);
-            ApiError::from(e)
-        })?;
+    let schema = catalog.get_table_schema(&table_name).map_err(|e| {
+        warn!("Table '{}' not found: {}", table_name, e);
+        ApiError::from(e)
+    })?;
 
     // Build SQL query
-    let columns_clause = params.columns.as_ref()
-        .map(|c| c.as_str())
-        .unwrap_or("*");
+    let columns_clause = params.columns.as_ref().map(|c| c.as_str()).unwrap_or("*");
 
     let mut sql = format!("SELECT {} FROM {}", columns_clause, table_name);
 
@@ -200,11 +193,10 @@ pub async fn query_data(
     sql.push_str(&format!(" LIMIT {} OFFSET {}", params.limit + 1, offset)); // Request one extra to check has_more
 
     // Execute query
-    let results = state.db.query(&sql, &[])
-        .map_err(|e| {
-            error!("Failed to query data: {}", e);
-            ApiError::from(e)
-        })?;
+    let results = state.db.query(&sql, &[]).map_err(|e| {
+        error!("Failed to query data: {}", e);
+        ApiError::from(e)
+    })?;
 
     // Check if there are more results
     let has_more = results.len() > params.limit as usize;
@@ -222,14 +214,14 @@ pub async fn query_data(
             count_sql.push_str(&format!(" WHERE {}", filter));
         }
 
-        let count_result = state.db.query(&count_sql, &[])
-            .map_err(|e| {
-                error!("Failed to count rows: {}", e);
-                ApiError::from(e)
-            })?;
+        let count_result = state.db.query(&count_sql, &[]).map_err(|e| {
+            error!("Failed to count rows: {}", e);
+            ApiError::from(e)
+        })?;
 
         // Extract count from result
-        count_result.first()
+        count_result
+            .first()
             .and_then(|tuple| tuple.values.first())
             .and_then(|v| match v {
                 Value::Int8(n) => Some(*n as u64),
@@ -241,7 +233,8 @@ pub async fn query_data(
     };
 
     // Convert tuples to JSON-friendly format
-    let rows: Vec<std::collections::HashMap<String, serde_json::Value>> = actual_results.iter()
+    let rows: Vec<std::collections::HashMap<String, serde_json::Value>> = actual_results
+        .iter()
         .map(|tuple| tuple_to_map(tuple, &schema))
         .collect();
 
@@ -310,11 +303,10 @@ pub async fn insert_data(
 
     // Get table schema
     let catalog = state.db.storage.catalog();
-    let schema = catalog.get_table_schema(&table_name)
-        .map_err(|e| {
-            warn!("Table '{}' not found: {}", table_name, e);
-            ApiError::from(e)
-        })?;
+    let schema = catalog.get_table_schema(&table_name).map_err(|e| {
+        warn!("Table '{}' not found: {}", table_name, e);
+        ApiError::from(e)
+    })?;
 
     let mut inserted_count = 0u64;
     let mut row_ids = Vec::new();
@@ -328,10 +320,7 @@ pub async fn insert_data(
             let value = if let Some(json_val) = row.get(&column.name) {
                 // Convert JSON value to our Value type
                 json_to_value(json_val, &column.data_type)
-                    .map_err(|e| ApiError::bad_request(format!(
-                        "Invalid value for column '{}': {}",
-                        column.name, e
-                    )))?
+                    .map_err(|e| ApiError::bad_request(format!("Invalid value for column '{}': {}", column.name, e)))?
             } else if column.nullable {
                 Value::Null
             } else {
@@ -348,21 +337,19 @@ pub async fn insert_data(
 
         // Get next row ID before insertion if needed
         let row_id = if request.return_ids {
-            Some(catalog.next_row_id(&table_name)
-                .map_err(|e| {
-                    error!("Failed to get next row ID: {}", e);
-                    ApiError::from(e)
-                })?)
+            Some(catalog.next_row_id(&table_name).map_err(|e| {
+                error!("Failed to get next row ID: {}", e);
+                ApiError::from(e)
+            })?)
         } else {
             None
         };
 
         // Insert the tuple
-        state.db.storage.insert_tuple(&table_name, tuple)
-            .map_err(|e| {
-                error!("Failed to insert data: {}", e);
-                ApiError::from(e)
-            })?;
+        state.db.storage.insert_tuple(&table_name, tuple).map_err(|e| {
+            error!("Failed to insert data: {}", e);
+            ApiError::from(e)
+        })?;
 
         inserted_count += 1;
 
@@ -409,10 +396,7 @@ pub async fn update_data(
     Path((branch_name, table_name)): Path<(String, String)>,
     Json(request): Json<UpdateDataRequest>,
 ) -> Result<Json<UpdateDataResponse>, ApiError> {
-    info!(
-        "Updating data in table '{}' in branch '{}'",
-        table_name, branch_name
-    );
+    info!("Updating data in table '{}' in branch '{}'", table_name, branch_name);
 
     // Validate branch exists
     validate_branch(&state, &branch_name)?;
@@ -423,11 +407,10 @@ pub async fn update_data(
 
     // Get table schema to validate columns
     let catalog = state.db.storage.catalog();
-    let schema = catalog.get_table_schema(&table_name)
-        .map_err(|e| {
-            warn!("Table '{}' not found: {}", table_name, e);
-            ApiError::from(e)
-        })?;
+    let schema = catalog.get_table_schema(&table_name).map_err(|e| {
+        warn!("Table '{}' not found: {}", table_name, e);
+        ApiError::from(e)
+    })?;
 
     // Validate that all update columns exist
     for col_name in request.values.keys() {
@@ -440,7 +423,9 @@ pub async fn update_data(
     }
 
     // Build UPDATE SQL
-    let set_clause: Vec<String> = request.values.keys()
+    let set_clause: Vec<String> = request
+        .values
+        .keys()
         .enumerate()
         .map(|(idx, col)| format!("{} = ${}", col, idx + 1))
         .collect();
@@ -452,26 +437,26 @@ pub async fn update_data(
     }
 
     // Prepare parameters
-    let params: Vec<Value> = request.values.iter()
+    let params: Vec<Value> = request
+        .values
+        .iter()
         .map(|(col_name, json_val)| {
-            let column = schema.columns.iter()
+            let column = schema
+                .columns
+                .iter()
                 .find(|c| &c.name == col_name)
                 .ok_or_else(|| ApiError::bad_request(format!("Column '{}' not found", col_name)))?;
 
             json_to_value(json_val, &column.data_type)
-                .map_err(|e| ApiError::bad_request(format!(
-                    "Invalid value for column '{}': {}",
-                    col_name, e
-                )))
+                .map_err(|e| ApiError::bad_request(format!("Invalid value for column '{}': {}", col_name, e)))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
     // Execute update
-    let updated_count = state.db.execute_params(&sql, &params)
-        .map_err(|e| {
-            error!("Failed to update data: {}", e);
-            ApiError::from(e)
-        })?;
+    let updated_count = state.db.execute_params(&sql, &params).map_err(|e| {
+        error!("Failed to update data: {}", e);
+        ApiError::from(e)
+    })?;
 
     let response = UpdateDataResponse {
         updated: updated_count,
@@ -509,21 +494,17 @@ pub async fn delete_data(
     Path((branch_name, table_name)): Path<(String, String)>,
     Json(request): Json<DeleteDataRequest>,
 ) -> Result<Json<DeleteDataResponse>, ApiError> {
-    info!(
-        "Deleting data from table '{}' in branch '{}'",
-        table_name, branch_name
-    );
+    info!("Deleting data from table '{}' in branch '{}'", table_name, branch_name);
 
     // Validate branch exists
     validate_branch(&state, &branch_name)?;
 
     // Validate table exists
     let catalog = state.db.storage.catalog();
-    let _schema = catalog.get_table_schema(&table_name)
-        .map_err(|e| {
-            warn!("Table '{}' not found: {}", table_name, e);
-            ApiError::from(e)
-        })?;
+    let _schema = catalog.get_table_schema(&table_name).map_err(|e| {
+        warn!("Table '{}' not found: {}", table_name, e);
+        ApiError::from(e)
+    })?;
 
     // Build DELETE SQL
     let mut sql = format!("DELETE FROM {}", table_name);
@@ -535,11 +516,10 @@ pub async fn delete_data(
     }
 
     // Execute delete
-    let deleted_count = state.db.execute(&sql)
-        .map_err(|e| {
-            error!("Failed to delete data: {}", e);
-            ApiError::from(e)
-        })?;
+    let deleted_count = state.db.execute(&sql).map_err(|e| {
+        error!("Failed to delete data: {}", e);
+        ApiError::from(e)
+    })?;
 
     let response = DeleteDataResponse {
         deleted: deleted_count,
@@ -561,7 +541,13 @@ mod tests {
     fn create_test_state() -> AppState {
         let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
         let query_registry = Arc::new(crate::compute::QueryRegistry::new());
-        AppState { db, query_registry, auth_bridge: None, oauth_registry: None, change_notifier: None }
+        AppState {
+            db,
+            query_registry,
+            auth_bridge: None,
+            oauth_registry: None,
+            change_notifier: None,
+        }
     }
 
     #[tokio::test]
@@ -602,7 +588,8 @@ mod tests {
             State(state),
             Path(("main".to_string(), "users".to_string())),
             Query(params),
-        ).await;
+        )
+        .await;
 
         assert!(result.is_ok());
         let response = result.unwrap();
@@ -630,7 +617,8 @@ mod tests {
             State(state),
             Path(("main".to_string(), "users".to_string())),
             Json(request),
-        ).await;
+        )
+        .await;
 
         assert!(result.is_ok());
         let (status, response) = result.unwrap();
@@ -658,13 +646,17 @@ mod tests {
             State(state),
             Path(("main".to_string(), "users".to_string())),
             Json(request),
-        ).await;
+        )
+        .await;
 
         // UPDATE with parameters may not be fully supported yet - skip if not implemented
         if let Err(ref e) = result {
             let err_str = format!("{e:?}");
-            if err_str.contains("not supported") || err_str.contains("not implemented")
-               || err_str.contains("deserialize") || err_str.contains("io error") {
+            if err_str.contains("not supported")
+                || err_str.contains("not implemented")
+                || err_str.contains("deserialize")
+                || err_str.contains("io error")
+            {
                 eprintln!("Skipping test_update_data: UPDATE with parameters not yet fully supported");
                 return;
             }
@@ -691,13 +683,16 @@ mod tests {
             State(state),
             Path(("main".to_string(), "users".to_string())),
             Json(request),
-        ).await;
+        )
+        .await;
 
         // DELETE may not be fully supported yet - skip if not implemented
         if let Err(ref e) = result {
             let err_str = format!("{e:?}");
-            if err_str.contains("not supported") || err_str.contains("not implemented")
-               || err_str.contains("not yet implemented") {
+            if err_str.contains("not supported")
+                || err_str.contains("not implemented")
+                || err_str.contains("not yet implemented")
+            {
                 eprintln!("Skipping test_delete_data: DELETE not yet fully supported");
                 return;
             }

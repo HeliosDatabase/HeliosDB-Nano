@@ -10,8 +10,8 @@ use uuid::Uuid;
 use heliosdb_nano::replication::{
     streaming::{StreamingClient, StreamingClientConfig, StreamingClientState, StreamingServer, StreamingServerConfig},
     transport::{NodeRole, SyncModeConfig},
-    wal_store::{WalStore, WalStoreConfig},
     wal_replicator::{WalEntry, WalEntryType},
+    wal_store::{WalStore, WalStoreConfig},
 };
 
 /// Test cluster configuration with default settings
@@ -24,7 +24,6 @@ fn test_server_config() -> StreamingServerConfig {
         ..Default::default()
     }
 }
-
 
 /// Create a test WAL entry
 fn make_test_entry(lsn: u64, data: &str) -> WalEntry {
@@ -70,12 +69,15 @@ async fn test_wal_store_basic_operations() {
 
     // Get batch
     use heliosdb_nano::replication::wal_store::BatchRequest;
-    let batch = store.get_batch(BatchRequest {
-        from_lsn: 0,
-        to_lsn: Some(10),
-        max_entries: 5,
-        max_bytes: 1024 * 1024,
-    }).await.expect("Failed to get batch");
+    let batch = store
+        .get_batch(BatchRequest {
+            from_lsn: 0,
+            to_lsn: Some(10),
+            max_entries: 5,
+            max_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("Failed to get batch");
 
     assert_eq!(batch.entries.len(), 5);
     assert!(batch.has_more);
@@ -187,7 +189,11 @@ async fn test_sync_mode_configurations() {
         min_applied: 2,
         timeout_ms: 10000,
     };
-    if let SyncModeConfig::Sync { min_applied, timeout_ms } = sync_config {
+    if let SyncModeConfig::Sync {
+        min_applied,
+        timeout_ms,
+    } = sync_config
+    {
         assert_eq!(min_applied, 2);
         assert_eq!(timeout_ms, 10000);
     }

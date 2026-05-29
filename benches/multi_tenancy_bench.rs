@@ -9,15 +9,10 @@
 //!
 //! Run with: cargo bench --bench multi_tenancy_bench
 
-use criterion::{
-    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput
-};
-use heliosdb_nano::tenant::{
-    TenantManager, IsolationMode, RLSCommand, ChangeType,
-    ResourceLimits, TenantContext
-};
-use uuid::Uuid;
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use heliosdb_nano::tenant::{ChangeType, IsolationMode, RLSCommand, ResourceLimits, TenantContext, TenantManager};
 use std::sync::Arc;
+use uuid::Uuid;
 
 // ============================================================================
 // Setup Functions
@@ -27,10 +22,7 @@ fn create_tenant_manager_with_n_tenants(n: usize) -> TenantManager {
     let manager = TenantManager::new();
 
     for i in 0..n {
-        manager.register_tenant(
-            format!("Tenant{}", i),
-            IsolationMode::SharedSchema,
-        );
+        manager.register_tenant(format!("Tenant{}", i), IsolationMode::SharedSchema);
     }
 
     manager
@@ -38,10 +30,7 @@ fn create_tenant_manager_with_n_tenants(n: usize) -> TenantManager {
 
 fn create_tenant_manager_with_policies(n_tables: usize) -> TenantManager {
     let manager = TenantManager::new();
-    let tenant = manager.register_tenant(
-        "TestTenant".to_string(),
-        IsolationMode::SharedSchema,
-    );
+    let tenant = manager.register_tenant("TestTenant".to_string(), IsolationMode::SharedSchema);
 
     // Create RLS policies for N tables
     for i in 0..n_tables {
@@ -113,24 +102,17 @@ fn benchmark_rls_scaling_with_policies(c: &mut Criterion) {
     for n_tables in [1, 10, 100, 1000].iter() {
         group.throughput(Throughput::Elements(*n_tables as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("check_all_tables", n_tables),
-            n_tables,
-            |b, &n| {
-                let manager = create_tenant_manager_with_policies(n);
+        group.bench_with_input(BenchmarkId::new("check_all_tables", n_tables), n_tables, |b, &n| {
+            let manager = create_tenant_manager_with_policies(n);
 
-                b.iter(|| {
-                    // Check RLS for all tables
-                    for i in 0..n {
-                        let should_apply = manager.should_apply_rls(
-                            &format!("table_{}", i),
-                            "SELECT"
-                        );
-                        black_box(should_apply);
-                    }
-                });
-            },
-        );
+            b.iter(|| {
+                // Check RLS for all tables
+                for i in 0..n {
+                    let should_apply = manager.should_apply_rls(&format!("table_{}", i), "SELECT");
+                    black_box(should_apply);
+                }
+            });
+        });
     }
 
     group.finish();
@@ -213,14 +195,16 @@ fn benchmark_quota_updates(c: &mut Criterion) {
         let tenant_id = manager.list_tenants()[0].id;
 
         // Set high QPS limit to avoid hitting it during benchmark
-        manager.update_resource_limits(
-            tenant_id,
-            ResourceLimits {
-                max_storage_bytes: 100 * 1024 * 1024 * 1024,
-                max_connections: 1000,
-                max_qps: 1_000_000,
-            }
-        ).unwrap();
+        manager
+            .update_resource_limits(
+                tenant_id,
+                ResourceLimits {
+                    max_storage_bytes: 100 * 1024 * 1024 * 1024,
+                    max_connections: 1000,
+                    max_qps: 1_000_000,
+                },
+            )
+            .unwrap();
 
         b.iter(|| {
             let _ = manager.record_query(tenant_id);
@@ -246,22 +230,18 @@ fn benchmark_quota_scaling(c: &mut Criterion) {
     for n_tenants in [10, 100, 1000].iter() {
         group.throughput(Throughput::Elements(*n_tenants as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("check_all_tenants", n_tenants),
-            n_tenants,
-            |b, &n| {
-                let manager = create_tenant_manager_with_n_tenants(n);
-                let tenants = manager.list_tenants();
+        group.bench_with_input(BenchmarkId::new("check_all_tenants", n_tenants), n_tenants, |b, &n| {
+            let manager = create_tenant_manager_with_n_tenants(n);
+            let tenants = manager.list_tenants();
 
-                b.iter(|| {
-                    // Check quota for all tenants
-                    for tenant in &tenants {
-                        let can_connect = manager.check_quota(tenant.id, "connections");
-                        black_box(can_connect);
-                    }
-                });
-            },
-        );
+            b.iter(|| {
+                // Check quota for all tenants
+                for tenant in &tenants {
+                    let can_connect = manager.check_quota(tenant.id, "connections");
+                    black_box(can_connect);
+                }
+            });
+        });
     }
 
     group.finish();
@@ -472,10 +452,7 @@ fn benchmark_tenant_operations(c: &mut Criterion) {
         let mut counter = 0;
 
         b.iter(|| {
-            let tenant = manager.register_tenant(
-                format!("Tenant{}", counter),
-                IsolationMode::SharedSchema,
-            );
+            let tenant = manager.register_tenant(format!("Tenant{}", counter), IsolationMode::SharedSchema);
             counter += 1;
             black_box(tenant);
         });
@@ -673,30 +650,15 @@ criterion_group!(
     benchmark_cdc_multi_tenant,
 );
 
-criterion_group!(
-    context_benches,
-    benchmark_context_switching,
-);
+criterion_group!(context_benches, benchmark_context_switching,);
 
-criterion_group!(
-    tenant_benches,
-    benchmark_tenant_operations,
-);
+criterion_group!(tenant_benches, benchmark_tenant_operations,);
 
-criterion_group!(
-    concurrent_benches,
-    benchmark_concurrent_quota_checks,
-);
+criterion_group!(concurrent_benches, benchmark_concurrent_quota_checks,);
 
-criterion_group!(
-    migration_benches,
-    benchmark_migration_operations,
-);
+criterion_group!(migration_benches, benchmark_migration_operations,);
 
-criterion_group!(
-    workflow_benches,
-    benchmark_typical_query_workflow,
-);
+criterion_group!(workflow_benches, benchmark_typical_query_workflow,);
 
 criterion_main!(
     rls_benches,

@@ -39,19 +39,15 @@ use heliosdb_nano::{
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let source_dir = args.get(1).cloned().unwrap_or_else(|| "src".into());
-    let index_base = args
-        .get(2)
-        .cloned()
-        .unwrap_or_else(|| ".helios-index".into());
+    let index_base = args.get(2).cloned().unwrap_or_else(|| ".helios-index".into());
 
     println!("=== HeliosDB-Nano code-graph pilot ===");
     println!("source:       {source_dir}");
     println!("index base:   {index_base}");
 
     let data_dir = Path::new(&index_base).join("heliosdb-data");
-    fs::create_dir_all(&data_dir).map_err(|e| {
-        heliosdb_nano::Error::storage(format!("failed to create {data_dir:?}: {e}"))
-    })?;
+    fs::create_dir_all(&data_dir)
+        .map_err(|e| heliosdb_nano::Error::storage(format!("failed to create {data_dir:?}: {e}")))?;
 
     let db = EmbeddedDatabase::new(&data_dir)?;
     // Bootstrap source table. IF NOT EXISTS so repeated runs work.
@@ -79,18 +75,11 @@ fn main() -> Result<()> {
             Ok(c) => c,
             Err(_) => return Ok(()),
         };
-        let rel = path
-            .strip_prefix(&source_dir)
-            .unwrap_or(path)
-            .display()
-            .to_string();
+        let rel = path.strip_prefix(&source_dir).unwrap_or(path).display().to_string();
         let bytes = content.len() as i64;
         // Parameterised insert so source contents with embedded
         // quotes / backslashes / `$1` literals round-trip cleanly.
-        db.execute_params_returning(
-            "DELETE FROM src WHERE path = $1",
-            &[Value::String(rel.clone())],
-        )?;
+        db.execute_params_returning("DELETE FROM src WHERE path = $1", &[Value::String(rel.clone())])?;
         db.execute_params_returning(
             "INSERT INTO src (path, lang, content, size_bytes) \
              VALUES ($1, $2, $3, $4)",
@@ -147,12 +136,7 @@ fn main() -> Result<()> {
 
     // Pick a handful of symbol names that almost certainly exist in
     // Nano's own source tree. Callers can edit these freely.
-    let probes: &[&str] = &[
-        "EmbeddedDatabase",
-        "code_index",
-        "lsp_definition",
-        "ProductQuantizer",
-    ];
+    let probes: &[&str] = &["EmbeddedDatabase", "code_index", "lsp_definition", "ProductQuantizer"];
     for &name in probes {
         let t = Instant::now();
         let defs = db.lsp_definition(name, &DefinitionHint::default())?;
@@ -242,7 +226,10 @@ fn walk(root: &Path, f: &mut dyn FnMut(&Path) -> Result<()>) -> Result<()> {
         if md.is_dir() {
             // Skip common build/output directories.
             if let Some(name) = cur.file_name().and_then(|s| s.to_str()) {
-                if matches!(name, "target" | "node_modules" | ".git" | "__pycache__" | ".helios-index") {
+                if matches!(
+                    name,
+                    "target" | "node_modules" | ".git" | "__pycache__" | ".helios-index"
+                ) {
                     continue;
                 }
             }

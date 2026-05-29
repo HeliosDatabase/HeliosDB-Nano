@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::{EmbeddedDatabase, Result, Error, Value, Tuple};
+use crate::{EmbeddedDatabase, Error, Result, Tuple, Value};
 
 /// Executes REST API operations against the embedded database.
 #[allow(dead_code)]
@@ -98,10 +98,11 @@ pub fn parse_filter(column: &str, expr: &str, param_offset: usize) -> Result<Par
     let neg = if negated { "NOT " } else { "" };
 
     // Split on first '.' to get operator and value
-    let (op_str, value_str) = rest.split_once('.')
-        .ok_or_else(|| Error::sql_parse(format!(
+    let (op_str, value_str) = rest.split_once('.').ok_or_else(|| {
+        Error::sql_parse(format!(
             "Invalid filter expression: '{expr}'. Expected format: operator.value"
-        )))?;
+        ))
+    })?;
 
     match op_str {
         "eq" => {
@@ -181,9 +182,11 @@ pub fn parse_filter(column: &str, expr: &str, param_offset: usize) -> Result<Par
             let inner = value_str
                 .strip_prefix('(')
                 .and_then(|s| s.strip_suffix(')'))
-                .ok_or_else(|| Error::sql_parse(format!(
-                    "Invalid IN value: '{value_str}'. Expected format: (val1,val2,...)"
-                )))?;
+                .ok_or_else(|| {
+                    Error::sql_parse(format!(
+                        "Invalid IN value: '{value_str}'. Expected format: (val1,val2,...)"
+                    ))
+                })?;
 
             let items: Vec<&str> = inner.split(',').collect();
             if items.is_empty() {
@@ -203,9 +206,7 @@ pub fn parse_filter(column: &str, expr: &str, param_offset: usize) -> Result<Par
                 params,
             })
         }
-        other => Err(Error::sql_parse(format!(
-            "Unsupported filter operator: '{other}'"
-        ))),
+        other => Err(Error::sql_parse(format!("Unsupported filter operator: '{other}'"))),
     }
 }
 
@@ -228,9 +229,11 @@ pub fn parse_order_clause(order: &str) -> Result<String> {
         let dir_sql = match dir.to_lowercase().as_str() {
             "asc" => "ASC",
             "desc" => "DESC",
-            other => return Err(Error::sql_parse(format!(
-                "Invalid order direction: '{other}'. Expected asc or desc"
-            ))),
+            other => {
+                return Err(Error::sql_parse(format!(
+                    "Invalid order direction: '{other}'. Expected asc or desc"
+                )))
+            }
         };
         parts.push(format!("{} {dir_sql}", quote_ident(col)));
     }
@@ -326,10 +329,7 @@ impl RestExecutor {
             let tuples = self.db.query_params(&sql, &params)?;
 
             // Derive column names: run a LIMIT 0 variant to grab names cheaply.
-            let col_sql = format!(
-                "SELECT {columns} FROM {} LIMIT 0",
-                quote_ident(table)
-            );
+            let col_sql = format!("SELECT {columns} FROM {} LIMIT 0", quote_ident(table));
             let (_, col_names) = self.db.query_with_columns(&col_sql)?;
             Ok((tuples, col_names))
         }
@@ -392,12 +392,7 @@ impl RestExecutor {
     // ── DELETE with RLS ─────────────────────────────────────────────────
 
     /// Delete rows with an implicit RLS ownership filter.
-    pub fn delete_with_rls(
-        &self,
-        table: &str,
-        filters: &[(String, String)],
-        user_id: Option<&str>,
-    ) -> Result<u64> {
+    pub fn delete_with_rls(&self, table: &str, filters: &[(String, String)], user_id: Option<&str>) -> Result<u64> {
         let mut all_filters: Vec<(String, String)> = filters.to_vec();
 
         if let Some(uid) = user_id {
@@ -434,11 +429,7 @@ impl RestExecutor {
     /// Returns `(affected_rows, inserted_tuples, column_names)`.
     /// The returned tuples come from a follow-up SELECT; if the table is
     /// empty after insert this falls back gracefully.
-    pub fn insert(
-        &self,
-        table: &str,
-        rows: &[serde_json::Value],
-    ) -> Result<(u64, Vec<Tuple>, Vec<String>)> {
+    pub fn insert(&self, table: &str, rows: &[serde_json::Value]) -> Result<(u64, Vec<Tuple>, Vec<String>)> {
         validate_identifier(table)?;
 
         if rows.is_empty() {
@@ -448,9 +439,9 @@ impl RestExecutor {
         let mut total_affected: u64 = 0;
 
         for row in rows {
-            let obj = row.as_object().ok_or_else(|| {
-                Error::sql_parse("Each row must be a JSON object")
-            })?;
+            let obj = row
+                .as_object()
+                .ok_or_else(|| Error::sql_parse("Each row must be a JSON object"))?;
 
             if obj.is_empty() {
                 return Err(Error::sql_parse("Row object must have at least one column"));
@@ -490,17 +481,12 @@ impl RestExecutor {
     /// Update rows matching `filters` with the values from `set_values`.
     ///
     /// Returns the number of rows affected.
-    pub fn update(
-        &self,
-        table: &str,
-        set_values: &serde_json::Value,
-        filters: &[(String, String)],
-    ) -> Result<u64> {
+    pub fn update(&self, table: &str, set_values: &serde_json::Value, filters: &[(String, String)]) -> Result<u64> {
         validate_identifier(table)?;
 
-        let obj = set_values.as_object().ok_or_else(|| {
-            Error::sql_parse("Update body must be a JSON object")
-        })?;
+        let obj = set_values
+            .as_object()
+            .ok_or_else(|| Error::sql_parse("Update body must be a JSON object"))?;
 
         if obj.is_empty() {
             return Err(Error::sql_parse("Update body must have at least one column"));
@@ -517,11 +503,7 @@ impl RestExecutor {
             param_idx += 1;
         }
 
-        let mut sql = format!(
-            "UPDATE {} SET {}",
-            quote_ident(table),
-            set_parts.join(", "),
-        );
+        let mut sql = format!("UPDATE {} SET {}", quote_ident(table), set_parts.join(", "),);
 
         // WHERE clause
         if !filters.is_empty() {
@@ -544,11 +526,7 @@ impl RestExecutor {
     /// Delete rows matching `filters`.
     ///
     /// Returns the number of rows affected.
-    pub fn delete(
-        &self,
-        table: &str,
-        filters: &[(String, String)],
-    ) -> Result<u64> {
+    pub fn delete(&self, table: &str, filters: &[(String, String)]) -> Result<u64> {
         validate_identifier(table)?;
 
         let mut sql = format!("DELETE FROM {}", quote_ident(table));
@@ -908,12 +886,9 @@ mod tests {
         db.execute("INSERT INTO nums VALUES (3, 30)").unwrap();
 
         let exec = RestExecutor::new(db);
-        let (rows, _) = exec.select(
-            "nums", "*", &[],
-            Some("id.desc"),
-            Some(2),
-            Some(0),
-        ).unwrap();
+        let (rows, _) = exec
+            .select("nums", "*", &[], Some("id.desc"), Some(2), Some(0))
+            .unwrap();
         assert_eq!(rows.len(), 2);
     }
 

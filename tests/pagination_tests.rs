@@ -54,7 +54,11 @@ fn planner_accepts_limit_offset_placeholders() -> Result<()> {
     let ast = parser.parse_one("SELECT * FROM t LIMIT $1 OFFSET $2")?;
     let planner = Planner::new();
     let plan = planner.statement_to_plan(ast);
-    assert!(plan.is_ok(), "planner should accept placeholders in LIMIT/OFFSET: {:?}", plan.err());
+    assert!(
+        plan.is_ok(),
+        "planner should accept placeholders in LIMIT/OFFSET: {:?}",
+        plan.err()
+    );
     Ok(())
 }
 
@@ -69,12 +73,26 @@ fn order_by_limit_offset_is_deterministic() -> Result<()> {
 
     // Newest-first page 1 (offset 0): expect ids 100, 99, 98, 97, 96
     let rows = db.query("SELECT id FROM t ORDER BY id DESC LIMIT 5 OFFSET 0", &[])?;
-    let ids: Vec<i64> = rows.iter().map(|t| match t.values[0] { Value::Int8(n) => n, Value::Int4(n) => n as i64, _ => -1 }).collect();
+    let ids: Vec<i64> = rows
+        .iter()
+        .map(|t| match t.values[0] {
+            Value::Int8(n) => n,
+            Value::Int4(n) => n as i64,
+            _ => -1,
+        })
+        .collect();
     assert_eq!(ids, vec![100, 99, 98, 97, 96]);
 
     // Page 3 (offset 10, limit 5): expect ids 90..86 descending
     let rows = db.query("SELECT id FROM t ORDER BY id DESC LIMIT 5 OFFSET 10", &[])?;
-    let ids: Vec<i64> = rows.iter().map(|t| match t.values[0] { Value::Int8(n) => n, Value::Int4(n) => n as i64, _ => -1 }).collect();
+    let ids: Vec<i64> = rows
+        .iter()
+        .map(|t| match t.values[0] {
+            Value::Int8(n) => n,
+            Value::Int4(n) => n as i64,
+            _ => -1,
+        })
+        .collect();
     assert_eq!(ids, vec![90, 89, 88, 87, 86]);
 
     // Last-partial page: offset 95, limit 10 expects 5 rows (ids 5..1)
@@ -148,11 +166,15 @@ fn keyset_tuple_comparison_works() -> Result<()> {
     assert_eq!(first_id, 21);
 
     // Single-column keyset: WHERE id < 10 ORDER BY id DESC LIMIT 3
-    let single = db.query(
-        "SELECT id FROM t WHERE id < 10 ORDER BY id DESC LIMIT 3",
-        &[],
-    )?;
-    let ids: Vec<i64> = single.iter().map(|t| match t.values[0] { Value::Int8(n) => n, Value::Int4(n) => n as i64, _ => -1 }).collect();
+    let single = db.query("SELECT id FROM t WHERE id < 10 ORDER BY id DESC LIMIT 3", &[])?;
+    let ids: Vec<i64> = single
+        .iter()
+        .map(|t| match t.values[0] {
+            Value::Int8(n) => n,
+            Value::Int4(n) => n as i64,
+            _ => -1,
+        })
+        .collect();
     assert_eq!(ids, vec![9, 8, 7]);
     Ok(())
 }

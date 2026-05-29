@@ -40,7 +40,10 @@ pub struct BiasOptions {
 
 impl Default for BiasOptions {
     fn default() -> Self {
-        Self { alpha: 0.2, over_fetch_multiplier: 4 }
+        Self {
+            alpha: 0.2,
+            over_fetch_multiplier: 4,
+        }
     }
 }
 
@@ -73,10 +76,7 @@ pub fn apply_bias(
     // a centrality map this is a pure top-k by distance, which the
     // input order already provides.
     let mut scored: Vec<(u64, f32)> = if let Some(cent) = centrality {
-        let max_dist = kept
-            .iter()
-            .map(|(_, d)| *d)
-            .fold(f32::MIN, f32::max);
+        let max_dist = kept.iter().map(|(_, d)| *d).fold(f32::MIN, f32::max);
         let alpha = opts.alpha.clamp(0.0, 1.0);
         kept.into_iter()
             .map(|(id, dist)| {
@@ -91,9 +91,7 @@ pub fn apply_bias(
     } else {
         kept
     };
-    scored.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     scored.truncate(k);
     Ok(scored)
 }
@@ -131,7 +129,10 @@ mod tests {
         // weighting, 3 (high centrality) overtakes.
         let cands = vec![(1, 0.10), (2, 0.20), (3, 0.30)];
         let cent = cent_map(&[(1, 0.0), (2, 0.0), (3, 1.0)]);
-        let opts = BiasOptions { alpha: 0.9, over_fetch_multiplier: 1 };
+        let opts = BiasOptions {
+            alpha: 0.9,
+            over_fetch_multiplier: 1,
+        };
         let r = apply_bias(cands, 1, Some(&cent), None, &opts).unwrap();
         assert_eq!(r.len(), 1);
         assert_eq!(r[0].0, 3, "high-centrality node should win");
@@ -141,7 +142,10 @@ mod tests {
     fn alpha_zero_ignores_centrality() {
         let cands = vec![(1, 0.10), (2, 0.20), (3, 0.30)];
         let cent = cent_map(&[(1, 0.0), (2, 0.0), (3, 1.0)]);
-        let opts = BiasOptions { alpha: 0.0, ..BiasOptions::default() };
+        let opts = BiasOptions {
+            alpha: 0.0,
+            ..BiasOptions::default()
+        };
         let r = apply_bias(cands, 1, Some(&cent), None, &opts).unwrap();
         assert_eq!(r[0].0, 1, "alpha=0 must fall back to pure distance");
     }

@@ -3,9 +3,9 @@
 //! Multi-dialect parser for procedural SQL (PL/pgSQL, T-SQL, PL/SQL, DB2 PL).
 //! Automatically detects dialect based on syntax patterns or explicit specification.
 
-use crate::{Result, Error, DataType};
-use crate::sql::LogicalExpr;
 use super::ast::*;
+use crate::sql::LogicalExpr;
+use crate::{DataType, Error, Result};
 
 /// Procedural language parser
 pub struct ProceduralParser {
@@ -774,7 +774,10 @@ impl ProceduralParser {
                         if self.peek_char() == Some(';') {
                             self.advance();
                         }
-                        return Ok(Some(ProceduralStatement::Assignment { target: var_name, value }));
+                        return Ok(Some(ProceduralStatement::Assignment {
+                            target: var_name,
+                            value,
+                        }));
                     }
                 }
             }
@@ -1106,8 +1109,12 @@ impl ProceduralParser {
             } else if depth == 0 {
                 // Check for keywords that end expression
                 let rest = &self.source[self.pos..].to_uppercase();
-                if rest.starts_with("THEN") || rest.starts_with("LOOP") || rest.starts_with("END")
-                    || rest.starts_with("ELSE") || rest.starts_with("ELSIF") || rest.starts_with("WHEN")
+                if rest.starts_with("THEN")
+                    || rest.starts_with("LOOP")
+                    || rest.starts_with("END")
+                    || rest.starts_with("ELSE")
+                    || rest.starts_with("ELSIF")
+                    || rest.starts_with("WHEN")
                 {
                     break;
                 }
@@ -1179,7 +1186,9 @@ impl ProceduralParser {
     }
 
     fn parse_string_literal(&mut self) -> Result<String> {
-        let quote = self.peek_char().ok_or_else(|| Error::sql_parse("Expected string literal"))?;
+        let quote = self
+            .peek_char()
+            .ok_or_else(|| Error::sql_parse("Expected string literal"))?;
         if quote != '\'' && quote != '"' {
             return Err(Error::sql_parse("Expected string literal"));
         }
@@ -1393,7 +1402,9 @@ mod tests {
 
         assert_eq!(block.statements.len(), 1);
         match &block.statements[0] {
-            ProceduralStatement::If { then_block, else_block, .. } => {
+            ProceduralStatement::If {
+                then_block, else_block, ..
+            } => {
                 assert_eq!(then_block.len(), 1);
                 assert!(else_block.is_some());
             }

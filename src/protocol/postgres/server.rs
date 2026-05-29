@@ -3,20 +3,17 @@
 //! This module implements a TCP server that listens for PostgreSQL protocol
 //! connections and spawns handlers for each connection.
 
-use crate::{Result, Error, EmbeddedDatabase};
-use super::handler::PgConnectionHandler;
 use super::auth::{AuthManager, AuthMethod};
-use super::ssl::{SslConfig, SslNegotiator, SslMode, SecureConnection};
+use super::handler::PgConnectionHandler;
+use super::ssl::{SecureConnection, SslConfig, SslMode, SslNegotiator};
+use crate::{EmbeddedDatabase, Error, Result};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
-use std::sync::Arc;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
 /// Default PostgreSQL listen address (0.0.0.0:5432)
-const DEFAULT_PG_ADDRESS: SocketAddr = SocketAddr::new(
-    IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-    5432
-);
+const DEFAULT_PG_ADDRESS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5432);
 
 /// PostgreSQL server configuration
 #[derive(Debug, Clone)]
@@ -71,11 +68,7 @@ impl PgServerConfig {
 
     /// Enable SSL with default test certificates
     pub fn with_ssl_test(mut self) -> Result<Self> {
-        let ssl_config = SslConfig::new(
-            SslMode::Allow,
-            "certs/server.crt",
-            "certs/server.key",
-        );
+        let ssl_config = SslConfig::new(SslMode::Allow, "certs/server.crt", "certs/server.key");
         self.ssl_config = Some(ssl_config);
         Ok(self)
     }
@@ -112,10 +105,7 @@ impl PgServer {
     pub fn new(config: PgServerConfig, database: Arc<EmbeddedDatabase>) -> Result<Self> {
         Self::enforce_trust_loopback_only(&config)?;
 
-        let auth_manager = Arc::new(
-            AuthManager::new(config.auth_method)
-                .with_default_users()
-        );
+        let auth_manager = Arc::new(AuthManager::new(config.auth_method).with_default_users());
 
         // Initialize SSL negotiator if SSL is configured
         let ssl_negotiator = if let Some(ref ssl_config) = config.ssl_config {
@@ -176,7 +166,8 @@ impl PgServer {
     /// This method runs the server loop and does not return unless an error occurs.
     /// Use `tokio::spawn()` to run it in the background.
     pub async fn serve(&self) -> Result<()> {
-        let listener = TcpListener::bind(self.config.address).await
+        let listener = TcpListener::bind(self.config.address)
+            .await
             .map_err(|e| Error::network(format!("Failed to bind to {}: {}", self.config.address, e)))?;
 
         let ssl_enabled = self.ssl_negotiator.is_some();
@@ -199,7 +190,11 @@ impl PgServer {
                     let permit = match Arc::clone(&self.connection_limiter).try_acquire_owned() {
                         Ok(permit) => permit,
                         Err(_) => {
-                            tracing::warn!("Connection limit reached ({}), rejecting {}", self.config.max_connections, addr);
+                            tracing::warn!(
+                                "Connection limit reached ({}), rejecting {}",
+                                self.config.max_connections,
+                                addr
+                            );
                             drop(stream);
                             continue;
                         }
@@ -237,12 +232,16 @@ impl PgServer {
 
         // Read message length
         let mut len_buf = [0u8; 4];
-        stream.read_exact(&mut len_buf).await
+        stream
+            .read_exact(&mut len_buf)
+            .await
             .map_err(|e| Error::network(format!("Failed to read message length: {}", e)))?;
 
         // Read request code
         let mut code_buf = [0u8; 4];
-        stream.read_exact(&mut code_buf).await
+        stream
+            .read_exact(&mut code_buf)
+            .await
             .map_err(|e| Error::network(format!("Failed to read request code: {}", e)))?;
 
         let code = i32::from_be_bytes(code_buf);
@@ -258,7 +257,9 @@ impl PgServer {
                     // Upgrade connection to TLS
                     if let Some(acceptor) = negotiator.acceptor() {
                         tracing::debug!("Upgrading connection to TLS");
-                        let tls_stream = acceptor.accept(stream).await
+                        let tls_stream = acceptor
+                            .accept(stream)
+                            .await
                             .map_err(|e| Error::network(format!("TLS handshake failed: {}", e)))?;
 
                         let secure_conn = SecureConnection::Tls(tls_stream);
@@ -266,7 +267,7 @@ impl PgServer {
                             secure_conn,
                             database,
                             auth_manager,
-                            None // TLS stream starts fresh
+                            None, // TLS stream starts fresh
                         );
                         return handler.handle().await;
                     }
@@ -279,21 +280,20 @@ impl PgServer {
         } else if is_ssl_request {
             // SSL is not configured, but client requested it - reject with 'N'
             tracing::debug!("SSL request received but SSL is not configured, sending rejection");
-            stream.write_all(b"N").await
+            stream
+                .write_all(b"N")
+                .await
                 .map_err(|e| Error::network(format!("Failed to send SSL rejection: {}", e)))?;
-            stream.flush().await
+            stream
+                .flush()
+                .await
                 .map_err(|e| Error::network(format!("Failed to flush stream: {}", e)))?;
-            
+
             // After rejection, client will send startup message.
             // We haven't consumed any of THAT message yet.
             // So initial_data should be None for the handler.
             let secure_conn = SecureConnection::Plain(stream);
-            let mut handler = PgConnectionHandler::new_with_stream(
-                secure_conn,
-                database,
-                auth_manager,
-                None
-            );
+            let mut handler = PgConnectionHandler::new_with_stream(secure_conn, database, auth_manager, None);
             return handler.handle().await;
         }
 
@@ -303,12 +303,8 @@ impl PgServer {
         initial_data.extend_from_slice(&code_buf);
 
         let secure_conn = SecureConnection::Plain(stream);
-        let mut handler = PgConnectionHandler::new_with_stream(
-            secure_conn,
-            database,
-            auth_manager,
-            Some(&initial_data)
-        );
+        let mut handler =
+            PgConnectionHandler::new_with_stream(secure_conn, database, auth_manager, Some(&initial_data));
         handler.handle().await
     }
 
@@ -365,11 +361,7 @@ impl PgServerBuilder {
 
     /// Enable SSL with test certificates
     pub fn ssl_test(mut self) -> Self {
-        self.config.ssl_config = Some(SslConfig::new(
-            SslMode::Allow,
-            "certs/server.crt",
-            "certs/server.key",
-        ));
+        self.config.ssl_config = Some(SslConfig::new(SslMode::Allow, "certs/server.crt", "certs/server.key"));
         self
     }
 
@@ -434,11 +426,7 @@ mod tests {
         let config = PgServerConfig::default();
         assert!(config.ssl_config.is_none());
 
-        let ssl_config = SslConfig::new(
-            SslMode::Require,
-            "cert.pem",
-            "key.pem",
-        );
+        let ssl_config = SslConfig::new(SslMode::Require, "cert.pem", "key.pem");
         let config_with_ssl = PgServerConfig::default().with_ssl(ssl_config);
         assert!(config_with_ssl.ssl_config.is_some());
     }

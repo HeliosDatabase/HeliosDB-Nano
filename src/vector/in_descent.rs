@@ -51,7 +51,12 @@ pub struct InDescentOptions {
 
 impl Default for InDescentOptions {
     fn default() -> Self {
-        Self { alpha: 0.2, epsilon: 0.05, ef: 64, entry_points: 1 }
+        Self {
+            alpha: 0.2,
+            epsilon: 0.05,
+            ef: 64,
+            entry_points: 1,
+        }
     }
 }
 
@@ -76,12 +81,7 @@ pub fn search(
         return Ok(Vec::new());
     }
 
-    let dist_to = |id: &u64| -> f32 {
-        positions
-            .get(id)
-            .map(|v| l2_dist(query, v))
-            .unwrap_or(f32::INFINITY)
-    };
+    let dist_to = |id: &u64| -> f32 { positions.get(id).map(|v| l2_dist(query, v)).unwrap_or(f32::INFINITY) };
 
     // Working set: keep the best `ef` candidates by score.  Score
     // is a min-heap of (NotNan dist, centrality, id) so smaller
@@ -100,7 +100,11 @@ pub fn search(
         }
         let d = dist_to(&eid);
         let c = centrality.get(&eid).copied().unwrap_or(0.0);
-        let cand = Candidate { id: eid, dist: d, centrality: c };
+        let cand = Candidate {
+            id: eid,
+            dist: d,
+            centrality: c,
+        };
         frontier.push(std::cmp::Reverse(cand));
         best.push(cand);
         if best.len() > opts.ef {
@@ -116,7 +120,9 @@ pub fn search(
                 break;
             }
         }
-        let Some(neighbours) = adjacency.get(&current.id) else { continue };
+        let Some(neighbours) = adjacency.get(&current.id) else {
+            continue;
+        };
         for &n in neighbours {
             if !visited.insert(n) {
                 continue;
@@ -126,7 +132,11 @@ pub fn search(
             }
             let d = dist_to(&n);
             let c = centrality.get(&n).copied().unwrap_or(0.0);
-            let cand = Candidate { id: n, dist: d, centrality: c };
+            let cand = Candidate {
+                id: n,
+                dist: d,
+                centrality: c,
+            };
             // Within-ε bias: if this candidate's distance is close
             // to the running best, weight by centrality.  Outside
             // the window, fall back to pure distance.
@@ -134,8 +144,7 @@ pub fn search(
                 Some(worst) if best.len() >= opts.ef => {
                     if cand.dist < worst.dist {
                         true
-                    } else if (cand.dist - worst.dist).abs()
-                        <= worst.dist * opts.epsilon
+                    } else if (cand.dist - worst.dist).abs() <= worst.dist * opts.epsilon
                         && cand.centrality > worst.centrality
                     {
                         true
@@ -166,9 +175,7 @@ pub fn search(
             (c.id, score)
         })
         .collect();
-    out.sort_by(|a, b| {
-        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    out.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
     out.truncate(k);
     Ok(out)
 }
@@ -196,17 +203,11 @@ impl Ord for Candidate {
         // Larger dist sorts first → max-heap by dist (so .pop()
         // discards the worst).  Tie-break by centrality
         // descending.
-        match self
-            .dist
-            .partial_cmp(&other.dist)
-            .unwrap_or(std::cmp::Ordering::Equal)
-        {
-            std::cmp::Ordering::Equal => {
-                other
-                    .centrality
-                    .partial_cmp(&self.centrality)
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            }
+        match self.dist.partial_cmp(&other.dist).unwrap_or(std::cmp::Ordering::Equal) {
+            std::cmp::Ordering::Equal => other
+                .centrality
+                .partial_cmp(&self.centrality)
+                .unwrap_or(std::cmp::Ordering::Equal),
             o => o,
         }
     }
@@ -264,7 +265,10 @@ mod tests {
         // centrality and use heavy alpha to win the tie.
         let mut cent: HashMap<u64, f32> = HashMap::new();
         cent.insert(3, 1.0);
-        let opts = InDescentOptions { alpha: 0.9, ..Default::default() };
+        let opts = InDescentOptions {
+            alpha: 0.9,
+            ..Default::default()
+        };
         let r = search(&adj, &pos, &cent, &[0], &[2.5], 1, None, &opts).unwrap();
         assert_eq!(r[0].0, 3);
     }

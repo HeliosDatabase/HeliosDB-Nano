@@ -7,7 +7,7 @@
 
 #[cfg(test)]
 mod trigger_tests {
-    use heliosdb_nano::{EmbeddedDatabase, Value, DataType};
+    use heliosdb_nano::{DataType, EmbeddedDatabase, Value};
 
     /// Create an in-memory test database
     fn create_test_db() -> EmbeddedDatabase {
@@ -28,7 +28,7 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  SELECT 1;
-             END"
+             END",
         );
 
         // Note: This may fail if triggers are not fully implemented
@@ -51,7 +51,7 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  SELECT 1;
-             END"
+             END",
         );
 
         // Create same trigger again with IF NOT EXISTS
@@ -61,7 +61,7 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  SELECT 1;
-             END"
+             END",
         );
 
         match (result1, result2) {
@@ -103,8 +103,10 @@ mod trigger_tests {
     #[test]
     fn test_before_insert_trigger() {
         let db = create_test_db();
-        db.execute("CREATE TABLE products (id INT, name TEXT, price DECIMAL, created_at TEXT)").unwrap();
-        db.execute("CREATE TABLE audit_log (action TEXT, timestamp TEXT)").unwrap();
+        db.execute("CREATE TABLE products (id INT, name TEXT, price DECIMAL, created_at TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE audit_log (action TEXT, timestamp TEXT)")
+            .unwrap();
 
         // Create BEFORE INSERT trigger
         let result = db.execute(
@@ -113,13 +115,16 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO audit_log VALUES ('BEFORE INSERT', datetime('now'));
-             END"
+             END",
         );
 
         if result.is_ok() {
-            db.execute("INSERT INTO products VALUES (1, 'Widget', 19.99, datetime('now'))").unwrap();
+            db.execute("INSERT INTO products VALUES (1, 'Widget', 19.99, datetime('now'))")
+                .unwrap();
 
-            let rows = db.query("SELECT COUNT(*) FROM audit_log WHERE action = 'BEFORE INSERT'", &[]).unwrap();
+            let rows = db
+                .query("SELECT COUNT(*) FROM audit_log WHERE action = 'BEFORE INSERT'", &[])
+                .unwrap();
             assert!(rows.len() > 0, "BEFORE INSERT trigger should have fired");
         } else {
             println!("BEFORE INSERT trigger not implemented: {}", result.unwrap_err());
@@ -129,8 +134,10 @@ mod trigger_tests {
     #[test]
     fn test_before_update_trigger() {
         let db = create_test_db();
-        db.execute("CREATE TABLE products (id INT, name TEXT, price DECIMAL)").unwrap();
-        db.execute("CREATE TABLE price_history (product_id INT, old_price DECIMAL, new_price DECIMAL)").unwrap();
+        db.execute("CREATE TABLE products (id INT, name TEXT, price DECIMAL)")
+            .unwrap();
+        db.execute("CREATE TABLE price_history (product_id INT, old_price DECIMAL, new_price DECIMAL)")
+            .unwrap();
 
         let result = db.execute(
             "CREATE TRIGGER before_product_update
@@ -138,7 +145,7 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO price_history VALUES (OLD.id, OLD.price, NEW.price);
-             END"
+             END",
         );
 
         if result.is_ok() {
@@ -155,8 +162,10 @@ mod trigger_tests {
     #[test]
     fn test_before_delete_trigger() {
         let db = create_test_db();
-        db.execute("CREATE TABLE products (id INT, name TEXT, price DECIMAL)").unwrap();
-        db.execute("CREATE TABLE deleted_products (id INT, name TEXT, deleted_at TEXT)").unwrap();
+        db.execute("CREATE TABLE products (id INT, name TEXT, price DECIMAL)")
+            .unwrap();
+        db.execute("CREATE TABLE deleted_products (id INT, name TEXT, deleted_at TEXT)")
+            .unwrap();
 
         let result = db.execute(
             "CREATE TRIGGER before_product_delete
@@ -164,7 +173,7 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO deleted_products VALUES (OLD.id, OLD.name, datetime('now'));
-             END"
+             END",
         );
 
         if result.is_ok() {
@@ -183,8 +192,10 @@ mod trigger_tests {
     #[test]
     fn test_after_insert_trigger() {
         let db = create_test_db();
-        db.execute("CREATE TABLE orders (id INT, customer_id INT, total DECIMAL)").unwrap();
-        db.execute("CREATE TABLE order_stats (total_orders INT, total_revenue DECIMAL)").unwrap();
+        db.execute("CREATE TABLE orders (id INT, customer_id INT, total DECIMAL)")
+            .unwrap();
+        db.execute("CREATE TABLE order_stats (total_orders INT, total_revenue DECIMAL)")
+            .unwrap();
         db.execute("INSERT INTO order_stats VALUES (0, 0.0)").unwrap();
 
         let result = db.execute(
@@ -194,7 +205,7 @@ mod trigger_tests {
              BEGIN
                  UPDATE order_stats SET total_orders = total_orders + 1,
                                        total_revenue = total_revenue + NEW.total;
-             END"
+             END",
         );
 
         if result.is_ok() {
@@ -210,8 +221,12 @@ mod trigger_tests {
     #[test]
     fn test_after_update_trigger() {
         let db = create_test_db();
-        db.execute("CREATE TABLE accounts (id INT, balance DECIMAL, updated_at TEXT)").unwrap();
-        db.execute("CREATE TABLE balance_log (account_id INT, old_balance DECIMAL, new_balance DECIMAL, changed_at TEXT)").unwrap();
+        db.execute("CREATE TABLE accounts (id INT, balance DECIMAL, updated_at TEXT)")
+            .unwrap();
+        db.execute(
+            "CREATE TABLE balance_log (account_id INT, old_balance DECIMAL, new_balance DECIMAL, changed_at TEXT)",
+        )
+        .unwrap();
 
         let result = db.execute(
             "CREATE TRIGGER after_account_update
@@ -219,12 +234,14 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO balance_log VALUES (NEW.id, OLD.balance, NEW.balance, datetime('now'));
-             END"
+             END",
         );
 
         if result.is_ok() {
-            db.execute("INSERT INTO accounts VALUES (1, 1000.00, datetime('now'))").unwrap();
-            db.execute("UPDATE accounts SET balance = 1500.00 WHERE id = 1").unwrap();
+            db.execute("INSERT INTO accounts VALUES (1, 1000.00, datetime('now'))")
+                .unwrap();
+            db.execute("UPDATE accounts SET balance = 1500.00 WHERE id = 1")
+                .unwrap();
 
             let rows = db.query("SELECT COUNT(*) FROM balance_log", &[]).unwrap();
             assert!(rows.len() > 0, "AFTER UPDATE trigger should have logged change");
@@ -236,7 +253,8 @@ mod trigger_tests {
     #[test]
     fn test_after_delete_trigger() {
         let db = create_test_db();
-        db.execute("CREATE TABLE users (id INT, name TEXT, email TEXT)").unwrap();
+        db.execute("CREATE TABLE users (id INT, name TEXT, email TEXT)")
+            .unwrap();
         db.execute("CREATE TABLE user_count (count INT)").unwrap();
         db.execute("INSERT INTO user_count VALUES (0)").unwrap();
 
@@ -246,11 +264,12 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  UPDATE user_count SET count = count - 1;
-             END"
+             END",
         );
 
         if result.is_ok() {
-            db.execute("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')").unwrap();
+            db.execute("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')")
+                .unwrap();
             db.execute("DELETE FROM users WHERE id = 1").unwrap();
 
             let rows = db.query("SELECT count FROM user_count", &[]).unwrap();
@@ -278,7 +297,7 @@ mod trigger_tests {
                  FOR EACH ROW
                  BEGIN
                      INSERT INTO base_table VALUES (NEW.id, NEW.data);
-                 END"
+                 END",
             );
 
             if trigger_result.is_ok() {
@@ -308,17 +327,21 @@ mod trigger_tests {
                  FOR EACH ROW
                  BEGIN
                      UPDATE base_table SET data = NEW.data WHERE id = OLD.id;
-                 END"
+                 END",
             );
 
             if trigger_result.is_ok() {
                 db.execute("INSERT INTO base_table VALUES (1, 'original')").unwrap();
-                db.execute("UPDATE view_table SET data = 'updated' WHERE id = 1").unwrap();
+                db.execute("UPDATE view_table SET data = 'updated' WHERE id = 1")
+                    .unwrap();
 
                 let rows = db.query("SELECT data FROM base_table WHERE id = 1", &[]).unwrap();
                 assert!(rows.len() > 0, "INSTEAD OF UPDATE should have updated base table");
             } else {
-                println!("INSTEAD OF UPDATE trigger not implemented: {}", trigger_result.unwrap_err());
+                println!(
+                    "INSTEAD OF UPDATE trigger not implemented: {}",
+                    trigger_result.unwrap_err()
+                );
             }
         }
     }
@@ -326,7 +349,8 @@ mod trigger_tests {
     #[test]
     fn test_instead_of_delete_trigger() {
         let db = create_test_db();
-        db.execute("CREATE TABLE base_table (id INT, data TEXT, deleted INT DEFAULT 0)").unwrap();
+        db.execute("CREATE TABLE base_table (id INT, data TEXT, deleted INT DEFAULT 0)")
+            .unwrap();
 
         let result = db.execute("CREATE VIEW active_items AS SELECT id, data FROM base_table WHERE deleted = 0");
 
@@ -337,7 +361,7 @@ mod trigger_tests {
                  FOR EACH ROW
                  BEGIN
                      UPDATE base_table SET deleted = 1 WHERE id = OLD.id;
-                 END"
+                 END",
             );
 
             if trigger_result.is_ok() {
@@ -347,7 +371,10 @@ mod trigger_tests {
                 let rows = db.query("SELECT deleted FROM base_table WHERE id = 1", &[]).unwrap();
                 assert!(rows.len() > 0, "INSTEAD OF DELETE should have soft-deleted");
             } else {
-                println!("INSTEAD OF DELETE trigger not implemented: {}", trigger_result.unwrap_err());
+                println!(
+                    "INSTEAD OF DELETE trigger not implemented: {}",
+                    trigger_result.unwrap_err()
+                );
             }
         }
     }
@@ -367,7 +394,7 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  UPDATE row_count SET count = count + 1;
-             END"
+             END",
         );
 
         if result.is_ok() {
@@ -388,7 +415,8 @@ mod trigger_tests {
     fn test_for_each_statement_trigger() {
         let db = create_test_db();
         db.execute("CREATE TABLE items (id INT, name TEXT)").unwrap();
-        db.execute("CREATE TABLE statement_count (count INT DEFAULT 0)").unwrap();
+        db.execute("CREATE TABLE statement_count (count INT DEFAULT 0)")
+            .unwrap();
         db.execute("INSERT INTO statement_count VALUES (0)").unwrap();
 
         let result = db.execute(
@@ -397,7 +425,7 @@ mod trigger_tests {
              FOR EACH STATEMENT
              BEGIN
                  UPDATE statement_count SET count = count + 1;
-             END"
+             END",
         );
 
         if result.is_ok() {
@@ -408,7 +436,10 @@ mod trigger_tests {
 
             let rows = db.query("SELECT count FROM statement_count", &[]).unwrap();
             // FOR EACH STATEMENT should fire 3 times (once per INSERT statement)
-            assert!(rows.len() > 0, "FOR EACH STATEMENT trigger should fire once per statement");
+            assert!(
+                rows.len() > 0,
+                "FOR EACH STATEMENT trigger should fire once per statement"
+            );
         } else {
             println!("FOR EACH STATEMENT trigger not implemented: {}", result.unwrap_err());
         }
@@ -419,8 +450,10 @@ mod trigger_tests {
     #[test]
     fn test_trigger_with_when_clause() {
         let db = create_test_db();
-        db.execute("CREATE TABLE products (id INT, name TEXT, price DECIMAL)").unwrap();
-        db.execute("CREATE TABLE expensive_products (id INT, name TEXT, price DECIMAL)").unwrap();
+        db.execute("CREATE TABLE products (id INT, name TEXT, price DECIMAL)")
+            .unwrap();
+        db.execute("CREATE TABLE expensive_products (id INT, name TEXT, price DECIMAL)")
+            .unwrap();
 
         let result = db.execute(
             "CREATE TRIGGER track_expensive
@@ -429,14 +462,17 @@ mod trigger_tests {
              WHEN (NEW.price > 100.0)
              BEGIN
                  INSERT INTO expensive_products VALUES (NEW.id, NEW.name, NEW.price);
-             END"
+             END",
         );
 
         if result.is_ok() {
             // Insert products with different prices
-            db.execute("INSERT INTO products VALUES (1, 'Cheap Widget', 10.00)").unwrap();
-            db.execute("INSERT INTO products VALUES (2, 'Expensive Gadget', 250.00)").unwrap();
-            db.execute("INSERT INTO products VALUES (3, 'Luxury Item', 500.00)").unwrap();
+            db.execute("INSERT INTO products VALUES (1, 'Cheap Widget', 10.00)")
+                .unwrap();
+            db.execute("INSERT INTO products VALUES (2, 'Expensive Gadget', 250.00)")
+                .unwrap();
+            db.execute("INSERT INTO products VALUES (3, 'Luxury Item', 500.00)")
+                .unwrap();
 
             let rows = db.query("SELECT COUNT(*) FROM expensive_products", &[]).unwrap();
             // Only products with price > 100 should be tracked
@@ -450,7 +486,8 @@ mod trigger_tests {
     fn test_trigger_when_clause_with_old_new() {
         let db = create_test_db();
         db.execute("CREATE TABLE accounts (id INT, balance DECIMAL)").unwrap();
-        db.execute("CREATE TABLE balance_increases (account_id INT, amount DECIMAL)").unwrap();
+        db.execute("CREATE TABLE balance_increases (account_id INT, amount DECIMAL)")
+            .unwrap();
 
         let result = db.execute(
             "CREATE TRIGGER track_increases
@@ -459,12 +496,13 @@ mod trigger_tests {
              WHEN (NEW.balance > OLD.balance)
              BEGIN
                  INSERT INTO balance_increases VALUES (NEW.id, NEW.balance - OLD.balance);
-             END"
+             END",
         );
 
         if result.is_ok() {
             db.execute("INSERT INTO accounts VALUES (1, 1000.00)").unwrap();
-            db.execute("UPDATE accounts SET balance = 1500.00 WHERE id = 1").unwrap();
+            db.execute("UPDATE accounts SET balance = 1500.00 WHERE id = 1")
+                .unwrap();
             db.execute("UPDATE accounts SET balance = 900.00 WHERE id = 1").unwrap(); // Decrease
 
             let rows = db.query("SELECT COUNT(*) FROM balance_increases", &[]).unwrap();
@@ -481,7 +519,8 @@ mod trigger_tests {
     fn test_new_context_in_insert_trigger() {
         let db = create_test_db();
         db.execute("CREATE TABLE orders (id INT, total DECIMAL)").unwrap();
-        db.execute("CREATE TABLE order_log (order_id INT, amount DECIMAL)").unwrap();
+        db.execute("CREATE TABLE order_log (order_id INT, amount DECIMAL)")
+            .unwrap();
 
         let result = db.execute(
             "CREATE TRIGGER log_new_order
@@ -489,13 +528,15 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO order_log VALUES (NEW.id, NEW.total);
-             END"
+             END",
         );
 
         if result.is_ok() {
             db.execute("INSERT INTO orders VALUES (1, 99.99)").unwrap();
 
-            let rows = db.query("SELECT amount FROM order_log WHERE order_id = 1", &[]).unwrap();
+            let rows = db
+                .query("SELECT amount FROM order_log WHERE order_id = 1", &[])
+                .unwrap();
             assert!(rows.len() > 0, "NEW context should provide inserted values");
         } else {
             println!("NEW context variable not implemented: {}", result.unwrap_err());
@@ -506,7 +547,8 @@ mod trigger_tests {
     fn test_old_context_in_delete_trigger() {
         let db = create_test_db();
         db.execute("CREATE TABLE products (id INT, name TEXT)").unwrap();
-        db.execute("CREATE TABLE deletion_log (deleted_id INT, deleted_name TEXT)").unwrap();
+        db.execute("CREATE TABLE deletion_log (deleted_id INT, deleted_name TEXT)")
+            .unwrap();
 
         let result = db.execute(
             "CREATE TRIGGER log_deletions
@@ -514,14 +556,16 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO deletion_log VALUES (OLD.id, OLD.name);
-             END"
+             END",
         );
 
         if result.is_ok() {
             db.execute("INSERT INTO products VALUES (1, 'Widget')").unwrap();
             db.execute("DELETE FROM products WHERE id = 1").unwrap();
 
-            let rows = db.query("SELECT deleted_name FROM deletion_log WHERE deleted_id = 1", &[]).unwrap();
+            let rows = db
+                .query("SELECT deleted_name FROM deletion_log WHERE deleted_id = 1", &[])
+                .unwrap();
             assert!(rows.len() > 0, "OLD context should provide deleted values");
         } else {
             println!("OLD context variable not implemented: {}", result.unwrap_err());
@@ -532,7 +576,8 @@ mod trigger_tests {
     fn test_old_new_context_in_update_trigger() {
         let db = create_test_db();
         db.execute("CREATE TABLE inventory (id INT, quantity INT)").unwrap();
-        db.execute("CREATE TABLE inventory_changes (item_id INT, old_qty INT, new_qty INT)").unwrap();
+        db.execute("CREATE TABLE inventory_changes (item_id INT, old_qty INT, new_qty INT)")
+            .unwrap();
 
         let result = db.execute(
             "CREATE TRIGGER track_inventory_changes
@@ -540,15 +585,20 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO inventory_changes VALUES (NEW.id, OLD.quantity, NEW.quantity);
-             END"
+             END",
         );
 
         if result.is_ok() {
             db.execute("INSERT INTO inventory VALUES (1, 100)").unwrap();
             db.execute("UPDATE inventory SET quantity = 150 WHERE id = 1").unwrap();
 
-            let rows = db.query("SELECT old_qty, new_qty FROM inventory_changes WHERE item_id = 1", &[]).unwrap();
-            assert!(rows.len() > 0, "Both OLD and NEW contexts should be available in UPDATE triggers");
+            let rows = db
+                .query("SELECT old_qty, new_qty FROM inventory_changes WHERE item_id = 1", &[])
+                .unwrap();
+            assert!(
+                rows.len() > 0,
+                "Both OLD and NEW contexts should be available in UPDATE triggers"
+            );
         } else {
             println!("OLD/NEW context in UPDATE not implemented: {}", result.unwrap_err());
         }
@@ -570,7 +620,7 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO table2 VALUES (NEW.id, NEW.value);
-             END"
+             END",
         );
 
         // Trigger 2: Insert into table2 triggers insert into table3
@@ -580,7 +630,7 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO table3 VALUES (NEW.id, NEW.value);
-             END"
+             END",
         );
 
         if result1.is_ok() && result2.is_ok() {
@@ -613,7 +663,9 @@ mod trigger_tests {
                  BEGIN
                      INSERT INTO level{} VALUES (NEW.id);
                  END",
-                i, i, i + 1
+                i,
+                i,
+                i + 1
             );
 
             let _ = db.execute(&trigger_sql);
@@ -637,7 +689,8 @@ mod trigger_tests {
 
         // Create 20 tables for deep cascading
         for i in 1..=20 {
-            db.execute(&format!("CREATE TABLE depth{} (id INT, level INT)", i)).unwrap();
+            db.execute(&format!("CREATE TABLE depth{} (id INT, level INT)", i))
+                .unwrap();
         }
 
         // Create 19 cascading triggers
@@ -649,7 +702,10 @@ mod trigger_tests {
                  BEGIN
                      INSERT INTO depth{} VALUES (NEW.id, {});
                  END",
-                i, i, i + 1, i + 1
+                i,
+                i,
+                i + 1,
+                i + 1
             );
 
             let _ = db.execute(&trigger_sql);
@@ -696,7 +752,7 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  SELECT * FROM nonexistent_table;
-             END"
+             END",
         );
 
         // Should either reject the trigger or fail at runtime
@@ -718,7 +774,7 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO log_table VALUES (NULL);
-             END"
+             END",
         );
 
         if result.is_ok() {
@@ -754,7 +810,7 @@ mod trigger_tests {
                      WHEN NOT EXISTS (SELECT 1 FROM parent WHERE id = NEW.parent_id)
                      THEN RAISE(ABORT, 'Parent does not exist')
                  END;
-             END"
+             END",
         );
 
         if result.is_ok() {
@@ -771,7 +827,10 @@ mod trigger_tests {
                 Err(e) => println!("Trigger correctly enforced constraint: {}", e),
             }
         } else {
-            println!("Constraint enforcement trigger not implemented: {}", result.unwrap_err());
+            println!(
+                "Constraint enforcement trigger not implemented: {}",
+                result.unwrap_err()
+            );
         }
     }
 
@@ -781,7 +840,8 @@ mod trigger_tests {
     fn test_multiple_triggers_same_event() {
         let db = create_test_db();
         db.execute("CREATE TABLE test_table (id INT)").unwrap();
-        db.execute("CREATE TABLE execution_order (trigger_name TEXT, execution_time TEXT)").unwrap();
+        db.execute("CREATE TABLE execution_order (trigger_name TEXT, execution_time TEXT)")
+            .unwrap();
 
         // Create multiple triggers on the same event
         let result1 = db.execute(
@@ -790,7 +850,7 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO execution_order VALUES ('trigger_a', datetime('now'));
-             END"
+             END",
         );
 
         let result2 = db.execute(
@@ -799,7 +859,7 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO execution_order VALUES ('trigger_b', datetime('now'));
-             END"
+             END",
         );
 
         let result3 = db.execute(
@@ -808,13 +868,15 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO execution_order VALUES ('trigger_c', datetime('now'));
-             END"
+             END",
         );
 
         if result1.is_ok() && result2.is_ok() && result3.is_ok() {
             db.execute("INSERT INTO test_table VALUES (1)").unwrap();
 
-            let rows = db.query("SELECT trigger_name FROM execution_order ORDER BY execution_time", &[]).unwrap();
+            let rows = db
+                .query("SELECT trigger_name FROM execution_order ORDER BY execution_time", &[])
+                .unwrap();
 
             println!("Trigger execution order: {:?}", rows.len());
             assert!(rows.len() > 0, "All triggers should have executed");
@@ -835,7 +897,7 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO trigger_log VALUES ('BEFORE', NEW.value);
-             END"
+             END",
         );
 
         let after_result = db.execute(
@@ -844,7 +906,7 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO trigger_log VALUES ('AFTER', NEW.value);
-             END"
+             END",
         );
 
         if before_result.is_ok() && after_result.is_ok() {
@@ -875,12 +937,13 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO event_log VALUES ('CHANGE');
-             END"
+             END",
         );
 
         if result.is_ok() {
             db.execute("INSERT INTO test_table VALUES (1, 'test')").unwrap();
-            db.execute("UPDATE test_table SET value = 'updated' WHERE id = 1").unwrap();
+            db.execute("UPDATE test_table SET value = 'updated' WHERE id = 1")
+                .unwrap();
             db.execute("DELETE FROM test_table WHERE id = 1").unwrap();
 
             let rows = db.query("SELECT COUNT(*) FROM event_log", &[]).unwrap();
@@ -894,8 +957,10 @@ mod trigger_tests {
     #[test]
     fn test_trigger_referencing_multiple_tables() {
         let db = create_test_db();
-        db.execute("CREATE TABLE orders (id INT, customer_id INT, amount DECIMAL)").unwrap();
-        db.execute("CREATE TABLE customers (id INT, total_spent DECIMAL)").unwrap();
+        db.execute("CREATE TABLE orders (id INT, customer_id INT, amount DECIMAL)")
+            .unwrap();
+        db.execute("CREATE TABLE customers (id INT, total_spent DECIMAL)")
+            .unwrap();
         db.execute("INSERT INTO customers VALUES (1, 0.0)").unwrap();
 
         let result = db.execute(
@@ -906,7 +971,7 @@ mod trigger_tests {
                  UPDATE customers
                  SET total_spent = total_spent + NEW.amount
                  WHERE id = NEW.customer_id;
-             END"
+             END",
         );
 
         if result.is_ok() {
@@ -916,15 +981,20 @@ mod trigger_tests {
             let rows = db.query("SELECT total_spent FROM customers WHERE id = 1", &[]).unwrap();
             assert!(rows.len() > 0, "Trigger should update related table");
         } else {
-            println!("Triggers referencing multiple tables not implemented: {}", result.unwrap_err());
+            println!(
+                "Triggers referencing multiple tables not implemented: {}",
+                result.unwrap_err()
+            );
         }
     }
 
     #[test]
     fn test_trigger_with_subquery() {
         let db = create_test_db();
-        db.execute("CREATE TABLE products (id INT, category_id INT, price DECIMAL)").unwrap();
-        db.execute("CREATE TABLE categories (id INT, max_price DECIMAL)").unwrap();
+        db.execute("CREATE TABLE products (id INT, category_id INT, price DECIMAL)")
+            .unwrap();
+        db.execute("CREATE TABLE categories (id INT, max_price DECIMAL)")
+            .unwrap();
         db.execute("INSERT INTO categories VALUES (1, 100.0)").unwrap();
 
         let result = db.execute(
@@ -936,7 +1006,7 @@ mod trigger_tests {
                      WHEN NEW.price > (SELECT max_price FROM categories WHERE id = NEW.category_id)
                      THEN RAISE(ABORT, 'Price exceeds category maximum')
                  END;
-             END"
+             END",
         );
 
         if result.is_ok() {
@@ -964,7 +1034,7 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO log_table VALUES (NEW.id);
-             END"
+             END",
         );
 
         if result.is_ok() {
@@ -979,8 +1049,11 @@ mod trigger_tests {
             let test_rows = db.query("SELECT COUNT(*) FROM test_table", &[]).unwrap();
             let log_rows = db.query("SELECT COUNT(*) FROM log_table", &[]).unwrap();
 
-            println!("Transaction rollback test: test_table rows: {:?}, log_table rows: {:?}",
-                     test_rows.len(), log_rows.len());
+            println!(
+                "Transaction rollback test: test_table rows: {:?}, log_table rows: {:?}",
+                test_rows.len(),
+                log_rows.len()
+            );
         } else {
             println!("Triggers in transactions not implemented: {}", result.unwrap_err());
         }
@@ -989,8 +1062,10 @@ mod trigger_tests {
     #[test]
     fn test_trigger_update_of_specific_columns() {
         let db = create_test_db();
-        db.execute("CREATE TABLE products (id INT, name TEXT, price DECIMAL, description TEXT)").unwrap();
-        db.execute("CREATE TABLE price_changes (product_id INT, old_price DECIMAL, new_price DECIMAL)").unwrap();
+        db.execute("CREATE TABLE products (id INT, name TEXT, price DECIMAL, description TEXT)")
+            .unwrap();
+        db.execute("CREATE TABLE price_changes (product_id INT, old_price DECIMAL, new_price DECIMAL)")
+            .unwrap();
 
         // Trigger only on price column updates
         let result = db.execute(
@@ -999,14 +1074,16 @@ mod trigger_tests {
              FOR EACH ROW
              BEGIN
                  INSERT INTO price_changes VALUES (NEW.id, OLD.price, NEW.price);
-             END"
+             END",
         );
 
         if result.is_ok() {
-            db.execute("INSERT INTO products VALUES (1, 'Widget', 10.0, 'A widget')").unwrap();
+            db.execute("INSERT INTO products VALUES (1, 'Widget', 10.0, 'A widget')")
+                .unwrap();
 
             // Update name only - should not trigger
-            db.execute("UPDATE products SET name = 'Super Widget' WHERE id = 1").unwrap();
+            db.execute("UPDATE products SET name = 'Super Widget' WHERE id = 1")
+                .unwrap();
 
             // Update price - should trigger
             db.execute("UPDATE products SET price = 15.0 WHERE id = 1").unwrap();

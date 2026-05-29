@@ -1,6 +1,6 @@
 //! Network protocol tests
 
-use heliosdb_nano::{EmbeddedDatabase, network::PgServer};
+use heliosdb_nano::{network::PgServer, EmbeddedDatabase};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;

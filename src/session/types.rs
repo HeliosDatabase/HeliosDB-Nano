@@ -22,11 +22,11 @@
 //! let session = Session::new(user.id, IsolationLevel::RepeatableRead);
 //! ```
 
-use std::sync::atomic::{AtomicU64, Ordering};
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
 };
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Unique identifier for a database session
 ///

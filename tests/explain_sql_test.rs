@@ -17,12 +17,11 @@ fn test_explain_simple_select() {
     assert!(!result.is_empty(), "EXPLAIN should return plan rows");
 
     // Check that it contains expected output
-    let plan_text: String = result.iter()
-        .map(|row| {
-            match &row.values[0] {
-                heliosdb_nano::Value::String(s) => s.clone(),
-                _ => String::new(),
-            }
+    let plan_text: String = result
+        .iter()
+        .map(|row| match &row.values[0] {
+            heliosdb_nano::Value::String(s) => s.clone(),
+            _ => String::new(),
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -36,22 +35,25 @@ fn test_explain_analyze_select() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
 
     // Create a test table
-    db.execute("CREATE TABLE products (id INT4, name TEXT, price FLOAT8)").unwrap();
-    db.execute("INSERT INTO products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99)").unwrap();
+    db.execute("CREATE TABLE products (id INT4, name TEXT, price FLOAT8)")
+        .unwrap();
+    db.execute("INSERT INTO products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99)")
+        .unwrap();
 
     // Test EXPLAIN ANALYZE
-    let result = db.query("EXPLAIN ANALYZE SELECT * FROM products WHERE price > 10", &[]).unwrap();
+    let result = db
+        .query("EXPLAIN ANALYZE SELECT * FROM products WHERE price > 10", &[])
+        .unwrap();
 
     // Should return rows with the query plan and statistics
     assert!(!result.is_empty(), "EXPLAIN ANALYZE should return plan rows");
 
     // Check that it contains expected output
-    let plan_text: String = result.iter()
-        .map(|row| {
-            match &row.values[0] {
-                heliosdb_nano::Value::String(s) => s.clone(),
-                _ => String::new(),
-            }
+    let plan_text: String = result
+        .iter()
+        .map(|row| match &row.values[0] {
+            heliosdb_nano::Value::String(s) => s.clone(),
+            _ => String::new(),
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -59,8 +61,10 @@ fn test_explain_analyze_select() {
     println!("EXPLAIN ANALYZE output:\n{}", plan_text);
 
     // EXPLAIN ANALYZE should execute the query and show stats
-    assert!(plan_text.contains("EXPLAIN ANALYZE") || plan_text.contains("Execution"),
-            "Plan should indicate ANALYZE mode");
+    assert!(
+        plan_text.contains("EXPLAIN ANALYZE") || plan_text.contains("Execution"),
+        "Plan should indicate ANALYZE mode"
+    );
 }
 
 #[test]
@@ -77,12 +81,11 @@ fn test_explain_insert() {
     assert!(!result.is_empty(), "EXPLAIN should return plan rows for INSERT");
 
     // Check that it contains expected output
-    let plan_text: String = result.iter()
-        .map(|row| {
-            match &row.values[0] {
-                heliosdb_nano::Value::String(s) => s.clone(),
-                _ => String::new(),
-            }
+    let plan_text: String = result
+        .iter()
+        .map(|row| match &row.values[0] {
+            heliosdb_nano::Value::String(s) => s.clone(),
+            _ => String::new(),
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -95,20 +98,23 @@ fn test_explain_insert() {
 fn test_explain_with_filter() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
 
-    db.execute("CREATE TABLE orders (id INT4, customer_id INT4, total FLOAT8)").unwrap();
-    db.execute("INSERT INTO orders VALUES (1, 100, 50.0), (2, 101, 75.0), (3, 100, 25.0)").unwrap();
+    db.execute("CREATE TABLE orders (id INT4, customer_id INT4, total FLOAT8)")
+        .unwrap();
+    db.execute("INSERT INTO orders VALUES (1, 100, 50.0), (2, 101, 75.0), (3, 100, 25.0)")
+        .unwrap();
 
     // Test EXPLAIN for filtered SELECT
-    let result = db.query("EXPLAIN SELECT * FROM orders WHERE customer_id = 100", &[]).unwrap();
+    let result = db
+        .query("EXPLAIN SELECT * FROM orders WHERE customer_id = 100", &[])
+        .unwrap();
 
     assert!(!result.is_empty(), "EXPLAIN should return plan rows");
 
-    let plan_text: String = result.iter()
-        .map(|row| {
-            match &row.values[0] {
-                heliosdb_nano::Value::String(s) => s.clone(),
-                _ => String::new(),
-            }
+    let plan_text: String = result
+        .iter()
+        .map(|row| match &row.values[0] {
+            heliosdb_nano::Value::String(s) => s.clone(),
+            _ => String::new(),
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -116,6 +122,8 @@ fn test_explain_with_filter() {
     println!("EXPLAIN with filter:\n{}", plan_text);
 
     // Should show either Filter or predicate info
-    assert!(plan_text.contains("Filter") || plan_text.contains("predicate") || plan_text.contains("Scan"),
-            "Plan should contain filtering information");
+    assert!(
+        plan_text.contains("Filter") || plan_text.contains("predicate") || plan_text.contains("Scan"),
+        "Plan should contain filtering information"
+    );
 }

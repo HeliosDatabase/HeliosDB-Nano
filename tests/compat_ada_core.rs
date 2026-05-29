@@ -74,10 +74,7 @@ fn vector_explicit_dim_cast_still_works() {
 fn vector_bare_in_ddl_still_errors() {
     let db = EmbeddedDatabase::new_in_memory().expect("db");
     let r = db.execute("CREATE TABLE v (id INT PRIMARY KEY, embedding vector)");
-    assert!(
-        r.is_err(),
-        "DDL with bare VECTOR (no dim) must still error; got {r:?}"
-    );
+    assert!(r.is_err(), "DDL with bare VECTOR (no dim) must still error; got {r:?}");
 }
 
 /// Empty literal `'[]'::vector` cannot infer a dimension — must error
@@ -100,11 +97,10 @@ fn vector_bare_cast_on_empty_literal_errors() {
 #[test]
 fn uuid_cast_to_text_returns_bare_canonical_form() {
     let db = EmbeddedDatabase::new_in_memory().expect("db");
-    db.execute("CREATE TABLE u (id UUID PRIMARY KEY, label TEXT)").expect("create u");
-    db.execute(
-        "INSERT INTO u VALUES ('550e8400-e29b-41d4-a716-446655440000', 'sample')",
-    )
-    .expect("insert uuid");
+    db.execute("CREATE TABLE u (id UUID PRIMARY KEY, label TEXT)")
+        .expect("create u");
+    db.execute("INSERT INTO u VALUES ('550e8400-e29b-41d4-a716-446655440000', 'sample')")
+        .expect("insert uuid");
 
     // Use string equality: if the CAST produced `'<uuid>'`, the LIKE
     // pattern `5%` would not match (would start with a quote char).

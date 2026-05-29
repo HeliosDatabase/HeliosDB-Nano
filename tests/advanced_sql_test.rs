@@ -18,11 +18,15 @@ fn test_complex_group_by_with_having() -> Result<()> {
     // Complex query: Find departments with more than 2 employees and average salary > 85000
     let results = db.query(
         "SELECT dept, COUNT(*), AVG(salary) FROM employees GROUP BY dept HAVING COUNT(*) > 2",
-        &[]
+        &[],
     )?;
 
     // Only Engineering has 3 employees
-    assert_eq!(results.len(), 1, "Should return 1 department with more than 2 employees");
+    assert_eq!(
+        results.len(),
+        1,
+        "Should return 1 department with more than 2 employees"
+    );
     assert_eq!(results[0].get(0).unwrap(), &Value::String("Engineering".to_string()));
     assert_eq!(results[0].get(1).unwrap(), &Value::Int8(3)); // COUNT(*) = 3
 
@@ -47,7 +51,7 @@ fn test_join_with_aggregation() -> Result<()> {
     // Join departments with employees
     let results = db.query(
         "SELECT * FROM employees INNER JOIN departments ON employees.department_id = departments.dept_id",
-        &[]
+        &[],
     )?;
 
     // Should return 4 joined rows
@@ -74,7 +78,7 @@ fn test_multi_column_group_by() -> Result<()> {
     // Group by multiple columns
     let results = db.query(
         "SELECT region, product, SUM(amount) FROM sales GROUP BY region, product",
-        &[]
+        &[],
     )?;
 
     // Should have 4 distinct region-product combinations
@@ -96,10 +100,7 @@ fn test_count_with_distinct_and_aggregates() -> Result<()> {
     db.execute("INSERT INTO orders (id, customer, product, price) VALUES (4, 'Alice', 'Keyboard', 50)")?;
 
     // Get total count and distinct product count
-    let results = db.query(
-        "SELECT COUNT(*), COUNT(DISTINCT product) FROM orders",
-        &[]
-    )?;
+    let results = db.query("SELECT COUNT(*), COUNT(DISTINCT product) FROM orders", &[])?;
 
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].get(0).unwrap(), &Value::Int8(4)); // Total orders
@@ -124,7 +125,7 @@ fn test_having_with_average() -> Result<()> {
     // Find students with average score > 80
     let results = db.query(
         "SELECT student, AVG(score) FROM grades GROUP BY student HAVING AVG(score) > 80",
-        &[]
+        &[],
     )?;
 
     // Alice (87.5) and Charlie (93.5) should be returned, not Bob (72.5)
@@ -152,7 +153,7 @@ fn test_cross_join() -> Result<()> {
     // For now, this tests basic multi-table join capability
     let results = db.query(
         "SELECT * FROM colors INNER JOIN sizes ON colors.id = sizes.size_id",
-        &[]
+        &[],
     )?;
 
     // With matching IDs, we should get 2 matches (Red-Small, Blue-Large)
@@ -174,7 +175,7 @@ fn test_aggregate_with_nulls() -> Result<()> {
     // Aggregates should handle NULLs correctly (exclude them except for COUNT(*))
     let results = db.query(
         "SELECT COUNT(*), MIN(price), MAX(price), AVG(price), SUM(price) FROM products",
-        &[]
+        &[],
     )?;
 
     assert_eq!(results.len(), 1);
@@ -195,10 +196,7 @@ fn test_empty_group_by() -> Result<()> {
     db.execute("CREATE TABLE empty_table (id INT PRIMARY KEY, value INT)")?;
 
     // Aggregates on empty table should return appropriate values
-    let results = db.query(
-        "SELECT COUNT(*), SUM(value) FROM empty_table",
-        &[]
-    )?;
+    let results = db.query("SELECT COUNT(*), SUM(value) FROM empty_table", &[])?;
 
     // Empty table should return 1 row with COUNT(*) = 0
     assert_eq!(results.len(), 1);

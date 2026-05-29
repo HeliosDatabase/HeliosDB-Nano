@@ -48,7 +48,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender, RecvTimeoutError};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -371,8 +371,8 @@ impl LockFreeIngestionEngine {
 
         let txn_id = self.next_txn_id.fetch_add(1, Ordering::Relaxed);
         let read_timestamp = self.global_timestamp.load(Ordering::Acquire);
-        let partition = (self.next_partition.fetch_add(1, Ordering::Relaxed)
-            % self.config.partition_count as u64) as u16;
+        let partition =
+            (self.next_partition.fetch_add(1, Ordering::Relaxed) % self.config.partition_count as u64) as u16;
 
         // Create transaction buffer
         let buffer = TransactionBuffer::new(txn_id, read_timestamp);
@@ -384,12 +384,11 @@ impl LockFreeIngestionEngine {
         let current = self.active_transactions.len() as u64;
         let mut peak = self.stats.peak_pending.load(Ordering::Relaxed);
         while current > peak {
-            match self.stats.peak_pending.compare_exchange_weak(
-                peak,
-                current,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+            match self
+                .stats
+                .peak_pending
+                .compare_exchange_weak(peak, current, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => break,
                 Err(p) => peak = p,
             }
@@ -416,13 +415,7 @@ impl LockFreeIngestionEngine {
     ///
     /// The write is buffered in the transaction and not visible to other
     /// transactions until commit. This operation is completely lock-free.
-    pub fn insert(
-        &self,
-        handle: &TransactionHandle,
-        table: &str,
-        row_id: u64,
-        data: &[u8],
-    ) -> IngestionResult<()> {
+    pub fn insert(&self, handle: &TransactionHandle, table: &str, row_id: u64, data: &[u8]) -> IngestionResult<()> {
         self.check_handle(handle)?;
         self.check_backpressure()?;
 
@@ -444,13 +437,7 @@ impl LockFreeIngestionEngine {
     }
 
     /// Update a row (buffered, lock-free)
-    pub fn update(
-        &self,
-        handle: &TransactionHandle,
-        table: &str,
-        row_id: u64,
-        data: &[u8],
-    ) -> IngestionResult<()> {
+    pub fn update(&self, handle: &TransactionHandle, table: &str, row_id: u64, data: &[u8]) -> IngestionResult<()> {
         self.check_handle(handle)?;
         self.check_backpressure()?;
 
@@ -472,12 +459,7 @@ impl LockFreeIngestionEngine {
     }
 
     /// Delete a row (buffered, lock-free)
-    pub fn delete(
-        &self,
-        handle: &TransactionHandle,
-        table: &str,
-        row_id: u64,
-    ) -> IngestionResult<()> {
+    pub fn delete(&self, handle: &TransactionHandle, table: &str, row_id: u64) -> IngestionResult<()> {
         self.check_handle(handle)?;
         self.check_backpressure()?;
 
@@ -538,10 +520,7 @@ impl LockFreeIngestionEngine {
             .map_err(|_| IngestionError::EngineShutdown)?;
 
         // Wait for response
-        match response_rx
-            .recv()
-            .map_err(|_| IngestionError::EngineShutdown)?
-        {
+        match response_rx.recv().map_err(|_| IngestionError::EngineShutdown)? {
             CommitResponse::Success { commit_timestamp } => {
                 self.stats.transactions_committed.fetch_add(1, Ordering::Relaxed);
                 Ok(commit_timestamp)
@@ -581,11 +560,7 @@ impl LockFreeIngestionEngine {
     ///
     /// Optimized for high-throughput ingestion. Automatically batches
     /// and manages backpressure.
-    pub fn bulk_insert<I>(
-        &self,
-        table: &str,
-        rows: I,
-    ) -> IngestionResult<BulkInsertResult>
+    pub fn bulk_insert<I>(&self, table: &str, rows: I) -> IngestionResult<BulkInsertResult>
     where
         I: IntoIterator<Item = Vec<u8>>,
     {
@@ -622,8 +597,7 @@ impl LockFreeIngestionEngine {
     /// Force a WAL sync (for testing or explicit durability)
     pub fn force_sync(&self) -> IngestionResult<()> {
         if let Some(ref wal) = self.wal_manager {
-            wal.sync_all()
-                .map_err(|e| IngestionError::WalError(format!("{}", e)))?;
+            wal.sync_all().map_err(|e| IngestionError::WalError(format!("{}", e)))?;
             self.stats.wal_syncs.fetch_add(1, Ordering::Relaxed);
         }
         Ok(())
@@ -717,14 +691,7 @@ impl LockFreeIngestionEngine {
         thread::Builder::new()
             .name("lockfree-commit-worker".to_string())
             .spawn(move || {
-                Self::commit_worker_loop(
-                    receiver,
-                    safety_level,
-                    wal_manager,
-                    stats,
-                    shutdown,
-                    apply_callback,
-                );
+                Self::commit_worker_loop(receiver, safety_level, wal_manager, stats, shutdown, apply_callback);
             })
             .expect("Failed to spawn commit worker")
     }
@@ -743,10 +710,7 @@ impl LockFreeIngestionEngine {
             .batch_params()
             .map(|(_, d)| d)
             .unwrap_or(Duration::from_millis(1));
-        let batch_size = safety_level
-            .batch_params()
-            .map(|(s, _)| s)
-            .unwrap_or(1);
+        let batch_size = safety_level.batch_params().map(|(s, _)| s).unwrap_or(1);
 
         loop {
             batch.clear();
@@ -780,13 +744,7 @@ impl LockFreeIngestionEngine {
             }
 
             // Process batch
-            Self::process_commit_batch(
-                &batch,
-                &wal_manager,
-                &safety_level,
-                &stats,
-                &apply_callback,
-            );
+            Self::process_commit_batch(&batch, &wal_manager, &safety_level, &stats, &apply_callback);
         }
     }
 
@@ -840,9 +798,9 @@ impl LockFreeIngestionEngine {
 
                 // Write commit record
                 if let Err(e) = wal.write_commit(req.txn_id, commit_ts, ops) {
-                    let _ = req.response.send(CommitResponse::Error(
-                        IngestionError::WalError(e.to_string()),
-                    ));
+                    let _ = req
+                        .response
+                        .send(CommitResponse::Error(IngestionError::WalError(e.to_string())));
                     continue;
                 }
             }
@@ -853,9 +811,9 @@ impl LockFreeIngestionEngine {
             if safety_level.sync_on_commit() {
                 if let Err(e) = wal.sync_all() {
                     for req in batch {
-                        let _ = req.response.send(CommitResponse::Error(
-                            IngestionError::WalError(format!("{}", e)),
-                        ));
+                        let _ = req
+                            .response
+                            .send(CommitResponse::Error(IngestionError::WalError(format!("{}", e))));
                     }
                     return;
                 }
@@ -943,9 +901,7 @@ mod tests {
         let txn = engine.begin_transaction().unwrap();
         let row_id = engine.generate_row_id("test");
 
-        engine
-            .insert(&txn, "test", row_id, b"hello world")
-            .unwrap();
+        engine.insert(&txn, "test", row_id, b"hello world").unwrap();
         let commit_ts = engine.commit(txn).unwrap();
 
         assert!(commit_ts > 0);
@@ -1008,9 +964,7 @@ mod tests {
         let txn = engine.begin_transaction().unwrap();
         let row_id = engine.generate_row_id("test");
 
-        engine
-            .insert(&txn, "test", row_id, b"hello world")
-            .unwrap();
+        engine.insert(&txn, "test", row_id, b"hello world").unwrap();
         engine.abort(txn).unwrap();
 
         let stats = engine.stats();
@@ -1052,12 +1006,7 @@ mod tests {
                         let txn = engine.begin_transaction().unwrap();
                         let row_id = engine.generate_row_id("test");
                         engine
-                            .insert(
-                                &txn,
-                                "test",
-                                row_id,
-                                format!("thread_{}_row_{}", t, i).as_bytes(),
-                            )
+                            .insert(&txn, "test", row_id, format!("thread_{}_row_{}", t, i).as_bytes())
                             .unwrap();
                         engine.commit(txn).unwrap();
                     }

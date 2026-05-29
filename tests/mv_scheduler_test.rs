@@ -9,12 +9,12 @@
 //! - Base table change triggers
 
 use heliosdb_nano::{
-    Config, EmbeddedDatabase, Schema, Column, DataType,
-    storage::{
-        MVScheduler, SchedulerConfig, Priority, CpuMonitor,
-        StorageEngine, MaterializedViewCatalog, MaterializedViewMetadata,
-    },
     sql::LogicalPlan,
+    storage::{
+        CpuMonitor, MVScheduler, MaterializedViewCatalog, MaterializedViewMetadata, Priority, SchedulerConfig,
+        StorageEngine,
+    },
+    Column, Config, DataType, EmbeddedDatabase, Schema,
 };
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,13 +51,19 @@ fn test_cpu_monitor() {
 
     // Test raw CPU usage
     let raw_usage = monitor.get_cpu_usage().unwrap();
-    assert!(raw_usage >= 0.0 && raw_usage <= 100.0,
-        "CPU usage should be between 0 and 100: {}", raw_usage);
+    assert!(
+        raw_usage >= 0.0 && raw_usage <= 100.0,
+        "CPU usage should be between 0 and 100: {}",
+        raw_usage
+    );
 
     // Test smoothed CPU usage
     let smoothed_usage = monitor.get_smoothed_cpu_usage().unwrap();
-    assert!(smoothed_usage >= 0.0 && smoothed_usage <= 100.0,
-        "Smoothed CPU usage should be between 0 and 100: {}", smoothed_usage);
+    assert!(
+        smoothed_usage >= 0.0 && smoothed_usage <= 100.0,
+        "Smoothed CPU usage should be between 0 and 100: {}",
+        smoothed_usage
+    );
 
     // Multiple calls should provide consistent results
     let usage2 = monitor.get_smoothed_cpu_usage().unwrap();
@@ -82,12 +88,10 @@ fn test_scheduler_config_validation() {
     assert!(config.auto_retry);
 
     // Test clamping
-    let config2 = SchedulerConfig::default()
-        .with_max_cpu_percent(150.0);  // Should clamp to 100
+    let config2 = SchedulerConfig::default().with_max_cpu_percent(150.0); // Should clamp to 100
     assert_eq!(config2.max_cpu_percent, 100.0);
 
-    let config3 = SchedulerConfig::default()
-        .with_max_cpu_percent(-10.0);  // Should clamp to 0
+    let config3 = SchedulerConfig::default().with_max_cpu_percent(-10.0); // Should clamp to 0
     assert_eq!(config3.max_cpu_percent, 0.0);
 }
 
@@ -166,8 +170,10 @@ fn test_on_base_table_change() {
 
     let stats = scheduler.get_stats();
     // Should schedule user_stats and combined_stats (2 MVs)
-    assert_eq!(stats.queue_size, 2,
-        "Should schedule 2 MVs that depend on 'users' table");
+    assert_eq!(
+        stats.queue_size, 2,
+        "Should schedule 2 MVs that depend on 'users' table"
+    );
 }
 
 #[test]
@@ -181,14 +187,15 @@ fn test_scheduler_with_max_concurrent_limit() {
     }
 
     // Create scheduler with max_concurrent = 2
-    let scheduler_config = SchedulerConfig::default()
-        .with_max_concurrent(2);
+    let scheduler_config = SchedulerConfig::default().with_max_concurrent(2);
 
     let scheduler = MVScheduler::new(scheduler_config, Arc::clone(&storage));
 
     // Schedule 10 MVs
     for i in 0..10 {
-        scheduler.schedule_refresh(&format!("mv{}", i), Priority::Normal).unwrap();
+        scheduler
+            .schedule_refresh(&format!("mv{}", i), Priority::Normal)
+            .unwrap();
     }
 
     let stats = scheduler.get_stats();
@@ -210,15 +217,15 @@ fn test_scheduler_batch_size() {
     }
 
     // Create scheduler with batch_size = 5
-    let scheduler_config = SchedulerConfig::default()
-        .with_batch_size(5)
-        .with_max_concurrent(10);
+    let scheduler_config = SchedulerConfig::default().with_batch_size(5).with_max_concurrent(10);
 
     let scheduler = MVScheduler::new(scheduler_config, Arc::clone(&storage));
 
     // Schedule 20 MVs
     for i in 0..20 {
-        scheduler.schedule_refresh(&format!("mv{}", i), Priority::Normal).unwrap();
+        scheduler
+            .schedule_refresh(&format!("mv{}", i), Priority::Normal)
+            .unwrap();
     }
 
     let stats = scheduler.get_stats();
@@ -236,8 +243,7 @@ fn test_priority_degradation_on_retry() {
     let mv_catalog = MaterializedViewCatalog::new(&storage);
     create_test_mv(&mv_catalog, "failing_mv");
 
-    let scheduler_config = SchedulerConfig::default()
-        .with_auto_retry(true);
+    let scheduler_config = SchedulerConfig::default().with_auto_retry(true);
 
     let scheduler = MVScheduler::new(scheduler_config, Arc::clone(&storage));
 
@@ -278,9 +284,7 @@ fn test_scheduler_clone() {
 // Helper functions
 
 fn create_test_mv(catalog: &MaterializedViewCatalog, mv_name: &str) {
-    let schema = Schema::new(vec![
-        Column::new("count", DataType::Int8),
-    ]);
+    let schema = Schema::new(vec![Column::new("count", DataType::Int8)]);
 
     let query_plan = LogicalPlan::Scan {
         alias: None,
@@ -303,14 +307,8 @@ fn create_test_mv(catalog: &MaterializedViewCatalog, mv_name: &str) {
     catalog.create_view(metadata).unwrap();
 }
 
-fn create_test_mv_with_base_tables(
-    catalog: &MaterializedViewCatalog,
-    mv_name: &str,
-    base_tables: Vec<&str>,
-) {
-    let schema = Schema::new(vec![
-        Column::new("count", DataType::Int8),
-    ]);
+fn create_test_mv_with_base_tables(catalog: &MaterializedViewCatalog, mv_name: &str, base_tables: Vec<&str>) {
+    let schema = Schema::new(vec![Column::new("count", DataType::Int8)]);
 
     let query_plan = LogicalPlan::Scan {
         alias: None,

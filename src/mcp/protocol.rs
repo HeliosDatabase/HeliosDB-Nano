@@ -164,9 +164,7 @@ pub enum ToolContent {
         mime_type: String,
     },
     #[serde(rename = "resource")]
-    Resource {
-        resource: ResourceReference,
-    },
+    Resource { resource: ResourceReference },
 }
 
 /// Resource reference

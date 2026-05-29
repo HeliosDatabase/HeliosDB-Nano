@@ -13,17 +13,17 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-mod openai;
 mod anthropic;
 mod azure;
-mod ollama;
 mod google;
+mod ollama;
+mod openai;
 
-pub use openai::OpenAiProvider;
 pub use anthropic::AnthropicProvider;
 pub use azure::AzureOpenAiProvider;
-pub use ollama::OllamaProvider;
 pub use google::GoogleProvider;
+pub use ollama::OllamaProvider;
+pub use openai::OpenAiProvider;
 
 /// LLM provider error
 #[derive(Debug, thiserror::Error)]
@@ -290,10 +290,7 @@ impl ProviderRegistry {
             "azure" => Ok(Arc::new(AzureOpenAiProvider::new(config)?)),
             "ollama" => Ok(Arc::new(OllamaProvider::new(config)?)),
             "google" | "gemini" => Ok(Arc::new(GoogleProvider::new(config)?)),
-            _ => Err(ProviderError::Config(format!(
-                "Unknown provider: {}",
-                config.provider
-            ))),
+            _ => Err(ProviderError::Config(format!("Unknown provider: {}", config.provider))),
         }
     }
 }

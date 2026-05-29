@@ -24,10 +24,9 @@
 use super::config::{FailoverConfig, WalStreamingConfig};
 use super::ha_state::{ha_state, StandbyInfo, StandbyState as HAStandbyState, SyncMode as HASyncMode};
 use super::transport::{
-    AckPayload, AckType, Capabilities, HandshakeRequest, HandshakeResponse,
-    HeartbeatPayload, HealthStatus, Message, MessageType, NodeRole, ReplicationConnection,
-    SyncModeConfig, WalBatchPayload, WalEntryPayload, WalEntryType as TransportWalEntryType,
-    WalRequestPayload, HEARTBEAT_INTERVAL,
+    AckPayload, AckType, Capabilities, HandshakeRequest, HandshakeResponse, HealthStatus, HeartbeatPayload, Message,
+    MessageType, NodeRole, ReplicationConnection, SyncModeConfig, WalBatchPayload, WalEntryPayload,
+    WalEntryType as TransportWalEntryType, WalRequestPayload, HEARTBEAT_INTERVAL,
 };
 use super::wal_replicator::{Lsn, WalEntry, WalEntryType};
 use super::wal_store::{BatchRequest, WalStore};
@@ -249,12 +248,7 @@ impl StreamingServer {
         let request: HandshakeRequest = bincode::deserialize(&msg.payload)
             .map_err(|e| ReplicationError::Transport(format!("Deserialize failed: {}", e)))?;
 
-        tracing::info!(
-            "Handshake from {:?} node {} at {}",
-            request.role,
-            request.node_id,
-            addr
-        );
+        tracing::info!("Handshake from {:?} node {} at {}", request.role, request.node_id, addr);
 
         // Build response - respect the standby's requested sync mode
         // Standby announces its desired mode; primary honors it
@@ -405,12 +399,21 @@ impl StreamingServer {
         standby_id: Uuid,
         msg: Message,
     ) -> Result<()> {
-        tracing::debug!("StreamingServer: Received message from standby {}: type={:?}", standby_id, msg.header.msg_type);
+        tracing::debug!(
+            "StreamingServer: Received message from standby {}: type={:?}",
+            standby_id,
+            msg.header.msg_type
+        );
         match msg.header.msg_type {
             MessageType::Ack => {
                 let ack: AckPayload = bincode::deserialize(&msg.payload)
                     .map_err(|e| ReplicationError::Transport(format!("Deserialize failed: {}", e)))?;
-                tracing::info!("StreamingServer: Received ACK from standby {} for LSN={} type={:?}", standby_id, ack.lsn, ack.ack_type);
+                tracing::info!(
+                    "StreamingServer: Received ACK from standby {} for LSN={} type={:?}",
+                    standby_id,
+                    ack.lsn,
+                    ack.ack_type
+                );
 
                 let mut standbys = standbys.write().await;
                 if let Some(standby) = standbys.get_mut(&standby_id) {
@@ -532,11 +535,7 @@ impl StreamingServer {
             );
 
             // Convert entries to transport format
-            let entry_payloads: Vec<WalEntryPayload> = batch
-                .entries
-                .iter()
-                .map(Self::wal_entry_to_payload)
-                .collect();
+            let entry_payloads: Vec<WalEntryPayload> = batch.entries.iter().map(Self::wal_entry_to_payload).collect();
 
             let batch_payload = WalBatchPayload {
                 start_lsn: batch.start_lsn,
@@ -622,11 +621,7 @@ impl StreamingServer {
 
                 let standbys = standbys.read().await;
                 for (_, standby) in standbys.iter() {
-                    let msg = Message::new(
-                        MessageType::Heartbeat,
-                        Bytes::from(payload.clone()),
-                        0,
-                    );
+                    let msg = Message::new(MessageType::Heartbeat, Bytes::from(payload.clone()), 0);
                     let _ = standby.msg_tx.send(msg).await;
                 }
             }
@@ -650,22 +645,21 @@ impl StreamingServer {
                 Ok(())
             }
             SyncModeConfig::SemiSync { min_acks, timeout_ms } => {
-                self.wait_for_acks(lsn, min_acks as usize, AckType::Received, timeout_ms).await
+                self.wait_for_acks(lsn, min_acks as usize, AckType::Received, timeout_ms)
+                    .await
             }
-            SyncModeConfig::Sync { min_applied, timeout_ms } => {
-                self.wait_for_acks(lsn, min_applied as usize, AckType::Applied, timeout_ms).await
+            SyncModeConfig::Sync {
+                min_applied,
+                timeout_ms,
+            } => {
+                self.wait_for_acks(lsn, min_applied as usize, AckType::Applied, timeout_ms)
+                    .await
             }
         }
     }
 
     /// Wait for specific number of ACKs of a given type
-    async fn wait_for_acks(
-        &self,
-        lsn: Lsn,
-        min_acks: usize,
-        ack_type: AckType,
-        timeout_ms: u32,
-    ) -> Result<()> {
+    async fn wait_for_acks(&self, lsn: Lsn, min_acks: usize, ack_type: AckType, timeout_ms: u32) -> Result<()> {
         let deadline = Instant::now() + Duration::from_millis(timeout_ms as u64);
 
         loop {
@@ -824,9 +818,7 @@ impl StreamingClient {
                         || current_state == StreamingClientState::CatchingUp;
 
                     if was_streaming || was_streaming_before {
-                        tracing::info!(
-                            "Connection lost after successful streaming - resetting reconnect counter"
-                        );
+                        tracing::info!("Connection lost after successful streaming - resetting reconnect counter");
                         reconnect_attempts = 0;
                     }
 
@@ -848,10 +840,7 @@ impl StreamingClient {
                     // Calculate exponential backoff delay
                     // delay = base_delay * 2^(attempts-1), capped at max_delay
                     let backoff_multiplier = 2u32.saturating_pow(reconnect_attempts.saturating_sub(1).min(6));
-                    let delay = std::cmp::min(
-                        base_delay.saturating_mul(backoff_multiplier),
-                        max_delay,
-                    );
+                    let delay = std::cmp::min(base_delay.saturating_mul(backoff_multiplier), max_delay);
 
                     if unlimited {
                         tracing::warn!(
@@ -893,11 +882,7 @@ impl StreamingClient {
         let mut shutdown_rx = self.shutdown_tx.subscribe();
 
         // Connect to primary
-        let mut conn = ReplicationConnection::connect(
-            self.config.primary_addr,
-            self.config.connect_timeout,
-        )
-        .await?;
+        let mut conn = ReplicationConnection::connect(self.config.primary_addr, self.config.connect_timeout).await?;
 
         // Send handshake
         *self.state.write().await = StreamingClientState::Handshaking;
@@ -989,14 +974,13 @@ impl StreamingClient {
     }
 
     /// Handle message from primary
-    async fn handle_primary_message(
-        &self,
-        conn: &mut ReplicationConnection,
-        msg: Message,
-    ) -> Result<()> {
+    async fn handle_primary_message(&self, conn: &mut ReplicationConnection, msg: Message) -> Result<()> {
         match msg.header.msg_type {
             MessageType::WalEntry => {
-                tracing::info!("StreamingClient: Received WalEntry message, payload_len={}", msg.payload.len());
+                tracing::info!(
+                    "StreamingClient: Received WalEntry message, payload_len={}",
+                    msg.payload.len()
+                );
                 let payload: WalEntryPayload = bincode::deserialize(&msg.payload)
                     .map_err(|e| ReplicationError::Transport(format!("Deserialize failed: {}", e)))?;
 
@@ -1034,7 +1018,8 @@ impl StreamingClient {
                 }
 
                 // ACK the batch
-                self.send_ack(conn, payload.end_lsn, AckType::Received, msg.header.sequence).await?;
+                self.send_ack(conn, payload.end_lsn, AckType::Received, msg.header.sequence)
+                    .await?;
 
                 if payload.is_final {
                     *self.state.write().await = StreamingClientState::Streaming;
@@ -1094,7 +1079,12 @@ impl StreamingClient {
         };
 
         tracing::debug!("send_ack called for LSN={} type={:?}", lsn, ack_type);
-        tracing::info!("StreamingClient: Sending ACK for LSN={} type={:?} seq={}", lsn, ack_type, sequence);
+        tracing::info!(
+            "StreamingClient: Sending ACK for LSN={} type={:?} seq={}",
+            lsn,
+            ack_type,
+            sequence
+        );
         let result = conn.send_ack(ack).await;
         tracing::debug!("send_ack result for LSN={}: {:?}", lsn, result.is_ok());
         match &result {
@@ -1114,7 +1104,7 @@ impl StreamingClient {
             node_id: self.config.node_id,
             role: NodeRole::Standby,
             current_lsn: flushed.max(applied), // Current position is max of flush and apply
-            flush_lsn: flushed,                 // Separately tracked flush position
+            flush_lsn: flushed,                // Separately tracked flush position
             apply_lsn: Some(applied),
             timestamp_ms: chrono::Utc::now().timestamp_millis() as u64,
             lag_bytes: primary.saturating_sub(flushed),
@@ -1217,18 +1207,42 @@ mod tests {
     #[test]
     fn test_ack_type_satisfies() {
         // Applied satisfies all
-        assert!(StreamingServer::ack_type_satisfies(&AckType::Applied, &AckType::Received));
-        assert!(StreamingServer::ack_type_satisfies(&AckType::Applied, &AckType::Written));
-        assert!(StreamingServer::ack_type_satisfies(&AckType::Applied, &AckType::Applied));
+        assert!(StreamingServer::ack_type_satisfies(
+            &AckType::Applied,
+            &AckType::Received
+        ));
+        assert!(StreamingServer::ack_type_satisfies(
+            &AckType::Applied,
+            &AckType::Written
+        ));
+        assert!(StreamingServer::ack_type_satisfies(
+            &AckType::Applied,
+            &AckType::Applied
+        ));
 
         // Written satisfies received and written
-        assert!(StreamingServer::ack_type_satisfies(&AckType::Written, &AckType::Received));
-        assert!(StreamingServer::ack_type_satisfies(&AckType::Written, &AckType::Written));
-        assert!(!StreamingServer::ack_type_satisfies(&AckType::Written, &AckType::Applied));
+        assert!(StreamingServer::ack_type_satisfies(
+            &AckType::Written,
+            &AckType::Received
+        ));
+        assert!(StreamingServer::ack_type_satisfies(
+            &AckType::Written,
+            &AckType::Written
+        ));
+        assert!(!StreamingServer::ack_type_satisfies(
+            &AckType::Written,
+            &AckType::Applied
+        ));
 
         // Received only satisfies received
-        assert!(StreamingServer::ack_type_satisfies(&AckType::Received, &AckType::Received));
-        assert!(!StreamingServer::ack_type_satisfies(&AckType::Received, &AckType::Written));
+        assert!(StreamingServer::ack_type_satisfies(
+            &AckType::Received,
+            &AckType::Received
+        ));
+        assert!(!StreamingServer::ack_type_satisfies(
+            &AckType::Received,
+            &AckType::Written
+        ));
     }
 
     #[test]

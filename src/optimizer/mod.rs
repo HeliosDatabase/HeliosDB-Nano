@@ -5,16 +5,16 @@
 //! The optimizer applies a series of transformation rules to logical query plans,
 //! producing equivalent but more efficient execution strategies.
 
-pub mod rules;
-pub mod planner;
 pub mod cost;
+pub mod planner;
+pub mod rules;
 
 use tracing::debug;
 
 use crate::sql::logical_plan::LogicalPlan;
 use crate::Result;
-use rules::{OptimizationRule, create_default_rules};
 use cost::{CostEstimator, StatsCatalog};
+use rules::{create_default_rules, OptimizationRule};
 
 /// Query optimizer configuration
 #[derive(Debug, Clone)]
@@ -95,11 +95,7 @@ impl Optimizer {
     }
 
     /// Create optimizer with custom rules
-    pub fn with_rules(
-        stats: StatsCatalog,
-        rules: Vec<Box<dyn OptimizationRule>>,
-        config: OptimizerConfig,
-    ) -> Self {
+    pub fn with_rules(stats: StatsCatalog, rules: Vec<Box<dyn OptimizationRule>>, config: OptimizerConfig) -> Self {
         Self {
             rules,
             cost_estimator: CostEstimator::new(stats),
@@ -127,8 +123,7 @@ impl Optimizer {
         let mut pass_count = 0;
 
         // Calculate initial cost for comparison
-        let initial_cost = self.cost_estimator.estimate_cost(&current_plan)
-            .unwrap_or(f64::MAX);
+        let initial_cost = self.cost_estimator.estimate_cost(&current_plan).unwrap_or(f64::MAX);
 
         if self.config.verbose {
             debug!("=== Query Optimizer ===");
@@ -167,20 +162,13 @@ impl Optimizer {
                 match rule.apply(current_plan.clone(), &self.cost_estimator) {
                     Ok(Some(new_plan)) => {
                         // Calculate cost of new plan
-                        let new_cost = self.cost_estimator.estimate_cost(&new_plan)
-                            .unwrap_or(f64::MAX);
-                        let old_cost = self.cost_estimator.estimate_cost(&current_plan)
-                            .unwrap_or(f64::MAX);
+                        let new_cost = self.cost_estimator.estimate_cost(&new_plan).unwrap_or(f64::MAX);
+                        let old_cost = self.cost_estimator.estimate_cost(&current_plan).unwrap_or(f64::MAX);
 
                         // Only accept if cost improved or stayed the same
                         if new_cost <= old_cost {
                             if self.config.verbose {
-                                debug!(
-                                    "  Applied {}: cost {:.2} -> {:.2}",
-                                    rule.name(),
-                                    old_cost,
-                                    new_cost
-                                );
+                                debug!("  Applied {}: cost {:.2} -> {:.2}", rule.name(), old_cost, new_cost);
                             }
                             current_plan = new_plan;
                             plan_changed = true;
@@ -215,8 +203,7 @@ impl Optimizer {
         }
 
         // Calculate final cost
-        let final_cost = self.cost_estimator.estimate_cost(&current_plan)
-            .unwrap_or(f64::MAX);
+        let final_cost = self.cost_estimator.estimate_cost(&current_plan).unwrap_or(f64::MAX);
 
         if self.config.verbose {
             let improvement = if initial_cost > 0.0 {
@@ -249,7 +236,13 @@ impl Optimizer {
                     predicate,
                 }
             }
-            LogicalPlan::Project { input, exprs, aliases, distinct, distinct_on } => {
+            LogicalPlan::Project {
+                input,
+                exprs,
+                aliases,
+                distinct,
+                distinct_on,
+            } => {
                 let optimized_input = self.optimize_recursive(*input)?;
                 LogicalPlan::Project {
                     input: Box::new(optimized_input),
@@ -259,7 +252,13 @@ impl Optimizer {
                     distinct_on,
                 }
             }
-            LogicalPlan::Join { left, right, join_type, on, lateral } => {
+            LogicalPlan::Join {
+                left,
+                right,
+                join_type,
+                on,
+                lateral,
+            } => {
                 let optimized_left = self.optimize_recursive(*left)?;
                 let optimized_right = self.optimize_recursive(*right)?;
                 LogicalPlan::Join {
@@ -270,7 +269,12 @@ impl Optimizer {
                     lateral,
                 }
             }
-            LogicalPlan::Aggregate { input, group_by, aggr_exprs, having } => {
+            LogicalPlan::Aggregate {
+                input,
+                group_by,
+                aggr_exprs,
+                having,
+            } => {
                 let optimized_input = self.optimize_recursive(*input)?;
                 LogicalPlan::Aggregate {
                     input: Box::new(optimized_input),
@@ -287,7 +291,13 @@ impl Optimizer {
                     asc,
                 }
             }
-            LogicalPlan::Limit { input, limit, offset, limit_param, offset_param } => {
+            LogicalPlan::Limit {
+                input,
+                limit,
+                offset,
+                limit_param,
+                offset_param,
+            } => {
                 let optimized_input = self.optimize_recursive(*input)?;
                 LogicalPlan::Limit {
                     input: Box::new(optimized_input),
@@ -298,7 +308,12 @@ impl Optimizer {
                 }
             }
             // InsertSelect - optimize the source sub-plan
-            LogicalPlan::InsertSelect { table_name, columns, source, returning } => {
+            LogicalPlan::InsertSelect {
+                table_name,
+                columns,
+                source,
+                returning,
+            } => {
                 let optimized_source = self.optimize_recursive(*source)?;
                 LogicalPlan::InsertSelect {
                     table_name,
@@ -326,8 +341,7 @@ impl Optimizer {
         explanation.push_str("Query Optimization Analysis\n");
         explanation.push_str("===========================\n\n");
 
-        let initial_cost = self.cost_estimator.estimate_cost(&current_plan)
-            .unwrap_or(f64::MAX);
+        let initial_cost = self.cost_estimator.estimate_cost(&current_plan).unwrap_or(f64::MAX);
         explanation.push_str(&format!("Initial estimated cost: {:.2}\n\n", initial_cost));
 
         while pass_count < self.config.max_passes {
@@ -343,10 +357,8 @@ impl Optimizer {
 
                 match rule.apply(current_plan.clone(), &self.cost_estimator) {
                     Ok(Some(new_plan)) => {
-                        let new_cost = self.cost_estimator.estimate_cost(&new_plan)
-                            .unwrap_or(f64::MAX);
-                        let old_cost = self.cost_estimator.estimate_cost(&current_plan)
-                            .unwrap_or(f64::MAX);
+                        let new_cost = self.cost_estimator.estimate_cost(&new_plan).unwrap_or(f64::MAX);
+                        let old_cost = self.cost_estimator.estimate_cost(&current_plan).unwrap_or(f64::MAX);
 
                         if new_cost <= old_cost {
                             explanation.push_str(&format!(
@@ -375,8 +387,7 @@ impl Optimizer {
             explanation.push('\n');
         }
 
-        let final_cost = self.cost_estimator.estimate_cost(&current_plan)
-            .unwrap_or(f64::MAX);
+        let final_cost = self.cost_estimator.estimate_cost(&current_plan).unwrap_or(f64::MAX);
         let improvement = if initial_cost > 0.0 {
             ((initial_cost - final_cost) / initial_cost) * 100.0
         } else {
@@ -396,7 +407,7 @@ impl Optimizer {
 mod tests {
     use super::*;
     use crate::sql::logical_plan::*;
-    use crate::{Schema, Column, DataType, Value};
+    use crate::{Column, DataType, Schema, Value};
     use cost::{StatsCatalog, TableStats};
     use std::sync::Arc;
 
@@ -410,9 +421,9 @@ mod tests {
                     primary_key: true,
                     source_table: None,
                     source_table_name: None,
-                default_expr: None,
-                unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
                 Column {
                     name: "name".to_string(),
@@ -421,9 +432,9 @@ mod tests {
                     primary_key: false,
                     source_table: None,
                     source_table_name: None,
-                default_expr: None,
-                unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
                 Column {
                     name: "age".to_string(),
@@ -432,9 +443,9 @@ mod tests {
                     primary_key: false,
                     source_table: None,
                     source_table_name: None,
-                default_expr: None,
-                unique: false,
-                storage_mode: crate::ColumnStorageMode::Default,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
                 },
             ],
         })
@@ -446,7 +457,7 @@ mod tests {
         stats_catalog.add_table_stats(
             TableStats::new("users".to_string())
                 .with_row_count(1000)
-                .with_avg_row_size(256)
+                .with_avg_row_size(256),
         );
 
         let optimizer = Optimizer::new(stats_catalog);
@@ -470,7 +481,7 @@ mod tests {
         stats_catalog.add_table_stats(
             TableStats::new("users".to_string())
                 .with_row_count(1000)
-                .with_avg_row_size(256)
+                .with_avg_row_size(256),
         );
 
         let config = OptimizerConfig::new().with_verbose(false);
@@ -489,7 +500,10 @@ mod tests {
         let filter = LogicalPlan::Filter {
             input: Box::new(scan),
             predicate: LogicalExpr::BinaryExpr {
-                left: Box::new(LogicalExpr::Column { table: None, name: "id".to_string()  }),
+                left: Box::new(LogicalExpr::Column {
+                    table: None,
+                    name: "id".to_string(),
+                }),
                 op: BinaryOperator::Eq,
                 right: Box::new(LogicalExpr::Literal(Value::Int4(1))),
             },
@@ -544,7 +558,7 @@ mod tests {
         stats_catalog.add_table_stats(
             TableStats::new("users".to_string())
                 .with_row_count(1000)
-                .with_avg_row_size(256)
+                .with_avg_row_size(256),
         );
 
         let optimizer = Optimizer::new(stats_catalog);

@@ -20,10 +20,12 @@ fn register_then_parse_via_db_handle() {
     // Register tree-sitter-rust under a custom name so we can confirm
     // the dynamic dispatch path is what's resolving the parse.
     let prior = db.register_grammar("custom_rust", tree_sitter_rust::LANGUAGE.into());
-    assert!(prior.is_none(), "fresh registration should not return an existing entry");
+    assert!(
+        prior.is_none(),
+        "fresh registration should not return an existing entry"
+    );
 
-    let tree = parse_by_name("custom_rust", "fn main() { let x = 1; }")
-        .expect("registered grammar parses");
+    let tree = parse_by_name("custom_rust", "fn main() { let x = 1; }").expect("registered grammar parses");
     assert_eq!(tree.root_node().kind(), "source_file");
 
     let names = db.registered_grammars();
@@ -63,9 +65,6 @@ fn parse_by_name_unknown_errors_with_useful_message() {
     let _db = EmbeddedDatabase::new_in_memory().expect("db");
     let err = parse_by_name("hypothetical_grammar_xyz", "data").expect_err("must error");
     let msg = err.to_string();
-    assert!(
-        msg.contains("no tree-sitter grammar registered"),
-        "got: {msg}"
-    );
+    assert!(msg.contains("no tree-sitter grammar registered"), "got: {msg}");
     assert!(msg.contains("register_grammar"), "should mention API: {msg}");
 }

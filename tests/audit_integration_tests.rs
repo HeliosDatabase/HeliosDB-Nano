@@ -7,7 +7,7 @@
 //! - Event metadata handling
 //! - Tamper detection via checksums
 
-use heliosdb_nano::audit::{AuditEvent, OperationType, AuditMetadata};
+use heliosdb_nano::audit::{AuditEvent, AuditMetadata, OperationType};
 
 #[test]
 fn test_audit_event_creation() {
@@ -79,10 +79,7 @@ fn test_audit_event_checksum_tamper_detection() {
     event.affected_rows = 999;
 
     // Checksum should now be invalid
-    assert!(
-        !event.verify_checksum(),
-        "Checksum should detect tampering"
-    );
+    assert!(!event.verify_checksum(), "Checksum should detect tampering");
 }
 
 #[test]
@@ -157,14 +154,8 @@ fn test_operation_type_from_sql_transaction() {
         OperationType::from_sql_statement("BEGIN TRANSACTION"),
         OperationType::Begin
     );
-    assert_eq!(
-        OperationType::from_sql_statement("COMMIT"),
-        OperationType::Commit
-    );
-    assert_eq!(
-        OperationType::from_sql_statement("ROLLBACK"),
-        OperationType::Rollback
-    );
+    assert_eq!(OperationType::from_sql_statement("COMMIT"), OperationType::Commit);
+    assert_eq!(OperationType::from_sql_statement("ROLLBACK"), OperationType::Rollback);
 }
 
 #[test]
@@ -266,14 +257,8 @@ fn test_audit_metadata_custom_fields() {
         custom_fields,
     };
 
-    assert_eq!(
-        metadata.custom_fields.get("request_id"),
-        Some(&"req-12345".to_string())
-    );
-    assert_eq!(
-        metadata.custom_fields.get("api_version"),
-        Some(&"v2".to_string())
-    );
+    assert_eq!(metadata.custom_fields.get("request_id"), Some(&"req-12345".to_string()));
+    assert_eq!(metadata.custom_fields.get("api_version"), Some(&"v2".to_string()));
 }
 
 #[test]
@@ -371,8 +356,7 @@ fn test_audit_event_serialization() {
     assert!(json.contains("session-ser"));
 
     // Deserialize back
-    let deserialized: AuditEvent = serde_json::from_str(&json)
-        .expect("Deserialization failed");
+    let deserialized: AuditEvent = serde_json::from_str(&json).expect("Deserialization failed");
 
     assert_eq!(deserialized.id, event.id);
     assert_eq!(deserialized.session_id, event.session_id);
@@ -425,11 +409,10 @@ fn test_audit_event_special_characters() {
 
 #[test]
 fn test_audit_initialization() {
-    use heliosdb_nano::{Config, storage::StorageEngine};
+    use heliosdb_nano::{storage::StorageEngine, Config};
 
     let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config)
-        .expect("Failed to create storage engine");
+    let storage = StorageEngine::open_in_memory(&config).expect("Failed to create storage engine");
 
     // Initialize audit tables
     let result = heliosdb_nano::audit::initialize_audit_tables(&storage);
@@ -450,11 +433,10 @@ fn test_audit_initialization() {
 
 #[test]
 fn test_audit_initialization_idempotent() {
-    use heliosdb_nano::{Config, storage::StorageEngine};
+    use heliosdb_nano::{storage::StorageEngine, Config};
 
     let config = Config::in_memory();
-    let storage = StorageEngine::open_in_memory(&config)
-        .expect("Failed to create storage engine");
+    let storage = StorageEngine::open_in_memory(&config).expect("Failed to create storage engine");
 
     // Initialize twice
     let result1 = heliosdb_nano::audit::initialize_audit_tables(&storage);

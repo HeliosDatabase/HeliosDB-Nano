@@ -19,11 +19,11 @@
 #![allow(dead_code)]
 #![allow(unused_variables)]
 
-use crate::storage::{StorageEngine, BranchManager};
+use crate::storage::{BranchManager, StorageEngine};
 use crate::Result;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 // ============================================================================
 // Time-Travel Diff Target Types
@@ -41,15 +41,9 @@ pub enum DiffTarget {
     /// Current state of a branch
     Branch(String),
     /// Branch at a specific LSN (Transaction ID)
-    BranchAtLsn {
-        branch: String,
-        lsn: u64,
-    },
+    BranchAtLsn { branch: String, lsn: u64 },
     /// Branch at a specific SCN (System Change Number)
-    BranchAtScn {
-        branch: String,
-        scn: u64,
-    },
+    BranchAtScn { branch: String, scn: u64 },
     /// Specific LSN on the current/default branch
     Lsn(u64),
     /// Specific SCN on the current/default branch
@@ -77,13 +71,15 @@ impl DiffTarget {
 
         // Check for @lsn: or @scn: prefix (no branch specified)
         if let Some(rest) = input.strip_prefix("@lsn:") {
-            let lsn = rest.parse::<u64>()
+            let lsn = rest
+                .parse::<u64>()
                 .map_err(|_| crate::Error::query_execution(format!("Invalid LSN: {}", rest)))?;
             return Ok(DiffTarget::Lsn(lsn));
         }
 
         if let Some(rest) = input.strip_prefix("@scn:") {
-            let scn = rest.parse::<u64>()
+            let scn = rest
+                .parse::<u64>()
                 .map_err(|_| crate::Error::query_execution(format!("Invalid SCN: {}", rest)))?;
             return Ok(DiffTarget::Scn(scn));
         }
@@ -94,20 +90,23 @@ impl DiffTarget {
             let qualifier = &input[at_pos + 1..];
 
             if let Some(lsn_str) = qualifier.strip_prefix("lsn:") {
-                let lsn = lsn_str.parse::<u64>()
+                let lsn = lsn_str
+                    .parse::<u64>()
                     .map_err(|_| crate::Error::query_execution(format!("Invalid LSN: {}", lsn_str)))?;
                 return Ok(DiffTarget::BranchAtLsn { branch, lsn });
             }
 
             if let Some(scn_str) = qualifier.strip_prefix("scn:") {
-                let scn = scn_str.parse::<u64>()
+                let scn = scn_str
+                    .parse::<u64>()
                     .map_err(|_| crate::Error::query_execution(format!("Invalid SCN: {}", scn_str)))?;
                 return Ok(DiffTarget::BranchAtScn { branch, scn });
             }
 
-            return Err(crate::Error::query_execution(
-                format!("Invalid diff target qualifier: {}. Use @lsn:N or @scn:N", qualifier)
-            ));
+            return Err(crate::Error::query_execution(format!(
+                "Invalid diff target qualifier: {}. Use @lsn:N or @scn:N",
+                qualifier
+            )));
         }
 
         // Plain branch name
@@ -198,16 +197,28 @@ impl DiffSpec {
     /// Create an LSN-to-LSN diff within the same branch
     pub fn lsn_range(branch: &str, from_lsn: u64, to_lsn: u64) -> Self {
         Self::new(
-            DiffTarget::BranchAtLsn { branch: branch.to_string(), lsn: from_lsn },
-            DiffTarget::BranchAtLsn { branch: branch.to_string(), lsn: to_lsn },
+            DiffTarget::BranchAtLsn {
+                branch: branch.to_string(),
+                lsn: from_lsn,
+            },
+            DiffTarget::BranchAtLsn {
+                branch: branch.to_string(),
+                lsn: to_lsn,
+            },
         )
     }
 
     /// Create an SCN-to-SCN diff within the same branch
     pub fn scn_range(branch: &str, from_scn: u64, to_scn: u64) -> Self {
         Self::new(
-            DiffTarget::BranchAtScn { branch: branch.to_string(), scn: from_scn },
-            DiffTarget::BranchAtScn { branch: branch.to_string(), scn: to_scn },
+            DiffTarget::BranchAtScn {
+                branch: branch.to_string(),
+                scn: from_scn,
+            },
+            DiffTarget::BranchAtScn {
+                branch: branch.to_string(),
+                scn: to_scn,
+            },
         )
     }
 
@@ -230,9 +241,10 @@ impl DiffSpec {
             return Ok(Self::new(source, target));
         }
 
-        Err(crate::Error::query_execution(
-            format!("Invalid diff spec: {}. Use format 'source..target'", input)
-        ))
+        Err(crate::Error::query_execution(format!(
+            "Invalid diff spec: {}. Use format 'source..target'",
+            input
+        )))
     }
 
     /// Check if this is a same-branch time-travel diff
@@ -544,7 +556,8 @@ impl<'a> DiffEngine<'a> {
             let catalog = storage.catalog();
             for table_diff in &schema.table_diffs {
                 if table_diff.change_type != SchemaChangeType::Removed {
-                    let count = catalog.get_table_statistics(&table_diff.table_name)
+                    let count = catalog
+                        .get_table_statistics(&table_diff.table_name)
                         .ok()
                         .flatten()
                         .map(|s| s.row_count)
@@ -595,7 +608,9 @@ impl<'a> DiffEngine<'a> {
         let tables_to_diff: Vec<String> = if let Some(specific_tables) = tables {
             specific_tables.to_vec()
         } else {
-            schema.table_diffs.iter()
+            schema
+                .table_diffs
+                .iter()
                 .filter(|d| d.change_type != SchemaChangeType::Removed)
                 .map(|d| d.table_name.clone())
                 .collect()
@@ -644,19 +659,17 @@ impl<'a> DiffEngine<'a> {
                 (None, Some(counts))
             }
             DiffLevel::Full => {
-                let (changes, counts) = self.get_full_diff_for_targets(
-                    &spec.source,
-                    &spec.target,
-                    spec.tables.as_deref(),
-                    &schema_diff,
-                )?;
+                let (changes, counts) =
+                    self.get_full_diff_for_targets(&spec.source, &spec.target, spec.tables.as_deref(), &schema_diff)?;
                 (Some(changes), Some(counts))
             }
         };
 
         // Calculate stats
         let mut stats = DiffStats::default();
-        stats.tables_changed = schema_diff.table_diffs.iter()
+        stats.tables_changed = schema_diff
+            .table_diffs
+            .iter()
             .filter(|t| t.change_type != SchemaChangeType::Unchanged)
             .count();
 
@@ -689,13 +702,7 @@ impl<'a> DiffEngine<'a> {
     /// // Compare branch 'main' at LSN 100 vs LSN 200
     /// let diff = engine.diff_lsn("main", 100, 200, DiffLevel::Full)?;
     /// ```
-    pub fn diff_lsn(
-        &self,
-        branch: &str,
-        from_lsn: u64,
-        to_lsn: u64,
-        level: DiffLevel,
-    ) -> Result<TimeTravelDiff> {
+    pub fn diff_lsn(&self, branch: &str, from_lsn: u64, to_lsn: u64, level: DiffLevel) -> Result<TimeTravelDiff> {
         let spec = DiffSpec::lsn_range(branch, from_lsn, to_lsn);
         self.diff_with_spec(&spec, level)
     }
@@ -710,13 +717,7 @@ impl<'a> DiffEngine<'a> {
     /// // Compare branch 'main' at SCN 10 vs SCN 20
     /// let diff = engine.diff_scn("main", 10, 20, DiffLevel::Full)?;
     /// ```
-    pub fn diff_scn(
-        &self,
-        branch: &str,
-        from_scn: u64,
-        to_scn: u64,
-        level: DiffLevel,
-    ) -> Result<TimeTravelDiff> {
+    pub fn diff_scn(&self, branch: &str, from_scn: u64, to_scn: u64, level: DiffLevel) -> Result<TimeTravelDiff> {
         let spec = DiffSpec::scn_range(branch, from_scn, to_scn);
         self.diff_with_spec(&spec, level)
     }
@@ -730,12 +731,7 @@ impl<'a> DiffEngine<'a> {
     /// let target = DiffTarget::BranchAtScn { branch: "feature".to_string(), scn: 50 };
     /// let diff = engine.diff_targets(source, target, DiffLevel::Full)?;
     /// ```
-    pub fn diff_targets(
-        &self,
-        source: DiffTarget,
-        target: DiffTarget,
-        level: DiffLevel,
-    ) -> Result<TimeTravelDiff> {
+    pub fn diff_targets(&self, source: DiffTarget, target: DiffTarget, level: DiffLevel) -> Result<TimeTravelDiff> {
         let spec = DiffSpec::new(source, target);
         self.diff_with_spec(&spec, level)
     }
@@ -770,7 +766,8 @@ impl<'a> DiffEngine<'a> {
             let catalog = storage.catalog();
             for table_diff in &schema.table_diffs {
                 if table_diff.change_type != SchemaChangeType::Removed {
-                    let count = catalog.get_table_statistics(&table_diff.table_name)
+                    let count = catalog
+                        .get_table_statistics(&table_diff.table_name)
                         .ok()
                         .flatten()
                         .map(|s| s.row_count)
@@ -804,7 +801,9 @@ impl<'a> DiffEngine<'a> {
         let tables_to_diff: Vec<String> = if let Some(specific) = tables {
             specific.to_vec()
         } else {
-            schema.table_diffs.iter()
+            schema
+                .table_diffs
+                .iter()
                 .filter(|d| d.change_type != SchemaChangeType::Removed)
                 .map(|d| d.table_name.clone())
                 .collect()
@@ -819,7 +818,8 @@ impl<'a> DiffEngine<'a> {
             let target_ts = self.resolve_target_timestamp(target)?;
 
             for table_name in tables_to_diff {
-                let count = catalog.get_table_statistics(&table_name)
+                let count = catalog
+                    .get_table_statistics(&table_name)
                     .ok()
                     .flatten()
                     .map(|s| s.row_count)
@@ -869,12 +869,7 @@ impl<'a> DiffEngine<'a> {
     }
 
     /// Internal: Diff table data between two timestamps
-    fn diff_table_data(
-        &self,
-        table_name: &str,
-        source_ts: u64,
-        target_ts: u64,
-    ) -> Result<TableDataDiff> {
+    fn diff_table_data(&self, table_name: &str, source_ts: u64, target_ts: u64) -> Result<TableDataDiff> {
         let mut added_rows = Vec::new();
         let mut removed_rows = Vec::new();
 
@@ -901,9 +896,7 @@ impl<'a> DiffEngine<'a> {
             // Group by row_id and determine changes
             let mut row_versions: HashMap<u64, Vec<(u64, Vec<u8>)>> = HashMap::new();
             for (row_id, ts, data) in versions {
-                row_versions.entry(row_id)
-                    .or_default()
-                    .push((ts, data));
+                row_versions.entry(row_id).or_default().push((ts, data));
             }
 
             // For each row, determine if it was added or removed
@@ -912,16 +905,15 @@ impl<'a> DiffEngine<'a> {
                 let has_target = versions.iter().any(|(ts, _)| *ts <= target_ts);
 
                 // Get latest version data for JSON output
-                let latest_data = versions.iter()
-                    .max_by_key(|(ts, _)| *ts)
-                    .map(|(_, data)| data);
+                let latest_data = versions.iter().max_by_key(|(ts, _)| *ts).map(|(_, data)| data);
 
                 if let Some(data) = latest_data {
-                    let json_value = serde_json::from_slice::<serde_json::Value>(data)
-                        .unwrap_or_else(|_| serde_json::json!({
+                    let json_value = serde_json::from_slice::<serde_json::Value>(data).unwrap_or_else(|_| {
+                        serde_json::json!({
                             "row_id": row_id,
                             "data": "<binary>"
-                        }));
+                        })
+                    });
 
                     if has_target && !has_source {
                         added_rows.push(json_value);
@@ -983,10 +975,7 @@ impl<'a> DiffEngine<'a> {
         // Stats
         output.push_str(&format!(
             "\n-- Stats: {} tables changed, +{} rows, -{} rows ({} ms)\n",
-            diff.stats.tables_changed,
-            diff.stats.rows_added,
-            diff.stats.rows_removed,
-            diff.stats.duration_ms
+            diff.stats.tables_changed, diff.stats.rows_added, diff.stats.rows_removed, diff.stats.duration_ms
         ));
 
         output
@@ -1025,10 +1014,7 @@ impl<'a> DiffEngine<'a> {
                         table_change.added_rows.len(),
                         table_change.table_name
                     ));
-                    output.push_str(&format!(
-                        "-- INSERT INTO {} VALUES (...);\n",
-                        table_change.table_name
-                    ));
+                    output.push_str(&format!("-- INSERT INTO {} VALUES (...);\n", table_change.table_name));
                 }
             }
         }
@@ -1047,10 +1033,7 @@ impl<'a> DiffEngine<'a> {
 
     fn format_unified(&self, diff: &SchemaDiff) -> String {
         let mut output = String::new();
-        output.push_str(&format!(
-            "--- {}\n+++ {}\n",
-            diff.source_branch, diff.target_branch
-        ));
+        output.push_str(&format!("--- {}\n+++ {}\n", diff.source_branch, diff.target_branch));
 
         for table_diff in &diff.table_diffs {
             match table_diff.change_type {
@@ -1099,7 +1082,9 @@ impl<'a> DiffEngine<'a> {
                 SchemaChangeType::Added => {
                     // Generate CREATE TABLE statement from column changes
                     output.push_str(&format!("CREATE TABLE {} (\n", table_diff.table_name));
-                    let columns: Vec<String> = table_diff.column_changes.iter()
+                    let columns: Vec<String> = table_diff
+                        .column_changes
+                        .iter()
                         .filter(|c| matches!(c.change_type, SchemaChangeType::Added))
                         .map(|c| {
                             let col_type = c.new_type.as_deref().unwrap_or("TEXT");
@@ -1177,19 +1162,25 @@ mod tests {
     #[test]
     fn test_diff_target_parse_branch_at_lsn() {
         let target = DiffTarget::parse("feature@lsn:100").unwrap();
-        assert_eq!(target, DiffTarget::BranchAtLsn {
-            branch: "feature".to_string(),
-            lsn: 100,
-        });
+        assert_eq!(
+            target,
+            DiffTarget::BranchAtLsn {
+                branch: "feature".to_string(),
+                lsn: 100,
+            }
+        );
     }
 
     #[test]
     fn test_diff_target_parse_branch_at_scn() {
         let target = DiffTarget::parse("main@scn:50").unwrap();
-        assert_eq!(target, DiffTarget::BranchAtScn {
-            branch: "main".to_string(),
-            scn: 50,
-        });
+        assert_eq!(
+            target,
+            DiffTarget::BranchAtScn {
+                branch: "main".to_string(),
+                scn: 50,
+            }
+        );
     }
 
     #[test]
@@ -1217,11 +1208,19 @@ mod tests {
     fn test_diff_target_display() {
         assert_eq!(DiffTarget::Branch("main".to_string()).display(), "main");
         assert_eq!(
-            DiffTarget::BranchAtLsn { branch: "dev".to_string(), lsn: 100 }.display(),
+            DiffTarget::BranchAtLsn {
+                branch: "dev".to_string(),
+                lsn: 100
+            }
+            .display(),
             "dev@lsn:100"
         );
         assert_eq!(
-            DiffTarget::BranchAtScn { branch: "prod".to_string(), scn: 50 }.display(),
+            DiffTarget::BranchAtScn {
+                branch: "prod".to_string(),
+                scn: 50
+            }
+            .display(),
             "prod@scn:50"
         );
         assert_eq!(DiffTarget::Lsn(200).display(), "@lsn:200");
@@ -1244,14 +1243,20 @@ mod tests {
     fn test_diff_spec_parse_with_lsn() {
         let spec = DiffSpec::parse("main@lsn:10..main@lsn:20").unwrap();
         assert!(spec.is_same_branch_diff());
-        assert_eq!(spec.source, DiffTarget::BranchAtLsn {
-            branch: "main".to_string(),
-            lsn: 10,
-        });
-        assert_eq!(spec.target, DiffTarget::BranchAtLsn {
-            branch: "main".to_string(),
-            lsn: 20,
-        });
+        assert_eq!(
+            spec.source,
+            DiffTarget::BranchAtLsn {
+                branch: "main".to_string(),
+                lsn: 10,
+            }
+        );
+        assert_eq!(
+            spec.target,
+            DiffTarget::BranchAtLsn {
+                branch: "main".to_string(),
+                lsn: 20,
+            }
+        );
     }
 
     #[test]

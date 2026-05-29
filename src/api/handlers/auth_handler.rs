@@ -12,10 +12,7 @@ use axum::{
 use tracing::{info, warn};
 
 use crate::api::{
-    auth_bridge::{
-        AuthError, AuthSession, AuthUser, LogoutRequest, RefreshRequest, SignInRequest,
-        SignUpRequest,
-    },
+    auth_bridge::{AuthError, AuthSession, AuthUser, LogoutRequest, RefreshRequest, SignInRequest, SignUpRequest},
     models::ApiError,
     server::AppState,
 };
@@ -29,8 +26,12 @@ fn map_auth_err(e: AuthError) -> ApiError {
     let status = match e.error.as_str() {
         "validation_failed" | "weak_password" => StatusCode::BAD_REQUEST,
         "user_already_exists" => StatusCode::CONFLICT,
-        "invalid_credentials" | "invalid_token" | "token_expired" | "token_error"
-        | "invalid_signature" | "token_revoked" => StatusCode::UNAUTHORIZED,
+        "invalid_credentials"
+        | "invalid_token"
+        | "token_expired"
+        | "token_error"
+        | "invalid_signature"
+        | "token_revoked" => StatusCode::UNAUTHORIZED,
         "invalid_refresh_token" => StatusCode::UNAUTHORIZED,
         "user_not_found" => StatusCode::NOT_FOUND,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -60,10 +61,13 @@ pub async fn signup(
 ) -> Result<Json<AuthSession>, ApiError> {
     info!("Auth signup request for email: {}", body.email);
 
-    let auth = state
-        .auth_bridge
-        .as_ref()
-        .ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "auth_not_enabled", "Auth service is not configured"))?;
+    let auth = state.auth_bridge.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auth_not_enabled",
+            "Auth service is not configured",
+        )
+    })?;
 
     let session = auth.sign_up(&body.email, &body.password).map_err(|e| {
         warn!("Signup failed for {}: {}", body.email, e);
@@ -83,10 +87,13 @@ pub async fn signin(
 ) -> Result<Json<AuthSession>, ApiError> {
     info!("Auth signin request for email: {}", body.email);
 
-    let auth = state
-        .auth_bridge
-        .as_ref()
-        .ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "auth_not_enabled", "Auth service is not configured"))?;
+    let auth = state.auth_bridge.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auth_not_enabled",
+            "Auth service is not configured",
+        )
+    })?;
 
     let session = auth.sign_in(&body.email, &body.password).map_err(|e| {
         warn!("Signin failed for {}: {}", body.email, e);
@@ -100,14 +107,14 @@ pub async fn signin(
 /// `POST /auth/logout`
 ///
 /// Revoke the given refresh token.
-pub async fn logout(
-    State(state): State<AppState>,
-    Json(body): Json<LogoutRequest>,
-) -> Result<StatusCode, ApiError> {
-    let auth = state
-        .auth_bridge
-        .as_ref()
-        .ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "auth_not_enabled", "Auth service is not configured"))?;
+pub async fn logout(State(state): State<AppState>, Json(body): Json<LogoutRequest>) -> Result<StatusCode, ApiError> {
+    let auth = state.auth_bridge.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auth_not_enabled",
+            "Auth service is not configured",
+        )
+    })?;
 
     auth.sign_out(&body.refresh_token).map_err(|e| {
         warn!("Logout failed: {}", e);
@@ -125,10 +132,13 @@ pub async fn refresh(
     State(state): State<AppState>,
     Json(body): Json<RefreshRequest>,
 ) -> Result<Json<AuthSession>, ApiError> {
-    let auth = state
-        .auth_bridge
-        .as_ref()
-        .ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "auth_not_enabled", "Auth service is not configured"))?;
+    let auth = state.auth_bridge.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auth_not_enabled",
+            "Auth service is not configured",
+        )
+    })?;
 
     let session = auth.refresh(&body.refresh_token).map_err(|e| {
         warn!("Token refresh failed: {}", e);
@@ -142,18 +152,17 @@ pub async fn refresh(
 /// `GET /auth/user`
 ///
 /// Return the authenticated user from the `Authorization: Bearer <token>` header.
-pub async fn get_user(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Result<Json<AuthUser>, ApiError> {
-    let auth = state
-        .auth_bridge
-        .as_ref()
-        .ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "auth_not_enabled", "Auth service is not configured"))?;
-
-    let token = extract_bearer(&headers).ok_or_else(|| {
-        ApiError::unauthorized("Missing or invalid Authorization header")
+pub async fn get_user(State(state): State<AppState>, headers: HeaderMap) -> Result<Json<AuthUser>, ApiError> {
+    let auth = state.auth_bridge.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auth_not_enabled",
+            "Auth service is not configured",
+        )
     })?;
+
+    let token =
+        extract_bearer(&headers).ok_or_else(|| ApiError::unauthorized("Missing or invalid Authorization header"))?;
 
     let user = auth.get_user(&token).map_err(|e| {
         warn!("Get user failed: {}", e);

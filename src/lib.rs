@@ -6631,12 +6631,10 @@ impl EmbeddedDatabase {
                     .as_ref()
                     .map(|e| Box::new(Self::resolve_excluded_refs(e, excluded_map))),
             },
-            sql::logical_plan::LogicalExpr::IsNull { expr: inner, is_null } => {
-                sql::logical_plan::LogicalExpr::IsNull {
-                    expr: Box::new(Self::resolve_excluded_refs(inner, excluded_map)),
-                    is_null: *is_null,
-                }
-            }
+            sql::logical_plan::LogicalExpr::IsNull { expr: inner, is_null } => sql::logical_plan::LogicalExpr::IsNull {
+                expr: Box::new(Self::resolve_excluded_refs(inner, excluded_map)),
+                is_null: *is_null,
+            },
             sql::logical_plan::LogicalExpr::Between {
                 expr: inner,
                 low,

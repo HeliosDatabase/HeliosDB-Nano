@@ -8,16 +8,16 @@
 //! - Drops unused filters after configurable inactivity period
 //! - Zero memory footprint (all storage-persisted)
 
+use chrono::{DateTime, Utc};
+use parking_lot::RwLock;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use parking_lot::RwLock;
-use serde::{Deserialize, Serialize};
-use chrono::{DateTime, Utc};
 
-use crate::Value;
 use super::bloom_filter::{BloomFilter, BloomFilterConfig};
 use super::simd_filter::FilterOp;
+use crate::Value;
 
 /// Type of query pattern detected
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -49,8 +49,8 @@ pub struct QueryPattern {
 
 impl QueryPattern {
     pub fn new(table_name: &str, column_name: &str, pattern_type: PatternType) -> Self {
-        use std::hash::{Hash, Hasher};
         use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
 
         let mut hasher = DefaultHasher::new();
         table_name.hash(&mut hasher);
@@ -219,7 +219,8 @@ impl QueryPatternTracker {
     pub fn get_filter_candidates(&self) -> Vec<PatternStats> {
         let patterns = self.patterns.read();
 
-        patterns.values()
+        patterns
+            .values()
             .filter(|stats| self.should_create_filter(stats))
             .cloned()
             .collect()
@@ -272,7 +273,8 @@ impl QueryPatternTracker {
 
     /// Get all patterns for a table
     pub fn get_table_patterns(&self, table_name: &str) -> Vec<PatternStats> {
-        self.patterns.read()
+        self.patterns
+            .read()
             .values()
             .filter(|s| s.pattern.table_name == table_name)
             .cloned()
@@ -353,7 +355,10 @@ impl SpeculativeFilterManager {
             // Check if filter already exists
             {
                 let filters = self.filters.read();
-                if filters.values().any(|f| f.pattern.pattern_hash == candidate.pattern.pattern_hash) {
+                if filters
+                    .values()
+                    .any(|f| f.pattern.pattern_hash == candidate.pattern.pattern_hash)
+                {
                     continue;
                 }
             }
@@ -361,7 +366,8 @@ impl SpeculativeFilterManager {
             // Check per-table limit
             {
                 let filters = self.filters.read();
-                let table_count = filters.values()
+                let table_count = filters
+                    .values()
                     .filter(|f| f.pattern.table_name == candidate.pattern.table_name)
                     .filter(|f| f.status == FilterStatus::Active)
                     .count();
@@ -420,9 +426,9 @@ impl SpeculativeFilterManager {
         let pattern = QueryPattern::new(table_name, column_name, pattern_type);
         let filters = self.filters.read();
 
-        filters.values().any(|f| {
-            f.pattern.pattern_hash == pattern.pattern_hash && f.status == FilterStatus::Active
-        })
+        filters
+            .values()
+            .any(|f| f.pattern.pattern_hash == pattern.pattern_hash && f.status == FilterStatus::Active)
     }
 
     /// Get bloom filter for a column (if speculatively created)
@@ -475,7 +481,8 @@ impl SpeculativeFilterManager {
         let mut filters = self.filters.write();
         let mut bloom_filters = self.bloom_filters.write();
 
-        let to_drop: Vec<_> = filters.iter()
+        let to_drop: Vec<_> = filters
+            .iter()
             .filter(|(_, meta)| meta.last_used < cutoff && meta.status == FilterStatus::Active)
             .map(|(&id, meta)| (id, meta.pattern.clone()))
             .collect();
@@ -509,7 +516,8 @@ impl SpeculativeFilterManager {
 
     /// Get active filters for a table
     pub fn get_table_filters(&self, table_name: &str) -> Vec<SpeculativeFilterMeta> {
-        self.filters.read()
+        self.filters
+            .read()
             .values()
             .filter(|f| f.pattern.table_name == table_name && f.status == FilterStatus::Active)
             .cloned()

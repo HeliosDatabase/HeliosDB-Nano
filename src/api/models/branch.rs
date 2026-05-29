@@ -2,7 +2,7 @@
 //!
 //! Request and response models for branch operations.
 
-use base64::{Engine as _, engine::general_purpose::STANDARD};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -203,12 +203,14 @@ impl From<crate::storage::BranchState> for BranchStateDto {
     fn from(state: crate::storage::BranchState) -> Self {
         match state {
             crate::storage::BranchState::Active => BranchStateDto::Active,
-            crate::storage::BranchState::Merged { into_branch, at_timestamp } => {
-                BranchStateDto::Merged { into_branch, at_timestamp }
-            }
-            crate::storage::BranchState::Dropped { at_timestamp } => {
-                BranchStateDto::Dropped { at_timestamp }
-            }
+            crate::storage::BranchState::Merged {
+                into_branch,
+                at_timestamp,
+            } => BranchStateDto::Merged {
+                into_branch,
+                at_timestamp,
+            },
+            crate::storage::BranchState::Dropped { at_timestamp } => BranchStateDto::Dropped { at_timestamp },
         }
     }
 }

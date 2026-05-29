@@ -6,7 +6,7 @@
 use super::handler::OracleProtocolHandler;
 use super::tns::TnsPacket;
 use super::DEFAULT_ORACLE_PORT;
-use crate::{Result, Error, storage::StorageEngine};
+use crate::{storage::StorageEngine, Error, Result};
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -69,7 +69,11 @@ impl OracleServer {
 
         loop {
             // Wait for connection slot
-            let permit = self.connection_limiter.clone().acquire_owned().await
+            let permit = self
+                .connection_limiter
+                .clone()
+                .acquire_owned()
+                .await
                 .map_err(|e| Error::io(format!("Semaphore error: {}", e)))?;
 
             // Accept connection
@@ -113,7 +117,9 @@ async fn handle_connection(mut socket: TcpStream, storage: Arc<StorageEngine>) -
 
     loop {
         // Read TNS packet
-        let n = socket.read(&mut buffer).await
+        let n = socket
+            .read(&mut buffer)
+            .await
             .map_err(|e| Error::io(format!("Failed to read from socket: {}", e)))?;
 
         if n == 0 {
@@ -150,7 +156,9 @@ async fn handle_connection(mut socket: TcpStream, storage: Arc<StorageEngine>) -
         // Send response packets
         for response in response_packets {
             let encoded = response.encode();
-            socket.write_all(&encoded).await
+            socket
+                .write_all(&encoded)
+                .await
                 .map_err(|e| Error::io(format!("Failed to write to socket: {}", e)))?;
 
             tracing::debug!("Sent {} bytes to client", encoded.len());
@@ -166,10 +174,7 @@ async fn handle_connection(mut socket: TcpStream, storage: Arc<StorageEngine>) -
 }
 
 /// Start Oracle server with storage engine
-pub async fn start_oracle_server(
-    storage: Arc<StorageEngine>,
-    config: OracleServerConfig,
-) -> Result<()> {
+pub async fn start_oracle_server(storage: Arc<StorageEngine>, config: OracleServerConfig) -> Result<()> {
     let server = OracleServer::new(storage, config);
     server.start().await
 }
@@ -210,10 +215,7 @@ mod tests {
         };
 
         let server = OracleServer::new(Arc::new(storage), server_config);
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            server.start()
-        ).await;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), server.start()).await;
 
         // Should timeout or error immediately
         assert!(result.is_err() || result.unwrap().is_err());

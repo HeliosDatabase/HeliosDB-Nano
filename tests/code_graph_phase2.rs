@@ -11,9 +11,7 @@ use heliosdb_nano::{
 
 fn setup() -> Result<EmbeddedDatabase> {
     let db = EmbeddedDatabase::new_in_memory()?;
-    db.execute(
-        "CREATE TABLE src (path TEXT PRIMARY KEY, lang TEXT, content TEXT)",
-    )?;
+    db.execute("CREATE TABLE src (path TEXT PRIMARY KEY, lang TEXT, content TEXT)")?;
     Ok(db)
 }
 
@@ -153,10 +151,7 @@ fn rust_imports_extracted() -> Result<()> {
         "use std::collections::HashMap;\nuse crate::foo::Bar;\n\npub fn entry() {}\n",
     )?;
     db.code_index(CodeIndexOptions::for_table("src"))?;
-    let rows = db.query(
-        "SELECT to_name FROM _hdb_code_symbol_refs WHERE kind = 'IMPORTS'",
-        &[],
-    )?;
+    let rows = db.query("SELECT to_name FROM _hdb_code_symbol_refs WHERE kind = 'IMPORTS'", &[])?;
     let names: Vec<String> = rows
         .iter()
         .filter_map(|r| match r.values.first() {
@@ -179,10 +174,7 @@ fn python_imports_extracted() -> Result<()> {
         "import os\nfrom collections import defaultdict\n\ndef run():\n    return 1\n",
     )?;
     db.code_index(CodeIndexOptions::for_table("src"))?;
-    let rows = db.query(
-        "SELECT to_name FROM _hdb_code_symbol_refs WHERE kind = 'IMPORTS'",
-        &[],
-    )?;
+    let rows = db.query("SELECT to_name FROM _hdb_code_symbol_refs WHERE kind = 'IMPORTS'", &[])?;
     let names: Vec<String> = rows
         .iter()
         .filter_map(|r| match r.values.first() {
@@ -205,10 +197,7 @@ fn go_imports_extracted() -> Result<()> {
         "package p\n\nimport \"fmt\"\n\nfunc Go() { fmt.Println(\"hi\") }\n",
     )?;
     db.code_index(CodeIndexOptions::for_table("src"))?;
-    let rows = db.query(
-        "SELECT to_name FROM _hdb_code_symbol_refs WHERE kind = 'IMPORTS'",
-        &[],
-    )?;
+    let rows = db.query("SELECT to_name FROM _hdb_code_symbol_refs WHERE kind = 'IMPORTS'", &[])?;
     let names: Vec<String> = rows
         .iter()
         .filter_map(|r| match r.values.first() {
@@ -225,18 +214,8 @@ fn cross_file_ref_resolves() -> Result<()> {
     let db = setup()?;
     // `caller.py` calls `helper()` from `helper.py`; the in-file
     // resolver can't find it, but the cross-file pass should rebind.
-    insert(
-        &db,
-        "helper.py",
-        "python",
-        "def helper():\n    return 42\n",
-    )?;
-    insert(
-        &db,
-        "caller.py",
-        "python",
-        "def run():\n    return helper()\n",
-    )?;
+    insert(&db, "helper.py", "python", "def helper():\n    return 42\n")?;
+    insert(&db, "caller.py", "python", "def run():\n    return helper()\n")?;
     db.code_index(CodeIndexOptions::for_table("src"))?;
 
     // The ref from run → helper should be resolved cross-file.
@@ -274,11 +253,31 @@ fn cross_file_ref_resolves() -> Result<()> {
 // release.
 
 const PHASE2_FIXTURE: &[(&str, &str, &str)] = &[
-    ("a.rs", "rust", "pub fn alpha() { beta(); }\npub fn beta() {}\npub struct S;\nimpl S { pub fn m(&self) -> i32 { 0 } }\n"),
-    ("b.rs", "rust", "use crate::a::S;\npub fn make() -> S { S }\npub fn caller() { let s = make(); s.m(); }\n"),
-    ("c.rs", "rust", "pub trait T { fn run(&self); }\npub struct U;\nimpl T for U { fn run(&self) {} }\n"),
-    ("d.py", "python", "def hello():\n    print('hi')\n\nclass Foo:\n    def bar(self):\n        return hello()\n"),
-    ("e.py", "python", "from d import Foo\n\ndef use_foo():\n    f = Foo()\n    return f.bar()\n"),
+    (
+        "a.rs",
+        "rust",
+        "pub fn alpha() { beta(); }\npub fn beta() {}\npub struct S;\nimpl S { pub fn m(&self) -> i32 { 0 } }\n",
+    ),
+    (
+        "b.rs",
+        "rust",
+        "use crate::a::S;\npub fn make() -> S { S }\npub fn caller() { let s = make(); s.m(); }\n",
+    ),
+    (
+        "c.rs",
+        "rust",
+        "pub trait T { fn run(&self); }\npub struct U;\nimpl T for U { fn run(&self) {} }\n",
+    ),
+    (
+        "d.py",
+        "python",
+        "def hello():\n    print('hi')\n\nclass Foo:\n    def bar(self):\n        return hello()\n",
+    ),
+    (
+        "e.py",
+        "python",
+        "from d import Foo\n\ndef use_foo():\n    f = Foo()\n    return f.bar()\n",
+    ),
 ];
 
 fn populate_phase2_corpus(db: &EmbeddedDatabase) -> Result<()> {

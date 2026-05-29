@@ -41,17 +41,25 @@ mod subquery_hardening {
         db.execute("INSERT INTO departments VALUES (2, 'Sales')").unwrap();
         db.execute("INSERT INTO departments VALUES (3, 'HR')").unwrap();
 
-        db.execute("CREATE TABLE employees (id INT, name TEXT, dept_id INT, salary INT)").unwrap();
-        db.execute("INSERT INTO employees VALUES (1, 'Alice', 1, 90000)").unwrap();
+        db.execute("CREATE TABLE employees (id INT, name TEXT, dept_id INT, salary INT)")
+            .unwrap();
+        db.execute("INSERT INTO employees VALUES (1, 'Alice', 1, 90000)")
+            .unwrap();
         db.execute("INSERT INTO employees VALUES (2, 'Bob', 1, 80000)").unwrap();
-        db.execute("INSERT INTO employees VALUES (3, 'Charlie', 2, 70000)").unwrap();
-        db.execute("INSERT INTO employees VALUES (4, 'Diana', 2, 60000)").unwrap();
+        db.execute("INSERT INTO employees VALUES (3, 'Charlie', 2, 70000)")
+            .unwrap();
+        db.execute("INSERT INTO employees VALUES (4, 'Diana', 2, 60000)")
+            .unwrap();
         db.execute("INSERT INTO employees VALUES (5, 'Eve', 3, 75000)").unwrap();
 
-        db.execute("CREATE TABLE projects (id INT, name TEXT, lead_id INT, budget INT)").unwrap();
-        db.execute("INSERT INTO projects VALUES (1, 'Alpha', 1, 500000)").unwrap();
-        db.execute("INSERT INTO projects VALUES (2, 'Beta', 2, 300000)").unwrap();
-        db.execute("INSERT INTO projects VALUES (3, 'Gamma', 3, 200000)").unwrap();
+        db.execute("CREATE TABLE projects (id INT, name TEXT, lead_id INT, budget INT)")
+            .unwrap();
+        db.execute("INSERT INTO projects VALUES (1, 'Alpha', 1, 500000)")
+            .unwrap();
+        db.execute("INSERT INTO projects VALUES (2, 'Beta', 2, 300000)")
+            .unwrap();
+        db.execute("INSERT INTO projects VALUES (3, 'Gamma', 3, 200000)")
+            .unwrap();
 
         db
     }
@@ -143,7 +151,10 @@ mod subquery_hardening {
                 );
             }
             Err(e) => {
-                println!("KNOWN LIMITATION: Scalar subquery (0 rows -> NULL) not supported: {}", e);
+                println!(
+                    "KNOWN LIMITATION: Scalar subquery (0 rows -> NULL) not supported: {}",
+                    e
+                );
             }
         }
     }
@@ -352,7 +363,12 @@ mod subquery_hardening {
         let sql = "SELECT id, name FROM employees WHERE EXISTS (SELECT 1 FROM departments WHERE id > 999)";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 0, "EXISTS on empty subquery should be false, got {} rows", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    0,
+                    "EXISTS on empty subquery should be false, got {} rows",
+                    rows.len()
+                );
             }
             Err(e) => {
                 println!("KNOWN LIMITATION: EXISTS with empty subquery not supported: {}", e);
@@ -369,7 +385,12 @@ mod subquery_hardening {
         let sql = "SELECT id, name FROM employees WHERE EXISTS (SELECT 1 FROM departments) ORDER BY id";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 5, "EXISTS(non-empty) should return all 5 employees, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    5,
+                    "EXISTS(non-empty) should return all 5 employees, got {}",
+                    rows.len()
+                );
             }
             Err(e) => {
                 println!("KNOWN LIMITATION: Uncorrelated EXISTS not supported: {}", e);
@@ -396,7 +417,10 @@ mod subquery_hardening {
                 }
             }
             Err(e) => {
-                println!("KNOWN LIMITATION: Correlated NOT EXISTS with condition not supported: {}", e);
+                println!(
+                    "KNOWN LIMITATION: Correlated NOT EXISTS with condition not supported: {}",
+                    e
+                );
             }
         }
     }
@@ -428,7 +452,8 @@ mod subquery_hardening {
         // SELECT * FROM (SELECT dept_id, COUNT(*) AS cnt FROM employees GROUP BY dept_id) AS sub ORDER BY dept_id
         let db = setup_db();
 
-        let sql = "SELECT * FROM (SELECT dept_id, COUNT(*) AS cnt FROM employees GROUP BY dept_id) AS sub ORDER BY dept_id";
+        let sql =
+            "SELECT * FROM (SELECT dept_id, COUNT(*) AS cnt FROM employees GROUP BY dept_id) AS sub ORDER BY dept_id";
         match db.query(sql, &[]) {
             Ok(rows) => {
                 // dept 1: 2 employees, dept 2: 2 employees, dept 3: 1 employee
@@ -477,7 +502,12 @@ mod subquery_hardening {
         let sql = "SELECT * FROM (SELECT * FROM (SELECT id, name FROM employees) AS inner1 WHERE id <= 3) AS outer1 ORDER BY id";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 3, "Nested derived tables should return ids 1,2,3. Got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    3,
+                    "Nested derived tables should return ids 1,2,3. Got {}",
+                    rows.len()
+                );
                 assert_eq!(rows[0].get(0), Some(&Value::Int4(1)));
                 assert_eq!(rows[1].get(0), Some(&Value::Int4(2)));
                 assert_eq!(rows[2].get(0), Some(&Value::Int4(3)));
@@ -503,7 +533,12 @@ mod subquery_hardening {
         let sql = "SELECT id, name FROM employees e WHERE salary > (SELECT AVG(salary) FROM employees e2 WHERE e2.dept_id = e.dept_id) ORDER BY id";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 2, "Alice and Charlie earn above their dept avg, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "Alice and Charlie earn above their dept avg, got {}",
+                    rows.len()
+                );
                 assert_eq!(rows[0].get(1), Some(&Value::String("Alice".to_string())));
                 assert_eq!(rows[1].get(1), Some(&Value::String("Charlie".to_string())));
             }
@@ -523,7 +558,12 @@ mod subquery_hardening {
         let sql = "SELECT id, name FROM departments d WHERE EXISTS (SELECT 1 FROM employees e WHERE e.dept_id = d.id AND e.salary > 80000) ORDER BY id";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 1, "Only Engineering has someone earning > 80K, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "Only Engineering has someone earning > 80K, got {}",
+                    rows.len()
+                );
                 assert_eq!(rows[0].get(1), Some(&Value::String("Engineering".to_string())));
             }
             Err(e) => {
@@ -576,7 +616,10 @@ mod subquery_hardening {
                 );
             }
             Err(e) => {
-                println!("KNOWN LIMITATION: Correlated scalar subquery in SELECT not supported: {}", e);
+                println!(
+                    "KNOWN LIMITATION: Correlated scalar subquery in SELECT not supported: {}",
+                    e
+                );
             }
         }
     }
@@ -616,7 +659,12 @@ mod subquery_hardening {
         match db.query(sql, &[]) {
             Ok(rows) => {
                 // lead_ids appear twice each (1,2,3,1,2,3) but IN should yield 3 rows max
-                assert_eq!(rows.len(), 3, "UNION ALL duplicates should not cause duplicate matches, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    3,
+                    "UNION ALL duplicates should not cause duplicate matches, got {}",
+                    rows.len()
+                );
             }
             Err(e) => {
                 println!("KNOWN LIMITATION: IN subquery with UNION ALL not supported: {}", e);
@@ -663,7 +711,10 @@ mod subquery_hardening {
                 assert_eq!(rows[1].get(1), Some(&Value::String("Bob".to_string())));
             }
             Err(e) => {
-                println!("KNOWN LIMITATION: Self-referencing scalar subquery not supported: {}", e);
+                println!(
+                    "KNOWN LIMITATION: Self-referencing scalar subquery not supported: {}",
+                    e
+                );
             }
         }
     }
@@ -735,7 +786,10 @@ mod subquery_hardening {
                 );
             }
             Err(e) => {
-                println!("KNOWN LIMITATION: Derived table with ORDER BY + LIMIT not supported: {}", e);
+                println!(
+                    "KNOWN LIMITATION: Derived table with ORDER BY + LIMIT not supported: {}",
+                    e
+                );
             }
         }
     }
@@ -783,7 +837,12 @@ mod subquery_hardening {
         let sql = "SELECT id, name FROM employees WHERE id NOT IN (SELECT id FROM departments) ORDER BY id";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 2, "Employees 4 and 5 don't match dept ids, got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    2,
+                    "Employees 4 and 5 don't match dept ids, got {}",
+                    rows.len()
+                );
                 assert_eq!(rows[0].get(0), Some(&Value::Int4(4)));
                 assert_eq!(rows[1].get(0), Some(&Value::Int4(5)));
             }
@@ -801,7 +860,11 @@ mod subquery_hardening {
         let sql = "SELECT * FROM (SELECT id, name FROM employees WHERE id > 999) AS empty_sub";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 0, "Derived table should return 0 rows for impossible filter");
+                assert_eq!(
+                    rows.len(),
+                    0,
+                    "Derived table should return 0 rows for impossible filter"
+                );
             }
             Err(e) => {
                 println!("KNOWN LIMITATION: Empty derived table not supported: {}", e);
@@ -818,7 +881,12 @@ mod subquery_hardening {
         let sql = "SELECT id, name FROM employees WHERE EXISTS (SELECT * FROM projects WHERE projects.lead_id = employees.id) ORDER BY id";
         match db.query(sql, &[]) {
             Ok(rows) => {
-                assert_eq!(rows.len(), 3, "3 employees lead projects (using SELECT *), got {}", rows.len());
+                assert_eq!(
+                    rows.len(),
+                    3,
+                    "3 employees lead projects (using SELECT *), got {}",
+                    rows.len()
+                );
             }
             Err(e) => {
                 println!("KNOWN LIMITATION: EXISTS with SELECT * not supported: {}", e);

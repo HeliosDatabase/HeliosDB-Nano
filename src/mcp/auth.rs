@@ -69,11 +69,7 @@ impl Scope {
     /// per-tool ACL is a follow-up.
     pub fn for_method(method: &str) -> Self {
         match method {
-            "initialize"
-            | "ping"
-            | "tools/list"
-            | "resources/list"
-            | "resources/read" => Scope::Read,
+            "initialize" | "ping" | "tools/list" | "resources/list" | "resources/read" => Scope::Read,
             _ => Scope::Write,
         }
     }
@@ -90,9 +86,7 @@ impl McpAuth {
                 let token = header_value
                     .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")))
                     .ok_or(AuthError::MissingToken)?;
-                let claims = mgr
-                    .validate_token(token)
-                    .map_err(AuthError::InvalidToken)?;
+                let claims = mgr.validate_token(token).map_err(AuthError::InvalidToken)?;
                 let needed = scope.token();
                 if !claims.scopes.iter().any(|s| s == needed) {
                     return Err(AuthError::InsufficientScope(needed));
@@ -178,16 +172,8 @@ pub async fn require_write_scope(
     enforce(&auth, Scope::Write, req, next).await
 }
 
-async fn enforce(
-    auth: &McpAuth,
-    scope: Scope,
-    req: Request,
-    next: Next,
-) -> Result<Response, (StatusCode, String)> {
-    let header = req
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
+async fn enforce(auth: &McpAuth, scope: Scope, req: Request, next: Next) -> Result<Response, (StatusCode, String)> {
+    let header = req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
     match auth.check(header, scope) {
         Ok(_) => Ok(next.run(req).await),
         Err(e) => Err((e.status(), e.message())),
@@ -208,20 +194,13 @@ mod tests {
 
     fn jwt_with_scopes(scopes: &[&str]) -> (Arc<JwtManager>, String) {
         let mgr = Arc::new(JwtManager::new(b"test-secret"));
-        let token = mgr
-            .generate_token("u".into(), "t".into(), Uuid::new_v4())
-            .unwrap();
+        let token = mgr.generate_token("u".into(), "t".into(), Uuid::new_v4()).unwrap();
         // Decode + re-encode with custom scopes.
         let mut claims = mgr.validate_token(&token).unwrap();
         claims.scopes = scopes.iter().map(|s| (*s).to_string()).collect();
         // Re-encode using the same key.
         use jsonwebtoken::{encode, EncodingKey, Header};
-        let token = encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(b"test-secret"),
-        )
-        .unwrap();
+        let token = encode(&Header::default(), &claims, &EncodingKey::from_secret(b"test-secret")).unwrap();
         (mgr, token)
     }
 

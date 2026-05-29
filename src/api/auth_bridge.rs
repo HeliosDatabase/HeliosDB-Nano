@@ -394,10 +394,7 @@ impl AuthBridge {
     ///   avoid leaking cross-provider info).
     /// - If no user exists a new one is created with a random 32-byte password
     ///   (the user will never need it because they authenticate via OAuth).
-    pub fn oauth_sign_in(
-        &self,
-        info: &crate::api::oauth::OAuthUserInfo,
-    ) -> Result<AuthSession, AuthError> {
+    pub fn oauth_sign_in(&self, info: &crate::api::oauth::OAuthUserInfo) -> Result<AuthSession, AuthError> {
         let email_lower = info.email.to_lowercase();
 
         // Check if user with this email already exists
@@ -527,12 +524,8 @@ impl AuthBridge {
         )
         .map_err(|e| {
             let (code, desc) = match e.kind() {
-                jsonwebtoken::errors::ErrorKind::ExpiredSignature => {
-                    ("token_expired", "Token has expired")
-                }
-                jsonwebtoken::errors::ErrorKind::InvalidToken => {
-                    ("invalid_token", "Token is invalid")
-                }
+                jsonwebtoken::errors::ErrorKind::ExpiredSignature => ("token_expired", "Token has expired"),
+                jsonwebtoken::errors::ErrorKind::InvalidToken => ("invalid_token", "Token is invalid"),
                 jsonwebtoken::errors::ErrorKind::InvalidSignature => {
                     ("invalid_signature", "Token signature is invalid")
                 }
@@ -595,9 +588,7 @@ fn hash_password(password: &str) -> Result<String, AuthError> {
 /// Verify a plaintext password against an Argon2id hash.
 fn verify_password(password: &str, hash: &str) -> bool {
     match PasswordHash::new(hash) {
-        Ok(parsed) => Argon2::default()
-            .verify_password(password.as_bytes(), &parsed)
-            .is_ok(),
+        Ok(parsed) => Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok(),
         Err(_) => false,
     }
 }
@@ -669,16 +660,10 @@ mod tests {
     fn test_bootstrap_creates_tables() {
         let bridge = setup();
         // Should be able to query both tables without error
-        let users = bridge
-            .db
-            .query("SELECT id FROM _auth_users", &[])
-            .unwrap();
+        let users = bridge.db.query("SELECT id FROM _auth_users", &[]).unwrap();
         assert!(users.is_empty());
 
-        let tokens = bridge
-            .db
-            .query("SELECT token FROM _auth_refresh_tokens", &[])
-            .unwrap();
+        let tokens = bridge.db.query("SELECT token FROM _auth_refresh_tokens", &[]).unwrap();
         assert!(tokens.is_empty());
     }
 

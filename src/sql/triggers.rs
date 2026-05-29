@@ -3,10 +3,13 @@
 //! This module provides trigger storage, persistence, and retrieval for HeliosDB-Lite.
 //! Triggers are stored in-memory and persisted to the catalog for durability across sessions.
 
-use crate::{Result, Error, Schema, Tuple, Value};
-use super::logical_plan::{TriggerTiming, TriggerEvent, TriggerFor, LogicalPlan, LogicalExpr, TransitionTable, TriggerCharacteristics, TriggerType};
 use super::evaluator::Evaluator;
-use serde::{Serialize, Deserialize};
+use super::logical_plan::{
+    LogicalExpr, LogicalPlan, TransitionTable, TriggerCharacteristics, TriggerEvent, TriggerFor, TriggerTiming,
+    TriggerType,
+};
+use crate::{Error, Result, Schema, Tuple, Value};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
@@ -350,7 +353,9 @@ impl TriggerRegistry {
     pub fn register_trigger(&self, definition: TriggerDefinition) -> Result<()> {
         let key = (definition.table_name.clone(), definition.name.clone());
 
-        let mut triggers = self.triggers.write()
+        let mut triggers = self
+            .triggers
+            .write()
             .map_err(|e| Error::Generic(format!("Failed to acquire write lock: {}", e)))?;
 
         if triggers.contains_key(&key) {
@@ -377,7 +382,9 @@ impl TriggerRegistry {
     pub fn drop_trigger(&self, table_name: &str, trigger_name: &str) -> Result<bool> {
         let key = (table_name.to_string(), trigger_name.to_string());
 
-        let mut triggers = self.triggers.write()
+        let mut triggers = self
+            .triggers
+            .write()
             .map_err(|e| Error::Generic(format!("Failed to acquire write lock: {}", e)))?;
 
         Ok(triggers.remove(&key).is_some())
@@ -396,7 +403,9 @@ impl TriggerRegistry {
     pub fn get_trigger(&self, table_name: &str, trigger_name: &str) -> Result<Option<TriggerDefinition>> {
         let key = (table_name.to_string(), trigger_name.to_string());
 
-        let triggers = self.triggers.read()
+        let triggers = self
+            .triggers
+            .read()
             .map_err(|e| Error::Generic(format!("Failed to acquire read lock: {}", e)))?;
 
         Ok(triggers.get(&key).cloned())
@@ -421,7 +430,9 @@ impl TriggerRegistry {
 
     /// Vector of all trigger definitions for the table
     pub fn get_triggers_for_table(&self, table_name: &str) -> Result<Vec<TriggerDefinition>> {
-        let triggers = self.triggers.read()
+        let triggers = self
+            .triggers
+            .read()
             .map_err(|e| Error::Generic(format!("Failed to acquire read lock: {}", e)))?;
 
         Ok(triggers
@@ -448,17 +459,14 @@ impl TriggerRegistry {
         event: &TriggerEvent,
         timing: &TriggerTiming,
     ) -> Result<Vec<TriggerDefinition>> {
-        let triggers = self.triggers.read()
+        let triggers = self
+            .triggers
+            .read()
             .map_err(|e| Error::Generic(format!("Failed to acquire read lock: {}", e)))?;
 
         let mut matching: Vec<_> = triggers
             .values()
-            .filter(|t| {
-                t.table_name == table_name
-                    && t.enabled
-                    && t.matches_event(event)
-                    && t.matches_timing(timing)
-            })
+            .filter(|t| t.table_name == table_name && t.enabled && t.matches_event(event) && t.matches_timing(timing))
             .cloned()
             .collect();
 
@@ -481,7 +489,9 @@ impl TriggerRegistry {
     pub fn enable_trigger(&self, table_name: &str, trigger_name: &str) -> Result<bool> {
         let key = (table_name.to_string(), trigger_name.to_string());
 
-        let mut triggers = self.triggers.write()
+        let mut triggers = self
+            .triggers
+            .write()
             .map_err(|e| Error::Generic(format!("Failed to acquire write lock: {}", e)))?;
 
         if let Some(trigger) = triggers.get_mut(&key) {
@@ -505,7 +515,9 @@ impl TriggerRegistry {
     pub fn disable_trigger(&self, table_name: &str, trigger_name: &str) -> Result<bool> {
         let key = (table_name.to_string(), trigger_name.to_string());
 
-        let mut triggers = self.triggers.write()
+        let mut triggers = self
+            .triggers
+            .write()
             .map_err(|e| Error::Generic(format!("Failed to acquire write lock: {}", e)))?;
 
         if let Some(trigger) = triggers.get_mut(&key) {
@@ -522,7 +534,9 @@ impl TriggerRegistry {
     ///
     /// Vector of all trigger definitions
     pub fn list_all_triggers(&self) -> Result<Vec<TriggerDefinition>> {
-        let triggers = self.triggers.read()
+        let triggers = self
+            .triggers
+            .read()
             .map_err(|e| Error::Generic(format!("Failed to acquire read lock: {}", e)))?;
 
         Ok(triggers.values().cloned().collect())
@@ -541,7 +555,9 @@ impl TriggerRegistry {
     pub fn trigger_exists(&self, table_name: &str, trigger_name: &str) -> Result<bool> {
         let key = (table_name.to_string(), trigger_name.to_string());
 
-        let triggers = self.triggers.read()
+        let triggers = self
+            .triggers
+            .read()
             .map_err(|e| Error::Generic(format!("Failed to acquire read lock: {}", e)))?;
 
         Ok(triggers.contains_key(&key))
@@ -559,7 +575,9 @@ impl TriggerRegistry {
     ///
     /// Number of triggers dropped
     pub fn drop_table_triggers(&self, table_name: &str) -> Result<usize> {
-        let mut triggers = self.triggers.write()
+        let mut triggers = self
+            .triggers
+            .write()
             .map_err(|e| Error::Generic(format!("Failed to acquire write lock: {}", e)))?;
 
         let keys_to_remove: Vec<_> = triggers
@@ -586,7 +604,9 @@ impl TriggerRegistry {
     /// Clear all triggers (for testing)
     #[cfg(test)]
     pub fn clear(&self) -> Result<()> {
-        let mut triggers = self.triggers.write()
+        let mut triggers = self
+            .triggers
+            .write()
             .map_err(|e| Error::Generic(format!("Failed to acquire write lock: {}", e)))?;
         triggers.clear();
         Ok(())
@@ -595,7 +615,9 @@ impl TriggerRegistry {
     /// Get trigger count (for testing)
     #[cfg(test)]
     pub fn count(&self) -> Result<usize> {
-        let triggers = self.triggers.read()
+        let triggers = self
+            .triggers
+            .read()
             .map_err(|e| Error::Generic(format!("Failed to acquire read lock: {}", e)))?;
         Ok(triggers.len())
     }
@@ -674,11 +696,7 @@ impl TriggerRowContext {
     ///
     /// Returns `true` if the condition is satisfied, `false` otherwise.
     /// Returns an error if evaluation fails.
-    pub fn evaluate_when_condition(
-        &self,
-        when_expr: &LogicalExpr,
-        table_schema: Arc<Schema>,
-    ) -> Result<bool> {
+    pub fn evaluate_when_condition(&self, when_expr: &LogicalExpr, table_schema: Arc<Schema>) -> Result<bool> {
         // Create an evaluator with trigger row context
         let evaluator = Evaluator::with_trigger_row_context(
             table_schema.clone(),
@@ -768,7 +786,8 @@ impl TriggerRegistry {
                             // WHEN condition evaluation failed - log and skip this trigger
                             tracing::warn!(
                                 "WHEN condition evaluation failed for trigger '{}': {}",
-                                trigger_def.name, e
+                                trigger_def.name,
+                                e
                             );
                             false
                         }
@@ -845,11 +864,10 @@ impl TriggerRegistry {
         }
 
         // Separate ROW and STATEMENT triggers
-        let row_triggers: Vec<_> = triggers.iter()
-            .filter(|t| t.for_each == TriggerFor::Row)
-            .collect();
+        let row_triggers: Vec<_> = triggers.iter().filter(|t| t.for_each == TriggerFor::Row).collect();
 
-        let statement_triggers: Vec<_> = triggers.iter()
+        let statement_triggers: Vec<_> = triggers
+            .iter()
             .filter(|t| t.for_each == TriggerFor::Statement)
             .collect();
 
@@ -868,7 +886,8 @@ impl TriggerRegistry {
                                 // WHEN condition evaluation failed - log and skip this trigger
                                 tracing::warn!(
                                     "WHEN condition evaluation failed for trigger '{}': {}",
-                                    trigger_def.name, e
+                                    trigger_def.name,
+                                    e
                                 );
                                 false
                             }
@@ -934,7 +953,8 @@ impl TriggerRegistry {
                         Err(e) => {
                             tracing::warn!(
                                 "WHEN condition evaluation failed for trigger '{}': {}",
-                                trigger_def.name, e
+                                trigger_def.name,
+                                e
                             );
                             false
                         }
@@ -1057,10 +1077,7 @@ impl DeferredTriggerTracker {
 
     /// Add a pending trigger execution for deferred execution
     pub fn add_pending(&mut self, txn_id: u64, execution: PendingTriggerExecution) {
-        self.pending
-            .entry(txn_id)
-            .or_insert_with(Vec::new)
-            .push(execution);
+        self.pending.entry(txn_id).or_insert_with(Vec::new).push(execution);
     }
 
     /// Get all pending executions for a transaction
@@ -1126,7 +1143,8 @@ impl DeferredTriggerTracker {
                             Err(e) => {
                                 tracing::warn!(
                                     "Deferred WHEN condition evaluation failed for trigger '{}': {}",
-                                    execution.trigger.name, e
+                                    execution.trigger.name,
+                                    e
                                 );
                                 false
                             }
@@ -1456,7 +1474,10 @@ mod tests {
             "test".to_string(),
             "users".to_string(),
             TriggerTiming::Before,
-            vec![TriggerEvent::Update(Some(vec!["email".to_string(), "name".to_string()]))],
+            vec![TriggerEvent::Update(Some(vec![
+                "email".to_string(),
+                "name".to_string(),
+            ]))],
             TriggerFor::Row,
             None,
             vec![],
@@ -1498,9 +1519,9 @@ mod tests {
                 primary_key: true,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
             Column {
                 name: "age".to_string(),
@@ -1509,9 +1530,9 @@ mod tests {
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
             Column {
                 name: "status".to_string(),
@@ -1520,9 +1541,9 @@ mod tests {
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
         ]));
 
@@ -1536,7 +1557,9 @@ mod tests {
 
         // Test WHEN condition: NEW.age > 20 (should be true)
         let when_expr = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::NewRow { column: "age".to_string() }),
+            left: Box::new(LogicalExpr::NewRow {
+                column: "age".to_string(),
+            }),
             op: BinaryOperator::Gt,
             right: Box::new(LogicalExpr::Literal(Value::Int4(20))),
         };
@@ -1547,7 +1570,9 @@ mod tests {
 
         // Test WHEN condition: NEW.age > 30 (should be false)
         let when_expr_false = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::NewRow { column: "age".to_string() }),
+            left: Box::new(LogicalExpr::NewRow {
+                column: "age".to_string(),
+            }),
             op: BinaryOperator::Gt,
             right: Box::new(LogicalExpr::Literal(Value::Int4(30))),
         };
@@ -1558,7 +1583,9 @@ mod tests {
 
         // Test WHEN condition with string comparison: NEW.status = 'active'
         let when_expr_str = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::NewRow { column: "status".to_string() }),
+            left: Box::new(LogicalExpr::NewRow {
+                column: "status".to_string(),
+            }),
             op: BinaryOperator::Eq,
             right: Box::new(LogicalExpr::Literal(Value::String("active".to_string()))),
         };
@@ -1581,9 +1608,9 @@ mod tests {
                 primary_key: true,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
             Column {
                 name: "price".to_string(),
@@ -1592,9 +1619,9 @@ mod tests {
                 primary_key: false,
                 source_table: None,
                 source_table_name: None,
-            default_expr: None,
-            unique: false,
-            storage_mode: crate::ColumnStorageMode::Default,
+                default_expr: None,
+                unique: false,
+                storage_mode: crate::ColumnStorageMode::Default,
             },
         ]));
 
@@ -1605,9 +1632,13 @@ mod tests {
 
         // Test WHEN condition: NEW.price > OLD.price (price increased)
         let when_expr = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::NewRow { column: "price".to_string() }),
+            left: Box::new(LogicalExpr::NewRow {
+                column: "price".to_string(),
+            }),
             op: BinaryOperator::Gt,
-            right: Box::new(LogicalExpr::OldRow { column: "price".to_string() }),
+            right: Box::new(LogicalExpr::OldRow {
+                column: "price".to_string(),
+            }),
         };
 
         let result = row_context.evaluate_when_condition(&when_expr, schema.clone());
@@ -1616,9 +1647,13 @@ mod tests {
 
         // Test WHEN condition: NEW.price < OLD.price (price decreased - false)
         let when_expr_dec = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::NewRow { column: "price".to_string() }),
+            left: Box::new(LogicalExpr::NewRow {
+                column: "price".to_string(),
+            }),
             op: BinaryOperator::Lt,
-            right: Box::new(LogicalExpr::OldRow { column: "price".to_string() }),
+            right: Box::new(LogicalExpr::OldRow {
+                column: "price".to_string(),
+            }),
         };
 
         let result_dec = row_context.evaluate_when_condition(&when_expr_dec, schema);

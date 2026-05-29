@@ -23,14 +23,9 @@ mod null_semantics_hardening_tests {
     fn test_case_when_null_condition() {
         // CASE WHEN NULL THEN 'yes' ELSE 'no' END -- NULL is falsy, should return 'no'
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT CASE WHEN NULL THEN 'yes' ELSE 'no' END", &[])
-            .unwrap();
+        let rows = db.query("SELECT CASE WHEN NULL THEN 'yes' ELSE 'no' END", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("no".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("no".to_string()));
     }
 
     #[test]
@@ -47,14 +42,8 @@ mod null_semantics_hardening_tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0].get(1).unwrap(),
-            &Value::String("not null".to_string())
-        );
-        assert_eq!(
-            rows[1].get(1).unwrap(),
-            &Value::String("null".to_string())
-        );
+        assert_eq!(rows[0].get(1).unwrap(), &Value::String("not null".to_string()));
+        assert_eq!(rows[1].get(1).unwrap(), &Value::String("null".to_string()));
     }
 
     #[test]
@@ -63,16 +52,10 @@ mod null_semantics_hardening_tests {
         // In simple CASE, NULL = NULL is false, so 'no match'
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db
-            .query(
-                "SELECT CASE NULL WHEN NULL THEN 'match' ELSE 'no match' END",
-                &[],
-            )
+            .query("SELECT CASE NULL WHEN NULL THEN 'match' ELSE 'no match' END", &[])
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("no match".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("no match".to_string()));
     }
 
     #[test]
@@ -89,23 +72,15 @@ mod null_semantics_hardening_tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert_eq!(
-            rows[0].get(1).unwrap(),
-            &Value::String("id1_null".to_string())
-        );
-        assert_eq!(
-            rows[1].get(1).unwrap(),
-            &Value::String("has_value".to_string())
-        );
+        assert_eq!(rows[0].get(1).unwrap(), &Value::String("id1_null".to_string()));
+        assert_eq!(rows[1].get(1).unwrap(), &Value::String("has_value".to_string()));
     }
 
     #[test]
     fn test_case_no_else_no_match_returns_null() {
         // CASE with no ELSE and no match should return NULL
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT CASE WHEN 1 = 2 THEN 'match' END", &[])
-            .unwrap();
+        let rows = db.query("SELECT CASE WHEN 1 = 2 THEN 'match' END", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::Null);
     }
@@ -138,15 +113,14 @@ mod null_semantics_hardening_tests {
         db.execute("INSERT INTO t3 VALUES (1, NULL)").unwrap();
 
         // NULL = 1 is NULL (falsy), so first WHEN is skipped, second WHEN matches
-        let rows = db.query(
-            "SELECT CASE WHEN val = 1 THEN 'one' WHEN val IS NULL THEN 'is_null' ELSE 'other' END FROM t3",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query(
+                "SELECT CASE WHEN val = 1 THEN 'one' WHEN val IS NULL THEN 'is_null' ELSE 'other' END FROM t3",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("is_null".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("is_null".to_string()));
 
         // IS NULL guard also works
         let rows = db
@@ -156,10 +130,7 @@ mod null_semantics_hardening_tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("is_null".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("is_null".to_string()));
     }
 
     // ========================================================================
@@ -203,10 +174,7 @@ mod null_semantics_hardening_tests {
             .unwrap();
         assert_eq!(rows.len(), 2);
         // First row: matched
-        assert_eq!(
-            rows[0].get(1).unwrap(),
-            &Value::String("Alice".to_string())
-        );
+        assert_eq!(rows[0].get(1).unwrap(), &Value::String("Alice".to_string()));
         // Second row: no match, right columns should be NULL
         assert_eq!(rows[1].get(1).unwrap(), &Value::Null);
     }
@@ -240,10 +208,7 @@ mod null_semantics_hardening_tests {
         db.execute("INSERT INTO jb VALUES (1, NULL)").unwrap();
 
         let rows = db
-            .query(
-                "SELECT ja.id FROM ja INNER JOIN jb ON ja.k = jb.k",
-                &[],
-            )
+            .query("SELECT ja.id FROM ja INNER JOIN jb ON ja.k = jb.k", &[])
             .unwrap();
         // NULL = NULL is not true in SQL
         assert_eq!(rows.len(), 0);
@@ -304,10 +269,7 @@ mod null_semantics_hardening_tests {
         // Boss has no manager (mgr_id IS NULL), so m.name is NULL
         assert_eq!(rows[0].get(1).unwrap(), &Value::Null);
         // Worker's manager is Boss
-        assert_eq!(
-            rows[1].get(1).unwrap(),
-            &Value::String("Boss".to_string())
-        );
+        assert_eq!(rows[1].get(1).unwrap(), &Value::String("Boss".to_string()));
     }
 
     #[test]
@@ -359,10 +321,7 @@ mod null_semantics_hardening_tests {
         db.execute("INSERT INTO p2 VALUES (2, 5)").unwrap();
 
         let rows = db
-            .query(
-                "SELECT p1.id, p2.id FROM p1 INNER JOIN p2 ON p1.code = p2.code",
-                &[],
-            )
+            .query("SELECT p1.id, p2.id FROM p1 INNER JOIN p2 ON p1.code = p2.code", &[])
             .unwrap();
         // Only (2,2) should match; (1,1) with NULL=NULL should not
         assert_eq!(rows.len(), 1);
@@ -486,9 +445,7 @@ mod null_semantics_hardening_tests {
         db.execute("INSERT INTO agg5 VALUES (2)").unwrap();
         db.execute("INSERT INTO agg5 VALUES (NULL)").unwrap();
 
-        let rows = db
-            .query("SELECT COUNT(DISTINCT val) FROM agg5", &[])
-            .unwrap();
+        let rows = db.query("SELECT COUNT(DISTINCT val) FROM agg5", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         // Should count 1 and 2 only, not NULLs => 2
         let count = match rows[0].get(0).unwrap() {
@@ -570,13 +527,19 @@ mod null_semantics_hardening_tests {
 
         let rows = db.query("SELECT MIN(val) FROM agg8b", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &Value::Null,
-            "MIN on empty table should return NULL");
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &Value::Null,
+            "MIN on empty table should return NULL"
+        );
 
         let rows = db.query("SELECT MAX(val) FROM agg8b", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &Value::Null,
-            "MAX on empty table should return NULL");
+        assert_eq!(
+            rows[0].get(0).unwrap(),
+            &Value::Null,
+            "MAX on empty table should return NULL"
+        );
     }
 
     #[test]
@@ -662,7 +625,8 @@ mod null_semantics_hardening_tests {
             let query = format!("SELECT * FROM cmp3 WHERE val {} 1", op);
             let rows = db.query(&query, &[]).unwrap();
             assert_eq!(
-                rows.len(), 0,
+                rows.len(),
+                0,
                 "NULL {} 1 should be NULL (falsy), returning empty set",
                 op
             );
@@ -677,9 +641,7 @@ mod null_semantics_hardening_tests {
         db.execute("INSERT INTO cmp4 VALUES (2, 10)").unwrap();
 
         // IS NULL correctly finds NULL rows
-        let rows = db
-            .query("SELECT id FROM cmp4 WHERE val IS NULL", &[])
-            .unwrap();
+        let rows = db.query("SELECT id FROM cmp4 WHERE val IS NULL", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         let id = match rows[0].get(0).unwrap() {
             Value::Int4(v) => *v as i64,
@@ -709,9 +671,7 @@ mod null_semantics_hardening_tests {
         db.execute("INSERT INTO cmp5 VALUES (2, 10)").unwrap();
         db.execute("INSERT INTO cmp5 VALUES (3, NULL)").unwrap();
 
-        let rows = db
-            .query("SELECT id FROM cmp5 WHERE val IS NOT NULL", &[])
-            .unwrap();
+        let rows = db.query("SELECT id FROM cmp5 WHERE val IS NOT NULL", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         let id = match rows[0].get(0).unwrap() {
             Value::Int4(v) => *v as i64,
@@ -753,7 +713,11 @@ mod null_semantics_hardening_tests {
         db.execute("INSERT INTO cmp8 VALUES (1, NULL)").unwrap();
 
         let rows = db.query("SELECT * FROM cmp8 WHERE val NOT IN (1, 2, 3)", &[]).unwrap();
-        assert_eq!(rows.len(), 0, "NULL NOT IN (1,2,3) should be falsy, returning empty set");
+        assert_eq!(
+            rows.len(),
+            0,
+            "NULL NOT IN (1,2,3) should be falsy, returning empty set"
+        );
     }
 
     #[test]
@@ -764,20 +728,19 @@ mod null_semantics_hardening_tests {
         db.execute("INSERT INTO cmp9 VALUES (1, NULL)").unwrap();
 
         let rows = db.query("SELECT * FROM cmp9 WHERE val BETWEEN 1 AND 10", &[]).unwrap();
-        assert_eq!(rows.len(), 0, "NULL BETWEEN 1 AND 10 should be falsy, returning empty set");
+        assert_eq!(
+            rows.len(),
+            0,
+            "NULL BETWEEN 1 AND 10 should be falsy, returning empty set"
+        );
     }
 
     #[test]
     fn test_coalesce_with_nulls() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT COALESCE(NULL, NULL, 'default')", &[])
-            .unwrap();
+        let rows = db.query("SELECT COALESCE(NULL, NULL, 'default')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("default".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("default".to_string()));
     }
 
     // ========================================================================
@@ -790,8 +753,7 @@ mod null_semantics_hardening_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT NULL + 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &Value::Null,
-            "NULL + 1 should return NULL");
+        assert_eq!(rows[0].get(0).unwrap(), &Value::Null, "NULL + 1 should return NULL");
     }
 
     #[test]
@@ -800,8 +762,7 @@ mod null_semantics_hardening_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT NULL * 0", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &Value::Null,
-            "NULL * 0 should return NULL");
+        assert_eq!(rows[0].get(0).unwrap(), &Value::Null, "NULL * 0 should return NULL");
     }
 
     #[test]
@@ -810,8 +771,7 @@ mod null_semantics_hardening_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT NULL - NULL", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &Value::Null,
-            "NULL - NULL should return NULL");
+        assert_eq!(rows[0].get(0).unwrap(), &Value::Null, "NULL - NULL should return NULL");
     }
 
     #[test]
@@ -820,8 +780,7 @@ mod null_semantics_hardening_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT 1 / NULL", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0).unwrap(), &Value::Null,
-            "1 / NULL should return NULL");
+        assert_eq!(rows[0].get(0).unwrap(), &Value::Null, "1 / NULL should return NULL");
     }
 
     #[test]
@@ -832,11 +791,12 @@ mod null_semantics_hardening_tests {
         db.execute("INSERT INTO arith1 VALUES (1, 10, NULL)").unwrap();
         db.execute("INSERT INTO arith1 VALUES (2, 5, 3)").unwrap();
 
-        let rows = db.query("SELECT id, a + b AS total FROM arith1 ORDER BY id", &[]).unwrap();
+        let rows = db
+            .query("SELECT id, a + b AS total FROM arith1 ORDER BY id", &[])
+            .unwrap();
         assert_eq!(rows.len(), 2);
         // Row 1: 10 + NULL = NULL
-        assert_eq!(rows[0].get(1).unwrap(), &Value::Null,
-            "10 + NULL should return NULL");
+        assert_eq!(rows[0].get(1).unwrap(), &Value::Null, "10 + NULL should return NULL");
         // Row 2: 5 + 3 = 8
         let total = match rows[1].get(1).unwrap() {
             Value::Int4(v) => *v as i64,
@@ -856,7 +816,11 @@ mod null_semantics_hardening_tests {
         db.execute("INSERT INTO arith2 VALUES (2, 10)").unwrap();
 
         let rows = db.query("SELECT id FROM arith2 WHERE val + 1 > 5", &[]).unwrap();
-        assert_eq!(rows.len(), 1, "Only non-NULL row matching val + 1 > 5 should be returned");
+        assert_eq!(
+            rows.len(),
+            1,
+            "Only non-NULL row matching val + 1 > 5 should be returned"
+        );
         let id = match rows[0].get(0).unwrap() {
             Value::Int4(v) => *v as i64,
             Value::Int8(v) => *v,
@@ -874,9 +838,7 @@ mod null_semantics_hardening_tests {
         db.execute("INSERT INTO ord1 VALUES (3, 10)").unwrap();
 
         // Test ORDER BY with NULLs - just verify the query succeeds and returns all rows
-        let rows = db
-            .query("SELECT id, val FROM ord1 ORDER BY val", &[])
-            .unwrap();
+        let rows = db.query("SELECT id, val FROM ord1 ORDER BY val", &[]).unwrap();
         assert_eq!(rows.len(), 3);
         // NULLs should appear somewhere (first or last depending on implementation)
         let has_null = rows.iter().any(|r| r.get(1).unwrap() == &Value::Null);
@@ -892,10 +854,7 @@ mod null_semantics_hardening_tests {
         db.execute("INSERT INTO arith3 VALUES (2, 10)").unwrap();
 
         let rows = db
-            .query(
-                "SELECT id, COALESCE(val, 0) + 5 AS result FROM arith3 ORDER BY id",
-                &[],
-            )
+            .query("SELECT id, COALESCE(val, 0) + 5 AS result FROM arith3 ORDER BY id", &[])
             .unwrap();
         assert_eq!(rows.len(), 2);
         // Row 1: COALESCE(NULL, 0) + 5 = 5
@@ -971,11 +930,7 @@ mod null_semantics_hardening_tests {
         // CONCAT in PostgreSQL treats NULL as empty string
         let val = rows[0].get(0).unwrap();
         match val {
-            Value::String(s) => assert!(
-                s == "helloworld" || s == "hellonullworld",
-                "CONCAT result: {:?}",
-                s
-            ),
+            Value::String(s) => assert!(s == "helloworld" || s == "hellonullworld", "CONCAT result: {:?}", s),
             Value::Null => {} // Also acceptable in some interpretations
             other => panic!("Unexpected type for CONCAT: {:?}", other),
         }
@@ -987,10 +942,7 @@ mod null_semantics_hardening_tests {
         // SQL standard: TRIM(NULL) should return NULL.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let result = db.query("SELECT TRIM(NULL)", &[]);
-        assert!(
-            result.is_err(),
-            "KNOWN LIMITATION: TRIM(NULL) is not supported"
-        );
+        assert!(result.is_err(), "KNOWN LIMITATION: TRIM(NULL) is not supported");
     }
 
     #[test]
@@ -1027,9 +979,7 @@ mod null_semantics_hardening_tests {
         db.execute("INSERT INTO str2b VALUES (1, 'hello')").unwrap();
         db.execute("INSERT INTO str2b VALUES (2, 'world')").unwrap();
 
-        let rows = db
-            .query("SELECT id FROM str2b WHERE val LIKE '%ell%'", &[])
-            .unwrap();
+        let rows = db.query("SELECT id FROM str2b WHERE val LIKE '%ell%'", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         let id = match rows[0].get(0).unwrap() {
             Value::Int4(v) => *v as i64,
@@ -1077,10 +1027,7 @@ mod null_semantics_hardening_tests {
 
         // Verify initial state
         let rows = db.query("SELECT name FROM dml3 WHERE id = 1", &[]).unwrap();
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("Alice".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("Alice".to_string()));
 
         // Update to NULL
         db.execute("UPDATE dml3 SET name = NULL WHERE id = 1").unwrap();
@@ -1111,7 +1058,8 @@ mod null_semantics_hardening_tests {
     #[test]
     fn test_insert_null_into_not_null_column_errors() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE dml5 (id INT NOT NULL, name TEXT NOT NULL)").unwrap();
+        db.execute("CREATE TABLE dml5 (id INT NOT NULL, name TEXT NOT NULL)")
+            .unwrap();
 
         let result = db.execute("INSERT INTO dml5 VALUES (1, NULL)");
         assert!(result.is_err(), "Inserting NULL into NOT NULL column should fail");

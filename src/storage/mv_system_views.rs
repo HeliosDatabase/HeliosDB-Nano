@@ -25,13 +25,13 @@
 
 #![allow(unused_variables)]
 
-use crate::{Result, Tuple, Value, Schema, Column, DataType};
 use super::{
-    StorageEngine, MaterializedViewCatalog, AutoRefreshWorker,
-    MVScheduler, SchedulerStats, mv_auto_refresh::RefreshHistoryEntry,
+    mv_auto_refresh::RefreshHistoryEntry, AutoRefreshWorker, MVScheduler, MaterializedViewCatalog, SchedulerStats,
+    StorageEngine,
 };
+use crate::{Column, DataType, Result, Schema, Tuple, Value};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use serde::{Serialize, Deserialize};
 
 /// Auto-refresh status for a single MV
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -83,10 +83,7 @@ pub struct MvSystemViews {
 
 impl MvSystemViews {
     /// Create a new system views manager
-    pub fn new(
-        storage: Arc<StorageEngine>,
-        scheduler: Arc<MVScheduler>,
-    ) -> Self {
+    pub fn new(storage: Arc<StorageEngine>, scheduler: Arc<MVScheduler>) -> Self {
         Self {
             storage,
             auto_refresh_worker: None,
@@ -105,7 +102,9 @@ impl MvSystemViews {
         let catalog = MaterializedViewCatalog::new(&self.storage);
         let all_mvs = catalog.list_views()?;
 
-        let worker_config = self.auto_refresh_worker.as_ref()
+        let worker_config = self
+            .auto_refresh_worker
+            .as_ref()
             .map(|w| w.config())
             .unwrap_or_default();
 
@@ -118,7 +117,8 @@ impl MvSystemViews {
             let metadata = catalog.get_view(&mv_name)?;
 
             // Check if auto-refresh is enabled
-            let auto_refresh_enabled = metadata.metadata
+            let auto_refresh_enabled = metadata
+                .metadata
                 .get("auto_refresh")
                 .and_then(|v| v.parse::<bool>().ok())
                 .unwrap_or(false);
@@ -174,7 +174,9 @@ impl MvSystemViews {
     /// Get CPU usage information
     pub fn pg_mv_cpu_usage(&self) -> Result<CpuUsageInfo> {
         let stats = self.scheduler.get_stats();
-        let worker_config = self.auto_refresh_worker.as_ref()
+        let worker_config = self
+            .auto_refresh_worker
+            .as_ref()
             .map(|w| w.config())
             .unwrap_or_default();
 
@@ -200,9 +202,10 @@ impl MvSystemViews {
             Value::String(status.mv_name.clone()),
             Value::Boolean(status.auto_refresh_enabled),
             Value::String(
-                status.last_refresh
+                status
+                    .last_refresh
                     .map(|t| t.to_rfc3339())
-                    .unwrap_or_else(|| "never".to_string())
+                    .unwrap_or_else(|| "never".to_string()),
             ),
             Value::Int8(status.staleness_seconds.unwrap_or(-1)),
             Value::Int8(status.threshold_seconds),
@@ -268,9 +271,9 @@ impl MvSystemViews {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::super::mv_scheduler::SchedulerConfig;
     use super::*;
     use crate::Config;
-    use super::super::mv_scheduler::SchedulerConfig;
 
     #[test]
     fn test_status_schema() {

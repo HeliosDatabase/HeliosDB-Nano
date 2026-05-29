@@ -69,7 +69,7 @@ impl AuditEvent {
 
     /// Calculate cryptographic checksum for this event
     pub fn calculate_checksum(&self) -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         let mut hasher = Sha256::new();
         hasher.update(self.id.to_le_bytes());
@@ -139,20 +139,13 @@ impl OperationType {
     pub fn is_ddl(&self) -> bool {
         matches!(
             self,
-            Self::CreateTable
-                | Self::DropTable
-                | Self::AlterTable
-                | Self::CreateIndex
-                | Self::DropIndex
+            Self::CreateTable | Self::DropTable | Self::AlterTable | Self::CreateIndex | Self::DropIndex
         )
     }
 
     /// Check if this is a DML operation
     pub fn is_dml(&self) -> bool {
-        matches!(
-            self,
-            Self::Insert | Self::Update | Self::Delete | Self::Select
-        )
+        matches!(self, Self::Insert | Self::Update | Self::Delete | Self::Select)
     }
 
     /// Check if this is a transaction operation

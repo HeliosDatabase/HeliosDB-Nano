@@ -8,8 +8,8 @@
 //! The registry is designed to be wrapped in `Arc` and shared across handlers.
 
 use oauth2::{
-    basic::BasicClient, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken,
-    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
+    basic::BasicClient, AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge,
+    PkceCodeVerifier, RedirectUrl, Scope, TokenResponse, TokenUrl,
 };
 use parking_lot::RwLock;
 use serde::Deserialize;
@@ -162,9 +162,8 @@ impl OAuthRegistry {
     ) -> Result<(), OAuthError> {
         let auth_url = AuthUrl::new("https://github.com/login/oauth/authorize".to_string())
             .map_err(|e| OAuthError::ConfigError(format!("Invalid GitHub auth URL: {e}")))?;
-        let token_url =
-            TokenUrl::new("https://github.com/login/oauth/access_token".to_string())
-                .map_err(|e| OAuthError::ConfigError(format!("Invalid GitHub token URL: {e}")))?;
+        let token_url = TokenUrl::new("https://github.com/login/oauth/access_token".to_string())
+            .map_err(|e| OAuthError::ConfigError(format!("Invalid GitHub token URL: {e}")))?;
         let redirect = RedirectUrl::new(redirect_uri.to_string())
             .map_err(|e| OAuthError::ConfigError(format!("Invalid redirect URI: {e}")))?;
 
@@ -201,17 +200,13 @@ impl OAuthRegistry {
 
         let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-        let mut auth_req = prov
-            .client
-            .authorize_url(CsrfToken::new_random);
+        let mut auth_req = prov.client.authorize_url(CsrfToken::new_random);
 
         for scope in &prov.scopes {
             auth_req = auth_req.add_scope(Scope::new(scope.clone()));
         }
 
-        let (auth_url, csrf_state) = auth_req
-            .set_pkce_challenge(pkce_challenge)
-            .url();
+        let (auth_url, csrf_state) = auth_req.set_pkce_challenge(pkce_challenge).url();
 
         let state_str = csrf_state.secret().clone();
 
@@ -233,11 +228,7 @@ impl OAuthRegistry {
     /// 2. Exchanges `code` for an access token via the provider's token endpoint.
     /// 3. Fetches the provider's userinfo endpoint with that token.
     /// 4. Parses the response into [`OAuthUserInfo`].
-    pub async fn exchange_code(
-        &self,
-        code: &str,
-        state: &str,
-    ) -> Result<OAuthUserInfo, OAuthError> {
+    pub async fn exchange_code(&self, code: &str, state: &str) -> Result<OAuthUserInfo, OAuthError> {
         // 1. Pop the pending flow
         let pending = self
             .pending_flows
@@ -262,22 +253,14 @@ impl OAuthRegistry {
             .client
             .exchange_code(AuthorizationCode::new(code.to_string()))
             .set_pkce_verifier(pending.verifier)
-            .request_async(|req: oauth2::HttpRequest| async move {
-                oauth2_http_adapter(&client_for_token, req).await
-            })
+            .request_async(|req: oauth2::HttpRequest| async move { oauth2_http_adapter(&client_for_token, req).await })
             .await
             .map_err(|e| OAuthError::TokenExchange(format!("{e}")))?;
 
         let access_token = token_result.access_token().secret().clone();
 
         // 3. Fetch userinfo
-        let userinfo = fetch_userinfo(
-            &http_client,
-            &prov.userinfo_url,
-            &access_token,
-            provider_name,
-        )
-        .await?;
+        let userinfo = fetch_userinfo(&http_client, &prov.userinfo_url, &access_token, provider_name).await?;
 
         Ok(userinfo)
     }
@@ -287,10 +270,7 @@ impl OAuthRegistry {
     /// This is useful for the callback handler to know which provider initiated
     /// the flow without requiring a separate query parameter.
     pub fn provider_for_state(&self, state: &str) -> Option<String> {
-        self.pending_flows
-            .read()
-            .get(state)
-            .map(|f| f.provider.clone())
+        self.pending_flows.read().get(state).map(|f| f.provider.clone())
     }
 
     /// Returns `true` if there is at least one registered provider.
@@ -413,9 +393,7 @@ async fn fetch_userinfo(
     match provider {
         "google" => parse_google_userinfo(resp).await,
         "github" => parse_github_userinfo(resp, client, access_token).await,
-        other => Err(OAuthError::UserInfoFetch(format!(
-            "Unknown provider: {other}"
-        ))),
+        other => Err(OAuthError::UserInfoFetch(format!("Unknown provider: {other}"))),
     }
 }
 
@@ -494,10 +472,7 @@ async fn parse_github_userinfo(
 }
 
 /// Fetch the primary verified email from GitHub's `/user/emails` endpoint.
-async fn fetch_github_primary_email(
-    client: &reqwest::Client,
-    access_token: &str,
-) -> Result<String, OAuthError> {
+async fn fetch_github_primary_email(client: &reqwest::Client, access_token: &str) -> Result<String, OAuthError> {
     let resp = client
         .get("https://api.github.com/user/emails")
         .bearer_auth(access_token)
@@ -640,9 +615,7 @@ mod tests {
     #[test]
     fn test_authorize_url_scopes() {
         let mut registry = OAuthRegistry::new();
-        registry
-            .register_google("id", "secret", "http://localhost/cb")
-            .unwrap();
+        registry.register_google("id", "secret", "http://localhost/cb").unwrap();
 
         let (url, _) = registry.get_authorize_url("google").unwrap();
         // Scopes should be present in the URL

@@ -25,24 +25,29 @@ fn create_table_with_schema_qualified_reference_works() {
             "team_id" integer REFERENCES "public"."teams"("id"),
             "title" text
         )"#,
-    ).expect(r#"REFERENCES "public"."teams" must resolve"#);
+    )
+    .expect(r#"REFERENCES "public"."teams" must resolve"#);
 
     db.execute(r#"INSERT INTO "teams" VALUES (1, 'a')"#).expect("ins team");
-    db.execute(r#"INSERT INTO "tasks" VALUES (1, 1, 't1')"#).expect("ins task");
+    db.execute(r#"INSERT INTO "tasks" VALUES (1, 1, 't1')"#)
+        .expect("ins task");
 }
 
 #[test]
 fn alter_table_add_constraint_with_schema_qualified_reference() {
     let db = EmbeddedDatabase::new_in_memory().expect("db");
-    db.execute(r#"CREATE TABLE "teams" ("id" integer PRIMARY KEY, "name" text)"#).expect("teams");
-    db.execute(r#"CREATE TABLE "tasks" ("id" integer PRIMARY KEY, "team_id" integer)"#).expect("tasks");
+    db.execute(r#"CREATE TABLE "teams" ("id" integer PRIMARY KEY, "name" text)"#)
+        .expect("teams");
+    db.execute(r#"CREATE TABLE "tasks" ("id" integer PRIMARY KEY, "team_id" integer)"#)
+        .expect("tasks");
 
     // The exact ALTER drizzle-kit emits.
     db.execute(
         r#"ALTER TABLE "tasks" ADD CONSTRAINT "tasks_team_id_teams_id_fk"
            FOREIGN KEY ("team_id") REFERENCES "public"."teams"("id")
            ON DELETE no action ON UPDATE no action"#,
-    ).expect(r#"ALTER ADD CONSTRAINT REFERENCES "public"."teams" must resolve"#);
+    )
+    .expect(r#"ALTER ADD CONSTRAINT REFERENCES "public"."teams" must resolve"#);
 
     db.execute(r#"INSERT INTO "teams" VALUES (1, 'a')"#).expect("ins team");
     db.execute(r#"INSERT INTO "tasks" VALUES (1, 1)"#).expect("valid child");
@@ -55,7 +60,8 @@ fn alter_table_add_constraint_with_schema_qualified_reference() {
 #[test]
 fn extended_query_update_enforces_fk() {
     let db = EmbeddedDatabase::new_in_memory().expect("db");
-    db.execute("CREATE TABLE users (id integer PRIMARY KEY, name text)").expect("users");
+    db.execute("CREATE TABLE users (id integer PRIMARY KEY, name text)")
+        .expect("users");
     db.execute("CREATE TABLE tasks (id integer PRIMARY KEY, assigned_to integer REFERENCES users(id))")
         .expect("tasks");
     db.execute("INSERT INTO users VALUES (1, 'a')").expect("user1");

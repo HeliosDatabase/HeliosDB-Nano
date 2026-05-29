@@ -4,10 +4,10 @@
 
 use crate::storage::{BranchId, GIT_LINK_PREFIX};
 use crate::{Error, Result};
+use parking_lot::RwLock;
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 /// Git branch link record
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -76,10 +76,11 @@ impl LinkManager {
 
         // Serialize and store
         let key = Self::encode_key(git_branch);
-        let value = bincode::serialize(&link)
-            .map_err(|e| Error::storage(format!("Failed to serialize Git link: {}", e)))?;
+        let value =
+            bincode::serialize(&link).map_err(|e| Error::storage(format!("Failed to serialize Git link: {}", e)))?;
 
-        self.db.put(&key, &value)
+        self.db
+            .put(&key, &value)
             .map_err(|e| Error::storage(format!("Failed to save Git link: {}", e)))?;
 
         // Update cache
@@ -94,7 +95,8 @@ impl LinkManager {
     pub fn unlink(&self, git_branch: &str) -> Result<()> {
         let key = Self::encode_key(git_branch);
 
-        self.db.delete(&key)
+        self.db
+            .delete(&key)
             .map_err(|e| Error::storage(format!("Failed to delete Git link: {}", e)))?;
 
         // Remove from cache
@@ -167,7 +169,8 @@ impl LinkManager {
             let value = bincode::serialize(&link)
                 .map_err(|e| Error::storage(format!("Failed to serialize Git link: {}", e)))?;
 
-            self.db.put(&key, &value)
+            self.db
+                .put(&key, &value)
                 .map_err(|e| Error::storage(format!("Failed to update Git link: {}", e)))?;
 
             self.cache.write().insert(git_branch.to_string(), link);
@@ -183,8 +186,7 @@ impl LinkManager {
         let iter = self.db.prefix_iterator(GIT_LINK_PREFIX);
 
         for item in iter {
-            let (key, value) = item
-                .map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             // Check if still in prefix
             if !key.starts_with(GIT_LINK_PREFIX) {
@@ -218,8 +220,7 @@ impl LinkManager {
         let iter = self.db.prefix_iterator(GIT_LINK_PREFIX);
 
         for item in iter {
-            let (key, value) = item
-                .map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(GIT_LINK_PREFIX) {
                 break;
@@ -241,31 +242,30 @@ impl LinkManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Config;
     use crate::storage::StorageEngine;
+    use crate::Config;
 
     #[test]
     fn test_link_manager_basic() {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).expect("Failed to open engine");
 
-        let link_manager = LinkManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        );
+        let link_manager = LinkManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp));
 
         // Link a branch
         link_manager.link("feature/test", 2, true).expect("Failed to link");
 
         // Get linked branch
-        let linked = link_manager.get_linked_branch("feature/test")
+        let linked = link_manager
+            .get_linked_branch("feature/test")
             .expect("Failed to get linked branch");
         assert_eq!(linked, Some(2));
 
         // Unlink
         link_manager.unlink("feature/test").expect("Failed to unlink");
 
-        let linked = link_manager.get_linked_branch("feature/test")
+        let linked = link_manager
+            .get_linked_branch("feature/test")
             .expect("Failed to get linked branch");
         assert_eq!(linked, None);
     }

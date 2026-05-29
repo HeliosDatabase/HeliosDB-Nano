@@ -27,18 +27,31 @@ fn test_branch_create_and_list() {
     let results = execute_sql(&db, "SELECT * FROM pg_database_branches()").unwrap();
 
     // Should have at least 2 branches (main + dev)
-    assert!(results.len() >= 2, "Expected at least 2 branches, got {}", results.len());
+    assert!(
+        results.len() >= 2,
+        "Expected at least 2 branches, got {}",
+        results.len()
+    );
 
     // Verify branch names include 'dev'
-    let branch_names: Vec<String> = results.iter()
+    let branch_names: Vec<String> = results
+        .iter()
         .map(|t| match &t.values[0] {
             heliosdb_nano::Value::String(s) => s.clone(),
             _ => String::new(),
         })
         .collect();
 
-    assert!(branch_names.contains(&"dev".to_string()), "Branch 'dev' not found in {:?}", branch_names);
-    assert!(branch_names.contains(&"main".to_string()), "Branch 'main' not found in {:?}", branch_names);
+    assert!(
+        branch_names.contains(&"dev".to_string()),
+        "Branch 'dev' not found in {:?}",
+        branch_names
+    );
+    assert!(
+        branch_names.contains(&"main".to_string()),
+        "Branch 'main' not found in {:?}",
+        branch_names
+    );
 }
 
 #[test]
@@ -54,14 +67,18 @@ fn test_branch_drop() {
 
     // Verify branch is dropped by listing branches
     let results = execute_sql(&db, "SELECT * FROM pg_database_branches()").unwrap();
-    let branch_names: Vec<String> = results.iter()
+    let branch_names: Vec<String> = results
+        .iter()
         .map(|t| match &t.values[0] {
             heliosdb_nano::Value::String(s) => s.clone(),
             _ => String::new(),
         })
         .collect();
 
-    assert!(!branch_names.contains(&"temp".to_string()), "Branch 'temp' should have been dropped");
+    assert!(
+        !branch_names.contains(&"temp".to_string()),
+        "Branch 'temp' should have been dropped"
+    );
 }
 
 #[test]
@@ -71,7 +88,10 @@ fn test_branch_drop_if_exists() {
 
     // Drop non-existent branch with IF EXISTS - should not error
     let result = execute_ddl(&db, "DROP DATABASE BRANCH IF EXISTS nonexistent");
-    assert!(result.is_ok(), "DROP BRANCH IF EXISTS should not error for non-existent branch");
+    assert!(
+        result.is_ok(),
+        "DROP BRANCH IF EXISTS should not error for non-existent branch"
+    );
 }
 
 #[test]
@@ -131,7 +151,11 @@ fn test_materialized_view_concurrent_refresh() {
     execute_ddl(&db, "INSERT INTO products VALUES (2, 'Gadget', 20)").unwrap();
 
     // Create materialized view
-    execute_ddl(&db, "CREATE MATERIALIZED VIEW product_stats AS SELECT COUNT(*) as total, AVG(price) as avg_price FROM products").unwrap();
+    execute_ddl(
+        &db,
+        "CREATE MATERIALIZED VIEW product_stats AS SELECT COUNT(*) as total, AVG(price) as avg_price FROM products",
+    )
+    .unwrap();
 
     // Refresh concurrently (zero downtime)
     execute_ddl(&db, "REFRESH MATERIALIZED VIEW CONCURRENTLY product_stats").unwrap();
@@ -203,7 +227,11 @@ fn test_system_view_pg_database_branches() {
     let results = execute_sql(&db, "SELECT * FROM pg_database_branches()").unwrap();
 
     // Should have at least 3 branches (main, dev, staging)
-    assert!(results.len() >= 3, "Expected at least 3 branches, got {}", results.len());
+    assert!(
+        results.len() >= 3,
+        "Expected at least 3 branches, got {}",
+        results.len()
+    );
 
     // Each result should have columns (verify structure)
     for result in &results {
@@ -218,7 +246,11 @@ fn test_system_view_pg_mv_staleness() {
 
     // Create base table and materialized view
     execute_ddl(&db, "CREATE TABLE data (id INT)").unwrap();
-    execute_ddl(&db, "CREATE MATERIALIZED VIEW data_summary AS SELECT COUNT(*) FROM data").unwrap();
+    execute_ddl(
+        &db,
+        "CREATE MATERIALIZED VIEW data_summary AS SELECT COUNT(*) FROM data",
+    )
+    .unwrap();
 
     // Query staleness view
     let results = execute_sql(&db, "SELECT * FROM pg_mv_staleness()").unwrap();
@@ -241,11 +273,16 @@ fn test_branch_with_options() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
 
     // Create branch with simple options (key=value format without parentheses)
-    execute_ddl(&db, "CREATE DATABASE BRANCH dev FROM CURRENT AS OF NOW WITH replication_factor=3").unwrap();
+    execute_ddl(
+        &db,
+        "CREATE DATABASE BRANCH dev FROM CURRENT AS OF NOW WITH replication_factor=3",
+    )
+    .unwrap();
 
     // Verify branch exists by listing branches
     let results = execute_sql(&db, "SELECT * FROM pg_database_branches()").unwrap();
-    let branch_names: Vec<String> = results.iter()
+    let branch_names: Vec<String> = results
+        .iter()
         .map(|t| match &t.values[0] {
             heliosdb_nano::Value::String(s) => s.clone(),
             _ => String::new(),
@@ -265,7 +302,11 @@ fn test_merge_with_conflict_resolution() {
     execute_ddl(&db, "CREATE DATABASE BRANCH branch2 FROM CURRENT AS OF NOW").unwrap();
 
     // Merge with conflict resolution strategy (using simple key=value format)
-    execute_ddl(&db, "MERGE DATABASE BRANCH branch1 INTO branch2 WITH conflict_resolution=branch_wins").unwrap();
+    execute_ddl(
+        &db,
+        "MERGE DATABASE BRANCH branch1 INTO branch2 WITH conflict_resolution=branch_wins",
+    )
+    .unwrap();
 
     // Verify merge completed by checking branches exist
     let results = execute_sql(&db, "SELECT * FROM pg_database_branches()").unwrap();
@@ -313,7 +354,10 @@ fn test_end_to_end_branch_workflow() {
 
     // List branches
     let results = execute_sql(&db, "SELECT * FROM pg_database_branches()").unwrap();
-    assert!(results.len() >= 3, "Should have at least 3 branches (main, development, feature)");
+    assert!(
+        results.len() >= 3,
+        "Should have at least 3 branches (main, development, feature)"
+    );
 
     // Merge feature into development
     execute_ddl(&db, "MERGE DATABASE BRANCH feature INTO development").unwrap();
@@ -361,7 +405,11 @@ fn test_end_to_end_materialized_view_workflow() {
 
     // Verify updated data
     let results = execute_sql(&db, "SELECT * FROM __mv_customer_stats").unwrap();
-    assert_eq!(results.len(), 3, "Should have 3 tiers after refresh (gold, silver, bronze)");
+    assert_eq!(
+        results.len(),
+        3,
+        "Should have 3 tiers after refresh (gold, silver, bronze)"
+    );
 
     // Clean up
     execute_ddl(&db, "DROP MATERIALIZED VIEW customer_stats").unwrap();

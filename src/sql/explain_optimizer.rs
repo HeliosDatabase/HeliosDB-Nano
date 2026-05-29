@@ -238,12 +238,7 @@ impl OptimizationEngine {
         })
     }
 
-    fn generate_query_rewrites(
-        &self,
-        query_pattern: &str,
-        has_join: bool,
-        has_aggregation: bool,
-    ) -> Vec<QueryRewrite> {
+    fn generate_query_rewrites(&self, query_pattern: &str, has_join: bool, has_aggregation: bool) -> Vec<QueryRewrite> {
         let mut rewrites = Vec::new();
 
         // Rewrite 1: IN to EXISTS transformation
@@ -338,9 +333,7 @@ impl OptimizationEngine {
                     SELECT a.*, b.* FROM {} a JOIN {} b ON a.id = b.{}_id",
                     tables[0], tables[1], tables[0], tables[1], tables[0]
                 ),
-                target_queries: vec![
-                    format!("Queries joining {} and {}", tables[0], tables[1]),
-                ],
+                target_queries: vec![format!("Queries joining {} and {}", tables[0], tables[1])],
                 estimated_speedup: 30.0,
                 storage_cost_mb: 500.0,
                 refresh_strategy: RefreshStrategy::Incremental,
@@ -389,10 +382,7 @@ impl OptimizationEngine {
             opportunities.push(DenormalizationOpportunity {
                 opportunity_type: DenormalizationType::PrecomputedJoin,
                 tables_involved: tables.to_vec(),
-                suggested_schema: format!(
-                    "Add denormalized columns from {} to {}",
-                    tables[1], tables[0]
-                ),
+                suggested_schema: format!("Add denormalized columns from {} to {}", tables[1], tables[0]),
                 query_improvement: 80.0,
                 storage_overhead: 15.0,
                 update_complexity: "Update triggers needed to maintain consistency".to_string(),
@@ -402,10 +392,7 @@ impl OptimizationEngine {
             opportunities.push(DenormalizationOpportunity {
                 opportunity_type: DenormalizationType::SummaryTable,
                 tables_involved: tables.to_vec(),
-                suggested_schema: format!(
-                    "CREATE TABLE {}_summary (id, count, total, avg, ...)",
-                    tables[0]
-                ),
+                suggested_schema: format!("CREATE TABLE {}_summary (id, count, total, avg, ...)", tables[0]),
                 query_improvement: 95.0,
                 storage_overhead: 5.0,
                 update_complexity: "Async background job to update summaries".to_string(),
@@ -542,7 +529,10 @@ impl OptimizationEngine {
         // Query rewrites
         if !suggestions.query_rewrites.is_empty() {
             output.push_str("───────────────────────────────────────────────────────────────\n");
-            output.push_str(&format!("  QUERY REWRITES ({} patterns)\n", suggestions.query_rewrites.len()));
+            output.push_str(&format!(
+                "  QUERY REWRITES ({} patterns)\n",
+                suggestions.query_rewrites.len()
+            ));
             output.push_str("───────────────────────────────────────────────────────────────\n\n");
 
             for rewrite in &suggestions.query_rewrites {
@@ -559,7 +549,10 @@ impl OptimizationEngine {
         // Materialized views
         if !suggestions.materialized_views.is_empty() {
             output.push_str("───────────────────────────────────────────────────────────────\n");
-            output.push_str(&format!("  MATERIALIZED VIEWS ({} recommendations)\n", suggestions.materialized_views.len()));
+            output.push_str(&format!(
+                "  MATERIALIZED VIEWS ({} recommendations)\n",
+                suggestions.materialized_views.len()
+            ));
             output.push_str("───────────────────────────────────────────────────────────────\n\n");
 
             for mv in &suggestions.materialized_views {
@@ -576,7 +569,10 @@ impl OptimizationEngine {
         // Partition strategies
         if !suggestions.partition_strategies.is_empty() {
             output.push_str("───────────────────────────────────────────────────────────────\n");
-            output.push_str(&format!("  PARTITION STRATEGIES ({} suggestions)\n", suggestions.partition_strategies.len()));
+            output.push_str(&format!(
+                "  PARTITION STRATEGIES ({} suggestions)\n",
+                suggestions.partition_strategies.len()
+            ));
             output.push_str("───────────────────────────────────────────────────────────────\n\n");
 
             for part in &suggestions.partition_strategies {
@@ -592,7 +588,10 @@ impl OptimizationEngine {
         // Denormalization opportunities
         if !suggestions.denormalization_opportunities.is_empty() {
             output.push_str("───────────────────────────────────────────────────────────────\n");
-            output.push_str(&format!("  DENORMALIZATION ({} opportunities)\n", suggestions.denormalization_opportunities.len()));
+            output.push_str(&format!(
+                "  DENORMALIZATION ({} opportunities)\n",
+                suggestions.denormalization_opportunities.len()
+            ));
             output.push_str("───────────────────────────────────────────────────────────────\n\n");
 
             for denorm in &suggestions.denormalization_opportunities {
@@ -608,7 +607,10 @@ impl OptimizationEngine {
         // Cost-benefit analysis
         if !suggestions.cost_benefit_analyses.is_empty() {
             output.push_str("───────────────────────────────────────────────────────────────\n");
-            output.push_str(&format!("  COST-BENEFIT ANALYSIS ({} optimizations)\n", suggestions.cost_benefit_analyses.len()));
+            output.push_str(&format!(
+                "  COST-BENEFIT ANALYSIS ({} optimizations)\n",
+                suggestions.cost_benefit_analyses.len()
+            ));
             output.push_str("───────────────────────────────────────────────────────────────\n\n");
 
             for analysis in &suggestions.cost_benefit_analyses {
@@ -616,13 +618,16 @@ impl OptimizationEngine {
                 output.push_str(&format!("  ROI: {:.0}%\n", analysis.roi_percent));
                 output.push_str(&format!("  Payback Period: {:.1} days\n", analysis.payback_period_days));
                 output.push_str(&format!("  Recommendation: {}\n", analysis.recommendation));
-                output.push_str(&format!("  Implementation: {:.1}h development, {:.0} MB storage\n",
-                    analysis.implementation_cost.development_hours,
-                    analysis.implementation_cost.storage_mb));
-                output.push_str(&format!("  Benefit: {:.0}% speedup, {:.0}% less CPU, {:.0}% less I/O\n",
+                output.push_str(&format!(
+                    "  Implementation: {:.1}h development, {:.0} MB storage\n",
+                    analysis.implementation_cost.development_hours, analysis.implementation_cost.storage_mb
+                ));
+                output.push_str(&format!(
+                    "  Benefit: {:.0}% speedup, {:.0}% less CPU, {:.0}% less I/O\n",
                     analysis.performance_benefit.query_speedup_percent,
                     analysis.performance_benefit.reduced_cpu_percent,
-                    analysis.performance_benefit.reduced_io_percent));
+                    analysis.performance_benefit.reduced_io_percent
+                ));
                 output.push_str("\n");
             }
         }

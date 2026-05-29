@@ -3,10 +3,10 @@
 //! Demonstrates the 5 core optimization rules with before/after comparisons.
 //! Shows expected performance improvements of 2-10x for different query patterns.
 
+use heliosdb_nano::optimizer::cost::{ColumnStats, StatsCatalog, TableStats};
 use heliosdb_nano::optimizer::{Optimizer, OptimizerConfig};
-use heliosdb_nano::optimizer::cost::{StatsCatalog, TableStats, ColumnStats};
 use heliosdb_nano::sql::logical_plan::*;
-use heliosdb_nano::{Schema, Column, DataType, Value};
+use heliosdb_nano::{Column, DataType, Schema, Value};
 use std::sync::Arc;
 
 fn main() {
@@ -79,17 +79,17 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
         .with_column_stats(
             ColumnStats::new("id".to_string())
                 .with_distinct_count(1_000_000)
-                .with_index("btree".to_string())
+                .with_index("btree".to_string()),
         )
         .with_column_stats(
             ColumnStats::new("email".to_string())
                 .with_distinct_count(1_000_000)
-                .with_index("btree".to_string())
+                .with_index("btree".to_string()),
         )
         .with_column_stats(
             ColumnStats::new("status".to_string())
                 .with_distinct_count(5)
-                .with_index("btree".to_string())
+                .with_index("btree".to_string()),
         );
 
     catalog.add_table_stats(users_stats);
@@ -107,12 +107,12 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
         .with_column_stats(
             ColumnStats::new("id".to_string())
                 .with_distinct_count(10_000_000)
-                .with_index("btree".to_string())
+                .with_index("btree".to_string()),
         )
         .with_column_stats(
             ColumnStats::new("user_id".to_string())
                 .with_distinct_count(1_000_000)
-                .with_index("btree".to_string())
+                .with_index("btree".to_string()),
         );
 
     catalog.add_table_stats(orders_stats);
@@ -128,7 +128,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
             Column {
                 name: "name".to_string(),
@@ -139,7 +139,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
             Column {
                 name: "email".to_string(),
@@ -150,7 +150,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
             Column {
                 name: "age".to_string(),
@@ -161,7 +161,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
             Column {
                 name: "status".to_string(),
@@ -172,7 +172,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
         ],
     });
@@ -188,7 +188,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
             Column {
                 name: "user_id".to_string(),
@@ -199,7 +199,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
             Column {
                 name: "amount".to_string(),
@@ -210,7 +210,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
             Column {
                 name: "order_date".to_string(),
@@ -221,7 +221,7 @@ fn setup_demo_environment() -> (StatsCatalog, Arc<Schema>, Arc<Schema>) {
                 source_table_name: None,
                 default_expr: None,
                 unique: false,
-            storage_mode: heliosdb_nano::ColumnStorageMode::Default,
+                storage_mode: heliosdb_nano::ColumnStorageMode::Default,
             },
         ],
     });
@@ -247,7 +247,10 @@ fn demo_constant_folding(optimizer: &Optimizer, schema: Arc<Schema>) {
     let filter = LogicalPlan::Filter {
         input: Box::new(scan.clone()),
         predicate: LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "age".to_string() }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "age".to_string(),
+            }),
             op: BinaryOperator::Gt,
             right: Box::new(LogicalExpr::BinaryExpr {
                 left: Box::new(LogicalExpr::Literal(Value::Int4(20))),
@@ -298,9 +301,18 @@ fn demo_selection_pushdown(optimizer: &Optimizer, schema: Arc<Schema>) {
     let project = LogicalPlan::Project {
         input: Box::new(scan),
         exprs: vec![
-            LogicalExpr::Column { table: None, name: "id".to_string() },
-            LogicalExpr::Column { table: None, name: "name".to_string() },
-            LogicalExpr::Column { table: None, name: "age".to_string() },
+            LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            },
+            LogicalExpr::Column {
+                table: None,
+                name: "name".to_string(),
+            },
+            LogicalExpr::Column {
+                table: None,
+                name: "age".to_string(),
+            },
         ],
         aliases: vec!["id".to_string(), "name".to_string(), "age".to_string()],
         distinct: false,
@@ -310,7 +322,10 @@ fn demo_selection_pushdown(optimizer: &Optimizer, schema: Arc<Schema>) {
     let filter = LogicalPlan::Filter {
         input: Box::new(project),
         predicate: LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "age".to_string() }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "age".to_string(),
+            }),
             op: BinaryOperator::Gt,
             right: Box::new(LogicalExpr::Literal(Value::Int4(21))),
         },
@@ -354,7 +369,10 @@ fn demo_projection_pruning(optimizer: &Optimizer, schema: Arc<Schema>) {
 
     let project = LogicalPlan::Project {
         input: Box::new(scan),
-        exprs: vec![LogicalExpr::Column { table: None, name: "name".to_string() }],
+        exprs: vec![LogicalExpr::Column {
+            table: None,
+            name: "name".to_string(),
+        }],
         aliases: vec!["name".to_string()],
         distinct: false,
         distinct_on: None,
@@ -411,9 +429,15 @@ fn demo_join_reordering(optimizer: &Optimizer, users_schema: Arc<Schema>, orders
         right: Box::new(users_scan),
         join_type: JoinType::Inner,
         on: Some(LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "user_id".to_string() }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "user_id".to_string(),
+            }),
             op: BinaryOperator::Eq,
-            right: Box::new(LogicalExpr::Column { table: None, name: "id".to_string() }),
+            right: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            }),
         }),
         lateral: false,
     };
@@ -460,7 +484,10 @@ fn demo_index_selection(optimizer: &Optimizer, schema: Arc<Schema>) {
     let filter = LogicalPlan::Filter {
         input: Box::new(scan),
         predicate: LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "status".to_string() }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "status".to_string(),
+            }),
             op: BinaryOperator::Eq,
             right: Box::new(LogicalExpr::Literal(Value::String("active".to_string()))),
         },
@@ -521,9 +548,15 @@ fn demo_complex_query(optimizer: &Optimizer, users_schema: Arc<Schema>, orders_s
         right: Box::new(users_scan),
         join_type: JoinType::Inner,
         on: Some(LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "user_id".to_string() }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "user_id".to_string(),
+            }),
             op: BinaryOperator::Eq,
-            right: Box::new(LogicalExpr::Column { table: None, name: "id".to_string() }),
+            right: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            }),
         }),
         lateral: false,
     };
@@ -533,13 +566,19 @@ fn demo_complex_query(optimizer: &Optimizer, users_schema: Arc<Schema>, orders_s
         input: Box::new(join),
         predicate: LogicalExpr::BinaryExpr {
             left: Box::new(LogicalExpr::BinaryExpr {
-                left: Box::new(LogicalExpr::Column { table: None, name: "status".to_string() }),
+                left: Box::new(LogicalExpr::Column {
+                    table: None,
+                    name: "status".to_string(),
+                }),
                 op: BinaryOperator::Eq,
                 right: Box::new(LogicalExpr::Literal(Value::String("active".to_string()))),
             }),
             op: BinaryOperator::And,
             right: Box::new(LogicalExpr::BinaryExpr {
-                left: Box::new(LogicalExpr::Column { table: None, name: "amount".to_string() }),
+                left: Box::new(LogicalExpr::Column {
+                    table: None,
+                    name: "amount".to_string(),
+                }),
                 op: BinaryOperator::Gt,
                 right: Box::new(LogicalExpr::BinaryExpr {
                     left: Box::new(LogicalExpr::Literal(Value::Int4(100))),
@@ -553,10 +592,16 @@ fn demo_complex_query(optimizer: &Optimizer, users_schema: Arc<Schema>, orders_s
     // Aggregate
     let aggregate = LogicalPlan::Aggregate {
         input: Box::new(filter),
-        group_by: vec![LogicalExpr::Column { table: None, name: "name".to_string() }],
+        group_by: vec![LogicalExpr::Column {
+            table: None,
+            name: "name".to_string(),
+        }],
         aggr_exprs: vec![LogicalExpr::AggregateFunction {
             fun: AggregateFunction::Sum,
-            args: vec![LogicalExpr::Column { table: None, name: "amount".to_string() }],
+            args: vec![LogicalExpr::Column {
+                table: None,
+                name: "amount".to_string(),
+            }],
             distinct: false,
         }],
         having: None,

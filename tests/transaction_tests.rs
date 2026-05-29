@@ -193,7 +193,10 @@ fn test_multiple_inserts_sequential() -> Result<()> {
     for i in 1..=100 {
         db.execute(&format!(
             "INSERT INTO users (id, name, email, age) VALUES ({}, 'User{}', 'user{}@example.com', {})",
-            i, i, i, 20 + (i % 50)
+            i,
+            i,
+            i,
+            20 + (i % 50)
         ))?;
     }
 
@@ -375,7 +378,10 @@ fn test_long_transaction_many_operations() -> Result<()> {
     for i in 1..=50 {
         db.execute(&format!(
             "INSERT INTO users (id, name, email, age) VALUES ({}, 'User{}', 'user{}@example.com', {})",
-            i, i, i, 20 + (i % 50)
+            i,
+            i,
+            i,
+            20 + (i % 50)
         ))?;
     }
 

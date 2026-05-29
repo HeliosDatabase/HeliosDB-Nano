@@ -20,8 +20,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::storage::StorageEngine;
 use crate::sql::logical_plan::LogicalPlan;
+use crate::storage::StorageEngine;
 use crate::{ColumnStorageMode, Result};
 
 /// Complete storage feature report for a table
@@ -358,10 +358,7 @@ pub struct StorageFeatureCollector;
 
 impl StorageFeatureCollector {
     /// Collect storage feature reports for all tables referenced in the plan
-    pub fn collect(
-        storage: Option<&Arc<StorageEngine>>,
-        plan: &LogicalPlan,
-    ) -> Result<Vec<StorageFeatureReport>> {
+    pub fn collect(storage: Option<&Arc<StorageEngine>>, plan: &LogicalPlan) -> Result<Vec<StorageFeatureReport>> {
         let mut reports = Vec::new();
         let tables = Self::extract_tables(plan);
 
@@ -385,8 +382,7 @@ impl StorageFeatureCollector {
 
     fn extract_tables_recursive(plan: &LogicalPlan, tables: &mut Vec<String>) {
         match plan {
-            LogicalPlan::Scan { table_name, .. }
-            | LogicalPlan::FilteredScan { table_name, .. } => {
+            LogicalPlan::Scan { table_name, .. } | LogicalPlan::FilteredScan { table_name, .. } => {
                 if !tables.contains(table_name) {
                     tables.push(table_name.clone());
                 }
@@ -421,10 +417,7 @@ impl StorageFeatureCollector {
     }
 
     /// Collect storage features for a single table
-    fn collect_for_table(
-        storage: &Arc<StorageEngine>,
-        table_name: &str,
-    ) -> Result<StorageFeatureReport> {
+    fn collect_for_table(storage: &Arc<StorageEngine>, table_name: &str) -> Result<StorageFeatureReport> {
         let catalog = storage.catalog();
 
         // Get schema for column storage modes
@@ -476,60 +469,46 @@ impl StorageFeatureCollector {
         let indexes = Self::collect_index_info(storage, table_name);
 
         // Table statistics
-        let statistics = catalog
-            .get_table_statistics(table_name)
-            .ok()
-            .flatten()
-            .map(|stats| {
-                let staleness_warning = Self::check_staleness(&stats.last_analyzed);
+        let statistics = catalog.get_table_statistics(table_name).ok().flatten().map(|stats| {
+            let staleness_warning = Self::check_staleness(&stats.last_analyzed);
 
-                StatisticsReport {
-                    row_count: stats.row_count,
-                    avg_row_size: stats.avg_row_size,
-                    total_size: stats.total_size,
-                    last_analyzed: stats.last_analyzed.to_rfc3339(),
-                    staleness_warning,
-                    column_stats: stats
-                        .columns
-                        .iter()
-                        .map(|(name, cs)| {
-                            (
-                                name.clone(),
-                                ColumnStatisticsReport {
-                                    null_fraction: cs.null_frac,
-                                    distinct_count: cs.n_distinct,
-                                    avg_width: cs.avg_width,
-                                    histogram_bounds: if cs.histogram_bounds.is_empty() {
-                                        None
-                                    } else {
-                                        Some(
-                                            cs.histogram_bounds
-                                                .iter()
-                                                .map(|v| format!("{:?}", v))
-                                                .collect(),
-                                        )
-                                    },
-                                    most_common_values: if cs.most_common_values.is_empty() {
-                                        None
-                                    } else {
-                                        Some(
-                                            cs.most_common_values
-                                                .iter()
-                                                .map(|v| format!("{:?}", v))
-                                                .collect(),
-                                        )
-                                    },
-                                    most_common_freqs: if cs.most_common_freqs.is_empty() {
-                                        None
-                                    } else {
-                                        Some(cs.most_common_freqs.clone())
-                                    },
+            StatisticsReport {
+                row_count: stats.row_count,
+                avg_row_size: stats.avg_row_size,
+                total_size: stats.total_size,
+                last_analyzed: stats.last_analyzed.to_rfc3339(),
+                staleness_warning,
+                column_stats: stats
+                    .columns
+                    .iter()
+                    .map(|(name, cs)| {
+                        (
+                            name.clone(),
+                            ColumnStatisticsReport {
+                                null_fraction: cs.null_frac,
+                                distinct_count: cs.n_distinct,
+                                avg_width: cs.avg_width,
+                                histogram_bounds: if cs.histogram_bounds.is_empty() {
+                                    None
+                                } else {
+                                    Some(cs.histogram_bounds.iter().map(|v| format!("{:?}", v)).collect())
                                 },
-                            )
-                        })
-                        .collect(),
-                }
-            });
+                                most_common_values: if cs.most_common_values.is_empty() {
+                                    None
+                                } else {
+                                    Some(cs.most_common_values.iter().map(|v| format!("{:?}", v)).collect())
+                                },
+                                most_common_freqs: if cs.most_common_freqs.is_empty() {
+                                    None
+                                } else {
+                                    Some(cs.most_common_freqs.clone())
+                                },
+                            },
+                        )
+                    })
+                    .collect(),
+            }
+        });
 
         // Columnar stats (if applicable)
         let columnar = if has_columnar {
@@ -620,15 +599,9 @@ impl StorageFeatureCollector {
         let days = age.num_days();
 
         if days > 30 {
-            Some(format!(
-                "Statistics are {} days old. Consider running ANALYZE.",
-                days
-            ))
+            Some(format!("Statistics are {} days old. Consider running ANALYZE.", days))
         } else if days > 7 {
-            Some(format!(
-                "Statistics are {} days old. May benefit from ANALYZE.",
-                days
-            ))
+            Some(format!("Statistics are {} days old. May benefit from ANALYZE.", days))
         } else {
             None
         }
@@ -720,7 +693,10 @@ pub fn format_storage_features_text(reports: &[StorageFeatureReport]) -> String 
         // Bloom Filter
         if let Some(bloom) = &report.bloom_filter {
             result.push_str("\n  Bloom Filter:\n");
-            result.push_str(&format!("    Status      : {}\n", if bloom.enabled { "Enabled" } else { "Disabled" }));
+            result.push_str(&format!(
+                "    Status      : {}\n",
+                if bloom.enabled { "Enabled" } else { "Disabled" }
+            ));
             result.push_str(&format!("    Target FPR  : {:.2}%\n", bloom.target_fpr * 100.0));
             if let Some(fpr) = bloom.actual_fpr {
                 result.push_str(&format!("    Actual FPR  : {:.2}%\n", fpr * 100.0));
@@ -733,9 +709,16 @@ pub fn format_storage_features_text(reports: &[StorageFeatureReport]) -> String 
         // Zone Maps
         if let Some(zones) = &report.zone_maps {
             result.push_str("\n  Zone Maps:\n");
-            result.push_str(&format!("    Status      : {}\n", if zones.enabled { "Enabled" } else { "Disabled" }));
+            result.push_str(&format!(
+                "    Status      : {}\n",
+                if zones.enabled { "Enabled" } else { "Disabled" }
+            ));
             result.push_str(&format!("    Total Blocks: {}\n", zones.total_blocks));
-            result.push_str(&format!("    Skipped     : {} ({:.1}%)\n", zones.blocks_skipped, zones.skip_ratio * 100.0));
+            result.push_str(&format!(
+                "    Skipped     : {} ({:.1}%)\n",
+                zones.blocks_skipped,
+                zones.skip_ratio * 100.0
+            ));
             result.push_str(&format!("    Scanned     : {}\n", zones.blocks_scanned));
             result.push_str(&format!("    Effectiveness: {}\n", zones.effectiveness));
         }
@@ -804,10 +787,7 @@ mod tests {
             BloomFilterEffectiveness::from_fpr(0.005),
             BloomFilterEffectiveness::Excellent
         );
-        assert_eq!(
-            BloomFilterEffectiveness::from_fpr(0.03),
-            BloomFilterEffectiveness::Good
-        );
+        assert_eq!(BloomFilterEffectiveness::from_fpr(0.03), BloomFilterEffectiveness::Good);
         assert_eq!(
             BloomFilterEffectiveness::from_fpr(0.07),
             BloomFilterEffectiveness::Moderate
@@ -824,10 +804,7 @@ mod tests {
             ZoneMapEffectiveness::from_skip_ratio(0.90),
             ZoneMapEffectiveness::Excellent
         );
-        assert_eq!(
-            ZoneMapEffectiveness::from_skip_ratio(0.60),
-            ZoneMapEffectiveness::Good
-        );
+        assert_eq!(ZoneMapEffectiveness::from_skip_ratio(0.60), ZoneMapEffectiveness::Good);
         assert_eq!(
             ZoneMapEffectiveness::from_skip_ratio(0.30),
             ZoneMapEffectiveness::Moderate

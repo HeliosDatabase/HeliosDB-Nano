@@ -11,9 +11,7 @@
 
 #![cfg(feature = "code-embed")]
 
-use heliosdb_nano::code_graph::{
-    code_index_with_embedder, CodeIndexOptions, FastEmbedder,
-};
+use heliosdb_nano::code_graph::{code_index_with_embedder, CodeIndexOptions, FastEmbedder};
 use heliosdb_nano::{EmbeddedDatabase, Value};
 
 #[test]
@@ -37,8 +35,8 @@ fn fastembed_populates_body_vec() {
         .query("SELECT body_vec FROM _hdb_code_symbols", &[])
         .expect("body_vec column present");
     assert!(!rows.is_empty());
-    let any_vec = rows.iter().any(|t| {
-        matches!(t.values.first(), Some(Value::Vector(v)) if v.len() == 384)
-    });
+    let any_vec = rows
+        .iter()
+        .any(|t| matches!(t.values.first(), Some(Value::Vector(v)) if v.len() == 384));
     assert!(any_vec, "expected at least one 384-dim BGE-Small embedding");
 }

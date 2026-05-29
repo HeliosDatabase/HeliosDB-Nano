@@ -13,8 +13,8 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 
-use heliosdb_nano::EmbeddedDatabase;
 use heliosdb_nano::protocol::postgres::{AuthManager, AuthMethod, PgServer, PgServerConfig};
+use heliosdb_nano::EmbeddedDatabase;
 
 // ---------- Bug 2: SCRAM client-first parser ---------------------------------
 
@@ -73,10 +73,7 @@ fn scram_parser_rejects_missing_nonce() {
 #[test]
 fn trust_auth_on_loopback_is_allowed() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
-    let config = PgServerConfig::with_address(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        0,
-    ));
+    let config = PgServerConfig::with_address(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0));
     // default auth_method is Trust; this MUST succeed because 127.0.0.1 is loopback.
     let result = PgServer::new(config, db);
     assert!(
@@ -89,12 +86,13 @@ fn trust_auth_on_loopback_is_allowed() {
 #[test]
 fn trust_auth_on_ipv6_loopback_is_allowed() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
-    let config = PgServerConfig::with_address(SocketAddr::new(
-        IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        0,
-    ));
+    let config = PgServerConfig::with_address(SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 0));
     let result = PgServer::new(config, db);
-    assert!(result.is_ok(), "trust on ::1 must be allowed; got {:?}", result.err().map(|e| e.to_string()).unwrap_or_default());
+    assert!(
+        result.is_ok(),
+        "trust on ::1 must be allowed; got {:?}",
+        result.err().map(|e| e.to_string()).unwrap_or_default()
+    );
 }
 
 #[test]
@@ -102,10 +100,7 @@ fn trust_auth_on_unspecified_address_is_refused() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
     // 0.0.0.0 means "all interfaces" — includes the public interface, so
     // trust is unsafe.
-    let config = PgServerConfig::with_address(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        5432,
-    ));
+    let config = PgServerConfig::with_address(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5432));
     let result = PgServer::new(config, db);
     assert!(
         result.is_err(),
@@ -118,7 +113,8 @@ fn trust_auth_on_unspecified_address_is_refused() {
         Err(e) => e.to_string().to_lowercase(),
     };
     assert!(
-        msg.contains("trust") && (msg.contains("loopback") || msg.contains("127.0.0.1") || msg.contains("non-loopback")),
+        msg.contains("trust")
+            && (msg.contains("loopback") || msg.contains("127.0.0.1") || msg.contains("non-loopback")),
         "error must explain why trust is refused on non-loopback; got {msg}"
     );
 }
@@ -127,10 +123,7 @@ fn trust_auth_on_unspecified_address_is_refused() {
 fn trust_auth_on_public_address_is_refused() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
     // 192.0.2.1 is in TEST-NET-1 (RFC 5737) and not loopback.
-    let config = PgServerConfig::with_address(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-        5432,
-    ));
+    let config = PgServerConfig::with_address(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 5432));
     let result = PgServer::new(config, db);
     assert!(
         result.is_err(),
@@ -141,11 +134,8 @@ fn trust_auth_on_public_address_is_refused() {
 #[test]
 fn password_auth_on_public_address_is_allowed() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
-    let config = PgServerConfig::with_address(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-        5432,
-    ))
-    .with_auth_method(AuthMethod::CleartextPassword);
+    let config = PgServerConfig::with_address(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 5432))
+        .with_auth_method(AuthMethod::CleartextPassword);
     let result = PgServer::new(config, db);
     assert!(
         result.is_ok(),
@@ -157,11 +147,8 @@ fn password_auth_on_public_address_is_allowed() {
 #[test]
 fn scram_auth_on_public_address_is_allowed() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
-    let config = PgServerConfig::with_address(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)),
-        5432,
-    ))
-    .with_auth_method(AuthMethod::ScramSha256);
+    let config = PgServerConfig::with_address(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 5432))
+        .with_auth_method(AuthMethod::ScramSha256);
     let result = PgServer::new(config, db);
     assert!(
         result.is_ok(),
@@ -173,10 +160,7 @@ fn scram_auth_on_public_address_is_allowed() {
 #[test]
 fn with_auth_manager_also_enforces_trust_loopback() {
     let db = Arc::new(EmbeddedDatabase::new_in_memory().expect("db"));
-    let config = PgServerConfig::with_address(SocketAddr::new(
-        IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-        5432,
-    ));
+    let config = PgServerConfig::with_address(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 5432));
     let auth_mgr = AuthManager::new(AuthMethod::Trust).with_default_users();
     let result = PgServer::with_auth_manager(config, db, auth_mgr);
     assert!(

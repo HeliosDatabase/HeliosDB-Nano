@@ -53,13 +53,7 @@ mod decimal_tests {
         db.execute("CREATE TABLE precision_test (value DECIMAL)").unwrap();
 
         // Test various precision levels
-        let test_values = vec![
-            "1.1",
-            "1.123",
-            "1.123456789",
-            "0.0000000001",
-            "999999999.999999999",
-        ];
+        let test_values = vec!["1.1", "1.123", "1.123456789", "0.0000000001", "999999999.999999999"];
 
         for value in &test_values {
             let sql = format!("INSERT INTO precision_test VALUES ({})", value);
@@ -107,7 +101,9 @@ mod decimal_tests {
         assert!(rows.len() >= 1, "Should return at least 1 value > 10.0");
 
         // Test less than or equal
-        let rows = db.query("SELECT value FROM comp_test WHERE value <= 20.3", &[]).unwrap();
+        let rows = db
+            .query("SELECT value FROM comp_test WHERE value <= 20.3", &[])
+            .unwrap();
         assert!(rows.len() >= 2, "Should return at least 2 values <= 20.3");
     }
 
@@ -124,14 +120,17 @@ mod decimal_tests {
         let rows = db.query("SELECT id FROM null_test WHERE value IS NULL", &[]).unwrap();
         assert_eq!(rows.len(), 1, "Should find NULL value");
 
-        let rows = db.query("SELECT id FROM null_test WHERE value IS NOT NULL", &[]).unwrap();
+        let rows = db
+            .query("SELECT id FROM null_test WHERE value IS NOT NULL", &[])
+            .unwrap();
         assert_eq!(rows.len(), 2, "Should find non-NULL values");
     }
 
     #[test]
     fn test_decimal_type_conversion() {
         let db = create_test_db();
-        db.execute("CREATE TABLE conv_test (dec_val DECIMAL, int_val INT, float_val FLOAT8)").unwrap();
+        db.execute("CREATE TABLE conv_test (dec_val DECIMAL, int_val INT, float_val FLOAT8)")
+            .unwrap();
 
         // Test casting to decimal in INSERT
         let result = db.execute("INSERT INTO conv_test VALUES (CAST(100 AS NUMERIC), 100, 50.5)");
@@ -155,13 +154,9 @@ mod decimal_tests {
         db.execute("INSERT INTO where_test VALUES (3, 30.25)").unwrap();
 
         // Test greater than comparison
-        let rows = db.query(
-            "SELECT id FROM where_test WHERE price > 15.0",
-            &[],
-        ).unwrap();
+        let rows = db.query("SELECT id FROM where_test WHERE price > 15.0", &[]).unwrap();
         assert!(rows.len() >= 1, "Should find prices > 15.0");
     }
-
 
     #[test]
     fn test_decimal_edge_cases() {
@@ -198,17 +193,17 @@ mod decimal_tests {
         assert_eq!(rows.len(), 1, "Should support SUM with DECIMAL");
 
         // Test COUNT with DECIMAL WHERE clause
-        let rows = db.query(
-            "SELECT COUNT(*) as cnt FROM agg_test WHERE amount > 15.0",
-            &[],
-        ).unwrap();
+        let rows = db
+            .query("SELECT COUNT(*) as cnt FROM agg_test WHERE amount > 15.0", &[])
+            .unwrap();
         assert_eq!(rows.len(), 1, "Should count DECIMAL rows");
     }
 
     #[test]
     fn test_decimal_unary_operations() {
         let db = create_test_db();
-        db.execute("CREATE TABLE unary_test (positive DECIMAL, negative DECIMAL)").unwrap();
+        db.execute("CREATE TABLE unary_test (positive DECIMAL, negative DECIMAL)")
+            .unwrap();
 
         db.execute("INSERT INTO unary_test VALUES (123.45, -123.45)").unwrap();
 
@@ -277,18 +272,23 @@ mod decimal_tests {
         db.execute("INSERT INTO order_test VALUES (4, 75.00)").unwrap();
 
         // Test ascending order
-        let rows = db.query("SELECT amount FROM order_test ORDER BY amount ASC", &[]).unwrap();
+        let rows = db
+            .query("SELECT amount FROM order_test ORDER BY amount ASC", &[])
+            .unwrap();
         assert_eq!(rows.len(), 4, "Should order DECIMAL values ascending");
 
         // Test descending order
-        let rows = db.query("SELECT amount FROM order_test ORDER BY amount DESC", &[]).unwrap();
+        let rows = db
+            .query("SELECT amount FROM order_test ORDER BY amount DESC", &[])
+            .unwrap();
         assert_eq!(rows.len(), 4, "Should order DECIMAL values descending");
     }
 
     #[test]
     fn test_decimal_in_group_by() {
         let db = create_test_db();
-        db.execute("CREATE TABLE group_test (category TEXT, amount DECIMAL)").unwrap();
+        db.execute("CREATE TABLE group_test (category TEXT, amount DECIMAL)")
+            .unwrap();
 
         db.execute("INSERT INTO group_test VALUES ('A', 10.5)").unwrap();
         db.execute("INSERT INTO group_test VALUES ('A', 10.5)").unwrap();
@@ -296,7 +296,9 @@ mod decimal_tests {
         db.execute("INSERT INTO group_test VALUES ('B', 20.3)").unwrap();
 
         // GROUP BY on DECIMAL may have precision-based grouping behavior
-        let rows = db.query("SELECT amount, COUNT(*) FROM group_test GROUP BY amount", &[]).unwrap();
+        let rows = db
+            .query("SELECT amount, COUNT(*) FROM group_test GROUP BY amount", &[])
+            .unwrap();
         assert!(rows.len() >= 1, "Should support GROUP BY on DECIMAL values");
     }
 
@@ -401,7 +403,8 @@ mod decimal_tests {
     #[test]
     fn test_decimal_rounding() {
         let db = create_test_db();
-        db.execute("CREATE TABLE round_test (original DECIMAL, rounded DECIMAL)").unwrap();
+        db.execute("CREATE TABLE round_test (original DECIMAL, rounded DECIMAL)")
+            .unwrap();
 
         // Test rounding with ROUND function
         let result = db.execute("INSERT INTO round_test VALUES (123.456, ROUND(123.456, 2))");
@@ -418,7 +421,8 @@ mod decimal_tests {
     #[test]
     fn test_decimal_in_case_expression() {
         let db = create_test_db();
-        db.execute("CREATE TABLE case_test (value DECIMAL, category TEXT)").unwrap();
+        db.execute("CREATE TABLE case_test (value DECIMAL, category TEXT)")
+            .unwrap();
 
         let result = db.execute(
             "INSERT INTO case_test
@@ -426,7 +430,7 @@ mod decimal_tests {
                  WHEN 50.0 < 25.0 THEN 'Low'
                  WHEN 50.0 >= 25.0 AND 50.0 < 75.0 THEN 'Medium'
                  ELSE 'High'
-             END"
+             END",
         );
 
         match result {
@@ -441,7 +445,8 @@ mod decimal_tests {
     #[test]
     fn test_decimal_in_coalesce() {
         let db = create_test_db();
-        db.execute("CREATE TABLE coalesce_test (id INT, value1 DECIMAL, value2 DECIMAL)").unwrap();
+        db.execute("CREATE TABLE coalesce_test (id INT, value1 DECIMAL, value2 DECIMAL)")
+            .unwrap();
 
         db.execute("INSERT INTO coalesce_test VALUES (1, NULL, 100.5)").unwrap();
         db.execute("INSERT INTO coalesce_test VALUES (2, 50.25, NULL)").unwrap();
@@ -465,7 +470,7 @@ mod decimal_tests {
         // Subqueries may not be fully supported yet
         match db.query(
             "SELECT id FROM products WHERE price > (SELECT AVG(price) FROM products)",
-            &[]
+            &[],
         ) {
             Ok(rows) => assert!(rows.len() >= 1, "Should support DECIMAL in subqueries"),
             Err(e) => println!("Subquery expressions not supported: {}", e),
@@ -475,18 +480,22 @@ mod decimal_tests {
     #[test]
     fn test_decimal_in_join() {
         let db = create_test_db();
-        db.execute("CREATE TABLE prices (product_id INT, amount DECIMAL)").unwrap();
-        db.execute("CREATE TABLE discounts (price_point DECIMAL, discount_pct DECIMAL)").unwrap();
+        db.execute("CREATE TABLE prices (product_id INT, amount DECIMAL)")
+            .unwrap();
+        db.execute("CREATE TABLE discounts (price_point DECIMAL, discount_pct DECIMAL)")
+            .unwrap();
 
         db.execute("INSERT INTO prices VALUES (1, 100.0)").unwrap();
         db.execute("INSERT INTO discounts VALUES (100.0, 0.10)").unwrap();
 
-        let rows = db.query(
-            "SELECT p.product_id, d.discount_pct
+        let rows = db
+            .query(
+                "SELECT p.product_id, d.discount_pct
              FROM prices p
              JOIN discounts d ON p.amount = d.price_point",
-            &[]
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
 
         assert!(rows.len() >= 1, "Should support DECIMAL in JOIN conditions");
     }
@@ -494,20 +503,23 @@ mod decimal_tests {
     #[test]
     fn test_decimal_in_having_clause() {
         let db = create_test_db();
-        db.execute("CREATE TABLE sales (category TEXT, amount DECIMAL)").unwrap();
+        db.execute("CREATE TABLE sales (category TEXT, amount DECIMAL)")
+            .unwrap();
 
         db.execute("INSERT INTO sales VALUES ('A', 100.0)").unwrap();
         db.execute("INSERT INTO sales VALUES ('A', 150.0)").unwrap();
         db.execute("INSERT INTO sales VALUES ('B', 50.0)").unwrap();
         db.execute("INSERT INTO sales VALUES ('B', 30.0)").unwrap();
 
-        let rows = db.query(
-            "SELECT category, SUM(amount) as total
+        let rows = db
+            .query(
+                "SELECT category, SUM(amount) as total
              FROM sales
              GROUP BY category
              HAVING SUM(amount) > 100.0",
-            &[]
-        ).unwrap();
+                &[],
+            )
+            .unwrap();
 
         assert!(rows.len() >= 1, "Should support DECIMAL in HAVING clause");
     }
@@ -587,7 +599,8 @@ mod decimal_tests {
     #[test]
     fn test_decimal_abs_function() {
         let db = create_test_db();
-        db.execute("CREATE TABLE abs_test (value DECIMAL, absolute DECIMAL)").unwrap();
+        db.execute("CREATE TABLE abs_test (value DECIMAL, absolute DECIMAL)")
+            .unwrap();
 
         let result = db.execute("INSERT INTO abs_test VALUES (-123.45, ABS(-123.45))");
 
@@ -625,9 +638,7 @@ mod decimal_tests {
     fn test_decimal_with_check_constraint() {
         let db = create_test_db();
 
-        let result = db.execute(
-            "CREATE TABLE check_test (id INT, price DECIMAL CHECK (price > 0.0))"
-        );
+        let result = db.execute("CREATE TABLE check_test (id INT, price DECIMAL CHECK (price > 0.0))");
 
         match result {
             Ok(_) => {
@@ -647,7 +658,8 @@ mod decimal_tests {
     #[test]
     fn test_decimal_mixed_type_arithmetic() {
         let db = create_test_db();
-        db.execute("CREATE TABLE mixed_test (dec_val DECIMAL, int_val INT, result DECIMAL)").unwrap();
+        db.execute("CREATE TABLE mixed_test (dec_val DECIMAL, int_val INT, result DECIMAL)")
+            .unwrap();
 
         let result = db.execute("INSERT INTO mixed_test VALUES (10.5, 5, 10.5 + 5)");
 
@@ -689,14 +701,18 @@ mod decimal_tests {
         }
 
         // AVG on DECIMAL may not be fully supported, test SUM/MIN/MAX separately
-        match db.query("SELECT SUM(value), AVG(value), MIN(value), MAX(value) FROM agg_perf_test", &[]) {
+        match db.query(
+            "SELECT SUM(value), AVG(value), MIN(value), MAX(value) FROM agg_perf_test",
+            &[],
+        ) {
             Ok(rows) => assert_eq!(rows.len(), 1, "Should handle large DECIMAL aggregations"),
             Err(_) => {
                 // Fall back to testing just SUM, MIN, MAX if AVG fails
-                let rows = db.query("SELECT SUM(value), MIN(value), MAX(value) FROM agg_perf_test", &[]).unwrap();
+                let rows = db
+                    .query("SELECT SUM(value), MIN(value), MAX(value) FROM agg_perf_test", &[])
+                    .unwrap();
                 assert_eq!(rows.len(), 1, "Should handle DECIMAL aggregations without AVG");
             }
         }
     }
-
 }

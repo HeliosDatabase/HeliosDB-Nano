@@ -49,8 +49,11 @@ fn test_create_table_parsing() -> Result<()> {
         Err(e) => {
             // If it fails, it should be an execution error, not a parsing error
             let error_msg = e.to_string();
-            assert!(!error_msg.contains("parse"),
-                "Should not be a parsing error, got: {}", error_msg);
+            assert!(
+                !error_msg.contains("parse"),
+                "Should not be a parsing error, got: {}",
+                error_msg
+            );
         }
     }
 
@@ -72,8 +75,11 @@ fn test_insert_parsing() -> Result<()> {
         Err(e) => {
             // If it fails, it should be an execution error, not a parsing error
             let error_msg = e.to_string();
-            assert!(!error_msg.contains("parse"),
-                "Should not be a parsing error, got: {}", error_msg);
+            assert!(
+                !error_msg.contains("parse"),
+                "Should not be a parsing error, got: {}",
+                error_msg
+            );
         }
     }
 
@@ -96,8 +102,11 @@ fn test_select_with_where_parsing() -> Result<()> {
         Err(e) => {
             let error_msg = e.to_string();
             // Should not fail on parsing/planning
-            assert!(!error_msg.contains("parse") && !error_msg.contains("plan"),
-                "Should not be a parse/plan error, got: {}", error_msg);
+            assert!(
+                !error_msg.contains("parse") && !error_msg.contains("plan"),
+                "Should not be a parse/plan error, got: {}",
+                error_msg
+            );
         }
     }
 
@@ -118,8 +127,11 @@ fn test_select_with_limit_parsing() -> Result<()> {
         }
         Err(e) => {
             let error_msg = e.to_string();
-            assert!(!error_msg.contains("parse"),
-                "Should not be a parsing error, got: {}", error_msg);
+            assert!(
+                !error_msg.contains("parse"),
+                "Should not be a parsing error, got: {}",
+                error_msg
+            );
         }
     }
 
@@ -153,8 +165,11 @@ fn test_invalid_sql_returns_error() {
 
     let error = result.unwrap_err();
     let error_msg = error.to_string();
-    assert!(error_msg.contains("parse") || error_msg.contains("SQL"),
-        "Error should mention parsing or SQL issue, got: {}", error_msg);
+    assert!(
+        error_msg.contains("parse") || error_msg.contains("SQL"),
+        "Error should mention parsing or SQL issue, got: {}",
+        error_msg
+    );
 }
 
 #[test]
@@ -195,8 +210,11 @@ fn test_table_does_not_exist_error() {
         Err(e) => {
             // Error mentioning table not found is expected
             let msg = e.to_string();
-            assert!(msg.contains("not") || msg.contains("exist") || msg.contains("table"),
-                "Error should mention table issue, got: {}", msg);
+            assert!(
+                msg.contains("not") || msg.contains("exist") || msg.contains("table"),
+                "Error should mention table issue, got: {}",
+                msg
+            );
         }
     }
 }
@@ -438,12 +456,18 @@ fn test_min_max_aggregate() -> Result<()> {
     // Test MIN on strings
     let results = db.query("SELECT MIN(name) FROM users", &[])?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::String("Alice".to_string()));
+    assert_eq!(
+        results[0].get(0).unwrap(),
+        &heliosdb_nano::Value::String("Alice".to_string())
+    );
 
     // Test MAX on strings
     let results = db.query("SELECT MAX(name) FROM users", &[])?;
     assert_eq!(results.len(), 1);
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::String("Charlie".to_string()));
+    assert_eq!(
+        results[0].get(0).unwrap(),
+        &heliosdb_nano::Value::String("Charlie".to_string())
+    );
 
     Ok(())
 }
@@ -466,10 +490,16 @@ fn test_group_by() -> Result<()> {
     // Results should be sorted by dept (BTreeMap ordering)
     // Engineering comes before Sales alphabetically
     assert_eq!(results[0].len(), 2, "Each row should have 2 columns (dept, count)");
-    assert_eq!(results[0].get(0).unwrap(), &heliosdb_nano::Value::String("Engineering".to_string()));
+    assert_eq!(
+        results[0].get(0).unwrap(),
+        &heliosdb_nano::Value::String("Engineering".to_string())
+    );
     assert_eq!(results[0].get(1).unwrap(), &heliosdb_nano::Value::Int8(2));
 
-    assert_eq!(results[1].get(0).unwrap(), &heliosdb_nano::Value::String("Sales".to_string()));
+    assert_eq!(
+        results[1].get(0).unwrap(),
+        &heliosdb_nano::Value::String("Sales".to_string())
+    );
     assert_eq!(results[1].get(1).unwrap(), &heliosdb_nano::Value::Int8(2));
 
     // Test GROUP BY with SUM
@@ -522,7 +552,10 @@ fn test_multiple_aggregates() -> Result<()> {
     db.execute("INSERT INTO users (id, name, age) VALUES (3, 'Charlie', 40)")?;
 
     // Test multiple aggregates in same query
-    let results = db.query("SELECT COUNT(*), MIN(age), MAX(age), AVG(age), SUM(age) FROM users", &[])?;
+    let results = db.query(
+        "SELECT COUNT(*), MIN(age), MAX(age), AVG(age), SUM(age) FROM users",
+        &[],
+    )?;
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].len(), 5, "Should have 5 columns");
 
@@ -598,7 +631,10 @@ fn test_update_multiple_columns() -> Result<()> {
 
     // Verify both columns were updated
     let results = db.query("SELECT * FROM users WHERE id = 1", &[])?;
-    assert_eq!(results[0].get(1).unwrap(), &heliosdb_nano::Value::String("Alicia".to_string()));
+    assert_eq!(
+        results[0].get(1).unwrap(),
+        &heliosdb_nano::Value::String("Alicia".to_string())
+    );
     assert_eq!(results[0].get(2).unwrap(), &heliosdb_nano::Value::Int4(31));
 
     Ok(())
@@ -690,7 +726,8 @@ fn test_select_distinct_removes_duplicates() -> Result<()> {
 
     assert_eq!(results.len(), 2, "Should return 2 distinct customers");
 
-    let customers: Vec<String> = results.iter()
+    let customers: Vec<String> = results
+        .iter()
         .map(|r| match r.get(0).unwrap() {
             heliosdb_nano::Value::String(s) => s.clone(),
             _ => panic!("Expected string value"),
@@ -737,7 +774,11 @@ fn test_select_distinct_with_where() -> Result<()> {
     let results = db.query("SELECT DISTINCT region FROM sales WHERE amount > 100", &[])?;
 
     // Should return 3 distinct regions (North, South, East) from filtered results
-    assert_eq!(results.len(), 3, "Should return 3 distinct regions from filtered results");
+    assert_eq!(
+        results.len(),
+        3,
+        "Should return 3 distinct regions from filtered results"
+    );
 
     Ok(())
 }
@@ -782,7 +823,7 @@ fn test_inner_join_basic() -> Result<()> {
     // Join users and orders
     let results = db.query(
         "SELECT * FROM users INNER JOIN orders ON users.id = orders.user_id",
-        &[]
+        &[],
     )?;
 
     // Should return 3 rows (Alice's 2 orders + Bob's 1 order)
@@ -838,7 +879,7 @@ fn test_inner_join_no_matches() -> Result<()> {
     // Join with no matches (product_id 1 doesn't match product_ref 99)
     let results = db.query(
         "SELECT * FROM products INNER JOIN reviews ON products.product_id = reviews.product_ref",
-        &[]
+        &[],
     )?;
 
     // Should return 0 rows (no matching ids)
@@ -863,7 +904,7 @@ fn test_having_clause_basic() -> Result<()> {
     // Query with HAVING clause - only regions with total sales > 200
     let results = db.query(
         "SELECT region, SUM(amount) FROM sales GROUP BY region HAVING SUM(amount) > 200",
-        &[]
+        &[],
     )?;
 
     // Should return 2 regions: North (250) and South (500)
@@ -887,7 +928,7 @@ fn test_having_clause_count() -> Result<()> {
     // Query with HAVING clause - only customers with more than 1 order
     let results = db.query(
         "SELECT customer, COUNT(*) FROM orders GROUP BY customer HAVING COUNT(*) > 1",
-        &[]
+        &[],
     )?;
 
     // Should return only Alice (3 orders)
@@ -916,7 +957,7 @@ fn test_having_clause_filters_all() -> Result<()> {
     // Query with HAVING that filters out all groups
     let results = db.query(
         "SELECT category, SUM(price) FROM items GROUP BY category HAVING SUM(price) > 1000",
-        &[]
+        &[],
     )?;
 
     // Should return 0 rows (no category has sum > 1000)
@@ -937,10 +978,7 @@ fn test_group_by_without_having() -> Result<()> {
     db.execute("INSERT INTO revenue (id, dept, amount) VALUES (4, 'Marketing', 50)")?;
 
     // Query without HAVING - should return all groups
-    let results = db.query(
-        "SELECT dept, SUM(amount) FROM revenue GROUP BY dept",
-        &[]
-    )?;
+    let results = db.query("SELECT dept, SUM(amount) FROM revenue GROUP BY dept", &[])?;
 
     // Should return 3 departments
     assert_eq!(results.len(), 3, "Should return all 3 departments without HAVING");

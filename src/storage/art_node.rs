@@ -8,7 +8,6 @@
 //!
 //! Nodes automatically grow and shrink as keys are inserted/removed.
 
-
 /// Maximum key length for prefix compression
 pub const MAX_PREFIX_LEN: usize = 10;
 
@@ -95,7 +94,11 @@ pub struct LeafNode {
 impl LeafNode {
     /// Create a new leaf node with a single value
     pub fn new(key: Vec<u8>, value: RowId) -> Self {
-        Self { key, primary: value, extra: Vec::new() }
+        Self {
+            key,
+            primary: value,
+            extra: Vec::new(),
+        }
     }
 
     /// Create a leaf node from multiple values (e.g., during node splitting)
@@ -216,14 +219,12 @@ impl Node4 {
 
     /// Get a child by key byte
     pub fn get_child(&self, key: u8) -> Option<&ArtNode> {
-        self.find_child_index(key)
-            .and_then(|i| self.children[i].as_ref())
+        self.find_child_index(key).and_then(|i| self.children[i].as_ref())
     }
 
     /// Get a mutable child by key byte
     pub fn get_child_mut(&mut self, key: u8) -> Option<&mut ArtNode> {
-        self.find_child_index(key)
-            .and_then(|i| self.children[i].as_mut())
+        self.find_child_index(key).and_then(|i| self.children[i].as_mut())
     }
 
     /// Add a child (returns false if full)
@@ -273,9 +274,7 @@ impl Node4 {
     /// Iterate over all children
     pub fn iter_children(&self) -> impl Iterator<Item = (u8, &ArtNode)> {
         let n = self.header.num_children as usize;
-        (0..n).filter_map(move |i| {
-            self.children[i].as_ref().map(|c| (self.keys[i], c))
-        })
+        (0..n).filter_map(move |i| self.children[i].as_ref().map(|c| (self.keys[i], c)))
     }
 }
 
@@ -339,14 +338,12 @@ impl Node16 {
 
     /// Get a child by key byte
     pub fn get_child(&self, key: u8) -> Option<&ArtNode> {
-        self.find_child_index(key)
-            .and_then(|i| self.children[i].as_ref())
+        self.find_child_index(key).and_then(|i| self.children[i].as_ref())
     }
 
     /// Get a mutable child by key byte
     pub fn get_child_mut(&mut self, key: u8) -> Option<&mut ArtNode> {
-        self.find_child_index(key)
-            .and_then(|i| self.children[i].as_mut())
+        self.find_child_index(key).and_then(|i| self.children[i].as_mut())
     }
 
     /// Add a child (returns false if full)
@@ -416,9 +413,7 @@ impl Node16 {
     /// Iterate over all children
     pub fn iter_children(&self) -> impl Iterator<Item = (u8, &ArtNode)> {
         let n = self.header.num_children as usize;
-        (0..n).filter_map(move |i| {
-            self.children[i].as_ref().map(|c| (self.keys[i], c))
-        })
+        (0..n).filter_map(move |i| self.children[i].as_ref().map(|c| (self.keys[i], c)))
     }
 }
 
@@ -665,9 +660,7 @@ impl Node256 {
 
     /// Iterate over all children
     pub fn iter_children(&self) -> impl Iterator<Item = (u8, &ArtNode)> + '_ {
-        (0..256u16).filter_map(move |key| {
-            self.children[key as usize].as_ref().map(|c| (key as u8, c))
-        })
+        (0..256u16).filter_map(move |key| self.children[key as usize].as_ref().map(|c| (key as u8, c)))
     }
 }
 

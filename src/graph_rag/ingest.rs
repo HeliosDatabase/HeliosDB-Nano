@@ -64,20 +64,19 @@ pub struct IngestStats {
     pub rows_skipped: u64,
 }
 
-pub fn ingest_docs(
-    db: &EmbeddedDatabase,
-    opts: &IngestDocsOptions,
-) -> Result<IngestStats> {
+pub fn ingest_docs(db: &EmbeddedDatabase, opts: &IngestDocsOptions) -> Result<IngestStats> {
     ensure_tables(db)?;
     let mut stats = IngestStats::default();
     let cols = match &opts.title_col {
-        Some(tc) => format!("{id}, {text}, {title}", id = opts.id_col, text = opts.text_col, title = tc),
+        Some(tc) => format!(
+            "{id}, {text}, {title}",
+            id = opts.id_col,
+            text = opts.text_col,
+            title = tc
+        ),
         None => format!("{id}, {text}", id = opts.id_col, text = opts.text_col),
     };
-    let rows = db.query(
-        &format!("SELECT {cols} FROM {tbl}", tbl = opts.source_table),
-        &[],
-    )?;
+    let rows = db.query(&format!("SELECT {cols} FROM {tbl}", tbl = opts.source_table), &[])?;
     // Dedup against what's already projected.
     let existing = source_refs_with_prefix(db, "doc:")?;
     for row in rows {
@@ -92,7 +91,11 @@ pub fn ingest_docs(
             .title_col
             .as_deref()
             .and_then(|_| as_string(row.values.get(2)))
-            .or_else(|| body.lines().next().map(|l| l.trim_start_matches('#').trim().to_string()));
+            .or_else(|| {
+                body.lines()
+                    .next()
+                    .map(|l| l.trim_start_matches('#').trim().to_string())
+            });
 
         match opts.chunk_by {
             ChunkStrategy::Row => {
@@ -100,13 +103,7 @@ pub fn ingest_docs(
                 if existing.contains(&src_ref) {
                     continue;
                 }
-                let node_id = insert_node(
-                    db,
-                    "DocChunk",
-                    &src_ref,
-                    title.as_deref(),
-                    Some(&body),
-                )?;
+                let node_id = insert_node(db, "DocChunk", &src_ref, title.as_deref(), Some(&body))?;
                 let _ = node_id;
                 stats.nodes_added += 1;
             }
@@ -118,13 +115,7 @@ pub fn ingest_docs(
                         // DocSection
                         let section_ref = format!("doc:{id}:section:{i}");
                         if !existing.contains(&section_ref) {
-                            let sid = insert_node(
-                                db,
-                                "DocSection",
-                                &section_ref,
-                                Some(heading),
-                                None,
-                            )?;
+                            let sid = insert_node(db, "DocSection", &section_ref, Some(heading), None)?;
                             section_parent = Some(sid);
                             stats.nodes_added += 1;
                         }
@@ -139,13 +130,7 @@ pub fn ingest_docs(
                         } else {
                             title.as_deref()
                         };
-                        let cid = insert_node(
-                            db,
-                            "DocChunk",
-                            &chunk_ref,
-                            chunk_title,
-                            Some(content),
-                        )?;
+                        let cid = insert_node(db, "DocChunk", &chunk_ref, chunk_title, Some(content))?;
                         stats.nodes_added += 1;
                         if let Some(pid) = section_parent {
                             insert_edge(db, cid, pid, "PART_OF", 1.0)?;
@@ -201,10 +186,7 @@ pub struct IngestEmailOptions {
     pub in_reply_to_col: Option<String>,
 }
 
-pub fn ingest_email(
-    db: &EmbeddedDatabase,
-    opts: &IngestEmailOptions,
-) -> Result<IngestStats> {
+pub fn ingest_email(db: &EmbeddedDatabase, opts: &IngestEmailOptions) -> Result<IngestStats> {
     ensure_tables(db)?;
     let mut stats = IngestStats::default();
 
@@ -214,15 +196,26 @@ pub fn ingest_email(
         from = opts.from_col,
         body = opts.body_col,
     );
-    if let Some(t) = &opts.to_col { sel.push_str(&format!(", {t}")); } else { sel.push_str(", NULL"); }
-    if let Some(s) = &opts.subject_col { sel.push_str(&format!(", {s}")); } else { sel.push_str(", NULL"); }
-    if let Some(r) = &opts.in_reply_to_col { sel.push_str(&format!(", {r}")); } else { sel.push_str(", NULL"); }
+    if let Some(t) = &opts.to_col {
+        sel.push_str(&format!(", {t}"));
+    } else {
+        sel.push_str(", NULL");
+    }
+    if let Some(s) = &opts.subject_col {
+        sel.push_str(&format!(", {s}"));
+    } else {
+        sel.push_str(", NULL");
+    }
+    if let Some(r) = &opts.in_reply_to_col {
+        sel.push_str(&format!(", {r}"));
+    } else {
+        sel.push_str(", NULL");
+    }
     sel.push_str(&format!(" FROM {}", opts.source_table));
     let rows = db.query(&sel, &[])?;
 
     let mut existing_emails = source_refs_with_prefix(db, "email:")?;
-    let mut known_persons: HashMap<String, i64> =
-        source_refs_map_with_prefix(db, "person:")?;
+    let mut known_persons: HashMap<String, i64> = source_refs_map_with_prefix(db, "person:")?;
 
     // Second pass so we can resolve in_reply_to to its message id.
     let mut mid_to_node: HashMap<String, i64> = HashMap::new();
@@ -280,10 +273,7 @@ pub fn ingest_email(
         if reply_to.is_empty() {
             continue;
         }
-        let (Some(this), Some(parent)) = (
-            mid_to_node.get(&mid).copied(),
-            mid_to_node.get(&reply_to).copied(),
-        ) else {
+        let (Some(this), Some(parent)) = (mid_to_node.get(&mid).copied(), mid_to_node.get(&reply_to).copied()) else {
             continue;
         };
         insert_edge(db, this, parent, "REPLIES_TO", 1.0)?;
@@ -311,10 +301,7 @@ pub struct IngestIssuesOptions {
     pub fixed_by_json_col: Option<String>,
 }
 
-pub fn ingest_issues(
-    db: &EmbeddedDatabase,
-    opts: &IngestIssuesOptions,
-) -> Result<IngestStats> {
+pub fn ingest_issues(db: &EmbeddedDatabase, opts: &IngestIssuesOptions) -> Result<IngestStats> {
     ensure_tables(db)?;
     let mut stats = IngestStats::default();
     let mut sel = format!(
@@ -323,15 +310,26 @@ pub fn ingest_issues(
         title = opts.title_col,
         body = opts.body_col,
     );
-    if let Some(c) = &opts.reporter_col { sel.push_str(&format!(", {c}")); } else { sel.push_str(", NULL"); }
-    if let Some(c) = &opts.comments_json_col { sel.push_str(&format!(", {c}")); } else { sel.push_str(", NULL"); }
-    if let Some(c) = &opts.fixed_by_json_col { sel.push_str(&format!(", {c}")); } else { sel.push_str(", NULL"); }
+    if let Some(c) = &opts.reporter_col {
+        sel.push_str(&format!(", {c}"));
+    } else {
+        sel.push_str(", NULL");
+    }
+    if let Some(c) = &opts.comments_json_col {
+        sel.push_str(&format!(", {c}"));
+    } else {
+        sel.push_str(", NULL");
+    }
+    if let Some(c) = &opts.fixed_by_json_col {
+        sel.push_str(&format!(", {c}"));
+    } else {
+        sel.push_str(", NULL");
+    }
     sel.push_str(&format!(" FROM {}", opts.source_table));
     let rows = db.query(&sel, &[])?;
 
     let mut existing = source_refs_with_prefix(db, "issue:")?;
-    let mut known_persons: HashMap<String, i64> =
-        source_refs_map_with_prefix(db, "person:")?;
+    let mut known_persons: HashMap<String, i64> = source_refs_map_with_prefix(db, "person:")?;
 
     for row in rows {
         stats.rows_seen += 1;
@@ -370,23 +368,12 @@ pub fn ingest_issues(
                             continue;
                         }
                         let c_ref = format!("issue:{id}:comment:{ci}");
-                        let cid = insert_node(
-                            db,
-                            "Comment",
-                            &c_ref,
-                            None,
-                            Some(cbody),
-                        )?;
+                        let cid = insert_node(db, "Comment", &c_ref, None, Some(cbody))?;
                         stats.nodes_added += 1;
                         insert_edge(db, cid, iid, "REPLIES_TO", 1.0)?;
                         stats.edges_added += 1;
                         if !author.is_empty() {
-                            let pid = upsert_person(
-                                db,
-                                &mut known_persons,
-                                author,
-                                &mut stats,
-                            )?;
+                            let pid = upsert_person(db, &mut known_persons, author, &mut stats)?;
                             insert_edge(db, cid, pid, "AUTHORED_BY", 1.0)?;
                             stats.edges_added += 1;
                         }
@@ -423,26 +410,30 @@ pub struct IngestQaOptions {
     pub answerer_col: Option<String>,
 }
 
-pub fn ingest_qa(
-    db: &EmbeddedDatabase,
-    opts: &IngestQaOptions,
-) -> Result<IngestStats> {
+pub fn ingest_qa(db: &EmbeddedDatabase, opts: &IngestQaOptions) -> Result<IngestStats> {
     ensure_tables(db)?;
     let mut stats = IngestStats::default();
-    let mut sel = format!(
-        "SELECT {id}, {q}",
-        id = opts.id_col,
-        q = opts.question_col
-    );
-    if let Some(c) = &opts.answer_col { sel.push_str(&format!(", {c}")); } else { sel.push_str(", NULL"); }
-    if let Some(c) = &opts.asker_col { sel.push_str(&format!(", {c}")); } else { sel.push_str(", NULL"); }
-    if let Some(c) = &opts.answerer_col { sel.push_str(&format!(", {c}")); } else { sel.push_str(", NULL"); }
+    let mut sel = format!("SELECT {id}, {q}", id = opts.id_col, q = opts.question_col);
+    if let Some(c) = &opts.answer_col {
+        sel.push_str(&format!(", {c}"));
+    } else {
+        sel.push_str(", NULL");
+    }
+    if let Some(c) = &opts.asker_col {
+        sel.push_str(&format!(", {c}"));
+    } else {
+        sel.push_str(", NULL");
+    }
+    if let Some(c) = &opts.answerer_col {
+        sel.push_str(&format!(", {c}"));
+    } else {
+        sel.push_str(", NULL");
+    }
     sel.push_str(&format!(" FROM {}", opts.source_table));
     let rows = db.query(&sel, &[])?;
 
     let mut existing = source_refs_with_prefix(db, "qa:")?;
-    let mut known_persons: HashMap<String, i64> =
-        source_refs_map_with_prefix(db, "person:")?;
+    let mut known_persons: HashMap<String, i64> = source_refs_map_with_prefix(db, "person:")?;
 
     for row in rows {
         stats.rows_seen += 1;
@@ -478,19 +469,12 @@ pub fn ingest_qa(
 
         if !answer.is_empty() {
             let a_ref = format!("qa:{id}:a");
-            let aid = insert_node(
-                db,
-                "Answer",
-                &a_ref,
-                Some(&format!("A-{id}")),
-                Some(&answer),
-            )?;
+            let aid = insert_node(db, "Answer", &a_ref, Some(&format!("A-{id}")), Some(&answer))?;
             stats.nodes_added += 1;
             insert_edge(db, aid, qid, "ANSWERED_BY", 1.0)?;
             stats.edges_added += 1;
             if !answerer.is_empty() {
-                let pid =
-                    upsert_person(db, &mut known_persons, &answerer, &mut stats)?;
+                let pid = upsert_person(db, &mut known_persons, &answerer, &mut stats)?;
                 insert_edge(db, aid, pid, "AUTHORED_BY", 1.0)?;
                 stats.edges_added += 1;
             }
@@ -536,13 +520,7 @@ fn insert_node(
         .ok_or_else(|| Error::query_execution("insert_node: no RETURNING node_id"))
 }
 
-fn insert_edge(
-    db: &EmbeddedDatabase,
-    from: i64,
-    to: i64,
-    kind: &str,
-    weight: f64,
-) -> Result<()> {
+fn insert_edge(db: &EmbeddedDatabase, from: i64, to: i64, kind: &str, weight: f64) -> Result<()> {
     db.execute_params_returning(
         "INSERT INTO _hdb_graph_edges (from_node, to_node, edge_kind, weight) \
          VALUES ($1, $2, $3, $4)",
@@ -570,10 +548,7 @@ fn source_refs_with_prefix(db: &EmbeddedDatabase, prefix: &str) -> Result<HashSe
     Ok(out)
 }
 
-fn source_refs_map_with_prefix(
-    db: &EmbeddedDatabase,
-    prefix: &str,
-) -> Result<HashMap<String, i64>> {
+fn source_refs_map_with_prefix(db: &EmbeddedDatabase, prefix: &str) -> Result<HashMap<String, i64>> {
     let rows = db.query_params(
         "SELECT source_ref, node_id FROM _hdb_graph_nodes WHERE source_ref LIKE $1",
         &[Value::String(format!("{prefix}%"))],

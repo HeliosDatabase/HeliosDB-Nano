@@ -43,7 +43,10 @@ pub struct LspRewrite {
 pub fn rewrite_lsp_calls_full(sql: &str) -> LspRewrite {
     // Fast path: most queries never mention lsp_.
     if !contains_lsp_ignore_case(sql) {
-        return LspRewrite { sql: sql.to_string(), branch_override: None };
+        return LspRewrite {
+            sql: sql.to_string(),
+            branch_override: None,
+        };
     }
     let mut out = String::with_capacity(sql.len() + 64);
     let mut rest = sql;
@@ -53,9 +56,7 @@ pub fn rewrite_lsp_calls_full(sql: &str) -> LspRewrite {
         let expansion = match hit.func {
             Func::Definition => expand_definition(&hit.args, hit.as_of.as_deref()),
             Func::References => expand_references(&hit.args, hit.as_of.as_deref()),
-            Func::CallHierarchy => {
-                expand_call_hierarchy(&hit.args, hit.as_of.as_deref())
-            }
+            Func::CallHierarchy => expand_call_hierarchy(&hit.args, hit.as_of.as_deref()),
             Func::Hover => expand_hover(&hit.args, hit.as_of.as_deref()),
         };
         out.push('(');
@@ -71,7 +72,10 @@ pub fn rewrite_lsp_calls_full(sql: &str) -> LspRewrite {
         rest = &rest[hit.end..];
     }
     out.push_str(rest);
-    LspRewrite { sql: out, branch_override }
+    LspRewrite {
+        sql: out,
+        branch_override,
+    }
 }
 
 /// Backwards-compatible string-only API. Returns just the rewritten
@@ -541,9 +545,7 @@ mod tests {
 
     #[test]
     fn on_branch_directive_extracted_and_stripped() {
-        let r = rewrite_lsp_calls_full(
-            "SELECT * FROM lsp_definition('Foo') ON BRANCH 'preview'",
-        );
+        let r = rewrite_lsp_calls_full("SELECT * FROM lsp_definition('Foo') ON BRANCH 'preview'");
         assert_eq!(r.branch_override.as_deref(), Some("preview"));
         assert!(!r.sql.to_ascii_lowercase().contains("on branch"));
         assert!(r.sql.contains("_hdb_code_symbols"));
@@ -552,9 +554,7 @@ mod tests {
     #[test]
     fn on_branch_combines_with_as_of() {
         // Both clauses, AS OF first.
-        let r = rewrite_lsp_calls_full(
-            "SELECT * FROM lsp_references(42) AS OF COMMIT 'sha' ON BRANCH 'feat/x'",
-        );
+        let r = rewrite_lsp_calls_full("SELECT * FROM lsp_references(42) AS OF COMMIT 'sha' ON BRANCH 'feat/x'");
         assert_eq!(r.branch_override.as_deref(), Some("feat/x"));
         assert!(r.sql.contains("AS OF COMMIT 'sha'"));
         // ON BRANCH stripped from the rewritten output.
@@ -564,9 +564,7 @@ mod tests {
     #[test]
     fn on_branch_combines_reverse_order() {
         // ON BRANCH before AS OF is also accepted.
-        let r = rewrite_lsp_calls_full(
-            "SELECT * FROM lsp_hover(7) ON BRANCH 'b1' AS OF NOW",
-        );
+        let r = rewrite_lsp_calls_full("SELECT * FROM lsp_hover(7) ON BRANCH 'b1' AS OF NOW");
         assert_eq!(r.branch_override.as_deref(), Some("b1"));
         assert!(r.sql.contains("AS OF NOW"));
     }
@@ -575,9 +573,7 @@ mod tests {
     fn on_branch_quote_escaping() {
         // 'O''Brien' style branch name (unlikely, but the parser
         // should tolerate it).
-        let r = rewrite_lsp_calls_full(
-            "SELECT * FROM lsp_hover(1) ON BRANCH 'feat-O''Brien'",
-        );
+        let r = rewrite_lsp_calls_full("SELECT * FROM lsp_hover(1) ON BRANCH 'feat-O''Brien'");
         assert_eq!(r.branch_override.as_deref(), Some("feat-O'Brien"));
     }
 
@@ -794,7 +790,10 @@ pub fn detect_create_semantic_hash_index(sql: &str) -> Option<SemanticHashIndexD
         t.expect_word("on")?;
         let _table = t.take_ident()?;
     }
-    Some(SemanticHashIndexDdl { index_name, if_not_exists })
+    Some(SemanticHashIndexDdl {
+        index_name,
+        if_not_exists,
+    })
 }
 
 /// Detect `SELECT hdb_code.pause('index_name')` and
@@ -809,10 +808,7 @@ pub enum PauseResume {
 pub fn detect_pause_resume(sql: &str) -> Option<PauseResume> {
     let s = sql.trim().trim_end_matches(';');
     let low = s.to_ascii_lowercase();
-    for (needle, ctor) in &[
-        ("hdb_code.pause", true),
-        ("hdb_code.resume", false),
-    ] {
+    for (needle, ctor) in &[("hdb_code.pause", true), ("hdb_code.resume", false)] {
         if let Some(i) = low.find(needle) {
             let after = &s[i + needle.len()..];
             let after = after.trim_start();
@@ -850,7 +846,9 @@ struct Tokenizer<'a> {
 }
 
 impl<'a> Tokenizer<'a> {
-    fn new(s: &'a str) -> Self { Self { src: s, pos: 0 } }
+    fn new(s: &'a str) -> Self {
+        Self { src: s, pos: 0 }
+    }
 
     fn skip_ws(&mut self) {
         while self.pos < self.src.len() {
@@ -973,10 +971,7 @@ mod ast_index_tests {
 
     #[test]
     fn simple_create_ast_index() {
-        let d = detect_create_ast_index(
-            "CREATE AST INDEX src_ast ON src (content) USING tree_sitter(lang)",
-        )
-        .unwrap();
+        let d = detect_create_ast_index("CREATE AST INDEX src_ast ON src (content) USING tree_sitter(lang)").unwrap();
         assert_eq!(d.index_name, "src_ast");
         assert_eq!(d.table, "src");
         assert_eq!(d.content_col, "content");
@@ -1019,20 +1014,15 @@ mod ast_index_tests {
 
     #[test]
     fn detects_create_semantic_hash_index_basic() {
-        let d = detect_create_semantic_hash_index(
-            "CREATE SEMANTIC HASH INDEX code_merkle",
-        )
-        .expect("parsed");
+        let d = detect_create_semantic_hash_index("CREATE SEMANTIC HASH INDEX code_merkle").expect("parsed");
         assert_eq!(d.index_name, "code_merkle");
         assert!(!d.if_not_exists);
     }
 
     #[test]
     fn detects_create_semantic_hash_index_if_not_exists() {
-        let d = detect_create_semantic_hash_index(
-            "CREATE SEMANTIC HASH INDEX IF NOT EXISTS m ON _hdb_code_symbols;",
-        )
-        .expect("parsed");
+        let d = detect_create_semantic_hash_index("CREATE SEMANTIC HASH INDEX IF NOT EXISTS m ON _hdb_code_symbols;")
+            .expect("parsed");
         assert_eq!(d.index_name, "m");
         assert!(d.if_not_exists);
     }

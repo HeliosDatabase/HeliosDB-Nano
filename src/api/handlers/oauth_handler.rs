@@ -14,12 +14,7 @@ use axum::{
 use std::collections::HashMap;
 use tracing::{info, warn};
 
-use crate::api::{
-    auth_bridge::AuthSession,
-    models::ApiError,
-    oauth::OAuthError,
-    server::AppState,
-};
+use crate::api::{auth_bridge::AuthSession, models::ApiError, oauth::OAuthError, server::AppState};
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -28,32 +23,12 @@ use crate::api::{
 /// Map an [`OAuthError`] into an [`ApiError`] with a suitable HTTP status.
 fn map_oauth_err(e: OAuthError) -> ApiError {
     match &e {
-        OAuthError::ProviderNotFound(_) => {
-            ApiError::bad_request(e.to_string())
-        }
-        OAuthError::InvalidState => {
-            ApiError::new(StatusCode::UNAUTHORIZED, "invalid_state", e.to_string())
-        }
-        OAuthError::TokenExchange(_) => {
-            ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                "token_exchange_failed",
-                e.to_string(),
-            )
-        }
-        OAuthError::UserInfoFetch(_) => {
-            ApiError::new(
-                StatusCode::BAD_GATEWAY,
-                "userinfo_fetch_failed",
-                e.to_string(),
-            )
-        }
+        OAuthError::ProviderNotFound(_) => ApiError::bad_request(e.to_string()),
+        OAuthError::InvalidState => ApiError::new(StatusCode::UNAUTHORIZED, "invalid_state", e.to_string()),
+        OAuthError::TokenExchange(_) => ApiError::new(StatusCode::BAD_GATEWAY, "token_exchange_failed", e.to_string()),
+        OAuthError::UserInfoFetch(_) => ApiError::new(StatusCode::BAD_GATEWAY, "userinfo_fetch_failed", e.to_string()),
         OAuthError::ConfigError(_) => {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "oauth_config_error",
-                e.to_string(),
-            )
+            ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, "oauth_config_error", e.to_string())
         }
     }
 }
@@ -70,22 +45,19 @@ pub async fn authorize(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Redirect, ApiError> {
-    let provider = params.get("provider").ok_or_else(|| {
-        ApiError::bad_request("Missing required query parameter: provider")
-    })?;
+    let provider = params
+        .get("provider")
+        .ok_or_else(|| ApiError::bad_request("Missing required query parameter: provider"))?;
 
     info!("OAuth authorize request for provider: {provider}");
 
-    let registry = state
-        .oauth_registry
-        .as_ref()
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "oauth_not_configured",
-                "OAuth is not configured on this server",
-            )
-        })?;
+    let registry = state.oauth_registry.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oauth_not_configured",
+            "OAuth is not configured on this server",
+        )
+    })?;
 
     let (url, oauth_state) = registry.get_authorize_url(provider).map_err(|e| {
         warn!("OAuth authorize failed for {provider}: {e}");
@@ -105,25 +77,22 @@ pub async fn callback(
     State(state): State<AppState>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Result<Json<AuthSession>, ApiError> {
-    let code = params.get("code").ok_or_else(|| {
-        ApiError::bad_request("Missing required query parameter: code")
-    })?;
-    let state_param = params.get("state").ok_or_else(|| {
-        ApiError::bad_request("Missing required query parameter: state")
-    })?;
+    let code = params
+        .get("code")
+        .ok_or_else(|| ApiError::bad_request("Missing required query parameter: code"))?;
+    let state_param = params
+        .get("state")
+        .ok_or_else(|| ApiError::bad_request("Missing required query parameter: state"))?;
 
     info!("OAuth callback received (state={state_param})");
 
-    let registry = state
-        .oauth_registry
-        .as_ref()
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "oauth_not_configured",
-                "OAuth is not configured on this server",
-            )
-        })?;
+    let registry = state.oauth_registry.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "oauth_not_configured",
+            "OAuth is not configured on this server",
+        )
+    })?;
 
     // Exchange code for user info (async - hits the provider's token + userinfo endpoints)
     let user_info = registry.exchange_code(code, state_param).await.map_err(|e| {
@@ -137,16 +106,13 @@ pub async fn callback(
     );
 
     // Upsert user through AuthBridge
-    let auth = state
-        .auth_bridge
-        .as_ref()
-        .ok_or_else(|| {
-            ApiError::new(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "auth_not_enabled",
-                "Auth service is not configured",
-            )
-        })?;
+    let auth = state.auth_bridge.as_ref().ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "auth_not_enabled",
+            "Auth service is not configured",
+        )
+    })?;
 
     let session = auth.oauth_sign_in(&user_info).map_err(|e| {
         warn!("OAuth sign-in failed for {}: {e}", user_info.email);

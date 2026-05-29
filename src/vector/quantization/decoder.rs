@@ -2,7 +2,7 @@
 
 #![allow(unused_variables)]
 
-use super::{Codebook, QuantizedVector, PqError, PqResult};
+use super::{Codebook, PqError, PqResult, QuantizedVector};
 use crate::vector::Vector;
 use std::sync::Arc;
 
@@ -38,9 +38,7 @@ impl Decoder {
 
         // Look up each centroid and concatenate
         for (sq_idx, &code) in quantized.codes.iter().enumerate() {
-            let centroid = self
-                .codebook
-                .get_centroid(sq_idx, code as usize)?;
+            let centroid = self.codebook.get_centroid(sq_idx, code as usize)?;
 
             reconstructed.extend_from_slice(centroid);
         }
@@ -50,10 +48,7 @@ impl Decoder {
 
     /// Decode a batch of quantized vectors
     pub fn decode_batch(&self, quantized_vectors: &[QuantizedVector]) -> PqResult<Vec<Vector>> {
-        quantized_vectors
-            .iter()
-            .map(|qv| self.decode(qv))
-            .collect()
+        quantized_vectors.iter().map(|qv| self.decode(qv)).collect()
     }
 
     /// Get the codebook
@@ -136,10 +131,7 @@ mod tests {
         let codebook = Arc::new(create_test_codebook());
         let decoder = Decoder::new(codebook);
 
-        let quantized_vectors = vec![
-            QuantizedVector::new(vec![0, 0]),
-            QuantizedVector::new(vec![1, 1]),
-        ];
+        let quantized_vectors = vec![QuantizedVector::new(vec![0, 0]), QuantizedVector::new(vec![1, 1])];
 
         let reconstructed = decoder.decode_batch(&quantized_vectors).unwrap();
         assert_eq!(reconstructed.len(), 2);

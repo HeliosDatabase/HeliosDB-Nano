@@ -7,16 +7,11 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use tracing::{info, warn, error};
+use tracing::{error, info, warn};
 
 use crate::api::{
     models::{
-        ApiError,
-        CreateBranchRequest,
-        BranchResponse,
-        BranchListResponse,
-        MergeBranchRequest,
-        MergeBranchResponse,
+        ApiError, BranchListResponse, BranchResponse, CreateBranchRequest, MergeBranchRequest, MergeBranchResponse,
     },
     server::AppState,
 };
@@ -33,24 +28,22 @@ use crate::storage::BranchOptions;
 /// - 200 OK: Returns BranchListResponse with all branches
 /// - 500 Internal Server Error: Database error
 /// - 501 Not Implemented: Branching not enabled
-pub async fn list_branches(
-    State(state): State<AppState>,
-) -> Result<Json<BranchListResponse>, ApiError> {
+pub async fn list_branches(State(state): State<AppState>) -> Result<Json<BranchListResponse>, ApiError> {
     info!("Listing all branches");
 
     // Access the branch manager from storage
-    let branch_manager = state.db.storage.branch_manager()
-        .ok_or_else(|| ApiError::new(
+    let branch_manager = state.db.storage.branch_manager().ok_or_else(|| {
+        ApiError::new(
             axum::http::StatusCode::NOT_IMPLEMENTED,
             "BranchingNotEnabled",
-            "Database branching is not enabled for this instance"
-        ))?;
+            "Database branching is not enabled for this instance",
+        )
+    })?;
 
-    let branches = branch_manager.list_branches()
-        .map_err(|e| {
-            error!("Failed to list branches: {}", e);
-            ApiError::from(e)
-        })?;
+    let branches = branch_manager.list_branches().map_err(|e| {
+        error!("Failed to list branches: {}", e);
+        ApiError::from(e)
+    })?;
 
     let response = BranchListResponse {
         total: branches.len(),
@@ -95,42 +88,37 @@ pub async fn create_branch(
     }
 
     // Access the branch manager from storage
-    let branch_manager = state.db.storage.branch_manager()
-        .ok_or_else(|| ApiError::new(
+    let branch_manager = state.db.storage.branch_manager().ok_or_else(|| {
+        ApiError::new(
             axum::http::StatusCode::NOT_IMPLEMENTED,
             "BranchingNotEnabled",
-            "Database branching is not enabled for this instance"
-        ))?;
+            "Database branching is not enabled for this instance",
+        )
+    })?;
 
     // Get current snapshot ID or use provided one
-    let snapshot_id = request.snapshot_id.unwrap_or_else(|| {
-        branch_manager.current_timestamp()
-    });
+    let snapshot_id = request
+        .snapshot_id
+        .unwrap_or_else(|| branch_manager.current_timestamp());
 
     // Convert options
-    let options = request.options
-        .map(BranchOptions::from)
-        .unwrap_or_default();
+    let options = request.options.map(BranchOptions::from).unwrap_or_default();
 
     // Create the branch
-    let branch_id = branch_manager.create_branch(
-        &request.name,
-        request.parent.as_deref(),
-        snapshot_id,
-        options,
-    ).map_err(|e| {
-        error!("Failed to create branch '{}': {}", request.name, e);
-        ApiError::from(e)
-    })?;
+    let branch_id = branch_manager
+        .create_branch(&request.name, request.parent.as_deref(), snapshot_id, options)
+        .map_err(|e| {
+            error!("Failed to create branch '{}': {}", request.name, e);
+            ApiError::from(e)
+        })?;
 
     info!("Branch '{}' created with ID: {}", request.name, branch_id);
 
     // Get the created branch metadata
-    let metadata = branch_manager.get_branch_by_name(&request.name)
-        .map_err(|e| {
-            error!("Failed to retrieve created branch: {}", e);
-            ApiError::from(e)
-        })?;
+    let metadata = branch_manager.get_branch_by_name(&request.name).map_err(|e| {
+        error!("Failed to retrieve created branch: {}", e);
+        ApiError::from(e)
+    })?;
 
     Ok((StatusCode::CREATED, Json(BranchResponse::from(metadata))))
 }
@@ -158,18 +146,18 @@ pub async fn get_branch(
     info!("Getting branch: {}", name);
 
     // Access the branch manager from storage
-    let branch_manager = state.db.storage.branch_manager()
-        .ok_or_else(|| ApiError::new(
+    let branch_manager = state.db.storage.branch_manager().ok_or_else(|| {
+        ApiError::new(
             axum::http::StatusCode::NOT_IMPLEMENTED,
             "BranchingNotEnabled",
-            "Database branching is not enabled for this instance"
-        ))?;
+            "Database branching is not enabled for this instance",
+        )
+    })?;
 
-    let metadata = branch_manager.get_branch_by_name(&name)
-        .map_err(|e| {
-            warn!("Branch '{}' not found: {}", name, e);
-            ApiError::from(e)
-        })?;
+    let metadata = branch_manager.get_branch_by_name(&name).map_err(|e| {
+        warn!("Branch '{}' not found: {}", name, e);
+        ApiError::from(e)
+    })?;
 
     info!("Found branch '{}'", name);
 
@@ -198,26 +186,23 @@ pub async fn get_branch(
 /// - 404 Not Found: Branch does not exist (unless if_exists=true)
 /// - 500 Internal Server Error: Database error
 /// - 501 Not Implemented: Branching not enabled
-pub async fn delete_branch(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-) -> Result<StatusCode, ApiError> {
+pub async fn delete_branch(State(state): State<AppState>, Path(name): Path<String>) -> Result<StatusCode, ApiError> {
     info!("Deleting branch: {}", name);
 
     // Access the branch manager from storage
-    let branch_manager = state.db.storage.branch_manager()
-        .ok_or_else(|| ApiError::new(
+    let branch_manager = state.db.storage.branch_manager().ok_or_else(|| {
+        ApiError::new(
             axum::http::StatusCode::NOT_IMPLEMENTED,
             "BranchingNotEnabled",
-            "Database branching is not enabled for this instance"
-        ))?;
+            "Database branching is not enabled for this instance",
+        )
+    })?;
 
     // Drop the branch (if_exists = false for strict error handling)
-    branch_manager.drop_branch(&name, false)
-        .map_err(|e| {
-            error!("Failed to delete branch '{}': {}", name, e);
-            ApiError::from(e)
-        })?;
+    branch_manager.drop_branch(&name, false).map_err(|e| {
+        error!("Failed to delete branch '{}': {}", name, e);
+        ApiError::from(e)
+    })?;
 
     info!("Branch '{}' deleted successfully", name);
 
@@ -256,30 +241,27 @@ pub async fn merge_branch(
     info!("Merging branch '{}' into '{}'", source_name, request.target);
 
     // Access the branch manager from storage
-    let branch_manager = state.db.storage.branch_manager()
-        .ok_or_else(|| ApiError::new(
+    let branch_manager = state.db.storage.branch_manager().ok_or_else(|| {
+        ApiError::new(
             axum::http::StatusCode::NOT_IMPLEMENTED,
             "BranchingNotEnabled",
-            "Database branching is not enabled for this instance"
-        ))?;
+            "Database branching is not enabled for this instance",
+        )
+    })?;
 
     // Perform the merge
-    let merge_result = branch_manager.merge_branch(
-        &source_name,
-        &request.target,
-        request.strategy.into(),
-    ).map_err(|e| {
-        error!("Failed to merge '{}' into '{}': {}", source_name, request.target, e);
-        ApiError::from(e)
-    })?;
+    let merge_result = branch_manager
+        .merge_branch(&source_name, &request.target, request.strategy.into())
+        .map_err(|e| {
+            error!("Failed to merge '{}' into '{}': {}", source_name, request.target, e);
+            ApiError::from(e)
+        })?;
 
     let message = if merge_result.completed {
         if merge_result.conflicts.is_empty() {
             format!(
                 "Successfully merged {} keys from '{}' into '{}' with no conflicts",
-                merge_result.merged_keys,
-                source_name,
-                request.target
+                merge_result.merged_keys, source_name, request.target
             )
         } else {
             format!(
@@ -304,9 +286,7 @@ pub async fn merge_branch(
     Ok(Json(MergeBranchResponse {
         merge_timestamp: merge_result.merge_timestamp,
         merged_keys: merge_result.merged_keys,
-        conflicts: merge_result.conflicts.into_iter()
-            .map(|c| c.into())
-            .collect(),
+        conflicts: merge_result.conflicts.into_iter().map(|c| c.into()).collect(),
         completed: merge_result.completed,
         message,
     }))
@@ -316,14 +296,20 @@ pub async fn merge_branch(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
-    use crate::EmbeddedDatabase;
     use crate::api::models::branch::MergeStrategyDto;
+    use crate::EmbeddedDatabase;
     use std::sync::Arc;
 
     fn create_test_state() -> AppState {
         let db = Arc::new(EmbeddedDatabase::new_in_memory().unwrap());
         let query_registry = Arc::new(crate::compute::QueryRegistry::new());
-        AppState { db, query_registry, auth_bridge: None, oauth_registry: None, change_notifier: None }
+        AppState {
+            db,
+            query_registry,
+            auth_bridge: None,
+            oauth_registry: None,
+            change_notifier: None,
+        }
     }
 
     #[tokio::test]

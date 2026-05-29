@@ -80,13 +80,8 @@ impl KeyManager {
 
     /// Load key from file
     fn load_from_file(path: &Path) -> Result<EncryptionKey> {
-        let key_bytes = std::fs::read(path).map_err(|e| {
-            Error::encryption(format!(
-                "Failed to read key file '{}': {}",
-                path.display(),
-                e
-            ))
-        })?;
+        let key_bytes = std::fs::read(path)
+            .map_err(|e| Error::encryption(format!("Failed to read key file '{}': {}", path.display(), e)))?;
 
         // Support both raw binary (32 bytes) and hex-encoded files
         if key_bytes.len() == 32 {
@@ -95,9 +90,8 @@ impl KeyManager {
             Ok(key)
         } else {
             // Try to parse as hex string
-            let key_str = String::from_utf8(key_bytes).map_err(|_| {
-                Error::encryption("Key file must contain either 32 raw bytes or 64 hex characters")
-            })?;
+            let key_str = String::from_utf8(key_bytes)
+                .map_err(|_| Error::encryption("Key file must contain either 32 raw bytes or 64 hex characters"))?;
             Self::parse_hex_key(key_str.trim())
         }
     }
@@ -115,9 +109,10 @@ impl KeyManager {
 
         let mut key = [0u8; 32];
         for (i, chunk) in hex_str.as_bytes().chunks(2).enumerate() {
-            let hex_byte = std::str::from_utf8(chunk)
-                .map_err(|_| Error::encryption("Invalid hex string"))?;
-            let dest = key.get_mut(i).ok_or_else(|| Error::encryption("Key index out of bounds"))?;
+            let hex_byte = std::str::from_utf8(chunk).map_err(|_| Error::encryption("Invalid hex string"))?;
+            let dest = key
+                .get_mut(i)
+                .ok_or_else(|| Error::encryption("Key index out of bounds"))?;
             *dest = u8::from_str_radix(hex_byte, 16)
                 .map_err(|_| Error::encryption(format!("Invalid hex byte: {}", hex_byte)))?;
         }
@@ -203,7 +198,7 @@ impl KeyManager {
 
     /// Compute a key ID (hash) for audit purposes
     fn compute_key_id(key: &EncryptionKey) -> String {
-        use sha2::{Sha256, Digest};
+        use sha2::{Digest, Sha256};
 
         let mut hasher = Sha256::new();
         hasher.update(key);
@@ -246,8 +241,7 @@ mod tests {
         let password = "test_password_123";
         let salt = b"random_salt_1234";
 
-        let km = KeyManager::from_password(password, salt)
-            .expect("Failed to create key manager from password");
+        let km = KeyManager::from_password(password, salt).expect("Failed to create key manager from password");
 
         assert_eq!(km.key().len(), 32);
     }
@@ -255,8 +249,7 @@ mod tests {
     #[test]
     fn test_parse_hex_key() {
         let hex_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let key = KeyManager::parse_hex_key(hex_key)
-            .expect("Failed to parse hex key");
+        let key = KeyManager::parse_hex_key(hex_key).expect("Failed to parse hex key");
 
         assert_eq!(key.len(), 32);
         assert_eq!(key[0], 0x01);
@@ -271,8 +264,7 @@ mod tests {
         assert_eq!(hex.len(), 64);
 
         // Verify it's valid hex
-        let _parsed = KeyManager::parse_hex_key(&hex)
-            .expect("Failed to parse exported hex");
+        let _parsed = KeyManager::parse_hex_key(&hex).expect("Failed to parse exported hex");
     }
 
     #[test]
@@ -280,8 +272,7 @@ mod tests {
         let hex_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         std::env::set_var("TEST_HELIOSDB_KEY", hex_key);
 
-        let key = KeyManager::load_from_env("TEST_HELIOSDB_KEY")
-            .expect("Failed to load key from env");
+        let key = KeyManager::load_from_env("TEST_HELIOSDB_KEY").expect("Failed to load key from env");
 
         assert_eq!(key.len(), 32);
 
@@ -294,8 +285,7 @@ mod tests {
         std::env::set_var("TEST_HELIOSDB_KEY_2", hex_key);
 
         let source = KeySource::Environment("TEST_HELIOSDB_KEY_2".to_string());
-        let km = KeyManager::from_source(&source)
-            .expect("Failed to create key manager from source");
+        let km = KeyManager::from_source(&source).expect("Failed to create key manager from source");
 
         assert_eq!(km.key().len(), 32);
 

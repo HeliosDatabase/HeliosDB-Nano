@@ -32,10 +32,7 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT UPPER('Hello World 123!')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("HELLO WORLD 123!".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("HELLO WORLD 123!".to_string()));
     }
 
     #[test]
@@ -71,10 +68,7 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT LOWER('HeLLo WoRLd')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("hello world".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("hello world".to_string()));
     }
 
     #[test]
@@ -180,14 +174,9 @@ mod string_and_date_tests {
         // NOTE: SQL SUBSTRING(...) is parsed as Expr::Substring by sqlparser,
         // which the planner doesn't handle. Use SUBSTR() function-call syntax.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT SUBSTR('hello world', 7, 5)", &[])
-            .unwrap();
+        let rows = db.query("SELECT SUBSTR('hello world', 7, 5)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("world".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("world".to_string()));
     }
 
     #[test]
@@ -195,10 +184,7 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT SUBSTR('hello', 1, 5)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("hello".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("hello".to_string()));
     }
 
     #[test]
@@ -221,10 +207,7 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT BTRIM('  hello  ')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("hello".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("hello".to_string()));
     }
 
     #[test]
@@ -232,10 +215,7 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT BTRIM('hello')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("hello".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("hello".to_string()));
     }
 
     #[test]
@@ -251,10 +231,7 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT LTRIM('  hello  ')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("hello  ".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("hello  ".to_string()));
     }
 
     #[test]
@@ -262,10 +239,7 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT RTRIM('  hello  ')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("  hello".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("  hello".to_string()));
     }
 
     #[test]
@@ -273,10 +247,7 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT BTRIM('  hello  ')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("hello".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("hello".to_string()));
     }
 
     #[test]
@@ -298,10 +269,7 @@ mod string_and_date_tests {
             .query("SELECT REPLACE('hello world', 'world', 'there')", &[])
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("hello there".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("hello there".to_string()));
     }
 
     #[test]
@@ -309,23 +277,15 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT REPLACE('aaa', 'a', 'bb')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("bbbbbb".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("bbbbbb".to_string()));
     }
 
     #[test]
     fn test_string_func_replace_no_match() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT REPLACE('hello', 'xyz', 'abc')", &[])
-            .unwrap();
+        let rows = db.query("SELECT REPLACE('hello', 'xyz', 'abc')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("hello".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("hello".to_string()));
     }
 
     #[test]
@@ -339,14 +299,9 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_replace_empty_string() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT REPLACE('hello world', ' world', '')", &[])
-            .unwrap();
+        let rows = db.query("SELECT REPLACE('hello world', ' world', '')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("hello".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("hello".to_string()));
     }
 
     // ========================================================================
@@ -373,9 +328,7 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_concat_all_nulls() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT CONCAT(NULL, NULL, NULL)", &[])
-            .unwrap();
+        let rows = db.query("SELECT CONCAT(NULL, NULL, NULL)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("".to_string()));
     }
@@ -383,9 +336,7 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_concat_with_numbers() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT CONCAT('value: ', 42)", &[])
-            .unwrap();
+        let rows = db.query("SELECT CONCAT('value: ', 42)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         let val = rows[0].get(0).unwrap();
         if let Value::String(s) = val {
@@ -398,23 +349,16 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_concat_ws() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT CONCAT_WS(', ', 'a', 'b', 'c')", &[])
-            .unwrap();
+        let rows = db.query("SELECT CONCAT_WS(', ', 'a', 'b', 'c')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("a, b, c".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("a, b, c".to_string()));
     }
 
     #[test]
     fn test_string_func_concat_ws_null_separator() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         // If separator is NULL, result is NULL per PostgreSQL spec
-        let rows = db
-            .query("SELECT CONCAT_WS(NULL, 'a', 'b')", &[])
-            .unwrap();
+        let rows = db.query("SELECT CONCAT_WS(NULL, 'a', 'b')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::Null);
     }
@@ -422,27 +366,17 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_concat_ws_skips_nulls() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT CONCAT_WS('-', 'a', NULL, 'c')", &[])
-            .unwrap();
+        let rows = db.query("SELECT CONCAT_WS('-', 'a', NULL, 'c')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("a-c".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("a-c".to_string()));
     }
 
     #[test]
     fn test_string_func_concat_ws_single_arg() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT CONCAT_WS(',', 'only')", &[])
-            .unwrap();
+        let rows = db.query("SELECT CONCAT_WS(',', 'only')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("only".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("only".to_string()));
     }
 
     // ========================================================================
@@ -461,9 +395,7 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_strpos_not_found() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT STRPOS('hello', 'xyz')", &[])
-            .unwrap();
+        let rows = db.query("SELECT STRPOS('hello', 'xyz')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(0));
     }
@@ -479,9 +411,7 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_strpos_at_start() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT STRPOS('hello', 'he')", &[])
-            .unwrap();
+        let rows = db.query("SELECT STRPOS('hello', 'he')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(1));
     }
@@ -504,10 +434,7 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT REPEAT('ab', 3)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("ababab".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("ababab".to_string()));
     }
 
     #[test]
@@ -531,10 +458,7 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT REPEAT('*', 5)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("*****".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("*****".to_string()));
     }
 
     // ========================================================================
@@ -546,10 +470,7 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT REVERSE('hello')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("olleh".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("olleh".to_string()));
     }
 
     #[test]
@@ -573,10 +494,7 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT REVERSE('racecar')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("racecar".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("racecar".to_string()));
     }
 
     // ========================================================================
@@ -642,9 +560,7 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_left_right_complementary() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT LEFT('hello', 3), RIGHT('hello', 2)", &[])
-            .unwrap();
+        let rows = db.query("SELECT LEFT('hello', 3), RIGHT('hello', 2)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("hel".to_string()));
         assert_eq!(rows[0].get(1).unwrap(), &Value::String("lo".to_string()));
@@ -657,9 +573,7 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_split_part() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT SPLIT_PART('one,two,three', ',', 2)", &[])
-            .unwrap();
+        let rows = db.query("SELECT SPLIT_PART('one,two,three', ',', 2)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("two".to_string()));
     }
@@ -667,9 +581,7 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_split_part_first() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT SPLIT_PART('a-b-c', '-', 1)", &[])
-            .unwrap();
+        let rows = db.query("SELECT SPLIT_PART('a-b-c', '-', 1)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("a".to_string()));
     }
@@ -677,9 +589,7 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_split_part_beyond_parts() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT SPLIT_PART('a,b', ',', 5)", &[])
-            .unwrap();
+        let rows = db.query("SELECT SPLIT_PART('a,b', ',', 5)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("".to_string()));
     }
@@ -687,9 +597,7 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_split_part_null() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT SPLIT_PART(NULL, ',', 1)", &[])
-            .unwrap();
+        let rows = db.query("SELECT SPLIT_PART(NULL, ',', 1)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::Null);
     }
@@ -697,9 +605,7 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_split_part_multi_char_delimiter() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT SPLIT_PART('a::b::c', '::', 2)", &[])
-            .unwrap();
+        let rows = db.query("SELECT SPLIT_PART('a::b::c', '::', 2)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("b".to_string()));
     }
@@ -711,27 +617,17 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_initcap() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT INITCAP('hello world')", &[])
-            .unwrap();
+        let rows = db.query("SELECT INITCAP('hello world')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("Hello World".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("Hello World".to_string()));
     }
 
     #[test]
     fn test_string_func_initcap_mixed() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT INITCAP('hELLO wORLD')", &[])
-            .unwrap();
+        let rows = db.query("SELECT INITCAP('hELLO wORLD')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("Hello World".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("Hello World".to_string()));
     }
 
     #[test]
@@ -745,14 +641,9 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_initcap_with_punctuation() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT INITCAP('hello-world')", &[])
-            .unwrap();
+        let rows = db.query("SELECT INITCAP('hello-world')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("Hello-World".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("Hello-World".to_string()));
     }
 
     // ========================================================================
@@ -764,10 +655,7 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT LPAD('hi', 5)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("   hi".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("   hi".to_string()));
     }
 
     #[test]
@@ -775,23 +663,15 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT LPAD('hi', 5, '0')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("000hi".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("000hi".to_string()));
     }
 
     #[test]
     fn test_string_func_lpad_truncate() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT LPAD('hello world', 5)", &[])
-            .unwrap();
+        let rows = db.query("SELECT LPAD('hello world', 5)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("hello".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("hello".to_string()));
     }
 
     #[test]
@@ -807,10 +687,7 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT LPAD('x', 7, 'ab')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("abababx".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("abababx".to_string()));
     }
 
     #[test]
@@ -818,10 +695,7 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT RPAD('hi', 5)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("hi   ".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("hi   ".to_string()));
     }
 
     #[test]
@@ -829,23 +703,15 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT RPAD('hi', 5, 'x')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("hixxx".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("hixxx".to_string()));
     }
 
     #[test]
     fn test_string_func_rpad_truncate() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT RPAD('hello world', 5)", &[])
-            .unwrap();
+        let rows = db.query("SELECT RPAD('hello world', 5)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("hello".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("hello".to_string()));
     }
 
     #[test]
@@ -861,10 +727,7 @@ mod string_and_date_tests {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT RPAD('x', 7, 'ab')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("xababab".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("xababab".to_string()));
     }
 
     // ========================================================================
@@ -874,24 +737,13 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_upper_on_column() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE sf_upper_col (name TEXT)")
+        db.execute("CREATE TABLE sf_upper_col (name TEXT)").unwrap();
+        db.execute("INSERT INTO sf_upper_col (name) VALUES ('alice')").unwrap();
+        db.execute("INSERT INTO sf_upper_col (name) VALUES ('bob')").unwrap();
+        db.execute("INSERT INTO sf_upper_col (name) VALUES ('charlie')")
             .unwrap();
-        db.execute(
-            "INSERT INTO sf_upper_col (name) VALUES ('alice')"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_upper_col (name) VALUES ('bob')"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_upper_col (name) VALUES ('charlie')"
-        )
-        .unwrap();
 
-        let rows = db
-            .query("SELECT UPPER(name) FROM sf_upper_col", &[])
-            .unwrap();
+        let rows = db.query("SELECT UPPER(name) FROM sf_upper_col", &[]).unwrap();
         assert_eq!(rows.len(), 3);
 
         let mut values: Vec<String> = rows
@@ -908,20 +760,11 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_lower_on_column() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE sf_lower_col (name TEXT)")
-            .unwrap();
-        db.execute(
-            "INSERT INTO sf_lower_col (name) VALUES ('HELLO')"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_lower_col (name) VALUES ('WORLD')"
-        )
-        .unwrap();
+        db.execute("CREATE TABLE sf_lower_col (name TEXT)").unwrap();
+        db.execute("INSERT INTO sf_lower_col (name) VALUES ('HELLO')").unwrap();
+        db.execute("INSERT INTO sf_lower_col (name) VALUES ('WORLD')").unwrap();
 
-        let rows = db
-            .query("SELECT LOWER(name) FROM sf_lower_col", &[])
-            .unwrap();
+        let rows = db.query("SELECT LOWER(name) FROM sf_lower_col", &[]).unwrap();
         assert_eq!(rows.len(), 2);
 
         let mut values: Vec<String> = rows
@@ -938,24 +781,13 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_length_on_column() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE sf_len_col (word TEXT)")
+        db.execute("CREATE TABLE sf_len_col (word TEXT)").unwrap();
+        db.execute("INSERT INTO sf_len_col (word) VALUES ('hi')").unwrap();
+        db.execute("INSERT INTO sf_len_col (word) VALUES ('hello')").unwrap();
+        db.execute("INSERT INTO sf_len_col (word) VALUES ('greetings')")
             .unwrap();
-        db.execute(
-            "INSERT INTO sf_len_col (word) VALUES ('hi')"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_len_col (word) VALUES ('hello')"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_len_col (word) VALUES ('greetings')"
-        )
-        .unwrap();
 
-        let rows = db
-            .query("SELECT LENGTH(word) FROM sf_len_col", &[])
-            .unwrap();
+        let rows = db.query("SELECT LENGTH(word) FROM sf_len_col", &[]).unwrap();
         assert_eq!(rows.len(), 3);
 
         let mut lengths: Vec<i32> = rows
@@ -972,80 +804,47 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_concat_columns() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute(
-            "CREATE TABLE sf_concat_col (first_name TEXT, last_name TEXT)"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_concat_col (first_name, last_name) VALUES ('John', 'Doe')"
-        )
-        .unwrap();
+        db.execute("CREATE TABLE sf_concat_col (first_name TEXT, last_name TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO sf_concat_col (first_name, last_name) VALUES ('John', 'Doe')")
+            .unwrap();
 
         let rows = db
-            .query(
-                "SELECT CONCAT(first_name, ' ', last_name) FROM sf_concat_col",
-                &[],
-            )
+            .query("SELECT CONCAT(first_name, ' ', last_name) FROM sf_concat_col", &[])
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("John Doe".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("John Doe".to_string()));
     }
 
     #[test]
     fn test_string_func_replace_on_column() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE sf_repl_col (addr TEXT)")
+        db.execute("CREATE TABLE sf_repl_col (addr TEXT)").unwrap();
+        db.execute("INSERT INTO sf_repl_col (addr) VALUES ('user@old.com')")
             .unwrap();
-        db.execute(
-            "INSERT INTO sf_repl_col (addr) VALUES ('user@old.com')"
-        )
-        .unwrap();
 
         let rows = db
-            .query(
-                "SELECT REPLACE(addr, 'old.com', 'new.com') FROM sf_repl_col",
-                &[],
-            )
+            .query("SELECT REPLACE(addr, 'old.com', 'new.com') FROM sf_repl_col", &[])
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("user@new.com".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("user@new.com".to_string()));
     }
 
     #[test]
     fn test_string_func_where_clause_with_upper() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE sf_where_col (label TEXT)")
+        db.execute("CREATE TABLE sf_where_col (label TEXT)").unwrap();
+        db.execute("INSERT INTO sf_where_col (label) VALUES ('apple')").unwrap();
+        db.execute("INSERT INTO sf_where_col (label) VALUES ('Banana')")
             .unwrap();
-        db.execute(
-            "INSERT INTO sf_where_col (label) VALUES ('apple')"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_where_col (label) VALUES ('Banana')"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_where_col (label) VALUES ('CHERRY')"
-        )
-        .unwrap();
+        db.execute("INSERT INTO sf_where_col (label) VALUES ('CHERRY')")
+            .unwrap();
 
         let rows = db
-            .query(
-                "SELECT label FROM sf_where_col WHERE UPPER(label) = 'BANANA'",
-                &[],
-            )
+            .query("SELECT label FROM sf_where_col WHERE UPPER(label) = 'BANANA'", &[])
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("Banana".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("Banana".to_string()));
     }
 
     // ========================================================================
@@ -1055,27 +854,17 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_nested_upper_lower() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT LOWER(UPPER('hello'))", &[])
-            .unwrap();
+        let rows = db.query("SELECT LOWER(UPPER('hello'))", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("hello".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("hello".to_string()));
     }
 
     #[test]
     fn test_string_func_combined_left_upper() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT UPPER(LEFT('hello world', 5))", &[])
-            .unwrap();
+        let rows = db.query("SELECT UPPER(LEFT('hello world', 5))", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("HELLO".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("HELLO".to_string()));
     }
 
     #[test]
@@ -1088,19 +877,10 @@ mod string_and_date_tests {
             )
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("HELLO".to_string())
-        );
-        assert_eq!(
-            rows[0].get(1).unwrap(),
-            &Value::String("world".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("HELLO".to_string()));
+        assert_eq!(rows[0].get(1).unwrap(), &Value::String("world".to_string()));
         assert_eq!(rows[0].get(2).unwrap(), &Value::Int4(4));
-        assert_eq!(
-            rows[0].get(3).unwrap(),
-            &Value::String("cba".to_string())
-        );
+        assert_eq!(rows[0].get(3).unwrap(), &Value::String("cba".to_string()));
     }
 
     // ========================================================================
@@ -1111,16 +891,11 @@ mod string_and_date_tests {
     fn test_string_func_like_percent_start() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE sf_like1 (val TEXT)").unwrap();
-        db.execute("INSERT INTO sf_like1 (val) VALUES ('hello')")
-            .unwrap();
-        db.execute("INSERT INTO sf_like1 (val) VALUES ('world')")
-            .unwrap();
-        db.execute("INSERT INTO sf_like1 (val) VALUES ('help')")
-            .unwrap();
+        db.execute("INSERT INTO sf_like1 (val) VALUES ('hello')").unwrap();
+        db.execute("INSERT INTO sf_like1 (val) VALUES ('world')").unwrap();
+        db.execute("INSERT INTO sf_like1 (val) VALUES ('help')").unwrap();
 
-        let rows = db
-            .query("SELECT val FROM sf_like1 WHERE val LIKE 'h%'", &[])
-            .unwrap();
+        let rows = db.query("SELECT val FROM sf_like1 WHERE val LIKE 'h%'", &[]).unwrap();
         assert_eq!(rows.len(), 2);
         let mut vals: Vec<String> = rows
             .iter()
@@ -1137,14 +912,10 @@ mod string_and_date_tests {
     fn test_string_func_like_underscore() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE sf_like2 (val TEXT)").unwrap();
-        db.execute("INSERT INTO sf_like2 (val) VALUES ('hello')")
-            .unwrap();
-        db.execute("INSERT INTO sf_like2 (val) VALUES ('jello')")
-            .unwrap();
-        db.execute("INSERT INTO sf_like2 (val) VALUES ('cello')")
-            .unwrap();
-        db.execute("INSERT INTO sf_like2 (val) VALUES ('bell')")
-            .unwrap();
+        db.execute("INSERT INTO sf_like2 (val) VALUES ('hello')").unwrap();
+        db.execute("INSERT INTO sf_like2 (val) VALUES ('jello')").unwrap();
+        db.execute("INSERT INTO sf_like2 (val) VALUES ('cello')").unwrap();
+        db.execute("INSERT INTO sf_like2 (val) VALUES ('bell')").unwrap();
 
         // _ello matches exactly 5-char strings ending with 'ello'
         let rows = db
@@ -1166,18 +937,11 @@ mod string_and_date_tests {
     fn test_string_func_like_middle_percent() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE sf_like3 (val TEXT)").unwrap();
-        db.execute("INSERT INTO sf_like3 (val) VALUES ('hello')")
-            .unwrap();
-        db.execute("INSERT INTO sf_like3 (val) VALUES ('world')")
-            .unwrap();
-        db.execute(
-            "INSERT INTO sf_like3 (val) VALUES ('balloon')"
-        )
-        .unwrap();
+        db.execute("INSERT INTO sf_like3 (val) VALUES ('hello')").unwrap();
+        db.execute("INSERT INTO sf_like3 (val) VALUES ('world')").unwrap();
+        db.execute("INSERT INTO sf_like3 (val) VALUES ('balloon')").unwrap();
 
-        let rows = db
-            .query("SELECT val FROM sf_like3 WHERE val LIKE '%ll%'", &[])
-            .unwrap();
+        let rows = db.query("SELECT val FROM sf_like3 WHERE val LIKE '%ll%'", &[]).unwrap();
         assert_eq!(rows.len(), 2);
         let mut vals: Vec<String> = rows
             .iter()
@@ -1194,20 +958,11 @@ mod string_and_date_tests {
     fn test_string_func_like_percent_end() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE sf_like4 (val TEXT)").unwrap();
-        db.execute(
-            "INSERT INTO sf_like4 (val) VALUES ('testing')"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_like4 (val) VALUES ('flying')"
-        )
-        .unwrap();
-        db.execute("INSERT INTO sf_like4 (val) VALUES ('done')")
-            .unwrap();
+        db.execute("INSERT INTO sf_like4 (val) VALUES ('testing')").unwrap();
+        db.execute("INSERT INTO sf_like4 (val) VALUES ('flying')").unwrap();
+        db.execute("INSERT INTO sf_like4 (val) VALUES ('done')").unwrap();
 
-        let rows = db
-            .query("SELECT val FROM sf_like4 WHERE val LIKE '%ing'", &[])
-            .unwrap();
+        let rows = db.query("SELECT val FROM sf_like4 WHERE val LIKE '%ing'", &[]).unwrap();
         assert_eq!(rows.len(), 2);
         let mut vals: Vec<String> = rows
             .iter()
@@ -1223,53 +978,31 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_not_like() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE sf_notlike (val TEXT)")
-            .unwrap();
-        db.execute("INSERT INTO sf_notlike (val) VALUES ('abc')")
-            .unwrap();
-        db.execute("INSERT INTO sf_notlike (val) VALUES ('def')")
-            .unwrap();
-        db.execute("INSERT INTO sf_notlike (val) VALUES ('abx')")
-            .unwrap();
+        db.execute("CREATE TABLE sf_notlike (val TEXT)").unwrap();
+        db.execute("INSERT INTO sf_notlike (val) VALUES ('abc')").unwrap();
+        db.execute("INSERT INTO sf_notlike (val) VALUES ('def')").unwrap();
+        db.execute("INSERT INTO sf_notlike (val) VALUES ('abx')").unwrap();
 
         let rows = db
-            .query(
-                "SELECT val FROM sf_notlike WHERE val NOT LIKE 'ab%'",
-                &[],
-            )
+            .query("SELECT val FROM sf_notlike WHERE val NOT LIKE 'ab%'", &[])
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("def".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("def".to_string()));
     }
 
     #[test]
     fn test_string_func_like_exact_match() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE sf_like_exact (val TEXT)")
+        db.execute("CREATE TABLE sf_like_exact (val TEXT)").unwrap();
+        db.execute("INSERT INTO sf_like_exact (val) VALUES ('test')").unwrap();
+        db.execute("INSERT INTO sf_like_exact (val) VALUES ('testing')")
             .unwrap();
-        db.execute(
-            "INSERT INTO sf_like_exact (val) VALUES ('test')"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_like_exact (val) VALUES ('testing')"
-        )
-        .unwrap();
 
         let rows = db
-            .query(
-                "SELECT val FROM sf_like_exact WHERE val LIKE 'test'",
-                &[],
-            )
+            .query("SELECT val FROM sf_like_exact WHERE val LIKE 'test'", &[])
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("test".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("test".to_string()));
     }
 
     // ========================================================================
@@ -1279,26 +1012,13 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_ilike_case_insensitive() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE sf_ilike1 (val TEXT)")
-            .unwrap();
-        db.execute(
-            "INSERT INTO sf_ilike1 (val) VALUES ('Hello')"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_ilike1 (val) VALUES ('HELLO')"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_ilike1 (val) VALUES ('world')"
-        )
-        .unwrap();
+        db.execute("CREATE TABLE sf_ilike1 (val TEXT)").unwrap();
+        db.execute("INSERT INTO sf_ilike1 (val) VALUES ('Hello')").unwrap();
+        db.execute("INSERT INTO sf_ilike1 (val) VALUES ('HELLO')").unwrap();
+        db.execute("INSERT INTO sf_ilike1 (val) VALUES ('world')").unwrap();
 
         let rows = db
-            .query(
-                "SELECT val FROM sf_ilike1 WHERE val ILIKE 'hello'",
-                &[],
-            )
+            .query("SELECT val FROM sf_ilike1 WHERE val ILIKE 'hello'", &[])
             .unwrap();
         assert_eq!(rows.len(), 2);
         let mut vals: Vec<String> = rows
@@ -1315,26 +1035,13 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_ilike_with_pattern() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE sf_ilike2 (val TEXT)")
-            .unwrap();
-        db.execute(
-            "INSERT INTO sf_ilike2 (val) VALUES ('Apple')"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_ilike2 (val) VALUES ('APRICOT')"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_ilike2 (val) VALUES ('banana')"
-        )
-        .unwrap();
+        db.execute("CREATE TABLE sf_ilike2 (val TEXT)").unwrap();
+        db.execute("INSERT INTO sf_ilike2 (val) VALUES ('Apple')").unwrap();
+        db.execute("INSERT INTO sf_ilike2 (val) VALUES ('APRICOT')").unwrap();
+        db.execute("INSERT INTO sf_ilike2 (val) VALUES ('banana')").unwrap();
 
         let rows = db
-            .query(
-                "SELECT val FROM sf_ilike2 WHERE val ILIKE 'ap%'",
-                &[],
-            )
+            .query("SELECT val FROM sf_ilike2 WHERE val ILIKE 'ap%'", &[])
             .unwrap();
         assert_eq!(rows.len(), 2);
         let mut vals: Vec<String> = rows
@@ -1351,28 +1058,15 @@ mod string_and_date_tests {
     #[test]
     fn test_string_func_not_ilike() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute("CREATE TABLE sf_notilike (val TEXT)")
-            .unwrap();
-        db.execute(
-            "INSERT INTO sf_notilike (val) VALUES ('Apple')"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_notilike (val) VALUES ('banana')"
-        )
-        .unwrap();
+        db.execute("CREATE TABLE sf_notilike (val TEXT)").unwrap();
+        db.execute("INSERT INTO sf_notilike (val) VALUES ('Apple')").unwrap();
+        db.execute("INSERT INTO sf_notilike (val) VALUES ('banana')").unwrap();
 
         let rows = db
-            .query(
-                "SELECT val FROM sf_notilike WHERE val NOT ILIKE 'a%'",
-                &[],
-            )
+            .query("SELECT val FROM sf_notilike WHERE val NOT ILIKE 'a%'", &[])
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("banana".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("banana".to_string()));
     }
 
     // ========================================================================
@@ -1392,11 +1086,7 @@ mod string_and_date_tests {
             Value::Timestamp(ts) => {
                 let now = chrono::Utc::now();
                 let diff = (now - *ts).num_seconds().abs();
-                assert!(
-                    diff < 60,
-                    "NOW() timestamp too far from current time: {} seconds",
-                    diff
-                );
+                assert!(diff < 60, "NOW() timestamp too far from current time: {} seconds", diff);
             }
             other => panic!("Expected Timestamp from NOW(), got {:?}", other),
         }
@@ -1405,24 +1095,15 @@ mod string_and_date_tests {
     #[test]
     fn test_date_func_current_timestamp() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT CURRENT_TIMESTAMP()", &[])
-            .unwrap();
+        let rows = db.query("SELECT CURRENT_TIMESTAMP()", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         match rows[0].get(0).unwrap() {
             Value::Timestamp(ts) => {
                 let now = chrono::Utc::now();
                 let diff = (now - *ts).num_seconds().abs();
-                assert!(
-                    diff < 60,
-                    "CURRENT_TIMESTAMP() too far from now: {} seconds",
-                    diff
-                );
+                assert!(diff < 60, "CURRENT_TIMESTAMP() too far from now: {} seconds", diff);
             }
-            other => panic!(
-                "Expected Timestamp from CURRENT_TIMESTAMP(), got {:?}",
-                other
-            ),
+            other => panic!("Expected Timestamp from CURRENT_TIMESTAMP(), got {:?}", other),
         }
     }
 
@@ -1435,11 +1116,7 @@ mod string_and_date_tests {
             Value::Date(d) => {
                 let today = chrono::Utc::now().date_naive();
                 let diff = (*d - today).num_days().abs();
-                assert!(
-                    diff <= 1,
-                    "CURRENT_DATE() too far from today: {} days",
-                    diff
-                );
+                assert!(diff <= 1, "CURRENT_DATE() too far from today: {} days", diff);
             }
             other => panic!("Expected Date from CURRENT_DATE(), got {:?}", other),
         }
@@ -1452,10 +1129,7 @@ mod string_and_date_tests {
         assert_eq!(rows.len(), 1);
         match rows[0].get(0).unwrap() {
             Value::Time(_) => {}
-            other => panic!(
-                "Expected Time from CURRENT_TIME(), got {:?}",
-                other
-            ),
+            other => panic!("Expected Time from CURRENT_TIME(), got {:?}", other),
         }
     }
 
@@ -1467,10 +1141,7 @@ mod string_and_date_tests {
         assert_eq!(rows.len(), 1);
         match rows[0].get(0).unwrap() {
             Value::Timestamp(_) => {}
-            other => panic!(
-                "Expected Timestamp from SYSDATE(), got {:?}",
-                other
-            ),
+            other => panic!("Expected Timestamp from SYSDATE(), got {:?}", other),
         }
     }
 
@@ -1482,10 +1153,7 @@ mod string_and_date_tests {
         assert_eq!(rows.len(), 1);
         match rows[0].get(0).unwrap() {
             Value::Timestamp(_) => {}
-            other => panic!(
-                "Expected Timestamp from GETDATE(), got {:?}",
-                other
-            ),
+            other => panic!("Expected Timestamp from GETDATE(), got {:?}", other),
         }
     }
 
@@ -1520,10 +1188,7 @@ mod string_and_date_tests {
         assert_eq!(rows.len(), 1);
         match rows[0].get(0).unwrap() {
             Value::Timestamp(_) => {}
-            other => panic!(
-                "Expected Timestamp from UTC_TIMESTAMP(), got {:?}",
-                other
-            ),
+            other => panic!("Expected Timestamp from UTC_TIMESTAMP(), got {:?}", other),
         }
     }
 
@@ -1536,16 +1201,9 @@ mod string_and_date_tests {
             Value::Timestamp(ts) => {
                 let now = chrono::Utc::now();
                 let diff = (now - *ts).num_seconds().abs();
-                assert!(
-                    diff < 120,
-                    "LOCALTIMESTAMP() too far from now: {} seconds",
-                    diff
-                );
+                assert!(diff < 120, "LOCALTIMESTAMP() too far from now: {} seconds", diff);
             }
-            other => panic!(
-                "Expected Timestamp from LOCALTIMESTAMP(), got {:?}",
-                other
-            ),
+            other => panic!("Expected Timestamp from LOCALTIMESTAMP(), got {:?}", other),
         }
     }
 
@@ -1569,32 +1227,19 @@ mod string_and_date_tests {
     #[test]
     fn test_date_column_storage_and_retrieval() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute(
-            "CREATE TABLE sf_events (name TEXT, created_at TIMESTAMP)"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_events (name, created_at) VALUES ('event1', NOW())"
-        )
-        .unwrap();
-
-        let rows = db
-            .query("SELECT name, created_at FROM sf_events", &[])
+        db.execute("CREATE TABLE sf_events (name TEXT, created_at TIMESTAMP)")
             .unwrap();
+        db.execute("INSERT INTO sf_events (name, created_at) VALUES ('event1', NOW())")
+            .unwrap();
+
+        let rows = db.query("SELECT name, created_at FROM sf_events", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("event1".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("event1".to_string()));
         match rows[0].get(1).unwrap() {
             Value::Timestamp(ts) => {
                 let now = chrono::Utc::now();
                 let diff = (now - *ts).num_seconds().abs();
-                assert!(
-                    diff < 60,
-                    "Stored timestamp too far from now: {} seconds",
-                    diff
-                );
+                assert!(diff < 60, "Stored timestamp too far from now: {} seconds", diff);
             }
             other => panic!("Expected Timestamp, got {:?}", other),
         }
@@ -1603,32 +1248,18 @@ mod string_and_date_tests {
     #[test]
     fn test_date_column_with_date_type() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute(
-            "CREATE TABLE sf_dated (label TEXT, d DATE)"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_dated (label, d) VALUES ('today', CURRENT_DATE())"
-        )
-        .unwrap();
-
-        let rows = db
-            .query("SELECT label, d FROM sf_dated", &[])
+        db.execute("CREATE TABLE sf_dated (label TEXT, d DATE)").unwrap();
+        db.execute("INSERT INTO sf_dated (label, d) VALUES ('today', CURRENT_DATE())")
             .unwrap();
+
+        let rows = db.query("SELECT label, d FROM sf_dated", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("today".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("today".to_string()));
         match rows[0].get(1).unwrap() {
             Value::Date(d) => {
                 let today = chrono::Utc::now().date_naive();
                 let diff = (*d - today).num_days().abs();
-                assert!(
-                    diff <= 1,
-                    "Stored date too far from today: {} days",
-                    diff
-                );
+                assert!(diff <= 1, "Stored date too far from today: {} days", diff);
             }
             other => panic!("Expected Date, got {:?}", other),
         }
@@ -1637,22 +1268,13 @@ mod string_and_date_tests {
     #[test]
     fn test_date_multiple_timestamps() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute(
-            "CREATE TABLE sf_ts_multi (id INT, ts TIMESTAMP)"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_ts_multi (id, ts) VALUES (1, NOW())"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_ts_multi (id, ts) VALUES (2, NOW())"
-        )
-        .unwrap();
-
-        let rows = db
-            .query("SELECT id, ts FROM sf_ts_multi", &[])
+        db.execute("CREATE TABLE sf_ts_multi (id INT, ts TIMESTAMP)").unwrap();
+        db.execute("INSERT INTO sf_ts_multi (id, ts) VALUES (1, NOW())")
             .unwrap();
+        db.execute("INSERT INTO sf_ts_multi (id, ts) VALUES (2, NOW())")
+            .unwrap();
+
+        let rows = db.query("SELECT id, ts FROM sf_ts_multi", &[]).unwrap();
         assert_eq!(rows.len(), 2);
         for row in &rows {
             match row.get(1).unwrap() {
@@ -1665,26 +1287,16 @@ mod string_and_date_tests {
     #[test]
     fn test_date_now_in_where_clause() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        db.execute(
-            "CREATE TABLE sf_future (name TEXT, event_ts TIMESTAMP)"
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sf_future (name, event_ts) VALUES ('past', NOW())"
-        )
-        .unwrap();
+        db.execute("CREATE TABLE sf_future (name TEXT, event_ts TIMESTAMP)")
+            .unwrap();
+        db.execute("INSERT INTO sf_future (name, event_ts) VALUES ('past', NOW())")
+            .unwrap();
 
         // The inserted event's timestamp should be <= NOW()
         let rows = db
-            .query(
-                "SELECT name FROM sf_future WHERE event_ts <= NOW()",
-                &[],
-            )
+            .query("SELECT name FROM sf_future WHERE event_ts <= NOW()", &[])
             .unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("past".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("past".to_string()));
     }
 }

@@ -21,10 +21,10 @@
 
 use crate::storage::{BranchId, SnapshotId, GIT_DDL_HISTORY_PREFIX, GIT_SCHEMA_SNAPSHOT_PREFIX};
 use crate::{Error, Result};
+use parking_lot::RwLock;
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use parking_lot::RwLock;
 
 /// DDL operation type
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -247,9 +247,9 @@ impl DdlVersioningManager {
     }
 
     fn save_next_id(&self, key: &[u8], id: u64) -> Result<()> {
-        let data = bincode::serialize(&id)
-            .map_err(|e| Error::storage(format!("Failed to serialize ID: {}", e)))?;
-        self.db.put(key, &data)
+        let data = bincode::serialize(&id).map_err(|e| Error::storage(format!("Failed to serialize ID: {}", e)))?;
+        self.db
+            .put(key, &data)
             .map_err(|e| Error::storage(format!("Failed to save ID: {}", e)))
     }
 
@@ -291,14 +291,19 @@ impl DdlVersioningManager {
 
         // Store entry
         let key = Self::encode_ddl_key(branch_id, ddl_id);
-        let value = bincode::serialize(&entry)
-            .map_err(|e| Error::storage(format!("Failed to serialize DDL entry: {}", e)))?;
-        self.db.put(&key, &value)
+        let value =
+            bincode::serialize(&entry).map_err(|e| Error::storage(format!("Failed to serialize DDL entry: {}", e)))?;
+        self.db
+            .put(&key, &value)
             .map_err(|e| Error::storage(format!("Failed to save DDL entry: {}", e)))?;
 
         tracing::debug!(
             "Recorded DDL {}: {} {} {} on branch {}",
-            ddl_id, entry.operation, entry.object_type, object_name, branch_id
+            ddl_id,
+            entry.operation,
+            entry.object_type,
+            object_name,
+            branch_id
         );
 
         Ok(entry)
@@ -328,8 +333,7 @@ impl DdlVersioningManager {
         let iter = self.db.prefix_iterator(&prefix);
 
         for item in iter {
-            let (key, value) = item
-                .map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(&prefix) {
                 break;
@@ -388,12 +392,15 @@ impl DdlVersioningManager {
         let key = Self::encode_snapshot_key(branch_id, &snapshot.name);
         let value = bincode::serialize(&snapshot)
             .map_err(|e| Error::storage(format!("Failed to serialize snapshot: {}", e)))?;
-        self.db.put(&key, &value)
+        self.db
+            .put(&key, &value)
             .map_err(|e| Error::storage(format!("Failed to save snapshot: {}", e)))?;
 
         tracing::info!(
             "Created schema snapshot '{}' for branch {} with {} DDL statements",
-            name, branch_id, snapshot.schema_ddl.len()
+            name,
+            branch_id,
+            snapshot.schema_ddl.len()
         );
 
         Ok(snapshot)
@@ -438,8 +445,7 @@ impl DdlVersioningManager {
         let iter = self.db.prefix_iterator(&prefix);
 
         for item in iter {
-            let (key, value) = item
-                .map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            let (key, value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
 
             if !key.starts_with(&prefix) {
                 break;
@@ -458,9 +464,7 @@ impl DdlVersioningManager {
     pub fn get_ddl_since(&self, branch_id: BranchId, since_ddl_id: u64) -> Result<Vec<DdlHistoryEntry>> {
         let entries = self.get_ddl_history(branch_id, None)?;
 
-        Ok(entries.into_iter()
-            .filter(|e| e.ddl_id > since_ddl_id)
-            .collect())
+        Ok(entries.into_iter().filter(|e| e.ddl_id > since_ddl_id).collect())
     }
 
     /// Detect DDL conflicts between branches
@@ -476,8 +480,7 @@ impl DdlVersioningManager {
         let mut conflicts = Vec::new();
 
         // Build object -> DDL map for target
-        let mut target_objects: std::collections::HashMap<String, &DdlHistoryEntry> =
-            std::collections::HashMap::new();
+        let mut target_objects: std::collections::HashMap<String, &DdlHistoryEntry> = std::collections::HashMap::new();
 
         for entry in &target_ddl {
             let key = format!("{}.{}", entry.object_type, entry.object_name);
@@ -513,30 +516,30 @@ impl DdlVersioningManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Config;
     use crate::storage::StorageEngine;
+    use crate::Config;
 
     #[test]
     fn test_ddl_versioning_basic() {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).expect("Failed to open engine");
 
-        let manager = DdlVersioningManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        ).expect("Failed to create manager");
+        let manager = DdlVersioningManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp))
+            .expect("Failed to create manager");
 
         // Record DDL
-        let entry = manager.record_ddl(
-            1, // branch_id
-            100, // lsn
-            DdlOperation::Create,
-            DdlObjectType::Table,
-            "users",
-            "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)",
-            Some("admin".to_string()),
-            Some(1),
-        ).expect("Failed to record DDL");
+        let entry = manager
+            .record_ddl(
+                1,   // branch_id
+                100, // lsn
+                DdlOperation::Create,
+                DdlObjectType::Table,
+                "users",
+                "CREATE TABLE users (id INT PRIMARY KEY, name TEXT)",
+                Some("admin".to_string()),
+                Some(1),
+            )
+            .expect("Failed to record DDL");
 
         assert_eq!(entry.ddl_id, 1);
         assert_eq!(entry.object_name, "users");
@@ -551,29 +554,30 @@ mod tests {
         let config = Config::in_memory();
         let engine = StorageEngine::open_in_memory(&config).expect("Failed to open engine");
 
-        let manager = DdlVersioningManager::new(
-            Arc::clone(&engine.db),
-            Arc::clone(&engine.timestamp),
-        ).expect("Failed to create manager");
+        let manager = DdlVersioningManager::new(Arc::clone(&engine.db), Arc::clone(&engine.timestamp))
+            .expect("Failed to create manager");
 
         // Create snapshot
-        let snapshot = manager.create_schema_snapshot(
-            1,
-            "release-1.0",
-            vec![
-                "CREATE TABLE users (id INT PRIMARY KEY)".to_string(),
-                "CREATE INDEX idx_users ON users(id)".to_string(),
-            ],
-            100,
-            Some("Initial release".to_string()),
-            None,
-        ).expect("Failed to create snapshot");
+        let snapshot = manager
+            .create_schema_snapshot(
+                1,
+                "release-1.0",
+                vec![
+                    "CREATE TABLE users (id INT PRIMARY KEY)".to_string(),
+                    "CREATE INDEX idx_users ON users(id)".to_string(),
+                ],
+                100,
+                Some("Initial release".to_string()),
+                None,
+            )
+            .expect("Failed to create snapshot");
 
         assert_eq!(snapshot.name, "release-1.0");
         assert_eq!(snapshot.schema_ddl.len(), 2);
 
         // Get snapshot
-        let retrieved = manager.get_schema_snapshot(1, "release-1.0")
+        let retrieved = manager
+            .get_schema_snapshot(1, "release-1.0")
             .expect("Failed to get snapshot")
             .expect("Snapshot should exist");
 

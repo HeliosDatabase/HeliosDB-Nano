@@ -143,9 +143,8 @@ impl SymbolExtractor for StaticLanguageExtractor {
 }
 
 /// Process-static registry: language tag → extractor.
-fn extractor_registry()
-    -> &'static parking_lot::RwLock<std::collections::HashMap<String, std::sync::Arc<dyn SymbolExtractor>>>
-{
+fn extractor_registry(
+) -> &'static parking_lot::RwLock<std::collections::HashMap<String, std::sync::Arc<dyn SymbolExtractor>>> {
     static R: std::sync::OnceLock<
         parking_lot::RwLock<std::collections::HashMap<String, std::sync::Arc<dyn SymbolExtractor>>>,
     > = std::sync::OnceLock::new();
@@ -211,19 +210,16 @@ fn walk(
 ) {
     loop {
         let node = cursor.node();
-        let (sym_emitted, new_scope_component, descend_parent_idx) =
-            match lang {
-                Language::Rust => visit_rust(node, source, scope, parent_idx, symbols, refs),
-                Language::Python => visit_python(node, source, scope, parent_idx, symbols, refs),
-                Language::TypeScript | Language::Tsx | Language::JavaScript => {
-                    visit_typescript(node, source, scope, parent_idx, symbols, refs)
-                }
-                Language::Go => visit_go(node, source, scope, parent_idx, symbols, refs),
-                Language::Markdown => {
-                    visit_markdown(node, source, scope, parent_idx, symbols)
-                }
-                Language::Sql => visit_sql(node, source, scope, parent_idx, symbols),
-            };
+        let (sym_emitted, new_scope_component, descend_parent_idx) = match lang {
+            Language::Rust => visit_rust(node, source, scope, parent_idx, symbols, refs),
+            Language::Python => visit_python(node, source, scope, parent_idx, symbols, refs),
+            Language::TypeScript | Language::Tsx | Language::JavaScript => {
+                visit_typescript(node, source, scope, parent_idx, symbols, refs)
+            }
+            Language::Go => visit_go(node, source, scope, parent_idx, symbols, refs),
+            Language::Markdown => visit_markdown(node, source, scope, parent_idx, symbols),
+            Language::Sql => visit_sql(node, source, scope, parent_idx, symbols),
+        };
 
         // Descend into children with the possibly-updated scope / parent.
         if cursor.goto_first_child() {
@@ -273,89 +269,51 @@ fn visit_rust(
             let (name, sig) = rust_name_and_sig(node, source);
             let vis = rust_visibility(node, source);
             let qualified = make_qualified(scope, &name);
-            let idx = push(symbols, Symbol {
-                name,
-                qualified: qualified.clone(),
-                kind: SymbolKind::Function,
-                signature: sig,
-                visibility: vis,
-                line_start: node.start_position().row as u32 + 1,
-                line_end: node.end_position().row as u32 + 1,
-                byte_start: node.start_byte() as u32,
-                byte_end: node.end_byte() as u32,
-                parent_idx,
-            });
+            let idx = push(
+                symbols,
+                Symbol {
+                    name,
+                    qualified: qualified.clone(),
+                    kind: SymbolKind::Function,
+                    signature: sig,
+                    visibility: vis,
+                    line_start: node.start_position().row as u32 + 1,
+                    line_end: node.end_position().row as u32 + 1,
+                    byte_start: node.start_byte() as u32,
+                    byte_end: node.end_byte() as u32,
+                    parent_idx,
+                },
+            );
             collect_call_refs(source, node, idx, refs);
             (true, Some(qualified), Some(idx))
         }
-        "struct_item" => {
-            emit_named_block(
-                node,
-                source,
-                SymbolKind::Struct,
-                scope,
-                parent_idx,
-                symbols,
-            )
-        }
-        "enum_item" => emit_named_block(
-            node,
-            source,
-            SymbolKind::Enum,
-            scope,
-            parent_idx,
-            symbols,
-        ),
-        "trait_item" => emit_named_block(
-            node,
-            source,
-            SymbolKind::Trait,
-            scope,
-            parent_idx,
-            symbols,
-        ),
+        "struct_item" => emit_named_block(node, source, SymbolKind::Struct, scope, parent_idx, symbols),
+        "enum_item" => emit_named_block(node, source, SymbolKind::Enum, scope, parent_idx, symbols),
+        "trait_item" => emit_named_block(node, source, SymbolKind::Trait, scope, parent_idx, symbols),
         "impl_item" => {
             // impl <type> or impl <trait> for <type>
             let (name, sig) = rust_impl_header(node, source);
             let qualified = make_qualified(scope, &name);
-            let idx = push(symbols, Symbol {
-                name: name.clone(),
-                qualified: qualified.clone(),
-                kind: SymbolKind::Impl,
-                signature: sig,
-                visibility: Visibility::Module,
-                line_start: node.start_position().row as u32 + 1,
-                line_end: node.end_position().row as u32 + 1,
-                byte_start: node.start_byte() as u32,
-                byte_end: node.end_byte() as u32,
-                parent_idx,
-            });
+            let idx = push(
+                symbols,
+                Symbol {
+                    name: name.clone(),
+                    qualified: qualified.clone(),
+                    kind: SymbolKind::Impl,
+                    signature: sig,
+                    visibility: Visibility::Module,
+                    line_start: node.start_position().row as u32 + 1,
+                    line_end: node.end_position().row as u32 + 1,
+                    byte_start: node.start_byte() as u32,
+                    byte_end: node.end_byte() as u32,
+                    parent_idx,
+                },
+            );
             (true, Some(qualified), Some(idx))
         }
-        "mod_item" => emit_named_block(
-            node,
-            source,
-            SymbolKind::Module,
-            scope,
-            parent_idx,
-            symbols,
-        ),
-        "type_item" => emit_named_block(
-            node,
-            source,
-            SymbolKind::Type,
-            scope,
-            parent_idx,
-            symbols,
-        ),
-        "const_item" | "static_item" => emit_named_block(
-            node,
-            source,
-            SymbolKind::Const,
-            scope,
-            parent_idx,
-            symbols,
-        ),
+        "mod_item" => emit_named_block(node, source, SymbolKind::Module, scope, parent_idx, symbols),
+        "type_item" => emit_named_block(node, source, SymbolKind::Type, scope, parent_idx, symbols),
+        "const_item" | "static_item" => emit_named_block(node, source, SymbolKind::Const, scope, parent_idx, symbols),
         _ => (false, None, None),
     }
 }
@@ -377,18 +335,21 @@ fn emit_named_block(
     }
     let qualified = make_qualified(scope, &name);
     let sig = first_line(node_text(node, source).unwrap_or("")).to_string();
-    let idx = push(symbols, Symbol {
-        name,
-        qualified: qualified.clone(),
-        kind,
-        signature: sig,
-        visibility: Visibility::Module,
-        line_start: node.start_position().row as u32 + 1,
-        line_end: node.end_position().row as u32 + 1,
-        byte_start: node.start_byte() as u32,
-        byte_end: node.end_byte() as u32,
-        parent_idx,
-    });
+    let idx = push(
+        symbols,
+        Symbol {
+            name,
+            qualified: qualified.clone(),
+            kind,
+            signature: sig,
+            visibility: Visibility::Module,
+            line_start: node.start_position().row as u32 + 1,
+            line_end: node.end_position().row as u32 + 1,
+            byte_start: node.start_byte() as u32,
+            byte_end: node.end_byte() as u32,
+            parent_idx,
+        },
+    );
     (true, Some(qualified), Some(idx))
 }
 
@@ -402,65 +363,27 @@ fn visit_typescript(
 ) -> (bool, Option<String>, Option<usize>) {
     match node.kind() {
         "function_declaration" | "generator_function_declaration" => {
-            let (emitted, scope_c, idx) = emit_named_block(
-                node,
-                source,
-                SymbolKind::Function,
-                scope,
-                parent_idx,
-                symbols,
-            );
+            let (emitted, scope_c, idx) =
+                emit_named_block(node, source, SymbolKind::Function, scope, parent_idx, symbols);
             if let Some(i) = idx {
                 collect_call_refs(source, node, i, refs);
             }
             (emitted, scope_c, idx)
         }
         "method_definition" => {
-            let (emitted, scope_c, idx) = emit_named_block(
-                node,
-                source,
-                SymbolKind::Method,
-                scope,
-                parent_idx,
-                symbols,
-            );
+            let (emitted, scope_c, idx) =
+                emit_named_block(node, source, SymbolKind::Method, scope, parent_idx, symbols);
             if let Some(i) = idx {
                 collect_call_refs(source, node, i, refs);
             }
             (emitted, scope_c, idx)
         }
-        "class_declaration" | "abstract_class_declaration" => emit_named_block(
-            node,
-            source,
-            SymbolKind::Class,
-            scope,
-            parent_idx,
-            symbols,
-        ),
-        "interface_declaration" => emit_named_block(
-            node,
-            source,
-            SymbolKind::Trait,
-            scope,
-            parent_idx,
-            symbols,
-        ),
-        "type_alias_declaration" => emit_named_block(
-            node,
-            source,
-            SymbolKind::Type,
-            scope,
-            parent_idx,
-            symbols,
-        ),
-        "enum_declaration" => emit_named_block(
-            node,
-            source,
-            SymbolKind::Enum,
-            scope,
-            parent_idx,
-            symbols,
-        ),
+        "class_declaration" | "abstract_class_declaration" => {
+            emit_named_block(node, source, SymbolKind::Class, scope, parent_idx, symbols)
+        }
+        "interface_declaration" => emit_named_block(node, source, SymbolKind::Trait, scope, parent_idx, symbols),
+        "type_alias_declaration" => emit_named_block(node, source, SymbolKind::Type, scope, parent_idx, symbols),
+        "enum_declaration" => emit_named_block(node, source, SymbolKind::Enum, scope, parent_idx, symbols),
         _ => (false, None, None),
     }
 }
@@ -489,29 +412,25 @@ fn visit_python(
             } else {
                 SymbolKind::Method
             };
-            let idx = push(symbols, Symbol {
-                name,
-                qualified: qualified.clone(),
-                kind,
-                signature: sig,
-                visibility: Visibility::Module,
-                line_start: node.start_position().row as u32 + 1,
-                line_end: node.end_position().row as u32 + 1,
-                byte_start: node.start_byte() as u32,
-                byte_end: node.end_byte() as u32,
-                parent_idx,
-            });
+            let idx = push(
+                symbols,
+                Symbol {
+                    name,
+                    qualified: qualified.clone(),
+                    kind,
+                    signature: sig,
+                    visibility: Visibility::Module,
+                    line_start: node.start_position().row as u32 + 1,
+                    line_end: node.end_position().row as u32 + 1,
+                    byte_start: node.start_byte() as u32,
+                    byte_end: node.end_byte() as u32,
+                    parent_idx,
+                },
+            );
             collect_call_refs(source, node, idx, refs);
             (true, Some(qualified), Some(idx))
         }
-        "class_definition" => emit_named_block(
-            node,
-            source,
-            SymbolKind::Class,
-            scope,
-            parent_idx,
-            symbols,
-        ),
+        "class_definition" => emit_named_block(node, source, SymbolKind::Class, scope, parent_idx, symbols),
         _ => (false, None, None),
     }
 }
@@ -526,28 +445,16 @@ fn visit_go(
 ) -> (bool, Option<String>, Option<usize>) {
     match node.kind() {
         "function_declaration" => {
-            let (emitted, scope_c, idx) = emit_named_block(
-                node,
-                source,
-                SymbolKind::Function,
-                scope,
-                parent_idx,
-                symbols,
-            );
+            let (emitted, scope_c, idx) =
+                emit_named_block(node, source, SymbolKind::Function, scope, parent_idx, symbols);
             if let Some(i) = idx {
                 collect_call_refs(source, node, i, refs);
             }
             (emitted, scope_c, idx)
         }
         "method_declaration" => {
-            let (emitted, scope_c, idx) = emit_named_block(
-                node,
-                source,
-                SymbolKind::Method,
-                scope,
-                parent_idx,
-                symbols,
-            );
+            let (emitted, scope_c, idx) =
+                emit_named_block(node, source, SymbolKind::Method, scope, parent_idx, symbols);
             if let Some(i) = idx {
                 collect_call_refs(source, node, i, refs);
             }
@@ -596,12 +503,7 @@ fn visit_go(
                     qualified: qualified.clone(),
                     kind,
                     signature: sig,
-                    visibility: if name
-                        .chars()
-                        .next()
-                        .map(|c| c.is_ascii_uppercase())
-                        .unwrap_or(false)
-                    {
+                    visibility: if name.chars().next().map(|c| c.is_ascii_uppercase()).unwrap_or(false) {
                         Visibility::Public
                     } else {
                         Visibility::Private
@@ -720,12 +622,7 @@ fn visit_sql(
     (true, Some(qualified), Some(idx))
 }
 
-fn collect_call_refs(
-    source: &str,
-    owner: Node<'_>,
-    owner_idx: usize,
-    refs: &mut Vec<SymbolRef>,
-) {
+fn collect_call_refs(source: &str, owner: Node<'_>, owner_idx: usize, refs: &mut Vec<SymbolRef>) {
     // Walk the owner's subtree looking for `call_expression` /
     // `call`. Record the called name. Cross-file resolution happens
     // later; here we only capture the textual target.
@@ -771,10 +668,7 @@ fn rust_name_and_sig(node: Node<'_>, source: &str) -> (String, String) {
 fn rust_impl_header(node: Node<'_>, source: &str) -> (String, String) {
     let sig = first_line(node_text(node, source).unwrap_or("")).to_string();
     // Strip the trailing `{` if any; keep `impl A for B` as the display name.
-    let name = sig
-        .trim_end_matches('{')
-        .trim()
-        .to_string();
+    let name = sig.trim_end_matches('{').trim().to_string();
     (name, sig)
 }
 
@@ -799,7 +693,11 @@ fn node_text<'a>(n: Node<'_>, src: &'a str) -> Option<&'a str> {
 }
 
 fn first_line(s: &str) -> &str {
-    s.split(|c| c == '\n' || c == '\r').next().unwrap_or(s).trim_end_matches('{').trim_end()
+    s.split(|c| c == '\n' || c == '\r')
+        .next()
+        .unwrap_or(s)
+        .trim_end_matches('{')
+        .trim_end()
 }
 
 fn make_qualified(scope: &[String], name: &str) -> String {
@@ -832,9 +730,7 @@ fn collect_imports(lang: Language, source: &str, tree: &Tree, refs: &mut Vec<Sym
         match lang {
             Language::Rust => rust_import(n, source, refs),
             Language::Python => python_import(n, source, refs),
-            Language::TypeScript | Language::Tsx | Language::JavaScript => {
-                ts_import(n, source, refs)
-            }
+            Language::TypeScript | Language::Tsx | Language::JavaScript => ts_import(n, source, refs),
             Language::Go => go_import(n, source, refs),
             Language::Markdown | Language::Sql => {} // no imports modelled
         }

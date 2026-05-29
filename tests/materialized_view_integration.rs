@@ -18,9 +18,13 @@ fn test_create_materialized_view() -> Result<()> {
 
     // Create materialized view
     let result = db.execute(
-        "CREATE MATERIALIZED VIEW completed_orders AS SELECT id, amount FROM orders WHERE status = 'completed'"
+        "CREATE MATERIALIZED VIEW completed_orders AS SELECT id, amount FROM orders WHERE status = 'completed'",
     );
-    assert!(result.is_ok(), "CREATE MATERIALIZED VIEW should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "CREATE MATERIALIZED VIEW should succeed: {:?}",
+        result.err()
+    );
 
     Ok(())
 }
@@ -38,16 +42,19 @@ fn test_query_materialized_view() -> Result<()> {
     db.execute("INSERT INTO products VALUES (3, 'Keyboard', 75)")?;
 
     // Create materialized view
-    db.execute(
-        "CREATE MATERIALIZED VIEW expensive_products AS SELECT id, name, price FROM products WHERE price > 50"
-    )?;
+    db.execute("CREATE MATERIALIZED VIEW expensive_products AS SELECT id, name, price FROM products WHERE price > 50")?;
 
     // Query the materialized view
     let empty_params: &[&dyn std::fmt::Display] = &[];
     let results = db.query("SELECT * FROM expensive_products", empty_params)?;
 
     // Should have 2 rows (Laptop and Keyboard)
-    assert_eq!(results.len(), 2, "Expected 2 rows in materialized view, got {}", results.len());
+    assert_eq!(
+        results.len(),
+        2,
+        "Expected 2 rows in materialized view, got {}",
+        results.len()
+    );
 
     Ok(())
 }
@@ -63,9 +70,7 @@ fn test_refresh_materialized_view() -> Result<()> {
     db.execute("INSERT INTO sales VALUES (1, 100)")?;
 
     // Create materialized view with aggregation
-    db.execute(
-        "CREATE MATERIALIZED VIEW sales_summary AS SELECT SUM(amount) as total FROM sales"
-    )?;
+    db.execute("CREATE MATERIALIZED VIEW sales_summary AS SELECT SUM(amount) as total FROM sales")?;
 
     // Check initial value
     let empty_params: &[&dyn std::fmt::Display] = &[];
@@ -77,7 +82,11 @@ fn test_refresh_materialized_view() -> Result<()> {
 
     // Refresh the view
     let refresh_result = db.execute("REFRESH MATERIALIZED VIEW sales_summary");
-    assert!(refresh_result.is_ok(), "REFRESH should succeed: {:?}", refresh_result.err());
+    assert!(
+        refresh_result.is_ok(),
+        "REFRESH should succeed: {:?}",
+        refresh_result.err()
+    );
 
     // Query again - should now reflect updated data
     let results = db.query("SELECT * FROM sales_summary", empty_params)?;
@@ -121,7 +130,7 @@ fn test_refresh_after_insert() -> Result<()> {
 
     // Create materialized view
     db.execute(
-        "CREATE MATERIALIZED VIEW inventory_summary AS SELECT id, item, quantity FROM inventory WHERE quantity > 3"
+        "CREATE MATERIALIZED VIEW inventory_summary AS SELECT id, item, quantity FROM inventory WHERE quantity > 3",
     )?;
 
     // Query - should have 2 rows initially
@@ -156,9 +165,7 @@ fn test_refresh_after_update() -> Result<()> {
     db.execute("INSERT INTO stock VALUES (3, 'Cherry', 200)")?;
 
     // Create materialized view for expensive items
-    db.execute(
-        "CREATE MATERIALIZED VIEW expensive_stock AS SELECT id, product, price FROM stock WHERE price >= 100"
-    )?;
+    db.execute("CREATE MATERIALIZED VIEW expensive_stock AS SELECT id, product, price FROM stock WHERE price >= 100")?;
 
     // Query - should have 2 rows (Apple and Cherry)
     let results = db.query("SELECT * FROM expensive_stock", empty_params)?;
@@ -191,9 +198,7 @@ fn test_refresh_after_delete() -> Result<()> {
     db.execute("INSERT INTO customers VALUES (3, 'Charlie', 1)")?;
 
     // Create materialized view
-    db.execute(
-        "CREATE MATERIALIZED VIEW active_customers AS SELECT id, name FROM customers WHERE active = 1"
-    )?;
+    db.execute("CREATE MATERIALIZED VIEW active_customers AS SELECT id, name FROM customers WHERE active = 1")?;
 
     // Query - should have 3 rows
     let results = db.query("SELECT * FROM active_customers", empty_params)?;

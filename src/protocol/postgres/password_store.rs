@@ -26,13 +26,13 @@
 //! }
 //! ```
 
-use crate::{Result, Error};
+use crate::{Error, Result};
 use parking_lot::RwLock;
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use super::auth::{prepare_scram_credentials, scram_salted_password, scram_client_key, scram_stored_key};
+use super::auth::{prepare_scram_credentials, scram_client_key, scram_salted_password, scram_stored_key};
 
 /// SCRAM-SHA-256 credentials stored for a user
 #[derive(Debug, Clone)]
@@ -198,11 +198,7 @@ impl PasswordStore for InMemoryPasswordStore {
     }
 
     fn add_user(&mut self, username: &str, password: &str) -> Result<()> {
-        let credentials = ScramCredentials::from_password(
-            username.to_string(),
-            password,
-            self.default_iterations,
-        );
+        let credentials = ScramCredentials::from_password(username.to_string(), password, self.default_iterations);
 
         self.users.write().insert(username.to_string(), credentials);
         Ok(())

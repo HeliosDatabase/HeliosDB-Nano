@@ -4,9 +4,9 @@
 
 #![cfg(test)]
 
-use heliosdb_nano::{EmbeddedDatabase, Result};
-use heliosdb_nano::session::IsolationLevel;
 use crate::test_helpers::*;
+use heliosdb_nano::session::IsolationLevel;
+use heliosdb_nano::{EmbeddedDatabase, Result};
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::Duration;
@@ -41,17 +41,17 @@ fn test_write_lock_exclusive() -> Result<()> {
     db.execute("INSERT INTO test VALUES (1, 100)")?;
 
     let barrier = Arc::new(Barrier::new(2));
-    
+
     let db1 = Arc::clone(&db);
     let barrier1 = Arc::clone(&barrier);
     let handle1 = thread::spawn(move || -> Result<()> {
         let session = db1.create_session("user1", IsolationLevel::ReadCommitted)?;
         db1.begin_transaction_for_session(session)?;
         db1.execute_in_session(session, "UPDATE test SET val = 200 WHERE id = 1")?;
-        
+
         barrier1.wait();
         thread::sleep(Duration::from_millis(100));
-        
+
         db1.commit_transaction_for_session(session)?;
         db1.destroy_session(session)?;
         Ok(())
@@ -62,9 +62,9 @@ fn test_write_lock_exclusive() -> Result<()> {
     let handle2 = thread::spawn(move || -> Result<()> {
         let session = db2.create_session("user2", IsolationLevel::ReadCommitted)?;
         barrier2.wait();
-        
+
         // This should block until tx1 commits or times out
-        // The current implementation of execute_in_session might not yet fully use the lock manager 
+        // The current implementation of execute_in_session might not yet fully use the lock manager
         // for row-level locks unless it uses StorageEngine methods that use it.
         // But for this test, we just check if it eventually succeeds.
         db2.begin_transaction_for_session(session)?;

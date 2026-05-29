@@ -45,9 +45,7 @@ async fn setup() -> Result<(String, tokio::task::JoinHandle<()>), Box<dyn std::e
 #[tokio::test]
 async fn insert_then_select_visible_on_same_connection() {
     let (cs, server_handle) = setup().await.expect("server up");
-    let (client, connection) = tokio_postgres::connect(&cs, NoTls)
-        .await
-        .expect("connect");
+    let (client, connection) = tokio_postgres::connect(&cs, NoTls).await.expect("connect");
     let _conn_handle = tokio::spawn(async move {
         if let Err(e) = connection.await {
             eprintln!("connection error: {e}");
@@ -98,18 +96,12 @@ async fn insert_then_select_visible_on_same_connection() {
 
     // Also verify LIST (no WHERE on id) — the bug also masks rows
     // from `SELECT *` per the prod symptom matrix.
-    let list = client
-        .simple_query("SELECT id FROM databases")
-        .await
-        .expect("list");
+    let list = client.simple_query("SELECT id FROM databases").await.expect("list");
     let list_rows: Vec<_> = list
         .into_iter()
         .filter(|r| matches!(r, tokio_postgres::SimpleQueryMessage::Row(_)))
         .collect();
-    assert!(
-        !list_rows.is_empty(),
-        "LIST also missed the row — Theory A or C."
-    );
+    assert!(!list_rows.is_empty(), "LIST also missed the row — Theory A or C.");
 
     server_handle.abort();
 }

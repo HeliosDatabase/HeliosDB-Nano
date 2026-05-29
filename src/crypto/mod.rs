@@ -40,16 +40,15 @@ mod zero_knowledge;
 
 pub use key_manager::KeyManager;
 pub use provider::{
-    CryptoProvider, CryptoKey, HashOutput,
-    init_provider, provider as get_provider, is_fips_build, provider_name,
-    hash_content, derive_key, generate_random_key,
+    derive_key, generate_random_key, hash_content, init_provider, is_fips_build, provider as get_provider,
+    provider_name, CryptoKey, CryptoProvider, HashOutput,
 };
 pub use zero_knowledge::{
-    ZkeConfig, ZkeDerivedKeys, ZkeKeyDerivation, ZkeMode, ZkeRequestContext,
-    ZeroKnowledgeSession, NonceTracker, TimestampValidator,
+    NonceTracker, TimestampValidator, ZeroKnowledgeSession, ZkeConfig, ZkeDerivedKeys, ZkeKeyDerivation, ZkeMode,
+    ZkeRequestContext,
 };
 
-use crate::{Result, Error};
+use crate::{Error, Result};
 
 /// Encryption key (256 bits)
 pub type EncryptionKey = [u8; 32];
@@ -94,9 +93,11 @@ pub fn decrypt(key: &EncryptionKey, ciphertext_with_nonce: &[u8]) -> Result<Vec<
     }
 
     // Extract nonce (first 12 bytes)
-    let nonce_bytes = ciphertext_with_nonce.get(0..12)
+    let nonce_bytes = ciphertext_with_nonce
+        .get(0..12)
         .ok_or_else(|| Error::encryption("Ciphertext too short for nonce"))?;
-    let ciphertext = ciphertext_with_nonce.get(12..)
+    let ciphertext = ciphertext_with_nonce
+        .get(12..)
         .ok_or_else(|| Error::encryption("Ciphertext too short for data"))?;
 
     let cipher = Aes256Gcm::new(key.into());
@@ -112,12 +113,12 @@ pub fn decrypt(key: &EncryptionKey, ciphertext_with_nonce: &[u8]) -> Result<Vec<
 
 /// Generate encryption key from password
 pub fn derive_key_from_password(password: &str, salt: &[u8]) -> Result<EncryptionKey> {
-    use argon2::{Argon2, PasswordHasher};
     use argon2::password_hash::SaltString;
+    use argon2::{Argon2, PasswordHasher};
 
     // Use Argon2 for key derivation
-    let salt_string = SaltString::encode_b64(salt)
-        .map_err(|e| Error::encryption(format!("Salt encoding failed: {}", e)))?;
+    let salt_string =
+        SaltString::encode_b64(salt).map_err(|e| Error::encryption(format!("Salt encoding failed: {}", e)))?;
 
     let argon2 = Argon2::default();
     let hash = argon2
@@ -133,7 +134,11 @@ pub fn derive_key_from_password(password: &str, salt: &[u8]) -> Result<Encryptio
     }
 
     let mut key = [0u8; 32];
-    key.copy_from_slice(key_bytes.get(0..32).ok_or_else(|| Error::encryption("Derived key too short"))?);
+    key.copy_from_slice(
+        key_bytes
+            .get(0..32)
+            .ok_or_else(|| Error::encryption("Derived key too short"))?,
+    );
 
     Ok(key)
 }
@@ -148,10 +153,8 @@ mod tests {
         let key: EncryptionKey = rand::random();
         let plaintext = b"Hello, HeliosDB Lite!";
 
-        let ciphertext = encrypt(&key, plaintext)
-            .expect("Failed to encrypt plaintext");
-        let decrypted = decrypt(&key, &ciphertext)
-            .expect("Failed to decrypt ciphertext");
+        let ciphertext = encrypt(&key, plaintext).expect("Failed to encrypt plaintext");
+        let decrypted = decrypt(&key, &ciphertext).expect("Failed to decrypt ciphertext");
 
         assert_eq!(plaintext, &decrypted[..]);
     }
@@ -161,8 +164,7 @@ mod tests {
         let password = "supersecret";
         let salt = b"randomsalt123456";
 
-        let key = derive_key_from_password(password, salt)
-            .expect("Failed to derive key from password");
+        let key = derive_key_from_password(password, salt).expect("Failed to derive key from password");
         assert_eq!(key.len(), 32);
     }
 }

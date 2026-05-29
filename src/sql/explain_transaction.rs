@@ -212,11 +212,8 @@ impl TransactionExplainAnalyzer {
         };
 
         let transaction_cost = self.calculate_transaction_cost(&locks, &mvcc_visibility);
-        let optimization_suggestions = self.generate_optimization_suggestions(
-            &locks,
-            &deadlock_analysis,
-            &transaction_cost,
-        );
+        let optimization_suggestions =
+            self.generate_optimization_suggestions(&locks, &deadlock_analysis, &transaction_cost);
 
         Ok(TransactionExplain {
             isolation_level: self.isolation_level,
@@ -233,15 +230,13 @@ impl TransactionExplainAnalyzer {
 
         for table in tables {
             let (lock_type, wait_time) = match query_type {
-                "SELECT" => {
-                    match self.isolation_level {
-                        IsolationLevel::ReadUncommitted => (LockType::SharedRead, Some(0.0)),
-                        IsolationLevel::ReadCommitted => (LockType::SharedRead, Some(2.5)),
-                        IsolationLevel::RepeatableRead => (LockType::SharedRead, Some(5.0)),
-                        IsolationLevel::Serializable => (LockType::SharedRead, Some(12.0)),
-                        IsolationLevel::Snapshot => (LockType::SharedRead, Some(1.0)),
-                    }
-                }
+                "SELECT" => match self.isolation_level {
+                    IsolationLevel::ReadUncommitted => (LockType::SharedRead, Some(0.0)),
+                    IsolationLevel::ReadCommitted => (LockType::SharedRead, Some(2.5)),
+                    IsolationLevel::RepeatableRead => (LockType::SharedRead, Some(5.0)),
+                    IsolationLevel::Serializable => (LockType::SharedRead, Some(12.0)),
+                    IsolationLevel::Snapshot => (LockType::SharedRead, Some(1.0)),
+                },
                 "INSERT" | "UPDATE" | "DELETE" => (LockType::ExclusiveWrite, Some(15.0)),
                 _ => (LockType::IntentShared, Some(1.0)),
             };
@@ -259,12 +254,9 @@ impl TransactionExplainAnalyzer {
         locks
     }
 
-    fn analyze_deadlock_risk(
-        &self,
-        locks: &[LockInfo],
-        tables: &[String],
-    ) -> DeadlockAnalysis {
-        let write_locks = locks.iter()
+    fn analyze_deadlock_risk(&self, locks: &[LockInfo], tables: &[String]) -> DeadlockAnalysis {
+        let write_locks = locks
+            .iter()
             .filter(|l| matches!(l.lock_type, LockType::ExclusiveWrite))
             .count();
 
@@ -288,20 +280,15 @@ impl TransactionExplainAnalyzer {
                 tables.join(", ")
             ));
 
-            recommendations.push(
-                "Acquire locks in consistent order (alphabetically by table name)".to_string()
-            );
-            recommendations.push(
-                "Consider using explicit locking (SELECT ... FOR UPDATE) at transaction start".to_string()
-            );
+            recommendations.push("Acquire locks in consistent order (alphabetically by table name)".to_string());
+            recommendations
+                .push("Consider using explicit locking (SELECT ... FOR UPDATE) at transaction start".to_string());
         }
 
         if matches!(self.isolation_level, IsolationLevel::Serializable) && write_locks > 0 {
-            conflicting_patterns.push(
-                "SERIALIZABLE isolation with write locks increases deadlock risk".to_string()
-            );
+            conflicting_patterns.push("SERIALIZABLE isolation with write locks increases deadlock risk".to_string());
             recommendations.push(
-                "Consider lowering isolation level to REPEATABLE READ if phantom reads are acceptable".to_string()
+                "Consider lowering isolation level to REPEATABLE READ if phantom reads are acceptable".to_string(),
             );
         }
 
@@ -312,11 +299,7 @@ impl TransactionExplainAnalyzer {
         }
     }
 
-    fn analyze_mvcc_visibility(
-        &self,
-        locks: &[LockInfo],
-        isolation_level: IsolationLevel,
-    ) -> MVCCVisibility {
+    fn analyze_mvcc_visibility(&self, locks: &[LockInfo], isolation_level: IsolationLevel) -> MVCCVisibility {
         let (visible_versions, version_chain_length, requires_version_scan) = match isolation_level {
             IsolationLevel::ReadUncommitted => (10, 15, true),
             IsolationLevel::ReadCommitted => (5, 8, true),
@@ -337,18 +320,10 @@ impl TransactionExplainAnalyzer {
         }
     }
 
-    fn calculate_transaction_cost(
-        &self,
-        locks: &[LockInfo],
-        mvcc: &MVCCVisibility,
-    ) -> TransactionCost {
-        let lock_acquisition_cost: f64 = locks.iter()
-            .map(|l| l.acquisition_time_ms)
-            .sum();
+    fn calculate_transaction_cost(&self, locks: &[LockInfo], mvcc: &MVCCVisibility) -> TransactionCost {
+        let lock_acquisition_cost: f64 = locks.iter().map(|l| l.acquisition_time_ms).sum();
 
-        let lock_wait_cost: f64 = locks.iter()
-            .filter_map(|l| l.wait_time_ms)
-            .sum();
+        let lock_wait_cost: f64 = locks.iter().filter_map(|l| l.wait_time_ms).sum();
 
         let mvcc_version_cost = mvcc.visible_versions as f64 * 0.5;
 
@@ -405,7 +380,8 @@ impl TransactionExplainAnalyzer {
         // Lock wait optimization
         if cost.lock_wait_cost > 10.0 {
             suggestions.push(OptimizationSuggestion {
-                suggestion: "Reduce transaction duration by moving non-critical operations outside transaction".to_string(),
+                suggestion: "Reduce transaction duration by moving non-critical operations outside transaction"
+                    .to_string(),
                 expected_benefit: format!("Save {:.1}ms in lock wait time", cost.lock_wait_cost * 0.5),
                 risk_assessment: "Low risk if operations are truly non-critical".to_string(),
                 roi_percent: Some(25.0),
@@ -447,9 +423,10 @@ impl TransactionExplainAnalyzer {
 
         // Isolation level
         output.push_str(&format!("Isolation Level: {}\n", explain.isolation_level));
-        output.push_str(&format!("Transaction Cost: {} ({:.2}ms overhead)\n\n",
-            explain.transaction_cost.cost_category,
-            explain.transaction_cost.total_overhead));
+        output.push_str(&format!(
+            "Transaction Cost: {} ({:.2}ms overhead)\n\n",
+            explain.transaction_cost.cost_category, explain.transaction_cost.total_overhead
+        ));
 
         // Locks acquired
         output.push_str("───────────────────────────────────────────────────────────────\n");
@@ -472,10 +449,22 @@ impl TransactionExplainAnalyzer {
         output.push_str("───────────────────────────────────────────────────────────────\n");
         output.push_str("  MVCC VISIBILITY\n");
         output.push_str("───────────────────────────────────────────────────────────────\n\n");
-        output.push_str(&format!("Visible Versions: {}\n", explain.mvcc_visibility.visible_versions));
-        output.push_str(&format!("Version Chain Length: {}\n", explain.mvcc_visibility.version_chain_length));
-        output.push_str(&format!("Snapshot Timestamp: {}\n", explain.mvcc_visibility.snapshot_timestamp));
-        output.push_str(&format!("Requires Version Scan: {}\n\n", explain.mvcc_visibility.requires_version_scan));
+        output.push_str(&format!(
+            "Visible Versions: {}\n",
+            explain.mvcc_visibility.visible_versions
+        ));
+        output.push_str(&format!(
+            "Version Chain Length: {}\n",
+            explain.mvcc_visibility.version_chain_length
+        ));
+        output.push_str(&format!(
+            "Snapshot Timestamp: {}\n",
+            explain.mvcc_visibility.snapshot_timestamp
+        ));
+        output.push_str(&format!(
+            "Requires Version Scan: {}\n\n",
+            explain.mvcc_visibility.requires_version_scan
+        ));
 
         // Deadlock analysis
         output.push_str("───────────────────────────────────────────────────────────────\n");
@@ -501,11 +490,26 @@ impl TransactionExplainAnalyzer {
         output.push_str("\n───────────────────────────────────────────────────────────────\n");
         output.push_str("  TRANSACTION COST BREAKDOWN\n");
         output.push_str("───────────────────────────────────────────────────────────────\n\n");
-        output.push_str(&format!("Lock Acquisition: {:.2}ms\n", explain.transaction_cost.lock_acquisition_cost));
-        output.push_str(&format!("Lock Wait Time: {:.2}ms\n", explain.transaction_cost.lock_wait_cost));
-        output.push_str(&format!("MVCC Version Scan: {:.2}ms\n", explain.transaction_cost.mvcc_version_cost));
-        output.push_str(&format!("Validation: {:.2}ms\n", explain.transaction_cost.validation_cost));
-        output.push_str(&format!("Total Overhead: {:.2}ms\n", explain.transaction_cost.total_overhead));
+        output.push_str(&format!(
+            "Lock Acquisition: {:.2}ms\n",
+            explain.transaction_cost.lock_acquisition_cost
+        ));
+        output.push_str(&format!(
+            "Lock Wait Time: {:.2}ms\n",
+            explain.transaction_cost.lock_wait_cost
+        ));
+        output.push_str(&format!(
+            "MVCC Version Scan: {:.2}ms\n",
+            explain.transaction_cost.mvcc_version_cost
+        ));
+        output.push_str(&format!(
+            "Validation: {:.2}ms\n",
+            explain.transaction_cost.validation_cost
+        ));
+        output.push_str(&format!(
+            "Total Overhead: {:.2}ms\n",
+            explain.transaction_cost.total_overhead
+        ));
 
         // Optimization suggestions
         if !explain.optimization_suggestions.is_empty() {
@@ -547,7 +551,9 @@ mod tests {
     #[test]
     fn test_serializable_write_analysis() {
         let analyzer = TransactionExplainAnalyzer::new(IsolationLevel::Serializable);
-        let result = analyzer.analyze("UPDATE", &["users".to_string(), "orders".to_string()]).unwrap();
+        let result = analyzer
+            .analyze("UPDATE", &["users".to_string(), "orders".to_string()])
+            .unwrap();
 
         assert_eq!(result.locks.len(), 2);
         assert!(result.locks.iter().all(|l| l.lock_type == LockType::ExclusiveWrite));
@@ -585,7 +591,9 @@ mod tests {
     #[test]
     fn test_optimization_suggestions() {
         let analyzer = TransactionExplainAnalyzer::new(IsolationLevel::Serializable);
-        let result = analyzer.analyze("UPDATE", &["users".to_string(), "orders".to_string()]).unwrap();
+        let result = analyzer
+            .analyze("UPDATE", &["users".to_string(), "orders".to_string()])
+            .unwrap();
 
         assert!(!result.optimization_suggestions.is_empty());
         assert!(result.optimization_suggestions.iter().any(|s| s.roi_percent.is_some()));

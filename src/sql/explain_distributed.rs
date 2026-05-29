@@ -160,7 +160,10 @@ impl DistributedExplainAnalyzer {
         let (network_operations, cross_partition_joins) = if has_join {
             self.analyze_distributed_join(&partitions, &cluster_nodes)
         } else if has_aggregation {
-            (self.analyze_distributed_aggregation(&partitions, &cluster_nodes), vec![])
+            (
+                self.analyze_distributed_aggregation(&partitions, &cluster_nodes),
+                vec![],
+            )
         } else {
             (self.analyze_distributed_scan(&partitions, &cluster_nodes), vec![])
         };
@@ -171,15 +174,12 @@ impl DistributedExplainAnalyzer {
             None
         };
 
-        let total_network_cost_ms: f64 = network_operations.iter()
-            .map(|op| op.estimated_time_ms)
-            .sum();
+        let total_network_cost_ms: f64 = network_operations.iter().map(|op| op.estimated_time_ms).sum();
 
-        let total_data_transfer_mb: f64 = network_operations.iter()
-            .map(|op| op.data_size_mb)
-            .sum();
+        let total_data_transfer_mb: f64 = network_operations.iter().map(|op| op.data_size_mb).sum();
 
-        let parallelism_degree = cluster_nodes.iter()
+        let parallelism_degree = cluster_nodes
+            .iter()
             .filter(|n| matches!(n.role, NodeRole::Worker))
             .count();
 
@@ -197,15 +197,13 @@ impl DistributedExplainAnalyzer {
     }
 
     fn generate_cluster_topology(&self) -> Vec<ClusterNode> {
-        let mut nodes = vec![
-            ClusterNode {
-                node_id: "coordinator".to_string(),
-                host: "10.0.0.1".to_string(),
-                port: 5432,
-                role: NodeRole::Coordinator,
-                data_size_mb: 0.0,
-            }
-        ];
+        let mut nodes = vec![ClusterNode {
+            node_id: "coordinator".to_string(),
+            host: "10.0.0.1".to_string(),
+            port: 5432,
+            role: NodeRole::Coordinator,
+            data_size_mb: 0.0,
+        }];
 
         for i in 0..self.cluster_size {
             nodes.push(ClusterNode {
@@ -234,10 +232,7 @@ impl DistributedExplainAnalyzer {
                     row_count: 100000,
                     size_mb: 500.0,
                     partition_key: "id".to_string(),
-                    key_range: Some((
-                        format!("{}", i * 1000),
-                        format!("{}", (i + 1) * 1000 - 1),
-                    )),
+                    key_range: Some((format!("{}", i * 1000), format!("{}", (i + 1) * 1000 - 1))),
                 });
             }
         }
@@ -245,11 +240,7 @@ impl DistributedExplainAnalyzer {
         partitions
     }
 
-    fn analyze_partition_pruning(
-        &self,
-        query_type: &str,
-        partitions: &[PartitionInfo],
-    ) -> Option<PartitionPruning> {
+    fn analyze_partition_pruning(&self, query_type: &str, partitions: &[PartitionInfo]) -> Option<PartitionPruning> {
         if query_type == "SELECT" {
             let total = partitions.len();
             let scanned = (total as f64 * 0.25) as usize; // 25% scanned
@@ -270,11 +261,7 @@ impl DistributedExplainAnalyzer {
         }
     }
 
-    fn analyze_distributed_scan(
-        &self,
-        partitions: &[PartitionInfo],
-        nodes: &[ClusterNode],
-    ) -> Vec<NetworkOperation> {
+    fn analyze_distributed_scan(&self, partitions: &[PartitionInfo], nodes: &[ClusterNode]) -> Vec<NetworkOperation> {
         let mut operations = Vec::new();
         let partitions_per_worker = partitions.len() / self.cluster_size.max(1);
 
@@ -336,19 +323,22 @@ impl DistributedExplainAnalyzer {
         let mut joins = Vec::new();
 
         // Determine if broadcast or shuffle join
-        let tables: Vec<_> = partitions.iter()
+        let tables: Vec<_> = partitions
+            .iter()
             .map(|p| p.table_name.clone())
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect();
 
         if tables.len() >= 2 {
-            let left_size: f64 = partitions.iter()
+            let left_size: f64 = partitions
+                .iter()
                 .filter(|p| p.table_name == tables[0])
                 .map(|p| p.size_mb)
                 .sum();
 
-            let right_size: f64 = partitions.iter()
+            let right_size: f64 = partitions
+                .iter()
                 .filter(|p| p.table_name == tables[1])
                 .map(|p| p.size_mb)
                 .sum();
@@ -404,7 +394,8 @@ impl DistributedExplainAnalyzer {
     }
 
     fn analyze_distributed_transaction(&self, nodes: &[ClusterNode]) -> DistributedTransaction {
-        let worker_nodes: Vec<_> = nodes.iter()
+        let worker_nodes: Vec<_> = nodes
+            .iter()
             .filter(|n| matches!(n.role, NodeRole::Worker))
             .map(|n| n.node_id.clone())
             .collect();
@@ -414,7 +405,7 @@ impl DistributedExplainAnalyzer {
             participant_nodes: worker_nodes.clone(),
             two_phase_commit: true,
             coordination_overhead_ms: worker_nodes.len() as f64 * 5.0, // 5ms per participant
-            network_round_trips: 4, // 2PC requires 4 round trips
+            network_round_trips: 4,                                    // 2PC requires 4 round trips
         }
     }
 
@@ -455,19 +446,18 @@ impl DistributedExplainAnalyzer {
             output.push_str(&format!("  PARTITIONS ({} total)\n", explain.partitions.len()));
             output.push_str("───────────────────────────────────────────────────────────────\n\n");
 
-            let tables: std::collections::HashSet<_> = explain.partitions.iter()
-                .map(|p| p.table_name.clone())
-                .collect();
+            let tables: std::collections::HashSet<_> =
+                explain.partitions.iter().map(|p| p.table_name.clone()).collect();
 
             for table in tables {
-                let table_partitions: Vec<_> = explain.partitions.iter()
-                    .filter(|p| p.table_name == table)
-                    .collect();
+                let table_partitions: Vec<_> = explain.partitions.iter().filter(|p| p.table_name == table).collect();
 
                 output.push_str(&format!("Table: {} ({} partitions)\n", table, table_partitions.len()));
                 output.push_str(&format!("  Partition Key: {}\n", table_partitions[0].partition_key));
-                output.push_str(&format!("  Total Size: {:.2} MB\n",
-                    table_partitions.iter().map(|p| p.size_mb).sum::<f64>()));
+                output.push_str(&format!(
+                    "  Total Size: {:.2} MB\n",
+                    table_partitions.iter().map(|p| p.size_mb).sum::<f64>()
+                ));
                 output.push_str("\n");
             }
         }
@@ -478,12 +468,15 @@ impl DistributedExplainAnalyzer {
             output.push_str("  PARTITION PRUNING\n");
             output.push_str("───────────────────────────────────────────────────────────────\n\n");
             output.push_str(&format!("Total Partitions: {}\n", pruning.total_partitions));
-            output.push_str(&format!("Scanned: {} ({:.1}%)\n",
+            output.push_str(&format!(
+                "Scanned: {} ({:.1}%)\n",
                 pruning.scanned_partitions,
-                (pruning.scanned_partitions as f64 / pruning.total_partitions as f64) * 100.0));
-            output.push_str(&format!("Pruned: {} ({:.1}% efficiency)\n",
-                pruning.pruned_partitions,
-                pruning.pruning_efficiency));
+                (pruning.scanned_partitions as f64 / pruning.total_partitions as f64) * 100.0
+            ));
+            output.push_str(&format!(
+                "Pruned: {} ({:.1}% efficiency)\n",
+                pruning.pruned_partitions, pruning.pruning_efficiency
+            ));
 
             if !pruning.pruning_predicates.is_empty() {
                 output.push_str("\nPruning Predicates:\n");
@@ -497,16 +490,23 @@ impl DistributedExplainAnalyzer {
         // Network operations
         if !explain.network_operations.is_empty() {
             output.push_str("───────────────────────────────────────────────────────────────\n");
-            output.push_str(&format!("  NETWORK OPERATIONS ({} ops)\n", explain.network_operations.len()));
+            output.push_str(&format!(
+                "  NETWORK OPERATIONS ({} ops)\n",
+                explain.network_operations.len()
+            ));
             output.push_str("───────────────────────────────────────────────────────────────\n\n");
 
             for op in &explain.network_operations {
-                output.push_str(&format!("• {} {} → {}\n",
-                    op.operation_type, op.source_node, op.target_node));
+                output.push_str(&format!(
+                    "• {} {} → {}\n",
+                    op.operation_type, op.source_node, op.target_node
+                ));
                 output.push_str(&format!("  Data Transfer: {:.2} MB\n", op.data_size_mb));
                 output.push_str(&format!("  Estimated Time: {:.2} ms\n", op.estimated_time_ms));
-                output.push_str(&format!("  Compression: {}\n",
-                    if op.compression_enabled { "enabled" } else { "disabled" }));
+                output.push_str(&format!(
+                    "  Compression: {}\n",
+                    if op.compression_enabled { "enabled" } else { "disabled" }
+                ));
                 output.push_str("\n");
             }
         }
@@ -538,7 +538,10 @@ impl DistributedExplainAnalyzer {
             output.push_str(&format!("Coordinator: {}\n", txn.coordinator_node));
             output.push_str(&format!("Participants: {}\n", txn.participant_nodes.join(", ")));
             output.push_str(&format!("Two-Phase Commit: {}\n", txn.two_phase_commit));
-            output.push_str(&format!("Coordination Overhead: {:.2} ms\n", txn.coordination_overhead_ms));
+            output.push_str(&format!(
+                "Coordination Overhead: {:.2} ms\n",
+                txn.coordination_overhead_ms
+            ));
             output.push_str(&format!("Network Round Trips: {}\n", txn.network_round_trips));
             output.push_str("\n");
         }
@@ -548,8 +551,14 @@ impl DistributedExplainAnalyzer {
         output.push_str("  SUMMARY\n");
         output.push_str("───────────────────────────────────────────────────────────────\n\n");
         output.push_str(&format!("Parallelism Degree: {}\n", explain.parallelism_degree));
-        output.push_str(&format!("Total Network Cost: {:.2} ms\n", explain.total_network_cost_ms));
-        output.push_str(&format!("Total Data Transfer: {:.2} MB\n", explain.total_data_transfer_mb));
+        output.push_str(&format!(
+            "Total Network Cost: {:.2} ms\n",
+            explain.total_network_cost_ms
+        ));
+        output.push_str(&format!(
+            "Total Data Transfer: {:.2} MB\n",
+            explain.total_data_transfer_mb
+        ));
 
         output.push_str("\n═══════════════════════════════════════════════════════════════\n");
 
@@ -565,7 +574,9 @@ mod tests {
     #[test]
     fn test_cluster_topology() {
         let analyzer = DistributedExplainAnalyzer::new(4);
-        let result = analyzer.analyze("SELECT", &["users".to_string()], false, false).unwrap();
+        let result = analyzer
+            .analyze("SELECT", &["users".to_string()], false, false)
+            .unwrap();
 
         assert_eq!(result.cluster_nodes.len(), 5); // 1 coordinator + 4 workers
         assert_eq!(result.parallelism_degree, 4);
@@ -574,7 +585,9 @@ mod tests {
     #[test]
     fn test_partition_pruning() {
         let analyzer = DistributedExplainAnalyzer::new(4);
-        let result = analyzer.analyze("SELECT", &["users".to_string()], false, false).unwrap();
+        let result = analyzer
+            .analyze("SELECT", &["users".to_string()], false, false)
+            .unwrap();
 
         assert!(result.partition_pruning.is_some());
         let pruning = result.partition_pruning.unwrap();
@@ -585,7 +598,9 @@ mod tests {
     #[test]
     fn test_distributed_scan() {
         let analyzer = DistributedExplainAnalyzer::new(4);
-        let result = analyzer.analyze("SELECT", &["users".to_string()], false, false).unwrap();
+        let result = analyzer
+            .analyze("SELECT", &["users".to_string()], false, false)
+            .unwrap();
 
         assert!(!result.network_operations.is_empty());
         assert!(result.total_network_cost_ms > 0.0);
@@ -594,12 +609,9 @@ mod tests {
     #[test]
     fn test_distributed_join() {
         let analyzer = DistributedExplainAnalyzer::new(4);
-        let result = analyzer.analyze(
-            "SELECT",
-            &["users".to_string(), "orders".to_string()],
-            true,
-            false,
-        ).unwrap();
+        let result = analyzer
+            .analyze("SELECT", &["users".to_string(), "orders".to_string()], true, false)
+            .unwrap();
 
         assert!(!result.cross_partition_joins.is_empty());
         assert!(!result.network_operations.is_empty());
@@ -608,7 +620,9 @@ mod tests {
     #[test]
     fn test_distributed_transaction() {
         let analyzer = DistributedExplainAnalyzer::new(4);
-        let result = analyzer.analyze("UPDATE", &["users".to_string()], false, false).unwrap();
+        let result = analyzer
+            .analyze("UPDATE", &["users".to_string()], false, false)
+            .unwrap();
 
         assert!(result.distributed_transaction.is_some());
         let txn = result.distributed_transaction.unwrap();
@@ -619,7 +633,9 @@ mod tests {
     #[test]
     fn test_network_compression() {
         let analyzer = DistributedExplainAnalyzer::new(4).with_compression(true);
-        let result = analyzer.analyze("SELECT", &["users".to_string()], false, false).unwrap();
+        let result = analyzer
+            .analyze("SELECT", &["users".to_string()], false, false)
+            .unwrap();
 
         assert!(result.network_operations.iter().all(|op| op.compression_enabled));
     }
@@ -627,7 +643,9 @@ mod tests {
     #[test]
     fn test_format_output() {
         let analyzer = DistributedExplainAnalyzer::new(2);
-        let result = analyzer.analyze("SELECT", &["users".to_string()], false, false).unwrap();
+        let result = analyzer
+            .analyze("SELECT", &["users".to_string()], false, false)
+            .unwrap();
         let output = analyzer.format_output(&result);
 
         assert!(output.contains("DISTRIBUTED QUERY"));

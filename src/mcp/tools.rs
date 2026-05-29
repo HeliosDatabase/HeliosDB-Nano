@@ -64,10 +64,16 @@ pub struct ToolOutcome {
 
 impl ToolOutcome {
     pub fn ok(v: JsonValue) -> Self {
-        Self { is_error: false, payload: v }
+        Self {
+            is_error: false,
+            payload: v,
+        }
     }
     pub fn err<E: ToString>(e: E) -> Self {
-        Self { is_error: true, payload: json!({ "error": e.to_string() }) }
+        Self {
+            is_error: true,
+            payload: json!({ "error": e.to_string() }),
+        }
     }
 }
 
@@ -509,10 +515,18 @@ struct TimeTravelInput {
     branch: String,
 }
 
-fn default_branch() -> String { "main".to_string() }
-fn default_vector_column() -> String { "embedding".to_string() }
-fn default_top_k() -> usize { 10 }
-fn default_true() -> bool { true }
+fn default_branch() -> String {
+    "main".to_string()
+}
+fn default_vector_column() -> String {
+    "embedding".to_string()
+}
+fn default_top_k() -> usize {
+    10
+}
+fn default_true() -> bool {
+    true
+}
 
 // ---- DB-backed handlers ------------------------------------------------
 
@@ -623,8 +637,7 @@ fn do_insert(db: &EmbeddedDatabase, args: JsonValue) -> ToolOutcome {
         let mut inserted = 0usize;
         for row in &input.rows {
             let columns: Vec<&str> = row.keys().map(String::as_str).collect();
-            let placeholders: Vec<String> =
-                (1..=columns.len()).map(|i| format!("${i}")).collect();
+            let placeholders: Vec<String> = (1..=columns.len()).map(|i| format!("${i}")).collect();
             let values: Vec<Value> = row.values().map(json_to_value).collect();
             let sql = format!(
                 "INSERT INTO {} ({}) VALUES ({})",
@@ -813,14 +826,30 @@ struct EmbedAndStoreInput {
     text: String,
 }
 
-fn default_fusion() -> String { "rrf".to_string() }
-fn default_lambda() -> f64 { 0.5 }
-fn default_limit() -> usize { 10 }
-fn default_edge_label() -> String { "edge".to_string() }
-fn default_edge_weight() -> f64 { 1.0 }
-fn default_direction() -> String { "out".to_string() }
-fn default_depth() -> usize { 3 }
-fn default_algorithm() -> String { "bfs".to_string() }
+fn default_fusion() -> String {
+    "rrf".to_string()
+}
+fn default_lambda() -> f64 {
+    0.5
+}
+fn default_limit() -> usize {
+    10
+}
+fn default_edge_label() -> String {
+    "edge".to_string()
+}
+fn default_edge_weight() -> f64 {
+    1.0
+}
+fn default_direction() -> String {
+    "out".to_string()
+}
+fn default_depth() -> usize {
+    3
+}
+fn default_algorithm() -> String {
+    "bfs".to_string()
+}
 
 // ---- In-process handlers ----------------------------------------------
 
@@ -856,7 +885,11 @@ fn do_hybrid_search(args: JsonValue) -> ToolOutcome {
     let vec_hits: Vec<ScoredHit> = input
         .vector_hits
         .into_iter()
-        .map(|h| ScoredHit { doc_id: h.doc_id, score: h.score, vector: h.vector })
+        .map(|h| ScoredHit {
+            doc_id: h.doc_id,
+            score: h.score,
+            vector: h.vector,
+        })
         .collect();
     let fusion = match input.fusion.to_ascii_lowercase().as_str() {
         "rrf" => FusionMethod::Rrf,
@@ -910,13 +943,7 @@ fn do_graph_traverse(args: JsonValue) -> ToolOutcome {
         Ok(d) => d,
         Err(e) => return ToolOutcome::err(e.to_string()),
     };
-    let rows = graph_sql::graph_traverse(
-        &GRAPH_STORE,
-        start,
-        input.edge_label.as_deref(),
-        direction,
-        input.depth,
-    );
+    let rows = graph_sql::graph_traverse(&GRAPH_STORE, start, input.edge_label.as_deref(), direction, input.depth);
     ToolOutcome::ok(json!({
         "start": start.to_string(),
         "direction": format!("{direction:?}"),
@@ -1005,16 +1032,12 @@ pub(crate) fn value_to_json(v: &Value) -> JsonValue {
         Value::Int2(n) => JsonValue::from(*n),
         Value::Int4(n) => JsonValue::from(*n),
         Value::Int8(n) => JsonValue::from(*n),
-        Value::Float4(n) => {
-            serde_json::Number::from_f64(f64::from(*n))
-                .map(JsonValue::Number)
-                .unwrap_or(JsonValue::Null)
-        }
-        Value::Float8(n) => {
-            serde_json::Number::from_f64(*n)
-                .map(JsonValue::Number)
-                .unwrap_or(JsonValue::Null)
-        }
+        Value::Float4(n) => serde_json::Number::from_f64(f64::from(*n))
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
+        Value::Float8(n) => serde_json::Number::from_f64(*n)
+            .map(JsonValue::Number)
+            .unwrap_or(JsonValue::Null),
         Value::Numeric(s) | Value::String(s) => JsonValue::String(s.clone()),
         Value::Bytes(b) => {
             use base64::{engine::general_purpose::STANDARD as B64, Engine};
@@ -1057,10 +1080,7 @@ pub(crate) fn json_to_value(v: &JsonValue) -> Value {
         }
         JsonValue::String(s) => Value::String(s.clone()),
         JsonValue::Array(arr) => {
-            let floats: Result<Vec<f32>, ()> = arr
-                .iter()
-                .map(|v| v.as_f64().map(|f| f as f32).ok_or(()))
-                .collect();
+            let floats: Result<Vec<f32>, ()> = arr.iter().map(|v| v.as_f64().map(|f| f as f32).ok_or(())).collect();
             if let Ok(vec) = floats {
                 Value::Vector(vec)
             } else {
@@ -1150,11 +1170,7 @@ mod tests {
         let db = EmbeddedDatabase::new_in_memory().expect("db");
         db.execute("CREATE TABLE t (id INT4 PRIMARY KEY, name TEXT)").unwrap();
         db.execute("INSERT INTO t VALUES (1, 'alpha')").unwrap();
-        let r = call_tool(
-            Some(&db),
-            "heliosdb_query",
-            json!({ "sql": "SELECT id, name FROM t" }),
-        );
+        let r = call_tool(Some(&db), "heliosdb_query", json!({ "sql": "SELECT id, name FROM t" }));
         assert!(!r.is_error, "{:?}", r.payload);
         assert_eq!(r.payload["row_count"].as_u64(), Some(1));
     }

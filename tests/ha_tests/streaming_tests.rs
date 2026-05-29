@@ -10,8 +10,8 @@ use uuid::Uuid;
 use heliosdb_nano::replication::{
     streaming::{StreamingClient, StreamingClientConfig, StreamingClientState, StreamingServer, StreamingServerConfig},
     transport::SyncModeConfig,
-    wal_store::{WalStore, WalStoreConfig, BatchRequest, BatchStreamState},
     wal_replicator::{WalEntry, WalEntryType},
+    wal_store::{BatchRequest, BatchStreamState, WalStore, WalStoreConfig},
 };
 
 /// Create a test WAL entry
@@ -39,12 +39,15 @@ async fn test_batch_streaming_with_limits() {
     }
 
     // Test with max_entries limit
-    let batch = store.get_batch(BatchRequest {
-        from_lsn: 0,
-        to_lsn: Some(50),
-        max_entries: 10,
-        max_bytes: 1024 * 1024,
-    }).await.expect("Failed to get batch");
+    let batch = store
+        .get_batch(BatchRequest {
+            from_lsn: 0,
+            to_lsn: Some(50),
+            max_entries: 10,
+            max_bytes: 1024 * 1024,
+        })
+        .await
+        .expect("Failed to get batch");
 
     assert_eq!(batch.entries.len(), 10);
     assert!(batch.has_more);
@@ -65,12 +68,15 @@ async fn test_batch_streaming_with_byte_limit() {
     }
 
     // Test with byte limit (should get fewer than max_entries)
-    let batch = store.get_batch(BatchRequest {
-        from_lsn: 0,
-        to_lsn: Some(100),
-        max_entries: 100,
-        max_bytes: 5000, // ~5KB, should get ~5 entries
-    }).await.expect("Failed to get batch");
+    let batch = store
+        .get_batch(BatchRequest {
+            from_lsn: 0,
+            to_lsn: Some(100),
+            max_entries: 100,
+            max_bytes: 5000, // ~5KB, should get ~5 entries
+        })
+        .await
+        .expect("Failed to get batch");
 
     assert!(batch.entries.len() < 100);
     assert!(batch.total_bytes <= 5000);
@@ -269,7 +275,11 @@ async fn test_sync_mode_behavior() {
         min_applied: 2,
         timeout_ms: 10000,
     };
-    if let SyncModeConfig::Sync { min_applied, timeout_ms } = sync_mode {
+    if let SyncModeConfig::Sync {
+        min_applied,
+        timeout_ms,
+    } = sync_mode
+    {
         assert_eq!(min_applied, 2);
         assert_eq!(timeout_ms, 10000);
     }
@@ -378,7 +388,10 @@ async fn test_wal_checksum_verification() {
         data: data.to_vec(),
         checksum: correct_checksum,
     };
-    store.append(valid_entry.clone()).await.expect("Valid entry should append");
+    store
+        .append(valid_entry.clone())
+        .await
+        .expect("Valid entry should append");
 
     // Verify checksum on retrieval
     let retrieved = store.get(1).await.expect("Entry not found");

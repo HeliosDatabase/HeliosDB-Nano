@@ -88,14 +88,8 @@ pub fn lsp_references_diff(
     let a = fetch_refs(db, symbol_id, at_a)?;
     let b = fetch_refs(db, symbol_id, at_b)?;
 
-    let key_a: HashMap<RefKey, (String, i32)> = a
-        .iter()
-        .map(|r| (r.key(), (r.path.clone(), r.line)))
-        .collect();
-    let key_b: HashMap<RefKey, (String, i32)> = b
-        .iter()
-        .map(|r| (r.key(), (r.path.clone(), r.line)))
-        .collect();
+    let key_a: HashMap<RefKey, (String, i32)> = a.iter().map(|r| (r.key(), (r.path.clone(), r.line))).collect();
+    let key_b: HashMap<RefKey, (String, i32)> = b.iter().map(|r| (r.key(), (r.path.clone(), r.line))).collect();
 
     let mut out: Vec<RefDiffRow> = Vec::new();
     for r in &a {
@@ -106,14 +100,12 @@ pub fn lsp_references_diff(
                 line: r.line,
                 caller_symbol_id: r.caller_symbol_id,
             }),
-            Some((p, l)) if *p != r.path || *l != r.line => {
-                out.push(RefDiffRow {
-                    change: DiffChange::Moved,
-                    path: p.clone(),
-                    line: *l,
-                    caller_symbol_id: r.caller_symbol_id,
-                })
-            }
+            Some((p, l)) if *p != r.path || *l != r.line => out.push(RefDiffRow {
+                change: DiffChange::Moved,
+                path: p.clone(),
+                line: *l,
+                caller_symbol_id: r.caller_symbol_id,
+            }),
             _ => {}
         }
     }
@@ -188,12 +180,7 @@ pub struct AstDiffRow {
 
 /// File-level structural diff — which symbols exist / moved / disappeared
 /// between two temporal points. Matching key is `qualified`.
-pub fn ast_diff(
-    db: &EmbeddedDatabase,
-    file_path: &str,
-    at_a: &AsOfRef,
-    at_b: &AsOfRef,
-) -> Result<Vec<AstDiffRow>> {
+pub fn ast_diff(db: &EmbeddedDatabase, file_path: &str, at_a: &AsOfRef, at_b: &AsOfRef) -> Result<Vec<AstDiffRow>> {
     let a = fetch_symbols_for_path(db, file_path, at_a)?;
     let b = fetch_symbols_for_path(db, file_path, at_b)?;
     let a_map: HashMap<String, (String, i32)> = a
@@ -268,11 +255,7 @@ enum RefKey {
     ByLocation(String, i32, String),
 }
 
-fn fetch_refs(
-    db: &EmbeddedDatabase,
-    symbol_id: i64,
-    at: &AsOfRef,
-) -> Result<Vec<RefAt>> {
+fn fetch_refs(db: &EmbeddedDatabase, symbol_id: i64, at: &AsOfRef) -> Result<Vec<RefAt>> {
     let clause = at.to_sql_clause();
     let sql = format!(
         "SELECT f.path, r.line, r.kind, r.from_symbol \
@@ -311,11 +294,7 @@ fn fetch_refs(
     Ok(out)
 }
 
-fn fetch_signature(
-    db: &EmbeddedDatabase,
-    symbol_id: i64,
-    at: &AsOfRef,
-) -> Result<String> {
+fn fetch_signature(db: &EmbeddedDatabase, symbol_id: i64, at: &AsOfRef) -> Result<String> {
     let clause = at.to_sql_clause();
     let sql = format!(
         "SELECT signature FROM _hdb_code_symbols s{clause} \
@@ -334,11 +313,7 @@ struct SymAt {
     line_start: i32,
 }
 
-fn fetch_symbols_for_path(
-    db: &EmbeddedDatabase,
-    file_path: &str,
-    at: &AsOfRef,
-) -> Result<Vec<SymAt>> {
+fn fetch_symbols_for_path(db: &EmbeddedDatabase, file_path: &str, at: &AsOfRef) -> Result<Vec<SymAt>> {
     let clause = at.to_sql_clause();
     let esc = file_path.replace('\'', "''");
     let sql = format!(
@@ -431,10 +406,7 @@ mod tests {
     #[test]
     fn as_of_clause_renders() {
         assert_eq!(AsOfRef::Now.to_sql_clause(), "");
-        assert_eq!(
-            AsOfRef::commit("abc").to_sql_clause(),
-            " AS OF COMMIT 'abc'"
-        );
+        assert_eq!(AsOfRef::commit("abc").to_sql_clause(), " AS OF COMMIT 'abc'");
         assert_eq!(
             AsOfRef::timestamp("2025-01-01").to_sql_clause(),
             " AS OF TIMESTAMP '2025-01-01'"
@@ -443,10 +415,7 @@ mod tests {
 
     #[test]
     fn escapes_quote_in_as_of_literal() {
-        assert_eq!(
-            AsOfRef::commit("a'b").to_sql_clause(),
-            " AS OF COMMIT 'a''b'"
-        );
+        assert_eq!(AsOfRef::commit("a'b").to_sql_clause(), " AS OF COMMIT 'a''b'");
     }
 
     #[test]

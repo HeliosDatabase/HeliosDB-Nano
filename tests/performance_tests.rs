@@ -5,8 +5,8 @@
 mod test_helpers;
 
 use heliosdb_nano::{EmbeddedDatabase, Result};
-use test_helpers::*;
 use std::time::Duration;
+use test_helpers::*;
 
 // ============================================================================
 // Query Performance Tests
@@ -24,7 +24,7 @@ fn test_simple_query_performance() -> Result<()> {
             Ok(())
         },
         Duration::from_millis(500),
-        "Simple SELECT on 1000 rows"
+        "Simple SELECT on 1000 rows",
     );
 
     Ok(())
@@ -42,7 +42,7 @@ fn test_filtered_query_performance() -> Result<()> {
             Ok(())
         },
         Duration::from_millis(500),
-        "Filtered SELECT on 1000 rows"
+        "Filtered SELECT on 1000 rows",
     );
 
     Ok(())
@@ -60,7 +60,7 @@ fn test_aggregate_query_performance() -> Result<()> {
             Ok(())
         },
         Duration::from_millis(500),
-        "Aggregate query on 1000 rows"
+        "Aggregate query on 1000 rows",
     );
 
     Ok(())
@@ -78,7 +78,7 @@ fn test_order_by_performance() -> Result<()> {
             Ok(())
         },
         Duration::from_millis(1000),
-        "ORDER BY on 1000 rows"
+        "ORDER BY on 1000 rows",
     );
 
     Ok(())
@@ -100,7 +100,10 @@ fn test_group_by_performance() -> Result<()> {
         };
         db.execute(&format!(
             "INSERT INTO users (id, name, email, age) VALUES ({}, 'User{}', 'user{}@example.com', {})",
-            i, dept, i, 20 + (i % 50)
+            i,
+            dept,
+            i,
+            20 + (i % 50)
         ))?;
     }
 
@@ -111,7 +114,7 @@ fn test_group_by_performance() -> Result<()> {
             Ok(())
         },
         Duration::from_millis(1000),
-        "GROUP BY on 1000 rows"
+        "GROUP BY on 1000 rows",
     );
 
     Ok(())
@@ -151,7 +154,10 @@ fn test_bulk_insert_performance() -> Result<()> {
         for i in 1..=1000 {
             db.execute(&format!(
                 "INSERT INTO users (id, name, email, age) VALUES ({}, 'User{}', 'user{}@example.com', {})",
-                i, i, i, 20 + (i % 50)
+                i,
+                i,
+                i,
+                20 + (i % 50)
             ))?;
         }
         Ok(())
@@ -186,7 +192,7 @@ fn test_single_update_performance() -> Result<()> {
             Ok(())
         },
         Duration::from_millis(100),
-        "Single row UPDATE"
+        "Single row UPDATE",
     );
 
     Ok(())
@@ -226,7 +232,7 @@ fn test_filtered_update_performance() -> Result<()> {
             Ok(())
         },
         Duration::from_millis(500),
-        "Filtered UPDATE on subset of rows"
+        "Filtered UPDATE on subset of rows",
     );
 
     Ok(())
@@ -248,7 +254,7 @@ fn test_single_delete_performance() -> Result<()> {
             Ok(())
         },
         Duration::from_millis(100),
-        "Single row DELETE"
+        "Single row DELETE",
     );
 
     Ok(())
@@ -332,7 +338,7 @@ fn test_aggregate_10k_rows() -> Result<()> {
             Ok(())
         },
         Duration::from_secs(1),
-        "Aggregate on 10k rows"
+        "Aggregate on 10k rows",
     );
 
     Ok(())
@@ -353,7 +359,10 @@ fn test_repeated_inserts() -> Result<()> {
     for i in 1..=5000 {
         db.execute(&format!(
             "INSERT INTO users (id, name, email, age) VALUES ({}, 'User{}', 'user{}@example.com', {})",
-            i, i, i, 20 + (i % 50)
+            i,
+            i,
+            i,
+            20 + (i % 50)
         ))?;
     }
     let duration = start.elapsed();
@@ -413,7 +422,10 @@ fn test_mixed_workload() -> Result<()> {
             // Insert
             db.execute(&format!(
                 "INSERT INTO users (id, name, email, age) VALUES ({}, 'User{}', 'user{}@example.com', {})",
-                i + 10000, i, i, 30
+                i + 10000,
+                i,
+                i,
+                30
             ))?;
         } else {
             // Update
@@ -528,9 +540,11 @@ fn test_performance_baseline() -> Result<()> {
         ))?;
     }
     let insert_time = start.elapsed();
-    println!("1000 inserts: {:?} ({:.0} ops/sec)",
-             insert_time,
-             1000.0 / insert_time.as_secs_f64());
+    println!(
+        "1000 inserts: {:?} ({:.0} ops/sec)",
+        insert_time,
+        1000.0 / insert_time.as_secs_f64()
+    );
 
     // Query baseline
     let start = std::time::Instant::now();

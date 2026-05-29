@@ -1,8 +1,8 @@
 //! Result formatting and pretty printing
 
-use crate::{Tuple, Schema, Value, DataType};
-use prettytable::{Table, Row, Cell, format};
+use crate::{DataType, Schema, Tuple, Value};
 use colored::Colorize;
+use prettytable::{format, Cell, Row, Table};
 
 /// Format query results as a pretty table
 pub fn format_results(tuples: &[Tuple], schema: &Schema) -> String {
@@ -16,23 +16,27 @@ pub fn format_results(tuples: &[Tuple], schema: &Schema) -> String {
     table.set_format(*format::consts::FORMAT_BOX_CHARS);
 
     // Add header row
-    let header: Vec<Cell> = schema.columns.iter()
+    let header: Vec<Cell> = schema
+        .columns
+        .iter()
         .map(|col| Cell::new(&col.name).style_spec("Fb"))
         .collect();
     table.add_row(Row::new(header));
 
     // Add data rows
     for tuple in tuples {
-        let cells: Vec<Cell> = tuple.values.iter()
-            .map(|val| Cell::new(&format_value(val)))
-            .collect();
+        let cells: Vec<Cell> = tuple.values.iter().map(|val| Cell::new(&format_value(val))).collect();
         table.add_row(Row::new(cells));
     }
 
     let mut output = String::new();
     output.push_str(&table.to_string());
     output.push('\n');
-    output.push_str(&format!("({} row{})", tuples.len(), if tuples.len() == 1 { "" } else { "s" }).dimmed().to_string());
+    output.push_str(
+        &format!("({} row{})", tuples.len(), if tuples.len() == 1 { "" } else { "s" })
+            .dimmed()
+            .to_string(),
+    );
 
     output
 }
@@ -41,7 +45,13 @@ pub fn format_results(tuples: &[Tuple], schema: &Schema) -> String {
 fn format_value(value: &Value) -> String {
     match value {
         Value::Null => "NULL".dimmed().to_string(),
-        Value::Boolean(b) => if *b { "true".green().to_string() } else { "false".red().to_string() },
+        Value::Boolean(b) => {
+            if *b {
+                "true".green().to_string()
+            } else {
+                "false".red().to_string()
+            }
+        }
         Value::Int4(i) => i.to_string(),
         Value::Int8(i) => i.to_string(),
         Value::Float4(f) => format_float(*f as f64),
@@ -84,7 +94,10 @@ fn format_float(f: f64) -> String {
     } else if f.fract() == 0.0 && f.abs() < 1e10 {
         format!("{:.0}", f)
     } else {
-        format!("{:.6}", f).trim_end_matches('0').trim_end_matches('.').to_string()
+        format!("{:.6}", f)
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_string()
     }
 }
 
@@ -138,7 +151,7 @@ fn format_datatype(dt: &DataType) -> String {
             } else {
                 "VARCHAR".to_string()
             }
-        },
+        }
         DataType::Boolean => "BOOLEAN".to_string(),
         DataType::Date => "DATE".to_string(),
         DataType::Time => "TIME".to_string(),
@@ -160,10 +173,9 @@ fn format_datatype(dt: &DataType) -> String {
 mod hex {
     pub fn encode(bytes: &[u8]) -> String {
         use std::fmt::Write;
-        bytes.iter()
-            .fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
-                let _ = write!(acc, "{:02x}", b);
-                acc
-            })
+        bytes.iter().fold(String::with_capacity(bytes.len() * 2), |mut acc, b| {
+            let _ = write!(acc, "{:02x}", b);
+            acc
+        })
     }
 }

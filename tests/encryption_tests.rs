@@ -8,9 +8,7 @@
 
 #![cfg(feature = "internal-tests")]
 
-use heliosdb_nano::{
-    Config, Column, DataType, EmbeddedDatabase, Schema, Tuple, Value,
-};
+use heliosdb_nano::{Column, Config, DataType, EmbeddedDatabase, Schema, Tuple, Value};
 
 mod test_helpers;
 use test_helpers::*;
@@ -24,12 +22,11 @@ fn test_encryption_enabled_basic() {
     // Create config with encryption enabled
     let mut config = Config::in_memory();
     config.encryption.enabled = true;
-    config.encryption.key_source =
-        heliosdb_nano::KeySource::Environment("TEST_ENCRYPTION_KEY_1".to_string());
+    config.encryption.key_source = heliosdb_nano::KeySource::Environment("TEST_ENCRYPTION_KEY_1".to_string());
 
     // Create storage engine
-    let storage = heliosdb_nano::storage::StorageEngine::open_in_memory(&config)
-        .expect("Failed to open encrypted storage");
+    let storage =
+        heliosdb_nano::storage::StorageEngine::open_in_memory(&config).expect("Failed to open encrypted storage");
 
     assert!(storage.is_encrypted(), "Storage should be encrypted");
 
@@ -37,10 +34,10 @@ fn test_encryption_enabled_basic() {
     let key = b"test_key".to_vec();
     let value = b"test_value_encrypted".to_vec();
 
-    storage.put(&key, &value)
-        .expect("Failed to put encrypted value");
+    storage.put(&key, &value).expect("Failed to put encrypted value");
 
-    let retrieved = storage.get(&key)
+    let retrieved = storage
+        .get(&key)
         .expect("Failed to get encrypted value")
         .expect("Value should exist");
 
@@ -55,8 +52,8 @@ fn test_encryption_disabled() {
     let config = Config::in_memory();
     assert!(!config.encryption.enabled, "Encryption should be disabled by default");
 
-    let storage = heliosdb_nano::storage::StorageEngine::open_in_memory(&config)
-        .expect("Failed to open unencrypted storage");
+    let storage =
+        heliosdb_nano::storage::StorageEngine::open_in_memory(&config).expect("Failed to open unencrypted storage");
 
     assert!(!storage.is_encrypted(), "Storage should not be encrypted");
     assert!(storage.encryption_info().is_none(), "Should have no encryption info");
@@ -65,10 +62,10 @@ fn test_encryption_disabled() {
     let key = b"test_key".to_vec();
     let value = b"test_value_unencrypted".to_vec();
 
-    storage.put(&key, &value)
-        .expect("Failed to put value");
+    storage.put(&key, &value).expect("Failed to put value");
 
-    let retrieved = storage.get(&key)
+    let retrieved = storage
+        .get(&key)
         .expect("Failed to get value")
         .expect("Value should exist");
 
@@ -83,28 +80,26 @@ fn test_encrypted_vs_unencrypted_data() {
 
     let mut config = Config::in_memory();
     config.encryption.enabled = true;
-    config.encryption.key_source =
-        heliosdb_nano::KeySource::Environment("TEST_ENCRYPTION_KEY_2".to_string());
+    config.encryption.key_source = heliosdb_nano::KeySource::Environment("TEST_ENCRYPTION_KEY_2".to_string());
 
-    let storage = heliosdb_nano::storage::StorageEngine::open_in_memory(&config)
-        .expect("Failed to open encrypted storage");
+    let storage =
+        heliosdb_nano::storage::StorageEngine::open_in_memory(&config).expect("Failed to open encrypted storage");
 
     let key = b"test_key".to_vec();
     let plaintext = b"sensitive_data_12345";
 
-    storage.put(&key, plaintext)
-        .expect("Failed to put encrypted value");
+    storage.put(&key, plaintext).expect("Failed to put encrypted value");
 
     // Verify encryption is enabled
     assert!(storage.is_encrypted(), "Storage should report encryption enabled");
 
     // Verify encryption info is available
-    let enc_info = storage.encryption_info()
-        .expect("Encryption info should be available");
+    let enc_info = storage.encryption_info().expect("Encryption info should be available");
     assert!(!enc_info.is_empty(), "Encryption info should not be empty");
 
     // Decryption through storage API should work
-    let decrypted = storage.get(&key)
+    let decrypted = storage
+        .get(&key)
         .expect("Failed to decrypt value")
         .expect("Value should exist");
 
@@ -121,11 +116,10 @@ fn test_encryption_key_uniqueness() {
 
     let mut config = Config::in_memory();
     config.encryption.enabled = true;
-    config.encryption.key_source =
-        heliosdb_nano::KeySource::Environment("TEST_ENCRYPTION_KEY_3".to_string());
+    config.encryption.key_source = heliosdb_nano::KeySource::Environment("TEST_ENCRYPTION_KEY_3".to_string());
 
-    let storage = heliosdb_nano::storage::StorageEngine::open_in_memory(&config)
-        .expect("Failed to open encrypted storage");
+    let storage =
+        heliosdb_nano::storage::StorageEngine::open_in_memory(&config).expect("Failed to open encrypted storage");
 
     // Store same value multiple times under different keys
     let value = b"same_secret_data".to_vec();
@@ -157,12 +151,10 @@ fn test_wrong_key_fails_via_crypto() {
     let plaintext = b"sensitive data that should be protected";
 
     // Encrypt with key1
-    let ciphertext = crypto::encrypt(&key1, plaintext)
-        .expect("Encryption should succeed");
+    let ciphertext = crypto::encrypt(&key1, plaintext).expect("Encryption should succeed");
 
     // Verify decryption with correct key works
-    let decrypted = crypto::decrypt(&key1, &ciphertext)
-        .expect("Decryption with correct key should work");
+    let decrypted = crypto::decrypt(&key1, &ciphertext).expect("Decryption with correct key should work");
     assert_eq!(&decrypted[..], plaintext);
 
     // Verify decryption with wrong key fails
@@ -177,11 +169,10 @@ fn test_encrypted_table_operations() {
 
     let mut config = Config::in_memory();
     config.encryption.enabled = true;
-    config.encryption.key_source =
-        heliosdb_nano::KeySource::Environment("TEST_ENCRYPTION_KEY_5".to_string());
+    config.encryption.key_source = heliosdb_nano::KeySource::Environment("TEST_ENCRYPTION_KEY_5".to_string());
 
-    let storage = heliosdb_nano::storage::StorageEngine::open_in_memory(&config)
-        .expect("Failed to open encrypted storage");
+    let storage =
+        heliosdb_nano::storage::StorageEngine::open_in_memory(&config).expect("Failed to open encrypted storage");
 
     let catalog = storage.catalog();
 
@@ -205,7 +196,8 @@ fn test_encrypted_table_operations() {
         },
     ]);
 
-    catalog.create_table("secrets", schema.clone())
+    catalog
+        .create_table("secrets", schema.clone())
         .expect("Failed to create encrypted table");
 
     // Verify table exists (metadata is encrypted)
@@ -215,10 +207,14 @@ fn test_encrypted_table_operations() {
     );
 
     // Verify schema retrieval (decryption of metadata)
-    let retrieved_schema = catalog.get_table_schema("secrets")
+    let retrieved_schema = catalog
+        .get_table_schema("secrets")
         .expect("Failed to get encrypted schema");
 
-    assert_eq!(retrieved_schema, schema, "Schema should match after encryption/decryption");
+    assert_eq!(
+        retrieved_schema, schema,
+        "Schema should match after encryption/decryption"
+    );
 
     // Insert encrypted data
     let tuple = Tuple::new(vec![
@@ -226,16 +222,19 @@ fn test_encrypted_table_operations() {
         Value::String("classified_information".to_string()),
     ]);
 
-    storage.insert_tuple("secrets", tuple.clone())
+    storage
+        .insert_tuple("secrets", tuple.clone())
         .expect("Failed to insert encrypted tuple");
 
     // Scan table (decrypt all tuples)
-    let tuples = storage.scan_table("secrets")
-        .expect("Failed to scan encrypted table");
+    let tuples = storage.scan_table("secrets").expect("Failed to scan encrypted table");
 
     assert_eq!(tuples.len(), 1, "Should retrieve one tuple");
     // Compare values only (row_id is populated by scan_table)
-    assert_eq!(tuples[0].values, tuple.values, "Tuple values should match after encryption/decryption");
+    assert_eq!(
+        tuples[0].values, tuple.values,
+        "Tuple values should match after encryption/decryption"
+    );
 
     std::env::remove_var("TEST_ENCRYPTION_KEY_5");
 }
@@ -247,19 +246,17 @@ fn test_sql_queries_with_encryption() {
 
     let mut config = Config::in_memory();
     config.encryption.enabled = true;
-    config.encryption.key_source =
-        heliosdb_nano::KeySource::Environment("TEST_ENCRYPTION_KEY_6".to_string());
+    config.encryption.key_source = heliosdb_nano::KeySource::Environment("TEST_ENCRYPTION_KEY_6".to_string());
 
-    let db = heliosdb_nano::EmbeddedDatabase::new_in_memory()
-        .expect("Failed to create database");
+    let db = heliosdb_nano::EmbeddedDatabase::new_in_memory().expect("Failed to create database");
 
     // Manually set up encrypted storage (workaround for testing)
     // In production, EmbeddedDatabase should accept Config
     drop(db);
 
     // For now, let's just test direct storage operations
-    let storage = heliosdb_nano::storage::StorageEngine::open_in_memory(&config)
-        .expect("Failed to open encrypted storage");
+    let storage =
+        heliosdb_nano::storage::StorageEngine::open_in_memory(&config).expect("Failed to open encrypted storage");
 
     let catalog = storage.catalog();
     let schema = Schema::new(vec![
@@ -267,21 +264,23 @@ fn test_sql_queries_with_encryption() {
         Column::new("name", DataType::Text),
     ]);
 
-    catalog.create_table("users", schema)
-        .expect("Failed to create table");
+    catalog.create_table("users", schema).expect("Failed to create table");
 
-    storage.insert_tuple("users", Tuple::new(vec![
-        Value::Int4(1),
-        Value::String("Alice".to_string()),
-    ])).expect("Failed to insert");
+    storage
+        .insert_tuple(
+            "users",
+            Tuple::new(vec![Value::Int4(1), Value::String("Alice".to_string())]),
+        )
+        .expect("Failed to insert");
 
-    storage.insert_tuple("users", Tuple::new(vec![
-        Value::Int4(2),
-        Value::String("Bob".to_string()),
-    ])).expect("Failed to insert");
+    storage
+        .insert_tuple(
+            "users",
+            Tuple::new(vec![Value::Int4(2), Value::String("Bob".to_string())]),
+        )
+        .expect("Failed to insert");
 
-    let tuples = storage.scan_table("users")
-        .expect("Failed to scan");
+    let tuples = storage.scan_table("users").expect("Failed to scan");
 
     assert_eq!(tuples.len(), 2, "Should have 2 encrypted tuples");
 
@@ -298,24 +297,19 @@ fn test_key_manager_from_file() {
 
     // Write hex key to file
     let hex_key = generate_random_hex_key();
-    let mut file = std::fs::File::create(&key_file)
-        .expect("Failed to create key file");
-    file.write_all(hex_key.as_bytes())
-        .expect("Failed to write key");
+    let mut file = std::fs::File::create(&key_file).expect("Failed to create key file");
+    file.write_all(hex_key.as_bytes()).expect("Failed to write key");
 
     // Load key from file
     let key_source = heliosdb_nano::KeySource::File(key_file.clone());
-    let km = KeyManager::from_source(&key_source)
-        .expect("Failed to load key from file");
+    let km = KeyManager::from_source(&key_source).expect("Failed to load key from file");
 
     assert_eq!(km.key().len(), 32, "Key should be 32 bytes");
 
     // Test encryption/decryption with file-based key
     let plaintext = b"test data from file key";
-    let encrypted = heliosdb_nano::crypto::encrypt(km.key(), plaintext)
-        .expect("Failed to encrypt");
-    let decrypted = heliosdb_nano::crypto::decrypt(km.key(), &encrypted)
-        .expect("Failed to decrypt");
+    let encrypted = heliosdb_nano::crypto::encrypt(km.key(), plaintext).expect("Failed to encrypt");
+    let decrypted = heliosdb_nano::crypto::decrypt(km.key(), &encrypted).expect("Failed to decrypt");
 
     assert_eq!(decrypted, plaintext, "Decrypted data should match");
 }
@@ -327,28 +321,20 @@ fn test_key_manager_from_password() {
     let password = "my_super_secret_password_123";
     let salt = b"random_salt_16bytes!";
 
-    let km = KeyManager::from_password(password, salt)
-        .expect("Failed to create key from password");
+    let km = KeyManager::from_password(password, salt).expect("Failed to create key from password");
 
     assert_eq!(km.key().len(), 32, "Derived key should be 32 bytes");
 
     // Test that same password + salt produces same key
-    let km2 = KeyManager::from_password(password, salt)
-        .expect("Failed to create second key from password");
+    let km2 = KeyManager::from_password(password, salt).expect("Failed to create second key from password");
 
-    assert_eq!(
-        km.key(), km2.key(),
-        "Same password and salt should produce same key"
-    );
+    assert_eq!(km.key(), km2.key(), "Same password and salt should produce same key");
 
     // Different password should produce different key
-    let km3 = KeyManager::from_password("different_password", salt)
-        .expect("Failed to create key with different password");
+    let km3 =
+        KeyManager::from_password("different_password", salt).expect("Failed to create key with different password");
 
-    assert_ne!(
-        km.key(), km3.key(),
-        "Different password should produce different key"
-    );
+    assert_ne!(km.key(), km3.key(), "Different password should produce different key");
 }
 
 #[test]
@@ -358,28 +344,22 @@ fn test_encryption_with_delete() {
 
     let mut config = Config::in_memory();
     config.encryption.enabled = true;
-    config.encryption.key_source =
-        heliosdb_nano::KeySource::Environment("TEST_ENCRYPTION_KEY_7".to_string());
+    config.encryption.key_source = heliosdb_nano::KeySource::Environment("TEST_ENCRYPTION_KEY_7".to_string());
 
-    let storage = heliosdb_nano::storage::StorageEngine::open_in_memory(&config)
-        .expect("Failed to open encrypted storage");
+    let storage =
+        heliosdb_nano::storage::StorageEngine::open_in_memory(&config).expect("Failed to open encrypted storage");
 
     let key = b"delete_test".to_vec();
     let value = b"to_be_deleted".to_vec();
 
     // Put encrypted value
-    storage.put(&key, &value)
-        .expect("Failed to put encrypted value");
+    storage.put(&key, &value).expect("Failed to put encrypted value");
 
     // Verify it exists
-    assert!(
-        storage.get(&key).expect("Get failed").is_some(),
-        "Value should exist"
-    );
+    assert!(storage.get(&key).expect("Get failed").is_some(), "Value should exist");
 
     // Delete it
-    storage.delete(&key)
-        .expect("Failed to delete encrypted value");
+    storage.delete(&key).expect("Failed to delete encrypted value");
 
     // Verify it's gone
     assert!(
@@ -397,23 +377,15 @@ fn test_encryption_info() {
 
     let mut config = Config::in_memory();
     config.encryption.enabled = true;
-    config.encryption.key_source =
-        heliosdb_nano::KeySource::Environment("TEST_ENCRYPTION_KEY_8".to_string());
+    config.encryption.key_source = heliosdb_nano::KeySource::Environment("TEST_ENCRYPTION_KEY_8".to_string());
 
-    let storage = heliosdb_nano::storage::StorageEngine::open_in_memory(&config)
-        .expect("Failed to open encrypted storage");
+    let storage =
+        heliosdb_nano::storage::StorageEngine::open_in_memory(&config).expect("Failed to open encrypted storage");
 
-    let info = storage.encryption_info()
-        .expect("Should have encryption info");
+    let info = storage.encryption_info().expect("Should have encryption info");
 
-    assert!(
-        info.contains("AES-256-GCM"),
-        "Info should mention AES-256-GCM"
-    );
-    assert!(
-        info.contains("Enabled"),
-        "Info should say Enabled"
-    );
+    assert!(info.contains("AES-256-GCM"), "Info should mention AES-256-GCM");
+    assert!(info.contains("Enabled"), "Info should say Enabled");
 
     std::env::remove_var("TEST_ENCRYPTION_KEY_8");
 }

@@ -22,8 +22,8 @@
 //! );
 //! ```
 
-use serde::{Deserialize, Serialize};
 use rocksdb::DB;
+use serde::{Deserialize, Serialize};
 
 use crate::{Error, Result, Value};
 
@@ -126,18 +126,13 @@ impl ColumnarStore {
     /// * `column` - Column name
     /// * `row_id` - Row identifier
     /// * `value` - Value to store
-    pub fn store(
-        db: &DB,
-        table: &str,
-        column: &str,
-        row_id: u64,
-        value: Value,
-    ) -> Result<()> {
+    pub fn store(db: &DB, table: &str, column: &str, row_id: u64, value: Value) -> Result<()> {
         let (batch_id, _offset) = Self::batch_location(row_id);
         let key = Self::batch_key(table, column, batch_id);
 
         // Load or create batch
-        let mut batch = match db.get(&key)
+        let mut batch = match db
+            .get(&key)
             .map_err(|e| Error::storage(format!("Columnar load failed: {}", e)))?
         {
             Some(data) => bincode::deserialize(&data)
@@ -154,8 +149,8 @@ impl ColumnarStore {
         }
 
         // Save batch
-        let data = bincode::serialize(&batch)
-            .map_err(|e| Error::storage(format!("Columnar serialize failed: {}", e)))?;
+        let data =
+            bincode::serialize(&batch).map_err(|e| Error::storage(format!("Columnar serialize failed: {}", e)))?;
         db.put(&key, &data)
             .map_err(|e| Error::storage(format!("Columnar store failed: {}", e)))?;
 
@@ -172,16 +167,12 @@ impl ColumnarStore {
     ///
     /// # Returns
     /// The value if found, None if batch doesn't exist
-    pub fn get(
-        db: &DB,
-        table: &str,
-        column: &str,
-        row_id: u64,
-    ) -> Result<Option<Value>> {
+    pub fn get(db: &DB, table: &str, column: &str, row_id: u64) -> Result<Option<Value>> {
         let (batch_id, _offset) = Self::batch_location(row_id);
         let key = Self::batch_key(table, column, batch_id);
 
-        match db.get(&key)
+        match db
+            .get(&key)
             .map_err(|e| Error::storage(format!("Columnar load failed: {}", e)))?
         {
             Some(data) => {
@@ -204,18 +195,13 @@ impl ColumnarStore {
     ///
     /// # Returns
     /// Vector of (row_id, value) pairs for all non-null values
-    pub fn scan_column(
-        db: &DB,
-        table: &str,
-        column: &str,
-    ) -> Result<Vec<(u64, Value)>> {
+    pub fn scan_column(db: &DB, table: &str, column: &str) -> Result<Vec<(u64, Value)>> {
         let prefix = Self::column_prefix(table, column);
         let mut results = Vec::new();
 
         let iter = db.prefix_iterator(&prefix);
         for item in iter {
-            let (key, value) = item
-                .map_err(|e| Error::storage(format!("Columnar iterator error: {}", e)))?;
+            let (key, value) = item.map_err(|e| Error::storage(format!("Columnar iterator error: {}", e)))?;
 
             // Stop if we've passed the prefix
             if !key.starts_with(&prefix) {
@@ -239,28 +225,18 @@ impl ColumnarStore {
     /// Delete columnar data for a specific row
     ///
     /// Sets the value to Null in the batch (doesn't delete the batch).
-    pub fn delete(
-        db: &DB,
-        table: &str,
-        column: &str,
-        row_id: u64,
-    ) -> Result<()> {
+    pub fn delete(db: &DB, table: &str, column: &str, row_id: u64) -> Result<()> {
         Self::store(db, table, column, row_id, Value::Null)
     }
 
     /// Delete all columnar data for a table.column
-    pub fn drop_column(
-        db: &DB,
-        table: &str,
-        column: &str,
-    ) -> Result<usize> {
+    pub fn drop_column(db: &DB, table: &str, column: &str) -> Result<usize> {
         let prefix = Self::column_prefix(table, column);
         let mut deleted = 0;
 
         let iter = db.prefix_iterator(&prefix);
         for item in iter {
-            let (key, _) = item
-                .map_err(|e| Error::storage(format!("Columnar iterator error: {}", e)))?;
+            let (key, _) = item.map_err(|e| Error::storage(format!("Columnar iterator error: {}", e)))?;
 
             if !key.starts_with(&prefix) {
                 break;
@@ -275,11 +251,7 @@ impl ColumnarStore {
     }
 
     /// Get statistics for a columnar column
-    pub fn stats(
-        db: &DB,
-        table: &str,
-        column: &str,
-    ) -> Result<ColumnarStats> {
+    pub fn stats(db: &DB, table: &str, column: &str) -> Result<ColumnarStats> {
         let prefix = Self::column_prefix(table, column);
         let mut total_batches = 0;
         let mut total_values = 0;
@@ -287,8 +259,7 @@ impl ColumnarStore {
 
         let iter = db.prefix_iterator(&prefix);
         for item in iter {
-            let (key, value) = item
-                .map_err(|e| Error::storage(format!("Columnar iterator error: {}", e)))?;
+            let (key, value) = item.map_err(|e| Error::storage(format!("Columnar iterator error: {}", e)))?;
 
             if !key.starts_with(&prefix) {
                 break;
@@ -393,10 +364,7 @@ mod tests {
         ColumnarStore::store(&db, "test", "col", 2048, Value::Int4(4)).unwrap(); // First in batch 2
 
         // Verify all values
-        assert_eq!(
-            ColumnarStore::get(&db, "test", "col", 0).unwrap(),
-            Some(Value::Int4(1))
-        );
+        assert_eq!(ColumnarStore::get(&db, "test", "col", 0).unwrap(), Some(Value::Int4(1)));
         assert_eq!(
             ColumnarStore::get(&db, "test", "col", 1023).unwrap(),
             Some(Value::Int4(2))
@@ -425,10 +393,7 @@ mod tests {
         ColumnarStore::delete(&db, "test", "col", 5).unwrap();
 
         // Should be Null now
-        assert_eq!(
-            ColumnarStore::get(&db, "test", "col", 5).unwrap(),
-            Some(Value::Null)
-        );
+        assert_eq!(ColumnarStore::get(&db, "test", "col", 5).unwrap(), Some(Value::Null));
     }
 
     #[test]

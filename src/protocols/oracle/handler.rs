@@ -3,12 +3,12 @@
 //! Handles TNS/TTC protocol messages and executes SQL queries
 //! through the HeliosDB-Lite query executor.
 
-use super::tns::{TnsPacket, TnsPacketType, TnsConnect, TnsData};
-use super::ttc::{TtcMessage, TtcFunction, TtcParse, TtcExecute, TtcFetch, TtcLogon, TtcResponseBuilder};
+use super::tns::{TnsConnect, TnsData, TnsPacket, TnsPacketType};
 use super::translator::OracleTranslator;
+use super::ttc::{TtcExecute, TtcFetch, TtcFunction, TtcLogon, TtcMessage, TtcParse, TtcResponseBuilder};
 use super::ORACLE_PROTOCOL_VERSION;
-use crate::{Result, Error, storage::StorageEngine, Tuple, Value};
-use crate::sql::{Parser, Planner, Executor};
+use crate::sql::{Executor, Parser, Planner};
+use crate::{storage::StorageEngine, Error, Result, Tuple, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -79,15 +79,13 @@ impl OracleProtocolHandler {
         match packet.header.packet_type {
             TnsPacketType::Connect => self.handle_connect(packet),
             TnsPacketType::Data => self.handle_data(packet),
-            TnsPacketType::Ack => Ok(vec![]), // ACK doesn't need response
-            TnsPacketType::Marker => Ok(vec![]), // Marker doesn't need response
+            TnsPacketType::Ack => Ok(vec![]),       // ACK doesn't need response
+            TnsPacketType::Marker => Ok(vec![]),    // Marker doesn't need response
             TnsPacketType::Attention => Ok(vec![]), // Attention handled internally
-            _ => {
-                Err(Error::protocol(format!(
-                    "Unsupported TNS packet type: {:?}",
-                    packet.header.packet_type
-                )))
-            }
+            _ => Err(Error::protocol(format!(
+                "Unsupported TNS packet type: {:?}",
+                packet.header.packet_type
+            ))),
         }
     }
 
@@ -96,8 +94,7 @@ impl OracleProtocolHandler {
         let connect = TnsConnect::parse(&packet.payload)?;
 
         // Extract service name for logging
-        let service_name = connect.service_name()
-            .unwrap_or_else(|| "unknown".to_string());
+        let service_name = connect.service_name().unwrap_or_else(|| "unknown".to_string());
 
         tracing::info!(
             "TNS Connect received: version={}, service={}",
@@ -233,7 +230,9 @@ impl OracleProtocolHandler {
         let execute_msg = TtcExecute::parse(payload)?;
 
         // Get cursor
-        let cursor = self.cursors.get_mut(&execute_msg.cursor_id)
+        let cursor = self
+            .cursors
+            .get_mut(&execute_msg.cursor_id)
             .ok_or_else(|| Error::query_execution("Invalid cursor ID"))?;
 
         tracing::debug!("Executing SQL: {}", cursor.translated_sql);
@@ -272,7 +271,9 @@ impl OracleProtocolHandler {
         let fetch_msg = TtcFetch::parse(payload)?;
 
         // Get cursor
-        let cursor = self.cursors.get_mut(&fetch_msg.cursor_id)
+        let cursor = self
+            .cursors
+            .get_mut(&fetch_msg.cursor_id)
             .ok_or_else(|| Error::query_execution("Invalid cursor ID"))?;
 
         if !cursor.executed {

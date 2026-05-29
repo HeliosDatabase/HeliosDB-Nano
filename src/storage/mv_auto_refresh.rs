@@ -39,17 +39,20 @@
 //! worker.stop().await?;
 //! ```
 
-use crate::{Result, Error};
-use super::{StorageEngine, MaterializedViewCatalog, mv_scheduler::{MVScheduler, Priority}};
-use serde::{Serialize, Deserialize};
+use super::{
+    mv_scheduler::{MVScheduler, Priority},
+    MaterializedViewCatalog, StorageEngine,
+};
+use crate::{Error, Result};
+use chrono::{DateTime, Utc};
+use parking_lot::{Mutex, RwLock};
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::Duration;
-use std::collections::VecDeque;
-use parking_lot::{Mutex, RwLock};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{info, debug, warn, error};
-use chrono::{DateTime, Utc};
+use tracing::{debug, error, info, warn};
 
 /// Entry in the refresh history log
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -184,13 +187,11 @@ pub struct AutoRefreshWorker {
 
 impl AutoRefreshWorker {
     /// Create a new auto-refresh worker
-    pub fn new(
-        config: AutoRefreshConfig,
-        storage: Arc<StorageEngine>,
-        scheduler: Arc<MVScheduler>,
-    ) -> Self {
-        info!("Creating AutoRefreshWorker with config: enabled={}, interval={}s, staleness_threshold={}s",
-            config.enabled, config.interval_seconds, config.staleness_threshold_seconds);
+    pub fn new(config: AutoRefreshConfig, storage: Arc<StorageEngine>, scheduler: Arc<MVScheduler>) -> Self {
+        info!(
+            "Creating AutoRefreshWorker with config: enabled={}, interval={}s, staleness_threshold={}s",
+            config.enabled, config.interval_seconds, config.staleness_threshold_seconds
+        );
 
         Self {
             config: Arc::new(RwLock::new(config)),
@@ -491,7 +492,8 @@ impl AutoRefreshWorker {
             };
 
             // Check if auto_refresh is enabled
-            let auto_refresh_enabled = metadata.metadata
+            let auto_refresh_enabled = metadata
+                .metadata
                 .get("auto_refresh")
                 .and_then(|v| v.parse::<bool>().ok())
                 .unwrap_or(false);
@@ -560,9 +562,9 @@ impl AutoRefreshWorker {
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::{Config, Column, DataType, Schema};
     use crate::sql::LogicalPlan;
     use crate::storage::mv_scheduler::SchedulerConfig;
+    use crate::{Column, Config, DataType, Schema};
 
     fn create_test_storage() -> Arc<StorageEngine> {
         let config = Config::in_memory();
@@ -670,9 +672,7 @@ mod tests {
     async fn test_worker_stop_graceful() {
         let storage = create_test_storage();
         let scheduler = create_test_scheduler(Arc::clone(&storage));
-        let config = AutoRefreshConfig::new()
-            .with_enabled(true)
-            .with_interval_seconds(1);
+        let config = AutoRefreshConfig::new().with_enabled(true).with_interval_seconds(1);
 
         let mut worker = AutoRefreshWorker::new(config, storage, scheduler);
 
@@ -693,9 +693,7 @@ mod tests {
     async fn test_worker_check_now() {
         let storage = create_test_storage();
         let scheduler = create_test_scheduler(Arc::clone(&storage));
-        let config = AutoRefreshConfig::new()
-            .with_enabled(true)
-            .with_interval_seconds(60); // Long interval
+        let config = AutoRefreshConfig::new().with_enabled(true).with_interval_seconds(60); // Long interval
 
         let mut worker = AutoRefreshWorker::new(config, storage, scheduler);
 
@@ -754,9 +752,7 @@ mod tests {
     async fn test_staleness_check_with_no_views() {
         let storage = create_test_storage();
         let scheduler = create_test_scheduler(Arc::clone(&storage));
-        let config = AutoRefreshConfig::new()
-            .with_enabled(true)
-            .with_interval_seconds(1);
+        let config = AutoRefreshConfig::new().with_enabled(true).with_interval_seconds(1);
 
         let mut worker = AutoRefreshWorker::new(config, storage, scheduler);
 

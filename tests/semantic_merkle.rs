@@ -10,16 +10,10 @@ fn setup() -> Result<EmbeddedDatabase> {
 }
 
 fn upsert(db: &EmbeddedDatabase, path: &str, body: &str) -> Result<()> {
-    db.execute_params_returning(
-        "DELETE FROM src WHERE path = $1",
-        &[Value::String(path.into())],
-    )?;
+    db.execute_params_returning("DELETE FROM src WHERE path = $1", &[Value::String(path.into())])?;
     db.execute_params_returning(
         "INSERT INTO src (path, lang, content) VALUES ($1, 'rust', $2)",
-        &[
-            Value::String(path.into()),
-            Value::String(body.into()),
-        ],
+        &[Value::String(path.into()), Value::String(body.into())],
     )?;
     Ok(())
 }

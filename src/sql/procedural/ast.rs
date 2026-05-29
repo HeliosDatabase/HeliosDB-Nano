@@ -3,9 +3,9 @@
 //! Unified AST for procedural SQL dialects (PL/pgSQL, T-SQL, PL/SQL, DB2 PL).
 //! This module provides a common representation that all dialects can be translated to.
 
-use serde::{Deserialize, Serialize};
-use crate::DataType;
 use crate::sql::LogicalExpr;
+use crate::DataType;
+use serde::{Deserialize, Serialize};
 
 /// Procedural SQL dialect
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -89,10 +89,7 @@ pub struct VariableDeclaration {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ProceduralStatement {
     /// Variable assignment (SET, :=, =)
-    Assignment {
-        target: String,
-        value: LogicalExpr,
-    },
+    Assignment { target: String, value: LogicalExpr },
 
     /// IF statement
     If {
@@ -160,19 +157,13 @@ pub enum ProceduralStatement {
     },
 
     /// RETURN statement
-    Return {
-        value: Option<LogicalExpr>,
-    },
+    Return { value: Option<LogicalExpr> },
 
     /// RETURN NEXT (for set-returning functions)
-    ReturnNext {
-        value: LogicalExpr,
-    },
+    ReturnNext { value: LogicalExpr },
 
     /// RETURN QUERY (for set-returning functions)
-    ReturnQuery {
-        query: String,
-    },
+    ReturnQuery { query: String },
 
     /// RAISE (exception/notice)
     Raise {
@@ -184,10 +175,7 @@ pub enum ProceduralStatement {
     },
 
     /// Execute SQL statement
-    Execute {
-        sql: String,
-        into_variables: Vec<String>,
-    },
+    Execute { sql: String, into_variables: Vec<String> },
 
     /// Execute dynamic SQL
     ExecuteDynamic {
@@ -203,21 +191,13 @@ pub enum ProceduralStatement {
     Null,
 
     /// PRINT (T-SQL)
-    Print {
-        message: LogicalExpr,
-    },
+    Print { message: LogicalExpr },
 
     /// SELECT INTO (fetch into variables)
-    SelectInto {
-        query: String,
-        variables: Vec<String>,
-    },
+    SelectInto { query: String, variables: Vec<String> },
 
     /// OPEN cursor
-    OpenCursor {
-        cursor_name: String,
-        query: Option<String>,
-    },
+    OpenCursor { cursor_name: String, query: Option<String> },
 
     /// FETCH from cursor
     FetchCursor {
@@ -227,9 +207,7 @@ pub enum ProceduralStatement {
     },
 
     /// CLOSE cursor
-    CloseCursor {
-        cursor_name: String,
-    },
+    CloseCursor { cursor_name: String },
 
     /// CALL procedure
     Call {
@@ -343,9 +321,7 @@ pub enum ReturnType {
     /// Single value
     Scalar(DataType),
     /// TABLE (set of rows)
-    Table {
-        columns: Vec<(String, DataType)>,
-    },
+    Table { columns: Vec<(String, DataType)> },
     /// SETOF (set of single type)
     SetOf(DataType),
     /// VOID

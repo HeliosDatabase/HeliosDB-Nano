@@ -7,9 +7,7 @@ use uuid::Uuid;
 
 #[cfg(feature = "ha-tier1")]
 use heliosdb_nano::replication::{
-    split_brain::{
-        ClusterNode, ObserverConfig, ProtectionEvent, ProtectionState, SplitBrainProtector,
-    },
+    split_brain::{ClusterNode, ObserverConfig, ProtectionEvent, ProtectionState, SplitBrainProtector},
     transport::{NodeRole, VoteReason, VoteRequestPayload},
 };
 
@@ -199,25 +197,29 @@ async fn test_cluster_node_registration() {
     let standby1_id = Uuid::new_v4();
     let standby2_id = Uuid::new_v4();
 
-    protector.register_node(ClusterNode {
-        node_id: standby1_id,
-        role: NodeRole::Standby,
-        addr: "192.168.1.2:5433".parse().unwrap(),
-        last_lsn: 0,
-        last_heartbeat: std::time::Instant::now(),
-        is_healthy: true,
-        fencing_token: 1,
-    }).await;
+    protector
+        .register_node(ClusterNode {
+            node_id: standby1_id,
+            role: NodeRole::Standby,
+            addr: "192.168.1.2:5433".parse().unwrap(),
+            last_lsn: 0,
+            last_heartbeat: std::time::Instant::now(),
+            is_healthy: true,
+            fencing_token: 1,
+        })
+        .await;
 
-    protector.register_node(ClusterNode {
-        node_id: standby2_id,
-        role: NodeRole::Standby,
-        addr: "192.168.1.3:5433".parse().unwrap(),
-        last_lsn: 0,
-        last_heartbeat: std::time::Instant::now(),
-        is_healthy: true,
-        fencing_token: 1,
-    }).await;
+    protector
+        .register_node(ClusterNode {
+            node_id: standby2_id,
+            role: NodeRole::Standby,
+            addr: "192.168.1.3:5433".parse().unwrap(),
+            last_lsn: 0,
+            last_heartbeat: std::time::Instant::now(),
+            is_healthy: true,
+            fencing_token: 1,
+        })
+        .await;
 
     // Update heartbeat
     protector.update_node_heartbeat(standby1_id, 100).await;

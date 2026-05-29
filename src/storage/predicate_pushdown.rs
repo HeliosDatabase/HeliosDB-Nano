@@ -12,17 +12,15 @@
 //! The pushdown optimizer analyzes predicates and determines the most efficient
 //! filtering strategy based on predicate types and available indexes.
 
+use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
-use parking_lot::RwLock;
 
-use crate::sql::logical_plan::{LogicalExpr, BinaryOperator};
+use crate::sql::logical_plan::{BinaryOperator, LogicalExpr};
 use crate::storage::bloom_filter::TableBloomFilters;
-use crate::storage::zone_map::{TableZoneMap, RangeOp, ZoneMapStats};
-use crate::storage::simd_filter::{
-    SimdPredicateFilteringEngine, FilterPredicate, FilterOp, CombinedPredicate,
-};
+use crate::storage::simd_filter::{CombinedPredicate, FilterOp, FilterPredicate, SimdPredicateFilteringEngine};
+use crate::storage::zone_map::{RangeOp, TableZoneMap, ZoneMapStats};
 use crate::{Schema, Tuple, Value};
 
 /// Predicate pushdown capabilities
@@ -230,12 +228,7 @@ impl PredicatePushdownManager {
     }
 
     /// Initialize indexes for a table
-    pub fn initialize_table(
-        &self,
-        table_name: &str,
-        columns: &[String],
-        expected_rows: usize,
-    ) {
+    pub fn initialize_table(&self, table_name: &str, columns: &[String], expected_rows: usize) {
         // Create bloom filters for columns
         let mut tbf = TableBloomFilters::new(table_name.to_string(), expected_rows);
         for col in columns {
@@ -262,22 +255,13 @@ impl PredicatePushdownManager {
     }
 
     /// Analyze a logical expression to extract pushable predicates
-    pub fn analyze_predicate(
-        &self,
-        expr: &LogicalExpr,
-        schema: &Schema,
-    ) -> Vec<AnalyzedPredicate> {
+    pub fn analyze_predicate(&self, expr: &LogicalExpr, schema: &Schema) -> Vec<AnalyzedPredicate> {
         let mut predicates = Vec::new();
         self.extract_predicates(expr, schema, &mut predicates);
         predicates
     }
 
-    fn extract_predicates(
-        &self,
-        expr: &LogicalExpr,
-        schema: &Schema,
-        predicates: &mut Vec<AnalyzedPredicate>,
-    ) {
+    fn extract_predicates(&self, expr: &LogicalExpr, schema: &Schema, predicates: &mut Vec<AnalyzedPredicate>) {
         match expr {
             LogicalExpr::BinaryExpr { left, op, right } => {
                 match op {
@@ -290,9 +274,12 @@ impl PredicatePushdownManager {
                         // OR predicates are harder to push down
                         // For now, we don't extract them
                     }
-                    BinaryOperator::Eq | BinaryOperator::NotEq |
-                    BinaryOperator::Lt | BinaryOperator::LtEq |
-                    BinaryOperator::Gt | BinaryOperator::GtEq => {
+                    BinaryOperator::Eq
+                    | BinaryOperator::NotEq
+                    | BinaryOperator::Lt
+                    | BinaryOperator::LtEq
+                    | BinaryOperator::Gt
+                    | BinaryOperator::GtEq => {
                         // Try to extract column = value predicates
                         if let Some(pred) = self.extract_comparison(left, right, op, schema) {
                             predicates.push(pred);
@@ -314,7 +301,11 @@ impl PredicatePushdownManager {
                         predicates.push(AnalyzedPredicate {
                             column_name: name.clone(),
                             column_index: col_idx,
-                            op: if *is_null { PredicateOp::IsNull } else { PredicateOp::IsNotNull },
+                            op: if *is_null {
+                                PredicateOp::IsNull
+                            } else {
+                                PredicateOp::IsNotNull
+                            },
                             value: Value::Null,
                             value2: None,
                             value_list: Vec::new(),
@@ -325,7 +316,12 @@ impl PredicatePushdownManager {
                     }
                 }
             }
-            LogicalExpr::Between { expr, low, high, negated } => {
+            LogicalExpr::Between {
+                expr,
+                low,
+                high,
+                negated,
+            } => {
                 if let LogicalExpr::Column { name, .. } = expr.as_ref() {
                     if let (LogicalExpr::Literal(low_val), LogicalExpr::Literal(high_val)) =
                         (low.as_ref(), high.as_ref())
@@ -334,7 +330,11 @@ impl PredicatePushdownManager {
                             predicates.push(AnalyzedPredicate {
                                 column_name: name.clone(),
                                 column_index: col_idx,
-                                op: if *negated { PredicateOp::NotEq } else { PredicateOp::Between },
+                                op: if *negated {
+                                    PredicateOp::NotEq
+                                } else {
+                                    PredicateOp::Between
+                                },
                                 value: low_val.clone(),
                                 value2: Some(high_val.clone()),
                                 value_list: Vec::new(),
@@ -418,22 +418,19 @@ impl PredicatePushdownManager {
             value2: None,
             value_list: Vec::new(),
             selectivity: match pred_op {
-                PredicateOp::Eq => 0.01,  // Very selective
+                PredicateOp::Eq => 0.01, // Very selective
                 PredicateOp::NotEq => 0.99,
                 _ => 0.33, // Range predicates
             },
             can_use_bloom: pred_op == PredicateOp::Eq,
-            can_use_zone_map: matches!(pred_op, PredicateOp::Eq | PredicateOp::Lt |
-                PredicateOp::LtEq | PredicateOp::Gt | PredicateOp::GtEq),
+            can_use_zone_map: matches!(
+                pred_op,
+                PredicateOp::Eq | PredicateOp::Lt | PredicateOp::LtEq | PredicateOp::Gt | PredicateOp::GtEq
+            ),
         })
     }
 
-    fn extract_like(
-        &self,
-        left: &LogicalExpr,
-        right: &LogicalExpr,
-        schema: &Schema,
-    ) -> Option<AnalyzedPredicate> {
+    fn extract_like(&self, left: &LogicalExpr, right: &LogicalExpr, schema: &Schema) -> Option<AnalyzedPredicate> {
         let (column_name, column_index) = match left {
             LogicalExpr::Column { name, .. } => {
                 let idx = schema.get_column_index(name)?;
@@ -498,7 +495,9 @@ impl PredicatePushdownManager {
                         }
                     } else if pred.op == PredicateOp::In {
                         // Check if any value in the IN list might exist
-                        let might_exist = pred.value_list.iter()
+                        let might_exist = pred
+                            .value_list
+                            .iter()
                             .any(|v| tbf.might_contain_value(&pred.column_name, v));
                         if !might_exist {
                             stats.bloom_rows_skipped += tuples.len() as u64;
@@ -527,8 +526,7 @@ impl PredicatePushdownManager {
 
                         // Filter candidate indices to only matching blocks
                         let block_size = self.config.zone_map_block_size;
-                        let matching_set: std::collections::HashSet<u64> =
-                            matching_blocks.into_iter().collect();
+                        let matching_set: std::collections::HashSet<u64> = matching_blocks.into_iter().collect();
 
                         let before_count = candidate_indices.len();
                         candidate_indices.retain(|&idx| {
@@ -572,30 +570,26 @@ impl PredicatePushdownManager {
         let result = if let Some(lim) = limit {
             let combined = if filter_predicates.len() == 1 {
                 // Length is 1, so next() will succeed; use map_or for safety
-                filter_predicates.into_iter().next().map_or_else(
-                    || CombinedPredicate::And(vec![]),
-                    CombinedPredicate::Single
-                )
+                filter_predicates
+                    .into_iter()
+                    .next()
+                    .map_or_else(|| CombinedPredicate::And(vec![]), CombinedPredicate::Single)
             } else {
-                CombinedPredicate::And(
-                    filter_predicates.into_iter()
-                        .map(CombinedPredicate::Single)
-                        .collect()
-                )
+                CombinedPredicate::And(filter_predicates.into_iter().map(CombinedPredicate::Single).collect())
             };
             self.simd_engine.filter_rows_with_limit(&candidate_rows, &combined, lim)
         } else {
-            self.simd_engine.filter_and_predicates(&candidate_rows, &filter_predicates)
+            self.simd_engine
+                .filter_and_predicates(&candidate_rows, &filter_predicates)
         };
 
         stats.simd_rows_filtered += result.total_count as u64 - result.matched_count as u64;
 
         // Collect matching tuples
-        let matching_tuples: Vec<Tuple> = result.matched_indices
+        let matching_tuples: Vec<Tuple> = result
+            .matched_indices
             .iter()
-            .filter_map(|&idx| {
-                candidate_indices.get(idx).and_then(|&ci| tuples.get(ci)).cloned()
-            })
+            .filter_map(|&idx| candidate_indices.get(idx).and_then(|&ci| tuples.get(ci)).cloned())
             .collect();
 
         if result.matched_count < result.total_count && limit.is_some() {
@@ -683,18 +677,11 @@ pub struct PushdownAnalysis {
 }
 
 /// Analyze a filter expression for pushdown opportunities
-pub fn analyze_for_pushdown(
-    expr: &LogicalExpr,
-    schema: &Schema,
-) -> PushdownAnalysis {
+pub fn analyze_for_pushdown(expr: &LogicalExpr, schema: &Schema) -> PushdownAnalysis {
     let manager = PredicatePushdownManager::with_defaults();
     let predicates = manager.analyze_predicate(expr, schema);
 
-    let estimated_selectivity = predicates
-        .iter()
-        .map(|p| p.selectivity)
-        .product::<f64>()
-        .max(0.001); // Minimum selectivity
+    let estimated_selectivity = predicates.iter().map(|p| p.selectivity).product::<f64>().max(0.001); // Minimum selectivity
 
     PushdownAnalysis {
         pushable_predicates: predicates,
@@ -725,7 +712,10 @@ mod tests {
 
         // Test simple equality
         let expr = LogicalExpr::BinaryExpr {
-            left: Box::new(LogicalExpr::Column { table: None, name: "id".to_string()  }),
+            left: Box::new(LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            }),
             op: BinaryOperator::Eq,
             right: Box::new(LogicalExpr::Literal(Value::Int8(42))),
         };
@@ -744,13 +734,19 @@ mod tests {
 
         let expr = LogicalExpr::BinaryExpr {
             left: Box::new(LogicalExpr::BinaryExpr {
-                left: Box::new(LogicalExpr::Column { table: None, name: "age".to_string()  }),
+                left: Box::new(LogicalExpr::Column {
+                    table: None,
+                    name: "age".to_string(),
+                }),
                 op: BinaryOperator::GtEq,
                 right: Box::new(LogicalExpr::Literal(Value::Int4(18))),
             }),
             op: BinaryOperator::And,
             right: Box::new(LogicalExpr::BinaryExpr {
-                left: Box::new(LogicalExpr::Column { table: None, name: "status".to_string()  }),
+                left: Box::new(LogicalExpr::Column {
+                    table: None,
+                    name: "status".to_string(),
+                }),
                 op: BinaryOperator::Eq,
                 right: Box::new(LogicalExpr::Literal(Value::String("active".to_string()))),
             }),
@@ -766,14 +762,22 @@ mod tests {
         manager.initialize_table("users", &["id".to_string(), "name".to_string()], 1000);
 
         // Index some rows
-        manager.index_row("users", 1, &[
-            ("id".to_string(), Value::Int8(1)),
-            ("name".to_string(), Value::String("Alice".to_string())),
-        ]);
-        manager.index_row("users", 2, &[
-            ("id".to_string(), Value::Int8(2)),
-            ("name".to_string(), Value::String("Bob".to_string())),
-        ]);
+        manager.index_row(
+            "users",
+            1,
+            &[
+                ("id".to_string(), Value::Int8(1)),
+                ("name".to_string(), Value::String("Alice".to_string())),
+            ],
+        );
+        manager.index_row(
+            "users",
+            2,
+            &[
+                ("id".to_string(), Value::Int8(2)),
+                ("name".to_string(), Value::String("Bob".to_string())),
+            ],
+        );
 
         assert!(manager.bloom_filter_memory_usage() > 0);
     }
@@ -798,10 +802,14 @@ mod tests {
 
         // Index tuples
         for (idx, t) in tuples.iter().enumerate() {
-            manager.index_row("test", idx as u64, &[
-                ("id".to_string(), t.values[0].clone()),
-                ("status".to_string(), t.values[3].clone()),
-            ]);
+            manager.index_row(
+                "test",
+                idx as u64,
+                &[
+                    ("id".to_string(), t.values[0].clone()),
+                    ("status".to_string(), t.values[3].clone()),
+                ],
+            );
         }
 
         // Create filter predicate

@@ -10,9 +10,8 @@ use tracing::{debug, error, info};
 
 use super::auth::{ScramAuth, SimpleAuth};
 use super::protocol::{
-    BackendMessage, FrontendMessage, MessageDecoder, MessageEncoder, TransactionStatus,
-    AuthenticationMessage, DescribeKind, CloseKind, schema_to_row_description, value_to_pg_text,
-    parse_pg_text_param, error_fields,
+    error_fields, parse_pg_text_param, schema_to_row_description, value_to_pg_text, AuthenticationMessage,
+    BackendMessage, CloseKind, DescribeKind, FrontendMessage, MessageDecoder, MessageEncoder, TransactionStatus,
 };
 use crate::{EmbeddedDatabase, Error, Tuple, Value};
 
@@ -107,11 +106,15 @@ impl Session {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(self.idle_timeout_secs),
                     stream.read(&mut buf),
-                ).await {
+                )
+                .await
+                {
                     Ok(result) => result,
                     Err(_) => {
-                        info!("Session {} idle timeout ({}s), disconnecting",
-                            self.session_id, self.idle_timeout_secs);
+                        info!(
+                            "Session {} idle timeout ({}s), disconnecting",
+                            self.session_id, self.idle_timeout_secs
+                        );
                         return Ok(());
                     }
                 }
@@ -169,36 +172,31 @@ impl Session {
     /// Handle a frontend message
     async fn handle_message(&mut self, msg: FrontendMessage) -> Result<Vec<BackendMessage>, Error> {
         match msg {
-            FrontendMessage::Startup { protocol_version, params } => {
-                self.handle_startup(protocol_version, params).await
-            }
-            FrontendMessage::PasswordMessage { password } => {
-                self.handle_password(password).await
-            }
-            FrontendMessage::Query { query } => {
-                self.handle_query(&query).await
-            }
-            FrontendMessage::Parse { statement_name, query, param_types } => {
-                self.handle_parse(statement_name, query, param_types).await
-            }
-            FrontendMessage::Bind { portal_name, statement_name, param_formats: _, params, result_formats: _ } => {
-                self.handle_bind(portal_name, statement_name, params).await
-            }
-            FrontendMessage::Execute { portal_name, max_rows } => {
-                self.handle_execute(portal_name, max_rows).await
-            }
-            FrontendMessage::Describe { kind, name } => {
-                self.handle_describe(kind, name).await
-            }
-            FrontendMessage::Close { kind, name } => {
-                self.handle_close(kind, name).await
-            }
-            FrontendMessage::Sync => {
-                Ok(vec![BackendMessage::ReadyForQuery { status: self.transaction_status }])
-            }
-            FrontendMessage::Flush => {
-                Ok(vec![])
-            }
+            FrontendMessage::Startup {
+                protocol_version,
+                params,
+            } => self.handle_startup(protocol_version, params).await,
+            FrontendMessage::PasswordMessage { password } => self.handle_password(password).await,
+            FrontendMessage::Query { query } => self.handle_query(&query).await,
+            FrontendMessage::Parse {
+                statement_name,
+                query,
+                param_types,
+            } => self.handle_parse(statement_name, query, param_types).await,
+            FrontendMessage::Bind {
+                portal_name,
+                statement_name,
+                param_formats: _,
+                params,
+                result_formats: _,
+            } => self.handle_bind(portal_name, statement_name, params).await,
+            FrontendMessage::Execute { portal_name, max_rows } => self.handle_execute(portal_name, max_rows).await,
+            FrontendMessage::Describe { kind, name } => self.handle_describe(kind, name).await,
+            FrontendMessage::Close { kind, name } => self.handle_close(kind, name).await,
+            FrontendMessage::Sync => Ok(vec![BackendMessage::ReadyForQuery {
+                status: self.transaction_status,
+            }]),
+            FrontendMessage::Flush => Ok(vec![]),
             FrontendMessage::Terminate => {
                 info!("Session {} terminated", self.session_id);
                 Ok(vec![])
@@ -207,7 +205,11 @@ impl Session {
     }
 
     /// Handle startup message
-    async fn handle_startup(&mut self, protocol_version: i32, params: HashMap<String, String>) -> Result<Vec<BackendMessage>, Error> {
+    async fn handle_startup(
+        &mut self,
+        protocol_version: i32,
+        params: HashMap<String, String>,
+    ) -> Result<Vec<BackendMessage>, Error> {
         // Special case: SSL request
         if protocol_version == 80877103 {
             // We don't support SSL yet - client will retry without SSL
@@ -233,9 +235,10 @@ impl Session {
     /// Handle password message
     async fn handle_password(&mut self, password: String) -> Result<Vec<BackendMessage>, Error> {
         // Simple authentication (for MVP - use SCRAM in production)
-        let username = self.username.as_ref().ok_or_else(|| {
-            Error::protocol("No username provided")
-        })?;
+        let username = self
+            .username
+            .as_ref()
+            .ok_or_else(|| Error::protocol("No username provided"))?;
 
         // For MVP, accept any password (or configure specific credentials)
         let auth = SimpleAuth::new("postgres".to_string(), "postgres".to_string());
@@ -243,16 +246,16 @@ impl Session {
         if !(auth.verify(username, &password) || username == "postgres" || username == "helios") {
             return Ok(vec![
                 self.create_error_response("28P01", "Authentication failed"),
-                BackendMessage::ReadyForQuery { status: TransactionStatus::Idle },
+                BackendMessage::ReadyForQuery {
+                    status: TransactionStatus::Idle,
+                },
             ]);
         }
 
         self.auth_state = AuthState::Authenticated(username.clone());
 
         // Send successful authentication
-        let mut responses = vec![
-            BackendMessage::Authentication(AuthenticationMessage::Ok),
-        ];
+        let mut responses = vec![BackendMessage::Authentication(AuthenticationMessage::Ok)];
 
         // Send parameter status messages
         responses.push(BackendMessage::ParameterStatus {
@@ -295,7 +298,9 @@ impl Session {
         if !self.is_authenticated() {
             return Ok(vec![
                 self.create_error_response("08006", "Not authenticated"),
-                BackendMessage::ReadyForQuery { status: TransactionStatus::Idle },
+                BackendMessage::ReadyForQuery {
+                    status: TransactionStatus::Idle,
+                },
             ]);
         }
 
@@ -306,7 +311,9 @@ impl Session {
         if query.trim().is_empty() {
             return Ok(vec![
                 BackendMessage::EmptyQueryResponse,
-                BackendMessage::ReadyForQuery { status: self.transaction_status },
+                BackendMessage::ReadyForQuery {
+                    status: self.transaction_status,
+                },
             ]);
         }
 
@@ -323,13 +330,11 @@ impl Session {
 
         // Execute query with optional timeout from config
         let result = if let Some(timeout_ms) = self.db.query_timeout_ms() {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(timeout_ms),
-                self.execute_sql(query),
-            ).await {
+            match tokio::time::timeout(std::time::Duration::from_millis(timeout_ms), self.execute_sql(query)).await {
                 Ok(result) => result,
                 Err(_) => Err(Error::query_execution(format!(
-                    "Query cancelled: exceeded timeout of {}ms", timeout_ms
+                    "Query cancelled: exceeded timeout of {}ms",
+                    timeout_ms
                 ))),
             }
         } else {
@@ -392,7 +397,12 @@ impl Session {
     }
 
     /// Handle Parse message (prepare statement)
-    async fn handle_parse(&mut self, statement_name: String, query: String, param_types: Vec<i32>) -> Result<Vec<BackendMessage>, Error> {
+    async fn handle_parse(
+        &mut self,
+        statement_name: String,
+        query: String,
+        param_types: Vec<i32>,
+    ) -> Result<Vec<BackendMessage>, Error> {
         if !self.is_authenticated() {
             return Ok(vec![self.create_error_response("08006", "Not authenticated")]);
         }
@@ -408,19 +418,19 @@ impl Session {
         // }
 
         // Store prepared statement
-        self.prepared_statements.insert(
-            statement_name.clone(),
-            PreparedStatement {
-                query,
-                param_types,
-            },
-        );
+        self.prepared_statements
+            .insert(statement_name.clone(), PreparedStatement { query, param_types });
 
         Ok(vec![BackendMessage::ParseComplete])
     }
 
     /// Handle Bind message
-    async fn handle_bind(&mut self, portal_name: String, statement_name: String, params: Vec<Option<Vec<u8>>>) -> Result<Vec<BackendMessage>, Error> {
+    async fn handle_bind(
+        &mut self,
+        portal_name: String,
+        statement_name: String,
+        params: Vec<Option<Vec<u8>>>,
+    ) -> Result<Vec<BackendMessage>, Error> {
         if !self.is_authenticated() {
             return Ok(vec![self.create_error_response("08006", "Not authenticated")]);
         }
@@ -458,7 +468,7 @@ impl Session {
                         Err(e) => {
                             return Ok(vec![self.create_error_response(
                                 "22P02",
-                                &format!("Invalid parameter {}: {}", i + 1, e)
+                                &format!("Invalid parameter {}: {}", i + 1, e),
                             )]);
                         }
                     }
@@ -501,8 +511,12 @@ impl Session {
             }
         };
 
-        debug!("Executing portal '{}': {} with {} parameters",
-            portal_name, stmt.query, portal.param_values.len());
+        debug!(
+            "Executing portal '{}': {} with {} parameters",
+            portal_name,
+            stmt.query,
+            portal.param_values.len()
+        );
 
         // Clone data we need to avoid borrow issues
         let query = stmt.query.clone();
@@ -609,10 +623,7 @@ impl Session {
         if is_query {
             // Query - return rows
             // Convert Value params to &dyn Display for the query method
-            let param_refs: Vec<&dyn std::fmt::Display> = params
-                .iter()
-                .map(|v| v as &dyn std::fmt::Display)
-                .collect();
+            let param_refs: Vec<&dyn std::fmt::Display> = params.iter().map(|v| v as &dyn std::fmt::Display).collect();
             let rows = self.db.query(query, &param_refs)?;
 
             // Get schema from first row or create empty schema
@@ -721,13 +732,7 @@ impl Session {
 /// Query execution result
 enum QueryResult {
     /// Rows returned
-    Rows {
-        schema: crate::Schema,
-        rows: Vec<Tuple>,
-    },
+    Rows { schema: crate::Schema, rows: Vec<Tuple> },
     /// Rows modified
-    Modified {
-        count: u64,
-        operation: String,
-    },
+    Modified { count: u64, operation: String },
 }

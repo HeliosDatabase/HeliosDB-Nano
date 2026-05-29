@@ -30,8 +30,10 @@ mod jsonb_hardening {
     #[test]
     fn test_insert_retrieve_json_object() {
         let d = db();
-        d.execute("CREATE TABLE jb_obj (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_obj VALUES (1, '{"name":"alice","age":30}')"#).unwrap();
+        d.execute("CREATE TABLE jb_obj (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_obj VALUES (1, '{"name":"alice","age":30}')"#)
+            .unwrap();
         match d.query("SELECT data FROM jb_obj WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -45,7 +47,8 @@ mod jsonb_hardening {
     #[test]
     fn test_insert_retrieve_json_array() {
         let d = db();
-        d.execute("CREATE TABLE jb_arr (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_arr (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute(r#"INSERT INTO jb_arr VALUES (1, '[1,2,3,"four"]')"#).unwrap();
         match d.query("SELECT data FROM jb_arr WHERE id = 1", &[]) {
             Ok(rows) => {
@@ -60,8 +63,10 @@ mod jsonb_hardening {
     #[test]
     fn test_insert_nested_json() {
         let d = db();
-        d.execute("CREATE TABLE jb_nested (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_nested VALUES (1, '{"a":{"b":{"c":42}}}')"#).unwrap();
+        d.execute("CREATE TABLE jb_nested (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_nested VALUES (1, '{"a":{"b":{"c":42}}}')"#)
+            .unwrap();
         match d.query("SELECT data FROM jb_nested WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -75,8 +80,10 @@ mod jsonb_hardening {
     #[test]
     fn test_json_various_types() {
         let d = db();
-        d.execute("CREATE TABLE jb_types (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_types VALUES (1, '{"s":"hello","n":42,"f":3.14,"b":true,"nil":null}')"#).unwrap();
+        d.execute("CREATE TABLE jb_types (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_types VALUES (1, '{"s":"hello","n":42,"f":3.14,"b":true,"nil":null}')"#)
+            .unwrap();
         match d.query("SELECT data FROM jb_types WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -92,7 +99,8 @@ mod jsonb_hardening {
     #[test]
     fn test_update_json_column() {
         let d = db();
-        d.execute("CREATE TABLE jb_upd (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_upd (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute(r#"INSERT INTO jb_upd VALUES (1, '{"v":1}')"#).unwrap();
         d.execute(r#"UPDATE jb_upd SET data = '{"v":2}' WHERE id = 1"#).unwrap();
         match d.query("SELECT data FROM jb_upd WHERE id = 1", &[]) {
@@ -108,13 +116,17 @@ mod jsonb_hardening {
     #[test]
     fn test_null_json_column() {
         let d = db();
-        d.execute("CREATE TABLE jb_null (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_null (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute("INSERT INTO jb_null VALUES (1, NULL)").unwrap();
         match d.query("SELECT data FROM jb_null WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
-                assert!(matches!(rows[0].get(0).unwrap(), Value::Null),
-                    "Expected NULL, got {:?}", rows[0].get(0));
+                assert!(
+                    matches!(rows[0].get(0).unwrap(), Value::Null),
+                    "Expected NULL, got {:?}",
+                    rows[0].get(0)
+                );
             }
             Err(e) => eprintln!("[UNSUPPORTED] NULL JSON column: {e}"),
         }
@@ -123,7 +135,8 @@ mod jsonb_hardening {
     #[test]
     fn test_empty_json_object() {
         let d = db();
-        d.execute("CREATE TABLE jb_empty (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_empty (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute(r#"INSERT INTO jb_empty VALUES (1, '{}')"#).unwrap();
         match d.query("SELECT data FROM jb_empty WHERE id = 1", &[]) {
             Ok(rows) => {
@@ -142,8 +155,10 @@ mod jsonb_hardening {
     #[test]
     fn test_arrow_top_level_field() {
         let d = db();
-        d.execute("CREATE TABLE jb_ar1 (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_ar1 VALUES (1, '{"name":"bob","age":25}')"#).unwrap();
+        d.execute("CREATE TABLE jb_ar1 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_ar1 VALUES (1, '{"name":"bob","age":25}')"#)
+            .unwrap();
         match d.query("SELECT data->'name' FROM jb_ar1 WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -157,8 +172,10 @@ mod jsonb_hardening {
     #[test]
     fn test_arrow_nested_field() {
         let d = db();
-        d.execute("CREATE TABLE jb_ar2 (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_ar2 VALUES (1, '{"a":{"b":"deep"}}')"#).unwrap();
+        d.execute("CREATE TABLE jb_ar2 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_ar2 VALUES (1, '{"a":{"b":"deep"}}')"#)
+            .unwrap();
         match d.query("SELECT data->'a'->'b' FROM jb_ar2 WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -172,7 +189,8 @@ mod jsonb_hardening {
     #[test]
     fn test_arrow_array_element() {
         let d = db();
-        d.execute("CREATE TABLE jb_ar3 (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_ar3 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute(r#"INSERT INTO jb_ar3 VALUES (1, '["a","b","c"]')"#).unwrap();
         match d.query("SELECT data->1 FROM jb_ar3 WHERE id = 1", &[]) {
             Ok(rows) => {
@@ -187,13 +205,17 @@ mod jsonb_hardening {
     #[test]
     fn test_arrow_nonexistent_key() {
         let d = db();
-        d.execute("CREATE TABLE jb_ar4 (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_ar4 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute(r#"INSERT INTO jb_ar4 VALUES (1, '{"a":1}')"#).unwrap();
         match d.query("SELECT data->'missing' FROM jb_ar4 WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
-                assert!(matches!(rows[0].get(0).unwrap(), Value::Null),
-                    "Expected NULL for missing key, got {:?}", rows[0].get(0));
+                assert!(
+                    matches!(rows[0].get(0).unwrap(), Value::Null),
+                    "Expected NULL for missing key, got {:?}",
+                    rows[0].get(0)
+                );
             }
             Err(e) => eprintln!("[UNSUPPORTED] arrow nonexistent key: {e}"),
         }
@@ -202,8 +224,10 @@ mod jsonb_hardening {
     #[test]
     fn test_arrow_chain_multiple() {
         let d = db();
-        d.execute("CREATE TABLE jb_ar5 (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_ar5 VALUES (1, '{"x":{"y":{"z":"found"}}}')"#).unwrap();
+        d.execute("CREATE TABLE jb_ar5 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_ar5 VALUES (1, '{"x":{"y":{"z":"found"}}}')"#)
+            .unwrap();
         match d.query("SELECT data->'x'->'y'->'z' FROM jb_ar5 WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -217,13 +241,17 @@ mod jsonb_hardening {
     #[test]
     fn test_arrow_on_null_json() {
         let d = db();
-        d.execute("CREATE TABLE jb_ar6 (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_ar6 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute("INSERT INTO jb_ar6 VALUES (1, NULL)").unwrap();
         match d.query("SELECT data->'key' FROM jb_ar6 WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
-                assert!(matches!(rows[0].get(0).unwrap(), Value::Null),
-                    "Expected NULL for arrow on NULL, got {:?}", rows[0].get(0));
+                assert!(
+                    matches!(rows[0].get(0).unwrap(), Value::Null),
+                    "Expected NULL for arrow on NULL, got {:?}",
+                    rows[0].get(0)
+                );
             }
             Err(e) => eprintln!("[UNSUPPORTED] arrow on NULL JSON: {e}"),
         }
@@ -236,8 +264,10 @@ mod jsonb_hardening {
     #[test]
     fn test_text_arrow_extract_text() {
         let d = db();
-        d.execute("CREATE TABLE jb_ta1 (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_ta1 VALUES (1, '{"name":"carol"}')"#).unwrap();
+        d.execute("CREATE TABLE jb_ta1 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_ta1 VALUES (1, '{"name":"carol"}')"#)
+            .unwrap();
         match d.query("SELECT data->>'name' FROM jb_ta1 WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -252,8 +282,10 @@ mod jsonb_hardening {
     #[test]
     fn test_text_arrow_nested_path() {
         let d = db();
-        d.execute("CREATE TABLE jb_ta2 (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_ta2 VALUES (1, '{"a":{"b":"nested_val"}}')"#).unwrap();
+        d.execute("CREATE TABLE jb_ta2 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_ta2 VALUES (1, '{"a":{"b":"nested_val"}}')"#)
+            .unwrap();
         match d.query("SELECT data->'a'->>'b' FROM jb_ta2 WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -267,7 +299,8 @@ mod jsonb_hardening {
     #[test]
     fn test_text_arrow_extract_number() {
         let d = db();
-        d.execute("CREATE TABLE jb_ta3 (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_ta3 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute(r#"INSERT INTO jb_ta3 VALUES (1, '{"val":42}')"#).unwrap();
         match d.query("SELECT data->>'val' FROM jb_ta3 WHERE id = 1", &[]) {
             Ok(rows) => {
@@ -282,7 +315,8 @@ mod jsonb_hardening {
     #[test]
     fn test_text_arrow_extract_boolean() {
         let d = db();
-        d.execute("CREATE TABLE jb_ta4 (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_ta4 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute(r#"INSERT INTO jb_ta4 VALUES (1, '{"flag":true}')"#).unwrap();
         match d.query("SELECT data->>'flag' FROM jb_ta4 WHERE id = 1", &[]) {
             Ok(rows) => {
@@ -297,13 +331,17 @@ mod jsonb_hardening {
     #[test]
     fn test_text_arrow_nonexistent_key() {
         let d = db();
-        d.execute("CREATE TABLE jb_ta5 (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_ta5 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute(r#"INSERT INTO jb_ta5 VALUES (1, '{"a":1}')"#).unwrap();
         match d.query("SELECT data->>'missing' FROM jb_ta5 WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
-                assert!(matches!(rows[0].get(0).unwrap(), Value::Null),
-                    "Expected NULL for missing key, got {:?}", rows[0].get(0));
+                assert!(
+                    matches!(rows[0].get(0).unwrap(), Value::Null),
+                    "Expected NULL for missing key, got {:?}",
+                    rows[0].get(0)
+                );
             }
             Err(e) => eprintln!("[UNSUPPORTED] text arrow nonexistent key: {e}"),
         }
@@ -316,7 +354,8 @@ mod jsonb_hardening {
     #[test]
     fn test_contains_key_value_pair() {
         let d = db();
-        d.execute("CREATE TABLE jb_ct1 (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_ct1 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute(r#"INSERT INTO jb_ct1 VALUES (1, '{"a":1,"b":2}')"#).unwrap();
         match d.query(r#"SELECT data @> '{"a":1}' FROM jb_ct1 WHERE id = 1"#, &[]) {
             Ok(rows) => {
@@ -333,8 +372,10 @@ mod jsonb_hardening {
     #[test]
     fn test_contains_subset() {
         let d = db();
-        d.execute("CREATE TABLE jb_ct2 (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_ct2 VALUES (1, '{"a":1,"b":2,"c":3}')"#).unwrap();
+        d.execute("CREATE TABLE jb_ct2 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_ct2 VALUES (1, '{"a":1,"b":2,"c":3}')"#)
+            .unwrap();
         match d.query(r#"SELECT data @> '{"a":1,"c":3}' FROM jb_ct2 WHERE id = 1"#, &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -350,7 +391,8 @@ mod jsonb_hardening {
     #[test]
     fn test_contains_array_element() {
         let d = db();
-        d.execute("CREATE TABLE jb_ct3 (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_ct3 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute(r#"INSERT INTO jb_ct3 VALUES (1, '[1,2,3,4,5]')"#).unwrap();
         match d.query(r#"SELECT data @> '[3]' FROM jb_ct3 WHERE id = 1"#, &[]) {
             Ok(rows) => {
@@ -367,11 +409,18 @@ mod jsonb_hardening {
     #[test]
     fn test_contains_in_where() {
         let d = db();
-        d.execute("CREATE TABLE jb_ct4 (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_ct4 VALUES (1, '{"type":"admin","active":true}')"#).unwrap();
-        d.execute(r#"INSERT INTO jb_ct4 VALUES (2, '{"type":"user","active":true}')"#).unwrap();
-        d.execute(r#"INSERT INTO jb_ct4 VALUES (3, '{"type":"admin","active":false}')"#).unwrap();
-        match d.query(r#"SELECT id FROM jb_ct4 WHERE data @> '{"type":"admin"}' ORDER BY id"#, &[]) {
+        d.execute("CREATE TABLE jb_ct4 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_ct4 VALUES (1, '{"type":"admin","active":true}')"#)
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_ct4 VALUES (2, '{"type":"user","active":true}')"#)
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_ct4 VALUES (3, '{"type":"admin","active":false}')"#)
+            .unwrap();
+        match d.query(
+            r#"SELECT id FROM jb_ct4 WHERE data @> '{"type":"admin"}' ORDER BY id"#,
+            &[],
+        ) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 2, "Expected 2 admins, got {}", rows.len());
             }
@@ -382,7 +431,8 @@ mod jsonb_hardening {
     #[test]
     fn test_contains_negative() {
         let d = db();
-        d.execute("CREATE TABLE jb_ct5 (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_ct5 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute(r#"INSERT INTO jb_ct5 VALUES (1, '{"a":1}')"#).unwrap();
         match d.query(r#"SELECT data @> '{"a":2}' FROM jb_ct5 WHERE id = 1"#, &[]) {
             Ok(rows) => {
@@ -403,8 +453,10 @@ mod jsonb_hardening {
     #[test]
     fn test_exists_key_present() {
         let d = db();
-        d.execute("CREATE TABLE jb_ex1 (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_ex1 VALUES (1, '{"name":"test","age":10}')"#).unwrap();
+        d.execute("CREATE TABLE jb_ex1 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_ex1 VALUES (1, '{"name":"test","age":10}')"#)
+            .unwrap();
         match d.query("SELECT data ? 'name' FROM jb_ex1 WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -420,8 +472,10 @@ mod jsonb_hardening {
     #[test]
     fn test_exists_key_absent() {
         let d = db();
-        d.execute("CREATE TABLE jb_ex2 (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_ex2 VALUES (1, '{"name":"test"}')"#).unwrap();
+        d.execute("CREATE TABLE jb_ex2 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_ex2 VALUES (1, '{"name":"test"}')"#)
+            .unwrap();
         match d.query("SELECT data ? 'missing' FROM jb_ex2 WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -437,10 +491,14 @@ mod jsonb_hardening {
     #[test]
     fn test_exists_in_where_filter() {
         let d = db();
-        d.execute("CREATE TABLE jb_ex3 (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_ex3 VALUES (1, '{"email":"a@b.c"}')"#).unwrap();
-        d.execute(r#"INSERT INTO jb_ex3 VALUES (2, '{"phone":"555"}')"#).unwrap();
-        d.execute(r#"INSERT INTO jb_ex3 VALUES (3, '{"email":"d@e.f","phone":"111"}')"#).unwrap();
+        d.execute("CREATE TABLE jb_ex3 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_ex3 VALUES (1, '{"email":"a@b.c"}')"#)
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_ex3 VALUES (2, '{"phone":"555"}')"#)
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_ex3 VALUES (3, '{"email":"d@e.f","phone":"111"}')"#)
+            .unwrap();
         match d.query("SELECT id FROM jb_ex3 WHERE data ? 'email' ORDER BY id", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 2, "Expected 2 rows with 'email', got {}", rows.len());
@@ -452,14 +510,21 @@ mod jsonb_hardening {
     #[test]
     fn test_exists_multiple_checks() {
         let d = db();
-        d.execute("CREATE TABLE jb_ex4 (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_ex4 VALUES (1, '{"a":1,"b":2,"c":3}')"#).unwrap();
-        match d.query("SELECT data ? 'a', data ? 'b', data ? 'z' FROM jb_ex4 WHERE id = 1", &[]) {
+        d.execute("CREATE TABLE jb_ex4 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_ex4 VALUES (1, '{"a":1,"b":2,"c":3}')"#)
+            .unwrap();
+        match d.query(
+            "SELECT data ? 'a', data ? 'b', data ? 'z' FROM jb_ex4 WHERE id = 1",
+            &[],
+        ) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
-                if let (Value::Boolean(a), Value::Boolean(b), Value::Boolean(z)) =
-                    (rows[0].get(0).unwrap(), rows[0].get(1).unwrap(), rows[0].get(2).unwrap())
-                {
+                if let (Value::Boolean(a), Value::Boolean(b), Value::Boolean(z)) = (
+                    rows[0].get(0).unwrap(),
+                    rows[0].get(1).unwrap(),
+                    rows[0].get(2).unwrap(),
+                ) {
                     assert!(a, "Key 'a' should exist");
                     assert!(b, "Key 'b' should exist");
                     assert!(!z, "Key 'z' should not exist");
@@ -478,11 +543,18 @@ mod jsonb_hardening {
     #[test]
     fn test_where_filter_arrow() {
         let d = db();
-        d.execute("CREATE TABLE jb_qw1 (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_qw1 VALUES (1, '{"status":"active"}')"#).unwrap();
-        d.execute(r#"INSERT INTO jb_qw1 VALUES (2, '{"status":"inactive"}')"#).unwrap();
-        d.execute(r#"INSERT INTO jb_qw1 VALUES (3, '{"status":"active"}')"#).unwrap();
-        match d.query("SELECT id FROM jb_qw1 WHERE data->>'status' = 'active' ORDER BY id", &[]) {
+        d.execute("CREATE TABLE jb_qw1 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_qw1 VALUES (1, '{"status":"active"}')"#)
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_qw1 VALUES (2, '{"status":"inactive"}')"#)
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_qw1 VALUES (3, '{"status":"active"}')"#)
+            .unwrap();
+        match d.query(
+            "SELECT id FROM jb_qw1 WHERE data->>'status' = 'active' ORDER BY id",
+            &[],
+        ) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 2, "Expected 2 active rows, got {}", rows.len());
             }
@@ -493,7 +565,8 @@ mod jsonb_hardening {
     #[test]
     fn test_order_by_jsonb_field() {
         let d = db();
-        d.execute("CREATE TABLE jb_qo1 (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_qo1 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute(r#"INSERT INTO jb_qo1 VALUES (1, '{"rank":3}')"#).unwrap();
         d.execute(r#"INSERT INTO jb_qo1 VALUES (2, '{"rank":1}')"#).unwrap();
         d.execute(r#"INSERT INTO jb_qo1 VALUES (3, '{"rank":2}')"#).unwrap();
@@ -509,11 +582,15 @@ mod jsonb_hardening {
     #[test]
     fn test_group_by_jsonb_field() {
         let d = db();
-        d.execute("CREATE TABLE jb_qg1 (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_qg1 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute(r#"INSERT INTO jb_qg1 VALUES (1, '{"cat":"a"}')"#).unwrap();
         d.execute(r#"INSERT INTO jb_qg1 VALUES (2, '{"cat":"b"}')"#).unwrap();
         d.execute(r#"INSERT INTO jb_qg1 VALUES (3, '{"cat":"a"}')"#).unwrap();
-        match d.query("SELECT data->>'cat', COUNT(*) FROM jb_qg1 GROUP BY data->>'cat' ORDER BY data->>'cat'", &[]) {
+        match d.query(
+            "SELECT data->>'cat', COUNT(*) FROM jb_qg1 GROUP BY data->>'cat' ORDER BY data->>'cat'",
+            &[],
+        ) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 2, "Expected 2 groups, got {}", rows.len());
             }
@@ -524,13 +601,17 @@ mod jsonb_hardening {
     #[test]
     fn test_jsonb_in_join_condition() {
         let d = db();
-        d.execute("CREATE TABLE jb_qj1 (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_qj1 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute("CREATE TABLE jb_qj2 (id INT PRIMARY KEY, tag TEXT)").unwrap();
         d.execute(r#"INSERT INTO jb_qj1 VALUES (1, '{"tag":"x"}')"#).unwrap();
         d.execute(r#"INSERT INTO jb_qj1 VALUES (2, '{"tag":"y"}')"#).unwrap();
         d.execute("INSERT INTO jb_qj2 VALUES (10, 'x')").unwrap();
         d.execute("INSERT INTO jb_qj2 VALUES (20, 'z')").unwrap();
-        match d.query("SELECT jb_qj1.id, jb_qj2.id FROM jb_qj1 JOIN jb_qj2 ON jb_qj1.data->>'tag' = jb_qj2.tag", &[]) {
+        match d.query(
+            "SELECT jb_qj1.id, jb_qj2.id FROM jb_qj1 JOIN jb_qj2 ON jb_qj1.data->>'tag' = jb_qj2.tag",
+            &[],
+        ) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1, "Expected 1 joined row, got {}", rows.len());
             }
@@ -541,7 +622,8 @@ mod jsonb_hardening {
     #[test]
     fn test_insert_json_string_literal() {
         let d = db();
-        d.execute("CREATE TABLE jb_qi1 (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_qi1 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         match d.execute(r#"INSERT INTO jb_qi1 VALUES (1, '{"key":"value"}')"#) {
             Ok(_) => {
                 let rows = d.query("SELECT data FROM jb_qi1 WHERE id = 1", &[]).unwrap();
@@ -556,7 +638,8 @@ mod jsonb_hardening {
     #[test]
     fn test_cast_text_to_jsonb() {
         let d = db();
-        d.execute("CREATE TABLE jb_qc1 (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_qc1 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         match d.execute(r#"INSERT INTO jb_qc1 VALUES (1, CAST('{"x":1}' AS JSONB))"#) {
             Ok(_) => {
                 let rows = d.query("SELECT data FROM jb_qc1 WHERE id = 1", &[]).unwrap();
@@ -569,7 +652,8 @@ mod jsonb_hardening {
     #[test]
     fn test_jsonb_is_null_check() {
         let d = db();
-        d.execute("CREATE TABLE jb_qn1 (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_qn1 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute("INSERT INTO jb_qn1 VALUES (1, NULL)").unwrap();
         d.execute(r#"INSERT INTO jb_qn1 VALUES (2, '{"a":1}')"#).unwrap();
         match d.query("SELECT id FROM jb_qn1 WHERE data IS NULL", &[]) {
@@ -583,7 +667,8 @@ mod jsonb_hardening {
     #[test]
     fn test_jsonb_is_not_null_check() {
         let d = db();
-        d.execute("CREATE TABLE jb_qn2 (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_qn2 (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute("INSERT INTO jb_qn2 VALUES (1, NULL)").unwrap();
         d.execute(r#"INSERT INTO jb_qn2 VALUES (2, '{"a":1}')"#).unwrap();
         match d.query("SELECT id FROM jb_qn2 WHERE data IS NOT NULL", &[]) {
@@ -597,10 +682,13 @@ mod jsonb_hardening {
     #[test]
     fn test_large_json_document() {
         let d = db();
-        d.execute("CREATE TABLE jb_large (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_large (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         let mut json = String::from("{");
         for i in 0..50 {
-            if i > 0 { json.push(','); }
+            if i > 0 {
+                json.push(',');
+            }
             json.push_str(&format!(r#""k{}":"v{}""#, i, i));
         }
         json.push('}');
@@ -619,7 +707,8 @@ mod jsonb_hardening {
     #[test]
     fn test_json_with_special_chars() {
         let d = db();
-        d.execute("CREATE TABLE jb_spec (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_spec (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         match d.execute(r#"INSERT INTO jb_spec VALUES (1, '{"msg":"hello\nworld","quote":"say \"hi\""}')"#) {
             Ok(_) => {
                 let rows = d.query("SELECT data FROM jb_spec WHERE id = 1", &[]).unwrap();
@@ -632,7 +721,8 @@ mod jsonb_hardening {
     #[test]
     fn test_arrow_extract_number_value() {
         let d = db();
-        d.execute("CREATE TABLE jb_arn (id INT PRIMARY KEY, data JSONB)").unwrap();
+        d.execute("CREATE TABLE jb_arn (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
         d.execute(r#"INSERT INTO jb_arn VALUES (1, '{"count":99}')"#).unwrap();
         match d.query("SELECT data->'count' FROM jb_arn WHERE id = 1", &[]) {
             Ok(rows) => {
@@ -647,8 +737,10 @@ mod jsonb_hardening {
     #[test]
     fn test_deeply_nested_json() {
         let d = db();
-        d.execute("CREATE TABLE jb_deep (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_deep VALUES (1, '{"l1":{"l2":{"l3":{"l4":"bottom"}}}}')"#).unwrap();
+        d.execute("CREATE TABLE jb_deep (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_deep VALUES (1, '{"l1":{"l2":{"l3":{"l4":"bottom"}}}}')"#)
+            .unwrap();
         match d.query("SELECT data->'l1'->'l2'->'l3'->'l4' FROM jb_deep WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -662,8 +754,10 @@ mod jsonb_hardening {
     #[test]
     fn test_json_array_of_objects() {
         let d = db();
-        d.execute("CREATE TABLE jb_aoo (id INT PRIMARY KEY, data JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_aoo VALUES (1, '[{"n":"a"},{"n":"b"},{"n":"c"}]')"#).unwrap();
+        d.execute("CREATE TABLE jb_aoo (id INT PRIMARY KEY, data JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_aoo VALUES (1, '[{"n":"a"},{"n":"b"},{"n":"c"}]')"#)
+            .unwrap();
         match d.query("SELECT data->1->'n' FROM jb_aoo WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);
@@ -677,8 +771,10 @@ mod jsonb_hardening {
     #[test]
     fn test_multiple_jsonb_columns() {
         let d = db();
-        d.execute("CREATE TABLE jb_multi (id INT PRIMARY KEY, meta JSONB, config JSONB)").unwrap();
-        d.execute(r#"INSERT INTO jb_multi VALUES (1, '{"name":"x"}', '{"debug":true}')"#).unwrap();
+        d.execute("CREATE TABLE jb_multi (id INT PRIMARY KEY, meta JSONB, config JSONB)")
+            .unwrap();
+        d.execute(r#"INSERT INTO jb_multi VALUES (1, '{"name":"x"}', '{"debug":true}')"#)
+            .unwrap();
         match d.query("SELECT meta->>'name', config->>'debug' FROM jb_multi WHERE id = 1", &[]) {
             Ok(rows) => {
                 assert_eq!(rows.len(), 1);

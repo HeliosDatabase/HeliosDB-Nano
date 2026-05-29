@@ -3,7 +3,7 @@
 //! Implements HTTP handlers for query cancellation operations.
 
 use axum::{
-    extract::{Path, State, Query},
+    extract::{Path, Query, State},
     Json,
 };
 use serde::Deserialize;
@@ -11,14 +11,8 @@ use tracing::{info, warn};
 
 use crate::api::{
     models::{
-        ApiError,
-        CancelQueryRequest,
-        CancelQueryResponse,
-        RunningQueryInfo,
-        RunningQueriesResponse,
-        QueryStatusResponse,
-        CancelSessionQueriesRequest,
-        BulkCancelResponse,
+        ApiError, BulkCancelResponse, CancelQueryRequest, CancelQueryResponse, CancelSessionQueriesRequest,
+        QueryStatusResponse, RunningQueriesResponse, RunningQueryInfo,
     },
     server::AppState,
 };
@@ -127,7 +121,9 @@ pub async fn get_query_status(
     State(state): State<AppState>,
     Path(query_id): Path<u64>,
 ) -> Result<Json<QueryStatusResponse>, ApiError> {
-    let query = state.query_registry.get_query(query_id)
+    let query = state
+        .query_registry
+        .get_query(query_id)
         .ok_or_else(|| ApiError::not_found(format!("Query {} not found", query_id)))?;
 
     let is_running = matches!(
@@ -172,7 +168,8 @@ pub async fn cancel_query(
         state.query_registry.cancel_query_with_reason(query_id, &reason)
     } else {
         state.query_registry.cancel_query(query_id)
-    }.map_err(|e| {
+    }
+    .map_err(|e| {
         warn!("Failed to cancel query {}: {}", query_id, e);
         ApiError::bad_request(e.to_string())
     })?;
@@ -186,7 +183,10 @@ pub async fn cancel_query(
         }))
     } else {
         warn!("Query {} not found for cancellation", query_id);
-        Err(ApiError::not_found(format!("Query {} not found or already completed", query_id)))
+        Err(ApiError::not_found(format!(
+            "Query {} not found or already completed",
+            query_id
+        )))
     }
 }
 
@@ -212,14 +212,16 @@ pub async fn cancel_session_queries(
 
     let cancelled_count = state.query_registry.cancel_session_queries(request.session_id);
 
-    info!("Cancelled {} queries for session {}", cancelled_count, request.session_id);
+    info!(
+        "Cancelled {} queries for session {}",
+        cancelled_count, request.session_id
+    );
 
     Ok(Json(BulkCancelResponse {
         cancelled_count,
         message: format!(
             "Cancelled {} queries for session {}",
-            cancelled_count,
-            request.session_id
+            cancelled_count, request.session_id
         ),
     }))
 }
@@ -264,8 +266,7 @@ pub async fn cancel_timed_out_queries(
         cancelled_count,
         message: format!(
             "Cancelled {} queries exceeding {}s timeout",
-            cancelled_count,
-            params.timeout_secs
+            cancelled_count, params.timeout_secs
         ),
     }))
 }
@@ -279,19 +280,20 @@ pub async fn cancel_timed_out_queries(
 /// # Response
 ///
 /// - 200 OK: Returns statistics about running queries
-pub async fn get_query_stats(
-    State(state): State<AppState>,
-) -> Json<serde_json::Value> {
+pub async fn get_query_stats(State(state): State<AppState>) -> Json<serde_json::Value> {
     let running_count = state.query_registry.running_count();
     let all_queries = state.query_registry.list_all_queries();
 
-    let planning = all_queries.iter()
+    let planning = all_queries
+        .iter()
         .filter(|q| matches!(q.state, crate::compute::QueryState::Planning))
         .count();
-    let executing = all_queries.iter()
+    let executing = all_queries
+        .iter()
         .filter(|q| matches!(q.state, crate::compute::QueryState::Executing))
         .count();
-    let cancelling = all_queries.iter()
+    let cancelling = all_queries
+        .iter()
         .filter(|q| matches!(q.state, crate::compute::QueryState::Cancelling))
         .count();
 

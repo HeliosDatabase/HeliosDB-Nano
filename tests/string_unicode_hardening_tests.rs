@@ -5,12 +5,7 @@
 //! and large string handling. Avoids duplicating tests already present in
 //! `string_and_date_tests.rs`.
 
-#[allow(
-    clippy::unwrap_used,
-    clippy::expect_used,
-    clippy::panic,
-    clippy::indexing_slicing
-)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 mod string_unicode_hardening {
     use heliosdb_nano::{EmbeddedDatabase, Value};
 
@@ -64,9 +59,7 @@ mod string_unicode_hardening {
     fn test_coalesce_empty_string_is_not_null() {
         // COALESCE should return '' (not skip it) because '' is not NULL
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT COALESCE('', 'default')", &[])
-            .unwrap();
+        let rows = db.query("SELECT COALESCE('', 'default')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("".to_string()));
     }
@@ -83,12 +76,13 @@ mod string_unicode_hardening {
             .unwrap();
         db.execute("INSERT INTO uni_zh (id, txt) VALUES (1, '\u{4F60}\u{597D}\u{4E16}\u{754C}')")
             .unwrap();
-        let rows = db
-            .query("SELECT txt FROM uni_zh WHERE id = 1", &[])
-            .unwrap();
+        let rows = db.query("SELECT txt FROM uni_zh WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         match rows[0].get(0).unwrap() {
-            Value::String(s) => assert_eq!(s, "\u{4F60}\u{597D}\u{4E16}\u{754C}", "Chinese text must round-trip exactly"),
+            Value::String(s) => assert_eq!(
+                s, "\u{4F60}\u{597D}\u{4E16}\u{754C}",
+                "Chinese text must round-trip exactly"
+            ),
             other => panic!("Expected String, got {:?}", other),
         }
     }
@@ -101,12 +95,13 @@ mod string_unicode_hardening {
             .unwrap();
         db.execute("INSERT INTO uni_ar (id, txt) VALUES (1, '\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}')")
             .unwrap();
-        let rows = db
-            .query("SELECT txt FROM uni_ar WHERE id = 1", &[])
-            .unwrap();
+        let rows = db.query("SELECT txt FROM uni_ar WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         match rows[0].get(0).unwrap() {
-            Value::String(s) => assert_eq!(s, "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}", "Arabic text must round-trip exactly"),
+            Value::String(s) => assert_eq!(
+                s, "\u{0645}\u{0631}\u{062D}\u{0628}\u{0627}",
+                "Arabic text must round-trip exactly"
+            ),
             other => panic!("Expected String, got {:?}", other),
         }
     }
@@ -148,14 +143,9 @@ mod string_unicode_hardening {
         // SUBSTR('hello', 1, 3) on a Unicode string with accented chars
         // 'h\u{00E9}llo' = h,e-acute,l,l,o -- SUBSTR(1,3) should be 'h\u{00E9}l'
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT SUBSTR('h\u{00E9}llo', 1, 3)", &[])
-            .unwrap();
+        let rows = db.query("SELECT SUBSTR('h\u{00E9}llo', 1, 3)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("h\u{00E9}l".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("h\u{00E9}l".to_string()));
     }
 
     #[test]
@@ -170,9 +160,7 @@ mod string_unicode_hardening {
             .unwrap();
 
         // Verify both rows are stored and retrievable with exact content
-        let rows = db
-            .query("SELECT id, msg FROM uni_emoji ORDER BY id", &[])
-            .unwrap();
+        let rows = db.query("SELECT id, msg FROM uni_emoji ORDER BY id", &[]).unwrap();
         assert_eq!(rows.len(), 2);
         match rows[0].get(1).unwrap() {
             Value::String(s) => assert_eq!(s, "Hello \u{1F600}\u{1F389}", "Emoji text must round-trip exactly"),
@@ -188,9 +176,7 @@ mod string_unicode_hardening {
     fn test_emoji_in_literal_functions() {
         // String functions on emoji literals (no storage round-trip) should work
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT LENGTH('Hi\u{1F600}')", &[])
-            .unwrap();
+        let rows = db.query("SELECT LENGTH('Hi\u{1F600}')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         // 'H','i',emoji = 3 characters
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(3));
@@ -219,9 +205,7 @@ mod string_unicode_hardening {
             .unwrap();
 
         // ASCII equality should work
-        let rows = db
-            .query("SELECT id FROM uni_where WHERE name = 'cafe'", &[])
-            .unwrap();
+        let rows = db.query("SELECT id FROM uni_where WHERE name = 'cafe'", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         match rows[0].get(0).unwrap() {
             Value::Int4(n) => assert_eq!(*n, 2),
@@ -233,7 +217,11 @@ mod string_unicode_hardening {
         let rows = db
             .query("SELECT id FROM uni_where WHERE name = 'caf\u{00E9}'", &[])
             .unwrap();
-        assert_eq!(rows.len(), 1, "Unicode WHERE equality must match after storage round-trip");
+        assert_eq!(
+            rows.len(),
+            1,
+            "Unicode WHERE equality must match after storage round-trip"
+        );
         match rows[0].get(0).unwrap() {
             Value::Int4(n) => assert_eq!(*n, 1),
             Value::Int8(n) => assert_eq!(*n, 1),
@@ -273,9 +261,7 @@ mod string_unicode_hardening {
     fn test_replace_with_empty_replacement() {
         // REPLACE('hello', 'l', '') -> 'heo' (remove all 'l's)
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT REPLACE('hello', 'l', '')", &[])
-            .unwrap();
+        let rows = db.query("SELECT REPLACE('hello', 'l', '')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::String("heo".to_string()));
     }
@@ -285,9 +271,7 @@ mod string_unicode_hardening {
         // REPLACE('hello', '', 'X') -- Rust's str::replace("", "X") inserts X between every char
         // PostgreSQL returns 'hello' unchanged; Rust inserts. Test behavior exists and is consistent.
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT REPLACE('hello', '', 'X')", &[])
-            .unwrap();
+        let rows = db.query("SELECT REPLACE('hello', '', 'X')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         // Whatever the result, it should be a string (either 'hello' or 'XhXeXlXlXoX')
         match rows[0].get(0).unwrap() {
@@ -299,9 +283,7 @@ mod string_unicode_hardening {
     #[test]
     fn test_position_substring_not_found_returns_zero() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT POSITION('xyz', 'hello world')", &[])
-            .unwrap();
+        let rows = db.query("SELECT POSITION('xyz', 'hello world')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(0));
     }
@@ -310,40 +292,25 @@ mod string_unicode_hardening {
     fn test_btrim_with_custom_characters() {
         // BTRIM('xxxhelloxxx', 'x') should strip 'x' from both sides
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT BTRIM('xxxhelloxxx', 'x')", &[])
-            .unwrap();
+        let rows = db.query("SELECT BTRIM('xxxhelloxxx', 'x')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("hello".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("hello".to_string()));
     }
 
     #[test]
     fn test_ltrim_with_custom_characters() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT LTRIM('xxxhelloxxx', 'x')", &[])
-            .unwrap();
+        let rows = db.query("SELECT LTRIM('xxxhelloxxx', 'x')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("helloxxx".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("helloxxx".to_string()));
     }
 
     #[test]
     fn test_rtrim_with_custom_characters() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT RTRIM('xxxhelloxxx', 'x')", &[])
-            .unwrap();
+        let rows = db.query("SELECT RTRIM('xxxhelloxxx', 'x')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("xxxhello".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("xxxhello".to_string()));
     }
 
     #[test]
@@ -351,10 +318,7 @@ mod string_unicode_hardening {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT REPEAT('abc', 1)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("abc".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("abc".to_string()));
     }
 
     // ========================================================================
@@ -376,21 +340,13 @@ mod string_unicode_hardening {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE like_us (id INT PRIMARY KEY, val TEXT)")
             .unwrap();
-        db.execute("INSERT INTO like_us (id, val) VALUES (1, 'abc')")
-            .unwrap();
-        db.execute("INSERT INTO like_us (id, val) VALUES (2, 'bc')")
-            .unwrap();
-        db.execute("INSERT INTO like_us (id, val) VALUES (3, 'axc')")
-            .unwrap();
+        db.execute("INSERT INTO like_us (id, val) VALUES (1, 'abc')").unwrap();
+        db.execute("INSERT INTO like_us (id, val) VALUES (2, 'bc')").unwrap();
+        db.execute("INSERT INTO like_us (id, val) VALUES (3, 'axc')").unwrap();
 
-        let rows = db
-            .query("SELECT val FROM like_us WHERE val LIKE '_bc'", &[])
-            .unwrap();
+        let rows = db.query("SELECT val FROM like_us WHERE val LIKE '_bc'", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("abc".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("abc".to_string()));
     }
 
     #[test]
@@ -407,10 +363,7 @@ mod string_unicode_hardening {
             .unwrap();
 
         let rows = db
-            .query(
-                "SELECT val FROM ilike_exact WHERE val ILIKE 'hello'",
-                &[],
-            )
+            .query("SELECT val FROM ilike_exact WHERE val ILIKE 'hello'", &[])
             .unwrap();
         assert_eq!(rows.len(), 2);
         let mut vals: Vec<String> = rows
@@ -442,14 +395,10 @@ mod string_unicode_hardening {
             .unwrap();
         db.execute("INSERT INTO like_pct (id, val) VALUES (1, 'anything')")
             .unwrap();
-        db.execute("INSERT INTO like_pct (id, val) VALUES (2, '')")
-            .unwrap();
-        db.execute("INSERT INTO like_pct (id, val) VALUES (3, 'x')")
-            .unwrap();
+        db.execute("INSERT INTO like_pct (id, val) VALUES (2, '')").unwrap();
+        db.execute("INSERT INTO like_pct (id, val) VALUES (3, 'x')").unwrap();
 
-        let rows = db
-            .query("SELECT val FROM like_pct WHERE val LIKE '%'", &[])
-            .unwrap();
+        let rows = db.query("SELECT val FROM like_pct WHERE val LIKE '%'", &[]).unwrap();
         assert_eq!(rows.len(), 3);
     }
 
@@ -460,14 +409,9 @@ mod string_unicode_hardening {
     #[test]
     fn test_concat_with_empty_strings() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT CONCAT('', 'hello', '', 'world', '')", &[])
-            .unwrap();
+        let rows = db.query("SELECT CONCAT('', 'hello', '', 'world', '')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("helloworld".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("helloworld".to_string()));
     }
 
     #[test]
@@ -475,19 +419,14 @@ mod string_unicode_hardening {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         let rows = db.query("SELECT CONCAT('only')", &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("only".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("only".to_string()));
     }
 
     #[test]
     fn test_concat_with_integer_arguments() {
         // CONCAT with mixed string and int types
         let db = EmbeddedDatabase::new_in_memory().unwrap();
-        let rows = db
-            .query("SELECT CONCAT('num:', 42, ':', 100)", &[])
-            .unwrap();
+        let rows = db.query("SELECT CONCAT('num:', 42, ':', 100)", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         let val = match rows[0].get(0).unwrap() {
             Value::String(s) => s.clone(),
@@ -518,15 +457,10 @@ mod string_unicode_hardening {
 
         // Build a 10KB+ string
         let large = "A".repeat(12_000);
-        let insert_sql = format!(
-            "INSERT INTO big_str (id, content) VALUES (1, '{}')",
-            large
-        );
+        let insert_sql = format!("INSERT INTO big_str (id, content) VALUES (1, '{}')", large);
         db.execute(&insert_sql).unwrap();
 
-        let rows = db
-            .query("SELECT content FROM big_str WHERE id = 1", &[])
-            .unwrap();
+        let rows = db.query("SELECT content FROM big_str WHERE id = 1", &[]).unwrap();
         assert_eq!(rows.len(), 1);
         match rows[0].get(0).unwrap() {
             Value::String(s) => assert_eq!(s.len(), 12_000),
@@ -551,10 +485,7 @@ mod string_unicode_hardening {
         let query = format!("SELECT SUBSTR('{}', 9990, 5)", large);
         let rows = db.query(&query, &[]).unwrap();
         assert_eq!(rows.len(), 1);
-        assert_eq!(
-            rows[0].get(0).unwrap(),
-            &Value::String("ZZZZZ".to_string())
-        );
+        assert_eq!(rows[0].get(0).unwrap(), &Value::String("ZZZZZ".to_string()));
     }
 
     #[test]
@@ -565,18 +496,12 @@ mod string_unicode_hardening {
 
         let s1 = "B".repeat(10_000);
         let s2 = "B".repeat(10_000);
-        db.execute(&format!(
-            "INSERT INTO big_cmp (id, val) VALUES (1, '{}')",
-            s1
-        ))
-        .unwrap();
+        db.execute(&format!("INSERT INTO big_cmp (id, val) VALUES (1, '{}')", s1))
+            .unwrap();
 
         // WHERE clause comparing with an identical large string
         let rows = db
-            .query(
-                &format!("SELECT id FROM big_cmp WHERE val = '{}'", s2),
-                &[],
-            )
+            .query(&format!("SELECT id FROM big_cmp WHERE val = '{}'", s2), &[])
             .unwrap();
         assert_eq!(rows.len(), 1);
     }

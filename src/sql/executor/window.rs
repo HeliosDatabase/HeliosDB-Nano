@@ -4,12 +4,12 @@
 //! Window functions operate over a set of rows (a "window" or "partition") and
 //! return a value for each row based on its position within that partition.
 
-use crate::{Result, Tuple, Schema, Value};
-use crate::sql::logical_plan::{LogicalExpr, WindowFunctionType, WindowFrame, WindowFrameBound};
-use crate::sql::Evaluator;
 use super::PhysicalOperator;
-use std::sync::Arc;
+use crate::sql::logical_plan::{LogicalExpr, WindowFrame, WindowFrameBound, WindowFunctionType};
+use crate::sql::Evaluator;
+use crate::{Result, Schema, Tuple, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Window function operator
 ///
@@ -66,7 +66,14 @@ impl WindowOperator {
         let window_infos: Vec<WindowExprInfo> = window_exprs
             .into_iter()
             .map(|(expr, name)| {
-                if let LogicalExpr::WindowFunction { fun, args, partition_by, order_by, frame } = expr {
+                if let LogicalExpr::WindowFunction {
+                    fun,
+                    args,
+                    partition_by,
+                    order_by,
+                    frame,
+                } = expr
+                {
                     WindowExprInfo {
                         fun,
                         args,
@@ -270,7 +277,8 @@ impl WindowOperator {
                         .get(i)
                         .map(|(_, t)| t)
                         .map(|t| {
-                            order_by.iter()
+                            order_by
+                                .iter()
                                 .map(|(e, _)| self.evaluator.evaluate(e, t).unwrap_or(Value::Null))
                                 .collect()
                         })
@@ -310,9 +318,7 @@ impl WindowOperator {
                     .max(1);
 
                 let bucket_size = (len + n - 1) / n; // Ceiling division
-                Ok((0..len)
-                    .map(|i| Value::Int8((i / bucket_size + 1) as i64))
-                    .collect())
+                Ok((0..len).map(|i| Value::Int8((i / bucket_size + 1) as i64)).collect())
             }
 
             WindowFunctionType::Lag => {
@@ -473,7 +479,12 @@ impl WindowOperator {
     /// Compute RANK or DENSE_RANK
     #[allow(clippy::indexing_slicing)]
     // SAFETY: Loop index `i` ranges from 0..len; `i-1` only accessed when `i > 0`
-    fn compute_rank(&self, partition: &[(usize, Tuple)], order_by: &[(LogicalExpr, bool)], with_gaps: bool) -> Result<Vec<Value>> {
+    fn compute_rank(
+        &self,
+        partition: &[(usize, Tuple)],
+        order_by: &[(LogicalExpr, bool)],
+        with_gaps: bool,
+    ) -> Result<Vec<Value>> {
         let len = partition.len();
         if len == 0 {
             return Ok(vec![]);
@@ -486,10 +497,16 @@ impl WindowOperator {
         for i in 0..len {
             if i > 0 {
                 // Compare only ORDER BY expression values, not full tuple
-                let prev_vals: Vec<Value> = order_by.iter()
-                    .map(|(expr, _)| self.evaluator.evaluate(expr, &partition[i - 1].1).unwrap_or(Value::Null))
+                let prev_vals: Vec<Value> = order_by
+                    .iter()
+                    .map(|(expr, _)| {
+                        self.evaluator
+                            .evaluate(expr, &partition[i - 1].1)
+                            .unwrap_or(Value::Null)
+                    })
                     .collect();
-                let curr_vals: Vec<Value> = order_by.iter()
+                let curr_vals: Vec<Value> = order_by
+                    .iter()
                     .map(|(expr, _)| self.evaluator.evaluate(expr, &partition[i].1).unwrap_or(Value::Null))
                     .collect();
 
@@ -566,20 +583,16 @@ impl WindowOperator {
                             Value::Float8(nums.iter().sum::<f64>() / nums.len() as f64)
                         }
                     }
-                    crate::sql::AggregateFunction::Min => {
-                        values
-                            .into_iter()
-                            .filter(|v| !matches!(v, Value::Null))
-                            .min_by(|a, b| compare_values(a, b))
-                            .unwrap_or(Value::Null)
-                    }
-                    crate::sql::AggregateFunction::Max => {
-                        values
-                            .into_iter()
-                            .filter(|v| !matches!(v, Value::Null))
-                            .max_by(|a, b| compare_values(a, b))
-                            .unwrap_or(Value::Null)
-                    }
+                    crate::sql::AggregateFunction::Min => values
+                        .into_iter()
+                        .filter(|v| !matches!(v, Value::Null))
+                        .min_by(|a, b| compare_values(a, b))
+                        .unwrap_or(Value::Null),
+                    crate::sql::AggregateFunction::Max => values
+                        .into_iter()
+                        .filter(|v| !matches!(v, Value::Null))
+                        .max_by(|a, b| compare_values(a, b))
+                        .unwrap_or(Value::Null),
                     crate::sql::AggregateFunction::JsonAgg => {
                         // JSON aggregation - return array of values
                         Value::Array(values.clone())
@@ -622,7 +635,13 @@ impl WindowOperator {
     }
 
     /// Get frame end position
-    fn get_frame_end(&self, current: usize, partition_size: usize, frame: &Option<WindowFrame>, has_order_by: bool) -> usize {
+    fn get_frame_end(
+        &self,
+        current: usize,
+        partition_size: usize,
+        frame: &Option<WindowFrame>,
+        has_order_by: bool,
+    ) -> usize {
         let frame = match frame {
             Some(f) => f,
             // SQL standard defaults:

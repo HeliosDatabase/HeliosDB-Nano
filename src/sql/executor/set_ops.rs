@@ -5,13 +5,13 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::{Result, Schema, Tuple};
 use super::PhysicalOperator;
+use crate::{Result, Schema, Tuple};
 
 /// Hash a tuple's values for set operations
 fn hash_tuple(tuple: &Tuple) -> u64 {
-    use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
 
     let mut hasher = DefaultHasher::new();
     for value in &tuple.values {
@@ -48,11 +48,7 @@ pub struct UnionOperator {
 }
 
 impl UnionOperator {
-    pub fn new(
-        mut left: Box<dyn PhysicalOperator>,
-        mut right: Box<dyn PhysicalOperator>,
-        all: bool,
-    ) -> Result<Self> {
+    pub fn new(mut left: Box<dyn PhysicalOperator>, mut right: Box<dyn PhysicalOperator>, all: bool) -> Result<Self> {
         let schema = left.schema();
         let mut results = Vec::new();
 
@@ -74,8 +70,7 @@ impl UnionOperator {
             for tuple in results {
                 let hash = hash_tuple(&tuple);
                 // Check for actual equality in case of hash collision
-                let is_duplicate = seen.contains(&hash) &&
-                    unique_results.iter().any(|t| tuples_equal(t, &tuple));
+                let is_duplicate = seen.contains(&hash) && unique_results.iter().any(|t| tuples_equal(t, &tuple));
 
                 if !is_duplicate {
                     seen.insert(hash);
@@ -96,7 +91,10 @@ impl UnionOperator {
 impl PhysicalOperator for UnionOperator {
     fn next(&mut self) -> Result<Option<Tuple>> {
         if self.position < self.results.len() {
-            let tuple = self.results.get(self.position).cloned()
+            let tuple = self
+                .results
+                .get(self.position)
+                .cloned()
                 .ok_or_else(|| crate::Error::query_execution("Union index out of bounds"))?;
             self.position += 1;
             Ok(Some(tuple))
@@ -125,11 +123,7 @@ pub struct IntersectOperator {
 }
 
 impl IntersectOperator {
-    pub fn new(
-        mut left: Box<dyn PhysicalOperator>,
-        mut right: Box<dyn PhysicalOperator>,
-        all: bool,
-    ) -> Result<Self> {
+    pub fn new(mut left: Box<dyn PhysicalOperator>, mut right: Box<dyn PhysicalOperator>, all: bool) -> Result<Self> {
         let schema = left.schema();
 
         // Collect all tuples from both sides
@@ -169,9 +163,7 @@ impl IntersectOperator {
             let mut seen: HashSet<u64> = HashSet::new();
 
             // Build hash set of right side
-            let right_hashes: HashSet<u64> = right_tuples.iter()
-                .map(|t| hash_tuple(t))
-                .collect();
+            let right_hashes: HashSet<u64> = right_tuples.iter().map(|t| hash_tuple(t)).collect();
 
             for left_tuple in left_tuples {
                 let hash = hash_tuple(&left_tuple);
@@ -196,7 +188,10 @@ impl IntersectOperator {
 impl PhysicalOperator for IntersectOperator {
     fn next(&mut self) -> Result<Option<Tuple>> {
         if self.position < self.results.len() {
-            let tuple = self.results.get(self.position).cloned()
+            let tuple = self
+                .results
+                .get(self.position)
+                .cloned()
                 .ok_or_else(|| crate::Error::query_execution("Intersect index out of bounds"))?;
             self.position += 1;
             Ok(Some(tuple))
@@ -225,11 +220,7 @@ pub struct ExceptOperator {
 }
 
 impl ExceptOperator {
-    pub fn new(
-        mut left: Box<dyn PhysicalOperator>,
-        mut right: Box<dyn PhysicalOperator>,
-        all: bool,
-    ) -> Result<Self> {
+    pub fn new(mut left: Box<dyn PhysicalOperator>, mut right: Box<dyn PhysicalOperator>, all: bool) -> Result<Self> {
         let schema = left.schema();
 
         // Collect all tuples from both sides
@@ -271,16 +262,14 @@ impl ExceptOperator {
             let mut seen: HashSet<u64> = HashSet::new();
 
             // Build hash set of right side
-            let right_hashes: HashSet<u64> = right_tuples.iter()
-                .map(|t| hash_tuple(t))
-                .collect();
+            let right_hashes: HashSet<u64> = right_tuples.iter().map(|t| hash_tuple(t)).collect();
 
             for left_tuple in left_tuples {
                 let hash = hash_tuple(&left_tuple);
                 if seen.insert(hash) {
                     // Check if tuple exists in right
-                    let in_right = right_hashes.contains(&hash) &&
-                        right_tuples.iter().any(|t| tuples_equal(t, &left_tuple));
+                    let in_right =
+                        right_hashes.contains(&hash) && right_tuples.iter().any(|t| tuples_equal(t, &left_tuple));
 
                     if !in_right {
                         results.push(left_tuple);
@@ -300,7 +289,10 @@ impl ExceptOperator {
 impl PhysicalOperator for ExceptOperator {
     fn next(&mut self) -> Result<Option<Tuple>> {
         if self.position < self.results.len() {
-            let tuple = self.results.get(self.position).cloned()
+            let tuple = self
+                .results
+                .get(self.position)
+                .cloned()
                 .ok_or_else(|| crate::Error::query_execution("Except index out of bounds"))?;
             self.position += 1;
             Ok(Some(tuple))

@@ -148,12 +148,7 @@ impl PyDatabase {
     /// Run a query and return rows as `list[dict]`. Optional positional `params`
     /// bind to `$1..$n`.
     #[pyo3(signature = (sql, params = None))]
-    fn query(
-        &self,
-        py: Python<'_>,
-        sql: &str,
-        params: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<PyObject> {
+    fn query(&self, py: Python<'_>, sql: &str, params: Option<&Bound<'_, PyAny>>) -> PyResult<PyObject> {
         let ps = collect_params(params)?;
         let (rows, cols) = py
             .allow_threads(|| self.inner.query_params_with_columns(sql, &ps))
@@ -163,12 +158,7 @@ impl PyDatabase {
 
     /// Execute DDL/DML and return the affected row count. Optional positional params.
     #[pyo3(signature = (sql, params = None))]
-    fn execute(
-        &self,
-        py: Python<'_>,
-        sql: &str,
-        params: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<u64> {
+    fn execute(&self, py: Python<'_>, sql: &str, params: Option<&Bound<'_, PyAny>>) -> PyResult<u64> {
         let ps = collect_params(params)?;
         py.allow_threads(|| {
             if ps.is_empty() {
@@ -182,10 +172,7 @@ impl PyDatabase {
 
     /// Execute one statement against many parameter rows; returns total affected.
     fn execute_many(&self, py: Python<'_>, sql: &str, rows: &Bound<'_, PyList>) -> PyResult<u64> {
-        let batches: Vec<Vec<Value>> = rows
-            .iter()
-            .map(|r| collect_params(Some(&r)))
-            .collect::<PyResult<_>>()?;
+        let batches: Vec<Vec<Value>> = rows.iter().map(|r| collect_params(Some(&r))).collect::<PyResult<_>>()?;
         py.allow_threads(|| {
             let mut n = 0u64;
             for ps in &batches {
@@ -197,13 +184,7 @@ impl PyDatabase {
     }
 
     /// HNSW similarity search. Returns `list[(id, distance)]`.
-    fn vector_search(
-        &self,
-        py: Python<'_>,
-        store: &str,
-        query: Vec<f32>,
-        k: usize,
-    ) -> PyResult<Vec<(String, f32)>> {
+    fn vector_search(&self, py: Python<'_>, store: &str, query: Vec<f32>, k: usize) -> PyResult<Vec<(String, f32)>> {
         py.allow_threads(|| self.inner.search_vectors(store, query, k))
             .map_err(rt_err)
     }
@@ -217,12 +198,7 @@ impl PyDatabase {
     }
 
     /// Bulk-insert vectors; returns the generated ids.
-    fn insert_vectors(
-        &self,
-        py: Python<'_>,
-        store: &str,
-        vectors: Vec<Vec<f32>>,
-    ) -> PyResult<Vec<String>> {
+    fn insert_vectors(&self, py: Python<'_>, store: &str, vectors: Vec<Vec<f32>>) -> PyResult<Vec<String>> {
         py.allow_threads(|| self.inner.insert_vectors(store, vectors))
             .map_err(rt_err)
     }

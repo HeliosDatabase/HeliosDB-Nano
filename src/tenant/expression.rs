@@ -3,10 +3,10 @@
 //! This module provides functionality to parse and evaluate Row-Level Security (RLS)
 //! policy expressions for multi-tenant data isolation.
 
-use crate::{Result, Error, Value, Tuple, Schema};
-use crate::sql::{LogicalExpr, BinaryOperator};
+use crate::sql::{BinaryOperator, LogicalExpr};
 use crate::tenant::TenantContext;
-use sqlparser::ast::{Expr, BinaryOperator as SqlBinaryOp, UnaryOperator as SqlUnaryOp};
+use crate::{Error, Result, Schema, Tuple, Value};
+use sqlparser::ast::{BinaryOperator as SqlBinaryOp, Expr, UnaryOperator as SqlUnaryOp};
 use sqlparser::dialect::PostgreSqlDialect;
 use sqlparser::parser::Parser as SqlParser;
 use std::sync::Arc;
@@ -24,10 +24,7 @@ pub struct RLSExpressionEvaluator {
 impl RLSExpressionEvaluator {
     /// Create a new RLS expression evaluator
     pub fn new(schema: Arc<Schema>, tenant_context: Option<TenantContext>) -> Self {
-        Self {
-            schema,
-            tenant_context,
-        }
+        Self { schema, tenant_context }
     }
 
     /// Parse an RLS expression string into a LogicalExpr
@@ -50,7 +47,9 @@ impl RLSExpressionEvaluator {
             .map_err(|e| Error::query_execution(format!("Failed to parse RLS expression '{}': {}", expr_str, e)))?;
 
         if statements.len() != 1 {
-            return Err(Error::query_execution("Invalid RLS expression: expected single statement"));
+            return Err(Error::query_execution(
+                "Invalid RLS expression: expected single statement",
+            ));
         }
 
         // Extract the WHERE clause from the SELECT statement
@@ -64,7 +63,10 @@ impl RLSExpressionEvaluator {
             }
         }
 
-        Err(Error::query_execution(format!("Failed to extract WHERE clause from RLS expression: {}", expr_str)))
+        Err(Error::query_execution(format!(
+            "Failed to extract WHERE clause from RLS expression: {}",
+            expr_str
+        )))
     }
 
     /// Convert a SQL expression to a LogicalExpr
@@ -78,20 +80,26 @@ impl RLSExpressionEvaluator {
             Expr::CompoundIdentifier(idents) => {
                 // Handle table.column references - preserve the table qualifier for JOIN disambiguation
                 if idents.len() >= 2 {
-                    let table_alias = idents.get(idents.len() - 2)
+                    let table_alias = idents
+                        .get(idents.len() - 2)
                         .ok_or_else(|| Error::query_execution("Invalid compound identifier"))?
-                        .value.clone();
-                    let column_name = idents.last()
+                        .value
+                        .clone();
+                    let column_name = idents
+                        .last()
                         .ok_or_else(|| Error::query_execution("Empty compound identifier"))?
-                        .value.clone();
+                        .value
+                        .clone();
                     Ok(LogicalExpr::Column {
                         table: Some(table_alias),
                         name: column_name,
                     })
                 } else {
-                    let column_name = idents.last()
+                    let column_name = idents
+                        .last()
                         .ok_or_else(|| Error::query_execution("Empty compound identifier"))?
-                        .value.clone();
+                        .value
+                        .clone();
                     Ok(LogicalExpr::Column {
                         table: None,
                         name: column_name,
@@ -99,9 +107,7 @@ impl RLSExpressionEvaluator {
                 }
             }
 
-            Expr::Value(value) => {
-                Ok(LogicalExpr::Literal(self.sql_value_to_value(value)?))
-            }
+            Expr::Value(value) => Ok(LogicalExpr::Literal(self.sql_value_to_value(value)?)),
 
             Expr::BinaryOp { left, op, right } => {
                 let left_expr = self.sql_expr_to_logical(left)?;
@@ -133,7 +139,7 @@ impl RLSExpressionEvaluator {
                     sqlparser::ast::FunctionArguments::None => vec![],
                     sqlparser::ast::FunctionArguments::Subquery(_) => {
                         return Err(Error::query_execution(
-                            "Subquery arguments not supported in RLS functions".to_string()
+                            "Subquery arguments not supported in RLS functions".to_string(),
                         ));
                     }
                     sqlparser::ast::FunctionArguments::List(list) => list.args.clone(),
@@ -217,8 +223,7 @@ impl RLSExpressionEvaluator {
                     Err(Error::query_execution(format!("Invalid number: {}", n)))
                 }
             }
-            sqlparser::ast::Value::SingleQuotedString(s) |
-            sqlparser::ast::Value::DoubleQuotedString(s) => {
+            sqlparser::ast::Value::SingleQuotedString(s) | sqlparser::ast::Value::DoubleQuotedString(s) => {
                 Ok(Value::String(s.clone()))
             }
             sqlparser::ast::Value::Boolean(b) => Ok(Value::Boolean(*b)),
@@ -259,19 +264,16 @@ impl RLSExpressionEvaluator {
 
             LogicalExpr::Column { name, .. } => {
                 // Find column index in schema
-                let index = self.schema.get_column_index(name)
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "Column '{}' not found in schema",
-                        name
-                    )))?;
+                let index = self
+                    .schema
+                    .get_column_index(name)
+                    .ok_or_else(|| Error::query_execution(format!("Column '{}' not found in schema", name)))?;
 
                 // Get value from tuple
-                tuple.get(index)
+                tuple
+                    .get(index)
                     .cloned()
-                    .ok_or_else(|| Error::query_execution(format!(
-                        "Column index {} out of bounds in tuple",
-                        index
-                    )))
+                    .ok_or_else(|| Error::query_execution(format!("Column index {} out of bounds in tuple", index)))
             }
 
             LogicalExpr::BinaryExpr { left, op, right } => {
@@ -301,9 +303,7 @@ impl RLSExpressionEvaluator {
                 Ok(Value::Boolean(is_actually_null == *is_null))
             }
 
-            LogicalExpr::ScalarFunction { fun, args } => {
-                self.evaluate_scalar_function(fun, args, tuple)
-            }
+            LogicalExpr::ScalarFunction { fun, args } => self.evaluate_scalar_function(fun, args, tuple),
 
             _ => Err(Error::query_execution(format!(
                 "Expression not supported in RLS: {:?}",
@@ -325,7 +325,10 @@ impl RLSExpressionEvaluator {
                 (Value::Float8(l), Value::Float8(r)) => Ok(Value::Boolean(l < r)),
                 (Value::Float4(l), Value::Float4(r)) => Ok(Value::Boolean(l < r)),
                 (Value::String(l), Value::String(r)) => Ok(Value::Boolean(l < r)),
-                _ => Err(Error::query_execution(format!("Cannot compare {:?} < {:?}", left, right))),
+                _ => Err(Error::query_execution(format!(
+                    "Cannot compare {:?} < {:?}",
+                    left, right
+                ))),
             },
 
             BinaryOperator::LtEq => match (left, right) {
@@ -335,7 +338,10 @@ impl RLSExpressionEvaluator {
                 (Value::Float8(l), Value::Float8(r)) => Ok(Value::Boolean(l <= r)),
                 (Value::Float4(l), Value::Float4(r)) => Ok(Value::Boolean(l <= r)),
                 (Value::String(l), Value::String(r)) => Ok(Value::Boolean(l <= r)),
-                _ => Err(Error::query_execution(format!("Cannot compare {:?} <= {:?}", left, right))),
+                _ => Err(Error::query_execution(format!(
+                    "Cannot compare {:?} <= {:?}",
+                    left, right
+                ))),
             },
 
             BinaryOperator::Gt => match (left, right) {
@@ -345,7 +351,10 @@ impl RLSExpressionEvaluator {
                 (Value::Float8(l), Value::Float8(r)) => Ok(Value::Boolean(l > r)),
                 (Value::Float4(l), Value::Float4(r)) => Ok(Value::Boolean(l > r)),
                 (Value::String(l), Value::String(r)) => Ok(Value::Boolean(l > r)),
-                _ => Err(Error::query_execution(format!("Cannot compare {:?} > {:?}", left, right))),
+                _ => Err(Error::query_execution(format!(
+                    "Cannot compare {:?} > {:?}",
+                    left, right
+                ))),
             },
 
             BinaryOperator::GtEq => match (left, right) {
@@ -355,7 +364,10 @@ impl RLSExpressionEvaluator {
                 (Value::Float8(l), Value::Float8(r)) => Ok(Value::Boolean(l >= r)),
                 (Value::Float4(l), Value::Float4(r)) => Ok(Value::Boolean(l >= r)),
                 (Value::String(l), Value::String(r)) => Ok(Value::Boolean(l >= r)),
-                _ => Err(Error::query_execution(format!("Cannot compare {:?} >= {:?}", left, right))),
+                _ => Err(Error::query_execution(format!(
+                    "Cannot compare {:?} >= {:?}",
+                    left, right
+                ))),
             },
 
             BinaryOperator::And => Self::three_valued_and(left, right),
@@ -376,13 +388,16 @@ impl RLSExpressionEvaluator {
                 Ok(Value::Boolean(!b))
             }
             crate::sql::UnaryOperator::Minus => match val {
-                Value::Int8(i) => i.checked_neg()
+                Value::Int8(i) => i
+                    .checked_neg()
                     .map(Value::Int8)
                     .ok_or_else(|| Error::query_execution("integer overflow: BIGINT negation")),
-                Value::Int4(i) => i.checked_neg()
+                Value::Int4(i) => i
+                    .checked_neg()
                     .map(Value::Int4)
                     .ok_or_else(|| Error::query_execution("integer overflow: INT negation")),
-                Value::Int2(i) => i.checked_neg()
+                Value::Int2(i) => i
+                    .checked_neg()
                     .map(Value::Int2)
                     .ok_or_else(|| Error::query_execution("integer overflow: SMALLINT negation")),
                 Value::Float8(f) => Ok(Value::Float8(-f)),
@@ -397,10 +412,7 @@ impl RLSExpressionEvaluator {
     fn value_to_bool(&self, val: &Value) -> Result<bool> {
         match val {
             Value::Boolean(b) => Ok(*b),
-            _ => Err(Error::query_execution(format!(
-                "Expected boolean value, got {:?}",
-                val
-            ))),
+            _ => Err(Error::query_execution(format!("Expected boolean value, got {:?}", val))),
         }
     }
 
@@ -409,9 +421,7 @@ impl RLSExpressionEvaluator {
         match value {
             Value::Boolean(b) => Ok(Some(*b)),
             Value::Null => Ok(None),
-            _ => Err(Error::query_execution(format!(
-                "Cannot convert {:?} to boolean", value
-            ))),
+            _ => Err(Error::query_execution(format!("Cannot convert {:?} to boolean", value))),
         }
     }
 
@@ -438,12 +448,7 @@ impl RLSExpressionEvaluator {
     }
 
     /// Short-circuit AND evaluation with SQL three-valued NULL logic.
-    fn evaluate_and_short_circuit(
-        &self,
-        left: &LogicalExpr,
-        right: &LogicalExpr,
-        tuple: &Tuple,
-    ) -> Result<Value> {
+    fn evaluate_and_short_circuit(&self, left: &LogicalExpr, right: &LogicalExpr, tuple: &Tuple) -> Result<Value> {
         let left_val = self.evaluate_expr(left, tuple)?;
         match &left_val {
             Value::Boolean(false) => Ok(Value::Boolean(false)),
@@ -453,7 +458,8 @@ impl RLSExpressionEvaluator {
                     Value::Boolean(b) => Ok(Value::Boolean(*b)),
                     Value::Null => Ok(Value::Null),
                     _ => Err(Error::query_execution(format!(
-                        "Cannot convert {:?} to boolean", right_val
+                        "Cannot convert {:?} to boolean",
+                        right_val
                     ))),
                 }
             }
@@ -463,23 +469,20 @@ impl RLSExpressionEvaluator {
                     Value::Boolean(false) => Ok(Value::Boolean(false)),
                     Value::Boolean(true) | Value::Null => Ok(Value::Null),
                     _ => Err(Error::query_execution(format!(
-                        "Cannot convert {:?} to boolean", right_val
+                        "Cannot convert {:?} to boolean",
+                        right_val
                     ))),
                 }
             }
             _ => Err(Error::query_execution(format!(
-                "Cannot convert {:?} to boolean", left_val
+                "Cannot convert {:?} to boolean",
+                left_val
             ))),
         }
     }
 
     /// Short-circuit OR evaluation with SQL three-valued NULL logic.
-    fn evaluate_or_short_circuit(
-        &self,
-        left: &LogicalExpr,
-        right: &LogicalExpr,
-        tuple: &Tuple,
-    ) -> Result<Value> {
+    fn evaluate_or_short_circuit(&self, left: &LogicalExpr, right: &LogicalExpr, tuple: &Tuple) -> Result<Value> {
         let left_val = self.evaluate_expr(left, tuple)?;
         match &left_val {
             Value::Boolean(true) => Ok(Value::Boolean(true)),
@@ -489,7 +492,8 @@ impl RLSExpressionEvaluator {
                     Value::Boolean(b) => Ok(Value::Boolean(*b)),
                     Value::Null => Ok(Value::Null),
                     _ => Err(Error::query_execution(format!(
-                        "Cannot convert {:?} to boolean", right_val
+                        "Cannot convert {:?} to boolean",
+                        right_val
                     ))),
                 }
             }
@@ -499,12 +503,14 @@ impl RLSExpressionEvaluator {
                     Value::Boolean(true) => Ok(Value::Boolean(true)),
                     Value::Boolean(false) | Value::Null => Ok(Value::Null),
                     _ => Err(Error::query_execution(format!(
-                        "Cannot convert {:?} to boolean", right_val
+                        "Cannot convert {:?} to boolean",
+                        right_val
                     ))),
                 }
             }
             _ => Err(Error::query_execution(format!(
-                "Cannot convert {:?} to boolean", left_val
+                "Cannot convert {:?} to boolean",
+                left_val
             ))),
         }
     }
@@ -528,7 +534,11 @@ impl RLSExpressionEvaluator {
                 }
 
                 // Evaluate the argument to get the setting name
-                let setting_name_val = self.evaluate_expr(args.first().ok_or_else(|| Error::query_execution("current_setting() requires exactly 1 argument"))?, tuple)?;
+                let setting_name_val = self.evaluate_expr(
+                    args.first()
+                        .ok_or_else(|| Error::query_execution("current_setting() requires exactly 1 argument"))?,
+                    tuple,
+                )?;
                 let setting_name = match setting_name_val {
                     Value::String(s) => s,
                     _ => return Err(Error::query_execution("current_setting() argument must be a string")),
@@ -591,8 +601,8 @@ pub fn evaluate_rls_expression(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Column, DataType};
     use crate::tenant::IsolationMode;
+    use crate::{Column, DataType};
     use uuid::Uuid;
 
     fn create_test_schema() -> Arc<Schema> {
@@ -618,10 +628,14 @@ mod tests {
         let context = create_test_context();
         let evaluator = RLSExpressionEvaluator::new(schema, Some(context));
 
-        let expr = evaluator.parse("tenant_id = '550e8400-e29b-41d4-a716-446655440000'").unwrap();
+        let expr = evaluator
+            .parse("tenant_id = '550e8400-e29b-41d4-a716-446655440000'")
+            .unwrap();
 
         match expr {
-            LogicalExpr::BinaryExpr { op: BinaryOperator::Eq, .. } => {},
+            LogicalExpr::BinaryExpr {
+                op: BinaryOperator::Eq, ..
+            } => {}
             _ => panic!("Expected BinaryExpr with Eq operator"),
         }
     }
@@ -638,7 +652,9 @@ mod tests {
             Value::String("Test".to_string()),
         ]);
 
-        let expr = evaluator.parse("tenant_id = '550e8400-e29b-41d4-a716-446655440000'").unwrap();
+        let expr = evaluator
+            .parse("tenant_id = '550e8400-e29b-41d4-a716-446655440000'")
+            .unwrap();
         let result = evaluator.evaluate(&expr, &tuple).unwrap();
 
         assert!(result);
@@ -656,7 +672,9 @@ mod tests {
             Value::String("Test".to_string()),
         ]);
 
-        let expr = evaluator.parse("tenant_id = '550e8400-e29b-41d4-a716-446655440000'").unwrap();
+        let expr = evaluator
+            .parse("tenant_id = '550e8400-e29b-41d4-a716-446655440000'")
+            .unwrap();
         let result = evaluator.evaluate(&expr, &tuple).unwrap();
 
         assert!(!result);

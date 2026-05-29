@@ -3,10 +3,10 @@
 //! This module provides a thread-safe connection pool implementation
 //! that manages database connections efficiently.
 
-use crate::{Error, Result, Config, StorageEngine};
-use std::sync::Arc;
-use parking_lot::{RwLock, Mutex};
+use crate::{Config, Error, Result, StorageEngine};
+use parking_lot::{Mutex, RwLock};
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Connection wrapper
@@ -350,9 +350,7 @@ mod tests {
 
     #[test]
     fn test_pool_creation() -> Result<()> {
-        let config = PoolConfig::new()
-            .with_min_size(2)
-            .with_max_size(5);
+        let config = PoolConfig::new().with_min_size(2).with_max_size(5);
 
         let pool = ConnectionPool::new(config)?;
         assert_eq!(pool.size(), 2);
@@ -362,9 +360,7 @@ mod tests {
 
     #[test]
     fn test_pool_get_connection() -> Result<()> {
-        let config = PoolConfig::new()
-            .with_min_size(2)
-            .with_max_size(5);
+        let config = PoolConfig::new().with_min_size(2).with_max_size(5);
 
         let pool = ConnectionPool::new(config)?;
 
@@ -380,9 +376,7 @@ mod tests {
 
     #[test]
     fn test_pool_multiple_connections() -> Result<()> {
-        let config = PoolConfig::new()
-            .with_min_size(2)
-            .with_max_size(5);
+        let config = PoolConfig::new().with_min_size(2).with_max_size(5);
 
         let pool = ConnectionPool::new(config)?;
 
@@ -403,9 +397,7 @@ mod tests {
 
     #[test]
     fn test_pool_max_size() -> Result<()> {
-        let config = PoolConfig::new()
-            .with_min_size(1)
-            .with_max_size(2);
+        let config = PoolConfig::new().with_min_size(1).with_max_size(2);
 
         let pool = ConnectionPool::new(config)?;
 
@@ -429,9 +421,7 @@ mod tests {
 
     #[test]
     fn test_pool_stats() -> Result<()> {
-        let config = PoolConfig::new()
-            .with_min_size(2)
-            .with_max_size(5);
+        let config = PoolConfig::new().with_min_size(2).with_max_size(5);
 
         let pool = ConnectionPool::new(config)?;
 
@@ -448,9 +438,7 @@ mod tests {
 
     #[test]
     fn test_pool_connection_reuse() -> Result<()> {
-        let config = PoolConfig::new()
-            .with_min_size(1)
-            .with_max_size(3);
+        let config = PoolConfig::new().with_min_size(1).with_max_size(3);
 
         let pool = ConnectionPool::new(config)?;
 

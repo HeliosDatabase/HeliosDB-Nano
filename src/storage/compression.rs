@@ -4,8 +4,8 @@
 //! of RocksDB's built-in LZ4 block compression. These types are kept for backward
 //! compatibility with existing catalog entries.
 
-use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 /// Compression configuration for a table (deprecated)
 ///
@@ -30,9 +30,15 @@ pub struct CompressionConfig {
     pub compression_level: u8,
 }
 
-fn default_true() -> bool { true }
-fn default_min_data_size() -> usize { 1024 }
-fn default_min_compression_ratio() -> f64 { 1.2 }
+fn default_true() -> bool {
+    true
+}
+fn default_min_data_size() -> usize {
+    1024
+}
+fn default_min_compression_ratio() -> f64 {
+    1.2
+}
 
 /// Compression statistics for a table (deprecated)
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

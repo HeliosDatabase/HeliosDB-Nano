@@ -105,20 +105,19 @@ mod ring_provider {
         }
 
         fn derive_key(&self, password: &[u8], salt: &[u8], _iterations: u32) -> Result<CryptoKey> {
-            use argon2::{Argon2, PasswordHasher};
             use argon2::password_hash::SaltString;
+            use argon2::{Argon2, PasswordHasher};
 
             // Argon2id uses its own iteration/memory parameters
-            let salt_string = SaltString::encode_b64(salt)
-                .map_err(|e| Error::encryption(format!("Salt encoding failed: {}", e)))?;
+            let salt_string =
+                SaltString::encode_b64(salt).map_err(|e| Error::encryption(format!("Salt encoding failed: {}", e)))?;
 
             let argon2 = Argon2::default();
             let hash = argon2
                 .hash_password(password, &salt_string)
                 .map_err(|e| Error::encryption(format!("Key derivation failed: {}", e)))?;
 
-            let hash_bytes = hash.hash
-                .ok_or_else(|| Error::encryption("No hash generated"))?;
+            let hash_bytes = hash.hash.ok_or_else(|| Error::encryption("No hash generated"))?;
             let key_bytes = hash_bytes.as_bytes();
 
             if key_bytes.len() < 32 {
@@ -126,7 +125,11 @@ mod ring_provider {
             }
 
             let mut key = [0u8; 32];
-            key.copy_from_slice(key_bytes.get(0..32).ok_or_else(|| Error::encryption("Derived key too short"))?);
+            key.copy_from_slice(
+                key_bytes
+                    .get(0..32)
+                    .ok_or_else(|| Error::encryption("Derived key too short"))?,
+            );
             Ok(key)
         }
 
@@ -187,7 +190,7 @@ mod fips_provider {
         }
 
         fn hash_content(&self, data: &[u8]) -> HashOutput {
-            use sha2::{Sha256, Digest};
+            use sha2::{Digest, Sha256};
             let mut hasher = Sha256::new();
             hasher.update(data);
             hasher.finalize().into()
@@ -217,10 +220,8 @@ mod fips_provider {
             // 1. Test SHA-256 known answer
             let test_input = b"HeliosDB FIPS self-test";
             let expected_hash: [u8; 32] = [
-                0x9e, 0x8b, 0x4f, 0x3c, 0x12, 0x5d, 0xa7, 0x89,
-                0x6b, 0x2e, 0x1f, 0x4a, 0x8c, 0x3d, 0x7e, 0x5b,
-                0xa1, 0xc9, 0x2f, 0x6d, 0x8e, 0x4b, 0x7a, 0x3c,
-                0xf5, 0x1d, 0x9e, 0x6b, 0x2a, 0x8c, 0x4f, 0x7d,
+                0x9e, 0x8b, 0x4f, 0x3c, 0x12, 0x5d, 0xa7, 0x89, 0x6b, 0x2e, 0x1f, 0x4a, 0x8c, 0x3d, 0x7e, 0x5b, 0xa1,
+                0xc9, 0x2f, 0x6d, 0x8e, 0x4b, 0x7a, 0x3c, 0xf5, 0x1d, 0x9e, 0x6b, 0x2a, 0x8c, 0x4f, 0x7d,
             ];
             let actual_hash = self.hash_content(test_input);
 

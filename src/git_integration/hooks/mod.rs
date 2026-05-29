@@ -13,9 +13,9 @@
 #![allow(unused_variables)]
 
 use crate::{Error, Result};
-use std::path::PathBuf;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 
 /// Hook type
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -106,7 +106,8 @@ impl HookManager {
             format!("--database \"{}\"", self.config.database)
         };
 
-        format!(r#"#!/bin/sh
+        format!(
+            r#"#!/bin/sh
 # HeliosDB-Nano Git Hook: post-checkout
 # Auto-switch database branch when Git branch changes
 #
@@ -154,8 +155,13 @@ fi
             format!("--database \"{}\"", self.config.database)
         };
 
-        let migration_check = self.config.migration_dir.as_ref().map(|dir| {
-            format!(r#"
+        let migration_check = self
+            .config
+            .migration_dir
+            .as_ref()
+            .map(|dir| {
+                format!(
+                    r#"
 # Validate migrations
 if [ -d "{dir}" ]; then
     helios migration validate --dir "{dir}" {db_arg}
@@ -165,12 +171,14 @@ if [ -d "{dir}" ]; then
     fi
 fi
 "#,
-                dir = dir,
-                db_arg = db_arg
-            )
-        }).unwrap_or_default();
+                    dir = dir,
+                    db_arg = db_arg
+                )
+            })
+            .unwrap_or_default();
 
-        format!(r#"#!/bin/sh
+        format!(
+            r#"#!/bin/sh
 # HeliosDB-Nano Git Hook: pre-commit
 # Validate schema and migrations before commit
 
@@ -200,7 +208,8 @@ exit 0
             format!("--database \"{}\"", self.config.database)
         };
 
-        format!(r#"#!/bin/sh
+        format!(
+            r#"#!/bin/sh
 # HeliosDB-Nano Git Hook: post-merge
 # Sync database state after merge
 
@@ -268,8 +277,7 @@ exit 0
 
         // Write hook script
         let script = self.generate(hook_type);
-        fs::write(&hook_path, &script)
-            .map_err(|e| Error::io(format!("Failed to write hook: {}", e)))?;
+        fs::write(&hook_path, &script).map_err(|e| Error::io(format!("Failed to write hook: {}", e)))?;
 
         // Make executable (Unix only)
         #[cfg(unix)]
@@ -300,12 +308,11 @@ exit 0
 
         if hook_path.exists() {
             // Check if it's our hook
-            let content = fs::read_to_string(&hook_path)
-                .map_err(|e| Error::io(format!("Failed to read hook: {}", e)))?;
+            let content =
+                fs::read_to_string(&hook_path).map_err(|e| Error::io(format!("Failed to read hook: {}", e)))?;
 
             if content.contains("HeliosDB-Nano Git Hook") {
-                fs::remove_file(&hook_path)
-                    .map_err(|e| Error::io(format!("Failed to remove hook: {}", e)))?;
+                fs::remove_file(&hook_path).map_err(|e| Error::io(format!("Failed to remove hook: {}", e)))?;
 
                 // Restore backup if exists
                 let backup_path = hook_path.with_extension("backup");

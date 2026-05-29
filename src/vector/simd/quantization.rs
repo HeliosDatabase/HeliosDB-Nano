@@ -28,17 +28,22 @@ pub fn asymmetric_distance_simd(
     num_subquantizers: usize,
     codebook_size: usize,
 ) -> f32 {
-    assert_eq!(codes.len(), num_subquantizers, "Codes length must match number of sub-quantizers");
-    assert_eq!(distance_table.len(), num_subquantizers * codebook_size,
-               "Distance table size mismatch");
+    assert_eq!(
+        codes.len(),
+        num_subquantizers,
+        "Codes length must match number of sub-quantizers"
+    );
+    assert_eq!(
+        distance_table.len(),
+        num_subquantizers * codebook_size,
+        "Distance table size mismatch"
+    );
 
     #[cfg(target_arch = "x86_64")]
     {
         let features = cpu_features();
         if features.avx2 && num_subquantizers >= 8 {
-            return unsafe {
-                asymmetric_distance_avx2(codes, distance_table, num_subquantizers, codebook_size)
-            };
+            return unsafe { asymmetric_distance_avx2(codes, distance_table, num_subquantizers, codebook_size) };
         }
     }
 
@@ -247,10 +252,10 @@ mod tests {
     fn test_asymmetric_distance_simple() {
         let codes = vec![0, 1, 2, 3];
         let distance_table = vec![
-            1.0, 2.0, 3.0, 4.0,  // sub-quantizer 0
-            5.0, 6.0, 7.0, 8.0,  // sub-quantizer 1
-            9.0, 10.0, 11.0, 12.0,  // sub-quantizer 2
-            13.0, 14.0, 15.0, 16.0,  // sub-quantizer 3
+            1.0, 2.0, 3.0, 4.0, // sub-quantizer 0
+            5.0, 6.0, 7.0, 8.0, // sub-quantizer 1
+            9.0, 10.0, 11.0, 12.0, // sub-quantizer 2
+            13.0, 14.0, 15.0, 16.0, // sub-quantizer 3
         ];
 
         let dist = asymmetric_distance_simd(&[], &codes, &distance_table, 4, 4);
@@ -270,9 +275,7 @@ mod tests {
         let codebook_size = 256;
 
         let codes: Vec<u8> = (0..num_subquantizers).map(|i| (i * 13) as u8).collect();
-        let distance_table: Vec<f32> = (0..num_subquantizers * codebook_size)
-            .map(|i| i as f32 * 0.1)
-            .collect();
+        let distance_table: Vec<f32> = (0..num_subquantizers * codebook_size).map(|i| i as f32 * 0.1).collect();
 
         let dist_simd = asymmetric_distance_simd(&[], &codes, &distance_table, num_subquantizers, codebook_size);
         let dist_scalar = asymmetric_distance_scalar(&codes, &distance_table, num_subquantizers, codebook_size);
@@ -287,22 +290,21 @@ mod tests {
             1e-5
         };
 
-        assert!((dist_simd - dist_scalar).abs() < tolerance,
-                "SIMD ({}) != Scalar ({}), diff: {}", dist_simd, dist_scalar, (dist_simd - dist_scalar).abs());
+        assert!(
+            (dist_simd - dist_scalar).abs() < tolerance,
+            "SIMD ({}) != Scalar ({}), diff: {}",
+            dist_simd,
+            dist_scalar,
+            (dist_simd - dist_scalar).abs()
+        );
     }
 
     #[test]
     fn test_compute_distance_table() {
         // Create simple codebooks
         let codebooks = vec![
-            vec![
-                vec![1.0, 0.0],
-                vec![0.0, 1.0],
-            ],
-            vec![
-                vec![2.0, 0.0],
-                vec![0.0, 2.0],
-            ],
+            vec![vec![1.0, 0.0], vec![0.0, 1.0]],
+            vec![vec![2.0, 0.0], vec![0.0, 2.0]],
         ];
 
         let query = vec![1.0, 1.0, 1.0, 1.0];
@@ -321,14 +323,8 @@ mod tests {
     #[test]
     fn test_encode_vector_simd() {
         let codebooks = vec![
-            vec![
-                vec![0.0, 0.0],
-                vec![1.0, 1.0],
-            ],
-            vec![
-                vec![0.0, 0.0],
-                vec![2.0, 2.0],
-            ],
+            vec![vec![0.0, 0.0], vec![1.0, 1.0]],
+            vec![vec![0.0, 0.0], vec![2.0, 2.0]],
         ];
 
         let vector = vec![0.9, 0.9, 1.9, 1.9];
@@ -350,29 +346,23 @@ mod tests {
         for num_subquantizers in [8, 16, 32] {
             let codebook_size = 256;
 
-            let codes: Vec<u8> = (0..num_subquantizers)
-                .map(|_| rng.gen::<u8>())
-                .collect();
+            let codes: Vec<u8> = (0..num_subquantizers).map(|_| rng.gen::<u8>()).collect();
 
             let distance_table: Vec<f32> = (0..num_subquantizers * codebook_size)
                 .map(|_| rng.gen_range(0.0..10.0))
                 .collect();
 
-            let dist_simd = asymmetric_distance_simd(
-                &[], &codes, &distance_table, num_subquantizers, codebook_size
-            );
-            let dist_scalar = asymmetric_distance_scalar(
-                &codes, &distance_table, num_subquantizers, codebook_size
-            );
+            let dist_simd = asymmetric_distance_simd(&[], &codes, &distance_table, num_subquantizers, codebook_size);
+            let dist_scalar = asymmetric_distance_scalar(&codes, &distance_table, num_subquantizers, codebook_size);
 
             // Use adaptive tolerance based on magnitude
             let max_dist = dist_simd.max(dist_scalar);
             let tolerance = if max_dist > 100.0 {
-                max_dist * 1e-3  // 0.1% relative tolerance for large values
+                max_dist * 1e-3 // 0.1% relative tolerance for large values
             } else if max_dist > 10.0 {
-                max_dist * 1e-4  // 0.01% relative tolerance
+                max_dist * 1e-4 // 0.01% relative tolerance
             } else {
-                1e-4  // Absolute tolerance for small values
+                1e-4 // Absolute tolerance for small values
             };
 
             assert!(

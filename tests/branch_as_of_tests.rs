@@ -10,9 +10,8 @@
 #![cfg(feature = "internal-tests")]
 
 use heliosdb_nano::{
-    Config,
-    storage::{StorageEngine, BranchOptions},
-    Tuple, Value,
+    storage::{BranchOptions, StorageEngine},
+    Config, Tuple, Value,
 };
 
 #[test]
@@ -21,12 +20,14 @@ fn test_create_branch_as_of_now() {
     let engine = StorageEngine::open_in_memory(&config).unwrap();
 
     // Create branch with AS OF NOW (default behavior)
-    let branch_id = engine.create_branch_at_snapshot(
-        "dev",
-        Some("main"),
-        None, // AS OF NOW
-        BranchOptions::default(),
-    ).unwrap();
+    let branch_id = engine
+        .create_branch_at_snapshot(
+            "dev",
+            Some("main"),
+            None, // AS OF NOW
+            BranchOptions::default(),
+        )
+        .unwrap();
 
     assert!(branch_id > 1); // main is 1
 
@@ -48,12 +49,14 @@ fn test_create_branch_at_specific_snapshot() {
     snapshot_mgr.register_snapshot(100).unwrap();
 
     // Create branch at historical snapshot
-    let branch_id = engine.create_branch_at_snapshot(
-        "historical",
-        Some("main"),
-        Some(100), // Specific snapshot
-        BranchOptions::default(),
-    ).unwrap();
+    let branch_id = engine
+        .create_branch_at_snapshot(
+            "historical",
+            Some("main"),
+            Some(100), // Specific snapshot
+            BranchOptions::default(),
+        )
+        .unwrap();
 
     assert!(branch_id > 1);
 
@@ -75,9 +78,7 @@ fn test_create_branch_as_of_timestamp_string() {
     let timestamp_str = snapshot_meta.wall_clock_time;
 
     // Create branch using AS OF TIMESTAMP
-    let resolved = snapshot_mgr.resolve_as_of(
-        &heliosdb_nano::sql::logical_plan::AsOfClause::Timestamp(timestamp_str)
-    );
+    let resolved = snapshot_mgr.resolve_as_of(&heliosdb_nano::sql::logical_plan::AsOfClause::Timestamp(timestamp_str));
 
     // Should resolve successfully to snapshot 100
     assert!(resolved.is_ok(), "Failed to resolve timestamp: {:?}", resolved.err());
@@ -85,12 +86,9 @@ fn test_create_branch_as_of_timestamp_string() {
     assert_eq!(snapshot_id, 100);
 
     // Create branch at resolved snapshot
-    let branch_id = engine.create_branch_at_snapshot(
-        "time_travel",
-        Some("main"),
-        Some(snapshot_id),
-        BranchOptions::default(),
-    ).unwrap();
+    let branch_id = engine
+        .create_branch_at_snapshot("time_travel", Some("main"), Some(snapshot_id), BranchOptions::default())
+        .unwrap();
 
     assert!(branch_id > 1);
 
@@ -110,19 +108,16 @@ fn test_create_branch_as_of_transaction() {
     let txn_id = snapshot_meta.transaction_id;
 
     // Resolve using AS OF TRANSACTION
-    let resolved = snapshot_mgr.resolve_as_of(
-        &heliosdb_nano::sql::logical_plan::AsOfClause::Transaction(txn_id)
-    ).unwrap();
+    let resolved = snapshot_mgr
+        .resolve_as_of(&heliosdb_nano::sql::logical_plan::AsOfClause::Transaction(txn_id))
+        .unwrap();
 
     assert_eq!(resolved, 200);
 
     // Create branch at transaction point
-    let branch_id = engine.create_branch_at_snapshot(
-        "txn_branch",
-        Some("main"),
-        Some(resolved),
-        BranchOptions::default(),
-    ).unwrap();
+    let branch_id = engine
+        .create_branch_at_snapshot("txn_branch", Some("main"), Some(resolved), BranchOptions::default())
+        .unwrap();
 
     assert!(branch_id > 1);
 
@@ -142,19 +137,16 @@ fn test_create_branch_as_of_scn() {
     let scn = snapshot_meta.scn;
 
     // Resolve using AS OF SCN
-    let resolved = snapshot_mgr.resolve_as_of(
-        &heliosdb_nano::sql::logical_plan::AsOfClause::Scn(scn)
-    ).unwrap();
+    let resolved = snapshot_mgr
+        .resolve_as_of(&heliosdb_nano::sql::logical_plan::AsOfClause::Scn(scn))
+        .unwrap();
 
     assert_eq!(resolved, 300);
 
     // Create branch at SCN point
-    let branch_id = engine.create_branch_at_snapshot(
-        "scn_branch",
-        Some("main"),
-        Some(resolved),
-        BranchOptions::default(),
-    ).unwrap();
+    let branch_id = engine
+        .create_branch_at_snapshot("scn_branch", Some("main"), Some(resolved), BranchOptions::default())
+        .unwrap();
 
     assert!(branch_id > 1);
 
@@ -171,11 +163,9 @@ fn test_invalid_timestamp_returns_error() {
     let snapshot_mgr = engine.snapshot_manager();
 
     // Try to resolve non-existent timestamp
-    let result = snapshot_mgr.resolve_as_of(
-        &heliosdb_nano::sql::logical_plan::AsOfClause::Timestamp(
-            "2099-12-31 23:59:59".to_string()
-        )
-    );
+    let result = snapshot_mgr.resolve_as_of(&heliosdb_nano::sql::logical_plan::AsOfClause::Timestamp(
+        "2099-12-31 23:59:59".to_string(),
+    ));
 
     // Should fail - no snapshot exists for future timestamp
     assert!(result.is_err());
@@ -189,9 +179,7 @@ fn test_invalid_transaction_returns_error() {
     let snapshot_mgr = engine.snapshot_manager();
 
     // Try to resolve non-existent transaction
-    let result = snapshot_mgr.resolve_as_of(
-        &heliosdb_nano::sql::logical_plan::AsOfClause::Transaction(999999)
-    );
+    let result = snapshot_mgr.resolve_as_of(&heliosdb_nano::sql::logical_plan::AsOfClause::Transaction(999999));
 
     // Should fail - transaction doesn't exist
     assert!(result.is_err());
@@ -205,9 +193,7 @@ fn test_invalid_scn_returns_error() {
     let snapshot_mgr = engine.snapshot_manager();
 
     // Try to resolve non-existent SCN
-    let result = snapshot_mgr.resolve_as_of(
-        &heliosdb_nano::sql::logical_plan::AsOfClause::Scn(999999)
-    );
+    let result = snapshot_mgr.resolve_as_of(&heliosdb_nano::sql::logical_plan::AsOfClause::Scn(999999));
 
     // Should fail - SCN doesn't exist
     assert!(result.is_err());
@@ -226,26 +212,17 @@ fn test_multiple_snapshots_resolution() {
     let snap3 = snapshot_mgr.register_snapshot(300).unwrap();
 
     // Create branches at different snapshots
-    engine.create_branch_at_snapshot(
-        "branch1",
-        Some("main"),
-        Some(100),
-        BranchOptions::default(),
-    ).unwrap();
+    engine
+        .create_branch_at_snapshot("branch1", Some("main"), Some(100), BranchOptions::default())
+        .unwrap();
 
-    engine.create_branch_at_snapshot(
-        "branch2",
-        Some("main"),
-        Some(200),
-        BranchOptions::default(),
-    ).unwrap();
+    engine
+        .create_branch_at_snapshot("branch2", Some("main"), Some(200), BranchOptions::default())
+        .unwrap();
 
-    engine.create_branch_at_snapshot(
-        "branch3",
-        Some("main"),
-        Some(300),
-        BranchOptions::default(),
-    ).unwrap();
+    engine
+        .create_branch_at_snapshot("branch3", Some("main"), Some(300), BranchOptions::default())
+        .unwrap();
 
     // Verify each branch has correct snapshot
     let b1 = engine.get_branch("branch1").unwrap();
@@ -277,20 +254,14 @@ fn test_branch_created_at_snapshot_inherits_parent_state() {
     snapshot_mgr.register_snapshot(200).unwrap();
 
     // Create branch at first snapshot (should see v1)
-    engine.create_branch_at_snapshot(
-        "branch_v1",
-        Some("main"),
-        Some(100),
-        BranchOptions::default(),
-    ).unwrap();
+    engine
+        .create_branch_at_snapshot("branch_v1", Some("main"), Some(100), BranchOptions::default())
+        .unwrap();
 
     // Create branch at second snapshot (should see v2)
-    engine.create_branch_at_snapshot(
-        "branch_v2",
-        Some("main"),
-        Some(200),
-        BranchOptions::default(),
-    ).unwrap();
+    engine
+        .create_branch_at_snapshot("branch_v2", Some("main"), Some(200), BranchOptions::default())
+        .unwrap();
 
     // Verify branches were created at correct snapshots
     let b1 = engine.get_branch("branch_v1").unwrap();
@@ -312,14 +283,14 @@ fn test_timestamp_format_variations() {
 
     // Try different timestamp formats
     let formats = vec![
-        "2025-11-21 10:00:00",  // Space separator
-        "2025-11-21T10:00:00",  // ISO format
+        "2025-11-21 10:00:00", // Space separator
+        "2025-11-21T10:00:00", // ISO format
     ];
 
     for format in formats {
-        let result = snapshot_mgr.resolve_as_of(
-            &heliosdb_nano::sql::logical_plan::AsOfClause::Timestamp(format.to_string())
-        );
+        let result = snapshot_mgr.resolve_as_of(&heliosdb_nano::sql::logical_plan::AsOfClause::Timestamp(
+            format.to_string(),
+        ));
 
         // Should either resolve or fail gracefully (depending on whether snapshot exists)
         // The key is that it should not panic

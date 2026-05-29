@@ -7,13 +7,11 @@
 //! - Describe (introspect statements/portals)
 
 use heliosdb_nano::{
-    EmbeddedDatabase,
     protocol::postgres::{
-        PgServerBuilder, AuthMethod,
-        PreparedStatementManager, PreparedStatement, Portal, PortalState,
         prepared::{decode_parameter, substitute_parameters},
+        AuthMethod, PgServerBuilder, Portal, PortalState, PreparedStatement, PreparedStatementManager,
     },
-    Value,
+    EmbeddedDatabase, Value,
 };
 use std::sync::Arc;
 
@@ -269,19 +267,23 @@ fn test_portal_state_transitions() {
     manager.store_portal(portal).unwrap();
 
     // Ready → Suspended
-    manager.update_portal_state(
-        "test_portal",
-        PortalState::Suspended {
-            rows_returned: 10,
-            cached_results: None,
-        },
-    ).unwrap();
+    manager
+        .update_portal_state(
+            "test_portal",
+            PortalState::Suspended {
+                rows_returned: 10,
+                cached_results: None,
+            },
+        )
+        .unwrap();
 
     let portal = manager.get_portal("test_portal").unwrap().unwrap();
     assert!(matches!(portal.state, PortalState::Suspended { .. }));
 
     // Suspended → Complete
-    manager.update_portal_state("test_portal", PortalState::Complete).unwrap();
+    manager
+        .update_portal_state("test_portal", PortalState::Complete)
+        .unwrap();
 
     let portal = manager.get_portal("test_portal").unwrap().unwrap();
     assert_eq!(portal.state, PortalState::Complete);
@@ -329,9 +331,12 @@ fn test_schema_derivation() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
 
     // Create test table
-    db.execute("CREATE TABLE users (id INT, name TEXT, email TEXT)").unwrap();
-    db.execute("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')").unwrap();
-    db.execute("INSERT INTO users VALUES (2, 'Bob', 'bob@example.com')").unwrap();
+    db.execute("CREATE TABLE users (id INT, name TEXT, email TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO users VALUES (1, 'Alice', 'alice@example.com')")
+        .unwrap();
+    db.execute("INSERT INTO users VALUES (2, 'Bob', 'bob@example.com')")
+        .unwrap();
 
     // Parse a SELECT query and verify schema derivation
     let parser = heliosdb_nano::sql::Parser::new();
@@ -394,7 +399,8 @@ fn test_complex_query_schema() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
 
     // Create test tables
-    db.execute("CREATE TABLE orders (order_id INT, user_id INT, amount FLOAT8)").unwrap();
+    db.execute("CREATE TABLE orders (order_id INT, user_id INT, amount FLOAT8)")
+        .unwrap();
     db.execute("CREATE TABLE users (user_id INT, name TEXT)").unwrap();
 
     let parser = heliosdb_nano::sql::Parser::new();
@@ -402,15 +408,17 @@ fn test_complex_query_schema() {
     let planner = heliosdb_nano::sql::planner::Planner::with_catalog(&catalog);
 
     // Test aggregate query
-    let agg = parser.parse_one("SELECT user_id, COUNT(*), SUM(amount) FROM orders GROUP BY user_id").unwrap();
+    let agg = parser
+        .parse_one("SELECT user_id, COUNT(*), SUM(amount) FROM orders GROUP BY user_id")
+        .unwrap();
     let plan = planner.statement_to_plan(agg).unwrap();
     let schema = plan.schema();
     assert_eq!(schema.columns.len(), 3); // user_id, count, sum
 
     // Test join query
-    let join = parser.parse_one(
-        "SELECT users.name, orders.amount FROM users JOIN orders ON users.user_id = orders.user_id"
-    ).unwrap();
+    let join = parser
+        .parse_one("SELECT users.name, orders.amount FROM users JOIN orders ON users.user_id = orders.user_id")
+        .unwrap();
     let plan = planner.statement_to_plan(join).unwrap();
     let schema = plan.schema();
     assert_eq!(schema.columns.len(), 2); // name, amount

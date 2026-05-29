@@ -46,31 +46,31 @@ const UTF8MB4_GENERAL_CI: u8 = 45;
 pub struct CapabilityFlags(u32);
 
 impl CapabilityFlags {
-    pub const CLIENT_LONG_PASSWORD: u32                  = 0x0000_0001;
-    pub const CLIENT_FOUND_ROWS: u32                     = 0x0000_0002;
-    pub const CLIENT_LONG_FLAG: u32                      = 0x0000_0004;
-    pub const CLIENT_CONNECT_WITH_DB: u32                = 0x0000_0008;
-    pub const CLIENT_NO_SCHEMA: u32                      = 0x0000_0010;
-    pub const CLIENT_COMPRESS: u32                       = 0x0000_0020;
-    pub const CLIENT_ODBC: u32                           = 0x0000_0040;
-    pub const CLIENT_LOCAL_FILES: u32                    = 0x0000_0080;
-    pub const CLIENT_IGNORE_SPACE: u32                   = 0x0000_0100;
-    pub const CLIENT_PROTOCOL_41: u32                    = 0x0000_0200;
-    pub const CLIENT_INTERACTIVE: u32                    = 0x0000_0400;
-    pub const CLIENT_SSL: u32                            = 0x0000_0800;
-    pub const CLIENT_IGNORE_SIGPIPE: u32                 = 0x0000_1000;
-    pub const CLIENT_TRANSACTIONS: u32                   = 0x0000_2000;
-    pub const CLIENT_RESERVED: u32                       = 0x0000_4000;
-    pub const CLIENT_SECURE_CONNECTION: u32              = 0x0000_8000;
-    pub const CLIENT_MULTI_STATEMENTS: u32               = 0x0001_0000;
-    pub const CLIENT_MULTI_RESULTS: u32                  = 0x0002_0000;
-    pub const CLIENT_PS_MULTI_RESULTS: u32               = 0x0004_0000;
-    pub const CLIENT_PLUGIN_AUTH: u32                    = 0x0008_0000;
-    pub const CLIENT_CONNECT_ATTRS: u32                  = 0x0010_0000;
+    pub const CLIENT_LONG_PASSWORD: u32 = 0x0000_0001;
+    pub const CLIENT_FOUND_ROWS: u32 = 0x0000_0002;
+    pub const CLIENT_LONG_FLAG: u32 = 0x0000_0004;
+    pub const CLIENT_CONNECT_WITH_DB: u32 = 0x0000_0008;
+    pub const CLIENT_NO_SCHEMA: u32 = 0x0000_0010;
+    pub const CLIENT_COMPRESS: u32 = 0x0000_0020;
+    pub const CLIENT_ODBC: u32 = 0x0000_0040;
+    pub const CLIENT_LOCAL_FILES: u32 = 0x0000_0080;
+    pub const CLIENT_IGNORE_SPACE: u32 = 0x0000_0100;
+    pub const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
+    pub const CLIENT_INTERACTIVE: u32 = 0x0000_0400;
+    pub const CLIENT_SSL: u32 = 0x0000_0800;
+    pub const CLIENT_IGNORE_SIGPIPE: u32 = 0x0000_1000;
+    pub const CLIENT_TRANSACTIONS: u32 = 0x0000_2000;
+    pub const CLIENT_RESERVED: u32 = 0x0000_4000;
+    pub const CLIENT_SECURE_CONNECTION: u32 = 0x0000_8000;
+    pub const CLIENT_MULTI_STATEMENTS: u32 = 0x0001_0000;
+    pub const CLIENT_MULTI_RESULTS: u32 = 0x0002_0000;
+    pub const CLIENT_PS_MULTI_RESULTS: u32 = 0x0004_0000;
+    pub const CLIENT_PLUGIN_AUTH: u32 = 0x0008_0000;
+    pub const CLIENT_CONNECT_ATTRS: u32 = 0x0010_0000;
     pub const CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA: u32 = 0x0020_0000;
-    pub const CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS: u32   = 0x0040_0000;
-    pub const CLIENT_SESSION_TRACK: u32                  = 0x0080_0000;
-    pub const CLIENT_DEPRECATE_EOF: u32                  = 0x0100_0000;
+    pub const CLIENT_CAN_HANDLE_EXPIRED_PASSWORDS: u32 = 0x0040_0000;
+    pub const CLIENT_SESSION_TRACK: u32 = 0x0080_0000;
+    pub const CLIENT_DEPRECATE_EOF: u32 = 0x0100_0000;
 
     pub fn new(flags: u32) -> Self {
         Self(flags)
@@ -124,8 +124,8 @@ impl CapabilityFlags {
 pub struct StatusFlags(u16);
 
 impl StatusFlags {
-    pub const SERVER_STATUS_IN_TRANS: u16     = 0x0001;
-    pub const SERVER_STATUS_AUTOCOMMIT: u16  = 0x0002;
+    pub const SERVER_STATUS_IN_TRANS: u16 = 0x0001;
+    pub const SERVER_STATUS_AUTOCOMMIT: u16 = 0x0002;
     pub const SERVER_MORE_RESULTS_EXISTS: u16 = 0x0008;
 
     pub fn new(flags: u16) -> Self {
@@ -160,54 +160,54 @@ impl StatusFlags {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum ColumnType {
-    Decimal    = 0x00,
-    Tiny       = 0x01,
-    Short      = 0x02,
-    Long       = 0x03,
-    Float      = 0x04,
-    Double     = 0x05,
-    Null       = 0x06,
-    Timestamp  = 0x07,
-    LongLong   = 0x08,
-    Int24      = 0x09,
-    Date       = 0x0a,
-    Time       = 0x0b,
-    DateTime   = 0x0c,
-    Year       = 0x0d,
-    VarChar    = 0x0f,
-    Bit        = 0x10,
-    Json       = 0xf5,
+    Decimal = 0x00,
+    Tiny = 0x01,
+    Short = 0x02,
+    Long = 0x03,
+    Float = 0x04,
+    Double = 0x05,
+    Null = 0x06,
+    Timestamp = 0x07,
+    LongLong = 0x08,
+    Int24 = 0x09,
+    Date = 0x0a,
+    Time = 0x0b,
+    DateTime = 0x0c,
+    Year = 0x0d,
+    VarChar = 0x0f,
+    Bit = 0x10,
+    Json = 0xf5,
     NewDecimal = 0xf6,
-    Blob       = 0xfc,
-    VarString  = 0xfd,
-    String     = 0xfe,
+    Blob = 0xfc,
+    VarString = 0xfd,
+    String = 0xfe,
 }
 
 impl ColumnType {
     /// Map a Nano `Value` to the closest MySQL column type.
     fn from_value(v: &Value) -> Self {
         match v {
-            Value::Null       => ColumnType::Null,
+            Value::Null => ColumnType::Null,
             Value::Boolean(_) => ColumnType::Tiny,
-            Value::Int2(_)    => ColumnType::Short,
-            Value::Int4(_)    => ColumnType::Long,
-            Value::Int8(_)    => ColumnType::LongLong,
-            Value::Float4(_)  => ColumnType::Float,
-            Value::Float8(_)  => ColumnType::Double,
+            Value::Int2(_) => ColumnType::Short,
+            Value::Int4(_) => ColumnType::Long,
+            Value::Int8(_) => ColumnType::LongLong,
+            Value::Float4(_) => ColumnType::Float,
+            Value::Float8(_) => ColumnType::Double,
             Value::Numeric(_) => ColumnType::NewDecimal,
-            Value::String(_)  => ColumnType::VarString,
-            Value::Bytes(_)   => ColumnType::Blob,
-            Value::Uuid(_)    => ColumnType::VarString,
+            Value::String(_) => ColumnType::VarString,
+            Value::Bytes(_) => ColumnType::Blob,
+            Value::Uuid(_) => ColumnType::VarString,
             Value::Timestamp(_) => ColumnType::Timestamp,
-            Value::Date(_)    => ColumnType::Date,
-            Value::Time(_)    => ColumnType::Time,
+            Value::Date(_) => ColumnType::Date,
+            Value::Time(_) => ColumnType::Time,
             Value::Interval(_) => ColumnType::VarString,
-            Value::Json(_)    => ColumnType::Json,
-            Value::Array(_)   => ColumnType::Json,
-            Value::Vector(_)  => ColumnType::Json,
+            Value::Json(_) => ColumnType::Json,
+            Value::Array(_) => ColumnType::Json,
+            Value::Vector(_) => ColumnType::Json,
             Value::DictRef { .. } => ColumnType::LongLong,
-            Value::CasRef { .. }  => ColumnType::VarString,
-            Value::ColumnarRef    => ColumnType::VarString,
+            Value::CasRef { .. } => ColumnType::VarString,
+            Value::ColumnarRef => ColumnType::VarString,
         }
     }
 }
@@ -219,17 +219,17 @@ impl ColumnType {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[repr(u8)]
 pub enum Command {
-    ComQuit            = 0x01,
-    ComInitDb          = 0x02,
-    ComQuery           = 0x03,
-    ComFieldList       = 0x04,
-    ComStatistics      = 0x09,
-    ComPing            = 0x0e,
-    ComStmtPrepare     = 0x16,
-    ComStmtExecute     = 0x17,
-    ComStmtClose       = 0x19,
-    ComStmtReset       = 0x1a,
-    ComSetOption       = 0x1b,
+    ComQuit = 0x01,
+    ComInitDb = 0x02,
+    ComQuery = 0x03,
+    ComFieldList = 0x04,
+    ComStatistics = 0x09,
+    ComPing = 0x0e,
+    ComStmtPrepare = 0x16,
+    ComStmtExecute = 0x17,
+    ComStmtClose = 0x19,
+    ComStmtReset = 0x1a,
+    ComSetOption = 0x1b,
     ComResetConnection = 0x1f,
 }
 
@@ -248,7 +248,7 @@ impl Command {
             0x1a => Some(Self::ComStmtReset),
             0x1b => Some(Self::ComSetOption),
             0x1f => Some(Self::ComResetConnection),
-            _    => None,
+            _ => None,
         }
     }
 }
@@ -282,12 +282,12 @@ impl From<crate::Error> for MySqlError {
 impl std::fmt::Display for MySqlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Io(e)            => write!(f, "IO: {}", e),
-            Self::Protocol(msg)    => write!(f, "Protocol: {}", msg),
+            Self::Io(e) => write!(f, "IO: {}", e),
+            Self::Protocol(msg) => write!(f, "Protocol: {}", msg),
             Self::ConnectionClosed => write!(f, "Connection closed"),
-            Self::Unsupported(c)   => write!(f, "Unsupported command: 0x{:02x}", c),
+            Self::Unsupported(c) => write!(f, "Unsupported command: 0x{:02x}", c),
             Self::StatementNotFound(id) => write!(f, "Statement {} not found", id),
-            Self::Db(e)            => write!(f, "DB: {}", e),
+            Self::Db(e) => write!(f, "DB: {}", e),
         }
     }
 }
@@ -393,8 +393,7 @@ fn read_lenenc_str(buf: &mut Bytes) -> Result<String> {
         return Err(MySqlError::Protocol("short lenenc_str".into()));
     }
     let bytes = buf.copy_to_bytes(len);
-    String::from_utf8(bytes.to_vec())
-        .map_err(|e| MySqlError::Protocol(format!("invalid utf-8: {}", e)))
+    String::from_utf8(bytes.to_vec()).map_err(|e| MySqlError::Protocol(format!("invalid utf-8: {}", e)))
 }
 
 fn read_lenenc_bytes(buf: &mut Bytes) -> Result<Vec<u8>> {
@@ -417,8 +416,7 @@ fn read_null_terminated(buf: &mut Bytes) -> Result<String> {
         }
         out.push(b);
     }
-    String::from_utf8(out)
-        .map_err(|e| MySqlError::Protocol(format!("invalid utf-8: {}", e)))
+    String::from_utf8(out).map_err(|e| MySqlError::Protocol(format!("invalid utf-8: {}", e)))
 }
 
 fn read_null_terminated_bytes(buf: &mut Bytes) -> Result<Vec<u8>> {
@@ -469,32 +467,29 @@ impl HandshakeResponse {
 
         let username = read_null_terminated(&mut payload)?;
 
-        let auth_response =
-            if client_flags.has(CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
-                read_lenenc_bytes(&mut payload)?
-            } else if client_flags.has(CapabilityFlags::CLIENT_SECURE_CONNECTION) {
-                let len = payload.get_u8() as usize;
-                if payload.remaining() < len {
-                    return Err(MySqlError::Protocol("auth response truncated".into()));
-                }
-                payload.copy_to_bytes(len).to_vec()
-            } else {
-                read_null_terminated_bytes(&mut payload)?
-            };
+        let auth_response = if client_flags.has(CapabilityFlags::CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA) {
+            read_lenenc_bytes(&mut payload)?
+        } else if client_flags.has(CapabilityFlags::CLIENT_SECURE_CONNECTION) {
+            let len = payload.get_u8() as usize;
+            if payload.remaining() < len {
+                return Err(MySqlError::Protocol("auth response truncated".into()));
+            }
+            payload.copy_to_bytes(len).to_vec()
+        } else {
+            read_null_terminated_bytes(&mut payload)?
+        };
 
-        let database =
-            if client_flags.has(CapabilityFlags::CLIENT_CONNECT_WITH_DB) && payload.has_remaining() {
-                Some(read_null_terminated(&mut payload)?)
-            } else {
-                None
-            };
+        let database = if client_flags.has(CapabilityFlags::CLIENT_CONNECT_WITH_DB) && payload.has_remaining() {
+            Some(read_null_terminated(&mut payload)?)
+        } else {
+            None
+        };
 
-        let auth_plugin_name =
-            if client_flags.has(CapabilityFlags::CLIENT_PLUGIN_AUTH) && payload.has_remaining() {
-                Some(read_null_terminated(&mut payload)?)
-            } else {
-                None
-            };
+        let auth_plugin_name = if client_flags.has(CapabilityFlags::CLIENT_PLUGIN_AUTH) && payload.has_remaining() {
+            Some(read_null_terminated(&mut payload)?)
+        } else {
+            None
+        };
 
         let mut connect_attrs = HashMap::new();
         if client_flags.has(CapabilityFlags::CLIENT_CONNECT_ATTRS) && payload.has_remaining() {
@@ -684,11 +679,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
 
     /// Accept a MySQL client, perform handshake + auth, then enter the
     /// command loop.
-    pub async fn handle_connection(
-        database: Arc<EmbeddedDatabase>,
-        stream: S,
-        connection_id: u32,
-    ) -> Result<()> {
+    pub async fn handle_connection(database: Arc<EmbeddedDatabase>, stream: S, connection_id: u32) -> Result<()> {
         let mut handler = Self::new(database, stream, connection_id);
         info!("New MySQL connection: id={}", connection_id);
 
@@ -715,9 +706,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                                 error!("Command error: {}", e);
                                 let msg = e.to_string();
                                 let (code, state) = map_error_code(&msg);
-                                let _ = handler
-                                    .send_error(code, state, &msg)
-                                    .await;
+                                let _ = handler.send_error(code, state, &msg).await;
                             }
                         }
                     }
@@ -805,19 +794,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         self.current_database = hs.database.clone();
 
         // Intersect capabilities
-        self.capabilities = CapabilityFlags::new(
-            self.capabilities.as_u32() & hs.capability_flags.as_u32(),
-        );
+        self.capabilities = CapabilityFlags::new(self.capabilities.as_u32() & hs.capability_flags.as_u32());
 
-        let plugin = hs
-            .auth_plugin_name
-            .as_deref()
-            .unwrap_or("mysql_native_password");
+        let plugin = hs.auth_plugin_name.as_deref().unwrap_or("mysql_native_password");
 
-        debug!(
-            "Auth user='{}' plugin='{}' db={:?}",
-            hs.username, plugin, hs.database
-        );
+        debug!("Auth user='{}' plugin='{}' db={:?}", hs.username, plugin, hs.database);
 
         // Nano uses trust authentication — accept any connection.
         // A production deployment would verify credentials here.
@@ -838,8 +819,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         }
 
         let cmd_byte = payload.get_u8();
-        let command = Command::from_u8(cmd_byte)
-            .ok_or(MySqlError::Unsupported(cmd_byte))?;
+        let command = Command::from_u8(cmd_byte).ok_or(MySqlError::Unsupported(cmd_byte))?;
 
         debug!("Received {:?}", command);
         Ok((command, payload))
@@ -888,12 +868,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             }
             _ => {
                 warn!("Unsupported MySQL command: {:?}", cmd);
-                self.send_error(
-                    1047,
-                    "08S01",
-                    &format!("Unsupported command: {:?}", cmd),
-                )
-                .await?;
+                self.send_error(1047, "08S01", &format!("Unsupported command: {:?}", cmd))
+                    .await?;
             }
         }
         Ok(())
@@ -957,9 +933,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         }
 
         // ---- Transaction control ----
-        if starts_with_icase(trimmed, "BEGIN")
-            || starts_with_icase(trimmed, "START TRANSACTION")
-        {
+        if starts_with_icase(trimmed, "BEGIN") || starts_with_icase(trimmed, "START TRANSACTION") {
             return self.handle_begin().await;
         }
         if trimmed.eq_ignore_ascii_case("COMMIT") {
@@ -1371,11 +1345,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     fn query_last_serial_id(&self, table_name: &str) -> u64 {
         // Find the PK column name from the catalog
         let pk_col = match self.database.storage.catalog().get_table_schema(table_name) {
-            Ok(schema) => {
-                schema.columns.iter()
-                    .find(|c| c.primary_key)
-                    .map(|c| c.name.clone())
-            }
+            Ok(schema) => schema.columns.iter().find(|c| c.primary_key).map(|c| c.name.clone()),
             Err(_) => None,
         };
 
@@ -1388,7 +1358,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         let query = format!("SELECT MAX({}) FROM {}", pk_col, table_name);
         match self.database.query_with_columns(&query) {
             Ok((rows, _)) => {
-                let result = rows.first()
+                let result = rows
+                    .first()
                     .and_then(|r| r.values.first())
                     .and_then(|v| match v {
                         Value::Int4(n) => Some(*n as u64),
@@ -1397,7 +1368,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                         _ => None,
                     })
                     .unwrap_or(0);
-                tracing::debug!("query_last_serial_id({}): pk_col={}, result={}", table_name, pk_col, result);
+                tracing::debug!(
+                    "query_last_serial_id({}): pk_col={}, result={}",
+                    table_name,
+                    pk_col,
+                    result
+                );
                 result
             }
             Err(e) => {
@@ -1425,12 +1401,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
 
         if upper.contains("TABLES") {
             // Query actual tables from the catalog.
-            let mut tables = self
-                .database
-                .storage
-                .catalog()
-                .list_tables()
-                .unwrap_or_default();
+            let mut tables = self.database.storage.catalog().list_tables().unwrap_or_default();
 
             // SHOW TABLES LIKE 'pattern' — apply LIKE filter
             if let Some(like_pattern) = extract_like_pattern(trimmed) {
@@ -1453,23 +1424,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             return self.handle_show_create_table(trimmed).await;
         }
 
-        if upper.contains("VARIABLES") || upper.contains("SESSION STATUS")
-            || upper.contains("GLOBAL STATUS")
-        {
+        if upper.contains("VARIABLES") || upper.contains("SESSION STATUS") || upper.contains("GLOBAL STATUS") {
             return self.handle_show_variables(&upper).await;
         }
 
         if upper.contains("WARNINGS") {
             // Return empty set — no warnings queued.
-            return self
-                .show_three_columns("Level", "Code", "Message", &[])
-                .await;
+            return self.show_three_columns("Level", "Code", "Message", &[]).await;
         }
 
         if upper.contains("ERRORS") {
-            return self
-                .show_three_columns("Level", "Code", "Message", &[])
-                .await;
+            return self.show_three_columns("Level", "Code", "Message", &[]).await;
         }
 
         if upper.contains("COLLATION") {
@@ -1500,14 +1465,15 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             // SHOW GRANTS — return minimal ALL PRIVILEGES grant.
             let user = self.username.clone().unwrap_or_else(|| "root".to_string());
             let line = format!("GRANT ALL PRIVILEGES ON *.* TO '{}'@'%' WITH GRANT OPTION", user);
-            return self.show_single_column(
-                &format!("Grants for {}@%", user),
-                &[&line],
-            ).await;
+            return self
+                .show_single_column(&format!("Grants for {}@%", user), &[&line])
+                .await;
         }
 
-        if upper.contains("MASTER STATUS") || upper.contains("BINARY LOGS")
-            || upper.contains("REPLICA STATUS") || upper.contains("SLAVE STATUS")
+        if upper.contains("MASTER STATUS")
+            || upper.contains("BINARY LOGS")
+            || upper.contains("REPLICA STATUS")
+            || upper.contains("SLAVE STATUS")
         {
             // Empty result set — replication introspection not supported in embedded mode.
             return self.send_ok(0, 0).await;
@@ -1520,24 +1486,56 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     /// SHOW ENGINES — 6 columns (Engine, Support, Comment, Transactions, XA, Savepoints).
     async fn handle_show_engines(&mut self) -> Result<()> {
         let cols = vec![
-            "Engine".to_string(), "Support".to_string(), "Comment".to_string(),
-            "Transactions".to_string(), "XA".to_string(), "Savepoints".to_string(),
+            "Engine".to_string(),
+            "Support".to_string(),
+            "Comment".to_string(),
+            "Transactions".to_string(),
+            "XA".to_string(),
+            "Savepoints".to_string(),
         ];
         let row = |e: &str, s: &str, c: &str, t: &str, x: &str, sv: &str| {
             Tuple::new(vec![
-                Value::String(e.into()), Value::String(s.into()), Value::String(c.into()),
-                Value::String(t.into()), Value::String(x.into()), Value::String(sv.into()),
+                Value::String(e.into()),
+                Value::String(s.into()),
+                Value::String(c.into()),
+                Value::String(t.into()),
+                Value::String(x.into()),
+                Value::String(sv.into()),
             ])
         };
         let rows = vec![
-            row("HeliosDB", "DEFAULT", "HeliosDB Nano RocksDB-backed LSM engine",
-                "YES", "NO", "YES"),
-            row("InnoDB", "YES", "Alias of HeliosDB (for client compatibility)",
-                "YES", "NO", "YES"),
-            row("MEMORY", "YES", "In-memory tables (via CREATE TABLE ... ENGINE=MEMORY)",
-                "NO", "NO", "NO"),
-            row("MyISAM", "YES", "Alias of HeliosDB (for client compatibility)",
-                "NO", "NO", "NO"),
+            row(
+                "HeliosDB",
+                "DEFAULT",
+                "HeliosDB Nano RocksDB-backed LSM engine",
+                "YES",
+                "NO",
+                "YES",
+            ),
+            row(
+                "InnoDB",
+                "YES",
+                "Alias of HeliosDB (for client compatibility)",
+                "YES",
+                "NO",
+                "YES",
+            ),
+            row(
+                "MEMORY",
+                "YES",
+                "In-memory tables (via CREATE TABLE ... ENGINE=MEMORY)",
+                "NO",
+                "NO",
+                "NO",
+            ),
+            row(
+                "MyISAM",
+                "YES",
+                "Alias of HeliosDB (for client compatibility)",
+                "NO",
+                "NO",
+                "NO",
+            ),
         ];
         self.send_result_set(&cols, &rows).await
     }
@@ -1545,13 +1543,17 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     /// SHOW CHARACTER SET — 4 columns.
     async fn handle_show_character_set(&mut self) -> Result<()> {
         let cols = vec![
-            "Charset".to_string(), "Description".to_string(),
-            "Default collation".to_string(), "Maxlen".to_string(),
+            "Charset".to_string(),
+            "Description".to_string(),
+            "Default collation".to_string(),
+            "Maxlen".to_string(),
         ];
         let row = |c: &str, d: &str, dc: &str, m: i64| {
             Tuple::new(vec![
-                Value::String(c.into()), Value::String(d.into()),
-                Value::String(dc.into()), Value::Int8(m),
+                Value::String(c.into()),
+                Value::String(d.into()),
+                Value::String(dc.into()),
+                Value::Int8(m),
             ])
         };
         let rows = vec![
@@ -1568,14 +1570,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     /// SHOW COLLATION — 6 columns.
     async fn handle_show_collation(&mut self) -> Result<()> {
         let cols = vec![
-            "Collation".to_string(), "Charset".to_string(), "Id".to_string(),
-            "Default".to_string(), "Compiled".to_string(), "Sortlen".to_string(),
+            "Collation".to_string(),
+            "Charset".to_string(),
+            "Id".to_string(),
+            "Default".to_string(),
+            "Compiled".to_string(),
+            "Sortlen".to_string(),
         ];
         let row = |coll: &str, cs: &str, id: i64, d: &str| {
             Tuple::new(vec![
-                Value::String(coll.into()), Value::String(cs.into()),
-                Value::Int8(id), Value::String(d.into()),
-                Value::String("Yes".into()), Value::Int8(1),
+                Value::String(coll.into()),
+                Value::String(cs.into()),
+                Value::Int8(id),
+                Value::String(d.into()),
+                Value::String("Yes".into()),
+                Value::Int8(1),
             ])
         };
         let rows = vec![
@@ -1593,9 +1602,14 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     /// SHOW PROCESSLIST — 8 columns. Reports this connection only.
     async fn handle_show_processlist(&mut self) -> Result<()> {
         let cols = vec![
-            "Id".to_string(), "User".to_string(), "Host".to_string(),
-            "db".to_string(), "Command".to_string(), "Time".to_string(),
-            "State".to_string(), "Info".to_string(),
+            "Id".to_string(),
+            "User".to_string(),
+            "Host".to_string(),
+            "db".to_string(),
+            "Command".to_string(),
+            "Time".to_string(),
+            "State".to_string(),
+            "Info".to_string(),
         ];
         let user = self.username.clone().unwrap_or_else(|| "root".to_string());
         let db = self.current_database.clone().unwrap_or_else(|| "heliosdb".to_string());
@@ -1615,8 +1629,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     /// SHOW PLUGINS — minimal empty-ish set (Name, Status, Type, Library, License).
     async fn handle_show_plugins(&mut self) -> Result<()> {
         let cols = vec![
-            "Name".to_string(), "Status".to_string(), "Type".to_string(),
-            "Library".to_string(), "License".to_string(),
+            "Name".to_string(),
+            "Status".to_string(),
+            "Type".to_string(),
+            "Library".to_string(),
+            "License".to_string(),
         ];
         let rows = vec![Tuple::new(vec![
             Value::String("mysql_native_password".into()),
@@ -1630,12 +1647,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
 
     /// SHOW PRIVILEGES — minimal set.
     async fn handle_show_privileges(&mut self) -> Result<()> {
-        let cols = vec![
-            "Privilege".to_string(), "Context".to_string(), "Comment".to_string(),
-        ];
+        let cols = vec!["Privilege".to_string(), "Context".to_string(), "Comment".to_string()];
         let row = |p: &str, c: &str, d: &str| {
             Tuple::new(vec![
-                Value::String(p.into()), Value::String(c.into()), Value::String(d.into()),
+                Value::String(p.into()),
+                Value::String(c.into()),
+                Value::String(d.into()),
             ])
         };
         let rows = vec![
@@ -1655,14 +1672,12 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         let is_full = upper.contains("FULL");
 
         // Extract table name from "SHOW [FULL] COLUMNS FROM <table>"
-        let table_name = upper
-            .find("FROM ")
-            .and_then(|pos| {
-                let rest = sql.get(pos + 5..)?;
-                let name = rest.trim().trim_end_matches(';').trim();
-                let name = name.trim_matches('`').trim_matches('"');
-                Some(name.to_string())
-            });
+        let table_name = upper.find("FROM ").and_then(|pos| {
+            let rest = sql.get(pos + 5..)?;
+            let name = rest.trim().trim_end_matches(';').trim();
+            let name = name.trim_matches('`').trim_matches('"');
+            Some(name.to_string())
+        });
 
         let table_name = match table_name {
             Some(t) => t,
@@ -1673,76 +1688,110 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         let schema = match self.database.storage.catalog().get_table_schema(&table_name) {
             Ok(s) => s,
             Err(_) => {
-                return self.send_error(1146, "42S02",
-                    &format!("Table '{}' doesn't exist", table_name)).await;
+                return self
+                    .send_error(1146, "42S02", &format!("Table '{}' doesn't exist", table_name))
+                    .await;
             }
         };
 
         if is_full {
             // SHOW FULL COLUMNS: Field, Type, Collation, Null, Key, Default, Extra, Privileges, Comment
             let cols = vec![
-                "Field".to_string(), "Type".to_string(), "Collation".to_string(),
-                "Null".to_string(), "Key".to_string(), "Default".to_string(),
-                "Extra".to_string(), "Privileges".to_string(), "Comment".to_string(),
+                "Field".to_string(),
+                "Type".to_string(),
+                "Collation".to_string(),
+                "Null".to_string(),
+                "Key".to_string(),
+                "Default".to_string(),
+                "Extra".to_string(),
+                "Privileges".to_string(),
+                "Comment".to_string(),
             ];
-            let rows: Vec<Tuple> = schema.columns.iter().map(|c| {
-                let type_str = datatype_to_mysql(&c.data_type);
-                let null_str = if c.nullable { "YES" } else { "NO" };
-                let key_str = if c.primary_key { "PRI" } else if c.unique { "UNI" } else { "" };
-                let default_str = c.default_expr.as_deref().unwrap_or("NULL");
-                let extra = if c.primary_key && matches!(c.data_type, crate::DataType::Int4 | crate::DataType::Int8) {
-                    "auto_increment"
-                } else { "" };
-                Tuple::new(vec![
-                    Value::String(c.name.clone()),
-                    Value::String(type_str),
-                    Value::String("utf8mb4_unicode_ci".to_string()),
-                    Value::String(null_str.to_string()),
-                    Value::String(key_str.to_string()),
-                    Value::String(default_str.to_string()),
-                    Value::String(extra.to_string()),
-                    Value::String("select,insert,update,references".to_string()),
-                    Value::String(String::new()),
-                ])
-            }).collect();
+            let rows: Vec<Tuple> = schema
+                .columns
+                .iter()
+                .map(|c| {
+                    let type_str = datatype_to_mysql(&c.data_type);
+                    let null_str = if c.nullable { "YES" } else { "NO" };
+                    let key_str = if c.primary_key {
+                        "PRI"
+                    } else if c.unique {
+                        "UNI"
+                    } else {
+                        ""
+                    };
+                    let default_str = c.default_expr.as_deref().unwrap_or("NULL");
+                    let extra = if c.primary_key && matches!(c.data_type, crate::DataType::Int4 | crate::DataType::Int8)
+                    {
+                        "auto_increment"
+                    } else {
+                        ""
+                    };
+                    Tuple::new(vec![
+                        Value::String(c.name.clone()),
+                        Value::String(type_str),
+                        Value::String("utf8mb4_unicode_ci".to_string()),
+                        Value::String(null_str.to_string()),
+                        Value::String(key_str.to_string()),
+                        Value::String(default_str.to_string()),
+                        Value::String(extra.to_string()),
+                        Value::String("select,insert,update,references".to_string()),
+                        Value::String(String::new()),
+                    ])
+                })
+                .collect();
             self.send_result_set(&cols, &rows).await
         } else {
             // SHOW COLUMNS: Field, Type, Null, Key, Default, Extra
             let cols = vec![
-                "Field".to_string(), "Type".to_string(), "Null".to_string(),
-                "Key".to_string(), "Default".to_string(), "Extra".to_string(),
+                "Field".to_string(),
+                "Type".to_string(),
+                "Null".to_string(),
+                "Key".to_string(),
+                "Default".to_string(),
+                "Extra".to_string(),
             ];
-            let rows: Vec<Tuple> = schema.columns.iter().map(|c| {
-                let type_str = datatype_to_mysql(&c.data_type);
-                let null_str = if c.nullable { "YES" } else { "NO" };
-                let key_str = if c.primary_key { "PRI" } else if c.unique { "UNI" } else { "" };
-                let default_str = c.default_expr.as_deref().unwrap_or("NULL");
-                let extra = if c.primary_key && matches!(c.data_type, crate::DataType::Int4 | crate::DataType::Int8) {
-                    "auto_increment"
-                } else { "" };
-                Tuple::new(vec![
-                    Value::String(c.name.clone()),
-                    Value::String(type_str),
-                    Value::String(null_str.to_string()),
-                    Value::String(key_str.to_string()),
-                    Value::String(default_str.to_string()),
-                    Value::String(extra.to_string()),
-                ])
-            }).collect();
+            let rows: Vec<Tuple> = schema
+                .columns
+                .iter()
+                .map(|c| {
+                    let type_str = datatype_to_mysql(&c.data_type);
+                    let null_str = if c.nullable { "YES" } else { "NO" };
+                    let key_str = if c.primary_key {
+                        "PRI"
+                    } else if c.unique {
+                        "UNI"
+                    } else {
+                        ""
+                    };
+                    let default_str = c.default_expr.as_deref().unwrap_or("NULL");
+                    let extra = if c.primary_key && matches!(c.data_type, crate::DataType::Int4 | crate::DataType::Int8)
+                    {
+                        "auto_increment"
+                    } else {
+                        ""
+                    };
+                    Tuple::new(vec![
+                        Value::String(c.name.clone()),
+                        Value::String(type_str),
+                        Value::String(null_str.to_string()),
+                        Value::String(key_str.to_string()),
+                        Value::String(default_str.to_string()),
+                        Value::String(extra.to_string()),
+                    ])
+                })
+                .collect();
             self.send_result_set(&cols, &rows).await
         }
     }
 
     async fn handle_show_create_table(&mut self, sql: &str) -> Result<()> {
-        let table_name = sql
-            .to_uppercase()
-            .find("TABLE ")
-            .and_then(|pos| {
-                let after_kw = sql.get(pos + 6..)?;
-                let name = after_kw.trim().trim_end_matches(';').trim();
-                let name = name.trim_matches('`');
-                Some(name.to_string())
-            });
+        let table_name = sql.to_uppercase().find("TABLE ").and_then(|pos| {
+            let after_kw = sql.get(pos + 6..)?;
+            let name = after_kw.trim().trim_end_matches(';').trim();
+            let name = name.trim_matches('`');
+            Some(name.to_string())
+        });
 
         let table_name = match table_name {
             Some(t) => t,
@@ -1751,10 +1800,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
 
         let ddl = self.generate_create_table_ddl(&table_name);
         let cols = vec!["Table".to_string(), "Create Table".to_string()];
-        let row = Tuple::new(vec![
-            Value::String(table_name),
-            Value::String(ddl),
-        ]);
+        let row = Tuple::new(vec![Value::String(table_name), Value::String(ddl)]);
         self.send_result_set(&cols, &[row]).await
     }
 
@@ -1763,7 +1809,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         let schema = match self.database.storage.catalog().get_table_schema(table_name) {
             Ok(s) => s,
             Err(_) => {
-                return format!("CREATE TABLE `{}` (\n  /* schema not available */\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4", table_name);
+                return format!(
+                    "CREATE TABLE `{}` (\n  /* schema not available */\n) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4",
+                    table_name
+                );
             }
         };
 
@@ -1773,7 +1822,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         for col in &schema.columns {
             let mysql_type = datatype_to_mysql(&col.data_type);
             let nullable = if col.nullable { "" } else { " NOT NULL" };
-            let default = col.default_expr.as_ref().map_or(String::new(), |d| format!(" DEFAULT {}", d));
+            let default = col
+                .default_expr
+                .as_ref()
+                .map_or(String::new(), |d| format!(" DEFAULT {}", d));
             col_defs.push(format!("  `{}` {}{}{}", col.name, mysql_type, nullable, default));
             if col.primary_key {
                 pk_cols.push(format!("`{}`", col.name));
@@ -1858,22 +1910,22 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     /// Returns MySQL-compatible index metadata columns. At minimum, returns the
     /// primary key if one exists.
     async fn handle_show_index(&mut self, sql: &str) -> Result<()> {
-        let table_name = sql
-            .to_uppercase()
-            .find("FROM ")
-            .and_then(|pos| {
-                let rest = sql.get(pos + 5..)?;
-                // Take only the first token (table name), stripping backticks,
-                // semicolons, and ignoring any trailing FROM db / WHERE clause.
-                let name = rest.trim();
-                let name = name.split_once(|c: char| c.is_whitespace() || c == ';')
-                    .map_or(name, |(first, _)| first);
-                let name = name.trim_matches('`').trim_matches('"');
-                if name.is_empty() { return None; }
-                // Strip database qualifier (db.table -> table)
-                let name = name.rsplit('.').next().unwrap_or(name);
-                Some(name.to_string())
-            });
+        let table_name = sql.to_uppercase().find("FROM ").and_then(|pos| {
+            let rest = sql.get(pos + 5..)?;
+            // Take only the first token (table name), stripping backticks,
+            // semicolons, and ignoring any trailing FROM db / WHERE clause.
+            let name = rest.trim();
+            let name = name
+                .split_once(|c: char| c.is_whitespace() || c == ';')
+                .map_or(name, |(first, _)| first);
+            let name = name.trim_matches('`').trim_matches('"');
+            if name.is_empty() {
+                return None;
+            }
+            // Strip database qualifier (db.table -> table)
+            let name = name.rsplit('.').next().unwrap_or(name);
+            Some(name.to_string())
+        });
 
         let table_name = match table_name {
             Some(t) => t,
@@ -1905,19 +1957,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             for col in &schema.columns {
                 if col.primary_key {
                     rows.push(Tuple::new(vec![
-                        Value::String(table_name.clone()),       // Table
-                        Value::String("0".to_string()),          // Non_unique (0 = unique)
-                        Value::String("PRIMARY".to_string()),    // Key_name
-                        Value::String(seq.to_string()),          // Seq_in_index
-                        Value::String(col.name.clone()),         // Column_name
-                        Value::String("A".to_string()),          // Collation
-                        Value::String("0".to_string()),          // Cardinality
-                        Value::Null,                             // Sub_part
-                        Value::Null,                             // Packed
-                        Value::String(String::new()),            // Null
-                        Value::String("BTREE".to_string()),      // Index_type
-                        Value::String(String::new()),            // Comment
-                        Value::String(String::new()),            // Index_comment
+                        Value::String(table_name.clone()),    // Table
+                        Value::String("0".to_string()),       // Non_unique (0 = unique)
+                        Value::String("PRIMARY".to_string()), // Key_name
+                        Value::String(seq.to_string()),       // Seq_in_index
+                        Value::String(col.name.clone()),      // Column_name
+                        Value::String("A".to_string()),       // Collation
+                        Value::String("0".to_string()),       // Cardinality
+                        Value::Null,                          // Sub_part
+                        Value::Null,                          // Packed
+                        Value::String(String::new()),         // Null
+                        Value::String("BTREE".to_string()),   // Index_type
+                        Value::String(String::new()),         // Comment
+                        Value::String(String::new()),         // Index_comment
                     ]));
                     seq += 1;
                 }
@@ -1940,7 +1992,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                         Value::String("0".to_string()),
                         Value::Null,
                         Value::Null,
-                        if col.nullable { Value::String("YES".to_string()) } else { Value::String(String::new()) },
+                        if col.nullable {
+                            Value::String("YES".to_string())
+                        } else {
+                            Value::String(String::new())
+                        },
                         Value::String("BTREE".to_string()),
                         Value::String(String::new()),
                         Value::String(String::new()),
@@ -1966,7 +2022,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                     }
                     let key_name = uc.name.clone();
                     for (idx, col_name) in uc.columns.iter().enumerate() {
-                        let nullable = schema.columns.iter()
+                        let nullable = schema
+                            .columns
+                            .iter()
                             .find(|c| c.name.eq_ignore_ascii_case(col_name))
                             .map_or(false, |c| c.nullable);
                         rows.push(Tuple::new(vec![
@@ -1979,7 +2037,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                             Value::String("0".to_string()),
                             Value::Null,
                             Value::Null,
-                            if nullable { Value::String("YES".to_string()) } else { Value::String(String::new()) },
+                            if nullable {
+                                Value::String("YES".to_string())
+                            } else {
+                                Value::String(String::new())
+                            },
                             Value::String("BTREE".to_string()),
                             Value::String(String::new()),
                             Value::String(String::new()),
@@ -2006,8 +2068,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         // Handles both @@session.var and @@global.var and @@var forms.
         static VAR_RE: OnceLock<Regex> = OnceLock::new();
         let re = VAR_RE.get_or_init(|| {
-            Regex::new(r"@@(?:session\.|global\.)?(\w+)")
-                .unwrap_or_else(|_| Regex::new("^$").expect("static regex"))
+            Regex::new(r"@@(?:session\.|global\.)?(\w+)").unwrap_or_else(|_| Regex::new("^$").expect("static regex"))
         });
 
         let mut col_names: Vec<String> = Vec::new();
@@ -2070,9 +2131,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         let catalog = PgCatalog::with_database(Arc::clone(&self.database));
         match catalog.handle_query(sql) {
             Ok(Some((schema, rows))) => {
-                let col_names: Vec<String> = schema.columns.iter()
-                    .map(|c| c.name.clone())
-                    .collect();
+                let col_names: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
                 self.send_result_set(&col_names, &rows).await
             }
             Ok(None) => {
@@ -2128,24 +2187,24 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             }
 
             rows.push(Tuple::new(vec![
-                Value::String(table.clone()),                      // Name
-                Value::String("InnoDB".to_string()),               // Engine
-                Value::String("10".to_string()),                   // Version
-                Value::String("Dynamic".to_string()),              // Row_format
-                Value::Int8(0),                                    // Rows (estimate)
-                Value::Int8(0),                                    // Avg_row_length
-                Value::Int8(0),                                    // Data_length
-                Value::Int8(0),                                    // Max_data_length
-                Value::Int8(0),                                    // Index_length
-                Value::Int8(0),                                    // Data_free
-                Value::Null,                                       // Auto_increment
-                Value::Null,                                       // Create_time
-                Value::Null,                                       // Update_time
-                Value::Null,                                       // Check_time
-                Value::String("utf8mb4_general_ci".to_string()),   // Collation
-                Value::Null,                                       // Checksum
-                Value::String(String::new()),                      // Create_options
-                Value::String(String::new()),                      // Comment
+                Value::String(table.clone()),                    // Name
+                Value::String("InnoDB".to_string()),             // Engine
+                Value::String("10".to_string()),                 // Version
+                Value::String("Dynamic".to_string()),            // Row_format
+                Value::Int8(0),                                  // Rows (estimate)
+                Value::Int8(0),                                  // Avg_row_length
+                Value::Int8(0),                                  // Data_length
+                Value::Int8(0),                                  // Max_data_length
+                Value::Int8(0),                                  // Index_length
+                Value::Int8(0),                                  // Data_free
+                Value::Null,                                     // Auto_increment
+                Value::Null,                                     // Create_time
+                Value::Null,                                     // Update_time
+                Value::Null,                                     // Check_time
+                Value::String("utf8mb4_general_ci".to_string()), // Collation
+                Value::Null,                                     // Checksum
+                Value::String(String::new()),                    // Create_options
+                Value::String(String::new()),                    // Comment
             ]));
         }
 
@@ -2202,7 +2261,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
                     Value::String(mysql_type),
                     Value::String(null_str.to_string()),
                     Value::String(key_str.to_string()),
-                    if default_val.is_empty() { Value::Null } else { Value::String(default_val) },
+                    if default_val.is_empty() {
+                        Value::Null
+                    } else {
+                        Value::String(default_val)
+                    },
                     Value::String(String::new()),
                 ]));
             }
@@ -2281,8 +2344,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
 
         // Send param column definitions (all as VARCHAR for now)
         for i in 0..num_params {
-            self.send_column_def(&format!("?{}", i), ColumnType::VarString)
-                .await?;
+            self.send_column_def(&format!("?{}", i), ColumnType::VarString).await?;
         }
 
         if num_params > 0 && !self.capabilities.has(CapabilityFlags::CLIENT_DEPRECATE_EOF) {
@@ -2329,11 +2391,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     // ------------------------------------------------------------------
 
     /// Encode and send a full result set (column defs + rows + EOF).
-    async fn send_result_set(
-        &mut self,
-        columns: &[String],
-        rows: &[Tuple],
-    ) -> Result<()> {
+    async fn send_result_set(&mut self, columns: &[String], rows: &[Tuple]) -> Result<()> {
         let ncols = columns.len();
 
         // 1. Column count
@@ -2347,7 +2405,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
         // Infer types by scanning rows for the first non-NULL value per column.
         // If all values are NULL, fall back to VarString (never send Null type).
         for (i, col_name) in columns.iter().enumerate() {
-            let col_type = rows.iter()
+            let col_type = rows
+                .iter()
                 .filter_map(|r| r.values.get(i))
                 .find(|v| !matches!(v, Value::Null))
                 .map(ColumnType::from_value)
@@ -2377,21 +2436,21 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
     async fn send_column_def(&mut self, name: &str, col_type: ColumnType) -> Result<()> {
         let mut p = BytesMut::new();
 
-        write_lenenc_str(&mut p, "def");       // catalog
-        write_lenenc_str(&mut p, "");           // schema
-        write_lenenc_str(&mut p, "");           // virtual table
-        write_lenenc_str(&mut p, "");           // physical table
-        write_lenenc_str(&mut p, name);         // virtual column name
-        write_lenenc_str(&mut p, name);         // physical column name
+        write_lenenc_str(&mut p, "def"); // catalog
+        write_lenenc_str(&mut p, ""); // schema
+        write_lenenc_str(&mut p, ""); // virtual table
+        write_lenenc_str(&mut p, ""); // physical table
+        write_lenenc_str(&mut p, name); // virtual column name
+        write_lenenc_str(&mut p, name); // physical column name
 
         // Fixed-length fields (0x0c = 12 bytes follow)
         write_lenenc_int(&mut p, 0x0c);
         p.put_u16_le(u16::from(UTF8MB4_GENERAL_CI)); // charset
-        p.put_u32_le(255);                            // column length
-        p.put_u8(col_type as u8);                     // type
-        p.put_u16_le(0);                              // flags
-        p.put_u8(0);                                  // decimals
-        p.put_u16_le(0);                              // filler
+        p.put_u32_le(255); // column length
+        p.put_u8(col_type as u8); // type
+        p.put_u16_le(0); // flags
+        p.put_u8(0); // decimals
+        p.put_u16_le(0); // filler
 
         self.write_pkt(&p).await
     }
@@ -2442,11 +2501,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MySqlHandler<S> {
             let state_bytes = state.as_bytes();
             #[allow(clippy::indexing_slicing)]
             for i in 0..5 {
-                p.put_u8(if i < state_bytes.len() {
-                    state_bytes[i]
-                } else {
-                    b' '
-                });
+                p.put_u8(if i < state_bytes.len() { state_bytes[i] } else { b' ' });
             }
         }
 
@@ -2570,9 +2625,7 @@ fn sql_like_match(value: &str, pattern: &str) -> bool {
         }
     }
     regex_str.push('$');
-    Regex::new(&regex_str)
-        .map(|re| re.is_match(value))
-        .unwrap_or(false)
+    Regex::new(&regex_str).map(|re| re.is_match(value)).unwrap_or(false)
 }
 
 /// Extract the LIKE pattern from a SQL statement (e.g. `SHOW TABLES LIKE 'wp_%'`).
@@ -2635,11 +2688,7 @@ pub fn compute_caching_sha2_auth(password: &str, nonce: &[u8]) -> Vec<u8> {
     h.update(stage2);
     h.update(nonce);
     let stage3 = h.finalize();
-    stage1
-        .iter()
-        .zip(stage3.iter())
-        .map(|(a, b)| a ^ b)
-        .collect()
+    stage1.iter().zip(stage3.iter()).map(|(a, b)| a ^ b).collect()
 }
 
 /// Compute `mysql_native_password` auth response (SHA256 approximation).
@@ -2656,11 +2705,7 @@ pub fn compute_native_auth(password: &str, nonce: &[u8]) -> Vec<u8> {
     h.update(stage2);
     h.update(nonce);
     let stage3 = h.finalize();
-    stage1
-        .iter()
-        .zip(stage3.iter())
-        .map(|(a, b)| a ^ b)
-        .collect()
+    stage1.iter().zip(stage3.iter()).map(|(a, b)| a ^ b).collect()
 }
 
 // ============================================================================
@@ -2782,10 +2827,7 @@ mod tests {
         assert_eq!(value_to_mysql_string(&Value::Boolean(true)), "1");
         assert_eq!(value_to_mysql_string(&Value::Boolean(false)), "0");
         assert_eq!(value_to_mysql_string(&Value::Int4(42)), "42");
-        assert_eq!(
-            value_to_mysql_string(&Value::String("abc".into())),
-            "abc"
-        );
+        assert_eq!(value_to_mysql_string(&Value::String("abc".into())), "abc");
     }
 
     #[test]

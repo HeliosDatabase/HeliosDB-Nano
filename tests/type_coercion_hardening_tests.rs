@@ -54,7 +54,8 @@ fn test_string_vs_int_in_expression() {
 #[test]
 fn test_insert_numeric_string_into_int_column() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE str_to_int (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE str_to_int (id INT PRIMARY KEY, val INT)")
+        .unwrap();
 
     // INSERT string value '42' into INT column
     let result = db.execute("INSERT INTO str_to_int (id, val) VALUES (1, '42')");
@@ -79,7 +80,8 @@ fn test_insert_numeric_string_into_int_column() {
 #[test]
 fn test_arithmetic_with_string_operand() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE arith_str (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE arith_str (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO arith_str (id, val) VALUES (1, 10)").unwrap();
 
     // SELECT int_col + '5' (arithmetic with string operand)
@@ -101,7 +103,8 @@ fn test_arithmetic_with_string_operand() {
 #[test]
 fn test_numeric_string_in_list() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE in_coerce (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE in_coerce (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO in_coerce (id, val) VALUES (1, 1)").unwrap();
     db.execute("INSERT INTO in_coerce (id, val) VALUES (2, 2)").unwrap();
     db.execute("INSERT INTO in_coerce (id, val) VALUES (3, 3)").unwrap();
@@ -119,7 +122,8 @@ fn test_numeric_string_in_list() {
 #[test]
 fn test_numeric_string_with_leading_zeros() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE lead_zeros (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE lead_zeros (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO lead_zeros (id, val) VALUES (1, 7)").unwrap();
 
     // '007' = 7 (leading zeros in numeric context)
@@ -137,7 +141,8 @@ fn test_numeric_string_with_leading_zeros() {
 #[test]
 fn test_non_numeric_string_to_int_should_error() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE bad_cast (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE bad_cast (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO bad_cast (id, val) VALUES (1, 42)").unwrap();
 
     // WHERE int_col = 'abc' -- non-numeric string should fail or return no rows
@@ -155,7 +160,8 @@ fn test_non_numeric_string_to_int_should_error() {
 #[test]
 fn test_empty_string_to_int() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE empty_str (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE empty_str (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO empty_str (id, val) VALUES (1, 0)").unwrap();
 
     // WHERE int_col = '' -- empty string compared to int
@@ -178,7 +184,8 @@ fn test_empty_string_to_int() {
 #[test]
 fn test_int2_plus_int4_promotion() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE promo1 (id INT PRIMARY KEY, a SMALLINT, b INT)").unwrap();
+    db.execute("CREATE TABLE promo1 (id INT PRIMARY KEY, a SMALLINT, b INT)")
+        .unwrap();
     db.execute("INSERT INTO promo1 (id, a, b) VALUES (1, 10, 20)").unwrap();
 
     // INT2 + INT4 arithmetic
@@ -191,24 +198,32 @@ fn test_int2_plus_int4_promotion() {
 #[test]
 fn test_int4_plus_int8_promotion() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE promo2 (id INT PRIMARY KEY, a INT, b BIGINT)").unwrap();
-    db.execute("INSERT INTO promo2 (id, a, b) VALUES (1, 100, 9223372036854775000)").unwrap();
+    db.execute("CREATE TABLE promo2 (id INT PRIMARY KEY, a INT, b BIGINT)")
+        .unwrap();
+    db.execute("INSERT INTO promo2 (id, a, b) VALUES (1, 100, 9223372036854775000)")
+        .unwrap();
 
     // INT4 + INT8 arithmetic
     let rows = db.query("SELECT a + b AS sum FROM promo2 WHERE id = 1", &[]).unwrap();
     assert_eq!(rows.len(), 1, "Should compute INT4 + INT8");
     let val = get_int_value(&rows[0], 0);
     if let Some(v) = val {
-        assert!(v > 9223372036854775000_i64, "Sum should be larger than the BIGINT value");
+        assert!(
+            v > 9223372036854775000_i64,
+            "Sum should be larger than the BIGINT value"
+        );
     }
 }
 
 #[test]
 fn test_int_float_comparison() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE int_flt (id INT PRIMARY KEY, ival INT, fval DECIMAL)").unwrap();
-    db.execute("INSERT INTO int_flt (id, ival, fval) VALUES (1, 10, 10.5)").unwrap();
-    db.execute("INSERT INTO int_flt (id, ival, fval) VALUES (2, 11, 10.5)").unwrap();
+    db.execute("CREATE TABLE int_flt (id INT PRIMARY KEY, ival INT, fval DECIMAL)")
+        .unwrap();
+    db.execute("INSERT INTO int_flt (id, ival, fval) VALUES (1, 10, 10.5)")
+        .unwrap();
+    db.execute("INSERT INTO int_flt (id, ival, fval) VALUES (2, 11, 10.5)")
+        .unwrap();
 
     // INT compared to FLOAT: WHERE ival > fval
     let rows = db.query("SELECT id FROM int_flt WHERE ival > fval", &[]).unwrap();
@@ -250,10 +265,13 @@ fn test_int_plus_numeric_arithmetic() {
 #[test]
 fn test_float_plus_numeric_precision() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE flt_num (id INT, fval DECIMAL, nval DECIMAL)").unwrap();
+    db.execute("CREATE TABLE flt_num (id INT, fval DECIMAL, nval DECIMAL)")
+        .unwrap();
     db.execute("INSERT INTO flt_num VALUES (1, 1.1, 2.2)").unwrap();
 
-    let rows = db.query("SELECT fval + nval AS sum FROM flt_num WHERE id = 1", &[]).unwrap();
+    let rows = db
+        .query("SELECT fval + nval AS sum FROM flt_num WHERE id = 1", &[])
+        .unwrap();
     assert_eq!(rows.len(), 1, "Should compute FLOAT + NUMERIC");
     // The result should be approximately 3.3
     let val = &rows[0].values[0];
@@ -292,7 +310,8 @@ fn test_integer_division_result() {
 #[test]
 fn test_negative_integer_overflow_int4() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE overflow_test (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE overflow_test (id INT PRIMARY KEY, val INT)")
+        .unwrap();
 
     // Try to insert a value that overflows INT4: -2147483648 - 1
     let result = db.execute("INSERT INTO overflow_test (id, val) VALUES (1, -2147483649)");
@@ -311,11 +330,15 @@ fn test_negative_integer_overflow_int4() {
 #[test]
 fn test_int8_max_value_arithmetic() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE bigint_arith (id INT PRIMARY KEY, val BIGINT)").unwrap();
-    db.execute("INSERT INTO bigint_arith (id, val) VALUES (1, 9223372036854775807)").unwrap();
+    db.execute("CREATE TABLE bigint_arith (id INT PRIMARY KEY, val BIGINT)")
+        .unwrap();
+    db.execute("INSERT INTO bigint_arith (id, val) VALUES (1, 9223372036854775807)")
+        .unwrap();
 
     // Adding 0 to MAX value should be fine
-    let rows = db.query("SELECT val + 0 AS result FROM bigint_arith WHERE id = 1", &[]).unwrap();
+    let rows = db
+        .query("SELECT val + 0 AS result FROM bigint_arith WHERE id = 1", &[])
+        .unwrap();
     assert_eq!(rows.len(), 1, "Should handle BIGINT max value + 0");
 
     // Verify the value is correct
@@ -326,10 +349,15 @@ fn test_int8_max_value_arithmetic() {
     let result = db.query("SELECT val + 1 AS result FROM bigint_arith WHERE id = 1", &[]);
     assert!(result.is_err(), "BIGINT MAX + 1 should return an overflow error");
     let err_msg = format!("{}", result.unwrap_err());
-    assert!(err_msg.contains("overflow"), "Error should mention overflow, got: {}", err_msg);
+    assert!(
+        err_msg.contains("overflow"),
+        "Error should mention overflow, got: {}",
+        err_msg
+    );
 
     // Subtracting 1 from MIN should also return an overflow error
-    db.execute("INSERT INTO bigint_arith (id, val) VALUES (2, -9223372036854775808)").unwrap();
+    db.execute("INSERT INTO bigint_arith (id, val) VALUES (2, -9223372036854775808)")
+        .unwrap();
     let result = db.query("SELECT val - 1 AS result FROM bigint_arith WHERE id = 2", &[]);
     assert!(result.is_err(), "BIGINT MIN - 1 should return an overflow error");
 
@@ -406,7 +434,8 @@ fn test_cast_boolean_as_text() {
     let val_lower = val.to_lowercase();
     assert!(
         val_lower == "true" || val_lower == "t" || val_lower == "1",
-        "CAST(TRUE AS TEXT) should be 'true', got '{}'", val
+        "CAST(TRUE AS TEXT) should be 'true', got '{}'",
+        val
     );
 
     let rows_false = db.query("SELECT CAST(FALSE AS TEXT) AS result", &[]).unwrap();
@@ -415,7 +444,8 @@ fn test_cast_boolean_as_text() {
     let val_lower = val.to_lowercase();
     assert!(
         val_lower == "false" || val_lower == "f" || val_lower == "0",
-        "CAST(FALSE AS TEXT) should be 'false', got '{}'", val
+        "CAST(FALSE AS TEXT) should be 'false', got '{}'",
+        val
     );
 }
 
@@ -426,11 +456,19 @@ fn test_cast_text_as_boolean_variants() {
     // 'true' => true
     let rows = db.query("SELECT CAST('true' AS BOOLEAN) AS result", &[]).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].values[0], Value::Boolean(true), "'true' -> BOOLEAN should be true");
+    assert_eq!(
+        rows[0].values[0],
+        Value::Boolean(true),
+        "'true' -> BOOLEAN should be true"
+    );
 
     // 'false' => false
     let rows = db.query("SELECT CAST('false' AS BOOLEAN) AS result", &[]).unwrap();
-    assert_eq!(rows[0].values[0], Value::Boolean(false), "'false' -> BOOLEAN should be false");
+    assert_eq!(
+        rows[0].values[0],
+        Value::Boolean(false),
+        "'false' -> BOOLEAN should be false"
+    );
 
     // 't' => true
     let rows = db.query("SELECT CAST('t' AS BOOLEAN) AS result", &[]).unwrap();
@@ -438,7 +476,11 @@ fn test_cast_text_as_boolean_variants() {
 
     // 'f' => false
     let rows = db.query("SELECT CAST('f' AS BOOLEAN) AS result", &[]).unwrap();
-    assert_eq!(rows[0].values[0], Value::Boolean(false), "'f' -> BOOLEAN should be false");
+    assert_eq!(
+        rows[0].values[0],
+        Value::Boolean(false),
+        "'f' -> BOOLEAN should be false"
+    );
 
     // '1' => true
     let rows = db.query("SELECT CAST('1' AS BOOLEAN) AS result", &[]).unwrap();
@@ -446,7 +488,11 @@ fn test_cast_text_as_boolean_variants() {
 
     // '0' => false
     let rows = db.query("SELECT CAST('0' AS BOOLEAN) AS result", &[]).unwrap();
-    assert_eq!(rows[0].values[0], Value::Boolean(false), "'0' -> BOOLEAN should be false");
+    assert_eq!(
+        rows[0].values[0],
+        Value::Boolean(false),
+        "'0' -> BOOLEAN should be false"
+    );
 }
 
 #[test]
@@ -456,15 +502,27 @@ fn test_cast_integer_as_boolean() {
     // CAST(0 AS BOOLEAN) => false
     let rows = db.query("SELECT CAST(0 AS BOOLEAN) AS result", &[]).unwrap();
     assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].values[0], Value::Boolean(false), "CAST(0 AS BOOLEAN) should be false");
+    assert_eq!(
+        rows[0].values[0],
+        Value::Boolean(false),
+        "CAST(0 AS BOOLEAN) should be false"
+    );
 
     // CAST(1 AS BOOLEAN) => true
     let rows = db.query("SELECT CAST(1 AS BOOLEAN) AS result", &[]).unwrap();
-    assert_eq!(rows[0].values[0], Value::Boolean(true), "CAST(1 AS BOOLEAN) should be true");
+    assert_eq!(
+        rows[0].values[0],
+        Value::Boolean(true),
+        "CAST(1 AS BOOLEAN) should be true"
+    );
 
     // CAST(42 AS BOOLEAN) => true (any non-zero)
     let rows = db.query("SELECT CAST(42 AS BOOLEAN) AS result", &[]).unwrap();
-    assert_eq!(rows[0].values[0], Value::Boolean(true), "CAST(42 AS BOOLEAN) should be true");
+    assert_eq!(
+        rows[0].values[0],
+        Value::Boolean(true),
+        "CAST(42 AS BOOLEAN) should be true"
+    );
 }
 
 #[test]
@@ -477,7 +535,11 @@ fn test_cast_date_as_text_and_back() {
         Ok(r) => {
             assert_eq!(r.len(), 1);
             let val = get_string_value(&r[0], 0).unwrap();
-            assert!(val.contains("2024"), "Date text should contain year 2024, got '{}'", val);
+            assert!(
+                val.contains("2024"),
+                "Date text should contain year 2024, got '{}'",
+                val
+            );
             assert!(val.contains("01") || val.contains("Jan"), "Should contain month");
             assert!(val.contains("15"), "Should contain day 15");
         }
@@ -510,7 +572,11 @@ fn test_cast_timestamp_as_date() {
                     assert_eq!(d.to_string(), "2024-01-15", "Should be date only, no time component");
                 }
                 Value::String(s) => {
-                    assert!(s.contains("2024-01-15"), "Date string should contain 2024-01-15, got '{}'", s);
+                    assert!(
+                        s.contains("2024-01-15"),
+                        "Date string should contain 2024-01-15, got '{}'",
+                        s
+                    );
                     assert!(!s.contains("14:30"), "Time component should be dropped");
                 }
                 _ => {} // Other representations acceptable
@@ -539,7 +605,9 @@ fn test_double_cast() {
     }
 
     // A safer double cast: int -> text -> int
-    let rows = db.query("SELECT CAST(CAST(42 AS TEXT) AS INTEGER) AS result", &[]).unwrap();
+    let rows = db
+        .query("SELECT CAST(CAST(42 AS TEXT) AS INTEGER) AS result", &[])
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(get_int_value(&rows[0], 0), Some(42), "42 -> '42' -> 42");
 }
@@ -570,7 +638,9 @@ fn test_case_int_vs_decimal() {
     let db = create_test_db().unwrap();
 
     // CASE WHEN true THEN 1 ELSE 2.5 END (int vs decimal)
-    let rows = db.query("SELECT CASE WHEN TRUE THEN 1 ELSE 2.5 END AS result", &[]).unwrap();
+    let rows = db
+        .query("SELECT CASE WHEN TRUE THEN 1 ELSE 2.5 END AS result", &[])
+        .unwrap();
     assert_eq!(rows.len(), 1, "CASE with mixed int/decimal should work");
     // Result should be 1 (the TRUE branch), but type might be promoted
     let val = &rows[0].values[0];
@@ -590,12 +660,16 @@ fn test_case_text_with_null() {
     let db = create_test_db().unwrap();
 
     // CASE WHEN true THEN 'text' ELSE NULL END
-    let rows = db.query("SELECT CASE WHEN TRUE THEN 'text' ELSE NULL END AS result", &[]).unwrap();
+    let rows = db
+        .query("SELECT CASE WHEN TRUE THEN 'text' ELSE NULL END AS result", &[])
+        .unwrap();
     assert_eq!(rows.len(), 1, "CASE with text/NULL should work");
     assert_eq!(get_string_value(&rows[0], 0), Some("text".to_string()));
 
     // CASE WHEN false THEN 'text' ELSE NULL END
-    let rows = db.query("SELECT CASE WHEN FALSE THEN 'text' ELSE NULL END AS result", &[]).unwrap();
+    let rows = db
+        .query("SELECT CASE WHEN FALSE THEN 'text' ELSE NULL END AS result", &[])
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].values[0], Value::Null, "FALSE branch should return NULL");
 }
@@ -603,15 +677,19 @@ fn test_case_text_with_null() {
 #[test]
 fn test_case_different_numeric_types() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE case_nums (id INT PRIMARY KEY, flag BOOLEAN)").unwrap();
+    db.execute("CREATE TABLE case_nums (id INT PRIMARY KEY, flag BOOLEAN)")
+        .unwrap();
     db.execute("INSERT INTO case_nums (id, flag) VALUES (1, TRUE)").unwrap();
-    db.execute("INSERT INTO case_nums (id, flag) VALUES (2, FALSE)").unwrap();
+    db.execute("INSERT INTO case_nums (id, flag) VALUES (2, FALSE)")
+        .unwrap();
 
     // CASE returning different numeric types
-    let rows = db.query(
-        "SELECT CASE WHEN flag = TRUE THEN 100 ELSE 999999999999 END AS result FROM case_nums ORDER BY id",
-        &[]
-    ).unwrap();
+    let rows = db
+        .query(
+            "SELECT CASE WHEN flag = TRUE THEN 100 ELSE 999999999999 END AS result FROM case_nums ORDER BY id",
+            &[],
+        )
+        .unwrap();
     assert_eq!(rows.len(), 2, "Should return two rows");
     // First row (TRUE) gets 100
     let v1 = get_int_value(&rows[0], 0);
@@ -640,12 +718,14 @@ fn test_nested_case_with_type_mixing() {
     let db = create_test_db().unwrap();
 
     // Nested CASE with different types
-    let rows = db.query(
-        "SELECT CASE WHEN TRUE THEN
+    let rows = db
+        .query(
+            "SELECT CASE WHEN TRUE THEN
             CASE WHEN FALSE THEN 'inner_false' ELSE 'inner_true' END
         ELSE 'outer_false' END AS result",
-        &[]
-    ).unwrap();
+            &[],
+        )
+        .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(get_string_value(&rows[0], 0), Some("inner_true".to_string()));
 }
@@ -653,11 +733,11 @@ fn test_nested_case_with_type_mixing() {
 #[test]
 fn test_case_in_insert_values() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE case_insert (id INT PRIMARY KEY, label TEXT)").unwrap();
+    db.execute("CREATE TABLE case_insert (id INT PRIMARY KEY, label TEXT)")
+        .unwrap();
 
-    let result = db.execute(
-        "INSERT INTO case_insert (id, label) VALUES (1, CASE WHEN 1 > 0 THEN 'positive' ELSE 'negative' END)"
-    );
+    let result = db
+        .execute("INSERT INTO case_insert (id, label) VALUES (1, CASE WHEN 1 > 0 THEN 'positive' ELSE 'negative' END)");
     match result {
         Ok(_) => {
             let rows = db.query("SELECT label FROM case_insert WHERE id = 1", &[]).unwrap();
@@ -773,10 +853,14 @@ fn test_union_boolean_and_integer() {
 #[test]
 fn test_boolean_in_where_without_equals_true() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE bool_where (id INT PRIMARY KEY, active BOOLEAN)").unwrap();
-    db.execute("INSERT INTO bool_where (id, active) VALUES (1, TRUE)").unwrap();
-    db.execute("INSERT INTO bool_where (id, active) VALUES (2, FALSE)").unwrap();
-    db.execute("INSERT INTO bool_where (id, active) VALUES (3, TRUE)").unwrap();
+    db.execute("CREATE TABLE bool_where (id INT PRIMARY KEY, active BOOLEAN)")
+        .unwrap();
+    db.execute("INSERT INTO bool_where (id, active) VALUES (1, TRUE)")
+        .unwrap();
+    db.execute("INSERT INTO bool_where (id, active) VALUES (2, FALSE)")
+        .unwrap();
+    db.execute("INSERT INTO bool_where (id, active) VALUES (3, TRUE)")
+        .unwrap();
 
     // WHERE bool_col (implicit boolean test, no = TRUE needed)
     let result = db.query("SELECT id FROM bool_where WHERE active", &[]);
@@ -795,7 +879,8 @@ fn test_boolean_in_where_without_equals_true() {
 #[test]
 fn test_integer_compared_to_decimal() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE int_dec (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE int_dec (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO int_dec (id, val) VALUES (1, 1)").unwrap();
     db.execute("INSERT INTO int_dec (id, val) VALUES (2, 2)").unwrap();
 
@@ -815,7 +900,8 @@ fn test_integer_compared_to_decimal() {
 #[test]
 fn test_like_on_non_text_column() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE like_test (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE like_test (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO like_test (id, val) VALUES (1, 123)").unwrap();
     db.execute("INSERT INTO like_test (id, val) VALUES (2, 456)").unwrap();
 
@@ -835,7 +921,8 @@ fn test_like_on_non_text_column() {
 #[test]
 fn test_date_compared_to_timestamp() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE dt_compare (id INT PRIMARY KEY, d DATE, ts TIMESTAMP)").unwrap();
+    db.execute("CREATE TABLE dt_compare (id INT PRIMARY KEY, d DATE, ts TIMESTAMP)")
+        .unwrap();
 
     let result = db.execute("INSERT INTO dt_compare (id, d, ts) VALUES (1, '2024-01-15', '2024-01-15 00:00:00')");
     match result {
@@ -860,7 +947,8 @@ fn test_date_compared_to_timestamp() {
 #[test]
 fn test_in_list_with_mixed_types() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE mixed_in (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE mixed_in (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO mixed_in (id, val) VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO mixed_in (id, val) VALUES (2, 20)").unwrap();
     db.execute("INSERT INTO mixed_in (id, val) VALUES (3, 30)").unwrap();
@@ -873,7 +961,8 @@ fn test_in_list_with_mixed_types() {
 #[test]
 fn test_between_with_mixed_types() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE between_mix (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE between_mix (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO between_mix (id, val) VALUES (1, 5)").unwrap();
     db.execute("INSERT INTO between_mix (id, val) VALUES (2, 15)").unwrap();
     db.execute("INSERT INTO between_mix (id, val) VALUES (3, 25)").unwrap();
@@ -925,7 +1014,9 @@ fn test_decimal_comparison_many_decimal_places() {
     db.execute("INSERT INTO prec_cmp VALUES (3, 1.0000000003)").unwrap();
 
     // Comparison with many decimal places
-    let rows = db.query("SELECT id FROM prec_cmp WHERE val > 1.00000000015", &[]).unwrap();
+    let rows = db
+        .query("SELECT id FROM prec_cmp WHERE val > 1.00000000015", &[])
+        .unwrap();
     assert!(rows.len() >= 1, "Should find values > 1.00000000015");
 }
 
@@ -1006,7 +1097,8 @@ fn test_cast_large_int_to_smallint() {
 #[test]
 fn test_numeric_string_insert_into_decimal_column() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE str_dec (id INT PRIMARY KEY, val DECIMAL)").unwrap();
+    db.execute("CREATE TABLE str_dec (id INT PRIMARY KEY, val DECIMAL)")
+        .unwrap();
 
     // Insert string '123.456' into DECIMAL column
     let result = db.execute("INSERT INTO str_dec (id, val) VALUES (1, '123.456')");
@@ -1064,23 +1156,31 @@ fn test_cast_text_to_numeric_invalid() {
 #[test]
 fn test_where_clause_with_cast() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE cast_where (id INT PRIMARY KEY, val TEXT)").unwrap();
-    db.execute("INSERT INTO cast_where (id, val) VALUES (1, '100')").unwrap();
-    db.execute("INSERT INTO cast_where (id, val) VALUES (2, '200')").unwrap();
-    db.execute("INSERT INTO cast_where (id, val) VALUES (3, '300')").unwrap();
+    db.execute("CREATE TABLE cast_where (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO cast_where (id, val) VALUES (1, '100')")
+        .unwrap();
+    db.execute("INSERT INTO cast_where (id, val) VALUES (2, '200')")
+        .unwrap();
+    db.execute("INSERT INTO cast_where (id, val) VALUES (3, '300')")
+        .unwrap();
 
     // Using CAST in WHERE clause
-    let rows = db.query("SELECT id FROM cast_where WHERE CAST(val AS INTEGER) > 150", &[]).unwrap();
+    let rows = db
+        .query("SELECT id FROM cast_where WHERE CAST(val AS INTEGER) > 150", &[])
+        .unwrap();
     assert_eq!(rows.len(), 2, "CAST in WHERE should filter properly (200, 300 > 150)");
 }
 
 #[test]
 fn test_cast_in_order_by() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE cast_order (id INT PRIMARY KEY, val TEXT)").unwrap();
+    db.execute("CREATE TABLE cast_order (id INT PRIMARY KEY, val TEXT)")
+        .unwrap();
     db.execute("INSERT INTO cast_order (id, val) VALUES (1, '30')").unwrap();
     db.execute("INSERT INTO cast_order (id, val) VALUES (2, '5')").unwrap();
-    db.execute("INSERT INTO cast_order (id, val) VALUES (3, '100')").unwrap();
+    db.execute("INSERT INTO cast_order (id, val) VALUES (3, '100')")
+        .unwrap();
 
     // ORDER BY with CAST to ensure numeric ordering (not lexicographic)
     let rows = db.query("SELECT id, val FROM cast_order ORDER BY CAST(val AS INTEGER) ASC", &[]);
@@ -1106,7 +1206,10 @@ fn test_coalesce_with_mixed_types() {
     db.execute("INSERT INTO coal_mix VALUES (2, 42, 'other')").unwrap();
 
     // COALESCE with CAST to make types compatible
-    let result = db.query("SELECT COALESCE(CAST(a AS TEXT), b) AS result FROM coal_mix ORDER BY id", &[]);
+    let result = db.query(
+        "SELECT COALESCE(CAST(a AS TEXT), b) AS result FROM coal_mix ORDER BY id",
+        &[],
+    );
     match result {
         Ok(rows) => {
             assert_eq!(rows.len(), 2);
@@ -1154,7 +1257,8 @@ fn test_cast_boolean_to_integer() {
 #[test]
 fn test_implicit_coercion_in_update_set() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE upd_coerce (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE upd_coerce (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO upd_coerce (id, val) VALUES (1, 10)").unwrap();
 
     // UPDATE with expression that returns a different type
@@ -1178,7 +1282,9 @@ fn test_cast_bigint_to_int_safe() {
     let db = create_test_db().unwrap();
 
     // Value that fits in INT4
-    let rows = db.query("SELECT CAST(CAST(42 AS BIGINT) AS INTEGER) AS result", &[]).unwrap();
+    let rows = db
+        .query("SELECT CAST(CAST(42 AS BIGINT) AS INTEGER) AS result", &[])
+        .unwrap();
     assert_eq!(rows.len(), 1);
     let val = get_int_value(&rows[0], 0);
     assert_eq!(val, Some(42), "CAST(42::BIGINT AS INTEGER) should be 42");
@@ -1187,7 +1293,8 @@ fn test_cast_bigint_to_int_safe() {
 #[test]
 fn test_aggregate_with_type_coercion() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE agg_coerce (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE agg_coerce (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO agg_coerce (id, val) VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO agg_coerce (id, val) VALUES (2, 20)").unwrap();
     db.execute("INSERT INTO agg_coerce (id, val) VALUES (3, 30)").unwrap();
@@ -1214,7 +1321,8 @@ fn test_aggregate_with_type_coercion() {
 #[test]
 fn test_comparison_with_null_coercion() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE null_cmp (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE null_cmp (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO null_cmp (id, val) VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO null_cmp (id, val) VALUES (2, NULL)").unwrap();
 
@@ -1242,20 +1350,32 @@ fn test_comparison_with_null_coercion() {
 #[test]
 fn test_not_equals_with_null() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE neq_null (id INT PRIMARY KEY, val INT)").unwrap();
+    db.execute("CREATE TABLE neq_null (id INT PRIMARY KEY, val INT)")
+        .unwrap();
     db.execute("INSERT INTO neq_null (id, val) VALUES (1, 10)").unwrap();
     db.execute("INSERT INTO neq_null (id, val) VALUES (2, 20)").unwrap();
     db.execute("INSERT INTO neq_null (id, val) VALUES (3, NULL)").unwrap();
 
     // val != 10 with NULL rows: NULL != 10 yields NULL (falsy in WHERE), so
     // the NULL row is excluded. SQL three-valued logic is handled by compare_values.
-    let rows = db.query("SELECT id FROM neq_null WHERE val != 10 ORDER BY id", &[]).unwrap();
-    assert_eq!(rows.len(), 1, "val != 10 should exclude NULL rows and id=1, leaving only id=2");
+    let rows = db
+        .query("SELECT id FROM neq_null WHERE val != 10 ORDER BY id", &[])
+        .unwrap();
+    assert_eq!(
+        rows.len(),
+        1,
+        "val != 10 should exclude NULL rows and id=1, leaving only id=2"
+    );
     assert_eq!(get_int_value(&rows[0], 0), Some(2));
 
     // AND short-circuit evaluation: `val IS NOT NULL` is false for the NULL row,
     // so `val != 10` is never evaluated for that row.
-    let rows2 = db.query("SELECT id FROM neq_null WHERE val IS NOT NULL AND val != 10 ORDER BY id", &[]).unwrap();
+    let rows2 = db
+        .query(
+            "SELECT id FROM neq_null WHERE val IS NOT NULL AND val != 10 ORDER BY id",
+            &[],
+        )
+        .unwrap();
     assert_eq!(rows2.len(), 1, "IS NOT NULL AND val != 10 should find id=2");
     assert_eq!(get_int_value(&rows2[0], 0), Some(2));
 }
@@ -1386,23 +1506,29 @@ fn test_cast_text_to_timestamp() {
 fn test_multiple_casts_in_single_query() {
     let db = create_test_db().unwrap();
 
-    let rows = db.query(
-        "SELECT CAST(1 AS TEXT) AS a, CAST('2' AS INTEGER) AS b, CAST(TRUE AS TEXT) AS c",
-        &[]
-    ).unwrap();
+    let rows = db
+        .query(
+            "SELECT CAST(1 AS TEXT) AS a, CAST('2' AS INTEGER) AS b, CAST(TRUE AS TEXT) AS c",
+            &[],
+        )
+        .unwrap();
     assert_eq!(rows.len(), 1, "Multiple CASTs in single query should work");
     assert_eq!(get_string_value(&rows[0], 0), Some("1".to_string()));
     assert_eq!(get_int_value(&rows[0], 1), Some(2));
     // Third column is boolean-to-text
     let c_val = get_string_value(&rows[0], 2).unwrap().to_lowercase();
-    assert!(c_val == "true" || c_val == "t" || c_val == "1",
-            "CAST(TRUE AS TEXT) should be 'true', got '{}'", c_val);
+    assert!(
+        c_val == "true" || c_val == "t" || c_val == "1",
+        "CAST(TRUE AS TEXT) should be 'true', got '{}'",
+        c_val
+    );
 }
 
 #[test]
 fn test_cast_in_group_by() {
     let db = create_test_db().unwrap();
-    db.execute("CREATE TABLE cast_gb (id INT, category TEXT, val INT)").unwrap();
+    db.execute("CREATE TABLE cast_gb (id INT, category TEXT, val INT)")
+        .unwrap();
     db.execute("INSERT INTO cast_gb VALUES (1, '1', 10)").unwrap();
     db.execute("INSERT INTO cast_gb VALUES (2, '1', 20)").unwrap();
     db.execute("INSERT INTO cast_gb VALUES (3, '2', 30)").unwrap();
@@ -1410,7 +1536,7 @@ fn test_cast_in_group_by() {
     // GROUP BY with CAST
     let result = db.query(
         "SELECT CAST(category AS INTEGER) AS cat, SUM(val) AS total FROM cast_gb GROUP BY category ORDER BY cat",
-        &[]
+        &[],
     );
     match result {
         Ok(rows) => {

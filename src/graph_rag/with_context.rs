@@ -222,11 +222,7 @@ fn split_top_commas(s: &str) -> Vec<&str> {
     out
 }
 
-fn strip_prefix_ci<'a>(
-    original: &'a str,
-    lower: &str,
-    prefix: &str,
-) -> Option<&'a str> {
+fn strip_prefix_ci<'a>(original: &'a str, lower: &str, prefix: &str) -> Option<&'a str> {
     if lower.starts_with(prefix) {
         let after = &original[prefix.len()..];
         // Require a space or `=` between key and value.
@@ -370,12 +366,7 @@ fn load_hit(db: &EmbeddedDatabase, node_id: i64) -> Result<Option<GraphRagHit>> 
     }))
 }
 
-fn fetch_peers(
-    db: &EmbeddedDatabase,
-    seed: i64,
-    direction: Direction,
-    kinds: &[String],
-) -> Result<Vec<i64>> {
+fn fetch_peers(db: &EmbeddedDatabase, seed: i64, direction: Direction, kinds: &[String]) -> Result<Vec<i64>> {
     let kind_filter = if kinds.is_empty() {
         String::new()
     } else {
@@ -414,10 +405,7 @@ fn fetch_peers(
 
 /// Silence the unused `graph_rag_search` re-export when `WITH CONTEXT`
 /// is live but a caller does not also use the typed search API.
-pub fn _graph_rag_search_typed_link(
-    db: &EmbeddedDatabase,
-    opts: &GraphRagOptions,
-) -> Result<Vec<GraphRagHit>> {
+pub fn _graph_rag_search_typed_link(db: &EmbeddedDatabase, opts: &GraphRagOptions) -> Result<Vec<GraphRagHit>> {
     graph_rag_search(db, opts)
 }
 

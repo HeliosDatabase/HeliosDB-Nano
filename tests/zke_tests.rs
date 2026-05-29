@@ -3,16 +3,15 @@
 //! Tests for client-side encryption with per-request keys.
 
 use heliosdb_nano::{
-    ZkeKeyDerivation, ZeroKnowledgeSession, ZkeConfig, ZkeRequestContext,
-    NonceTracker, TimestampValidator, ZkeDerivedKeys,
+    NonceTracker, TimestampValidator, ZeroKnowledgeSession, ZkeConfig, ZkeDerivedKeys, ZkeKeyDerivation,
+    ZkeRequestContext,
 };
 use std::sync::Arc;
 
 /// Test client-side key derivation
 #[test]
 fn test_zke_key_derivation_basic() {
-    let keys = ZkeKeyDerivation::derive_keys("my_password", "user@example.com")
-        .expect("Key derivation should succeed");
+    let keys = ZkeKeyDerivation::derive_keys("my_password", "user@example.com").expect("Key derivation should succeed");
 
     // Keys should be 32 bytes
     assert_eq!(keys.auth_key.len(), 32);
@@ -76,8 +75,7 @@ fn test_zke_session_encrypt_decrypt() {
 #[test]
 fn test_zke_session_from_hex_key() {
     let hex_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-    let session = ZeroKnowledgeSession::from_hex_key(hex_key)
-        .expect("Should create session from hex key");
+    let session = ZeroKnowledgeSession::from_hex_key(hex_key).expect("Should create session from hex key");
 
     let plaintext = b"test data for hex key session";
     let ciphertext = session.encrypt(plaintext).unwrap();
@@ -206,9 +204,7 @@ fn test_timestamp_validator() {
 #[test]
 fn test_zke_session_with_nonce() {
     let key: [u8; 32] = rand::random();
-    let session = ZeroKnowledgeSession::new(key)
-        .unwrap()
-        .with_random_nonce();
+    let session = ZeroKnowledgeSession::new(key).unwrap().with_random_nonce();
 
     assert!(session.nonce().is_some());
     assert!(session.nonce_hex().is_some());
@@ -254,7 +250,9 @@ fn test_zke_request_context_invalid_hash() {
     let wrong_hash = "0000000000000000000000000000000000000000000000000000000000000000";
 
     // Should fail with wrong hash
-    assert!(context.validate(Some(wrong_hash), Some(&nonce), Some(timestamp)).is_err());
+    assert!(context
+        .validate(Some(wrong_hash), Some(&nonce), Some(timestamp))
+        .is_err());
 }
 
 /// Test ZKE request context detects replay
@@ -275,14 +273,18 @@ fn test_zke_request_context_replay_detection() {
     let hash_hex = keys.key_hash_hex();
 
     // First request should pass
-    assert!(context1.validate(Some(&hash_hex), Some(&nonce), Some(timestamp)).is_ok());
+    assert!(context1
+        .validate(Some(&hash_hex), Some(&nonce), Some(timestamp))
+        .is_ok());
 
     // Second request with same nonce (replay attack)
     let session2 = ZeroKnowledgeSession::from_derived_keys(&keys).unwrap();
     let context2 = ZkeRequestContext::new(session2, Arc::clone(&nonce_tracker), config);
 
     // Should fail - nonce already used
-    assert!(context2.validate(Some(&hash_hex), Some(&nonce), Some(timestamp)).is_err());
+    assert!(context2
+        .validate(Some(&hash_hex), Some(&nonce), Some(timestamp))
+        .is_err());
 }
 
 /// Test ZKE context encrypt/decrypt

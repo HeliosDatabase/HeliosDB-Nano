@@ -7,17 +7,16 @@
 //! - Primary connection status (when running as standby)
 //! - Replication lag and performance metrics
 
-use std::sync::RwLock;
-use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
-use uuid::Uuid;
-use tokio::sync::broadcast;
-use super::wal_replicator::{WalEntry, WalEntryType, Lsn};
+use super::wal_replicator::{Lsn, WalEntry, WalEntryType};
 use crate::storage::WalOperation;
+use std::collections::HashMap;
+use std::sync::RwLock;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio::sync::broadcast;
+use uuid::Uuid;
 
 /// Global HA state registry instance
-static HA_STATE: once_cell::sync::Lazy<HAStateRegistry> =
-    once_cell::sync::Lazy::new(HAStateRegistry::new);
+static HA_STATE: once_cell::sync::Lazy<HAStateRegistry> = once_cell::sync::Lazy::new(HAStateRegistry::new);
 
 /// Get the global HA state registry
 pub fn ha_state() -> &'static HAStateRegistry {
@@ -289,7 +288,8 @@ impl HAStateRegistry {
 
     /// Get all standbys
     pub fn get_standbys(&self) -> Vec<StandbyInfo> {
-        self.standbys.read()
+        self.standbys
+            .read()
             .map(|s| s.values().cloned().collect())
             .unwrap_or_default()
     }
@@ -357,9 +357,7 @@ impl HAStateRegistry {
 
     /// Get replication metrics
     pub fn get_metrics(&self) -> ReplicationMetrics {
-        self.metrics.read()
-            .map(|m| m.clone())
-            .unwrap_or_default()
+        self.metrics.read().map(|m| m.clone()).unwrap_or_default()
     }
 
     /// Update metrics
@@ -430,9 +428,7 @@ impl HAStateRegistry {
 
     /// Check if WAL broadcasting is enabled
     pub fn has_wal_broadcast(&self) -> bool {
-        self.wal_broadcast_tx.read()
-            .map(|tx| tx.is_some())
-            .unwrap_or(false)
+        self.wal_broadcast_tx.read().map(|tx| tx.is_some()).unwrap_or(false)
     }
 
     /// Broadcast a WAL entry to standbys (called by storage engine)
@@ -446,7 +442,12 @@ impl HAStateRegistry {
                 // Broadcast to all subscribers
                 match tx.send(entry) {
                     Ok(receiver_count) => {
-                        tracing::info!("broadcast_wal_entry: LSN={} sent to {} receivers, data_len={}", lsn, receiver_count, data_len);
+                        tracing::info!(
+                            "broadcast_wal_entry: LSN={} sent to {} receivers, data_len={}",
+                            lsn,
+                            receiver_count,
+                            data_len
+                        );
                         // Update metrics
                         self.record_replication(1, data_len);
                         return Some(lsn);
@@ -492,7 +493,12 @@ impl HAStateRegistry {
                     let standbys = self.get_standbys();
                     tracing::debug!("wait_for_sync: Checking {} standbys for LSN={}", standbys.len(), lsn);
                     for s in &standbys {
-                        tracing::debug!("wait_for_sync: Standby {} flush_lsn={} apply_lsn={}", s.node_id, s.flush_lsn, s.apply_lsn);
+                        tracing::debug!(
+                            "wait_for_sync: Standby {} flush_lsn={} apply_lsn={}",
+                            s.node_id,
+                            s.flush_lsn,
+                            s.apply_lsn
+                        );
                     }
                     let acked = standbys.iter().any(|s| s.flush_lsn >= lsn);
 
@@ -512,7 +518,12 @@ impl HAStateRegistry {
     /// Converts WalOperation to replication WalEntry and broadcasts
     pub fn broadcast_wal_operation(&self, lsn: u64, operation: &WalOperation) -> Option<Lsn> {
         let role = self.get_role();
-        tracing::info!("broadcast_wal_operation: LSN={}, role={:?}, op={:?}", lsn, role, std::mem::discriminant(operation));
+        tracing::info!(
+            "broadcast_wal_operation: LSN={}, role={:?}, op={:?}",
+            lsn,
+            role,
+            std::mem::discriminant(operation)
+        );
 
         // Only broadcast if we're the primary
         if role != HARole::Primary {
@@ -550,7 +561,9 @@ impl HAStateRegistry {
             // Materialized view operations
             WalOperation::CreateMaterializedView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
             WalOperation::DropMaterializedView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
-            WalOperation::RefreshMaterializedView { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
+            WalOperation::RefreshMaterializedView { .. } => {
+                (WalEntryType::SchemaChange, serialize_operation(operation))
+            }
 
             // Constraint operations
             WalOperation::AddConstraint { .. } => (WalEntryType::SchemaChange, serialize_operation(operation)),
@@ -626,10 +639,7 @@ mod tests {
         let registry = HAStateRegistry::new();
         let standby_id = Uuid::new_v4();
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
 
         registry.register_standby(StandbyInfo {
             node_id: standby_id,

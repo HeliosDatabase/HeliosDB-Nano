@@ -1,6 +1,6 @@
 //! Request and Response models for REST API
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Generic API response wrapper for consistent response format
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -116,69 +116,30 @@ pub struct EmbeddingUsage {
     pub total_tokens: u32,
 }
 
+pub mod auth;
 pub mod branch;
+pub mod cancellation;
+pub mod data;
 pub mod error;
 pub mod query;
-pub mod auth;
-pub mod data;
-pub mod cancellation;
 
 // Re-exports
-pub use branch::{
-    CreateBranchRequest,
-    BranchResponse,
-    BranchListResponse,
-    MergeBranchRequest,
-    MergeBranchResponse,
-    MergeStrategyDto,
-    BranchStateDto,
-    BranchStatsDto,
-    MergeConflictDto,
-};
-pub use error::ApiError;
-pub use query::{
-    QueryRequest,
-    QueryResponse,
-    ExecuteRequest,
-    ExecuteResponse,
-    QueryParameter,
-    AsOfSpec,
-};
 pub use auth::{
-    ApiKeyAuth,
-    JwtAuth,
-    UserContextResponse,
-    RateLimitInfoResponse,
-    LoginRequest,
-    LoginResponse,
-    RefreshTokenRequest,
-    RefreshTokenResponse,
-    CreateApiKeyRequest,
-    CreateApiKeyResponse,
-    ApiKeyListItem,
+    ApiKeyAuth, ApiKeyListItem, CreateApiKeyRequest, CreateApiKeyResponse, JwtAuth, LoginRequest, LoginResponse,
+    RateLimitInfoResponse, RefreshTokenRequest, RefreshTokenResponse, UserContextResponse,
 };
-pub use data::{
-    TableListResponse,
-    TableInfoResponse,
-    DataQueryParams,
-    DataQueryResponse,
-    InsertDataRequest,
-    InsertDataResponse,
-    UpdateDataRequest,
-    UpdateDataResponse,
-    DeleteDataRequest,
-    DeleteDataResponse,
-    BatchInferResponse,
-    OptimizationResponse,
-    SchemaComparisonResponse,
-    NaturalLanguageSchemaResponse,
+pub use branch::{
+    BranchListResponse, BranchResponse, BranchStateDto, BranchStatsDto, CreateBranchRequest, MergeBranchRequest,
+    MergeBranchResponse, MergeConflictDto, MergeStrategyDto,
 };
 pub use cancellation::{
-    CancelQueryRequest,
-    CancelQueryResponse,
-    RunningQueryInfo,
-    RunningQueriesResponse,
-    QueryStatusResponse,
-    CancelSessionQueriesRequest,
-    BulkCancelResponse,
+    BulkCancelResponse, CancelQueryRequest, CancelQueryResponse, CancelSessionQueriesRequest, QueryStatusResponse,
+    RunningQueriesResponse, RunningQueryInfo,
 };
+pub use data::{
+    BatchInferResponse, DataQueryParams, DataQueryResponse, DeleteDataRequest, DeleteDataResponse, InsertDataRequest,
+    InsertDataResponse, NaturalLanguageSchemaResponse, OptimizationResponse, SchemaComparisonResponse,
+    TableInfoResponse, TableListResponse, UpdateDataRequest, UpdateDataResponse,
+};
+pub use error::ApiError;
+pub use query::{AsOfSpec, ExecuteRequest, ExecuteResponse, QueryParameter, QueryRequest, QueryResponse};
