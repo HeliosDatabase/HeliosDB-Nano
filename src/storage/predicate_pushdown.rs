@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::sql::logical_plan::{BinaryOperator, LogicalExpr};
 use crate::storage::bloom_filter::TableBloomFilters;
-use crate::storage::simd_filter::{CombinedPredicate, FilterOp, FilterPredicate, SimdPredicateFilteringEngine};
+use crate::storage::simd_filter::{FilterOp, FilterPredicate};
 use crate::storage::zone_map::{RangeOp, TableZoneMap, ZoneMapStats};
 use crate::{Schema, Tuple, Value};
 
@@ -204,8 +204,6 @@ pub struct PredicatePushdownManager {
     bloom_filters: Arc<RwLock<HashMap<String, TableBloomFilters>>>,
     /// Per-table zone maps
     zone_maps: Arc<RwLock<HashMap<String, TableZoneMap>>>,
-    /// SIMD filtering engine
-    simd_engine: SimdPredicateFilteringEngine,
     /// Statistics
     stats: Arc<RwLock<PushdownStats>>,
 }
@@ -217,7 +215,6 @@ impl PredicatePushdownManager {
             config,
             bloom_filters: Arc::new(RwLock::new(HashMap::new())),
             zone_maps: Arc::new(RwLock::new(HashMap::new())),
-            simd_engine: SimdPredicateFilteringEngine::new(),
             stats: Arc::new(RwLock::new(PushdownStats::default())),
         }
     }
@@ -560,39 +557,32 @@ impl PredicatePushdownManager {
             })
             .collect();
 
-        // Build candidate rows
-        let candidate_rows: Vec<Vec<Value>> = candidate_indices
-            .iter()
-            .filter_map(|&idx| tuples.get(idx).map(|t| t.values.to_vec()))
-            .collect();
+        let total_count = candidate_indices.len();
+        let mut matching_tuples = Vec::with_capacity(limit.map_or(total_count, |lim| lim.min(total_count)));
 
-        // Apply SIMD filtering
-        let result = if let Some(lim) = limit {
-            let combined = if filter_predicates.len() == 1 {
-                // Length is 1, so next() will succeed; use map_or for safety
-                filter_predicates
-                    .into_iter()
-                    .next()
-                    .map_or_else(|| CombinedPredicate::And(vec![]), CombinedPredicate::Single)
-            } else {
-                CombinedPredicate::And(filter_predicates.into_iter().map(CombinedPredicate::Single).collect())
+        'outer: for &tuple_idx in &candidate_indices {
+            let Some(tuple) = tuples.get(tuple_idx) else {
+                continue;
             };
-            self.simd_engine.filter_rows_with_limit(&candidate_rows, &combined, lim)
-        } else {
-            self.simd_engine
-                .filter_and_predicates(&candidate_rows, &filter_predicates)
-        };
 
-        stats.simd_rows_filtered += result.total_count as u64 - result.matched_count as u64;
+            for pred in &filter_predicates {
+                let Some(value) = tuple.values.get(pred.column_index) else {
+                    continue 'outer;
+                };
+                if !pred.evaluate(value) {
+                    continue 'outer;
+                }
+            }
 
-        // Collect matching tuples
-        let matching_tuples: Vec<Tuple> = result
-            .matched_indices
-            .iter()
-            .filter_map(|&idx| candidate_indices.get(idx).and_then(|&ci| tuples.get(ci)).cloned())
-            .collect();
+            matching_tuples.push(tuple.clone());
+            if limit.is_some_and(|lim| matching_tuples.len() >= lim) {
+                break;
+            }
+        }
 
-        if result.matched_count < result.total_count && limit.is_some() {
+        stats.simd_rows_filtered += total_count.saturating_sub(matching_tuples.len()) as u64;
+
+        if matching_tuples.len() < total_count && limit.is_some() {
             stats.early_terminations += 1;
         }
 
