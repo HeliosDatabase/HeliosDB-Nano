@@ -111,3 +111,56 @@ hangs and was skipped during the full-suite run — same class.)
 
 None block the perf work (all pre-existing in v3.33.1). Group A1 (correlated
 subqueries) is the most impactful functional gap.
+
+---
+
+## Resolution status (2026-05-29, after triage)
+
+**Fixed + committed on `main`:**
+- **A1/Defect-2** (`subquery_hardening::test_subquery_in_having`): HAVING expressions
+  weren't run through `materialize_subqueries` (unlike Filter/Project), so a subquery
+  in HAVING erred and dropped every group. One-line fix in
+  `sql/executor/mod.rs` AggregateOperator construction. (`946dd13`)
+- **A5** (`savepoint_hardening::*_no_ryow`): stale test — the engine now correctly
+  does read-your-own-writes; flipped the assertion + renamed to `*_reads_own_writes`.
+  (`946dd13`)
+- **A2** (3 `information_schema_completion` tests): stale tests asserting the
+  *removed* `PgCatalog::handle_query` interception contract. The views are served by
+  the planner-backed `SystemViewRegistry` (referential_constraints — verified correct
+  FK metadata) and by interception (schemata). Rewrote the tests to the real query
+  paths; all 9 pass. (Engine correct; tests stale.) (`df438e9`)
+
+**Offloaded to the concurrent (Codex) session — test/data fixes, in progress:**
+- **B1** (null default-value stale test), **C1** (SCRAM timing fragility),
+  **C2** (PQ training-data sample count). Codex confirmed ownership; lands on
+  codex-fk and merges.
+
+**Scoped follow-ups (NOT fixed — require dedicated, reviewed effort):**
+- **A1/Defect-1 — correlated subqueries/EXISTS (8 tests).** This is the high-impact
+  functional gap, but it is **deliberately deferred by the codebase**: see the
+  in-code notes at `sql/executor/mod.rs:532-544` and `:500-516` ("true
+  correlated-subquery support needs nested-loop join or dependent-rewrite
+  (significant planner work, deferred)"). `materialize_subqueries` evaluates a
+  subquery **once at plan-build time with no outer-row binding**; a correlated inner
+  SELECT references an outer column, errors, and the error is **intentionally
+  swallowed** to `false`/`NULL` — a fallback **drizzle-kit / info_schema
+  introspection relies on** (pg_class correlated EXISTS). **Fix plan** (from the
+  root-cause workflow): detect correlation (outer-column refs in the inner plan);
+  leave correlated subqueries un-materialized; give `FilterOperator` (and the
+  Project path for scalar-subquery-in-SELECT) the storage handle + outer schema so it
+  can, per outer row, bind outer columns to literals and execute the inner plan;
+  **keep** the uncorrelated fast path and **keep** the swallow only for
+  genuinely-unresolvable system-catalog cases (so drizzle doesn't regress). Medium
+  size, **moderate regression risk** → must not be rushed.
+- **A6 — HNSW `len()` semantics (1 test).** Not an engine bug to fix blindly:
+  `vector_index.rs:676/685/700` use `len()` as the **live** `num_vectors`, so the
+  current `len()` = live count (2 after deleting 1 of 3) is correct for real callers;
+  the test asserts the **physical/tombstone** count (3). **Decision needed** (vector
+  module owner): add a separate `physical_len()`/`tombstone_count()` accessor for the
+  test, or update the test to assert the live count. Don't change `len()` (breaks
+  `num_vectors` callers).
+- **A4 — TRUNCATE/DELETE affected-row-count** (`truncate_hardening`): minor pre-existing
+  behavior detail (DELETE-returns-5 / TRUNCATE-returns-0 semantics); low priority.
+
+**Environment-limited (CI, not code):** C3 — `ha_integration` / `postgres_ssl` tests
+hang (bind ports / wait on connections) in this sandbox on both `main` and baseline.
