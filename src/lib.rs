@@ -394,6 +394,9 @@ pub struct EmbeddedDatabase {
     parse_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, sqlparser::ast::Statement>>>,
     /// Query result cache: SQL string → cached results (invalidated on DML per-table)
     result_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<Vec<Tuple>>>>>,
+    /// Repeated parameterized INSERT metadata cache. Invalidated with the plan cache on DDL.
+    fast_param_insert_cache:
+        std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamInsertSpec>>>>,
     /// ART index undo log for transaction rollback: (table, row_id, col_values)
     /// Cleared on commit, replayed as on_delete on rollback
     art_undo_log: std::sync::Arc<parking_lot::RwLock<Vec<ArtUndoOp>>>,
@@ -464,6 +467,19 @@ enum ArtUndoOp {
         old_col_values: std::collections::HashMap<String, Value>,
         new_col_values: std::collections::HashMap<String, Value>,
     },
+}
+
+#[derive(Clone)]
+struct FastParamInsertColumn {
+    col_idx: usize,
+    data_type: DataType,
+    expr: sql::LogicalExpr,
+}
+
+struct FastParamInsertSpec {
+    table_name: String,
+    schema: std::sync::Arc<Schema>,
+    columns: Vec<FastParamInsertColumn>,
 }
 
 struct FastDeleteTarget {
@@ -628,6 +644,14 @@ impl<'a> Drop for CodeGraphBranchGuard<'a> {
 }
 
 impl EmbeddedDatabase {
+    #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
+    fn new_fast_param_insert_cache(
+    ) -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamInsertSpec>>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
+        )))
+    }
+
     /// Check if a SQL statement is a transaction control statement (zero-allocation)
     fn is_transaction_control(sql: &str) -> bool {
         let trimmed = sql.trim().trim_end_matches(';').trim();
@@ -3424,6 +3448,7 @@ impl EmbeddedDatabase {
             result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
             ))),
+            fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
@@ -3488,6 +3513,7 @@ impl EmbeddedDatabase {
             result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
             ))),
+            fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
@@ -3575,6 +3601,7 @@ impl EmbeddedDatabase {
             result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
             ))),
+            fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
             fk_validation_source: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationSource::Engine)),
@@ -4386,7 +4413,12 @@ impl EmbeddedDatabase {
     /// direct storage path used by literal INSERTs. This keeps PG-wire
     /// extended-protocol inserts from falling back to the slower
     /// versioned/logical-plan path on every row.
-    fn try_autocommit_fast_insert_params(&self, plan: &sql::LogicalPlan, params: &[Value]) -> Option<Result<u64>> {
+    fn try_autocommit_fast_insert_params(
+        &self,
+        sql: &str,
+        plan: &sql::LogicalPlan,
+        params: &[Value],
+    ) -> Option<Result<u64>> {
         if self.in_transaction()
             || !self.savepoints.read().is_empty()
             || !self.session_transactions.is_empty()
@@ -4396,104 +4428,18 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let sql::LogicalPlan::Insert {
-            table_name,
-            columns,
-            values,
-            returning,
-            on_conflict,
-        } = plan
-        else {
-            return None;
+        let spec = match self.fast_param_insert_spec(sql, plan)? {
+            Ok(spec) => spec,
+            Err(e) => return Some(Err(e)),
         };
-
-        if returning.is_some() || on_conflict.is_some() || values.len() != 1 {
-            return None;
-        }
-        if self.tenant_manager.should_apply_rls(table_name, "INSERT") {
-            return None;
-        }
-        if self.trigger_registry.has_triggers_for_table(table_name) {
-            return None;
-        }
-
-        let catalog = self.storage.catalog();
-        let schema = match catalog.get_table_schema(table_name) {
-            Ok(schema) => schema,
-            Err(_) => return None,
+        let tuple = match Self::materialize_fast_param_insert_tuple(&spec, params) {
+            Ok(tuple) => tuple,
+            Err(e) => return Some(Err(e)),
         };
-        if let Ok(tc) = catalog.load_table_constraints(table_name) {
-            if !tc.foreign_keys.is_empty() || !tc.check_constraints.is_empty() {
-                return None;
-            }
-        }
-
-        let column_names: Vec<&str> = columns.as_ref().map_or_else(
-            || schema.columns.iter().map(|c| c.name.as_str()).collect(),
-            |cols| cols.iter().map(String::as_str).collect(),
-        );
-        let value_row = values.first()?;
-        if column_names.len() != value_row.len() {
-            return None;
-        }
-
-        let mut tuple_values = vec![Value::Null; schema.columns.len()];
-        let mut user_provided = vec![false; schema.columns.len()];
-
-        for (col_name, expr) in column_names.iter().zip(value_row) {
-            let col_idx = match schema.get_column_index(col_name) {
-                Some(idx) => idx,
-                None => return None,
-            };
-            let target_col = match schema.get_column_at(col_idx) {
-                Some(col) => col,
-                None => return None,
-            };
-
-            if matches!(expr, sql::LogicalExpr::DefaultValue) {
-                continue;
-            }
-            if !Self::fast_param_insert_expr_supported(expr) {
-                return None;
-            }
-
-            let mut value = match Self::fast_eval_param_expr(expr, params) {
-                Some(Ok(value)) => value,
-                Some(Err(e)) => return Some(Err(e)),
-                None => {
-                    let evaluator = sql::Evaluator::with_parameters(
-                        std::sync::Arc::new(Schema { columns: vec![] }),
-                        params.to_vec(),
-                    );
-                    let empty_tuple = Tuple::new(vec![]);
-                    match evaluator.evaluate(expr, &empty_tuple) {
-                        Ok(value) => value,
-                        Err(e) => return Some(Err(e)),
-                    }
-                }
-            };
-            if Self::insert_value_needs_cast(&value, &target_col.data_type) {
-                value = match Self::fast_cast_value(value, &target_col.data_type) {
-                    Ok(value) => value,
-                    Err(e) => return Some(Err(e)),
-                };
-            }
-
-            if let Some(slot) = tuple_values.get_mut(col_idx) {
-                *slot = value;
-            }
-            if let Some(flag) = user_provided.get_mut(col_idx) {
-                *flag = true;
-            }
-        }
-
-        if let Err(e) = Self::apply_defaults_and_check_not_null(&mut tuple_values, &schema, &user_provided) {
-            return Some(Err(e));
-        }
 
         let result = self
             .storage
-            .insert_tuple_fast(table_name, Tuple::new(tuple_values), &schema)
+            .insert_tuple_fast(&spec.table_name, tuple, &spec.schema)
             .map(|_| 1);
         if result.is_ok() {
             self.storage.increment_lsn();
@@ -4501,7 +4447,12 @@ impl EmbeddedDatabase {
         Some(result)
     }
 
-    fn try_transaction_fast_insert_params(&self, plan: &sql::LogicalPlan, params: &[Value]) -> Option<Result<u64>> {
+    fn try_transaction_fast_insert_params(
+        &self,
+        sql: &str,
+        plan: &sql::LogicalPlan,
+        params: &[Value],
+    ) -> Option<Result<u64>> {
         if !self.in_transaction()
             || !self.savepoints.read().is_empty()
             || !self.session_transactions.is_empty()
@@ -4510,6 +4461,46 @@ impl EmbeddedDatabase {
             return None;
         }
 
+        let spec = match self.fast_param_insert_spec(sql, plan)? {
+            Ok(spec) => spec,
+            Err(e) => return Some(Err(e)),
+        };
+        let tuple = match Self::materialize_fast_param_insert_tuple(&spec, params) {
+            Ok(tuple) => tuple,
+            Err(e) => return Some(Err(e)),
+        };
+
+        let txn_guard = match self.current_transaction.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let txn = txn_guard.as_ref()?;
+        Some(self.insert_validated_tuples_in_transaction(&spec.table_name, vec![tuple], &spec.schema, txn))
+    }
+
+    fn fast_param_insert_spec(
+        &self,
+        sql: &str,
+        plan: &sql::LogicalPlan,
+    ) -> Option<Result<std::sync::Arc<FastParamInsertSpec>>> {
+        let cache_key = format!("\0fast_param_insert\0{sql}");
+        if let Ok(mut cache) = self.fast_param_insert_cache.lock() {
+            if let Some(spec) = cache.get(&cache_key) {
+                return Some(Ok(std::sync::Arc::clone(spec)));
+            }
+        }
+
+        let spec = match self.build_fast_param_insert_spec(plan)? {
+            Ok(spec) => std::sync::Arc::new(spec),
+            Err(e) => return Some(Err(e)),
+        };
+        if let Ok(mut cache) = self.fast_param_insert_cache.lock() {
+            cache.put(cache_key, std::sync::Arc::clone(&spec));
+        }
+        Some(Ok(spec))
+    }
+
+    fn build_fast_param_insert_spec(&self, plan: &sql::LogicalPlan) -> Option<Result<FastParamInsertSpec>> {
         let sql::LogicalPlan::Insert {
             table_name,
             columns,
@@ -4533,7 +4524,7 @@ impl EmbeddedDatabase {
 
         let catalog = self.storage.catalog();
         let schema = match catalog.get_table_schema(table_name) {
-            Ok(schema) => schema,
+            Ok(schema) => std::sync::Arc::new(schema),
             Err(_) => return None,
         };
         if let Ok(tc) = catalog.load_table_constraints(table_name) {
@@ -4551,9 +4542,7 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let mut tuple_values = vec![Value::Null; schema.columns.len()];
-        let mut user_provided = vec![false; schema.columns.len()];
-
+        let mut insert_columns = Vec::with_capacity(column_names.len());
         for (col_name, expr) in column_names.iter().zip(value_row) {
             let col_idx = match schema.get_column_index(col_name) {
                 Some(idx) => idx,
@@ -4563,54 +4552,56 @@ impl EmbeddedDatabase {
                 Some(col) => col,
                 None => return None,
             };
-
-            if matches!(expr, sql::LogicalExpr::DefaultValue) {
-                continue;
-            }
             if !Self::fast_param_insert_expr_supported(expr) {
                 return None;
             }
+            insert_columns.push(FastParamInsertColumn {
+                col_idx,
+                data_type: target_col.data_type.clone(),
+                expr: expr.clone(),
+            });
+        }
 
-            let mut value = match Self::fast_eval_param_expr(expr, params) {
-                Some(Ok(value)) => value,
-                Some(Err(e)) => return Some(Err(e)),
+        Some(Ok(FastParamInsertSpec {
+            table_name: table_name.clone(),
+            schema,
+            columns: insert_columns,
+        }))
+    }
+
+    fn materialize_fast_param_insert_tuple(spec: &FastParamInsertSpec, params: &[Value]) -> Result<Tuple> {
+        let mut tuple_values = vec![Value::Null; spec.schema.columns.len()];
+        let mut user_provided = vec![false; spec.schema.columns.len()];
+
+        for column in &spec.columns {
+            if matches!(column.expr, sql::LogicalExpr::DefaultValue) {
+                continue;
+            }
+
+            let mut value = match Self::fast_eval_param_expr(&column.expr, params) {
+                Some(value) => value?,
                 None => {
                     let evaluator = sql::Evaluator::with_parameters(
                         std::sync::Arc::new(Schema { columns: vec![] }),
                         params.to_vec(),
                     );
-                    let empty_tuple = Tuple::new(vec![]);
-                    match evaluator.evaluate(expr, &empty_tuple) {
-                        Ok(value) => value,
-                        Err(e) => return Some(Err(e)),
-                    }
+                    evaluator.evaluate(&column.expr, &Tuple::new(vec![]))?
                 }
             };
-            if Self::insert_value_needs_cast(&value, &target_col.data_type) {
-                value = match Self::fast_cast_value(value, &target_col.data_type) {
-                    Ok(value) => value,
-                    Err(e) => return Some(Err(e)),
-                };
+            if Self::insert_value_needs_cast(&value, &column.data_type) {
+                value = Self::fast_cast_value(value, &column.data_type)?;
             }
 
-            if let Some(slot) = tuple_values.get_mut(col_idx) {
+            if let Some(slot) = tuple_values.get_mut(column.col_idx) {
                 *slot = value;
             }
-            if let Some(flag) = user_provided.get_mut(col_idx) {
+            if let Some(flag) = user_provided.get_mut(column.col_idx) {
                 *flag = true;
             }
         }
 
-        if let Err(e) = Self::apply_defaults_and_check_not_null(&mut tuple_values, &schema, &user_provided) {
-            return Some(Err(e));
-        }
-
-        let txn_guard = match self.current_transaction.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        let txn = txn_guard.as_ref()?;
-        Some(self.insert_validated_tuples_in_transaction(table_name, vec![Tuple::new(tuple_values)], &schema, txn))
+        Self::apply_defaults_and_check_not_null(&mut tuple_values, &spec.schema, &user_provided)?;
+        Ok(Tuple::new(tuple_values))
     }
 
     fn fast_param_insert_expr_supported(expr: &sql::LogicalExpr) -> bool {
@@ -5067,6 +5058,9 @@ impl EmbeddedDatabase {
         }
         // Also invalidate parse cache since schema changes may affect SQL interpretation
         if let Ok(mut cache) = self.parse_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.fast_param_insert_cache.lock() {
             cache.clear();
         }
         // Also invalidate result cache since schema changes affect query results
@@ -7797,12 +7791,12 @@ impl EmbeddedDatabase {
     pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<u64> {
         let plan = self.parameterized_plan_cached(sql)?;
 
-        if let Some(result) = self.try_transaction_fast_insert_params(&plan, params) {
+        if let Some(result) = self.try_transaction_fast_insert_params(sql, &plan, params) {
             let count = result?;
             self.invalidate_result_cache();
             return Ok(count);
         }
-        if let Some(result) = self.try_autocommit_fast_insert_params(&plan, params) {
+        if let Some(result) = self.try_autocommit_fast_insert_params(sql, &plan, params) {
             let count = result?;
             self.invalidate_result_cache();
             return Ok(count);
@@ -10814,6 +10808,7 @@ impl EmbeddedDatabase {
             plan_cache: self.plan_cache.clone(),
             parse_cache: self.parse_cache.clone(),
             result_cache: self.result_cache.clone(),
+            fast_param_insert_cache: self.fast_param_insert_cache.clone(),
             art_undo_log: self.art_undo_log.clone(),
             fk_validation_mode: self.fk_validation_mode.clone(),
             fk_validation_source: self.fk_validation_source.clone(),
