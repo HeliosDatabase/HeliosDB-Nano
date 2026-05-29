@@ -1292,6 +1292,41 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Like `log_data_insert` but appends without a per-statement fsync.
+    /// The entry is still broadcast to HA standbys by the WAL layer.
+    pub fn log_data_insert_nosync(&self, table_name: &str, key: &[u8], tuple_data: &[u8]) -> Result<()> {
+        if self.is_replaying.load(Ordering::Acquire) {
+            return Ok(());
+        }
+
+        if let Some(wal) = &self.wal {
+            let wal = wal.read();
+            wal.append_nosync(WalOperation::Insert {
+                table: table_name.to_string(),
+                key: key.to_vec(),
+                tuple: tuple_data.to_vec(),
+            })?;
+        }
+        Ok(())
+    }
+
+    fn fast_insert_requires_logical_wal(&self) -> bool {
+        if !self.is_wal_enabled() {
+            return false;
+        }
+        if self.config.storage.logical_wal_per_statement {
+            return true;
+        }
+        #[cfg(feature = "ha-tier1")]
+        {
+            use crate::replication::ha_state::{ha_state, HARole};
+            if ha_state().get_role() == HARole::Primary {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Log a data UPDATE operation to WAL for replication
     ///
     /// This is used when UPDATE is done through a transaction which
@@ -4578,6 +4613,14 @@ impl StorageEngine {
         let key = Self::build_data_key(table_name, row_id);
         self.put(&key, &value)?;
 
+        if self.fast_insert_requires_logical_wal() {
+            if self.config.storage.logical_wal_per_statement {
+                self.log_data_insert(table_name, &key, &value)?;
+            } else {
+                self.log_data_insert_nosync(table_name, &key, &value)?;
+            }
+        }
+
         // ART index update (constraint already verified above)
         if let Err(e) = self.art_index_manager.on_insert(table_name, row_id, &col_values) {
             tracing::debug!("ART index insert for table '{}': {}", table_name, e);
@@ -5317,6 +5360,67 @@ mod tests {
                 "WAL should contain insert operation for test_users table"
             );
         }
+    }
+
+    #[test]
+    fn test_fast_insert_logs_wal_when_strict_logical_wal_enabled() {
+        let mut config = Config::in_memory();
+        config.storage.wal_enabled = true;
+        config.storage.logical_wal_per_statement = true;
+
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
+        let schema = Schema {
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    data_type: DataType::Int4,
+                    nullable: false,
+                    primary_key: true,
+                    source_table: None,
+                    source_table_name: None,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
+                },
+                Column {
+                    name: "name".to_string(),
+                    data_type: DataType::Text,
+                    nullable: false,
+                    primary_key: false,
+                    source_table: None,
+                    source_table_name: None,
+                    default_expr: None,
+                    unique: false,
+                    storage_mode: crate::ColumnStorageMode::Default,
+                },
+            ],
+        };
+
+        engine
+            .catalog()
+            .create_table("fast_wal_users", schema.clone())
+            .expect("Failed to create table");
+
+        let tuple = Tuple {
+            values: vec![Value::Int4(1), Value::String("Alice".to_string())],
+            row_id: None,
+            branch_id: None,
+        };
+        engine
+            .insert_tuple_fast("fast_wal_users", tuple, &schema)
+            .expect("Failed to fast insert tuple");
+
+        let wal = engine.wal.as_ref().expect("WAL should be enabled").read();
+        let entries = wal.replay().expect("Failed to replay WAL");
+        let has_fast_insert = entries.iter().any(|entry| {
+            if let crate::storage::WalOperation::Insert { table, .. } = &entry.operation {
+                table == "fast_wal_users"
+            } else {
+                false
+            }
+        });
+
+        assert!(has_fast_insert, "fast insert should be present in logical WAL");
     }
 }
 
