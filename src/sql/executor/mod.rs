@@ -37,6 +37,8 @@ pub use set_ops::{ExceptOperator, IntersectOperator, UnionOperator};
 pub use topk::TopKOperator;
 pub use window::WindowOperator;
 
+type IntRangeBounds = (Option<(i64, bool)>, Option<(i64, bool)>);
+
 /// Create a schema for COUNT(*) fast path results (single Int8 column).
 fn count_star_schema() -> Arc<Schema> {
     Arc::new(Schema {
@@ -1063,23 +1065,42 @@ impl<'a> Executor<'a> {
         predicate: &crate::sql::LogicalExpr,
         pk_name: &str,
         pk_type: &crate::DataType,
-    ) -> Option<(Option<(i64, bool)>, Option<(i64, bool)>)> {
-        use crate::sql::LogicalExpr;
+    ) -> Option<IntRangeBounds> {
+        use crate::sql::{BinaryOperator, LogicalExpr};
 
-        let LogicalExpr::BinaryExpr { left, op, right } = predicate else {
-            return None;
-        };
-
-        let left_col = Self::expr_matches_column(left, pk_name);
-        let right_col = Self::expr_matches_column(right, pk_name);
-        match (left_col, right_col) {
-            (true, false) => {
-                let bound = self.bound_expr_to_i64(right, pk_type)?;
-                Self::range_for_column_op(*op, bound)
+        match predicate {
+            LogicalExpr::BinaryExpr {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => Self::merge_int_ranges(
+                self.pk_int_range_from_predicate(left, pk_name, pk_type)?,
+                self.pk_int_range_from_predicate(right, pk_name, pk_type)?,
+            ),
+            LogicalExpr::BinaryExpr { left, op, right } => {
+                let left_col = Self::expr_matches_column(left, pk_name);
+                let right_col = Self::expr_matches_column(right, pk_name);
+                match (left_col, right_col) {
+                    (true, false) => {
+                        let bound = self.bound_expr_to_i64(right, pk_type)?;
+                        Self::range_for_column_op(*op, bound)
+                    }
+                    (false, true) => {
+                        let bound = self.bound_expr_to_i64(left, pk_type)?;
+                        Self::range_for_value_op(*op, bound)
+                    }
+                    _ => None,
+                }
             }
-            (false, true) => {
-                let bound = self.bound_expr_to_i64(left, pk_type)?;
-                Self::range_for_value_op(*op, bound)
+            LogicalExpr::Between {
+                expr,
+                low,
+                high,
+                negated: false,
+            } if Self::expr_matches_column(expr, pk_name) => {
+                let low = self.bound_expr_to_i64(low, pk_type)?;
+                let high = self.bound_expr_to_i64(high, pk_type)?;
+                Some((Some((low, true)), Some((high, true))))
             }
             _ => None,
         }
@@ -1125,7 +1146,7 @@ impl<'a> Executor<'a> {
     fn range_for_column_op(
         op: crate::sql::BinaryOperator,
         bound: i64,
-    ) -> Option<(Option<(i64, bool)>, Option<(i64, bool)>)> {
+    ) -> Option<IntRangeBounds> {
         use crate::sql::BinaryOperator;
         match op {
             BinaryOperator::Eq => Some((Some((bound, true)), Some((bound, true)))),
@@ -1140,7 +1161,7 @@ impl<'a> Executor<'a> {
     fn range_for_value_op(
         op: crate::sql::BinaryOperator,
         bound: i64,
-    ) -> Option<(Option<(i64, bool)>, Option<(i64, bool)>)> {
+    ) -> Option<IntRangeBounds> {
         use crate::sql::BinaryOperator;
         match op {
             BinaryOperator::Eq => Some((Some((bound, true)), Some((bound, true)))),
@@ -1150,6 +1171,46 @@ impl<'a> Executor<'a> {
             BinaryOperator::GtEq => Some((None, Some((bound, true)))),
             _ => None,
         }
+    }
+
+    fn merge_int_ranges(left: IntRangeBounds, right: IntRangeBounds) -> Option<IntRangeBounds> {
+        fn tighter_lower(a: Option<(i64, bool)>, b: Option<(i64, bool)>) -> Option<(i64, bool)> {
+            match (a, b) {
+                (None, x) | (x, None) => x,
+                (Some((av, ai)), Some((bv, bi))) => {
+                    if av > bv {
+                        Some((av, ai))
+                    } else if bv > av {
+                        Some((bv, bi))
+                    } else {
+                        Some((av, ai && bi))
+                    }
+                }
+            }
+        }
+        fn tighter_upper(a: Option<(i64, bool)>, b: Option<(i64, bool)>) -> Option<(i64, bool)> {
+            match (a, b) {
+                (None, x) | (x, None) => x,
+                (Some((av, ai)), Some((bv, bi))) => {
+                    if av < bv {
+                        Some((av, ai))
+                    } else if bv < av {
+                        Some((bv, bi))
+                    } else {
+                        Some((av, ai && bi))
+                    }
+                }
+            }
+        }
+
+        let lower = tighter_lower(left.0, right.0);
+        let upper = tighter_upper(left.1, right.1);
+        if let (Some((lo, lo_inc)), Some((hi, hi_inc))) = (lower, upper) {
+            if lo > hi || (lo == hi && !(lo_inc && hi_inc)) {
+                return Some((Some((1, true)), Some((0, true))));
+            }
+        }
+        Some((lower, upper))
     }
 
     /// Convert a logical plan to a physical operator
