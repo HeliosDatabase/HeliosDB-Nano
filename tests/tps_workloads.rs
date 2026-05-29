@@ -259,6 +259,14 @@ fn run_scaling_diag() {
                 .unwrap();
         }
         let upd_us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+        // UPDATE by pk with EXPRESSION RHS (`v = v + 1`) — P0#3 fast_eval_simple_expr path
+        let t = Instant::now();
+        for k in 0..reps {
+            db.execute(&format!("UPDATE t SET v = v + 1 WHERE id = {}", (k * 7919) % rows))
+                .unwrap();
+        }
+        let upd_expr_us = t.elapsed().as_secs_f64() * 1e6 / reps as f64;
+        eprintln!("    [rows={rows}] UPDATE literal={upd_us:.1}us  UPDATE expr(v+1)={upd_expr_us:.1}us");
         // DELETE by pk (delete distinct high ids we add first so table size stays ~constant during loop)
         db.execute("BEGIN").unwrap();
         for k in 0..reps {
