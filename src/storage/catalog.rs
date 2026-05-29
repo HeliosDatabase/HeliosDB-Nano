@@ -899,17 +899,26 @@ impl<'a> Catalog<'a> {
         let key = Self::table_constraints_key(table_name);
         let value = bincode::serialize(constraints)
             .map_err(|e| Error::storage(format!("Failed to serialize table constraints: {}", e)))?;
-        self.storage.put(&key, &value)
+        self.storage.put(&key, &value)?;
+        self.storage.cache_table_constraints(table_name, constraints.clone());
+        self.storage.clear_referencing_fk_cache();
+        Ok(())
     }
 
     /// Load table constraints from persistent storage
     pub fn load_table_constraints(&self, table_name: &str) -> Result<crate::sql::TableConstraints> {
-        let key = Self::table_constraints_key(table_name);
-        match self.storage.get(&key)? {
-            Some(data) => bincode::deserialize(&data)
-                .map_err(|e| Error::storage(format!("Failed to deserialize table constraints: {}", e))),
-            None => Ok(crate::sql::TableConstraints::default()),
+        if let Some(constraints) = self.storage.get_cached_table_constraints(table_name) {
+            return Ok(constraints);
         }
+
+        let key = Self::table_constraints_key(table_name);
+        let constraints = match self.storage.get(&key)? {
+            Some(data) => bincode::deserialize(&data)
+                .map_err(|e| Error::storage(format!("Failed to deserialize table constraints: {}", e)))?,
+            None => crate::sql::TableConstraints::default(),
+        };
+        self.storage.cache_table_constraints(table_name, constraints.clone());
+        Ok(constraints)
     }
 
     /// Add a foreign key constraint to a table
@@ -941,6 +950,10 @@ impl<'a> Catalog<'a> {
 
     /// Get all foreign key constraints referencing a specific table
     pub fn get_referencing_fks(&self, referenced_table: &str) -> Result<Vec<crate::sql::ForeignKeyConstraint>> {
+        if let Some(cached) = self.storage.get_cached_referencing_fks(referenced_table) {
+            return Ok(cached);
+        }
+
         let mut result = Vec::new();
         let prefix = b"table_constraints:";
 
@@ -974,13 +987,16 @@ impl<'a> Catalog<'a> {
             }
         }
 
+        self.storage.cache_referencing_fks(referenced_table, result.clone());
         Ok(result)
     }
 
     /// Delete all constraints for a table (called when table is dropped)
     pub fn delete_table_constraints(&self, table_name: &str) -> Result<()> {
         let key = Self::table_constraints_key(table_name);
-        self.storage.delete(&key)
+        self.storage.delete(&key)?;
+        self.storage.invalidate_table_constraints_cache(table_name);
+        Ok(())
     }
 
     /// Drop a specific constraint by name

@@ -201,11 +201,13 @@ mod tests {
             )
             .unwrap();
 
-        // Generate training vectors for PQ
-        let training_vectors = generate_random_vectors(1000, 768);
+        // Generate enough training vectors for the 768-dimension PQ config.
+        let training_vectors = generate_random_vectors(1920, 768);
 
         // Create PQ config
-        let pq_config = ProductQuantizerConfig::default_for_dimension(768).unwrap();
+        let mut pq_config = ProductQuantizerConfig::default_for_dimension(768).unwrap();
+        pq_config.num_centroids = 16;
+        pq_config.training_iterations = 1;
 
         // Create quantized index
         manager

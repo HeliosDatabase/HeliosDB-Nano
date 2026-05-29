@@ -9,6 +9,7 @@
 //!   disk       -> on-disk, WAL=Sync         (fsync per write — the durable default)
 //!   disk_group -> on-disk, WAL=GroupCommit  (batched fsync)
 //!   disk_nowal -> on-disk, WAL disabled     (RocksDB default durability only)
+//! HELIOS_TPS_TIME_TRAVEL=0 disables MVCC version-key maintenance for write-path diagnosis.
 
 use heliosdb_nano::config::WalSyncModeConfig;
 use heliosdb_nano::{Config, EmbeddedDatabase, Result};
@@ -133,12 +134,23 @@ fn bench<F: FnMut() -> Result<()>>(label: &str, ops: usize, mut f: F) {
     );
 }
 
+fn env_bool_enabled(name: &str, default: bool) -> bool {
+    match std::env::var(name) {
+        Ok(v) if matches!(v.as_str(), "0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO") => false,
+        Ok(_) => true,
+        Err(_) => default,
+    }
+}
+
+fn apply_tps_overrides(config: &mut Config) {
+    config.storage.time_travel_enabled = env_bool_enabled("HELIOS_TPS_TIME_TRAVEL", true);
+}
+
 fn make_db(mode: &str, dir: &std::path::Path) -> Result<EmbeddedDatabase> {
     match mode {
         "mem" => {
             let mut c = Config::in_memory();
-            // P0#1 A/B: HELIOS_NO_TT=1 disables MVCC version-history emission.
-            c.storage.time_travel_enabled = std::env::var("HELIOS_NO_TT").is_err();
+            apply_tps_overrides(&mut c);
             EmbeddedDatabase::with_config(c)
         }
         "disk" => {
@@ -147,9 +159,8 @@ fn make_db(mode: &str, dir: &std::path::Path) -> Result<EmbeddedDatabase> {
             c.storage.memory_only = false;
             c.storage.wal_enabled = true;
             c.storage.wal_sync_mode = WalSyncModeConfig::Sync;
-            // P0#2 A/B: HELIOS_LOGICAL_WAL=1 restores the legacy per-statement
-            // fsync'd logical-WAL append for autocommit UPDATE/DELETE.
             c.storage.logical_wal_per_statement = std::env::var("HELIOS_LOGICAL_WAL").is_ok();
+            apply_tps_overrides(&mut c);
             EmbeddedDatabase::with_config(c)
         }
         "disk_group" => {
@@ -158,6 +169,7 @@ fn make_db(mode: &str, dir: &std::path::Path) -> Result<EmbeddedDatabase> {
             c.storage.memory_only = false;
             c.storage.wal_enabled = true;
             c.storage.wal_sync_mode = WalSyncModeConfig::GroupCommit;
+            apply_tps_overrides(&mut c);
             EmbeddedDatabase::with_config(c)
         }
         "disk_nowal" => {
@@ -165,6 +177,7 @@ fn make_db(mode: &str, dir: &std::path::Path) -> Result<EmbeddedDatabase> {
             c.storage.path = Some(dir.to_path_buf());
             c.storage.memory_only = false;
             c.storage.wal_enabled = false;
+            apply_tps_overrides(&mut c);
             EmbeddedDatabase::with_config(c)
         }
         other => panic!("unknown HELIOS_TPS_MODE: {other}"),
@@ -353,7 +366,11 @@ fn run_tps_suite() {
     std::fs::create_dir_all(&tmp).unwrap();
 
     println!("\n================ HeliosDB-Nano TPS suite ================");
-    println!("mode={mode}  N={n}  M={m}  dir={}", tmp.display());
+    println!(
+        "mode={mode}  N={n}  M={m}  time_travel={}  dir={}",
+        env_bool_enabled("HELIOS_TPS_TIME_TRAVEL", true),
+        tmp.display()
+    );
     println!("{}", "-".repeat(80));
 
     let db = make_db(&mode, &tmp).expect("db open");

@@ -1078,20 +1078,17 @@ mod null_semantics_hardening_tests {
     }
 
     #[test]
-    fn test_default_value_on_omitted_column_known_limitation() {
-        // KNOWN LIMITATION: Omitting a column with DEFAULT does not use the default;
-        // it inserts NULL instead. SQL standard: should use DEFAULT value.
+    fn test_default_value_on_omitted_column_uses_default() {
         let db = EmbeddedDatabase::new_in_memory().unwrap();
         db.execute("CREATE TABLE dml6b (id INT, val INT DEFAULT 42)").unwrap();
 
         // Insert omitting val -- should use default of 42
         db.execute("INSERT INTO dml6b (id) VALUES (2)").unwrap();
         let rows = db.query("SELECT val FROM dml6b WHERE id = 2", &[]).unwrap();
-        // KNOWN LIMITATION: Returns NULL instead of 42
         assert_eq!(
             rows[0].get(0).unwrap(),
-            &Value::Null,
-            "KNOWN LIMITATION: Omitted column with DEFAULT gets NULL instead of default value"
+            &Value::Int4(42),
+            "Omitted column with DEFAULT should use the default value"
         );
     }
 }

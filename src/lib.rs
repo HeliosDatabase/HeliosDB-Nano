@@ -466,6 +466,14 @@ enum ArtUndoOp {
     },
 }
 
+struct FastDeleteTarget {
+    table_name: String,
+    row_id: u64,
+    key: Vec<u8>,
+    schema: Schema,
+    existing_row: Tuple,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FkValidationMode {
     Enforced,
@@ -975,6 +983,13 @@ impl EmbeddedDatabase {
         // Fast path: simple UPDATE with PK WHERE clause (skips full SQL parsing)
         if use_fast_paths {
             if let Some(result) = self.try_fast_update(sql) {
+                return result;
+            }
+        }
+
+        // Fast path: simple DELETE with PK WHERE clause (skips full SQL parsing)
+        if use_fast_paths {
+            if let Some(result) = self.try_fast_delete(sql, txn) {
                 return result;
             }
         }
@@ -4279,6 +4294,8 @@ impl EmbeddedDatabase {
                 .as_ref()
                 .ok_or_else(|| Error::transaction("Transaction lock in invalid state"))?;
             self.execute_in_transaction_no_fast_path(sql, txn_ref)
+        } else if let Some(result) = self.try_autocommit_fast_update_delete(sql) {
+            result
         } else {
             // No active transaction - create implicit transaction
             self.execute_with_implicit_transaction(sql)
@@ -4334,6 +4351,32 @@ impl EmbeddedDatabase {
     /// ```
     pub fn execute_returning(&self, sql: &str) -> Result<(u64, Vec<Tuple>)> {
         self.execute_params_returning(sql, &[])
+    }
+
+    /// Execute eligible autocommit UPDATE/DELETE fast paths without creating an
+    /// otherwise-empty transaction wrapper.
+    fn try_autocommit_fast_update_delete(&self, sql: &str) -> Option<Result<u64>> {
+        if !self.savepoints.read().is_empty()
+            || !self.session_transactions.is_empty()
+            || self.tenant_manager.get_current_context().is_some()
+        {
+            return None;
+        }
+
+        let trimmed = sql.trim_start();
+        let prefix = trimmed.as_bytes().get(..6)?;
+        let result = if prefix.eq_ignore_ascii_case(b"UPDATE") {
+            self.try_fast_update(sql)?
+        } else if prefix.eq_ignore_ascii_case(b"DELETE") {
+            self.try_fast_delete_autocommit(sql)?
+        } else {
+            return None;
+        };
+
+        if result.is_ok() {
+            self.storage.increment_lsn();
+        }
+        Some(result)
     }
 
     /// Execute SQL with an implicit transaction (auto-commit)
@@ -4963,11 +5006,218 @@ impl EmbeddedDatabase {
 
         let new_tuple = Tuple::new(new_values);
 
+        // Preserve logical WAL / HA broadcast semantics while avoiding the
+        // implicit transaction wrapper. RocksDB's WAL covers local storage,
+        // but standbys consume the app-level WAL stream.
+        let key = self.storage.branch_aware_data_key(table_name, row_id);
+        let value = match bincode::serialize(&new_tuple) {
+            Ok(value) => value,
+            Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
+        };
+        if self.storage.is_wal_enabled() {
+            let wal_result = if self.storage.logical_wal_per_statement() {
+                self.storage.log_data_update(table_name, &key, &value)
+            } else {
+                self.storage.log_data_update_nosync(table_name, &key, &value)
+            };
+            if let Err(e) = wal_result {
+                return Some(Err(e));
+            }
+        }
+
         // Use fast update storage path
         Some(
             self.storage
                 .update_tuple_fast(table_name, row_id, new_tuple, &existing_row, &schema),
         )
+    }
+
+    fn prepare_fast_delete(&self, sql: &str) -> Option<Result<Option<FastDeleteTarget>>> {
+        let trimmed = sql.trim();
+
+        if trimmed.len() < 24 || !trimmed.as_bytes().get(..6)?.eq_ignore_ascii_case(b"DELETE") {
+            return None;
+        }
+
+        let upper = trimmed.to_ascii_uppercase();
+        if upper.contains("RETURNING")
+            || upper.contains("USING")
+            || upper.contains("JOIN")
+            || upper.contains("SELECT")
+            || upper.contains("WITH")
+        {
+            return None;
+        }
+
+        let after_delete = trimmed.get(6..)?.trim_start();
+        if after_delete.len() < 4 || !after_delete.as_bytes().get(..4)?.eq_ignore_ascii_case(b"FROM") {
+            return None;
+        }
+        let after_from = after_delete.get(4..)?.trim_start();
+
+        let table_end = after_from.find(|c: char| c.is_whitespace())?;
+        let table_name = after_from.get(..table_end)?.trim().trim_matches('"');
+        if table_name.is_empty() {
+            return None;
+        }
+
+        let rest = after_from.get(table_end..)?.trim_start();
+        if rest.len() < 5 || !rest.as_bytes().get(..5)?.eq_ignore_ascii_case(b"WHERE") {
+            return None;
+        }
+
+        let where_clause = rest.get(5..)?.trim_start();
+        let where_clause = where_clause.strip_suffix(';').unwrap_or(where_clause).trim();
+        let where_upper = where_clause.to_ascii_uppercase();
+        if where_upper.contains("AND")
+            || where_upper.contains("OR")
+            || where_upper.contains("IN")
+            || where_upper.contains("BETWEEN")
+            || where_upper.contains("LIKE")
+        {
+            return None;
+        }
+
+        let eq_pos = where_clause.find('=')?;
+        if where_clause.get(eq_pos + 1..)?.contains('=') {
+            return None;
+        }
+        let pk_col = where_clause.get(..eq_pos)?.trim().trim_matches('"');
+        let pk_val_str = where_clause.get(eq_pos + 1..)?.trim();
+        if pk_col.is_empty() || pk_val_str.is_empty() {
+            return None;
+        }
+
+        if self.tenant_manager.should_apply_rls(table_name, "DELETE")
+            || self.tenant_manager.get_current_context().is_some()
+        {
+            return None;
+        }
+        if self.trigger_registry.has_triggers_for_table(table_name) {
+            return None;
+        }
+        if self.storage.get_current_branch().is_some() {
+            return None;
+        }
+
+        let catalog = self.storage.catalog();
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+
+        let pk_col_idx = schema.get_column_index(pk_col)?;
+        let pk_column = schema.get_column_at(pk_col_idx)?;
+        if !pk_column.primary_key {
+            return None;
+        }
+
+        if let Ok(constraints) = catalog.load_table_constraints(table_name) {
+            if !constraints.foreign_keys.is_empty() {
+                return None;
+            }
+        }
+        if *self.fk_validation_mode.read() != FkValidationMode::Off
+            && *self.fk_validation_source.read() != FkValidationSource::Proxy
+        {
+            match catalog.get_referencing_fks(table_name) {
+                Ok(referencing_fks) if referencing_fks.is_empty() => {}
+                Ok(_) => return None,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        let (pk_value, _) = Self::fast_parse_one_value(pk_val_str, &pk_column.data_type)?;
+        let existing_row = match self.storage.get_row_by_pk_with_schema(table_name, &pk_value, &schema) {
+            Ok(Some(row)) => row,
+            Ok(None) => return Some(Ok(None)),
+            Err(e) => return Some(Err(e)),
+        };
+
+        let row_id = existing_row.row_id.unwrap_or(0);
+        if row_id == 0 {
+            return None;
+        }
+
+        let table_name = table_name.to_string();
+        let key = self.storage.branch_aware_data_key(&table_name, row_id);
+        Some(Ok(Some(FastDeleteTarget {
+            table_name,
+            row_id,
+            key,
+            schema,
+            existing_row,
+        })))
+    }
+
+    /// Fast path for simple DELETE: `DELETE FROM table WHERE pk_col = literal`.
+    /// Returns None to fall through to the normal path for complex DELETE statements.
+    fn try_fast_delete(&self, sql: &str, txn: &storage::Transaction) -> Option<Result<u64>> {
+        let target = match self.prepare_fast_delete(sql)? {
+            Ok(Some(target)) => target,
+            Ok(None) => return Some(Ok(0)),
+            Err(e) => return Some(Err(e)),
+        };
+        let result = (|| {
+            txn.delete(target.key.clone())?;
+
+            if self.storage.is_wal_enabled() {
+                if self.storage.logical_wal_per_statement() {
+                    self.storage.log_data_delete(&target.table_name, &target.key)?;
+                } else {
+                    self.storage.log_data_delete_nosync(&target.table_name, &target.key)?;
+                }
+            }
+
+            if let Err(e) = self.storage.art_indexes().on_delete_tuple(
+                &target.table_name,
+                target.row_id,
+                &target.schema,
+                &target.existing_row,
+            ) {
+                tracing::debug!("ART index delete for table '{}': {}", target.table_name, e);
+            }
+
+            let mut col_values = std::collections::HashMap::with_capacity(target.schema.columns.len());
+            for (i, col) in target.schema.columns.iter().enumerate() {
+                if let Some(v) = target.existing_row.values.get(i) {
+                    col_values.insert(col.name.clone(), v.clone());
+                }
+            }
+            self.art_undo_log.write().push(ArtUndoOp::RestoreDeleted {
+                table_name: target.table_name.clone(),
+                row_id: target.row_id,
+                col_values,
+            });
+
+            self.storage.row_cache().invalidate(&target.table_name, target.row_id);
+            Ok(1)
+        })();
+
+        Some(result)
+    }
+
+    fn try_fast_delete_autocommit(&self, sql: &str) -> Option<Result<u64>> {
+        let target = match self.prepare_fast_delete(sql)? {
+            Ok(Some(target)) => target,
+            Ok(None) => return Some(Ok(0)),
+            Err(e) => return Some(Err(e)),
+        };
+
+        let result = (|| {
+            if self.storage.is_wal_enabled() {
+                if self.storage.logical_wal_per_statement() {
+                    self.storage.log_data_delete(&target.table_name, &target.key)?;
+                } else {
+                    self.storage.log_data_delete_nosync(&target.table_name, &target.key)?;
+                }
+            }
+
+            self.storage
+                .delete_tuple_fast(&target.table_name, target.row_id, &target.existing_row, &target.schema)
+        })();
+
+        Some(result)
     }
 
     /// Fast path for SELECT: `SELECT * FROM table WHERE pk_col = literal`
@@ -5009,13 +5259,12 @@ impl EmbeddedDatabase {
         let where_clause = rest.get(5..)?.trim_start();
 
         // Bail on complex WHERE
-        let upper = where_clause.to_ascii_uppercase();
-        if upper.contains("AND")
-            || upper.contains("OR")
-            || upper.contains("JOIN")
-            || upper.contains("ORDER")
-            || upper.contains("GROUP")
-            || upper.contains("LIMIT")
+        if Self::contains_ascii_case_insensitive(where_clause, b"AND")
+            || Self::contains_ascii_case_insensitive(where_clause, b"OR")
+            || Self::contains_ascii_case_insensitive(where_clause, b"JOIN")
+            || Self::contains_ascii_case_insensitive(where_clause, b"ORDER")
+            || Self::contains_ascii_case_insensitive(where_clause, b"GROUP")
+            || Self::contains_ascii_case_insensitive(where_clause, b"LIMIT")
         {
             return None;
         }
@@ -5209,6 +5458,14 @@ impl EmbeddedDatabase {
             i += 1;
         }
         count
+    }
+
+    fn contains_ascii_case_insensitive(haystack: &str, needle: &[u8]) -> bool {
+        !needle.is_empty()
+            && haystack
+                .as_bytes()
+                .windows(needle.len())
+                .any(|window| window.eq_ignore_ascii_case(needle))
     }
 
     /// Parse comma-separated literal values with type hints.
@@ -7551,8 +7808,13 @@ impl EmbeddedDatabase {
         // implemented".  The RETURNING path still returns rows, while
         // non-RETURNING DML returns an empty result set.
         {
-            let upper = sql.trim().to_uppercase();
-            let is_dml = upper.starts_with("INSERT") || upper.starts_with("UPDATE") || upper.starts_with("DELETE");
+            let trimmed = sql.trim_start();
+            let prefix = trimmed.as_bytes().get(..6);
+            let is_dml = prefix.is_some_and(|p| {
+                p.eq_ignore_ascii_case(b"INSERT")
+                    || p.eq_ignore_ascii_case(b"UPDATE")
+                    || p.eq_ignore_ascii_case(b"DELETE")
+            });
             if is_dml {
                 let (_count, tuples) = self.execute_returning(sql)?;
                 self.invalidate_result_cache();
@@ -7600,21 +7862,18 @@ impl EmbeddedDatabase {
         // state, and gen_random_uuid / random / now / clock_timestamp
         // must return a fresh value every time. Caching any of these
         // would serve stale rows to the caller.
-        let is_non_deterministic = {
-            let up = sql.to_ascii_uppercase();
-            [
-                "NEXTVAL",
-                "SETVAL",
-                "CURRVAL",
-                "GEN_RANDOM_UUID",
-                "UUID_GENERATE_V4",
-                "RANDOM(",
-                "NOW(",
-                "CLOCK_TIMESTAMP",
-            ]
-            .iter()
-            .any(|m| up.contains(m))
-        };
+        let is_non_deterministic = [
+            b"NEXTVAL".as_slice(),
+            b"SETVAL".as_slice(),
+            b"CURRVAL".as_slice(),
+            b"GEN_RANDOM_UUID".as_slice(),
+            b"UUID_GENERATE_V4".as_slice(),
+            b"RANDOM(".as_slice(),
+            b"NOW(".as_slice(),
+            b"CLOCK_TIMESTAMP".as_slice(),
+        ]
+        .iter()
+        .any(|needle| Self::contains_ascii_case_insensitive(sql, needle));
         if !is_non_deterministic {
             if let Some(cached_results) = self
                 .result_cache

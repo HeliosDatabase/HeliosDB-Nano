@@ -116,6 +116,11 @@ pub struct StorageEngine {
     db_path: Option<std::path::PathBuf>,
     /// In-memory schema cache (avoids repeated RocksDB get + bincode deserialize)
     schema_cache: Arc<parking_lot::Mutex<std::collections::HashMap<String, crate::Schema>>>,
+    /// In-memory table-constraints cache (avoids repeated metadata gets on DML)
+    constraints_cache: Arc<parking_lot::Mutex<std::collections::HashMap<String, crate::sql::TableConstraints>>>,
+    /// In-memory reverse-FK cache (referenced table -> constraints that point at it)
+    referencing_fk_cache:
+        Arc<parking_lot::Mutex<std::collections::HashMap<String, Vec<crate::sql::ForeignKeyConstraint>>>>,
 }
 
 /// Minimum free disk space threshold (100 MB)
@@ -426,6 +431,8 @@ impl StorageEngine {
             write_counter: Arc::new(AtomicU64::new(0)),
             db_path: Some(db_path),
             schema_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         };
 
         // Load counters from storage
@@ -612,6 +619,8 @@ impl StorageEngine {
             write_counter: Arc::new(AtomicU64::new(0)),
             db_path: None, // No disk space check for in-memory mode
             schema_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            constraints_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
+            referencing_fk_cache: Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -638,6 +647,41 @@ impl StorageEngine {
     /// Clear all cached schemas (call on bulk DDL operations)
     pub fn clear_schema_cache(&self) {
         self.schema_cache.lock().clear();
+    }
+
+    /// Get cached constraints for a table
+    pub fn get_cached_table_constraints(&self, table_name: &str) -> Option<crate::sql::TableConstraints> {
+        self.constraints_cache.lock().get(table_name).cloned()
+    }
+
+    /// Cache constraints for a table
+    pub fn cache_table_constraints(&self, table_name: &str, constraints: crate::sql::TableConstraints) {
+        self.constraints_cache
+            .lock()
+            .insert(table_name.to_string(), constraints);
+    }
+
+    /// Invalidate cached constraints (call on constraint DDL changes)
+    pub fn invalidate_table_constraints_cache(&self, table_name: &str) {
+        self.constraints_cache.lock().remove(table_name);
+        self.referencing_fk_cache.lock().clear();
+    }
+
+    /// Get cached reverse-FK constraints for a referenced table.
+    pub fn get_cached_referencing_fks(&self, referenced_table: &str) -> Option<Vec<crate::sql::ForeignKeyConstraint>> {
+        self.referencing_fk_cache.lock().get(referenced_table).cloned()
+    }
+
+    /// Cache reverse-FK constraints for a referenced table.
+    pub fn cache_referencing_fks(&self, referenced_table: &str, constraints: Vec<crate::sql::ForeignKeyConstraint>) {
+        self.referencing_fk_cache
+            .lock()
+            .insert(referenced_table.to_string(), constraints);
+    }
+
+    /// Clear all cached reverse-FK lookups.
+    pub fn clear_referencing_fk_cache(&self) {
+        self.referencing_fk_cache.lock().clear();
     }
 
     /// Pre-warm schema cache by loading all table schemas into memory.
@@ -4544,6 +4588,31 @@ impl StorageEngine {
         // Invalidate row cache for this row
         self.row_cache.invalidate(table_name, row_id);
 
+        Ok(1)
+    }
+
+    /// Fast DELETE: removes a row in-place, updates ART indexes, invalidates row cache.
+    /// Callers that need logical replication/replay must append the logical WAL entry first.
+    pub fn delete_tuple_fast(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        old_tuple: &Tuple,
+        schema: &crate::Schema,
+    ) -> Result<u64> {
+        let key = Self::build_data_key(table_name, row_id);
+        self.db
+            .delete(&key)
+            .map_err(|e| Error::storage(format!("Fast delete failed: {}", e)))?;
+
+        if let Err(e) = self
+            .art_index_manager
+            .on_delete_tuple(table_name, row_id, schema, old_tuple)
+        {
+            tracing::debug!("ART index delete for table '{}': {}", table_name, e);
+        }
+
+        self.row_cache.invalidate(table_name, row_id);
         Ok(1)
     }
 
