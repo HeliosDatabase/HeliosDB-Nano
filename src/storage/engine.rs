@@ -1330,7 +1330,10 @@ impl StorageEngine {
     /// Begin a transaction
     pub fn begin_transaction(&self) -> Result<Transaction> {
         let snapshot_id = self.next_timestamp();
-        Transaction::new(Arc::clone(&self.db), snapshot_id, Arc::clone(&self.snapshot_manager))
+        let mut txn = Transaction::new(Arc::clone(&self.db), snapshot_id, Arc::clone(&self.snapshot_manager))?;
+        // P0#1: emit MVCC version-history at commit only when time-travel is on.
+        txn.set_versioning_enabled(self.config.storage.time_travel_enabled);
+        Ok(txn)
     }
 
     /// Get next timestamp (for MVCC)
