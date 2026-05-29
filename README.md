@@ -12,11 +12,11 @@ Use your existing clients (`psql`, `mysql`), RESTful HTTP, drivers (`psycopg2`, 
 
 Nano is one of four products in the HeliosDB family. SDKs and integrations are cross-edition — the same client code works against Nano, Lite, and Full.
 
-- **[dimensigon/heliosdb-sdks](https://github.com/dimensigon/heliosdb-sdks)** — Official client SDKs (Python, TypeScript, Rust, Go) + integrations (VS Code, n8n, Zapier, Make, Retool, AutoGen) + cross-platform CLI. Apache 2.0.
-- **[dimensigon/HDB-HeliosDB-Lite](https://github.com/dimensigon/HDB-HeliosDB-Lite)** — Production self-hosted database with HeliosProxy + HeliosCore baked in. SSPL-1.0.
-- **[dimensigon/HDB-HeliosDB-Full](https://github.com/dimensigon/HDB-HeliosDB-Full)** — Distributed enterprise database with 14 native wire protocols. SSPL-1.0.
-- **[dimensigon/HDB-HeliosDB-Proxy](https://github.com/dimensigon/HDB-HeliosDB-Proxy)** — Programmable Postgres data-plane (PgBouncer drop-in + WASM plugins + zero-downtime PG-12→17 upgrade). Apache 2.0.
-- **[dimensigon/HDB-HeliosDB-Proxy-Plugins](https://github.com/dimensigon/HDB-HeliosDB-Proxy-Plugins)** · **[Operator](https://github.com/dimensigon/HDB-HeliosDB-Proxy-Operator)** · **[Terraform](https://github.com/dimensigon/terraform-provider-HDB-HeliosDB-Proxy)** · **[Pulumi](https://github.com/dimensigon/pulumi-HDB-HeliosDB-Proxy)** — Proxy ecosystem.
+- **[dimensigon/heliosdb-sdks](https://github.com/HeliosDatabase/HeliosDB-SDKs)** — Official client SDKs (Python, TypeScript, Rust, Go) + integrations (VS Code, n8n, Zapier, Make, Retool, AutoGen) + cross-platform CLI. Apache 2.0.
+- **[dimensigon/HDB-HeliosDB-Lite](https://github.com/HeliosDatabase/HeliosDB-Lite)** — Production self-hosted database with HeliosProxy + HeliosCore baked in. SSPL-1.0.
+- **[dimensigon/HDB-HeliosDB-Full](https://github.com/HeliosDatabase/HeliosDB-Full)** — Distributed enterprise database with 14 native wire protocols. SSPL-1.0.
+- **[dimensigon/HDB-HeliosDB-Proxy](https://github.com/HeliosDatabase/HeliosDB-Proxy)** — Programmable Postgres data-plane (PgBouncer drop-in + WASM plugins + zero-downtime PG-12→17 upgrade). Apache 2.0.
+- **[dimensigon/HDB-HeliosDB-Proxy-Plugins](https://github.com/HeliosDatabase/HeliosDB-Proxy-Plugins)** · **[Operator](https://github.com/HeliosDatabase/HeliosDB-Proxy-Operator)** · **[Terraform](https://github.com/HeliosDatabase/terraform-provider-HeliosDB-Proxy)** · **[Pulumi](https://github.com/HeliosDatabase/pulumi-HeliosDB-Proxy)** — Proxy ecosystem.
 
 **Catalogue:** [heliosdb.com/sdks.html](https://www.heliosdb.com/sdks.html) · **Build with AI agents:** [heliosdb.com/build-with-agents.html](https://www.heliosdb.com/build-with-agents.html) · **LLM-discoverable index:** [heliosdb.com/llms.txt](https://www.heliosdb.com/llms.txt)
 
@@ -33,7 +33,7 @@ brew install dimensigon/tap/heliosdb-nano
 docker run -p 5432:5432 -p 3306:3306 -p 8080:8080 heliosdb/nano:latest
 
 # Binary release
-curl -L https://github.com/Dimensigon/HDB-HeliosDB-Nano/releases/latest/download/heliosdb-nano-$(uname -m)-$(uname -s | tr A-Z a-z).tar.gz | tar xz
+curl -L https://github.com/HeliosDatabase/HeliosDB-Nano/releases/latest/download/heliosdb-nano-$(uname -m)-$(uname -s | tr A-Z a-z).tar.gz | tar xz
 ```
 
 ## Start the Server
@@ -457,7 +457,7 @@ cargo build --release --features "ha-full"
 
 Official client SDKs (Go, Python, TypeScript, Rust) and platform integrations (VS Code, Zapier, n8n, Retool, Make, AutoGen) live in a shared repository:
 
-**[heliosdb-sdks](https://github.com/dimensigon/heliosdb-sdks)** — works with all HeliosDB editions.
+**[heliosdb-sdks](https://github.com/HeliosDatabase/HeliosDB-SDKs)** — works with all HeliosDB editions.
 
 ```bash
 # JavaScript / TypeScript (Supabase-compatible fluent API)

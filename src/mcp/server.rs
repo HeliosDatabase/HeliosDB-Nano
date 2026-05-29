@@ -3,7 +3,7 @@
 //! Reads JSON-RPC 2.0 requests line-by-line from stdin, dispatches via
 //! the shared `rpc::handle_rpc_with_db`, and writes responses to stdout.
 //! This is the transport used by the out-of-tree
-//! [`heliosdb-codekb-mcp`](https://github.com/dimensigon/heliosdb-codekb-mcp)
+//! [`heliosdb-codekb-mcp`](https://github.com/HeliosDatabase/HeliosDB-CodeKB-MCP)
 //! plugin's `serve` subcommand and by any MCP client that spawns the
 //! plugin as a subprocess via:
 //! `{"mcpServers":{"helios":{"command":"heliosdb-codekb-mcp","args":["serve","--source","/abs/repo"]}}}`.

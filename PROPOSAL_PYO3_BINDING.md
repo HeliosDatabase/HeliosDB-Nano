@@ -14,7 +14,7 @@ referenced column prefix (~25% on `COUNT(DISTINCT)`) leaves Nano well above sqli
 parity needs **columnar scans** — see `PROPOSAL_COLUMNAR_STORAGE.md`. The binding remains
 the right access layer; columnar storage is the orthogonal lever underneath it.
 
-Closes the latency gap reported in [issue #1](https://github.com/dimensigon/HDB-HeliosDB-Nano/issues/1):
+Closes the latency gap reported in [issue #1](https://github.com/HeliosDatabase/HeliosDB-Nano/issues/1):
 the Token-Dashboard team's only Python-accessible "embedded" mode today is the
 `heliosdb-nano repl` subprocess (stdin/stdout pipe), which loses to `sqlite3` by
 3–100× on simple aggregates because of IPC + a text protocol + Python-side parsing.
