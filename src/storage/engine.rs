@@ -39,6 +39,13 @@ thread_local! {
     static KEY_BUFFER: RefCell<Vec<u8>> = RefCell::new(Vec::with_capacity(256));
 }
 
+#[derive(Clone, Copy)]
+enum RowDecodeHint<'a> {
+    Full,
+    Prefix(usize),
+    Columns(&'a [usize]),
+}
+
 /// Storage engine
 pub struct StorageEngine {
     /// RocksDB instance
@@ -1656,7 +1663,7 @@ impl StorageEngine {
 
     /// Scan all rows in a table using a pre-fetched schema (avoids duplicate schema lookup).
     pub fn scan_table_with_schema(&self, table_name: &str, schema: &crate::Schema) -> Result<Vec<Tuple>> {
-        self.scan_table_with_schema_opt(table_name, schema, None)
+        self.scan_table_with_schema_opt(table_name, schema, RowDecodeHint::Full)
     }
 
     /// Like `scan_table_with_schema`, but only the first `prefix_len` column values are
@@ -1670,20 +1677,35 @@ impl StorageEngine {
         schema: &crate::Schema,
         prefix_len: usize,
     ) -> Result<Vec<Tuple>> {
-        // No benefit (and avoid the seed path) when we'd decode every column anyway.
-        let opt = if prefix_len >= schema.columns.len() {
-            None
+        if prefix_len >= schema.columns.len() {
+            self.scan_table_with_schema_opt(table_name, schema, RowDecodeHint::Full)
         } else {
-            Some(prefix_len)
-        };
-        self.scan_table_with_schema_opt(table_name, schema, opt)
+            self.scan_table_with_schema_opt(table_name, schema, RowDecodeHint::Prefix(prefix_len))
+        }
+    }
+
+    /// Like `scan_table_with_schema`, but materializes only the requested sorted,
+    /// unique column indexes. Unrequested columns are left `Null`.
+    pub fn scan_table_with_schema_columns(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        columns: &[usize],
+    ) -> Result<Vec<Tuple>> {
+        if columns.is_empty() {
+            self.scan_table_with_schema_opt(table_name, schema, RowDecodeHint::Prefix(0))
+        } else if columns.len() >= schema.columns.len() {
+            self.scan_table_with_schema_opt(table_name, schema, RowDecodeHint::Full)
+        } else {
+            self.scan_table_with_schema_opt(table_name, schema, RowDecodeHint::Columns(columns))
+        }
     }
 
     fn scan_table_with_schema_opt(
         &self,
         table_name: &str,
         schema: &crate::Schema,
-        prefix_len: Option<usize>,
+        decode_hint: RowDecodeHint<'_>,
     ) -> Result<Vec<Tuple>> {
         let scan_start = std::time::Instant::now();
         let prefix = format!("data:{}:", table_name);
@@ -1711,22 +1733,31 @@ impl StorageEngine {
         let decode = |key: &[u8], raw_value: &[u8]| -> Result<Tuple> {
             {
                 // Deserialize tuple (decrypt first if encryption is enabled). With a
-                // prefix_len, decode only the leading columns and stop — the trailing
-                // (often large) column bytes are never parsed.
+                // decode hint, materialize only the columns the executor will read.
                 let mut tuple: Tuple = if let Some(km) = &self.key_manager {
                     let decrypted = crypto::decrypt(km.key(), &raw_value)?;
-                    match prefix_len {
-                        Some(k) => {
+                    match decode_hint {
+                        RowDecodeHint::Prefix(k) => {
                             crate::storage::prefix_decode::decode_tuple_prefix(&decrypted, k, schema.columns.len())
                         }
-                        None => bincode::deserialize(&decrypted),
+                        RowDecodeHint::Columns(columns) => crate::storage::prefix_decode::decode_tuple_columns(
+                            &decrypted,
+                            columns,
+                            schema.columns.len(),
+                        ),
+                        RowDecodeHint::Full => bincode::deserialize(&decrypted),
                     }
                 } else {
-                    match prefix_len {
-                        Some(k) => {
+                    match decode_hint {
+                        RowDecodeHint::Prefix(k) => {
                             crate::storage::prefix_decode::decode_tuple_prefix(&raw_value, k, schema.columns.len())
                         }
-                        None => bincode::deserialize(&raw_value),
+                        RowDecodeHint::Columns(columns) => crate::storage::prefix_decode::decode_tuple_columns(
+                            &raw_value,
+                            columns,
+                            schema.columns.len(),
+                        ),
+                        RowDecodeHint::Full => bincode::deserialize(&raw_value),
                     }
                 }
                 .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
@@ -5651,6 +5682,22 @@ impl StorageEngine {
         let branch_name = self.current_branch.lock().clone();
         if branch_name.is_none() || branch_name.as_deref() == Some("main") {
             return self.scan_table_with_schema_prefix(table_name, schema, prefix_len);
+        }
+        self.scan_table_branch_aware_with_schema(table_name, schema)
+    }
+
+    /// Branch-aware scan that materializes only the requested columns. On `main` this
+    /// uses selected-column row decode; non-main branches fall back to the full
+    /// branch-aware merge path.
+    pub fn scan_table_branch_aware_with_schema_columns(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        columns: &[usize],
+    ) -> Result<Vec<Tuple>> {
+        let branch_name = self.current_branch.lock().clone();
+        if branch_name.is_none() || branch_name.as_deref() == Some("main") {
+            return self.scan_table_with_schema_columns(table_name, schema, columns);
         }
         self.scan_table_branch_aware_with_schema(table_name, schema)
     }
