@@ -5,7 +5,7 @@ edition = "2021"
 rust-version = "1.85"
 license = "Apache-2.0"
 description = "In-process Python binding for HeliosDB-Nano's embedded database"
-repository = "https://github.com/dimensigon/HDB-HeliosDB-Nano"
+repository = "https://github.com/HeliosDatabase/HeliosDB-Nano"
 
 [lib]
 # The importable Python module name. Must match the `#[pymodule]` fn and pyclass `module`.

@@ -28,7 +28,7 @@ brew upgrade dimensigon/tap/heliosdb-nano   # macOS / Linux
 # or
 docker pull heliosdb/nano:latest
 # or
-curl -L https://github.com/Dimensigon/HDB-HeliosDB-Nano/releases/latest/download/heliosdb-nano-$(uname -m)-$(uname -s | tr A-Z a-z).tar.gz | tar xz
+curl -L https://github.com/HeliosDatabase/HeliosDB-Nano/releases/latest/download/heliosdb-nano-$(uname -m)-$(uname -s | tr A-Z a-z).tar.gz | tar xz
 
 # Start with the same data-dir
 heliosdb-nano start --data-dir ./mydata

@@ -5,7 +5,7 @@
 Take an existing Python app that uses `sqlite3` and retarget it to HeliosDB
 Nano with **one import change**. The combined effect of Nano's
 SQLite-compat rewrites (engine side) and the
-[`heliosdb_sqlite`](https://github.com/Dimensigon/heliosdb-sdks/tree/main/sdks/python)
+[`heliosdb_sqlite`](https://github.com/HeliosDatabase/HeliosDB-SDKs/tree/main/sdks/python)
 shim (client side) is true drop-in for the common SQLite surface — `?`
 placeholders, `INSERT OR REPLACE/IGNORE`, `INTEGER PRIMARY KEY
 AUTOINCREMENT`, `sqlite_master` and `PRAGMA table_info` introspection,
