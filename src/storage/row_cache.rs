@@ -17,6 +17,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::num::NonZeroUsize;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Cache key for row lookups
@@ -150,8 +151,14 @@ pub struct RowCache {
     hot_tables_last_reset: RwLock<Instant>,
     /// Configuration
     config: RowCacheConfig,
-    /// Statistics
+    /// Statistics (cold counters: inserts/evictions/invalidations/peak)
     stats: RwLock<RowCacheStats>,
+    /// Hot per-lookup counters — atomics so the read path needs no stats lock
+    /// (P0#4). Merged into `stats()` on demand.
+    hot_lookups: AtomicU64,
+    hot_hits: AtomicU64,
+    hot_misses: AtomicU64,
+    hot_expirations: AtomicU64,
 }
 
 impl RowCache {
@@ -171,6 +178,10 @@ impl RowCache {
             hot_tables_last_reset: RwLock::new(Instant::now()),
             config,
             stats: RwLock::new(RowCacheStats::default()),
+            hot_lookups: AtomicU64::new(0),
+            hot_hits: AtomicU64::new(0),
+            hot_misses: AtomicU64::new(0),
+            hot_expirations: AtomicU64::new(0),
         }
     }
 
@@ -192,34 +203,48 @@ impl RowCache {
 
         let key = RowCacheKey::new(table, row_id);
 
-        // Fast path: read lock for lookup
-        {
-            let mut stats = self.stats.write();
-            stats.lookups += 1;
+        // P0#4: concurrent-read path. Use a SHARED read lock + `peek` (no LRU
+        // recency mutation) so simultaneous point lookups don't serialize on an
+        // exclusive cache lock, and bump lock-free atomic counters instead of
+        // taking the stats lock. Trade-off: reads no longer promote LRU recency,
+        // so a read-hot row may be evicted slightly sooner; TTL is unchanged.
+        // Expired entries are left in place (reaped on the next put/eviction).
+        self.hot_lookups.fetch_add(1, Ordering::Relaxed);
+
+        // HELIOS_ROWCACHE_LEGACY=1 restores the exclusive-write-lock + LRU-recency
+        // read path for A/B comparison (and as a fallback if strict LRU recency is
+        // required). Read once.
+        static LEGACY: once_cell::sync::Lazy<bool> =
+            once_cell::sync::Lazy::new(|| std::env::var("HELIOS_ROWCACHE_LEGACY").is_ok());
+        if *LEGACY {
+            let mut cache = self.cache.write();
+            if let Some(entry) = cache.get_mut(&key) {
+                if entry.is_expired() {
+                    cache.pop(&key);
+                    self.hot_expirations.fetch_add(1, Ordering::Relaxed);
+                    return None;
+                }
+                let tuple = entry.access();
+                self.hot_hits.fetch_add(1, Ordering::Relaxed);
+                return Some(tuple);
+            }
+            self.hot_misses.fetch_add(1, Ordering::Relaxed);
+            return None;
         }
 
-        let mut cache = self.cache.write();
-
-        if let Some(entry) = cache.get_mut(&key) {
+        let cache = self.cache.read();
+        if let Some(entry) = cache.peek(&key) {
             if entry.is_expired() {
-                // Entry expired, remove it
-                cache.pop(&key);
-                let mut stats = self.stats.write();
-                stats.expirations += 1;
-                stats.current_entries = cache.len() as u64;
+                // Expired: count it but leave it in place (reaped on next put/
+                // eviction) — popping would require an exclusive lock.
+                self.hot_expirations.fetch_add(1, Ordering::Relaxed);
                 return None;
             }
-
-            // Cache hit
-            let tuple = entry.access();
-            let mut stats = self.stats.write();
-            stats.hits += 1;
+            let tuple = entry.tuple.clone();
+            self.hot_hits.fetch_add(1, Ordering::Relaxed);
             return Some(tuple);
         }
-
-        // Cache miss
-        let mut stats = self.stats.write();
-        stats.misses += 1;
+        self.hot_misses.fetch_add(1, Ordering::Relaxed);
         None
     }
 
@@ -314,7 +339,13 @@ impl RowCache {
 
     /// Get cache statistics
     pub fn stats(&self) -> RowCacheStats {
-        self.stats.read().clone()
+        let mut s = self.stats.read().clone();
+        // Merge the lock-free hot counters (P0#4).
+        s.lookups += self.hot_lookups.load(Ordering::Relaxed);
+        s.hits += self.hot_hits.load(Ordering::Relaxed);
+        s.misses += self.hot_misses.load(Ordering::Relaxed);
+        s.expirations += self.hot_expirations.load(Ordering::Relaxed);
+        s
     }
 
     /// Reset statistics
@@ -326,6 +357,10 @@ impl RowCache {
             peak_entries: current_entries,
             ..Default::default()
         };
+        self.hot_lookups.store(0, Ordering::Relaxed);
+        self.hot_hits.store(0, Ordering::Relaxed);
+        self.hot_misses.store(0, Ordering::Relaxed);
+        self.hot_expirations.store(0, Ordering::Relaxed);
     }
 
     /// Check if cache is enabled

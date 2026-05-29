@@ -14,6 +14,52 @@ use heliosdb_nano::config::WalSyncModeConfig;
 use heliosdb_nano::{Config, EmbeddedDatabase, Result};
 use std::time::Instant;
 
+/// Concurrent point-lookup benchmark (P0#4 row-cache read-lock).
+/// Compares aggregate hot-row lookup throughput as thread count scales.
+/// HELIOS_ROWCACHE_LEGACY=1 forces the legacy exclusive-write-lock read path.
+///   HELIOS_CACHE_CONC=1 cargo test --profile perf --test tps_workloads run_cache_concurrency_bench -- --nocapture --test-threads=1
+#[test]
+fn run_cache_concurrency_bench() {
+    if std::env::var("HELIOS_CACHE_CONC").is_err() {
+        eprintln!("skipping run_cache_concurrency_bench (set HELIOS_CACHE_CONC=1)");
+        return;
+    }
+    let legacy = std::env::var("HELIOS_ROWCACHE_LEGACY").is_ok();
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE hot (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("BEGIN").unwrap();
+    for i in 0..2000 {
+        db.execute(&format!("INSERT INTO hot (id, v) VALUES ({i}, {})", i * 2)).unwrap();
+    }
+    db.execute("COMMIT").unwrap();
+    // Warm the row cache over the hot set.
+    for k in 0..2000 {
+        let _ = db.query(&format!("SELECT * FROM hot WHERE id = {k}"), &[]).unwrap();
+    }
+
+    let per_thread = 200_000usize;
+    println!("\n=== cache concurrency: read path = {} ===", if legacy { "LEGACY write-lock" } else { "read-lock+peek" });
+    for &threads in &[1usize, 4, 16] {
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            for t in 0..threads {
+                let dbr = &db;
+                s.spawn(move || {
+                    let mut id = (t * 7919) % 2000;
+                    for _ in 0..per_thread {
+                        id = (id + 7919) % 2000;
+                        let _ = dbr.query(&format!("SELECT * FROM hot WHERE id = {id}"), &[]).unwrap();
+                    }
+                });
+            }
+        });
+        let total = threads * per_thread;
+        let secs = start.elapsed().as_secs_f64();
+        println!("{threads:>3} threads  {:>12.0} lookups/s  ({:.2} M total in {:.2}s)", total as f64 / secs, total as f64 / 1e6, secs);
+    }
+    println!();
+}
+
 /// Analytics scan benchmark over a large table (P1#6 parallel-decode).
 /// Set HELIOS_SCAN_SERIAL=1 to force the serial decode path for A/B comparison.
 ///   HELIOS_SCAN=1 HELIOS_SCAN_N=300000 cargo test --profile perf --test tps_workloads run_scan_bench -- --nocapture --test-threads=1
