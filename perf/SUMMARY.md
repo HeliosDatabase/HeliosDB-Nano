@@ -88,8 +88,19 @@ HELIOS_CACHE_CONC=1 cargo test --profile perf --test tps_workloads run_cache_con
 
 Worktree branch off `030948b`; one fmt baseline commit (`f12aeb0`) neutralizes the
 repo's non-rustfmt-clean state. Expected merge overlaps with the concurrent
-insert-path work: `transaction.rs::commit_with_timestamp` (their `counter:*`
-special-case vs my `if versioning_enabled` wrapper — independent loop regions) and
-ordinary `lib.rs` insert-region context. The scoped follow-ups (`try_fast_delete`,
-query-path Mutex sharding, columnar scan) are deliberately sequenced **after** the
-insert-path work merges, to avoid churn in the files it is actively editing.
+insert-path work — all in **different functions**, so low-conflict:
+
+| file | their edits (insert path) | my edits |
+|---|---|---|
+| `transaction.rs` | `commit_with_timestamp` `counter:*` special-case | `commit_with_timestamp` `if versioning_enabled` wrapper (P0#1); `Transaction` field + `set_versioning_enabled` |
+| `storage/engine.rs` | `insert_tuples_fast_batch`, `insert_tuple_fast` + row-counter staging | `scan_table_with_schema_opt` (P1#6), `log_data_{update,delete}_nosync` (P0#2), `begin_transaction` versioning (P0#1), `logical_wal_per_statement()` accessor |
+| `lib.rs` | INSERT arms + `try_fast_insert*` routing in `execute_in_transaction_inner` | UPDATE/DELETE arms WAL gates (P0#2) |
+| `config.rs` | — | `logical_wal_per_statement` field (P0#2) |
+| `row_cache.rs` | — (untouched) | shared-lock read path + atomic counters (P0#4) |
+
+`transaction.rs::commit_with_timestamp` is the only function both touch; the
+`counter:*` arm and the version-key wrapper are independent regions of the
+write-set loop and should auto-merge or trivially resolve. The scoped follow-ups
+(`try_fast_delete`, query-path Mutex sharding, columnar scan) are deliberately
+sequenced **after** the insert-path work merges, to avoid churn in the files it is
+actively editing.
