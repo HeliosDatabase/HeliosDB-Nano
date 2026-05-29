@@ -70,21 +70,23 @@ fn routines_view_select_star_exposes_full_sql_standard_columns() {
 
 #[test]
 fn referential_constraints_view_returns_zero_rows_for_no_fks() {
-    let (cat, db) = catalog_with_db();
+    // Query via the SQL path (planner-backed SystemViewRegistry). The legacy
+    // PgCatalog::handle_query interception for this view was removed in the v3.31
+    // phase-2.8 migration; the view is now served by the planner.
+    let (_cat, db) = catalog_with_db();
     db.execute("CREATE TABLE t (a INT PRIMARY KEY)").expect("create");
-    let (schema, rows) = cat
-        .handle_query("SELECT * FROM information_schema.referential_constraints")
-        .expect("query")
-        .expect("intercepted");
-    assert!(schema.columns.iter().any(|c| c.name == "constraint_name"));
-    assert!(schema.columns.iter().any(|c| c.name == "update_rule"));
-    assert!(schema.columns.iter().any(|c| c.name == "delete_rule"));
+    let (rows, cols) = db
+        .query_with_columns("SELECT * FROM information_schema.referential_constraints")
+        .expect("query");
+    assert!(cols.iter().any(|c| c == "constraint_name"));
+    assert!(cols.iter().any(|c| c == "update_rule"));
+    assert!(cols.iter().any(|c| c == "delete_rule"));
     assert_eq!(rows.len(), 0);
 }
 
 #[test]
 fn referential_constraints_view_exposes_real_fk_metadata() {
-    let (cat, db) = catalog_with_db();
+    let (_cat, db) = catalog_with_db();
     db.execute("CREATE TABLE parents (id INT PRIMARY KEY)")
         .expect("parents");
     db.execute(
@@ -92,19 +94,17 @@ fn referential_constraints_view_exposes_real_fk_metadata() {
     )
     .expect("kids");
 
-    let (schema, rows) = cat
-        .handle_query("SELECT * FROM information_schema.referential_constraints WHERE constraint_schema = 'public'")
-        .expect("query")
-        .expect("intercepted");
+    // Served by the planner-backed SystemViewRegistry (legacy interception removed).
+    let (rows, cols) = db
+        .query_with_columns("SELECT * FROM information_schema.referential_constraints WHERE constraint_schema = 'public'")
+        .expect("query");
 
     assert_eq!(rows.len(), 1, "expected exactly one FK row, got {}", rows.len());
 
     // Find indices.
     let idx = |name: &str| {
-        schema
-            .columns
-            .iter()
-            .position(|c| c.name == name)
+        cols.iter()
+            .position(|c| c == name)
             .unwrap_or_else(|| panic!("column {name} missing"))
     };
     let i_name = idx("constraint_name");
@@ -212,8 +212,12 @@ fn truly_unknown_information_schema_view_errors_loudly() {
 
 #[test]
 fn existing_views_still_work() {
-    // Regression check — make sure adding the new views didn't break the four
-    // pre-existing handlers.
+    // Regression check — the pre-existing information_schema views still answer
+    // for a PG-wire client. After the v3.31 phase-2.8 migration these views are
+    // served one of two ways: the PgCatalog still intercepts some (e.g. schemata),
+    // while others (tables/columns/key_column_usage/table_constraints) return
+    // Ok(None) from handle_query and fall through to the planner-backed
+    // SystemViewRegistry. So each view must be answerable by EITHER path.
     let (cat, db) = catalog_with_db();
     db.execute("CREATE TABLE t (id INT PRIMARY KEY, name TEXT NOT NULL)")
         .expect("create");
@@ -225,8 +229,11 @@ fn existing_views_still_work() {
         "SELECT constraint_name FROM information_schema.key_column_usage",
         "SELECT constraint_name FROM information_schema.table_constraints",
     ] {
-        let result = cat.handle_query(q);
-        assert!(result.is_ok(), "regression on `{q}`: {result:?}");
-        assert!(result.unwrap().is_some(), "regression on `{q}`: not intercepted");
+        let intercepted = matches!(cat.handle_query(q), Ok(Some(_)));
+        let via_planner = db.query_with_columns(q).is_ok();
+        assert!(
+            intercepted || via_planner,
+            "regression on `{q}`: not served by PgCatalog interception nor the planner"
+        );
     }
 }
