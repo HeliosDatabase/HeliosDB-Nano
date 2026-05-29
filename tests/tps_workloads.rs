@@ -110,6 +110,7 @@ fn run_scan_bench() {
     bench("filter_scan(d>50000)", &|r| {
         format!("SELECT id, a FROM wide WHERE d > 50000 AND b >= {r}")
     });
+    bench("count_star(all)", &|r| format!("SELECT COUNT(*) FROM wide{}", " ".repeat(r + 1)));
     bench("count_star(id>=r)", &|r| {
         format!("SELECT COUNT(*) FROM wide WHERE id >= {r}")
     });

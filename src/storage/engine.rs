@@ -1809,6 +1809,23 @@ impl StorageEngine {
     /// Count rows in a table without deserializing tuples (fast COUNT(*) path).
     /// Only counts key prefixes matching `data:{table_name}:` — no deserialization.
     pub fn count_table_rows(&self, table_name: &str) -> Result<usize> {
+        let on_main_branch = self.current_branch.lock().as_deref().map_or(true, |name| name == "main");
+        let has_user_branches = self
+            .list_branches()
+            .map(|branches| branches.iter().any(|branch| branch.name != "main"))
+            .unwrap_or(true);
+        if on_main_branch && !has_user_branches {
+            if let Some(count) = self.art_index_manager.pk_index_len(table_name) {
+                tracing::debug!(
+                    phase = "count_pk_art_path",
+                    table = table_name,
+                    count = count,
+                    "COUNT(*) primary-key ART fast path completed"
+                );
+                return Ok(count);
+            }
+        }
+
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let mut read_opts = ReadOptions::default();

@@ -567,6 +567,19 @@ impl ArtIndexManager {
         })
     }
 
+    /// Return the number of live entries in a table's primary-key index.
+    ///
+    /// For a PK index this is the table row count. This avoids cloning the ART
+    /// and lets COUNT(*) skip a RocksDB key-prefix walk on ordinary PK tables.
+    pub fn pk_index_len(&self, table: &str) -> Option<usize> {
+        let pk_name = {
+            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
+            pk_indexes.get(table).cloned()
+        }?;
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        indexes.get(&pk_name).map(|idx| idx.len() as usize)
+    }
+
     /// Count rows in a single-column integer PK index that satisfy an optional
     /// numeric range. Iterates the in-memory ART only; it does not fetch or
     /// deserialize table rows.
