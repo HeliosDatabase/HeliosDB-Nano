@@ -75,4 +75,25 @@ fn count_star_pk_range_handles_negative_keys() {
 
     let rows = db.query("SELECT COUNT(*) FROM n WHERE 0 <= id", &[]).unwrap();
     assert_eq!(int(&rows[0].values[0]), 3);
+
+    let rows = db
+        .query("SELECT COUNT(*) FROM n WHERE id >= -1 AND id <= 1", &[])
+        .unwrap();
+    assert_eq!(int(&rows[0].values[0]), 3);
+
+    let rows = db
+        .query("SELECT COUNT(*) FROM n WHERE id BETWEEN -1 AND 1", &[])
+        .unwrap();
+    assert_eq!(int(&rows[0].values[0]), 3);
+
+    let rows = db
+        .query_params(
+            "SELECT COUNT(*) FROM n WHERE id >= $1 AND id <= $2",
+            &[Value::Int4(-1), Value::Int4(1)],
+        )
+        .unwrap();
+    assert_eq!(int(&rows[0].values[0]), 3);
+
+    let rows = db.query("SELECT COUNT(*) FROM n WHERE id > 1 AND id < 1", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 0);
 }
