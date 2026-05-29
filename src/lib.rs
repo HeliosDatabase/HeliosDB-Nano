@@ -4437,9 +4437,6 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let evaluator =
-            sql::Evaluator::with_parameters(std::sync::Arc::new(Schema { columns: vec![] }), params.to_vec());
-        let empty_tuple = Tuple::new(vec![]);
         let mut tuple_values = vec![Value::Null; schema.columns.len()];
         let mut user_provided = vec![false; schema.columns.len()];
 
@@ -4460,12 +4457,23 @@ impl EmbeddedDatabase {
                 return None;
             }
 
-            let mut value = match evaluator.evaluate(expr, &empty_tuple) {
-                Ok(value) => value,
-                Err(e) => return Some(Err(e)),
+            let mut value = match Self::fast_eval_param_expr(expr, params) {
+                Some(Ok(value)) => value,
+                Some(Err(e)) => return Some(Err(e)),
+                None => {
+                    let evaluator = sql::Evaluator::with_parameters(
+                        std::sync::Arc::new(Schema { columns: vec![] }),
+                        params.to_vec(),
+                    );
+                    let empty_tuple = Tuple::new(vec![]);
+                    match evaluator.evaluate(expr, &empty_tuple) {
+                        Ok(value) => value,
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
             };
             if Self::insert_value_needs_cast(&value, &target_col.data_type) {
-                value = match evaluator.cast_value(value, &target_col.data_type) {
+                value = match Self::fast_cast_value(value, &target_col.data_type) {
                     Ok(value) => value,
                     Err(e) => return Some(Err(e)),
                 };
@@ -4543,9 +4551,6 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let evaluator =
-            sql::Evaluator::with_parameters(std::sync::Arc::new(Schema { columns: vec![] }), params.to_vec());
-        let empty_tuple = Tuple::new(vec![]);
         let mut tuple_values = vec![Value::Null; schema.columns.len()];
         let mut user_provided = vec![false; schema.columns.len()];
 
@@ -4566,12 +4571,23 @@ impl EmbeddedDatabase {
                 return None;
             }
 
-            let mut value = match evaluator.evaluate(expr, &empty_tuple) {
-                Ok(value) => value,
-                Err(e) => return Some(Err(e)),
+            let mut value = match Self::fast_eval_param_expr(expr, params) {
+                Some(Ok(value)) => value,
+                Some(Err(e)) => return Some(Err(e)),
+                None => {
+                    let evaluator = sql::Evaluator::with_parameters(
+                        std::sync::Arc::new(Schema { columns: vec![] }),
+                        params.to_vec(),
+                    );
+                    let empty_tuple = Tuple::new(vec![]);
+                    match evaluator.evaluate(expr, &empty_tuple) {
+                        Ok(value) => value,
+                        Err(e) => return Some(Err(e)),
+                    }
+                }
             };
             if Self::insert_value_needs_cast(&value, &target_col.data_type) {
-                value = match evaluator.cast_value(value, &target_col.data_type) {
+                value = match Self::fast_cast_value(value, &target_col.data_type) {
                     Ok(value) => value,
                     Err(e) => return Some(Err(e)),
                 };
@@ -4602,6 +4618,76 @@ impl EmbeddedDatabase {
             sql::LogicalExpr::Literal(_) | sql::LogicalExpr::Parameter { .. } | sql::LogicalExpr::DefaultValue => true,
             sql::LogicalExpr::Cast { expr, .. } => Self::fast_param_insert_expr_supported(expr),
             _ => false,
+        }
+    }
+
+    fn fast_param_value(index: usize, params: &[Value]) -> Result<Value> {
+        if index == 0 {
+            return Err(Error::query_execution(
+                "Parameter indices must be 1-based (e.g., $1, $2)",
+            ));
+        }
+
+        params.get(index - 1).cloned().ok_or_else(|| {
+            Error::query_execution(format!(
+                "Parameter ${} not provided. Expected {} parameters, got {}",
+                index,
+                index,
+                params.len()
+            ))
+        })
+    }
+
+    fn fast_eval_param_expr(expr: &sql::LogicalExpr, params: &[Value]) -> Option<Result<Value>> {
+        match expr {
+            sql::LogicalExpr::Literal(value) => Some(Ok(value.clone())),
+            sql::LogicalExpr::Parameter { index } => Some(Self::fast_param_value(*index, params)),
+            sql::LogicalExpr::Cast { expr, data_type } => {
+                let value = match Self::fast_eval_param_expr(expr, params)? {
+                    Ok(value) => value,
+                    Err(e) => return Some(Err(e)),
+                };
+                Some(Self::fast_cast_value(value, data_type))
+            }
+            sql::LogicalExpr::DefaultValue => None,
+            _ => None,
+        }
+    }
+
+    fn fast_cast_value(value: Value, target_type: &DataType) -> Result<Value> {
+        match (value, target_type) {
+            (value @ Value::Null, _) => Ok(value),
+            (value @ Value::Int2(_), DataType::Int2)
+            | (value @ Value::Int4(_), DataType::Int4)
+            | (value @ Value::Int8(_), DataType::Int8)
+            | (value @ Value::Float4(_), DataType::Float4)
+            | (value @ Value::Float8(_), DataType::Float8)
+            | (value @ Value::String(_), DataType::Text | DataType::Varchar(_))
+            | (value @ Value::Boolean(_), DataType::Boolean)
+            | (value @ Value::Json(_), DataType::Json | DataType::Jsonb) => Ok(value),
+            (Value::Int2(v), DataType::Int4) => Ok(Value::Int4(i32::from(v))),
+            (Value::Int2(v), DataType::Int8) => Ok(Value::Int8(i64::from(v))),
+            (Value::Int4(v), DataType::Int2) => i16::try_from(v)
+                .map(Value::Int2)
+                .map_err(|_| Error::type_conversion(format!("INTEGER value {} out of range for SMALLINT", v))),
+            (Value::Int4(v), DataType::Int8) => Ok(Value::Int8(i64::from(v))),
+            (Value::Int8(v), DataType::Int2) => i16::try_from(v)
+                .map(Value::Int2)
+                .map_err(|_| Error::type_conversion(format!("BIGINT value {} out of range for SMALLINT", v))),
+            (Value::Int8(v), DataType::Int4) => i32::try_from(v)
+                .map(Value::Int4)
+                .map_err(|_| Error::type_conversion(format!("BIGINT value {} out of range for INTEGER", v))),
+            (Value::Int2(v), DataType::Float4) => Ok(Value::Float4(v as f32)),
+            (Value::Int2(v), DataType::Float8) => Ok(Value::Float8(v as f64)),
+            (Value::Int4(v), DataType::Float4) => Ok(Value::Float4(v as f32)),
+            (Value::Int4(v), DataType::Float8) => Ok(Value::Float8(v as f64)),
+            (Value::Int8(v), DataType::Float4) => Ok(Value::Float4(v as f32)),
+            (Value::Int8(v), DataType::Float8) => Ok(Value::Float8(v as f64)),
+            (Value::Float4(v), DataType::Float8) => Ok(Value::Float8(f64::from(v))),
+            (value, _) => {
+                let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema { columns: vec![] }));
+                evaluator.cast_value(value, target_type)
+            }
         }
     }
 
@@ -4718,7 +4804,7 @@ impl EmbeddedDatabase {
                 Err(e) => return Some(Err(e)),
             };
             if Self::insert_value_needs_cast(&value, &column.data_type) {
-                value = match evaluator.cast_value(value, &column.data_type) {
+                value = match Self::fast_cast_value(value, &column.data_type) {
                     Ok(value) => value,
                     Err(e) => return Some(Err(e)),
                 };
@@ -4854,15 +4940,21 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let evaluator =
-            sql::Evaluator::with_parameters(std::sync::Arc::new(Schema { columns: vec![] }), params.to_vec());
-        let empty_tuple = Tuple::new(vec![]);
-        let mut value = match evaluator.evaluate(value_expr, &empty_tuple) {
-            Ok(value) => value,
-            Err(e) => return Some(Err(e)),
+        let mut value = match Self::fast_eval_param_expr(value_expr, params) {
+            Some(Ok(value)) => value,
+            Some(Err(e)) => return Some(Err(e)),
+            None => {
+                let evaluator =
+                    sql::Evaluator::with_parameters(std::sync::Arc::new(Schema { columns: vec![] }), params.to_vec());
+                let empty_tuple = Tuple::new(vec![]);
+                match evaluator.evaluate(value_expr, &empty_tuple) {
+                    Ok(value) => value,
+                    Err(e) => return Some(Err(e)),
+                }
+            }
         };
         if Self::insert_value_needs_cast(&value, &column.data_type) {
-            value = match evaluator.cast_value(value, &column.data_type) {
+            value = match Self::fast_cast_value(value, &column.data_type) {
                 Ok(value) => value,
                 Err(e) => return Some(Err(e)),
             };
@@ -6233,9 +6325,7 @@ impl EmbeddedDatabase {
                 }
             };
             if Self::insert_value_needs_cast(&value, target_type) {
-                let evaluator =
-                    sql::Evaluator::with_parameters(std::sync::Arc::new(Schema { columns: vec![] }), params.to_vec());
-                value = match evaluator.cast_value(value, target_type) {
+                value = match Self::fast_cast_value(value, target_type) {
                     Ok(value) => value,
                     Err(e) => return Some(Err(e)),
                 };
