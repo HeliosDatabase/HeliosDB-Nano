@@ -1415,6 +1415,18 @@ impl<'a> Executor<'a> {
                                 predicate,
                             } = input.as_ref()
                             {
+                                if let Some(mut point_op) = self.try_index_point_lookup(filter_input, predicate)? {
+                                    let mut count: i64 = 0;
+                                    while let Some(_tuple) = point_op.next()? {
+                                        count += 1;
+                                    }
+                                    let result_tuple = crate::Tuple::new(vec![crate::Value::Int8(count)]);
+                                    return Ok(Box::new(MaterializedOperator::new(
+                                        vec![result_tuple],
+                                        count_star_schema(),
+                                    )));
+                                }
+
                                 let scan_table_filtered = match filter_input.as_ref() {
                                     LogicalPlan::Scan { table_name, .. } => {
                                         Some((table_name.as_str(), filter_input.as_ref()))
@@ -1454,6 +1466,34 @@ impl<'a> Executor<'a> {
                                             )));
                                         }
                                     }
+                                }
+                            }
+                            if let LogicalPlan::FilteredScan {
+                                table_name,
+                                alias,
+                                schema,
+                                projection,
+                                predicate: Some(predicate),
+                                as_of,
+                            } = input.as_ref()
+                            {
+                                let scan_plan = LogicalPlan::Scan {
+                                    table_name: table_name.clone(),
+                                    alias: alias.clone(),
+                                    schema: schema.clone(),
+                                    projection: projection.clone(),
+                                    as_of: as_of.clone(),
+                                };
+                                if let Some(mut point_op) = self.try_index_point_lookup(&scan_plan, predicate)? {
+                                    let mut count: i64 = 0;
+                                    while let Some(_tuple) = point_op.next()? {
+                                        count += 1;
+                                    }
+                                    let result_tuple = crate::Tuple::new(vec![crate::Value::Int8(count)]);
+                                    return Ok(Box::new(MaterializedOperator::new(
+                                        vec![result_tuple],
+                                        count_star_schema(),
+                                    )));
                                 }
                             }
                         } // end if is_count_star
