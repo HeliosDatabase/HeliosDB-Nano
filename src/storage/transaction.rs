@@ -87,6 +87,12 @@ pub struct Transaction {
     acquired_locks: Arc<RwLock<Vec<LockGuard>>>,
     /// Dirty tracker for dump operations
     dirty_tracker: Option<Arc<DirtyTracker>>,
+    /// Whether to emit MVCC version-history keys (`v:` / `v_idx:`) at commit.
+    /// Mirrors `StorageConfig::time_travel_enabled`. When false, commit writes
+    /// only the `data:` key per row (no version value + index, no double
+    /// serialization) — for read-committed workloads that don't need
+    /// AS OF / snapshot-history reads.
+    versioning_enabled: bool,
 }
 
 impl Transaction {
@@ -114,7 +120,14 @@ impl Transaction {
             lock_manager: None,
             acquired_locks: Arc::new(RwLock::new(Vec::new())),
             dirty_tracker: None,
+            versioning_enabled: true,
         })
+    }
+
+    /// Enable/disable MVCC version-history emission at commit (see field docs).
+    /// Set by the engine from `StorageConfig::time_travel_enabled`.
+    pub fn set_versioning_enabled(&mut self, enabled: bool) {
+        self.versioning_enabled = enabled;
     }
 
     /// Create a new transaction with session and lock manager support
@@ -151,6 +164,7 @@ impl Transaction {
             lock_manager: Some(lock_manager),
             acquired_locks: Arc::new(RwLock::new(Vec::new())),
             dirty_tracker: Some(dirty_tracker),
+            versioning_enabled: true,
         })
     }
 
@@ -426,9 +440,14 @@ impl Transaction {
                 Some(val) => {
                     batch.put(key, val);
 
-                    // Create version index for snapshot reads
-                    if let Ok(key_str) = std::str::from_utf8(key) {
-                        if key_str.starts_with("data:") {
+                    // Create version history (value + reverse-ts index) for AS OF /
+                    // snapshot-history reads. P0#1: skip entirely when versioning is
+                    // disabled — saves 2 extra keys/row and a second serialization of
+                    // the row value. Read-committed reads use the `data:` key directly,
+                    // so they are unaffected.
+                    if self.versioning_enabled {
+                        if let Ok(key_str) = std::str::from_utf8(key) {
+                            if key_str.starts_with("data:") {
                             let rest = &key_str[5..];
                             if let Some(colon_pos) = rest.find(':') {
                                 let table_name = &rest[..colon_pos];
@@ -444,6 +463,7 @@ impl Transaction {
                                     let ts_bytes = commit_ts.to_be_bytes();
                                     batch.put(v_idx_key.as_bytes(), ts_bytes);
                                 }
+                            }
                             }
                         }
                     }

@@ -89,7 +89,12 @@ fn bench<F: FnMut() -> Result<()>>(label: &str, ops: usize, mut f: F) {
 
 fn make_db(mode: &str, dir: &std::path::Path) -> Result<EmbeddedDatabase> {
     match mode {
-        "mem" => EmbeddedDatabase::new_in_memory(),
+        "mem" => {
+            let mut c = Config::in_memory();
+            // P0#1 A/B: HELIOS_NO_TT=1 disables MVCC version-history emission.
+            c.storage.time_travel_enabled = std::env::var("HELIOS_NO_TT").is_err();
+            EmbeddedDatabase::with_config(c)
+        }
         "disk" => {
             let mut c = Config::default();
             c.storage.path = Some(dir.to_path_buf());
