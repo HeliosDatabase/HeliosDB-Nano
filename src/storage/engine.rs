@@ -4753,9 +4753,11 @@ impl StorageEngine {
         old_tuple: &Tuple,
         schema: &crate::Schema,
     ) -> Result<u64> {
-        // Serialize new tuple
-        let value =
-            bincode::serialize(&new_tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+        let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &new_tuple, schema)?;
+        // Serialize the storage-format tuple; logical WAL is emitted by callers
+        // before this fast storage write.
+        let value = bincode::serialize(&stored_tuple)
+            .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
 
         // Overwrite the row in storage
         let key = Self::build_data_key(table_name, row_id);
@@ -4812,6 +4814,10 @@ impl StorageEngine {
             .on_delete_tuple(table_name, row_id, schema, old_tuple)
         {
             tracing::debug!("ART index delete for table '{}': {}", table_name, e);
+        }
+
+        for column in schema.columns.iter().filter(|column| column.storage_mode == ColumnStorageMode::Columnar) {
+            ColumnarStore::delete(&self.db, table_name, &column.name, row_id)?;
         }
 
         self.row_cache.invalidate(table_name, row_id);
