@@ -1252,6 +1252,41 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Like `log_data_update` but appends without a per-statement fsync.
+    /// The logical WAL entry is still written (so crash-recovery replay and
+    /// logical replication stay consistent), only the synchronous fsync is
+    /// skipped — durability then matches the RocksDB WriteBatch at commit. See
+    /// `StorageConfig::logical_wal_per_statement`.
+    pub fn log_data_update_nosync(&self, table_name: &str, key: &[u8], tuple_data: &[u8]) -> Result<()> {
+        if self.is_replaying.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(wal) = &self.wal {
+            let wal = wal.read();
+            wal.append_nosync(WalOperation::Update {
+                table: table_name.to_string(),
+                key: key.to_vec(),
+                tuple: tuple_data.to_vec(),
+            })?;
+        }
+        Ok(())
+    }
+
+    /// Like `log_data_delete` but appends without a per-statement fsync.
+    pub fn log_data_delete_nosync(&self, table_name: &str, key: &[u8]) -> Result<()> {
+        if self.is_replaying.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        if let Some(wal) = &self.wal {
+            let wal = wal.read();
+            wal.append_nosync(WalOperation::Delete {
+                table: table_name.to_string(),
+                key: key.to_vec(),
+            })?;
+        }
+        Ok(())
+    }
+
     /// Internal put: encrypt and store without WAL logging
     /// Use this for internal metadata like counters, version history, etc.
     fn put_internal(&self, key: &[u8], value: &[u8]) -> Result<()> {
@@ -3228,6 +3263,14 @@ impl StorageEngine {
     /// Check if WAL is enabled
     pub fn is_wal_enabled(&self) -> bool {
         self.wal.is_some()
+    }
+
+    /// Whether autocommit UPDATE/DELETE should append a per-statement logical
+    /// WAL entry (legacy strict-durability behavior). Default false: rely on the
+    /// RocksDB WriteBatch at commit, uniform with the INSERT fast path. See
+    /// `StorageConfig::logical_wal_per_statement`.
+    pub fn logical_wal_per_statement(&self) -> bool {
+        self.config.storage.logical_wal_per_statement
     }
 
     /// Get current WAL LSN (Log Sequence Number)
