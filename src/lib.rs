@@ -1793,7 +1793,19 @@ impl EmbeddedDatabase {
                                         }
                                     }
 
-                                    // Write updated tuple back
+                                    // Write updated tuple back and stage columnar side-data
+                                    // inside the same transaction. Keep the row bytes logical
+                                    // in the write set so read-your-own-writes returns values,
+                                    // not storage references.
+                                    if self.storage.get_current_branch().is_none() {
+                                        self.storage.stage_tuple_for_column_storage_in_transaction(
+                                            table_name,
+                                            existing_row_id,
+                                            &existing_tuple,
+                                            &schema,
+                                            txn,
+                                        )?;
+                                    }
                                     let updated_val = bincode::serialize(&existing_tuple)
                                         .map_err(|err| Error::storage(err.to_string()))?;
                                     txn.put(existing_key.clone(), updated_val.clone())?;
@@ -1925,7 +1937,12 @@ impl EmbeddedDatabase {
                     // the same transaction (read-your-own-writes).
                     self.check_fk_constraints_on_write(table_name, &col_values, Some(txn))?;
 
-                    // Serialize tuple directly (RocksDB LZ4 handles compression at block level)
+                    // Stage columnar side-data in the transaction write set,
+                    // but keep the row value logical for read-your-own-writes.
+                    if self.storage.get_current_branch().is_none() {
+                        self.storage
+                            .stage_tuple_for_column_storage_in_transaction(table_name, row_id, &tuple, &schema, txn)?;
+                    }
                     let val = bincode::serialize(&tuple).map_err(|e| Error::storage(e.to_string()))?;
                     txn.put(key.clone(), val.clone())?;
 
@@ -2534,6 +2551,10 @@ impl EmbeddedDatabase {
                 // Use branch-aware keys so updates on branches don't pollute main
                 for (row_id, old_tuple, tuple) in &updates {
                     let key = self.storage.branch_aware_data_key(table_name, *row_id);
+                    if !on_branch {
+                        self.storage
+                            .stage_tuple_for_column_storage_in_transaction(table_name, *row_id, tuple, &schema, txn)?;
+                    }
                     let value = bincode::serialize(tuple)
                         .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
                     txn.put(key.clone(), value.clone())?;
@@ -2866,6 +2887,10 @@ impl EmbeddedDatabase {
                     }
                 } else {
                     // Main branch: actual key deletion
+                    for (row_id, _) in &deleted_tuples {
+                        self.storage
+                            .stage_columnar_delete_in_transaction(table_name, *row_id, &schema_arc, txn)?;
+                    }
                     for row_id in &row_ids_to_delete {
                         let key = format!("data:{}:{}", table_name, row_id).into_bytes();
                         txn.delete(key.clone())?;
@@ -5847,6 +5872,10 @@ impl EmbeddedDatabase {
         let col_values = Self::tuple_column_values(schema, &tuple);
         self.check_fk_constraints_on_write(table_name, &col_values, Some(txn))?;
 
+        if self.storage.get_current_branch().is_none() {
+            self.storage
+                .stage_tuple_for_column_storage_in_transaction(table_name, row_id, &tuple, schema, txn)?;
+        }
         let val = bincode::serialize(&tuple).map_err(|e| Error::storage(e.to_string()))?;
         let key = self.storage.branch_aware_data_key(table_name, row_id);
         txn.put(key, val)?;
@@ -11141,6 +11170,10 @@ impl EmbeddedDatabase {
         let txn = self.storage.begin_transaction()?;
         for (row_id, new_tuple) in rows_to_update {
             let key = self.storage.branch_aware_data_key(table_name, row_id);
+            if self.storage.get_current_branch().is_none() {
+                self.storage
+                    .stage_tuple_for_column_storage_in_transaction(table_name, row_id, &new_tuple, &schema, &txn)?;
+            }
             let val = bincode::serialize(&new_tuple).map_err(|e| Error::storage(e.to_string()))?;
             txn.put(key.clone(), val.clone())?;
 

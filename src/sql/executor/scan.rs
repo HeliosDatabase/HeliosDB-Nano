@@ -87,6 +87,45 @@ fn choose_scan_decode_hint(indices: &[usize], total_cols: usize) -> Option<ScanD
     None
 }
 
+fn columnar_scan_columns(
+    schema: &Schema,
+    projection: Option<&Vec<usize>>,
+    hint: Option<&ScanDecodeHint>,
+) -> Option<Vec<usize>> {
+    if let Some(hint) = hint {
+        let indices = match hint {
+            ScanDecodeHint::Prefix(prefix_len) => (0..*prefix_len).collect(),
+            ScanDecodeHint::Columns(columns) => columns.clone(),
+        };
+        if indices_are_columnar(schema, &indices) {
+            return Some(indices);
+        }
+        return None;
+    }
+
+    let indices: Vec<usize> = if let Some(projection) = projection {
+        projection.clone()
+    } else if schema
+        .columns
+        .iter()
+        .all(|column| column.storage_mode == crate::ColumnStorageMode::Columnar)
+    {
+        (0..schema.columns.len()).collect()
+    } else {
+        return None;
+    };
+
+    indices_are_columnar(schema, &indices).then_some(indices)
+}
+
+fn indices_are_columnar(schema: &Schema, indices: &[usize]) -> bool {
+    indices.iter().all(|&idx| {
+        schema.columns.get(idx).map_or(false, |column| {
+            column.storage_mode == crate::ColumnStorageMode::Columnar
+        })
+    })
+}
+
 fn collect_single_table_column_indices(plan: &LogicalPlan) -> Option<(String, Vec<usize>, usize)> {
     let mut cols: HashSet<String> = HashSet::new();
     let mut tables: Vec<(String, Arc<Schema>)> = Vec::new();
@@ -1128,14 +1167,25 @@ pub(super) fn handle_scan(executor: &Executor, plan: &LogicalPlan) -> Result<Box
                 // Issue #1 follow-up: when the executor's needed-column analysis is
                 // certain (single regular table, no wildcard/subquery), decode only the
                 // leading columns and skip the costly tail.
-                match executor.scan_decode_hint_for(table_name) {
-                    Some(ScanDecodeHint::Prefix(prefix_len)) if actual_table_name == *table_name => {
-                        storage.scan_table_branch_aware_with_schema_prefix(&actual_table_name, &schema, *prefix_len)?
+                let decode_hint = executor.scan_decode_hint_for(table_name);
+                if actual_table_name == *table_name {
+                    if let Some(columns) = columnar_scan_columns(&schema, projection.as_ref(), decode_hint) {
+                        storage.scan_table_branch_aware_with_schema_columnar_columns(
+                            &actual_table_name,
+                            &schema,
+                            &columns,
+                        )?
+                    } else {
+                        match decode_hint {
+                            Some(ScanDecodeHint::Prefix(prefix_len)) => storage
+                                .scan_table_branch_aware_with_schema_prefix(&actual_table_name, &schema, *prefix_len)?,
+                            Some(ScanDecodeHint::Columns(columns)) => storage
+                                .scan_table_branch_aware_with_schema_columns(&actual_table_name, &schema, columns)?,
+                            _ => storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?,
+                        }
                     }
-                    Some(ScanDecodeHint::Columns(columns)) if actual_table_name == *table_name => {
-                        storage.scan_table_branch_aware_with_schema_columns(&actual_table_name, &schema, columns)?
-                    }
-                    _ => storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?,
+                } else {
+                    storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?
                 }
             };
 
@@ -1318,14 +1368,25 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                 )
             } else {
                 // Normal filtered scan (current data) with branch isolation
-                let base_tuples = match executor.scan_decode_hint_for(table_name) {
-                    Some(ScanDecodeHint::Prefix(prefix_len)) if actual_table_name == *table_name => {
-                        storage.scan_table_branch_aware_with_schema_prefix(&actual_table_name, &schema, *prefix_len)?
+                let decode_hint = executor.scan_decode_hint_for(table_name);
+                let base_tuples = if actual_table_name == *table_name {
+                    if let Some(columns) = columnar_scan_columns(&schema, projection.as_ref(), decode_hint) {
+                        storage.scan_table_branch_aware_with_schema_columnar_columns(
+                            &actual_table_name,
+                            &schema,
+                            &columns,
+                        )?
+                    } else {
+                        match decode_hint {
+                            Some(ScanDecodeHint::Prefix(prefix_len)) => storage
+                                .scan_table_branch_aware_with_schema_prefix(&actual_table_name, &schema, *prefix_len)?,
+                            Some(ScanDecodeHint::Columns(columns)) => storage
+                                .scan_table_branch_aware_with_schema_columns(&actual_table_name, &schema, columns)?,
+                            _ => storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?,
+                        }
                     }
-                    Some(ScanDecodeHint::Columns(columns)) if actual_table_name == *table_name => {
-                        storage.scan_table_branch_aware_with_schema_columns(&actual_table_name, &schema, columns)?
-                    }
-                    _ => storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?,
+                } else {
+                    storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?
                 };
 
                 // Apply storage-level filtering through predicate pushdown manager
