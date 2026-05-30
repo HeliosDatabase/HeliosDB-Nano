@@ -75,6 +75,12 @@ pub struct Transaction {
     snapshot_manager: Arc<SnapshotManager>,
     /// Write set (buffered writes) - uses DashMap for lock-free concurrent access
     write_set: Arc<DashMap<Key, Option<Vec<u8>>>>,
+    /// Latest row-counter values staged by fast transactional inserts.
+    ///
+    /// Only the final counter value per table needs to be persisted at commit,
+    /// so keeping it out of `write_set` avoids a redundant DashMap overwrite on
+    /// every inserted row in large explicit transactions.
+    row_counter_stages: Arc<DashMap<String, u64>>,
     /// Transaction state - uses AtomicU8 for lock-free state checking
     state: AtomicU8,
     /// Session ID (for multi-user support)
@@ -118,6 +124,7 @@ impl Transaction {
             transaction_id,
             snapshot_manager,
             write_set: Arc::new(DashMap::new()),
+            row_counter_stages: Arc::new(DashMap::new()),
             state: AtomicU8::new(TransactionState::Active.to_u8()),
             session_id: None,
             isolation_level: IsolationLevel::ReadCommitted,
@@ -167,6 +174,7 @@ impl Transaction {
             transaction_id,
             snapshot_manager,
             write_set: Arc::new(DashMap::new()),
+            row_counter_stages: Arc::new(DashMap::new()),
             state: AtomicU8::new(TransactionState::Active.to_u8()),
             session_id: Some(session_id),
             isolation_level,
@@ -340,6 +348,31 @@ impl Transaction {
         Ok(())
     }
 
+    /// Stage a table row-counter update to be written once at commit.
+    ///
+    /// Fast transactional INSERTs allocate row IDs from the engine's volatile
+    /// counter. Persisting the counter through `write_set` on every row creates
+    /// avoidable per-row work because each insert overwrites the same key. This
+    /// side staging map keeps only the highest row ID per table and emits one
+    /// `counter:<table>` write in the final WriteBatch.
+    pub fn stage_row_counter(&self, table_name: &str, row_id: u64) -> Result<()> {
+        let state_value = self.state.load(Ordering::Acquire);
+        let state = TransactionState::from_u8(state_value);
+        if state != TransactionState::Active {
+            return Err(Error::transaction("Transaction is not active"));
+        }
+
+        self.row_counter_stages
+            .entry(table_name.to_string())
+            .and_modify(|current| {
+                if row_id > *current {
+                    *current = row_id;
+                }
+            })
+            .or_insert(row_id);
+        Ok(())
+    }
+
     /// Delete a key
     ///
     /// Buffered as tombstone until commit.
@@ -424,7 +457,7 @@ impl Transaction {
     /// Commit the transaction with a specific timestamp
     pub fn commit_with_timestamp(self, commit_ts: u64) -> Result<()> {
         let commit_start = std::time::Instant::now();
-        let write_count = self.write_set.len();
+        let write_count = self.write_set.len() + self.row_counter_stages.len();
         let lock_count = self.acquired_locks.read().len();
 
         trace!(
@@ -469,28 +502,36 @@ impl Transaction {
                     if self.versioning_enabled {
                         if let Ok(key_str) = std::str::from_utf8(key) {
                             if key_str.starts_with("data:") {
-                            let rest = &key_str[5..];
-                            if let Some(colon_pos) = rest.find(':') {
-                                let table_name = &rest[..colon_pos];
-                                let row_id_str = &rest[colon_pos + 1..];
+                                let rest = &key_str[5..];
+                                if let Some(colon_pos) = rest.find(':') {
+                                    let table_name = &rest[..colon_pos];
+                                    let row_id_str = &rest[colon_pos + 1..];
 
-                                if let Ok(row_id) = row_id_str.parse::<u64>() {
-                                    // Write actual version data at commit timestamp
-                                    let v_key = format!("v:{}:{}:{}", table_name, row_id, commit_ts);
-                                    batch.put(v_key.as_bytes(), val);
+                                    if let Ok(row_id) = row_id_str.parse::<u64>() {
+                                        // Write actual version data at commit timestamp
+                                        let v_key = format!("v:{}:{}:{}", table_name, row_id, commit_ts);
+                                        batch.put(v_key.as_bytes(), val);
 
-                                    // Create version index entry with BIG ENDIAN commit timestamp
-                                    let v_idx_key = format!("v_idx:{}:{}:{:020}", table_name, row_id_str, reverse_ts);
-                                    let ts_bytes = commit_ts.to_be_bytes();
-                                    batch.put(v_idx_key.as_bytes(), ts_bytes);
+                                        // Create version index entry with BIG ENDIAN commit timestamp
+                                        let v_idx_key =
+                                            format!("v_idx:{}:{}:{:020}", table_name, row_id_str, reverse_ts);
+                                        let ts_bytes = commit_ts.to_be_bytes();
+                                        batch.put(v_idx_key.as_bytes(), ts_bytes);
+                                    }
                                 }
-                            }
                             }
                         }
                     }
                 }
                 None => batch.delete(key),
             }
+        }
+
+        for entry in self.row_counter_stages.iter() {
+            let key = format!("counter:{}", entry.key());
+            let value = bincode::serialize(entry.value())
+                .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
+            batch.put(key.as_bytes(), value);
         }
 
         let result = if self.rocksdb_wal_enabled {
@@ -580,6 +621,7 @@ impl Transaction {
 
         // Clear write set (DashMap handles concurrency)
         self.write_set.clear();
+        self.row_counter_stages.clear();
 
         debug!(txn_id = self.transaction_id, "Transaction rolled back successfully");
 
@@ -772,6 +814,37 @@ mod tests {
         // Should see own writes before commit
         let result = tx.get(&key).expect("Failed to get value");
         assert_eq!(result, Some(value));
+    }
+
+    #[test]
+    fn test_row_counter_staging_commits_latest_without_write_set_overwrites() {
+        let config = Config::in_memory();
+        let engine = StorageEngine::open_in_memory(&config).expect("Failed to open in-memory storage");
+
+        let tx = engine.begin_transaction().expect("Failed to begin transaction");
+        tx.stage_row_counter("users", 3).unwrap();
+        tx.stage_row_counter("users", 9).unwrap();
+        tx.stage_row_counter("users", 7).unwrap();
+        tx.stage_row_counter("orders", 4).unwrap();
+
+        assert_eq!(tx.write_set.len(), 0);
+        assert_eq!(tx.row_counter_stages.len(), 2);
+
+        tx.commit().expect("Failed to commit transaction");
+
+        let users_counter = engine
+            .get(&b"counter:users".to_vec())
+            .expect("Failed to read users counter")
+            .expect("users counter missing");
+        let users_counter: u64 = bincode::deserialize(&users_counter).unwrap();
+        assert_eq!(users_counter, 9);
+
+        let orders_counter = engine
+            .get(&b"counter:orders".to_vec())
+            .expect("Failed to read orders counter")
+            .expect("orders counter missing");
+        let orders_counter: u64 = bincode::deserialize(&orders_counter).unwrap();
+        assert_eq!(orders_counter, 4);
     }
 
     #[test]

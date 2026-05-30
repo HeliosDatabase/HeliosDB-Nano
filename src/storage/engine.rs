@@ -1812,7 +1812,11 @@ impl StorageEngine {
     /// Count rows in a table without deserializing tuples (fast COUNT(*) path).
     /// Only counts key prefixes matching `data:{table_name}:` — no deserialization.
     pub fn count_table_rows(&self, table_name: &str) -> Result<usize> {
-        let on_main_branch = self.current_branch.lock().as_deref().map_or(true, |name| name == "main");
+        let on_main_branch = self
+            .current_branch
+            .lock()
+            .as_deref()
+            .map_or(true, |name| name == "main");
         let has_user_branches = self
             .list_branches()
             .map(|branches| branches.iter().any(|branch| branch.name != "main"))
@@ -4819,7 +4823,11 @@ impl StorageEngine {
             tracing::debug!("ART index delete for table '{}': {}", table_name, e);
         }
 
-        for column in schema.columns.iter().filter(|column| column.storage_mode == ColumnStorageMode::Columnar) {
+        for column in schema
+            .columns
+            .iter()
+            .filter(|column| column.storage_mode == ColumnStorageMode::Columnar)
+        {
             ColumnarStore::delete(&self.db, table_name, &column.name, row_id)?;
         }
 
@@ -4994,10 +5002,7 @@ impl StorageEngine {
         row_id: u64,
         txn: &crate::storage::Transaction,
     ) -> Result<()> {
-        let key = format!("counter:{}", table_name).into_bytes();
-        let value =
-            bincode::serialize(&row_id).map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
-        txn.put(key, value)
+        txn.stage_row_counter(table_name, row_id)
     }
 
     /// Persist the current row counter value for a table.
@@ -5655,10 +5660,7 @@ impl StorageEngine {
 
     /// Check if a non-main branch is currently active
     pub fn is_branch_active(&self) -> bool {
-        self.current_branch
-            .lock()
-            .as_deref()
-            .is_some_and(|name| name != "main")
+        self.current_branch.lock().as_deref().is_some_and(|name| name != "main")
     }
 
     /// Get current branch ID if a non-main branch is active
