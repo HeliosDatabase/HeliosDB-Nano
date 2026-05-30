@@ -215,6 +215,80 @@ fn build_group_key(values: &[Value], positions: &[usize]) -> Vec<Value> {
         .collect()
 }
 
+struct RowTopKEntry {
+    key: Vec<Value>,
+    tuple: Tuple,
+    asc: Arc<Vec<bool>>,
+}
+
+impl PartialEq for RowTopKEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for RowTopKEntry {}
+
+impl PartialOrd for RowTopKEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RowTopKEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        compare_topk_keys(&self.key, &other.key, &self.asc)
+    }
+}
+
+fn compare_topk_keys(left: &[Value], right: &[Value], asc: &[bool]) -> std::cmp::Ordering {
+    for (idx, (left, right)) in left.iter().zip(right).enumerate() {
+        let mut cmp = crate::sql::executor::compare_values(left, right);
+        if !asc.get(idx).copied().unwrap_or(true) {
+            cmp = cmp.reverse();
+        }
+        if cmp != std::cmp::Ordering::Equal {
+            return cmp;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+fn compare_values_to_topk_key(
+    values: &[Value],
+    positions: &[usize],
+    key: &[Value],
+    asc: &[bool],
+) -> std::cmp::Ordering {
+    for (idx, (&pos, right)) in positions.iter().zip(key).enumerate() {
+        let left = values.get(pos).unwrap_or(&Value::Null);
+        let mut cmp = crate::sql::executor::compare_values(left, right);
+        if !asc.get(idx).copied().unwrap_or(true) {
+            cmp = cmp.reverse();
+        }
+        if cmp != std::cmp::Ordering::Equal {
+            return cmp;
+        }
+    }
+    positions.len().cmp(&key.len())
+}
+
+fn build_topk_key(values: &[Value], positions: &[usize]) -> Vec<Value> {
+    positions
+        .iter()
+        .map(|&pos| values.get(pos).cloned().unwrap_or(Value::Null))
+        .collect()
+}
+
+fn build_projected_tuple(values: &[Value], positions: &[usize]) -> Tuple {
+    Tuple::new(
+        positions
+            .iter()
+            .map(|&pos| values.get(pos).cloned().unwrap_or(Value::Null))
+            .collect(),
+    )
+}
+
 enum ColumnarSumState {
     Empty,
     Int(i64),
@@ -2104,6 +2178,115 @@ impl StorageEngine {
         }
 
         Ok(Some(tuples))
+    }
+
+    /// Compact row-store Top-N for direct-column projections. It scans only the
+    /// output and sort columns into compact value vectors and keeps a bounded
+    /// heap of projected output tuples, avoiding a full table-sized Vec<Tuple>
+    /// before the executor TopK operator can trim to LIMIT.
+    pub(crate) fn scan_table_topk_projected_columns(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        output_columns: &[usize],
+        sort_columns: &[usize],
+        asc: &[bool],
+        k: usize,
+    ) -> Result<Option<Vec<Tuple>>> {
+        if k == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        if sort_columns.is_empty() || sort_columns.len() != asc.len() {
+            return Ok(None);
+        }
+
+        let branch_name = self.current_branch.lock().clone();
+        if branch_name.is_some() && branch_name.as_deref() != Some("main") {
+            return Ok(None);
+        }
+
+        let mut requested: Vec<usize> = output_columns.to_vec();
+        requested.extend_from_slice(sort_columns);
+        requested.sort_unstable();
+        requested.dedup();
+
+        for &idx in &requested {
+            let Some(column) = schema.columns.get(idx) else {
+                return Err(Error::storage(format!(
+                    "Column index {} out of bounds for {}",
+                    idx, table_name
+                )));
+            };
+            if column.storage_mode != ColumnStorageMode::Default {
+                return Ok(None);
+            }
+        }
+
+        let requested_pos = |column_index: usize| -> Result<usize> {
+            requested.binary_search(&column_index).map_err(|_| {
+                Error::storage(format!(
+                    "Column index {} missing from Top-N decode set for {}",
+                    column_index, table_name
+                ))
+            })
+        };
+        let output_positions: Vec<usize> = output_columns
+            .iter()
+            .map(|&idx| requested_pos(idx))
+            .collect::<Result<Vec<_>>>()?;
+        let sort_positions: Vec<usize> = sort_columns
+            .iter()
+            .map(|&idx| requested_pos(idx))
+            .collect::<Result<Vec<_>>>()?;
+        let asc = Arc::new(asc.to_vec());
+
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        let mut heap = std::collections::BinaryHeap::with_capacity(k.saturating_add(1));
+        for item in iter {
+            let (key, raw_value) =
+                item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+
+            let values =
+                self.decode_rowstore_column_values(&raw_value, &requested, schema.columns.len())?;
+            let replace = if heap.len() < k {
+                true
+            } else {
+                heap.peek()
+                    .map(|top: &RowTopKEntry| {
+                        compare_values_to_topk_key(&values, &sort_positions, &top.key, &asc)
+                            == std::cmp::Ordering::Less
+                    })
+                    .unwrap_or(false)
+            };
+
+            if replace {
+                if heap.len() >= k {
+                    heap.pop();
+                }
+                heap.push(RowTopKEntry {
+                    key: build_topk_key(&values, &sort_positions),
+                    tuple: build_projected_tuple(&values, &output_positions),
+                    asc: Arc::clone(&asc),
+                });
+            }
+        }
+
+        Ok(Some(
+            heap.into_sorted_vec()
+                .into_iter()
+                .map(|entry| entry.tuple)
+                .collect(),
+        ))
     }
 
     /// Scan a table by reading only row keys plus the requested columnar side-data.
