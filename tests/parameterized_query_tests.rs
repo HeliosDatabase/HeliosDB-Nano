@@ -250,6 +250,48 @@ fn test_parameterized_insert_in_explicit_transaction_commit_and_rollback() {
 }
 
 #[test]
+fn test_parameterized_insert_log_respects_later_update_and_delete_in_transaction() {
+    let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
+    db.execute("CREATE TABLE txn_insert_log (id INT PRIMARY KEY, name TEXT, score INT)")
+        .unwrap();
+
+    db.execute("BEGIN").unwrap();
+    db.execute_params(
+        "INSERT INTO txn_insert_log (id, name, score) VALUES ($1, $2, $3)",
+        &[Value::Int4(1), Value::String("before".to_string()), Value::Int4(10)],
+    )
+    .unwrap();
+    db.execute_params(
+        "UPDATE txn_insert_log SET name = $1, score = score + 5 WHERE id = $2",
+        &[Value::String("after".to_string()), Value::Int4(1)],
+    )
+    .unwrap();
+    db.execute("COMMIT").unwrap();
+
+    let rows = db
+        .query_params("SELECT * FROM txn_insert_log WHERE id = $1", &[Value::Int4(1)])
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[1], Value::String("after".to_string()));
+    assert_eq!(rows[0].values[2], Value::Int4(15));
+
+    db.execute("BEGIN").unwrap();
+    db.execute_params(
+        "INSERT INTO txn_insert_log (id, name, score) VALUES ($1, $2, $3)",
+        &[Value::Int4(2), Value::String("temp".to_string()), Value::Int4(1)],
+    )
+    .unwrap();
+    db.execute_params("DELETE FROM txn_insert_log WHERE id = $1", &[Value::Int4(2)])
+        .unwrap();
+    db.execute("COMMIT").unwrap();
+
+    let deleted = db
+        .query_params("SELECT * FROM txn_insert_log WHERE id = $1", &[Value::Int4(2)])
+        .unwrap();
+    assert_eq!(deleted.len(), 0);
+}
+
+#[test]
 fn test_execute_many_params_insert_autocommit() {
     let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
     db.execute("CREATE TABLE many_params (id INT PRIMARY KEY, name TEXT)")

@@ -75,12 +75,18 @@ pub struct Transaction {
     snapshot_manager: Arc<SnapshotManager>,
     /// Write set (buffered writes) - uses DashMap for lock-free concurrent access
     write_set: Arc<DashMap<Key, Option<Vec<u8>>>>,
+    /// Append-only data-row inserts staged by SQL fast paths.
+    ///
+    /// Large explicit-transaction INSERT loops are single-writer in the embedded
+    /// API and do not need per-row DashMap hashing. Updates/deletes still go to
+    /// `write_set`; if both contain the same key, `write_set` is the final value.
+    insert_log: Arc<RwLock<Vec<(Key, Vec<u8>)>>>,
     /// Latest row-counter values staged by fast transactional inserts.
     ///
     /// Only the final counter value per table needs to be persisted at commit,
     /// so keeping it out of `write_set` avoids a redundant DashMap overwrite on
     /// every inserted row in large explicit transactions.
-    row_counter_stages: Arc<DashMap<String, u64>>,
+    row_counter_stages: Arc<RwLock<std::collections::HashMap<String, u64>>>,
     /// Transaction state - uses AtomicU8 for lock-free state checking
     state: AtomicU8,
     /// Session ID (for multi-user support)
@@ -105,6 +111,13 @@ pub struct Transaction {
     rocksdb_wal_enabled: bool,
 }
 
+/// Transaction state captured by a SAVEPOINT.
+#[derive(Clone, Default)]
+pub struct TransactionSavepointSnapshot {
+    write_set: Vec<(Key, Option<Vec<u8>>)>,
+    insert_log_len: usize,
+}
+
 impl Transaction {
     /// Create a new transaction (backwards compatible)
     pub fn new(db: Arc<DB>, snapshot_id: SnapshotId, snapshot_manager: Arc<SnapshotManager>) -> Result<Self> {
@@ -124,7 +137,8 @@ impl Transaction {
             transaction_id,
             snapshot_manager,
             write_set: Arc::new(DashMap::new()),
-            row_counter_stages: Arc::new(DashMap::new()),
+            insert_log: Arc::new(RwLock::new(Vec::new())),
+            row_counter_stages: Arc::new(RwLock::new(std::collections::HashMap::new())),
             state: AtomicU8::new(TransactionState::Active.to_u8()),
             session_id: None,
             isolation_level: IsolationLevel::ReadCommitted,
@@ -174,7 +188,8 @@ impl Transaction {
             transaction_id,
             snapshot_manager,
             write_set: Arc::new(DashMap::new()),
-            row_counter_stages: Arc::new(DashMap::new()),
+            insert_log: Arc::new(RwLock::new(Vec::new())),
+            row_counter_stages: Arc::new(RwLock::new(std::collections::HashMap::new())),
             state: AtomicU8::new(TransactionState::Active.to_u8()),
             session_id: Some(session_id),
             isolation_level,
@@ -223,6 +238,12 @@ impl Transaction {
         // Lock-free write set lookup using DashMap
         if let Some(entry) = self.write_set.get(key) {
             return Ok(entry.value().clone());
+        }
+
+        for (logged_key, logged_value) in self.insert_log.read().iter().rev() {
+            if logged_key == key {
+                return Ok(Some(logged_value.clone()));
+            }
         }
 
         // Read from database at snapshot using MVCC
@@ -348,6 +369,26 @@ impl Transaction {
         Ok(())
     }
 
+    /// Stage a fast INSERT data row without the per-row DashMap overhead.
+    ///
+    /// This is used only for embedded explicit-transaction fast INSERT paths.
+    /// Session transactions still use `put()` so lock and dirty tracking remain
+    /// unchanged.
+    pub fn put_insert_fast(&self, key: Key, value: Vec<u8>) -> Result<()> {
+        let state_value = self.state.load(Ordering::Acquire);
+        let state = TransactionState::from_u8(state_value);
+        if state != TransactionState::Active {
+            return Err(Error::transaction("Transaction is not active"));
+        }
+
+        if self.lock_manager.is_some() || self.dirty_tracker.is_some() {
+            return self.put(key, value);
+        }
+
+        self.insert_log.write().push((key, value));
+        Ok(())
+    }
+
     /// Stage a table row-counter update to be written once at commit.
     ///
     /// Fast transactional INSERTs allocate row IDs from the engine's volatile
@@ -362,12 +403,10 @@ impl Transaction {
             return Err(Error::transaction("Transaction is not active"));
         }
 
-        if let Some(mut current) = self.row_counter_stages.get_mut(table_name) {
-            if row_id > *current {
-                *current = row_id;
-            }
-        } else {
-            self.row_counter_stages.insert(table_name.to_string(), row_id);
+        let mut stages = self.row_counter_stages.write();
+        let current = stages.entry(table_name.to_string()).or_insert(row_id);
+        if row_id > *current {
+            *current = row_id;
         }
         Ok(())
     }
@@ -456,7 +495,9 @@ impl Transaction {
     /// Commit the transaction with a specific timestamp
     pub fn commit_with_timestamp(self, commit_ts: u64) -> Result<()> {
         let commit_start = std::time::Instant::now();
-        let write_count = self.write_set.len() + self.row_counter_stages.len();
+        let insert_count = self.insert_log.read().len();
+        let row_counter_count = self.row_counter_stages.read().len();
+        let write_count = self.write_set.len() + insert_count + row_counter_count;
         let lock_count = self.acquired_locks.read().len();
 
         trace!(
@@ -485,50 +526,32 @@ impl Transaction {
 
         // Apply write set atomically using RocksDB batch
         let mut batch = rocksdb::WriteBatch::default();
+        let write_set_has_entries = !self.write_set.is_empty();
+
+        {
+            let insert_log = self.insert_log.read();
+            for (key, val) in insert_log.iter() {
+                if write_set_has_entries && self.write_set.contains_key(key) {
+                    continue;
+                }
+                Self::put_versioned_batch(&mut batch, key, val, commit_ts, reverse_ts, self.versioning_enabled);
+            }
+        }
 
         // Iterate over DashMap entries
         for entry in self.write_set.iter() {
             let (key, value) = (entry.key(), entry.value());
             match value {
                 Some(val) => {
-                    batch.put(key, val);
-
-                    // Create version history (value + reverse-ts index) for AS OF /
-                    // snapshot-history reads. P0#1: skip entirely when versioning is
-                    // disabled — saves 2 extra keys/row and a second serialization of
-                    // the row value. Read-committed reads use the `data:` key directly,
-                    // so they are unaffected.
-                    if self.versioning_enabled {
-                        if let Ok(key_str) = std::str::from_utf8(key) {
-                            if key_str.starts_with("data:") {
-                                let rest = &key_str[5..];
-                                if let Some(colon_pos) = rest.find(':') {
-                                    let table_name = &rest[..colon_pos];
-                                    let row_id_str = &rest[colon_pos + 1..];
-
-                                    if let Ok(row_id) = row_id_str.parse::<u64>() {
-                                        // Write actual version data at commit timestamp
-                                        let v_key = format!("v:{}:{}:{}", table_name, row_id, commit_ts);
-                                        batch.put(v_key.as_bytes(), val);
-
-                                        // Create version index entry with BIG ENDIAN commit timestamp
-                                        let v_idx_key =
-                                            format!("v_idx:{}:{}:{:020}", table_name, row_id_str, reverse_ts);
-                                        let ts_bytes = commit_ts.to_be_bytes();
-                                        batch.put(v_idx_key.as_bytes(), ts_bytes);
-                                    }
-                                }
-                            }
-                        }
-                    }
+                    Self::put_versioned_batch(&mut batch, key, val, commit_ts, reverse_ts, self.versioning_enabled);
                 }
                 None => batch.delete(key),
             }
         }
 
-        for entry in self.row_counter_stages.iter() {
-            let key = format!("counter:{}", entry.key());
-            let value = bincode::serialize(entry.value())
+        for (table_name, row_id) in self.row_counter_stages.read().iter() {
+            let key = format!("counter:{}", table_name);
+            let value = bincode::serialize(row_id)
                 .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
             batch.put(key.as_bytes(), value);
         }
@@ -572,6 +595,43 @@ impl Transaction {
         Ok(())
     }
 
+    fn put_versioned_batch(
+        batch: &mut rocksdb::WriteBatch,
+        key: &[u8],
+        val: &[u8],
+        commit_ts: u64,
+        reverse_ts: u64,
+        versioning_enabled: bool,
+    ) {
+        batch.put(key, val);
+
+        // Create version history (value + reverse-ts index) for AS OF /
+        // snapshot-history reads. P0#1: skip entirely when versioning is
+        // disabled — saves 2 extra keys/row and a second serialization of the
+        // row value. Read-committed reads use the `data:` key directly, so they
+        // are unaffected.
+        if versioning_enabled {
+            if let Ok(key_str) = std::str::from_utf8(key) {
+                if key_str.starts_with("data:") {
+                    let rest = &key_str[5..];
+                    if let Some(colon_pos) = rest.find(':') {
+                        let table_name = &rest[..colon_pos];
+                        let row_id_str = &rest[colon_pos + 1..];
+
+                        if let Ok(row_id) = row_id_str.parse::<u64>() {
+                            let v_key = format!("v:{}:{}:{}", table_name, row_id, commit_ts);
+                            batch.put(v_key.as_bytes(), val);
+
+                            let v_idx_key = format!("v_idx:{}:{}:{:020}", table_name, row_id_str, reverse_ts);
+                            let ts_bytes = commit_ts.to_be_bytes();
+                            batch.put(v_idx_key.as_bytes(), ts_bytes);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Commit the transaction
     ///
     /// Atomically apply all buffered writes and create version index entries.
@@ -590,7 +650,7 @@ impl Transaction {
     ///
     /// v3.1.0: Enhanced with lock release
     pub fn rollback(self) -> Result<()> {
-        let write_count = self.write_set.len();
+        let write_count = self.write_set.len() + self.insert_log.read().len();
         let lock_count = self.acquired_locks.read().len();
 
         debug!(
@@ -620,7 +680,8 @@ impl Transaction {
 
         // Clear write set (DashMap handles concurrency)
         self.write_set.clear();
-        self.row_counter_stages.clear();
+        self.insert_log.write().clear();
+        self.row_counter_stages.write().clear();
 
         debug!(txn_id = self.transaction_id, "Transaction rolled back successfully");
 
@@ -654,11 +715,15 @@ impl Transaction {
     /// Returns a copy of all key-value pairs currently in the write set.
     /// This snapshot can later be passed to `rollback_to_savepoint()` to
     /// restore the write set to this state.
-    pub fn savepoint_snapshot(&self) -> Vec<(Key, Option<Vec<u8>>)> {
-        self.write_set
-            .iter()
-            .map(|entry| (entry.key().clone(), entry.value().clone()))
-            .collect()
+    pub fn savepoint_snapshot(&self) -> TransactionSavepointSnapshot {
+        TransactionSavepointSnapshot {
+            write_set: self
+                .write_set
+                .iter()
+                .map(|entry| (entry.key().clone(), entry.value().clone()))
+                .collect(),
+            insert_log_len: self.insert_log.read().len(),
+        }
     }
 
     /// Rollback the write set to a previously captured savepoint snapshot.
@@ -669,9 +734,9 @@ impl Transaction {
     ///
     /// # Arguments
     /// * `snapshot` - The write set snapshot captured at savepoint creation time
-    pub fn rollback_to_savepoint(&self, snapshot: &[(Key, Option<Vec<u8>>)]) {
+    pub fn rollback_to_savepoint(&self, snapshot: &TransactionSavepointSnapshot) {
         // Build a set of keys that existed at savepoint time for quick lookup
-        let snapshot_keys: std::collections::HashSet<&Key> = snapshot.iter().map(|(k, _)| k).collect();
+        let snapshot_keys: std::collections::HashSet<&Key> = snapshot.write_set.iter().map(|(k, _)| k).collect();
 
         // Remove keys that were added after the savepoint
         let current_keys: Vec<Key> = self.write_set.iter().map(|entry| entry.key().clone()).collect();
@@ -683,9 +748,11 @@ impl Transaction {
         }
 
         // Restore keys to their savepoint values (handles modifications and re-inserts)
-        for (key, value) in snapshot {
+        for (key, value) in &snapshot.write_set {
             self.write_set.insert(key.clone(), value.clone());
         }
+
+        self.insert_log.write().truncate(snapshot.insert_log_len);
     }
 
     /// Merge a set of tuples with the transaction's write set
@@ -745,6 +812,26 @@ impl Transaction {
                                 new_tuple.row_id = Some(row_id);
                                 tuples.push(new_tuple);
                             }
+                        }
+                    }
+                }
+            }
+        }
+
+        let write_set_has_entries = !self.write_set.is_empty();
+        for (key, data) in self.insert_log.read().iter() {
+            if write_set_has_entries && self.write_set.contains_key(key) {
+                continue;
+            }
+            if let Ok(key_str) = std::str::from_utf8(key) {
+                if let Some(row_id_str) = key_str.strip_prefix(&prefix) {
+                    if let Ok(row_id) = row_id_str.parse::<u64>() {
+                        if !handled_row_ids.contains(&row_id) {
+                            let mut new_tuple: Tuple = bincode::deserialize(data)
+                                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+                            new_tuple.row_id = Some(row_id);
+                            tuples.push(new_tuple);
+                            handled_row_ids.insert(row_id);
                         }
                     }
                 }
@@ -827,7 +914,7 @@ mod tests {
         tx.stage_row_counter("orders", 4).unwrap();
 
         assert_eq!(tx.write_set.len(), 0);
-        assert_eq!(tx.row_counter_stages.len(), 2);
+        assert_eq!(tx.row_counter_stages.read().len(), 2);
 
         tx.commit().expect("Failed to commit transaction");
 
