@@ -5562,23 +5562,62 @@ impl StorageEngine {
         let mut batch = WriteBatch::default();
         let mut indexed_rows = Vec::with_capacity(prepared.len());
         let mut final_row_id = 0_u64;
+        let data_prefix = format!("data:{}:", table_name);
+        let mut row_id_buf = itoa::Buffer::new();
+        let mut key_buf = Vec::with_capacity(data_prefix.len() + 32);
 
-        for (row_id, tuple) in prepared {
-            let value = bincode::serialize(&tuple)
-                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
-            let key = Self::build_data_key(table_name, row_id);
-            batch.put(&key, &value);
+        if let (Some(ts), Some(reverse_ts)) = (commit_ts, reverse_ts) {
+            let version_prefix = format!("v:{}:", table_name);
+            let version_suffix = format!(":{}", ts);
+            let version_index_prefix = format!("v_idx:{}:", table_name);
+            let mut reverse_ts_buf = itoa::Buffer::new();
+            let mut version_key_buf = Vec::with_capacity(version_prefix.len() + 64);
+            let mut version_index_key_buf = Vec::with_capacity(version_index_prefix.len() + 64);
 
-            if let (Some(ts), Some(reverse_ts)) = (commit_ts, reverse_ts) {
-                let version_key = format!("v:{}:{}:{}", table_name, row_id, ts);
-                batch.put(version_key.as_bytes(), &value);
+            for (row_id, tuple) in prepared {
+                let value = bincode::serialize(&tuple)
+                    .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+                let row_id_str = row_id_buf.format(row_id);
 
-                let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, reverse_ts);
-                batch.put(index_key.as_bytes(), ts.to_be_bytes());
+                key_buf.clear();
+                key_buf.extend_from_slice(data_prefix.as_bytes());
+                key_buf.extend_from_slice(row_id_str.as_bytes());
+                batch.put(&key_buf, &value);
+
+                version_key_buf.clear();
+                version_key_buf.extend_from_slice(version_prefix.as_bytes());
+                version_key_buf.extend_from_slice(row_id_str.as_bytes());
+                version_key_buf.extend_from_slice(version_suffix.as_bytes());
+                batch.put(&version_key_buf, &value);
+
+                version_index_key_buf.clear();
+                version_index_key_buf.extend_from_slice(version_index_prefix.as_bytes());
+                version_index_key_buf.extend_from_slice(row_id_str.as_bytes());
+                version_index_key_buf.push(b':');
+                let reverse_ts_str = reverse_ts_buf.format(reverse_ts);
+                for _ in reverse_ts_str.len()..20 {
+                    version_index_key_buf.push(b'0');
+                }
+                version_index_key_buf.extend_from_slice(reverse_ts_str.as_bytes());
+                batch.put(&version_index_key_buf, ts.to_be_bytes());
+
+                final_row_id = row_id;
+                indexed_rows.push((row_id, tuple));
             }
+        } else {
+            for (row_id, tuple) in prepared {
+                let value = bincode::serialize(&tuple)
+                    .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+                let row_id_str = row_id_buf.format(row_id);
 
-            final_row_id = row_id;
-            indexed_rows.push((row_id, tuple));
+                key_buf.clear();
+                key_buf.extend_from_slice(data_prefix.as_bytes());
+                key_buf.extend_from_slice(row_id_str.as_bytes());
+                batch.put(&key_buf, &value);
+
+                final_row_id = row_id;
+                indexed_rows.push((row_id, tuple));
+            }
         }
 
         if final_row_id > 0 {
