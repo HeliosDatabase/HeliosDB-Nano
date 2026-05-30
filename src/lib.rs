@@ -4974,6 +4974,38 @@ impl EmbeddedDatabase {
         }
         drop(txn_guard);
 
+        if !self.storage.fast_dml_requires_logical_wal() {
+            let txn = match self.storage.begin_transaction() {
+                Ok(txn) => txn,
+                Err(e) => return Some(Err(e)),
+            };
+            let inserted =
+                match self.insert_validated_tuples_in_transaction(&spec.table_name, tuples, &spec.schema, &txn) {
+                    Ok(inserted) => inserted,
+                    Err(e) => {
+                        let _ = txn.rollback();
+                        self.rollback_art_undo_log();
+                        self.deferred_fk_checks.lock().clear();
+                        return Some(Err(e));
+                    }
+                };
+            if let Err(e) = self.validate_deferred_fk_checks(Some(&txn)) {
+                let _ = txn.rollback();
+                self.rollback_art_undo_log();
+                self.deferred_fk_checks.lock().clear();
+                return Some(Err(e));
+            }
+            if let Err(e) = txn.commit() {
+                self.rollback_art_undo_log();
+                self.deferred_fk_checks.lock().clear();
+                return Some(Err(e));
+            }
+            self.art_undo_log.write().clear();
+            self.deferred_fk_checks.lock().clear();
+            self.storage.increment_lsn();
+            return Some(Ok(inserted));
+        }
+
         let mut inserted = 0_u64;
         for tuple in tuples {
             if let Err(e) = self.storage.insert_tuple_fast(&spec.table_name, tuple, &spec.schema) {
