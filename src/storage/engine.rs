@@ -4797,21 +4797,25 @@ impl StorageEngine {
             return Err(Error::constraint_violation(e.to_string()));
         }
 
-        let logical_tuple = tuple.clone();
-        let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &tuple, schema)?;
-        let value = bincode::serialize(&stored_tuple)
-            .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
-        let logical_value = if schema_uses_column_storage(schema) {
-            bincode::serialize(&logical_tuple)
+        let uses_side_storage = schema_uses_column_storage(schema);
+        let value = if uses_side_storage {
+            let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &tuple, schema)?;
+            bincode::serialize(&stored_tuple)
                 .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
         } else {
-            value.clone()
+            bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
         };
 
         let key = Self::build_data_key(table_name, row_id);
         self.put(&key, &value)?;
 
         if self.fast_dml_requires_logical_wal() {
+            let logical_value = if uses_side_storage {
+                bincode::serialize(&tuple)
+                    .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
+            } else {
+                value.clone()
+            };
             if self.config.storage.logical_wal_per_statement {
                 self.log_data_insert(table_name, &key, &logical_value)?;
             } else {
@@ -4954,11 +4958,16 @@ impl StorageEngine {
         old_tuple: &Tuple,
         schema: &crate::Schema,
     ) -> Result<u64> {
-        let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &new_tuple, schema)?;
         // Serialize the storage-format tuple; logical WAL is emitted by callers
-        // before this fast storage write.
-        let value = bincode::serialize(&stored_tuple)
-            .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+        // before this fast storage write. Default row-store tables can serialize
+        // directly and avoid a full tuple clone in the hot UPDATE path.
+        let value = if schema_uses_column_storage(schema) {
+            let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &new_tuple, schema)?;
+            bincode::serialize(&stored_tuple)
+                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
+        } else {
+            bincode::serialize(&new_tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
+        };
 
         // Overwrite the row in storage
         let key = Self::build_data_key(table_name, row_id);
