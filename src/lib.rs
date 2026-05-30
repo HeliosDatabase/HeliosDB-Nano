@@ -5449,12 +5449,12 @@ impl EmbeddedDatabase {
         }
 
         let new_tuple = Tuple::new(new_values);
-        let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
-        let value = match bincode::serialize(&new_tuple) {
-            Ok(value) => value,
-            Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
-        };
         if self.storage.fast_dml_requires_logical_wal() {
+            let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
+            let value = match bincode::serialize(&new_tuple) {
+                Ok(value) => value,
+                Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
+            };
             let wal_result = if self.storage.logical_wal_per_statement() {
                 self.storage.log_data_update(&spec.table_name, &key, &value)
             } else {
@@ -6817,12 +6817,12 @@ impl EmbeddedDatabase {
         // Preserve logical WAL / HA broadcast semantics only when strict
         // logical WAL or HA replication needs the logical stream. In the
         // standalone default, RocksDB's own WAL covers local recovery.
-        let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
-        let value = match bincode::serialize(&new_tuple) {
-            Ok(value) => value,
-            Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
-        };
         if self.storage.fast_dml_requires_logical_wal() {
+            let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
+            let value = match bincode::serialize(&new_tuple) {
+                Ok(value) => value,
+                Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
+            };
             let wal_result = if self.storage.logical_wal_per_statement() {
                 self.storage.log_data_update(&spec.table_name, &key, &value)
             } else {
