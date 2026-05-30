@@ -8,7 +8,7 @@ use crate::{Error, Result, Schema, Tuple};
 use std::sync::Arc;
 
 /// Group key for aggregate grouping
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Hash)]
 struct GroupKey(Vec<crate::Value>);
 
 impl Eq for GroupKey {}
@@ -464,14 +464,14 @@ impl AggregateOperator {
         timeout_ctx: &Option<TimeoutContext>,
     ) -> Result<Vec<Tuple>> {
         use crate::Value;
-        use std::collections::BTreeMap;
+        use std::collections::HashMap;
 
         let arg_accessors: Vec<AggregateArgAccessor> = aggr_exprs
             .iter()
             .map(|expr| AggregateArgAccessor::for_aggregate(expr, input_schema))
             .collect::<Result<Vec<_>>>()?;
 
-        let mut groups: BTreeMap<GroupKey, Vec<StreamingAccumulator>> = BTreeMap::new();
+        let mut groups: HashMap<GroupKey, Vec<StreamingAccumulator>> = HashMap::new();
         while let Some(tuple) = input.next()? {
             if let Some(ref ctx) = timeout_ctx {
                 ctx.check_timeout()?;
@@ -487,8 +487,11 @@ impl AggregateOperator {
             }
         }
 
-        let mut output_tuples = Vec::with_capacity(groups.len());
-        for (group_key, accumulators) in groups {
+        let mut grouped: Vec<(GroupKey, Vec<StreamingAccumulator>)> = groups.into_iter().collect();
+        grouped.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let mut output_tuples = Vec::with_capacity(grouped.len());
+        for (group_key, accumulators) in grouped {
             if let Some(ref ctx) = timeout_ctx {
                 ctx.check_timeout()?;
             }
@@ -558,7 +561,7 @@ impl AggregateOperator {
         timeout_ctx: &Option<TimeoutContext>,
     ) -> Result<Vec<Tuple>> {
         use crate::Value;
-        use std::collections::BTreeMap;
+        use std::collections::HashMap;
 
         // Collect all input tuples
         let mut tuples = Vec::new();
@@ -570,7 +573,7 @@ impl AggregateOperator {
         }
 
         // Group tuples
-        let mut groups: BTreeMap<GroupKey, Vec<Tuple>> = BTreeMap::new();
+        let mut groups: HashMap<GroupKey, Vec<Tuple>> = HashMap::new();
         if group_by.is_empty() {
             let key = GroupKey(vec![]);
             groups.insert(key, tuples);
@@ -583,8 +586,11 @@ impl AggregateOperator {
         }
 
         // Compute aggregates for each group
-        let mut output_tuples = Vec::new();
-        for (group_key, group_tuples) in groups {
+        let mut grouped: Vec<(GroupKey, Vec<Tuple>)> = groups.into_iter().collect();
+        grouped.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+        let mut output_tuples = Vec::with_capacity(grouped.len());
+        for (group_key, group_tuples) in grouped {
             if let Some(ref ctx) = timeout_ctx {
                 ctx.check_timeout()?;
             }
