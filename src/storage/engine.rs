@@ -199,6 +199,22 @@ fn compare_value_slices(left: &[Value], right: &[Value]) -> std::cmp::Ordering {
     left.len().cmp(&right.len())
 }
 
+fn group_key_matches_values(key: &[Value], values: &[Value], positions: &[usize]) -> bool {
+    key.len() == positions.len()
+        && key.iter().zip(positions).all(|(expected, &pos)| {
+            values
+                .get(pos)
+                .map_or(matches!(expected, Value::Null), |actual| expected == actual)
+        })
+}
+
+fn build_group_key(values: &[Value], positions: &[usize]) -> Vec<Value> {
+    positions
+        .iter()
+        .map(|&pos| values.get(pos).cloned().unwrap_or(Value::Null))
+        .collect()
+}
+
 enum ColumnarSumState {
     Empty,
     Int(i64),
@@ -2635,7 +2651,9 @@ impl StorageEngine {
             return Ok(Some(tuples));
         }
 
-        let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+        const LINEAR_GROUP_LIMIT: usize = 64;
+        let mut small_groups: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = Vec::new();
+        let mut hash_groups: Option<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> = None;
         for item in iter {
             let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
             if !key.starts_with(prefix_bytes) {
@@ -2647,25 +2665,47 @@ impl StorageEngine {
                 continue;
             }
 
-            let group_key: Vec<Value> = group_by_columns
+            if let Some(groups) = hash_groups.as_mut() {
+                let group_key = build_group_key(&values, &group_positions);
+                let states = groups.entry(group_key).or_insert_with(|| {
+                    aggregates
+                        .iter()
+                        .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                        .collect()
+                });
+                for ((state, aggregate), position) in states.iter_mut().zip(aggregates).zip(&aggregate_positions) {
+                    let value = position.and_then(|pos| values.get(pos));
+                    state.update(aggregate.op, value)?;
+                }
+            } else if let Some(idx) = small_groups
                 .iter()
-                .zip(&group_positions)
-                .map(|(_, &pos)| values.get(pos).cloned().unwrap_or(Value::Null))
-                .collect();
-            let states = groups.entry(group_key).or_insert_with(|| {
-                aggregates
+                .position(|(group_key, _)| group_key_matches_values(group_key, &values, &group_positions))
+            {
+                let states = &mut small_groups[idx].1;
+                for ((state, aggregate), position) in states.iter_mut().zip(aggregates).zip(&aggregate_positions) {
+                    let value = position.and_then(|pos| values.get(pos));
+                    state.update(aggregate.op, value)?;
+                }
+            } else {
+                let mut states: Vec<ColumnarAggregateState> = aggregates
                     .iter()
                     .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
-                    .collect()
-            });
-
-            for ((state, aggregate), position) in states.iter_mut().zip(aggregates).zip(&aggregate_positions) {
-                let value = position.and_then(|pos| values.get(pos));
-                state.update(aggregate.op, value)?;
+                    .collect();
+                for ((state, aggregate), position) in states.iter_mut().zip(aggregates).zip(&aggregate_positions) {
+                    let value = position.and_then(|pos| values.get(pos));
+                    state.update(aggregate.op, value)?;
+                }
+                small_groups.push((build_group_key(&values, &group_positions), states));
+                if small_groups.len() > LINEAR_GROUP_LIMIT {
+                    hash_groups = Some(small_groups.drain(..).collect());
+                }
             }
         }
 
-        let mut grouped: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = groups.into_iter().collect();
+        let mut grouped: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = match hash_groups {
+            Some(groups) => groups.into_iter().collect(),
+            None => small_groups,
+        };
         grouped.sort_by(|(left, _), (right, _)| compare_value_slices(left, right));
 
         let mut tuples = Vec::with_capacity(grouped.len());
