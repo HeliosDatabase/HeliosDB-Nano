@@ -4972,7 +4972,7 @@ impl EmbeddedDatabase {
             Ok(value) => value,
             Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
         };
-        if self.storage.is_wal_enabled() {
+        if self.storage.fast_dml_requires_logical_wal() {
             let wal_result = if self.storage.logical_wal_per_statement() {
                 self.storage.log_data_update(table_name, &key, &value)
             } else {
@@ -5044,7 +5044,7 @@ impl EmbeddedDatabase {
 
         let key = self.storage.branch_aware_data_key(table_name, row_id);
         let result = (|| {
-            if self.storage.is_wal_enabled() {
+            if self.storage.fast_dml_requires_logical_wal() {
                 if self.storage.logical_wal_per_statement() {
                     self.storage.log_data_delete(table_name, &key)?;
                 } else {
@@ -6071,15 +6071,15 @@ impl EmbeddedDatabase {
 
         let new_tuple = Tuple::new(new_values);
 
-        // Preserve logical WAL / HA broadcast semantics while avoiding the
-        // implicit transaction wrapper. RocksDB's WAL covers local storage,
-        // but standbys consume the app-level WAL stream.
+        // Preserve logical WAL / HA broadcast semantics only when strict
+        // logical WAL or HA replication needs the logical stream. In the
+        // standalone default, RocksDB's own WAL covers local recovery.
         let key = self.storage.branch_aware_data_key(table_name, row_id);
         let value = match bincode::serialize(&new_tuple) {
             Ok(value) => value,
             Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
         };
-        if self.storage.is_wal_enabled() {
+        if self.storage.fast_dml_requires_logical_wal() {
             let wal_result = if self.storage.logical_wal_per_statement() {
                 self.storage.log_data_update(table_name, &key, &value)
             } else {
@@ -6224,7 +6224,7 @@ impl EmbeddedDatabase {
         let result = (|| {
             txn.delete(target.key.clone())?;
 
-            if self.storage.is_wal_enabled() {
+            if self.storage.fast_dml_requires_logical_wal() {
                 if self.storage.logical_wal_per_statement() {
                     self.storage.log_data_delete(&target.table_name, &target.key)?;
                 } else {
@@ -6268,7 +6268,7 @@ impl EmbeddedDatabase {
         };
 
         let result = (|| {
-            if self.storage.is_wal_enabled() {
+            if self.storage.fast_dml_requires_logical_wal() {
                 if self.storage.logical_wal_per_statement() {
                     self.storage.log_data_delete(&target.table_name, &target.key)?;
                 } else {
@@ -12478,6 +12478,110 @@ mod tests {
             if_exists: false,
         };
         assert!(EmbeddedDatabase::plan_invalidates_sql_caches(&drop_trigger));
+    }
+
+    #[test]
+    fn test_fast_update_delete_skip_logical_wal_in_relaxed_standalone() {
+        #[cfg(feature = "ha-tier1")]
+        {
+            use crate::replication::ha_state::{ha_state, HARole};
+            if ha_state().get_role() == HARole::Primary {
+                return;
+            }
+        }
+
+        let mut config = Config::in_memory();
+        config.storage.wal_enabled = true;
+        config.storage.logical_wal_per_statement = false;
+        let db = EmbeddedDatabase::with_config(config).unwrap();
+
+        db.execute("CREATE TABLE fast_ud_relaxed (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        db.execute("INSERT INTO fast_ud_relaxed (id, v) VALUES (1, 10)")
+            .unwrap();
+
+        let entries = db.storage.wal_entries_for_tests().unwrap();
+        let updates_before = entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.operation,
+                    storage::WalOperation::Update { table, .. } if table == "fast_ud_relaxed"
+                )
+            })
+            .count();
+        let deletes_before = entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.operation,
+                    storage::WalOperation::Delete { table, .. } if table == "fast_ud_relaxed"
+                )
+            })
+            .count();
+
+        db.execute("UPDATE fast_ud_relaxed SET v = 20 WHERE id = 1").unwrap();
+        let rows = db.query("SELECT v FROM fast_ud_relaxed WHERE id = 1", &[]).unwrap();
+        assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(20));
+
+        db.execute("DELETE FROM fast_ud_relaxed WHERE id = 1").unwrap();
+        let rows = db.query("SELECT v FROM fast_ud_relaxed WHERE id = 1", &[]).unwrap();
+        assert!(rows.is_empty());
+
+        let entries = db.storage.wal_entries_for_tests().unwrap();
+        let updates_after = entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.operation,
+                    storage::WalOperation::Update { table, .. } if table == "fast_ud_relaxed"
+                )
+            })
+            .count();
+        let deletes_after = entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    &entry.operation,
+                    storage::WalOperation::Delete { table, .. } if table == "fast_ud_relaxed"
+                )
+            })
+            .count();
+
+        assert_eq!(updates_after, updates_before);
+        assert_eq!(deletes_after, deletes_before);
+    }
+
+    #[test]
+    fn test_fast_update_delete_logical_wal_when_strict_enabled() {
+        let mut config = Config::in_memory();
+        config.storage.wal_enabled = true;
+        config.storage.logical_wal_per_statement = true;
+        let db = EmbeddedDatabase::with_config(config).unwrap();
+
+        db.execute("CREATE TABLE fast_ud_strict (id INT PRIMARY KEY, v INT)")
+            .unwrap();
+        db.execute("INSERT INTO fast_ud_strict (id, v) VALUES (1, 10)").unwrap();
+
+        db.execute("UPDATE fast_ud_strict SET v = 20 WHERE id = 1").unwrap();
+        db.execute("DELETE FROM fast_ud_strict WHERE id = 1").unwrap();
+
+        let entries = db.storage.wal_entries_for_tests().unwrap();
+        let has_update = entries.iter().any(|entry| {
+            matches!(
+                &entry.operation,
+                storage::WalOperation::Update { table, .. } if table == "fast_ud_strict"
+            )
+        });
+        let has_delete = entries.iter().any(|entry| {
+            matches!(
+                &entry.operation,
+                storage::WalOperation::Delete { table, .. } if table == "fast_ud_strict"
+            )
+        });
+
+        assert!(has_update, "strict fast UPDATE should be present in logical WAL");
+        assert!(has_delete, "strict fast DELETE should be present in logical WAL");
     }
 
     #[test]
