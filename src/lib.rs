@@ -6065,6 +6065,19 @@ impl EmbeddedDatabase {
     }
 
     fn validate_fast_insert_batch(&self, table_name: &str, schema: &Schema, tuples: &[Tuple]) -> Result<()> {
+        if let Some(tuple) = tuples.first() {
+            if tuples.len() == 1 {
+                if let Err(e) = self
+                    .storage
+                    .art_indexes()
+                    .check_unique_constraints_tuple(table_name, schema, tuple)
+                {
+                    return Err(Error::constraint_violation(e.to_string()));
+                }
+                return Ok(());
+            }
+        }
+
         let mut unique_specs: Vec<Vec<usize>> = schema
             .columns
             .iter()
@@ -6102,11 +6115,10 @@ impl EmbeddedDatabase {
 
         let mut seen = std::collections::HashSet::new();
         for tuple in tuples {
-            let col_values = Self::tuple_column_values(schema, tuple);
             if let Err(e) = self
                 .storage
                 .art_indexes()
-                .check_unique_constraints(table_name, &col_values)
+                .check_unique_constraints_tuple(table_name, schema, tuple)
             {
                 return Err(Error::constraint_violation(e.to_string()));
             }
@@ -6204,7 +6216,10 @@ impl EmbeddedDatabase {
         txn: &storage::Transaction,
     ) -> Result<()> {
         let col_values = Self::tuple_column_values(schema, &tuple);
-        self.check_fk_constraints_on_write(table_name, &col_values, Some(txn))?;
+        // Callers reach this helper only through the fast INSERT paths, which
+        // already reject tables with FK/CHECK constraints while building their
+        // statement metadata. Avoid reloading constraint metadata on every row
+        // in large explicit-transaction insert loops.
 
         if self.storage.get_current_branch().is_none() {
             self.storage
