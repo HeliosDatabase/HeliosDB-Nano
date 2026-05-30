@@ -1150,37 +1150,41 @@ impl<'a> Executor<'a> {
         use crate::sql::LogicalExpr;
         use crate::storage::{ColumnarAggregateOp, ColumnarAggregateSpec};
 
-        let LogicalExpr::AggregateFunction {
-            fun,
-            args,
-            distinct: false,
-        } = expr
-        else {
+        let LogicalExpr::AggregateFunction { fun, args, distinct } = expr else {
             return None;
         };
         let arg = args.first()?;
         match fun {
-            AggregateFunction::Count if matches!(arg, LogicalExpr::Wildcard) => Some(ColumnarAggregateSpec {
+            AggregateFunction::Count if !distinct && matches!(arg, LogicalExpr::Wildcard) => Some(ColumnarAggregateSpec {
                 op: ColumnarAggregateOp::CountStar,
                 column_index: None,
             }),
+            AggregateFunction::Count if *distinct => {
+                if matches!(arg, LogicalExpr::Wildcard) {
+                    return None;
+                }
+                Some(ColumnarAggregateSpec {
+                    op: ColumnarAggregateOp::CountDistinct,
+                    column_index: Some(Self::column_expr_index(arg, schema)?),
+                })
+            }
             AggregateFunction::Count => Some(ColumnarAggregateSpec {
                 op: ColumnarAggregateOp::Count,
                 column_index: Some(Self::column_expr_index(arg, schema)?),
             }),
-            AggregateFunction::Sum => Some(ColumnarAggregateSpec {
+            AggregateFunction::Sum if !distinct => Some(ColumnarAggregateSpec {
                 op: ColumnarAggregateOp::Sum,
                 column_index: Some(Self::column_expr_index(arg, schema)?),
             }),
-            AggregateFunction::Avg => Some(ColumnarAggregateSpec {
+            AggregateFunction::Avg if !distinct => Some(ColumnarAggregateSpec {
                 op: ColumnarAggregateOp::Avg,
                 column_index: Some(Self::column_expr_index(arg, schema)?),
             }),
-            AggregateFunction::Min => Some(ColumnarAggregateSpec {
+            AggregateFunction::Min if !distinct => Some(ColumnarAggregateSpec {
                 op: ColumnarAggregateOp::Min,
                 column_index: Some(Self::column_expr_index(arg, schema)?),
             }),
-            AggregateFunction::Max => Some(ColumnarAggregateSpec {
+            AggregateFunction::Max if !distinct => Some(ColumnarAggregateSpec {
                 op: ColumnarAggregateOp::Max,
                 column_index: Some(Self::column_expr_index(arg, schema)?),
             }),

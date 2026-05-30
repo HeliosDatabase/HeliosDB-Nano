@@ -296,6 +296,47 @@ fn test_columnar_native_aggregate_respects_live_rows() {
 }
 
 #[test]
+fn test_columnar_count_distinct_respects_sql_semantics() {
+    let db = test_db();
+
+    db.execute("CREATE TABLE metrics (id INT PRIMARY KEY, bucket INT STORAGE COLUMNAR, val INT STORAGE COLUMNAR)")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, bucket, val) VALUES (1, 1, 10)")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, bucket, val) VALUES (2, 1, 10)")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, bucket, val) VALUES (3, 1, 20)")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, bucket, val) VALUES (4, 2, 20)")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, bucket, val) VALUES (5, 2, NULL)")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, bucket, val) VALUES (6, 2, 30)")
+        .unwrap();
+    db.execute("DELETE FROM metrics WHERE id = 6").unwrap();
+
+    let rows = db
+        .query("SELECT COUNT(DISTINCT val) FROM metrics", &[])
+        .unwrap();
+    assert_eq!(rows[0].values, vec![Value::Int8(2)]);
+
+    let filtered = db
+        .query("SELECT COUNT(DISTINCT val) FROM metrics WHERE bucket = 1", &[])
+        .unwrap();
+    assert_eq!(filtered[0].values, vec![Value::Int8(2)]);
+
+    let grouped = db
+        .query(
+            "SELECT bucket, COUNT(DISTINCT val) FROM metrics WHERE bucket >= 1 GROUP BY bucket",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(grouped.len(), 2);
+    assert_eq!(grouped[0].values, vec![Value::Int4(1), Value::Int8(2)]);
+    assert_eq!(grouped[1].values, vec![Value::Int4(2), Value::Int8(1)]);
+}
+
+#[test]
 fn test_columnar_transaction_insert_stages_side_data() {
     let db = test_db();
 
