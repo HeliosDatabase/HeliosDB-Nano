@@ -2708,7 +2708,7 @@ impl StorageEngine {
         // Fetch schema internally for callers that don't have it
         let catalog = Catalog::new(self);
         let schema = catalog.get_table_schema(table_name).ok();
-        self.get_row_by_pk_inner(table_name, pk_value, schema.as_ref(), true)
+        self.get_row_by_pk_inner(table_name, pk_value, schema.as_ref(), true, true)
     }
 
     /// PK point lookup using a pre-fetched schema (avoids redundant catalog lookup)
@@ -2718,7 +2718,18 @@ impl StorageEngine {
         pk_value: &crate::Value,
         schema: &crate::Schema,
     ) -> Result<Option<Tuple>> {
-        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), true)
+        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), true, true)
+    }
+
+    /// PK point lookup when the caller already parsed/coerced the PK value to
+    /// the schema's exact PK type.
+    pub fn get_row_by_typed_pk_with_schema(
+        &self,
+        table_name: &str,
+        pk_value: &crate::Value,
+        schema: &crate::Schema,
+    ) -> Result<Option<Tuple>> {
+        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), true, false)
     }
 
     /// PK point lookup for write paths. Cache hits are used, but cache misses
@@ -2729,7 +2740,18 @@ impl StorageEngine {
         pk_value: &crate::Value,
         schema: &crate::Schema,
     ) -> Result<Option<Tuple>> {
-        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), false)
+        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), false, true)
+    }
+
+    /// Write-path PK lookup when the caller already parsed/coerced the PK value
+    /// to the schema's exact PK type.
+    pub fn get_row_by_typed_pk_for_write_with_schema(
+        &self,
+        table_name: &str,
+        pk_value: &crate::Value,
+        schema: &crate::Schema,
+    ) -> Result<Option<Tuple>> {
+        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), false, false)
     }
 
     /// Fetch a row directly by its row_id (for index-nested-loop join)
@@ -2801,6 +2823,7 @@ impl StorageEngine {
         pk_value: &crate::Value,
         schema: Option<&crate::Schema>,
         populate_cache_on_miss: bool,
+        coerce_pk_value: bool,
     ) -> Result<Option<Tuple>> {
         let lookup_start = std::time::Instant::now();
 
@@ -2808,10 +2831,14 @@ impl StorageEngine {
         // key encoding is identical to the one produced at INSERT time.  Without
         // this, e.g. Int4(1) encodes as 4 bytes while the stored Int8(1) uses 8.
         let coerced: crate::Value;
-        let effective_pk = if let Some(s) = schema {
-            if let Some(pk_col) = s.columns.iter().find(|c| c.primary_key) {
-                coerced = Self::coerce_pk_value(pk_value, &pk_col.data_type);
-                &coerced
+        let effective_pk = if coerce_pk_value {
+            if let Some(s) = schema {
+                if let Some(pk_col) = s.columns.iter().find(|c| c.primary_key) {
+                    coerced = Self::coerce_pk_value(pk_value, &pk_col.data_type);
+                    &coerced
+                } else {
+                    pk_value
+                }
             } else {
                 pk_value
             }

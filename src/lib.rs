@@ -5431,7 +5431,7 @@ impl EmbeddedDatabase {
         let existing_row =
             match self
                 .storage
-                .get_row_by_pk_for_write_with_schema(&spec.table_name, &pk_value, &spec.schema)
+                .get_row_by_typed_pk_for_write_with_schema(&spec.table_name, &pk_value, &spec.schema)
             {
                 Ok(Some(row)) => row,
                 Ok(None) => return Some(Ok(0)),
@@ -5527,7 +5527,7 @@ impl EmbeddedDatabase {
         let existing_row =
             match self
                 .storage
-                .get_row_by_pk_for_write_with_schema(&spec.table_name, &pk_value, &spec.schema)
+                .get_row_by_typed_pk_for_write_with_schema(&spec.table_name, &pk_value, &spec.schema)
             {
                 Ok(Some(row)) => row,
                 Ok(None) => return Some(Ok(0)),
@@ -6792,7 +6792,7 @@ impl EmbeddedDatabase {
         let existing_row =
             match self
                 .storage
-                .get_row_by_pk_for_write_with_schema(&spec.table_name, &pk_value, &spec.schema)
+                .get_row_by_typed_pk_for_write_with_schema(&spec.table_name, &pk_value, &spec.schema)
             {
                 Ok(Some(row)) => row,
                 Ok(None) => return Some(Ok(0)), // No matching row
@@ -6944,7 +6944,7 @@ impl EmbeddedDatabase {
         let existing_row =
             match self
                 .storage
-                .get_row_by_pk_for_write_with_schema(&spec.table_name, &pk_value, &spec.schema)
+                .get_row_by_typed_pk_for_write_with_schema(&spec.table_name, &pk_value, &spec.schema)
             {
                 Ok(Some(row)) => row,
                 Ok(None) => return Some(Ok(None)),
@@ -7159,7 +7159,7 @@ impl EmbeddedDatabase {
         // Direct PK lookup via ART index + RocksDB
         match self
             .storage
-            .get_row_by_pk_with_schema(&spec.table_name, &pk_value, &spec.schema)
+            .get_row_by_typed_pk_with_schema(&spec.table_name, &pk_value, &spec.schema)
         {
             Ok(Some(row)) => Some(Ok(vec![row])),
             Ok(None) => Some(Ok(vec![])),
@@ -7227,7 +7227,7 @@ impl EmbeddedDatabase {
 
         match self
             .storage
-            .get_row_by_pk_with_schema(&spec.table_name, &pk_value, &spec.schema)
+            .get_row_by_typed_pk_with_schema(&spec.table_name, &pk_value, &spec.schema)
         {
             Ok(Some(row)) => Some(Ok(vec![row])),
             Ok(None) => Some(Ok(vec![])),
