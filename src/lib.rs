@@ -1122,6 +1122,7 @@ impl EmbeddedDatabase {
             // Clear ART undo log (changes are now committed)
             self.art_undo_log.write().clear();
             self.deferred_fk_checks.lock().clear();
+            self.invalidate_result_cache();
             // Increment LSN to track transaction commits
             self.storage.increment_lsn();
             Ok(())
@@ -4181,6 +4182,7 @@ impl EmbeddedDatabase {
         txn.commit()?;
         self.art_undo_log.write().clear();
         self.deferred_fk_checks.lock().clear();
+        self.invalidate_result_cache();
         self.storage.increment_lsn();
         tracing::debug!(
             phase = "txn_commit",
@@ -4767,37 +4769,32 @@ impl EmbeddedDatabase {
             return self.handle_transaction_control(sql);
         }
 
-        // Check if we have an active transaction
-        let has_active_txn = {
+        let (result, defer_cache_invalidation) = {
             let txn_lock = self
                 .current_transaction
                 .lock()
                 .map_lock_err("Failed to acquire transaction lock for execute")?;
-            txn_lock.is_some()
-        };
-
-        let result = if has_active_txn {
-            // Execute within existing transaction context
-            let txn_lock = self
-                .current_transaction
-                .lock()
-                .map_lock_err("Failed to acquire transaction lock for execute")?;
-            let txn_ref = txn_lock
-                .as_ref()
-                .ok_or_else(|| Error::transaction("Transaction lock in invalid state"))?;
-            self.execute_in_transaction_no_fast_path(sql, txn_ref)
-        } else if let Some(result) = self.try_autocommit_fast_insert(sql) {
-            result
-        } else if let Some(result) = self.try_autocommit_fast_update_delete(sql) {
-            result
-        } else {
-            // No active transaction - create implicit transaction
-            self.execute_with_implicit_transaction(sql)
+            if let Some(txn_ref) = txn_lock.as_ref() {
+                // Execute within existing transaction context.
+                (self.execute_in_transaction_no_fast_path(sql, txn_ref), true)
+            } else {
+                drop(txn_lock);
+                if let Some(result) = self.try_autocommit_fast_insert(sql) {
+                    (result, false)
+                } else if let Some(result) = self.try_autocommit_fast_update_delete(sql) {
+                    (result, false)
+                } else {
+                    // No active transaction - create implicit transaction
+                    (self.execute_with_implicit_transaction(sql), false)
+                }
+            }
         };
 
         // Invalidate result cache on successful DML (any data modification)
         if result.is_ok() {
-            self.invalidate_result_cache();
+            if !defer_cache_invalidation {
+                self.invalidate_result_cache();
+            }
             #[cfg(feature = "code-graph")]
             {
                 let touched = Self::touched_table_from_sql(sql);
@@ -8899,7 +8896,6 @@ impl EmbeddedDatabase {
 
         if let Some(result) = self.try_transaction_fast_insert_params(sql, &plan, params) {
             let count = result?;
-            self.invalidate_result_cache();
             return Ok(count);
         }
         if let Some(result) = self.try_autocommit_fast_insert_params(sql, &plan, params) {
@@ -8931,7 +8927,9 @@ impl EmbeddedDatabase {
         let plan = self.parameterized_plan_cached(sql)?;
         if let Some(result) = self.try_fast_insert_many_params(sql, &plan, rows) {
             let count = result?;
-            self.invalidate_result_cache();
+            if !self.in_transaction() {
+                self.invalidate_result_cache();
+            }
             return Ok(count);
         }
 
@@ -13599,6 +13597,38 @@ mod tests {
         db.execute("UPDATE fast_select_cache SET val = 'after' WHERE id = 1")
             .unwrap();
 
+        let rows = db.query(sql, &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(1), Some(&Value::String("after".to_string())));
+    }
+
+    #[test]
+    fn test_result_cache_invalidated_on_explicit_commit() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE txn_cache_commit (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO txn_cache_commit VALUES (1, 'before')")
+            .unwrap();
+
+        let sql = "SELECT * FROM txn_cache_commit WHERE id = 1";
+        let rows = db.query(sql, &[]).unwrap();
+        assert_eq!(rows[0].get(1), Some(&Value::String("before".to_string())));
+        let rows = db.query(sql, &[]).unwrap();
+        assert_eq!(rows[0].get(1), Some(&Value::String("before".to_string())));
+        assert!(
+            db.result_cache.lock().unwrap().contains(sql),
+            "repeated SELECT should populate the result cache before the transaction"
+        );
+
+        db.execute("BEGIN").unwrap();
+        db.execute("UPDATE txn_cache_commit SET val = 'after' WHERE id = 1")
+            .unwrap();
+        db.execute("COMMIT").unwrap();
+
+        assert!(
+            !db.result_cache.lock().unwrap().contains(sql),
+            "COMMIT of transactional DML must invalidate cached pre-transaction results"
+        );
         let rows = db.query(sql, &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(1), Some(&Value::String("after".to_string())));
