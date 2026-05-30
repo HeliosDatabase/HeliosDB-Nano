@@ -465,7 +465,7 @@ impl WriteAheadLog {
             .map_err(|e| Error::storage(format!("Failed to append WAL entry: {}", e)))?;
 
         // Broadcast to standbys (and, in sync/semi-sync mode, wait for first ACK).
-        self.broadcast_after_append(lsn, &entry.operation);
+        Self::broadcast_after_append(lsn, &entry.operation);
 
         debug!("Appended WAL entry with LSN {}", lsn);
         Ok(lsn)
@@ -476,12 +476,29 @@ impl WriteAheadLog {
     /// configured. Shared by `append` and `append_nosync` so the fsync decision
     /// can never silently disable replication (see P0#2): an autocommit
     /// UPDATE/DELETE on the nosync path must still replicate exactly like INSERT.
-    fn broadcast_after_append(&self, lsn: u64, operation: &WalOperation) {
+    fn broadcast_after_append(lsn: u64, operation: &WalOperation) {
+        Self::broadcast_after_batch(std::iter::once((lsn, operation)));
+    }
+
+    fn broadcast_after_batch<'a, I>(entries: I)
+    where
+        I: IntoIterator<Item = (u64, &'a WalOperation)>,
+    {
         #[cfg(feature = "ha-tier1")]
         {
-            if let Some(replicated_lsn) = ha_state().broadcast_wal_operation(lsn, operation) {
-                debug!("WAL entry {} replicated to standbys", replicated_lsn);
+            let mut highest_replicated_lsn: Option<u64> = None;
+            for (lsn, operation) in entries {
+                if let Some(replicated_lsn) = ha_state().broadcast_wal_operation(lsn, operation) {
+                    debug!("WAL entry {} replicated to standbys", replicated_lsn);
+                    highest_replicated_lsn =
+                        Some(highest_replicated_lsn.map_or(replicated_lsn, |current| current.max(replicated_lsn)));
+                }
+            }
+
+            if let Some(replicated_lsn) = highest_replicated_lsn {
                 // Faster-safe: wait for the first standby ACK, not all.
+                // Standby flush/apply LSNs are monotonic, so waiting for the
+                // highest LSN in a committed batch covers every earlier entry.
                 const DEFAULT_SYNC_TIMEOUT_MS: u64 = 10000;
                 if let Err(e) = ha_state().wait_for_sync(replicated_lsn, DEFAULT_SYNC_TIMEOUT_MS) {
                     // Log but don't fail — data is written locally; degraded mode.
@@ -491,7 +508,7 @@ impl WriteAheadLog {
         }
         #[cfg(not(feature = "ha-tier1"))]
         {
-            let _ = (lsn, operation);
+            let _ = entries;
         }
     }
 
@@ -516,7 +533,7 @@ impl WriteAheadLog {
 
         // P0#2 fix: still broadcast to HA standbys (and honor sync/semi-sync ACK).
         // The nosync path only skips the local fsync — it must NOT skip replication.
-        self.broadcast_after_append(lsn, &entry.operation);
+        Self::broadcast_after_append(lsn, &entry.operation);
 
         Ok(lsn)
     }
@@ -773,13 +790,9 @@ impl WriteAheadLog {
 
             match db.write_opt(batch, &write_opts) {
                 Ok(()) => {
-                    // Broadcast to standbys for replication (if HA is enabled)
-                    #[cfg(feature = "ha-tier1")]
-                    {
-                        for write in &pending {
-                            ha_state().broadcast_wal_operation(write.entry.lsn, &write.entry.operation);
-                        }
-                    }
+                    // Broadcast to standbys for replication and, in sync/semi-sync
+                    // mode, wait for the highest batch LSN before reporting success.
+                    Self::broadcast_after_batch(pending.iter().map(|write| (write.entry.lsn, &write.entry.operation)));
 
                     // Notify all waiters of success
                     for write in pending {
