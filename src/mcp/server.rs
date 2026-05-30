@@ -72,7 +72,12 @@ impl McpServer {
                 }
             };
 
-            if req.method == "initialized" {
+            // Initialization notifications are fire-and-forget in MCP. Some
+            // clients use the current namespaced method while older clients used
+            // `initialized`.
+            if req.id.is_none()
+                && (req.method == "initialized" || req.method == "notifications/initialized")
+            {
                 continue;
             }
 
