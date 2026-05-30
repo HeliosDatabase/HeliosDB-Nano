@@ -233,7 +233,7 @@ impl NestedLoopJoinOperator {
 /// This provides O(N + M) time complexity vs O(N * M) for nested loop join.
 /// Algorithm from Silberschatz "Database System Concepts" Ch. 12.5.3.
 pub struct HashJoinOperator {
-    // Input operators
+    // Probe input operator
     left: Box<dyn PhysicalOperator>,
 
     // Join specification
@@ -253,6 +253,7 @@ pub struct HashJoinOperator {
     left_evaluator: crate::sql::Evaluator,
     right_evaluator: crate::sql::Evaluator,
     direct_key_indices: Option<DirectJoinKeyIndices>,
+    build_side: HashJoinBuildSide,
 
     // State machine
     state: JoinState,
@@ -285,6 +286,12 @@ pub struct HashJoinOperator {
 struct DirectJoinKeyIndices {
     left: Vec<usize>,
     right: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HashJoinBuildSide {
+    Left,
+    Right,
 }
 
 /// Join key for hash table lookups.
@@ -488,6 +495,28 @@ impl HashJoinOperator {
             right,
             join_type,
             on_condition,
+            HashJoinBuildSide::Right,
+            Self::DEFAULT_MEMORY_LIMIT,
+            timeout_ctx,
+        )
+    }
+
+    /// Create a hash join that builds the left input and probes the right input.
+    /// Restricted to INNER joins by the caller so output column order can be
+    /// preserved without changing outer-join NULL-extension semantics.
+    pub fn new_build_left(
+        left: Box<dyn PhysicalOperator>,
+        right: Box<dyn PhysicalOperator>,
+        join_type: crate::sql::JoinType,
+        on_condition: Option<crate::sql::LogicalExpr>,
+        timeout_ctx: Option<TimeoutContext>,
+    ) -> Result<Self> {
+        Self::with_memory_limit(
+            left,
+            right,
+            join_type,
+            on_condition,
+            HashJoinBuildSide::Left,
             Self::DEFAULT_MEMORY_LIMIT,
             timeout_ctx,
         )
@@ -496,9 +525,10 @@ impl HashJoinOperator {
     /// Create a new hash join operator with custom memory limit
     fn with_memory_limit(
         left: Box<dyn PhysicalOperator>,
-        mut right: Box<dyn PhysicalOperator>, // Must be mutable to consume in build_phase
+        right: Box<dyn PhysicalOperator>,
         join_type: crate::sql::JoinType,
         on_condition: Option<crate::sql::LogicalExpr>,
+        build_side: HashJoinBuildSide,
         memory_limit: usize,
         timeout_ctx: Option<TimeoutContext>,
     ) -> Result<Self> {
@@ -524,10 +554,14 @@ impl HashJoinOperator {
         // Create separate evaluators for key extraction (left and right schemas)
         let left_evaluator = crate::sql::Evaluator::new(left_schema);
         let right_evaluator = crate::sql::Evaluator::new(right_schema);
+        let (probe_input, mut build_input) = match build_side {
+            HashJoinBuildSide::Right => (left, right),
+            HashJoinBuildSide::Left => (right, left),
+        };
 
         // Create the operator instance
         let mut operator = Self {
-            left,
+            left: probe_input,
             join_type,
             on_condition,
             hash_table: std::collections::HashMap::new(),
@@ -536,6 +570,7 @@ impl HashJoinOperator {
             left_evaluator,
             right_evaluator,
             direct_key_indices,
+            build_side,
             state: JoinState::Initial,
             current_left_tuple: None,
             current_match_key: None,
@@ -553,7 +588,7 @@ impl HashJoinOperator {
         };
 
         // Execute build phase during construction
-        operator.build_phase(&mut right)?;
+        operator.build_phase(&mut build_input)?;
 
         Ok(operator)
     }
@@ -564,9 +599,9 @@ impl HashJoinOperator {
         self
     }
 
-    /// Execute build phase: construct hash table from right side
+    /// Execute build phase: construct hash table from the selected build side.
     ///
-    /// This phase materializes ALL tuples from the right (build) input
+    /// This phase materializes ALL tuples from the build input
     /// into an in-memory hash table indexed by join keys.
     fn build_phase(&mut self, right: &mut Box<dyn PhysicalOperator>) -> Result<()> {
         tracing::debug!(
@@ -583,7 +618,7 @@ impl HashJoinOperator {
             }
 
             // Extract join key from tuple
-            let key_opt = self.extract_join_key(&tuple, true)?;
+            let key_opt = self.extract_join_key(&tuple, self.build_side == HashJoinBuildSide::Right)?;
             tracing::debug!("HashJoin build: extracted key = {:?}", key_opt);
 
             // Skip tuples with NULL join keys (they will never match per SQL standard)
@@ -730,7 +765,7 @@ impl HashJoinOperator {
                             .as_ref()
                             .ok_or_else(|| Error::query_execution("Missing left tuple"))?;
                         self.match_index += 1;
-                        return Ok(Some(Self::join_tuples(left_tuple, right_tuple)));
+                        return Ok(Some(self.join_probe_with_build(left_tuple, right_tuple)));
                     }
                 }
 
@@ -752,7 +787,7 @@ impl HashJoinOperator {
                     .as_ref()
                     .ok_or_else(|| Error::query_execution("Missing left tuple"))?;
 
-                return Ok(Some(Self::join_tuples(left_tuple, right_tuple)));
+                return Ok(Some(self.join_probe_with_build(left_tuple, right_tuple)));
             }
 
             // Get next left tuple
@@ -770,7 +805,7 @@ impl HashJoinOperator {
                 }
                 Some(left_tuple) => {
                     // Extract join key and probe hash table
-                    let key_opt = self.extract_join_key(&left_tuple, false)?;
+                    let key_opt = self.extract_join_key(&left_tuple, self.build_side == HashJoinBuildSide::Left)?;
                     tracing::debug!(
                         "HashJoin probe: left_tuple = {:?}, extracted key = {:?}",
                         left_tuple.values,
@@ -808,7 +843,10 @@ impl HashJoinOperator {
 
                         let filtered_matches: Vec<Tuple> = matches
                             .iter()
-                            .filter(|right_tuple| self.evaluate_join_condition(&left_tuple, right_tuple).unwrap_or(false))
+                            .filter(|right_tuple| {
+                                self.evaluate_probe_build_condition(&left_tuple, right_tuple)
+                                    .unwrap_or(false)
+                            })
                             .cloned()
                             .collect();
 
@@ -875,6 +913,13 @@ impl HashJoinOperator {
         }
     }
 
+    fn evaluate_probe_build_condition(&self, probe: &Tuple, build: &Tuple) -> Result<bool> {
+        match self.build_side {
+            HashJoinBuildSide::Right => self.evaluate_join_condition(probe, build),
+            HashJoinBuildSide::Left => self.evaluate_join_condition(build, probe),
+        }
+    }
+
     /// Emit unmatched tuples from right side (for RIGHT/FULL joins)
     fn emit_unmatched(&mut self) -> Result<Option<Tuple>> {
         // Initialize iterator if not already done
@@ -916,6 +961,13 @@ impl HashJoinOperator {
         values.extend_from_slice(&left.values);
         values.extend_from_slice(&right.values);
         Tuple::new(values)
+    }
+
+    fn join_probe_with_build(&self, probe: &Tuple, build: &Tuple) -> Tuple {
+        match self.build_side {
+            HashJoinBuildSide::Right => Self::join_tuples(probe, build),
+            HashJoinBuildSide::Left => Self::join_tuples(build, probe),
+        }
     }
 
     /// Join left tuple with NULLs (for unmatched left tuple in LEFT/FULL join)
@@ -1023,6 +1075,14 @@ pub(super) fn handle_join(
     // small-to-medium tables (individual RocksDB lookups are slower than batch scans).
     // Enable with cardinality-based cost estimation in the future.
 
+    let left_rows = estimate_hash_join_rows(executor, left);
+    let right_rows = estimate_hash_join_rows(executor, right);
+    // Diagnostic kill switch for A/B perf runs; default is to build the
+    // smaller known side for inner equi-joins.
+    let build_left_for_inner = matches!(join_type, crate::sql::JoinType::Inner)
+        && std::env::var("HELIOS_HASHJOIN_BUILD_RIGHT").is_err()
+        && matches!((left_rows, right_rows), (Some(l), Some(r)) if l < r);
+
     let left_op = executor.plan_to_operator(left)?;
     let right_op = executor.plan_to_operator(right)?;
     let timeout_ctx = executor.timeout_ctx();
@@ -1045,13 +1105,23 @@ pub(super) fn handle_join(
 
             if equi_part.is_some() {
                 // Use hash join on equi-join keys
-                let mut join_op: Box<dyn PhysicalOperator> = Box::new(HashJoinOperator::new(
-                    left_op,
-                    right_op,
-                    join_type.clone(),
-                    equi_part,
-                    timeout_ctx,
-                )?);
+                let mut join_op: Box<dyn PhysicalOperator> = if build_left_for_inner {
+                    Box::new(HashJoinOperator::new_build_left(
+                        left_op,
+                        right_op,
+                        join_type.clone(),
+                        equi_part,
+                        timeout_ctx,
+                    )?)
+                } else {
+                    Box::new(HashJoinOperator::new(
+                        left_op,
+                        right_op,
+                        join_type.clone(),
+                        equi_part,
+                        timeout_ctx,
+                    )?)
+                };
 
                 // Apply residual filter on top if present
                 if let Some(residual) = residual_part {
@@ -1071,6 +1141,36 @@ pub(super) fn handle_join(
             }
         }
     }
+}
+
+fn estimate_hash_join_rows(executor: &Executor<'_>, plan: &crate::sql::LogicalPlan) -> Option<usize> {
+    match plan {
+        crate::sql::LogicalPlan::Scan { table_name, .. } => executor.storage()?.count_table_rows(table_name).ok(),
+        crate::sql::LogicalPlan::FilteredScan {
+            table_name, predicate, ..
+        } => {
+            let rows = executor.storage()?.count_table_rows(table_name).ok()?;
+            if predicate.is_some() {
+                Some(estimate_filtered_rows(rows))
+            } else {
+                Some(rows)
+            }
+        }
+        crate::sql::LogicalPlan::Filter { input, .. } => {
+            estimate_hash_join_rows(executor, input).map(estimate_filtered_rows)
+        }
+        crate::sql::LogicalPlan::Project { input, .. } | crate::sql::LogicalPlan::Sort { input, .. } => {
+            estimate_hash_join_rows(executor, input)
+        }
+        crate::sql::LogicalPlan::Limit { input, limit, .. } => {
+            estimate_hash_join_rows(executor, input).map(|rows| rows.min(*limit))
+        }
+        _ => None,
+    }
+}
+
+fn estimate_filtered_rows(rows: usize) -> usize {
+    rows.saturating_mul(33).saturating_add(99).saturating_div(100).max(1)
 }
 
 /// Try to use Index-Nested-Loop Join when the right table has an ART index on the join column.

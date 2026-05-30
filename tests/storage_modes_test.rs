@@ -271,6 +271,10 @@ fn test_columnar_native_aggregate_respects_live_rows() {
         vec![Value::Int8(60), Value::Float8(20.0), Value::Int4(2), Value::Int8(3)]
     );
 
+    let filtered_rows = db.query("SELECT a FROM metrics WHERE e = 2", &[]).unwrap();
+    assert_eq!(filtered_rows.len(), 1);
+    assert_eq!(filtered_rows[0].values[0], Value::Int4(30));
+
     let empty = db
         .query("SELECT COUNT(*), SUM(a), AVG(a), MAX(b) FROM metrics WHERE b > 100", &[])
         .unwrap();
