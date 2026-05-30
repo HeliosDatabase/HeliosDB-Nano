@@ -658,6 +658,10 @@ fn run_param_tps_suite() {
     let db = make_db(&mode, &tmp).expect("db open");
     db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT, age INTEGER, balance INTEGER)")
         .unwrap();
+    db.execute(
+        "CREATE TABLE users_many (id INTEGER PRIMARY KEY, name TEXT, email TEXT, age INTEGER, balance INTEGER)",
+    )
+    .unwrap();
 
     bench("param_bulk_insert(txn)", n, || {
         db.execute("BEGIN")?;
@@ -674,6 +678,25 @@ fn run_param_tps_suite() {
             )?;
         }
         db.execute("COMMIT")?;
+        Ok(())
+    });
+
+    bench("param_execute_many_insert", n, || {
+        let rows: Vec<Vec<Value>> = (0..n)
+            .map(|i| {
+                vec![
+                    Value::Int8(i as i64),
+                    Value::String(format!("User{i}")),
+                    Value::String(format!("u{i}@ex.com")),
+                    Value::Int4(18 + (i % 60) as i32),
+                    Value::Int8(((i * 7) % 100000) as i64),
+                ]
+            })
+            .collect();
+        db.execute_many_params(
+            "INSERT INTO users_many (id, name, email, age, balance) VALUES ($1, $2, $3, $4, $5)",
+            &rows,
+        )?;
         Ok(())
     });
 

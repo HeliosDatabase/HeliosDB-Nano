@@ -201,6 +201,54 @@ fn test_parameterized_insert_in_explicit_transaction_commit_and_rollback() {
 }
 
 #[test]
+fn test_execute_many_params_insert_autocommit() {
+    let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
+    db.execute("CREATE TABLE many_params (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+
+    let rows = vec![
+        vec![Value::Int4(1), Value::String("a".to_string())],
+        vec![Value::Int4(2), Value::String("b".to_string())],
+        vec![Value::Int4(3), Value::String("c".to_string())],
+    ];
+    let count = db
+        .execute_many_params("INSERT INTO many_params (id, name) VALUES ($1, $2)", &rows)
+        .unwrap();
+    assert_eq!(count, 3);
+
+    let results = db
+        .query("SELECT id, name FROM many_params ORDER BY id", &[])
+        .unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[1].get(1).unwrap(), &Value::String("b".to_string()));
+}
+
+#[test]
+fn test_execute_many_params_insert_transaction_visibility_and_rollback() {
+    let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
+    db.execute("CREATE TABLE many_txn (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    let rows = vec![
+        vec![Value::Int4(1), Value::String("one".to_string())],
+        vec![Value::Int4(2), Value::String("two".to_string())],
+    ];
+
+    db.execute("BEGIN").unwrap();
+    let count = db
+        .execute_many_params("INSERT INTO many_txn (id, name) VALUES ($1, $2)", &rows)
+        .unwrap();
+    assert_eq!(count, 2);
+    let in_txn = db
+        .query_params("SELECT * FROM many_txn WHERE id = $1", &[Value::Int4(2)])
+        .unwrap();
+    assert_eq!(in_txn.len(), 1);
+    db.execute("ROLLBACK").unwrap();
+
+    let after_rollback = db.query("SELECT * FROM many_txn", &[]).unwrap();
+    assert_eq!(after_rollback.len(), 0);
+}
+
+#[test]
 fn test_update_with_parameters() {
     let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
 

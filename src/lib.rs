@@ -4636,6 +4636,59 @@ impl EmbeddedDatabase {
         Some(self.insert_validated_tuples_in_transaction(&spec.table_name, vec![tuple], &spec.schema, txn))
     }
 
+    fn try_fast_insert_many_params(
+        &self,
+        sql: &str,
+        plan: &sql::LogicalPlan,
+        rows: &[Vec<Value>],
+    ) -> Option<Result<u64>> {
+        if rows.is_empty() {
+            return Some(Ok(0));
+        }
+        if !self.savepoints.read().is_empty()
+            || !self.session_transactions.is_empty()
+            || self.tenant_manager.get_current_context().is_some()
+            || self.storage.get_current_branch_id().is_some()
+        {
+            return None;
+        }
+
+        let spec = match self.fast_param_insert_spec(sql, plan)? {
+            Ok(spec) => spec,
+            Err(e) => return Some(Err(e)),
+        };
+
+        let mut tuples = Vec::with_capacity(rows.len());
+        for params in rows {
+            match Self::materialize_fast_param_insert_tuple(&spec, params) {
+                Ok(tuple) => tuples.push(tuple),
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        let txn_guard = match self.current_transaction.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(txn) = txn_guard.as_ref() {
+            return Some(self.insert_validated_tuples_in_transaction(&spec.table_name, tuples, &spec.schema, txn));
+        }
+        drop(txn_guard);
+
+        let mut inserted = 0_u64;
+        for tuple in tuples {
+            if let Err(e) = self.storage.insert_tuple_fast(&spec.table_name, tuple, &spec.schema) {
+                if inserted > 0 {
+                    self.invalidate_result_cache();
+                }
+                return Some(Err(e));
+            }
+            inserted += 1;
+            self.storage.increment_lsn();
+        }
+        Some(Ok(inserted))
+    }
+
     fn fast_param_insert_spec(
         &self,
         sql: &str,
@@ -8017,6 +8070,31 @@ impl EmbeddedDatabase {
 
         let (count, _tuples) = self.execute_plan_with_params(&plan, params)?;
         Ok(count)
+    }
+
+    /// Execute one parameterized statement for many parameter rows.
+    ///
+    /// Repeated simple INSERTs use a batched fast path that parses/plans once,
+    /// materializes all tuples once, and stages the whole batch in the active
+    /// transaction when one exists. Other statements fall back to the exact
+    /// per-row `execute_params` behavior.
+    pub fn execute_many_params(&self, sql: &str, rows: &[Vec<Value>]) -> Result<u64> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let plan = self.parameterized_plan_cached(sql)?;
+        if let Some(result) = self.try_fast_insert_many_params(sql, &plan, rows) {
+            let count = result?;
+            self.invalidate_result_cache();
+            return Ok(count);
+        }
+
+        let mut total = 0_u64;
+        for params in rows {
+            total += self.execute_params(sql, params)?;
+        }
+        Ok(total)
     }
 
     /// Execute a parameterized SQL statement with RETURNING clause support
