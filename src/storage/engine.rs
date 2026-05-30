@@ -161,6 +161,15 @@ fn columnar_row_matches_filters(
     })
 }
 
+fn row_tuple_matches_filters(tuple: &Tuple, predicates: &[FilterPredicate]) -> bool {
+    predicates.iter().all(|predicate| {
+        tuple
+            .values
+            .get(predicate.column_index)
+            .is_some_and(|value| predicate.evaluate(value))
+    })
+}
+
 fn columnar_batch_value<'a>(
     column_batches: &'a HashMap<usize, ColumnarBatchIndex>,
     column_index: usize,
@@ -2436,6 +2445,167 @@ impl StorageEngine {
         );
 
         Ok(tuples)
+    }
+
+    /// Aggregate directly over row-store data without materializing a ScanOperator
+    /// input vector. This is the row-store counterpart to
+    /// `aggregate_columnar_columns`: it decodes only the columns referenced by the
+    /// aggregate/group/filter expressions and updates aggregate state while walking
+    /// the RocksDB prefix.
+    pub(crate) fn try_aggregate_row_columns(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        group_by_columns: &[usize],
+        aggregates: &[ColumnarAggregateSpec],
+        predicates: &[AnalyzedPredicate],
+    ) -> Result<Option<Vec<Tuple>>> {
+        let scan_start = std::time::Instant::now();
+        let mut requested: Vec<usize> = group_by_columns.to_vec();
+        requested.extend(aggregates.iter().filter_map(|aggregate| aggregate.column_index));
+        requested.extend(predicates.iter().map(|predicate| predicate.column_index));
+        requested.sort_unstable();
+        requested.dedup();
+
+        for &idx in &requested {
+            let column = schema
+                .columns
+                .get(idx)
+                .ok_or_else(|| Error::storage(format!("Column index {} out of bounds for {}", idx, table_name)))?;
+            if column.storage_mode != ColumnStorageMode::Default {
+                return Ok(None);
+            }
+        }
+
+        let filter_predicates: Vec<FilterPredicate> = predicates.iter().filter_map(columnar_filter_predicate).collect();
+        if filter_predicates.len() != predicates.len() {
+            return Ok(None);
+        }
+
+        if requested.is_empty() && group_by_columns.is_empty() && predicates.is_empty() {
+            let count = self.count_table_rows(table_name)? as i64;
+            let values = aggregates
+                .iter()
+                .map(|aggregate| match aggregate.op {
+                    ColumnarAggregateOp::CountStar => Ok(Value::Int8(count)),
+                    _ => Err(Error::query_execution("row aggregate requires a referenced column")),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            return Ok(Some(vec![Tuple::new(values)]));
+        }
+
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        if group_by_columns.is_empty() {
+            let mut states: Vec<ColumnarAggregateState> = aggregates
+                .iter()
+                .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                .collect();
+
+            for item in iter {
+                let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
+
+                let tuple = self.decode_rowstore_aggregate_tuple(&raw_value, &requested, schema.columns.len())?;
+                if !row_tuple_matches_filters(&tuple, &filter_predicates) {
+                    continue;
+                }
+
+                for (state, aggregate) in states.iter_mut().zip(aggregates) {
+                    let value = aggregate.column_index.and_then(|idx| tuple.values.get(idx));
+                    state.update(aggregate.op, value)?;
+                }
+            }
+
+            let tuple_values: Result<Vec<Value>> = states.into_iter().map(ColumnarAggregateState::finalize).collect();
+            let tuples = vec![Tuple::new(tuple_values?)];
+            tracing::debug!(
+                phase = "storage_row_aggregate",
+                table = table_name,
+                rows = tuples.len(),
+                columns = requested.len(),
+                predicates = filter_predicates.len(),
+                duration_us = scan_start.elapsed().as_micros() as u64,
+                "Row-store aggregate complete"
+            );
+            return Ok(Some(tuples));
+        }
+
+        let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+        for item in iter {
+            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+
+            let tuple = self.decode_rowstore_aggregate_tuple(&raw_value, &requested, schema.columns.len())?;
+            if !row_tuple_matches_filters(&tuple, &filter_predicates) {
+                continue;
+            }
+
+            let group_key: Vec<Value> = group_by_columns
+                .iter()
+                .map(|&idx| tuple.values.get(idx).cloned().unwrap_or(Value::Null))
+                .collect();
+            let states = groups.entry(group_key).or_insert_with(|| {
+                aggregates
+                    .iter()
+                    .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                    .collect()
+            });
+
+            for (state, aggregate) in states.iter_mut().zip(aggregates) {
+                let value = aggregate.column_index.and_then(|idx| tuple.values.get(idx));
+                state.update(aggregate.op, value)?;
+            }
+        }
+
+        let mut grouped: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = groups.into_iter().collect();
+        grouped.sort_by(|(left, _), (right, _)| compare_value_slices(left, right));
+
+        let mut tuples = Vec::with_capacity(grouped.len());
+        for (mut group_key, states) in grouped {
+            let mut aggregate_values: Result<Vec<Value>> =
+                states.into_iter().map(ColumnarAggregateState::finalize).collect();
+            group_key.append(&mut aggregate_values?);
+            tuples.push(Tuple::new(group_key));
+        }
+
+        tracing::debug!(
+            phase = "storage_row_aggregate",
+            table = table_name,
+            rows = tuples.len(),
+            columns = requested.len(),
+            predicates = filter_predicates.len(),
+            duration_us = scan_start.elapsed().as_micros() as u64,
+            "Row-store grouped aggregate complete"
+        );
+
+        Ok(Some(tuples))
+    }
+
+    fn decode_rowstore_aggregate_tuple(
+        &self,
+        raw_value: &[u8],
+        columns: &[usize],
+        total_cols: usize,
+    ) -> Result<Tuple> {
+        let tuple = if let Some(km) = &self.key_manager {
+            let decrypted = crypto::decrypt(km.key(), raw_value)?;
+            crate::storage::prefix_decode::decode_tuple_columns(&decrypted, columns, total_cols)
+        } else {
+            crate::storage::prefix_decode::decode_tuple_columns(raw_value, columns, total_cols)
+        }
+        .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+        Ok(tuple)
     }
 
     fn scan_table_with_schema_opt(
