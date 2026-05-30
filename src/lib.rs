@@ -405,6 +405,10 @@ pub struct EmbeddedDatabase {
     /// Repeated parameterized INSERT metadata cache. Invalidated with the plan cache on DDL.
     fast_param_insert_cache:
         std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamInsertSpec>>>>,
+    /// Repeated literal INSERT shape cache. Literal values differ per statement,
+    /// but table/column metadata is stable until DDL.
+    fast_literal_insert_cache:
+        std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastLiteralInsertSpec>>>>,
     /// Repeated parameterized UPDATE metadata cache. Invalidated with the plan cache on DDL.
     fast_param_update_cache:
         std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamUpdateSpec>>>>,
@@ -496,6 +500,14 @@ struct FastParamInsertSpec {
     table_name: String,
     schema: std::sync::Arc<Schema>,
     columns: Vec<FastParamInsertColumn>,
+    all_columns_explicit_no_default: bool,
+}
+
+struct FastLiteralInsertSpec {
+    table_name: String,
+    schema: std::sync::Arc<Schema>,
+    col_indices: Vec<usize>,
+    target_types: Vec<DataType>,
     all_columns_explicit_no_default: bool,
 }
 
@@ -695,6 +707,14 @@ impl EmbeddedDatabase {
     #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
     fn new_fast_param_insert_cache(
     ) -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamInsertSpec>>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
+        )))
+    }
+
+    #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
+    fn new_fast_literal_insert_cache(
+    ) -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastLiteralInsertSpec>>>> {
         std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
             std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
         )))
@@ -3680,6 +3700,7 @@ impl EmbeddedDatabase {
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
+            fast_literal_insert_cache: Self::new_fast_literal_insert_cache(),
             fast_param_update_cache: Self::new_fast_param_update_cache(),
             fast_param_delete_cache: Self::new_fast_param_delete_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
@@ -3750,6 +3771,7 @@ impl EmbeddedDatabase {
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
+            fast_literal_insert_cache: Self::new_fast_literal_insert_cache(),
             fast_param_update_cache: Self::new_fast_param_update_cache(),
             fast_param_delete_cache: Self::new_fast_param_delete_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
@@ -3843,6 +3865,7 @@ impl EmbeddedDatabase {
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
+            fast_literal_insert_cache: Self::new_fast_literal_insert_cache(),
             fast_param_update_cache: Self::new_fast_param_update_cache(),
             fast_param_delete_cache: Self::new_fast_param_delete_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
@@ -4785,6 +4808,133 @@ impl EmbeddedDatabase {
         Some(Ok(inserted))
     }
 
+    fn fast_literal_insert_cache_key(table_name: &str, columns: Option<&[&str]>) -> String {
+        let mut key = String::with_capacity(table_name.len() + columns.map_or(8, |cols| cols.len() * 12));
+        key.push_str("\0fast_literal_insert\0");
+        key.push_str(table_name);
+        key.push('\0');
+        if let Some(columns) = columns {
+            for column in columns {
+                key.push_str(column);
+                key.push('\0');
+            }
+        } else {
+            key.push('*');
+        }
+        key
+    }
+
+    fn fast_literal_insert_spec(
+        &self,
+        table_name: &str,
+        explicit_columns: Option<&[&str]>,
+        value_count: usize,
+    ) -> Option<Result<std::sync::Arc<FastLiteralInsertSpec>>> {
+        if value_count == 0 {
+            return None;
+        }
+
+        let cache_key = Self::fast_literal_insert_cache_key(table_name, explicit_columns);
+        if let Ok(mut cache) = self.fast_literal_insert_cache.lock() {
+            if let Some(spec) = cache.get(&cache_key) {
+                if spec.target_types.len() == value_count {
+                    return Some(Ok(std::sync::Arc::clone(spec)));
+                }
+                return None;
+            }
+        }
+
+        let catalog = self.storage.catalog();
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(schema) => std::sync::Arc::new(schema),
+            Err(_) => return None,
+        };
+
+        if let Ok(tc) = catalog.load_table_constraints(table_name) {
+            if !tc.foreign_keys.is_empty() || !tc.check_constraints.is_empty() {
+                return None;
+            }
+        }
+
+        let column_names: Vec<&str> = explicit_columns.map_or_else(
+            || schema.columns.iter().map(|c| c.name.as_str()).collect(),
+            |columns| columns.to_vec(),
+        );
+        if column_names.len() != value_count {
+            return None;
+        }
+
+        let mut col_indices = Vec::with_capacity(column_names.len());
+        let mut target_types = Vec::with_capacity(column_names.len());
+        let mut provided_columns = vec![false; schema.columns.len()];
+        for col_name in &column_names {
+            let col_idx = match schema.get_column_index(col_name) {
+                Some(idx) => idx,
+                None => return None,
+            };
+            if provided_columns.get(col_idx).copied().unwrap_or(false) {
+                return None;
+            }
+            if let Some(provided) = provided_columns.get_mut(col_idx) {
+                *provided = true;
+            }
+            let target_col = match schema.get_column_at(col_idx) {
+                Some(col) => col,
+                None => return None,
+            };
+            col_indices.push(col_idx);
+            target_types.push(target_col.data_type.clone());
+        }
+
+        let spec = std::sync::Arc::new(FastLiteralInsertSpec {
+            table_name: table_name.to_string(),
+            schema,
+            col_indices,
+            target_types,
+            all_columns_explicit_no_default: provided_columns.iter().all(|provided| *provided),
+        });
+        if let Ok(mut cache) = self.fast_literal_insert_cache.lock() {
+            cache.put(cache_key, std::sync::Arc::clone(&spec));
+        }
+        Some(Ok(spec))
+    }
+
+    fn materialize_fast_literal_insert_tuple(
+        spec: &FastLiteralInsertSpec,
+        values_str: &str,
+    ) -> Option<Result<Tuple>> {
+        let values = Self::fast_parse_values(values_str, &spec.target_types)?;
+        let mut tuple_values = vec![Value::Null; spec.schema.columns.len()];
+        let mut user_provided = if spec.all_columns_explicit_no_default {
+            Vec::new()
+        } else {
+            vec![false; spec.schema.columns.len()]
+        };
+
+        for (i, &col_idx) in spec.col_indices.iter().enumerate() {
+            if let Some(value) = values.get(i) {
+                if let Some(slot) = tuple_values.get_mut(col_idx) {
+                    *slot = value.clone();
+                }
+                if !spec.all_columns_explicit_no_default {
+                    if let Some(flag) = user_provided.get_mut(col_idx) {
+                        *flag = true;
+                    }
+                }
+            }
+        }
+
+        let result = if spec.all_columns_explicit_no_default {
+            Self::check_not_null_for_materialized_insert(&tuple_values, &spec.schema)
+        } else {
+            Self::apply_defaults_and_check_not_null(&mut tuple_values, &spec.schema, &user_provided)
+        };
+        if let Err(e) = result {
+            return Some(Err(e));
+        }
+        Some(Ok(Tuple::new(tuple_values)))
+    }
+
     fn fast_param_insert_spec(
         &self,
         sql: &str,
@@ -5553,6 +5703,9 @@ impl EmbeddedDatabase {
         if let Ok(mut cache) = self.fast_param_insert_cache.lock() {
             cache.clear();
         }
+        if let Ok(mut cache) = self.fast_literal_insert_cache.lock() {
+            cache.clear();
+        }
         if let Ok(mut cache) = self.fast_param_update_cache.lock() {
             cache.clear();
         }
@@ -5877,84 +6030,27 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        // Get schema (from cache or RocksDB)
-        let catalog = self.storage.catalog();
-        let schema = match catalog.get_table_schema(table_name) {
-            Ok(s) => s,
-            Err(_) => return None, // Table doesn't exist — let normal path handle error
+        let value_count = Self::fast_parse_value_count(values_str);
+        let spec = match self.fast_literal_insert_spec(table_name, columns.as_deref(), value_count)? {
+            Ok(spec) => spec,
+            Err(e) => return Some(Err(e)),
+        };
+        let tuple = match Self::materialize_fast_literal_insert_tuple(&spec, values_str)? {
+            Ok(tuple) => tuple,
+            Err(e) => return Some(Err(e)),
         };
 
-        // Bail if the target table has any foreign key constraints.
-        // The fast path skips FK validation entirely and used to let
-        // orphan rows slip in silently (B36 data-integrity half). The
-        // normal path's Insert arm does the full FK check, so it's
-        // both simpler and safer to route FK-bearing tables through
-        // it than to re-implement validation here.
-        if let Ok(tc) = catalog.load_table_constraints(table_name) {
-            if !tc.foreign_keys.is_empty() {
-                return None;
-            }
-        }
-
-        // Resolve column indices and target types
-        let value_count = Self::fast_parse_value_count(values_str);
-        let expected_count = columns.as_ref().map_or(schema.columns.len(), Vec::len);
-        if expected_count != value_count {
-            return None; // Column/value count mismatch
-        }
-
-        let mut target_types = Vec::with_capacity(expected_count);
-        let mut col_indices = Vec::with_capacity(expected_count);
-        if let Some(columns) = &columns {
-            for col_name in columns {
-                match schema.get_column_index(col_name) {
-                    Some(idx) => {
-                        col_indices.push(idx);
-                        match schema.get_column_at(idx) {
-                            Some(col) => target_types.push(col.data_type.clone()),
-                            None => return None,
-                        }
-                    }
-                    None => return None, // Unknown column — let normal path handle error
-                }
-            }
-        } else {
-            for (idx, col) in schema.columns.iter().enumerate() {
-                col_indices.push(idx);
-                target_types.push(col.data_type.clone());
-            }
-        }
-
-        // Parse value literals
-        let values = Self::fast_parse_values(values_str, &target_types)?;
-
-        // Build ordered tuple (columns may be in non-schema order)
-        let mut tuple_values = vec![Value::Null; schema.columns.len()];
-        let mut user_provided = vec![false; schema.columns.len()];
-        for (i, &col_idx) in col_indices.iter().enumerate() {
-            if let Some(val) = values.get(i) {
-                if col_idx < tuple_values.len() {
-                    tuple_values[col_idx] = val.clone();
-                    user_provided[col_idx] = true;
-                }
-            }
-        }
-
-        // Apply DEFAULT expressions for omitted columns and enforce
-        // NOT NULL (B24 / B26). Evaluator errors here bubble up as the
-        // Result from this fast path — caller handles accordingly.
-        if let Err(e) = Self::apply_defaults_and_check_not_null(&mut tuple_values, &schema, &user_provided) {
-            return Some(Err(e));
-        }
-
-        let tuple = Tuple::new(tuple_values);
         // Use fast INSERT (skip WAL fsync + snapshot versioning) when on main branch
         if self.storage.get_current_branch_id().is_none() {
-            Some(self.storage.insert_tuple_fast(table_name, tuple, &schema).map(|_| 1))
+            Some(
+                self.storage
+                    .insert_tuple_fast(&spec.table_name, tuple, &spec.schema)
+                    .map(|_| 1),
+            )
         } else {
             Some(
                 self.storage
-                    .insert_tuple_branch_aware_with_schema(table_name, tuple, &schema)
+                    .insert_tuple_branch_aware_with_schema(&spec.table_name, tuple, &spec.schema)
                     .map(|_| 1),
             )
         }
@@ -6014,59 +6110,27 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let catalog = self.storage.catalog();
-        let schema = match catalog.get_table_schema(table_name) {
-            Ok(schema) => schema,
-            Err(_) => return None,
+        let first_values = value_groups.first()?;
+        let value_count = Self::fast_parse_value_count(first_values);
+        let spec = match self.fast_literal_insert_spec(table_name, explicit_columns.as_deref(), value_count)? {
+            Ok(spec) => spec,
+            Err(e) => return Some(Err(e)),
         };
-        if let Ok(tc) = catalog.load_table_constraints(table_name) {
-            if !tc.foreign_keys.is_empty() || !tc.check_constraints.is_empty() {
-                return None;
-            }
-        }
-
-        let columns = explicit_columns.unwrap_or_else(|| schema.columns.iter().map(|c| c.name.as_str()).collect());
-
-        let mut target_types = Vec::with_capacity(columns.len());
-        let mut col_indices = Vec::with_capacity(columns.len());
-        for col_name in &columns {
-            match schema.get_column_index(col_name) {
-                Some(idx) => {
-                    col_indices.push(idx);
-                    match schema.get_column_at(idx) {
-                        Some(col) => target_types.push(col.data_type.clone()),
-                        None => return None,
-                    }
-                }
-                None => return None,
-            }
-        }
 
         let mut tuples = Vec::with_capacity(value_groups.len());
         for values_str in value_groups {
-            if columns.len() != Self::fast_parse_value_count(values_str) {
+            if spec.target_types.len() != Self::fast_parse_value_count(values_str) {
                 return None;
             }
 
-            let values = Self::fast_parse_values(values_str, &target_types)?;
-            let mut tuple_values = vec![Value::Null; schema.columns.len()];
-            let mut user_provided = vec![false; schema.columns.len()];
-            for (i, &col_idx) in col_indices.iter().enumerate() {
-                if let Some(value) = values.get(i) {
-                    if col_idx < tuple_values.len() {
-                        tuple_values[col_idx] = value.clone();
-                        user_provided[col_idx] = true;
-                    }
-                }
-            }
-
-            if let Err(e) = Self::apply_defaults_and_check_not_null(&mut tuple_values, &schema, &user_provided) {
-                return Some(Err(e));
-            }
-            tuples.push(Tuple::new(tuple_values));
+            let tuple = match Self::materialize_fast_literal_insert_tuple(&spec, values_str)? {
+                Ok(tuple) => tuple,
+                Err(e) => return Some(Err(e)),
+            };
+            tuples.push(tuple);
         }
 
-        Some(self.insert_validated_tuples_in_transaction(table_name, tuples, &schema, txn))
+        Some(self.insert_validated_tuples_in_transaction(&spec.table_name, tuples, &spec.schema, txn))
     }
 
     fn tuple_column_values(schema: &Schema, tuple: &Tuple) -> std::collections::HashMap<String, Value> {
@@ -11389,6 +11453,7 @@ impl EmbeddedDatabase {
             result_cache_nonempty: self.result_cache_nonempty.clone(),
             last_fast_select_fingerprint: self.last_fast_select_fingerprint.clone(),
             fast_param_insert_cache: self.fast_param_insert_cache.clone(),
+            fast_literal_insert_cache: self.fast_literal_insert_cache.clone(),
             fast_param_update_cache: self.fast_param_update_cache.clone(),
             fast_param_delete_cache: self.fast_param_delete_cache.clone(),
             query_profiler: self.query_profiler.clone(),
