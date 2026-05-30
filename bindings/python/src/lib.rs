@@ -173,14 +173,8 @@ impl PyDatabase {
     /// Execute one statement against many parameter rows; returns total affected.
     fn execute_many(&self, py: Python<'_>, sql: &str, rows: &Bound<'_, PyList>) -> PyResult<u64> {
         let batches: Vec<Vec<Value>> = rows.iter().map(|r| collect_params(Some(&r))).collect::<PyResult<_>>()?;
-        py.allow_threads(|| {
-            let mut n = 0u64;
-            for ps in &batches {
-                n += self.inner.execute_params(sql, ps)?;
-            }
-            Ok::<u64, heliosdb_core::Error>(n)
-        })
-        .map_err(rt_err)
+        py.allow_threads(|| self.inner.execute_many_params(sql, &batches))
+            .map_err(rt_err)
     }
 
     /// HNSW similarity search. Returns `list[(id, distance)]`.
