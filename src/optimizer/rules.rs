@@ -328,7 +328,7 @@ impl SelectionPushdownRule {
 
     fn collect_table_refs_inner(plan: &LogicalPlan, refs: &mut HashSet<String>) {
         match plan {
-            LogicalPlan::Scan { table_name, alias, .. } => {
+            LogicalPlan::Scan { table_name, alias, .. } | LogicalPlan::FilteredScan { table_name, alias, .. } => {
                 refs.insert(table_name.clone());
                 if let Some(a) = alias {
                     refs.insert(a.clone());
@@ -1151,8 +1151,9 @@ impl StorageFilterPushdownRule {
                     }
                     // AND predicates can be pushed if all parts can be pushed
                     BinaryOperator::And => Self::can_push_predicate(left) && Self::can_push_predicate(right),
-                    // OR predicates are more complex but can still be pushed
-                    BinaryOperator::Or => Self::can_push_predicate(left) && Self::can_push_predicate(right),
+                    // The storage predicate analyzer does not preserve full
+                    // OR semantics, so keep OR predicates at executor level.
+                    BinaryOperator::Or => false,
                     // LIKE can be pushed for prefix patterns
                     BinaryOperator::Like => {
                         matches!(
@@ -1283,8 +1284,8 @@ impl OptimizationRule for StorageFilterPushdownRule {
 
     fn is_applicable(&self, plan: &LogicalPlan) -> bool {
         // Look for Filter over Scan pattern
-        if let LogicalPlan::Filter { input, .. } = plan {
-            return matches!(input.as_ref(), LogicalPlan::Scan { .. });
+        if let LogicalPlan::Filter { input, predicate } = plan {
+            return matches!(input.as_ref(), LogicalPlan::Scan { .. }) && Self::can_push_predicate(predicate);
         }
         false
     }
@@ -1301,17 +1302,8 @@ impl OptimizationRule for StorageFilterPushdownRule {
             {
                 // Check if predicate can be pushed down
                 if !Self::can_push_predicate(&predicate) {
-                    // Cannot push - return original
-                    return Ok(Some(LogicalPlan::Filter {
-                        input: Box::new(LogicalPlan::Scan {
-                            table_name,
-                            alias,
-                            schema,
-                            projection,
-                            as_of,
-                        }),
-                        predicate,
-                    }));
+                    // Cannot push - leave the original plan unchanged.
+                    return Ok(None);
                 }
 
                 // Estimate selectivity
@@ -1888,6 +1880,17 @@ mod tests {
         }
     }
 
+    fn make_filtered_scan(name: &str, alias: &str) -> LogicalPlan {
+        LogicalPlan::FilteredScan {
+            table_name: name.to_string(),
+            alias: Some(alias.to_string()),
+            schema: create_test_schema(),
+            projection: None,
+            predicate: Some(binary(col(alias, "name"), BinaryOperator::Eq, lit_str("alice"))),
+            as_of: None,
+        }
+    }
+
     fn col(table: &str, name: &str) -> LogicalExpr {
         LogicalExpr::Column {
             table: Some(table.to_string()),
@@ -1975,6 +1978,20 @@ mod tests {
         assert!(
             result.is_none(),
             "cross-side ON should NOT be rewritten, got {:?}",
+            result
+        );
+    }
+
+    #[test]
+    fn jpp_keeps_cross_side_equi_predicate_with_filtered_scan_input() {
+        let rule = JoinPredicatePushdownRule::new();
+        let estimator = CostEstimator::new(StatsCatalog::new());
+        let on = binary(col("l", "id"), BinaryOperator::Eq, col("r", "id"));
+        let plan = make_join(make_filtered_scan("left_table", "l"), make_scan("r"), Some(on), JoinType::Inner);
+        let result = rule.apply(plan, &estimator).unwrap();
+        assert!(
+            result.is_none(),
+            "cross-side ON should stay on Join when one side is already a FilteredScan, got {:?}",
             result
         );
     }
@@ -2129,5 +2146,23 @@ mod tests {
             distinct_on: None,
         };
         assert!(!rule.is_applicable(&project));
+    }
+
+    #[test]
+    fn storage_pushdown_keeps_or_predicates_at_executor_level() {
+        let rule = StorageFilterPushdownRule::new();
+        let estimator = CostEstimator::new(StatsCatalog::new());
+        let predicate = binary(
+            binary(col("t", "id"), BinaryOperator::Eq, lit_int(1)),
+            BinaryOperator::Or,
+            binary(col("t", "id"), BinaryOperator::Eq, lit_int(2)),
+        );
+        let plan = LogicalPlan::Filter {
+            input: Box::new(make_scan("t")),
+            predicate,
+        };
+
+        assert!(!rule.is_applicable(&plan));
+        assert!(rule.apply(plan, &estimator).unwrap().is_none());
     }
 }
