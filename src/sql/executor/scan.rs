@@ -1396,6 +1396,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                 // Normal filtered scan (current data) with branch isolation
                 let decode_hint = executor.scan_decode_hint_for(table_name);
                 let mut columnar_predicates_applied = false;
+                let mut row_predicates_applied = false;
                 let base_tuples = if actual_table_name == *table_name {
                     if let Some(columns) = columnar_scan_columns_with_predicates(
                         &schema,
@@ -1416,6 +1417,37 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                             &columns,
                             pushed_predicates,
                         )?
+                    } else if !analyzed_predicates.is_empty() {
+                        let selected_columns: Option<Vec<usize>> = match decode_hint {
+                            Some(ScanDecodeHint::Prefix(prefix_len)) => Some((0..*prefix_len).collect()),
+                            Some(ScanDecodeHint::Columns(columns)) => Some(columns.clone()),
+                            None => None,
+                        };
+                        if let Some(tuples) = storage.scan_table_with_schema_columns_filtered(
+                            &actual_table_name,
+                            &schema,
+                            selected_columns.as_deref(),
+                            &analyzed_predicates,
+                        )? {
+                            row_predicates_applied = true;
+                            tuples
+                        } else {
+                            match decode_hint {
+                                Some(ScanDecodeHint::Prefix(prefix_len)) => storage
+                                    .scan_table_branch_aware_with_schema_prefix(
+                                        &actual_table_name,
+                                        &schema,
+                                        *prefix_len,
+                                    )?,
+                                Some(ScanDecodeHint::Columns(columns)) => storage
+                                    .scan_table_branch_aware_with_schema_columns(
+                                        &actual_table_name,
+                                        &schema,
+                                        columns,
+                                    )?,
+                                _ => storage.scan_table_branch_aware_with_schema(&actual_table_name, &schema)?,
+                            }
+                        }
                     } else {
                         match decode_hint {
                             Some(ScanDecodeHint::Prefix(prefix_len)) => storage
@@ -1430,7 +1462,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                 };
 
                 // Apply storage-level filtering through predicate pushdown manager
-                if columnar_predicates_applied {
+                if columnar_predicates_applied || row_predicates_applied {
                     base_tuples
                 } else {
                     storage.predicate_pushdown().scan_with_pushdown(

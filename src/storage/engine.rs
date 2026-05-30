@@ -2015,6 +2015,74 @@ impl StorageEngine {
         }
     }
 
+    /// Row-store filtered scan that evaluates simple storage predicates while
+    /// walking RocksDB, so non-matching rows are never appended to the result
+    /// vector. Returns `None` when a branch overlay, non-default column storage,
+    /// or unsupported predicate requires the generic scan-then-filter path.
+    pub(crate) fn scan_table_with_schema_columns_filtered(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        columns: Option<&[usize]>,
+        predicates: &[AnalyzedPredicate],
+    ) -> Result<Option<Vec<Tuple>>> {
+        let branch_name = self.current_branch.lock().clone();
+        if branch_name.is_some() && branch_name.as_deref() != Some("main") {
+            return Ok(None);
+        }
+
+        let filter_predicates: Vec<FilterPredicate> = predicates.iter().filter_map(columnar_filter_predicate).collect();
+        if filter_predicates.len() != predicates.len() {
+            return Ok(None);
+        }
+
+        let mut requested: Vec<usize> = columns
+            .map(|cols| cols.to_vec())
+            .unwrap_or_else(|| (0..schema.columns.len()).collect());
+        requested.extend(predicates.iter().map(|predicate| predicate.column_index));
+        requested.sort_unstable();
+        requested.dedup();
+
+        for &idx in &requested {
+            let Some(column) = schema.columns.get(idx) else {
+                return Err(Error::storage(format!(
+                    "Column index {} out of bounds for {}",
+                    idx, table_name
+                )));
+            };
+            if column.storage_mode != ColumnStorageMode::Default {
+                return Ok(None);
+            }
+        }
+
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        let mut tuples = Vec::new();
+        for item in iter {
+            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+
+            let mut tuple = self.decode_rowstore_columns(&raw_value, &requested, schema.columns.len())?;
+            if !row_tuple_matches_filters(&tuple, &filter_predicates) {
+                continue;
+            }
+            if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
+                tuple.row_id = Some(row_id);
+            }
+            tuples.push(tuple);
+        }
+
+        Ok(Some(tuples))
+    }
+
     /// Scan a table by reading only row keys plus the requested columnar side-data.
     ///
     /// The caller must only pass column indexes whose schema storage mode is
