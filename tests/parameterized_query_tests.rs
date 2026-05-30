@@ -118,6 +118,20 @@ fn test_insert_with_parameters() {
 }
 
 #[test]
+fn test_parameterized_insert_all_columns_enforces_not_null() {
+    let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
+    db.execute("CREATE TABLE required_params (id INT, name TEXT NOT NULL)")
+        .unwrap();
+
+    let result = db.execute_params(
+        "INSERT INTO required_params VALUES ($1, $2)",
+        &[Value::Int4(1), Value::Null],
+    );
+
+    assert!(result.is_err(), "NULL parameter should fail NOT NULL check");
+}
+
+#[test]
 fn test_parameterized_insert_cache_invalidated_by_schema_change() {
     let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
     db.execute("CREATE TABLE param_cache_schema (id INT PRIMARY KEY, name TEXT)")
