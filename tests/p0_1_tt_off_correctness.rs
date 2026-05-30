@@ -107,3 +107,24 @@ fn tt_off_main_branch_context_does_not_force_versioned_insert() {
         "TT-off insert on main must not route through versioned branch-aware insert"
     );
 }
+
+#[test]
+fn tt_off_direct_versioned_insert_skips_snapshot_write() {
+    let mut c = Config::in_memory();
+    c.storage.time_travel_enabled = false;
+    let db = EmbeddedDatabase::with_config(c).unwrap();
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+
+    let snapshots_before = db.storage.snapshot_manager().snapshot_count();
+    db.storage
+        .insert_tuple_versioned("t", Tuple::new(vec![Value::Int4(1), Value::Int4(10)]))
+        .unwrap();
+
+    assert_eq!(
+        db.storage.snapshot_manager().snapshot_count(),
+        snapshots_before,
+        "TT-off direct versioned insert must not maintain snapshot history"
+    );
+    let rows = db.query("SELECT v FROM t WHERE id = 1", &[]).unwrap();
+    assert_eq!(rows[0].get(0), Some(&Value::Int4(10)));
+}

@@ -4533,9 +4533,6 @@ impl StorageEngine {
             value.clone()
         };
 
-        // Get current timestamp for MVCC
-        let timestamp = self.next_timestamp();
-
         // Write current version (for fast non-time-travel queries)
         let key = Self::build_data_key(table_name, row_id);
         self.put(&key, &value)?;
@@ -4556,17 +4553,20 @@ impl StorageEngine {
             }
         }
 
-        // Write versioned copy (for time-travel queries)
-        self.snapshot_manager
-            .write_version(table_name, row_id, timestamp, &logical_value)?;
+        if self.config.storage.time_travel_enabled {
+            // Write versioned copy (for time-travel queries)
+            let timestamp = self.next_timestamp();
+            self.snapshot_manager
+                .write_version(table_name, row_id, timestamp, &logical_value)?;
 
-        // Register snapshot with WAL LSN for AS OF TRANSACTION queries
-        // This ensures the transaction ID matches what users see in the REPL
-        if let Some(lsn) = self.wal_lsn() {
-            let _ = self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn);
-        } else {
-            // Fallback to auto-generated transaction ID if WAL is disabled
-            let _ = self.snapshot_manager.register_snapshot(timestamp);
+            // Register snapshot with WAL LSN for AS OF TRANSACTION queries.
+            // This ensures the transaction ID matches what users see in the REPL.
+            if let Some(lsn) = self.wal_lsn() {
+                let _ = self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn);
+            } else {
+                // Fallback to auto-generated transaction ID if WAL is disabled
+                let _ = self.snapshot_manager.register_snapshot(timestamp);
+            }
         }
 
         // Skip delta tracking in bulk load mode for improved performance
