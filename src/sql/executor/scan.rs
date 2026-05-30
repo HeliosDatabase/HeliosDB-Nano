@@ -150,9 +150,10 @@ fn should_use_selected_decode(indices: &[usize], total_columns: usize) -> bool {
     }
 
     let skips_leading = indices.first().copied().unwrap_or(0) > 0;
+    let skipped_columns = total_columns.saturating_sub(indices.len());
     let sparse = indices.len().saturating_mul(2) <= total_columns;
 
-    skips_leading || sparse
+    skips_leading || sparse || skipped_columns >= 2
 }
 
 #[derive(Clone)]
@@ -470,10 +471,7 @@ fn resolve_table_column(
 ) -> Option<(usize, usize)> {
     if let Some(qualifier) = qualifier {
         let qualifier = qualifier.to_ascii_lowercase();
-        let Some(table_idx) = tables
-            .iter()
-            .position(|table| table.qualifiers.contains(&qualifier))
-        else {
+        let Some(table_idx) = tables.iter().position(|table| table.qualifiers.contains(&qualifier)) else {
             // Derived or outer-reference column; no base table decode needed here.
             return None;
         };
@@ -1825,6 +1823,11 @@ mod tests {
             compute_scan_decode_hint(&plan),
             Some(("w".to_string(), ScanDecodeHint::Columns(vec![2, 3])))
         );
+    }
+
+    #[test]
+    fn selected_decode_hint_allows_two_skipped_columns() {
+        assert!(should_use_selected_decode(&[0, 1, 3], 5));
     }
 
     #[test]
