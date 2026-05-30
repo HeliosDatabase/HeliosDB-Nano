@@ -5429,12 +5429,11 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        // Bail on complex features (case-insensitive substring check)
-        let upper = trimmed.to_ascii_uppercase();
-        if upper.contains("RETURNING")
-            || upper.contains("ON CONFLICT")
-            || upper.contains("DEFAULT")
-            || upper.contains("SELECT")
+        // Bail on complex features without allocating an uppercased copy.
+        if Self::contains_ascii_case_insensitive(trimmed, b"RETURNING")
+            || Self::contains_ascii_case_insensitive(trimmed, b"ON CONFLICT")
+            || Self::contains_ascii_case_insensitive(trimmed, b"DEFAULT")
+            || Self::contains_ascii_case_insensitive(trimmed, b"SELECT")
         {
             return None;
         }
@@ -5875,13 +5874,12 @@ impl EmbeddedDatabase {
         }
 
         // Bail on complex features
-        let upper = trimmed.to_ascii_uppercase();
-        if upper.contains("RETURNING")
-            || upper.contains("JOIN")
-            || upper.contains("FROM")
-            || upper.contains("SELECT")
-            || upper.contains("CASE")
-            || upper.contains("COALESCE")
+        if Self::contains_ascii_case_insensitive(trimmed, b"RETURNING")
+            || Self::contains_ascii_case_insensitive(trimmed, b"JOIN")
+            || Self::contains_ascii_case_insensitive(trimmed, b"FROM")
+            || Self::contains_ascii_case_insensitive(trimmed, b"SELECT")
+            || Self::contains_ascii_case_insensitive(trimmed, b"CASE")
+            || Self::contains_ascii_case_insensitive(trimmed, b"COALESCE")
         {
             return None;
         }
@@ -5905,8 +5903,7 @@ impl EmbeddedDatabase {
 
         // Find WHERE keyword (case-insensitive)
         let where_pos = {
-            let upper_rest = after_set.to_ascii_uppercase();
-            let pos = upper_rest.find("WHERE")?;
+            let pos = Self::find_ascii_case_insensitive(after_set, b"WHERE")?;
             // Ensure WHERE is word-bounded (preceded by whitespace)
             if pos == 0 {
                 return None;
@@ -5936,11 +5933,10 @@ impl EmbeddedDatabase {
         // Strip trailing semicolon if present
         let where_clause = where_clause.strip_suffix(';').unwrap_or(where_clause).trim();
         // Bail on complex WHERE (AND, OR, etc.)
-        let where_upper = where_clause.to_ascii_uppercase();
-        if where_upper.contains("AND")
-            || where_upper.contains("OR")
-            || where_upper.contains("IN")
-            || where_upper.contains("BETWEEN")
+        if Self::contains_ascii_case_insensitive(where_clause, b"AND")
+            || Self::contains_ascii_case_insensitive(where_clause, b"OR")
+            || Self::contains_ascii_case_insensitive(where_clause, b"IN")
+            || Self::contains_ascii_case_insensitive(where_clause, b"BETWEEN")
         {
             return None;
         }
@@ -6079,12 +6075,11 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let upper = trimmed.to_ascii_uppercase();
-        if upper.contains("RETURNING")
-            || upper.contains("USING")
-            || upper.contains("JOIN")
-            || upper.contains("SELECT")
-            || upper.contains("WITH")
+        if Self::contains_ascii_case_insensitive(trimmed, b"RETURNING")
+            || Self::contains_ascii_case_insensitive(trimmed, b"USING")
+            || Self::contains_ascii_case_insensitive(trimmed, b"JOIN")
+            || Self::contains_ascii_case_insensitive(trimmed, b"SELECT")
+            || Self::contains_ascii_case_insensitive(trimmed, b"WITH")
         {
             return None;
         }
@@ -6108,12 +6103,11 @@ impl EmbeddedDatabase {
 
         let where_clause = rest.get(5..)?.trim_start();
         let where_clause = where_clause.strip_suffix(';').unwrap_or(where_clause).trim();
-        let where_upper = where_clause.to_ascii_uppercase();
-        if where_upper.contains("AND")
-            || where_upper.contains("OR")
-            || where_upper.contains("IN")
-            || where_upper.contains("BETWEEN")
-            || where_upper.contains("LIKE")
+        if Self::contains_ascii_case_insensitive(where_clause, b"AND")
+            || Self::contains_ascii_case_insensitive(where_clause, b"OR")
+            || Self::contains_ascii_case_insensitive(where_clause, b"IN")
+            || Self::contains_ascii_case_insensitive(where_clause, b"BETWEEN")
+            || Self::contains_ascii_case_insensitive(where_clause, b"LIKE")
         {
             return None;
         }
@@ -6628,6 +6622,16 @@ impl EmbeddedDatabase {
                 .as_bytes()
                 .windows(needle.len())
                 .any(|window| window.eq_ignore_ascii_case(needle))
+    }
+
+    fn find_ascii_case_insensitive(haystack: &str, needle: &[u8]) -> Option<usize> {
+        if needle.is_empty() {
+            return None;
+        }
+        haystack
+            .as_bytes()
+            .windows(needle.len())
+            .position(|window| window.eq_ignore_ascii_case(needle))
     }
 
     /// Parse one or more VALUES groups from a simple INSERT statement.
