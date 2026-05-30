@@ -48,6 +48,22 @@ enum RowDecodeHint<'a> {
     Columns(&'a [usize]),
 }
 
+#[derive(Clone, Copy)]
+pub(crate) enum ColumnarAggregateOp {
+    CountStar,
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ColumnarAggregateSpec {
+    pub op: ColumnarAggregateOp,
+    pub column_index: Option<usize>,
+}
+
 fn schema_uses_column_storage(schema: &crate::Schema) -> bool {
     schema
         .columns
@@ -90,6 +106,215 @@ fn columnar_row_matches_filters(
             predicate.evaluate(&Value::Null)
         }
     })
+}
+
+fn columnar_batch_value<'a>(
+    column_batches: &'a HashMap<usize, HashMap<u64, super::columnar::ColumnBatch>>,
+    column_index: usize,
+    batch_id: u64,
+    offset: usize,
+) -> Option<&'a Value> {
+    column_batches
+        .get(&column_index)
+        .and_then(|by_batch| by_batch.get(&batch_id))
+        .and_then(|batch| batch.values.get(offset))
+}
+
+fn compare_value_slices(left: &[Value], right: &[Value]) -> std::cmp::Ordering {
+    for (a, b) in left.iter().zip(right) {
+        let cmp = crate::sql::executor::compare_values(a, b);
+        if cmp != std::cmp::Ordering::Equal {
+            return cmp;
+        }
+    }
+    left.len().cmp(&right.len())
+}
+
+enum ColumnarSumState {
+    Empty,
+    Int(i64),
+    Decimal(rust_decimal::Decimal),
+}
+
+enum ColumnarAggregateState {
+    Count(i64),
+    Sum(ColumnarSumState),
+    Avg { sum: f64, count: u64 },
+    Min(Option<Value>),
+    Max(Option<Value>),
+}
+
+impl ColumnarAggregateState {
+    fn new(op: ColumnarAggregateOp) -> Self {
+        match op {
+            ColumnarAggregateOp::CountStar | ColumnarAggregateOp::Count => Self::Count(0),
+            ColumnarAggregateOp::Sum => Self::Sum(ColumnarSumState::Empty),
+            ColumnarAggregateOp::Avg => Self::Avg { sum: 0.0, count: 0 },
+            ColumnarAggregateOp::Min => Self::Min(None),
+            ColumnarAggregateOp::Max => Self::Max(None),
+        }
+    }
+
+    fn update(&mut self, op: ColumnarAggregateOp, value: Option<&Value>) -> Result<()> {
+        match (self, op) {
+            (Self::Count(count), ColumnarAggregateOp::CountStar) => {
+                *count += 1;
+                Ok(())
+            }
+            (Self::Count(count), ColumnarAggregateOp::Count) => {
+                if !matches!(value, None | Some(Value::Null)) {
+                    *count += 1;
+                }
+                Ok(())
+            }
+            (Self::Sum(state), ColumnarAggregateOp::Sum) => {
+                let Some(value) = value else {
+                    return Ok(());
+                };
+                update_columnar_sum(state, value)
+            }
+            (Self::Avg { sum, count }, ColumnarAggregateOp::Avg) => {
+                let Some(value) = value else {
+                    return Ok(());
+                };
+                if matches!(value, Value::Null) {
+                    return Ok(());
+                }
+                match value {
+                    Value::Int2(i) => {
+                        *sum += *i as f64;
+                        *count += 1;
+                    }
+                    Value::Int4(i) => {
+                        *sum += *i as f64;
+                        *count += 1;
+                    }
+                    Value::Int8(i) => {
+                        *sum += *i as f64;
+                        *count += 1;
+                    }
+                    Value::Float4(f) => {
+                        *sum += *f as f64;
+                        *count += 1;
+                    }
+                    Value::Float8(f) => {
+                        *sum += *f;
+                        *count += 1;
+                    }
+                    Value::Numeric(n) => {
+                        if let Ok(f) = n.parse::<f64>() {
+                            *sum += f;
+                            *count += 1;
+                        }
+                    }
+                    _ => return Err(Error::query_execution("AVG requires numeric values")),
+                }
+                Ok(())
+            }
+            (Self::Min(current), ColumnarAggregateOp::Min) => {
+                let Some(value) = value else {
+                    return Ok(());
+                };
+                if matches!(value, Value::Null) {
+                    return Ok(());
+                }
+                match current {
+                    None => *current = Some(value.clone()),
+                    Some(existing) => {
+                        if crate::sql::executor::compare_values(value, existing) == std::cmp::Ordering::Less {
+                            *current = Some(value.clone());
+                        }
+                    }
+                }
+                Ok(())
+            }
+            (Self::Max(current), ColumnarAggregateOp::Max) => {
+                let Some(value) = value else {
+                    return Ok(());
+                };
+                if matches!(value, Value::Null) {
+                    return Ok(());
+                }
+                match current {
+                    None => *current = Some(value.clone()),
+                    Some(existing) => {
+                        if crate::sql::executor::compare_values(value, existing) == std::cmp::Ordering::Greater {
+                            *current = Some(value.clone());
+                        }
+                    }
+                }
+                Ok(())
+            }
+            _ => Err(Error::query_execution("Invalid columnar aggregate state")),
+        }
+    }
+
+    fn finalize(self) -> Result<Value> {
+        match self {
+            Self::Count(count) => Ok(Value::Int8(count)),
+            Self::Sum(state) => match state {
+                ColumnarSumState::Empty => Ok(Value::Null),
+                ColumnarSumState::Int(sum) => Ok(Value::Int8(sum)),
+                ColumnarSumState::Decimal(sum) => Ok(Value::Numeric(format!("{sum}"))),
+            },
+            Self::Avg { sum, count } => {
+                if count == 0 {
+                    Ok(Value::Null)
+                } else {
+                    Ok(Value::Float8(sum / count as f64))
+                }
+            }
+            Self::Min(value) | Self::Max(value) => Ok(value.unwrap_or(Value::Null)),
+        }
+    }
+}
+
+fn update_columnar_sum(state: &mut ColumnarSumState, value: &Value) -> Result<()> {
+    if matches!(value, Value::Null) {
+        return Ok(());
+    }
+    match value {
+        Value::Int2(i) => update_columnar_int_sum(state, *i as i64),
+        Value::Int4(i) => update_columnar_int_sum(state, *i as i64),
+        Value::Int8(i) => update_columnar_int_sum(state, *i),
+        Value::Float4(f) => {
+            let dec = rust_decimal::Decimal::try_from(*f as f64).unwrap_or_default();
+            update_columnar_decimal_sum(state, dec);
+            Ok(())
+        }
+        Value::Float8(f) => {
+            let dec = rust_decimal::Decimal::try_from(*f).unwrap_or_default();
+            update_columnar_decimal_sum(state, dec);
+            Ok(())
+        }
+        Value::Numeric(n) => {
+            let dec = n.parse::<rust_decimal::Decimal>().unwrap_or_default();
+            update_columnar_decimal_sum(state, dec);
+            Ok(())
+        }
+        _ => Err(Error::query_execution("SUM requires numeric values")),
+    }
+}
+
+fn update_columnar_int_sum(state: &mut ColumnarSumState, value: i64) -> Result<()> {
+    match state {
+        ColumnarSumState::Empty => *state = ColumnarSumState::Int(value),
+        ColumnarSumState::Int(sum) => {
+            *sum = sum
+                .checked_add(value)
+                .ok_or_else(|| Error::query_execution("integer overflow: BIGINT SUM"))?;
+        }
+        ColumnarSumState::Decimal(sum) => *sum += rust_decimal::Decimal::from(value),
+    }
+    Ok(())
+}
+
+fn update_columnar_decimal_sum(state: &mut ColumnarSumState, value: rust_decimal::Decimal) {
+    match state {
+        ColumnarSumState::Empty => *state = ColumnarSumState::Decimal(value),
+        ColumnarSumState::Int(sum) => *state = ColumnarSumState::Decimal(rust_decimal::Decimal::from(*sum) + value),
+        ColumnarSumState::Decimal(sum) => *sum += value,
+    }
 }
 
 /// Storage engine
@@ -1836,6 +2061,135 @@ impl StorageEngine {
             predicates = filter_predicates.len(),
             duration_us = scan_start.elapsed().as_micros() as u64,
             "Columnar table scan complete"
+        );
+
+        Ok(tuples)
+    }
+
+    /// Aggregate directly over columnar side-data while scanning row keys only
+    /// for live-row membership. This avoids materializing a row-shaped tuple per
+    /// input row for simple analytical aggregates.
+    pub(crate) fn aggregate_columnar_columns(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        group_by_columns: &[usize],
+        aggregates: &[ColumnarAggregateSpec],
+        predicates: &[AnalyzedPredicate],
+    ) -> Result<Vec<Tuple>> {
+        let scan_start = std::time::Instant::now();
+        let mut requested: Vec<usize> = group_by_columns.to_vec();
+        requested.extend(aggregates.iter().filter_map(|aggregate| aggregate.column_index));
+        requested.extend(predicates.iter().map(|predicate| predicate.column_index));
+        requested.sort_unstable();
+        requested.dedup();
+
+        if requested.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        for &idx in &requested {
+            let column = schema
+                .columns
+                .get(idx)
+                .ok_or_else(|| Error::storage(format!("Column index {} out of bounds for {}", idx, table_name)))?;
+            if column.storage_mode != ColumnStorageMode::Columnar {
+                return Err(Error::storage(format!(
+                    "Columnar aggregate requested non-columnar column {}.{}",
+                    table_name, column.name
+                )));
+            }
+        }
+
+        let mut column_batches: HashMap<usize, HashMap<u64, super::columnar::ColumnBatch>> =
+            HashMap::with_capacity(requested.len());
+        for &idx in &requested {
+            let column = &schema.columns[idx];
+            let mut batches = HashMap::new();
+            for (batch_id, batch) in ColumnarStore::scan_column_batches(&self.db, table_name, &column.name)? {
+                batches.insert(batch_id, batch);
+            }
+            column_batches.insert(idx, batches);
+        }
+
+        let filter_predicates: Vec<FilterPredicate> = predicates.iter().filter_map(columnar_filter_predicate).collect();
+        let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+            let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                continue;
+            };
+
+            let batch_id = row_id / BATCH_SIZE as u64;
+            let offset = (row_id % BATCH_SIZE as u64) as usize;
+            if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
+                continue;
+            }
+
+            let group_key: Vec<Value> = group_by_columns
+                .iter()
+                .map(|&idx| {
+                    columnar_batch_value(&column_batches, idx, batch_id, offset)
+                        .cloned()
+                        .unwrap_or(Value::Null)
+                })
+                .collect();
+            let states = groups.entry(group_key).or_insert_with(|| {
+                aggregates
+                    .iter()
+                    .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                    .collect()
+            });
+
+            for (state, aggregate) in states.iter_mut().zip(aggregates) {
+                let value = aggregate
+                    .column_index
+                    .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
+                state.update(aggregate.op, value)?;
+            }
+        }
+
+        if group_by_columns.is_empty() && groups.is_empty() {
+            groups.insert(
+                Vec::new(),
+                aggregates
+                    .iter()
+                    .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                    .collect(),
+            );
+        }
+
+        let mut grouped: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = groups.into_iter().collect();
+        grouped.sort_by(|(left, _), (right, _)| compare_value_slices(left, right));
+
+        let mut tuples = Vec::with_capacity(grouped.len());
+        for (mut group_key, states) in grouped {
+            let mut aggregate_values: Result<Vec<Value>> =
+                states.into_iter().map(ColumnarAggregateState::finalize).collect();
+            group_key.append(&mut aggregate_values?);
+            tuples.push(Tuple::new(group_key));
+        }
+
+        tracing::debug!(
+            phase = "storage_columnar_aggregate",
+            table = table_name,
+            rows = tuples.len(),
+            columns = requested.len(),
+            predicates = filter_predicates.len(),
+            duration_us = scan_start.elapsed().as_micros() as u64,
+            "Columnar aggregate complete"
         );
 
         Ok(tuples)

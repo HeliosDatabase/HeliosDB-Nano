@@ -75,7 +75,36 @@ impl AggregateOperator {
             Self::materialized_aggregate(&mut input, &group_by, &aggr_exprs, &evaluator, &timeout_ctx)?
         };
 
-        // Build output schema: GROUP BY columns + aggregate columns
+        let schema = Self::output_schema(&group_by, &aggr_exprs, &input_schema);
+
+        // Filter output tuples based on HAVING clause if present
+        if let Some(having_expr) = having {
+            // Rewrite HAVING expression to replace aggregate functions with column references
+            let rewritten_having = Self::rewrite_having_expr(&having_expr, &aggr_exprs);
+
+            let having_evaluator = crate::sql::Evaluator::new(schema.clone());
+            output_tuples = output_tuples
+                .into_iter()
+                .filter(|tuple| match having_evaluator.evaluate(&rewritten_having, tuple) {
+                    Ok(crate::Value::Boolean(true)) => true,
+                    _ => false,
+                })
+                .collect();
+        }
+
+        Ok(Self {
+            output_tuples,
+            current_index: 0,
+            schema,
+            timeout_ctx,
+        })
+    }
+
+    pub(crate) fn output_schema(
+        group_by: &[crate::sql::LogicalExpr],
+        aggr_exprs: &[crate::sql::LogicalExpr],
+        input_schema: &Schema,
+    ) -> Arc<Schema> {
         use crate::sql::TypeInference;
         use crate::DataType;
         let mut columns = Vec::new();
@@ -116,29 +145,7 @@ impl AggregateOperator {
             });
         }
 
-        let schema = Arc::new(Schema { columns });
-
-        // Filter output tuples based on HAVING clause if present
-        if let Some(having_expr) = having {
-            // Rewrite HAVING expression to replace aggregate functions with column references
-            let rewritten_having = Self::rewrite_having_expr(&having_expr, &aggr_exprs);
-
-            let having_evaluator = crate::sql::Evaluator::new(schema.clone());
-            output_tuples = output_tuples
-                .into_iter()
-                .filter(|tuple| match having_evaluator.evaluate(&rewritten_having, tuple) {
-                    Ok(crate::Value::Boolean(true)) => true,
-                    _ => false,
-                })
-                .collect();
-        }
-
-        Ok(Self {
-            output_tuples,
-            current_index: 0,
-            schema,
-            timeout_ctx,
-        })
+        Arc::new(Schema { columns })
     }
 
     /// Set timeout context (no-op since timeout is set during construction)
