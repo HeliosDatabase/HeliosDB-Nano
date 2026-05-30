@@ -1782,7 +1782,10 @@ impl StorageEngine {
         // HELIOS_SCAN_SERIAL=1 forces the serial path (A/B benchmarking + kill switch).
         static SCAN_SERIAL: once_cell::sync::Lazy<bool> =
             once_cell::sync::Lazy::new(|| std::env::var("HELIOS_SCAN_SERIAL").is_ok());
-        const PAR_DECODE_THRESHOLD: usize = 4096;
+        // Parallel decode only pays off once row counts are high enough to
+        // amortize rayon scheduling and raw-row staging. Sparse analytic scans
+        // at TPS scale are faster serially.
+        const PAR_DECODE_THRESHOLD: usize = 131_072;
         let tuples: Vec<Tuple> = if !*SCAN_SERIAL && raw_rows.len() >= PAR_DECODE_THRESHOLD {
             use rayon::prelude::*;
             raw_rows
