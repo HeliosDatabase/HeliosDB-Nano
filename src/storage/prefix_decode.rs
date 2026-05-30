@@ -166,6 +166,25 @@ pub(crate) fn decode_tuple_columns(bytes: &[u8], columns: &[usize], total_cols: 
     })
 }
 
+/// Decode only the selected sorted, unique column indexes into a compact value
+/// vector matching `columns` order. This is for storage-local consumers such as
+/// aggregate scans that do not need downstream full-width positional indexing.
+pub(crate) fn decode_tuple_column_values(
+    bytes: &[u8],
+    columns: &[usize],
+    total_cols: usize,
+) -> bincode::Result<Vec<Value>> {
+    if let Some(values) = try_decode_tuple_column_values_fast(bytes, columns) {
+        return Ok(values);
+    }
+
+    let tuple = decode_tuple_columns(bytes, columns, total_cols)?;
+    Ok(columns
+        .iter()
+        .map(|&idx| tuple.values.get(idx).cloned().unwrap_or(Value::Null))
+        .collect())
+}
+
 struct ByteCursor<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -259,6 +278,33 @@ fn try_decode_tuple_columns_fast(bytes: &[u8], columns: &[usize], total_cols: us
         row_id: None,
         branch_id: None,
     })
+}
+
+fn try_decode_tuple_column_values_fast(bytes: &[u8], columns: &[usize]) -> Option<Vec<Value>> {
+    let mut cur = ByteCursor::new(bytes);
+    let stored_cols = cur.read_len()?;
+    let mut out = Vec::with_capacity(columns.len());
+    let mut wanted = columns.iter().copied().peekable();
+
+    for idx in 0..stored_cols {
+        match wanted.peek().copied() {
+            Some(want) if want == idx => {
+                out.push(read_value(&mut cur)?);
+                wanted.next();
+                if wanted.peek().is_none() {
+                    return Some(out);
+                }
+            }
+            Some(want) if want > idx => skip_value(&mut cur)?,
+            Some(_) => return None,
+            None => return Some(out),
+        }
+    }
+
+    while wanted.next().is_some() {
+        out.push(Value::Null);
+    }
+    Some(out)
 }
 
 fn skip_value(cur: &mut ByteCursor<'_>) -> Option<()> {
@@ -425,6 +471,16 @@ mod tests {
     }
 
     #[test]
+    fn compact_selected_decode_returns_requested_values_only() {
+        let t = sample();
+        let bytes = bincode::serialize(&t).unwrap();
+        let full: Tuple = bincode::deserialize(&bytes).unwrap();
+
+        let selected = decode_tuple_column_values(&bytes, &[1, 3], 6).unwrap();
+        assert_eq!(selected, vec![full.values[1].clone(), full.values[3].clone()]);
+    }
+
+    #[test]
     fn selected_decode_falls_back_for_unsupported_skips() {
         let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 29).unwrap();
         let t = Tuple::new(vec![
@@ -441,5 +497,8 @@ mod tests {
         assert_eq!(selected.values[0], Value::Null);
         assert_eq!(selected.values[1], Value::Null);
         assert_eq!(selected.values[2], full.values[2]);
+
+        let compact = decode_tuple_column_values(&bytes, &[2], 3).unwrap();
+        assert_eq!(compact, vec![full.values[2].clone()]);
     }
 }
