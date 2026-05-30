@@ -558,23 +558,24 @@ impl PredicatePushdownManager {
             .collect();
 
         let total_count = candidate_indices.len();
+        let all_rows_are_candidates = candidate_indices.len() == tuples.len();
+        let candidate_set = if all_rows_are_candidates {
+            None
+        } else {
+            Some(candidate_indices.into_iter().collect::<std::collections::HashSet<_>>())
+        };
         let mut matching_tuples = Vec::with_capacity(limit.map_or(total_count, |lim| lim.min(total_count)));
 
-        'outer: for &tuple_idx in &candidate_indices {
-            let Some(tuple) = tuples.get(tuple_idx) else {
+        for (tuple_idx, tuple) in tuples.into_iter().enumerate() {
+            if candidate_set.as_ref().is_some_and(|candidates| !candidates.contains(&tuple_idx)) {
                 continue;
-            };
-
-            for pred in &filter_predicates {
-                let Some(value) = tuple.values.get(pred.column_index) else {
-                    continue 'outer;
-                };
-                if !pred.evaluate(value) {
-                    continue 'outer;
-                }
             }
 
-            matching_tuples.push(tuple.clone());
+            if !tuple_matches_filter_predicates(&tuple, &filter_predicates) {
+                continue;
+            }
+
+            matching_tuples.push(tuple);
             if limit.is_some_and(|lim| matching_tuples.len() >= lim) {
                 break;
             }
@@ -645,6 +646,15 @@ impl PredicatePushdownManager {
         self.bloom_filters.write().remove(table_name);
         self.zone_maps.write().remove(table_name);
     }
+}
+
+fn tuple_matches_filter_predicates(tuple: &Tuple, predicates: &[FilterPredicate]) -> bool {
+    predicates.iter().all(|pred| {
+        tuple
+            .values
+            .get(pred.column_index)
+            .is_some_and(|value| pred.evaluate(value))
+    })
 }
 
 impl Default for PredicatePushdownManager {
