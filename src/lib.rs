@@ -4932,7 +4932,7 @@ impl EmbeddedDatabase {
             Err(poisoned) => poisoned.into_inner(),
         };
         let txn = txn_guard.as_ref()?;
-        Some(self.insert_validated_tuples_in_transaction(&spec.table_name, vec![tuple], &spec.schema, txn))
+        Some(self.insert_validated_tuple_in_transaction(&spec.table_name, tuple, &spec.schema, txn))
     }
 
     fn try_fast_insert_many_params(
@@ -6486,7 +6486,20 @@ impl EmbeddedDatabase {
             return None;
         }
         let values_rest = after_cols.get(6..)?.trim_start();
-        let value_groups = Self::fast_parse_value_groups(values_rest)?;
+
+        let single_values = if values_rest.starts_with('(') {
+            let inner = values_rest.get(1..)?;
+            let close_idx = Self::find_closing_paren(inner)?;
+            let values_str = inner.get(..close_idx)?;
+            let after_values = inner.get(close_idx + 1..)?.trim_start();
+            if after_values.is_empty() || after_values == ";" {
+                Some(values_str)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         if self.tenant_manager.should_apply_rls(table_name, "INSERT") {
             return None;
@@ -6495,6 +6508,22 @@ impl EmbeddedDatabase {
             return None;
         }
 
+        if let Some(values_str) = single_values {
+            let value_count = Self::fast_parse_value_count(values_str);
+            let spec = match self.fast_literal_insert_spec(table_name, explicit_columns.as_deref(), value_count)? {
+                Ok(spec) => spec,
+                Err(e) => return Some(Err(e)),
+            };
+
+            let tuple = match Self::materialize_fast_literal_insert_tuple(&spec, values_str)? {
+                Ok(tuple) => tuple,
+                Err(e) => return Some(Err(e)),
+            };
+
+            return Some(self.insert_validated_tuple_in_transaction(&spec.table_name, tuple, &spec.schema, txn));
+        }
+
+        let value_groups = Self::fast_parse_value_groups(values_rest)?;
         let first_values = value_groups.first()?;
         let value_count = Self::fast_parse_value_count(first_values);
         let spec = match self.fast_literal_insert_spec(table_name, explicit_columns.as_deref(), value_count)? {
@@ -6627,10 +6656,7 @@ impl EmbeddedDatabase {
                 .into_iter()
                 .next()
                 .ok_or_else(|| Error::internal("missing insert tuple"))?;
-            let (row_id, tuple) = self.prepare_tuple_for_transaction_insert(table_name, tuple, schema);
-            self.insert_prepared_tuple_in_transaction(table_name, row_id, tuple, schema, txn, false)?;
-            self.storage.stage_row_counter_in_transaction(table_name, row_id, txn)?;
-            return Ok(1);
+            return self.insert_validated_tuple_in_transaction(table_name, tuple, schema, txn);
         }
 
         let mut prepared = Vec::with_capacity(tuples.len());
@@ -6655,6 +6681,19 @@ impl EmbeddedDatabase {
             self.storage.stage_row_counter_in_transaction(table_name, row_id, txn)?;
         }
         Ok(inserted)
+    }
+
+    fn insert_validated_tuple_in_transaction(
+        &self,
+        table_name: &str,
+        tuple: Tuple,
+        schema: &Schema,
+        txn: &storage::Transaction,
+    ) -> Result<u64> {
+        let (row_id, tuple) = self.prepare_tuple_for_transaction_insert(table_name, tuple, schema);
+        self.insert_prepared_tuple_in_transaction(table_name, row_id, tuple, schema, txn, false)?;
+        self.storage.stage_row_counter_in_transaction(table_name, row_id, txn)?;
+        Ok(1)
     }
 
     fn prepare_tuple_for_transaction_insert(

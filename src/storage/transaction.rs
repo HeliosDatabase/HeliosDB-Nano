@@ -362,14 +362,13 @@ impl Transaction {
             return Err(Error::transaction("Transaction is not active"));
         }
 
-        self.row_counter_stages
-            .entry(table_name.to_string())
-            .and_modify(|current| {
-                if row_id > *current {
-                    *current = row_id;
-                }
-            })
-            .or_insert(row_id);
+        if let Some(mut current) = self.row_counter_stages.get_mut(table_name) {
+            if row_id > *current {
+                *current = row_id;
+            }
+        } else {
+            self.row_counter_stages.insert(table_name.to_string(), row_id);
+        }
         Ok(())
     }
 
