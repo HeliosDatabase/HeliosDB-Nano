@@ -29,7 +29,7 @@ use crate::{Config, Error, Result, Tuple, Value};
 use parking_lot::RwLock;
 use rocksdb::{BlockBasedOptions, Cache, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions, DB};
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -52,6 +52,7 @@ enum RowDecodeHint<'a> {
 pub(crate) enum ColumnarAggregateOp {
     CountStar,
     Count,
+    CountDistinct,
     Sum,
     Avg,
     Min,
@@ -190,6 +191,7 @@ enum ColumnarSumState {
 
 enum ColumnarAggregateState {
     Count(i64),
+    CountDistinct(HashSet<Value>),
     Sum(ColumnarSumState),
     Avg { sum: f64, count: u64 },
     Min(Option<Value>),
@@ -200,6 +202,7 @@ impl ColumnarAggregateState {
     fn new(op: ColumnarAggregateOp) -> Self {
         match op {
             ColumnarAggregateOp::CountStar | ColumnarAggregateOp::Count => Self::Count(0),
+            ColumnarAggregateOp::CountDistinct => Self::CountDistinct(HashSet::new()),
             ColumnarAggregateOp::Sum => Self::Sum(ColumnarSumState::Empty),
             ColumnarAggregateOp::Avg => Self::Avg { sum: 0.0, count: 0 },
             ColumnarAggregateOp::Min => Self::Min(None),
@@ -216,6 +219,14 @@ impl ColumnarAggregateState {
             (Self::Count(count), ColumnarAggregateOp::Count) => {
                 if !matches!(value, None | Some(Value::Null)) {
                     *count += 1;
+                }
+                Ok(())
+            }
+            (Self::CountDistinct(values), ColumnarAggregateOp::CountDistinct) => {
+                if let Some(value) = value {
+                    if !matches!(value, Value::Null) {
+                        values.insert(value.clone());
+                    }
                 }
                 Ok(())
             }
@@ -304,6 +315,7 @@ impl ColumnarAggregateState {
     fn finalize(self) -> Result<Value> {
         match self {
             Self::Count(count) => Ok(Value::Int8(count)),
+            Self::CountDistinct(values) => Ok(Value::Int8(values.len() as i64)),
             Self::Sum(state) => match state {
                 ColumnarSumState::Empty => Ok(Value::Null),
                 ColumnarSumState::Int(sum) => Ok(Value::Int8(sum)),
