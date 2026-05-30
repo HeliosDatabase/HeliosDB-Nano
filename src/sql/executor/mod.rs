@@ -1274,6 +1274,121 @@ impl<'a> Executor<'a> {
         Ok(Some(Box::new(MaterializedOperator::new(tuples, output_schema))))
     }
 
+    fn try_rowstore_aggregate(
+        &mut self,
+        input: &LogicalPlan,
+        group_by: &[crate::sql::LogicalExpr],
+        aggr_exprs: &[crate::sql::LogicalExpr],
+        having: &Option<crate::sql::LogicalExpr>,
+    ) -> Result<Option<Box<dyn PhysicalOperator>>> {
+        if having.is_some() || self.transaction.is_some() {
+            return Ok(None);
+        }
+        let storage = match self.storage {
+            Some(storage) => storage,
+            None => return Ok(None),
+        };
+        if storage.is_branch_active() {
+            return Ok(None);
+        }
+
+        let Some((table_name, schema, predicate, as_of)) = Self::columnar_aggregate_input(input) else {
+            return Ok(None);
+        };
+        if as_of.is_some() || self.get_cte(table_name).is_some() {
+            return Ok(None);
+        }
+
+        let predicate = predicate
+            .map(|predicate| self.materialize_subqueries(predicate))
+            .transpose()?;
+        if predicate
+            .as_ref()
+            .is_some_and(|predicate| !Self::is_simple_columnar_pushdown_predicate(predicate))
+        {
+            return Ok(None);
+        }
+        let analyzed_predicates = predicate
+            .as_ref()
+            .map(|predicate| storage.predicate_pushdown().analyze_predicate(predicate, schema))
+            .unwrap_or_default();
+        if predicate.is_some() && analyzed_predicates.is_empty() {
+            return Ok(None);
+        }
+        if !Self::rowstore_aggregate_predicates_are_sql_safe(&analyzed_predicates) {
+            return Ok(None);
+        }
+
+        let mut group_indices = Vec::with_capacity(group_by.len());
+        for expr in group_by {
+            let Some(idx) = Self::column_expr_index(expr, schema) else {
+                return Ok(None);
+            };
+            group_indices.push(idx);
+        }
+
+        let mut aggregate_specs = Vec::with_capacity(aggr_exprs.len());
+        for expr in aggr_exprs {
+            let Some(spec) = Self::columnar_aggregate_spec(expr, schema) else {
+                return Ok(None);
+            };
+            aggregate_specs.push(spec);
+        }
+
+        let mut referenced = group_indices.clone();
+        referenced.extend(aggregate_specs.iter().filter_map(|spec| spec.column_index));
+        referenced.extend(analyzed_predicates.iter().map(|predicate| predicate.column_index));
+        referenced.sort_unstable();
+        referenced.dedup();
+        if referenced.iter().any(|&idx| {
+            schema.columns.get(idx).map_or(true, |column| {
+                column.storage_mode != crate::ColumnStorageMode::Default
+            })
+        }) {
+            return Ok(None);
+        }
+
+        let Some(tuples) = storage.try_aggregate_row_columns(
+            table_name,
+            schema,
+            &group_indices,
+            &aggregate_specs,
+            &analyzed_predicates,
+        )?
+        else {
+            return Ok(None);
+        };
+        let output_schema = AggregateOperator::output_schema(group_by, aggr_exprs, schema);
+        Ok(Some(Box::new(MaterializedOperator::new(tuples, output_schema))))
+    }
+
+    fn rowstore_aggregate_predicates_are_sql_safe(
+        predicates: &[crate::storage::predicate_pushdown::AnalyzedPredicate],
+    ) -> bool {
+        use crate::storage::predicate_pushdown::PredicateOp;
+
+        predicates.iter().all(|predicate| match predicate.op {
+            PredicateOp::Eq
+            | PredicateOp::Lt
+            | PredicateOp::LtEq
+            | PredicateOp::Gt
+            | PredicateOp::GtEq
+            | PredicateOp::Like => !matches!(predicate.value, crate::Value::Null),
+            PredicateOp::Between => {
+                !matches!(predicate.value, crate::Value::Null)
+                    && !matches!(predicate.value2, None | Some(crate::Value::Null))
+            }
+            PredicateOp::In => predicate
+                .value_list
+                .iter()
+                .all(|value| !matches!(value, crate::Value::Null)),
+            PredicateOp::IsNull | PredicateOp::IsNotNull => true,
+            // FilterPredicate::NotEq/NotIn treat NULL as a positive match; keep
+            // SQL three-valued logic on the generic evaluator path.
+            PredicateOp::NotEq => false,
+        })
+    }
+
     fn columnar_aggregate_input<'b>(
         input: &'b LogicalPlan,
     ) -> Option<(
@@ -2119,6 +2234,9 @@ impl<'a> Executor<'a> {
                             }
                         } // end if is_count_star
                     }
+                }
+                if let Some(op) = self.try_rowstore_aggregate(input, group_by, aggr_exprs, having)? {
+                    return Ok(op);
                 }
                 let input_op = self.plan_to_operator(input)?;
                 // Materialize any subqueries in the HAVING expression — the Filter

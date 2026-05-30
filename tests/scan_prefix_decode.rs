@@ -13,6 +13,14 @@ fn int(v: &Value) -> i64 {
     }
 }
 
+fn float(v: &Value) -> f64 {
+    match v {
+        Value::Float8(n) => *n,
+        Value::Float4(n) => f64::from(*n),
+        other => panic!("expected float, got {other:?}"),
+    }
+}
+
 #[test]
 fn prefix_decode_preserves_results() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
@@ -179,4 +187,43 @@ fn count_pk_and_count_star_pk_in_list_use_index_cardinality() {
 
     let rows = db.query("SELECT COUNT(bucket) FROM n WHERE id IN (1, 2, 3)", &[]).unwrap();
     assert_eq!(int(&rows[0].values[0]), 3);
+}
+
+#[test]
+fn rowstore_aggregate_fast_path_preserves_filter_and_group_results() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER, y INTEGER, g INTEGER)")
+        .unwrap();
+    for id in 0..12 {
+        db.execute(&format!(
+            "INSERT INTO a (id, x, y, g) VALUES ({id}, {}, {}, {})",
+            id % 5,
+            id * 10,
+            id % 3
+        ))
+        .unwrap();
+    }
+    db.execute("INSERT INTO a (id, x, y, g) VALUES (100, NULL, NULL, 1)")
+        .unwrap();
+
+    let rows = db
+        .query("SELECT SUM(x), AVG(y), MAX(y) FROM a WHERE y >= 30", &[])
+        .unwrap();
+    assert_eq!(int(&rows[0].values[0]), 18);
+    assert!((float(&rows[0].values[1]) - 70.0).abs() < 0.0001);
+    assert_eq!(int(&rows[0].values[2]), 110);
+
+    let rows = db
+        .query("SELECT g, COUNT(*), SUM(x) FROM a WHERE y >= 30 GROUP BY g", &[])
+        .unwrap();
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[0].values, vec![Value::Int4(0), Value::Int8(3), Value::Int8(8)]);
+    assert_eq!(rows[1].values, vec![Value::Int4(1), Value::Int8(3), Value::Int8(6)]);
+    assert_eq!(rows[2].values, vec![Value::Int4(2), Value::Int8(3), Value::Int8(4)]);
+
+    // NOT-EQ with NULL must keep SQL three-valued logic. The row-store aggregate
+    // fast path deliberately falls back here because the storage FilterPredicate
+    // NotEq helper treats NULL as a positive match.
+    let rows = db.query("SELECT COUNT(*) FROM a WHERE x != 1", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 9);
 }
