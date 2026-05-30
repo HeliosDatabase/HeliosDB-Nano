@@ -5526,6 +5526,38 @@ impl StorageEngine {
         Ok(1)
     }
 
+    /// Fast DELETE for tables whose only ART index is a single-column PK.
+    /// This skips fetching/deserializing the old tuple because no secondary
+    /// index or side-column storage needs old values.
+    pub fn delete_tuple_fast_pk_only(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        pk_key: &[u8],
+        pk_value: &crate::Value,
+    ) -> Result<u64> {
+        let key = Self::build_data_key(table_name, row_id);
+        if let Some(opts) = &self.memory_write_options {
+            self.db
+                .delete_opt(&key, opts)
+                .map_err(|e| Error::storage(format!("Fast PK delete failed: {}", e)))?;
+        } else {
+            self.db
+                .delete(&key)
+                .map_err(|e| Error::storage(format!("Fast PK delete failed: {}", e)))?;
+        }
+
+        if let Err(e) = self
+            .art_index_manager
+            .remove_single_pk_key(table_name, pk_key, row_id, pk_value)
+        {
+            tracing::debug!("ART PK delete for table '{}': {}", table_name, e);
+        }
+
+        self.row_cache.invalidate(table_name, row_id);
+        Ok(1)
+    }
+
     /// Get snapshot manager
     ///
     /// Returns a reference to the snapshot manager for time-travel operations.
