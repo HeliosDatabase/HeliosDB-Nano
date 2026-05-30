@@ -9108,6 +9108,9 @@ impl EmbeddedDatabase {
         if let Some(result) = self.try_fast_select(sql) {
             let results = result?;
             self.log_slow_query(sql, start.elapsed(), results.len() as u64);
+            if let Ok(mut cache) = self.result_cache.lock() {
+                cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
+            }
             return Ok(results);
         }
 
@@ -12438,6 +12441,31 @@ mod tests {
             if_exists: false,
         };
         assert!(EmbeddedDatabase::plan_invalidates_sql_caches(&drop_trigger));
+    }
+
+    #[test]
+    fn test_fast_select_result_cache_invalidated_by_dml() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE fast_select_cache (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO fast_select_cache VALUES (1, 'before')")
+            .unwrap();
+
+        let sql = "SELECT * FROM fast_select_cache WHERE id = 1";
+        let rows = db.query(sql, &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(1), Some(&Value::String("before".to_string())));
+        assert!(
+            db.result_cache.lock().unwrap().contains(sql),
+            "fast SELECT should populate the result cache"
+        );
+
+        db.execute("UPDATE fast_select_cache SET val = 'after' WHERE id = 1")
+            .unwrap();
+
+        let rows = db.query(sql, &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(1), Some(&Value::String("after".to_string())));
     }
 
     // ========================================================================
