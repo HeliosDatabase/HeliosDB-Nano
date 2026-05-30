@@ -2150,6 +2150,41 @@ impl StorageEngine {
 
         let filter_predicates: Vec<FilterPredicate> = predicates.iter().filter_map(columnar_filter_predicate).collect();
 
+        if group_by_columns.is_empty() && filter_predicates.is_empty() {
+            let mut values = Vec::with_capacity(aggregates.len());
+            for aggregate in aggregates {
+                if matches!(aggregate.op, ColumnarAggregateOp::CountStar) {
+                    values.push(Value::Int8(self.count_table_rows(table_name)? as i64));
+                    continue;
+                }
+
+                let mut state = ColumnarAggregateState::new(aggregate.op);
+                if let Some(column_index) = aggregate.column_index {
+                    if let Some(batches) = column_batches.get(&column_index) {
+                        for (_, batch) in batches.ordered_batches() {
+                            for value in &batch.values {
+                                state.update(aggregate.op, Some(value))?;
+                            }
+                        }
+                    }
+                }
+                values.push(state.finalize()?);
+            }
+
+            let tuples = vec![Tuple::new(values)];
+            tracing::debug!(
+                phase = "storage_columnar_aggregate",
+                table = table_name,
+                rows = tuples.len(),
+                columns = requested.len(),
+                predicates = 0usize,
+                duration_us = scan_start.elapsed().as_micros() as u64,
+                "Columnar unfiltered aggregate complete"
+            );
+
+            return Ok(tuples);
+        }
+
         if let Some(driver_predicate) = null_rejecting_filter_predicate(&filter_predicates) {
             if let Some(driver_batches) = column_batches.get(&driver_predicate.column_index) {
                 if group_by_columns.is_empty() {
