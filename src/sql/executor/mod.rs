@@ -1009,6 +1009,95 @@ impl<'a> Executor<'a> {
         ))
     }
 
+    fn count_distinct_schema_operator(
+        count: i64,
+        group_by: &[crate::sql::LogicalExpr],
+        aggr_exprs: &[crate::sql::LogicalExpr],
+        input_schema: &Schema,
+    ) -> Box<dyn PhysicalOperator> {
+        Box::new(MaterializedOperator::new(
+            vec![crate::Tuple::new(vec![crate::Value::Int8(count)])],
+            AggregateOperator::output_schema(group_by, aggr_exprs, input_schema),
+        ))
+    }
+
+    fn try_count_distinct_pk(
+        &mut self,
+        input: &LogicalPlan,
+        group_by: &[crate::sql::LogicalExpr],
+        aggr_exprs: &[crate::sql::LogicalExpr],
+        having: &Option<crate::sql::LogicalExpr>,
+    ) -> Result<Option<Box<dyn PhysicalOperator>>> {
+        use crate::sql::logical_plan::AggregateFunction;
+        use crate::sql::LogicalExpr;
+
+        if !group_by.is_empty() || having.is_some() || aggr_exprs.len() != 1 || self.transaction.is_some() {
+            return Ok(None);
+        }
+        let storage = match self.storage {
+            Some(storage) => storage,
+            None => return Ok(None),
+        };
+        if storage.is_branch_active() {
+            return Ok(None);
+        }
+
+        let LogicalExpr::AggregateFunction {
+            fun: AggregateFunction::Count,
+            args,
+            distinct: true,
+        } = &aggr_exprs[0]
+        else {
+            return Ok(None);
+        };
+        let Some(arg) = args.first() else {
+            return Ok(None);
+        };
+        if matches!(arg, LogicalExpr::Wildcard) {
+            return Ok(None);
+        }
+
+        let Some((table_name, schema, predicate, as_of)) = Self::columnar_aggregate_input(input) else {
+            return Ok(None);
+        };
+        if as_of.is_some() || self.get_cte(table_name).is_some() {
+            return Ok(None);
+        }
+
+        let Some(arg_idx) = Self::column_expr_index(arg, schema) else {
+            return Ok(None);
+        };
+        let Some(pk_col) = schema.columns.get(arg_idx).filter(|col| col.primary_key) else {
+            return Ok(None);
+        };
+        if schema.columns.iter().filter(|col| col.primary_key).count() != 1 {
+            return Ok(None);
+        }
+
+        let count = match predicate {
+            None => storage.count_table_rows(table_name)?,
+            Some(predicate) => {
+                let predicate = self.materialize_subqueries(predicate)?;
+                let Some((lower, upper)) =
+                    self.pk_int_range_from_predicate(&predicate, &pk_col.name, &pk_col.data_type)
+                else {
+                    return Ok(None);
+                };
+                match storage.count_table_pk_int_range_with_schema(table_name, schema, lower, upper)? {
+                    Some(count) => count,
+                    None => return Ok(None),
+                }
+            }
+        };
+
+        Ok(Some(Self::count_distinct_schema_operator(
+            count as i64,
+            group_by,
+            aggr_exprs,
+            schema,
+        )))
+    }
+
     fn try_columnar_aggregate(
         &mut self,
         input: &LogicalPlan,
@@ -1809,6 +1898,9 @@ impl<'a> Executor<'a> {
                 aggr_exprs,
                 having,
             } => {
+                if let Some(op) = self.try_count_distinct_pk(input, group_by, aggr_exprs, having)? {
+                    return Ok(op);
+                }
                 if let Some(op) = self.try_columnar_aggregate(input, group_by, aggr_exprs, having)? {
                     return Ok(op);
                 }
