@@ -252,6 +252,7 @@ pub struct HashJoinOperator {
     // Separate evaluators for left and right sides (used during key extraction)
     left_evaluator: crate::sql::Evaluator,
     right_evaluator: crate::sql::Evaluator,
+    direct_key_indices: Option<DirectJoinKeyIndices>,
 
     // State machine
     state: JoinState,
@@ -276,6 +277,12 @@ pub struct HashJoinOperator {
 
     // Query timeout
     timeout_ctx: Option<TimeoutContext>,
+}
+
+#[derive(Debug, Clone)]
+struct DirectJoinKeyIndices {
+    left: Vec<usize>,
+    right: Vec<usize>,
 }
 
 /// Join key for hash table lookups.
@@ -353,6 +360,102 @@ fn values_equal_for_join(a: &crate::Value, b: &crate::Value) -> bool {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum DirectJoinKeySide {
+    Left(usize),
+    Right(usize),
+}
+
+fn build_direct_join_key_indices(
+    condition: &crate::sql::LogicalExpr,
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> Option<DirectJoinKeyIndices> {
+    let mut pairs = Vec::new();
+    collect_direct_equi_pairs(condition, &mut pairs)?;
+    if pairs.is_empty() {
+        return None;
+    }
+
+    let mut left = Vec::with_capacity(pairs.len());
+    let mut right = Vec::with_capacity(pairs.len());
+    for (lhs, rhs) in pairs {
+        let lhs_side = direct_join_key_side(lhs, left_schema, right_schema)?;
+        let rhs_side = direct_join_key_side(rhs, left_schema, right_schema)?;
+        match (lhs_side, rhs_side) {
+            (DirectJoinKeySide::Left(left_idx), DirectJoinKeySide::Right(right_idx))
+            | (DirectJoinKeySide::Right(right_idx), DirectJoinKeySide::Left(left_idx)) => {
+                left.push(left_idx);
+                right.push(right_idx);
+            }
+            _ => return None,
+        }
+    }
+
+    Some(DirectJoinKeyIndices { left, right })
+}
+
+fn collect_direct_equi_pairs<'a>(
+    expr: &'a crate::sql::LogicalExpr,
+    pairs: &mut Vec<(&'a crate::sql::LogicalExpr, &'a crate::sql::LogicalExpr)>,
+) -> Option<()> {
+    use crate::sql::{BinaryOperator, LogicalExpr};
+    match expr {
+        LogicalExpr::BinaryExpr {
+            left,
+            op: BinaryOperator::And,
+            right,
+        } => {
+            collect_direct_equi_pairs(left, pairs)?;
+            collect_direct_equi_pairs(right, pairs)
+        }
+        LogicalExpr::BinaryExpr {
+            left,
+            op: BinaryOperator::Eq,
+            right,
+        } => {
+            pairs.push((left, right));
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+fn direct_join_key_side(
+    expr: &crate::sql::LogicalExpr,
+    left_schema: &Schema,
+    right_schema: &Schema,
+) -> Option<DirectJoinKeySide> {
+    let crate::sql::LogicalExpr::Column { table, name } = expr else {
+        return None;
+    };
+    let left = resolve_direct_join_column(left_schema, table.as_deref(), name);
+    let right = resolve_direct_join_column(right_schema, table.as_deref(), name);
+    match (left, right) {
+        (Some(idx), None) => Some(DirectJoinKeySide::Left(idx)),
+        (None, Some(idx)) => Some(DirectJoinKeySide::Right(idx)),
+        _ => None,
+    }
+}
+
+fn resolve_direct_join_column(schema: &Schema, qualifier: Option<&str>, name: &str) -> Option<usize> {
+    let mut matches = schema.columns.iter().enumerate().filter(|(_, column)| {
+        if !column.name.eq_ignore_ascii_case(name) {
+            return false;
+        }
+        qualifier.map_or(true, |q| {
+            option_eq_ignore_ascii_case(column.source_table.as_deref(), q)
+                || option_eq_ignore_ascii_case(column.source_table_name.as_deref(), q)
+        })
+    });
+    let (idx, _) = matches.next()?;
+    matches.next().is_none().then_some(idx)
+}
+
+fn option_eq_ignore_ascii_case(value: Option<&str>, expected: &str) -> bool {
+    value.is_some_and(|value| value.eq_ignore_ascii_case(expected))
+}
+
 /// State machine for join execution
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JoinState {
@@ -408,6 +511,10 @@ impl HashJoinOperator {
         columns.extend(right_schema.columns.clone());
         let output_schema = Arc::new(Schema { columns });
 
+        let direct_key_indices = on_condition
+            .as_ref()
+            .and_then(|condition| build_direct_join_key_indices(condition, &left_schema, &right_schema));
+
         // Create evaluator with output schema for evaluating join conditions on combined tuples
         let evaluator = crate::sql::Evaluator::new(output_schema.clone());
 
@@ -425,6 +532,7 @@ impl HashJoinOperator {
             evaluator,
             left_evaluator,
             right_evaluator,
+            direct_key_indices,
             state: JoinState::Initial,
             current_left_tuple: None,
             current_matches: Vec::new(),
@@ -511,6 +619,23 @@ impl HashJoinOperator {
     ///
     /// Returns None if any join key value is NULL (per SQL standard, NULLs never match in joins)
     fn extract_join_key(&self, tuple: &Tuple, is_right_side: bool) -> Result<Option<JoinKey>> {
+        if let Some(indices) = &self.direct_key_indices {
+            let key_indices = if is_right_side { &indices.right } else { &indices.left };
+            let mut key_values = Vec::with_capacity(key_indices.len());
+            for &idx in key_indices {
+                let value = tuple
+                    .values
+                    .get(idx)
+                    .ok_or_else(|| Error::query_execution("Join key index out of bounds"))?
+                    .clone();
+                if matches!(value, crate::Value::Null) {
+                    return Ok(None);
+                }
+                key_values.push(value);
+            }
+            return Ok(Some(JoinKey(key_values)));
+        }
+
         if let Some(condition) = &self.on_condition {
             let key_values = self.extract_join_columns(condition, tuple, is_right_side)?;
 
