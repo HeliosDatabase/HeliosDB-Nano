@@ -5090,8 +5090,17 @@ impl EmbeddedDatabase {
 
         for (i, &col_idx) in spec.col_indices.iter().enumerate() {
             if let Some(value) = values.get(i) {
+                let mut value = value.clone();
+                if let Some(target_type) = spec.target_types.get(i) {
+                    if Self::insert_value_needs_cast(&value, target_type) {
+                        value = match Self::fast_cast_value(value, target_type) {
+                            Ok(value) => value,
+                            Err(e) => return Some(Err(e)),
+                        };
+                    }
+                }
                 if let Some(slot) = tuple_values.get_mut(col_idx) {
-                    *slot = value.clone();
+                    *slot = value;
                 }
                 if !spec.all_columns_explicit_no_default {
                     if let Some(flag) = user_provided.get_mut(col_idx) {
@@ -7889,6 +7898,10 @@ impl EmbeddedDatabase {
 
             // Parse based on target type
             let value = match target_type {
+                DataType::Int2 => {
+                    let n: i16 = num_str.parse().ok()?;
+                    Value::Int2(n)
+                }
                 DataType::Int4 => {
                     let n: i32 = num_str.parse().ok()?;
                     Value::Int4(n)
@@ -12162,7 +12175,7 @@ impl EmbeddedDatabase {
 
         // Find all rows that reference the parent row
         let tuples = self.storage.scan_table(table_name)?;
-        let mut row_ids_to_delete: Vec<u64> = Vec::new();
+        let mut rows_to_delete: Vec<(u64, Tuple)> = Vec::new();
 
         for tuple in tuples {
             let mut matches = true;
@@ -12184,21 +12197,34 @@ impl EmbeddedDatabase {
 
             if matches {
                 if let Some(row_id) = tuple.row_id {
-                    row_ids_to_delete.push(row_id);
+                    rows_to_delete.push((row_id, tuple));
                 }
             }
         }
 
         // Delete the matching rows
         let txn = self.storage.begin_transaction()?;
-        for row_id in row_ids_to_delete {
-            let key = self.storage.branch_aware_data_key(table_name, row_id);
+        for (row_id, _) in &rows_to_delete {
+            let key = self.storage.branch_aware_data_key(table_name, *row_id);
+            self.storage
+                .stage_columnar_delete_in_transaction(table_name, *row_id, &schema, &txn)?;
             txn.delete(key.clone())?;
 
             // Log to WAL for crash recovery
             self.storage.log_data_delete(table_name, &key)?;
         }
         txn.commit()?;
+
+        for (row_id, tuple) in rows_to_delete {
+            if let Err(e) = self
+                .storage
+                .art_indexes()
+                .on_delete_tuple(table_name, row_id, &schema, &tuple)
+            {
+                tracing::debug!("ART index delete for cascade table '{}': {}", table_name, e);
+            }
+            self.storage.row_cache().invalidate(table_name, row_id);
+        }
 
         Ok(())
     }
