@@ -580,6 +580,25 @@ impl ArtIndexManager {
         indexes.get(&pk_name).map(|idx| idx.len() as usize)
     }
 
+    /// Return true when the table has exactly one ART index: a single-column
+    /// primary-key index. Such tables can delete by PK without materializing
+    /// the old tuple because no secondary index needs old column values.
+    pub fn has_only_single_column_pk_index(&self, table: &str) -> bool {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let mut pk_count = 0usize;
+
+        for index in indexes.values().filter(|idx| idx.table() == table) {
+            match index.index_type() {
+                ArtIndexType::PrimaryKey if index.columns().len() == 1 => {
+                    pk_count += 1;
+                }
+                _ => return false,
+            }
+        }
+
+        pk_count == 1
+    }
+
     /// Count rows in a single-column integer PK index that satisfy an optional
     /// numeric range. Iterates the in-memory ART only; it does not fetch or
     /// deserialize table rows.
@@ -1144,6 +1163,44 @@ impl ArtIndexManager {
         }
 
         Ok(())
+    }
+
+    /// Remove one single-column primary-key entry when the caller already has
+    /// the encoded PK key. This avoids fetching/deserializing the old row for
+    /// PK-only DELETE fast paths.
+    pub fn remove_single_pk_key(
+        &self,
+        table: &str,
+        key: &[u8],
+        row_id: RowId,
+        pk_value: &Value,
+    ) -> ArtResult<bool> {
+        let pk_name = {
+            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
+            match pk_indexes.get(table) {
+                Some(name) => name.clone(),
+                None => return Ok(false),
+            }
+        };
+
+        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+        let Some(index) = indexes.get_mut(&pk_name) else {
+            return Ok(false);
+        };
+        if !matches!(index.index_type(), ArtIndexType::PrimaryKey)
+            || index.columns().len() != 1
+            || index.get(key) != Some(row_id)
+        {
+            return Ok(false);
+        }
+
+        let removed = index.remove(key)?.is_some();
+        if removed {
+            if let Some((value, _)) = Self::int_value_width(pk_value) {
+                index.record_dense_int_delete(value);
+            }
+        }
+        Ok(removed)
     }
 
     /// Update indexes after UPDATE

@@ -543,6 +543,7 @@ struct FastParamDeleteSpec {
     schema: std::sync::Arc<Schema>,
     pk_expr: sql::LogicalExpr,
     pk_data_type: DataType,
+    pk_only_delete: bool,
 }
 
 struct FastLiteralUpdateSpec {
@@ -560,6 +561,7 @@ struct FastLiteralDeleteSpec {
     table_name: String,
     schema: std::sync::Arc<Schema>,
     pk_data_type: DataType,
+    pk_only_delete: bool,
 }
 
 struct FastSelectSpec {
@@ -572,8 +574,11 @@ struct FastDeleteTarget {
     table_name: String,
     row_id: u64,
     key: Vec<u8>,
+    pk_key: Vec<u8>,
+    pk_value: Value,
     schema: std::sync::Arc<Schema>,
-    existing_row: Tuple,
+    existing_row: Option<Tuple>,
+    pk_only_delete: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5541,19 +5546,29 @@ impl EmbeddedDatabase {
             None => return None,
         };
 
-        let existing_row =
-            match self
-                .storage
-                .get_row_by_typed_pk_for_write_with_schema(&spec.table_name, &pk_value, &spec.schema)
-            {
-                Ok(Some(row)) => row,
-                Ok(None) => return Some(Ok(0)),
-                Err(e) => return Some(Err(e)),
-            };
-        let row_id = existing_row.row_id.unwrap_or(0);
-        if row_id == 0 {
-            return None;
-        }
+        let pk_key =
+            crate::storage::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(&pk_value));
+        let (row_id, existing_row) = if spec.pk_only_delete {
+            match self.storage.art_indexes().pk_index_lookup(&spec.table_name, &pk_key) {
+                Some(row_id) => (row_id, None),
+                None => return Some(Ok(0)),
+            }
+        } else {
+            let existing_row =
+                match self
+                    .storage
+                    .get_row_by_typed_pk_for_write_with_schema(&spec.table_name, &pk_value, &spec.schema)
+                {
+                    Ok(Some(row)) => row,
+                    Ok(None) => return Some(Ok(0)),
+                    Err(e) => return Some(Err(e)),
+                };
+            let row_id = existing_row.row_id.unwrap_or(0);
+            if row_id == 0 {
+                return None;
+            }
+            (row_id, Some(existing_row))
+        };
 
         let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
         let result = (|| {
@@ -5564,8 +5579,16 @@ impl EmbeddedDatabase {
                     self.storage.log_data_delete_nosync(&spec.table_name, &key)?;
                 }
             }
-            self.storage
-                .delete_tuple_fast(&spec.table_name, row_id, &existing_row, &spec.schema)
+            if spec.pk_only_delete {
+                self.storage
+                    .delete_tuple_fast_pk_only(&spec.table_name, row_id, &pk_key, &pk_value)
+            } else {
+                let existing_row = existing_row
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("missing fast delete tuple"))?;
+                self.storage
+                    .delete_tuple_fast(&spec.table_name, row_id, existing_row, &spec.schema)
+            }
         })();
         if result.is_ok() {
             self.storage.increment_lsn();
@@ -5742,6 +5765,7 @@ impl EmbeddedDatabase {
         let (pk_expr, pk_data_type) = Self::fast_pk_expr_from_selection(selection, &schema)?;
         Some(Ok(FastParamDeleteSpec {
             table_name: table_name.to_string(),
+            pk_only_delete: self.fast_delete_can_skip_tuple_fetch(table_name, &schema),
             schema,
             pk_expr,
             pk_data_type,
@@ -6842,6 +6866,7 @@ impl EmbeddedDatabase {
 
         let spec = std::sync::Arc::new(FastLiteralDeleteSpec {
             table_name: table_name.to_string(),
+            pk_only_delete: self.fast_delete_can_skip_tuple_fetch(table_name, &schema),
             schema,
             pk_data_type,
         });
@@ -6849,6 +6874,14 @@ impl EmbeddedDatabase {
             cache.put(cache_key, std::sync::Arc::clone(&spec));
         }
         Some(Ok(spec))
+    }
+
+    fn fast_delete_can_skip_tuple_fetch(&self, table_name: &str, schema: &Schema) -> bool {
+        schema
+            .columns
+            .iter()
+            .all(|column| column.storage_mode == ColumnStorageMode::Default)
+            && self.storage.art_indexes().has_only_single_column_pk_index(table_name)
     }
 
     /// Fast path for simple UPDATE: `UPDATE table SET col = literal WHERE pk_col = literal`
@@ -7027,7 +7060,11 @@ impl EmbeddedDatabase {
         ))
     }
 
-    fn prepare_fast_delete(&self, sql: &str) -> Option<Result<Option<FastDeleteTarget>>> {
+    fn prepare_fast_delete(
+        &self,
+        sql: &str,
+        require_tuple: bool,
+    ) -> Option<Result<Option<FastDeleteTarget>>> {
         let trimmed = sql.trim();
 
         if trimmed.len() < 24 || !trimmed.as_bytes().get(..6)?.eq_ignore_ascii_case(b"DELETE") {
@@ -7101,39 +7138,53 @@ impl EmbeddedDatabase {
         };
 
         let (pk_value, _) = Self::fast_parse_one_value(pk_val_str, &spec.pk_data_type)?;
-        let existing_row =
-            match self
-                .storage
-                .get_row_by_typed_pk_for_write_with_schema(&spec.table_name, &pk_value, &spec.schema)
-            {
-                Ok(Some(row)) => row,
-                Ok(None) => return Some(Ok(None)),
-                Err(e) => return Some(Err(e)),
-            };
+        let pk_key =
+            crate::storage::art_manager::ArtIndexManager::encode_key(std::slice::from_ref(&pk_value));
+        let (row_id, existing_row) = if spec.pk_only_delete && !require_tuple {
+            match self.storage.art_indexes().pk_index_lookup(&spec.table_name, &pk_key) {
+                Some(row_id) => (row_id, None),
+                None => return Some(Ok(None)),
+            }
+        } else {
+            let existing_row =
+                match self
+                    .storage
+                    .get_row_by_typed_pk_for_write_with_schema(&spec.table_name, &pk_value, &spec.schema)
+                {
+                    Ok(Some(row)) => row,
+                    Ok(None) => return Some(Ok(None)),
+                    Err(e) => return Some(Err(e)),
+                };
 
-        let row_id = existing_row.row_id.unwrap_or(0);
-        if row_id == 0 {
-            return None;
-        }
+            let row_id = existing_row.row_id.unwrap_or(0);
+            if row_id == 0 {
+                return None;
+            }
+            (row_id, Some(existing_row))
+        };
 
         let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
         Some(Ok(Some(FastDeleteTarget {
             table_name: spec.table_name.clone(),
             row_id,
             key,
+            pk_key,
+            pk_value,
             schema: std::sync::Arc::clone(&spec.schema),
             existing_row,
+            pk_only_delete: spec.pk_only_delete,
         })))
     }
 
     /// Fast path for simple DELETE: `DELETE FROM table WHERE pk_col = literal`.
     /// Returns None to fall through to the normal path for complex DELETE statements.
     fn try_fast_delete(&self, sql: &str, txn: &storage::Transaction) -> Option<Result<u64>> {
-        let target = match self.prepare_fast_delete(sql)? {
+        let target = match self.prepare_fast_delete(sql, true)? {
             Ok(Some(target)) => target,
             Ok(None) => return Some(Ok(0)),
             Err(e) => return Some(Err(e)),
         };
+        let existing_row = target.existing_row.as_ref()?;
         let result = (|| {
             self.storage.stage_columnar_delete_in_transaction(
                 &target.table_name,
@@ -7155,14 +7206,14 @@ impl EmbeddedDatabase {
                 &target.table_name,
                 target.row_id,
                 &target.schema,
-                &target.existing_row,
+                existing_row,
             ) {
                 tracing::debug!("ART index delete for table '{}': {}", target.table_name, e);
             }
 
             let mut col_values = std::collections::HashMap::with_capacity(target.schema.columns.len());
             for (i, col) in target.schema.columns.iter().enumerate() {
-                if let Some(v) = target.existing_row.values.get(i) {
+                if let Some(v) = existing_row.values.get(i) {
                     col_values.insert(col.name.clone(), v.clone());
                 }
             }
@@ -7180,7 +7231,7 @@ impl EmbeddedDatabase {
     }
 
     fn try_fast_delete_autocommit(&self, sql: &str) -> Option<Result<u64>> {
-        let target = match self.prepare_fast_delete(sql)? {
+        let target = match self.prepare_fast_delete(sql, false)? {
             Ok(Some(target)) => target,
             Ok(None) => return Some(Ok(0)),
             Err(e) => return Some(Err(e)),
@@ -7195,8 +7246,21 @@ impl EmbeddedDatabase {
                 }
             }
 
-            self.storage
-                .delete_tuple_fast(&target.table_name, target.row_id, &target.existing_row, &target.schema)
+            if target.pk_only_delete {
+                self.storage.delete_tuple_fast_pk_only(
+                    &target.table_name,
+                    target.row_id,
+                    &target.pk_key,
+                    &target.pk_value,
+                )
+            } else {
+                let existing_row = target
+                    .existing_row
+                    .as_ref()
+                    .ok_or_else(|| Error::internal("missing fast delete tuple"))?;
+                self.storage
+                    .delete_tuple_fast(&target.table_name, target.row_id, existing_row, &target.schema)
+            }
         })();
 
         Some(result)
