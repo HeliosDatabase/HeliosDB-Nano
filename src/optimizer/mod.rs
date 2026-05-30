@@ -228,9 +228,13 @@ impl Optimizer {
     /// This method recursively optimizes each node in the plan tree,
     /// applying optimizations bottom-up.
     pub fn optimize_recursive(&self, plan: LogicalPlan) -> Result<LogicalPlan> {
+        self.optimize_recursive_inner(plan, 0)
+    }
+
+    fn optimize_recursive_inner(&self, plan: LogicalPlan, depth: usize) -> Result<LogicalPlan> {
         let optimized = match plan {
             LogicalPlan::Filter { input, predicate } => {
-                let optimized_input = self.optimize_recursive(*input)?;
+                let optimized_input = self.optimize_recursive_inner(*input, depth)?;
                 LogicalPlan::Filter {
                     input: Box::new(optimized_input),
                     predicate,
@@ -243,7 +247,7 @@ impl Optimizer {
                 distinct,
                 distinct_on,
             } => {
-                let optimized_input = self.optimize_recursive(*input)?;
+                let optimized_input = self.optimize_recursive_inner(*input, depth)?;
                 LogicalPlan::Project {
                     input: Box::new(optimized_input),
                     exprs,
@@ -259,8 +263,8 @@ impl Optimizer {
                 on,
                 lateral,
             } => {
-                let optimized_left = self.optimize_recursive(*left)?;
-                let optimized_right = self.optimize_recursive(*right)?;
+                let optimized_left = self.optimize_recursive_inner(*left, depth)?;
+                let optimized_right = self.optimize_recursive_inner(*right, depth)?;
                 LogicalPlan::Join {
                     left: Box::new(optimized_left),
                     right: Box::new(optimized_right),
@@ -275,7 +279,7 @@ impl Optimizer {
                 aggr_exprs,
                 having,
             } => {
-                let optimized_input = self.optimize_recursive(*input)?;
+                let optimized_input = self.optimize_recursive_inner(*input, depth)?;
                 LogicalPlan::Aggregate {
                     input: Box::new(optimized_input),
                     group_by,
@@ -284,7 +288,7 @@ impl Optimizer {
                 }
             }
             LogicalPlan::Sort { input, exprs, asc } => {
-                let optimized_input = self.optimize_recursive(*input)?;
+                let optimized_input = self.optimize_recursive_inner(*input, depth)?;
                 LogicalPlan::Sort {
                     input: Box::new(optimized_input),
                     exprs,
@@ -298,7 +302,7 @@ impl Optimizer {
                 limit_param,
                 offset_param,
             } => {
-                let optimized_input = self.optimize_recursive(*input)?;
+                let optimized_input = self.optimize_recursive_inner(*input, depth)?;
                 LogicalPlan::Limit {
                     input: Box::new(optimized_input),
                     limit,
@@ -314,7 +318,7 @@ impl Optimizer {
                 source,
                 returning,
             } => {
-                let optimized_source = self.optimize_recursive(*source)?;
+                let optimized_source = self.optimize_recursive_inner(*source, depth)?;
                 LogicalPlan::InsertSelect {
                     table_name,
                     columns,
@@ -326,8 +330,16 @@ impl Optimizer {
             other => other,
         };
 
-        // Apply optimization rules to this node
-        self.optimize(optimized)
+        // Apply optimization rules to this node. Some rewrites create new
+        // optimizable descendants, such as Filter(Join) -> Join(Filter(Scan)).
+        // Re-enter changed subtrees so those descendants can reach storage-level
+        // pushdown in the same optimization call.
+        let rewritten = self.optimize(optimized.clone())?;
+        if rewritten != optimized && depth + 1 < self.config.max_passes {
+            self.optimize_recursive_inner(rewritten, depth + 1)
+        } else {
+            Ok(rewritten)
+        }
     }
 
     /// Explain optimization decisions for a plan

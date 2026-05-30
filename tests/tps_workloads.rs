@@ -299,6 +299,13 @@ fn bench<F: FnMut() -> Result<()>>(label: &str, ops: usize, mut f: F) {
     );
 }
 
+fn no_result_cache(sql: &str) -> String {
+    // query() intentionally skips its result cache for SQL text containing
+    // NOW(. Keep the marker inside a comment so the benchmark measures the
+    // operator path with normal plan-cache reuse and unchanged SQL semantics.
+    format!("{sql} /* NOW(helios_tps_uncached) */")
+}
+
 fn env_bool_enabled(name: &str, default: bool) -> bool {
     match std::env::var(name) {
         Ok(v) if matches!(v.as_str(), "0" | "false" | "FALSE" | "off" | "OFF" | "no" | "NO") => false,
@@ -624,24 +631,27 @@ fn run_tps_suite() {
     // 7) Filtered scan (non-indexed predicate over N rows).
     let scan_iters = 20usize;
     bench("filter_scan(age>50)", scan_iters, || {
+        let sql = no_result_cache("SELECT id, name FROM users WHERE age > 50");
         for _ in 0..scan_iters {
-            let _ = db.query("SELECT id, name FROM users WHERE age > 50", &[])?;
+            let _ = db.query(&sql, &[])?;
         }
         Ok(())
     });
 
     // 8) Aggregate: COUNT + SUM + AVG, no group.
     bench("agg_count_sum_avg", scan_iters, || {
+        let sql = no_result_cache("SELECT COUNT(*), SUM(balance), AVG(age) FROM users");
         for _ in 0..scan_iters {
-            let _ = db.query("SELECT COUNT(*), SUM(balance), AVG(age) FROM users", &[])?;
+            let _ = db.query(&sql, &[])?;
         }
         Ok(())
     });
 
     // 9) GROUP BY aggregate.
     bench("group_by_status", scan_iters, || {
+        let sql = no_result_cache("SELECT status, COUNT(*), SUM(amount) FROM orders GROUP BY status");
         for _ in 0..scan_iters {
-            let _ = db.query("SELECT status, COUNT(*), SUM(amount) FROM orders GROUP BY status", &[])?;
+            let _ = db.query(&sql, &[])?;
         }
         Ok(())
     });
@@ -649,19 +659,20 @@ fn run_tps_suite() {
     // 10) JOIN users x orders with filter.
     let join_iters = 10usize;
     bench("join_users_orders", join_iters, || {
+        let sql = no_result_cache(
+            "SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE o.status = 'paid' AND u.age > 40",
+        );
         for _ in 0..join_iters {
-            let _ = db.query(
-                "SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE o.status = 'paid' AND u.age > 40",
-                &[],
-            )?;
+            let _ = db.query(&sql, &[])?;
         }
         Ok(())
     });
 
     // 11) ORDER BY ... LIMIT (top-N).
     bench("order_by_limit10", scan_iters, || {
+        let sql = no_result_cache("SELECT id, balance FROM users ORDER BY balance DESC LIMIT 10");
         for _ in 0..scan_iters {
-            let _ = db.query("SELECT id, balance FROM users ORDER BY balance DESC LIMIT 10", &[])?;
+            let _ = db.query(&sql, &[])?;
         }
         Ok(())
     });

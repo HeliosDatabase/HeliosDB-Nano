@@ -402,6 +402,81 @@ fn test_selection_pushdown_merge_filters() {
     }
 }
 
+#[test]
+fn test_recursive_pushdown_revisits_join_input_filters() {
+    let stats = create_test_stats();
+    let optimizer = Optimizer::new(stats);
+
+    let users_scan = LogicalPlan::Scan {
+        alias: Some("u".to_string()),
+        table_name: "users".to_string(),
+        schema: create_users_schema(),
+        projection: None,
+        as_of: None,
+    };
+    let orders_scan = LogicalPlan::Scan {
+        alias: Some("o".to_string()),
+        table_name: "orders".to_string(),
+        schema: create_orders_schema(),
+        projection: None,
+        as_of: None,
+    };
+
+    let join = LogicalPlan::Join {
+        left: Box::new(users_scan),
+        right: Box::new(orders_scan),
+        join_type: JoinType::Inner,
+        on: Some(LogicalExpr::BinaryExpr {
+            left: Box::new(LogicalExpr::Column {
+                table: Some("u".to_string()),
+                name: "id".to_string(),
+            }),
+            op: BinaryOperator::Eq,
+            right: Box::new(LogicalExpr::Column {
+                table: Some("o".to_string()),
+                name: "user_id".to_string(),
+            }),
+        }),
+        lateral: false,
+    };
+
+    let filter = LogicalPlan::Filter {
+        input: Box::new(join),
+        predicate: LogicalExpr::BinaryExpr {
+            left: Box::new(LogicalExpr::BinaryExpr {
+                left: Box::new(LogicalExpr::Column {
+                    table: Some("u".to_string()),
+                    name: "age".to_string(),
+                }),
+                op: BinaryOperator::Gt,
+                right: Box::new(LogicalExpr::Literal(Value::Int4(40))),
+            }),
+            op: BinaryOperator::And,
+            right: Box::new(LogicalExpr::BinaryExpr {
+                left: Box::new(LogicalExpr::Column {
+                    table: Some("o".to_string()),
+                    name: "status".to_string(),
+                }),
+                op: BinaryOperator::Eq,
+                right: Box::new(LogicalExpr::Literal(Value::String("paid".to_string()))),
+            }),
+        },
+    };
+
+    let optimized = optimizer.optimize_recursive(filter).expect("Optimization failed");
+    let LogicalPlan::Join { left, right, .. } = optimized else {
+        panic!("expected pushed-down Join, got {:?}", optimized);
+    };
+    assert!(
+        matches!(*left, LogicalPlan::FilteredScan { .. }),
+        "left-side filter should reach storage-level scan"
+    );
+    assert!(
+        matches!(*right, LogicalPlan::FilteredScan { .. }),
+        "right-side filter should reach storage-level scan"
+    );
+}
+
 // =============================================================================
 // Test 3: Projection Pruning
 // =============================================================================
