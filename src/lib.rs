@@ -483,6 +483,7 @@ struct FastParamInsertSpec {
     table_name: String,
     schema: std::sync::Arc<Schema>,
     columns: Vec<FastParamInsertColumn>,
+    all_columns_explicit_no_default: bool,
 }
 
 struct FastDeleteTarget {
@@ -4696,11 +4697,18 @@ impl EmbeddedDatabase {
         }
 
         let mut insert_columns = Vec::with_capacity(column_names.len());
+        let mut provided_columns = vec![false; schema.columns.len()];
+        let mut all_columns_explicit_no_default = column_names.len() == schema.columns.len();
         for (col_name, expr) in column_names.iter().zip(value_row) {
             let col_idx = match schema.get_column_index(col_name) {
                 Some(idx) => idx,
                 None => return None,
             };
+            if provided_columns.get(col_idx).copied().unwrap_or(false) {
+                all_columns_explicit_no_default = false;
+            } else if let Some(provided) = provided_columns.get_mut(col_idx) {
+                *provided = true;
+            }
             let target_col = match schema.get_column_at(col_idx) {
                 Some(col) => col,
                 None => return None,
@@ -4708,23 +4716,34 @@ impl EmbeddedDatabase {
             if !Self::fast_param_insert_expr_supported(expr) {
                 return None;
             }
+            if matches!(expr, sql::LogicalExpr::DefaultValue) {
+                all_columns_explicit_no_default = false;
+            }
             insert_columns.push(FastParamInsertColumn {
                 col_idx,
                 data_type: target_col.data_type.clone(),
                 expr: expr.clone(),
             });
         }
+        if !provided_columns.iter().all(|provided| *provided) {
+            all_columns_explicit_no_default = false;
+        }
 
         Some(Ok(FastParamInsertSpec {
             table_name: table_name.clone(),
             schema,
             columns: insert_columns,
+            all_columns_explicit_no_default,
         }))
     }
 
     fn materialize_fast_param_insert_tuple(spec: &FastParamInsertSpec, params: &[Value]) -> Result<Tuple> {
         let mut tuple_values = vec![Value::Null; spec.schema.columns.len()];
-        let mut user_provided = vec![false; spec.schema.columns.len()];
+        let mut user_provided = if spec.all_columns_explicit_no_default {
+            Vec::new()
+        } else {
+            vec![false; spec.schema.columns.len()]
+        };
 
         for column in &spec.columns {
             if matches!(column.expr, sql::LogicalExpr::DefaultValue) {
@@ -4748,13 +4767,34 @@ impl EmbeddedDatabase {
             if let Some(slot) = tuple_values.get_mut(column.col_idx) {
                 *slot = value;
             }
-            if let Some(flag) = user_provided.get_mut(column.col_idx) {
-                *flag = true;
+            if !spec.all_columns_explicit_no_default {
+                if let Some(flag) = user_provided.get_mut(column.col_idx) {
+                    *flag = true;
+                }
             }
         }
 
-        Self::apply_defaults_and_check_not_null(&mut tuple_values, &spec.schema, &user_provided)?;
+        if spec.all_columns_explicit_no_default {
+            Self::check_not_null_for_materialized_insert(&tuple_values, &spec.schema)?;
+        } else {
+            Self::apply_defaults_and_check_not_null(&mut tuple_values, &spec.schema, &user_provided)?;
+        }
         Ok(Tuple::new(tuple_values))
+    }
+
+    fn check_not_null_for_materialized_insert(tuple_values: &[Value], schema: &Schema) -> Result<()> {
+        for (idx, col) in schema.columns.iter().enumerate() {
+            if col.nullable || col.primary_key {
+                continue;
+            }
+            if matches!(tuple_values.get(idx), Some(Value::Null)) {
+                return Err(Error::constraint_violation(format!(
+                    "NOT NULL constraint violated: cannot insert NULL into column '{}'",
+                    col.name
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn fast_param_insert_expr_supported(expr: &sql::LogicalExpr) -> bool {
