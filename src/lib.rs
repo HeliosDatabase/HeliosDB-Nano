@@ -4974,6 +4974,27 @@ impl EmbeddedDatabase {
         }
         drop(txn_guard);
 
+        if !self.storage.fast_dml_requires_logical_wal()
+            && Self::fast_insert_batch_can_use_direct_write(&spec.schema)
+        {
+            let prepared = match self.prepare_fast_insert_batch(&spec.table_name, tuples, &spec.schema) {
+                Ok(prepared) => prepared,
+                Err(e) => return Some(Err(e)),
+            };
+            if let Err(e) = self.validate_fast_insert_batch(&spec.table_name, &spec.schema, &prepared) {
+                return Some(Err(e));
+            }
+            let inserted = match self
+                .storage
+                .insert_prepared_tuples_fast_batch(&spec.table_name, prepared, &spec.schema)
+            {
+                Ok(inserted) => inserted,
+                Err(e) => return Some(Err(e)),
+            };
+            self.storage.increment_lsn();
+            return Some(Ok(inserted));
+        }
+
         if !self.storage.fast_dml_requires_logical_wal() {
             let txn = match self.storage.begin_transaction() {
                 Ok(txn) => txn,
@@ -5018,6 +5039,13 @@ impl EmbeddedDatabase {
             self.storage.increment_lsn();
         }
         Some(Ok(inserted))
+    }
+
+    fn fast_insert_batch_can_use_direct_write(schema: &Schema) -> bool {
+        schema
+            .columns
+            .iter()
+            .all(|column| column.storage_mode == ColumnStorageMode::Default)
     }
 
     fn fast_literal_insert_cache_key(table_name: &str, columns: Option<&[&str]>) -> String {
@@ -6652,14 +6680,22 @@ impl EmbeddedDatabase {
         unique_specs.sort();
         unique_specs.dedup();
 
+        let check_existing_unique_indexes = self
+            .storage
+            .art_indexes()
+            .pk_index_len(table_name)
+            .map_or(true, |len| len != 0);
+
         let mut seen = std::collections::HashSet::new();
         for (_, tuple) in prepared {
-            if let Err(e) = self
-                .storage
-                .art_indexes()
-                .check_unique_constraints_tuple(table_name, schema, tuple)
-            {
-                return Err(Error::constraint_violation(e.to_string()));
+            if check_existing_unique_indexes {
+                if let Err(e) = self
+                    .storage
+                    .art_indexes()
+                    .check_unique_constraints_tuple(table_name, schema, tuple)
+                {
+                    return Err(Error::constraint_violation(e.to_string()));
+                }
             }
 
             for spec in &unique_specs {
@@ -6711,11 +6747,7 @@ impl EmbeddedDatabase {
             return self.insert_validated_tuple_in_transaction(table_name, tuple, schema, txn);
         }
 
-        let mut prepared = Vec::with_capacity(tuples.len());
-        for tuple in tuples {
-            let (row_id, tuple) = self.prepare_tuple_for_transaction_insert(table_name, tuple, schema);
-            prepared.push((row_id, tuple));
-        }
+        let prepared = self.prepare_fast_insert_batch(table_name, tuples, schema)?;
 
         self.validate_fast_insert_batch(table_name, schema, &prepared)?;
 
@@ -6731,6 +6763,20 @@ impl EmbeddedDatabase {
             self.storage.stage_row_counter_in_transaction(table_name, row_id, txn)?;
         }
         Ok(inserted)
+    }
+
+    fn prepare_fast_insert_batch(
+        &self,
+        table_name: &str,
+        tuples: Vec<Tuple>,
+        schema: &Schema,
+    ) -> Result<Vec<(u64, Tuple)>> {
+        let mut prepared = Vec::with_capacity(tuples.len());
+        for tuple in tuples {
+            let (row_id, tuple) = self.prepare_tuple_for_transaction_insert(table_name, tuple, schema);
+            prepared.push((row_id, tuple));
+        }
+        Ok(prepared)
     }
 
     fn insert_validated_tuple_in_transaction(

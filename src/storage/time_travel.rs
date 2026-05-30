@@ -346,7 +346,9 @@ impl SnapshotManager {
                 let snap_timestamp = snap_time.timestamp() as u64;
                 if snap_timestamp <= target_time {
                     let diff = target_time - snap_timestamp;
-                    if diff < best_diff {
+                    if diff < best_diff
+                        || (diff == best_diff && best_match.is_none_or(|best| metadata.timestamp > best))
+                    {
                         best_diff = diff;
                         best_match = Some(metadata.timestamp);
                     }

@@ -273,6 +273,71 @@ fn test_execute_many_params_insert_autocommit() {
 }
 
 #[test]
+fn test_execute_many_params_insert_autocommit_rejects_duplicate_batch() {
+    let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
+    db.execute("CREATE TABLE many_dup (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+
+    let rows = vec![
+        vec![Value::Int4(1), Value::String("a".to_string())],
+        vec![Value::Int4(1), Value::String("duplicate".to_string())],
+    ];
+    let result = db.execute_many_params("INSERT INTO many_dup (id, name) VALUES ($1, $2)", &rows);
+    assert!(result.is_err(), "duplicate execute_many batch must fail");
+
+    let rows = db.query("SELECT * FROM many_dup", &[]).unwrap();
+    assert_eq!(rows.len(), 0, "failed execute_many batch must not write partial rows");
+}
+
+#[test]
+fn test_execute_many_params_insert_autocommit_rejects_existing_duplicate() {
+    let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
+    db.execute("CREATE TABLE many_existing_dup (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO many_existing_dup (id, name) VALUES (1, 'existing')")
+        .unwrap();
+
+    let rows = vec![
+        vec![Value::Int4(1), Value::String("duplicate".to_string())],
+        vec![Value::Int4(2), Value::String("new".to_string())],
+    ];
+    let result = db.execute_many_params("INSERT INTO many_existing_dup (id, name) VALUES ($1, $2)", &rows);
+    assert!(result.is_err(), "execute_many must reject duplicates already in the table");
+
+    let rows = db
+        .query("SELECT id, name FROM many_existing_dup ORDER BY id", &[])
+        .unwrap();
+    assert_eq!(rows.len(), 1, "failed execute_many batch must not write partial rows");
+    assert_eq!(rows[0].get(1).unwrap(), &Value::String("existing".to_string()));
+}
+
+#[test]
+fn test_execute_many_params_insert_autocommit_preserves_time_travel_versions() {
+    let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
+    db.execute("CREATE TABLE many_tt (id INT PRIMARY KEY, name TEXT)")
+        .unwrap();
+
+    let rows = vec![
+        vec![Value::Int4(1), Value::String("a".to_string())],
+        vec![Value::Int4(2), Value::String("b".to_string())],
+    ];
+    db.execute_many_params("INSERT INTO many_tt (id, name) VALUES ($1, $2)", &rows)
+        .unwrap();
+
+    let current_rows = db.query("SELECT name FROM many_tt WHERE id = 2", &[]).unwrap();
+    assert_eq!(current_rows.len(), 1);
+
+    let rows = db
+        .query(
+            "SELECT name FROM many_tt AS OF TIMESTAMP '2999-01-01 00:00:00' WHERE id = 2",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get(0).unwrap(), &Value::String("b".to_string()));
+}
+
+#[test]
 fn test_execute_many_params_insert_transaction_visibility_and_rollback() {
     let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
     db.execute("CREATE TABLE many_txn (id INT PRIMARY KEY, name TEXT)")
