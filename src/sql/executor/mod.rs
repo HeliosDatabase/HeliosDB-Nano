@@ -1021,7 +1021,7 @@ impl<'a> Executor<'a> {
         ))
     }
 
-    fn try_count_distinct_pk(
+    fn try_count_pk_cardinality(
         &mut self,
         input: &LogicalPlan,
         group_by: &[crate::sql::LogicalExpr],
@@ -1045,7 +1045,7 @@ impl<'a> Executor<'a> {
         let LogicalExpr::AggregateFunction {
             fun: AggregateFunction::Count,
             args,
-            distinct: true,
+            distinct: _,
         } = &aggr_exprs[0]
         else {
             return Ok(None);
@@ -1077,13 +1077,7 @@ impl<'a> Executor<'a> {
         let count = match predicate {
             None => storage.count_table_rows(table_name)?,
             Some(predicate) => {
-                let predicate = self.materialize_subqueries(predicate)?;
-                let Some((lower, upper)) =
-                    self.pk_int_range_from_predicate(&predicate, &pk_col.name, &pk_col.data_type)
-                else {
-                    return Ok(None);
-                };
-                match storage.count_table_pk_int_range_with_schema(table_name, schema, lower, upper)? {
+                match self.count_single_pk_predicate(table_name, schema, pk_col, predicate)? {
                     Some(count) => count,
                     None => return Ok(None),
                 }
@@ -1096,6 +1090,104 @@ impl<'a> Executor<'a> {
             aggr_exprs,
             schema,
         )))
+    }
+
+    fn count_single_pk_predicate(
+        &mut self,
+        table_name: &str,
+        schema: &Schema,
+        pk_col: &crate::Column,
+        predicate: &crate::sql::LogicalExpr,
+    ) -> Result<Option<usize>> {
+        let storage = match self.storage {
+            Some(storage) => storage,
+            None => return Ok(None),
+        };
+        if storage.is_branch_active() {
+            return Ok(None);
+        }
+        let predicate = self.materialize_subqueries(predicate)?;
+        if let Some((lower, upper)) = self.pk_int_range_from_predicate(&predicate, &pk_col.name, &pk_col.data_type) {
+            return storage.count_table_pk_int_range_with_schema(table_name, schema, lower, upper);
+        }
+        self.count_single_pk_in_list(table_name, pk_col, &predicate)
+    }
+
+    fn count_single_pk_in_list(
+        &self,
+        table_name: &str,
+        pk_col: &crate::Column,
+        predicate: &crate::sql::LogicalExpr,
+    ) -> Result<Option<usize>> {
+        use crate::sql::LogicalExpr;
+
+        let LogicalExpr::InList {
+            expr,
+            list,
+            negated: false,
+        } = predicate
+        else {
+            return Ok(None);
+        };
+        if !Self::expr_matches_column(expr, &pk_col.name) {
+            return Ok(None);
+        }
+        let storage = match self.storage {
+            Some(storage) => storage,
+            None => return Ok(None),
+        };
+
+        let mut seen = std::collections::HashSet::new();
+        let mut count = 0usize;
+        for item in list {
+            let Some(value) = self.pk_in_list_value(item, &pk_col.data_type) else {
+                return Ok(None);
+            };
+            if matches!(value, crate::Value::Null) {
+                continue;
+            }
+            let key = crate::storage::ArtIndexManager::encode_key(std::slice::from_ref(&value));
+            if seen.insert(key.clone()) {
+                match storage.art_indexes().pk_index_contains(table_name, &key) {
+                    Some(true) => count += 1,
+                    Some(false) => {}
+                    None => return Ok(None),
+                }
+            }
+        }
+
+        Ok(Some(count))
+    }
+
+    fn pk_in_list_value(&self, expr: &crate::sql::LogicalExpr, pk_type: &crate::DataType) -> Option<crate::Value> {
+        use crate::sql::LogicalExpr;
+        use crate::{DataType, Value};
+
+        let value = match expr {
+            LogicalExpr::Literal(value) => value.clone(),
+            LogicalExpr::Parameter { index } => self.parameters.get(index.saturating_sub(1)).cloned()?,
+            _ => return None,
+        };
+
+        if matches!(value, Value::Null) {
+            return Some(Value::Null);
+        }
+
+        match pk_type {
+            DataType::Int2 => {
+                let raw = Self::value_to_i64_for_pk_range(&value, pk_type)?;
+                i16::try_from(raw).ok().map(Value::Int2)
+            }
+            DataType::Int4 => {
+                let raw = Self::value_to_i64_for_pk_range(&value, pk_type)?;
+                i32::try_from(raw).ok().map(Value::Int4)
+            }
+            DataType::Int8 => {
+                let raw = Self::value_to_i64_for_pk_range(&value, pk_type)?;
+                Some(Value::Int8(raw))
+            }
+            _ => Some(self::coerce_literal_to_column_type(value, pk_type)),
+        }
     }
 
     fn try_columnar_aggregate(
@@ -1327,11 +1419,10 @@ impl<'a> Executor<'a> {
         }
     }
 
-    fn try_count_star_pk_range(&self, input: &LogicalPlan) -> Result<Option<Box<dyn PhysicalOperator>>> {
-        let storage = match self.storage {
-            Some(s) => s,
-            None => return Ok(None),
-        };
+    fn try_count_star_pk_range(&mut self, input: &LogicalPlan) -> Result<Option<Box<dyn PhysicalOperator>>> {
+        if self.storage.is_none() {
+            return Ok(None);
+        }
         if self.transaction.is_some() {
             return Ok(None);
         }
@@ -1368,10 +1459,7 @@ impl<'a> Executor<'a> {
             (Some(col), None) => col,
             _ => return Ok(None),
         };
-        let Some((lower, upper)) = self.pk_int_range_from_predicate(predicate, &pk_col.name, &pk_col.data_type) else {
-            return Ok(None);
-        };
-        let Some(count) = storage.count_table_pk_int_range_with_schema(table_name, schema, lower, upper)? else {
+        let Some(count) = self.count_single_pk_predicate(table_name, schema, pk_col, predicate)? else {
             return Ok(None);
         };
         Ok(Some(Self::count_star_schema_operator(count as i64)))
@@ -1898,7 +1986,7 @@ impl<'a> Executor<'a> {
                 aggr_exprs,
                 having,
             } => {
-                if let Some(op) = self.try_count_distinct_pk(input, group_by, aggr_exprs, having)? {
+                if let Some(op) = self.try_count_pk_cardinality(input, group_by, aggr_exprs, having)? {
                     return Ok(op);
                 }
                 if let Some(op) = self.try_columnar_aggregate(input, group_by, aggr_exprs, having)? {

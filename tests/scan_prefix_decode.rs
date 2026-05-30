@@ -146,3 +146,37 @@ fn count_distinct_pk_uses_index_cardinality() {
     let rows = db.query("SELECT COUNT(DISTINCT bucket) FROM n", &[]).unwrap();
     assert_eq!(int(&rows[0].values[0]), 3);
 }
+
+#[test]
+fn count_pk_and_count_star_pk_in_list_use_index_cardinality() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE n (id INTEGER PRIMARY KEY, bucket INT)").unwrap();
+    for id in 1..=10 {
+        db.execute(&format!("INSERT INTO n VALUES ({id}, {})", id % 3))
+            .unwrap();
+    }
+
+    let rows = db.query("SELECT COUNT(id) FROM n", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 10);
+
+    let rows = db
+        .query("SELECT COUNT(*) FROM n WHERE id IN (1, 1, 3, NULL, 99)", &[])
+        .unwrap();
+    assert_eq!(int(&rows[0].values[0]), 2);
+
+    let rows = db
+        .query("SELECT COUNT(id) FROM n WHERE id IN (2, 2, 4, 100)", &[])
+        .unwrap();
+    assert_eq!(int(&rows[0].values[0]), 2);
+
+    let rows = db
+        .query_params(
+            "SELECT COUNT(DISTINCT id) FROM n WHERE id IN ($1, $2, $3)",
+            &[Value::Int4(5), Value::Int4(5), Value::Int4(7)],
+        )
+        .unwrap();
+    assert_eq!(int(&rows[0].values[0]), 2);
+
+    let rows = db.query("SELECT COUNT(bucket) FROM n WHERE id IN (1, 2, 3)", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 3);
+}

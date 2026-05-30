@@ -132,8 +132,28 @@ fn run_scan_bench() {
     bench("count_star(id=r)", &|r| {
         format!("SELECT COUNT(*) FROM wide WHERE id = {r}")
     });
+    bench("count_star(id IN)", &|r| {
+        format!(
+            "SELECT COUNT(*) FROM wide WHERE id IN ({}, {}, {}, {}, {})",
+            r,
+            r + 1,
+            r + 1,
+            n + r,
+            n / 2
+        )
+    });
     bench("count_star(id range)", &|r| {
         format!("SELECT COUNT(*) FROM wide WHERE id >= {r} AND id <= {}", r + n / 2)
+    });
+    bench("count_pk(id IN)", &|r| {
+        format!(
+            "SELECT COUNT(id) FROM wide WHERE id IN ({}, {}, {}, {}, {})",
+            r,
+            r + 1,
+            r + 1,
+            n + r,
+            n / 2
+        )
     });
     bench("count_distinct_expr(range)", &|r| {
         format!(
