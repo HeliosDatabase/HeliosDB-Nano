@@ -1805,6 +1805,9 @@ impl<'a> Executor<'a> {
                 aggr_exprs,
                 having,
             } => {
+                if let Some(op) = self.try_columnar_aggregate(input, group_by, aggr_exprs, having)? {
+                    return Ok(op);
+                }
                 // Fast path: COUNT(*) with no GROUP BY, no HAVING, plain Scan input
                 #[allow(clippy::indexing_slicing)] // Safety: aggr_exprs.len() == 1 checked in condition
                 if group_by.is_empty() && having.is_none() && aggr_exprs.len() == 1 {
@@ -1932,9 +1935,6 @@ impl<'a> Executor<'a> {
                             }
                         } // end if is_count_star
                     }
-                }
-                if let Some(op) = self.try_columnar_aggregate(input, group_by, aggr_exprs, having)? {
-                    return Ok(op);
                 }
                 let input_op = self.plan_to_operator(input)?;
                 // Materialize any subqueries in the HAVING expression — the Filter

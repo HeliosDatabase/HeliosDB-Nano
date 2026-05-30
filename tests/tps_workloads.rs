@@ -230,6 +230,11 @@ fn run_columnar_scan_bench() {
         &|r| format!("SELECT SUM(a), AVG(d), MAX(b) FROM col_wide WHERE b >= {r}"),
     );
     bench_pair(
+        "count_star_filter",
+        &|r| format!("SELECT COUNT(*) FROM row_wide WHERE b >= {r}"),
+        &|r| format!("SELECT COUNT(*) FROM col_wide WHERE b >= {r}"),
+    );
+    bench_pair(
         "group_by_e",
         &|r| format!("SELECT e, COUNT(*), SUM(a) FROM row_wide WHERE b >= {r} GROUP BY e"),
         &|r| format!("SELECT e, COUNT(*), SUM(a) FROM col_wide WHERE b >= {r} GROUP BY e"),
