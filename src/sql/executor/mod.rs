@@ -260,6 +260,36 @@ pub struct CteData {
     pub schema: Arc<Schema>,
 }
 
+struct DirectTopKProjectSpec {
+    table_name: String,
+    scan_schema: Arc<Schema>,
+    output_schema: Arc<Schema>,
+    output_columns: Vec<usize>,
+    sort_columns: Vec<usize>,
+}
+
+fn direct_expr_column_index(schema: &Schema, expr: &crate::sql::LogicalExpr) -> Option<usize> {
+    match expr {
+        crate::sql::LogicalExpr::Column { table, name } => schema
+            .get_qualified_column_index(table.as_deref(), name)
+            .or_else(|| schema.get_column_index(name)),
+        _ => None,
+    }
+}
+
+fn resolve_sort_columns_to_base(
+    sort_exprs: &[crate::sql::LogicalExpr],
+    output_schema: &Schema,
+    output_columns: &[usize],
+) -> Option<Vec<usize>> {
+    let mut sort_columns = Vec::with_capacity(sort_exprs.len());
+    for expr in sort_exprs {
+        let output_idx = direct_expr_column_index(output_schema, expr)?;
+        sort_columns.push(*output_columns.get(output_idx)?);
+    }
+    Some(sort_columns)
+}
+
 /// Query executor
 ///
 /// Converts logical plans into physical operators and executes them.
@@ -432,6 +462,173 @@ impl<'a> Executor<'a> {
             }
             _ => None,
         }
+    }
+
+    fn try_storage_direct_topk(
+        &self,
+        input: &LogicalPlan,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Option<Box<dyn PhysicalOperator>>> {
+        if limit == usize::MAX || self.transaction.is_some() {
+            return Ok(None);
+        }
+        let Some(storage) = self.storage else {
+            return Ok(None);
+        };
+        let LogicalPlan::Sort {
+            input: sort_input,
+            exprs: sort_exprs,
+            asc,
+        } = input
+        else {
+            return Ok(None);
+        };
+        if sort_exprs.is_empty() || sort_exprs.len() != asc.len() {
+            return Ok(None);
+        }
+
+        if let Some(spec) = self.direct_topk_project_spec(sort_input, sort_exprs)? {
+            let Some(tuples) = storage.scan_table_topk_projected_columns(
+                &spec.table_name,
+                &spec.scan_schema,
+                &spec.output_columns,
+                &spec.sort_columns,
+                asc,
+                limit.saturating_add(offset),
+            )?
+            else {
+                return Ok(None);
+            };
+            let input: Box<dyn PhysicalOperator> =
+                Box::new(MaterializedOperator::new(tuples, spec.output_schema));
+            return Ok(Some(Box::new(
+                LimitOperator::new(input, limit, offset).with_timeout(self.timeout_ctx.clone()),
+            )));
+        }
+
+        Ok(None)
+    }
+
+    fn direct_topk_project_spec(
+        &self,
+        input: &LogicalPlan,
+        sort_exprs: &[crate::sql::LogicalExpr],
+    ) -> Result<Option<DirectTopKProjectSpec>> {
+        match input {
+            LogicalPlan::Project {
+                input,
+                exprs,
+                aliases,
+                distinct: false,
+                distinct_on: None,
+            } => {
+                let Some((table_name, scan_schema)) = self.direct_topk_scan_schema(input)? else {
+                    return Ok(None);
+                };
+                let mut output_columns = Vec::with_capacity(exprs.len());
+                for expr in exprs {
+                    let Some(idx) = direct_expr_column_index(&scan_schema, expr) else {
+                        return Ok(None);
+                    };
+                    output_columns.push(idx);
+                }
+                let output_schema = Arc::new(Schema {
+                    columns: output_columns
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(idx, &base_idx)| {
+                            scan_schema.columns.get(base_idx).map(|base| {
+                                let mut column = base.clone();
+                                if let Some(alias) = aliases.get(idx).filter(|alias| !alias.is_empty()) {
+                                    column.name = alias.clone();
+                                }
+                                column.source_table = None;
+                                column.source_table_name = None;
+                                column.primary_key = false;
+                                column.unique = false;
+                                column
+                            })
+                        })
+                        .collect(),
+                });
+                if output_schema.columns.len() != output_columns.len() {
+                    return Ok(None);
+                }
+                let Some(sort_columns) =
+                    resolve_sort_columns_to_base(sort_exprs, &output_schema, &output_columns)
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(DirectTopKProjectSpec {
+                    table_name,
+                    scan_schema,
+                    output_schema,
+                    output_columns,
+                    sort_columns,
+                }))
+            }
+            LogicalPlan::Scan { projection, .. } => {
+                let Some((table_name, scan_schema)) = self.direct_topk_scan_schema(input)? else {
+                    return Ok(None);
+                };
+                let output_columns: Vec<usize> = projection
+                    .clone()
+                    .unwrap_or_else(|| (0..scan_schema.columns.len()).collect());
+                let output_schema = Arc::new(Schema {
+                    columns: output_columns
+                        .iter()
+                        .filter_map(|&idx| scan_schema.columns.get(idx).cloned())
+                        .collect(),
+                });
+                if output_schema.columns.len() != output_columns.len() {
+                    return Ok(None);
+                }
+                let Some(sort_columns) =
+                    resolve_sort_columns_to_base(sort_exprs, &output_schema, &output_columns)
+                else {
+                    return Ok(None);
+                };
+                Ok(Some(DirectTopKProjectSpec {
+                    table_name,
+                    scan_schema,
+                    output_schema,
+                    output_columns,
+                    sort_columns,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    fn direct_topk_scan_schema(&self, input: &LogicalPlan) -> Result<Option<(String, Arc<Schema>)>> {
+        let Some(storage) = self.storage else {
+            return Ok(None);
+        };
+        let LogicalPlan::Scan {
+            table_name,
+            alias,
+            schema,
+            as_of,
+            ..
+        } = input
+        else {
+            return Ok(None);
+        };
+        if as_of.is_some()
+            || self.get_cte(table_name).is_some()
+            || storage.mv_catalog().view_exists(table_name)?
+            || !storage.catalog().table_exists(table_name)?
+        {
+            return Ok(None);
+        }
+        let source_name = alias.as_ref().unwrap_or(table_name);
+        let mut scan_schema = schema.as_ref().clone();
+        for column in &mut scan_schema.columns {
+            column.source_table = Some(source_name.clone());
+            column.source_table_name = Some(table_name.clone());
+        }
+        Ok(Some((table_name.clone(), Arc::new(scan_schema))))
     }
 
     /// Materialize IN subqueries by executing them and converting to InList
@@ -2047,6 +2244,9 @@ impl<'a> Executor<'a> {
                 let k = limit.saturating_add(*offset);
                 let real_bound = *limit != usize::MAX;
                 if real_bound {
+                    if let Some(topk) = self.try_storage_direct_topk(input, *limit, *offset)? {
+                        return Ok(topk);
+                    }
                     if let Some((sort_exprs, sort_asc, sort_input, project_wrap)) = Self::extract_sort_for_topk(input) {
                         let sort_input_op = self.plan_to_operator(sort_input)?;
                         let topk: Box<dyn PhysicalOperator> = Box::new(TopKOperator::new(

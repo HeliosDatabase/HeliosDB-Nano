@@ -101,6 +101,15 @@ fn order_by_limit_offset_is_deterministic() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn system_view_order_by_limit_uses_registry_rows() -> Result<()> {
+    let db = EmbeddedDatabase::new_in_memory()?;
+    let rows = db.query("SELECT nspname FROM pg_namespace ORDER BY nspname LIMIT 1", &[])?;
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0].values.first(), Some(Value::String(_))));
+    Ok(())
+}
+
 // ---------------------------------------------------------------------
 // Acceptance criterion 4: LEFT OUTER JOIN + LIMIT + OFFSET composes.
 // ---------------------------------------------------------------------
