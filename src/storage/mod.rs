@@ -68,6 +68,7 @@ pub use dump::{
     CompressionType as DumpCompressionType, DumpManager, DumpMetadata, DumpMode, DumpOptions, DumpOutputFormat,
     DumpReport, DumpType, RestoreOptions, RestoreReport,
 };
+pub(crate) use engine::{ColumnarAggregateOp, ColumnarAggregateSpec};
 pub use engine::{DirectBulkLoadResult, StorageEngine, StorageStats};
 pub use gin_index::{GinIndex, GinIndexStats};
 pub use lock_manager::{LockGuard, LockManager, LockState, LockType};

@@ -1009,6 +1009,231 @@ impl<'a> Executor<'a> {
         ))
     }
 
+    fn try_columnar_aggregate(
+        &mut self,
+        input: &LogicalPlan,
+        group_by: &[crate::sql::LogicalExpr],
+        aggr_exprs: &[crate::sql::LogicalExpr],
+        having: &Option<crate::sql::LogicalExpr>,
+    ) -> Result<Option<Box<dyn PhysicalOperator>>> {
+        if having.is_some() || self.transaction.is_some() {
+            return Ok(None);
+        }
+        let storage = match self.storage {
+            Some(storage) => storage,
+            None => return Ok(None),
+        };
+        if storage.is_branch_active() {
+            return Ok(None);
+        }
+
+        let Some((table_name, schema, predicate, as_of)) = Self::columnar_aggregate_input(input) else {
+            return Ok(None);
+        };
+        if as_of.is_some() || self.get_cte(table_name).is_some() {
+            return Ok(None);
+        }
+
+        let predicate = predicate
+            .map(|predicate| self.materialize_subqueries(predicate))
+            .transpose()?;
+        if predicate
+            .as_ref()
+            .is_some_and(|predicate| !Self::is_simple_columnar_pushdown_predicate(predicate))
+        {
+            return Ok(None);
+        }
+        let analyzed_predicates = predicate
+            .as_ref()
+            .map(|predicate| storage.predicate_pushdown().analyze_predicate(predicate, schema))
+            .unwrap_or_default();
+        if predicate.is_some() && analyzed_predicates.is_empty() {
+            return Ok(None);
+        }
+
+        let mut group_indices = Vec::with_capacity(group_by.len());
+        for expr in group_by {
+            let Some(idx) = Self::column_expr_index(expr, schema) else {
+                return Ok(None);
+            };
+            group_indices.push(idx);
+        }
+
+        let mut aggregate_specs = Vec::with_capacity(aggr_exprs.len());
+        for expr in aggr_exprs {
+            let Some(spec) = Self::columnar_aggregate_spec(expr, schema) else {
+                return Ok(None);
+            };
+            aggregate_specs.push(spec);
+        }
+
+        let mut referenced = group_indices.clone();
+        referenced.extend(aggregate_specs.iter().filter_map(|spec| spec.column_index));
+        referenced.extend(analyzed_predicates.iter().map(|predicate| predicate.column_index));
+        referenced.sort_unstable();
+        referenced.dedup();
+        if referenced.is_empty()
+            || referenced.iter().any(|&idx| {
+                schema.columns.get(idx).map_or(true, |column| {
+                    column.storage_mode != crate::ColumnStorageMode::Columnar
+                })
+            })
+        {
+            return Ok(None);
+        }
+
+        let tuples = storage.aggregate_columnar_columns(
+            table_name,
+            schema,
+            &group_indices,
+            &aggregate_specs,
+            &analyzed_predicates,
+        )?;
+        let output_schema = AggregateOperator::output_schema(group_by, aggr_exprs, schema);
+        Ok(Some(Box::new(MaterializedOperator::new(tuples, output_schema))))
+    }
+
+    fn columnar_aggregate_input<'b>(
+        input: &'b LogicalPlan,
+    ) -> Option<(
+        &'b str,
+        &'b Schema,
+        Option<&'b crate::sql::LogicalExpr>,
+        Option<&'b crate::sql::logical_plan::AsOfClause>,
+    )> {
+        match input {
+            LogicalPlan::Scan {
+                table_name,
+                schema,
+                projection,
+                as_of,
+                ..
+            } if projection.is_none() => Some((table_name.as_str(), schema.as_ref(), None, as_of.as_ref())),
+            LogicalPlan::FilteredScan {
+                table_name,
+                schema,
+                projection,
+                predicate,
+                as_of,
+                ..
+            } if projection.is_none() => {
+                Some((table_name.as_str(), schema.as_ref(), predicate.as_ref(), as_of.as_ref()))
+            }
+            LogicalPlan::Filter { input, predicate } => match input.as_ref() {
+                LogicalPlan::Scan {
+                    table_name,
+                    schema,
+                    projection,
+                    as_of,
+                    ..
+                } if projection.is_none() => Some((table_name.as_str(), schema.as_ref(), Some(predicate), as_of.as_ref())),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    fn column_expr_index(expr: &crate::sql::LogicalExpr, schema: &Schema) -> Option<usize> {
+        match expr {
+            crate::sql::LogicalExpr::Column { table, name } => schema
+                .get_qualified_column_index(table.as_deref(), name)
+                .or_else(|| schema.get_column_index(name)),
+            _ => None,
+        }
+    }
+
+    fn columnar_aggregate_spec(
+        expr: &crate::sql::LogicalExpr,
+        schema: &Schema,
+    ) -> Option<crate::storage::ColumnarAggregateSpec> {
+        use crate::sql::logical_plan::AggregateFunction;
+        use crate::sql::LogicalExpr;
+        use crate::storage::{ColumnarAggregateOp, ColumnarAggregateSpec};
+
+        let LogicalExpr::AggregateFunction {
+            fun,
+            args,
+            distinct: false,
+        } = expr
+        else {
+            return None;
+        };
+        let arg = args.first()?;
+        match fun {
+            AggregateFunction::Count if matches!(arg, LogicalExpr::Wildcard) => Some(ColumnarAggregateSpec {
+                op: ColumnarAggregateOp::CountStar,
+                column_index: None,
+            }),
+            AggregateFunction::Count => Some(ColumnarAggregateSpec {
+                op: ColumnarAggregateOp::Count,
+                column_index: Some(Self::column_expr_index(arg, schema)?),
+            }),
+            AggregateFunction::Sum => Some(ColumnarAggregateSpec {
+                op: ColumnarAggregateOp::Sum,
+                column_index: Some(Self::column_expr_index(arg, schema)?),
+            }),
+            AggregateFunction::Avg => Some(ColumnarAggregateSpec {
+                op: ColumnarAggregateOp::Avg,
+                column_index: Some(Self::column_expr_index(arg, schema)?),
+            }),
+            AggregateFunction::Min => Some(ColumnarAggregateSpec {
+                op: ColumnarAggregateOp::Min,
+                column_index: Some(Self::column_expr_index(arg, schema)?),
+            }),
+            AggregateFunction::Max => Some(ColumnarAggregateSpec {
+                op: ColumnarAggregateOp::Max,
+                column_index: Some(Self::column_expr_index(arg, schema)?),
+            }),
+            _ => None,
+        }
+    }
+
+    fn is_simple_columnar_pushdown_predicate(expr: &crate::sql::LogicalExpr) -> bool {
+        use crate::sql::{BinaryOperator, LogicalExpr};
+
+        match expr {
+            LogicalExpr::BinaryExpr { left, op, right } if *op == BinaryOperator::And => {
+                Self::is_simple_columnar_pushdown_predicate(left)
+                    && Self::is_simple_columnar_pushdown_predicate(right)
+            }
+            LogicalExpr::BinaryExpr { left, op, right }
+                if matches!(
+                    op,
+                    BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::Lt
+                        | BinaryOperator::LtEq
+                        | BinaryOperator::Gt
+                        | BinaryOperator::GtEq
+                        | BinaryOperator::Like
+                ) =>
+            {
+                matches!(left.as_ref(), LogicalExpr::Column { .. })
+                    && matches!(right.as_ref(), LogicalExpr::Literal(_))
+            }
+            LogicalExpr::IsNull { expr, .. } => matches!(expr.as_ref(), LogicalExpr::Column { .. }),
+            LogicalExpr::Between {
+                expr,
+                low,
+                high,
+                negated: false,
+            } => {
+                matches!(expr.as_ref(), LogicalExpr::Column { .. })
+                    && matches!(low.as_ref(), LogicalExpr::Literal(_))
+                    && matches!(high.as_ref(), LogicalExpr::Literal(_))
+            }
+            LogicalExpr::InList {
+                expr,
+                list,
+                negated: false,
+            } => {
+                matches!(expr.as_ref(), LogicalExpr::Column { .. })
+                    && list.iter().all(|item| matches!(item, LogicalExpr::Literal(_)))
+            }
+            _ => false,
+        }
+    }
+
     fn try_count_star_pk_range(&self, input: &LogicalPlan) -> Result<Option<Box<dyn PhysicalOperator>>> {
         let storage = match self.storage {
             Some(s) => s,
@@ -1707,6 +1932,9 @@ impl<'a> Executor<'a> {
                             }
                         } // end if is_count_star
                     }
+                }
+                if let Some(op) = self.try_columnar_aggregate(input, group_by, aggr_exprs, having)? {
+                    return Ok(op);
                 }
                 let input_op = self.plan_to_operator(input)?;
                 // Materialize any subqueries in the HAVING expression — the Filter

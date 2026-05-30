@@ -239,6 +239,50 @@ fn test_columnar_scan_reads_requested_side_data() {
 }
 
 #[test]
+fn test_columnar_native_aggregate_respects_live_rows() {
+    let db = test_db();
+
+    db.execute("CREATE TABLE metrics (id INT PRIMARY KEY, a INT STORAGE COLUMNAR, b INT STORAGE COLUMNAR, e INT STORAGE COLUMNAR)")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, a, b, e) VALUES (1, 10, 10, 1)")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, a, b, e) VALUES (2, 20, 20, 1)")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, a, b, e) VALUES (3, 30, 30, 2)")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, a, b, e) VALUES (4, 40, 40, 2)")
+        .unwrap();
+    db.execute("DELETE FROM metrics WHERE id = 4").unwrap();
+
+    let rows = db
+        .query("SELECT SUM(a), AVG(a), MAX(b) FROM metrics WHERE b >= 20", &[])
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], Value::Int8(50));
+    assert_eq!(rows[0].values[1], Value::Float8(25.0));
+    assert_eq!(rows[0].values[2], Value::Int4(30));
+
+    let empty = db
+        .query("SELECT COUNT(*), SUM(a), AVG(a), MAX(b) FROM metrics WHERE b > 100", &[])
+        .unwrap();
+    assert_eq!(empty.len(), 1);
+    assert_eq!(
+        empty[0].values,
+        vec![Value::Int8(0), Value::Null, Value::Null, Value::Null]
+    );
+
+    let grouped = db
+        .query(
+            "SELECT e, COUNT(*), SUM(a) FROM metrics WHERE b >= 10 GROUP BY e",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(grouped.len(), 2);
+    assert_eq!(grouped[0].values, vec![Value::Int4(1), Value::Int8(2), Value::Int8(30)]);
+    assert_eq!(grouped[1].values, vec![Value::Int4(2), Value::Int8(1), Value::Int8(30)]);
+}
+
+#[test]
 fn test_columnar_transaction_insert_stages_side_data() {
     let db = test_db();
 
