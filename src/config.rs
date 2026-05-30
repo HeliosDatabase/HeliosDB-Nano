@@ -244,18 +244,13 @@ pub struct StorageConfig {
     /// Default: Some(1000) (1 second)
     #[serde(default = "default_slow_query_threshold")]
     pub slow_query_threshold_ms: Option<u64>,
-    /// fsync the per-statement logical WAL entry for autocommit UPDATE/DELETE.
+    /// Write and fsync per-statement logical WAL entries for fast DML.
     ///
-    /// Default: false. The logical WAL entry is **always** written and **always**
-    /// broadcast to HA standbys (so crash-recovery replay and replication stay
-    /// correct either way — see `WriteAheadLog::broadcast_after_append`); this
-    /// flag only controls whether the entry is **fsync'd** per statement. With
-    /// `false` (default) the entry is written without a per-statement fsync —
-    /// local durability then relies on RocksDB's own WAL flush (process-crash
-    /// safe; a power-loss window can lose the last few autocommit mutations,
-    /// matching SQLite WAL + `synchronous=NORMAL`). Setting `true` restores the
-    /// legacy fsync-per-statement durability, which caps durable autocommit
-    /// UPDATE/DELETE throughput at the device fsync rate (~tens–hundreds/s).
+    /// Default: false. Standalone fast DML relies on RocksDB's own WAL for local
+    /// recovery and skips the extra logical-WAL RocksDB batch. HA primaries still
+    /// append and broadcast logical WAL entries even when this is false. Setting
+    /// this to true restores the legacy strict logical-WAL path for every fast
+    /// INSERT/UPDATE/DELETE, including a per-statement fsync.
     #[serde(default)]
     pub logical_wal_per_statement: bool,
 }
@@ -282,7 +277,7 @@ impl Default for StorageConfig {
             statement_timeout_ms: None, // Unlimited by default
             transaction_isolation: TransactionIsolation::ReadCommitted, // PostgreSQL default
             slow_query_threshold_ms: Some(1000), // 1 second default
-            logical_wal_per_statement: false,    // rely on RocksDB WAL at commit (see field docs)
+            logical_wal_per_statement: false, // rely on RocksDB WAL at commit (see field docs)
         }
     }
 }

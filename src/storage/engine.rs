@@ -1380,7 +1380,9 @@ impl StorageEngine {
         Ok(())
     }
 
-    fn fast_insert_requires_logical_wal(&self) -> bool {
+    /// Fast DML can skip the logical-WAL keyspace in standalone relaxed mode,
+    /// but strict logical WAL and HA primaries still need append+broadcast.
+    pub fn fast_dml_requires_logical_wal(&self) -> bool {
         if !self.is_wal_enabled() {
             return false;
         }
@@ -3584,12 +3586,20 @@ impl StorageEngine {
         self.wal.is_some()
     }
 
-    /// Whether autocommit UPDATE/DELETE should append a per-statement logical
-    /// WAL entry (legacy strict-durability behavior). Default false: rely on the
-    /// RocksDB WriteBatch at commit, uniform with the INSERT fast path. See
+    /// Whether fast DML should append a per-statement logical WAL entry
+    /// (legacy strict-durability behavior). Default false: rely on the
+    /// RocksDB write path in standalone mode. See
     /// `StorageConfig::logical_wal_per_statement`.
     pub fn logical_wal_per_statement(&self) -> bool {
         self.config.storage.logical_wal_per_statement
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wal_entries_for_tests(&self) -> Result<Vec<super::wal::WalEntry>> {
+        match &self.wal {
+            Some(wal) => wal.read().replay(),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// Whether MVCC version history / time-travel is enabled. When false,
@@ -4823,7 +4833,7 @@ impl StorageEngine {
         let key = Self::build_data_key(table_name, row_id);
         self.put(&key, &value)?;
 
-        if self.fast_insert_requires_logical_wal() {
+        if self.fast_dml_requires_logical_wal() {
             if self.config.storage.logical_wal_per_statement {
                 self.log_data_insert(table_name, &key, &logical_value)?;
             } else {
