@@ -673,8 +673,16 @@ impl ArtIndexManager {
 
     /// Encode a composite key from multiple values
     pub fn encode_key(values: &[Value]) -> Vec<u8> {
+        Self::encode_key_from_values(values.iter())
+    }
+
+    /// Encode a composite key from borrowed values.
+    ///
+    /// Hot insert validation paths often already hold references into a tuple;
+    /// this avoids cloning strings/arrays solely to call `encode_key`.
+    pub fn encode_key_from_values<'a>(values: impl IntoIterator<Item = &'a Value>) -> Vec<u8> {
         let mut key = Vec::new();
-        for (i, value) in values.iter().enumerate() {
+        for (i, value) in values.into_iter().enumerate() {
             if i > 0 {
                 key.push(0); // Separator
             }
@@ -695,7 +703,7 @@ impl ArtIndexManager {
                 Value::Timestamp(ts) => key.extend_from_slice(ts.to_rfc3339().as_bytes()),
                 Value::Array(arr) => {
                     // Recursively encode array elements
-                    let nested = Self::encode_key(arr);
+                    let nested = Self::encode_key_from_values(arr.iter());
                     key.extend_from_slice(&nested);
                 }
                 Value::Json(j) => key.extend_from_slice(j.as_bytes()),
