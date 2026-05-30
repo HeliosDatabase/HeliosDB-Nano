@@ -220,6 +220,11 @@ fn run_columnar_scan_bench() {
         &|r| format!("SELECT a FROM col_wide WHERE d > 50000 AND b >= {r}"),
     );
     bench_pair(
+        "filter_eq_e",
+        &|r| format!("SELECT a FROM row_wide WHERE e = {}", (r + 3) % 8),
+        &|r| format!("SELECT a FROM col_wide WHERE e = {}", (r + 3) % 8),
+    );
+    bench_pair(
         "agg_sum_avg",
         &|r| format!("SELECT SUM(a), AVG(d), MAX(b) FROM row_wide WHERE b >= {r}"),
         &|r| format!("SELECT SUM(a), AVG(d), MAX(b) FROM col_wide WHERE b >= {r}"),

@@ -7,6 +7,7 @@
 use super::{Executor, PhysicalOperator, TimeoutContext};
 use crate::sql::logical_plan::LogicalExpr;
 use crate::sql::LogicalPlan;
+use crate::storage::predicate_pushdown::AnalyzedPredicate;
 use crate::{Error, Result, Schema, Tuple};
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -118,12 +119,37 @@ fn columnar_scan_columns(
     indices_are_columnar(schema, &indices).then_some(indices)
 }
 
+fn columnar_scan_columns_with_predicates(
+    schema: &Schema,
+    projection: Option<&Vec<usize>>,
+    hint: Option<&ScanDecodeHint>,
+    predicates: &[AnalyzedPredicate],
+) -> Option<Vec<usize>> {
+    let mut indices = columnar_scan_columns(schema, projection, hint)?;
+    indices.extend(predicates.iter().map(|predicate| predicate.column_index));
+    indices.sort_unstable();
+    indices.dedup();
+    indices_are_columnar(schema, &indices).then_some(indices)
+}
+
 fn indices_are_columnar(schema: &Schema, indices: &[usize]) -> bool {
     indices.iter().all(|&idx| {
         schema.columns.get(idx).map_or(false, |column| {
             column.storage_mode == crate::ColumnStorageMode::Columnar
         })
     })
+}
+
+fn should_apply_columnar_predicates(predicates: &[AnalyzedPredicate]) -> bool {
+    predicates.len() > 1
+        || predicates.iter().any(|predicate| {
+            matches!(
+                predicate.op,
+                crate::storage::predicate_pushdown::PredicateOp::Eq
+                    | crate::storage::predicate_pushdown::PredicateOp::In
+                    | crate::storage::predicate_pushdown::PredicateOp::IsNull
+            )
+        })
 }
 
 fn collect_single_table_column_indices(plan: &LogicalPlan) -> Option<(String, Vec<usize>, usize)> {
@@ -1369,12 +1395,26 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
             } else {
                 // Normal filtered scan (current data) with branch isolation
                 let decode_hint = executor.scan_decode_hint_for(table_name);
+                let mut columnar_predicates_applied = false;
                 let base_tuples = if actual_table_name == *table_name {
-                    if let Some(columns) = columnar_scan_columns(&schema, projection.as_ref(), decode_hint) {
-                        storage.scan_table_branch_aware_with_schema_columnar_columns(
+                    if let Some(columns) = columnar_scan_columns_with_predicates(
+                        &schema,
+                        projection.as_ref(),
+                        decode_hint,
+                        &analyzed_predicates,
+                    ) {
+                        let apply_columnar_predicates = should_apply_columnar_predicates(&analyzed_predicates);
+                        columnar_predicates_applied = apply_columnar_predicates && !storage.is_branch_active();
+                        let pushed_predicates = if apply_columnar_predicates {
+                            analyzed_predicates.as_slice()
+                        } else {
+                            &[]
+                        };
+                        storage.scan_table_branch_aware_with_schema_columnar_columns_filtered(
                             &actual_table_name,
                             &schema,
                             &columns,
+                            pushed_predicates,
                         )?
                     } else {
                         match decode_hint {
@@ -1390,13 +1430,17 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                 };
 
                 // Apply storage-level filtering through predicate pushdown manager
-                storage.predicate_pushdown().scan_with_pushdown(
-                    &actual_table_name,
-                    base_tuples,
-                    &analyzed_predicates,
-                    &schema,
-                    None, // No limit at storage level
-                )
+                if columnar_predicates_applied {
+                    base_tuples
+                } else {
+                    storage.predicate_pushdown().scan_with_pushdown(
+                        &actual_table_name,
+                        base_tuples,
+                        &analyzed_predicates,
+                        &schema,
+                        None, // No limit at storage level
+                    )
+                }
             };
 
             tracing::debug!("FilteredScan returned {} tuples after predicate pushdown", tuples.len());
