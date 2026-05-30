@@ -328,6 +328,25 @@ fn test_update_with_parameters() {
 }
 
 #[test]
+fn test_update_arithmetic_with_pk_parameter() {
+    let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
+
+    db.execute("CREATE TABLE balances (id INT PRIMARY KEY, amount INT)")
+        .unwrap();
+    db.execute("INSERT INTO balances VALUES (1, 10)").unwrap();
+
+    let count = db
+        .execute_params("UPDATE balances SET amount = amount + 5 WHERE id = $1", &[Value::Int4(1)])
+        .expect("Failed to update with arithmetic expression");
+    assert_eq!(count, 1);
+
+    let rows = db
+        .query_params("SELECT amount FROM balances WHERE id = $1", &[Value::Int4(1)])
+        .unwrap();
+    assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(15));
+}
+
+#[test]
 fn test_delete_with_parameters() {
     let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
 

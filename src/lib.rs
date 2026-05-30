@@ -5442,12 +5442,32 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let evaluator = sql::Evaluator::with_parameters(std::sync::Arc::clone(&spec.schema), params.to_vec());
+        let mut evaluator: Option<sql::Evaluator> = None;
         let mut new_values = existing_row.values.clone();
         for assignment in &spec.assignments {
-            let mut value = match evaluator.evaluate(&assignment.expr, &existing_row) {
-                Ok(value) => value,
-                Err(e) => return Some(Err(e)),
+            let mut value = if let Some(value) = Self::fast_eval_param_expr(&assignment.expr, params) {
+                match value {
+                    Ok(value) => value,
+                    Err(e) => return Some(Err(e)),
+                }
+            } else if let Some(value) = Self::fast_eval_self_arithmetic_expr(
+                &assignment.expr,
+                &assignment.col_name,
+                assignment.col_idx,
+                &existing_row,
+            ) {
+                match value {
+                    Ok(value) => value,
+                    Err(e) => return Some(Err(e)),
+                }
+            } else {
+                let evaluator = evaluator.get_or_insert_with(|| {
+                    sql::Evaluator::with_parameters(std::sync::Arc::clone(&spec.schema), params.to_vec())
+                });
+                match evaluator.evaluate(&assignment.expr, &existing_row) {
+                    Ok(value) => value,
+                    Err(e) => return Some(Err(e)),
+                }
             };
             if Self::insert_value_needs_cast(&value, &assignment.data_type) {
                 value = match Self::fast_cast_value(value, &assignment.data_type) {
@@ -5783,6 +5803,149 @@ impl EmbeddedDatabase {
             };
         }
         Some(Ok(value))
+    }
+
+    fn fast_eval_self_arithmetic_expr(
+        expr: &sql::LogicalExpr,
+        col_name: &str,
+        col_idx: usize,
+        row: &Tuple,
+    ) -> Option<Result<Value>> {
+        let sql::LogicalExpr::BinaryExpr { left, op, right } = expr else {
+            return None;
+        };
+        if !matches!(
+            op,
+            sql::BinaryOperator::Plus
+                | sql::BinaryOperator::Minus
+                | sql::BinaryOperator::Multiply
+                | sql::BinaryOperator::Divide
+                | sql::BinaryOperator::Modulo
+        ) {
+            return None;
+        }
+
+        let sql::LogicalExpr::Column { table: None, name } = left.as_ref() else {
+            return None;
+        };
+        if !name.eq_ignore_ascii_case(col_name) {
+            return None;
+        }
+        let current = row.values.get(col_idx)?;
+        let sql::LogicalExpr::Literal(rhs) = right.as_ref() else {
+            return None;
+        };
+
+        Some(Self::fast_apply_numeric_op(current, op, rhs))
+    }
+
+    fn fast_apply_numeric_op(left: &Value, op: &sql::BinaryOperator, right: &Value) -> Result<Value> {
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(Value::Null);
+        }
+
+        if let (Some(l), Some(r)) = (Self::fast_int_as_i128(left), Self::fast_int_as_i128(right)) {
+            return Self::fast_apply_i128(l, op, r, |v| Self::fast_int_like(left, v));
+        }
+
+        if matches!(left, Value::Float4(_) | Value::Float8(_)) {
+            if let Some(r) = Self::fast_numeric_as_f64(right) {
+                let l = Self::fast_numeric_as_f64(left).expect("Float value must convert to f64");
+                let value = Self::fast_apply_f64(l, op, r)?;
+                return if matches!(left, Value::Float4(_)) {
+                    Ok(Value::Float4(value as f32))
+                } else {
+                    Ok(Value::Float8(value))
+                };
+            }
+        }
+
+        let evaluator = sql::Evaluator::new(std::sync::Arc::new(Schema { columns: vec![] }));
+        let expr = sql::LogicalExpr::BinaryExpr {
+            left: Box::new(sql::LogicalExpr::Literal(left.clone())),
+            op: *op,
+            right: Box::new(sql::LogicalExpr::Literal(right.clone())),
+        };
+        evaluator.evaluate(&expr, &Tuple::new(vec![]))
+    }
+
+    fn fast_int_as_i128(value: &Value) -> Option<i128> {
+        match value {
+            Value::Int2(v) => Some(i128::from(*v)),
+            Value::Int4(v) => Some(i128::from(*v)),
+            Value::Int8(v) => Some(i128::from(*v)),
+            _ => None,
+        }
+    }
+
+    fn fast_int_like(template: &Value, value: i128) -> Option<Value> {
+        match template {
+            Value::Int2(_) => i16::try_from(value).ok().map(Value::Int2),
+            Value::Int4(_) => i32::try_from(value).ok().map(Value::Int4),
+            Value::Int8(_) => i64::try_from(value).ok().map(Value::Int8),
+            _ => None,
+        }
+    }
+
+    fn fast_numeric_as_f64(value: &Value) -> Option<f64> {
+        match value {
+            Value::Int2(v) => Some(f64::from(*v)),
+            Value::Int4(v) => Some(f64::from(*v)),
+            Value::Int8(v) => Some(*v as f64),
+            Value::Float4(v) => Some(f64::from(*v)),
+            Value::Float8(v) => Some(*v),
+            _ => None,
+        }
+    }
+
+    fn fast_apply_i128<F>(left: i128, op: &sql::BinaryOperator, right: i128, convert: F) -> Result<Value>
+    where
+        F: FnOnce(i128) -> Option<Value>,
+    {
+        let value = match op {
+            sql::BinaryOperator::Plus => left.checked_add(right),
+            sql::BinaryOperator::Minus => left.checked_sub(right),
+            sql::BinaryOperator::Multiply => left.checked_mul(right),
+            sql::BinaryOperator::Divide => {
+                if right == 0 {
+                    return Err(Error::query_execution("Division by zero"));
+                }
+                left.checked_div(right)
+            }
+            sql::BinaryOperator::Modulo => {
+                if right == 0 {
+                    return Err(Error::query_execution("Division by zero"));
+                }
+                left.checked_rem(right)
+            }
+            _ => None,
+        }
+        .and_then(convert)
+        .ok_or_else(|| Error::query_execution("Arithmetic overflow"))?;
+        Ok(value)
+    }
+
+    fn fast_apply_f64(left: f64, op: &sql::BinaryOperator, right: f64) -> Result<f64> {
+        match op {
+            sql::BinaryOperator::Plus => Ok(left + right),
+            sql::BinaryOperator::Minus => Ok(left - right),
+            sql::BinaryOperator::Multiply => Ok(left * right),
+            sql::BinaryOperator::Divide => {
+                if right == 0.0 {
+                    Err(Error::query_execution("Division by zero"))
+                } else {
+                    Ok(left / right)
+                }
+            }
+            sql::BinaryOperator::Modulo => {
+                if right == 0.0 {
+                    Err(Error::query_execution("Division by zero"))
+                } else {
+                    Ok(left % right)
+                }
+            }
+            _ => Err(Error::query_execution("Unsupported arithmetic operator")),
+        }
     }
 
     fn fast_update_expr_supported(expr: &sql::LogicalExpr) -> bool {
