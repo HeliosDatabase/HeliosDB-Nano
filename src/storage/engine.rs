@@ -120,6 +120,25 @@ impl ColumnarBatchIndex {
             Self::Sparse(batches) => batches.get(&batch_id),
         }
     }
+
+    fn ordered_batches(&self) -> Vec<(u64, &ColumnBatch)> {
+        match self {
+            Self::Dense(batches) => batches
+                .iter()
+                .enumerate()
+                .filter_map(|(batch_id, batch)| batch.as_ref().map(|batch| (batch_id as u64, batch)))
+                .collect(),
+            Self::Sparse(batches) => {
+                let mut ordered: Vec<_> = batches.iter().map(|(batch_id, batch)| (*batch_id, batch)).collect();
+                ordered.sort_by_key(|(batch_id, _)| *batch_id);
+                ordered
+            }
+        }
+    }
+}
+
+fn null_rejecting_filter_predicate(predicates: &[FilterPredicate]) -> Option<&FilterPredicate> {
+    predicates.iter().find(|predicate| !predicate.evaluate(&Value::Null))
 }
 
 fn columnar_row_matches_filters(
@@ -2027,25 +2046,6 @@ impl StorageEngine {
             }
         }
 
-        let prefix = format!("data:{}:", table_name);
-        let prefix_bytes = prefix.as_bytes();
-        let mut row_ids = Vec::new();
-
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self
-            .db
-            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
-        for item in iter {
-            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if !key.starts_with(prefix_bytes) {
-                break;
-            }
-            if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
-                row_ids.push(row_id);
-            }
-        }
-
         let mut column_batches: HashMap<usize, ColumnarBatchIndex> = HashMap::with_capacity(requested.len());
         for &idx in &requested {
             let column = &schema.columns[idx];
@@ -2059,8 +2059,23 @@ impl StorageEngine {
             .filter_map(columnar_filter_predicate)
             .collect();
 
-        let mut tuples = Vec::with_capacity(row_ids.len());
-        for row_id in row_ids {
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut tuples = Vec::new();
+
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+            let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                continue;
+            };
             let batch_id = row_id / BATCH_SIZE as u64;
             let offset = (row_id % BATCH_SIZE as u64) as usize;
             if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
@@ -2134,6 +2149,113 @@ impl StorageEngine {
         }
 
         let filter_predicates: Vec<FilterPredicate> = predicates.iter().filter_map(columnar_filter_predicate).collect();
+
+        if let Some(driver_predicate) = null_rejecting_filter_predicate(&filter_predicates) {
+            if let Some(driver_batches) = column_batches.get(&driver_predicate.column_index) {
+                if group_by_columns.is_empty() {
+                    let mut states: Vec<ColumnarAggregateState> = aggregates
+                        .iter()
+                        .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                        .collect();
+
+                    for (batch_id, batch) in driver_batches.ordered_batches() {
+                        for (offset, value) in batch.values.iter().enumerate() {
+                            if !driver_predicate.evaluate(value)
+                                || !columnar_row_matches_filters(
+                                    &column_batches,
+                                    batch_id,
+                                    offset,
+                                    &filter_predicates,
+                                )
+                            {
+                                continue;
+                            }
+
+                            for (state, aggregate) in states.iter_mut().zip(aggregates) {
+                                let value = aggregate
+                                    .column_index
+                                    .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
+                                state.update(aggregate.op, value)?;
+                            }
+                        }
+                    }
+
+                    let tuple_values: Result<Vec<Value>> =
+                        states.into_iter().map(ColumnarAggregateState::finalize).collect();
+                    let tuples = vec![Tuple::new(tuple_values?)];
+                    tracing::debug!(
+                        phase = "storage_columnar_aggregate",
+                        table = table_name,
+                        rows = tuples.len(),
+                        columns = requested.len(),
+                        predicates = filter_predicates.len(),
+                        driver_column = driver_predicate.column_name.as_str(),
+                        duration_us = scan_start.elapsed().as_micros() as u64,
+                        "Columnar driver aggregate complete"
+                    );
+
+                    return Ok(tuples);
+                }
+
+                let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
+
+                for (batch_id, batch) in driver_batches.ordered_batches() {
+                    for (offset, value) in batch.values.iter().enumerate() {
+                        if !driver_predicate.evaluate(value)
+                            || !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates)
+                        {
+                            continue;
+                        }
+
+                        let group_key: Vec<Value> = group_by_columns
+                            .iter()
+                            .map(|&idx| {
+                                columnar_batch_value(&column_batches, idx, batch_id, offset)
+                                    .cloned()
+                                    .unwrap_or(Value::Null)
+                            })
+                            .collect();
+                        let states = groups.entry(group_key).or_insert_with(|| {
+                            aggregates
+                                .iter()
+                                .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                                .collect()
+                        });
+
+                        for (state, aggregate) in states.iter_mut().zip(aggregates) {
+                            let value = aggregate
+                                .column_index
+                                .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
+                            state.update(aggregate.op, value)?;
+                        }
+                    }
+                }
+
+                let mut grouped: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = groups.into_iter().collect();
+                grouped.sort_by(|(left, _), (right, _)| compare_value_slices(left, right));
+
+                let mut tuples = Vec::with_capacity(grouped.len());
+                for (mut group_key, states) in grouped {
+                    let mut aggregate_values: Result<Vec<Value>> =
+                        states.into_iter().map(ColumnarAggregateState::finalize).collect();
+                    group_key.append(&mut aggregate_values?);
+                    tuples.push(Tuple::new(group_key));
+                }
+
+                tracing::debug!(
+                    phase = "storage_columnar_aggregate",
+                    table = table_name,
+                    rows = tuples.len(),
+                    columns = requested.len(),
+                    predicates = filter_predicates.len(),
+                    driver_column = driver_predicate.column_name.as_str(),
+                    duration_us = scan_start.elapsed().as_micros() as u64,
+                    "Columnar driver grouped aggregate complete"
+                );
+
+                return Ok(tuples);
+            }
+        }
 
         if group_by_columns.is_empty() {
             let mut states: Vec<ColumnarAggregateState> = aggregates
