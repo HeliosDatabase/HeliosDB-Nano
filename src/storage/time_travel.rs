@@ -28,7 +28,7 @@ use crate::{Error, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
-use rocksdb::DB;
+use rocksdb::{DB, WriteBatch};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -615,6 +615,75 @@ impl SnapshotManager {
         Ok(())
     }
 
+    /// Write a row version and its snapshot metadata in a single RocksDB batch.
+    ///
+    /// Fast autocommit DML needs the same durable state as `write_version` plus
+    /// `register_snapshot(_with_lsn)`, but issuing five separate RocksDB writes
+    /// per row dominates single-row insert throughput. This method keeps the
+    /// same keys and in-memory indexes while committing them together.
+    pub fn write_version_and_register_snapshot(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        timestamp: u64,
+        value: &[u8],
+        lsn: Option<u64>,
+    ) -> Result<SnapshotMetadata> {
+        let txn_id = match lsn {
+            Some(lsn) => {
+                let mut txn_id = self.current_txn_id.write();
+                if lsn >= *txn_id {
+                    *txn_id = lsn + 1;
+                }
+                lsn
+            }
+            None => self.next_transaction_id(),
+        };
+        let scn = self.next_scn();
+        let metadata = SnapshotMetadata::new(timestamp, txn_id, scn);
+
+        let mut batch = WriteBatch::default();
+
+        let version_key = format!("v:{}:{}:{}", table_name, row_id, timestamp);
+        batch.put(version_key.as_bytes(), value);
+
+        let reverse_ts = u64::MAX - timestamp;
+        let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, reverse_ts);
+        batch.put(index_key.as_bytes(), timestamp.to_be_bytes());
+
+        let snapshot_key = format!("snapshot:{}", metadata.timestamp);
+        let snapshot_value = bincode::serialize(&metadata)
+            .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
+        batch.put(snapshot_key.as_bytes(), snapshot_value);
+
+        let txn_key = format!("txn_map:{}", metadata.transaction_id);
+        let txn_value = bincode::serialize(&metadata.timestamp)
+            .map_err(|e| Error::storage(format!("Failed to serialize txn mapping: {}", e)))?;
+        batch.put(txn_key.as_bytes(), txn_value);
+
+        let scn_key = format!("scn_map:{}", metadata.scn);
+        let scn_value = bincode::serialize(&metadata.timestamp)
+            .map_err(|e| Error::storage(format!("Failed to serialize scn mapping: {}", e)))?;
+        batch.put(scn_key.as_bytes(), scn_value);
+
+        self.db
+            .write(batch)
+            .map_err(|e| Error::storage(format!("Failed to write version snapshot batch: {}", e)))?;
+
+        self.snapshots.write().insert(timestamp, metadata.clone());
+        self.txn_to_timestamp.write().insert(txn_id, timestamp);
+        self.scn_to_timestamp.write().insert(scn, timestamp);
+        self.invalidate_cache_for_row(table_name, row_id);
+
+        if self.gc_config.auto_gc_enabled {
+            if let Err(e) = self.gc_if_needed() {
+                eprintln!("Warning: Snapshot GC failed: {}", e);
+            }
+        }
+
+        Ok(metadata)
+    }
+
     /// Invalidate all cache entries for a specific row
     ///
     /// This is called when a new version is written to ensure cache consistency.
@@ -734,6 +803,7 @@ impl SnapshotManager {
 
         // Remove snapshots
         let count = to_remove.len();
+        let mut delete_batch = WriteBatch::default();
         for ts in &to_remove {
             if let Some(metadata) = snapshots.remove(ts) {
                 // Remove from mappings
@@ -745,14 +815,20 @@ impl SnapshotManager {
                 let txn_key = format!("txn_map:{}", metadata.transaction_id);
                 let scn_key = format!("scn_map:{}", metadata.scn);
 
-                let _ = self.db.delete(snap_key.as_bytes());
-                let _ = self.db.delete(txn_key.as_bytes());
-                let _ = self.db.delete(scn_key.as_bytes());
+                delete_batch.delete(snap_key.as_bytes());
+                delete_batch.delete(txn_key.as_bytes());
+                delete_batch.delete(scn_key.as_bytes());
 
                 // Note: We don't delete the versioned data (v:*) here
                 // That would require a separate GC pass to avoid breaking
                 // any in-flight queries
             }
+        }
+
+        if count > 0 {
+            self.db
+                .write(delete_batch)
+                .map_err(|e| Error::storage(format!("Failed to delete old snapshots: {}", e)))?;
         }
 
         Ok(count)
@@ -761,7 +837,9 @@ impl SnapshotManager {
     /// Run GC if needed
     fn gc_if_needed(&self) -> Result<()> {
         let snapshot_count = self.snapshots.read().len();
-        if snapshot_count > self.gc_config.max_snapshots {
+        let slack = self.gc_config.max_snapshots.clamp(1, 1000);
+        let trigger = self.gc_config.max_snapshots.saturating_add(slack);
+        if snapshot_count > trigger {
             self.gc_old_snapshots()?;
         }
         Ok(())
