@@ -15,6 +15,7 @@ use super::filter_index_delta::{FilterIndexConfig, FilterIndexDeltaTracker};
 use super::mv_scheduler::CpuMonitor;
 use super::parallel_filter::{ParallelFilterConfig, ParallelFilterEngine};
 use super::predicate_pushdown::{AnalyzedPredicate, PredicatePushdownManager, PushdownConfig};
+use super::simd_filter::FilterPredicate;
 use super::speculative_filter::{SpeculativeConfig, SpeculativeFilterManager};
 use super::wal::{WalOperation, WalSyncMode, WriteAheadLog};
 use super::zone_map::TableZoneMap;
@@ -52,6 +53,43 @@ fn schema_uses_column_storage(schema: &crate::Schema) -> bool {
         .columns
         .iter()
         .any(|column| column.storage_mode != ColumnStorageMode::Default)
+}
+
+fn columnar_filter_predicate(predicate: &AnalyzedPredicate) -> Option<FilterPredicate> {
+    let op = predicate.op.to_filter_op()?;
+    Some(FilterPredicate {
+        column_index: predicate.column_index,
+        column_name: predicate.column_name.clone(),
+        op,
+        value: predicate.value.clone(),
+        value2: predicate.value2.clone(),
+        value_list: predicate.value_list.clone(),
+        pattern: match &predicate.value {
+            Value::String(pattern) if predicate.op == super::predicate_pushdown::PredicateOp::Like => {
+                Some(pattern.clone())
+            }
+            _ => None,
+        },
+    })
+}
+
+fn columnar_row_matches_filters(
+    column_batches: &HashMap<usize, HashMap<u64, super::columnar::ColumnBatch>>,
+    batch_id: u64,
+    offset: usize,
+    predicates: &[FilterPredicate],
+) -> bool {
+    predicates.iter().all(|predicate| {
+        if let Some(value) = column_batches
+            .get(&predicate.column_index)
+            .and_then(|by_batch| by_batch.get(&batch_id))
+            .and_then(|batch| batch.values.get(offset))
+        {
+            predicate.evaluate(value)
+        } else {
+            predicate.evaluate(&Value::Null)
+        }
+    })
 }
 
 /// Storage engine
@@ -1688,6 +1726,29 @@ impl StorageEngine {
         schema: &crate::Schema,
         columns: &[usize],
     ) -> Result<Vec<Tuple>> {
+        self.scan_table_with_schema_columnar_columns_opt(table_name, schema, columns, &[])
+    }
+
+    /// Like `scan_table_with_schema_columnar_columns`, but evaluates simple
+    /// analyzed predicates directly against column batches before materializing
+    /// row-shaped tuples.
+    pub fn scan_table_with_schema_columnar_columns_filtered(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        columns: &[usize],
+        predicates: &[AnalyzedPredicate],
+    ) -> Result<Vec<Tuple>> {
+        self.scan_table_with_schema_columnar_columns_opt(table_name, schema, columns, predicates)
+    }
+
+    fn scan_table_with_schema_columnar_columns_opt(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        columns: &[usize],
+        predicates: &[AnalyzedPredicate],
+    ) -> Result<Vec<Tuple>> {
         let scan_start = std::time::Instant::now();
         let mut requested: Vec<usize> = columns.to_vec();
         requested.sort_unstable();
@@ -1736,11 +1797,21 @@ impl StorageEngine {
             column_batches.insert(idx, batches);
         }
 
+        let filter_predicates: Vec<FilterPredicate> = predicates
+            .iter()
+            .filter(|predicate| requested.binary_search(&predicate.column_index).is_ok())
+            .filter_map(columnar_filter_predicate)
+            .collect();
+
         let mut tuples = Vec::with_capacity(row_ids.len());
         for row_id in row_ids {
-            let mut values = vec![Value::Null; schema.columns.len()];
             let batch_id = row_id / BATCH_SIZE as u64;
             let offset = (row_id % BATCH_SIZE as u64) as usize;
+            if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
+                continue;
+            }
+
+            let mut values = vec![Value::Null; schema.columns.len()];
             for &idx in &requested {
                 if let Some(value) = column_batches
                     .get(&idx)
@@ -1760,6 +1831,7 @@ impl StorageEngine {
             table = table_name,
             rows = tuples.len(),
             columns = requested.len(),
+            predicates = filter_predicates.len(),
             duration_us = scan_start.elapsed().as_micros() as u64,
             "Columnar table scan complete"
         );
@@ -5930,6 +6002,22 @@ impl StorageEngine {
         let branch_name = self.current_branch.lock().clone();
         if branch_name.is_none() || branch_name.as_deref() == Some("main") {
             return self.scan_table_with_schema_columnar_columns(table_name, schema, columns);
+        }
+        self.scan_table_branch_aware_with_schema(table_name, schema)
+    }
+
+    /// Branch-aware filtered columnar scan. Non-main branches fall back to the
+    /// full branch-aware merge path because branch overlays are row-oriented.
+    pub fn scan_table_branch_aware_with_schema_columnar_columns_filtered(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        columns: &[usize],
+        predicates: &[AnalyzedPredicate],
+    ) -> Result<Vec<Tuple>> {
+        let branch_name = self.current_branch.lock().clone();
+        if branch_name.is_none() || branch_name.as_deref() == Some("main") {
+            return self.scan_table_with_schema_columnar_columns_filtered(table_name, schema, columns, predicates);
         }
         self.scan_table_branch_aware_with_schema(table_name, schema)
     }
