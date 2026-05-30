@@ -3860,7 +3860,11 @@ impl EmbeddedDatabase {
 
         let mut total_rows = 0u64;
         for sql in statements {
-            match self.execute_in_transaction(sql, &txn) {
+            // Batch atomicity depends on every DML write going through this
+            // transaction write set. The no-fast-path variant still allows the
+            // transaction-aware INSERT fast path, but prevents direct UPDATE /
+            // DELETE storage writes from escaping rollback on a later failure.
+            match self.execute_in_transaction_no_fast_path(sql, &txn) {
                 Ok(count) => total_rows += count,
                 Err(e) => {
                     let _ = txn.rollback();
@@ -6262,6 +6266,12 @@ impl EmbeddedDatabase {
             Err(e) => return Some(Err(e)),
         };
         let result = (|| {
+            self.storage.stage_columnar_delete_in_transaction(
+                &target.table_name,
+                target.row_id,
+                &target.schema,
+                txn,
+            )?;
             txn.delete(target.key.clone())?;
 
             if self.storage.fast_dml_requires_logical_wal() {

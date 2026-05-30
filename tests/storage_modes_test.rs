@@ -427,6 +427,32 @@ fn test_columnar_fast_delete_clears_side_data() {
 }
 
 #[test]
+fn test_columnar_execute_batch_delete_clears_side_data() {
+    let db = test_db();
+
+    db.execute("CREATE TABLE metrics (id INT PRIMARY KEY, value FLOAT8)")
+        .unwrap();
+    db.execute("ALTER TABLE metrics ALTER COLUMN value SET STORAGE COLUMNAR")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, value) VALUES (1, 10.5)").unwrap();
+
+    db.execute_batch(&["DELETE FROM metrics WHERE id = 1"]).unwrap();
+
+    let rocks = db.storage.db();
+    assert_eq!(
+        ColumnarStore::get(rocks.as_ref(), "metrics", "value", 1).unwrap(),
+        Some(Value::Null)
+    );
+    assert_eq!(
+        db.storage
+            .columnar_column_stats("metrics", "value")
+            .unwrap()
+            .non_null_values,
+        0
+    );
+}
+
+#[test]
 fn test_migrate_back_to_default() {
     let db = test_db();
 
