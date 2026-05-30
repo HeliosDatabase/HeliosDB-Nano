@@ -10499,6 +10499,7 @@ impl EmbeddedDatabase {
                 Box::new(optimizer::rules::SelectionPushdownRule::new()),
                 Box::new(optimizer::rules::JoinPredicatePushdownRule::new()),
                 Box::new(optimizer::rules::ProjectionPruningRule::new()),
+                Box::new(optimizer::rules::StorageFilterPushdownRule::new()),
             ];
             let opt = optimizer::Optimizer::with_rules(stats, rules, optimizer::OptimizerConfig::default());
             let optimized = opt.optimize_recursive(plan)?;
@@ -10568,6 +10569,7 @@ impl EmbeddedDatabase {
                 Box::new(optimizer::rules::SelectionPushdownRule::new()),
                 Box::new(optimizer::rules::JoinPredicatePushdownRule::new()),
                 Box::new(optimizer::rules::ProjectionPruningRule::new()),
+                Box::new(optimizer::rules::StorageFilterPushdownRule::new()),
             ];
             let opt = optimizer::Optimizer::with_rules(stats, rules, optimizer::OptimizerConfig::default());
             opt.optimize_recursive(plan)?
@@ -11279,6 +11281,7 @@ impl EmbeddedDatabase {
                 Box::new(optimizer::rules::SelectionPushdownRule::new()),
                 Box::new(optimizer::rules::JoinPredicatePushdownRule::new()),
                 Box::new(optimizer::rules::ProjectionPruningRule::new()),
+                Box::new(optimizer::rules::StorageFilterPushdownRule::new()),
             ];
             let opt = optimizer::Optimizer::with_rules(stats, rules, optimizer::OptimizerConfig::default());
             opt.optimize_recursive(plan)?
