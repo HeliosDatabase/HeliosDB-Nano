@@ -395,6 +395,9 @@ pub struct EmbeddedDatabase {
     parse_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, sqlparser::ast::Statement>>>,
     /// Query result cache: SQL string → cached results (invalidated on DML per-table)
     result_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<Vec<Tuple>>>>>,
+    /// Fast DML invalidation gate; avoids taking the result-cache mutex when
+    /// no query has populated it since the last invalidation.
+    result_cache_nonempty: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Repeated parameterized INSERT metadata cache. Invalidated with the plan cache on DDL.
     fast_param_insert_cache:
         std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamInsertSpec>>>>,
@@ -3593,6 +3596,7 @@ impl EmbeddedDatabase {
             result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
             ))),
+            result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
@@ -3659,6 +3663,7 @@ impl EmbeddedDatabase {
             result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
             ))),
+            result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
@@ -3748,6 +3753,7 @@ impl EmbeddedDatabase {
             result_cache: std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
             ))),
+            result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
@@ -5319,6 +5325,12 @@ impl EmbeddedDatabase {
 
     /// Invalidate all cached query results (called on any DML operation)
     fn invalidate_result_cache(&self) {
+        if !self
+            .result_cache_nonempty
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            return;
+        }
         if let Ok(mut cache) = self.result_cache.lock() {
             cache.clear();
         }
@@ -9271,6 +9283,8 @@ impl EmbeddedDatabase {
             self.log_slow_query(sql, start.elapsed(), results.len() as u64);
             if let Ok(mut cache) = self.result_cache.lock() {
                 cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
+                self.result_cache_nonempty
+                    .store(true, std::sync::atomic::Ordering::Release);
             }
             return Ok(results);
         }
@@ -9302,6 +9316,8 @@ impl EmbeddedDatabase {
                 // Cache the results for future identical queries
                 if let Ok(mut cache) = self.result_cache.lock() {
                     cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
+                    self.result_cache_nonempty
+                        .store(true, std::sync::atomic::Ordering::Release);
                 }
                 return Ok(results);
             }
@@ -9388,6 +9404,8 @@ impl EmbeddedDatabase {
         // Cache the results for future identical queries
         if let Ok(mut cache) = self.result_cache.lock() {
             cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
+            self.result_cache_nonempty
+                .store(true, std::sync::atomic::Ordering::Release);
         }
 
         Ok(results)
@@ -11101,6 +11119,7 @@ impl EmbeddedDatabase {
             plan_cache: self.plan_cache.clone(),
             parse_cache: self.parse_cache.clone(),
             result_cache: self.result_cache.clone(),
+            result_cache_nonempty: self.result_cache_nonempty.clone(),
             fast_param_insert_cache: self.fast_param_insert_cache.clone(),
             query_profiler: self.query_profiler.clone(),
             art_undo_log: self.art_undo_log.clone(),
