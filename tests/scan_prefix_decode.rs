@@ -120,3 +120,29 @@ fn count_star_uses_live_pk_index_size_after_mutations() {
     let rows = db.query("SELECT COUNT(*) FROM n", &[]).unwrap();
     assert_eq!(int(&rows[0].values[0]), 0);
 }
+
+#[test]
+fn count_distinct_pk_uses_index_cardinality() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE n (id INTEGER PRIMARY KEY, bucket INT, v TEXT)")
+        .unwrap();
+    for id in -10i32..=10 {
+        db.execute(&format!("INSERT INTO n VALUES ({id}, {}, 'v{id}')", id.rem_euclid(3)))
+            .unwrap();
+    }
+
+    let rows = db.query("SELECT COUNT(DISTINCT id) FROM n", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 21);
+
+    let rows = db
+        .query("SELECT COUNT(DISTINCT id) FROM n WHERE id >= -3 AND id < 5", &[])
+        .unwrap();
+    assert_eq!(int(&rows[0].values[0]), 8);
+
+    db.execute("DELETE FROM n WHERE id = 0").unwrap();
+    let rows = db.query("SELECT COUNT(DISTINCT id) FROM n", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 20);
+
+    let rows = db.query("SELECT COUNT(DISTINCT bucket) FROM n", &[]).unwrap();
+    assert_eq!(int(&rows[0].values[0]), 3);
+}
