@@ -1011,6 +1011,38 @@ impl ArtIndexManager {
         Ok(())
     }
 
+    /// Return true if a tuple update changes any column covered by an ART index.
+    ///
+    /// Most OLTP updates mutate payload columns while the PK/unique/manual index
+    /// columns stay unchanged. In that case callers can skip the expensive
+    /// delete+insert index maintenance path entirely.
+    pub fn tuple_update_affects_indexes(
+        &self,
+        table: &str,
+        schema: &Schema,
+        old_tuple: &Tuple,
+        new_tuple: &Tuple,
+    ) -> bool {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+
+        for index in indexes.values() {
+            if index.table() != table {
+                continue;
+            }
+
+            for column_name in index.columns() {
+                let Some(idx) = schema.get_column_index(column_name) else {
+                    return true;
+                };
+                if old_tuple.values.get(idx) != new_tuple.values.get(idx) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     /// Clear all index data for a table without removing the index structures.
     ///
     /// This is used by TRUNCATE TABLE to reset index contents while keeping
@@ -1245,6 +1277,48 @@ mod tests {
         null_values.insert("email".to_string(), Value::Null);
         let result = manager.check_unique_constraints("users", &null_values);
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_tuple_update_affects_indexes_only_for_index_columns() {
+        use crate::Column;
+
+        let manager = ArtIndexManager::new();
+        manager.create_pk_index("users", &["id".to_string()]).unwrap();
+        manager
+            .create_unique_index("users", &["email".to_string()], None)
+            .unwrap();
+
+        let schema = Schema::new(vec![
+            Column::new("id", DataType::Int4).primary_key(),
+            Column::new("email", DataType::Text).unique(),
+            Column::new("balance", DataType::Int4),
+        ]);
+
+        let old_tuple = Tuple::new(vec![
+            Value::Int4(1),
+            Value::String("a@example.com".to_string()),
+            Value::Int4(10),
+        ]);
+        let payload_update = Tuple::new(vec![
+            Value::Int4(1),
+            Value::String("a@example.com".to_string()),
+            Value::Int4(11),
+        ]);
+        let unique_update = Tuple::new(vec![
+            Value::Int4(1),
+            Value::String("b@example.com".to_string()),
+            Value::Int4(10),
+        ]);
+        let pk_update = Tuple::new(vec![
+            Value::Int4(2),
+            Value::String("a@example.com".to_string()),
+            Value::Int4(10),
+        ]);
+
+        assert!(!manager.tuple_update_affects_indexes("users", &schema, &old_tuple, &payload_update));
+        assert!(manager.tuple_update_affects_indexes("users", &schema, &old_tuple, &unique_update));
+        assert!(manager.tuple_update_affects_indexes("users", &schema, &old_tuple, &pk_update));
     }
 
     #[test]
