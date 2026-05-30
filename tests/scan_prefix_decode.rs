@@ -227,3 +227,24 @@ fn rowstore_aggregate_fast_path_preserves_filter_and_group_results() {
     let rows = db.query("SELECT COUNT(*) FROM a WHERE x != 1", &[]).unwrap();
     assert_eq!(int(&rows[0].values[0]), 9);
 }
+
+#[test]
+fn storage_filter_pushdown_preserves_sql_null_predicates() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE f (id INTEGER PRIMARY KEY, x INTEGER, payload TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO f VALUES (1, 1, 'a')").unwrap();
+    db.execute("INSERT INTO f VALUES (2, 2, 'b')").unwrap();
+    db.execute("INSERT INTO f VALUES (3, NULL, 'n')").unwrap();
+    db.execute("INSERT INTO f VALUES (4, 20, 'c')").unwrap();
+
+    let rows = db
+        .query("SELECT id FROM f WHERE x > 1 ORDER BY id", &[])
+        .unwrap();
+    assert_eq!(rows.iter().map(|row| int(&row.values[0])).collect::<Vec<_>>(), vec![2, 4]);
+
+    let rows = db
+        .query("SELECT id FROM f WHERE x != 1 ORDER BY id", &[])
+        .unwrap();
+    assert_eq!(rows.iter().map(|row| int(&row.values[0])).collect::<Vec<_>>(), vec![2, 4]);
+}

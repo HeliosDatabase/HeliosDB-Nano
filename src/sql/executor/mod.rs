@@ -1500,7 +1500,6 @@ impl<'a> Executor<'a> {
                 if matches!(
                     op,
                     BinaryOperator::Eq
-                        | BinaryOperator::NotEq
                         | BinaryOperator::Lt
                         | BinaryOperator::LtEq
                         | BinaryOperator::Gt
@@ -1509,7 +1508,7 @@ impl<'a> Executor<'a> {
                 ) =>
             {
                 matches!(left.as_ref(), LogicalExpr::Column { .. })
-                    && matches!(right.as_ref(), LogicalExpr::Literal(_))
+                    && matches!(right.as_ref(), LogicalExpr::Literal(v) if !matches!(v, crate::Value::Null))
             }
             LogicalExpr::IsNull { expr, .. } => matches!(expr.as_ref(), LogicalExpr::Column { .. }),
             LogicalExpr::Between {
@@ -1519,8 +1518,8 @@ impl<'a> Executor<'a> {
                 negated: false,
             } => {
                 matches!(expr.as_ref(), LogicalExpr::Column { .. })
-                    && matches!(low.as_ref(), LogicalExpr::Literal(_))
-                    && matches!(high.as_ref(), LogicalExpr::Literal(_))
+                    && matches!(low.as_ref(), LogicalExpr::Literal(v) if !matches!(v, crate::Value::Null))
+                    && matches!(high.as_ref(), LogicalExpr::Literal(v) if !matches!(v, crate::Value::Null))
             }
             LogicalExpr::InList {
                 expr,
@@ -1528,7 +1527,9 @@ impl<'a> Executor<'a> {
                 negated: false,
             } => {
                 matches!(expr.as_ref(), LogicalExpr::Column { .. })
-                    && list.iter().all(|item| matches!(item, LogicalExpr::Literal(_)))
+                    && list
+                        .iter()
+                        .all(|item| matches!(item, LogicalExpr::Literal(v) if !matches!(v, crate::Value::Null)))
             }
             _ => false,
         }

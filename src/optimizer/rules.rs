@@ -1136,18 +1136,17 @@ impl StorageFilterPushdownRule {
                 match op {
                     // Equality and comparison operators
                     BinaryOperator::Eq
-                    | BinaryOperator::NotEq
                     | BinaryOperator::Lt
                     | BinaryOperator::LtEq
                     | BinaryOperator::Gt
                     | BinaryOperator::GtEq => {
                         // Check if it's column vs literal
-                        let is_column_literal = matches!(
+                        matches!(
                             (left.as_ref(), right.as_ref()),
-                            (LogicalExpr::Column { .. }, LogicalExpr::Literal(_))
-                                | (LogicalExpr::Literal(_), LogicalExpr::Column { .. })
-                        );
-                        is_column_literal
+                            (LogicalExpr::Column { .. }, LogicalExpr::Literal(v))
+                                | (LogicalExpr::Literal(v), LogicalExpr::Column { .. })
+                                if !matches!(v, crate::Value::Null)
+                        )
                     }
                     // AND predicates can be pushed if all parts can be pushed
                     BinaryOperator::And => Self::can_push_predicate(left) && Self::can_push_predicate(right),
@@ -1169,15 +1168,26 @@ impl StorageFilterPushdownRule {
                 matches!(expr.as_ref(), LogicalExpr::Column { .. })
             }
             // BETWEEN can be pushed
-            LogicalExpr::Between { expr, low, high, .. } => {
+            LogicalExpr::Between {
+                expr,
+                low,
+                high,
+                negated: false,
+            } => {
                 matches!(expr.as_ref(), LogicalExpr::Column { .. })
-                    && matches!(low.as_ref(), LogicalExpr::Literal(_))
-                    && matches!(high.as_ref(), LogicalExpr::Literal(_))
+                    && matches!(low.as_ref(), LogicalExpr::Literal(v) if !matches!(v, crate::Value::Null))
+                    && matches!(high.as_ref(), LogicalExpr::Literal(v) if !matches!(v, crate::Value::Null))
             }
             // IN lists can be pushed
-            LogicalExpr::InList { expr, list, .. } => {
+            LogicalExpr::InList {
+                expr,
+                list,
+                negated: false,
+            } => {
                 matches!(expr.as_ref(), LogicalExpr::Column { .. })
-                    && list.iter().all(|e| matches!(e, LogicalExpr::Literal(_)))
+                    && list
+                        .iter()
+                        .all(|e| matches!(e, LogicalExpr::Literal(v) if !matches!(v, crate::Value::Null)))
             }
             _ => false,
         }
