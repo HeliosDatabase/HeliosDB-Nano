@@ -5401,6 +5401,18 @@ impl StorageEngine {
         old_tuple: &Tuple,
         schema: &crate::Schema,
     ) -> Result<u64> {
+        self.update_tuple_fast_with_index_hint(table_name, row_id, new_tuple, old_tuple, schema, None)
+    }
+
+    pub fn update_tuple_fast_with_index_hint(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        new_tuple: Tuple,
+        old_tuple: &Tuple,
+        schema: &crate::Schema,
+        index_update_needed: Option<bool>,
+    ) -> Result<u64> {
         // Serialize the storage-format tuple; logical WAL is emitted by callers
         // before this fast storage write. Default row-store tables can serialize
         // directly and avoid a full tuple clone in the hot UPDATE path.
@@ -5419,10 +5431,11 @@ impl StorageEngine {
         // Update ART indexes only if an indexed column actually changed.
         // Common OLTP updates mutate payload columns while the PK/unique keys
         // remain stable; rebuilding those ART entries is pure overhead.
-        if self
-            .art_index_manager
-            .tuple_update_affects_indexes(table_name, schema, old_tuple, &new_tuple)
-        {
+        let update_indexes = index_update_needed.unwrap_or_else(|| {
+            self.art_index_manager
+                .tuple_update_affects_indexes(table_name, schema, old_tuple, &new_tuple)
+        });
+        if update_indexes {
             let mut old_col_values = std::collections::HashMap::new();
             let mut new_col_values = std::collections::HashMap::new();
             for (i, col) in schema.columns.iter().enumerate() {
