@@ -274,10 +274,10 @@ pub struct Executor<'a> {
     transaction: Option<&'a crate::storage::Transaction>,
     /// Materialized CTE results (name -> data)
     cte_context: std::collections::HashMap<String, CteData>,
-    /// Single-table row-decode hint, computed once per top-level
-    /// `execute`/`execute_with_columns`: scans of `table` need only materialize the
-    /// columns the plan can read. `None` = full decode.
-    scan_decode_hint: Option<(String, scan::ScanDecodeHint)>,
+    /// Row-decode hints, computed once per top-level `execute` /
+    /// `execute_with_columns`: scans of a listed table need only materialize the
+    /// columns the plan can read. Missing table = full decode.
+    scan_decode_hints: Vec<(String, scan::ScanDecodeHint)>,
 }
 
 impl<'a> Executor<'a> {
@@ -289,7 +289,7 @@ impl<'a> Executor<'a> {
             parameters: Vec::new(),
             transaction: None,
             cte_context: std::collections::HashMap::new(),
-            scan_decode_hint: None,
+            scan_decode_hints: Vec::new(),
         }
     }
 
@@ -301,17 +301,16 @@ impl<'a> Executor<'a> {
             parameters: Vec::new(),
             transaction: None,
             cte_context: std::collections::HashMap::new(),
-            scan_decode_hint: None,
+            scan_decode_hints: Vec::new(),
         }
     }
 
     /// Row-decode hint for `table` if the current plan's needed-column analysis was
-    /// certain enough to apply it. See `scan::compute_scan_decode_hint`.
+    /// certain enough to apply it. See `scan::compute_scan_decode_hints`.
     pub(crate) fn scan_decode_hint_for(&self, table: &str) -> Option<&scan::ScanDecodeHint> {
-        match &self.scan_decode_hint {
-            Some((t, hint)) if t == table => Some(hint),
-            _ => None,
-        }
+        self.scan_decode_hints
+            .iter()
+            .find_map(|(t, hint)| (t == table).then_some(hint))
     }
 
     /// Get a CTE by name if it exists in the context
@@ -345,7 +344,7 @@ impl<'a> Executor<'a> {
     /// Execute a logical plan and return all results
     pub fn execute(&mut self, plan: &LogicalPlan) -> Result<Vec<Tuple>> {
         let build_start = Instant::now();
-        self.scan_decode_hint = scan::compute_scan_decode_hint(plan);
+        self.scan_decode_hints = scan::compute_scan_decode_hints(plan);
         let mut operator = self.plan_to_operator(plan)?;
         let build_elapsed = build_start.elapsed();
         tracing::debug!(
@@ -373,7 +372,7 @@ impl<'a> Executor<'a> {
 
     /// Execute a plan and return both tuples and output column names.
     pub fn execute_with_columns(&mut self, plan: &LogicalPlan) -> Result<(Vec<Tuple>, Vec<String>)> {
-        self.scan_decode_hint = scan::compute_scan_decode_hint(plan);
+        self.scan_decode_hints = scan::compute_scan_decode_hints(plan);
         let mut operator = self.plan_to_operator(plan)?;
         let columns: Vec<String> = operator.schema().columns.iter().map(|c| c.name.clone()).collect();
         let mut results = Vec::with_capacity(256);

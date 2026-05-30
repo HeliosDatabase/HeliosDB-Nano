@@ -37,14 +37,51 @@ pub(super) fn compute_scan_prefix_hint(plan: &LogicalPlan) -> Option<(String, us
 /// skip unrelated leading/middle/tail values.
 pub(super) fn compute_scan_decode_hint(plan: &LogicalPlan) -> Option<(String, ScanDecodeHint)> {
     let (table_name, indices, total_cols) = collect_single_table_column_indices(plan)?;
-    let prefix_len = indices.last().map(|idx| idx + 1).unwrap_or(0);
+    choose_scan_decode_hint(&indices, total_cols).map(|hint| (table_name, hint))
+}
 
-    if is_prefix_contiguous(&indices) && should_use_prefix_decode(prefix_len, total_cols) {
-        return Some((table_name, ScanDecodeHint::Prefix(prefix_len)));
+/// Compute row-decode hints for every table in a read plan. This extends the
+/// single-table fast path to joins only when column references can be mapped
+/// unambiguously to a scan table/alias. Anything uncertain falls back to full
+/// decode for the whole plan.
+pub(super) fn compute_scan_decode_hints(plan: &LogicalPlan) -> Vec<(String, ScanDecodeHint)> {
+    if let Some(hint) = compute_scan_decode_hint(plan) {
+        return vec![hint];
     }
 
-    if should_use_selected_decode(&indices, total_cols) {
-        return Some((table_name, ScanDecodeHint::Columns(indices)));
+    let mut tables = Vec::new();
+    let mut bail = false;
+    collect_scan_tables(plan, &mut tables, &mut bail);
+    if bail || tables.len() < 2 || !table_qualifiers_are_unique(&tables) {
+        return Vec::new();
+    }
+
+    let mut needed: Vec<HashSet<usize>> = (0..tables.len()).map(|_| HashSet::new()).collect();
+    collect_plan_columns_by_table(plan, &tables, &mut needed, &mut bail, true);
+    if bail {
+        return Vec::new();
+    }
+
+    let mut hints = Vec::new();
+    for (idx, table) in tables.iter().enumerate() {
+        let mut indices: Vec<usize> = needed[idx].iter().copied().collect();
+        indices.sort_unstable();
+        if let Some(hint) = choose_scan_decode_hint(&indices, table.schema.columns.len()) {
+            hints.push((table.table_name.clone(), hint));
+        }
+    }
+    hints
+}
+
+fn choose_scan_decode_hint(indices: &[usize], total_cols: usize) -> Option<ScanDecodeHint> {
+    let prefix_len = indices.last().map(|idx| idx + 1).unwrap_or(0);
+
+    if is_prefix_contiguous(indices) && should_use_prefix_decode(prefix_len, total_cols) {
+        return Some(ScanDecodeHint::Prefix(prefix_len));
+    }
+
+    if should_use_selected_decode(indices, total_cols) {
+        return Some(ScanDecodeHint::Columns(indices.to_vec()));
     }
 
     None
@@ -116,6 +153,348 @@ fn should_use_selected_decode(indices: &[usize], total_columns: usize) -> bool {
     let sparse = indices.len().saturating_mul(2) <= total_columns;
 
     skips_leading || sparse
+}
+
+#[derive(Clone)]
+struct ScanTableRef {
+    table_name: String,
+    qualifiers: HashSet<String>,
+    schema: Arc<Schema>,
+}
+
+fn collect_scan_tables(plan: &LogicalPlan, tables: &mut Vec<ScanTableRef>, bail: &mut bool) {
+    if *bail {
+        return;
+    }
+    match plan {
+        LogicalPlan::Scan {
+            table_name,
+            alias,
+            schema,
+            ..
+        }
+        | LogicalPlan::FilteredScan {
+            table_name,
+            alias,
+            schema,
+            ..
+        } => {
+            let mut qualifiers = HashSet::new();
+            qualifiers.insert(table_name.to_ascii_lowercase());
+            if let Some(alias) = alias {
+                qualifiers.insert(alias.to_ascii_lowercase());
+            }
+            tables.push(ScanTableRef {
+                table_name: table_name.clone(),
+                qualifiers,
+                schema: schema.clone(),
+            });
+        }
+        LogicalPlan::Filter { input, .. }
+        | LogicalPlan::Project { input, .. }
+        | LogicalPlan::Aggregate { input, .. }
+        | LogicalPlan::Sort { input, .. }
+        | LogicalPlan::Limit { input, .. } => collect_scan_tables(input, tables, bail),
+        LogicalPlan::Join {
+            left, right, lateral, ..
+        } => {
+            if *lateral {
+                *bail = true;
+                return;
+            }
+            collect_scan_tables(left, tables, bail);
+            collect_scan_tables(right, tables, bail);
+        }
+        _ => *bail = true,
+    }
+}
+
+fn table_qualifiers_are_unique(tables: &[ScanTableRef]) -> bool {
+    let mut table_names = HashSet::new();
+    let mut qualifiers = HashSet::new();
+    for table in tables {
+        if !table_names.insert(table.table_name.to_ascii_lowercase()) {
+            return false;
+        }
+        for qualifier in &table.qualifiers {
+            if !qualifiers.insert(qualifier.clone()) {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn collect_plan_columns_by_table(
+    plan: &LogicalPlan,
+    tables: &[ScanTableRef],
+    needed: &mut [HashSet<usize>],
+    bail: &mut bool,
+    output_required: bool,
+) {
+    if *bail {
+        return;
+    }
+    match plan {
+        LogicalPlan::Scan {
+            table_name,
+            schema,
+            projection,
+            ..
+        } => {
+            if let Some(table_idx) = find_scan_table_index(tables, table_name) {
+                collect_projection_indices(schema, projection.as_ref(), &mut needed[table_idx], bail);
+                if output_required && projection.is_none() {
+                    collect_all_schema_indices(schema, &mut needed[table_idx]);
+                }
+            } else {
+                *bail = true;
+            }
+        }
+        LogicalPlan::FilteredScan {
+            table_name,
+            schema,
+            projection,
+            predicate,
+            ..
+        } => {
+            if let Some(table_idx) = find_scan_table_index(tables, table_name) {
+                collect_projection_indices(schema, projection.as_ref(), &mut needed[table_idx], bail);
+                if output_required && projection.is_none() {
+                    collect_all_schema_indices(schema, &mut needed[table_idx]);
+                }
+                if let Some(predicate) = predicate {
+                    collect_expr_columns_by_table(predicate, tables, needed, bail);
+                }
+            } else {
+                *bail = true;
+            }
+        }
+        LogicalPlan::Filter { input, predicate } => {
+            collect_expr_columns_by_table(predicate, tables, needed, bail);
+            collect_plan_columns_by_table(input, tables, needed, bail, output_required);
+        }
+        LogicalPlan::Project {
+            input,
+            exprs,
+            distinct_on,
+            ..
+        } => {
+            for expr in exprs {
+                collect_expr_columns_by_table(expr, tables, needed, bail);
+            }
+            if let Some(distinct_on) = distinct_on {
+                for expr in distinct_on {
+                    collect_expr_columns_by_table(expr, tables, needed, bail);
+                }
+            }
+            collect_plan_columns_by_table(input, tables, needed, bail, false);
+        }
+        LogicalPlan::Aggregate {
+            input,
+            group_by,
+            aggr_exprs,
+            having,
+        } => {
+            for expr in group_by {
+                collect_expr_columns_by_table(expr, tables, needed, bail);
+            }
+            for expr in aggr_exprs {
+                collect_expr_columns_by_table(expr, tables, needed, bail);
+            }
+            if let Some(having) = having {
+                collect_expr_columns_by_table(having, tables, needed, bail);
+            }
+            collect_plan_columns_by_table(input, tables, needed, bail, false);
+        }
+        LogicalPlan::Sort { input, exprs, .. } => {
+            for expr in exprs {
+                collect_expr_columns_by_table(expr, tables, needed, bail);
+            }
+            collect_plan_columns_by_table(input, tables, needed, bail, output_required);
+        }
+        LogicalPlan::Limit { input, .. } => collect_plan_columns_by_table(input, tables, needed, bail, output_required),
+        LogicalPlan::Join {
+            left,
+            right,
+            on,
+            lateral,
+            ..
+        } => {
+            if *lateral {
+                *bail = true;
+                return;
+            }
+            if let Some(on) = on {
+                collect_expr_columns_by_table(on, tables, needed, bail);
+            }
+            collect_plan_columns_by_table(left, tables, needed, bail, output_required);
+            collect_plan_columns_by_table(right, tables, needed, bail, output_required);
+        }
+        _ => *bail = true,
+    }
+}
+
+fn find_scan_table_index(tables: &[ScanTableRef], table_name: &str) -> Option<usize> {
+    let table_name = table_name.to_ascii_lowercase();
+    tables
+        .iter()
+        .position(|table| table.table_name.eq_ignore_ascii_case(&table_name))
+}
+
+fn collect_projection_indices(
+    schema: &Schema,
+    projection: Option<&Vec<usize>>,
+    needed: &mut HashSet<usize>,
+    bail: &mut bool,
+) {
+    if let Some(indices) = projection {
+        for &idx in indices {
+            if idx < schema.columns.len() {
+                needed.insert(idx);
+            } else {
+                *bail = true;
+                return;
+            }
+        }
+    }
+}
+
+fn collect_all_schema_indices(schema: &Schema, needed: &mut HashSet<usize>) {
+    needed.extend(0..schema.columns.len());
+}
+
+fn collect_expr_columns_by_table(
+    expr: &LogicalExpr,
+    tables: &[ScanTableRef],
+    needed: &mut [HashSet<usize>],
+    bail: &mut bool,
+) {
+    if *bail {
+        return;
+    }
+    match expr {
+        LogicalExpr::Column { table, name } => {
+            if let Some((table_idx, column_idx)) = resolve_table_column(tables, table.as_deref(), name, bail) {
+                needed[table_idx].insert(column_idx);
+            }
+        }
+        LogicalExpr::NewRow { .. } | LogicalExpr::OldRow { .. } => *bail = true,
+        LogicalExpr::Wildcard => {
+            for (table_idx, table) in tables.iter().enumerate() {
+                collect_all_schema_indices(&table.schema, &mut needed[table_idx]);
+            }
+        }
+        LogicalExpr::ScalarSubquery { .. } | LogicalExpr::InSubquery { .. } | LogicalExpr::Exists { .. } => {
+            *bail = true;
+        }
+        LogicalExpr::BinaryExpr { left, right, .. } => {
+            collect_expr_columns_by_table(left, tables, needed, bail);
+            collect_expr_columns_by_table(right, tables, needed, bail);
+        }
+        LogicalExpr::UnaryExpr { expr, .. } => collect_expr_columns_by_table(expr, tables, needed, bail),
+        LogicalExpr::AggregateFunction {
+            fun: crate::sql::logical_plan::AggregateFunction::Count,
+            args,
+            ..
+        } if args.iter().all(|arg| matches!(arg, LogicalExpr::Wildcard)) => {}
+        LogicalExpr::AggregateFunction { args, .. } | LogicalExpr::ScalarFunction { args, .. } => {
+            for arg in args {
+                collect_expr_columns_by_table(arg, tables, needed, bail);
+            }
+        }
+        LogicalExpr::Case {
+            expr,
+            when_then,
+            else_result,
+        } => {
+            if let Some(expr) = expr {
+                collect_expr_columns_by_table(expr, tables, needed, bail);
+            }
+            for (when, then) in when_then {
+                collect_expr_columns_by_table(when, tables, needed, bail);
+                collect_expr_columns_by_table(then, tables, needed, bail);
+            }
+            if let Some(expr) = else_result {
+                collect_expr_columns_by_table(expr, tables, needed, bail);
+            }
+        }
+        LogicalExpr::Cast { expr, .. } => collect_expr_columns_by_table(expr, tables, needed, bail),
+        LogicalExpr::IsNull { expr, .. } => collect_expr_columns_by_table(expr, tables, needed, bail),
+        LogicalExpr::Between { expr, low, high, .. } => {
+            collect_expr_columns_by_table(expr, tables, needed, bail);
+            collect_expr_columns_by_table(low, tables, needed, bail);
+            collect_expr_columns_by_table(high, tables, needed, bail);
+        }
+        LogicalExpr::InList { expr, list, .. } => {
+            collect_expr_columns_by_table(expr, tables, needed, bail);
+            for item in list {
+                collect_expr_columns_by_table(item, tables, needed, bail);
+            }
+        }
+        LogicalExpr::InSet { expr, .. } => collect_expr_columns_by_table(expr, tables, needed, bail),
+        LogicalExpr::ArraySubscript { array, index } => {
+            collect_expr_columns_by_table(array, tables, needed, bail);
+            collect_expr_columns_by_table(index, tables, needed, bail);
+        }
+        LogicalExpr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_expr_columns_by_table(arg, tables, needed, bail);
+            }
+            for expr in partition_by {
+                collect_expr_columns_by_table(expr, tables, needed, bail);
+            }
+            for (expr, _) in order_by {
+                collect_expr_columns_by_table(expr, tables, needed, bail);
+            }
+        }
+        LogicalExpr::Tuple { items } => {
+            for item in items {
+                collect_expr_columns_by_table(item, tables, needed, bail);
+            }
+        }
+        LogicalExpr::Literal(_) | LogicalExpr::Parameter { .. } | LogicalExpr::DefaultValue => {}
+    }
+}
+
+fn resolve_table_column(
+    tables: &[ScanTableRef],
+    qualifier: Option<&str>,
+    name: &str,
+    bail: &mut bool,
+) -> Option<(usize, usize)> {
+    if let Some(qualifier) = qualifier {
+        let qualifier = qualifier.to_ascii_lowercase();
+        let Some(table_idx) = tables
+            .iter()
+            .position(|table| table.qualifiers.contains(&qualifier))
+        else {
+            // Derived or outer-reference column; no base table decode needed here.
+            return None;
+        };
+        if let Some(column_idx) = resolve_col_index(&tables[table_idx].schema, name) {
+            return Some((table_idx, column_idx));
+        }
+        *bail = true;
+        return None;
+    }
+
+    let mut found = None;
+    for (table_idx, table) in tables.iter().enumerate() {
+        if let Some(column_idx) = resolve_col_index(&table.schema, name) {
+            if found.is_some() {
+                *bail = true;
+                return None;
+            }
+            found = Some((table_idx, column_idx));
+        }
+    }
+    found
 }
 
 fn collect_plan_columns(
@@ -1319,6 +1698,31 @@ mod tests {
         }
     }
 
+    fn col(table: &str, name: &str) -> LogicalExpr {
+        LogicalExpr::Column {
+            table: Some(table.to_string()),
+            name: name.to_string(),
+        }
+    }
+
+    fn eq(left: LogicalExpr, right: LogicalExpr) -> LogicalExpr {
+        LogicalExpr::BinaryExpr {
+            left: Box::new(left),
+            op: crate::sql::logical_plan::BinaryOperator::Eq,
+            right: Box::new(right),
+        }
+    }
+
+    fn scan_with_alias(table_name: &str, alias: &str) -> LogicalPlan {
+        LogicalPlan::Scan {
+            table_name: table_name.to_string(),
+            alias: Some(alias.to_string()),
+            schema: test_schema(),
+            projection: None,
+            as_of: None,
+        }
+    }
+
     #[test]
     fn test_scan_operator_empty() {
         let schema = Arc::new(Schema {
@@ -1421,6 +1825,72 @@ mod tests {
             compute_scan_decode_hint(&plan),
             Some(("w".to_string(), ScanDecodeHint::Columns(vec![2, 3])))
         );
+    }
+
+    #[test]
+    fn join_decode_hints_resolve_qualified_columns_per_table() {
+        let plan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Join {
+                left: Box::new(scan_with_alias("left_table", "l")),
+                right: Box::new(scan_with_alias("right_table", "r")),
+                join_type: crate::sql::JoinType::Inner,
+                on: Some(eq(col("l", "id"), col("r", "id"))),
+                lateral: false,
+            }),
+            exprs: vec![col("l", "k"), col("r", "note")],
+            aliases: vec!["k".to_string(), "note".to_string()],
+            distinct: false,
+            distinct_on: None,
+        };
+
+        assert_eq!(
+            compute_scan_decode_hints(&plan),
+            vec![
+                ("left_table".to_string(), ScanDecodeHint::Prefix(2)),
+                ("right_table".to_string(), ScanDecodeHint::Columns(vec![0, 3])),
+            ]
+        );
+    }
+
+    #[test]
+    fn join_decode_hints_reject_ambiguous_unqualified_columns() {
+        let plan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Join {
+                left: Box::new(scan_with_alias("left_table", "l")),
+                right: Box::new(scan_with_alias("right_table", "r")),
+                join_type: crate::sql::JoinType::Inner,
+                on: Some(eq(col("l", "id"), col("r", "id"))),
+                lateral: false,
+            }),
+            exprs: vec![LogicalExpr::Column {
+                table: None,
+                name: "id".to_string(),
+            }],
+            aliases: vec!["id".to_string()],
+            distinct: false,
+            distinct_on: None,
+        };
+
+        assert!(compute_scan_decode_hints(&plan).is_empty());
+    }
+
+    #[test]
+    fn join_decode_hints_reject_self_join_by_table_name() {
+        let plan = LogicalPlan::Project {
+            input: Box::new(LogicalPlan::Join {
+                left: Box::new(scan_with_alias("same_table", "l")),
+                right: Box::new(scan_with_alias("same_table", "r")),
+                join_type: crate::sql::JoinType::Inner,
+                on: Some(eq(col("l", "id"), col("r", "id"))),
+                lateral: false,
+            }),
+            exprs: vec![col("l", "k")],
+            aliases: vec!["k".to_string()],
+            distinct: false,
+            distinct_on: None,
+        };
+
+        assert!(compute_scan_decode_hints(&plan).is_empty());
     }
 
     #[test]
