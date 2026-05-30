@@ -256,6 +256,23 @@ impl StorageEngine {
         })
     }
 
+    #[inline]
+    fn parse_row_id_after_prefix(key: &[u8], prefix_len: usize) -> Option<u64> {
+        let suffix = key.get(prefix_len..)?;
+        if suffix.is_empty() {
+            return None;
+        }
+
+        let mut row_id = 0_u64;
+        for &byte in suffix {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            row_id = row_id.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+        }
+        Some(row_id)
+    }
+
     /// Open a storage engine
     pub fn open(path: impl AsRef<Path>, config: &Config) -> Result<Self> {
         let db_path = path.as_ref().to_path_buf();
@@ -1703,12 +1720,8 @@ impl StorageEngine {
             if !key.starts_with(prefix_bytes) {
                 break;
             }
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if let Some(row_id_str) = key_str.strip_prefix(&prefix) {
-                    if let Ok(row_id) = row_id_str.parse::<u64>() {
-                        row_ids.push(row_id);
-                    }
-                }
+            if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
+                row_ids.push(row_id);
             }
         }
 
@@ -1817,13 +1830,9 @@ impl StorageEngine {
 
                 // Extract row_id from key (key format: "data:{table_name}:{row_id}")
                 let mut row_id = 0u64;
-                if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if let Some(row_id_str) = key_str.strip_prefix(&prefix) {
-                        if let Ok(rid) = row_id_str.parse::<u64>() {
-                            row_id = rid;
-                            tuple.row_id = Some(row_id);
-                        }
-                    }
+                if let Some(rid) = Self::parse_row_id_after_prefix(key, prefix_bytes.len()) {
+                    row_id = rid;
+                    tuple.row_id = Some(row_id);
                 }
 
                 // Resolve per-column storage references
@@ -2021,12 +2030,8 @@ impl StorageEngine {
                 bincode::deserialize(&raw_value)
             }
             .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if let Some(row_id_str) = key_str.strip_prefix(&prefix) {
-                    if let Ok(rid) = row_id_str.parse::<u64>() {
-                        tuple.row_id = Some(rid);
-                    }
-                }
+            if let Some(rid) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
+                tuple.row_id = Some(rid);
             }
             // Resolve per-column storage references
             for (idx, column) in schema.columns.iter().enumerate() {
@@ -2140,12 +2145,8 @@ impl StorageEngine {
                     bincode::deserialize(&raw_value)
                 }
                 .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
-                if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if let Some(row_id_str) = key_str.strip_prefix(&prefix) {
-                        if let Ok(rid) = row_id_str.parse::<u64>() {
-                            tuple.row_id = Some(rid);
-                        }
-                    }
+                if let Some(rid) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
+                    tuple.row_id = Some(rid);
                 }
                 // Resolve per-column storage references
                 for (idx, column) in schema.columns.iter().enumerate() {
@@ -2520,15 +2521,7 @@ impl StorageEngine {
             }
 
             // Extract row_id from key
-            let row_id = if let Ok(key_str) = std::str::from_utf8(&key) {
-                if let Some(row_id_str) = key_str.strip_prefix(&prefix) {
-                    row_id_str.parse::<u64>().unwrap_or(0)
-                } else {
-                    0
-                }
-            } else {
-                0
-            };
+            let row_id = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()).unwrap_or(0);
 
             // Step 1: Decode from old format to original value
             let cur_val = tuple
@@ -3319,15 +3312,11 @@ impl StorageEngine {
                     break;
                 }
 
-                if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if let Some(row_id_str) = key_str.strip_prefix(&delete_prefix) {
-                        if let Ok(row_id) = row_id_str.parse::<u64>() {
-                            deleted_rows_by_table
-                                .entry(table_name.clone())
-                                .or_default()
-                                .insert(row_id);
-                        }
-                    }
+                if let Some(row_id) = Self::parse_row_id_after_prefix(&key, delete_prefix_bytes.len()) {
+                    deleted_rows_by_table
+                        .entry(table_name.clone())
+                        .or_default()
+                        .insert(row_id);
                 }
             }
         }
@@ -3348,22 +3337,18 @@ impl StorageEngine {
                     break;
                 }
 
-                if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if let Some(row_id_str) = key_str.strip_prefix(&branch_prefix) {
-                        if let Ok(row_id) = row_id_str.parse::<u64>() {
-                            // Write to target with appropriate key format
-                            let target_key = if merge_to_main {
-                                format!("data:{}:{}", table_name, row_id)
-                            } else {
-                                format!("bdata:{}:{}:{}", target_id, table_name, row_id)
-                            };
+                if let Some(row_id) = Self::parse_row_id_after_prefix(&key, branch_prefix_bytes.len()) {
+                    // Write to target with appropriate key format
+                    let target_key = if merge_to_main {
+                        format!("data:{}:{}", table_name, row_id)
+                    } else {
+                        format!("bdata:{}:{}:{}", target_id, table_name, row_id)
+                    };
 
-                            self.db
-                                .put(target_key.as_bytes(), &value)
-                                .map_err(|e| Error::storage(format!("Failed to merge data: {}", e)))?;
-                            merged_keys += 1;
-                        }
-                    }
+                    self.db
+                        .put(target_key.as_bytes(), &value)
+                        .map_err(|e| Error::storage(format!("Failed to merge data: {}", e)))?;
+                    merged_keys += 1;
                 }
             }
         }
@@ -5030,12 +5015,8 @@ impl StorageEngine {
 
             if key.starts_with(prefix_bytes) {
                 // Parse row ID from key: data:{table}:{row_id}
-                if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if let Some(row_id_str) = key_str.strip_prefix(&prefix) {
-                        if let Ok(row_id) = row_id_str.parse::<u64>() {
-                            seen_rows.insert(row_id);
-                        }
-                    }
+                if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
+                    seen_rows.insert(row_id);
                 }
             } else if key.first() > prefix_bytes.first() {
                 // Optimization: break early if we've passed the prefix range
@@ -5174,6 +5155,30 @@ impl StorageEngine {
 mod tests {
     use super::*;
     use crate::{Column, DataType, Schema, Value};
+
+    #[test]
+    fn test_parse_row_id_after_prefix() {
+        assert_eq!(
+            StorageEngine::parse_row_id_after_prefix(b"data:users:42", b"data:users:".len()),
+            Some(42)
+        );
+        assert_eq!(
+            StorageEngine::parse_row_id_after_prefix(b"data:users:18446744073709551615", b"data:users:".len()),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            StorageEngine::parse_row_id_after_prefix(b"data:users:", b"data:users:".len()),
+            None
+        );
+        assert_eq!(
+            StorageEngine::parse_row_id_after_prefix(b"data:users:4x", b"data:users:".len()),
+            None
+        );
+        assert_eq!(
+            StorageEngine::parse_row_id_after_prefix(b"data:users:18446744073709551616", b"data:users:".len()),
+            None
+        );
+    }
 
     #[test]
     fn test_storage_engine_creation() {
@@ -5980,18 +5985,14 @@ impl StorageEngine {
                 break;
             }
 
-            if let Ok(key_str) = std::str::from_utf8(&key) {
-                if let Some(row_id_str) = key_str.strip_prefix(&main_prefix) {
-                    if let Ok(row_id) = row_id_str.parse::<u64>() {
-                        let value = self.decrypt_value(&raw_value)?;
+            if let Some(row_id) = Self::parse_row_id_after_prefix(&key, main_prefix_bytes.len()) {
+                let value = self.decrypt_value(&raw_value)?;
 
-                        let mut tuple: Tuple = bincode::deserialize(&value)
-                            .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
-                        tuple.row_id = Some(row_id);
-                        tuple.branch_id = None; // From main
-                        result_tuples.insert(row_id, tuple);
-                    }
-                }
+                let mut tuple: Tuple = bincode::deserialize(&value)
+                    .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+                tuple.row_id = Some(row_id);
+                tuple.branch_id = None; // From main
+                result_tuples.insert(row_id, tuple);
             }
         }
 
@@ -6013,12 +6014,8 @@ impl StorageEngine {
                     break;
                 }
 
-                if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if let Some(row_id_str) = key_str.strip_prefix(&delete_prefix) {
-                        if let Ok(row_id) = row_id_str.parse::<u64>() {
-                            deleted_rows.insert(row_id);
-                        }
-                    }
+                if let Some(row_id) = Self::parse_row_id_after_prefix(&key, delete_prefix_bytes.len()) {
+                    deleted_rows.insert(row_id);
                 }
             }
 
@@ -6037,19 +6034,15 @@ impl StorageEngine {
                     break;
                 }
 
-                if let Ok(key_str) = std::str::from_utf8(&key) {
-                    if let Some(row_id_str) = key_str.strip_prefix(&branch_prefix) {
-                        if let Ok(row_id) = row_id_str.parse::<u64>() {
-                            let value = self.decrypt_value(&raw_value)?;
+                if let Some(row_id) = Self::parse_row_id_after_prefix(&key, branch_prefix_bytes.len()) {
+                    let value = self.decrypt_value(&raw_value)?;
 
-                            let mut tuple: Tuple = bincode::deserialize(&value)
-                                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
-                            tuple.row_id = Some(row_id);
-                            tuple.branch_id = Some(chain_branch_id);
-                            // Override any parent data for this row_id
-                            result_tuples.insert(row_id, tuple);
-                        }
-                    }
+                    let mut tuple: Tuple = bincode::deserialize(&value)
+                        .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+                    tuple.row_id = Some(row_id);
+                    tuple.branch_id = Some(chain_branch_id);
+                    // Override any parent data for this row_id
+                    result_tuples.insert(row_id, tuple);
                 }
             }
         }
