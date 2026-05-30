@@ -1127,6 +1127,33 @@ impl ArtIndexManager {
         false
     }
 
+    /// Return true when any provided column participates in an ART index for
+    /// this table. Fast UPDATE paths use this statement-level hint to avoid a
+    /// per-row old/new tuple comparison for payload-only updates.
+    pub fn columns_affect_indexes(&self, table: &str, column_names: &[String]) -> bool {
+        if column_names.is_empty() {
+            return false;
+        }
+
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        for index in indexes.values() {
+            if index.table() != table {
+                continue;
+            }
+
+            for indexed_column in index.columns() {
+                if column_names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(indexed_column))
+                {
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
     /// Clear all index data for a table without removing the index structures.
     ///
     /// This is used by TRUNCATE TABLE to reset index contents while keeping
@@ -1403,6 +1430,10 @@ mod tests {
         assert!(!manager.tuple_update_affects_indexes("users", &schema, &old_tuple, &payload_update));
         assert!(manager.tuple_update_affects_indexes("users", &schema, &old_tuple, &unique_update));
         assert!(manager.tuple_update_affects_indexes("users", &schema, &old_tuple, &pk_update));
+
+        assert!(!manager.columns_affect_indexes("users", &["balance".to_string()]));
+        assert!(manager.columns_affect_indexes("users", &["email".to_string()]));
+        assert!(manager.columns_affect_indexes("users", &["ID".to_string()]));
     }
 
     #[test]

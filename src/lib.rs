@@ -513,6 +513,7 @@ struct FastParamUpdateSpec {
     pk_expr: sql::LogicalExpr,
     pk_data_type: DataType,
     assignments: Vec<FastParamUpdateAssignment>,
+    assignments_affect_indexes: bool,
 }
 
 struct FastParamDeleteSpec {
@@ -5160,7 +5161,14 @@ impl EmbeddedDatabase {
 
         let result = self
             .storage
-            .update_tuple_fast(&spec.table_name, row_id, new_tuple, &existing_row, &spec.schema);
+            .update_tuple_fast_with_index_hint(
+                &spec.table_name,
+                row_id,
+                new_tuple,
+                &existing_row,
+                &spec.schema,
+                Some(spec.assignments_affect_indexes),
+            );
         if result.is_ok() {
             self.storage.increment_lsn();
         }
@@ -5276,6 +5284,7 @@ impl EmbeddedDatabase {
 
         let (pk_expr, pk_data_type) = Self::fast_pk_expr_from_selection(selection, &schema)?;
         let mut fast_assignments = Vec::with_capacity(assignments.len());
+        let mut assignment_columns = Vec::with_capacity(assignments.len());
         for (col_name, expr) in assignments {
             let col_idx = match schema.get_column_index(col_name) {
                 Some(idx) => idx,
@@ -5288,6 +5297,7 @@ impl EmbeddedDatabase {
             if column.primary_key || column.unique || !Self::fast_update_expr_supported(expr) {
                 return None;
             }
+            assignment_columns.push(col_name.clone());
             fast_assignments.push(FastParamUpdateAssignment {
                 col_idx,
                 col_name: col_name.clone(),
@@ -5296,6 +5306,10 @@ impl EmbeddedDatabase {
                 expr: expr.clone(),
             });
         }
+        let assignments_affect_indexes = self
+            .storage
+            .art_indexes()
+            .columns_affect_indexes(table_name, &assignment_columns);
 
         Some(Ok(FastParamUpdateSpec {
             table_name: table_name.to_string(),
@@ -5303,6 +5317,7 @@ impl EmbeddedDatabase {
             pk_expr,
             pk_data_type,
             assignments: fast_assignments,
+            assignments_affect_indexes,
         }))
     }
 
@@ -6443,10 +6458,20 @@ impl EmbeddedDatabase {
         }
 
         // Use fast update storage path
-        Some(
-            self.storage
-                .update_tuple_fast(table_name, row_id, new_tuple, &existing_row, &schema),
-        )
+        let assignment_columns = [set_col.to_string()];
+        let assignment_affects_indexes = self
+            .storage
+            .art_indexes()
+            .columns_affect_indexes(table_name, &assignment_columns);
+
+        Some(self.storage.update_tuple_fast_with_index_hint(
+            table_name,
+            row_id,
+            new_tuple,
+            &existing_row,
+            &schema,
+            Some(assignment_affects_indexes),
+        ))
     }
 
     fn prepare_fast_delete(&self, sql: &str) -> Option<Result<Option<FastDeleteTarget>>> {
