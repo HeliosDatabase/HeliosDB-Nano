@@ -16,6 +16,7 @@ use super::art_node::RowId;
 use crate::{DataType, Schema, Tuple, Value};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::RwLock;
 
 /// Metadata about a foreign key constraint
@@ -56,6 +57,69 @@ pub struct ArtManagerStats {
     pub index_renames: u64,
 }
 
+#[derive(Debug, Default)]
+struct AtomicArtManagerStats {
+    total_indexes: AtomicU64,
+    pk_indexes: AtomicU64,
+    fk_indexes: AtomicU64,
+    unique_indexes: AtomicU64,
+    manual_indexes: AtomicU64,
+    constraint_checks: AtomicU64,
+    violations_caught: AtomicU64,
+    index_renames: AtomicU64,
+}
+
+impl AtomicArtManagerStats {
+    fn snapshot(&self) -> ArtManagerStats {
+        ArtManagerStats {
+            total_indexes: self.total_indexes.load(Ordering::Relaxed),
+            pk_indexes: self.pk_indexes.load(Ordering::Relaxed),
+            fk_indexes: self.fk_indexes.load(Ordering::Relaxed),
+            unique_indexes: self.unique_indexes.load(Ordering::Relaxed),
+            manual_indexes: self.manual_indexes.load(Ordering::Relaxed),
+            constraint_checks: self.constraint_checks.load(Ordering::Relaxed),
+            violations_caught: self.violations_caught.load(Ordering::Relaxed),
+            index_renames: self.index_renames.load(Ordering::Relaxed),
+        }
+    }
+
+    fn add_index(&self, index_type: ArtIndexType) {
+        self.total_indexes.fetch_add(1, Ordering::Relaxed);
+        match index_type {
+            ArtIndexType::PrimaryKey => {
+                self.pk_indexes.fetch_add(1, Ordering::Relaxed);
+            }
+            ArtIndexType::ForeignKey => {
+                self.fk_indexes.fetch_add(1, Ordering::Relaxed);
+            }
+            ArtIndexType::Unique => {
+                self.unique_indexes.fetch_add(1, Ordering::Relaxed);
+            }
+            ArtIndexType::Manual => {
+                self.manual_indexes.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn remove_index(&self, index_type: ArtIndexType) {
+        self.total_indexes.fetch_sub(1, Ordering::Relaxed);
+        match index_type {
+            ArtIndexType::PrimaryKey => {
+                self.pk_indexes.fetch_sub(1, Ordering::Relaxed);
+            }
+            ArtIndexType::ForeignKey => {
+                self.fk_indexes.fetch_sub(1, Ordering::Relaxed);
+            }
+            ArtIndexType::Unique => {
+                self.unique_indexes.fetch_sub(1, Ordering::Relaxed);
+            }
+            ArtIndexType::Manual => {
+                self.manual_indexes.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// ART Index Manager
 ///
 /// Thread-safe manager for all ART indexes in the database.
@@ -72,7 +136,7 @@ pub struct ArtIndexManager {
     /// Unique constraint indexes by table (table -> list of unique index names)
     unique_indexes: RwLock<HashMap<String, Vec<String>>>,
     /// Statistics
-    stats: RwLock<ArtManagerStats>,
+    stats: AtomicArtManagerStats,
 }
 
 impl Default for ArtIndexManager {
@@ -101,7 +165,7 @@ impl ArtIndexManager {
             fk_indexes: RwLock::new(HashMap::new()),
             fk_info: RwLock::new(HashMap::new()),
             unique_indexes: RwLock::new(HashMap::new()),
-            stats: RwLock::new(ArtManagerStats::default()),
+            stats: AtomicArtManagerStats::default(),
         }
     }
 
@@ -153,11 +217,7 @@ impl ArtIndexManager {
             pk_indexes.insert(table.to_string(), index_name.clone());
         }
 
-        {
-            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
-            stats.total_indexes += 1;
-            stats.pk_indexes += 1;
-        }
+        self.stats.add_index(ArtIndexType::PrimaryKey);
 
         Ok(index_name)
     }
@@ -218,11 +278,7 @@ impl ArtIndexManager {
             fk_info_map.insert(index_name.clone(), fk_info);
         }
 
-        {
-            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
-            stats.total_indexes += 1;
-            stats.fk_indexes += 1;
-        }
+        self.stats.add_index(ArtIndexType::ForeignKey);
 
         Ok(index_name)
     }
@@ -263,11 +319,7 @@ impl ArtIndexManager {
                 .push(index_name.clone());
         }
 
-        {
-            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
-            stats.total_indexes += 1;
-            stats.unique_indexes += 1;
-        }
+        self.stats.add_index(ArtIndexType::Unique);
 
         Ok(index_name)
     }
@@ -291,11 +343,7 @@ impl ArtIndexManager {
             indexes.insert(name.to_string(), index);
         }
 
-        {
-            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
-            stats.total_indexes += 1;
-            stats.manual_indexes += 1;
-        }
+        self.stats.add_index(ArtIndexType::Manual);
 
         Ok(name.to_string())
     }
@@ -343,17 +391,7 @@ impl ArtIndexManager {
             }
         }
 
-        // Update stats
-        {
-            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
-            stats.total_indexes -= 1;
-            match index_type {
-                ArtIndexType::PrimaryKey => stats.pk_indexes -= 1,
-                ArtIndexType::ForeignKey => stats.fk_indexes -= 1,
-                ArtIndexType::Unique => stats.unique_indexes -= 1,
-                ArtIndexType::Manual => stats.manual_indexes -= 1,
-            }
-        }
+        self.stats.remove_index(index_type);
 
         Ok(())
     }
@@ -447,11 +485,7 @@ impl ArtIndexManager {
             }
         }
 
-        // Update stats
-        {
-            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
-            stats.index_renames += 1;
-        }
+        self.stats.index_renames.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -726,11 +760,15 @@ impl ArtIndexManager {
         key
     }
 
-    fn index_values_from_tuple(columns: &[String], schema: &Schema, tuple: &Tuple) -> Option<Vec<Value>> {
+    fn index_value_refs_from_tuple<'a>(
+        columns: &[String],
+        schema: &Schema,
+        tuple: &'a Tuple,
+    ) -> Option<Vec<&'a Value>> {
         let mut values = Vec::with_capacity(columns.len());
         for column in columns {
             let idx = schema.get_column_index(column)?;
-            values.push(tuple.values.get(idx)?.clone());
+            values.push(tuple.values.get(idx)?);
         }
         Some(values)
     }
@@ -759,10 +797,7 @@ impl ArtIndexManager {
             }
         }
 
-        {
-            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
-            stats.constraint_checks += 1;
-        }
+        self.stats.constraint_checks.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -845,10 +880,7 @@ impl ArtIndexManager {
             }
         }
 
-        {
-            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
-            stats.constraint_checks += 1;
-        }
+        self.stats.constraint_checks.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -864,9 +896,9 @@ impl ArtIndexManager {
             let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
             if let Some(pk_name) = pk_indexes.get(table) {
                 if let Some(pk_index) = indexes.get(pk_name) {
-                    if let Some(values) = Self::index_values_from_tuple(pk_index.columns(), schema, tuple) {
-                        if !values.iter().any(|v| matches!(v, Value::Null)) {
-                            let key = Self::encode_key(&values);
+                    if let Some(values) = Self::index_value_refs_from_tuple(pk_index.columns(), schema, tuple) {
+                        if !values.iter().any(|v| matches!(**v, Value::Null)) {
+                            let key = Self::encode_key_from_values(values.iter().copied());
                             if pk_index.contains(&key) {
                                 return Err(ArtIndexError::DuplicateKey(format!(
                                     "Duplicate key value violates PRIMARY KEY constraint \"{}\"",
@@ -883,11 +915,11 @@ impl ArtIndexManager {
         if let Some(unique_names) = unique_indexes.get(table) {
             for unique_name in unique_names {
                 if let Some(index) = indexes.get(unique_name) {
-                    if let Some(values) = Self::index_values_from_tuple(index.columns(), schema, tuple) {
-                        if values.iter().any(|v| matches!(v, Value::Null)) {
+                    if let Some(values) = Self::index_value_refs_from_tuple(index.columns(), schema, tuple) {
+                        if values.iter().any(|v| matches!(**v, Value::Null)) {
                             continue;
                         }
-                        let key = Self::encode_key(&values);
+                        let key = Self::encode_key_from_values(values.iter().copied());
                         if index.contains(&key) {
                             return Err(ArtIndexError::DuplicateKey(format!(
                                 "Duplicate key value violates UNIQUE constraint \"{}\"",
@@ -899,10 +931,7 @@ impl ArtIndexManager {
             }
         }
 
-        {
-            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
-            stats.constraint_checks += 1;
-        }
+        self.stats.constraint_checks.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -956,8 +985,7 @@ impl ArtIndexManager {
                         if let Some(ref_index) = indexes.get(ref_pk_name) {
                             let key = Self::encode_key(&values);
                             if !ref_index.contains(&key) {
-                                let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
-                                stats.violations_caught += 1;
+                                self.stats.violations_caught.fetch_add(1, Ordering::Relaxed);
                                 return Err(ArtIndexError::ForeignKeyViolation(format!(
                                     "Key ({:?}) not present in table \"{}\"",
                                     values, ref_table
@@ -969,10 +997,7 @@ impl ArtIndexManager {
             }
         }
 
-        {
-            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
-            stats.constraint_checks += 1;
-        }
+        self.stats.constraint_checks.fetch_add(1, Ordering::Relaxed);
 
         Ok(())
     }
@@ -1032,13 +1057,13 @@ impl ArtIndexManager {
                 continue;
             }
 
-            if let Some(values) = Self::index_values_from_tuple(index.columns(), schema, tuple) {
-                let key = Self::encode_key(&values);
+            if let Some(values) = Self::index_value_refs_from_tuple(index.columns(), schema, tuple) {
+                let key = Self::encode_key_from_values(values.iter().copied());
                 match index.index_type() {
                     ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
                         index.insert(&key, row_id)?;
                         if index.index_type() == ArtIndexType::PrimaryKey && values.len() == 1 {
-                            if let Some((value, key_width)) = Self::int_value_width(&values[0]) {
+                            if let Some((value, key_width)) = Self::int_value_width(values[0]) {
                                 index.record_dense_int_insert(key_width, value);
                             }
                         }
@@ -1076,7 +1101,7 @@ impl ArtIndexManager {
                     values.clear();
                     break;
                 };
-                let Some(value) = tuple.values.get(idx).cloned() else {
+                let Some(value) = tuple.values.get(idx) else {
                     values.clear();
                     break;
                 };
@@ -1085,7 +1110,7 @@ impl ArtIndexManager {
             }
 
             if values.len() == index.columns().len() {
-                let key = Self::encode_key(&values);
+                let key = Self::encode_key_from_values(values.iter().copied());
                 match index.index_type() {
                     ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
                         index.insert(&key, row_id)?;
@@ -1152,8 +1177,8 @@ impl ArtIndexManager {
                 continue;
             }
 
-            if let Some(values) = Self::index_values_from_tuple(index.columns(), schema, tuple) {
-                let key = Self::encode_key(&values);
+            if let Some(values) = Self::index_value_refs_from_tuple(index.columns(), schema, tuple) {
+                let key = Self::encode_key_from_values(values.iter().copied());
                 match index.index_type() {
                     ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
                         let removed = index.remove(&key)?.is_some();
@@ -1314,7 +1339,7 @@ impl ArtIndexManager {
 
     /// Get manager statistics
     pub fn stats(&self) -> ArtManagerStats {
-        self.stats.read().unwrap_or_else(|e| e.into_inner()).clone()
+        self.stats.snapshot()
     }
 
     /// Get statistics for a specific index
