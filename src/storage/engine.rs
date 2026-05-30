@@ -2618,25 +2618,6 @@ impl StorageEngine {
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
 
-        // Phase 1: collect raw (key,value) byte pairs (cheap memcpy from RocksDB).
-        let mut read_opts = ReadOptions::default();
-        read_opts.set_total_order_seek(true);
-        let iter = self
-            .db
-            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
-        let mut raw_rows: Vec<(Box<[u8]>, Box<[u8]>)> = Vec::new();
-        for item in iter {
-            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
-            if !key.starts_with(prefix_bytes) {
-                break; // past the prefix range
-            }
-            raw_rows.push((key, raw_value));
-        }
-
-        // Phase 2: decode each row. The per-row decode (decrypt + bincode +
-        // column-storage resolution) is the CPU cost; we parallelize it across
-        // cores for large scans (P1#6 intra-query parallelism). `par_iter`
-        // preserves input order, so the result order matches the serial path.
         let decode = |key: &[u8], raw_value: &[u8]| -> Result<Tuple> {
             {
                 // Deserialize tuple (decrypt first if encryption is enabled). With a
@@ -2722,8 +2703,9 @@ impl StorageEngine {
             }
         };
 
-        // Parallelize decode for large scans; stay serial for small ones to
-        // avoid thread-pool dispatch overhead. par_iter preserves order.
+        // Parallelize decode for large scans; stay streaming-serial for smaller
+        // scans to avoid staging every RocksDB value into an intermediate raw
+        // buffer before decoding. par_iter preserves order on the large path.
         // HELIOS_SCAN_SERIAL=1 forces the serial path (A/B benchmarking + kill switch).
         static SCAN_SERIAL: once_cell::sync::Lazy<bool> =
             once_cell::sync::Lazy::new(|| std::env::var("HELIOS_SCAN_SERIAL").is_ok());
@@ -2731,17 +2713,44 @@ impl StorageEngine {
         // amortize rayon scheduling and raw-row staging. Sparse analytic scans
         // at TPS scale are faster serially.
         const PAR_DECODE_THRESHOLD: usize = 131_072;
-        let tuples: Vec<Tuple> = if !*SCAN_SERIAL && raw_rows.len() >= PAR_DECODE_THRESHOLD {
+
+        let row_count_hint = self.art_index_manager.pk_index_len(table_name);
+        let parallel_decode = !*SCAN_SERIAL
+            && row_count_hint
+                .map(|count| count >= PAR_DECODE_THRESHOLD)
+                .unwrap_or(false);
+
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        let tuples: Vec<Tuple> = if parallel_decode {
+            let mut raw_rows: Vec<(Box<[u8]>, Box<[u8]>)> =
+                Vec::with_capacity(row_count_hint.unwrap_or_default());
+            for item in iter {
+                let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                if !key.starts_with(prefix_bytes) {
+                    break; // past the prefix range
+                }
+                raw_rows.push((key, raw_value));
+            }
             use rayon::prelude::*;
             raw_rows
                 .par_iter()
                 .map(|kv| decode(&kv.0, &kv.1))
                 .collect::<Result<Vec<_>>>()?
         } else {
-            raw_rows
-                .iter()
-                .map(|kv| decode(&kv.0, &kv.1))
-                .collect::<Result<Vec<_>>>()?
+            let mut tuples = Vec::with_capacity(row_count_hint.unwrap_or(256));
+            for item in iter {
+                let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                if !key.starts_with(prefix_bytes) {
+                    break; // past the prefix range
+                }
+                tuples.push(decode(&key, &raw_value)?);
+            }
+            tuples
         };
 
         tracing::debug!(
