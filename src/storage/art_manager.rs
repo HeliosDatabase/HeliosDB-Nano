@@ -605,25 +605,34 @@ impl ArtIndexManager {
         if index.columns().len() != 1 {
             return None;
         }
+        if let Some(count) = index.dense_int_count(key_width, lower, upper) {
+            return Some(count);
+        }
 
         Some(
             index
                 .iter()
                 .filter_map(|(key, _)| decode_int_key(&key, key_width))
                 .filter(|value| {
-                    lower.map_or(true, |(bound, inclusive)| {
-                        if inclusive {
-                            *value >= bound
-                        } else {
-                            *value > bound
-                        }
-                    }) && upper.map_or(true, |(bound, inclusive)| {
-                        if inclusive {
-                            *value <= bound
-                        } else {
-                            *value < bound
-                        }
-                    })
+                    lower.map_or(
+                        true,
+                        |(bound, inclusive)| {
+                            if inclusive {
+                                *value >= bound
+                            } else {
+                                *value > bound
+                            }
+                        },
+                    ) && upper.map_or(
+                        true,
+                        |(bound, inclusive)| {
+                            if inclusive {
+                                *value <= bound
+                            } else {
+                                *value < bound
+                            }
+                        },
+                    )
                 })
                 .count(),
         )
@@ -903,6 +912,11 @@ impl ArtIndexManager {
                     ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
                         // Already checked, just insert
                         index.insert(&key, row_id)?;
+                        if index.index_type() == ArtIndexType::PrimaryKey && values.len() == 1 {
+                            if let Some((value, key_width)) = Self::int_value_width(&values[0]) {
+                                index.record_dense_int_insert(key_width, value);
+                            }
+                        }
                     }
                     ArtIndexType::ForeignKey | ArtIndexType::Manual => {
                         // These allow duplicates
@@ -935,7 +949,12 @@ impl ArtIndexManager {
                 match index.index_type() {
                     ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
                         // Unique indexes: remove entire key entry
-                        let _ = index.remove(&key);
+                        let removed = index.remove(&key)?.is_some();
+                        if removed && index.index_type() == ArtIndexType::PrimaryKey && values.len() == 1 {
+                            if let Some((value, _)) = Self::int_value_width(&values[0]) {
+                                index.record_dense_int_delete(value);
+                            }
+                        }
                     }
                     ArtIndexType::ForeignKey | ArtIndexType::Manual => {
                         // Non-unique indexes: remove only the specific row_id
@@ -961,7 +980,12 @@ impl ArtIndexManager {
                 let key = Self::encode_key(&values);
                 match index.index_type() {
                     ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
-                        let _ = index.remove(&key);
+                        let removed = index.remove(&key)?.is_some();
+                        if removed && index.index_type() == ArtIndexType::PrimaryKey && values.len() == 1 {
+                            if let Some((value, _)) = Self::int_value_width(&values[0]) {
+                                index.record_dense_int_delete(value);
+                            }
+                        }
                     }
                     ArtIndexType::ForeignKey | ArtIndexType::Manual => {
                         let _ = index.remove_value(&key, row_id);
@@ -999,6 +1023,15 @@ impl ArtIndexManager {
             if index.table() == table {
                 index.clear();
             }
+        }
+    }
+
+    fn int_value_width(value: &Value) -> Option<(i64, usize)> {
+        match value {
+            Value::Int2(v) => Some((i64::from(*v), 2)),
+            Value::Int4(v) => Some((i64::from(*v), 4)),
+            Value::Int8(v) => Some((*v, 8)),
+            _ => None,
         }
     }
 
@@ -1126,6 +1159,67 @@ mod tests {
         assert_eq!(
             manager.pk_index_count_int_range("events", &DataType::Int8, Some((-1, true)), Some((1, true))),
             Some(3)
+        );
+    }
+
+    #[test]
+    fn test_dense_pk_int_range_count_stays_exact_after_edge_deletes() {
+        let manager = ArtIndexManager::new();
+        manager.create_pk_index("events", &["id".to_string()]).unwrap();
+
+        for id in 0_i32..10 {
+            let mut values = HashMap::new();
+            values.insert("id".to_string(), Value::Int4(id));
+            manager.on_insert("events", id as u64 + 1, &values).unwrap();
+        }
+
+        assert_eq!(
+            manager.pk_index_count_int_range("events", &DataType::Int4, Some((3, true)), None),
+            Some(7)
+        );
+        assert_eq!(
+            manager.pk_index_count_int_range("events", &DataType::Int4, Some((2, true)), Some((5, true))),
+            Some(4)
+        );
+
+        for id in [0_i32, 9] {
+            let mut values = HashMap::new();
+            values.insert("id".to_string(), Value::Int4(id));
+            manager.on_delete("events", id as u64 + 1, &values).unwrap();
+        }
+
+        assert_eq!(
+            manager.pk_index_count_int_range("events", &DataType::Int4, None, None),
+            Some(8)
+        );
+        assert_eq!(
+            manager.pk_index_count_int_range("events", &DataType::Int4, Some((1, true)), Some((8, true))),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn test_dense_pk_int_range_count_falls_back_after_gap_delete() {
+        let manager = ArtIndexManager::new();
+        manager.create_pk_index("events", &["id".to_string()]).unwrap();
+
+        for id in 0_i32..10 {
+            let mut values = HashMap::new();
+            values.insert("id".to_string(), Value::Int4(id));
+            manager.on_insert("events", id as u64 + 1, &values).unwrap();
+        }
+
+        let mut values = HashMap::new();
+        values.insert("id".to_string(), Value::Int4(5));
+        manager.on_delete("events", 6, &values).unwrap();
+
+        assert_eq!(
+            manager.pk_index_count_int_range("events", &DataType::Int4, None, None),
+            Some(9)
+        );
+        assert_eq!(
+            manager.pk_index_count_int_range("events", &DataType::Int4, Some((4, true)), Some((6, true))),
+            Some(2)
         );
     }
 
