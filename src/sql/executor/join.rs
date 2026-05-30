@@ -259,8 +259,10 @@ pub struct HashJoinOperator {
 
     // Probe phase state
     current_left_tuple: Option<Tuple>,
+    current_match_key: Option<JoinKey>,
     current_matches: Vec<Tuple>,
     match_index: usize,
+    pure_equi_join: bool,
 
     // LEFT/RIGHT/FULL join state
     matched_right_keys: std::collections::HashSet<JoinKey>,
@@ -514,6 +516,7 @@ impl HashJoinOperator {
         let direct_key_indices = on_condition
             .as_ref()
             .and_then(|condition| build_direct_join_key_indices(condition, &left_schema, &right_schema));
+        let pure_equi_join = is_pure_equi_join(&on_condition);
 
         // Create evaluator with output schema for evaluating join conditions on combined tuples
         let evaluator = crate::sql::Evaluator::new(output_schema.clone());
@@ -535,8 +538,10 @@ impl HashJoinOperator {
             direct_key_indices,
             state: JoinState::Initial,
             current_left_tuple: None,
+            current_match_key: None,
             current_matches: Vec::new(),
             match_index: 0,
+            pure_equi_join,
             matched_right_keys: std::collections::HashSet::new(),
             unmatched_right_iter: None,
             unmatched_right_current: None,
@@ -712,6 +717,28 @@ impl HashJoinOperator {
                 ctx.check_timeout()?;
             }
 
+            // Pure equi-joins can stream directly from the hash bucket. Avoid
+            // cloning the whole match vector for every probe row.
+            if let Some(key) = self.current_match_key.as_ref() {
+                if let Some(matches) = self.hash_table.get(key) {
+                    if self.match_index < matches.len() {
+                        let right_tuple = matches
+                            .get(self.match_index)
+                            .ok_or_else(|| Error::query_execution("Match index out of bounds"))?;
+                        let left_tuple = self
+                            .current_left_tuple
+                            .as_ref()
+                            .ok_or_else(|| Error::query_execution("Missing left tuple"))?;
+                        self.match_index += 1;
+                        return Ok(Some(Self::join_tuples(left_tuple, right_tuple)));
+                    }
+                }
+
+                self.current_match_key = None;
+                self.current_left_tuple = None;
+                self.match_index = 0;
+            }
+
             // If we have pending matches for current left tuple, emit them
             if self.match_index < self.current_matches.len() {
                 let right_tuple = self
@@ -765,20 +792,25 @@ impl HashJoinOperator {
 
                     // Lookup in hash table
                     if let Some(matches) = self.hash_table.get(&key) {
-                        // For pure equi-joins, hash lookup already confirmed match —
-                        // skip per-tuple filter and clone directly
-                        let is_equi = is_pure_equi_join(&self.on_condition);
-                        let filtered_matches: Vec<Tuple> = if is_equi {
-                            matches.clone()
-                        } else {
-                            matches
-                                .iter()
-                                .filter(|right_tuple| {
-                                    self.evaluate_join_condition(&left_tuple, right_tuple).unwrap_or(false)
-                                })
-                                .cloned()
-                                .collect()
-                        };
+                        if self.pure_equi_join {
+                            // Mark key as matched (for RIGHT/FULL joins)
+                            if matches!(self.join_type, crate::sql::JoinType::Right | crate::sql::JoinType::Full) {
+                                self.matched_right_keys.insert(key.clone());
+                            }
+
+                            self.current_left_tuple = Some(left_tuple);
+                            self.current_match_key = Some(key);
+                            self.match_index = 0;
+
+                            // Continue loop to emit first match
+                            continue;
+                        }
+
+                        let filtered_matches: Vec<Tuple> = matches
+                            .iter()
+                            .filter(|right_tuple| self.evaluate_join_condition(&left_tuple, right_tuple).unwrap_or(false))
+                            .cloned()
+                            .collect();
 
                         if !filtered_matches.is_empty() {
                             // Mark key as matched (for RIGHT/FULL joins)
