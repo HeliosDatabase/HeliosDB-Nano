@@ -105,6 +105,99 @@ pub struct ArtIndexStats {
     pub delete_count: u64,
 }
 
+#[derive(Debug, Clone)]
+struct DenseIntStats {
+    key_width: usize,
+    len: usize,
+    min: i64,
+    max: i64,
+    dense: bool,
+    valid: bool,
+}
+
+impl DenseIntStats {
+    fn new(key_width: usize, value: i64) -> Self {
+        Self {
+            key_width,
+            len: 1,
+            min: value,
+            max: value,
+            dense: true,
+            valid: true,
+        }
+    }
+
+    fn insert(&mut self, key_width: usize, value: i64) {
+        if !self.valid || self.key_width != key_width {
+            self.valid = false;
+            return;
+        }
+        self.len += 1;
+        self.min = self.min.min(value);
+        self.max = self.max.max(value);
+        self.dense = self.is_contiguous();
+    }
+
+    fn delete(&mut self, value: i64) {
+        if !self.valid || self.len == 0 {
+            self.valid = false;
+            return;
+        }
+        if self.len == 1 {
+            self.len = 0;
+            self.dense = true;
+            self.min = 0;
+            self.max = 0;
+            return;
+        }
+
+        self.len -= 1;
+        if self.dense {
+            if value == self.min {
+                self.min = self.min.saturating_add(1);
+            } else if value == self.max {
+                self.max = self.max.saturating_sub(1);
+            } else {
+                self.dense = false;
+            }
+        } else {
+            // Without storing every key, deleting from a sparse set can make
+            // min/max stale. Keep the stat present but force the exact fallback.
+            self.valid = false;
+        }
+    }
+
+    fn is_contiguous(&self) -> bool {
+        if !self.valid {
+            return false;
+        }
+        let span = i128::from(self.max) - i128::from(self.min) + 1;
+        span >= 0 && span == self.len as i128
+    }
+
+    fn count_range(&self, key_width: usize, lower: Option<(i64, bool)>, upper: Option<(i64, bool)>) -> Option<usize> {
+        if !self.valid || !self.dense || self.len == 0 || self.key_width != key_width {
+            return None;
+        }
+
+        let mut lo = i128::from(self.min);
+        let mut hi = i128::from(self.max);
+        if let Some((bound, inclusive)) = lower {
+            let bound = i128::from(bound) + if inclusive { 0 } else { 1 };
+            lo = lo.max(bound);
+        }
+        if let Some((bound, inclusive)) = upper {
+            let bound = i128::from(bound) - if inclusive { 0 } else { 1 };
+            hi = hi.min(bound);
+        }
+
+        if lo > hi {
+            return Some(0);
+        }
+        usize::try_from(hi - lo + 1).ok()
+    }
+}
+
 impl ArtIndexStats {
     /// Total number of internal nodes
     pub fn total_nodes(&self) -> u64 {
@@ -129,6 +222,8 @@ pub struct AdaptiveRadixTree {
     size: u64,
     /// Statistics
     stats: ArtIndexStats,
+    /// Exact O(1) range-count metadata for dense single-column integer PKs.
+    dense_int_stats: Option<DenseIntStats>,
 }
 
 #[allow(clippy::indexing_slicing)] // SAFETY: key[depth] access bounded by depth < key.len() checks; node child access bounded by node type invariants
@@ -143,6 +238,7 @@ impl AdaptiveRadixTree {
             index_type,
             size: 0,
             stats: ArtIndexStats::default(),
+            dense_int_stats: None,
         }
     }
 
@@ -185,6 +281,36 @@ impl AdaptiveRadixTree {
     /// Get statistics
     pub fn stats(&self) -> &ArtIndexStats {
         &self.stats
+    }
+
+    /// Record a single-column integer primary-key insert for O(1) dense range counts.
+    pub fn record_dense_int_insert(&mut self, key_width: usize, value: i64) {
+        self.dense_int_stats
+            .as_mut()
+            .map(|stats| stats.insert(key_width, value))
+            .unwrap_or_else(|| self.dense_int_stats = Some(DenseIntStats::new(key_width, value)));
+    }
+
+    /// Record a single-column integer primary-key delete.
+    pub fn record_dense_int_delete(&mut self, value: i64) {
+        if let Some(stats) = self.dense_int_stats.as_mut() {
+            stats.delete(value);
+            if stats.len == 0 {
+                self.dense_int_stats = None;
+            }
+        }
+    }
+
+    /// Count a range from dense integer PK metadata, if the table remains contiguous.
+    pub fn dense_int_count(
+        &self,
+        key_width: usize,
+        lower: Option<(i64, bool)>,
+        upper: Option<(i64, bool)>,
+    ) -> Option<usize> {
+        self.dense_int_stats
+            .as_ref()
+            .and_then(|stats| stats.count_range(key_width, lower, upper))
     }
 
     /// Insert a key-value pair
@@ -903,6 +1029,7 @@ impl AdaptiveRadixTree {
         self.root = None;
         self.size = 0;
         self.stats = ArtIndexStats::default();
+        self.dense_int_stats = None;
     }
 }
 
