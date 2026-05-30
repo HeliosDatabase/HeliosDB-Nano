@@ -4789,33 +4789,11 @@ impl StorageEngine {
             }
         }
 
-        // Check PK/UNIQUE constraints BEFORE writing data to prevent duplicates
-        let col_values = {
-            let mut m = std::collections::HashMap::new();
-            for (i, col) in schema.columns.iter().enumerate() {
-                if let Some(v) = tuple.values.get(i) {
-                    m.insert(col.name.clone(), v.clone());
-                }
-            }
-            m
-        };
-
-        // Check PK constraint
-        let pk_cols: Vec<crate::Value> = schema
-            .columns
-            .iter()
-            .enumerate()
-            .filter(|(_, c)| c.primary_key)
-            .filter_map(|(i, _)| tuple.values.get(i).cloned())
-            .collect();
-        if !pk_cols.is_empty() {
-            if let Err(e) = self.art_index_manager.check_pk_constraint(table_name, &pk_cols) {
-                return Err(Error::constraint_violation(e.to_string()));
-            }
-        }
-
-        // Check UNIQUE constraints
-        if let Err(e) = self.art_index_manager.check_unique_constraints(table_name, &col_values) {
+        // Check PK/UNIQUE constraints BEFORE writing data to prevent duplicates.
+        if let Err(e) = self
+            .art_index_manager
+            .check_unique_constraints_tuple(table_name, schema, &tuple)
+        {
             return Err(Error::constraint_violation(e.to_string()));
         }
 
@@ -4842,7 +4820,10 @@ impl StorageEngine {
         }
 
         // ART index update (constraint already verified above)
-        if let Err(e) = self.art_index_manager.on_insert(table_name, row_id, &col_values) {
+        if let Err(e) = self
+            .art_index_manager
+            .on_insert_tuple(table_name, row_id, schema, &tuple)
+        {
             tracing::debug!("ART index insert for table '{}': {}", table_name, e);
         }
 

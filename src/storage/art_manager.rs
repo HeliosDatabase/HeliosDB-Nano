@@ -826,6 +826,60 @@ impl ArtIndexManager {
         Ok(())
     }
 
+    /// Tuple-backed PK/UNIQUE constraint check for storage fast paths.
+    ///
+    /// This avoids building a column-name map for every inserted row when the
+    /// values are already available in schema order.
+    pub fn check_unique_constraints_tuple(&self, table: &str, schema: &Schema, tuple: &Tuple) -> ArtResult<()> {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+
+        {
+            let pk_indexes = self.pk_indexes.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(pk_name) = pk_indexes.get(table) {
+                if let Some(pk_index) = indexes.get(pk_name) {
+                    if let Some(values) = Self::index_values_from_tuple(pk_index.columns(), schema, tuple) {
+                        if !values.iter().any(|v| matches!(v, Value::Null)) {
+                            let key = Self::encode_key(&values);
+                            if pk_index.contains(&key) {
+                                return Err(ArtIndexError::DuplicateKey(format!(
+                                    "Duplicate key value violates PRIMARY KEY constraint \"{}\"",
+                                    pk_name
+                                )));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let unique_indexes = self.unique_indexes.read().unwrap_or_else(|e| e.into_inner());
+        if let Some(unique_names) = unique_indexes.get(table) {
+            for unique_name in unique_names {
+                if let Some(index) = indexes.get(unique_name) {
+                    if let Some(values) = Self::index_values_from_tuple(index.columns(), schema, tuple) {
+                        if values.iter().any(|v| matches!(v, Value::Null)) {
+                            continue;
+                        }
+                        let key = Self::encode_key(&values);
+                        if index.contains(&key) {
+                            return Err(ArtIndexError::DuplicateKey(format!(
+                                "Duplicate key value violates UNIQUE constraint \"{}\"",
+                                unique_name
+                            )));
+                        }
+                    }
+                }
+            }
+        }
+
+        {
+            let mut stats = self.stats.write().unwrap_or_else(|e| e.into_inner());
+            stats.constraint_checks += 1;
+        }
+
+        Ok(())
+    }
+
     /// Check foreign key constraint before INSERT/UPDATE
     pub fn check_fk_constraints(&self, table: &str, column_values: &HashMap<String, Value>) -> ArtResult<()> {
         let fk_indexes = self.fk_indexes.read().unwrap_or_else(|e| e.into_inner());
@@ -920,6 +974,36 @@ impl ArtIndexManager {
                     }
                     ArtIndexType::ForeignKey | ArtIndexType::Manual => {
                         // These allow duplicates
+                        let _ = index.insert(&key, row_id);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Update indexes after INSERT using an already-materialized tuple.
+    pub fn on_insert_tuple(&self, table: &str, row_id: RowId, schema: &Schema, tuple: &Tuple) -> ArtResult<()> {
+        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+
+        for index in indexes.values_mut() {
+            if index.table() != table {
+                continue;
+            }
+
+            if let Some(values) = Self::index_values_from_tuple(index.columns(), schema, tuple) {
+                let key = Self::encode_key(&values);
+                match index.index_type() {
+                    ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
+                        index.insert(&key, row_id)?;
+                        if index.index_type() == ArtIndexType::PrimaryKey && values.len() == 1 {
+                            if let Some((value, key_width)) = Self::int_value_width(&values[0]) {
+                                index.record_dense_int_insert(key_width, value);
+                            }
+                        }
+                    }
+                    ArtIndexType::ForeignKey | ArtIndexType::Manual => {
                         let _ = index.insert(&key, row_id);
                     }
                 }
@@ -1319,6 +1403,58 @@ mod tests {
         assert!(!manager.tuple_update_affects_indexes("users", &schema, &old_tuple, &payload_update));
         assert!(manager.tuple_update_affects_indexes("users", &schema, &old_tuple, &unique_update));
         assert!(manager.tuple_update_affects_indexes("users", &schema, &old_tuple, &pk_update));
+    }
+
+    #[test]
+    fn test_tuple_backed_insert_constraints_and_index_update() {
+        use crate::Column;
+
+        let manager = ArtIndexManager::new();
+        manager.create_pk_index("users", &["id".to_string()]).unwrap();
+        manager
+            .create_unique_index("users", &["email".to_string()], None)
+            .unwrap();
+
+        let schema = Schema::new(vec![
+            Column::new("id", DataType::Int4).primary_key(),
+            Column::new("email", DataType::Text).unique(),
+            Column::new("balance", DataType::Int4),
+        ]);
+        let tuple = Tuple::new(vec![
+            Value::Int4(1),
+            Value::String("a@example.com".to_string()),
+            Value::Int4(10),
+        ]);
+
+        manager
+            .check_unique_constraints_tuple("users", &schema, &tuple)
+            .unwrap();
+        manager.on_insert_tuple("users", 1, &schema, &tuple).unwrap();
+
+        let dup_pk = Tuple::new(vec![
+            Value::Int4(1),
+            Value::String("b@example.com".to_string()),
+            Value::Int4(20),
+        ]);
+        assert!(matches!(
+            manager.check_unique_constraints_tuple("users", &schema, &dup_pk),
+            Err(ArtIndexError::DuplicateKey(_))
+        ));
+
+        let dup_unique = Tuple::new(vec![
+            Value::Int4(2),
+            Value::String("a@example.com".to_string()),
+            Value::Int4(20),
+        ]);
+        assert!(matches!(
+            manager.check_unique_constraints_tuple("users", &schema, &dup_unique),
+            Err(ArtIndexError::DuplicateKey(_))
+        ));
+
+        let null_unique = Tuple::new(vec![Value::Int4(2), Value::Null, Value::Int4(20)]);
+        assert!(manager
+            .check_unique_constraints_tuple("users", &schema, &null_unique)
+            .is_ok());
     }
 
     #[test]
