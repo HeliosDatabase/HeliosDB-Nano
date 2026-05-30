@@ -2514,7 +2514,7 @@ impl StorageEngine {
                     break;
                 }
 
-                let tuple = self.decode_rowstore_aggregate_tuple(&raw_value, &requested, schema.columns.len())?;
+                let tuple = self.decode_rowstore_columns(&raw_value, &requested, schema.columns.len())?;
                 if !row_tuple_matches_filters(&tuple, &filter_predicates) {
                     continue;
                 }
@@ -2546,7 +2546,7 @@ impl StorageEngine {
                 break;
             }
 
-            let tuple = self.decode_rowstore_aggregate_tuple(&raw_value, &requested, schema.columns.len())?;
+            let tuple = self.decode_rowstore_columns(&raw_value, &requested, schema.columns.len())?;
             if !row_tuple_matches_filters(&tuple, &filter_predicates) {
                 continue;
             }
@@ -2592,7 +2592,7 @@ impl StorageEngine {
         Ok(Some(tuples))
     }
 
-    fn decode_rowstore_aggregate_tuple(
+    fn decode_rowstore_columns(
         &self,
         raw_value: &[u8],
         columns: &[usize],
