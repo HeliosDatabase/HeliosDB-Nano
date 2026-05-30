@@ -88,7 +88,7 @@ pub use mvcc::{Snapshot, SnapshotId};
 pub use statistics::{ColumnStatistics, StatisticsAnalyzer, StatisticsCache, TableStatistics};
 pub use stats::{DatabaseStats, GlobalStatsCollector, ReplicationRole, StatsSnapshot};
 pub use time_travel::{GcConfig, Scn, SnapshotManager, SnapshotMetadata, TransactionId};
-pub use transaction::Transaction;
+pub use transaction::{Transaction, TransactionSavepointSnapshot};
 pub use vector_index::{
     StoredVectorRecord, StoredVectorSearchResult, VectorIndexManager, VectorIndexMetadata, VectorIndexStats,
     VectorIndexType,

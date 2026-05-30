@@ -473,10 +473,9 @@ impl Drop for EmbeddedDatabase {
 struct SavepointState {
     /// Savepoint name
     name: String,
-    /// Snapshot of the transaction write set at savepoint creation time.
+    /// Snapshot of transaction staged writes at savepoint creation time.
     /// Used by ROLLBACK TO SAVEPOINT to undo data changes made after the savepoint.
-    /// Contains all (key, value) pairs from the write set when the savepoint was created.
-    write_set_snapshot: Vec<(Vec<u8>, Option<Vec<u8>>)>,
+    write_set_snapshot: storage::TransactionSavepointSnapshot,
 }
 
 #[derive(Clone)]
@@ -6855,7 +6854,7 @@ impl EmbeddedDatabase {
         }
         let val = bincode::serialize(&tuple).map_err(|e| Error::storage(e.to_string()))?;
         let key = self.storage.branch_aware_data_key(table_name, row_id);
-        if let Err(e) = txn.put(key, val) {
+        if let Err(e) = txn.put_insert_fast(key, val) {
             let _ = self.storage.art_indexes().on_delete(table_name, row_id, &col_values);
             return Err(e);
         }
@@ -9884,11 +9883,24 @@ impl EmbeddedDatabase {
                 let eval_schema = schema.clone().with_source_table_name(table_name);
                 let evaluator = sql::Evaluator::with_parameters(std::sync::Arc::new(eval_schema), params.to_vec());
 
-                // Use branch-aware scan to read tuples
-                let tuples = self.storage.scan_table_branch_aware(table_name)?;
-                let mut updates: Vec<(u64, Tuple)> = Vec::new();
+                let txn_guard = self
+                    .current_transaction
+                    .lock()
+                    .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
+                let active_txn = txn_guard.as_ref();
 
-                for mut tuple in tuples {
+                // Use branch-aware scan to read tuples, then merge any active
+                // transaction writes so parameterized UPDATE has the same
+                // read-your-own-writes behavior as the simple-query path.
+                let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
+                let tuples = if let Some(txn) = active_txn {
+                    txn.merge_with_write_set(table_name, base_tuples)?
+                } else {
+                    base_tuples
+                };
+                let mut updates: Vec<(u64, Tuple, Tuple)> = Vec::new();
+
+                for tuple in tuples {
                     let matches = if let Some(predicate) = selection {
                         let result = evaluator.evaluate(predicate, &tuple)?;
                         match result {
@@ -9900,6 +9912,8 @@ impl EmbeddedDatabase {
                     };
 
                     if matches {
+                        let old_tuple = tuple.clone();
+                        let mut tuple = tuple;
                         for (col_name, value_expr) in assignments {
                             let bound =
                                 self.materialize_scalar_subqueries_for_row(value_expr, &tuple, &schema, table_name)?;
@@ -9957,10 +9971,10 @@ impl EmbeddedDatabase {
                                 new_col_values.insert(col.name.clone(), v.clone());
                             }
                         }
-                        self.check_fk_constraints_on_write(table_name, &new_col_values, None)?;
+                        self.check_fk_constraints_on_write(table_name, &new_col_values, active_txn)?;
 
                         let row_id = tuple.row_id.unwrap_or(0);
-                        updates.push((row_id, tuple));
+                        updates.push((row_id, old_tuple, tuple));
                     }
                 }
 
@@ -9968,14 +9982,64 @@ impl EmbeddedDatabase {
                 let returned_tuples: Vec<Tuple> = if returning.is_some() {
                     updates
                         .iter()
-                        .filter_map(|(_, tuple)| Self::project_returning_columns(tuple, &schema, returning))
+                        .filter_map(|(_, _, tuple)| Self::project_returning_columns(tuple, &schema, returning))
                         .collect()
                 } else {
                     Vec::new()
                 };
 
-                // Use branch-aware update
-                let count = self.storage.update_tuples_branch_aware(table_name, updates)?;
+                let count = if let Some(txn) = active_txn {
+                    let on_branch = self.storage.get_current_branch().is_some();
+                    for (row_id, old_tuple, tuple) in &updates {
+                        let key = self.storage.branch_aware_data_key(table_name, *row_id);
+                        if !on_branch {
+                            self.storage
+                                .stage_tuple_for_column_storage_in_transaction(table_name, *row_id, tuple, &schema, txn)?;
+                        }
+                        let value = bincode::serialize(tuple)
+                            .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+                        txn.put(key.clone(), value)?;
+
+                        let mut old_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+                        let mut new_col_values = std::collections::HashMap::with_capacity(schema.columns.len());
+                        for (i, col) in schema.columns.iter().enumerate() {
+                            if let Some(v) = old_tuple.values.get(i) {
+                                old_col_values.insert(col.name.clone(), v.clone());
+                            }
+                            if let Some(v) = tuple.values.get(i) {
+                                new_col_values.insert(col.name.clone(), v.clone());
+                            }
+                        }
+                        if let Err(e) = self
+                            .storage
+                            .art_indexes()
+                            .on_delete(table_name, *row_id, &old_col_values)
+                        {
+                            tracing::debug!("ART index update/delete-old for '{}': {}", table_name, e);
+                        }
+                        if let Err(e) = self
+                            .storage
+                            .art_indexes()
+                            .on_insert(table_name, *row_id, &new_col_values)
+                        {
+                            tracing::debug!("ART index update/insert-new for '{}': {}", table_name, e);
+                        }
+                        self.art_undo_log.write().push(ArtUndoOp::RestoreUpdated {
+                            table_name: table_name.clone(),
+                            row_id: *row_id,
+                            old_col_values,
+                            new_col_values,
+                        });
+                        self.storage.row_cache().invalidate(table_name, *row_id);
+                    }
+                    updates.len() as u64
+                } else {
+                    let updates: Vec<(u64, Tuple)> = updates
+                        .into_iter()
+                        .map(|(row_id, _old_tuple, tuple)| (row_id, tuple))
+                        .collect();
+                    self.storage.update_tuples_branch_aware(table_name, updates)?
+                };
                 Ok((count, returned_tuples))
             }
             sql::LogicalPlan::Delete {
@@ -9988,8 +10052,21 @@ impl EmbeddedDatabase {
                 let eval_schema = schema.clone().with_source_table_name(table_name);
                 let evaluator = sql::Evaluator::with_parameters(std::sync::Arc::new(eval_schema), params.to_vec());
 
-                // Use branch-aware scan to read tuples
-                let tuples = self.storage.scan_table_branch_aware(table_name)?;
+                let txn_guard = self
+                    .current_transaction
+                    .lock()
+                    .map_err(|_| Error::query_execution("Failed to lock transaction"))?;
+                let active_txn = txn_guard.as_ref();
+
+                // Use branch-aware scan to read tuples, then merge any active
+                // transaction writes so parameterized DELETE has the same
+                // read-your-own-writes behavior as the simple-query path.
+                let base_tuples = self.storage.scan_table_branch_aware(table_name)?;
+                let tuples = if let Some(txn) = active_txn {
+                    txn.merge_with_write_set(table_name, base_tuples)?
+                } else {
+                    base_tuples
+                };
                 let mut row_ids_to_delete: Vec<u64> = Vec::new();
                 let mut deleted_tuples: Vec<(u64, Tuple)> = Vec::new();
                 let mut returned_tuples: Vec<Tuple> = Vec::new();
@@ -10032,10 +10109,30 @@ impl EmbeddedDatabase {
                     if let Err(e) = self.storage.art_indexes().on_delete(table_name, *row_id, &col_values) {
                         tracing::debug!("ART index delete for table '{}': {}", table_name, e);
                     }
+                    if active_txn.is_some() {
+                        self.art_undo_log.write().push(ArtUndoOp::RestoreDeleted {
+                            table_name: table_name.clone(),
+                            row_id: *row_id,
+                            col_values,
+                        });
+                    }
                 }
 
-                // Use branch-aware delete
-                let count = self.storage.delete_tuples_branch_aware(table_name, row_ids_to_delete)?;
+                let count = if let Some(txn) = active_txn {
+                    let on_branch = self.storage.get_current_branch().is_some();
+                    for row_id in &row_ids_to_delete {
+                        let key = self.storage.branch_aware_data_key(table_name, *row_id);
+                        if !on_branch {
+                            self.storage
+                                .stage_columnar_delete_in_transaction(table_name, *row_id, &schema, txn)?;
+                        }
+                        txn.delete(key.clone())?;
+                        self.storage.row_cache().invalidate(table_name, *row_id);
+                    }
+                    row_ids_to_delete.len() as u64
+                } else {
+                    self.storage.delete_tuples_branch_aware(table_name, row_ids_to_delete)?
+                };
                 Ok((count, returned_tuples))
             }
             // Transaction control statements
