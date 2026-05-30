@@ -170,6 +170,13 @@ fn row_tuple_matches_filters(tuple: &Tuple, predicates: &[FilterPredicate]) -> b
     })
 }
 
+fn row_values_match_filters(values: &[Value], predicates: &[FilterPredicate], positions: &[usize]) -> bool {
+    predicates
+        .iter()
+        .zip(positions)
+        .all(|(predicate, &pos)| values.get(pos).is_some_and(|value| predicate.evaluate(value)))
+}
+
 fn columnar_batch_value<'a>(
     column_batches: &'a HashMap<usize, ColumnarBatchIndex>,
     column_index: usize,
@@ -2562,6 +2569,27 @@ impl StorageEngine {
             return Ok(Some(vec![Tuple::new(values)]));
         }
 
+        let requested_pos = |column_index: usize| -> Result<usize> {
+            requested.binary_search(&column_index).map_err(|_| {
+                Error::storage(format!(
+                    "Column index {} missing from aggregate decode set for {}",
+                    column_index, table_name
+                ))
+            })
+        };
+        let group_positions: Vec<usize> = group_by_columns
+            .iter()
+            .map(|&idx| requested_pos(idx))
+            .collect::<Result<Vec<_>>>()?;
+        let aggregate_positions: Vec<Option<usize>> = aggregates
+            .iter()
+            .map(|aggregate| aggregate.column_index.map(&requested_pos).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        let filter_positions: Vec<usize> = predicates
+            .iter()
+            .map(|predicate| requested_pos(predicate.column_index))
+            .collect::<Result<Vec<_>>>()?;
+
         let prefix = format!("data:{}:", table_name);
         let prefix_bytes = prefix.as_bytes();
         let mut read_opts = ReadOptions::default();
@@ -2582,13 +2610,13 @@ impl StorageEngine {
                     break;
                 }
 
-                let tuple = self.decode_rowstore_columns(&raw_value, &requested, schema.columns.len())?;
-                if !row_tuple_matches_filters(&tuple, &filter_predicates) {
+                let values = self.decode_rowstore_column_values(&raw_value, &requested, schema.columns.len())?;
+                if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
                     continue;
                 }
 
-                for (state, aggregate) in states.iter_mut().zip(aggregates) {
-                    let value = aggregate.column_index.and_then(|idx| tuple.values.get(idx));
+                for ((state, aggregate), position) in states.iter_mut().zip(aggregates).zip(&aggregate_positions) {
+                    let value = position.and_then(|pos| values.get(pos));
                     state.update(aggregate.op, value)?;
                 }
             }
@@ -2614,14 +2642,15 @@ impl StorageEngine {
                 break;
             }
 
-            let tuple = self.decode_rowstore_columns(&raw_value, &requested, schema.columns.len())?;
-            if !row_tuple_matches_filters(&tuple, &filter_predicates) {
+            let values = self.decode_rowstore_column_values(&raw_value, &requested, schema.columns.len())?;
+            if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
                 continue;
             }
 
             let group_key: Vec<Value> = group_by_columns
                 .iter()
-                .map(|&idx| tuple.values.get(idx).cloned().unwrap_or(Value::Null))
+                .zip(&group_positions)
+                .map(|(_, &pos)| values.get(pos).cloned().unwrap_or(Value::Null))
                 .collect();
             let states = groups.entry(group_key).or_insert_with(|| {
                 aggregates
@@ -2630,8 +2659,8 @@ impl StorageEngine {
                     .collect()
             });
 
-            for (state, aggregate) in states.iter_mut().zip(aggregates) {
-                let value = aggregate.column_index.and_then(|idx| tuple.values.get(idx));
+            for ((state, aggregate), position) in states.iter_mut().zip(aggregates).zip(&aggregate_positions) {
+                let value = position.and_then(|pos| values.get(pos));
                 state.update(aggregate.op, value)?;
             }
         }
@@ -2674,6 +2703,22 @@ impl StorageEngine {
         }
         .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
         Ok(tuple)
+    }
+
+    fn decode_rowstore_column_values(
+        &self,
+        raw_value: &[u8],
+        columns: &[usize],
+        total_cols: usize,
+    ) -> Result<Vec<Value>> {
+        let values = if let Some(km) = &self.key_manager {
+            let decrypted = crypto::decrypt(km.key(), raw_value)?;
+            crate::storage::prefix_decode::decode_tuple_column_values(&decrypted, columns, total_cols)
+        } else {
+            crate::storage::prefix_decode::decode_tuple_column_values(raw_value, columns, total_cols)
+        }
+        .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+        Ok(values)
     }
 
     fn scan_table_with_schema_opt(
