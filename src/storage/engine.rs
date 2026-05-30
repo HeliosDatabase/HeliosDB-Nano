@@ -5227,12 +5227,11 @@ impl StorageEngine {
         Ok(row_id)
     }
 
-    /// Fast-path INSERT: writes data + ART index only.
+    /// Fast-path INSERT: writes data + ART index, with logical WAL and
+    /// MVCC versioning when the active configuration requires them.
     ///
-    /// Skips: WAL logging (RocksDB's own WAL handles crash recovery),
-    /// snapshot versioning (time-travel), delta tracking (MV/SMFI).
-    /// Used for batch INSERTs via the SQL fast-path where per-row
-    /// fsync and time-travel overhead is not justified.
+    /// Skips delta tracking (MV/SMFI). Used for SQL fast paths where
+    /// parser/planner overhead and per-row counter persistence dominate.
     pub fn insert_tuple_fast(&self, table_name: &str, tuple: Tuple, schema: &crate::Schema) -> Result<u64> {
         let row_id = self.next_row_id_volatile(table_name);
 
@@ -5279,17 +5278,26 @@ impl StorageEngine {
         let key = Self::build_data_key(table_name, row_id);
         self.put(&key, &value)?;
 
-        if self.fast_dml_requires_logical_wal() {
-            let logical_value = if uses_side_storage {
+        let needs_logical_value = self.fast_dml_requires_logical_wal() || self.config.storage.time_travel_enabled;
+        let logical_value = if needs_logical_value {
+            Some(if uses_side_storage {
                 bincode::serialize(&tuple)
                     .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
             } else {
                 value.clone()
-            };
+            })
+        } else {
+            None
+        };
+
+        if self.fast_dml_requires_logical_wal() {
+            let logical_value = logical_value
+                .as_deref()
+                .ok_or_else(|| Error::internal("missing logical insert value"))?;
             if self.config.storage.logical_wal_per_statement {
-                self.log_data_insert(table_name, &key, &logical_value)?;
+                self.log_data_insert(table_name, &key, logical_value)?;
             } else {
-                self.log_data_insert_nosync(table_name, &key, &logical_value)?;
+                self.log_data_insert_nosync(table_name, &key, logical_value)?;
             }
         }
 
@@ -5304,6 +5312,21 @@ impl StorageEngine {
         // Periodically persist row counter (every 64 inserts) for crash safety
         if row_id % 64 == 0 {
             let _ = self.flush_row_counter(table_name);
+        }
+
+        if self.config.storage.time_travel_enabled {
+            let logical_value = logical_value
+                .as_deref()
+                .ok_or_else(|| Error::internal("missing logical insert value"))?;
+            let timestamp = self.next_timestamp();
+            self.snapshot_manager
+                .write_version(table_name, row_id, timestamp, logical_value)?;
+
+            if let Some(lsn) = self.wal_lsn() {
+                let _ = self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn);
+            } else {
+                let _ = self.snapshot_manager.register_snapshot(timestamp);
+            }
         }
 
         Ok(row_id)
