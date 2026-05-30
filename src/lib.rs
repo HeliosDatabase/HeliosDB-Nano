@@ -422,6 +422,9 @@ pub struct EmbeddedDatabase {
     /// Repeated literal DELETE shape cache. Literal PK values differ per statement.
     fast_literal_delete_cache:
         std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastLiteralDeleteSpec>>>>,
+    /// Repeated simple PK SELECT metadata cache. Literal/parameter values differ
+    /// per statement, but table/PK metadata is stable until DDL.
+    fast_select_cache: std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastSelectSpec>>>>,
     /// Lightweight SQL-visible query profiler, disabled by default.
     query_profiler: std::sync::Arc<query_trace::QueryProfiler>,
     /// ART index undo log for transaction rollback: (table, row_id, col_values)
@@ -554,6 +557,12 @@ struct FastLiteralUpdateSpec {
 }
 
 struct FastLiteralDeleteSpec {
+    table_name: String,
+    schema: std::sync::Arc<Schema>,
+    pk_data_type: DataType,
+}
+
+struct FastSelectSpec {
     table_name: String,
     schema: std::sync::Arc<Schema>,
     pk_data_type: DataType,
@@ -771,6 +780,14 @@ impl EmbeddedDatabase {
     #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
     fn new_fast_literal_delete_cache(
     ) -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastLiteralDeleteSpec>>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
+        )))
+    }
+
+    #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
+    fn new_fast_select_cache(
+    ) -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastSelectSpec>>>> {
         std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
             std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
         )))
@@ -3857,6 +3874,7 @@ impl EmbeddedDatabase {
             fast_literal_update_cache: Self::new_fast_literal_update_cache(),
             fast_param_delete_cache: Self::new_fast_param_delete_cache(),
             fast_literal_delete_cache: Self::new_fast_literal_delete_cache(),
+            fast_select_cache: Self::new_fast_select_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
@@ -3930,6 +3948,7 @@ impl EmbeddedDatabase {
             fast_literal_update_cache: Self::new_fast_literal_update_cache(),
             fast_param_delete_cache: Self::new_fast_param_delete_cache(),
             fast_literal_delete_cache: Self::new_fast_literal_delete_cache(),
+            fast_select_cache: Self::new_fast_select_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
@@ -4026,6 +4045,7 @@ impl EmbeddedDatabase {
             fast_literal_update_cache: Self::new_fast_literal_update_cache(),
             fast_param_delete_cache: Self::new_fast_param_delete_cache(),
             fast_literal_delete_cache: Self::new_fast_literal_delete_cache(),
+            fast_select_cache: Self::new_fast_select_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
@@ -5890,6 +5910,9 @@ impl EmbeddedDatabase {
         if let Ok(mut cache) = self.fast_literal_delete_cache.lock() {
             cache.clear();
         }
+        if let Ok(mut cache) = self.fast_select_cache.lock() {
+            cache.clear();
+        }
         // Also invalidate result cache since schema changes affect query results
         self.invalidate_result_cache();
     }
@@ -7019,6 +7042,50 @@ impl EmbeddedDatabase {
         Some(result)
     }
 
+    fn fast_select_cache_key(table_name: &str, pk_col: &str) -> String {
+        format!("\0fast_select\0{table_name}\0{pk_col}")
+    }
+
+    fn fast_select_spec(
+        &self,
+        table_name: &str,
+        pk_col: &str,
+    ) -> Option<Result<std::sync::Arc<FastSelectSpec>>> {
+        if self.tenant_manager.should_apply_rls(table_name, "SELECT") {
+            return None;
+        }
+
+        let cache_key = Self::fast_select_cache_key(table_name, pk_col);
+        if let Ok(mut cache) = self.fast_select_cache.lock() {
+            if let Some(spec) = cache.get(&cache_key) {
+                return Some(Ok(std::sync::Arc::clone(spec)));
+            }
+        }
+
+        let catalog = self.storage.catalog();
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(schema) => std::sync::Arc::new(schema),
+            Err(_) => return None,
+        };
+
+        let pk_col_idx = schema.get_column_index(pk_col)?;
+        let pk_column = schema.get_column_at(pk_col_idx)?;
+        if !pk_column.primary_key {
+            return None;
+        }
+        let pk_data_type = pk_column.data_type.clone();
+
+        let spec = std::sync::Arc::new(FastSelectSpec {
+            table_name: table_name.to_string(),
+            schema,
+            pk_data_type,
+        });
+        if let Ok(mut cache) = self.fast_select_cache.lock() {
+            cache.put(cache_key, std::sync::Arc::clone(&spec));
+        }
+        Some(Ok(spec))
+    }
+
     /// Fast path for SELECT: `SELECT * FROM table WHERE pk_col = literal`
     /// Bypasses full SQL parsing, planning, and optimization for simple PK lookups.
     fn try_fast_select(&self, sql: &str) -> Option<Result<Vec<Tuple>>> {
@@ -7049,7 +7116,7 @@ impl EmbeddedDatabase {
 
         // Extract table name (until whitespace)
         let table_end = after_from.find(|c: char| c.is_whitespace())?;
-        let table_name = after_from.get(..table_end)?.trim();
+        let table_name = after_from.get(..table_end)?.trim().trim_matches('"');
         if table_name.is_empty() {
             return None;
         }
@@ -7075,36 +7142,25 @@ impl EmbeddedDatabase {
         // Parse WHERE: col = value
         let where_clause = where_clause.strip_suffix(';').unwrap_or(where_clause).trim();
         let eq_pos = where_clause.find('=')?;
-        let pk_col = where_clause.get(..eq_pos)?.trim();
+        let pk_col = where_clause.get(..eq_pos)?.trim().trim_matches('"');
         let pk_val_str = where_clause.get(eq_pos + 1..)?.trim();
         if pk_col.is_empty() || pk_val_str.is_empty() {
             return None;
         }
 
-        // Check RLS
-        if self.tenant_manager.should_apply_rls(table_name, "SELECT") {
-            return None;
-        }
-
-        // Get schema
-        let catalog = self.storage.catalog();
-        let schema = match catalog.get_table_schema(table_name) {
-            Ok(s) => s,
-            Err(_) => return None,
+        let spec = match self.fast_select_spec(table_name, pk_col)? {
+            Ok(spec) => spec,
+            Err(e) => return Some(Err(e)),
         };
 
-        // Verify WHERE column is the PK
-        let pk_col_idx = schema.get_column_index(pk_col)?;
-        let pk_column = schema.get_column_at(pk_col_idx)?;
-        if !pk_column.primary_key {
-            return None; // Not a PK lookup — fall through to normal path
-        }
-
         // Parse PK value
-        let (pk_value, _) = Self::fast_parse_one_value(pk_val_str, &pk_column.data_type)?;
+        let (pk_value, _) = Self::fast_parse_one_value(pk_val_str, &spec.pk_data_type)?;
 
         // Direct PK lookup via ART index + RocksDB
-        match self.storage.get_row_by_pk_with_schema(table_name, &pk_value, &schema) {
+        match self
+            .storage
+            .get_row_by_pk_with_schema(&spec.table_name, &pk_value, &spec.schema)
+        {
             Ok(Some(row)) => Some(Ok(vec![row])),
             Ok(None) => Some(Ok(vec![])),
             Err(e) => Some(Err(e)),
@@ -7158,28 +7214,21 @@ impl EmbeddedDatabase {
         if pk_col.is_empty() || pk_val_str.is_empty() {
             return None;
         }
-        if self.tenant_manager.should_apply_rls(table_name, "SELECT") {
-            return None;
-        }
-
-        let catalog = self.storage.catalog();
-        let schema = match catalog.get_table_schema(table_name) {
-            Ok(schema) => schema,
-            Err(_) => return None,
+        let spec = match self.fast_select_spec(table_name, pk_col)? {
+            Ok(spec) => spec,
+            Err(e) => return Some(Err(e)),
         };
-        let pk_col_idx = schema.get_column_index(pk_col)?;
-        let pk_column = schema.get_column_at(pk_col_idx)?;
-        if !pk_column.primary_key {
-            return None;
-        }
 
-        let pk_value = match Self::fast_param_or_literal_value(pk_val_str, params, &pk_column.data_type) {
+        let pk_value = match Self::fast_param_or_literal_value(pk_val_str, params, &spec.pk_data_type) {
             Some(Ok(value)) => value,
             Some(Err(e)) => return Some(Err(e)),
             None => return None,
         };
 
-        match self.storage.get_row_by_pk_with_schema(table_name, &pk_value, &schema) {
+        match self
+            .storage
+            .get_row_by_pk_with_schema(&spec.table_name, &pk_value, &spec.schema)
+        {
             Ok(Some(row)) => Some(Ok(vec![row])),
             Ok(None) => Some(Ok(vec![])),
             Err(e) => Some(Err(e)),
@@ -9885,7 +9934,11 @@ impl EmbeddedDatabase {
         ]
         .iter()
         .any(|needle| Self::contains_ascii_case_insensitive(sql, needle));
-        if !is_non_deterministic {
+        if !is_non_deterministic
+            && self
+                .result_cache_nonempty
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             if let Some(cached_results) = self
                 .result_cache
                 .lock()
@@ -11744,6 +11797,7 @@ impl EmbeddedDatabase {
             fast_literal_update_cache: self.fast_literal_update_cache.clone(),
             fast_param_delete_cache: self.fast_param_delete_cache.clone(),
             fast_literal_delete_cache: self.fast_literal_delete_cache.clone(),
+            fast_select_cache: self.fast_select_cache.clone(),
             query_profiler: self.query_profiler.clone(),
             art_undo_log: self.art_undo_log.clone(),
             fk_validation_mode: self.fk_validation_mode.clone(),
@@ -13383,6 +13437,38 @@ mod tests {
             .unwrap();
 
         let rows = db.query(sql, &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(1), Some(&Value::String("after".to_string())));
+    }
+
+    #[test]
+    fn test_fast_select_metadata_cache_invalidated_by_ddl() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE fast_select_meta (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO fast_select_meta VALUES (1, 'before')")
+            .unwrap();
+
+        let rows = db.query("SELECT * FROM fast_select_meta WHERE id = 1", &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !db.fast_select_cache.lock().unwrap().is_empty(),
+            "fast SELECT should cache stable table/PK metadata"
+        );
+
+        db.execute("DROP TABLE fast_select_meta").unwrap();
+        assert!(
+            db.fast_select_cache.lock().unwrap().is_empty(),
+            "DDL must clear fast SELECT metadata"
+        );
+
+        db.execute("CREATE TABLE fast_select_meta (id TEXT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO fast_select_meta VALUES ('next', 'after')")
+            .unwrap();
+        let rows = db
+            .query("SELECT * FROM fast_select_meta WHERE id = 'next'", &[])
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(1), Some(&Value::String("after".to_string())));
     }
