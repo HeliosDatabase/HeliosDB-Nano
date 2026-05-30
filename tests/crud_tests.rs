@@ -272,6 +272,54 @@ fn test_update_no_matching_rows() -> Result<()> {
 }
 
 #[test]
+fn test_update_fast_path_respects_check_constraints() -> Result<()> {
+    let db = create_test_db()?;
+    db.execute("CREATE TABLE checked_update (id INT PRIMARY KEY, score INT CHECK (score >= 0))")?;
+    db.execute("INSERT INTO checked_update VALUES (1, 10)")?;
+
+    let result = db.execute("UPDATE checked_update SET score = -1 WHERE id = 1");
+    assert!(result.is_err(), "UPDATE fast path must not bypass CHECK constraints");
+
+    let rows = db.query("SELECT score FROM checked_update WHERE id = 1", &[])?;
+    assert_eq!(rows[0].get(0).unwrap(), &Value::Int4(10));
+    Ok(())
+}
+
+#[test]
+fn test_update_fast_path_does_not_corrupt_unique_indexes() -> Result<()> {
+    let db = create_test_db()?;
+    db.execute("CREATE TABLE unique_update (id INT PRIMARY KEY, email TEXT UNIQUE, age INT)")?;
+    db.execute("INSERT INTO unique_update VALUES (1, 'a@example.com', 30)")?;
+    db.execute("INSERT INTO unique_update VALUES (2, 'b@example.com', 31)")?;
+
+    let result = db.execute("UPDATE unique_update SET email = 'b@example.com' WHERE id = 1");
+    assert!(result.is_err(), "UPDATE fast path must not bypass UNIQUE constraints");
+
+    let rows = db.query("SELECT email FROM unique_update WHERE id = 1", &[])?;
+    assert_eq!(rows[0].get(0).unwrap(), &Value::String("a@example.com".to_string()));
+    Ok(())
+}
+
+#[test]
+fn test_update_rejects_multi_row_unique_collision() -> Result<()> {
+    let db = create_test_db()?;
+    db.execute("CREATE TABLE unique_update_many (id INT PRIMARY KEY, email TEXT UNIQUE, age INT)")?;
+    db.execute("INSERT INTO unique_update_many VALUES (1, 'a@example.com', 30)")?;
+    db.execute("INSERT INTO unique_update_many VALUES (2, 'b@example.com', 31)")?;
+
+    let result = db.execute("UPDATE unique_update_many SET email = 'same@example.com' WHERE age > 0");
+    assert!(
+        result.is_err(),
+        "UPDATE must reject duplicates staged by the same statement"
+    );
+
+    let rows = db.query("SELECT email FROM unique_update_many ORDER BY id", &[])?;
+    assert_eq!(rows[0].get(0).unwrap(), &Value::String("a@example.com".to_string()));
+    assert_eq!(rows[1].get(0).unwrap(), &Value::String("b@example.com".to_string()));
+    Ok(())
+}
+
+#[test]
 fn test_update_with_complex_where() -> Result<()> {
     let db = create_test_db()?;
     setup_users_table(&db)?;
