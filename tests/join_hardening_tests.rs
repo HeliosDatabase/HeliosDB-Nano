@@ -58,6 +58,33 @@ mod join_hardening {
     }
 
     #[test]
+    fn test_inner_join_smaller_left_preserves_output_order() {
+        let d = db();
+        d.execute("CREATE TABLE j_inner_small_left (id INT, name TEXT)")
+            .unwrap();
+        d.execute("CREATE TABLE j_inner_big_right (aid INT, score INT)")
+            .unwrap();
+        d.execute("INSERT INTO j_inner_small_left VALUES (1, 'Alice'), (2, 'Bob')")
+            .unwrap();
+        d.execute("INSERT INTO j_inner_big_right VALUES (1, 90), (2, 80), (3, 70), (4, 60)")
+            .unwrap();
+
+        let rows = d
+            .query(
+                "SELECT a.name, b.score FROM j_inner_small_left a INNER JOIN j_inner_big_right b ON a.id = b.aid",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        let pairs: Vec<(String, i64)> = rows
+            .iter()
+            .map(|r| (to_str(r.get(0).unwrap()), to_i64(r.get(1).unwrap())))
+            .collect();
+        assert!(pairs.contains(&("Alice".to_string(), 90)));
+        assert!(pairs.contains(&("Bob".to_string(), 80)));
+    }
+
+    #[test]
     fn test_inner_join_on_text_column() {
         let d = db();
         d.execute("CREATE TABLE j_inner_t1 (code TEXT, val INT)").unwrap();
