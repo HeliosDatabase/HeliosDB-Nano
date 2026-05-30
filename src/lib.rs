@@ -398,6 +398,10 @@ pub struct EmbeddedDatabase {
     /// Fast DML invalidation gate; avoids taking the result-cache mutex when
     /// no query has populated it since the last invalidation.
     result_cache_nonempty: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Fingerprint of the most recent literal fast PK lookup. Used to avoid
+    /// filling the result cache with one-off point lookups while still caching
+    /// repeated hot-key queries after the second consecutive hit.
+    last_fast_select_fingerprint: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Repeated parameterized INSERT metadata cache. Invalidated with the plan cache on DDL.
     fast_param_insert_cache:
         std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamInsertSpec>>>>,
@@ -737,6 +741,37 @@ impl EmbeddedDatabase {
         default
             .as_ref()
             .map(|expr| serde_json::to_string(expr).unwrap_or_default())
+    }
+
+    fn fast_select_fingerprint(sql: &str) -> u64 {
+        const FNV_OFFSET: u64 = 0xcbf29ce484222325;
+        const FNV_PRIME: u64 = 0x100000001b3;
+        let mut hash = FNV_OFFSET;
+        for byte in sql.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+        if hash == 0 {
+            1
+        } else {
+            hash
+        }
+    }
+
+    fn maybe_cache_repeated_fast_select(&self, sql: &str, results: &[Tuple]) {
+        let fingerprint = Self::fast_select_fingerprint(sql);
+        let previous = self
+            .last_fast_select_fingerprint
+            .swap(fingerprint, std::sync::atomic::Ordering::AcqRel);
+        if previous != fingerprint {
+            return;
+        }
+
+        if let Ok(mut cache) = self.result_cache.lock() {
+            cache.put(sql.to_string(), std::sync::Arc::new(results.to_vec()));
+            self.result_cache_nonempty
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Check if a SQL statement is a transaction control statement (zero-allocation)
@@ -3642,6 +3677,7 @@ impl EmbeddedDatabase {
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
             ))),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             fast_param_update_cache: Self::new_fast_param_update_cache(),
             fast_param_delete_cache: Self::new_fast_param_delete_cache(),
@@ -3711,6 +3747,7 @@ impl EmbeddedDatabase {
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
             ))),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             fast_param_update_cache: Self::new_fast_param_update_cache(),
             fast_param_delete_cache: Self::new_fast_param_delete_cache(),
@@ -3803,6 +3840,7 @@ impl EmbeddedDatabase {
                 std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
             ))),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_fast_select_fingerprint: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             fast_param_update_cache: Self::new_fast_param_update_cache(),
             fast_param_delete_cache: Self::new_fast_param_delete_cache(),
@@ -9468,11 +9506,7 @@ impl EmbeddedDatabase {
         if let Some(result) = self.try_fast_select(sql) {
             let results = result?;
             self.log_slow_query(sql, start.elapsed(), results.len() as u64);
-            if let Ok(mut cache) = self.result_cache.lock() {
-                cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
-                self.result_cache_nonempty
-                    .store(true, std::sync::atomic::Ordering::Release);
-            }
+            self.maybe_cache_repeated_fast_select(sql, &results);
             return Ok(results);
         }
 
@@ -11307,6 +11341,7 @@ impl EmbeddedDatabase {
             parse_cache: self.parse_cache.clone(),
             result_cache: self.result_cache.clone(),
             result_cache_nonempty: self.result_cache_nonempty.clone(),
+            last_fast_select_fingerprint: self.last_fast_select_fingerprint.clone(),
             fast_param_insert_cache: self.fast_param_insert_cache.clone(),
             fast_param_update_cache: self.fast_param_update_cache.clone(),
             fast_param_delete_cache: self.fast_param_delete_cache.clone(),
@@ -12933,8 +12968,16 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(1), Some(&Value::String("before".to_string())));
         assert!(
+            !db.result_cache.lock().unwrap().contains(sql),
+            "one-off fast SELECT should not populate the result cache"
+        );
+
+        let rows = db.query(sql, &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].get(1), Some(&Value::String("before".to_string())));
+        assert!(
             db.result_cache.lock().unwrap().contains(sql),
-            "fast SELECT should populate the result cache"
+            "repeated fast SELECT should populate the result cache"
         );
 
         db.execute("UPDATE fast_select_cache SET val = 'after' WHERE id = 1")
