@@ -5433,9 +5433,8 @@ impl StorageEngine {
         };
 
         let key = Self::build_data_key(table_name, row_id);
-        self.put(&key, &value)?;
-
-        let needs_logical_value = self.fast_dml_requires_logical_wal() || self.config.storage.time_travel_enabled;
+        let requires_logical_wal = self.fast_dml_requires_logical_wal();
+        let needs_logical_value = requires_logical_wal || self.config.storage.time_travel_enabled;
         let logical_value = if needs_logical_value {
             Some(if uses_side_storage {
                 bincode::serialize(&tuple)
@@ -5447,7 +5446,33 @@ impl StorageEngine {
             None
         };
 
-        if self.fast_dml_requires_logical_wal() {
+        let data_and_version_batched =
+            self.config.storage.time_travel_enabled && !requires_logical_wal && !uses_side_storage;
+
+        if data_and_version_batched {
+            // Mirrors the checks in `put()` before writing this direct batch.
+            if let Some(ref db_path) = self.db_path {
+                let count = self.write_counter.fetch_add(1, Ordering::Relaxed);
+                if count % 1000 == 0 {
+                    Self::check_disk_space(db_path)?;
+                }
+            }
+            if self.memory_limit_bytes > 0 {
+                let write_size = (key.len() + value.len()) as u64;
+                let current = self.data_bytes_written.fetch_add(write_size, Ordering::Relaxed);
+                if current + write_size > self.memory_limit_bytes {
+                    self.data_bytes_written.fetch_sub(write_size, Ordering::Relaxed);
+                    return Err(Error::storage(format!(
+                        "Memory limit exceeded ({} MB). Increase resource_quotas.memory_limit_per_user_mb or use disk-backed mode.",
+                        self.memory_limit_bytes / (1024 * 1024)
+                    )));
+                }
+            }
+        } else {
+            self.put(&key, &value)?;
+        }
+
+        if requires_logical_wal {
             let logical_value = logical_value
                 .as_deref()
                 .ok_or_else(|| Error::internal("missing logical insert value"))?;
@@ -5476,8 +5501,26 @@ impl StorageEngine {
                 .as_deref()
                 .ok_or_else(|| Error::internal("missing logical insert value"))?;
             let timestamp = self.next_timestamp();
-            self.snapshot_manager
-                .write_version_and_register_snapshot(table_name, row_id, timestamp, logical_value, self.wal_lsn())?;
+            if data_and_version_batched {
+                self.snapshot_manager.write_data_version_and_register_snapshot(
+                    &key,
+                    &value,
+                    table_name,
+                    row_id,
+                    timestamp,
+                    logical_value,
+                    self.wal_lsn(),
+                    self.memory_write_options.as_ref(),
+                )?;
+            } else {
+                self.snapshot_manager.write_version_and_register_snapshot(
+                    table_name,
+                    row_id,
+                    timestamp,
+                    logical_value,
+                    self.wal_lsn(),
+                )?;
+            }
         }
 
         Ok(row_id)

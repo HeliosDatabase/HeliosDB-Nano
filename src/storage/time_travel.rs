@@ -666,6 +666,48 @@ impl SnapshotManager {
         value: &[u8],
         lsn: Option<u64>,
     ) -> Result<SnapshotMetadata> {
+        let (metadata, txn_id, scn) = self.allocate_snapshot_metadata(timestamp, lsn);
+        let mut batch = WriteBatch::default();
+        self.append_version_snapshot_to_batch(&mut batch, table_name, row_id, timestamp, value, &metadata)?;
+        self.write_batch(batch, "Failed to write version snapshot batch")?;
+        self.finish_version_snapshot(table_name, row_id, timestamp, txn_id, scn, metadata)
+    }
+
+    /// Write current row data plus its time-travel version/snapshot metadata in
+    /// one RocksDB batch. Used by fast autocommit INSERT after logical-WAL/HA
+    /// has been ruled out by the caller.
+    pub fn write_data_version_and_register_snapshot(
+        &self,
+        data_key: &[u8],
+        data_value: &[u8],
+        table_name: &str,
+        row_id: u64,
+        timestamp: u64,
+        version_value: &[u8],
+        lsn: Option<u64>,
+        write_options: Option<&WriteOptions>,
+    ) -> Result<SnapshotMetadata> {
+        let (metadata, txn_id, scn) = self.allocate_snapshot_metadata(timestamp, lsn);
+        let mut batch = WriteBatch::default();
+        batch.put(data_key, data_value);
+        self.append_version_snapshot_to_batch(&mut batch, table_name, row_id, timestamp, version_value, &metadata)?;
+
+        if let Some(opts) = write_options {
+            self.db
+                .write_opt(batch, opts)
+                .map_err(|e| Error::storage(format!("Failed to write data/version snapshot batch: {}", e)))?;
+        } else {
+            self.write_batch(batch, "Failed to write data/version snapshot batch")?;
+        }
+
+        self.finish_version_snapshot(table_name, row_id, timestamp, txn_id, scn, metadata)
+    }
+
+    fn allocate_snapshot_metadata(
+        &self,
+        timestamp: u64,
+        lsn: Option<u64>,
+    ) -> (SnapshotMetadata, TransactionId, Scn) {
         let txn_id = match lsn {
             Some(lsn) => {
                 let mut txn_id = self.current_txn_id.write();
@@ -678,9 +720,18 @@ impl SnapshotManager {
         };
         let scn = self.next_scn();
         let metadata = SnapshotMetadata::new(timestamp, txn_id, scn);
+        (metadata, txn_id, scn)
+    }
 
-        let mut batch = WriteBatch::default();
-
+    fn append_version_snapshot_to_batch(
+        &self,
+        batch: &mut WriteBatch,
+        table_name: &str,
+        row_id: u64,
+        timestamp: u64,
+        value: &[u8],
+        metadata: &SnapshotMetadata,
+    ) -> Result<()> {
         let version_key = format!("v:{}:{}:{}", table_name, row_id, timestamp);
         batch.put(version_key.as_bytes(), value);
 
@@ -705,8 +756,18 @@ impl SnapshotManager {
             batch.put(scn_key.as_bytes(), scn_value);
         }
 
-        self.write_batch(batch, "Failed to write version snapshot batch")?;
+        Ok(())
+    }
 
+    fn finish_version_snapshot(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        timestamp: u64,
+        txn_id: TransactionId,
+        scn: Scn,
+        metadata: SnapshotMetadata,
+    ) -> Result<SnapshotMetadata> {
         self.snapshots.write().insert(timestamp, metadata.clone());
         self.txn_to_timestamp.write().insert(txn_id, timestamp);
         self.scn_to_timestamp.write().insert(scn, timestamp);
