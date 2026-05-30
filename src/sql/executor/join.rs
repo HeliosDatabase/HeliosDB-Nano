@@ -6,6 +6,7 @@
 
 use super::{Executor, PhysicalOperator, TimeoutContext};
 use crate::{Error, Result, Schema, Tuple};
+use std::hash::Hash;
 use std::sync::Arc;
 
 /// Nested loop join operator
@@ -302,8 +303,23 @@ impl std::hash::Hash for JoinKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.0.len().hash(state);
         for v in &self.0 {
-            v.hash(state);
+            hash_value_for_join(v, state);
         }
+    }
+}
+
+fn hash_value_for_join<H: std::hash::Hasher>(value: &crate::Value, state: &mut H) {
+    use crate::Value;
+    match value {
+        Value::String(s) => {
+            if let Ok(n) = s.parse::<i64>() {
+                2u8.hash(state);
+                n.hash(state);
+            } else {
+                value.hash(state);
+            }
+        }
+        _ => value.hash(state),
     }
 }
 
@@ -328,6 +344,9 @@ fn values_equal_for_join(a: &crate::Value, b: &crate::Value) -> bool {
         }
         (Value::String(s), Value::Int8(n)) | (Value::Int8(n), Value::String(s)) => {
             s.parse::<i64>().map_or(false, |parsed| parsed == *n)
+        }
+        (Value::String(s), Value::Int2(n)) | (Value::Int2(n), Value::String(s)) => {
+            s.parse::<i16>().map_or(false, |parsed| parsed == *n)
         }
         // Default: derived PartialEq
         _ => a == b,

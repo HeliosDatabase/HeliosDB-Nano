@@ -78,6 +78,28 @@ mod join_hardening {
     }
 
     #[test]
+    fn test_inner_join_cross_type_text_int_key() {
+        let d = db();
+        d.execute("CREATE TABLE j_inner_xt1 (id INT, name TEXT)").unwrap();
+        d.execute("CREATE TABLE j_inner_xt2 (id_text TEXT, label TEXT)")
+            .unwrap();
+        d.execute("INSERT INTO j_inner_xt1 VALUES (1, 'one'), (2, 'two')")
+            .unwrap();
+        d.execute("INSERT INTO j_inner_xt2 VALUES ('1', 'match'), ('3', 'miss')")
+            .unwrap();
+
+        let rows = d
+            .query(
+                "SELECT a.name, b.label FROM j_inner_xt1 a INNER JOIN j_inner_xt2 b ON a.id = b.id_text",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(to_str(rows[0].get(0).unwrap()), "one");
+        assert_eq!(to_str(rows[0].get(1).unwrap()), "match");
+    }
+
+    #[test]
     fn test_inner_join_with_where_filter() {
         let d = db();
         d.execute("CREATE TABLE j_inner_w1 (id INT, v INT)").unwrap();
