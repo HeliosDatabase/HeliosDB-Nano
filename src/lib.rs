@@ -6237,6 +6237,14 @@ impl EmbeddedDatabase {
         schema: &Schema,
         txn: &storage::Transaction,
     ) -> Result<u64> {
+        if tuples.len() == 1 {
+            let tuple = tuples.into_iter().next().ok_or_else(|| Error::internal("missing insert tuple"))?;
+            let (row_id, tuple) = self.prepare_tuple_for_transaction_insert(table_name, tuple, schema);
+            self.insert_prepared_tuple_in_transaction(table_name, row_id, tuple, schema, txn, false)?;
+            self.storage.stage_row_counter_in_transaction(table_name, row_id, txn)?;
+            return Ok(1);
+        }
+
         let mut prepared = Vec::with_capacity(tuples.len());
         let mut generated_tuples = Vec::with_capacity(tuples.len());
         for tuple in tuples {
@@ -6250,7 +6258,7 @@ impl EmbeddedDatabase {
         let mut inserted = 0_u64;
         let mut final_row_id = None;
         for (row_id, tuple) in prepared {
-            self.insert_prepared_tuple_in_transaction(table_name, row_id, tuple, schema, txn)?;
+            self.insert_prepared_tuple_in_transaction(table_name, row_id, tuple, schema, txn, true)?;
             final_row_id = Some(row_id);
             inserted += 1;
         }
@@ -6293,19 +6301,12 @@ impl EmbeddedDatabase {
         tuple: Tuple,
         schema: &Schema,
         txn: &storage::Transaction,
+        constraints_prechecked: bool,
     ) -> Result<()> {
         // Callers reach this helper only through the fast INSERT paths, which
         // already reject tables with FK/CHECK constraints while building their
         // statement metadata. Avoid reloading constraint metadata on every row
         // in large explicit-transaction insert loops.
-
-        if self.storage.get_current_branch().is_none() {
-            self.storage
-                .stage_tuple_for_column_storage_in_transaction(table_name, row_id, &tuple, schema, txn)?;
-        }
-        let val = bincode::serialize(&tuple).map_err(|e| Error::storage(e.to_string()))?;
-        let key = self.storage.branch_aware_data_key(table_name, row_id);
-        txn.put(key, val)?;
 
         let col_values = match self
             .storage
@@ -6313,11 +6314,28 @@ impl EmbeddedDatabase {
             .on_insert_tuple_collect_index_values(table_name, row_id, schema, &tuple)
         {
             Ok(values) => values,
-            Err(e) => {
+            Err(e) if constraints_prechecked => {
                 tracing::debug!("ART index insert for '{}': {}", table_name, e);
                 Self::tuple_column_values(schema, &tuple)
             }
+            Err(e) => return Err(Error::constraint_violation(e.to_string())),
         };
+
+        if self.storage.get_current_branch().is_none() {
+            if let Err(e) = self
+                .storage
+                .stage_tuple_for_column_storage_in_transaction(table_name, row_id, &tuple, schema, txn)
+            {
+                let _ = self.storage.art_indexes().on_delete(table_name, row_id, &col_values);
+                return Err(e);
+            }
+        }
+        let val = bincode::serialize(&tuple).map_err(|e| Error::storage(e.to_string()))?;
+        let key = self.storage.branch_aware_data_key(table_name, row_id);
+        if let Err(e) = txn.put(key, val) {
+            let _ = self.storage.art_indexes().on_delete(table_name, row_id, &col_values);
+            return Err(e);
+        }
         self.art_undo_log.write().push(ArtUndoOp::RemoveInserted {
             table_name: table_name.to_string(),
             row_id,
