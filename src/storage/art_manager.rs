@@ -880,6 +880,19 @@ impl ArtIndexManager {
         Ok(())
     }
 
+    /// Return whether a PK/UNIQUE ART index already contains this key.
+    pub fn unique_key_exists(&self, table: &str, columns: &[String], values: &[Value]) -> bool {
+        let indexes = self.indexes.read().unwrap_or_else(|e| e.into_inner());
+        let key = Self::encode_key(values);
+
+        indexes.values().any(|index| {
+            index.table() == table
+                && matches!(index.index_type(), ArtIndexType::PrimaryKey | ArtIndexType::Unique)
+                && index.columns() == columns
+                && index.contains(&key)
+        })
+    }
+
     /// Check foreign key constraint before INSERT/UPDATE
     pub fn check_fk_constraints(&self, table: &str, column_values: &HashMap<String, Value>) -> ArtResult<()> {
         let fk_indexes = self.fk_indexes.read().unwrap_or_else(|e| e.into_inner());
@@ -1040,9 +1053,7 @@ impl ArtIndexManager {
                     values.clear();
                     break;
                 };
-                indexed_values
-                    .entry(column.clone())
-                    .or_insert_with(|| value.clone());
+                indexed_values.entry(column.clone()).or_insert_with(|| value.clone());
                 values.push(value);
             }
 
