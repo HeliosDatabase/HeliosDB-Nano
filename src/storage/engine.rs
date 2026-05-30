@@ -4983,7 +4983,12 @@ impl StorageEngine {
         let key = Self::build_data_key(table_name, row_id);
         self.put(&key, &value)?;
 
-        // Update ART indexes: remove old entries, insert new entries
+        // Update ART indexes only if an indexed column actually changed.
+        // Common OLTP updates mutate payload columns while the PK/unique keys
+        // remain stable; rebuilding those ART entries is pure overhead.
+        if self
+            .art_index_manager
+            .tuple_update_affects_indexes(table_name, schema, old_tuple, &new_tuple)
         {
             let mut old_col_values = std::collections::HashMap::new();
             let mut new_col_values = std::collections::HashMap::new();
