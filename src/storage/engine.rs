@@ -7,7 +7,7 @@
 
 use super::art_manager::ArtIndexManager;
 use super::bloom_filter::TableBloomFilters;
-use super::columnar::{ColumnarStore, BATCH_SIZE};
+use super::columnar::{ColumnBatch, ColumnarStore, BATCH_SIZE};
 use super::content_addr::ContentAddressedStore;
 use super::dictionary::DictionaryManager;
 use super::filter_consolidation_worker::{ConsolidationConfig, FilterConsolidationWorker};
@@ -89,8 +89,41 @@ fn columnar_filter_predicate(predicate: &AnalyzedPredicate) -> Option<FilterPred
     })
 }
 
+enum ColumnarBatchIndex {
+    Dense(Vec<Option<ColumnBatch>>),
+    Sparse(HashMap<u64, ColumnBatch>),
+}
+
+impl ColumnarBatchIndex {
+    fn from_batches(batches: Vec<(u64, ColumnBatch)>) -> Self {
+        let Some(max_batch_id) = batches.last().map(|(batch_id, _)| *batch_id) else {
+            return Self::Dense(Vec::new());
+        };
+
+        let batch_count = batches.len();
+        if max_batch_id <= (batch_count as u64).saturating_mul(4).saturating_add(16) && max_batch_id <= 1_000_000 {
+            let mut dense = vec![None; max_batch_id as usize + 1];
+            for (batch_id, batch) in batches {
+                if let Some(slot) = dense.get_mut(batch_id as usize) {
+                    *slot = Some(batch);
+                }
+            }
+            Self::Dense(dense)
+        } else {
+            Self::Sparse(batches.into_iter().collect())
+        }
+    }
+
+    fn get(&self, batch_id: u64) -> Option<&ColumnBatch> {
+        match self {
+            Self::Dense(batches) => batches.get(batch_id as usize).and_then(Option::as_ref),
+            Self::Sparse(batches) => batches.get(&batch_id),
+        }
+    }
+}
+
 fn columnar_row_matches_filters(
-    column_batches: &HashMap<usize, HashMap<u64, super::columnar::ColumnBatch>>,
+    column_batches: &HashMap<usize, ColumnarBatchIndex>,
     batch_id: u64,
     offset: usize,
     predicates: &[FilterPredicate],
@@ -98,7 +131,7 @@ fn columnar_row_matches_filters(
     predicates.iter().all(|predicate| {
         if let Some(value) = column_batches
             .get(&predicate.column_index)
-            .and_then(|by_batch| by_batch.get(&batch_id))
+            .and_then(|by_batch| by_batch.get(batch_id))
             .and_then(|batch| batch.values.get(offset))
         {
             predicate.evaluate(value)
@@ -109,14 +142,14 @@ fn columnar_row_matches_filters(
 }
 
 fn columnar_batch_value<'a>(
-    column_batches: &'a HashMap<usize, HashMap<u64, super::columnar::ColumnBatch>>,
+    column_batches: &'a HashMap<usize, ColumnarBatchIndex>,
     column_index: usize,
     batch_id: u64,
     offset: usize,
 ) -> Option<&'a Value> {
     column_batches
         .get(&column_index)
-        .and_then(|by_batch| by_batch.get(&batch_id))
+        .and_then(|by_batch| by_batch.get(batch_id))
         .and_then(|batch| batch.values.get(offset))
 }
 
@@ -2013,15 +2046,11 @@ impl StorageEngine {
             }
         }
 
-        let mut column_batches: HashMap<usize, HashMap<u64, super::columnar::ColumnBatch>> =
-            HashMap::with_capacity(requested.len());
+        let mut column_batches: HashMap<usize, ColumnarBatchIndex> = HashMap::with_capacity(requested.len());
         for &idx in &requested {
             let column = &schema.columns[idx];
-            let mut batches = HashMap::new();
-            for (batch_id, batch) in ColumnarStore::scan_column_batches(&self.db, table_name, &column.name)? {
-                batches.insert(batch_id, batch);
-            }
-            column_batches.insert(idx, batches);
+            let batches = ColumnarStore::scan_column_batches(&self.db, table_name, &column.name)?;
+            column_batches.insert(idx, ColumnarBatchIndex::from_batches(batches));
         }
 
         let filter_predicates: Vec<FilterPredicate> = predicates
@@ -2040,11 +2069,7 @@ impl StorageEngine {
 
             let mut values = vec![Value::Null; schema.columns.len()];
             for &idx in &requested {
-                if let Some(value) = column_batches
-                    .get(&idx)
-                    .and_then(|by_batch| by_batch.get(&batch_id))
-                    .and_then(|batch| batch.values.get(offset))
-                {
+                if let Some(value) = columnar_batch_value(&column_batches, idx, batch_id, offset) {
                     values[idx] = value.clone();
                 }
             }
@@ -2101,18 +2126,67 @@ impl StorageEngine {
             }
         }
 
-        let mut column_batches: HashMap<usize, HashMap<u64, super::columnar::ColumnBatch>> =
-            HashMap::with_capacity(requested.len());
+        let mut column_batches: HashMap<usize, ColumnarBatchIndex> = HashMap::with_capacity(requested.len());
         for &idx in &requested {
             let column = &schema.columns[idx];
-            let mut batches = HashMap::new();
-            for (batch_id, batch) in ColumnarStore::scan_column_batches(&self.db, table_name, &column.name)? {
-                batches.insert(batch_id, batch);
-            }
-            column_batches.insert(idx, batches);
+            let batches = ColumnarStore::scan_column_batches(&self.db, table_name, &column.name)?;
+            column_batches.insert(idx, ColumnarBatchIndex::from_batches(batches));
         }
 
         let filter_predicates: Vec<FilterPredicate> = predicates.iter().filter_map(columnar_filter_predicate).collect();
+
+        if group_by_columns.is_empty() {
+            let mut states: Vec<ColumnarAggregateState> = aggregates
+                .iter()
+                .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
+                .collect();
+
+            let prefix = format!("data:{}:", table_name);
+            let prefix_bytes = prefix.as_bytes();
+            let mut read_opts = ReadOptions::default();
+            read_opts.set_total_order_seek(true);
+            let iter = self
+                .db
+                .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+            for item in iter {
+                let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+                if !key.starts_with(prefix_bytes) {
+                    break;
+                }
+                let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                    continue;
+                };
+
+                let batch_id = row_id / BATCH_SIZE as u64;
+                let offset = (row_id % BATCH_SIZE as u64) as usize;
+                if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
+                    continue;
+                }
+
+                for (state, aggregate) in states.iter_mut().zip(aggregates) {
+                    let value = aggregate
+                        .column_index
+                        .and_then(|idx| columnar_batch_value(&column_batches, idx, batch_id, offset));
+                    state.update(aggregate.op, value)?;
+                }
+            }
+
+            let tuple_values: Result<Vec<Value>> = states.into_iter().map(ColumnarAggregateState::finalize).collect();
+            let tuples = vec![Tuple::new(tuple_values?)];
+            tracing::debug!(
+                phase = "storage_columnar_aggregate",
+                table = table_name,
+                rows = tuples.len(),
+                columns = requested.len(),
+                predicates = filter_predicates.len(),
+                duration_us = scan_start.elapsed().as_micros() as u64,
+                "Columnar aggregate complete"
+            );
+
+            return Ok(tuples);
+        }
+
         let mut groups: HashMap<Vec<Value>, Vec<ColumnarAggregateState>> = HashMap::new();
 
         let prefix = format!("data:{}:", table_name);
