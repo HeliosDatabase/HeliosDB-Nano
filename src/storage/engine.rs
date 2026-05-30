@@ -5320,13 +5320,7 @@ impl StorageEngine {
                 .ok_or_else(|| Error::internal("missing logical insert value"))?;
             let timestamp = self.next_timestamp();
             self.snapshot_manager
-                .write_version(table_name, row_id, timestamp, logical_value)?;
-
-            if let Some(lsn) = self.wal_lsn() {
-                let _ = self.snapshot_manager.register_snapshot_with_lsn(timestamp, lsn);
-            } else {
-                let _ = self.snapshot_manager.register_snapshot(timestamp);
-            }
+                .write_version_and_register_snapshot(table_name, row_id, timestamp, logical_value, self.wal_lsn())?;
         }
 
         Ok(row_id)
