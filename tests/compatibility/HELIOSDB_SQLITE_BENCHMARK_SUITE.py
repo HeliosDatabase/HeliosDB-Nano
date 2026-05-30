@@ -13,6 +13,7 @@ Usage:
 
 Requirements:
     pip install pytest psutil tabulate matplotlib
+    maturin develop -m bindings/python/Cargo.toml
 """
 
 import argparse
@@ -29,6 +30,11 @@ from typing import List, Dict, Any, Callable, Tuple
 from dataclasses import dataclass, field
 from tabulate import tabulate
 import json
+
+try:
+    import heliosdb_nano
+except ImportError:
+    heliosdb_nano = None
 
 
 # ============================================================================
@@ -437,6 +443,211 @@ class SQLiteBenchmarks:
 
 
 # ============================================================================
+# HeliosDB Benchmarks
+# ============================================================================
+
+class HeliosDBBenchmarks:
+    """Benchmark implementations for the in-process HeliosDB Python binding"""
+
+    @staticmethod
+    def require_binding():
+        if heliosdb_nano is None:
+            raise RuntimeError(
+                "heliosdb_nano Python binding is not installed. "
+                "Run: maturin develop -m bindings/python/Cargo.toml"
+            )
+
+    @staticmethod
+    def benchmark_simple_select(config: BenchmarkConfig) -> BenchmarkResult:
+        """Benchmark simple SELECT query"""
+        HeliosDBBenchmarks.require_binding()
+        harness = BenchmarkHarness(config)
+
+        def setup():
+            db = heliosdb_nano.EmbeddedDatabase.in_memory()
+            db.execute("CREATE TABLE test (id INTEGER, value TEXT)")
+            db.execute("INSERT INTO test VALUES (1, 'test')")
+            return {"db": db}
+
+        def benchmark(ctx):
+            ctx["db"].query("SELECT * FROM test WHERE id = 1")
+
+        return harness.run_benchmark(
+            "Simple SELECT",
+            "heliosdb",
+            setup,
+            benchmark,
+        )
+
+    @staticmethod
+    def benchmark_batch_insert(config: BenchmarkConfig) -> BenchmarkResult:
+        """Benchmark batch INSERT operations"""
+        HeliosDBBenchmarks.require_binding()
+        harness = BenchmarkHarness(config)
+
+        def setup():
+            db = heliosdb_nano.EmbeddedDatabase.in_memory()
+            db.execute("CREATE TABLE test (id INTEGER, value TEXT)")
+            return {"db": db}
+
+        def benchmark(ctx):
+            data = [(i, f"value_{i}") for i in range(config.batch_size)]
+            ctx["db"].execute_many("INSERT INTO test VALUES ($1, $2)", data)
+            ctx["db"].execute("DELETE FROM test")
+
+        return harness.run_benchmark(
+            "Batch INSERT",
+            "heliosdb",
+            setup,
+            benchmark,
+        )
+
+    @staticmethod
+    def benchmark_transaction_commit(config: BenchmarkConfig) -> BenchmarkResult:
+        """Benchmark transaction COMMIT performance"""
+        HeliosDBBenchmarks.require_binding()
+        harness = BenchmarkHarness(config)
+        counter = {"value": 0}
+
+        def setup():
+            db = heliosdb_nano.EmbeddedDatabase.in_memory()
+            db.execute("CREATE TABLE test (id INTEGER)")
+            return {"db": db, "counter": counter}
+
+        def benchmark(ctx):
+            ctx["db"].execute("BEGIN")
+            ctx["db"].execute("INSERT INTO test VALUES ($1)", (ctx["counter"]["value"],))
+            ctx["counter"]["value"] += 1
+            ctx["db"].execute("COMMIT")
+
+        return harness.run_benchmark(
+            "Transaction COMMIT",
+            "heliosdb",
+            setup,
+            benchmark,
+        )
+
+    @staticmethod
+    def benchmark_join_query(config: BenchmarkConfig) -> BenchmarkResult:
+        """Benchmark JOIN query performance"""
+        HeliosDBBenchmarks.require_binding()
+        harness = BenchmarkHarness(config)
+
+        def setup():
+            db = heliosdb_nano.EmbeddedDatabase.in_memory()
+            db.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+            db.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, amount DOUBLE PRECISION)")
+
+            users = [(i, f"user_{i}") for i in range(100)]
+            orders = [(i, i % 100, i * 10.0) for i in range(1000)]
+            db.execute_many("INSERT INTO users VALUES ($1, $2)", users)
+            db.execute_many("INSERT INTO orders VALUES ($1, $2, $3)", orders)
+            return {"db": db}
+
+        def benchmark(ctx):
+            ctx["db"].query("""
+                SELECT u.name, SUM(o.amount)
+                FROM users u
+                JOIN orders o ON u.id = o.user_id
+                GROUP BY u.name
+            """)
+
+        return harness.run_benchmark(
+            "JOIN Query",
+            "heliosdb",
+            setup,
+            benchmark,
+        )
+
+    @staticmethod
+    def benchmark_aggregate_query(config: BenchmarkConfig) -> BenchmarkResult:
+        """Benchmark aggregate function performance"""
+        HeliosDBBenchmarks.require_binding()
+        harness = BenchmarkHarness(config)
+
+        def setup():
+            db = heliosdb_nano.EmbeddedDatabase.in_memory()
+            db.execute("CREATE TABLE sales (category TEXT, amount DOUBLE PRECISION)")
+            data = [(f"cat_{i % 10}", i * 1.5) for i in range(1000)]
+            db.execute_many("INSERT INTO sales VALUES ($1, $2)", data)
+            return {"db": db}
+
+        def benchmark(ctx):
+            ctx["db"].query("""
+                SELECT category,
+                       COUNT(*),
+                       SUM(amount),
+                       AVG(amount),
+                       MIN(amount),
+                       MAX(amount)
+                FROM sales
+                GROUP BY category
+            """)
+
+        return harness.run_benchmark(
+            "Aggregate Query",
+            "heliosdb",
+            setup,
+            benchmark,
+        )
+
+    @staticmethod
+    def benchmark_large_result_set(config: BenchmarkConfig) -> BenchmarkResult:
+        """Benchmark fetching large result set"""
+        HeliosDBBenchmarks.require_binding()
+        harness = BenchmarkHarness(config)
+
+        def setup():
+            db = heliosdb_nano.EmbeddedDatabase.in_memory()
+            db.execute("CREATE TABLE test (id INTEGER, data TEXT)")
+            data = [(i, f"data_{i}") for i in range(config.large_dataset_size)]
+            db.execute_many("INSERT INTO test VALUES ($1, $2)", data)
+            return {"db": db}
+
+        def benchmark(ctx):
+            ctx["db"].query("SELECT * FROM test")
+
+        return harness.run_benchmark(
+            "Large Result Set",
+            "heliosdb",
+            setup,
+            benchmark,
+        )
+
+    @staticmethod
+    def benchmark_concurrent_reads(config: BenchmarkConfig) -> BenchmarkResult:
+        """Benchmark concurrent read operations"""
+        HeliosDBBenchmarks.require_binding()
+        harness = BenchmarkHarness(config)
+
+        def setup():
+            db = heliosdb_nano.EmbeddedDatabase.in_memory()
+            db.execute("CREATE TABLE test (id INTEGER, value TEXT)")
+            db.execute("INSERT INTO test VALUES (1, 'test')")
+            return {"db": db}
+
+        def benchmark(ctx):
+            def read_worker():
+                ctx["db"].query("SELECT * FROM test")
+
+            threads = [
+                threading.Thread(target=read_worker)
+                for _ in range(config.concurrent_connections)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        return harness.run_benchmark(
+            "Concurrent Reads",
+            "heliosdb",
+            setup,
+            benchmark,
+        )
+
+
+# ============================================================================
 # Report Generation
 # ============================================================================
 
@@ -598,45 +809,28 @@ class BenchmarkReporter:
 def run_all_benchmarks(config: BenchmarkConfig) -> List[ComparisonResult]:
     """
     Run all benchmarks and return comparison results
-
-    Note: This version only runs SQLite benchmarks.
-    HeliosDB benchmarks would require actual HeliosDB server connection.
     """
+    HeliosDBBenchmarks.require_binding()
+
     print("\n" + "=" * 80)
-    print("Running SQLite Benchmarks")
+    print("Running SQLite and HeliosDB Benchmarks")
     print("=" * 80 + "\n")
 
     benchmarks = [
-        SQLiteBenchmarks.benchmark_simple_select,
-        SQLiteBenchmarks.benchmark_batch_insert,
-        SQLiteBenchmarks.benchmark_transaction_commit,
-        SQLiteBenchmarks.benchmark_join_query,
-        SQLiteBenchmarks.benchmark_aggregate_query,
-        SQLiteBenchmarks.benchmark_large_result_set,
-        SQLiteBenchmarks.benchmark_concurrent_reads,
+        (SQLiteBenchmarks.benchmark_simple_select, HeliosDBBenchmarks.benchmark_simple_select),
+        (SQLiteBenchmarks.benchmark_batch_insert, HeliosDBBenchmarks.benchmark_batch_insert),
+        (SQLiteBenchmarks.benchmark_transaction_commit, HeliosDBBenchmarks.benchmark_transaction_commit),
+        (SQLiteBenchmarks.benchmark_join_query, HeliosDBBenchmarks.benchmark_join_query),
+        (SQLiteBenchmarks.benchmark_aggregate_query, HeliosDBBenchmarks.benchmark_aggregate_query),
+        (SQLiteBenchmarks.benchmark_large_result_set, HeliosDBBenchmarks.benchmark_large_result_set),
+        (SQLiteBenchmarks.benchmark_concurrent_reads, HeliosDBBenchmarks.benchmark_concurrent_reads),
     ]
 
     comparison_results = []
 
-    for benchmark_fn in benchmarks:
-        sqlite_result = benchmark_fn(config)
-
-        # For now, create placeholder HeliosDB result
-        # In production, this would run against actual HeliosDB server
-        heliosdb_result = BenchmarkResult(
-            name=sqlite_result.name,
-            implementation="heliosdb",
-            iterations=sqlite_result.iterations,
-            total_time=sqlite_result.total_time * 0.9,  # Placeholder: assume 10% faster
-            mean_time=sqlite_result.mean_time * 0.9,
-            median_time=sqlite_result.median_time * 0.9,
-            min_time=sqlite_result.min_time * 0.9,
-            max_time=sqlite_result.max_time * 0.9,
-            std_dev=sqlite_result.std_dev * 0.9,
-            throughput=sqlite_result.throughput * 1.1,
-            memory_used_mb=sqlite_result.memory_used_mb * 1.05,
-            timings=[t * 0.9 for t in sqlite_result.timings],
-        )
+    for sqlite_fn, heliosdb_fn in benchmarks:
+        sqlite_result = sqlite_fn(config)
+        heliosdb_result = heliosdb_fn(config)
 
         comparison = ComparisonResult(
             benchmark_name=sqlite_result.name,
@@ -697,7 +891,11 @@ def main():
     )
 
     # Run benchmarks
-    results = run_all_benchmarks(config)
+    try:
+        results = run_all_benchmarks(config)
+    except RuntimeError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
 
     # Generate report
     reporter = BenchmarkReporter()
