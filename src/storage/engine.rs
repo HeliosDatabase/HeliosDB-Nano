@@ -848,7 +848,7 @@ impl StorageEngine {
         };
 
         // Initialize snapshot manager
-        let snapshot_manager = Arc::new(SnapshotManager::new(Arc::clone(&db)));
+        let snapshot_manager = Arc::new(SnapshotManager::new_non_durable(Arc::clone(&db)));
 
         let timestamp = Arc::new(RwLock::new(1));
 

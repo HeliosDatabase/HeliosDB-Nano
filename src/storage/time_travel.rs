@@ -28,7 +28,7 @@ use crate::{Error, Result};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use lru::LruCache;
 use parking_lot::{Mutex, RwLock};
-use rocksdb::{DB, WriteBatch};
+use rocksdb::{DB, WriteBatch, WriteOptions};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
@@ -96,6 +96,8 @@ pub struct SnapshotManager {
     cache_config: CacheConfig,
     /// GC configuration
     gc_config: GcConfig,
+    /// Use non-durable RocksDB writes for memory-only databases.
+    non_durable_writes: bool,
 }
 
 /// Snapshot cache configuration
@@ -154,7 +156,15 @@ impl SnapshotManager {
             snapshot_cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
             cache_config,
             gc_config: GcConfig::default(),
+            non_durable_writes: false,
         }
+    }
+
+    /// Create a snapshot manager for memory-only databases.
+    pub fn new_non_durable(db: Arc<DB>) -> Self {
+        let mut manager = Self::new(db);
+        manager.non_durable_writes = true;
+        manager
     }
 
     /// Create a new snapshot manager with custom GC config
@@ -173,6 +183,7 @@ impl SnapshotManager {
             snapshot_cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
             cache_config,
             gc_config,
+            non_durable_writes: false,
         }
     }
 
@@ -191,6 +202,22 @@ impl SnapshotManager {
             snapshot_cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
             cache_config,
             gc_config,
+            non_durable_writes: false,
+        }
+    }
+
+    fn write_batch(&self, batch: WriteBatch, context: &str) -> Result<()> {
+        if self.non_durable_writes {
+            let mut opts = WriteOptions::default();
+            opts.set_sync(false);
+            opts.disable_wal(true);
+            self.db
+                .write_opt(batch, &opts)
+                .map_err(|e| Error::storage(format!("{}: {}", context, e)))
+        } else {
+            self.db
+                .write(batch)
+                .map_err(|e| Error::storage(format!("{}: {}", context, e)))
         }
     }
 
@@ -666,9 +693,7 @@ impl SnapshotManager {
             .map_err(|e| Error::storage(format!("Failed to serialize scn mapping: {}", e)))?;
         batch.put(scn_key.as_bytes(), scn_value);
 
-        self.db
-            .write(batch)
-            .map_err(|e| Error::storage(format!("Failed to write version snapshot batch: {}", e)))?;
+        self.write_batch(batch, "Failed to write version snapshot batch")?;
 
         self.snapshots.write().insert(timestamp, metadata.clone());
         self.txn_to_timestamp.write().insert(txn_id, timestamp);
@@ -826,9 +851,7 @@ impl SnapshotManager {
         }
 
         if count > 0 {
-            self.db
-                .write(delete_batch)
-                .map_err(|e| Error::storage(format!("Failed to delete old snapshots: {}", e)))?;
+            self.write_batch(delete_batch, "Failed to delete old snapshots")?;
         }
 
         Ok(count)
