@@ -98,6 +98,9 @@ pub struct SnapshotManager {
     gc_config: GcConfig,
     /// Use non-durable RocksDB writes for memory-only databases.
     non_durable_writes: bool,
+    /// Persist snapshot metadata keys. Memory-only databases keep this metadata
+    /// in process and do not need it for recovery.
+    persist_metadata: bool,
 }
 
 /// Snapshot cache configuration
@@ -157,6 +160,7 @@ impl SnapshotManager {
             cache_config,
             gc_config: GcConfig::default(),
             non_durable_writes: false,
+            persist_metadata: true,
         }
     }
 
@@ -164,6 +168,7 @@ impl SnapshotManager {
     pub fn new_non_durable(db: Arc<DB>) -> Self {
         let mut manager = Self::new(db);
         manager.non_durable_writes = true;
+        manager.persist_metadata = false;
         manager
     }
 
@@ -184,6 +189,7 @@ impl SnapshotManager {
             cache_config,
             gc_config,
             non_durable_writes: false,
+            persist_metadata: true,
         }
     }
 
@@ -203,6 +209,7 @@ impl SnapshotManager {
             cache_config,
             gc_config,
             non_durable_writes: false,
+            persist_metadata: true,
         }
     }
 
@@ -257,8 +264,9 @@ impl SnapshotManager {
         self.txn_to_timestamp.write().insert(txn_id, timestamp);
         self.scn_to_timestamp.write().insert(scn, timestamp);
 
-        // Persist to RocksDB
-        self.persist_snapshot_metadata(&metadata)?;
+        if self.persist_metadata {
+            self.persist_snapshot_metadata(&metadata)?;
+        }
 
         // Run GC if enabled
         if self.gc_config.auto_gc_enabled {
@@ -678,20 +686,22 @@ impl SnapshotManager {
         let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, reverse_ts);
         batch.put(index_key.as_bytes(), timestamp.to_be_bytes());
 
-        let snapshot_key = format!("snapshot:{}", metadata.timestamp);
-        let snapshot_value = bincode::serialize(&metadata)
-            .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
-        batch.put(snapshot_key.as_bytes(), snapshot_value);
+        if self.persist_metadata {
+            let snapshot_key = format!("snapshot:{}", metadata.timestamp);
+            let snapshot_value = bincode::serialize(&metadata)
+                .map_err(|e| Error::storage(format!("Failed to serialize metadata: {}", e)))?;
+            batch.put(snapshot_key.as_bytes(), snapshot_value);
 
-        let txn_key = format!("txn_map:{}", metadata.transaction_id);
-        let txn_value = bincode::serialize(&metadata.timestamp)
-            .map_err(|e| Error::storage(format!("Failed to serialize txn mapping: {}", e)))?;
-        batch.put(txn_key.as_bytes(), txn_value);
+            let txn_key = format!("txn_map:{}", metadata.transaction_id);
+            let txn_value = bincode::serialize(&metadata.timestamp)
+                .map_err(|e| Error::storage(format!("Failed to serialize txn mapping: {}", e)))?;
+            batch.put(txn_key.as_bytes(), txn_value);
 
-        let scn_key = format!("scn_map:{}", metadata.scn);
-        let scn_value = bincode::serialize(&metadata.timestamp)
-            .map_err(|e| Error::storage(format!("Failed to serialize scn mapping: {}", e)))?;
-        batch.put(scn_key.as_bytes(), scn_value);
+            let scn_key = format!("scn_map:{}", metadata.scn);
+            let scn_value = bincode::serialize(&metadata.timestamp)
+                .map_err(|e| Error::storage(format!("Failed to serialize scn mapping: {}", e)))?;
+            batch.put(scn_key.as_bytes(), scn_value);
+        }
 
         self.write_batch(batch, "Failed to write version snapshot batch")?;
 
@@ -835,14 +845,15 @@ impl SnapshotManager {
                 self.txn_to_timestamp.write().remove(&metadata.transaction_id);
                 self.scn_to_timestamp.write().remove(&metadata.scn);
 
-                // Remove from disk
-                let snap_key = format!("snapshot:{}", ts);
-                let txn_key = format!("txn_map:{}", metadata.transaction_id);
-                let scn_key = format!("scn_map:{}", metadata.scn);
+                if self.persist_metadata {
+                    let snap_key = format!("snapshot:{}", ts);
+                    let txn_key = format!("txn_map:{}", metadata.transaction_id);
+                    let scn_key = format!("scn_map:{}", metadata.scn);
 
-                delete_batch.delete(snap_key.as_bytes());
-                delete_batch.delete(txn_key.as_bytes());
-                delete_batch.delete(scn_key.as_bytes());
+                    delete_batch.delete(snap_key.as_bytes());
+                    delete_batch.delete(txn_key.as_bytes());
+                    delete_batch.delete(scn_key.as_bytes());
+                }
 
                 // Note: We don't delete the versioned data (v:*) here
                 // That would require a separate GC pass to avoid breaking
@@ -850,7 +861,7 @@ impl SnapshotManager {
             }
         }
 
-        if count > 0 {
+        if count > 0 && self.persist_metadata {
             self.write_batch(delete_batch, "Failed to delete old snapshots")?;
         }
 
@@ -1095,6 +1106,27 @@ mod tests {
 
         let resolved = manager.resolve_scn(scn).unwrap();
         assert_eq!(resolved, 100);
+    }
+
+    #[test]
+    fn test_non_durable_snapshot_manager_keeps_metadata_in_memory_only() {
+        let (db, _temp) = create_test_db();
+        let manager = SnapshotManager::new_non_durable(Arc::clone(&db));
+
+        let metadata = manager
+            .write_version_and_register_snapshot("users", 1, 100, b"value_at_100", Some(42))
+            .unwrap();
+
+        assert_eq!(manager.get_snapshot_metadata(100).unwrap().transaction_id, 42);
+        assert_eq!(manager.resolve_transaction(42).unwrap(), 100);
+        assert_eq!(manager.resolve_scn(metadata.scn).unwrap(), 100);
+        assert!(manager.read_at_snapshot("users", 1, 100).unwrap().is_some());
+
+        assert!(db.get(b"v:users:1:100").unwrap().is_some());
+        assert!(db.get(b"v_idx:users:1:18446744073709551515").unwrap().is_some());
+        assert!(db.get(b"snapshot:100").unwrap().is_none());
+        assert!(db.get(b"txn_map:42").unwrap().is_none());
+        assert!(db.get(format!("scn_map:{}", metadata.scn).as_bytes()).unwrap().is_none());
     }
 
     #[test]
