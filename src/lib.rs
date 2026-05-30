@@ -6294,7 +6294,6 @@ impl EmbeddedDatabase {
         schema: &Schema,
         txn: &storage::Transaction,
     ) -> Result<()> {
-        let col_values = Self::tuple_column_values(schema, &tuple);
         // Callers reach this helper only through the fast INSERT paths, which
         // already reject tables with FK/CHECK constraints while building their
         // statement metadata. Avoid reloading constraint metadata on every row
@@ -6308,9 +6307,17 @@ impl EmbeddedDatabase {
         let key = self.storage.branch_aware_data_key(table_name, row_id);
         txn.put(key, val)?;
 
-        if let Err(e) = self.storage.art_indexes().on_insert(table_name, row_id, &col_values) {
-            tracing::debug!("ART index insert for '{}': {}", table_name, e);
-        }
+        let col_values = match self
+            .storage
+            .art_indexes()
+            .on_insert_tuple_collect_index_values(table_name, row_id, schema, &tuple)
+        {
+            Ok(values) => values,
+            Err(e) => {
+                tracing::debug!("ART index insert for '{}': {}", table_name, e);
+                Self::tuple_column_values(schema, &tuple)
+            }
+        };
         self.art_undo_log.write().push(ArtUndoOp::RemoveInserted {
             table_name: table_name.to_string(),
             row_id,

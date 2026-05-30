@@ -1013,6 +1013,60 @@ impl ArtIndexManager {
         Ok(())
     }
 
+    /// Update indexes after INSERT using an already-materialized tuple and
+    /// return only the indexed column values needed to undo the insert.
+    pub fn on_insert_tuple_collect_index_values(
+        &self,
+        table: &str,
+        row_id: RowId,
+        schema: &Schema,
+        tuple: &Tuple,
+    ) -> ArtResult<HashMap<String, Value>> {
+        let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
+        let mut indexed_values = HashMap::new();
+
+        for index in indexes.values_mut() {
+            if index.table() != table {
+                continue;
+            }
+
+            let mut values = Vec::with_capacity(index.columns().len());
+            for column in index.columns() {
+                let Some(idx) = schema.get_column_index(column) else {
+                    values.clear();
+                    break;
+                };
+                let Some(value) = tuple.values.get(idx).cloned() else {
+                    values.clear();
+                    break;
+                };
+                indexed_values
+                    .entry(column.clone())
+                    .or_insert_with(|| value.clone());
+                values.push(value);
+            }
+
+            if values.len() == index.columns().len() {
+                let key = Self::encode_key(&values);
+                match index.index_type() {
+                    ArtIndexType::PrimaryKey | ArtIndexType::Unique => {
+                        index.insert(&key, row_id)?;
+                        if index.index_type() == ArtIndexType::PrimaryKey && values.len() == 1 {
+                            if let Some((value, key_width)) = Self::int_value_width(&values[0]) {
+                                index.record_dense_int_insert(key_width, value);
+                            }
+                        }
+                    }
+                    ArtIndexType::ForeignKey | ArtIndexType::Manual => {
+                        let _ = index.insert(&key, row_id);
+                    }
+                }
+            }
+        }
+
+        Ok(indexed_values)
+    }
+
     /// Update indexes after DELETE
     pub fn on_delete(&self, table: &str, row_id: RowId, column_values: &HashMap<String, Value>) -> ArtResult<()> {
         let mut indexes = self.indexes.write().unwrap_or_else(|e| e.into_inner());
@@ -1460,7 +1514,16 @@ mod tests {
         manager
             .check_unique_constraints_tuple("users", &schema, &tuple)
             .unwrap();
-        manager.on_insert_tuple("users", 1, &schema, &tuple).unwrap();
+        let indexed_values = manager
+            .on_insert_tuple_collect_index_values("users", 1, &schema, &tuple)
+            .unwrap();
+        assert_eq!(indexed_values.len(), 2);
+        assert_eq!(indexed_values.get("id"), Some(&Value::Int4(1)));
+        assert_eq!(
+            indexed_values.get("email"),
+            Some(&Value::String("a@example.com".to_string()))
+        );
+        assert!(!indexed_values.contains_key("balance"));
 
         let dup_pk = Tuple::new(vec![
             Value::Int4(1),
@@ -1485,6 +1548,11 @@ mod tests {
         let null_unique = Tuple::new(vec![Value::Int4(2), Value::Null, Value::Int4(20)]);
         assert!(manager
             .check_unique_constraints_tuple("users", &schema, &null_unique)
+            .is_ok());
+
+        manager.on_delete("users", 1, &indexed_values).unwrap();
+        assert!(manager
+            .check_unique_constraints_tuple("users", &schema, &dup_pk)
             .is_ok());
     }
 
