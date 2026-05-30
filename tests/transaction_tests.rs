@@ -133,6 +133,25 @@ fn test_atomicity_all_or_nothing() -> Result<()> {
 }
 
 #[test]
+fn test_execute_batch_rolls_back_update_on_later_error() -> Result<()> {
+    let db = create_test_db()?;
+    db.execute("CREATE TABLE items (id INT PRIMARY KEY, value INT)")?;
+    db.execute("INSERT INTO items (id, value) VALUES (1, 10)")?;
+
+    let result = db.execute_batch(&[
+        "UPDATE items SET value = 20 WHERE id = 1",
+        "INSERT INTO missing_table VALUES (1)",
+    ]);
+    assert!(result.is_err(), "batch should fail on the invalid second statement");
+
+    let rows = db.query("SELECT value FROM items WHERE id = 1", &[])?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values[0], heliosdb_nano::Value::Int4(10));
+
+    Ok(())
+}
+
+#[test]
 fn test_consistency_constraints() -> Result<()> {
     let db = create_test_db()?;
     db.execute("CREATE TABLE constrained (id INT PRIMARY KEY, value INT NOT NULL)")?;
