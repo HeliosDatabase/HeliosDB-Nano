@@ -5153,12 +5153,15 @@ impl StorageEngine {
     /// Get next row ID for a table (thread-safe)
     pub fn next_row_id(&self, table_name: &str) -> Result<u64> {
         // Get or initialize counter
-        let counter = self
-            .row_counters
-            .entry(table_name.to_string())
-            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
-
-        let next = counter.fetch_add(1, Ordering::SeqCst) + 1;
+        let next = if let Some(counter) = self.row_counters.get(table_name) {
+            counter.fetch_add(1, Ordering::Relaxed) + 1
+        } else {
+            let counter = self
+                .row_counters
+                .entry(table_name.to_string())
+                .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
+            counter.fetch_add(1, Ordering::Relaxed) + 1
+        };
 
         // Persist to storage with encryption
         let key = format!("counter:{}", table_name).into_bytes();
@@ -5188,11 +5191,15 @@ impl StorageEngine {
     /// call `flush_row_counter()` after the batch to persist the
     /// final counter value. Used by the fast INSERT path.
     pub fn next_row_id_volatile(&self, table_name: &str) -> u64 {
+        if let Some(counter) = self.row_counters.get(table_name) {
+            return counter.fetch_add(1, Ordering::Relaxed) + 1;
+        }
+
         let counter = self
             .row_counters
             .entry(table_name.to_string())
             .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
-        counter.fetch_add(1, Ordering::SeqCst) + 1
+        counter.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     /// Stage a row counter update in an active transaction.
@@ -5214,11 +5221,15 @@ impl StorageEngine {
     /// Called after a batch of volatile row ID allocations to ensure
     /// the counter survives a crash.
     pub fn flush_row_counter(&self, table_name: &str) -> Result<()> {
-        let counter = self
-            .row_counters
-            .entry(table_name.to_string())
-            .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
-        let current = counter.load(Ordering::SeqCst);
+        let current = if let Some(counter) = self.row_counters.get(table_name) {
+            counter.load(Ordering::Relaxed)
+        } else {
+            let counter = self
+                .row_counters
+                .entry(table_name.to_string())
+                .or_insert_with(|| std::sync::atomic::AtomicU64::new(0));
+            counter.load(Ordering::Relaxed)
+        };
 
         let key = format!("counter:{}", table_name).into_bytes();
         let value =
