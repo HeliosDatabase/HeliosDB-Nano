@@ -63,6 +63,11 @@ pub struct TopKOperator {
     schema: Arc<Schema>,
 }
 
+enum SortKeyAccessor {
+    Column(usize),
+    Expr(crate::sql::LogicalExpr),
+}
+
 impl TopKOperator {
     /// `k` is the number of rows to keep (typically `limit + offset`).
     /// The caller is responsible for wrapping in a `LimitOperator` to
@@ -76,6 +81,16 @@ impl TopKOperator {
     ) -> Result<Self> {
         let schema = input.schema();
         let evaluator = crate::sql::Evaluator::new(schema.clone());
+        let key_accessors: Vec<SortKeyAccessor> = exprs
+            .into_iter()
+            .map(|expr| match &expr {
+                crate::sql::LogicalExpr::Column { table, name } => schema
+                    .get_qualified_column_index(table.as_deref(), name)
+                    .map(SortKeyAccessor::Column)
+                    .unwrap_or_else(|| SortKeyAccessor::Expr(expr)),
+                _ => SortKeyAccessor::Expr(expr),
+            })
+            .collect();
         let asc = Arc::new(asc);
 
         // Degenerate case: k == 0 ⇒ no rows to return.
@@ -93,11 +108,16 @@ impl TopKOperator {
                 ctx.check_timeout()?;
             }
             // Build the sort key for this tuple
-            let mut key = Vec::with_capacity(exprs.len());
-            for expr in &exprs {
-                match evaluator.evaluate(expr, &tuple) {
-                    Ok(v) => key.push(v),
-                    Err(_) => key.push(Value::Null),
+            let mut key = Vec::with_capacity(key_accessors.len());
+            for accessor in &key_accessors {
+                match accessor {
+                    SortKeyAccessor::Column(index) => {
+                        key.push(tuple.get(*index).cloned().unwrap_or(Value::Null));
+                    }
+                    SortKeyAccessor::Expr(expr) => match evaluator.evaluate(expr, &tuple) {
+                        Ok(v) => key.push(v),
+                        Err(_) => key.push(Value::Null),
+                    },
                 }
             }
             let entry = HeapEntry {
