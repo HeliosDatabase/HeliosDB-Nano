@@ -5483,6 +5483,91 @@ impl StorageEngine {
         Ok(row_id)
     }
 
+    /// Fast autocommit batch INSERT for already-validated default-storage rows.
+    ///
+    /// This is intentionally narrower than `insert_tuple_fast`: it is only for
+    /// callers that have already materialized row IDs, checked PK/UNIQUE
+    /// constraints, and proven that logical WAL/HA broadcast is not required.
+    /// It avoids staging every row through Transaction::write_set while keeping
+    /// data keys, version keys, and the row counter in one RocksDB WriteBatch.
+    pub fn insert_prepared_tuples_fast_batch(
+        &self,
+        table_name: &str,
+        prepared: Vec<(u64, Tuple)>,
+        schema: &crate::Schema,
+    ) -> Result<u64> {
+        if prepared.is_empty() {
+            return Ok(0);
+        }
+        if self.fast_dml_requires_logical_wal() {
+            return Err(Error::internal(
+                "fast batch insert requires Transaction path when logical WAL is active",
+            ));
+        }
+        if schema_uses_column_storage(schema) {
+            return Err(Error::internal(
+                "fast batch insert direct WriteBatch requires default row storage",
+            ));
+        }
+
+        let commit_ts = if self.config.storage.time_travel_enabled {
+            Some(self.next_timestamp())
+        } else {
+            None
+        };
+        let reverse_ts = commit_ts.map(|ts| u64::MAX - ts);
+        let mut batch = WriteBatch::default();
+        let mut indexed_rows = Vec::with_capacity(prepared.len());
+        let mut final_row_id = 0_u64;
+
+        for (row_id, tuple) in prepared {
+            let value = bincode::serialize(&tuple)
+                .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+            let key = Self::build_data_key(table_name, row_id);
+            batch.put(&key, &value);
+
+            if let (Some(ts), Some(reverse_ts)) = (commit_ts, reverse_ts) {
+                let version_key = format!("v:{}:{}:{}", table_name, row_id, ts);
+                batch.put(version_key.as_bytes(), &value);
+
+                let index_key = format!("v_idx:{}:{}:{:020}", table_name, row_id, reverse_ts);
+                batch.put(index_key.as_bytes(), ts.to_be_bytes());
+            }
+
+            final_row_id = row_id;
+            indexed_rows.push((row_id, tuple));
+        }
+
+        if final_row_id > 0 {
+            let counter_key = format!("counter:{}", table_name);
+            let counter_value = bincode::serialize(&final_row_id)
+                .map_err(|e| Error::storage(format!("Failed to serialize counter: {}", e)))?;
+            batch.put(counter_key.as_bytes(), counter_value);
+        }
+
+        let result = if let Some(opts) = &self.memory_write_options {
+            self.db.write_opt(batch, opts)
+        } else {
+            self.db.write(batch)
+        };
+        result.map_err(|e| Error::storage(format!("Fast batch insert failed: {}", e)))?;
+
+        if let Some(ts) = commit_ts {
+            let _ = self.snapshot_manager.register_snapshot(ts);
+        }
+
+        for (row_id, tuple) in &indexed_rows {
+            if let Err(e) = self
+                .art_index_manager
+                .on_insert_tuple(table_name, *row_id, schema, tuple)
+            {
+                tracing::debug!("ART index batch insert for table '{}': {}", table_name, e);
+            }
+        }
+
+        Ok(indexed_rows.len() as u64)
+    }
+
     fn transform_tuple_for_column_storage(
         &self,
         table_name: &str,
