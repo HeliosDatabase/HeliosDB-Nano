@@ -2708,7 +2708,7 @@ impl StorageEngine {
         // Fetch schema internally for callers that don't have it
         let catalog = Catalog::new(self);
         let schema = catalog.get_table_schema(table_name).ok();
-        self.get_row_by_pk_inner(table_name, pk_value, schema.as_ref())
+        self.get_row_by_pk_inner(table_name, pk_value, schema.as_ref(), true)
     }
 
     /// PK point lookup using a pre-fetched schema (avoids redundant catalog lookup)
@@ -2718,7 +2718,18 @@ impl StorageEngine {
         pk_value: &crate::Value,
         schema: &crate::Schema,
     ) -> Result<Option<Tuple>> {
-        self.get_row_by_pk_inner(table_name, pk_value, Some(schema))
+        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), true)
+    }
+
+    /// PK point lookup for write paths. Cache hits are used, but cache misses
+    /// are not inserted because UPDATE/DELETE immediately invalidate the row.
+    pub fn get_row_by_pk_for_write_with_schema(
+        &self,
+        table_name: &str,
+        pk_value: &crate::Value,
+        schema: &crate::Schema,
+    ) -> Result<Option<Tuple>> {
+        self.get_row_by_pk_inner(table_name, pk_value, Some(schema), false)
     }
 
     /// Fetch a row directly by its row_id (for index-nested-loop join)
@@ -2789,6 +2800,7 @@ impl StorageEngine {
         table_name: &str,
         pk_value: &crate::Value,
         schema: Option<&crate::Schema>,
+        populate_cache_on_miss: bool,
     ) -> Result<Option<Tuple>> {
         let lookup_start = std::time::Instant::now();
 
@@ -2887,8 +2899,11 @@ impl StorageEngine {
             }
         }
 
-        // Populate row cache with resolved tuple
-        self.row_cache.put(table_name, row_id, tuple.clone());
+        // Populate row cache with resolved tuple for read lookups. Write paths
+        // skip this because they immediately invalidate the same row.
+        if populate_cache_on_miss {
+            self.row_cache.put(table_name, row_id, tuple.clone());
+        }
 
         tracing::debug!(
             phase = "index_lookup",

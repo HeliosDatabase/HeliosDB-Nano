@@ -5104,7 +5104,7 @@ impl EmbeddedDatabase {
 
         let existing_row = match self
             .storage
-            .get_row_by_pk_with_schema(&spec.table_name, &pk_value, &spec.schema)
+            .get_row_by_pk_for_write_with_schema(&spec.table_name, &pk_value, &spec.schema)
         {
             Ok(Some(row)) => row,
             Ok(None) => return Some(Ok(0)),
@@ -5194,7 +5194,7 @@ impl EmbeddedDatabase {
 
         let existing_row = match self
             .storage
-            .get_row_by_pk_with_schema(&spec.table_name, &pk_value, &spec.schema)
+            .get_row_by_pk_for_write_with_schema(&spec.table_name, &pk_value, &spec.schema)
         {
             Ok(Some(row)) => row,
             Ok(None) => return Some(Ok(0)),
@@ -6363,7 +6363,10 @@ impl EmbeddedDatabase {
         let (pk_value, _) = Self::fast_parse_one_value(pk_val_str, &pk_column.data_type)?;
 
         // Look up the existing row by PK (needed for both literal and expression SET)
-        let existing_row = match self.storage.get_row_by_pk_with_schema(table_name, &pk_value, &schema) {
+        let existing_row = match self
+            .storage
+            .get_row_by_pk_for_write_with_schema(table_name, &pk_value, &schema)
+        {
             Ok(Some(row)) => row,
             Ok(None) => return Some(Ok(0)), // No matching row
             Err(e) => return Some(Err(e)),
@@ -6525,7 +6528,10 @@ impl EmbeddedDatabase {
         }
 
         let (pk_value, _) = Self::fast_parse_one_value(pk_val_str, &pk_column.data_type)?;
-        let existing_row = match self.storage.get_row_by_pk_with_schema(table_name, &pk_value, &schema) {
+        let existing_row = match self
+            .storage
+            .get_row_by_pk_for_write_with_schema(table_name, &pk_value, &schema)
+        {
             Ok(Some(row)) => row,
             Ok(None) => return Some(Ok(None)),
             Err(e) => return Some(Err(e)),
