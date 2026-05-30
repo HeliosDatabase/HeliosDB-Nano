@@ -6598,9 +6598,14 @@ impl EmbeddedDatabase {
         col_values
     }
 
-    fn validate_fast_insert_batch(&self, table_name: &str, schema: &Schema, tuples: &[Tuple]) -> Result<()> {
-        if let Some(tuple) = tuples.first() {
-            if tuples.len() == 1 {
+    fn validate_fast_insert_batch(
+        &self,
+        table_name: &str,
+        schema: &Schema,
+        prepared: &[(u64, Tuple)],
+    ) -> Result<()> {
+        if let Some((_, tuple)) = prepared.first() {
+            if prepared.len() == 1 {
                 if let Err(e) = self
                     .storage
                     .art_indexes()
@@ -6648,7 +6653,7 @@ impl EmbeddedDatabase {
         unique_specs.dedup();
 
         let mut seen = std::collections::HashSet::new();
-        for tuple in tuples {
+        for (_, tuple) in prepared {
             if let Err(e) = self
                 .storage
                 .art_indexes()
@@ -6658,22 +6663,9 @@ impl EmbeddedDatabase {
             }
 
             for spec in &unique_specs {
-                let mut parts = Vec::with_capacity(spec.len());
-                let mut has_null = false;
-                for &idx in spec {
-                    match tuple.values.get(idx) {
-                        Some(Value::Null) | None => {
-                            has_null = true;
-                            break;
-                        }
-                        Some(value) => parts.push(format!("{:?}", value)),
-                    }
-                }
-                if has_null {
+                let Some(key) = Self::fast_insert_batch_unique_key(spec, tuple) else {
                     continue;
-                }
-
-                let key = format!("{:?}:{:?}", spec, parts);
+                };
                 if !seen.insert(key) {
                     return Err(Error::constraint_violation(
                         "Duplicate key value violates UNIQUE constraint".to_string(),
@@ -6683,6 +6675,25 @@ impl EmbeddedDatabase {
         }
 
         Ok(())
+    }
+
+    fn fast_insert_batch_unique_key(spec: &[usize], tuple: &Tuple) -> Option<Vec<u8>> {
+        let mut values = Vec::with_capacity(spec.len());
+        for &idx in spec {
+            match tuple.values.get(idx) {
+                Some(Value::Null) | None => return None,
+                Some(value) => values.push(value),
+            }
+        }
+
+        let value_key = crate::storage::art_manager::ArtIndexManager::encode_key_from_values(values);
+        let mut key = Vec::with_capacity(spec.len() * std::mem::size_of::<u64>() + 1 + value_key.len());
+        for &idx in spec {
+            key.extend_from_slice(&(idx as u64).to_be_bytes());
+        }
+        key.push(0xff);
+        key.extend_from_slice(&value_key);
+        Some(key)
     }
 
     fn insert_validated_tuples_in_transaction(
@@ -6701,14 +6712,12 @@ impl EmbeddedDatabase {
         }
 
         let mut prepared = Vec::with_capacity(tuples.len());
-        let mut generated_tuples = Vec::with_capacity(tuples.len());
         for tuple in tuples {
             let (row_id, tuple) = self.prepare_tuple_for_transaction_insert(table_name, tuple, schema);
-            generated_tuples.push(tuple.clone());
             prepared.push((row_id, tuple));
         }
 
-        self.validate_fast_insert_batch(table_name, schema, &generated_tuples)?;
+        self.validate_fast_insert_batch(table_name, schema, &prepared)?;
 
         let mut inserted = 0_u64;
         let mut final_row_id = None;
