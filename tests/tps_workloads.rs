@@ -27,10 +27,12 @@ fn run_cache_concurrency_bench() {
     }
     let legacy = std::env::var("HELIOS_ROWCACHE_LEGACY").is_ok();
     let db = EmbeddedDatabase::new_in_memory().unwrap();
-    db.execute("CREATE TABLE hot (id INTEGER PRIMARY KEY, v INTEGER)").unwrap();
+    db.execute("CREATE TABLE hot (id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
     db.execute("BEGIN").unwrap();
     for i in 0..2000 {
-        db.execute(&format!("INSERT INTO hot (id, v) VALUES ({i}, {})", i * 2)).unwrap();
+        db.execute(&format!("INSERT INTO hot (id, v) VALUES ({i}, {})", i * 2))
+            .unwrap();
     }
     db.execute("COMMIT").unwrap();
     // Warm the row cache over the hot set.
@@ -39,7 +41,10 @@ fn run_cache_concurrency_bench() {
     }
 
     let per_thread = 200_000usize;
-    println!("\n=== cache concurrency: read path = {} ===", if legacy { "LEGACY write-lock" } else { "read-lock+peek" });
+    println!(
+        "\n=== cache concurrency: read path = {} ===",
+        if legacy { "LEGACY write-lock" } else { "read-lock+peek" }
+    );
     for &threads in &[1usize, 4, 16] {
         let start = Instant::now();
         std::thread::scope(|s| {
@@ -56,7 +61,12 @@ fn run_cache_concurrency_bench() {
         });
         let total = threads * per_thread;
         let secs = start.elapsed().as_secs_f64();
-        println!("{threads:>3} threads  {:>12.0} lookups/s  ({:.2} M total in {:.2}s)", total as f64 / secs, total as f64 / 1e6, secs);
+        println!(
+            "{threads:>3} threads  {:>12.0} lookups/s  ({:.2} M total in {:.2}s)",
+            total as f64 / secs,
+            total as f64 / 1e6,
+            secs
+        );
     }
     println!();
 }
@@ -70,7 +80,10 @@ fn run_scan_bench() {
         eprintln!("skipping run_scan_bench (set HELIOS_SCAN=1)");
         return;
     }
-    let n: usize = std::env::var("HELIOS_SCAN_N").ok().and_then(|s| s.parse().ok()).unwrap_or(300_000);
+    let n: usize = std::env::var("HELIOS_SCAN_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300_000);
     let serial = std::env::var("HELIOS_SCAN_SERIAL").is_ok();
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE TABLE wide (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, d INTEGER, e INTEGER)")
@@ -110,7 +123,9 @@ fn run_scan_bench() {
     bench("filter_scan(d>50000)", &|r| {
         format!("SELECT id, a FROM wide WHERE d > 50000 AND b >= {r}")
     });
-    bench("count_star(all)", &|r| format!("SELECT COUNT(*) FROM wide{}", " ".repeat(r + 1)));
+    bench("count_star(all)", &|r| {
+        format!("SELECT COUNT(*) FROM wide{}", " ".repeat(r + 1))
+    });
     bench("count_star(id>=r)", &|r| {
         format!("SELECT COUNT(*) FROM wide WHERE id >= {r}")
     });
@@ -126,6 +141,94 @@ fn run_scan_bench() {
     bench("group_by_e", &|r| {
         format!("SELECT e, COUNT(*), SUM(a) FROM wide WHERE b >= {r} GROUP BY e")
     });
+    println!();
+}
+
+/// A/B benchmark for the columnar-native scan path. It compares identical
+/// analytical queries over a default row-store table and a table whose referenced
+/// scan columns are `STORAGE COLUMNAR`.
+///
+///   HELIOS_COLUMNAR_SCAN=1 HELIOS_COLUMNAR_SCAN_N=50000 cargo test --profile perf --test tps_workloads run_columnar_scan_bench -- --nocapture --test-threads=1
+#[test]
+fn run_columnar_scan_bench() {
+    if std::env::var("HELIOS_COLUMNAR_SCAN").is_err() {
+        eprintln!("skipping run_columnar_scan_bench (set HELIOS_COLUMNAR_SCAN=1)");
+        return;
+    }
+
+    let n: usize = std::env::var("HELIOS_COLUMNAR_SCAN_N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(50_000);
+    let runs = 5usize;
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+
+    db.execute("CREATE TABLE row_wide (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c TEXT, d INTEGER, e INTEGER)")
+        .unwrap();
+    db.execute(
+        "CREATE TABLE col_wide (
+            id INTEGER PRIMARY KEY,
+            a INTEGER STORAGE COLUMNAR,
+            b INTEGER STORAGE COLUMNAR,
+            c TEXT,
+            d INTEGER STORAGE COLUMNAR,
+            e INTEGER STORAGE COLUMNAR
+        )",
+    )
+    .unwrap();
+
+    db.execute("BEGIN").unwrap();
+    for i in 0..n {
+        let a = i % 1000;
+        let b = (i * 7) % 100000;
+        let d = (i * 13) % 100000;
+        let e = i % 8;
+        db.execute(&format!(
+            "INSERT INTO row_wide (id,a,b,c,d,e) VALUES ({i},{a},{b},'row{i}',{d},{e})"
+        ))
+        .unwrap();
+        db.execute(&format!(
+            "INSERT INTO col_wide (id,a,b,c,d,e) VALUES ({i},{a},{b},'row{i}',{d},{e})"
+        ))
+        .unwrap();
+    }
+    db.execute("COMMIT").unwrap();
+
+    println!("\n=== columnar scan bench: N={n} ===");
+    let bench_pair = |label: &str, row_sql: &dyn Fn(usize) -> String, col_sql: &dyn Fn(usize) -> String| {
+        let time_query = |mk: &dyn Fn(usize) -> String| {
+            let t = Instant::now();
+            let mut rows = 0usize;
+            for r in 0..runs {
+                rows = db.query(&mk(r), &[]).unwrap().len();
+            }
+            (t.elapsed().as_secs_f64() * 1e6 / runs as f64, rows)
+        };
+
+        let (row_us, row_rows) = time_query(row_sql);
+        let (col_us, col_rows) = time_query(col_sql);
+        assert_eq!(row_rows, col_rows, "{label} row/columnar row counts differ");
+        println!(
+            "{label:<24} row={row_us:>10.1} us/query  columnar={col_us:>10.1} us/query  speedup={:>5.2}x  ({col_rows} rows)",
+            row_us / col_us
+        );
+    };
+
+    bench_pair(
+        "filter_scan",
+        &|r| format!("SELECT a FROM row_wide WHERE d > 50000 AND b >= {r}"),
+        &|r| format!("SELECT a FROM col_wide WHERE d > 50000 AND b >= {r}"),
+    );
+    bench_pair(
+        "agg_sum_avg",
+        &|r| format!("SELECT SUM(a), AVG(d), MAX(b) FROM row_wide WHERE b >= {r}"),
+        &|r| format!("SELECT SUM(a), AVG(d), MAX(b) FROM col_wide WHERE b >= {r}"),
+    );
+    bench_pair(
+        "group_by_e",
+        &|r| format!("SELECT e, COUNT(*), SUM(a) FROM row_wide WHERE b >= {r} GROUP BY e"),
+        &|r| format!("SELECT e, COUNT(*), SUM(a) FROM col_wide WHERE b >= {r} GROUP BY e"),
+    );
     println!();
 }
 

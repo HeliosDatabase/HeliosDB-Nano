@@ -199,6 +199,83 @@ fn test_columnar_storage_fast_insert_side_data() {
 }
 
 #[test]
+fn test_columnar_scan_reads_requested_side_data() {
+    let db = test_db();
+
+    db.execute("CREATE TABLE metrics (id INT PRIMARY KEY, value FLOAT8, bucket INT)")
+        .unwrap();
+    db.execute("ALTER TABLE metrics ALTER COLUMN value SET STORAGE COLUMNAR")
+        .unwrap();
+    db.execute("ALTER TABLE metrics ALTER COLUMN bucket SET STORAGE COLUMNAR")
+        .unwrap();
+
+    db.execute("INSERT INTO metrics (id, value, bucket) VALUES (1, 10.5, 1)")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, value, bucket) VALUES (2, NULL, 1)")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, value, bucket) VALUES (3, 30.5, 2)")
+        .unwrap();
+    db.execute("DELETE FROM metrics WHERE id = 3").unwrap();
+
+    let schema = db.storage.catalog().get_table_schema("metrics").unwrap();
+    let rows = db
+        .storage
+        .scan_table_with_schema_columnar_columns("metrics", &schema, &[1, 2])
+        .unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].row_id, Some(1));
+    assert_eq!(rows[0].values[0], Value::Null);
+    assert_eq!(rows[0].values[1], Value::Float8(10.5));
+    assert_eq!(rows[0].values[2], Value::Int4(1));
+    assert_eq!(rows[1].row_id, Some(2));
+    assert_eq!(rows[1].values[1], Value::Null);
+    assert_eq!(rows[1].values[2], Value::Int4(1));
+
+    let projected = db.query("SELECT value FROM metrics WHERE bucket = 1", &[]).unwrap();
+    assert_eq!(projected.len(), 2);
+    assert_eq!(projected[0].values[0], Value::Float8(10.5));
+    assert_eq!(projected[1].values[0], Value::Null);
+}
+
+#[test]
+fn test_columnar_transaction_insert_stages_side_data() {
+    let db = test_db();
+
+    db.execute("CREATE TABLE metrics (id INT PRIMARY KEY, value FLOAT8, bucket INT)")
+        .unwrap();
+    db.execute("ALTER TABLE metrics ALTER COLUMN value SET STORAGE COLUMNAR")
+        .unwrap();
+    db.execute("ALTER TABLE metrics ALTER COLUMN bucket SET STORAGE COLUMNAR")
+        .unwrap();
+
+    db.execute("BEGIN").unwrap();
+    db.execute("INSERT INTO metrics (id, value, bucket) VALUES (1, 10.5, 1)")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, value, bucket) VALUES (2, 20.5, 2)")
+        .unwrap();
+    let in_txn = db.query("SELECT value FROM metrics WHERE bucket = 2", &[]).unwrap();
+    assert_eq!(in_txn.len(), 1);
+    assert_eq!(in_txn[0].values[0], Value::Float8(20.5));
+    db.execute("COMMIT").unwrap();
+
+    let schema = db.storage.catalog().get_table_schema("metrics").unwrap();
+    let rows = db
+        .storage
+        .scan_table_with_schema_columnar_columns("metrics", &schema, &[1, 2])
+        .unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values[1], Value::Float8(10.5));
+    assert_eq!(rows[0].values[2], Value::Int4(1));
+    assert_eq!(rows[1].values[1], Value::Float8(20.5));
+    assert_eq!(rows[1].values[2], Value::Int4(2));
+
+    let projected = db.query("SELECT value FROM metrics WHERE bucket = 2", &[]).unwrap();
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].values[0], Value::Float8(20.5));
+}
+
+#[test]
 fn test_columnar_fast_insert_wal_logs_logical_tuple() {
     let db = wal_test_db(true);
 
@@ -246,6 +323,36 @@ fn test_columnar_fast_update_refreshes_side_data() {
         Some(Value::Float8(20.5))
     );
     let rows = db.query("SELECT value FROM metrics WHERE id = 1", &[]).unwrap();
+    assert_eq!(rows[0].values[0], Value::Float8(20.5));
+}
+
+#[test]
+fn test_columnar_slow_update_refreshes_side_data() {
+    let db = test_db();
+
+    db.execute("CREATE TABLE metrics (id INT PRIMARY KEY, value FLOAT8, bucket INT)")
+        .unwrap();
+    db.execute("ALTER TABLE metrics ALTER COLUMN value SET STORAGE COLUMNAR")
+        .unwrap();
+    db.execute("ALTER TABLE metrics ALTER COLUMN bucket SET STORAGE COLUMNAR")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, value, bucket) VALUES (1, 10.5, 1)")
+        .unwrap();
+    db.execute("INSERT INTO metrics (id, value, bucket) VALUES (2, 30.5, 2)")
+        .unwrap();
+
+    assert_eq!(
+        db.execute("UPDATE metrics SET value = 20.5 WHERE bucket = 1").unwrap(),
+        1
+    );
+
+    let rocks = db.storage.db();
+    assert_eq!(
+        ColumnarStore::get(rocks.as_ref(), "metrics", "value", 1).unwrap(),
+        Some(Value::Float8(20.5))
+    );
+    let rows = db.query("SELECT value FROM metrics WHERE bucket = 1", &[]).unwrap();
+    assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].values[0], Value::Float8(20.5));
 }
 

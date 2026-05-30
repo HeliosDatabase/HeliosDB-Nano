@@ -25,6 +25,7 @@
 use rocksdb::DB;
 use serde::{Deserialize, Serialize};
 
+use super::Transaction;
 use crate::{Error, Result, Value};
 
 /// Number of values per columnar batch
@@ -157,6 +158,48 @@ impl ColumnarStore {
         Ok(())
     }
 
+    /// Stage a value in columnar format inside a transaction write set.
+    ///
+    /// This mirrors `store`, but reads any previously staged batch through the
+    /// transaction first and buffers the updated batch with `txn.put()`. That
+    /// keeps explicit transaction INSERTs rollback-safe and prevents multiple
+    /// rows in the same columnar batch from overwriting each other before commit.
+    pub fn store_in_transaction(
+        db: &DB,
+        txn: &Transaction,
+        table: &str,
+        column: &str,
+        row_id: u64,
+        value: Value,
+    ) -> Result<()> {
+        let (batch_id, _offset) = Self::batch_location(row_id);
+        let key = Self::batch_key(table, column, batch_id);
+
+        let mut batch = match txn.get(&key)? {
+            Some(data) => bincode::deserialize(&data)
+                .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?,
+            None => match db
+                .get(&key)
+                .map_err(|e| Error::storage(format!("Columnar load failed: {}", e)))?
+            {
+                Some(data) => bincode::deserialize(&data)
+                    .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?,
+                None => ColumnBatch::new(column, batch_id * BATCH_SIZE as u64),
+            },
+        };
+
+        if !batch.set(row_id, value) {
+            return Err(Error::storage(format!(
+                "Invalid row_id {} for batch starting at {}",
+                row_id, batch.start_row_id
+            )));
+        }
+
+        let data =
+            bincode::serialize(&batch).map_err(|e| Error::storage(format!("Columnar serialize failed: {}", e)))?;
+        txn.put(key, data)
+    }
+
     /// Retrieve a value from columnar storage
     ///
     /// # Arguments
@@ -221,6 +264,33 @@ impl ColumnarStore {
 
         results.sort_by_key(|(row_id, _)| *row_id);
         Ok(results)
+    }
+
+    /// Scan all physical batches for a column.
+    ///
+    /// This is the lower-overhead primitive for executor-side columnar scans:
+    /// callers can use the batch id and row offset directly instead of expanding
+    /// every cell into a row-id map first.
+    pub fn scan_column_batches(db: &DB, table: &str, column: &str) -> Result<Vec<(u64, ColumnBatch)>> {
+        let prefix = Self::column_prefix(table, column);
+        let mut batches = Vec::new();
+
+        let iter = db.prefix_iterator(&prefix);
+        for item in iter {
+            let (key, value) = item.map_err(|e| Error::storage(format!("Columnar iterator error: {}", e)))?;
+
+            if !key.starts_with(&prefix) {
+                break;
+            }
+
+            let batch: ColumnBatch = bincode::deserialize(&value)
+                .map_err(|e| Error::storage(format!("Columnar deserialize failed: {}", e)))?;
+            let batch_id = batch.start_row_id / BATCH_SIZE as u64;
+            batches.push((batch_id, batch));
+        }
+
+        batches.sort_by_key(|(batch_id, _)| *batch_id);
+        Ok(batches)
     }
 
     /// Delete columnar data for a specific row

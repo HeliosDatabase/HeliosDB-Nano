@@ -7,7 +7,7 @@
 
 use super::art_manager::ArtIndexManager;
 use super::bloom_filter::TableBloomFilters;
-use super::columnar::ColumnarStore;
+use super::columnar::{ColumnarStore, BATCH_SIZE};
 use super::content_addr::ContentAddressedStore;
 use super::dictionary::DictionaryManager;
 use super::filter_consolidation_worker::{ConsolidationConfig, FilterConsolidationWorker};
@@ -24,10 +24,11 @@ use super::{
 };
 use crate::crypto::{self, KeyManager};
 use crate::ColumnStorageMode;
-use crate::{Config, Error, Result, Tuple};
+use crate::{Config, Error, Result, Tuple, Value};
 use parking_lot::RwLock;
 use rocksdb::{BlockBasedOptions, Cache, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions, DB};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -1657,6 +1658,100 @@ impl StorageEngine {
         } else {
             self.scan_table_with_schema_opt(table_name, schema, RowDecodeHint::Columns(columns))
         }
+    }
+
+    /// Scan a table by reading only row keys plus the requested columnar side-data.
+    ///
+    /// The caller must only pass column indexes whose schema storage mode is
+    /// `Columnar`. Unrequested columns are left `Null`, matching the selected
+    /// row-decode path used by the executor.
+    pub fn scan_table_with_schema_columnar_columns(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        columns: &[usize],
+    ) -> Result<Vec<Tuple>> {
+        let scan_start = std::time::Instant::now();
+        let mut requested: Vec<usize> = columns.to_vec();
+        requested.sort_unstable();
+        requested.dedup();
+
+        for &idx in &requested {
+            let column = schema
+                .columns
+                .get(idx)
+                .ok_or_else(|| Error::storage(format!("Column index {} out of bounds for {}", idx, table_name)))?;
+            if column.storage_mode != ColumnStorageMode::Columnar {
+                return Err(Error::storage(format!(
+                    "Columnar scan requested non-columnar column {}.{}",
+                    table_name, column.name
+                )));
+            }
+        }
+
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut row_ids = Vec::new();
+
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+            if let Ok(key_str) = std::str::from_utf8(&key) {
+                if let Some(row_id_str) = key_str.strip_prefix(&prefix) {
+                    if let Ok(row_id) = row_id_str.parse::<u64>() {
+                        row_ids.push(row_id);
+                    }
+                }
+            }
+        }
+
+        let mut column_batches: HashMap<usize, HashMap<u64, super::columnar::ColumnBatch>> =
+            HashMap::with_capacity(requested.len());
+        for &idx in &requested {
+            let column = &schema.columns[idx];
+            let mut batches = HashMap::new();
+            for (batch_id, batch) in ColumnarStore::scan_column_batches(&self.db, table_name, &column.name)? {
+                batches.insert(batch_id, batch);
+            }
+            column_batches.insert(idx, batches);
+        }
+
+        let mut tuples = Vec::with_capacity(row_ids.len());
+        for row_id in row_ids {
+            let mut values = vec![Value::Null; schema.columns.len()];
+            let batch_id = row_id / BATCH_SIZE as u64;
+            let offset = (row_id % BATCH_SIZE as u64) as usize;
+            for &idx in &requested {
+                if let Some(value) = column_batches
+                    .get(&idx)
+                    .and_then(|by_batch| by_batch.get(&batch_id))
+                    .and_then(|batch| batch.values.get(offset))
+                {
+                    values[idx] = value.clone();
+                }
+            }
+            let mut tuple = Tuple::new(values);
+            tuple.row_id = Some(row_id);
+            tuples.push(tuple);
+        }
+
+        tracing::debug!(
+            phase = "storage_columnar_scan",
+            table = table_name,
+            rows = tuples.len(),
+            columns = requested.len(),
+            duration_us = scan_start.elapsed().as_micros() as u64,
+            "Columnar table scan complete"
+        );
+
+        Ok(tuples)
     }
 
     fn scan_table_with_schema_opt(
@@ -4750,6 +4845,57 @@ impl StorageEngine {
         Ok(transformed)
     }
 
+    pub(crate) fn stage_tuple_for_column_storage_in_transaction(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        tuple: &Tuple,
+        schema: &crate::Schema,
+        txn: &Transaction,
+    ) -> Result<()> {
+        if !schema_uses_column_storage(schema) {
+            return Ok(());
+        }
+
+        for (idx, column) in schema.columns.iter().enumerate() {
+            if idx >= tuple.values.len() {
+                break;
+            }
+            if column.storage_mode == ColumnStorageMode::Columnar {
+                let cur_val = tuple
+                    .values
+                    .get(idx)
+                    .ok_or_else(|| Error::internal("index out of bounds in columnar transaction stage"))?
+                    .clone();
+                ColumnarStore::store_in_transaction(&self.db, txn, table_name, &column.name, row_id, cur_val)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn stage_columnar_delete_in_transaction(
+        &self,
+        table_name: &str,
+        row_id: u64,
+        schema: &crate::Schema,
+        txn: &Transaction,
+    ) -> Result<()> {
+        if !schema_uses_column_storage(schema) {
+            return Ok(());
+        }
+
+        for column in schema
+            .columns
+            .iter()
+            .filter(|column| column.storage_mode == ColumnStorageMode::Columnar)
+        {
+            ColumnarStore::store_in_transaction(&self.db, txn, table_name, &column.name, row_id, Value::Null)?;
+        }
+
+        Ok(())
+    }
+
     /// Fast UPDATE: overwrites a row in-place, updates ART indexes, invalidates row cache.
     /// Skips WAL fsync, snapshot versioning, and MV delta tracking.
     pub fn update_tuple_fast(
@@ -5768,6 +5914,21 @@ impl StorageEngine {
         self.scan_table_branch_aware_with_schema(table_name, schema)
     }
 
+    /// Branch-aware columnar side-data scan. Non-main branches fall back to the
+    /// full branch-aware merge path because branch overlays are row-oriented.
+    pub fn scan_table_branch_aware_with_schema_columnar_columns(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        columns: &[usize],
+    ) -> Result<Vec<Tuple>> {
+        let branch_name = self.current_branch.lock().clone();
+        if branch_name.is_none() || branch_name.as_deref() == Some("main") {
+            return self.scan_table_with_schema_columnar_columns(table_name, schema, columns);
+        }
+        self.scan_table_branch_aware_with_schema(table_name, schema)
+    }
+
     /// Branch-aware scan using a pre-fetched schema (avoids duplicate schema lookup).
     pub fn scan_table_branch_aware_with_schema(&self, table_name: &str, schema: &crate::Schema) -> Result<Vec<Tuple>> {
         // Get current branch name
@@ -6084,15 +6245,24 @@ impl StorageEngine {
                 }
             }
 
-            // Serialize tuple directly (RocksDB LZ4 handles compression at block level)
-            let value =
+            // Serialize the logical tuple for WAL/recovery, but store the
+            // physical tuple format for main-branch tables that use side
+            // storage. Branch overlays are row-oriented and remain logical.
+            let logical_value =
                 bincode::serialize(&tuple).map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?;
+            let value = if branch_id.is_none() && schema_uses_column_storage(&schema) {
+                let stored_tuple = self.transform_tuple_for_column_storage(table_name, row_id, &tuple, &schema)?;
+                bincode::serialize(&stored_tuple)
+                    .map_err(|e| Error::storage(format!("Failed to serialize tuple: {}", e)))?
+            } else {
+                logical_value.clone()
+            };
 
             // Write updated tuple to current key (overwrites old value)
             self.put(&current_key, &value)?;
 
             // Log to WAL for replication (put() no longer logs to avoid INSERT/UPDATE confusion)
-            self.log_data_update(table_name, &current_key, &value)?;
+            self.log_data_update(table_name, &current_key, &logical_value)?;
 
             // Write versioned copy of NEW value for time-travel (encrypted if TDE enabled)
             let version_key = if let Some(bid) = branch_id {
