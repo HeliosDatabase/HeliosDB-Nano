@@ -470,6 +470,10 @@ impl AggregateOperator {
             .iter()
             .map(|expr| AggregateArgAccessor::for_aggregate(expr, input_schema))
             .collect::<Result<Vec<_>>>()?;
+        let group_accessors: Vec<GroupByAccessor> = group_by
+            .iter()
+            .map(|expr| GroupByAccessor::for_group_expr(expr, input_schema))
+            .collect::<Result<Vec<_>>>()?;
 
         let mut groups: HashMap<GroupKey, Vec<StreamingAccumulator>> = HashMap::new();
         while let Some(tuple) = input.next()? {
@@ -477,7 +481,10 @@ impl AggregateOperator {
                 ctx.check_timeout()?;
             }
 
-            let key_values: Result<Vec<Value>> = group_by.iter().map(|expr| evaluator.evaluate(expr, &tuple)).collect();
+            let key_values: Result<Vec<Value>> = group_accessors
+                .iter()
+                .map(|accessor| accessor.value(&tuple, evaluator))
+                .collect();
             let accumulators = groups
                 .entry(GroupKey(key_values?))
                 .or_insert_with(|| Self::new_streaming_accumulators(aggr_exprs));
@@ -578,8 +585,15 @@ impl AggregateOperator {
             let key = GroupKey(vec![]);
             groups.insert(key, tuples);
         } else {
+            let group_accessors: Vec<GroupByAccessor> = group_by
+                .iter()
+                .map(|expr| GroupByAccessor::for_group_expr(expr, evaluator.schema().as_ref()))
+                .collect::<Result<Vec<_>>>()?;
             for tuple in tuples {
-                let key: Result<Vec<Value>> = group_by.iter().map(|expr| evaluator.evaluate(expr, &tuple)).collect();
+                let key: Result<Vec<Value>> = group_accessors
+                    .iter()
+                    .map(|accessor| accessor.value(&tuple, evaluator))
+                    .collect();
                 let key = GroupKey(key?);
                 groups.entry(key).or_insert_with(Vec::new).push(tuple);
             }
@@ -605,6 +619,46 @@ impl AggregateOperator {
         }
 
         Ok(output_tuples)
+    }
+}
+
+enum GroupByAccessor {
+    Column(usize),
+    Expr(crate::sql::LogicalExpr),
+}
+
+impl GroupByAccessor {
+    fn for_group_expr(expr: &crate::sql::LogicalExpr, schema: &Schema) -> Result<Self> {
+        use crate::sql::LogicalExpr;
+
+        match expr {
+            LogicalExpr::Column { table, name } => {
+                let index = schema
+                    .get_qualified_column_index(table.as_deref(), name)
+                    .ok_or_else(|| {
+                        Error::query_execution(format!(
+                            "Column '{}' not found in GROUP BY input schema",
+                            if let Some(t) = table {
+                                format!("{}.{}", t, name)
+                            } else {
+                                name.clone()
+                            }
+                        ))
+                    })?;
+                Ok(Self::Column(index))
+            }
+            _ => Ok(Self::Expr(expr.clone())),
+        }
+    }
+
+    fn value(&self, tuple: &Tuple, evaluator: &crate::sql::Evaluator) -> Result<crate::Value> {
+        match self {
+            Self::Column(index) => tuple
+                .get(*index)
+                .cloned()
+                .ok_or_else(|| Error::query_execution(format!("Column index {} out of bounds in GROUP BY", index))),
+            Self::Expr(expr) => evaluator.evaluate(expr, tuple),
+        }
     }
 }
 
