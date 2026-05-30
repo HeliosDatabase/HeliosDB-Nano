@@ -15,6 +15,7 @@ pub struct ProjectOperator {
     aliases: Vec<String>,
     output_schema: Arc<Schema>,
     evaluator: crate::sql::Evaluator,
+    direct_column_indices: Option<Vec<usize>>,
     distinct: bool,
     seen: std::collections::HashSet<Vec<u8>>,
     timeout_ctx: Option<TimeoutContext>,
@@ -68,6 +69,8 @@ impl ProjectOperator {
             .collect();
         let output_schema = Arc::new(Schema { columns });
 
+        let direct_column_indices = direct_project_column_indices(&input_schema, &exprs);
+
         // Create evaluator with input schema and parameters
         let evaluator = crate::sql::Evaluator::with_parameters(input_schema, parameters);
 
@@ -77,6 +80,7 @@ impl ProjectOperator {
             aliases,
             output_schema,
             evaluator,
+            direct_column_indices,
             distinct,
             seen: std::collections::HashSet::new(),
             timeout_ctx: None,
@@ -98,11 +102,24 @@ impl PhysicalOperator for ProjectOperator {
                 None => return Ok(None),
                 Some(tuple) => {
                     // Evaluate each expression to produce output values
-                    let output_values: Result<Vec<crate::Value>> = self
-                        .exprs
-                        .iter()
-                        .map(|expr| self.evaluator.evaluate(expr, &tuple))
-                        .collect();
+                    let output_values: Result<Vec<crate::Value>> = if let Some(indices) = &self.direct_column_indices {
+                        indices
+                            .iter()
+                            .map(|&idx| {
+                                tuple.get(idx).cloned().ok_or_else(|| {
+                                    crate::Error::query_execution(format!(
+                                        "Column index {} out of bounds in tuple",
+                                        idx
+                                    ))
+                                })
+                            })
+                            .collect()
+                    } else {
+                        self.exprs
+                            .iter()
+                            .map(|expr| self.evaluator.evaluate(expr, &tuple))
+                            .collect()
+                    };
 
                     let mut output_tuple = Tuple::new(output_values?);
                     // Preserve row_id through projection for DML operations
@@ -150,6 +167,18 @@ impl PhysicalOperator for ProjectOperator {
     fn schema(&self) -> Arc<Schema> {
         self.output_schema.clone()
     }
+}
+
+fn direct_project_column_indices(schema: &Schema, exprs: &[crate::sql::LogicalExpr]) -> Option<Vec<usize>> {
+    let mut indices = Vec::with_capacity(exprs.len());
+    for expr in exprs {
+        let crate::sql::LogicalExpr::Column { table, name } = expr else {
+            return None;
+        };
+        let idx = schema.get_qualified_column_index(table.as_deref(), name)?;
+        indices.push(idx);
+    }
+    Some(indices)
 }
 
 /// Limit operator
@@ -221,6 +250,59 @@ mod tests {
     use crate::sql::executor::ScanOperator;
     use crate::Column;
     use crate::DataType;
+    use crate::Value;
+
+    fn test_column(name: &str, source: Option<&str>) -> Column {
+        Column {
+            name: name.to_string(),
+            data_type: DataType::Int4,
+            nullable: false,
+            primary_key: false,
+            source_table: source.map(str::to_string),
+            source_table_name: source.map(str::to_string),
+            default_expr: None,
+            unique: false,
+            storage_mode: crate::ColumnStorageMode::Default,
+        }
+    }
+
+    #[test]
+    fn project_operator_uses_direct_indices_for_plain_columns() {
+        let schema = Arc::new(Schema {
+            columns: vec![
+                test_column("id", Some("u")),
+                test_column("age", Some("u")),
+                test_column("amount", Some("o")),
+            ],
+        });
+        let scan = ScanOperator::new(
+            "joined".to_string(),
+            schema,
+            None,
+            vec![Tuple::new(vec![Value::Int4(1), Value::Int4(42), Value::Int4(99)])],
+            Vec::new(),
+        );
+        let mut project = ProjectOperator::new(
+            Box::new(scan),
+            vec![
+                crate::sql::LogicalExpr::Column {
+                    table: Some("u".to_string()),
+                    name: "age".to_string(),
+                },
+                crate::sql::LogicalExpr::Column {
+                    table: Some("o".to_string()),
+                    name: "amount".to_string(),
+                },
+            ],
+            vec!["age".to_string(), "amount".to_string()],
+            false,
+            Vec::new(),
+        );
+
+        assert_eq!(project.direct_column_indices, Some(vec![1, 2]));
+        let row = project.next().unwrap().unwrap();
+        assert_eq!(row.values, vec![Value::Int4(42), Value::Int4(99)]);
+    }
 
     #[test]
     fn test_limit_operator() {
