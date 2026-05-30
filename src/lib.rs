@@ -401,6 +401,12 @@ pub struct EmbeddedDatabase {
     /// Repeated parameterized INSERT metadata cache. Invalidated with the plan cache on DDL.
     fast_param_insert_cache:
         std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamInsertSpec>>>>,
+    /// Repeated parameterized UPDATE metadata cache. Invalidated with the plan cache on DDL.
+    fast_param_update_cache:
+        std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamUpdateSpec>>>>,
+    /// Repeated parameterized DELETE metadata cache. Invalidated with the plan cache on DDL.
+    fast_param_delete_cache:
+        std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamDeleteSpec>>>>,
     /// Lightweight SQL-visible query profiler, disabled by default.
     query_profiler: std::sync::Arc<query_trace::QueryProfiler>,
     /// ART index undo log for transaction rollback: (table, row_id, col_values)
@@ -487,6 +493,29 @@ struct FastParamInsertSpec {
     schema: std::sync::Arc<Schema>,
     columns: Vec<FastParamInsertColumn>,
     all_columns_explicit_no_default: bool,
+}
+
+struct FastParamUpdateAssignment {
+    col_idx: usize,
+    col_name: String,
+    data_type: DataType,
+    nullable: bool,
+    expr: sql::LogicalExpr,
+}
+
+struct FastParamUpdateSpec {
+    table_name: String,
+    schema: std::sync::Arc<Schema>,
+    pk_expr: sql::LogicalExpr,
+    pk_data_type: DataType,
+    assignments: Vec<FastParamUpdateAssignment>,
+}
+
+struct FastParamDeleteSpec {
+    table_name: String,
+    schema: std::sync::Arc<Schema>,
+    pk_expr: sql::LogicalExpr,
+    pk_data_type: DataType,
 }
 
 struct FastDeleteTarget {
@@ -661,6 +690,22 @@ impl EmbeddedDatabase {
     #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
     fn new_fast_param_insert_cache(
     ) -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamInsertSpec>>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
+        )))
+    }
+
+    #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
+    fn new_fast_param_update_cache(
+    ) -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamUpdateSpec>>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
+            std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
+        )))
+    }
+
+    #[allow(clippy::expect_used)] // Safety: cache size is a non-zero compile-time constant.
+    fn new_fast_param_delete_cache(
+    ) -> std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamDeleteSpec>>>> {
         std::sync::Arc::new(std::sync::Mutex::new(lru::LruCache::new(
             std::num::NonZeroUsize::new(128).expect("128 is non-zero"),
         )))
@@ -3598,6 +3643,8 @@ impl EmbeddedDatabase {
             ))),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
+            fast_param_update_cache: Self::new_fast_param_update_cache(),
+            fast_param_delete_cache: Self::new_fast_param_delete_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
@@ -3665,6 +3712,8 @@ impl EmbeddedDatabase {
             ))),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
+            fast_param_update_cache: Self::new_fast_param_update_cache(),
+            fast_param_delete_cache: Self::new_fast_param_delete_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
@@ -3755,6 +3804,8 @@ impl EmbeddedDatabase {
             ))),
             result_cache_nonempty: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
+            fast_param_update_cache: Self::new_fast_param_update_cache(),
+            fast_param_delete_cache: Self::new_fast_param_delete_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
             art_undo_log: std::sync::Arc::new(parking_lot::RwLock::new(Vec::new())),
             fk_validation_mode: std::sync::Arc::new(parking_lot::RwLock::new(FkValidationMode::Enforced)),
@@ -4957,6 +5008,7 @@ impl EmbeddedDatabase {
 
     fn try_autocommit_fast_update_delete_params(
         &self,
+        sql: &str,
         plan: &sql::LogicalPlan,
         params: &[Value],
     ) -> Option<Result<u64>> {
@@ -4975,18 +5027,19 @@ impl EmbeddedDatabase {
                 assignments,
                 selection,
                 returning,
-            } => self.try_fast_update_params(table_name, assignments, selection, returning, params),
+            } => self.try_fast_update_params(sql, table_name, assignments, selection, returning, params),
             sql::LogicalPlan::Delete {
                 table_name,
                 selection,
                 returning,
-            } => self.try_fast_delete_params(table_name, selection, returning, params),
+            } => self.try_fast_delete_params(sql, table_name, selection, returning, params),
             _ => None,
         }
     }
 
     fn try_fast_update_params(
         &self,
+        sql: &str,
         table_name: &str,
         assignments: &[(String, sql::LogicalExpr)],
         selection: &Option<sql::LogicalExpr>,
@@ -5001,24 +5054,20 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let catalog = self.storage.catalog();
-        let schema = match catalog.get_table_schema(table_name) {
-            Ok(schema) => schema,
-            Err(_) => return None,
+        let spec = match self.fast_param_update_spec(sql, table_name, assignments, selection, returning)? {
+            Ok(spec) => spec,
+            Err(e) => return Some(Err(e)),
         };
-        if let Ok(constraints) = catalog.load_table_constraints(table_name) {
-            if !constraints.foreign_keys.is_empty() || !constraints.check_constraints.is_empty() {
-                return None;
-            }
-        }
-
-        let pk_value = match self.fast_pk_value_from_selection(selection, &schema, params) {
+        let pk_value = match Self::fast_pk_value_from_expr(&spec.pk_expr, &spec.pk_data_type, params) {
             Some(Ok(value)) => value,
             Some(Err(e)) => return Some(Err(e)),
             None => return None,
         };
 
-        let existing_row = match self.storage.get_row_by_pk_with_schema(table_name, &pk_value, &schema) {
+        let existing_row = match self
+            .storage
+            .get_row_by_pk_with_schema(&spec.table_name, &pk_value, &spec.schema)
+        {
             Ok(Some(row)) => row,
             Ok(None) => return Some(Ok(0)),
             Err(e) => return Some(Err(e)),
@@ -5028,41 +5077,26 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let evaluator = sql::Evaluator::with_parameters(std::sync::Arc::new(schema.clone()), params.to_vec());
+        let evaluator = sql::Evaluator::with_parameters(std::sync::Arc::clone(&spec.schema), params.to_vec());
         let mut new_values = existing_row.values.clone();
-        for (col_name, expr) in assignments {
-            let col_idx = match schema.get_column_index(col_name) {
-                Some(idx) => idx,
-                None => return None,
-            };
-            let column = match schema.get_column_at(col_idx) {
-                Some(column) => column,
-                None => return None,
-            };
-            if column.primary_key || column.unique {
-                return None;
-            }
-            if !Self::fast_update_expr_supported(expr) {
-                return None;
-            }
-
-            let mut value = match evaluator.evaluate(expr, &existing_row) {
+        for assignment in &spec.assignments {
+            let mut value = match evaluator.evaluate(&assignment.expr, &existing_row) {
                 Ok(value) => value,
                 Err(e) => return Some(Err(e)),
             };
-            if Self::insert_value_needs_cast(&value, &column.data_type) {
-                value = match Self::fast_cast_value(value, &column.data_type) {
+            if Self::insert_value_needs_cast(&value, &assignment.data_type) {
+                value = match Self::fast_cast_value(value, &assignment.data_type) {
                     Ok(value) => value,
                     Err(e) => return Some(Err(e)),
                 };
             }
-            if !column.nullable && matches!(value, Value::Null) {
+            if !assignment.nullable && matches!(value, Value::Null) {
                 return Some(Err(Error::constraint_violation(format!(
                     "Column '{}' cannot be null",
-                    col_name
+                    assignment.col_name
                 ))));
             }
-            if let Some(slot) = new_values.get_mut(col_idx) {
+            if let Some(slot) = new_values.get_mut(assignment.col_idx) {
                 *slot = value;
             } else {
                 return None;
@@ -5070,16 +5104,16 @@ impl EmbeddedDatabase {
         }
 
         let new_tuple = Tuple::new(new_values);
-        let key = self.storage.branch_aware_data_key(table_name, row_id);
+        let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
         let value = match bincode::serialize(&new_tuple) {
             Ok(value) => value,
             Err(e) => return Some(Err(Error::storage(format!("Failed to serialize tuple: {}", e)))),
         };
         if self.storage.fast_dml_requires_logical_wal() {
             let wal_result = if self.storage.logical_wal_per_statement() {
-                self.storage.log_data_update(table_name, &key, &value)
+                self.storage.log_data_update(&spec.table_name, &key, &value)
             } else {
-                self.storage.log_data_update_nosync(table_name, &key, &value)
+                self.storage.log_data_update_nosync(&spec.table_name, &key, &value)
             };
             if let Err(e) = wal_result {
                 return Some(Err(e));
@@ -5088,7 +5122,7 @@ impl EmbeddedDatabase {
 
         let result = self
             .storage
-            .update_tuple_fast(table_name, row_id, new_tuple, &existing_row, &schema);
+            .update_tuple_fast(&spec.table_name, row_id, new_tuple, &existing_row, &spec.schema);
         if result.is_ok() {
             self.storage.increment_lsn();
         }
@@ -5097,6 +5131,7 @@ impl EmbeddedDatabase {
 
     fn try_fast_delete_params(
         &self,
+        sql: &str,
         table_name: &str,
         selection: &Option<sql::LogicalExpr>,
         returning: &Option<Vec<sql::logical_plan::ReturningItem>>,
@@ -5109,33 +5144,20 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let catalog = self.storage.catalog();
-        let schema = match catalog.get_table_schema(table_name) {
-            Ok(schema) => schema,
-            Err(_) => return None,
+        let spec = match self.fast_param_delete_spec(sql, table_name, selection, returning)? {
+            Ok(spec) => spec,
+            Err(e) => return Some(Err(e)),
         };
-        if let Ok(constraints) = catalog.load_table_constraints(table_name) {
-            if !constraints.foreign_keys.is_empty() {
-                return None;
-            }
-        }
-        if *self.fk_validation_mode.read() != FkValidationMode::Off
-            && *self.fk_validation_source.read() != FkValidationSource::Proxy
-        {
-            match catalog.get_referencing_fks(table_name) {
-                Ok(referencing_fks) if referencing_fks.is_empty() => {}
-                Ok(_) => return None,
-                Err(e) => return Some(Err(e)),
-            }
-        }
-
-        let pk_value = match self.fast_pk_value_from_selection(selection, &schema, params) {
+        let pk_value = match Self::fast_pk_value_from_expr(&spec.pk_expr, &spec.pk_data_type, params) {
             Some(Ok(value)) => value,
             Some(Err(e)) => return Some(Err(e)),
             None => return None,
         };
 
-        let existing_row = match self.storage.get_row_by_pk_with_schema(table_name, &pk_value, &schema) {
+        let existing_row = match self
+            .storage
+            .get_row_by_pk_with_schema(&spec.table_name, &pk_value, &spec.schema)
+        {
             Ok(Some(row)) => row,
             Ok(None) => return Some(Ok(0)),
             Err(e) => return Some(Err(e)),
@@ -5145,17 +5167,17 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let key = self.storage.branch_aware_data_key(table_name, row_id);
+        let key = self.storage.branch_aware_data_key(&spec.table_name, row_id);
         let result = (|| {
             if self.storage.fast_dml_requires_logical_wal() {
                 if self.storage.logical_wal_per_statement() {
-                    self.storage.log_data_delete(table_name, &key)?;
+                    self.storage.log_data_delete(&spec.table_name, &key)?;
                 } else {
-                    self.storage.log_data_delete_nosync(table_name, &key)?;
+                    self.storage.log_data_delete_nosync(&spec.table_name, &key)?;
                 }
             }
             self.storage
-                .delete_tuple_fast(table_name, row_id, &existing_row, &schema)
+                .delete_tuple_fast(&spec.table_name, row_id, &existing_row, &spec.schema)
         })();
         if result.is_ok() {
             self.storage.increment_lsn();
@@ -5163,12 +5185,161 @@ impl EmbeddedDatabase {
         Some(result)
     }
 
-    fn fast_pk_value_from_selection(
+    fn fast_param_update_spec(
         &self,
+        sql: &str,
+        table_name: &str,
+        assignments: &[(String, sql::LogicalExpr)],
+        selection: &Option<sql::LogicalExpr>,
+        returning: &Option<Vec<sql::logical_plan::ReturningItem>>,
+    ) -> Option<Result<std::sync::Arc<FastParamUpdateSpec>>> {
+        let cache_key = format!("\0fast_param_update\0{sql}");
+        if let Ok(mut cache) = self.fast_param_update_cache.lock() {
+            if let Some(spec) = cache.get(&cache_key) {
+                return Some(Ok(std::sync::Arc::clone(spec)));
+            }
+        }
+
+        let spec = match self.build_fast_param_update_spec(table_name, assignments, selection, returning)? {
+            Ok(spec) => std::sync::Arc::new(spec),
+            Err(e) => return Some(Err(e)),
+        };
+        if let Ok(mut cache) = self.fast_param_update_cache.lock() {
+            cache.put(cache_key, std::sync::Arc::clone(&spec));
+        }
+        Some(Ok(spec))
+    }
+
+    fn build_fast_param_update_spec(
+        &self,
+        table_name: &str,
+        assignments: &[(String, sql::LogicalExpr)],
+        selection: &Option<sql::LogicalExpr>,
+        returning: &Option<Vec<sql::logical_plan::ReturningItem>>,
+    ) -> Option<Result<FastParamUpdateSpec>> {
+        if returning.is_some()
+            || assignments.is_empty()
+            || self.tenant_manager.should_apply_rls(table_name, "UPDATE")
+            || self.trigger_registry.has_triggers_for_table(table_name)
+        {
+            return None;
+        }
+
+        let catalog = self.storage.catalog();
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(schema) => std::sync::Arc::new(schema),
+            Err(_) => return None,
+        };
+        if let Ok(constraints) = catalog.load_table_constraints(table_name) {
+            if !constraints.foreign_keys.is_empty() || !constraints.check_constraints.is_empty() {
+                return None;
+            }
+        }
+
+        let (pk_expr, pk_data_type) = Self::fast_pk_expr_from_selection(selection, &schema)?;
+        let mut fast_assignments = Vec::with_capacity(assignments.len());
+        for (col_name, expr) in assignments {
+            let col_idx = match schema.get_column_index(col_name) {
+                Some(idx) => idx,
+                None => return None,
+            };
+            let column = match schema.get_column_at(col_idx) {
+                Some(column) => column,
+                None => return None,
+            };
+            if column.primary_key || column.unique || !Self::fast_update_expr_supported(expr) {
+                return None;
+            }
+            fast_assignments.push(FastParamUpdateAssignment {
+                col_idx,
+                col_name: col_name.clone(),
+                data_type: column.data_type.clone(),
+                nullable: column.nullable,
+                expr: expr.clone(),
+            });
+        }
+
+        Some(Ok(FastParamUpdateSpec {
+            table_name: table_name.to_string(),
+            schema,
+            pk_expr,
+            pk_data_type,
+            assignments: fast_assignments,
+        }))
+    }
+
+    fn fast_param_delete_spec(
+        &self,
+        sql: &str,
+        table_name: &str,
+        selection: &Option<sql::LogicalExpr>,
+        returning: &Option<Vec<sql::logical_plan::ReturningItem>>,
+    ) -> Option<Result<std::sync::Arc<FastParamDeleteSpec>>> {
+        let fk_mode = *self.fk_validation_mode.read();
+        let fk_source = *self.fk_validation_source.read();
+        let cache_key = format!("\0fast_param_delete\0{fk_mode:?}\0{fk_source:?}\0{sql}");
+        if let Ok(mut cache) = self.fast_param_delete_cache.lock() {
+            if let Some(spec) = cache.get(&cache_key) {
+                return Some(Ok(std::sync::Arc::clone(spec)));
+            }
+        }
+
+        let spec = match self.build_fast_param_delete_spec(table_name, selection, returning, fk_mode, fk_source)? {
+            Ok(spec) => std::sync::Arc::new(spec),
+            Err(e) => return Some(Err(e)),
+        };
+        if let Ok(mut cache) = self.fast_param_delete_cache.lock() {
+            cache.put(cache_key, std::sync::Arc::clone(&spec));
+        }
+        Some(Ok(spec))
+    }
+
+    fn build_fast_param_delete_spec(
+        &self,
+        table_name: &str,
+        selection: &Option<sql::LogicalExpr>,
+        returning: &Option<Vec<sql::logical_plan::ReturningItem>>,
+        fk_mode: FkValidationMode,
+        fk_source: FkValidationSource,
+    ) -> Option<Result<FastParamDeleteSpec>> {
+        if returning.is_some()
+            || self.tenant_manager.should_apply_rls(table_name, "DELETE")
+            || self.trigger_registry.has_triggers_for_table(table_name)
+        {
+            return None;
+        }
+
+        let catalog = self.storage.catalog();
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(schema) => std::sync::Arc::new(schema),
+            Err(_) => return None,
+        };
+        if let Ok(constraints) = catalog.load_table_constraints(table_name) {
+            if !constraints.foreign_keys.is_empty() {
+                return None;
+            }
+        }
+        if fk_mode != FkValidationMode::Off && fk_source != FkValidationSource::Proxy {
+            match catalog.get_referencing_fks(table_name) {
+                Ok(referencing_fks) if referencing_fks.is_empty() => {}
+                Ok(_) => return None,
+                Err(e) => return Some(Err(e)),
+            }
+        }
+
+        let (pk_expr, pk_data_type) = Self::fast_pk_expr_from_selection(selection, &schema)?;
+        Some(Ok(FastParamDeleteSpec {
+            table_name: table_name.to_string(),
+            schema,
+            pk_expr,
+            pk_data_type,
+        }))
+    }
+
+    fn fast_pk_expr_from_selection(
         selection: &Option<sql::LogicalExpr>,
         schema: &Schema,
-        params: &[Value],
-    ) -> Option<Result<Value>> {
+    ) -> Option<(sql::LogicalExpr, DataType)> {
         let sql::LogicalExpr::BinaryExpr { left, op, right } = selection.as_ref()? else {
             return None;
         };
@@ -5183,25 +5354,35 @@ impl EmbeddedDatabase {
         };
         let col_idx = schema.get_column_index(column_name)?;
         let column = schema.get_column_at(col_idx)?;
-        if !column.primary_key || !Self::fast_param_insert_expr_supported(value_expr) {
+        if !column.primary_key
+            || matches!(value_expr, sql::LogicalExpr::DefaultValue)
+            || !Self::fast_param_insert_expr_supported(value_expr)
+        {
             return None;
         }
+        Some((value_expr.clone(), column.data_type.clone()))
+    }
 
-        let mut value = match Self::fast_eval_param_expr(value_expr, params) {
+    fn fast_pk_value_from_expr(
+        expr: &sql::LogicalExpr,
+        data_type: &DataType,
+        params: &[Value],
+    ) -> Option<Result<Value>> {
+        let mut value = match Self::fast_eval_param_expr(expr, params) {
             Some(Ok(value)) => value,
             Some(Err(e)) => return Some(Err(e)),
             None => {
                 let evaluator =
                     sql::Evaluator::with_parameters(std::sync::Arc::new(Schema { columns: vec![] }), params.to_vec());
                 let empty_tuple = Tuple::new(vec![]);
-                match evaluator.evaluate(value_expr, &empty_tuple) {
+                match evaluator.evaluate(expr, &empty_tuple) {
                     Ok(value) => value,
                     Err(e) => return Some(Err(e)),
                 }
             }
         };
-        if Self::insert_value_needs_cast(&value, &column.data_type) {
-            value = match Self::fast_cast_value(value, &column.data_type) {
+        if Self::insert_value_needs_cast(&value, data_type) {
+            value = match Self::fast_cast_value(value, data_type) {
                 Ok(value) => value,
                 Err(e) => return Some(Err(e)),
             };
@@ -5317,6 +5498,12 @@ impl EmbeddedDatabase {
             cache.clear();
         }
         if let Ok(mut cache) = self.fast_param_insert_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.fast_param_update_cache.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = self.fast_param_delete_cache.lock() {
             cache.clear();
         }
         // Also invalidate result cache since schema changes affect query results
@@ -8074,7 +8261,7 @@ impl EmbeddedDatabase {
             self.invalidate_result_cache();
             return Ok(count);
         }
-        if let Some(result) = self.try_autocommit_fast_update_delete_params(&plan, params) {
+        if let Some(result) = self.try_autocommit_fast_update_delete_params(sql, &plan, params) {
             let count = result?;
             self.invalidate_result_cache();
             return Ok(count);
@@ -11121,6 +11308,8 @@ impl EmbeddedDatabase {
             result_cache: self.result_cache.clone(),
             result_cache_nonempty: self.result_cache_nonempty.clone(),
             fast_param_insert_cache: self.fast_param_insert_cache.clone(),
+            fast_param_update_cache: self.fast_param_update_cache.clone(),
+            fast_param_delete_cache: self.fast_param_delete_cache.clone(),
             query_profiler: self.query_profiler.clone(),
             art_undo_log: self.art_undo_log.clone(),
             fk_validation_mode: self.fk_validation_mode.clone(),

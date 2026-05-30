@@ -155,6 +155,55 @@ fn test_parameterized_insert_cache_invalidated_by_schema_change() {
 }
 
 #[test]
+fn test_parameterized_update_cache_invalidated_by_schema_change() {
+    let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
+    let sql = "UPDATE param_update_cache SET v = $1 WHERE id = $2";
+
+    db.execute("CREATE TABLE param_update_cache (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    db.execute("INSERT INTO param_update_cache VALUES (1, 10)")
+        .unwrap();
+    db.execute_params(sql, &[Value::Int4(11), Value::Int4(1)])
+        .unwrap();
+
+    db.execute("DROP TABLE param_update_cache").unwrap();
+    db.execute("CREATE TABLE param_update_cache (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO param_update_cache VALUES (1, 'before')")
+        .unwrap();
+    db.execute_params(sql, &[Value::String("after".to_string()), Value::Int4(1)])
+        .unwrap();
+
+    let rows = db
+        .query("SELECT v FROM param_update_cache WHERE id = 1", &[])
+        .unwrap();
+    assert_eq!(rows[0].get(0).unwrap(), &Value::String("after".to_string()));
+}
+
+#[test]
+fn test_parameterized_delete_cache_invalidated_by_schema_change() {
+    let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
+    let sql = "DELETE FROM param_delete_cache WHERE id = $1";
+
+    db.execute("CREATE TABLE param_delete_cache (id INT PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO param_delete_cache VALUES (1, 'old')")
+        .unwrap();
+    db.execute_params(sql, &[Value::Int4(1)]).unwrap();
+
+    db.execute("DROP TABLE param_delete_cache").unwrap();
+    db.execute("CREATE TABLE param_delete_cache (id TEXT PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO param_delete_cache VALUES ('k1', 'new')")
+        .unwrap();
+    db.execute_params(sql, &[Value::String("k1".to_string())])
+        .unwrap();
+
+    let rows = db.query("SELECT * FROM param_delete_cache", &[]).unwrap();
+    assert_eq!(rows.len(), 0);
+}
+
+#[test]
 fn test_parameterized_insert_in_explicit_transaction_commit_and_rollback() {
     let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
     db.execute("CREATE TABLE txn_params (id INT PRIMARY KEY, name TEXT)")
