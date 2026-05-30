@@ -300,27 +300,78 @@ enum HashJoinBuildSide {
 /// match each other in the hash table. This is critical for JOINs where one
 /// side has SERIAL (Int4) and the other BIGSERIAL (Int8).
 #[derive(Debug, Clone)]
-struct JoinKey(Vec<crate::Value>);
+enum JoinKey {
+    Int(i64),
+    Single(crate::Value),
+    Composite(Vec<crate::Value>),
+}
+
+impl JoinKey {
+    fn from_values(mut values: Vec<crate::Value>) -> Self {
+        if values.len() == 1 {
+            match values.pop().expect("single value exists") {
+                crate::Value::Int2(value) => Self::Int(i64::from(value)),
+                crate::Value::Int4(value) => Self::Int(i64::from(value)),
+                crate::Value::Int8(value) => Self::Int(value),
+                value => Self::Single(value),
+            }
+        } else {
+            Self::Composite(values)
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Self::Int(_) => 1,
+            Self::Single(_) => 1,
+            Self::Composite(values) => values.len(),
+        }
+    }
+
+    fn for_each_value(&self, mut f: impl FnMut(&crate::Value)) {
+        match self {
+            Self::Int(value) => f(&crate::Value::Int8(*value)),
+            Self::Single(value) => f(value),
+            Self::Composite(values) => {
+                for value in values {
+                    f(value);
+                }
+            }
+        }
+    }
+}
 
 impl PartialEq for JoinKey {
     fn eq(&self, other: &Self) -> bool {
-        if self.0.len() != other.0.len() {
+        if self.len() != other.len() {
             return false;
         }
-        self.0
-            .iter()
-            .zip(other.0.iter())
-            .all(|(a, b)| values_equal_for_join(a, b))
+
+        match (self, other) {
+            (Self::Int(a), Self::Int(b)) => a == b,
+            (Self::Int(a), Self::Single(b)) | (Self::Single(b), Self::Int(a)) => {
+                values_equal_for_join(&crate::Value::Int8(*a), b)
+            }
+            (Self::Int(a), Self::Composite(values)) | (Self::Composite(values), Self::Int(a)) => values
+                .first()
+                .is_some_and(|b| values_equal_for_join(&crate::Value::Int8(*a), b)),
+            (Self::Single(a), Self::Single(b)) => values_equal_for_join(a, b),
+            (Self::Single(a), Self::Composite(values)) | (Self::Composite(values), Self::Single(a)) => {
+                values.first().is_some_and(|b| values_equal_for_join(a, b))
+            }
+            (Self::Composite(left), Self::Composite(right)) => left
+                .iter()
+                .zip(right)
+                .all(|(a, b)| values_equal_for_join(a, b)),
+        }
     }
 }
 impl Eq for JoinKey {}
 
 impl std::hash::Hash for JoinKey {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.0.len().hash(state);
-        for v in &self.0 {
-            hash_value_for_join(v, state);
-        }
+        self.len().hash(state);
+        self.for_each_value(|value| hash_value_for_join(value, state));
     }
 }
 
@@ -673,7 +724,7 @@ impl HashJoinOperator {
                 }
                 key_values.push(value);
             }
-            return Ok(Some(JoinKey(key_values)));
+            return Ok(Some(JoinKey::from_values(key_values)));
         }
 
         if let Some(condition) = &self.on_condition {
@@ -684,10 +735,10 @@ impl HashJoinOperator {
                 return Ok(None);
             }
 
-            Ok(Some(JoinKey(key_values)))
+            Ok(Some(JoinKey::from_values(key_values)))
         } else {
             // Cross join - use empty key (all tuples match)
-            Ok(Some(JoinKey(vec![])))
+            Ok(Some(JoinKey::Composite(Vec::new())))
         }
     }
 
@@ -1024,7 +1075,15 @@ impl HashJoinOperator {
 
     /// Estimate memory size of a join key
     fn estimate_key_size(key: &JoinKey) -> usize {
-        24 + key.0.iter().map(Self::estimate_value_size).sum::<usize>()
+        let mut values_size = 0usize;
+        key.for_each_value(|value| {
+            values_size += Self::estimate_value_size(value);
+        });
+        match key {
+            JoinKey::Int(_) => std::mem::size_of::<i64>(),
+            JoinKey::Single(_) => values_size,
+            JoinKey::Composite(_) => 24 + values_size,
+        }
     }
 }
 
