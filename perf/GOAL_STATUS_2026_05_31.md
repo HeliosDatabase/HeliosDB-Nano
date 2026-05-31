@@ -762,3 +762,57 @@ Interpretation: another small but clean hash-join executor win. Nano's measured
 join rate is now roughly one-third of the same-host SQLite mirror's 201/s
 memory number, so completion still requires a larger compact/vectorized
 scan-filter-join path rather than only hash-key micro-optimizations.
+
+## Accepted Follow-Up: Lazy Integer Top-N Projection
+
+Commit after this report: `perf: defer integer top-n projection materialization`.
+
+Finding:
+
+- The direct integer Top-N scan already decoded only the integer sort column for
+  every row, but it still decoded projected output columns and built a `Tuple`
+  for every candidate accepted into the bounded heap.
+- In the TPS shape, `balance = (i * 7) % 100000` is monotonically increasing at
+  `N=10000`, while the query asks for `ORDER BY balance DESC LIMIT 10`. That
+  means almost every scanned row replaces the heap top, so eager projection
+  materialization produced thousands of short-lived tuples before returning the
+  final 10 rows.
+
+Change:
+
+- `RowIntTopKEntry` now keeps the sort key, raw row bytes, and row id for heap
+  candidates.
+- Projected output values are decoded only after `heap.into_sorted_vec()`, so
+  the integer Top-N path materializes the final K tuples rather than every heap
+  replacement. The raw bytes are the same iterator values used by the previous
+  eager path, so the scan's consistency behavior is unchanged.
+- The generic multi-key / non-integer Top-N path is unchanged.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --release --test pagination_tests order_by_limit_offset_is_deterministic -- --nocapture --test-threads=1
+cargo test --test integration_test test_order_by_with_limit -- --nocapture --test-threads=1
+cargo test --test pagination_tests -- --nocapture --test-threads=1
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+immediate pre-change baseline      order_by_limit10 302/s
+recent committed best range        order_by_limit10 314-319/s
+lazy projection run 1              order_by_limit10 427/s
+lazy projection run 2              order_by_limit10 380/s
+```
+
+The same post-change runs kept the broader suite in the current noise range:
+
+```text
+run 1  filter 211/s, aggregate 484/s, group_by 178/s, join 65/s
+run 2  filter 194/s, aggregate 447/s, group_by 171/s, join 59/s
+```
+
+Interpretation: this closes most of the mirrored in-memory Top-N gap to
+SQLite's recorded 461/s result on this host. The remaining SQLite gap is now
+more concentrated in default bulk insert, aggregate scans, and joins.
