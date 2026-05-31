@@ -255,6 +255,25 @@ pub(crate) fn decode_tuple_numeric_column_values_into(
     Some(())
 }
 
+/// Decode one primitive numeric column without materializing a `Vec`.
+pub(crate) fn decode_tuple_numeric_column_value(bytes: &[u8], column: usize) -> Option<DecodedNumericValue> {
+    let mut cur = ByteCursor::new(bytes);
+    let stored_cols = cur.read_len()?;
+
+    for idx in 0..stored_cols {
+        if idx == column {
+            return read_numeric_value(&mut cur);
+        }
+        if idx < column {
+            skip_value(&mut cur)?;
+        } else {
+            break;
+        }
+    }
+
+    Some(DecodedNumericValue::Null)
+}
+
 struct ByteCursor<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -624,6 +643,15 @@ mod tests {
 
         decode_tuple_numeric_column_values_into(&bytes, &[2], &mut out).unwrap();
         assert_eq!(out, vec![DecodedNumericValue::Int(11)]);
+
+        assert_eq!(
+            decode_tuple_numeric_column_value(&bytes, 2).unwrap(),
+            DecodedNumericValue::Int(11)
+        );
+        assert_eq!(
+            decode_tuple_numeric_column_value(&bytes, 9).unwrap(),
+            DecodedNumericValue::Null
+        );
     }
 
     #[test]

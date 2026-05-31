@@ -289,6 +289,46 @@ fn build_projected_tuple(values: &[Value], positions: &[usize]) -> Tuple {
     )
 }
 
+struct RowIntTopKEntry {
+    key: i64,
+    tuple: Tuple,
+    asc: bool,
+}
+
+impl PartialEq for RowIntTopKEntry {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for RowIntTopKEntry {}
+
+impl PartialOrd for RowIntTopKEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RowIntTopKEntry {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let cmp = self.key.cmp(&other.key);
+        if self.asc {
+            cmp
+        } else {
+            cmp.reverse()
+        }
+    }
+}
+
+fn compare_int_to_topk_key(left: i64, right: i64, asc: bool) -> std::cmp::Ordering {
+    let cmp = left.cmp(&right);
+    if asc {
+        cmp
+    } else {
+        cmp.reverse()
+    }
+}
+
 enum ColumnarSumState {
     Empty,
     Int(i64),
@@ -2299,6 +2339,94 @@ impl StorageEngine {
         Ok(Some(tuples))
     }
 
+    fn scan_table_topk_single_int_projected_columns(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        output_columns: &[usize],
+        sort_column: usize,
+        asc: bool,
+        k: usize,
+    ) -> Result<Option<Vec<Tuple>>> {
+        let mut output_decode_columns = output_columns.to_vec();
+        output_decode_columns.sort_unstable();
+        output_decode_columns.dedup();
+
+        let output_pos = |column_index: usize| -> Result<usize> {
+            output_decode_columns.binary_search(&column_index).map_err(|_| {
+                Error::storage(format!(
+                    "Column index {} missing from integer Top-N output set for {}",
+                    column_index, table_name
+                ))
+            })
+        };
+        let output_positions: Vec<usize> = output_columns
+            .iter()
+            .map(|&idx| output_pos(idx))
+            .collect::<Result<Vec<_>>>()?;
+
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        let mut heap = std::collections::BinaryHeap::with_capacity(k.saturating_add(1));
+        for item in iter {
+            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+
+            let sort_value = if let Some(km) = &self.key_manager {
+                let decrypted = crypto::decrypt(km.key(), &raw_value)?;
+                crate::storage::prefix_decode::decode_tuple_numeric_column_value(&decrypted, sort_column)
+            } else {
+                crate::storage::prefix_decode::decode_tuple_numeric_column_value(&raw_value, sort_column)
+            };
+            let Some(crate::storage::prefix_decode::DecodedNumericValue::Int(sort_key)) = sort_value else {
+                return Ok(None);
+            };
+
+            let replace = if heap.len() < k {
+                true
+            } else {
+                heap.peek()
+                    .map(|top: &RowIntTopKEntry| {
+                        compare_int_to_topk_key(sort_key, top.key, asc) == std::cmp::Ordering::Less
+                    })
+                    .unwrap_or(false)
+            };
+
+            if replace {
+                if heap.len() >= k {
+                    heap.pop();
+                }
+
+                let output_values =
+                    self.decode_rowstore_column_values(&raw_value, &output_decode_columns, schema.columns.len())?;
+                let mut tuple = build_projected_tuple(&output_values, &output_positions);
+                if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
+                    tuple.row_id = Some(row_id);
+                }
+                heap.push(RowIntTopKEntry {
+                    key: sort_key,
+                    tuple,
+                    asc,
+                });
+            }
+        }
+
+        Ok(Some(
+            heap.into_sorted_vec()
+                .into_iter()
+                .map(|entry| entry.tuple)
+                .collect(),
+        ))
+    }
+
     /// Compact row-store Top-N for direct-column projections. It scans only the
     /// output and sort columns into compact value vectors and keeps a bounded
     /// heap of projected output tuples, avoiding a full table-sized Vec<Tuple>
@@ -2338,6 +2466,22 @@ impl StorageEngine {
             };
             if column.storage_mode != ColumnStorageMode::Default {
                 return Ok(None);
+            }
+        }
+
+        if sort_columns.len() == 1
+            && primitive_integer_data_type(&schema.columns[sort_columns[0]].data_type)
+            && output_columns.len() < schema.columns.len()
+        {
+            if let Some(tuples) = self.scan_table_topk_single_int_projected_columns(
+                table_name,
+                schema,
+                output_columns,
+                sort_columns[0],
+                asc[0],
+                k,
+            )? {
+                return Ok(Some(tuples));
             }
         }
 
