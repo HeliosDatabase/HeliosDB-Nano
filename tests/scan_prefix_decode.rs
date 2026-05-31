@@ -251,3 +251,43 @@ fn storage_filter_pushdown_preserves_sql_null_predicates() {
         vec![2, 4]
     );
 }
+
+#[test]
+fn cached_projected_filtered_scan_preserves_results_with_result_cache_disabled() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE pf (id INTEGER PRIMARY KEY, name TEXT, age INTEGER, payload TEXT)")
+        .unwrap();
+    for id in 0..8 {
+        db.execute(&format!(
+            "INSERT INTO pf (id, name, age, payload) VALUES ({id}, 'n{id}', {}, 'payload-{id}')",
+            45 + id
+        ))
+        .unwrap();
+    }
+    db.execute("INSERT INTO pf (id, name, age, payload) VALUES (99, 'null-age', NULL, 'payload-null')")
+        .unwrap();
+
+    let sql = "SELECT id, name FROM pf WHERE age > 50 /* NOW(disable_result_cache) */";
+    let rows = db.query(sql, &[]).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values, vec![Value::Int4(6), Value::String("n6".into())]);
+    assert_eq!(rows[1].values, vec![Value::Int4(7), Value::String("n7".into())]);
+
+    // The second execution uses the cached logical plan. The direct projected
+    // filtered-scan path must match the normal first execution exactly.
+    let rows = db.query(sql, &[]).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values, vec![Value::Int4(6), Value::String("n6".into())]);
+    assert_eq!(rows[1].values, vec![Value::Int4(7), Value::String("n7".into())]);
+
+    let rows = db
+        .query(
+            "SELECT id FROM pf WHERE age != 51 /* NOW(disable_result_cache) */",
+            &[],
+        )
+        .unwrap();
+    assert!(
+        rows.iter().all(|row| row.values[0] != Value::Int4(99)),
+        "NULL rows must not match SQL != predicates"
+    );
+}

@@ -7781,6 +7781,78 @@ impl EmbeddedDatabase {
         }
     }
 
+    fn try_direct_projected_filtered_scan(&self, plan: &sql::LogicalPlan) -> Option<Result<Vec<Tuple>>> {
+        if self.in_transaction() || self.tenant_manager.get_current_context().is_some() {
+            return None;
+        }
+
+        let sql::LogicalPlan::FilteredScan {
+            table_name,
+            alias,
+            schema: _plan_schema,
+            projection: Some(projection),
+            predicate: Some(predicate),
+            as_of: None,
+        } = plan
+        else {
+            return None;
+        };
+
+        if alias.is_some() || projection.is_empty() || self.tenant_manager.should_apply_rls(table_name, "SELECT") {
+            return None;
+        }
+
+        if !Self::direct_projected_filter_expr_supported(predicate) {
+            return None;
+        }
+
+        let catalog = self.storage.catalog();
+        let schema = match catalog.get_table_schema(table_name) {
+            Ok(schema) => schema,
+            Err(_) => return None,
+        };
+        match self.storage.mv_catalog().view_exists(table_name) {
+            Ok(true) | Err(_) => return None,
+            Ok(false) => {}
+        }
+
+        let analyzed_predicates = self.storage.predicate_pushdown().analyze_predicate(predicate, &schema);
+        if analyzed_predicates.len() != 1
+            || !crate::sql::executor::scan::storage_predicates_are_sql_safe(&schema, &analyzed_predicates)
+        {
+            return None;
+        }
+
+        match self.storage.scan_table_with_schema_projected_filtered(
+            table_name,
+            &schema,
+            projection,
+            &analyzed_predicates,
+        ) {
+            Ok(Some(rows)) => Some(Ok(rows)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    fn direct_projected_filter_expr_supported(expr: &sql::LogicalExpr) -> bool {
+        let sql::LogicalExpr::BinaryExpr { left, op, right } = expr else {
+            return false;
+        };
+        matches!(
+            op,
+            sql::BinaryOperator::Eq
+                | sql::BinaryOperator::Lt
+                | sql::BinaryOperator::LtEq
+                | sql::BinaryOperator::Gt
+                | sql::BinaryOperator::GtEq
+        ) && matches!(left.as_ref(), sql::LogicalExpr::Column { .. })
+            && matches!(
+                right.as_ref(),
+                sql::LogicalExpr::Literal(value) if !matches!(value, Value::Null)
+            )
+    }
+
     fn try_fast_select_params(&self, sql: &str, params: &[Value]) -> Option<Result<Vec<Tuple>>> {
         if self.in_transaction() {
             return None;
@@ -10681,6 +10753,24 @@ impl EmbeddedDatabase {
 
             // Fast path: no RLS context → execute directly from Arc (no deep clone)
             if self.tenant_manager.get_current_context().is_none() {
+                if let Some(result) = self.try_direct_projected_filtered_scan(&arc_plan) {
+                    let results = result?;
+                    tracing::debug!(
+                        phase = "execute",
+                        rows = results.len() as u64,
+                        "Projected filtered scan executed directly"
+                    );
+                    self.log_slow_query(sql, start.elapsed(), results.len() as u64);
+                    if !is_non_deterministic {
+                        if let Ok(mut cache) = self.result_cache.lock() {
+                            cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
+                            self.result_cache_nonempty
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                    }
+                    return Ok(results);
+                }
+
                 let exec_start = std::time::Instant::now();
                 let mut executor =
                     sql::Executor::with_storage(&self.storage).with_timeout(self.config.storage.query_timeout_ms);

@@ -352,6 +352,68 @@ Rejected during this pass:
 - In-memory RocksDB block-cache option: first pass looked positive, second pass regressed, so it was reverted.
 - Primitive aggregate visitor and two-column decoder variants: correctness-clean, but `agg_count_sum_avg` regressed to 390-408/s versus the committed 436-443/s range.
 
+## Accepted Follow-Up: Cached Projected Filtered Scan Dispatch
+
+Commit after this report: `perf: bypass cached projected filtered scan operators`.
+
+Change:
+
+- `src/lib.rs` can execute a cached, already-optimized `FilteredScan` plan
+  directly through `StorageEngine::scan_table_with_schema_projected_filtered`.
+- The gate is deliberately narrow: no active transaction, no tenant/RLS
+  context, no alias, no AS OF, no materialized view, projected output present,
+  and a single column-vs-non-NULL-literal predicate using `=`, `<`, `<=`, `>`,
+  or `>=`.
+- `!=` is excluded because the storage predicate helper treats `NULL != value`
+  as true, which is not SQL three-valued logic. Unsupported shapes keep the
+  normal executor path.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test scan_prefix_decode cached_projected_filtered_scan_preserves_results_with_result_cache_disabled -- --nocapture --test-threads=1
+cargo test --test scan_prefix_decode -- --nocapture --test-threads=1
+cargo test --test query_optimizer_tests -- --nocapture --test-threads=1
+cargo test --test aggregate_hardening_tests -- --nocapture --test-threads=1
+cargo test --test join_hardening_tests -- --nocapture --test-threads=1
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+same-turn baseline mixed run:
+filter_scan(age>50)       198/s
+agg_count_sum_avg         488/s
+join_users_orders          73/s
+order_by_limit10          487/s
+
+after direct cached projected filtered scan:
+mixed run 1:
+filter_scan(age>50)       235/s
+agg_count_sum_avg         555/s
+join_users_orders          76/s
+order_by_limit10          485/s
+
+filter-only:
+filter_scan(age>50)       224/s
+
+after tightening NULL/!= gate:
+mixed run 2:
+filter_scan(age>50)       200/s
+agg_count_sum_avg         524/s
+join_users_orders          75/s
+order_by_limit10          469/s
+
+filter-only:
+filter_scan(age>50)       232/s
+```
+
+Conclusion: this is safe and directionally useful, but not a decisive lever.
+It confirms that the remaining SQLite in-memory filter/join gap is dominated by
+row decoding/materialization and tuple movement, not only by cached-plan
+operator dispatch.
+
 ## Accepted Follow-Up: Skip Dead Result-Cache Writes
 
 Commit after this report: `perf: skip result cache writes for nondeterministic queries`.
