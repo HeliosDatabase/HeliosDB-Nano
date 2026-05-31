@@ -2449,6 +2449,106 @@ impl StorageEngine {
         Ok(Some(tuples))
     }
 
+    /// Row-store filtered scan that emits compact projected tuples directly.
+    ///
+    /// This is the storage-local counterpart of `FilteredScan { projection }`:
+    /// decode only predicate + output columns, evaluate predicates before row
+    /// materialization, then cross the executor boundary with projected tuples
+    /// so `ScanOperator` does not have to re-project a sparse full-width row.
+    pub(crate) fn scan_table_with_schema_projected_filtered(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        projection: &[usize],
+        predicates: &[AnalyzedPredicate],
+    ) -> Result<Option<Vec<Tuple>>> {
+        if projection.is_empty() {
+            return Ok(None);
+        }
+
+        let branch_name = self.current_branch.lock().clone();
+        if branch_name.is_some() && branch_name.as_deref() != Some("main") {
+            return Ok(None);
+        }
+
+        let filter_predicates: Vec<FilterPredicate> = predicates.iter().filter_map(columnar_filter_predicate).collect();
+        if filter_predicates.len() != predicates.len() {
+            return Ok(None);
+        }
+
+        let mut requested: Vec<usize> = projection.to_vec();
+        requested.extend(predicates.iter().map(|predicate| predicate.column_index));
+        requested.sort_unstable();
+        requested.dedup();
+
+        for &idx in &requested {
+            let Some(column) = schema.columns.get(idx) else {
+                return Err(Error::storage(format!(
+                    "Column index {} out of bounds for {}",
+                    idx, table_name
+                )));
+            };
+            if column.storage_mode != ColumnStorageMode::Default {
+                return Ok(None);
+            }
+        }
+
+        let requested_pos = |column_index: usize| -> Result<usize> {
+            requested.binary_search(&column_index).map_err(|_| {
+                Error::storage(format!(
+                    "Column index {} missing from projected filtered scan decode set for {}",
+                    column_index, table_name
+                ))
+            })
+        };
+        let projection_positions: Vec<usize> = projection
+            .iter()
+            .map(|&idx| requested_pos(idx))
+            .collect::<Result<Vec<_>>>()?;
+        let filter_positions: Vec<usize> = predicates
+            .iter()
+            .map(|predicate| requested_pos(predicate.column_index))
+            .collect::<Result<Vec<_>>>()?;
+
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        let mut values = Vec::with_capacity(requested.len());
+        let mut tuples = Vec::new();
+        for item in iter {
+            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+
+            self.decode_rowstore_column_values_into(&raw_value, &requested, schema.columns.len(), &mut values)?;
+            if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
+                continue;
+            }
+
+            let mut projected_values = Vec::with_capacity(projection_positions.len());
+            for &pos in &projection_positions {
+                if let Some(value) = values.get_mut(pos) {
+                    projected_values.push(std::mem::replace(value, Value::Null));
+                } else {
+                    projected_values.push(Value::Null);
+                }
+            }
+            let mut tuple = Tuple::new(projected_values);
+            if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
+                tuple.row_id = Some(row_id);
+            }
+            tuples.push(tuple);
+        }
+
+        Ok(Some(tuples))
+    }
+
     fn scan_table_topk_single_int_projected_columns(
         &self,
         table_name: &str,

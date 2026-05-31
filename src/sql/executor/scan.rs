@@ -1435,6 +1435,7 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
         }
 
         // Fetch actual schema from storage and scan table with filtering
+        let mut row_projection_applied = false;
         let (actual_schema, tuples) = if let Some(storage) = executor.storage() {
             let catalog = storage.catalog();
             let mv_catalog = storage.mv_catalog();
@@ -1555,7 +1556,21 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
                             Some(ScanDecodeHint::Columns(columns)) => Some(columns.clone()),
                             None => None,
                         };
-                        if let Some(tuples) = storage.scan_table_with_schema_columns_filtered(
+                        let projected_filtered = if let Some(projection) = projection.as_deref() {
+                            storage.scan_table_with_schema_projected_filtered(
+                                &actual_table_name,
+                                &schema,
+                                projection,
+                                pushed_predicates,
+                            )?
+                        } else {
+                            None
+                        };
+                        if let Some(projected) = projected_filtered {
+                            row_predicates_applied = true;
+                            row_projection_applied = true;
+                            projected
+                        } else if let Some(tuples) = storage.scan_table_with_schema_columns_filtered(
                             &actual_table_name,
                             &schema,
                             selected_columns.as_deref(),
@@ -1611,9 +1626,18 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
 
             // Set source_table (alias) and source_table_name (actual) on each column for JOIN disambiguation
             // This allows both `e.name` (alias) and `employees.name` (full name) syntax in queries
+            let scan_columns: Vec<_> = if row_projection_applied {
+                projection
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter_map(|&idx| schema.columns.get(idx).cloned())
+                    .collect()
+            } else {
+                schema.columns.clone()
+            };
             let schema_with_source = Schema {
-                columns: schema
-                    .columns
+                columns: scan_columns
                     .into_iter()
                     .map(|mut col| {
                         col.source_table = Some(source_name.clone());
@@ -1642,7 +1666,11 @@ pub(super) fn handle_filtered_scan(executor: &Executor, plan: &LogicalPlan) -> R
             ScanOperator::new(
                 table_name.clone(),
                 actual_schema,
-                projection.clone(),
+                if row_projection_applied {
+                    None
+                } else {
+                    projection.clone()
+                },
                 tuples,
                 executor.parameters().to_vec(),
             )

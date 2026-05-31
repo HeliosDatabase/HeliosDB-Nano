@@ -90,8 +90,10 @@ caveats are explicit. Current status:
   `execute_many` insert, 391k/s lookup, 293k/s batched UPDATE, and 499k/s
   batched DELETE versus SQLite params at about 491k/s bulk insert, 310k/s
   lookup, 243k/s UPDATE, and 266k/s DELETE. Row-store analytics remain behind
-  SQLite on filter, aggregate, and join; the gated columnar profile wins the
-  aggregate shape but not the full analytics set.
+  SQLite on filter, aggregate, and join, although the final projected
+  `FilteredScan` follow-up nudged row-store filter to about 229/s and join to
+  about 64/s. The gated columnar profile wins the aggregate shape but not the
+  full analytics set.
 
 This means the release meets the revised acceptance bar for publication:
 surpass-or-similar is achieved across the PostgreSQL/MariaDB Docker mirror and
