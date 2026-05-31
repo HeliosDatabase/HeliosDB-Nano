@@ -86,6 +86,12 @@ caveats are explicit. Current status:
   `execute_many_params()` is now similar/ahead on the focused in-memory run.
   SQLite still leads single-row best-path bound-parameter UPDATE and several
   analytical scan/join shapes.
+  Final focused 3.34.0 snapshot: `oltp_fast` params reached about 541k/s
+  `execute_many` insert, 391k/s lookup, 293k/s batched UPDATE, and 499k/s
+  batched DELETE versus SQLite params at about 491k/s bulk insert, 310k/s
+  lookup, 243k/s UPDATE, and 266k/s DELETE. Row-store analytics remain behind
+  SQLite on filter, aggregate, and join; the gated columnar profile wins the
+  aggregate shape but not the full analytics set.
 
 This means the release meets the revised acceptance bar for publication:
 surpass-or-similar is achieved across the PostgreSQL/MariaDB Docker mirror and
