@@ -46,6 +46,8 @@ post-release performance work rather than regressions from the release batch.
     before entering the parameterized plan cache;
   - one-entry hot fast-spec caches avoid LRU work for tight prepared-style
     UPDATE/DELETE loops;
+  - eligible autocommit `execute_many_params()` UPDATE/DELETE batches reuse the
+    fast DML specs and invalidate result-cache entries once per batch;
   - focused in-memory parameterized DELETE is now close to SQLite's
     bound-parameter path on this host, while UPDATE remains a tracked gap.
 
@@ -79,8 +81,10 @@ caveats are explicit. Current status:
   similar/better on literal-SQL write/lookup shapes when SQLite is also driven
   through literal SQL; it is similar/better on hot lookup, random lookup under
   current runs, group-by, Top-N, and parameterized/`execute_many` insert in the
-  gated `oltp_fast` profile. SQLite still leads best-path bound-parameter
-  UPDATE and several analytical scan/join shapes.
+  gated `oltp_fast` profile. Batched parameterized UPDATE/DELETE via
+  `execute_many_params()` is now similar/ahead on the focused in-memory run.
+  SQLite still leads single-row best-path bound-parameter UPDATE and several
+  analytical scan/join shapes.
 
 This means the release meets the revised acceptance bar for publication:
 surpass-or-similar is achieved across the PostgreSQL/MariaDB Docker mirror and

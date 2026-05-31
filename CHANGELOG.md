@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hot spec cache for prepared-style loops. This improves the remaining
   bound-parameter write gap without changing the first-execution planning path
   or transaction/branch/RLS/trigger safety gates.
+- Added a fast autocommit `execute_many_params()` path for eligible
+  parameterized UPDATE/DELETE batches, so batch clients avoid per-row
+  `execute_params()` dispatch and result-cache invalidation while preserving the
+  existing DML safety gates.
 
 ### Release notes
 

@@ -949,12 +949,22 @@ fn run_param_tps_suite() {
         "param_update_by_pk",
         &["param_update", "update_by_pk", "update"],
     );
+    let run_execute_many_update = workload_enabled(
+        selected.as_ref(),
+        "param_execute_many_update",
+        &["execute_many_update", "param_update_many", "update_many"],
+    );
     let run_delete = workload_enabled(
         selected.as_ref(),
         "param_delete_by_pk",
         &["param_delete", "delete_by_pk", "delete"],
     );
-    let need_base_users = run_bulk || run_point || run_update;
+    let run_execute_many_delete = workload_enabled(
+        selected.as_ref(),
+        "param_execute_many_delete",
+        &["execute_many_delete", "param_delete_many", "delete_many"],
+    );
+    let need_base_users = run_bulk || run_point || run_update || run_execute_many_update;
 
     let load_users = || -> Result<()> {
         db.execute("BEGIN")?;
@@ -1022,6 +1032,23 @@ fn run_param_tps_suite() {
         load_autocommit_rows().unwrap();
     }
 
+    let load_execute_many_delete_rows = || -> Result<()> {
+        for i in 0..m {
+            let id = n + m + i;
+            db.execute_params(
+                "INSERT INTO users (id, name, email, age, balance) VALUES ($1, $2, $3, $4, $5)",
+                &[
+                    Value::Int8(id as i64),
+                    Value::String(format!("DM{id}")),
+                    Value::String(format!("dm{id}@ex.com")),
+                    Value::Int4(34),
+                    Value::Int8(600),
+                ],
+            )?;
+        }
+        Ok(())
+    };
+
     if run_point {
         bench("param_point_lookup_pk", m, || {
             for i in 0..m {
@@ -1046,12 +1073,31 @@ fn run_param_tps_suite() {
         });
     }
 
+    if run_execute_many_update {
+        let rows: Vec<Vec<Value>> = (0..m)
+            .map(|i| vec![Value::Int8(((i * 40503usize) % n) as i64)])
+            .collect();
+        bench("param_execute_many_update", m, || {
+            db.execute_many_params("UPDATE users SET balance = balance + 1 WHERE id = $1", &rows)?;
+            Ok(())
+        });
+    }
+
     if run_delete {
         bench("param_delete_by_pk", m, || {
             for i in 0..m {
                 let id = n + i;
                 db.execute_params("DELETE FROM users WHERE id = $1", &[Value::Int8(id as i64)])?;
             }
+            Ok(())
+        });
+    }
+
+    if run_execute_many_delete {
+        load_execute_many_delete_rows().unwrap();
+        let rows: Vec<Vec<Value>> = (0..m).map(|i| vec![Value::Int8((n + m + i) as i64)]).collect();
+        bench("param_execute_many_delete", m, || {
+            db.execute_many_params("DELETE FROM users WHERE id = $1", &rows)?;
             Ok(())
         });
     }
