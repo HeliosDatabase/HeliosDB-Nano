@@ -2609,6 +2609,7 @@ impl StorageEngine {
         requested.sort_unstable();
         requested.dedup();
 
+        let mut all_default = true;
         for &idx in &requested {
             let Some(column) = schema.columns.get(idx) else {
                 return Err(Error::storage(format!(
@@ -2617,8 +2618,17 @@ impl StorageEngine {
                 )));
             };
             if column.storage_mode != ColumnStorageMode::Default {
-                return Ok(None);
+                all_default = false;
+                break;
             }
+        }
+        if !all_default {
+            return self.scan_table_with_schema_mixed_projected_filtered(
+                table_name,
+                schema,
+                projection,
+                &filter_predicates,
+            );
         }
 
         if let Some(candidate) = integer_filter_candidate(schema, &filter_predicates) {
@@ -2762,6 +2772,160 @@ impl StorageEngine {
                     projected_values.push(std::mem::replace(value, Value::Null));
                 } else {
                     projected_values.push(Value::Null);
+                }
+            }
+            tuples.push(Tuple::new(projected_values));
+        }
+
+        Ok(Some(tuples))
+    }
+
+    fn scan_table_with_schema_mixed_projected_filtered(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        projection: &[usize],
+        filter_predicates: &[FilterPredicate],
+    ) -> Result<Option<Vec<Tuple>>> {
+        if filter_predicates.is_empty() {
+            return Ok(None);
+        }
+
+        let mut columnar_requested: Vec<usize> = Vec::new();
+        for predicate in filter_predicates {
+            let Some(column) = schema.columns.get(predicate.column_index) else {
+                return Err(Error::storage(format!(
+                    "Column index {} out of bounds for {}",
+                    predicate.column_index, table_name
+                )));
+            };
+            if column.storage_mode != ColumnStorageMode::Columnar {
+                return Ok(None);
+            }
+            columnar_requested.push(predicate.column_index);
+        }
+
+        let mut default_requested = Vec::new();
+        for &idx in projection {
+            let Some(column) = schema.columns.get(idx) else {
+                return Err(Error::storage(format!(
+                    "Column index {} out of bounds for {}",
+                    idx, table_name
+                )));
+            };
+            match column.storage_mode {
+                ColumnStorageMode::Default => default_requested.push(idx),
+                ColumnStorageMode::Columnar => columnar_requested.push(idx),
+                ColumnStorageMode::Dictionary | ColumnStorageMode::ContentAddressed => return Ok(None),
+            }
+        }
+        default_requested.sort_unstable();
+        default_requested.dedup();
+        columnar_requested.sort_unstable();
+        columnar_requested.dedup();
+
+        if columnar_requested.is_empty() {
+            return Ok(None);
+        }
+
+        enum MixedProjectionSource {
+            Default(usize),
+            Columnar(usize),
+        }
+        let projection_sources: Vec<MixedProjectionSource> = projection
+            .iter()
+            .map(|&idx| {
+                let column = schema
+                    .columns
+                    .get(idx)
+                    .ok_or_else(|| Error::storage(format!("Column index {} out of bounds for {}", idx, table_name)))?;
+                match column.storage_mode {
+                    ColumnStorageMode::Default => default_requested
+                        .binary_search(&idx)
+                        .map(MixedProjectionSource::Default)
+                        .map_err(|_| {
+                            Error::storage(format!(
+                                "Column index {} missing from mixed projected scan decode set for {}",
+                                idx, table_name
+                            ))
+                        }),
+                    ColumnStorageMode::Columnar => Ok(MixedProjectionSource::Columnar(idx)),
+                    ColumnStorageMode::Dictionary | ColumnStorageMode::ContentAddressed => {
+                        Err(Error::storage(format!(
+                            "Column index {} uses unsupported mixed projected scan storage on {}",
+                            idx, table_name
+                        )))
+                    }
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let mut column_batches: HashMap<usize, ColumnarBatchIndex> = HashMap::with_capacity(columnar_requested.len());
+        for &idx in &columnar_requested {
+            let column = &schema.columns[idx];
+            let batches = ColumnarStore::scan_column_batches(&self.db, table_name, &column.name)?;
+            column_batches.insert(idx, ColumnarBatchIndex::from_batches(batches));
+        }
+
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        let mut default_values = Vec::with_capacity(default_requested.len());
+        let mut tuples = Vec::new();
+        for item in iter {
+            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+            let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                continue;
+            };
+            let batch_id = row_id / BATCH_SIZE as u64;
+            let offset = (row_id % BATCH_SIZE as u64) as usize;
+            if !columnar_row_matches_filters(&column_batches, batch_id, offset, filter_predicates) {
+                continue;
+            }
+
+            if !default_requested.is_empty() {
+                if let Some(km) = &self.key_manager {
+                    let decrypted = crypto::decrypt(km.key(), raw_value.as_ref())?;
+                    crate::storage::prefix_decode::decode_tuple_column_values_into(
+                        &decrypted,
+                        &default_requested,
+                        schema.columns.len(),
+                        &mut default_values,
+                    )
+                } else {
+                    crate::storage::prefix_decode::decode_tuple_column_values_into(
+                        raw_value.as_ref(),
+                        &default_requested,
+                        schema.columns.len(),
+                        &mut default_values,
+                    )
+                }
+                .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
+            } else {
+                default_values.clear();
+            }
+
+            let mut projected_values = Vec::with_capacity(projection_sources.len());
+            for source in &projection_sources {
+                match source {
+                    MixedProjectionSource::Default(pos) => {
+                        projected_values.push(default_values.get(*pos).cloned().unwrap_or(Value::Null));
+                    }
+                    MixedProjectionSource::Columnar(idx) => {
+                        projected_values.push(
+                            columnar_batch_value(&column_batches, *idx, batch_id, offset)
+                                .cloned()
+                                .unwrap_or(Value::Null),
+                        );
+                    }
                 }
             }
             tuples.push(Tuple::new(projected_values));
