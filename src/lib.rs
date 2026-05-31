@@ -10379,6 +10379,25 @@ impl EmbeddedDatabase {
             }
         }
 
+        let result_cache_nonempty = self
+            .result_cache_nonempty
+            .load(std::sync::atomic::Ordering::Acquire);
+
+        // Fast path: SELECT * FROM table WHERE pk = literal (skips full SQL
+        // parsing). When the result cache is empty, run it before the
+        // nondeterministic-function scan; this narrow grammar cannot contain
+        // volatile functions, and random point-lookups are hot enough that
+        // repeated SQL scans are measurable. Once a repeated hot SELECT has
+        // populated the result cache, keep the cache-hit path below.
+        if !result_cache_nonempty {
+            if let Some(result) = self.try_fast_select(sql) {
+                let results = result?;
+                self.log_slow_query(sql, start.elapsed(), results.len() as u64);
+                self.maybe_cache_repeated_fast_select(sql, &results);
+                return Ok(results);
+            }
+        }
+
         // Check result cache first (returns cached query results for identical SQL).
         // Skip queries that contain non-deterministic side-effecting
         // scalar functions — nextval/currval/setval mutate server-side
@@ -10397,11 +10416,7 @@ impl EmbeddedDatabase {
         ]
         .iter()
         .any(|needle| Self::contains_ascii_case_insensitive(sql, needle));
-        if !is_non_deterministic
-            && self
-                .result_cache_nonempty
-                .load(std::sync::atomic::Ordering::Acquire)
-        {
+        if !is_non_deterministic && result_cache_nonempty {
             if let Some(cached_results) = self
                 .result_cache
                 .lock()
@@ -10414,12 +10429,13 @@ impl EmbeddedDatabase {
             }
         }
 
-        // Fast path: SELECT * FROM table WHERE pk = literal (skips full SQL parsing)
-        if let Some(result) = self.try_fast_select(sql) {
-            let results = result?;
-            self.log_slow_query(sql, start.elapsed(), results.len() as u64);
-            self.maybe_cache_repeated_fast_select(sql, &results);
-            return Ok(results);
+        if result_cache_nonempty {
+            if let Some(result) = self.try_fast_select(sql) {
+                let results = result?;
+                self.log_slow_query(sql, start.elapsed(), results.len() as u64);
+                self.maybe_cache_repeated_fast_select(sql, &results);
+                return Ok(results);
+            }
         }
 
         // Check plan cache (Arc::clone is O(1))
