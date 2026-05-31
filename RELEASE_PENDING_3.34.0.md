@@ -1,18 +1,19 @@
-# HeliosDB-Nano 3.33.1 Release Closure
+# HeliosDB-Nano 3.34.0 Release Closure
 
 Date: 2026-05-31
 Branch: `codex-sqlite-inmem-gap`
-Package version: `3.33.1`
+Package version: `3.34.0`
 Latest crates.io version observed by `cargo search heliosdb-nano --limit 3`: `3.33.0`
 
 ## Release Decision
 
-Proceed with the `3.33.1` release candidate from the committed tree. The
-current branch contains the consolidated TPS work, the release docs, the
-release-gate fixes, and the stable post-RC parameterized-DML benchmark
-improvements listed below. It should not be held for the remaining known issues
-because they are pre-existing, explicitly deferred semantics decisions, or
-post-release performance work rather than regressions from the release batch.
+Proceed with the `3.34.0` release candidate from the committed tree. This is a
+minor performance release, not a patch release: the current branch contains the
+consolidated TPS work, the release docs, the release-gate fixes, and the stable
+post-RC parameterized-DML benchmark improvements listed below. It should not be
+held for the remaining known issues because they are pre-existing, explicitly
+deferred semantics decisions, or post-release performance work rather than
+regressions from the release batch.
 
 ## Included Work
 
@@ -147,8 +148,9 @@ run the package/publish commands without `--allow-dirty`.
   that excludes or isolates the known HA/SSL hang class.
 - Final result has only the accepted deferred A4/A6 failures, or explicit
   owner sign-off for any other failure.
-- `cargo package --allow-dirty` passes for the exact tree to be published.
-- `cargo publish --dry-run --allow-dirty` passes before the real publish.
+- `cargo package` passes on a committed tree for the exact crate contents to be
+  published.
+- `cargo publish --dry-run` passes on a committed tree before the real publish.
 
 ## Verification Run On This Release Candidate
 
@@ -159,7 +161,7 @@ cargo search heliosdb-nano --limit 3
   latest crates.io version observed: 3.33.0
 
 cargo metadata --no-deps --format-version 1
-  local heliosdb-nano package version: 3.33.1
+  local heliosdb-nano package version: 3.34.0
 
 cargo check --workspace --all-targets
   passed
@@ -224,7 +226,9 @@ final release-close packaging gate on committed docs
   cargo search heliosdb-nano --limit 3
     latest crates.io version observed: 3.33.0
   cargo metadata --no-deps --format-version 1
-    local heliosdb-nano package version: 3.33.1
+    local heliosdb-nano package version: 3.34.0
+  cargo check --workspace --all-targets
+    passed on 3.34.0 metadata
   cargo package
     passed; packaged 706 files, 12.7 MiB uncompressed, 2.5 MiB compressed
   cargo publish --dry-run

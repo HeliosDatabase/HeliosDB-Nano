@@ -1830,7 +1830,7 @@ fetch/serialize/write and row-cache invalidation rather than SQL planning.
 
 ## Release-Close Pending List
 
-The 3.33.1 release can publish with the committed work above. The following
+The 3.34.0 release can publish with the committed work above. The following
 items remain intentionally pending after release:
 
 1. SQLite embedded in-memory analytical gap.
