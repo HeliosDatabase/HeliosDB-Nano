@@ -2399,3 +2399,34 @@ Interpretation: this is the strongest of the recent join-input micro-pipeline
 wins because it removes allocation from the rejected-row predicate path. The
 full analytics run remains noisy, but the focused and mixed join measurements
 show a clear improvement over the previous 83-86/s string path range.
+
+## Rejected Follow-Up: One-Pass Integer Predicate + Projection Decode
+
+Experiment:
+
+- Added a row decoder helper that walked to one integer predicate column,
+  retained raw byte ranges for projected columns encountered before the
+  predicate, and materialized projected values only when the predicate matched.
+- Goal was to avoid the second row walk in the integer predicate-first
+  projected filtered scan used by `SELECT id, name FROM users WHERE age > 50`.
+
+Validation while present:
+
+```text
+cargo check --lib
+cargo test --lib storage::prefix_decode::tests::compact_integer_filter_materializes_projection_only_on_match -- --nocapture
+cargo test --test scan_prefix_decode -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+focused filter run 1       filter_scan 228/s
+focused filter run 2       filter_scan 235/s
+mixed run                  filter_scan 224/s, aggregate 561/s, join 87/s
+```
+
+Decision: reverted. The extra range scratch bookkeeping and delayed
+materialization did not beat the simpler current two-step integer path on the
+measured workload. This reinforces that the remaining SQLite filter gap is not
+likely to close through more tuple-local cursor machinery.
