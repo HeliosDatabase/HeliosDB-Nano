@@ -28,6 +28,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   comparisons and explicit embedded in-memory profiles:
   `HELIOS_TPS_EMBEDDED_PROFILE=columnar_analytics` and
   `HELIOS_TPS_EMBEDDED_PROFILE=oltp_fast`.
+- Added `SQLITE_TPS_BINDINGS=literal` to the SQLite mirror so the default Nano
+  literal-SQL TPS suite can be compared against SQLite driven through literal
+  SQL, while retaining SQLite's bound-parameter mode as the best-path reference.
+- Short-circuited repeated parameterized UPDATE/DELETE execution through cached
+  fast DML specs before entering the parameterized plan cache, with a one-entry
+  hot spec cache for prepared-style loops. This improves the remaining
+  bound-parameter write gap without changing the first-execution planning path
+  or transaction/branch/RLS/trigger safety gates.
 
 ### Release notes
 
@@ -35,7 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   version, so this verified release candidate can publish as `3.33.1`.
 - Known deferred items for this release are documented in
   `RELEASE_PENDING_3.33.1.md`: TRUNCATE affected-row count semantics and HNSW
-  tombstone/physical-count test semantics. They are pre-existing and are not
+  tombstone/physical-count test semantics. SQLite embedded analytical scans and
+  bound-parameter UPDATE remain post-release performance targets. These are not
   regressions from the TPS batch.
 
 ### Fixed — Release gate
