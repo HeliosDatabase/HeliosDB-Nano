@@ -5513,6 +5513,92 @@ impl EmbeddedDatabase {
         }
     }
 
+    fn try_autocommit_fast_update_delete_many_params(
+        &self,
+        sql: &str,
+        plan: &sql::LogicalPlan,
+        rows: &[Vec<Value>],
+    ) -> Option<Result<u64>> {
+        if rows.is_empty() {
+            return Some(Ok(0));
+        }
+        if self.in_transaction()
+            || !self.savepoints.read().is_empty()
+            || !self.session_transactions.is_empty()
+            || self.tenant_manager.get_current_context().is_some()
+            || self.storage.get_current_branch_id().is_some()
+        {
+            return None;
+        }
+
+        match plan {
+            sql::LogicalPlan::Update {
+                table_name,
+                assignments,
+                selection,
+                returning,
+            } => {
+                let spec = match self.fast_param_update_spec(sql, table_name, assignments, selection, returning)? {
+                    Ok(spec) => spec,
+                    Err(e) => return Some(Err(e)),
+                };
+                let mut total = 0_u64;
+                for params in rows {
+                    match self.try_execute_fast_update_param_spec(&spec, params) {
+                        Some(Ok(count)) => total += count,
+                        Some(Err(e)) => {
+                            if total > 0 {
+                                self.invalidate_result_cache();
+                            }
+                            return Some(Err(e));
+                        }
+                        None => {
+                            if total > 0 {
+                                self.invalidate_result_cache();
+                            }
+                            return Some(Err(Error::internal(
+                                "fast parameterized UPDATE batch became ineligible",
+                            )));
+                        }
+                    }
+                }
+                Some(Ok(total))
+            }
+            sql::LogicalPlan::Delete {
+                table_name,
+                selection,
+                returning,
+            } => {
+                let spec = match self.fast_param_delete_spec(sql, table_name, selection, returning)? {
+                    Ok(spec) => spec,
+                    Err(e) => return Some(Err(e)),
+                };
+                let mut total = 0_u64;
+                for params in rows {
+                    match self.try_execute_fast_delete_param_spec(&spec, params) {
+                        Some(Ok(count)) => total += count,
+                        Some(Err(e)) => {
+                            if total > 0 {
+                                self.invalidate_result_cache();
+                            }
+                            return Some(Err(e));
+                        }
+                        None => {
+                            if total > 0 {
+                                self.invalidate_result_cache();
+                            }
+                            return Some(Err(Error::internal(
+                                "fast parameterized DELETE batch became ineligible",
+                            )));
+                        }
+                    }
+                }
+                Some(Ok(total))
+            }
+            _ => None,
+        }
+    }
+
     fn try_autocommit_fast_update_delete_params_cached(&self, sql: &str, params: &[Value]) -> Option<Result<u64>> {
         if self.in_transaction()
             || !self.savepoints.read().is_empty()
@@ -5526,9 +5612,12 @@ impl EmbeddedDatabase {
         let trimmed = sql.trim_start();
         let prefix = trimmed.as_bytes().get(..6)?;
         if prefix.eq_ignore_ascii_case(b"UPDATE") {
-            let spec = if let Some(spec) = self.hot_fast_param_update_spec.read().as_ref().and_then(
-                |(cached_sql, spec)| (cached_sql == sql).then(|| std::sync::Arc::clone(spec)),
-            ) {
+            let spec = if let Some(spec) = self
+                .hot_fast_param_update_spec
+                .read()
+                .as_ref()
+                .and_then(|(cached_sql, spec)| (cached_sql == sql).then(|| std::sync::Arc::clone(spec)))
+            {
                 spec
             } else {
                 self.fast_param_update_cache
@@ -5548,9 +5637,12 @@ impl EmbeddedDatabase {
             let fk_mode = *self.fk_validation_mode.read();
             let fk_source = *self.fk_validation_source.read();
             let cache_key = format!("\0fast_param_delete\0{fk_mode:?}\0{fk_source:?}\0{sql}");
-            let spec = if let Some(spec) = self.hot_fast_param_delete_spec.read().as_ref().and_then(
-                |(cached_key, spec)| (cached_key == &cache_key).then(|| std::sync::Arc::clone(spec)),
-            ) {
+            let spec = if let Some(spec) = self
+                .hot_fast_param_delete_spec
+                .read()
+                .as_ref()
+                .and_then(|(cached_key, spec)| (cached_key == &cache_key).then(|| std::sync::Arc::clone(spec)))
+            {
                 spec
             } else {
                 self.fast_param_delete_cache
@@ -5593,11 +5685,7 @@ impl EmbeddedDatabase {
         self.try_execute_fast_update_param_spec(&spec, params)
     }
 
-    fn try_execute_fast_update_param_spec(
-        &self,
-        spec: &FastParamUpdateSpec,
-        params: &[Value],
-    ) -> Option<Result<u64>> {
+    fn try_execute_fast_update_param_spec(&self, spec: &FastParamUpdateSpec, params: &[Value]) -> Option<Result<u64>> {
         let pk_value = match Self::fast_pk_value_from_expr(&spec.pk_expr, &spec.pk_data_type, params) {
             Some(Ok(value)) => value,
             Some(Err(e)) => return Some(Err(e)),
@@ -5746,11 +5834,7 @@ impl EmbeddedDatabase {
         self.try_execute_fast_delete_param_spec(&spec, params)
     }
 
-    fn try_execute_fast_delete_param_spec(
-        &self,
-        spec: &FastParamDeleteSpec,
-        params: &[Value],
-    ) -> Option<Result<u64>> {
+    fn try_execute_fast_delete_param_spec(&self, spec: &FastParamDeleteSpec, params: &[Value]) -> Option<Result<u64>> {
         let pk_value = match Self::fast_pk_value_from_expr(&spec.pk_expr, &spec.pk_data_type, params) {
             Some(Ok(value)) => value,
             Some(Err(e)) => return Some(Err(e)),
@@ -9287,6 +9371,11 @@ impl EmbeddedDatabase {
             if !self.in_transaction() {
                 self.invalidate_result_cache();
             }
+            return Ok(count);
+        }
+        if let Some(result) = self.try_autocommit_fast_update_delete_many_params(sql, &plan, rows) {
+            let count = result?;
+            self.invalidate_result_cache();
             return Ok(count);
         }
 

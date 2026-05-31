@@ -1872,3 +1872,49 @@ items remain intentionally pending after release:
      code-index opt-out knobs.
    - Treat that as a separate release surface unless it lands through its own
      build/test/package gate.
+
+## Accepted Follow-Up: Batched Parameterized UPDATE/DELETE
+
+Finding:
+
+- `execute_many_params()` had a fast batch path for INSERT only.
+- Repeated UPDATE/DELETE rows fell back to a loop over `execute_params()`, so
+  every row still paid method dispatch and result-cache invalidation even after
+  the cached fast DML spec was hot.
+
+Change:
+
+- Add an autocommit-only `execute_many_params()` fast path for eligible
+  parameterized UPDATE/DELETE.
+- The path reuses the same fast DML specs and safety gates as the single-row
+  fast path: no active transaction/savepoint/session transaction, no tenant
+  context, no branch, current RLS/trigger checks, and existing FK gates.
+- Successful batches invalidate the result cache once. If a later row errors
+  after earlier rows succeeded, the helper invalidates before returning the
+  error, matching the old per-row autocommit behavior.
+- Add TPS harness workloads `param_execute_many_update` and
+  `param_execute_many_delete`.
+
+Validation:
+
+```text
+cargo check --lib
+cargo check --test tps_workloads
+cargo test --test parameterized_query_tests -- --nocapture --test-threads=1
+cargo test --test transaction_tests -- --nocapture --test-threads=1
+HELIOS_TPS_PARAMS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=param_update,param_delete,param_execute_many_update,param_execute_many_delete HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_param_tps_suite -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+run 1  param_update 167,160/s  execute_many_update 279,186/s  param_delete 227,771/s  execute_many_delete 476,773/s
+run 2  param_update 167,573/s  execute_many_update 277,657/s  param_delete 229,540/s  execute_many_delete 430,679/s
+run 3  param_update 161,454/s  execute_many_update 272,102/s  param_delete 209,189/s  execute_many_delete 392,364/s
+```
+
+Interpretation: this is a real structural win for clients using the batch API:
+batched parameterized UPDATE is now similar to SQLite's bound UPDATE reference
+on this host, and batched parameterized DELETE is ahead. It does not close the
+single-row `execute_params()` UPDATE gap, which still needs a deeper storage
+write-path profile.

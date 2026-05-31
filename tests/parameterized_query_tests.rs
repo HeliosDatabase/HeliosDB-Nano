@@ -400,6 +400,41 @@ fn test_execute_many_params_insert_transaction_visibility_and_rollback() {
 }
 
 #[test]
+fn test_execute_many_params_update_and_delete_autocommit() {
+    let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
+    db.execute("CREATE TABLE many_dml (id INT PRIMARY KEY, quantity INT, note TEXT)")
+        .unwrap();
+    db.execute("INSERT INTO many_dml VALUES (1, 10, 'a')").unwrap();
+    db.execute("INSERT INTO many_dml VALUES (2, 20, 'b')").unwrap();
+    db.execute("INSERT INTO many_dml VALUES (3, 30, 'c')").unwrap();
+
+    let update_rows = vec![vec![Value::Int4(1)], vec![Value::Int4(3)]];
+    let updated = db
+        .execute_many_params(
+            "UPDATE many_dml SET quantity = quantity + 5 WHERE id = $1",
+            &update_rows,
+        )
+        .unwrap();
+    assert_eq!(updated, 2);
+
+    let rows = db.query("SELECT id, quantity FROM many_dml ORDER BY id", &[]).unwrap();
+    assert_eq!(rows[0].values, vec![Value::Int4(1), Value::Int4(15)]);
+    assert_eq!(rows[1].values, vec![Value::Int4(2), Value::Int4(20)]);
+    assert_eq!(rows[2].values, vec![Value::Int4(3), Value::Int4(35)]);
+
+    let delete_rows = vec![vec![Value::Int4(2)], vec![Value::Int4(99)]];
+    let deleted = db
+        .execute_many_params("DELETE FROM many_dml WHERE id = $1", &delete_rows)
+        .unwrap();
+    assert_eq!(deleted, 1);
+
+    let rows = db.query("SELECT id FROM many_dml ORDER BY id", &[]).unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].values, vec![Value::Int4(1)]);
+    assert_eq!(rows[1].values, vec![Value::Int4(3)]);
+}
+
+#[test]
 fn test_update_with_parameters() {
     let db = EmbeddedDatabase::new_in_memory().expect("Failed to create database");
 
