@@ -80,6 +80,10 @@ regressions from the release batch.
   - mixed scans can now filter on columnar side-data while projecting default
     row-store columns, which removes one fallback class in hybrid analytical
     schemas;
+  - pure columnar projected scans with null-rejecting text predicates can now
+    drive directly from column batches instead of scanning row keys first,
+    improving the gated join path while integer predicates stay on the faster
+    row-key path;
   - non-main branches and mixed row/columnar scans still fall back to the
     existing branch-aware paths when the query requires unsupported storage
     modes.
@@ -382,6 +386,16 @@ post-close mixed columnar-predicate/default-projection scan gate
   HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_EMBEDDED_PROFILE=columnar_analytics HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10 HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
     full columnar profile: filter_scan 247/s, aggregate 2202/s,
     group_by_status 136/s, join_users_orders 60/s, order_by_limit10 204/s
+
+post-close text-driver columnar projected-filter gate
+  cargo check --lib
+    passed
+  cargo test --test scan_prefix_decode columnar_projected_filter_skips_deleted_rows -- --nocapture --test-threads=1
+    passed
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_EMBEDDED_PROFILE=columnar_analytics HELIOS_TPS_WORKLOADS=filter_scan,join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    focused columnar profile: filter_scan 236/s, join_users_orders 96/s
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    rowstore sanity: filter_scan 225/s, join_users_orders 83/s
 ```
 
 ## Recommended Publish Commands

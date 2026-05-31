@@ -302,6 +302,35 @@ fn mixed_columnar_filter_rowstore_projection_preserves_results() {
 }
 
 #[test]
+fn columnar_projected_filter_skips_deleted_rows() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute(
+        "CREATE TABLE columnar_orders (
+            id INTEGER PRIMARY KEY,
+            status TEXT STORAGE COLUMNAR,
+            amount INTEGER STORAGE COLUMNAR
+        )",
+    )
+    .unwrap();
+    db.execute("INSERT INTO columnar_orders VALUES (1, 'pending', 100)")
+        .unwrap();
+    db.execute("INSERT INTO columnar_orders VALUES (2, 'paid', 200)")
+        .unwrap();
+    db.execute("INSERT INTO columnar_orders VALUES (3, 'paid', 300)")
+        .unwrap();
+    db.execute("DELETE FROM columnar_orders WHERE id = 2").unwrap();
+
+    let rows = db
+        .query(
+            "SELECT status, amount FROM columnar_orders WHERE status = 'paid' ORDER BY amount",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].values, vec![Value::String("paid".into()), Value::Int4(300)]);
+}
+
+#[test]
 fn storage_filter_pushdown_preserves_sql_null_predicates() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE TABLE f (id INTEGER PRIMARY KEY, x INTEGER, payload TEXT)")

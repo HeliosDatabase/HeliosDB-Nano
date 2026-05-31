@@ -141,6 +141,18 @@ fn null_rejecting_filter_predicate(predicates: &[FilterPredicate]) -> Option<&Fi
     predicates.iter().find(|predicate| !predicate.evaluate(&Value::Null))
 }
 
+fn columnar_batch_driver_scan_beneficial(schema: &crate::Schema, predicate: &FilterPredicate) -> bool {
+    schema
+        .columns
+        .get(predicate.column_index)
+        .is_some_and(|column| {
+            matches!(
+                column.data_type,
+                crate::DataType::Text | crate::DataType::Varchar(_) | crate::DataType::Char(_)
+            )
+        })
+}
+
 fn columnar_row_matches_filters(
     column_batches: &HashMap<usize, ColumnarBatchIndex>,
     batch_id: u64,
@@ -3454,6 +3466,48 @@ impl StorageEngine {
             let column = &schema.columns[idx];
             let batches = ColumnarStore::scan_column_batches(&self.db, table_name, &column.name)?;
             column_batches.insert(idx, ColumnarBatchIndex::from_batches(batches));
+        }
+
+        if let Some(driver_predicate) = null_rejecting_filter_predicate(&filter_predicates)
+            .filter(|predicate| columnar_batch_driver_scan_beneficial(schema, predicate))
+        {
+            if let Some(driver_batches) = column_batches.get(&driver_predicate.column_index) {
+                let mut tuples = Vec::new();
+                for (_, batch) in driver_batches.ordered_batches() {
+                    for (offset, driver_value) in batch.values.iter().enumerate() {
+                        if !driver_predicate.evaluate(driver_value) {
+                            continue;
+                        }
+                        let row_id = batch.start_row_id + offset as u64;
+                        let batch_id = row_id / BATCH_SIZE as u64;
+                        let batch_offset = (row_id % BATCH_SIZE as u64) as usize;
+                        if filter_predicates.len() > 1
+                            && !columnar_row_matches_filters(
+                                &column_batches,
+                                batch_id,
+                                batch_offset,
+                                &filter_predicates,
+                            )
+                        {
+                            continue;
+                        }
+
+                        let mut values = Vec::with_capacity(projection.len());
+                        for &idx in projection {
+                            values.push(
+                                columnar_batch_value(&column_batches, idx, batch_id, batch_offset)
+                                    .cloned()
+                                    .unwrap_or(Value::Null),
+                            );
+                        }
+                        let mut tuple = Tuple::new(values);
+                        tuple.row_id = Some(row_id);
+                        tuples.push(tuple);
+                    }
+                }
+
+                return Ok(Some(tuples));
+            }
         }
 
         let prefix = format!("data:{}:", table_name);
