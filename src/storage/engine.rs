@@ -283,6 +283,42 @@ fn compare_value_slices(left: &[Value], right: &[Value]) -> std::cmp::Ordering {
     left.len().cmp(&right.len())
 }
 
+fn update_text_count_sum_group(
+    group_key: Option<&str>,
+    sum_value: Option<i64>,
+    small_groups: &mut Vec<(Option<String>, CountSumIntState)>,
+    hash_groups: &mut Option<HashMap<Option<String>, CountSumIntState>>,
+    linear_group_limit: usize,
+) -> Result<()> {
+    if let Some(groups) = hash_groups.as_mut() {
+        let state = groups
+            .entry(group_key.map(str::to_owned))
+            .or_insert_with(CountSumIntState::new);
+        state.update_count();
+        state.update_sum_int(sum_value)?;
+        return Ok(());
+    }
+
+    if let Some(idx) = small_groups
+        .iter()
+        .position(|(existing, _)| existing.as_deref() == group_key)
+    {
+        let state = &mut small_groups[idx].1;
+        state.update_count();
+        state.update_sum_int(sum_value)?;
+        return Ok(());
+    }
+
+    let mut state = CountSumIntState::new();
+    state.update_count();
+    state.update_sum_int(sum_value)?;
+    small_groups.push((group_key.map(str::to_owned), state));
+    if small_groups.len() > linear_group_limit {
+        *hash_groups = Some(small_groups.drain(..).collect());
+    }
+    Ok(())
+}
+
 fn group_key_matches_values(key: &[Value], values: &[Value], positions: &[usize]) -> bool {
     key.len() == positions.len()
         && key.iter().zip(positions).all(|(expected, &pos)| {
@@ -505,6 +541,13 @@ impl CountSumIntState {
             Value::Int4(value) => *value as i64,
             Value::Int8(value) => *value,
             _ => return Err(Error::query_execution("SUM requires numeric values")),
+        };
+        self.update_sum_int(Some(add))
+    }
+
+    fn update_sum_int(&mut self, value: Option<i64>) -> Result<()> {
+        let Some(add) = value else {
+            return Ok(());
         };
         self.sum = self
             .sum
@@ -3851,6 +3894,117 @@ impl StorageEngine {
         ))
     }
 
+    fn try_aggregate_row_text_group_count_sum_int(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        group_by_columns: &[usize],
+        aggregates: &[ColumnarAggregateSpec],
+        filter_predicates: &[FilterPredicate],
+    ) -> Result<Option<Vec<Tuple>>> {
+        if !filter_predicates.is_empty() || group_by_columns.len() != 1 || aggregates.len() != 2 {
+            return Ok(None);
+        }
+        if !matches!(aggregates[0].op, ColumnarAggregateOp::CountStar)
+            || !matches!(aggregates[1].op, ColumnarAggregateOp::Sum)
+        {
+            return Ok(None);
+        }
+        let sum_column = match aggregates[1].column_index {
+            Some(idx) => idx,
+            None => return Ok(None),
+        };
+        if !schema
+            .columns
+            .get(sum_column)
+            .is_some_and(|column| primitive_integer_data_type(&column.data_type))
+        {
+            return Ok(None);
+        }
+
+        let group_column = group_by_columns[0];
+        if group_column == sum_column
+            || !schema.columns.get(group_column).is_some_and(|column| {
+                matches!(
+                    column.data_type,
+                    crate::DataType::Text | crate::DataType::Varchar(_) | crate::DataType::Char(_)
+                )
+            })
+        {
+            return Ok(None);
+        }
+
+        const LINEAR_GROUP_LIMIT: usize = 64;
+        let mut small_groups: Vec<(Option<String>, CountSumIntState)> = Vec::new();
+        let mut hash_groups: Option<HashMap<Option<String>, CountSumIntState>> = None;
+
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        for item in iter {
+            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+
+            if let Some(km) = &self.key_manager {
+                let decrypted = crypto::decrypt(km.key(), &raw_value)?;
+                let Some((group_key, sum_value)) = crate::storage::prefix_decode::decode_tuple_text_and_int_columns(
+                    &decrypted,
+                    group_column,
+                    sum_column,
+                ) else {
+                    return Ok(None);
+                };
+                update_text_count_sum_group(
+                    group_key,
+                    sum_value,
+                    &mut small_groups,
+                    &mut hash_groups,
+                    LINEAR_GROUP_LIMIT,
+                )?;
+            } else {
+                let Some((group_key, sum_value)) = crate::storage::prefix_decode::decode_tuple_text_and_int_columns(
+                    &raw_value,
+                    group_column,
+                    sum_column,
+                ) else {
+                    return Ok(None);
+                };
+                update_text_count_sum_group(
+                    group_key,
+                    sum_value,
+                    &mut small_groups,
+                    &mut hash_groups,
+                    LINEAR_GROUP_LIMIT,
+                )?;
+            }
+        }
+
+        let mut grouped: Vec<(Option<String>, CountSumIntState)> = match hash_groups {
+            Some(groups) => groups.into_iter().collect(),
+            None => small_groups,
+        };
+        grouped.sort_by(|(left, _), (right, _)| match (left, right) {
+            (None, None) => std::cmp::Ordering::Equal,
+            (None, Some(_)) => std::cmp::Ordering::Less,
+            (Some(_), None) => std::cmp::Ordering::Greater,
+            (Some(left), Some(right)) => left.cmp(right),
+        });
+
+        Ok(Some(
+            grouped
+                .into_iter()
+                .map(|(group_key, state)| state.finish(group_key.map(Value::String).unwrap_or(Value::Null)))
+                .collect(),
+        ))
+    }
+
     /// Aggregate directly over row-store data without materializing a ScanOperator
     /// input vector. This is the row-store counterpart to
     /// `aggregate_columnar_columns`: it decodes only the columns referenced by the
@@ -4130,6 +4284,25 @@ impl StorageEngine {
                 })
                 .collect::<Result<Vec<_>>>()?;
             return Ok(Some(vec![Tuple::new(values)]));
+        }
+
+        if let Some(tuples) = self.try_aggregate_row_text_group_count_sum_int(
+            table_name,
+            schema,
+            group_by_columns,
+            aggregates,
+            &filter_predicates,
+        )? {
+            tracing::debug!(
+                phase = "storage_row_aggregate_text_count_sum",
+                table = table_name,
+                rows = tuples.len(),
+                columns = requested.len(),
+                predicates = filter_predicates.len(),
+                duration_us = scan_start.elapsed().as_micros() as u64,
+                "Row-store text grouped count/sum aggregate complete"
+            );
+            return Ok(Some(tuples));
         }
 
         let requested_pos = |column_index: usize| -> Result<usize> {

@@ -21,6 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Top-N projection, projected inner hash-join output, direct projection moves,
   row-cache invalidation misses, no-index UPDATE moves, and DELETE logical-WAL
   key deferral.
+- Added a guarded row-store text-group `COUNT(*)` + `SUM(integer)` aggregate
+  path that decodes the group and sum columns directly from row bytes for the
+  measured `GROUP BY status` workload while preserving generic fallback.
 - Added columnar analytics diagnostics and improvements: columnar range
   predicate pushdown, direct columnar Top-N, and small-group/direct
   `COUNT(*)` + `SUM(integer)` grouped aggregate handling.

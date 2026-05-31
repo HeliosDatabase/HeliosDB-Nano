@@ -2018,13 +2018,14 @@ items remain intentionally pending after release:
 ## Final 3.34.0 Focused Snapshot
 
 After the 3.34.0 release metadata commit (`77f0456`), the projected
-filtered-scan follow-up, and the compact join-input follow-up, the focused
-same-host in-memory comparison was re-run with `N=10000`, `M=2000`.
+filtered-scan follow-up, the compact join-input follow-up, and the row-store
+text grouped aggregate follow-up, the focused same-host in-memory comparison
+was re-run with `N=10000`, `M=2000`.
 
 Default row-store analytics:
 
 ```text
-Nano rowstore               filter 226/s, aggregate 501/s, group_by 172/s, join 76/s, Top-N 469/s
+Nano rowstore               filter 232/s, aggregate 578/s, group_by 236/s, join 97/s, Top-N 454/s
 SQLite params reference     filter 374/s, aggregate 978/s, group_by 178/s, join 216/s, Top-N 461/s
 ```
 
@@ -2036,9 +2037,10 @@ Nano columnar_analytics     filter 245/s, aggregate 2059/s, group_by 138/s, join
 
 The columnar profile validates the vectorized aggregate path, where Nano is
 about 2.1x faster than SQLite on this focused aggregate workload. It is not yet
-a broad analytics solution: join and filter still need a broader compact or
-vectorized scan/filter/project pipeline rather than more tuple-local
-micro-optimizations.
+a broad analytics solution: the default row-store path now beats the SQLite
+group-by reference on this focused shape, but join and filter still need a
+broader compact or vectorized scan/filter/project pipeline rather than more
+tuple-local micro-optimizations.
 
 Parameterized in-memory DML:
 
@@ -2430,3 +2432,48 @@ Decision: reverted. The extra range scratch bookkeeping and delayed
 materialization did not beat the simpler current two-step integer path on the
 measured workload. This reinforces that the remaining SQLite filter gap is not
 likely to close through more tuple-local cursor machinery.
+
+## Accepted Follow-Up: Row-Store Text Group COUNT/SUM
+
+Finding:
+
+- The generic row-store grouped aggregate path already avoids full tuple
+  materialization, but still builds a compact `Vec<Value>` per row, constructs
+  generic `Vec<Value>` group keys, and updates generic aggregate states.
+- The TPS `group_by_status` shape is narrower:
+  `SELECT status, COUNT(*), SUM(amount) FROM orders GROUP BY status`.
+
+Change:
+
+- Add `decode_tuple_text_and_int_columns()` to the row prefix decoder.
+- Add a guarded row-store aggregate specialization for one text group column
+  plus `COUNT(*)` and integer `SUM`.
+- It compares small groups using borrowed string slices and only allocates the
+  group key when a new group is first seen.
+- Gates require no pushed filters, exactly one text/varchar/char group column,
+  exactly `COUNT(*)` then `SUM(integer)`, default row storage, and supported row
+  byte shapes. Unsupported rows return `None` and fall back to the existing
+  generic grouped aggregate path.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --lib storage::prefix_decode::tests::compact_text_int_decode_reads_group_and_sum_without_values -- --nocapture
+cargo test --test scan_prefix_decode rowstore_text_group_count_sum_fast_path_preserves_nulls -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+previous accepted group_by_status band    176-179/s
+focused group_by_status after patch       245/s
+mixed analytics run                       filter 232/s, aggregate 578/s,
+                                          group_by 236/s, join 97/s, Top-N 454/s
+SQLite params reference                   group_by 178/s
+```
+
+Decision: kept. This closes the default row-store `group_by_status` gap against
+the current SQLite reference on this focused workload. It does not close the
+remaining SQLite embedded analytics gap because filter, aggregate, and join are
+still behind the SQLite reference.

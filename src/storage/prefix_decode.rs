@@ -301,6 +301,55 @@ pub(crate) fn tuple_string_column_eq(bytes: &[u8], column: usize, expected: &str
     Some(false)
 }
 
+/// Decode one text group column and one primitive integer aggregate column.
+///
+/// This is intentionally narrow: callers use it only as an aggregate fast path
+/// and fall back to the generic decoder if either requested column uses an
+/// unsupported wire shape.
+pub(crate) fn decode_tuple_text_and_int_columns(
+    bytes: &[u8],
+    text_column: usize,
+    int_column: usize,
+) -> Option<(Option<&str>, Option<i64>)> {
+    if text_column == int_column {
+        return None;
+    }
+
+    let mut cur = ByteCursor::new(bytes);
+    let stored_cols = cur.read_len()?;
+    let max_column = text_column.max(int_column);
+    let mut text_value: Option<Option<&str>> = None;
+    let mut int_value: Option<Option<i64>> = None;
+
+    for idx in 0..stored_cols {
+        if idx > max_column {
+            break;
+        }
+
+        if idx == text_column {
+            let tag = cur.read_u32()?;
+            text_value = Some(match tag {
+                0 => None,
+                8 => {
+                    let len = cur.read_len()?;
+                    Some(std::str::from_utf8(cur.take(len)?).ok()?)
+                }
+                _ => return None,
+            });
+        } else if idx == int_column {
+            int_value = Some(match read_numeric_value(&mut cur)? {
+                DecodedNumericValue::Null => None,
+                DecodedNumericValue::Int(value) => Some(value),
+                DecodedNumericValue::Float(_) => return None,
+            });
+        } else {
+            skip_value(&mut cur)?;
+        }
+    }
+
+    Some((text_value.unwrap_or(None), int_value.unwrap_or(None)))
+}
+
 struct ByteCursor<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -696,6 +745,28 @@ mod tests {
         assert_eq!(tuple_string_column_eq(&bytes, 3, "paid"), Some(false));
         assert_eq!(tuple_string_column_eq(&bytes, 9, "paid"), Some(false));
         assert_eq!(tuple_string_column_eq(&bytes, 0, "paid"), None);
+    }
+
+    #[test]
+    fn compact_text_int_decode_reads_group_and_sum_without_values() {
+        let t = Tuple::new(vec![
+            Value::Int4(7),
+            Value::String("paid".into()),
+            Value::Int8(42),
+            Value::Null,
+        ]);
+        let bytes = bincode::serialize(&t).unwrap();
+
+        assert_eq!(
+            decode_tuple_text_and_int_columns(&bytes, 1, 2),
+            Some((Some("paid"), Some(42)))
+        );
+        assert_eq!(decode_tuple_text_and_int_columns(&bytes, 3, 2), Some((None, Some(42))));
+        assert_eq!(
+            decode_tuple_text_and_int_columns(&bytes, 1, 9),
+            Some((Some("paid"), None))
+        );
+        assert_eq!(decode_tuple_text_and_int_columns(&bytes, 0, 2), None);
     }
 
     #[test]
