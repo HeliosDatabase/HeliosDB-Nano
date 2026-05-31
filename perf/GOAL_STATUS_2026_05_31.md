@@ -1873,6 +1873,49 @@ items remain intentionally pending after release:
    - Treat that as a separate release surface unless it lands through its own
      build/test/package gate.
 
+## Final 3.34.0 Focused Snapshot
+
+After the 3.34.0 release metadata commit (`77f0456`), the focused same-host
+in-memory comparison was re-run with `N=10000`, `M=2000`.
+
+Default row-store analytics:
+
+```text
+Nano rowstore               filter 221/s, aggregate 541/s, group_by 165/s, join 62/s, Top-N 441/s
+SQLite params reference     filter 374/s, aggregate 978/s, group_by 178/s, join 216/s, Top-N 461/s
+```
+
+Gated columnar analytics profile:
+
+```text
+Nano columnar_analytics     filter 245/s, aggregate 2059/s, group_by 138/s, join 53/s, Top-N 223/s
+```
+
+The columnar profile validates the vectorized aggregate path, where Nano is
+about 2.1x faster than SQLite on this focused aggregate workload. It is not yet
+a broad analytics solution: join, filter, and Top-N still need a compact or
+vectorized scan/filter/project/join pipeline rather than more tuple-local
+micro-optimizations.
+
+Parameterized in-memory DML:
+
+```text
+SQLite params reference     bulk 490998/s, insert 214606/s, lookup 309577/s, update 243199/s, delete 266012/s
+Nano rowstore params        bulk 149916/s, execute_many_insert 244211/s, insert 98277/s,
+                            lookup 336327/s, update 159748/s, execute_many_update 242524/s,
+                            delete 228951/s, execute_many_delete 481528/s
+Nano oltp_fast params       bulk 218993/s, execute_many_insert 541475/s, insert 151811/s,
+                            lookup 390552/s, update 182429/s, execute_many_update 292676/s,
+                            delete 234116/s, execute_many_delete 499413/s
+```
+
+Interpretation: with the gated `oltp_fast` profile, Nano now beats SQLite
+best-path params on `execute_many` insert, lookup, batched UPDATE, and batched
+DELETE. SQLite still leads single-row autocommit INSERT and single-row UPDATE.
+The remaining single-row UPDATE gap is below the threshold where parser/cache
+micro-tuning has helped; it needs a storage-level profile before more code is
+changed.
+
 ## Accepted Follow-Up: Batched Parameterized UPDATE/DELETE
 
 Finding:
