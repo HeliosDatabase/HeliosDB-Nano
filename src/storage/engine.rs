@@ -30,7 +30,6 @@ use parking_lot::RwLock;
 use rocksdb::{BlockBasedOptions, Cache, IteratorMode, Options, ReadOptions, WriteBatch, WriteOptions, DB};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
-use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -852,8 +851,11 @@ impl StorageEngine {
         KEY_BUFFER.with(|buf| {
             let mut buf = buf.borrow_mut();
             buf.clear();
-            // Write directly to buffer, avoiding intermediate String allocation
-            let _ = write!(buf, "data:{}:{}", table_name, row_id);
+            buf.extend_from_slice(b"data:");
+            buf.extend_from_slice(table_name.as_bytes());
+            buf.push(b':');
+            let mut row_id_buf = itoa::Buffer::new();
+            buf.extend_from_slice(row_id_buf.format(row_id).as_bytes());
             buf.clone()
         })
     }
