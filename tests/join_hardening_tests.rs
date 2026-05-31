@@ -155,10 +155,8 @@ mod join_hardening {
             .unwrap();
         d.execute("CREATE TABLE j_inner_pf_orders (user_id INT, amount INT, status TEXT)")
             .unwrap();
-        d.execute(
-            "INSERT INTO j_inner_pf_users VALUES (1, 'Ada', 41), (2, 'Ben', 39), (3, 'Cy', 55)",
-        )
-        .unwrap();
+        d.execute("INSERT INTO j_inner_pf_users VALUES (1, 'Ada', 41), (2, 'Ben', 39), (3, 'Cy', 55)")
+            .unwrap();
         d.execute(
             "INSERT INTO j_inner_pf_orders VALUES (1, 10, 'paid'), (1, 11, 'open'), (2, 20, 'paid'), (3, 30, 'paid')",
         )

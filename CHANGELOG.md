@@ -49,6 +49,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parameterized UPDATE/DELETE batches, so batch clients avoid per-row
   `execute_params()` dispatch and result-cache invalidation while preserving the
   existing DML safety gates.
+- Short-circuited pure equi hash joins when a probe key maps to a single build
+  tuple, avoiding the pending-match state machine on the common one-to-one /
+  many-to-one join case.
 
 ### Release notes
 

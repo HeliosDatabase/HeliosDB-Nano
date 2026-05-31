@@ -1310,6 +1310,13 @@ impl HashJoinOperator {
                                 self.matched_right_keys.insert(key.clone());
                             }
 
+                            if matches.len() == 1 {
+                                let right_tuple = matches
+                                    .get(0)
+                                    .ok_or_else(|| Error::query_execution("Match index out of bounds"))?;
+                                return Ok(Some(self.join_probe_with_build(&left_tuple, right_tuple)));
+                            }
+
                             self.current_left_tuple = Some(left_tuple);
                             self.current_match_key = Some(key);
                             self.match_index = 0;
