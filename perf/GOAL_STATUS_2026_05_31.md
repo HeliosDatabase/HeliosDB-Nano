@@ -2,15 +2,15 @@
 
 Date: 2026-05-31
 Branch: `codex-next-write-tps`
-Nano commit: `74dd498 perf: compact direct-column top-n scans`
+Nano commit: `4ff277c perf: reuse integer top-n sort key for projection`
 
 Objective: HeliosDB-Nano should have a few times better overall performance than PostgreSQL, MySQL, and SQLite.
 
 ## Current Evidence
 
-The goal is not complete. On this host, Nano is far ahead of SQLite on durable autocommit writes, but SQLite is still faster on most in-memory and analytical workloads in the mirrored TPS suite.
+The goal is not complete. On this host, Nano is far ahead of SQLite on durable autocommit writes and now beats same-host PostgreSQL/MariaDB Docker-client read/analytics smoke runs, but SQLite is still faster on most in-memory analytical workloads in the mirrored TPS suite.
 
-PostgreSQL/MySQL were not measured in this pass because `psql` and `mysql` clients are not installed in this environment. Existing external scripts are present under `benches/external/`, but those engines still need a same-host service/client gate.
+Host `psql` / `mysql` clients are not installed, so `benches/external/docker_sql_tps_mirror.py` was added to drive `psql` / `mariadb` inside existing Docker containers without Python DB drivers.
 
 ## Same-Host SQLite Comparison
 
@@ -75,6 +75,38 @@ This means the in-memory write gap is heavily tied to default time-travel/MVCC v
 | join_users_orders | 52 | 230 | SQLite 4.4x |
 | order_by_limit10 | 215 | 426 | SQLite 2.0x |
 
+## Same-Host PostgreSQL/MariaDB Docker-Client Comparison
+
+This is a new external gate for the PostgreSQL/MySQL part of the goal. It uses the database clients inside existing containers, discards query output, and mirrors the read/analytics half of `tests/tps_workloads.rs` at `N=10000`, `M=2000`.
+
+Commands:
+
+```bash
+python3 benches/external/docker_sql_tps_mirror.py \
+  --backend postgres --container postgres-primary \
+  --user helios --password helios --database heliosdb \
+  --n 10000 --m 2000 \
+  --workloads filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10
+
+python3 benches/external/docker_sql_tps_mirror.py \
+  --backend mysql --container hdb-sprint-gitea-mysql-db \
+  --user gitea --password gitea --database gitea \
+  --n 10000 --m 2000 \
+  --workloads filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10
+```
+
+Measured ops/s:
+
+| Workload | Nano latest observed | PostgreSQL 17 container | MariaDB 11 container | Current winner |
+|---|---:|---:|---:|---|
+| filter_scan(age>50) | 185-200 | 100 | 65 | Nano 1.9-3.1x |
+| agg_count_sum_avg | 386-455 | 157 | 124 | Nano 2.5-3.7x |
+| group_by_status | 166-173 | 111 | 14 | Nano 1.5-12.4x |
+| join_users_orders | 54-59 | 39 | 34 | Nano 1.4-1.7x |
+| order_by_limit10 | 241-287 | 132 | 80 | Nano 1.8-3.6x |
+
+This improves the PostgreSQL/MySQL evidence gap, but it is not the final proof required by the goal: the comparison path is Docker-client based, while the Nano numbers above are embedded TPS harness numbers. It is still useful because the same SQL shapes now have same-host PG/MySQL guardrails.
+
 ## Bottlenecks Confirmed
 
 1. Default time-travel write amplification is still expensive.
@@ -82,7 +114,7 @@ This means the in-memory write gap is heavily tied to default time-travel/MVCC v
    - TT-on bulk/param insert is roughly half that because each logical row also writes version history.
 
 2. Analytics remain row-materialization dominated.
-   - Top-N improved in `74dd498`, but SQLite is still ~2x faster on the mirrored in-memory Top-N.
+   - Top-N improved in `74dd498`, `b90c224`, and `4ff277c`, but SQLite is still faster on the mirrored in-memory Top-N.
    - Aggregation and filter scans are still ~2-3.5x behind SQLite.
 
 3. Joins remain the largest analytical gap.
@@ -105,8 +137,8 @@ This means the in-memory write gap is heavily tied to default time-travel/MVCC v
    - Better targets are reducing `Value` cloning, compact build/probe row storage, and avoiding full combined tuple materialization before projection.
 
 4. Add PostgreSQL/MySQL same-host gates.
-   - `benches/external/pg_vs_helios.py` exists but requires a running PG-compatible backend and `psycopg`.
-   - No MySQL mirror is currently present; either add one or run through the MySQL wire protocol with an equivalent script.
+   - `benches/external/docker_sql_tps_mirror.py` now covers PostgreSQL and MariaDB/MySQL through Docker-hosted clients with no Python driver dependency.
+   - Remaining follow-up: add a true client-driver or wire-protocol apples-to-apples Nano/PostgreSQL/MySQL harness if this external gate becomes release-blocking.
 
 ## Follow-Up Experiments
 
