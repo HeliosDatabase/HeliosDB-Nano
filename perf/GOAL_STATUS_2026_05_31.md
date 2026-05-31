@@ -1846,6 +1846,19 @@ items remain intentionally pending after release:
      `param_update_by_pk`, but it is not release-safe because it returned before
      the normal fast-update LSN increment path. The WIP patch is saved at
      `/tmp/heliosdb-nano-fixed-width-param-update-wip-20260531.patch`.
+   - Post-release re-test: the byte-patch prototype was corrected to increment
+     LSN after a successful patched row update, but it was still not a stable
+     win (`param_update_by_pk` 176k/s then 166k/s; committed hot-cache baseline
+     is about 166-172k/s on the same host). Saved patch:
+     `/tmp/heliosdb-nano-fixed-width-param-update-lsn-corrected-rejected-20260531.patch`.
+   - A lower-risk single-assignment fast path that skipped the per-row
+     replacement `Vec` also failed to improve TPS (`param_update_by_pk` about
+     163k/s). Saved patch:
+     `/tmp/heliosdb-nano-param-update-single-assignment-rejected-20260531.patch`.
+   - Conclusion: the remaining bound UPDATE gap is not solved by these
+     tuple-local micro-optimizations. Next work should either batch UPDATEs,
+     reduce RocksDB write/read amplification more structurally, or redesign
+     the current-row update path around a measured profile.
 
 3. Known correctness/semantics deferrals.
    - A4: TRUNCATE affected-row count semantics.
