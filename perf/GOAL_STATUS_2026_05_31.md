@@ -2,7 +2,7 @@
 
 Date: 2026-05-31
 Branch: `codex-next-write-tps`
-Nano commit: `4ff277c perf: reuse integer top-n sort key for projection`
+Nano commit: `3b01fd2 perf: reuse data key buffer for main branch lookups`
 
 Objective: HeliosDB-Nano should have a few times better overall performance than PostgreSQL, MySQL, and SQLite.
 
@@ -345,3 +345,40 @@ This is a noisy but positive Top-N improvement. SQLite still leads this mirrored
 Rejected during this pass:
 
 - Hash-join build hash-table pre-sizing from existing row estimates. Correctness-clean (`join_hardening_tests` 45/45), but TPS was mixed/regressed: `join_users_orders` 54/s then 58/s and scan/aggregate numbers fell versus the current committed range. Reverted.
+
+## Accepted Follow-Up: Reuse Main-Branch Row-Key Buffer
+
+Commit after this report: `perf: reuse data key buffer for main branch lookups`.
+
+Finding:
+
+- `StorageEngine::branch_aware_data_key()` still built main-branch row keys with `format!("data:{table}:{row_id}")`.
+- Other insert paths already used the thread-local `build_data_key()` byte buffer helper. The point-lookup and transactional-write paths were therefore paying avoidable string allocation on the common main-branch case.
+- The same pass also corrected the small-`N` TPS hot-lookup harness: `point_lookup_hot` now uses `min(12345, N - 1)` and precomputes the SQL string outside the measured loop.
+
+Change:
+
+- `branch_aware_data_key()` keeps the existing branch-specific `bdata:` behavior, but uses `build_data_key()` for the main branch.
+- `tests/tps_workloads.rs`, `benches/external/sqlite_tps_mirror.py`, and `benches/external/docker_sql_tps_mirror.py` now keep the hot lookup on an existing row for small `N` comparison runs.
+
+Validation:
+
+```text
+git diff --check
+python3 -m py_compile benches/external/docker_sql_tps_mirror.py benches/external/sqlite_tps_mirror.py
+cargo check --test tps_workloads
+cargo check --lib
+cargo test --test branch_storage_test -- --nocapture --test-threads=1
+cargo test --test branch_data_isolation_test -- --nocapture --test-threads=1
+cargo test --test query_trace_tools -- --nocapture --test-threads=1
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+post-hot-key-fix baseline        point_lookup_pk 253,938/s, hot 1,248,462/s, filter 183/s, aggregate 381/s, join 56/s, Top-N 267/s
+after change run 1               point_lookup_pk 276,783/s, hot 1,395,388/s, filter 189/s, aggregate 402/s, join 58/s, Top-N 285/s
+after change run 2               point_lookup_pk 278,628/s, hot 1,399,497/s, filter 201/s, aggregate 425/s, join 57/s, Top-N 280/s
+```
+
+The improvement is modest but consistent enough to keep. It does not change the goal status: SQLite still leads several in-memory analytical workloads, especially aggregate and join.
