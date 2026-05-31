@@ -65,6 +65,12 @@ regressions from the release batch.
   - this is gated to simple column-vs-non-NULL literal comparisons and avoids
     `!=` because the storage predicate helper is not SQL-NULL-safe for that
     operator.
+- Gated columnar analytics profile improvement:
+  - filtered scans whose predicate and projection are entirely `STORAGE
+    COLUMNAR` now emit compact projected tuples directly from columnar side-data
+    instead of building a full-width row and re-projecting it in `ScanOperator`;
+  - non-main branches and mixed row/columnar scans still fall back to the
+    existing branch-aware paths.
 
 ## Release-Gate Fixes
 
@@ -107,8 +113,9 @@ caveats are explicit. Current status:
   SQLite on filter, aggregate, and join, although the final projected
   `FilteredScan`, cached projected-filtered scan dispatch, and compact
   join-input follow-ups nudged row-store filter to about 224-235/s in focused
-  runs and join to about 74-76/s. The gated columnar profile wins
-  the aggregate shape but not the full analytics set.
+  runs and join to about 74-76/s. The gated columnar profile now reaches about
+  245-259/s on its columnar filter variant and about 2.1k/s on the aggregate
+  shape, but it still does not win the full analytics set.
 
 This means the release meets the revised acceptance bar for publication:
 surpass-or-similar is achieved across the PostgreSQL/MariaDB Docker mirror and

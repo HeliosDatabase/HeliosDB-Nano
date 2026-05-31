@@ -2943,6 +2943,91 @@ impl StorageEngine {
         self.scan_table_with_schema_columnar_columns_opt(table_name, schema, columns, predicates)
     }
 
+    /// Columnar filtered scan that emits compact projected tuples directly.
+    ///
+    /// This avoids building a full-width row only for `ScanOperator` to project
+    /// it back down when every referenced column lives in columnar side-data.
+    pub fn scan_table_with_schema_columnar_projected_filtered(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        projection: &[usize],
+        predicates: &[AnalyzedPredicate],
+    ) -> Result<Option<Vec<Tuple>>> {
+        if projection.is_empty() {
+            return Ok(None);
+        }
+        let branch_name = self.current_branch.lock().clone();
+        if branch_name.is_some() && branch_name.as_deref() != Some("main") {
+            return Ok(None);
+        }
+
+        let mut requested: Vec<usize> = projection.to_vec();
+        requested.extend(predicates.iter().map(|predicate| predicate.column_index));
+        requested.sort_unstable();
+        requested.dedup();
+
+        for &idx in &requested {
+            let column = schema
+                .columns
+                .get(idx)
+                .ok_or_else(|| Error::storage(format!("Column index {} out of bounds for {}", idx, table_name)))?;
+            if column.storage_mode != ColumnStorageMode::Columnar {
+                return Ok(None);
+            }
+        }
+
+        let filter_predicates: Vec<FilterPredicate> = predicates.iter().filter_map(columnar_filter_predicate).collect();
+        if filter_predicates.len() != predicates.len() {
+            return Ok(None);
+        }
+
+        let mut column_batches: HashMap<usize, ColumnarBatchIndex> = HashMap::with_capacity(requested.len());
+        for &idx in &requested {
+            let column = &schema.columns[idx];
+            let batches = ColumnarStore::scan_column_batches(&self.db, table_name, &column.name)?;
+            column_batches.insert(idx, ColumnarBatchIndex::from_batches(batches));
+        }
+
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        let mut tuples = Vec::new();
+        for item in iter {
+            let (key, _) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+            let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) else {
+                continue;
+            };
+            let batch_id = row_id / BATCH_SIZE as u64;
+            let offset = (row_id % BATCH_SIZE as u64) as usize;
+            if !columnar_row_matches_filters(&column_batches, batch_id, offset, &filter_predicates) {
+                continue;
+            }
+
+            let mut values = Vec::with_capacity(projection.len());
+            for &idx in projection {
+                values.push(
+                    columnar_batch_value(&column_batches, idx, batch_id, offset)
+                        .cloned()
+                        .unwrap_or(Value::Null),
+                );
+            }
+            let mut tuple = Tuple::new(values);
+            tuple.row_id = Some(row_id);
+            tuples.push(tuple);
+        }
+
+        Ok(Some(tuples))
+    }
+
     fn scan_table_with_schema_columnar_columns_opt(
         &self,
         table_name: &str,
