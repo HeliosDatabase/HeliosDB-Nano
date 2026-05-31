@@ -7804,8 +7804,7 @@ impl StorageEngine {
             // Branch-specific key: bdata:{branch_id}:{table}:{row_id}
             format!("bdata:{}:{}:{}", branch_id, table_name, row_id).into_bytes()
         } else {
-            // Standard key: data:{table}:{row_id}
-            format!("data:{}:{}", table_name, row_id).into_bytes()
+            Self::build_data_key(table_name, row_id)
         }
     }
 

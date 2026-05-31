@@ -604,9 +604,10 @@ fn run_tps_suite() {
 
     // 4) Point lookup, repeated hot key (row-cache / result-cache path).
     let hot_id = 12345usize.min(n - 1);
+    let hot_sql = format!("SELECT * FROM users WHERE id = {hot_id}");
     bench("point_lookup_hot", m, || {
         for _ in 0..m {
-            let _ = db.query(&format!("SELECT * FROM users WHERE id = {hot_id}"), &[])?;
+            let _ = db.query(&hot_sql, &[])?;
         }
         Ok(())
     });
