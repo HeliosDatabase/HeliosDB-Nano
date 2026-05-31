@@ -497,3 +497,61 @@ Rejected in the same pass:
 - Avoiding the duplicate serialized logical-value clone in `insert_tuple_fast()`
   was correctness-clean, but the TPS signal was flat/mixed (`autocommit_insert`
   stayed ~99k/s and `bulk_insert` fell in the first run), so it was reverted.
+
+## Accepted Follow-Up: Byte-Level MVCC Commit Keys
+
+Commit after this report: `perf: build transaction version keys without format`.
+
+Finding:
+
+- Explicit-transaction INSERTs already stage rows through `Transaction::insert_log`
+  and commit them in one RocksDB `WriteBatch`, but commit-time MVCC key emission
+  still converted every `data:<table>:<row_id>` key to UTF-8, parsed the row id,
+  and used `format!` twice per written row to build `v:` and `v_idx:` keys.
+- This overhead sits on the default `bulk_insert_users(txn)` path while
+  `storage.time_travel_enabled=true`.
+
+Change:
+
+- `Transaction::commit_with_timestamp()` now precomputes the commit timestamp
+  text, the zero-padded reverse timestamp text, and the 8-byte timestamp value
+  once per commit.
+- Version-history keys are built from the original data-key bytes with reusable
+  buffers instead of per-row `format!` strings.
+- The existing MVCC layout is preserved: `v:<table>:<row_id>:<commit_ts>` stores
+  the row value, and `v_idx:<table>:<row_id>:<reverse_ts>` stores the 8-byte
+  big-endian commit timestamp.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --lib storage::transaction -- --nocapture --test-threads=1
+cargo test --lib time_travel -- --nocapture --test-threads=1
+cargo test --lib mvcc -- --nocapture --test-threads=1
+cargo test --test multi_row_insert_values -- --nocapture --test-threads=1
+cargo test --test integration_v3 test_repeatable_read_isolation -- --nocapture --test-threads=1
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+pre-change run                       bulk_insert 132,217/s, autocommit_insert 104,794/s
+byte-key construction run 1           bulk_insert 136,112/s, autocommit_insert 107,072/s
+byte-key construction run 2           bulk_insert 138,826/s, autocommit_insert 105,949/s
+final reusable-buffer run 1           bulk_insert 129,820/s, autocommit_insert 103,755/s
+final reusable-buffer run 2           bulk_insert 135,736/s, autocommit_insert 100,866/s
+```
+
+Larger current-shape sample, `N=50000`, `M=10000`, time-travel on:
+
+```text
+bulk_insert_users(txn) 130,831/s
+autocommit_insert       92,393/s
+```
+
+Interpretation: this is a small/noisy commit hot-path cleanup, not the missing
+SQLite-scale bulk-write lever. It removes real per-row UTF-8 parsing and
+format-string allocation from transaction commit while preserving MVCC behavior,
+but the remaining default write gap is still dominated by SQL-text literal
+parsing/materialization and row serialization/index maintenance.
