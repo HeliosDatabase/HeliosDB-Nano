@@ -2315,3 +2315,46 @@ Interpretation: this is another small but clean row-store filter improvement.
 It avoids wasted projection decode for rejected rows and keeps join/Top-N
 healthy, but it still does not close the broader SQLite embedded in-memory
 analytics gap.
+
+## Accepted Follow-Up: Predicate-First String Equality Projected FilteredScan
+
+Finding:
+
+- The TPS join shape filters the orders input with `o.status = 'paid'` and
+  then needs only `user_id` and `amount` from matching rows.
+- The compact projected filtered scan still decoded the status predicate and
+  projected join payload columns together for every order row.
+
+Change:
+
+- Add a narrow row-store fast path for exactly one string equality predicate
+  over `TEXT`/`VARCHAR`/`CHAR` default-storage columns.
+- Decode the predicate column first into a reused one-value buffer.
+- For rejected rows, skip projected payload decode.
+- Matching rows still decode only the requested projected columns and use the
+  existing compact projected tuple shape.
+- Unsupported predicate shapes fall back to the existing projected filtered
+  scan.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test scan_prefix_decode -- --nocapture --test-threads=1
+cargo test --test join_hardening_tests test_inner_join_with_filter_only_columns -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+pre-change focused join        join_users_orders 82/s
+post-change focused join       join_users_orders 83/s
+mixed run 1                    filter_scan 231/s, aggregate 524/s, join 85/s
+mixed run 2                    filter_scan 232/s, aggregate 515/s, join 86/s
+```
+
+Interpretation: this is a small join-input boundary reduction. The gain is
+modest but repeatable enough to keep because it targets the measured join
+payload path and falls back for unsupported cases. SQLite still leads the
+mirrored in-memory join by a wide margin, so the broader pipeline work remains
+open.
