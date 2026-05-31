@@ -18,6 +18,13 @@ use bincode::Options;
 use serde::de::{DeserializeSeed, SeqAccess, Visitor};
 use std::fmt;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum DecodedNumericValue {
+    Null,
+    Int(i64),
+    Float(f64),
+}
+
 struct PrefixValues {
     prefix_len: usize,
     total_cols: usize,
@@ -185,6 +192,69 @@ pub(crate) fn decode_tuple_column_values(
         .collect())
 }
 
+/// Decode selected columns into a caller-owned compact value buffer.
+///
+/// Hot storage-local consumers such as row-store aggregates and Top-N scans call
+/// this once per row. Reusing the output allocation avoids a per-row `Vec`
+/// allocation while preserving the same selected-column semantics as
+/// `decode_tuple_column_values`.
+pub(crate) fn decode_tuple_column_values_into(
+    bytes: &[u8],
+    columns: &[usize],
+    total_cols: usize,
+    out: &mut Vec<Value>,
+) -> bincode::Result<()> {
+    if try_decode_tuple_column_values_fast_into(bytes, columns, out).is_some() {
+        return Ok(());
+    }
+
+    out.clear();
+    let tuple = decode_tuple_columns(bytes, columns, total_cols)?;
+    out.extend(
+        columns
+            .iter()
+            .map(|&idx| tuple.values.get(idx).cloned().unwrap_or(Value::Null)),
+    );
+    Ok(())
+}
+
+/// Decode primitive numeric selected columns into a caller-owned buffer.
+///
+/// Returns `None` if the row contains a requested value whose wire shape is not
+/// one of the fixed-width primitive numeric variants. Callers use this as a
+/// fast path and fall back to the generic `Value` decoder for full SQL
+/// semantics.
+pub(crate) fn decode_tuple_numeric_column_values_into(
+    bytes: &[u8],
+    columns: &[usize],
+    out: &mut Vec<DecodedNumericValue>,
+) -> Option<()> {
+    out.clear();
+    let mut cur = ByteCursor::new(bytes);
+    let stored_cols = cur.read_len()?;
+    let mut wanted = columns.iter().copied().peekable();
+
+    for idx in 0..stored_cols {
+        match wanted.peek().copied() {
+            Some(want) if want == idx => {
+                out.push(read_numeric_value(&mut cur)?);
+                wanted.next();
+                if wanted.peek().is_none() {
+                    return Some(());
+                }
+            }
+            Some(want) if want > idx => skip_value(&mut cur)?,
+            Some(_) => return None,
+            None => return Some(()),
+        }
+    }
+
+    while wanted.next().is_some() {
+        out.push(DecodedNumericValue::Null);
+    }
+    Some(())
+}
+
 struct ByteCursor<'a> {
     bytes: &'a [u8],
     pos: usize,
@@ -307,6 +377,33 @@ fn try_decode_tuple_column_values_fast(bytes: &[u8], columns: &[usize]) -> Optio
     Some(out)
 }
 
+fn try_decode_tuple_column_values_fast_into(bytes: &[u8], columns: &[usize], out: &mut Vec<Value>) -> Option<()> {
+    out.clear();
+    let mut cur = ByteCursor::new(bytes);
+    let stored_cols = cur.read_len()?;
+    let mut wanted = columns.iter().copied().peekable();
+
+    for idx in 0..stored_cols {
+        match wanted.peek().copied() {
+            Some(want) if want == idx => {
+                out.push(read_value(&mut cur)?);
+                wanted.next();
+                if wanted.peek().is_none() {
+                    return Some(());
+                }
+            }
+            Some(want) if want > idx => skip_value(&mut cur)?,
+            Some(_) => return None,
+            None => return Some(()),
+        }
+    }
+
+    while wanted.next().is_some() {
+        out.push(Value::Null);
+    }
+    Some(())
+}
+
 fn skip_value(cur: &mut ByteCursor<'_>) -> Option<()> {
     let tag = cur.read_u32()?;
     match tag {
@@ -385,6 +482,19 @@ fn read_value(cur: &mut ByteCursor<'_>) -> Option<Value> {
         }
         20 => Some(Value::ColumnarRef),
         11 | 12 | 13 => None,
+        _ => None,
+    }
+}
+
+fn read_numeric_value(cur: &mut ByteCursor<'_>) -> Option<DecodedNumericValue> {
+    let tag = cur.read_u32()?;
+    match tag {
+        0 => Some(DecodedNumericValue::Null),
+        2 => Some(DecodedNumericValue::Int(i64::from(cur.read_i16()?))),
+        3 => Some(DecodedNumericValue::Int(i64::from(cur.read_i32()?))),
+        4 => Some(DecodedNumericValue::Int(cur.read_i64()?)),
+        5 => Some(DecodedNumericValue::Float(f64::from(cur.read_f32()?))),
+        6 => Some(DecodedNumericValue::Float(cur.read_f64()?)),
         _ => None,
     }
 }
@@ -478,6 +588,42 @@ mod tests {
 
         let selected = decode_tuple_column_values(&bytes, &[1, 3], 6).unwrap();
         assert_eq!(selected, vec![full.values[1].clone(), full.values[3].clone()]);
+    }
+
+    #[test]
+    fn compact_selected_decode_into_reuses_output_buffer() {
+        let t = sample();
+        let bytes = bincode::serialize(&t).unwrap();
+        let full: Tuple = bincode::deserialize(&bytes).unwrap();
+
+        let mut out = Vec::with_capacity(8);
+        out.push(Value::String("stale".into()));
+        decode_tuple_column_values_into(&bytes, &[1, 3], 6, &mut out).unwrap();
+        assert_eq!(out, vec![full.values[1].clone(), full.values[3].clone()]);
+
+        decode_tuple_column_values_into(&bytes, &[2], 6, &mut out).unwrap();
+        assert_eq!(out, vec![full.values[2].clone()]);
+    }
+
+    #[test]
+    fn compact_numeric_decode_reads_primitives_without_values() {
+        let t = Tuple::new(vec![Value::Int4(7), Value::Null, Value::Int8(11), Value::Float8(2.5)]);
+        let bytes = bincode::serialize(&t).unwrap();
+        let mut out = Vec::new();
+
+        decode_tuple_numeric_column_values_into(&bytes, &[0, 1, 2, 3], &mut out).unwrap();
+        assert_eq!(
+            out,
+            vec![
+                DecodedNumericValue::Int(7),
+                DecodedNumericValue::Null,
+                DecodedNumericValue::Int(11),
+                DecodedNumericValue::Float(2.5),
+            ]
+        );
+
+        decode_tuple_numeric_column_values_into(&bytes, &[2], &mut out).unwrap();
+        assert_eq!(out, vec![DecodedNumericValue::Int(11)]);
     }
 
     #[test]

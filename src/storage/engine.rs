@@ -304,6 +304,96 @@ enum ColumnarAggregateState {
     Max(Option<Value>),
 }
 
+#[derive(Clone, Copy)]
+enum PrimitiveRowAggregate {
+    CountStar,
+    Count { position: usize },
+    SumInt { position: usize },
+    Avg { position: usize },
+}
+
+enum PrimitiveRowAggregateState {
+    Count(i64),
+    SumInt { sum: i64, seen: bool },
+    Avg { sum: f64, count: u64 },
+}
+
+impl PrimitiveRowAggregateState {
+    fn new(plan: PrimitiveRowAggregate) -> Self {
+        match plan {
+            PrimitiveRowAggregate::CountStar | PrimitiveRowAggregate::Count { .. } => Self::Count(0),
+            PrimitiveRowAggregate::SumInt { .. } => Self::SumInt { sum: 0, seen: false },
+            PrimitiveRowAggregate::Avg { .. } => Self::Avg { sum: 0.0, count: 0 },
+        }
+    }
+
+    fn update(
+        &mut self,
+        plan: PrimitiveRowAggregate,
+        values: &[crate::storage::prefix_decode::DecodedNumericValue],
+    ) -> Result<()> {
+        match (self, plan) {
+            (Self::Count(count), PrimitiveRowAggregate::CountStar) => {
+                *count += 1;
+                Ok(())
+            }
+            (Self::Count(count), PrimitiveRowAggregate::Count { position }) => {
+                if !matches!(
+                    values.get(position),
+                    None | Some(crate::storage::prefix_decode::DecodedNumericValue::Null)
+                ) {
+                    *count += 1;
+                }
+                Ok(())
+            }
+            (Self::SumInt { sum, seen }, PrimitiveRowAggregate::SumInt { position }) => {
+                if let Some(crate::storage::prefix_decode::DecodedNumericValue::Int(value)) = values.get(position) {
+                    *sum = sum
+                        .checked_add(*value)
+                        .ok_or_else(|| Error::query_execution("integer overflow: BIGINT SUM"))?;
+                    *seen = true;
+                }
+                Ok(())
+            }
+            (Self::Avg { sum, count }, PrimitiveRowAggregate::Avg { position }) => {
+                match values.get(position) {
+                    Some(crate::storage::prefix_decode::DecodedNumericValue::Int(value)) => {
+                        *sum += *value as f64;
+                        *count += 1;
+                    }
+                    Some(crate::storage::prefix_decode::DecodedNumericValue::Float(value)) => {
+                        *sum += *value;
+                        *count += 1;
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+            _ => Err(Error::query_execution("Invalid primitive row aggregate state")),
+        }
+    }
+
+    fn finalize(self) -> Value {
+        match self {
+            Self::Count(count) => Value::Int8(count),
+            Self::SumInt { sum, seen } => {
+                if seen {
+                    Value::Int8(sum)
+                } else {
+                    Value::Null
+                }
+            }
+            Self::Avg { sum, count } => {
+                if count == 0 {
+                    Value::Null
+                } else {
+                    Value::Float8(sum / count as f64)
+                }
+            }
+        }
+    }
+}
+
 impl ColumnarAggregateState {
     fn new(op: ColumnarAggregateOp) -> Self {
         match op {
@@ -485,6 +575,35 @@ fn update_columnar_decimal_sum(state: &mut ColumnarSumState, value: rust_decimal
         ColumnarSumState::Int(sum) => *state = ColumnarSumState::Decimal(rust_decimal::Decimal::from(*sum) + value),
         ColumnarSumState::Decimal(sum) => *sum += value,
     }
+}
+
+fn primitive_numeric_data_type(data_type: &crate::DataType) -> bool {
+    matches!(
+        data_type,
+        crate::DataType::Int2
+            | crate::DataType::Int4
+            | crate::DataType::Int8
+            | crate::DataType::Float4
+            | crate::DataType::Float8
+    )
+}
+
+fn primitive_integer_data_type(data_type: &crate::DataType) -> bool {
+    matches!(
+        data_type,
+        crate::DataType::Int2 | crate::DataType::Int4 | crate::DataType::Int8
+    )
+}
+
+fn row_blob_fast_skip_supported(data_type: &crate::DataType) -> bool {
+    !matches!(
+        data_type,
+        crate::DataType::Date
+            | crate::DataType::Time
+            | crate::DataType::Timestamp
+            | crate::DataType::Timestamptz
+            | crate::DataType::Array(_)
+    )
 }
 
 /// Storage engine
@@ -2249,6 +2368,7 @@ impl StorageEngine {
             .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
 
         let mut heap = std::collections::BinaryHeap::with_capacity(k.saturating_add(1));
+        let mut values = Vec::with_capacity(requested.len());
         for item in iter {
             let (key, raw_value) =
                 item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
@@ -2256,8 +2376,7 @@ impl StorageEngine {
                 break;
             }
 
-            let values =
-                self.decode_rowstore_column_values(&raw_value, &requested, schema.columns.len())?;
+            self.decode_rowstore_column_values_into(&raw_value, &requested, schema.columns.len(), &mut values)?;
             let replace = if heap.len() < k {
                 true
             } else {
@@ -2726,6 +2845,134 @@ impl StorageEngine {
     /// `aggregate_columnar_columns`: it decodes only the columns referenced by the
     /// aggregate/group/filter expressions and updates aggregate state while walking
     /// the RocksDB prefix.
+    fn primitive_row_aggregate_plan(
+        schema: &crate::Schema,
+        aggregates: &[ColumnarAggregateSpec],
+    ) -> Option<(Vec<usize>, Vec<PrimitiveRowAggregate>)> {
+        let mut requested = Vec::new();
+        for aggregate in aggregates {
+            match aggregate.op {
+                ColumnarAggregateOp::CountStar => {}
+                ColumnarAggregateOp::Count | ColumnarAggregateOp::Avg | ColumnarAggregateOp::Sum => {
+                    let idx = aggregate.column_index?;
+                    let column = schema.columns.get(idx)?;
+                    match aggregate.op {
+                        ColumnarAggregateOp::Count | ColumnarAggregateOp::Avg
+                            if primitive_numeric_data_type(&column.data_type) => {}
+                        ColumnarAggregateOp::Sum if primitive_integer_data_type(&column.data_type) => {}
+                        _ => return None,
+                    }
+                    requested.push(idx);
+                }
+                ColumnarAggregateOp::CountDistinct | ColumnarAggregateOp::Min | ColumnarAggregateOp::Max => {
+                    return None;
+                }
+            }
+        }
+        requested.sort_unstable();
+        requested.dedup();
+
+        if let Some(max_requested) = requested.last().copied() {
+            for idx in 0..=max_requested {
+                let column = schema.columns.get(idx)?;
+                if requested.binary_search(&idx).is_err() && !row_blob_fast_skip_supported(&column.data_type) {
+                    return None;
+                }
+            }
+        }
+
+        let mut plan = Vec::with_capacity(aggregates.len());
+        for aggregate in aggregates {
+            match aggregate.op {
+                ColumnarAggregateOp::CountStar => plan.push(PrimitiveRowAggregate::CountStar),
+                ColumnarAggregateOp::Count => {
+                    let position = requested.binary_search(&aggregate.column_index?).ok()?;
+                    plan.push(PrimitiveRowAggregate::Count { position });
+                }
+                ColumnarAggregateOp::Sum => {
+                    let position = requested.binary_search(&aggregate.column_index?).ok()?;
+                    plan.push(PrimitiveRowAggregate::SumInt { position });
+                }
+                ColumnarAggregateOp::Avg => {
+                    let position = requested.binary_search(&aggregate.column_index?).ok()?;
+                    plan.push(PrimitiveRowAggregate::Avg { position });
+                }
+                ColumnarAggregateOp::CountDistinct | ColumnarAggregateOp::Min | ColumnarAggregateOp::Max => {
+                    return None;
+                }
+            }
+        }
+
+        Some((requested, plan))
+    }
+
+    fn try_aggregate_primitive_row_columns(
+        &self,
+        table_name: &str,
+        schema: &crate::Schema,
+        aggregates: &[ColumnarAggregateSpec],
+    ) -> Result<Option<Vec<Tuple>>> {
+        let Some((requested, plan)) = Self::primitive_row_aggregate_plan(schema, aggregates) else {
+            return Ok(None);
+        };
+
+        if requested.is_empty() {
+            let count = self.count_table_rows(table_name)? as i64;
+            let values = plan
+                .iter()
+                .map(|aggregate| match aggregate {
+                    PrimitiveRowAggregate::CountStar => Value::Int8(count),
+                    _ => Value::Null,
+                })
+                .collect();
+            return Ok(Some(vec![Tuple::new(values)]));
+        }
+
+        let prefix = format!("data:{}:", table_name);
+        let prefix_bytes = prefix.as_bytes();
+        let mut read_opts = ReadOptions::default();
+        read_opts.set_total_order_seek(true);
+        let iter = self
+            .db
+            .iterator_opt(IteratorMode::From(prefix_bytes, rocksdb::Direction::Forward), read_opts);
+
+        let mut states: Vec<PrimitiveRowAggregateState> =
+            plan.iter().copied().map(PrimitiveRowAggregateState::new).collect();
+        let mut values = Vec::with_capacity(requested.len());
+        for item in iter {
+            let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
+            if !key.starts_with(prefix_bytes) {
+                break;
+            }
+
+            let decoded = if let Some(km) = &self.key_manager {
+                let decrypted = crypto::decrypt(km.key(), &raw_value)?;
+                crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                    &decrypted,
+                    &requested,
+                    &mut values,
+                )
+            } else {
+                crate::storage::prefix_decode::decode_tuple_numeric_column_values_into(
+                    &raw_value,
+                    &requested,
+                    &mut values,
+                )
+            };
+            if decoded.is_none() {
+                return Ok(None);
+            }
+
+            for (state, aggregate) in states.iter_mut().zip(&plan) {
+                state.update(*aggregate, &values)?;
+            }
+        }
+
+        Ok(Some(vec![Tuple::new(
+            states.into_iter().map(PrimitiveRowAggregateState::finalize).collect(),
+        )]))
+    }
+
     pub(crate) fn try_aggregate_row_columns(
         &self,
         table_name: &str,
@@ -2754,6 +3001,18 @@ impl StorageEngine {
         let filter_predicates: Vec<FilterPredicate> = predicates.iter().filter_map(columnar_filter_predicate).collect();
         if filter_predicates.len() != predicates.len() {
             return Ok(None);
+        }
+
+        if group_by_columns.is_empty() && predicates.is_empty() {
+            if let Some(tuples) = self.try_aggregate_primitive_row_columns(table_name, schema, aggregates)? {
+                tracing::debug!(
+                    phase = "storage_row_aggregate_primitive",
+                    table = table_name,
+                    rows = tuples.len(),
+                    "Primitive row-store aggregate complete"
+                );
+                return Ok(Some(tuples));
+            }
         }
 
         if requested.is_empty() && group_by_columns.is_empty() && predicates.is_empty() {
@@ -2802,6 +3061,7 @@ impl StorageEngine {
                 .iter()
                 .map(|aggregate| ColumnarAggregateState::new(aggregate.op))
                 .collect();
+            let mut values = Vec::with_capacity(requested.len());
 
             for item in iter {
                 let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
@@ -2809,7 +3069,7 @@ impl StorageEngine {
                     break;
                 }
 
-                let values = self.decode_rowstore_column_values(&raw_value, &requested, schema.columns.len())?;
+                self.decode_rowstore_column_values_into(&raw_value, &requested, schema.columns.len(), &mut values)?;
                 if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
                     continue;
                 }
@@ -2837,13 +3097,14 @@ impl StorageEngine {
         const LINEAR_GROUP_LIMIT: usize = 64;
         let mut small_groups: Vec<(Vec<Value>, Vec<ColumnarAggregateState>)> = Vec::new();
         let mut hash_groups: Option<HashMap<Vec<Value>, Vec<ColumnarAggregateState>>> = None;
+        let mut values = Vec::with_capacity(requested.len());
         for item in iter {
             let (key, raw_value) = item.map_err(|e| Error::storage(format!("Iterator error: {}", e)))?;
             if !key.starts_with(prefix_bytes) {
                 break;
             }
 
-            let values = self.decode_rowstore_column_values(&raw_value, &requested, schema.columns.len())?;
+            self.decode_rowstore_column_values_into(&raw_value, &requested, schema.columns.len(), &mut values)?;
             if !row_values_match_filters(&values, &filter_predicates, &filter_positions) {
                 continue;
             }
@@ -2942,6 +3203,22 @@ impl StorageEngine {
         }
         .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))?;
         Ok(values)
+    }
+
+    fn decode_rowstore_column_values_into(
+        &self,
+        raw_value: &[u8],
+        columns: &[usize],
+        total_cols: usize,
+        out: &mut Vec<Value>,
+    ) -> Result<()> {
+        if let Some(km) = &self.key_manager {
+            let decrypted = crypto::decrypt(km.key(), raw_value)?;
+            crate::storage::prefix_decode::decode_tuple_column_values_into(&decrypted, columns, total_cols, out)
+        } else {
+            crate::storage::prefix_decode::decode_tuple_column_values_into(raw_value, columns, total_cols, out)
+        }
+        .map_err(|e| Error::storage(format!("Failed to deserialize tuple: {}", e)))
     }
 
     fn scan_table_with_schema_opt(
