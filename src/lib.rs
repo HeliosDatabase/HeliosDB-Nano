@@ -5501,6 +5501,53 @@ impl EmbeddedDatabase {
         }
     }
 
+    fn try_autocommit_fast_update_delete_params_cached(&self, sql: &str, params: &[Value]) -> Option<Result<u64>> {
+        if self.in_transaction()
+            || !self.savepoints.read().is_empty()
+            || !self.session_transactions.is_empty()
+            || self.tenant_manager.get_current_context().is_some()
+            || self.storage.get_current_branch_id().is_some()
+        {
+            return None;
+        }
+
+        let trimmed = sql.trim_start();
+        let prefix = trimmed.as_bytes().get(..6)?;
+        if prefix.eq_ignore_ascii_case(b"UPDATE") {
+            let cache_key = format!("\0fast_param_update\0{sql}");
+            let spec = self
+                .fast_param_update_cache
+                .lock()
+                .ok()
+                .and_then(|mut cache| cache.get(&cache_key).map(std::sync::Arc::clone))?;
+            if self.tenant_manager.should_apply_rls(&spec.table_name, "UPDATE")
+                || self.trigger_registry.has_triggers_for_table(&spec.table_name)
+            {
+                return None;
+            }
+            return self.try_execute_fast_update_param_spec(&spec, params);
+        }
+
+        if prefix.eq_ignore_ascii_case(b"DELETE") {
+            let fk_mode = *self.fk_validation_mode.read();
+            let fk_source = *self.fk_validation_source.read();
+            let cache_key = format!("\0fast_param_delete\0{fk_mode:?}\0{fk_source:?}\0{sql}");
+            let spec = self
+                .fast_param_delete_cache
+                .lock()
+                .ok()
+                .and_then(|mut cache| cache.get(&cache_key).map(std::sync::Arc::clone))?;
+            if self.tenant_manager.should_apply_rls(&spec.table_name, "DELETE")
+                || self.trigger_registry.has_triggers_for_table(&spec.table_name)
+            {
+                return None;
+            }
+            return self.try_execute_fast_delete_param_spec(&spec, params);
+        }
+
+        None
+    }
+
     fn try_fast_update_params(
         &self,
         sql: &str,
@@ -5522,6 +5569,14 @@ impl EmbeddedDatabase {
             Ok(spec) => spec,
             Err(e) => return Some(Err(e)),
         };
+        self.try_execute_fast_update_param_spec(&spec, params)
+    }
+
+    fn try_execute_fast_update_param_spec(
+        &self,
+        spec: &FastParamUpdateSpec,
+        params: &[Value],
+    ) -> Option<Result<u64>> {
         let pk_value = match Self::fast_pk_value_from_expr(&spec.pk_expr, &spec.pk_data_type, params) {
             Some(Ok(value)) => value,
             Some(Err(e)) => return Some(Err(e)),
@@ -5667,6 +5722,14 @@ impl EmbeddedDatabase {
             Ok(spec) => spec,
             Err(e) => return Some(Err(e)),
         };
+        self.try_execute_fast_delete_param_spec(&spec, params)
+    }
+
+    fn try_execute_fast_delete_param_spec(
+        &self,
+        spec: &FastParamDeleteSpec,
+        params: &[Value],
+    ) -> Option<Result<u64>> {
         let pk_value = match Self::fast_pk_value_from_expr(&spec.pk_expr, &spec.pk_data_type, params) {
             Some(Ok(value)) => value,
             Some(Err(e)) => return Some(Err(e)),
@@ -9156,6 +9219,12 @@ impl EmbeddedDatabase {
     /// This method prevents SQL injection by treating parameters as data, not code.
     /// Even malicious input like `"'; DROP TABLE users; --"` is safely handled.
     pub fn execute_params(&self, sql: &str, params: &[Value]) -> Result<u64> {
+        if let Some(result) = self.try_autocommit_fast_update_delete_params_cached(sql, params) {
+            let count = result?;
+            self.invalidate_result_cache();
+            return Ok(count);
+        }
+
         let plan = self.parameterized_plan_cached(sql)?;
 
         if let Some(result) = self.try_transaction_fast_insert_params(sql, &plan, params) {
