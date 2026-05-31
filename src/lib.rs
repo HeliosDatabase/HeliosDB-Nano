@@ -5069,16 +5069,16 @@ impl EmbeddedDatabase {
         &self,
         table_name: &str,
         explicit_columns: Option<&[&str]>,
-        value_count: usize,
+        value_count: Option<usize>,
     ) -> Option<Result<std::sync::Arc<FastLiteralInsertSpec>>> {
-        if value_count == 0 {
+        if matches!(value_count, Some(0)) {
             return None;
         }
 
         let cache_key = Self::fast_literal_insert_cache_key(table_name, explicit_columns);
         if let Ok(mut cache) = self.fast_literal_insert_cache.lock() {
             if let Some(spec) = cache.get(&cache_key) {
-                if spec.target_types.len() == value_count {
+                if value_count.map_or(true, |count| spec.target_types.len() == count) {
                     return Some(Ok(std::sync::Arc::clone(spec)));
                 }
                 return None;
@@ -5101,7 +5101,7 @@ impl EmbeddedDatabase {
             || schema.columns.iter().map(|c| c.name.as_str()).collect(),
             |columns| columns.to_vec(),
         );
-        if column_names.len() != value_count {
+        if column_names.is_empty() || value_count.is_some_and(|count| column_names.len() != count) {
             return None;
         }
 
@@ -5172,6 +5172,9 @@ impl EmbeddedDatabase {
             }
 
             if i + 1 == spec.target_types.len() {
+                if !rest.trim().is_empty() {
+                    return None;
+                }
                 break;
             }
 
@@ -6497,8 +6500,7 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let value_count = Self::fast_parse_value_count(values_str);
-        let spec = match self.fast_literal_insert_spec(table_name, columns.as_deref(), value_count)? {
+        let spec = match self.fast_literal_insert_spec(table_name, columns.as_deref(), None)? {
             Ok(spec) => spec,
             Err(e) => return Some(Err(e)),
         };
@@ -6591,8 +6593,7 @@ impl EmbeddedDatabase {
         }
 
         if let Some(values_str) = single_values {
-            let value_count = Self::fast_parse_value_count(values_str);
-            let spec = match self.fast_literal_insert_spec(table_name, explicit_columns.as_deref(), value_count)? {
+            let spec = match self.fast_literal_insert_spec(table_name, explicit_columns.as_deref(), None)? {
                 Ok(spec) => spec,
                 Err(e) => return Some(Err(e)),
             };
@@ -6608,7 +6609,7 @@ impl EmbeddedDatabase {
         let value_groups = Self::fast_parse_value_groups(values_rest)?;
         let first_values = value_groups.first()?;
         let value_count = Self::fast_parse_value_count(first_values);
-        let spec = match self.fast_literal_insert_spec(table_name, explicit_columns.as_deref(), value_count)? {
+        let spec = match self.fast_literal_insert_spec(table_name, explicit_columns.as_deref(), Some(value_count))? {
             Ok(spec) => spec,
             Err(e) => return Some(Err(e)),
         };
