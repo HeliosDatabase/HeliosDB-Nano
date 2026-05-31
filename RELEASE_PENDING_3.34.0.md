@@ -58,6 +58,11 @@ regressions from the release batch.
   - this is a guarded extension of the projected join path and falls back for
     outer/lateral joins, unqualified or complex expressions, subqueries, and
     already-projected inputs.
+- Grouped aggregate improvement:
+  - simple row-store text-group `COUNT(*)` + integer `SUM` aggregates now decode
+    the group and sum columns directly from row bytes;
+  - this is gated to the measured no-filter shape and falls back for other
+    aggregate/group/filter forms.
 - Filtered scan dispatch improvement:
   - repeated simple projected `FilteredScan` plans can now call the compact
     storage projected-filtered scan primitive directly from the cached-plan
@@ -116,9 +121,10 @@ caveats are explicit. Current status:
   SQLite on filter, aggregate, and join, although the final projected
   `FilteredScan`, cached projected-filtered scan dispatch, and compact
   join-input follow-ups nudged row-store filter to about 224-235/s in focused
-  runs and join to about 78-81/s. The gated columnar profile now reaches about
-  245-259/s on its columnar filter variant and about 2.1k/s on the aggregate
-  shape, but it still does not win the full analytics set.
+  runs and join to about 78-97/s, and the row-store text grouped aggregate path
+  moved `group_by_status` to about 236-245/s. The gated columnar profile now
+  reaches about 245-259/s on its columnar filter variant and about 2.1k/s on
+  the aggregate shape, but it still does not win the full analytics set.
 
 This means the release meets the revised acceptance bar for publication:
 surpass-or-similar is achieved across the PostgreSQL/MariaDB Docker mirror and
@@ -347,6 +353,19 @@ post-close byte-level string predicate compare gate
   HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10 HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
     full focused analytics: filter_scan 229/s, aggregate 524/s,
     group_by_status 176/s, join_users_orders 89/s, order_by_limit10 438/s
+
+post-close row-store text grouped COUNT/SUM gate
+  cargo check --lib
+    passed
+  cargo test --lib storage::prefix_decode::tests::compact_text_int_decode_reads_group_and_sum_without_values -- --nocapture
+    passed
+  cargo test --test scan_prefix_decode rowstore_text_group_count_sum_fast_path_preserves_nulls -- --nocapture --test-threads=1
+    passed
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=group_by_status HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    focused group_by_status: 245/s
+  HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10 HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+    mixed run: filter_scan 232/s, aggregate 578/s,
+    group_by_status 236/s, join_users_orders 97/s, order_by_limit10 454/s
 ```
 
 ## Recommended Publish Commands

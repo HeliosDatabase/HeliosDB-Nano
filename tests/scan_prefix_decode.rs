@@ -230,6 +230,40 @@ fn rowstore_aggregate_fast_path_preserves_filter_and_group_results() {
 }
 
 #[test]
+fn rowstore_text_group_count_sum_fast_path_preserves_nulls() {
+    let db = EmbeddedDatabase::new_in_memory().unwrap();
+    db.execute("CREATE TABLE orders_g (id INTEGER PRIMARY KEY, status TEXT, amount INTEGER)")
+        .unwrap();
+    db.execute("INSERT INTO orders_g VALUES (1, 'paid', 10)").unwrap();
+    db.execute("INSERT INTO orders_g VALUES (2, 'pending', 20)").unwrap();
+    db.execute("INSERT INTO orders_g VALUES (3, 'paid', 5)").unwrap();
+    db.execute("INSERT INTO orders_g VALUES (4, NULL, 7)").unwrap();
+    db.execute("INSERT INTO orders_g VALUES (5, 'none', NULL)").unwrap();
+
+    let rows = db
+        .query(
+            "SELECT status, COUNT(*), SUM(amount) FROM orders_g GROUP BY status ORDER BY status",
+            &[],
+        )
+        .unwrap();
+
+    assert_eq!(rows.len(), 4);
+    assert_eq!(rows[0].values, vec![Value::Null, Value::Int8(1), Value::Int8(7)]);
+    assert_eq!(
+        rows[1].values,
+        vec![Value::String("none".into()), Value::Int8(1), Value::Null]
+    );
+    assert_eq!(
+        rows[2].values,
+        vec![Value::String("paid".into()), Value::Int8(2), Value::Int8(15)]
+    );
+    assert_eq!(
+        rows[3].values,
+        vec![Value::String("pending".into()), Value::Int8(1), Value::Int8(20)]
+    );
+}
+
+#[test]
 fn storage_filter_pushdown_preserves_sql_null_predicates() {
     let db = EmbeddedDatabase::new_in_memory().unwrap();
     db.execute("CREATE TABLE f (id INTEGER PRIMARY KEY, x INTEGER, payload TEXT)")
