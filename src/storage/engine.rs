@@ -291,7 +291,8 @@ fn build_projected_tuple(values: &[Value], positions: &[usize]) -> Tuple {
 
 struct RowIntTopKEntry {
     key: i64,
-    tuple: Tuple,
+    raw_value: Box<[u8]>,
+    row_id: Option<u64>,
     asc: bool,
 }
 
@@ -2433,44 +2434,43 @@ impl StorageEngine {
                 if heap.len() >= k {
                     heap.pop();
                 }
-
-                let output_values =
-                    self.decode_rowstore_column_values(&raw_value, &output_decode_columns, schema.columns.len())?;
-                let mut projected_values = Vec::with_capacity(output_sources.len());
-                for source in &output_sources {
-                    match source {
-                        IntTopKOutputSource::SortKey => {
-                            let value = int_value_for_data_type(sort_column_type, sort_key).ok_or_else(|| {
-                                Error::storage(format!(
-                                    "Integer Top-N sort key out of range for column {} on {}",
-                                    sort_column, table_name
-                                ))
-                            })?;
-                            projected_values.push(value);
-                        }
-                        IntTopKOutputSource::Decoded(pos) => {
-                            projected_values.push(output_values.get(*pos).cloned().unwrap_or(Value::Null));
-                        }
-                    }
-                }
-                let mut tuple = Tuple::new(projected_values);
-                if let Some(row_id) = Self::parse_row_id_after_prefix(&key, prefix_bytes.len()) {
-                    tuple.row_id = Some(row_id);
-                }
                 heap.push(RowIntTopKEntry {
                     key: sort_key,
-                    tuple,
+                    raw_value,
+                    row_id: Self::parse_row_id_after_prefix(&key, prefix_bytes.len()),
                     asc,
                 });
             }
         }
 
-        Ok(Some(
-            heap.into_sorted_vec()
-                .into_iter()
-                .map(|entry| entry.tuple)
-                .collect(),
-        ))
+        let entries = heap.into_sorted_vec();
+        let mut tuples = Vec::with_capacity(entries.len());
+        for entry in entries {
+            let output_values =
+                self.decode_rowstore_column_values(&entry.raw_value, &output_decode_columns, schema.columns.len())?;
+            let mut projected_values = Vec::with_capacity(output_sources.len());
+            for source in &output_sources {
+                match source {
+                    IntTopKOutputSource::SortKey => {
+                        let value = int_value_for_data_type(sort_column_type, entry.key).ok_or_else(|| {
+                            Error::storage(format!(
+                                "Integer Top-N sort key out of range for column {} on {}",
+                                sort_column, table_name
+                            ))
+                        })?;
+                        projected_values.push(value);
+                    }
+                    IntTopKOutputSource::Decoded(pos) => {
+                        projected_values.push(output_values.get(*pos).cloned().unwrap_or(Value::Null));
+                    }
+                }
+            }
+            let mut tuple = Tuple::new(projected_values);
+            tuple.row_id = entry.row_id;
+            tuples.push(tuple);
+        }
+
+        Ok(Some(tuples))
     }
 
     /// Compact row-store Top-N for direct-column projections. It scans only the
