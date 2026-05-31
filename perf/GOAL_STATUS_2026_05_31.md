@@ -1875,14 +1875,14 @@ items remain intentionally pending after release:
 
 ## Final 3.34.0 Focused Snapshot
 
-After the 3.34.0 release metadata commit (`77f0456`) and the projected
-filtered-scan follow-up, the focused same-host in-memory comparison was re-run
-with `N=10000`, `M=2000`.
+After the 3.34.0 release metadata commit (`77f0456`), the projected
+filtered-scan follow-up, and the compact join-input follow-up, the focused
+same-host in-memory comparison was re-run with `N=10000`, `M=2000`.
 
 Default row-store analytics:
 
 ```text
-Nano rowstore               filter 229/s, aggregate 540/s, group_by 164/s, join 64/s, Top-N 478/s
+Nano rowstore               filter 226/s, aggregate 501/s, group_by 172/s, join 76/s, Top-N 469/s
 SQLite params reference     filter 374/s, aggregate 978/s, group_by 178/s, join 216/s, Top-N 461/s
 ```
 
@@ -1894,8 +1894,8 @@ Nano columnar_analytics     filter 245/s, aggregate 2059/s, group_by 138/s, join
 
 The columnar profile validates the vectorized aggregate path, where Nano is
 about 2.1x faster than SQLite on this focused aggregate workload. It is not yet
-a broad analytics solution: join, filter, and Top-N still need a compact or
-vectorized scan/filter/project/join pipeline rather than more tuple-local
+a broad analytics solution: join and filter still need a broader compact or
+vectorized scan/filter/project pipeline rather than more tuple-local
 micro-optimizations.
 
 Parameterized in-memory DML:
@@ -1960,6 +1960,53 @@ Interpretation: keep this as a modest boundary-collapse improvement. It does
 not change the larger conclusion: SQLite still leads filter and join, and the
 next meaningful analytics lever remains a broader compact/vectorized
 scan-filter-project-join pipeline.
+
+## Accepted Follow-Up: Compact Projected Join Inputs
+
+Finding:
+
+- The projected inner hash-join path emitted compact final rows, but each
+  direct scan input still exposed the full table schema to the hash join.
+- The TPS join shape had already pushed `u.age > 40` and `o.status = 'paid'`
+  into `FilteredScan`, but the join still built/probed rows shaped like
+  `[id, name, email, age, balance, status]` and `[id, user_id, amount, status]`.
+
+Change:
+
+- Extend `handle_projected_join()` for guarded inner equi-joins so direct
+  `Scan` / `FilteredScan` inputs are projected before physical operator
+  construction.
+- Each side keeps only qualified join-key, pushed-filter, and projected output
+  columns. For the TPS join, the users side becomes `[id, name, age]` and the
+  orders side becomes `[user_id, amount, status]`.
+- The path falls back for outer/lateral joins, residual join predicates,
+  unqualified or complex expressions, subqueries, unsupported input shapes, and
+  already-projected inputs.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test join_hardening_tests -- --nocapture --test-threads=1
+cargo test --test query_optimizer_tests -- --nocapture --test-threads=1
+cargo test --test scan_prefix_decode -- --nocapture --test-threads=1
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=filter_scan,agg_count_sum_avg,group_by_status,join_users_orders,order_by_limit10 HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+```
+
+Focused row-store TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+pre-change final focused run  join_users_orders 64/s
+after change focused run 1    join_users_orders 74/s
+after change focused run 2    join_users_orders 75/s
+mixed analytics run           filter 226/s, aggregate 501/s, group 172/s, join 76/s, Top-N 469/s
+```
+
+Interpretation: this is a real but bounded join improvement, roughly 17-19%
+over the prior final focused snapshot. SQLite still leads this in-memory join
+shape by about 2.8x on the latest reference, so the broader compact/vectorized
+pipeline remains the next analytics lever.
 
 ## Accepted Follow-Up: Batched Parameterized UPDATE/DELETE
 

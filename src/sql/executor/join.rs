@@ -598,6 +598,279 @@ fn option_eq_ignore_ascii_case(value: Option<&str>, expected: &str) -> bool {
     value.is_some_and(|value| value.eq_ignore_ascii_case(expected))
 }
 
+fn join_input_leaf_info(plan: &crate::sql::LogicalPlan) -> Option<(&str, Option<&String>, &Schema, bool)> {
+    match plan {
+        crate::sql::LogicalPlan::Scan {
+            table_name,
+            alias,
+            schema,
+            projection,
+            ..
+        }
+        | crate::sql::LogicalPlan::FilteredScan {
+            table_name,
+            alias,
+            schema,
+            projection,
+            ..
+        } => Some((
+            table_name.as_str(),
+            alias.as_ref(),
+            schema.as_ref(),
+            projection.is_some(),
+        )),
+        crate::sql::LogicalPlan::Filter { input, .. } => join_input_leaf_info(input),
+        _ => None,
+    }
+}
+
+fn qualifier_matches_join_input(table_name: &str, alias: Option<&String>, qualifier: &str) -> bool {
+    qualifier.eq_ignore_ascii_case(table_name) || alias.is_some_and(|alias| qualifier.eq_ignore_ascii_case(alias))
+}
+
+fn collect_join_input_expr_columns(
+    input: &crate::sql::LogicalPlan,
+    expr: &crate::sql::LogicalExpr,
+    required: &mut std::collections::BTreeSet<usize>,
+) -> Option<()> {
+    let (table_name, alias, schema, _) = join_input_leaf_info(input)?;
+    collect_join_input_expr_columns_inner(table_name, alias, schema, expr, required)
+}
+
+fn collect_join_input_expr_columns_inner(
+    table_name: &str,
+    alias: Option<&String>,
+    schema: &Schema,
+    expr: &crate::sql::LogicalExpr,
+    required: &mut std::collections::BTreeSet<usize>,
+) -> Option<()> {
+    use crate::sql::LogicalExpr;
+    match expr {
+        LogicalExpr::Column {
+            table: Some(table),
+            name,
+        } => {
+            if qualifier_matches_join_input(table_name, alias, table) {
+                let idx = schema
+                    .columns
+                    .iter()
+                    .position(|column| column.name.eq_ignore_ascii_case(name))?;
+                required.insert(idx);
+            }
+            Some(())
+        }
+        // Leave unqualified join/projection/filter expressions on the old path.
+        // The compact path must know which side owns every referenced column.
+        LogicalExpr::Column { table: None, .. } | LogicalExpr::Wildcard => None,
+        LogicalExpr::BinaryExpr { left, right, .. } => {
+            collect_join_input_expr_columns_inner(table_name, alias, schema, left, required)?;
+            collect_join_input_expr_columns_inner(table_name, alias, schema, right, required)
+        }
+        LogicalExpr::UnaryExpr { expr, .. } | LogicalExpr::Cast { expr, .. } | LogicalExpr::IsNull { expr, .. } => {
+            collect_join_input_expr_columns_inner(table_name, alias, schema, expr, required)
+        }
+        LogicalExpr::Between { expr, low, high, .. } => {
+            collect_join_input_expr_columns_inner(table_name, alias, schema, expr, required)?;
+            collect_join_input_expr_columns_inner(table_name, alias, schema, low, required)?;
+            collect_join_input_expr_columns_inner(table_name, alias, schema, high, required)
+        }
+        LogicalExpr::InList { expr, list, .. } => {
+            collect_join_input_expr_columns_inner(table_name, alias, schema, expr, required)?;
+            for item in list {
+                collect_join_input_expr_columns_inner(table_name, alias, schema, item, required)?;
+            }
+            Some(())
+        }
+        LogicalExpr::InSet { expr, .. } => {
+            collect_join_input_expr_columns_inner(table_name, alias, schema, expr, required)
+        }
+        LogicalExpr::ArraySubscript { array, index } => {
+            collect_join_input_expr_columns_inner(table_name, alias, schema, array, required)?;
+            collect_join_input_expr_columns_inner(table_name, alias, schema, index, required)
+        }
+        LogicalExpr::Case {
+            expr,
+            when_then,
+            else_result,
+        } => {
+            if let Some(expr) = expr {
+                collect_join_input_expr_columns_inner(table_name, alias, schema, expr, required)?;
+            }
+            for (when, then) in when_then {
+                collect_join_input_expr_columns_inner(table_name, alias, schema, when, required)?;
+                collect_join_input_expr_columns_inner(table_name, alias, schema, then, required)?;
+            }
+            if let Some(else_result) = else_result {
+                collect_join_input_expr_columns_inner(table_name, alias, schema, else_result, required)?;
+            }
+            Some(())
+        }
+        LogicalExpr::ScalarFunction { args, .. } | LogicalExpr::AggregateFunction { args, .. } => {
+            for arg in args {
+                collect_join_input_expr_columns_inner(table_name, alias, schema, arg, required)?;
+            }
+            Some(())
+        }
+        LogicalExpr::WindowFunction {
+            args,
+            partition_by,
+            order_by,
+            ..
+        } => {
+            for arg in args {
+                collect_join_input_expr_columns_inner(table_name, alias, schema, arg, required)?;
+            }
+            for expr in partition_by {
+                collect_join_input_expr_columns_inner(table_name, alias, schema, expr, required)?;
+            }
+            for (expr, _) in order_by {
+                collect_join_input_expr_columns_inner(table_name, alias, schema, expr, required)?;
+            }
+            Some(())
+        }
+        LogicalExpr::Tuple { items } => {
+            for item in items {
+                collect_join_input_expr_columns_inner(table_name, alias, schema, item, required)?;
+            }
+            Some(())
+        }
+        LogicalExpr::Literal(_) | LogicalExpr::Parameter { .. } | LogicalExpr::DefaultValue => Some(()),
+        LogicalExpr::ScalarSubquery { .. }
+        | LogicalExpr::InSubquery { .. }
+        | LogicalExpr::Exists { .. }
+        | LogicalExpr::NewRow { .. }
+        | LogicalExpr::OldRow { .. } => None,
+    }
+}
+
+fn collect_join_input_local_filter_columns(
+    input: &crate::sql::LogicalPlan,
+    required: &mut std::collections::BTreeSet<usize>,
+) -> Option<()> {
+    match input {
+        crate::sql::LogicalPlan::FilteredScan {
+            predicate: Some(predicate),
+            ..
+        }
+        | crate::sql::LogicalPlan::Filter { predicate, .. } => {
+            collect_join_input_expr_columns(input, predicate, required)?;
+            if let crate::sql::LogicalPlan::Filter { input, .. } = input {
+                collect_join_input_local_filter_columns(input, required)?;
+            }
+            Some(())
+        }
+        crate::sql::LogicalPlan::FilteredScan { predicate: None, .. } | crate::sql::LogicalPlan::Scan { .. } => {
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+fn apply_join_input_projection(
+    input: &crate::sql::LogicalPlan,
+    required: &std::collections::BTreeSet<usize>,
+) -> Option<(crate::sql::LogicalPlan, bool)> {
+    if required.is_empty() {
+        return None;
+    }
+    let (_, _, schema, already_projected) = join_input_leaf_info(input)?;
+    if already_projected {
+        return None;
+    }
+    let indices: Vec<usize> = required.iter().copied().collect();
+    if indices.iter().any(|&idx| idx >= schema.columns.len()) {
+        return None;
+    }
+    if indices.len() >= schema.columns.len() {
+        return Some((input.clone(), false));
+    }
+
+    match input {
+        crate::sql::LogicalPlan::Scan {
+            table_name,
+            alias,
+            schema,
+            as_of,
+            ..
+        } => Some((
+            crate::sql::LogicalPlan::Scan {
+                table_name: table_name.clone(),
+                alias: alias.clone(),
+                schema: schema.clone(),
+                projection: Some(indices),
+                as_of: as_of.clone(),
+            },
+            true,
+        )),
+        crate::sql::LogicalPlan::FilteredScan {
+            table_name,
+            alias,
+            schema,
+            predicate,
+            as_of,
+            ..
+        } => Some((
+            crate::sql::LogicalPlan::FilteredScan {
+                table_name: table_name.clone(),
+                alias: alias.clone(),
+                schema: schema.clone(),
+                projection: Some(indices),
+                predicate: predicate.clone(),
+                as_of: as_of.clone(),
+            },
+            true,
+        )),
+        crate::sql::LogicalPlan::Filter { input, predicate } => {
+            let (projected_input, changed) = apply_join_input_projection(input, required)?;
+            Some((
+                crate::sql::LogicalPlan::Filter {
+                    input: Box::new(projected_input),
+                    predicate: predicate.clone(),
+                },
+                changed,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn compact_projected_join_inputs(
+    left: &crate::sql::LogicalPlan,
+    right: &crate::sql::LogicalPlan,
+    join_condition: &crate::sql::LogicalExpr,
+    post_join_predicate: Option<&crate::sql::LogicalExpr>,
+    project_exprs: &[crate::sql::LogicalExpr],
+) -> Option<(crate::sql::LogicalPlan, crate::sql::LogicalPlan)> {
+    let mut left_required = std::collections::BTreeSet::new();
+    let mut right_required = std::collections::BTreeSet::new();
+
+    collect_join_input_expr_columns(left, join_condition, &mut left_required)?;
+    collect_join_input_expr_columns(right, join_condition, &mut right_required)?;
+    if let Some(predicate) = post_join_predicate {
+        collect_join_input_expr_columns(left, predicate, &mut left_required)?;
+        collect_join_input_expr_columns(right, predicate, &mut right_required)?;
+    }
+    for expr in project_exprs {
+        collect_join_input_expr_columns(left, expr, &mut left_required)?;
+        collect_join_input_expr_columns(right, expr, &mut right_required)?;
+    }
+    collect_join_input_local_filter_columns(left, &mut left_required)?;
+    collect_join_input_local_filter_columns(right, &mut right_required)?;
+
+    let (projected_left, left_changed) = apply_join_input_projection(left, &left_required)?;
+    let (projected_right, right_changed) = apply_join_input_projection(right, &right_required)?;
+    if left_changed || right_changed {
+        tracing::debug!(
+            left_cols = ?left_required,
+            right_cols = ?right_required,
+            "projected inner join inputs to compact scan columns"
+        );
+        Some((projected_left, projected_right))
+    } else {
+        None
+    }
+}
+
 /// State machine for join execution
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum JoinState {
@@ -1377,13 +1650,23 @@ pub(super) fn handle_projected_join(
     exprs: &[crate::sql::LogicalExpr],
     aliases: &[String],
 ) -> Result<Option<Box<dyn PhysicalOperator>>> {
+    let (join_input, post_join_predicate) = match input {
+        crate::sql::LogicalPlan::Join { .. } => (input, None),
+        crate::sql::LogicalPlan::Filter { input, predicate }
+            if matches!(input.as_ref(), crate::sql::LogicalPlan::Join { .. }) =>
+        {
+            (input.as_ref(), Some(predicate))
+        }
+        _ => return Ok(None),
+    };
+
     let crate::sql::LogicalPlan::Join {
         left,
         right,
         join_type,
         on,
         lateral,
-    } = input
+    } = join_input
     else {
         return Ok(None);
     };
@@ -1399,7 +1682,36 @@ pub(super) fn handle_projected_join(
         return Ok(None);
     }
 
-    let combined_schema = input.schema();
+    for expr in exprs {
+        if !matches!(expr, crate::sql::LogicalExpr::Column { .. }) {
+            return Ok(None);
+        }
+    }
+
+    let left_rows = estimate_hash_join_rows(executor, left);
+    let right_rows = estimate_hash_join_rows(executor, right);
+    let build_left_for_inner = std::env::var("HELIOS_HASHJOIN_BUILD_RIGHT").is_err()
+        && matches!((left_rows, right_rows), (Some(l), Some(r)) if l < r);
+
+    let compact_plans = equi_part
+        .as_ref()
+        .and_then(|condition| compact_projected_join_inputs(left, right, condition, post_join_predicate, exprs));
+    if post_join_predicate.is_some() && compact_plans.is_none() {
+        return Ok(None);
+    }
+    let (left_plan, right_plan) =
+        compact_plans.unwrap_or_else(|| ((*left).as_ref().clone(), (*right).as_ref().clone()));
+
+    let left_op = executor.plan_to_operator(&left_plan)?;
+    let right_op = executor.plan_to_operator(&right_plan)?;
+    let left_schema = left_op.schema();
+    let right_schema = right_op.schema();
+    let mut combined_columns = left_schema.columns.clone();
+    combined_columns.extend(right_schema.columns.clone());
+    let combined_schema = Arc::new(Schema {
+        columns: combined_columns,
+    });
+
     let mut projection = Vec::with_capacity(exprs.len());
     for expr in exprs {
         let crate::sql::LogicalExpr::Column { table, name } = expr else {
@@ -1420,19 +1732,46 @@ pub(super) fn handle_projected_join(
             .collect(),
     });
 
-    let left_rows = estimate_hash_join_rows(executor, left);
-    let right_rows = estimate_hash_join_rows(executor, right);
-    let build_left_for_inner = std::env::var("HELIOS_HASHJOIN_BUILD_RIGHT").is_err()
-        && matches!((left_rows, right_rows), (Some(l), Some(r)) if l < r);
-
-    let left_op = executor.plan_to_operator(left)?;
-    let right_op = executor.plan_to_operator(right)?;
     let timeout_ctx = executor.timeout_ctx();
     let build_side = if build_left_for_inner {
         HashJoinBuildSide::Left
     } else {
         HashJoinBuildSide::Right
     };
+
+    if let Some(predicate) = post_join_predicate {
+        let mut join_op: Box<dyn PhysicalOperator> = if build_left_for_inner {
+            Box::new(HashJoinOperator::new_build_left(
+                left_op,
+                right_op,
+                crate::sql::JoinType::Inner,
+                equi_part,
+                timeout_ctx.clone(),
+            )?)
+        } else {
+            Box::new(HashJoinOperator::new(
+                left_op,
+                right_op,
+                crate::sql::JoinType::Inner,
+                equi_part,
+                timeout_ctx.clone(),
+            )?)
+        };
+        let materialized_predicate = executor.materialize_subqueries(predicate)?;
+        join_op = Box::new(
+            super::filter::FilterOperator::new(join_op, materialized_predicate, executor.parameters().to_vec())
+                .with_timeout(timeout_ctx.clone()),
+        );
+        let project_op = super::project::ProjectOperator::new(
+            join_op,
+            exprs.to_vec(),
+            aliases.to_vec(),
+            false,
+            executor.parameters().to_vec(),
+        )
+        .with_timeout(timeout_ctx);
+        return Ok(Some(Box::new(project_op)));
+    }
 
     let op = HashJoinOperator::new_projected_inner(
         left_op,
