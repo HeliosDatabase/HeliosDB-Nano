@@ -5141,7 +5141,6 @@ impl EmbeddedDatabase {
     }
 
     fn materialize_fast_literal_insert_tuple(spec: &FastLiteralInsertSpec, values_str: &str) -> Option<Result<Tuple>> {
-        let values = Self::fast_parse_values(values_str, &spec.target_types)?;
         let mut tuple_values = vec![Value::Null; spec.schema.columns.len()];
         let mut user_provided = if spec.all_columns_explicit_no_default {
             Vec::new()
@@ -5149,25 +5148,38 @@ impl EmbeddedDatabase {
             vec![false; spec.schema.columns.len()]
         };
 
-        for (i, &col_idx) in spec.col_indices.iter().enumerate() {
-            if let Some(value) = values.get(i) {
-                let mut value = value.clone();
-                if let Some(target_type) = spec.target_types.get(i) {
-                    if Self::insert_value_needs_cast(&value, target_type) {
-                        value = match Self::fast_cast_value(value, target_type) {
-                            Ok(value) => value,
-                            Err(e) => return Some(Err(e)),
-                        };
-                    }
+        let mut remaining = values_str;
+        for (i, (&col_idx, target_type)) in spec.col_indices.iter().zip(&spec.target_types).enumerate() {
+            remaining = remaining.trim_start();
+            if remaining.is_empty() {
+                return None;
+            }
+
+            let (mut value, rest) = Self::fast_parse_one_value(remaining, target_type)?;
+            if Self::insert_value_needs_cast(&value, target_type) {
+                value = match Self::fast_cast_value(value, target_type) {
+                    Ok(value) => value,
+                    Err(e) => return Some(Err(e)),
+                };
+            }
+            if let Some(slot) = tuple_values.get_mut(col_idx) {
+                *slot = value;
+            }
+            if !spec.all_columns_explicit_no_default {
+                if let Some(flag) = user_provided.get_mut(col_idx) {
+                    *flag = true;
                 }
-                if let Some(slot) = tuple_values.get_mut(col_idx) {
-                    *slot = value;
-                }
-                if !spec.all_columns_explicit_no_default {
-                    if let Some(flag) = user_provided.get_mut(col_idx) {
-                        *flag = true;
-                    }
-                }
+            }
+
+            if i + 1 == spec.target_types.len() {
+                break;
+            }
+
+            let rest = rest.trim_start();
+            if let Some(next) = rest.strip_prefix(',') {
+                remaining = next;
+            } else {
+                return None;
             }
         }
 
@@ -7848,40 +7860,6 @@ impl EmbeddedDatabase {
             None
         } else {
             Some(groups)
-        }
-    }
-
-    /// Parse comma-separated literal values with type hints.
-    /// Returns None for any non-literal value (expressions, function calls, etc.)
-    #[allow(clippy::indexing_slicing)] // Safety: type_idx bounded by while condition
-    fn fast_parse_values(s: &str, target_types: &[DataType]) -> Option<Vec<Value>> {
-        let mut values = Vec::with_capacity(target_types.len());
-        let mut remaining = s;
-        let mut type_idx = 0;
-
-        while !remaining.is_empty() && type_idx < target_types.len() {
-            remaining = remaining.trim_start();
-            if remaining.is_empty() {
-                break;
-            }
-
-            let (value, rest) = Self::fast_parse_one_value(remaining, &target_types[type_idx])?;
-            values.push(value);
-            type_idx += 1;
-
-            // Skip comma separator
-            let rest = rest.trim_start();
-            if rest.starts_with(',') {
-                remaining = rest.get(1..)?;
-            } else {
-                remaining = rest;
-            }
-        }
-
-        if values.len() == target_types.len() {
-            Some(values)
-        } else {
-            None
         }
     }
 
