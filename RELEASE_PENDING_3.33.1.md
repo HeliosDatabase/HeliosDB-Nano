@@ -215,6 +215,16 @@ post-RC parameterized-DML focused gate on branch codex-sqlite-inmem-gap
   HELIOS_TPS_PARAMS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=param_update,param_delete HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_param_tps_suite -- --nocapture --test-threads=1
     accepted committed hot-cache result: param_update_by_pk about 171,860/s,
     param_delete_by_pk about 227,122/s
+
+final release-close packaging gate on committed docs
+  cargo search heliosdb-nano --limit 3
+    latest crates.io version observed: 3.33.0
+  cargo metadata --no-deps --format-version 1
+    local heliosdb-nano package version: 3.33.1
+  cargo package
+    passed; packaged 706 files, 12.7 MiB uncompressed, 2.5 MiB compressed
+  cargo publish --dry-run
+    passed; dry-run aborted before upload as expected
 ```
 
 ## Recommended Publish Commands
