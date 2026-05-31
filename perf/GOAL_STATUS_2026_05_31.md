@@ -712,3 +712,53 @@ Interpretation: this is a small but cleaner hash-join build allocation win. It
 does not close the SQLite join gap by itself; the remaining gap still points to
 a compact/vectorized scan-filter-join pipeline that avoids full `Tuple` cloning
 through scan, join, and project.
+
+## Accepted Follow-Up: Direct Integer Join-Key Hashing
+
+Commit after this report: `perf: hash integer join keys directly`.
+
+Finding:
+
+- After the single-bucket change, the remaining direct integer join-key path
+  still hashed `JoinKey::Int` by constructing a temporary `Value::Int8` wrapper
+  through `for_each_value()`.
+- Equality between `JoinKey::Int` and `JoinKey::Single` also routed through a
+  temporary `Value::Int8` for cross-type comparisons.
+- The TPS join workload is the common integer equi-join shape
+  (`users.id = orders.user_id`).
+
+Change:
+
+- `JoinKey::Int` now hashes directly to the same normalized integer hash layout
+  as `Value` (`2u8` type marker + `i64` value), preserving cross-width
+  `Int2`/`Int4`/`Int8` semantics and text-int join compatibility.
+- Equality between integer keys and single/composite values now uses a borrowed
+  helper instead of constructing temporary `Value` objects.
+- Join-key memory estimation now matches on `JoinKey` directly.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test join_hardening_tests -- --nocapture --test-threads=1
+cargo test --test integration_test -- join --nocapture --test-threads=1
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+post-bucket baseline              join_users_orders 61-62/s
+direct integer key run 1           join_users_orders 64/s
+direct integer key run 2           join_users_orders 66/s
+```
+
+The second run also produced the current best aggregate-adjacent sample:
+
+```text
+filter 212/s, aggregate 485/s, group_by 190/s, Top-N 319/s
+```
+
+Interpretation: another small but clean hash-join executor win. Nano's measured
+join rate is now roughly one-third of the same-host SQLite mirror's 201/s
+memory number, so completion still requires a larger compact/vectorized
+scan-filter-join path rather than only hash-key micro-optimizations.
