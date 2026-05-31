@@ -2633,3 +2633,38 @@ not in simple storage-mode decoration, time-travel metadata, or result-vector
 allocation. The next credible implementation remains a deeper compact/vectorized
 scan-filter-project-join path or a purpose-built PK lookup join with measured
 evidence.
+
+## Rejected Follow-Up: Projected PK Lookup Join
+
+Experiment:
+
+- Added a guarded projected inner-join path for non-transactional equi-joins
+  where one join side joined on its primary key.
+- The path scanned the filtered driver side, looked up the other side through
+  the existing PK ART point lookup, evaluated the lookup side's local predicate,
+  then emitted projected rows directly.
+- The target was the TPS join shape:
+  `orders.user_id -> users.id` with `orders.status = 'paid'` and
+  `users.age > 40`.
+
+Validation while present:
+
+```text
+cargo check --lib
+cargo test --test join_hardening_tests -- --nocapture --test-threads=1
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+HELIOS_DISABLE_PK_LOOKUP_JOIN=1 HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_WORKLOADS=join_users_orders HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+projected PK lookup join prototype       join_users_orders 67/s
+hash-join fallback in same build          join_users_orders 91/s
+```
+
+Decision: reverted. The existing two-filtered-scan compact hash join is faster
+than thousands of PK point lookups for this workload. The next join lever should
+not be row-at-a-time index nested-loop unless a cost model proves extreme
+selectivity; it should instead reduce the scan/hash boundary or use a vectorized
+batch lookup strategy.
