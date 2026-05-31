@@ -211,3 +211,33 @@ Rejected during this pass:
 - Projected filtered scan and predicate-first projected scan: correctness-clean, but `filter_scan(age>50)` stayed at 165-169/s versus the 171/s recorded baseline.
 - In-memory RocksDB block-cache option: first pass looked positive, second pass regressed, so it was reverted.
 - Primitive aggregate visitor and two-column decoder variants: correctness-clean, but `agg_count_sum_avg` regressed to 390-408/s versus the committed 436-443/s range.
+
+## Accepted Follow-Up: Skip Dead Result-Cache Writes
+
+Commit after this report: `perf: skip result cache writes for nondeterministic queries`.
+
+Finding:
+
+- `query()` correctly skipped result-cache reads for SQL containing nondeterministic markers such as `NOW(`, but still cloned and wrote those results into the result cache after execution.
+- The TPS harness uses a `NOW(...)` comment to disable result-cache hits while preserving plan-cache reuse, so scan/join benchmark queries were paying useless result clone + mutex work every iteration.
+- Real nondeterministic queries also benefit because they now neither read from nor write to a cache entry that must never be reused.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test test_non_deterministic_query_does_not_populate_result_cache --lib -- --nocapture
+cargo test result_cache --lib -- --nocapture
+HELIOS_TPS=1 HELIOS_TPS_MODE=mem HELIOS_TPS_N=10000 HELIOS_TPS_M=2000 \
+  cargo test --profile perf --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+immediate baseline before change     filter_scan 177/s, join_users_orders 54/s
+after change run 1                   filter_scan 190/s, join_users_orders 56/s
+after change run 2                   filter_scan 183/s, join_users_orders 55/s
+```
+
+This is a modest but clean read-path win. It does not change the larger conclusion: the remaining SQLite gap still needs compact/vectorized scan/filter/join execution rather than more tuple-boundary micro-tweaks.

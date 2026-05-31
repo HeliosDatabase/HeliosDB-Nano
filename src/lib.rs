@@ -10444,11 +10444,15 @@ impl EmbeddedDatabase {
                     "Query executed"
                 );
                 self.log_slow_query(sql, start.elapsed(), results.len() as u64);
-                // Cache the results for future identical queries
-                if let Ok(mut cache) = self.result_cache.lock() {
-                    cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
-                    self.result_cache_nonempty
-                        .store(true, std::sync::atomic::Ordering::Release);
+                // Cache only deterministic query results. Non-deterministic
+                // queries already bypass lookup above and should not pay to
+                // clone rows into a cache they can never read from.
+                if !is_non_deterministic {
+                    if let Ok(mut cache) = self.result_cache.lock() {
+                        cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
+                        self.result_cache_nonempty
+                            .store(true, std::sync::atomic::Ordering::Release);
+                    }
                 }
                 return Ok(results);
             }
@@ -10533,11 +10537,15 @@ impl EmbeddedDatabase {
 
         self.log_slow_query(sql, start.elapsed(), results.len() as u64);
 
-        // Cache the results for future identical queries
-        if let Ok(mut cache) = self.result_cache.lock() {
-            cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
-            self.result_cache_nonempty
-                .store(true, std::sync::atomic::Ordering::Release);
+        // Cache only deterministic query results. Non-deterministic queries
+        // already bypass lookup above, so caching them only adds clone/lock
+        // overhead and risks serving stale rows if the lookup gate changes.
+        if !is_non_deterministic {
+            if let Ok(mut cache) = self.result_cache.lock() {
+                cache.put(sql.to_string(), std::sync::Arc::new(results.clone()));
+                self.result_cache_nonempty
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
         }
 
         Ok(results)
@@ -13948,6 +13956,25 @@ mod tests {
         let rows = db.query(sql, &[]).unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].get(1), Some(&Value::String("after".to_string())));
+    }
+
+    #[test]
+    fn test_non_deterministic_query_does_not_populate_result_cache() {
+        let db = EmbeddedDatabase::new_in_memory().unwrap();
+        db.execute("CREATE TABLE no_cache_marker (id INT PRIMARY KEY, val TEXT)")
+            .unwrap();
+        db.execute("INSERT INTO no_cache_marker VALUES (1, 'value')")
+            .unwrap();
+
+        let sql = "SELECT id, val FROM no_cache_marker /* NOW(no_result_cache_marker) */";
+        let rows = db.query(sql, &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        let rows = db.query(sql, &[]).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            !db.result_cache.lock().unwrap().contains(sql),
+            "non-deterministic queries bypass and must not populate the result cache"
+        );
     }
 
     #[test]
