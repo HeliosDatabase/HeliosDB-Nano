@@ -107,3 +107,44 @@ This means the in-memory write gap is heavily tied to default time-travel/MVCC v
 4. Add PostgreSQL/MySQL same-host gates.
    - `benches/external/pg_vs_helios.py` exists but requires a running PG-compatible backend and `psycopg`.
    - No MySQL mirror is currently present; either add one or run through the MySQL wire protocol with an equivalent script.
+
+## Follow-Up Experiments
+
+These were tested after the comparison snapshot and intentionally not kept:
+
+1. Direct projected inner hash join.
+   - Correctness: `join_hardening_tests` passed 45/45.
+   - TPS: `join_users_orders` stayed flat at 52/s vs the recorded 53/s baseline.
+   - Conclusion: avoiding only the final generic projection is not enough; the cost is deeper in build/probe `Value` cloning, full joined tuple materialization, or input-side scan/filter work.
+
+2. In-memory RocksDB explicit block cache + point-lookup options.
+   - Correctness: `cargo check --lib`.
+   - TPS: cold PK lookup fell to 267k/s from the immediate 275k/s run; Top-N fell to 186/s from 214/s.
+   - Conclusion: not a default win for the current tmpfs-backed in-memory profile. Revisit only as split A/B knobs, not as a bundle.
+
+3. Compact decode inside row-store filtered scan with re-expansion for survivors.
+   - Correctness: `cargo check --lib`.
+   - TPS: `filter_scan(age>50)` fell to 161/s from 174/s; `join_users_orders` fell to 50/s from 52/s.
+   - Conclusion: local compact decode followed by full-width tuple reconstruction is worse. The useful shape is a true compact/vector pipeline across scan/filter/project/join.
+
+Columnar scan diagnostic:
+
+```text
+HELIOS_COLUMNAR_SCAN=1 HELIOS_COLUMNAR_SCAN_N=50000 \
+  cargo test --profile perf --test tps_workloads run_columnar_scan_bench -- --nocapture --test-threads=1
+
+filter_scan              row=44460.9 us/query  columnar=41331.2 us/query  speedup=1.08x
+filter_eq_e              row=23025.5 us/query  columnar=22480.7 us/query  speedup=1.02x
+agg_sum_avg              row=18825.1 us/query  columnar=10146.8 us/query  speedup=1.86x
+agg_no_filter            row=18728.0 us/query  columnar= 4031.0 us/query  speedup=4.65x
+count_star_filter        row=16578.2 us/query  columnar= 2757.0 us/query  speedup=6.01x
+count_distinct_a         row=19396.2 us/query  columnar= 6504.5 us/query  speedup=2.98x
+group_by_e               row=20497.9 us/query  columnar=11391.0 us/query  speedup=1.80x
+```
+
+This matches public OSS design signals:
+
+- DuckDB documents a vectorized execution format built around fixed-size `DataChunk`/`Vector` batches rather than row-at-a-time `Tuple` movement: <https://duckdb.org/docs/lts/internals/vector.html>
+- SQLite's architecture keeps the hot embedded path close to bytecode VM, B-tree, and pager operations: <https://www.sqlite.org/arch.html>
+- PostgreSQL's executor centers row flow through plan nodes and tuple slots, which is flexible but not the analytical target to copy for Nano's SQLite/DuckDB-class embedded scans: <https://www.postgresql.org/docs/17/executor.html>
+- MySQL/InnoDB's change buffer is relevant to durable secondary-index write bursts, but less relevant to Nano's current in-memory analytical gap: <https://dev.mysql.com/doc/refman/8.1/en/innodb-change-buffer.html>
