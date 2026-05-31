@@ -2549,3 +2549,48 @@ Decision: kept as gated profile infrastructure. It removes a real fallback for
 hybrid analytical schemas and modestly improves the columnar join path, but it
 does not make the gated columnar profile broadly faster than the default
 row-store profile or SQLite on joins.
+
+## Accepted Follow-Up: Text-Driver Columnar Projected Filter
+
+Finding:
+
+- The pure columnar projected-filter path still scanned every row-store data key
+  just to recover row ids, even when a null-rejecting columnar predicate could
+  drive directly from the columnar batch.
+- A first version applied the batch driver to every null-rejecting predicate.
+  That improved the columnar join but slowed the integer filter workload, so
+  the kept version is deliberately narrower.
+
+Change:
+
+- For pure columnar projected scans, use a batch-driven path only when the
+  driver predicate is a text/varchar/char column. This targets the
+  `orders.status = 'paid'` side of the gated join workload.
+- Integer predicates such as `users.age > 50` stay on the previous row-key
+  projected columnar path because it remains faster on the measured filter
+  workload.
+- Added a deleted-row regression test for the text-driver path so tombstoned
+  columnar side-data does not leak through projected scans.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test scan_prefix_decode columnar_projected_filter_skips_deleted_rows -- --nocapture --test-threads=1
+```
+
+Focused TPS, embedded mem, `N=10000`, `M=2000`, ops/s:
+
+```text
+baseline rowstore sanity this turn       filter 230/s, join 93/s
+ungated batch-driver prototype           columnar filter 230/s, columnar join 82/s
+kept text-driver batch path              columnar filter 236/s, columnar join 96/s
+rowstore sanity after kept patch          filter 225/s, join 83/s
+```
+
+Decision: kept. This materially improves the gated columnar join path without
+forcing the integer filter workload through the slower batch-driver prototype.
+It still does not close the broader SQLite embedded analytics gap: row-store
+filter/aggregate/join and columnar join remain below the SQLite reference, so
+the next real lever is still a compact/vectorized scan-filter-project-join
+pipeline rather than tuple-local tuning.
