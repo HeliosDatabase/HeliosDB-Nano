@@ -2,7 +2,7 @@
 
 Date: 2026-05-31
 Branch: `codex-next-write-tps`
-Nano commit: `3b01fd2 perf: reuse data key buffer for main branch lookups`
+Nano commit: `e42cd5c perf: skip query trace allocation when disabled`
 
 Objective: HeliosDB-Nano should have a few times better overall performance than PostgreSQL, MySQL, and SQLite.
 
@@ -382,3 +382,36 @@ after change run 2               point_lookup_pk 278,628/s, hot 1,399,497/s, fil
 ```
 
 The improvement is modest but consistent enough to keep. It does not change the goal status: SQLite still leads several in-memory analytical workloads, especially aggregate and join.
+
+## Accepted Follow-Up: Avoid Disabled Trace Allocation
+
+Commit after this report: `perf: skip query trace allocation when disabled`.
+
+Finding:
+
+- `EmbeddedDatabase::log_slow_query()` always constructed `QueryTrace::new(sql, elapsed, rows)` before calling `QueryProfiler::record()`.
+- `record()` returns immediately when tracing is disabled, which is the default, but the caller had already trimmed and cloned the SQL string into the trace object.
+- This put a disabled observability feature on every `query()` / `execute()` hot path.
+
+Change:
+
+- `log_slow_query()` now checks `query_profiler.enabled()` before constructing a `QueryTrace`.
+- Slow-query WARN logging remains unchanged.
+
+Validation:
+
+```text
+cargo check --lib
+cargo test --test query_trace_tools -- --nocapture --test-threads=1
+cargo test test_non_deterministic_query_does_not_populate_result_cache --lib -- --nocapture
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+pre-change recent range       point_lookup_pk 276-279k/s, hot 1.39-1.40M/s, filter 189-201/s, aggregate 402-425/s, join 57-58/s, Top-N 280-285/s
+after change run 1            point_lookup_pk 244k/s, hot 1.32M/s, filter 203/s, aggregate 361/s, join 59/s, Top-N 285/s
+after change run 2            point_lookup_pk 275k/s, hot 1.44M/s, filter 193/s, aggregate 410/s, join 57/s, Top-N 286/s
+```
+
+The TPS signal is mostly noise at this scale, but the allocation removal is structurally correct and improves the default observability-off path.
