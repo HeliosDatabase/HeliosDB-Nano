@@ -523,10 +523,31 @@ impl Transaction {
         }
 
         let reverse_ts = u64::MAX - commit_ts;
+        let commit_ts_text = if self.versioning_enabled {
+            let mut buf = itoa::Buffer::new();
+            buf.format(commit_ts).to_owned()
+        } else {
+            String::new()
+        };
+        let reverse_ts_text = if self.versioning_enabled {
+            let mut buf = itoa::Buffer::new();
+            let digits = buf.format(reverse_ts);
+            let mut padded = String::with_capacity(20);
+            for _ in digits.len()..20 {
+                padded.push('0');
+            }
+            padded.push_str(digits);
+            padded
+        } else {
+            String::new()
+        };
+        let commit_ts_bytes = commit_ts.to_be_bytes();
 
         // Apply write set atomically using RocksDB batch
         let mut batch = rocksdb::WriteBatch::default();
         let write_set_has_entries = !self.write_set.is_empty();
+        let mut version_key_buf = Vec::with_capacity(128);
+        let mut version_index_key_buf = Vec::with_capacity(128);
 
         {
             let insert_log = self.insert_log.read();
@@ -534,7 +555,17 @@ impl Transaction {
                 if write_set_has_entries && self.write_set.contains_key(key) {
                     continue;
                 }
-                Self::put_versioned_batch(&mut batch, key, val, commit_ts, reverse_ts, self.versioning_enabled);
+                Self::put_versioned_batch(
+                    &mut batch,
+                    key,
+                    val,
+                    self.versioning_enabled,
+                    commit_ts_text.as_bytes(),
+                    reverse_ts_text.as_bytes(),
+                    &commit_ts_bytes,
+                    &mut version_key_buf,
+                    &mut version_index_key_buf,
+                );
             }
         }
 
@@ -543,7 +574,17 @@ impl Transaction {
             let (key, value) = (entry.key(), entry.value());
             match value {
                 Some(val) => {
-                    Self::put_versioned_batch(&mut batch, key, val, commit_ts, reverse_ts, self.versioning_enabled);
+                    Self::put_versioned_batch(
+                        &mut batch,
+                        key,
+                        val,
+                        self.versioning_enabled,
+                        commit_ts_text.as_bytes(),
+                        reverse_ts_text.as_bytes(),
+                        &commit_ts_bytes,
+                        &mut version_key_buf,
+                        &mut version_index_key_buf,
+                    );
                 }
                 None => batch.delete(key),
             }
@@ -599,9 +640,12 @@ impl Transaction {
         batch: &mut rocksdb::WriteBatch,
         key: &[u8],
         val: &[u8],
-        commit_ts: u64,
-        reverse_ts: u64,
         versioning_enabled: bool,
+        commit_ts_text: &[u8],
+        reverse_ts_text: &[u8],
+        commit_ts_bytes: &[u8; 8],
+        version_key_buf: &mut Vec<u8>,
+        version_index_key_buf: &mut Vec<u8>,
     ) {
         batch.put(key, val);
 
@@ -611,25 +655,58 @@ impl Transaction {
         // row value. Read-committed reads use the `data:` key directly, so they
         // are unaffected.
         if versioning_enabled {
-            if let Ok(key_str) = std::str::from_utf8(key) {
-                if key_str.starts_with("data:") {
-                    let rest = &key_str[5..];
-                    if let Some(colon_pos) = rest.find(':') {
-                        let table_name = &rest[..colon_pos];
-                        let row_id_str = &rest[colon_pos + 1..];
-
-                        if let Ok(row_id) = row_id_str.parse::<u64>() {
-                            let v_key = format!("v:{}:{}:{}", table_name, row_id, commit_ts);
-                            batch.put(v_key.as_bytes(), val);
-
-                            let v_idx_key = format!("v_idx:{}:{}:{:020}", table_name, row_id_str, reverse_ts);
-                            let ts_bytes = commit_ts.to_be_bytes();
-                            batch.put(v_idx_key.as_bytes(), ts_bytes);
-                        }
-                    }
-                }
-            }
+            Self::put_version_index_batch(
+                batch,
+                key,
+                val,
+                commit_ts_text,
+                reverse_ts_text,
+                commit_ts_bytes,
+                version_key_buf,
+                version_index_key_buf,
+            );
         }
+    }
+
+    fn put_version_index_batch(
+        batch: &mut rocksdb::WriteBatch,
+        key: &[u8],
+        val: &[u8],
+        commit_ts_text: &[u8],
+        reverse_ts_text: &[u8],
+        commit_ts_bytes: &[u8; 8],
+        version_key_buf: &mut Vec<u8>,
+        version_index_key_buf: &mut Vec<u8>,
+    ) {
+        let Some(rest) = key.strip_prefix(b"data:") else {
+            return;
+        };
+        let Some(colon_pos) = rest.iter().position(|b| *b == b':') else {
+            return;
+        };
+        let table_name = &rest[..colon_pos];
+        let row_id = &rest[colon_pos + 1..];
+        if table_name.is_empty() || row_id.is_empty() || !row_id.iter().all(u8::is_ascii_digit) {
+            return;
+        }
+
+        version_key_buf.clear();
+        version_key_buf.extend_from_slice(b"v:");
+        version_key_buf.extend_from_slice(table_name);
+        version_key_buf.push(b':');
+        version_key_buf.extend_from_slice(row_id);
+        version_key_buf.push(b':');
+        version_key_buf.extend_from_slice(commit_ts_text);
+        batch.put(&version_key_buf, val);
+
+        version_index_key_buf.clear();
+        version_index_key_buf.extend_from_slice(b"v_idx:");
+        version_index_key_buf.extend_from_slice(table_name);
+        version_index_key_buf.push(b':');
+        version_index_key_buf.extend_from_slice(row_id);
+        version_index_key_buf.push(b':');
+        version_index_key_buf.extend_from_slice(reverse_ts_text);
+        batch.put(&version_index_key_buf, commit_ts_bytes);
     }
 
     /// Commit the transaction
