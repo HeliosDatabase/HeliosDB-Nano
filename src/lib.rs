@@ -412,6 +412,9 @@ pub struct EmbeddedDatabase {
     /// Repeated parameterized UPDATE metadata cache. Invalidated with the plan cache on DDL.
     fast_param_update_cache:
         std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamUpdateSpec>>>>,
+    /// Last repeated parameterized UPDATE fast spec. Avoids the LRU mutex for hot prepared-style loops.
+    hot_fast_param_update_spec:
+        std::sync::Arc<parking_lot::RwLock<Option<(String, std::sync::Arc<FastParamUpdateSpec>)>>>,
     /// Repeated literal UPDATE shape cache. Literal values differ per statement,
     /// but table/column metadata is stable until DDL.
     fast_literal_update_cache:
@@ -419,6 +422,9 @@ pub struct EmbeddedDatabase {
     /// Repeated parameterized DELETE metadata cache. Invalidated with the plan cache on DDL.
     fast_param_delete_cache:
         std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastParamDeleteSpec>>>>,
+    /// Last repeated parameterized DELETE fast spec. Key includes FK validation mode/source.
+    hot_fast_param_delete_spec:
+        std::sync::Arc<parking_lot::RwLock<Option<(String, std::sync::Arc<FastParamDeleteSpec>)>>>,
     /// Repeated literal DELETE shape cache. Literal PK values differ per statement.
     fast_literal_delete_cache:
         std::sync::Arc<std::sync::Mutex<lru::LruCache<String, std::sync::Arc<FastLiteralDeleteSpec>>>>,
@@ -3890,8 +3896,10 @@ impl EmbeddedDatabase {
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             fast_literal_insert_cache: Self::new_fast_literal_insert_cache(),
             fast_param_update_cache: Self::new_fast_param_update_cache(),
+            hot_fast_param_update_spec: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             fast_literal_update_cache: Self::new_fast_literal_update_cache(),
             fast_param_delete_cache: Self::new_fast_param_delete_cache(),
+            hot_fast_param_delete_spec: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             fast_literal_delete_cache: Self::new_fast_literal_delete_cache(),
             fast_select_cache: Self::new_fast_select_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
@@ -3964,8 +3972,10 @@ impl EmbeddedDatabase {
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             fast_literal_insert_cache: Self::new_fast_literal_insert_cache(),
             fast_param_update_cache: Self::new_fast_param_update_cache(),
+            hot_fast_param_update_spec: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             fast_literal_update_cache: Self::new_fast_literal_update_cache(),
             fast_param_delete_cache: Self::new_fast_param_delete_cache(),
+            hot_fast_param_delete_spec: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             fast_literal_delete_cache: Self::new_fast_literal_delete_cache(),
             fast_select_cache: Self::new_fast_select_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
@@ -4061,8 +4071,10 @@ impl EmbeddedDatabase {
             fast_param_insert_cache: Self::new_fast_param_insert_cache(),
             fast_literal_insert_cache: Self::new_fast_literal_insert_cache(),
             fast_param_update_cache: Self::new_fast_param_update_cache(),
+            hot_fast_param_update_spec: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             fast_literal_update_cache: Self::new_fast_literal_update_cache(),
             fast_param_delete_cache: Self::new_fast_param_delete_cache(),
+            hot_fast_param_delete_spec: std::sync::Arc::new(parking_lot::RwLock::new(None)),
             fast_literal_delete_cache: Self::new_fast_literal_delete_cache(),
             fast_select_cache: Self::new_fast_select_cache(),
             query_profiler: std::sync::Arc::new(query_trace::QueryProfiler::new()),
@@ -5514,12 +5526,16 @@ impl EmbeddedDatabase {
         let trimmed = sql.trim_start();
         let prefix = trimmed.as_bytes().get(..6)?;
         if prefix.eq_ignore_ascii_case(b"UPDATE") {
-            let cache_key = format!("\0fast_param_update\0{sql}");
-            let spec = self
-                .fast_param_update_cache
-                .lock()
-                .ok()
-                .and_then(|mut cache| cache.get(&cache_key).map(std::sync::Arc::clone))?;
+            let spec = if let Some(spec) = self.hot_fast_param_update_spec.read().as_ref().and_then(
+                |(cached_sql, spec)| (cached_sql == sql).then(|| std::sync::Arc::clone(spec)),
+            ) {
+                spec
+            } else {
+                self.fast_param_update_cache
+                    .lock()
+                    .ok()
+                    .and_then(|mut cache| cache.get(sql).map(std::sync::Arc::clone))?
+            };
             if self.tenant_manager.should_apply_rls(&spec.table_name, "UPDATE")
                 || self.trigger_registry.has_triggers_for_table(&spec.table_name)
             {
@@ -5532,11 +5548,16 @@ impl EmbeddedDatabase {
             let fk_mode = *self.fk_validation_mode.read();
             let fk_source = *self.fk_validation_source.read();
             let cache_key = format!("\0fast_param_delete\0{fk_mode:?}\0{fk_source:?}\0{sql}");
-            let spec = self
-                .fast_param_delete_cache
-                .lock()
-                .ok()
-                .and_then(|mut cache| cache.get(&cache_key).map(std::sync::Arc::clone))?;
+            let spec = if let Some(spec) = self.hot_fast_param_delete_spec.read().as_ref().and_then(
+                |(cached_key, spec)| (cached_key == &cache_key).then(|| std::sync::Arc::clone(spec)),
+            ) {
+                spec
+            } else {
+                self.fast_param_delete_cache
+                    .lock()
+                    .ok()
+                    .and_then(|mut cache| cache.get(&cache_key).map(std::sync::Arc::clone))?
+            };
             if self.tenant_manager.should_apply_rls(&spec.table_name, "DELETE")
                 || self.trigger_registry.has_triggers_for_table(&spec.table_name)
             {
@@ -5801,9 +5822,8 @@ impl EmbeddedDatabase {
             return None;
         }
 
-        let cache_key = format!("\0fast_param_update\0{sql}");
         if let Ok(mut cache) = self.fast_param_update_cache.lock() {
-            if let Some(spec) = cache.get(&cache_key) {
+            if let Some(spec) = cache.get(sql) {
                 return Some(Ok(std::sync::Arc::clone(spec)));
             }
         }
@@ -5813,8 +5833,9 @@ impl EmbeddedDatabase {
             Err(e) => return Some(Err(e)),
         };
         if let Ok(mut cache) = self.fast_param_update_cache.lock() {
-            cache.put(cache_key, std::sync::Arc::clone(&spec));
+            cache.put(sql.to_string(), std::sync::Arc::clone(&spec));
         }
+        *self.hot_fast_param_update_spec.write() = Some((sql.to_string(), std::sync::Arc::clone(&spec)));
         Some(Ok(spec))
     }
 
@@ -5912,8 +5933,9 @@ impl EmbeddedDatabase {
             Err(e) => return Some(Err(e)),
         };
         if let Ok(mut cache) = self.fast_param_delete_cache.lock() {
-            cache.put(cache_key, std::sync::Arc::clone(&spec));
+            cache.put(cache_key.clone(), std::sync::Arc::clone(&spec));
         }
+        *self.hot_fast_param_delete_spec.write() = Some((cache_key, std::sync::Arc::clone(&spec)));
         Some(Ok(spec))
     }
 
@@ -6274,12 +6296,14 @@ impl EmbeddedDatabase {
         if let Ok(mut cache) = self.fast_param_update_cache.lock() {
             cache.clear();
         }
+        *self.hot_fast_param_update_spec.write() = None;
         if let Ok(mut cache) = self.fast_literal_update_cache.lock() {
             cache.clear();
         }
         if let Ok(mut cache) = self.fast_param_delete_cache.lock() {
             cache.clear();
         }
+        *self.hot_fast_param_delete_spec.write() = None;
         if let Ok(mut cache) = self.fast_literal_delete_cache.lock() {
             cache.clear();
         }
@@ -12468,8 +12492,10 @@ impl EmbeddedDatabase {
             fast_param_insert_cache: self.fast_param_insert_cache.clone(),
             fast_literal_insert_cache: self.fast_literal_insert_cache.clone(),
             fast_param_update_cache: self.fast_param_update_cache.clone(),
+            hot_fast_param_update_spec: self.hot_fast_param_update_spec.clone(),
             fast_literal_update_cache: self.fast_literal_update_cache.clone(),
             fast_param_delete_cache: self.fast_param_delete_cache.clone(),
+            hot_fast_param_delete_spec: self.hot_fast_param_delete_spec.clone(),
             fast_literal_delete_cache: self.fast_literal_delete_cache.clone(),
             fast_select_cache: self.fast_select_cache.clone(),
             query_profiler: self.query_profiler.clone(),
