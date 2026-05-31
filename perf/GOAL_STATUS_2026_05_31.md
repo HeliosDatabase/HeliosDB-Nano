@@ -148,3 +148,34 @@ This matches public OSS design signals:
 - SQLite's architecture keeps the hot embedded path close to bytecode VM, B-tree, and pager operations: <https://www.sqlite.org/arch.html>
 - PostgreSQL's executor centers row flow through plan nodes and tuple slots, which is flexible but not the analytical target to copy for Nano's SQLite/DuckDB-class embedded scans: <https://www.postgresql.org/docs/17/executor.html>
 - MySQL/InnoDB's change buffer is relevant to durable secondary-index write bursts, but less relevant to Nano's current in-memory analytical gap: <https://dev.mysql.com/doc/refman/8.1/en/innodb-change-buffer.html>
+
+## Accepted Follow-Up: Primitive Row Aggregates
+
+Commit after this report: `perf: reuse compact decode buffers for aggregates`.
+
+Change:
+
+- `src/storage/prefix_decode.rs` can now decode selected primitive numeric columns into a caller-owned compact buffer.
+- `src/storage/engine.rs` reuses compact selected-value buffers for row-store aggregate and Top-N scans.
+- Eligible no-filter/no-group `COUNT` / integer `SUM` / numeric `AVG` over default row-store data now update primitive aggregate state directly, avoiding per-row `Value` vectors.
+
+Validation:
+
+```text
+cargo test prefix_decode --lib -- --nocapture
+cargo check --lib
+cargo test --test aggregate_hardening_tests -- --nocapture --test-threads=1
+cargo test --test pagination_tests -- --nocapture --test-threads=1
+cargo test --test query_optimizer_tests -- --nocapture
+```
+
+Measured in-memory TPS, `N=10000`, `M=2000`, time-travel on:
+
+```text
+agg_count_sum_avg       436-443/s  (recorded baseline: 340/s)
+group_by_status         167-174/s  (recorded baseline: 148/s)
+join_users_orders            54/s  (recorded baseline: 53/s)
+order_by_limit10        221-239/s  (recorded baseline: 207/s)
+```
+
+This narrows the rowstore aggregate gap, but SQLite still leads the mirrored in-memory aggregate workload at 969/s. The remaining work is still a vector/compact pipeline across scan/filter/project/join, not isolated tuple-boundary tweaks.
