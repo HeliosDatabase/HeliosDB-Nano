@@ -947,3 +947,53 @@ Rejected during the next pass:
   softened, while `bulk_insert_users(txn)` only stayed in the existing
   142-144k/s range. Reverted. The extra insert-log metadata/layout is not worth
   the avoided commit-time key parse in the current workload shape.
+
+## Benchmark Harness Follow-Up: Focused TPS Workload Selection
+
+Commit after this report: `perf: add focused TPS workload selection`.
+
+Finding:
+
+- The TPS harness was useful as a broad guardrail, but every A/B pass paid the
+  setup and execution cost for all workloads. That made narrow write-path,
+  scan, aggregate, and join experiments slower than necessary and encouraged
+  smaller validation subsets outside the shared harness.
+- The parameterized harness is now the clearest way to separate SQL literal
+  parsing from engine write-path cost, so it needs the same focus mechanism.
+
+Change:
+
+- Add `HELIOS_TPS_WORKLOADS` support to `run_tps_suite`.
+- Add `HELIOS_TPS_PARAM_WORKLOADS`, falling back to `HELIOS_TPS_WORKLOADS`, to
+  `run_param_tps_suite`.
+- The selector accepts comma-separated workload labels or aliases such as
+  `bulk`, `join`, `param_execute_many_insert`, and `delete`. It still performs
+  required setup rows for dependent workloads, but does not time disabled
+  workloads.
+
+Validation:
+
+```text
+cargo check --test tps_workloads
+HELIOS_TPS=1 HELIOS_TPS_WORKLOADS=bulk HELIOS_TPS_MODE=mem HELIOS_TPS_N=1000 HELIOS_TPS_M=200 cargo test --release --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+HELIOS_TPS=1 HELIOS_TPS_WORKLOADS=point_lookup_pk,join HELIOS_TPS_MODE=mem HELIOS_TPS_N=1000 HELIOS_TPS_M=200 cargo test --release --test tps_workloads run_tps_suite -- --nocapture --test-threads=1
+HELIOS_TPS_PARAMS=1 HELIOS_TPS_WORKLOADS=param_execute_many_insert,param_delete_by_pk HELIOS_TPS_MODE=mem HELIOS_TPS_N=1000 HELIOS_TPS_M=200 cargo test --release --test tps_workloads run_param_tps_suite -- --nocapture --test-threads=1
+```
+
+Current parameterized in-memory write/read split, `N=10000`, `M=2000`,
+time-travel on:
+
+```text
+param_bulk_insert(txn)            161,968/s
+param_execute_many_insert         275,327/s
+param_autocommit_insert           127,290/s
+param_point_lookup_pk             388,174/s
+param_update_by_pk                124,189/s
+param_delete_by_pk                147,922/s
+```
+
+Interpretation: literal SQL parsing is not the whole remaining write gap.
+Parameterized per-row bulk is only modestly faster than default literal bulk,
+while `execute_many` is the healthier path. The next write-path lever should
+target batch transaction/index/row materialization directly rather than adding
+more literal parse caches.

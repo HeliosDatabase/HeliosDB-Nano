@@ -13,6 +13,7 @@
 
 use heliosdb_nano::config::WalSyncModeConfig;
 use heliosdb_nano::{Config, EmbeddedDatabase, Result, Value};
+use std::collections::HashSet;
 use std::time::Instant;
 
 /// Concurrent point-lookup benchmark (P0#4 row-cache read-lock).
@@ -299,6 +300,37 @@ fn bench<F: FnMut() -> Result<()>>(label: &str, ops: usize, mut f: F) {
     );
 }
 
+fn selected_workloads_env(name: &str) -> Option<HashSet<String>> {
+    let raw = std::env::var(name).ok()?;
+    let selected: HashSet<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_ascii_lowercase())
+        .collect();
+    (!selected.is_empty()).then_some(selected)
+}
+
+fn workload_enabled(selected: Option<&HashSet<String>>, label: &str, aliases: &[&str]) -> bool {
+    let Some(selected) = selected else {
+        return true;
+    };
+    selected.contains("all")
+        || selected.contains(&label.to_ascii_lowercase())
+        || aliases
+            .iter()
+            .any(|alias| selected.contains(&alias.to_ascii_lowercase()))
+}
+
+fn print_selected_workloads(selected: &HashSet<String>) {
+    println!("selected workloads: {}", {
+        let mut names: Vec<_> = selected.iter().map(String::as_str).collect();
+        names.sort_unstable();
+        names.join(",")
+    });
+    println!("{}", "-".repeat(80));
+}
+
 fn no_result_cache(sql: &str) -> String {
     // query() intentionally skips its result cache for SQL text containing
     // NOW(. Keep the marker inside a comment so the benchmark measures the
@@ -546,14 +578,33 @@ fn run_tps_suite() {
     println!("{}", "-".repeat(80));
 
     let db = make_db(&mode, &tmp).expect("db open");
+    let selected = selected_workloads_env("HELIOS_TPS_WORKLOADS");
+    if let Some(selected) = &selected {
+        print_selected_workloads(selected);
+    }
 
     db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT, age INTEGER, balance INTEGER)")
         .unwrap();
     db.execute("CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER, status TEXT)")
         .unwrap();
 
+    let run_bulk = workload_enabled(selected.as_ref(), "bulk_insert_users(txn)", &["bulk_insert", "bulk"]);
+    let run_autocommit = workload_enabled(selected.as_ref(), "autocommit_insert", &["autocommit_insert", "insert"]);
+    let run_point = workload_enabled(selected.as_ref(), "point_lookup_pk", &["point_lookup", "lookup"]);
+    let run_hot = workload_enabled(selected.as_ref(), "point_lookup_hot", &["hot_lookup", "lookup_hot"]);
+    let run_update = workload_enabled(selected.as_ref(), "update_by_pk", &["update"]);
+    let run_delete = workload_enabled(selected.as_ref(), "delete_by_pk", &["delete"]);
+    let run_filter = workload_enabled(selected.as_ref(), "filter_scan(age>50)", &["filter_scan", "filter"]);
+    let run_agg = workload_enabled(selected.as_ref(), "agg_count_sum_avg", &["aggregate", "agg"]);
+    let run_group = workload_enabled(selected.as_ref(), "group_by_status", &["group_by", "group"]);
+    let run_join = workload_enabled(selected.as_ref(), "join_users_orders", &["join"]);
+    let run_topn = workload_enabled(selected.as_ref(), "order_by_limit10", &["order_by", "topn", "top_n"]);
+
+    let need_base_users =
+        run_bulk || run_point || run_hot || run_update || run_filter || run_agg || run_join || run_topn;
+
     // 1) Bulk insert N users in one transaction (batch write throughput).
-    bench("bulk_insert_users(txn)", n, || {
+    let load_users = || -> Result<()> {
         db.execute("BEGIN")?;
         for i in 0..n {
             db.execute(&format!(
@@ -564,10 +615,15 @@ fn run_tps_suite() {
         }
         db.execute("COMMIT")?;
         Ok(())
-    });
+    };
+    if run_bulk {
+        bench("bulk_insert_users(txn)", n, load_users);
+    } else if need_base_users {
+        load_users().unwrap();
+    }
 
     // 1b) Bulk insert orders (for joins/aggregates), 2 orders per user.
-    {
+    if run_group || run_join {
         db.execute("BEGIN").unwrap();
         for i in 0..(n * 2) {
             let uid = i % n;
@@ -582,7 +638,7 @@ fn run_tps_suite() {
     }
 
     // 2) Autocommit insert M rows (each its own implicit txn) — the durable OLTP write TPS.
-    bench("autocommit_insert", m, || {
+    let load_autocommit_rows = || -> Result<()> {
         for i in 0..m {
             let id = n + i;
             db.execute(&format!(
@@ -590,94 +646,117 @@ fn run_tps_suite() {
             ))?;
         }
         Ok(())
-    });
+    };
+    if run_autocommit {
+        bench("autocommit_insert", m, load_autocommit_rows);
+    } else if run_delete {
+        load_autocommit_rows().unwrap();
+    }
 
     // 3) Point lookup by PK (read TPS).
-    bench("point_lookup_pk", m, || {
-        for i in 0..m {
-            let id = (i * 2654435761usize) % n;
-            let r = db.query(&format!("SELECT * FROM users WHERE id = {id}"), &[])?;
-            assert!(!r.is_empty());
-        }
-        Ok(())
-    });
+    if run_point {
+        bench("point_lookup_pk", m, || {
+            for i in 0..m {
+                let id = (i * 2654435761usize) % n;
+                let r = db.query(&format!("SELECT * FROM users WHERE id = {id}"), &[])?;
+                assert!(!r.is_empty());
+            }
+            Ok(())
+        });
+    }
 
     // 4) Point lookup, repeated hot key (row-cache / result-cache path).
     let hot_id = 12345usize.min(n - 1);
     let hot_sql = format!("SELECT * FROM users WHERE id = {hot_id}");
-    bench("point_lookup_hot", m, || {
-        for _ in 0..m {
-            let _ = db.query(&hot_sql, &[])?;
-        }
-        Ok(())
-    });
+    if run_hot {
+        bench("point_lookup_hot", m, || {
+            for _ in 0..m {
+                let _ = db.query(&hot_sql, &[])?;
+            }
+            Ok(())
+        });
+    }
 
     // 5) Update by PK (autocommit) — durable write TPS for updates.
-    bench("update_by_pk", m, || {
-        for i in 0..m {
-            let id = (i * 40503usize) % n;
-            db.execute(&format!("UPDATE users SET balance = balance + 1 WHERE id = {id}"))?;
-        }
-        Ok(())
-    });
+    if run_update {
+        bench("update_by_pk", m, || {
+            for i in 0..m {
+                let id = (i * 40503usize) % n;
+                db.execute(&format!("UPDATE users SET balance = balance + 1 WHERE id = {id}"))?;
+            }
+            Ok(())
+        });
+    }
 
     // 6) Delete by PK (autocommit) — delete the autocommit-inserted rows.
-    bench("delete_by_pk", m, || {
-        for i in 0..m {
-            let id = n + i;
-            db.execute(&format!("DELETE FROM users WHERE id = {id}"))?;
-        }
-        Ok(())
-    });
+    if run_delete {
+        bench("delete_by_pk", m, || {
+            for i in 0..m {
+                let id = n + i;
+                db.execute(&format!("DELETE FROM users WHERE id = {id}"))?;
+            }
+            Ok(())
+        });
+    }
 
     // 7) Filtered scan (non-indexed predicate over N rows).
     let scan_iters = 20usize;
-    bench("filter_scan(age>50)", scan_iters, || {
-        let sql = no_result_cache("SELECT id, name FROM users WHERE age > 50");
-        for _ in 0..scan_iters {
-            let _ = db.query(&sql, &[])?;
-        }
-        Ok(())
-    });
+    if run_filter {
+        bench("filter_scan(age>50)", scan_iters, || {
+            let sql = no_result_cache("SELECT id, name FROM users WHERE age > 50");
+            for _ in 0..scan_iters {
+                let _ = db.query(&sql, &[])?;
+            }
+            Ok(())
+        });
+    }
 
     // 8) Aggregate: COUNT + SUM + AVG, no group.
-    bench("agg_count_sum_avg", scan_iters, || {
-        let sql = no_result_cache("SELECT COUNT(*), SUM(balance), AVG(age) FROM users");
-        for _ in 0..scan_iters {
-            let _ = db.query(&sql, &[])?;
-        }
-        Ok(())
-    });
+    if run_agg {
+        bench("agg_count_sum_avg", scan_iters, || {
+            let sql = no_result_cache("SELECT COUNT(*), SUM(balance), AVG(age) FROM users");
+            for _ in 0..scan_iters {
+                let _ = db.query(&sql, &[])?;
+            }
+            Ok(())
+        });
+    }
 
     // 9) GROUP BY aggregate.
-    bench("group_by_status", scan_iters, || {
-        let sql = no_result_cache("SELECT status, COUNT(*), SUM(amount) FROM orders GROUP BY status");
-        for _ in 0..scan_iters {
-            let _ = db.query(&sql, &[])?;
-        }
-        Ok(())
-    });
+    if run_group {
+        bench("group_by_status", scan_iters, || {
+            let sql = no_result_cache("SELECT status, COUNT(*), SUM(amount) FROM orders GROUP BY status");
+            for _ in 0..scan_iters {
+                let _ = db.query(&sql, &[])?;
+            }
+            Ok(())
+        });
+    }
 
     // 10) JOIN users x orders with filter.
     let join_iters = 10usize;
-    bench("join_users_orders", join_iters, || {
-        let sql = no_result_cache(
+    if run_join {
+        bench("join_users_orders", join_iters, || {
+            let sql = no_result_cache(
             "SELECT u.name, o.amount FROM users u INNER JOIN orders o ON u.id = o.user_id WHERE o.status = 'paid' AND u.age > 40",
         );
-        for _ in 0..join_iters {
-            let _ = db.query(&sql, &[])?;
-        }
-        Ok(())
-    });
+            for _ in 0..join_iters {
+                let _ = db.query(&sql, &[])?;
+            }
+            Ok(())
+        });
+    }
 
     // 11) ORDER BY ... LIMIT (top-N).
-    bench("order_by_limit10", scan_iters, || {
-        let sql = no_result_cache("SELECT id, balance FROM users ORDER BY balance DESC LIMIT 10");
-        for _ in 0..scan_iters {
-            let _ = db.query(&sql, &[])?;
-        }
-        Ok(())
-    });
+    if run_topn {
+        bench("order_by_limit10", scan_iters, || {
+            let sql = no_result_cache("SELECT id, balance FROM users ORDER BY balance DESC LIMIT 10");
+            for _ in 0..scan_iters {
+                let _ = db.query(&sql, &[])?;
+            }
+            Ok(())
+        });
+    }
 
     println!("{}", "-".repeat(80));
     println!("done.\n");
@@ -716,14 +795,50 @@ fn run_param_tps_suite() {
     println!("{}", "-".repeat(80));
 
     let db = make_db(&mode, &tmp).expect("db open");
+    let selected =
+        selected_workloads_env("HELIOS_TPS_PARAM_WORKLOADS").or_else(|| selected_workloads_env("HELIOS_TPS_WORKLOADS"));
+    if let Some(selected) = &selected {
+        print_selected_workloads(selected);
+    }
+
     db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT, age INTEGER, balance INTEGER)")
         .unwrap();
-    db.execute(
-        "CREATE TABLE users_many (id INTEGER PRIMARY KEY, name TEXT, email TEXT, age INTEGER, balance INTEGER)",
-    )
-    .unwrap();
+    db.execute("CREATE TABLE users_many (id INTEGER PRIMARY KEY, name TEXT, email TEXT, age INTEGER, balance INTEGER)")
+        .unwrap();
 
-    bench("param_bulk_insert(txn)", n, || {
+    let run_bulk = workload_enabled(
+        selected.as_ref(),
+        "param_bulk_insert(txn)",
+        &["param_bulk_insert", "bulk_insert", "bulk"],
+    );
+    let run_execute_many = workload_enabled(
+        selected.as_ref(),
+        "param_execute_many_insert",
+        &["execute_many", "execute_many_insert", "param_execute_many"],
+    );
+    let run_autocommit = workload_enabled(
+        selected.as_ref(),
+        "param_autocommit_insert",
+        &["param_autocommit", "autocommit_insert", "autocommit", "insert"],
+    );
+    let run_point = workload_enabled(
+        selected.as_ref(),
+        "param_point_lookup_pk",
+        &["param_point_lookup", "point_lookup_pk", "point_lookup", "lookup"],
+    );
+    let run_update = workload_enabled(
+        selected.as_ref(),
+        "param_update_by_pk",
+        &["param_update", "update_by_pk", "update"],
+    );
+    let run_delete = workload_enabled(
+        selected.as_ref(),
+        "param_delete_by_pk",
+        &["param_delete", "delete_by_pk", "delete"],
+    );
+    let need_base_users = run_bulk || run_point || run_update;
+
+    let load_users = || -> Result<()> {
         db.execute("BEGIN")?;
         for i in 0..n {
             db.execute_params(
@@ -739,28 +854,35 @@ fn run_param_tps_suite() {
         }
         db.execute("COMMIT")?;
         Ok(())
-    });
+    };
+    if run_bulk {
+        bench("param_bulk_insert(txn)", n, load_users);
+    } else if need_base_users {
+        load_users().unwrap();
+    }
 
-    bench("param_execute_many_insert", n, || {
-        let rows: Vec<Vec<Value>> = (0..n)
-            .map(|i| {
-                vec![
-                    Value::Int8(i as i64),
-                    Value::String(format!("User{i}")),
-                    Value::String(format!("u{i}@ex.com")),
-                    Value::Int4(18 + (i % 60) as i32),
-                    Value::Int8(((i * 7) % 100000) as i64),
-                ]
-            })
-            .collect();
-        db.execute_many_params(
-            "INSERT INTO users_many (id, name, email, age, balance) VALUES ($1, $2, $3, $4, $5)",
-            &rows,
-        )?;
-        Ok(())
-    });
+    if run_execute_many {
+        bench("param_execute_many_insert", n, || {
+            let rows: Vec<Vec<Value>> = (0..n)
+                .map(|i| {
+                    vec![
+                        Value::Int8(i as i64),
+                        Value::String(format!("User{i}")),
+                        Value::String(format!("u{i}@ex.com")),
+                        Value::Int4(18 + (i % 60) as i32),
+                        Value::Int8(((i * 7) % 100000) as i64),
+                    ]
+                })
+                .collect();
+            db.execute_many_params(
+                "INSERT INTO users_many (id, name, email, age, balance) VALUES ($1, $2, $3, $4, $5)",
+                &rows,
+            )?;
+            Ok(())
+        });
+    }
 
-    bench("param_autocommit_insert", m, || {
+    let load_autocommit_rows = || -> Result<()> {
         for i in 0..m {
             let id = n + i;
             db.execute_params(
@@ -775,35 +897,46 @@ fn run_param_tps_suite() {
             )?;
         }
         Ok(())
-    });
+    };
+    if run_autocommit {
+        bench("param_autocommit_insert", m, load_autocommit_rows);
+    } else if run_delete {
+        load_autocommit_rows().unwrap();
+    }
 
-    bench("param_point_lookup_pk", m, || {
-        for i in 0..m {
-            let id = (i * 2654435761usize) % n;
-            let rows = db.query_params("SELECT * FROM users WHERE id = $1", &[Value::Int8(id as i64)])?;
-            assert!(!rows.is_empty());
-        }
-        Ok(())
-    });
+    if run_point {
+        bench("param_point_lookup_pk", m, || {
+            for i in 0..m {
+                let id = (i * 2654435761usize) % n;
+                let rows = db.query_params("SELECT * FROM users WHERE id = $1", &[Value::Int8(id as i64)])?;
+                assert!(!rows.is_empty());
+            }
+            Ok(())
+        });
+    }
 
-    bench("param_update_by_pk", m, || {
-        for i in 0..m {
-            let id = (i * 40503usize) % n;
-            db.execute_params(
-                "UPDATE users SET balance = balance + 1 WHERE id = $1",
-                &[Value::Int8(id as i64)],
-            )?;
-        }
-        Ok(())
-    });
+    if run_update {
+        bench("param_update_by_pk", m, || {
+            for i in 0..m {
+                let id = (i * 40503usize) % n;
+                db.execute_params(
+                    "UPDATE users SET balance = balance + 1 WHERE id = $1",
+                    &[Value::Int8(id as i64)],
+                )?;
+            }
+            Ok(())
+        });
+    }
 
-    bench("param_delete_by_pk", m, || {
-        for i in 0..m {
-            let id = n + i;
-            db.execute_params("DELETE FROM users WHERE id = $1", &[Value::Int8(id as i64)])?;
-        }
-        Ok(())
-    });
+    if run_delete {
+        bench("param_delete_by_pk", m, || {
+            for i in 0..m {
+                let id = n + i;
+                db.execute_params("DELETE FROM users WHERE id = $1", &[Value::Int8(id as i64)])?;
+            }
+            Ok(())
+        });
+    }
 
     println!("{}", "-".repeat(80));
     println!("done.\n");
